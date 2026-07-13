@@ -743,6 +743,7 @@ impl TryFrom<ArtifactSourceMetadataRecord> for ArtifactSourceStatus {
             total_size,
             file_count: record.file_count,
             chunk_count: record.chunk_count,
+            node_rank: record.node_rank,
         })
     }
 }
@@ -766,6 +767,7 @@ impl TryFrom<ArtifactSourceStatus> for ArtifactSourceMetadataRecord {
             total_size,
             file_count: status.file_count,
             chunk_count: status.chunk_count,
+            node_rank: status.node_rank,
         })
     }
 }
@@ -781,6 +783,7 @@ mod tests {
             total_size: i64::MAX as u64 + 1,
             file_count: 1,
             chunk_count: 1,
+            node_rank: 0,
         };
 
         assert!(ArtifactSourceStatus::try_from(record).is_err());
@@ -793,6 +796,7 @@ mod tests {
             total_size: -1,
             file_count: 1,
             chunk_count: 1,
+            node_rank: 0,
         };
 
         assert!(ArtifactSourceMetadataRecord::try_from(status).is_err());

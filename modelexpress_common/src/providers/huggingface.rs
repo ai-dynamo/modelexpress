@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    Utils,
     cache::{ModelInfo, ProviderCache, directory_size},
-    constants,
+    constants, envs,
     models::ModelProvider,
     providers::ModelProviderTrait,
 };
@@ -13,33 +12,27 @@ use futures::StreamExt;
 use hf_hub::api::tokio::{ApiBuilder, ApiError};
 use hf_hub::{Cache, Repo, RepoType};
 use std::collections::HashSet;
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
 
-const HF_TOKEN_ENV_VAR: &str = "HF_TOKEN";
-const HF_HUB_CACHE_ENV_VAR: &str = "HF_HUB_CACHE";
-const MODEL_EXPRESS_CACHE_ENV_VAR: &str = "MODEL_EXPRESS_CACHE_DIRECTORY";
-const HF_HUB_OFFLINE_ENV_VAR: &str = "HF_HUB_OFFLINE";
 const HF_FALLBACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const HF_FALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Check if offline mode is enabled via HF_HUB_OFFLINE environment variable.
-/// The variable is considered enabled if its value is one of: "1", "ON", "YES", "TRUE" (case-insensitive).
+/// Check if offline mode is enabled via `HF_HUB_OFFLINE`.
+/// See [`crate::envs::hf_offline`] for the accepted truthy values.
 fn is_offline_mode() -> bool {
-    env::var(HF_HUB_OFFLINE_ENV_VAR)
-        .map(|v| matches!(v.to_uppercase().as_str(), "1" | "ON" | "YES" | "TRUE"))
-        .unwrap_or(false)
+    envs::hf_offline()
 }
 
 /// Get the cache directory for Hugging Face models
 /// Priority order:
 /// 1. Provided cache_dir parameter
-/// 2. HF_HUB_CACHE environment variable
-/// 3. Default location (~/.cache/huggingface/hub)
+/// 2. MODEL_EXPRESS_CACHE_DIRECTORY environment variable
+/// 3. HF_HUB_CACHE environment variable
+/// 4. Default location (~/.cache/huggingface/hub)
 fn get_cache_dir(cache_dir: Option<PathBuf>) -> PathBuf {
     // Use provided cache directory if available
     if let Some(dir) = cache_dir {
@@ -47,18 +40,17 @@ fn get_cache_dir(cache_dir: Option<PathBuf>) -> PathBuf {
     }
 
     // Try MODEL_EXPRESS_CACHE_DIRECTORY environment variable first
-    if let Ok(cache_path) = env::var(MODEL_EXPRESS_CACHE_ENV_VAR) {
-        return PathBuf::from(cache_path);
+    if let Some(cache_path) = envs::cache_directory() {
+        return cache_path;
     }
 
-    // Try environment variable
-    if let Ok(cache_path) = env::var(HF_HUB_CACHE_ENV_VAR) {
-        return PathBuf::from(cache_path);
+    // Try HF_HUB_CACHE environment variable
+    if let Some(cache_path) = envs::hf_hub_cache() {
+        return cache_path;
     }
 
     // Fall back to default location
-    let home = Utils::get_home_dir().unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(constants::DEFAULT_HF_CACHE_PATH)
+    envs::home_dir_or_cwd().join(constants::DEFAULT_HF_CACHE_PATH)
 }
 
 /// Hugging Face model provider implementation
@@ -333,7 +325,7 @@ impl ModelProviderTrait for HuggingFaceProvider {
             return self.get_model_path(model_name, cache_dir).await;
         }
 
-        let token = env::var(HF_TOKEN_ENV_VAR).ok();
+        let token = envs::hf_token();
 
         info!("Using cache directory: {:?}", cache_dir);
         // High CPU download
@@ -455,7 +447,7 @@ impl ModelProviderTrait for HuggingFaceProvider {
     /// Returns Ok(()) if the model was successfully deleted or didn't exist
     async fn delete_model(&self, model_name: &str, cache_dir: PathBuf) -> Result<()> {
         info!("Deleting model from Hugging Face cache: {model_name}");
-        let token = env::var(HF_TOKEN_ENV_VAR).ok();
+        let token = envs::hf_token();
         let api = ApiBuilder::from_env()
             .with_token(token)
             .with_cache_dir(cache_dir.clone())
@@ -563,7 +555,7 @@ impl ModelProviderTrait for HuggingFaceProvider {
         }
 
         // Check against the latest commit hash from HF
-        let token = env::var(HF_TOKEN_ENV_VAR).ok();
+        let token = envs::hf_token();
         let api = ApiBuilder::from_env().with_token(token).build()?;
         let repo = api.model(model_name.to_string());
         let info = repo.info().await.map_err(|e| {
@@ -666,7 +658,8 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let hf_endpoint_guard = EnvVarGuard::set(env_lock, "HF_ENDPOINT", &server.uri());
+            let hf_endpoint_guard =
+                EnvVarGuard::set(env_lock, crate::envs::HF_ENDPOINT, &server.uri());
 
             Self {
                 _server: server,
@@ -816,9 +809,13 @@ mod tests {
         );
 
         let env_cache_path = env_cache.path().to_str().expect("Expected env cache path");
-        let _model_express_cache_guard =
-            EnvVarGuard::set(&env_lock, MODEL_EXPRESS_CACHE_ENV_VAR, env_cache_path);
-        let _hf_hub_cache_guard = EnvVarGuard::set(&env_lock, HF_HUB_CACHE_ENV_VAR, env_cache_path);
+        let _model_express_cache_guard = EnvVarGuard::set(
+            &env_lock,
+            crate::envs::MODEL_EXPRESS_CACHE_DIRECTORY,
+            env_cache_path,
+        );
+        let _hf_hub_cache_guard =
+            EnvVarGuard::set(&env_lock, crate::envs::HF_HUB_CACHE, env_cache_path);
 
         let delete_result = provider
             .delete_model("test/model", explicit_cache.path().to_path_buf())
@@ -885,9 +882,13 @@ mod tests {
             .await;
 
         let temp_cache_path = temp_cache.path().to_str().expect("Expected cache path");
-        let _model_express_cache_guard =
-            EnvVarGuard::set(&env_lock, MODEL_EXPRESS_CACHE_ENV_VAR, temp_cache_path);
-        let _hf_endpoint_guard = EnvVarGuard::set(&env_lock, "HF_ENDPOINT", &server.uri());
+        let _model_express_cache_guard = EnvVarGuard::set(
+            &env_lock,
+            crate::envs::MODEL_EXPRESS_CACHE_DIRECTORY,
+            temp_cache_path,
+        );
+        let _hf_endpoint_guard =
+            EnvVarGuard::set(&env_lock, crate::envs::HF_ENDPOINT, &server.uri());
 
         let result = provider
             .delete_model(model_name, temp_cache.path().to_path_buf())
@@ -1004,7 +1005,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let _hf_endpoint_guard = EnvVarGuard::set(&env_lock, "HF_ENDPOINT", &server.uri());
+        let _hf_endpoint_guard =
+            EnvVarGuard::set(&env_lock, crate::envs::HF_ENDPOINT, &server.uri());
 
         let provider = HuggingFaceProvider;
         let result = provider
@@ -1021,17 +1023,17 @@ mod tests {
     fn test_is_offline_mode() {
         let env_lock = acquire_env_mutex();
         {
-            let _offline_guard = EnvVarGuard::set(&env_lock, HF_HUB_OFFLINE_ENV_VAR, "1");
+            let _offline_guard = EnvVarGuard::set(&env_lock, crate::envs::HF_HUB_OFFLINE, "1");
             assert!(is_offline_mode());
         }
 
         {
-            let _offline_guard = EnvVarGuard::set(&env_lock, HF_HUB_OFFLINE_ENV_VAR, "0");
+            let _offline_guard = EnvVarGuard::set(&env_lock, crate::envs::HF_HUB_OFFLINE, "0");
             assert!(!is_offline_mode());
         }
 
         {
-            let _offline_guard = EnvVarGuard::remove(&env_lock, HF_HUB_OFFLINE_ENV_VAR);
+            let _offline_guard = EnvVarGuard::remove(&env_lock, crate::envs::HF_HUB_OFFLINE);
             assert!(!is_offline_mode());
         }
     }
@@ -1048,7 +1050,7 @@ mod tests {
             .join("abc1234");
         std::fs::create_dir_all(&snapshots_path).expect("Failed to create directory");
 
-        let _offline_guard = EnvVarGuard::set(&env_lock, HF_HUB_OFFLINE_ENV_VAR, "1");
+        let _offline_guard = EnvVarGuard::set(&env_lock, crate::envs::HF_HUB_OFFLINE, "1");
 
         let result = HuggingFaceProvider
             .download_model("test/model", Some(temp_dir.path().into()), false)
@@ -1064,7 +1066,7 @@ mod tests {
         let env_lock = acquire_env_mutex();
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
 
-        let _offline_guard = EnvVarGuard::set(&env_lock, HF_HUB_OFFLINE_ENV_VAR, "1");
+        let _offline_guard = EnvVarGuard::set(&env_lock, crate::envs::HF_HUB_OFFLINE, "1");
 
         let result = HuggingFaceProvider
             .download_model("nonexistent/model", Some(temp_dir.path().into()), false)

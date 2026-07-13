@@ -87,6 +87,9 @@ const (
 	MxSourceType_MX_SOURCE_TYPE_TORCH_COMPILE_CACHE MxSourceType = 3 // torch.compile cache files
 	MxSourceType_MX_SOURCE_TYPE_TRITON_CACHE        MxSourceType = 4 // Triton cache files
 	MxSourceType_MX_SOURCE_TYPE_DEEP_GEMM_CACHE     MxSourceType = 5 // DeepGEMM kernel cache files
+	MxSourceType_MX_SOURCE_TYPE_TILELANG_CACHE      MxSourceType = 6 // TileLang JIT kernel cache files
+	MxSourceType_MX_SOURCE_TYPE_CUTE_DSL_CACHE      MxSourceType = 7 // CuTe DSL compiled kernel cache files
+	MxSourceType_MX_SOURCE_TYPE_FLASHINFER_CACHE    MxSourceType = 8 // FlashInfer JIT workspace cache files
 )
 
 // Enum value maps for MxSourceType.
@@ -98,6 +101,9 @@ var (
 		3: "MX_SOURCE_TYPE_TORCH_COMPILE_CACHE",
 		4: "MX_SOURCE_TYPE_TRITON_CACHE",
 		5: "MX_SOURCE_TYPE_DEEP_GEMM_CACHE",
+		6: "MX_SOURCE_TYPE_TILELANG_CACHE",
+		7: "MX_SOURCE_TYPE_CUTE_DSL_CACHE",
+		8: "MX_SOURCE_TYPE_FLASHINFER_CACHE",
 	}
 	MxSourceType_value = map[string]int32{
 		"MX_SOURCE_TYPE_WEIGHTS":             0,
@@ -106,6 +112,9 @@ var (
 		"MX_SOURCE_TYPE_TORCH_COMPILE_CACHE": 3,
 		"MX_SOURCE_TYPE_TRITON_CACHE":        4,
 		"MX_SOURCE_TYPE_DEEP_GEMM_CACHE":     5,
+		"MX_SOURCE_TYPE_TILELANG_CACHE":      6,
+		"MX_SOURCE_TYPE_CUTE_DSL_CACHE":      7,
+		"MX_SOURCE_TYPE_FLASHINFER_CACHE":    8,
 	}
 )
 
@@ -486,7 +495,9 @@ type ArtifactSourceMetadata struct {
 	// Number of files in the sealed artifact manifest.
 	FileCount uint32 `protobuf:"varint,3,opt,name=file_count,json=fileCount,proto3" json:"file_count,omitempty"`
 	// Number of transfer chunks in the sealed artifact manifest.
-	ChunkCount    uint32 `protobuf:"varint,4,opt,name=chunk_count,json=chunkCount,proto3" json:"chunk_count,omitempty"`
+	ChunkCount uint32 `protobuf:"varint,4,opt,name=chunk_count,json=chunkCount,proto3" json:"chunk_count,omitempty"`
+	// Distributed node rank that owns this node-scoped artifact.
+	NodeRank      uint32 `protobuf:"varint,5,opt,name=node_rank,json=nodeRank,proto3" json:"node_rank,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -545,6 +556,13 @@ func (x *ArtifactSourceMetadata) GetFileCount() uint32 {
 func (x *ArtifactSourceMetadata) GetChunkCount() uint32 {
 	if x != nil {
 		return x.ChunkCount
+	}
+	return 0
+}
+
+func (x *ArtifactSourceMetadata) GetNodeRank() uint32 {
+	if x != nil {
+		return x.NodeRank
 	}
 	return 0
 }
@@ -2462,7 +2480,7 @@ const file_p2p_proto_rawDesc = "" +
 	"\x04addr\x18\x02 \x01(\x04R\x04addr\x12\x12\n" +
 	"\x04size\x18\x03 \x01(\x04R\x04size\x12\x1b\n" +
 	"\tdevice_id\x18\x04 \x01(\rR\bdeviceId\x12\x14\n" +
-	"\x05dtype\x18\x05 \x01(\tR\x05dtype\"\x98\x01\n" +
+	"\x05dtype\x18\x05 \x01(\tR\x05dtype\"\xb5\x01\n" +
 	"\x16ArtifactSourceMetadata\x12\x1f\n" +
 	"\vartifact_id\x18\x01 \x01(\tR\n" +
 	"artifactId\x12\x1d\n" +
@@ -2471,7 +2489,8 @@ const file_p2p_proto_rawDesc = "" +
 	"\n" +
 	"file_count\x18\x03 \x01(\rR\tfileCount\x12\x1f\n" +
 	"\vchunk_count\x18\x04 \x01(\rR\n" +
-	"chunkCount\"U\n" +
+	"chunkCount\x12\x1b\n" +
+	"\tnode_rank\x18\x05 \x01(\rR\bnodeRank\"U\n" +
 	"\x14TensorSourceMetadata\x12=\n" +
 	"\atensors\x18\x01 \x03(\v2#.model_express.p2p.TensorDescriptorR\atensors\"\xa4\x02\n" +
 	"\x10ArtifactManifest\x12)\n" +
@@ -2649,14 +2668,17 @@ const file_p2p_proto_rawDesc = "" +
 	"\x19BACKEND_FRAMEWORK_UNKNOWN\x10\x00\x12\x1a\n" +
 	"\x16BACKEND_FRAMEWORK_VLLM\x10\x01\x12\x1c\n" +
 	"\x18BACKEND_FRAMEWORK_SGLANG\x10\x02\x12\x1d\n" +
-	"\x19BACKEND_FRAMEWORK_TRT_LLM\x10\x03*\xcf\x01\n" +
+	"\x19BACKEND_FRAMEWORK_TRT_LLM\x10\x03*\xba\x02\n" +
 	"\fMxSourceType\x12\x1a\n" +
 	"\x16MX_SOURCE_TYPE_WEIGHTS\x10\x00\x12\x17\n" +
 	"\x13MX_SOURCE_TYPE_LORA\x10\x01\x12\x1d\n" +
 	"\x19MX_SOURCE_TYPE_CUDA_GRAPH\x10\x02\x12&\n" +
 	"\"MX_SOURCE_TYPE_TORCH_COMPILE_CACHE\x10\x03\x12\x1f\n" +
 	"\x1bMX_SOURCE_TYPE_TRITON_CACHE\x10\x04\x12\"\n" +
-	"\x1eMX_SOURCE_TYPE_DEEP_GEMM_CACHE\x10\x05*{\n" +
+	"\x1eMX_SOURCE_TYPE_DEEP_GEMM_CACHE\x10\x05\x12!\n" +
+	"\x1dMX_SOURCE_TYPE_TILELANG_CACHE\x10\x06\x12!\n" +
+	"\x1dMX_SOURCE_TYPE_CUTE_DSL_CACHE\x10\a\x12#\n" +
+	"\x1fMX_SOURCE_TYPE_FLASHINFER_CACHE\x10\b*{\n" +
 	"\fSourceStatus\x12\x19\n" +
 	"\x15SOURCE_STATUS_UNKNOWN\x10\x00\x12\x1e\n" +
 	"\x1aSOURCE_STATUS_INITIALIZING\x10\x01\x12\x17\n" +

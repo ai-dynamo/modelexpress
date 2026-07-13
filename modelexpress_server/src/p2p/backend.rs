@@ -144,6 +144,7 @@ pub struct ArtifactSourceMetadataRecord {
     pub total_size: u64,
     pub file_count: u32,
     pub chunk_count: u32,
+    pub node_rank: u32,
 }
 
 // Conversions from gRPC types
@@ -256,6 +257,7 @@ impl From<ArtifactSourceMetadata> for ArtifactSourceMetadataRecord {
             total_size: meta.total_size,
             file_count: meta.file_count,
             chunk_count: meta.chunk_count,
+            node_rank: meta.node_rank,
         }
     }
 }
@@ -267,6 +269,7 @@ impl From<ArtifactSourceMetadataRecord> for ArtifactSourceMetadata {
             total_size: record.total_size,
             file_count: record.file_count,
             chunk_count: record.chunk_count,
+            node_rank: record.node_rank,
         }
     }
 }

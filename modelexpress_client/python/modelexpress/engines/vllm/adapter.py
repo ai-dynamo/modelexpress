@@ -7,12 +7,12 @@ from __future__ import annotations
 
 import copy
 import logging
-import os
 import uuid
 from typing import TYPE_CHECKING, Iterator
 
 import torch
 
+from ... import envs
 from ...adapter import EngineAdapter
 from ...accelerators import accelerator_backend_for
 from ...load_strategy.context import LoadContext, LoadResult
@@ -67,8 +67,8 @@ class VllmAdapter(EngineAdapter):
     def discover_tensors(self, result: LoadResult) -> dict[str, torch.Tensor]:
         if result.model is None:
             raise RuntimeError("vLLM tensor discovery requires result.model")
-        adopt_hidden_tensors(result.model)
-        return collect_module_tensors(result.model)
+        adopt_hidden_tensors(result.model, self.accelerator_backend)
+        return collect_module_tensors(result.model, self.accelerator_backend)
 
     def prepare_rdma_target(self, result: LoadResult) -> LoadResult:
         if result.model is None:
@@ -171,7 +171,7 @@ class VllmAdapter(EngineAdapter):
 
         from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
-        with capture_tensor_attrs():
+        with capture_tensor_attrs(self.accelerator_backend):
             process_weights_after_loading(
                 result.model,
                 self.model_config,
@@ -189,7 +189,7 @@ class VllmAdapter(EngineAdapter):
             raise RuntimeError("vLLM RDMA post-load processing requires result.model")
 
         finalized_prefixes: list[str] = []
-        with capture_tensor_attrs():
+        with capture_tensor_attrs(self.accelerator_backend):
             for name, module in result.model.named_modules():
                 # Some vLLM finalizers are model-level hooks that recursively
                 # transform child layers. If a parent ran one, do not call another
@@ -246,7 +246,7 @@ class VllmAdapter(EngineAdapter):
         tp_size = getattr(self.vllm_config.parallel_config, "tensor_parallel_size", 1)
         return (
             tp_size > 1
-            and os.environ.get("MX_MS_DISTRIBUTED", "0").lower() in ("1", "true")
+            and envs.MX_MS_DISTRIBUTED
         )
 
 
@@ -307,6 +307,7 @@ def build_vllm_load_context(vllm_config, model_config) -> LoadContext:
         identity=adapter.build_identity(),
         mx_client=create_metadata_client(worker_rank=worker_rank),
         worker_id=uuid.uuid4().hex[:8],
+        node_rank=int(getattr(vllm_config.parallel_config, "node_rank", 0)),
         adapter=adapter,
         accelerator_backend=adapter.accelerator_backend,
     )

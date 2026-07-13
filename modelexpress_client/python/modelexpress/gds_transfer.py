@@ -16,12 +16,12 @@ Environment variables:
 from __future__ import annotations
 
 import logging
-import os
 import time
 from typing import Any
 
 import torch
 
+from . import envs
 from .accelerators import AcceleratorBackend
 
 logger = logging.getLogger("modelexpress.gds_transfer")
@@ -103,7 +103,7 @@ class GdsTransferManager:
         self._device_id: int | None = None
         self._agent: Any = None
         self._accelerator_backend = accelerator_backend
-        override = os.environ.get("MX_GDS_MAX_CHUNK_KB")
+        override = envs.MX_GDS_MAX_CHUNK_KB
         self._max_chunk_size = int(override) * 1024 if override else _DEFAULT_MAX_CHUNK
 
     def __enter__(self) -> GdsTransferManager:
@@ -129,7 +129,7 @@ class GdsTransferManager:
 
         self._device_id = self._accelerator_backend.current_device()
 
-        thread_count = int(os.environ.get("MX_GDS_THREADS", "8"))
+        thread_count = envs.MX_GDS_THREADS
         config = NixlAgentConfig(backends=["GDS_MT"], num_threads=thread_count)
         self._agent = NixlAgent(self._agent_name, config)
 
@@ -205,7 +205,7 @@ class GdsTransferManager:
             raise RuntimeError("GDS batch transfer failed")
 
         # Phase 4: Wait for completion
-        timeout = float(os.environ.get("MX_GDS_TIMEOUT", "120"))
+        timeout = envs.MX_GDS_TIMEOUT
         t0 = time.perf_counter()
         spins = 0
         while True:

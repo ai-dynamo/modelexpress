@@ -207,11 +207,10 @@ class TestModelStreamerLoad:
         mock_stream.assert_called_once_with("/models/deepseek", ctx, model)
 
     @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
-    def test_uri_from_model_weights_not_from_env(self, mock_register):
-        """The streaming URI comes from model_config, not from MX_MODEL_URI."""
+    def test_uri_from_env_with_hf_model_as_fallback(self, mock_register):
         model = MagicMock()
         ctx = self._make_ctx_with_uri(
-            model_weights="s3://bucket/from-config", model="/ignored"
+            model_weights=None, model="Qwen/Qwen2.5-0.5B"
         )
         strategy = self._make_strategy()
 
@@ -224,7 +223,7 @@ class TestModelStreamerLoad:
                 with pytest.raises(StrategyFailed, match="expected"):
                     strategy.load(model, ctx)
 
-        mock_stream.assert_called_once_with("s3://bucket/from-config", ctx, model)
+        mock_stream.assert_called_once_with("s3://other/path-in-env", ctx, model)
 
     @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
     def test_raises_strategy_failed_on_error(self, mock_register):

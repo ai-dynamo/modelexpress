@@ -14,6 +14,7 @@ import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from fcntl import flock, LOCK_EX, LOCK_UN
+from getpass import getuser
 from hashlib import sha256
 from importlib.metadata import version as pkg_version
 from pathlib import Path
@@ -21,6 +22,7 @@ from typing import Iterator
 
 import torch
 
+from ... import envs
 from ... import p2p_pb2
 from ...load_strategy.base import (
     _init_nixl_manager,
@@ -28,10 +30,14 @@ from ...load_strategy.base import (
 )
 from ...load_strategy.context import LoadContext
 from ...metadata.artifact_transfer import (
+    ArtifactCacheRoot,
     P2PArtifactTransfer,
     PublishedArtifactSource,
+    cute_dsl_cache_artifact_transfer,
     deep_gemm_cache_artifact_transfer,
+    flashinfer_cache_artifact_transfer,
     publish_artifact_source,
+    tilelang_cache_artifact_transfer,
     triton_cache_artifact_transfer,
     torch_compile_cache_artifact_transfer,
 )
@@ -41,17 +47,9 @@ from ...nixl_transfer import is_nixl_available
 
 logger = logging.getLogger("modelexpress.engines.vllm.artifacts")
 
-_ENABLE_ENV = "MX_ARTIFACT_TRANSFER"
-_BUNDLE_ROOT_ENV = "MX_ARTIFACT_BUNDLE_ROOT"
-_COMPILE_CONFIG_DIGEST_ENV = "MX_ARTIFACT_COMPILE_CONFIG_DIGEST"
-_DEEP_GEMM_CACHE_DIR_ENV = "DEEP_GEMM_CACHE_DIR"
-_DG_JIT_CACHE_DIR_ENV = "DG_JIT_CACHE_DIR"
-_READY_URL_ENV = "MX_ARTIFACT_READY_URL"
-_READY_TIMEOUT_ENV = "MX_ARTIFACT_READY_TIMEOUT_SECS"
 _DEFAULT_READY_URL = "http://127.0.0.1:8000/health"
 _READY_POLL_SECS = 5
 _CACHE_SETTLE_SECS = 5
-_TRUTHY = {"1", "true", "yes", "on"}
 
 _published_sources: dict[tuple[int, int], PublishedArtifactSource] = {}
 _scheduled_publishers: dict[tuple[int, int], PublisherThread] = {}
@@ -152,6 +150,7 @@ def schedule_vllm_cache_artifact_publish(ctx: LoadContext) -> None:
         if previous is not None:
             previous.stop()
 
+        source_roots = transfer.roots
         publisher_ref: list[PublisherThread | None] = [None]
         publisher = PublisherThread(
             mx_client=ctx.mx_client,
@@ -161,8 +160,8 @@ def schedule_vllm_cache_artifact_publish(ctx: LoadContext) -> None:
             publish_fn=lambda transfer=transfer, identity=identity: (
                 _publish_vllm_cache_artifact(ctx, transfer, identity).endpoint.mx_source_id
             ),
-            ready_fn=_vllm_artifact_ready_fn(transfer.source_root),
-            publish_timeout_secs=_ready_timeout_secs(),
+            ready_fn=_vllm_artifact_ready_fn(source_roots),
+            publish_timeout_secs=envs.MX_ARTIFACT_READY_TIMEOUT_SECS,
             interval_secs=_READY_POLL_SECS,
             heartbeat_after_publish=False,
             cleanup_fn=lambda marker_path=marker_path, publisher_ref=publisher_ref: (
@@ -176,10 +175,10 @@ def schedule_vllm_cache_artifact_publish(ctx: LoadContext) -> None:
         _scheduled_publishers[key] = publisher
         publisher.start()
         logger.info(
-            "[Worker %s] Scheduled vLLM artifact publisher: name=%s root=%s",
+            "[Worker %s] Scheduled vLLM artifact publisher: name=%s roots=%s",
             ctx.global_rank,
             transfer.name,
-            transfer.source_root,
+            [str(root.source_root) for root in source_roots],
         )
 
 
@@ -227,6 +226,7 @@ def _install_vllm_cache_artifact_once(
             identity,
             ctx.nixl_manager,
             worker_rank=None,
+            node_rank=ctx.node_rank,
         )
         transfer.install(header)
         _write_marker(marker_path, header.artifact_id)
@@ -243,10 +243,13 @@ def _publish_vllm_cache_artifact(
     worker_grpc_server = _get_worker_server(ctx.device_id)
     if worker_grpc_server is None:
         raise RuntimeError("P2P worker gRPC server is required for artifact publish")
-    if not _has_files(transfer.source_root):
+    required_roots = tuple(
+        root.source_root for root in transfer.roots if not root.optional
+    )
+    if not all(_has_files(path) for path in required_roots):
         raise LookupError(
-            f"vLLM artifact source {transfer.name} is empty or missing: "
-            f"{transfer.source_root}"
+            f"Required vLLM artifact sources {transfer.name} are empty or missing: "
+            f"{required_roots}"
         )
 
     start = time.perf_counter()
@@ -264,6 +267,7 @@ def _publish_vllm_cache_artifact(
         worker_id=_artifact_source_worker_id(ctx),
         worker_grpc_server=worker_grpc_server,
         worker_rank=ctx.worker_rank,
+        node_rank=ctx.node_rank,
     )
     _published_sources[key] = published
     elapsed = time.perf_counter() - start
@@ -282,7 +286,7 @@ def _publish_vllm_cache_artifact(
 
 
 def _artifact_transfer_enabled() -> bool:
-    return os.environ.get(_ENABLE_ENV, "").strip().lower() in _TRUTHY
+    return envs.MX_ARTIFACT_TRANSFER
 
 
 def _artifact_source_worker_id(
@@ -307,10 +311,11 @@ def _artifact_marker_key(
     identity: p2p_pb2.SourceIdentity,
     action: str,
 ) -> str:
-    path = transfer.source_root if action == "publish" else transfer.target_root
     digest = sha256()
     digest.update(identity.SerializeToString())
-    digest.update(str(path.resolve()).encode())
+    for root in transfer.roots:
+        path = root.source_root if action == "publish" else root.target_root
+        digest.update(str(path.resolve()).encode())
     digest.update(transfer.name.encode())
     return digest.hexdigest()[:16]
 
@@ -356,7 +361,7 @@ def _p2p_metadata_enabled_for_artifacts(ctx: LoadContext) -> bool:
 def _ensure_nixl_manager(ctx: LoadContext) -> None:
     if ctx.nixl_manager is not None:
         return
-    base_port = _env_int("MX_METADATA_PORT", 5555)
+    base_port = envs.MX_METADATA_PORT
     try:
         ctx.nixl_manager = _init_nixl_manager(
             ctx.global_rank,
@@ -376,33 +381,68 @@ def _vllm_artifact_transfers(
     ctx: LoadContext,
 ) -> list[tuple[P2PArtifactTransfer, p2p_pb2.SourceIdentity]]:
     bundle_root = _bundle_root(ctx)
-    transfer_specs = [
-        (
-            "torch_compile_cache",
-            torch_compile_cache_artifact_transfer,
-            p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
-            _torch_compile_cache_root(),
-        ),
-        (
-            "triton_cache",
-            triton_cache_artifact_transfer,
-            p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
-            _triton_cache_root(),
-        ),
-        (
-            "deep_gemm_cache",
-            deep_gemm_cache_artifact_transfer,
-            p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE,
-            _deep_gemm_cache_root(),
-        ),
-    ]
-
+    flashinfer_cache_root = _flashinfer_cache_root()
+    flashinfer_autotune_cache_root = _flashinfer_autotune_cache_root()
     return [
         (
-            factory(cache_root, cache_root, bundle_root / name),
-            _artifact_identity(ctx, mx_source_type),
-        )
-        for name, factory, mx_source_type, cache_root in transfer_specs
+            torch_compile_cache_artifact_transfer(
+                _torch_compile_cache_root(),
+                _torch_compile_cache_root(),
+                bundle_root / "torch_compile_cache",
+            ),
+            _artifact_identity(
+                ctx,
+                p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
+            ),
+        ),
+        (
+            triton_cache_artifact_transfer(
+                _triton_cache_root(),
+                _triton_cache_root(),
+                bundle_root / "triton_cache",
+            ),
+            _artifact_identity(ctx, p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE),
+        ),
+        (
+            deep_gemm_cache_artifact_transfer(
+                _deep_gemm_cache_root(),
+                _deep_gemm_cache_root(),
+                bundle_root / "deep_gemm_cache",
+            ),
+            _artifact_identity(ctx, p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE),
+        ),
+        (
+            tilelang_cache_artifact_transfer(
+                _tilelang_cache_root(),
+                _tilelang_cache_root(),
+                bundle_root / "tilelang_cache",
+            ),
+            _artifact_identity(ctx, p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE),
+        ),
+        (
+            cute_dsl_cache_artifact_transfer(
+                _cute_dsl_cache_root(),
+                _cute_dsl_cache_root(),
+                bundle_root / "cute_dsl_cache",
+            ),
+            _artifact_identity(ctx, p2p_pb2.MX_SOURCE_TYPE_CUTE_DSL_CACHE),
+        ),
+        (
+            flashinfer_cache_artifact_transfer(
+                flashinfer_cache_root,
+                flashinfer_cache_root,
+                bundle_root / "flashinfer_cache",
+                additional_roots=(
+                    ArtifactCacheRoot(
+                        name="autotune",
+                        source_root=flashinfer_autotune_cache_root,
+                        target_root=flashinfer_autotune_cache_root,
+                        optional=True,
+                    ),
+                ),
+            ),
+            _artifact_identity(ctx, p2p_pb2.MX_SOURCE_TYPE_FLASHINFER_CACHE),
+        ),
     ]
 
 
@@ -411,30 +451,60 @@ def _torch_compile_cache_root() -> Path:
 
 
 def _triton_cache_root() -> Path:
-    configured = os.environ.get("TRITON_CACHE_DIR")
+    configured = envs.TRITON_CACHE_DIR
     if configured:
         return Path(configured)
     return Path.home() / ".triton" / "cache"
 
 
 def _deep_gemm_cache_root() -> Path:
-    configured = os.environ.get(_DG_JIT_CACHE_DIR_ENV) or os.environ.get(
-        _DEEP_GEMM_CACHE_DIR_ENV
-    )
+    configured = envs.DG_JIT_CACHE_DIR or envs.DEEP_GEMM_CACHE_DIR
     if configured:
         return Path(configured)
     return _vllm_cache_root() / "deep_gemm"
 
 
+def _tilelang_cache_root() -> Path:
+    configured = envs.TILELANG_CACHE_DIR
+    if configured:
+        return Path(configured)
+    return Path.home() / ".tilelang" / "cache"
+
+
+def _cute_dsl_cache_root() -> Path:
+    configured = envs.CUTE_DSL_CACHE_DIR
+    if configured:
+        return Path(configured)
+    try:
+        user = getuser()
+    except (KeyError, OSError):
+        user = str(os.getuid())
+    return Path(tempfile.gettempdir()) / user / "cutlass_python_cache"
+
+
+def _flashinfer_cache_root() -> Path:
+    workspace_base = envs.FLASHINFER_WORKSPACE_BASE
+    if workspace_base:
+        return Path(workspace_base) / ".cache" / "flashinfer"
+    return Path.home() / ".cache" / "flashinfer"
+
+
+def _flashinfer_autotune_cache_root() -> Path:
+    configured = envs.VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR
+    if configured:
+        return Path(configured)
+    return _vllm_cache_root() / "flashinfer_autotune_cache"
+
+
 def _vllm_cache_root() -> Path:
-    configured = os.environ.get("VLLM_CACHE_ROOT")
+    configured = envs.VLLM_CACHE_ROOT
     if configured:
         return Path(configured)
     return Path.home() / ".cache" / "vllm"
 
 
 def _bundle_root(ctx: LoadContext) -> Path:
-    configured = os.environ.get(_BUNDLE_ROOT_ENV)
+    configured = envs.MX_ARTIFACT_BUNDLE_ROOT
     if configured:
         return Path(configured) / f"rank-{ctx.worker_rank}"
     return (
@@ -455,6 +525,12 @@ def _artifact_identity(
         return _triton_cache_identity(ctx)
     if mx_source_type == p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE:
         return _deep_gemm_cache_identity(ctx)
+    if mx_source_type == p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE:
+        return _tilelang_cache_identity(ctx)
+    if mx_source_type == p2p_pb2.MX_SOURCE_TYPE_CUTE_DSL_CACHE:
+        return _cute_dsl_cache_identity(ctx)
+    if mx_source_type == p2p_pb2.MX_SOURCE_TYPE_FLASHINFER_CACHE:
+        return _flashinfer_cache_identity(ctx)
     raise ValueError(f"unknown vLLM artifact source type: {mx_source_type}")
 
 
@@ -475,7 +551,7 @@ def _torch_compile_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         cuda_version=torch.version.cuda or "",
         triton_version=_triton_version(),
         gpu_arch=_gpu_arch(ctx.device_id),
-        compile_config_digest=os.environ.get(_COMPILE_CONFIG_DIGEST_ENV, ""),
+        compile_config_digest=envs.MX_ARTIFACT_COMPILE_CONFIG_DIGEST,
     )
     _set_extra_if_present(identity, "triton_key", _triton_key())
     return identity
@@ -508,6 +584,44 @@ def _deep_gemm_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
     return identity
 
 
+def _tilelang_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
+    # MX requires model_name; TileLang cache entries carry their own kernel keys.
+    identity = p2p_pb2.SourceIdentity(
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE,
+        model_name=ctx.identity.model_name,
+        backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
+        cuda_version=torch.version.cuda or "",
+        gpu_arch=_gpu_arch(ctx.device_id),
+    )
+    _set_extra_if_present(identity, "tilelang_version", _tilelang_version())
+    return identity
+
+
+def _cute_dsl_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
+    identity = p2p_pb2.SourceIdentity(
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_CUTE_DSL_CACHE,
+        model_name=ctx.identity.model_name,
+        backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
+        cuda_version=torch.version.cuda or "",
+        gpu_arch=_gpu_arch(ctx.device_id),
+    )
+    _set_extra_if_present(identity, "cutlass_dsl_version", _cutlass_dsl_version())
+    return identity
+
+
+def _flashinfer_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
+    identity = p2p_pb2.SourceIdentity(
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_FLASHINFER_CACHE,
+        model_name=ctx.identity.model_name,
+        backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
+        torch_version=torch.__version__,
+        cuda_version=torch.version.cuda or "",
+        gpu_arch=_gpu_arch(ctx.device_id),
+    )
+    _set_extra_if_present(identity, "flashinfer_version", _flashinfer_version())
+    return identity
+
+
 def _set_extra_if_present(
     identity: p2p_pb2.SourceIdentity,
     key: str,
@@ -523,18 +637,21 @@ def _has_files(path: Path) -> bool:
     return any(child.is_file() for child in path.rglob("*"))
 
 
-def _vllm_artifact_ready_fn(source_root: Path):
+def _vllm_artifact_ready_fn(source_roots: tuple[ArtifactCacheRoot, ...]):
+    server_ready = False
     stable_since: float | None = None
     last_signature: tuple[int, int, int] | None = None
 
     def ready() -> bool:
-        nonlocal stable_since, last_signature
-        if not _vllm_health_ready():
-            stable_since = None
-            last_signature = None
-            return False
+        nonlocal server_ready, stable_since, last_signature
+        if not server_ready:
+            if not _vllm_health_ready():
+                stable_since = None
+                last_signature = None
+                return False
+            server_ready = True
 
-        signature = _cache_signature(source_root)
+        signature = _cache_signature(source_roots)
         if signature is None:
             stable_since = None
             last_signature = None
@@ -551,20 +668,29 @@ def _vllm_artifact_ready_fn(source_root: Path):
     return ready
 
 
-def _cache_signature(path: Path) -> tuple[int, int, int] | None:
-    if not path.is_dir():
+def _cache_signature(
+    roots: tuple[ArtifactCacheRoot, ...],
+) -> tuple[int, int, int] | None:
+    if not all(
+        _has_files(root.source_root) for root in roots if not root.optional
+    ):
         return None
+
     count = 0
     total_size = 0
     max_mtime_ns = 0
     try:
-        for child in path.rglob("*"):
-            if not child.is_file():
+        for root in roots:
+            path = root.source_root
+            if not path.is_dir():
                 continue
-            stat = child.stat()
-            count += 1
-            total_size += stat.st_size
-            max_mtime_ns = max(max_mtime_ns, stat.st_mtime_ns)
+            for child in path.rglob("*"):
+                if not child.is_file():
+                    continue
+                stat = child.stat()
+                count += 1
+                total_size += stat.st_size
+                max_mtime_ns = max(max_mtime_ns, stat.st_mtime_ns)
     except OSError:
         return None
     if count == 0:
@@ -582,13 +708,13 @@ def _vllm_health_ready() -> bool:
 
 
 def _vllm_health_url() -> str:
-    configured = os.environ.get(_READY_URL_ENV, "").strip()
+    configured = envs.MX_ARTIFACT_READY_URL.strip()
     fallback = _statefulset_head_health_url() or _DEFAULT_READY_URL
     if not configured or configured == _DEFAULT_READY_URL:
         return fallback
     if _is_http_url(configured):
         return configured
-    logger.warning("Invalid %s=%r; using %s", _READY_URL_ENV, configured, fallback)
+    logger.warning("Invalid MX_ARTIFACT_READY_URL=%r; using %s", configured, fallback)
     return fallback
 
 
@@ -598,29 +724,14 @@ def _is_http_url(url: str) -> bool:
 
 
 def _statefulset_head_health_url() -> str | None:
-    pod_name, _, ordinal = os.environ.get("HOSTNAME", "").rpartition("-")
+    pod_name, _, ordinal = envs.HOSTNAME.rpartition("-")
     if not pod_name or not ordinal.isdigit() or ordinal == "0":
         return None
-    namespace = os.environ.get("POD_NAMESPACE", "").strip()
+    namespace = envs.POD_NAMESPACE.strip()
     host = f"{pod_name}-0.{pod_name}"
     if namespace:
         host = f"{host}.{namespace}.svc"
     return f"http://{host}:8000/health"
-
-
-def _ready_timeout_secs() -> int:
-    return _env_int(_READY_TIMEOUT_ENV, 1800)
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        logger.warning("Invalid %s=%r; using default %d", name, raw, default)
-        return default
 
 
 def _vllm_version() -> str:
@@ -665,6 +776,27 @@ def _deep_gemm_jit_key() -> str:
         from deep_gemm.jit.compiler import get_deep_gemm_version
 
         return get_deep_gemm_version()
+    except Exception:
+        return ""
+
+
+def _tilelang_version() -> str:
+    try:
+        return pkg_version("tilelang")
+    except Exception:
+        return ""
+
+
+def _cutlass_dsl_version() -> str:
+    try:
+        return pkg_version("nvidia-cutlass-dsl")
+    except Exception:
+        return ""
+
+
+def _flashinfer_version() -> str:
+    try:
+        return pkg_version("flashinfer-python")
     except Exception:
         return ""
 

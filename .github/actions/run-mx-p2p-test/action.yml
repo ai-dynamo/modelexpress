@@ -90,6 +90,15 @@ inputs:
       Catches silent TP collapse and rank-pairing regressions.
     required: false
     default: '1'
+  dp_size:
+    description: |
+      Data-parallel size of the target deployment. Forwarded to pytest as
+      --dp-size. DP replicas are interchangeable copies at the same
+      worker_rank, so the per-rank agent assertion accepts a distinct-agent
+      count in [tp_size, tp_size * dp_size] instead of exactly tp_size.
+      Defaults to 1 (pure TP / single copy).
+    required: false
+    default: '1'
   measure_vram:
     description: 'When true, sample source/target VRAM and enable the pytest VRAM parity assertions.'
     required: false
@@ -423,6 +432,7 @@ runs:
         WORKER_PORT: ${{ inputs.worker_port }}
         TEST_SCRIPT: ${{ inputs.test_script }}
         TP_SIZE: ${{ inputs.tp_size }}
+        DP_SIZE: ${{ inputs.dp_size }}
         PYTEST_ARGS: ${{ inputs.pytest_args }}
         EXPECTED_ARTIFACT_SOURCES: ${{ inputs.expected_artifact_sources }}
         EXPECTED_ARTIFACT_SOURCE_TYPES: ${{ inputs.expected_artifact_source_types }}
@@ -451,6 +461,7 @@ runs:
           --source-port "${SOURCE_PORT}" \
           --worker-port "${WORKER_PORT}" \
           --tp-size "${TP_SIZE}" \
+          --dp-size "${DP_SIZE}" \
           "${EXTRA[@]}"
 
     - name: Dump pod logs

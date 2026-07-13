@@ -7,13 +7,13 @@ from __future__ import annotations
 
 import copy
 import logging
-import os
 import uuid
 from importlib.metadata import version as pkg_version
 from typing import TYPE_CHECKING, Iterator
 
 import torch
 
+from ... import envs
 from ... import p2p_pb2
 from ...adapter import EngineAdapter
 from ...accelerators import accelerator_backend_for
@@ -75,13 +75,44 @@ class SglangAdapter(EngineAdapter):
     def discover_tensors(self, result: LoadResult) -> dict[str, torch.Tensor]:
         if result.model is None:
             raise RuntimeError("SGLang tensor discovery requires result.model")
-        return collect_sglang_tensors(result.model)
+        return self._collect_tensors(result.model)
+
+    def _collect_tensors(self, model) -> dict[str, torch.Tensor]:
+        """Collect SGLang model parameters for NIXL registration.
+
+        SGLang's current NIXL path registers contiguous parameters directly and
+        registers a byte view of the underlying storage for non-contiguous
+        parameters. Keep that naming behavior so source and target descriptors
+        match the upstream integration.
+        """
+        backend = self.accelerator_backend
+        tensors: dict[str, torch.Tensor] = {}
+        seen_ptrs: set[int] = set()
+
+        for name, param in model.named_parameters():
+            t = param.data
+            if not backend.is_accel_tensor(t):
+                continue
+            if t.is_contiguous():
+                tensor_name = name
+                registered = t
+            else:
+                tensor_name = f"{name}.__storage"
+                registered = torch.empty(0, dtype=torch.uint8, device=t.device).set_(
+                    t.untyped_storage()
+                )
+
+            ptr = registered.data_ptr()
+            if ptr in seen_ptrs:
+                continue
+            seen_ptrs.add(ptr)
+            tensors[tensor_name] = registered
+
+        return tensors
 
     def before_rdma_receive(self, result: LoadResult) -> LoadResult:
+        result = self._post_load_weights(result)
         return self._process_weights_after_loading(result)
-
-    def after_rdma_receive(self, result: LoadResult) -> LoadResult:
-        return self._post_load_weights(result)
 
     def apply_weight_iter(
         self,
@@ -188,7 +219,7 @@ class SglangAdapter(EngineAdapter):
         return (
             tp_size > 1
             and self.is_cuda_alike()
-            and os.environ.get("MX_MS_DISTRIBUTED", "0").lower() in ("1", "true")
+            and envs.MX_MS_DISTRIBUTED
         )
 
 
@@ -209,37 +240,6 @@ def _call_sglang_post_load_weights(model: torch.nn.Module) -> None:
         post_load_weights = getattr(child, "post_load_weights", None)
         if callable(post_load_weights):
             post_load_weights()
-
-
-def collect_sglang_tensors(model) -> dict[str, torch.Tensor]:
-    """Collect SGLang model parameters for NIXL registration.
-
-    SGLang's current NIXL path registers contiguous parameters directly and
-    registers a byte view of the underlying storage for non-contiguous
-    parameters. Keep that naming behavior so source and target descriptors
-    match the upstream integration.
-    """
-    tensors: dict[str, torch.Tensor] = {}
-    seen_ptrs: set[int] = set()
-
-    for name, param in model.named_parameters():
-        t = param.data
-        if t.is_contiguous():
-            tensor_name = name
-            registered = t
-        else:
-            tensor_name = f"{name}.__storage"
-            registered = torch.empty(0, dtype=torch.uint8, device=t.device).set_(
-                t.untyped_storage()
-            )
-
-        ptr = registered.data_ptr()
-        if ptr in seen_ptrs:
-            continue
-        seen_ptrs.add(ptr)
-        tensors[tensor_name] = registered
-
-    return tensors
 
 
 def build_sglang_source_identity(model_config: ModelConfig) -> p2p_pb2.SourceIdentity:
@@ -289,7 +289,7 @@ def _get_quantization(model_config: ModelConfig) -> str:
 
 
 def _get_revision(model_config: ModelConfig) -> str:
-    override = os.environ.get("MX_MODEL_REVISION", "")
+    override = envs.MX_MODEL_REVISION
     if override:
         return override
     return str(getattr(model_config, "revision", "") or "")

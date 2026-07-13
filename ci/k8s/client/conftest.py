@@ -52,6 +52,17 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="Tensor-parallel size — the per-rank transfer test expects this many distinct ranks.",
     )
     parser.addoption(
+        "--dp-size",
+        default=_positive_int(os.environ.get("DP_SIZE", "1")),
+        type=_positive_int,
+        help=(
+            "Data-parallel size — DP replicas are interchangeable full copies "
+            "at the same worker_rank, so the per-rank transfer test accepts a "
+            "distinct-agent count anywhere in [tp_size, tp_size * dp_size] "
+            "instead of exactly tp_size. Defaults to 1 (pure TP / single copy)."
+        ),
+    )
+    parser.addoption(
         "--transport",
         default=os.environ.get("TRANSPORT", "nixl"),
         help=(
@@ -153,6 +164,11 @@ def p2p_marker(request: pytest.FixtureRequest) -> str:
 @pytest.fixture(scope="session")
 def tp_size(request: pytest.FixtureRequest) -> int:
     return request.config.getoption("--tp-size")
+
+
+@pytest.fixture(scope="session")
+def dp_size(request: pytest.FixtureRequest) -> int:
+    return request.config.getoption("--dp-size")
 
 
 @pytest.fixture(scope="session")

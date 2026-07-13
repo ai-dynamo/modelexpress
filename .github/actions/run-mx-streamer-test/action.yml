@@ -5,7 +5,8 @@ name: 'Run ModelExpress Model Streamer Test'
 description: |
   Standalone model-streamer CI test. Runs a single vLLM pod via Docker on a
   GPU runner — no vCluster, no mx-server, no P2P. Exercises the
-  runai-model-streamer path by streaming safetensors directly from S3.
+  runai-model-streamer path by streaming safetensors directly from S3, or
+  verifies fallback to HuggingFace when S3 streaming fails.
 
   Pre-run setup (one-time): downloads the model safetensors from HuggingFace
   and uploads to S3 if not already present. Subsequent runs skip the upload.
@@ -47,6 +48,10 @@ inputs:
     description: 'HuggingFace token — only required for gated models. Ignored when empty (public models work without it).'
     required: false
     default: ''
+  test_model_streamer_fallback:
+    description: 'Test Model Streamer fallback to the default loader when S3 streaming fails'
+    required: false
+    default: 'false'
 
 runs:
   using: "composite"
@@ -57,6 +62,7 @@ runs:
         python-version: "3.12"
 
     - name: Populate S3 model cache (upload safetensors if missing)
+      if: inputs.test_model_streamer_fallback == 'false'
       shell: bash
       env:
         MODEL: ${{ inputs.model }}
@@ -141,11 +147,17 @@ runs:
         S3_REGION: ${{ inputs.s3_region }}
         PORT: ${{ inputs.port }}
         STREAMER_CONCURRENCY: ${{ inputs.streamer_concurrency }}
+        TEST_MODEL_STREAMER_FALLBACK: ${{ inputs.test_model_streamer_fallback }}
       run: |
         set -euo pipefail
         [[ "${PORT}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: port must be a positive integer, got '${PORT}'"; exit 1; }
         [[ "${STREAMER_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: streamer_concurrency must be a positive integer, got '${STREAMER_CONCURRENCY}'"; exit 1; }
         MODEL_S3_URI="s3://${S3_BUCKET}/models/${MODEL}"
+        MODEL_ARG="${MODEL_S3_URI}"
+        if [ "${TEST_MODEL_STREAMER_FALLBACK}" = "true" ]; then
+          MODEL_S3_URI="s3://${S3_BUCKET}/mx-ci-s3-fallback/missing/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/${MODEL}"
+          MODEL_ARG="${MODEL}"
+        fi
 
         # IRSA credentials don't auto-propagate into child containers. The EKS
         # runner pod gets AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE wired in,
@@ -173,28 +185,39 @@ runs:
           -p "${PORT}:${PORT}" \
           "${WORKER_IMAGE}" \
           -m vllm.entrypoints.openai.api_server \
-            --model "${MODEL}" \
+            --model "${MODEL_ARG}" \
+            --served-model-name "${MODEL}" \
+            --hf-config-path "${MODEL}" \
+            --tokenizer "${MODEL}" \
             --load-format mx \
             --port "${PORT}")
         echo "Container: ${CONTAINER_ID}"
         # Persist CONTAINER_ID for subsequent steps in this composite action.
         echo "CONTAINER_ID=${CONTAINER_ID}" >> "$GITHUB_ENV"
 
-    - name: Wait for model streamer to complete
+    - name: Wait for model load to complete
       shell: bash
       env:
         LOAD_TIMEOUT: ${{ inputs.load_timeout_seconds }}
+        TEST_MODEL_STREAMER_FALLBACK: ${{ inputs.test_model_streamer_fallback }}
       run: |
         set -euo pipefail
         [[ "${LOAD_TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: load_timeout_seconds must be a positive integer, got '${LOAD_TIMEOUT}'"; exit 1; }
         deadline=$((SECONDS + LOAD_TIMEOUT))
         while [ $SECONDS -lt $deadline ]; do
-          if docker logs "${CONTAINER_ID}" 2>&1 | grep -q "Model streamer weight loading complete"; then
+          LOGS="$(docker logs "${CONTAINER_ID}" 2>&1)"
+          if [ "${TEST_MODEL_STREAMER_FALLBACK}" = "true" ]; then
+            if echo "${LOGS}" | grep -q "Strategy model_streamer failed" \
+              && echo "${LOGS}" | grep -q "Weights loaded from disk"; then
+              echo "Model streamer fallback to default loader confirmed."
+              exit 0
+            fi
+          elif echo "${LOGS}" | grep -q "Model streamer weight loading complete"; then
             echo "Model streamer loading confirmed."
             exit 0
           fi
           if [ "$(docker inspect "${CONTAINER_ID}" --format '{{.State.Running}}')" != "true" ]; then
-            echo "ERROR: container exited before model streamer completed."
+            echo "ERROR: container exited before model loading completed."
             docker logs "${CONTAINER_ID}" 2>&1 | tail -80
             exit 1
           fi
@@ -202,7 +225,7 @@ runs:
           sleep 10
         done
 
-        echo "ERROR: model streamer did not complete within ${LOAD_TIMEOUT}s."
+        echo "ERROR: model loading did not complete within ${LOAD_TIMEOUT}s."
         docker logs "${CONTAINER_ID}" 2>&1 | tail -80
         exit 1
 

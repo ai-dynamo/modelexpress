@@ -3,13 +3,13 @@
 
 # Multi-node vLLM StatefulSet with ModelExpress P2P weight transfer.
 #
-# Deploys nvidia/Kimi-K2.5-NVFP4 as a single StatefulSet across 2 nodes (8 GPUs total):
+# Deploys deepseek-ai/DeepSeek-V4-Pro as a single StatefulSet across 2 nodes (8 GPUs total):
 #   - tensor-parallel-size=4 (within each node)
 #   - pipeline-parallel-size=2 (across nodes)
 #
 # Pod roles are determined by ordinal index:
-#   - pod-0: Ray head node + vLLM API server
-#   - pod-1: Ray worker node (joins pod-0's Ray cluster)
+#   - pod-0: vLLM API server + multiprocessing head
+#   - pod-1: headless vLLM multiprocessing worker
 #
 # The headless Service gives each pod a stable DNS name so pod-1 reliably
 # connects to pod-0 regardless of scheduling. Scaling to 2 StatefulSet
@@ -36,17 +36,16 @@ metadata:
     app: mx-vllm
 spec:
   clusterIP: None
+  # Make pod-0 DNS resolvable while both pods join the vLLM process group.
+  publishNotReadyAddresses: true
   selector:
     app: mx-vllm
   ports:
-    - port: 6379
-      targetPort: 6379
-      name: ray-gcs
     - port: 8000
       targetPort: 8000
       name: http
 ---
-# StatefulSet: 2 pods per instance (pod-0 = head + vLLM, pod-1 = Ray worker)
+# StatefulSet: 2 pods per instance (pod-0 = API/head, pod-1 = headless worker)
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -65,7 +64,7 @@ spec:
       labels:
         app: mx-vllm
     spec:
-      # Spread pods across different nodes for true multi-node Ray
+      # Spread the multiprocessing workers across different nodes.
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -87,19 +86,18 @@ spec:
           ports:
             - containerPort: 8000
               name: http
-            - containerPort: 6379
-              name: ray-gcs
           env:
             - name: VLLM_RPC_TIMEOUT
               value: "7200000"
             - name: HF_HOME
               value: "/models"
             - name: MODEL_NAME
-              value: "nvidia/Kimi-K2.5-NVFP4"
-            - name: VLLM_PLUGINS
-              value: "modelexpress"
+              value: "deepseek-ai/DeepSeek-V4-Pro"
             - name: MX_SERVER_ADDRESS
               value: "modelexpress-server:8001"
+            # Transfer compatible vLLM JIT caches after the source is healthy.
+            - name: MX_ARTIFACT_TRANSFER
+              value: "1"
             # Per-rank IB NIC pinning. Workaround for openucx/ucx#11259.
             - name: MX_RDMA_NIC_PIN
               value: "auto"
@@ -133,21 +131,23 @@ spec:
             - |
               ORDINAL=${HOSTNAME##*-}
               STS_NAME=${HOSTNAME%-*}
-              HEAD_ADDR=${STS_NAME}-0.${STS_NAME}:6379
+              MASTER_ADDR=${STS_NAME}-0.${STS_NAME}
 
-              if [ "$ORDINAL" = "0" ]; then
-                ray start --head --port=6379 --num-gpus=4
-                until ray status --address=127.0.0.1:6379 >/dev/null 2>&1; do sleep 1; done
-                RAY_ADDRESS=127.0.0.1:6379 vllm serve $MODEL_NAME \
-                  --load-format modelexpress \
-                  --tensor-parallel-size 4 \
-                  --pipeline-parallel-size 2 \
-                  --max-model-len 32768 \
-                  --trust-remote-code \
-                  --distributed-executor-backend ray
-              else
-                ray start --block --address=${HEAD_ADDR} --num-gpus=4
+              HEADLESS=""
+              if [ "$ORDINAL" != "0" ]; then
+                HEADLESS="--headless"
               fi
+
+              exec vllm serve "$MODEL_NAME" \
+                --load-format modelexpress \
+                --tensor-parallel-size 4 \
+                --pipeline-parallel-size 2 \
+                --nnodes 2 \
+                --node-rank "$ORDINAL" \
+                --master-addr "$MASTER_ADDR" \
+                --max-model-len 32768 \
+                --kv-cache-dtype fp8 \
+                $HEADLESS
           resources:
             limits:
               nvidia.com/gpu: "4"

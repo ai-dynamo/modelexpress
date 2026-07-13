@@ -3,7 +3,7 @@
 
 # Multi-node vLLM DynamoGraphDeployment with ModelExpress P2P weight transfer.
 #
-# Deploys nvidia/Kimi-K2.5-NVFP4 with TP=4, PP=2 (8 GPUs across 2 nodes per replica).
+# Deploys deepseek-ai/DeepSeek-V4-Pro with TP=4, PP=2 (8 GPUs across 2 nodes per replica).
 # Includes ModelExpress server (kubernetes CRD backend) and dynamo Frontend.
 #
 # Start with replicas=1 (source loads from disk), then scale to 2 for P2P:
@@ -106,13 +106,21 @@ spec:
         - name: HF_HOME
           value: "/models"
         - name: MODEL_NAME
-          value: "nvidia/Kimi-K2.5-NVFP4"
-        - name: VLLM_PLUGINS
-          value: "modelexpress"
+          value: "deepseek-ai/DeepSeek-V4-Pro"
+        # vLLM 0.23.0 recognizes --load-format modelexpress natively. For
+        # older vLLM versions, add:
+        # - name: VLLM_PLUGINS
+        #   value: "modelexpress"
         # Dynamo's ModelExpress integration uses MODEL_EXPRESS_URL today; MX is
         # standardizing on MX_SERVER_ADDRESS going forward (see README).
         - name: MODEL_EXPRESS_URL
           value: "mx-vllm-modelexpress:8000"
+        - name: MX_ARTIFACT_TRANSFER
+          value: "1"
+        # Dynamo serves worker health on 9090; publish caches only after the
+        # generate endpoint is ready and JIT warmup has completed.
+        - name: MX_ARTIFACT_READY_URL
+          value: "http://127.0.0.1:9090/health"
         # Per-rank IB NIC pinning. Workaround for openucx/ucx#11259.
         - name: MX_RDMA_NIC_PIN
           value: "auto"
@@ -142,7 +150,7 @@ spec:
             - dynamo.vllm
           args:
             - --model
-            - nvidia/Kimi-K2.5-NVFP4
+            - deepseek-ai/DeepSeek-V4-Pro
             - --load-format
             - modelexpress
             - --tensor-parallel-size
@@ -151,6 +159,8 @@ spec:
             - "2"
             - --max-model-len
             - "32768"
+            - --kv-cache-dtype
+            - fp8
             - --trust-remote-code
       volumeMounts:
         - name: shared-model-cache

@@ -31,7 +31,7 @@ Every source is identified by a `SourceIdentity` proto containing all fields tha
 | Field | Example | Purpose |
 |-------|---------|---------|
 | `mx_version` | `"0.5.0"` | Format compatibility across upgrades |
-| `mx_source_type` | `WEIGHTS`, `LORA`, `CUDA_GRAPH`, `TORCH_COMPILE_CACHE`, `TRITON_CACHE`, `DEEP_GEMM_CACHE` | Type of source metadata being served |
+| `mx_source_type` | `WEIGHTS`, `LORA`, `CUDA_GRAPH`, `TORCH_COMPILE_CACHE`, `TRITON_CACHE`, `DEEP_GEMM_CACHE`, `TILELANG_CACHE`, `CUTE_DSL_CACHE`, `FLASHINFER_CACHE` | Type of source metadata being served |
 | `model_name` | `"deepseek-ai/DeepSeek-V3"` | Model identifier |
 | `backend_framework` | `VLLM`, `SGLANG`, `TRT_LLM` | Inference framework |
 | `tensor_parallel_size` | `8` | TP degree |
@@ -60,7 +60,7 @@ Workers use `torch.distributed.get_rank()` as their global rank, which captures 
 | Payload | Purpose |
 |---------|---------|
 | `tensor_source` | Tensor descriptors for weight transfer. Readers fall back to the deprecated top-level `tensors` field for old publishers. |
-| `artifact_source` | Lightweight artifact discovery summary: `artifact_id`, `total_size`, `file_count`, and `chunk_count`. |
+| `artifact_source` | Lightweight artifact discovery summary: `artifact_id`, `total_size`, `file_count`, `chunk_count`, and the owning `node_rank`. |
 
 Artifact summaries do not contain full file or chunk tables. Targets use the worker's `worker_grpc_endpoint` to call `GetArtifactManifestHeader` and `GetArtifactManifestChunks` on the source worker, then use `PrepareArtifactChunk` and `ReleaseArtifactChunk` around each NIXL transfer. `artifact_id` is SHA-256 over the canonical artifact manifest JSON, encoded as lowercase hex without a prefix. File and chunk `checksum` fields use CRC32C lowercase hex. Manifest file paths are canonical absolute publisher paths and are included in the sealed manifest; transfer helpers may rewrite them to target-local staging paths before installing the artifact.
 
@@ -154,13 +154,16 @@ The Python `P2PArtifactTransfer` interface is the shared lifecycle for cache art
 
 The current implementation, `TarredP2PArtifactTransfer`, packages the source cache directory into one uncompressed tar file before building the artifact manifest. The source manifest records the publisher's tar path and therefore contributes that path to `artifact_id`. During transfer, the target rewrites the received file table to its own `bundle_root / artifact.tar`, then extracts that tar into `target_root`. This keeps the published manifest sealed while avoiding any requirement that source and target share the same absolute staging path.
 
-Factory helpers provide the three cache source types currently expected by loaders:
+Factory helpers provide the cache source types currently expected by loaders:
 
 | Helper | `mx_source_type` | Target cache shape |
 |--------|------------------|--------------------|
 | `torch_compile_cache_artifact_transfer()` | `TORCH_COMPILE_CACHE` | TorchInductor/vLLM torch compile cache directory |
 | `triton_cache_artifact_transfer()` | `TRITON_CACHE` | Triton kernel cache directory |
 | `deep_gemm_cache_artifact_transfer()` | `DEEP_GEMM_CACHE` | DeepGEMM JIT cache directory (`DG_JIT_CACHE_DIR`, or `VLLM_CACHE_ROOT/deep_gemm`) |
+| `tilelang_cache_artifact_transfer()` | `TILELANG_CACHE` | TileLang JIT cache directory (`TILELANG_CACHE_DIR`, or `~/.tilelang/cache`) |
+| `cute_dsl_cache_artifact_transfer()` | `CUTE_DSL_CACHE` | CuTe DSL compiled-kernel cache directory (`CUTE_DSL_CACHE_DIR`, or `$TMPDIR/<user>/cutlass_python_cache`) |
+| `flashinfer_cache_artifact_transfer()` | `FLASHINFER_CACHE` | Engine-selected FlashInfer JIT and autotune cache directories packaged as one artifact |
 
 ### UpdateStatus
 
@@ -380,6 +383,7 @@ status:
       totalSize: 67108864
       fileCount: 1
       chunkCount: 8
+      nodeRank: 0
     tensorCount: 0
     status: Ready
     updatedAt: "2025-11-14T22:13:20Z"

@@ -733,6 +733,7 @@ mod tests {
                                 total_size: 1024,
                                 file_count: 1,
                                 chunk_count: 2,
+                                node_rank: 0,
                             }
                             .into(),
                         ),

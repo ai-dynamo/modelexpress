@@ -12,14 +12,17 @@
 #     and the copies are interchangeable, so the ModelExpress identity carries
 #     no DP dimension (build_source_identity has tp/pp/ep, not dp) and every
 #     DP core resolves to the same worker_rank (0). The transfer pattern is
-#     therefore "N concurrent full-weight pulls from a single source," not
-#     rank-paired transfers (TEST_PLAN row 5.2).
+#     therefore "N concurrent full-weight pulls from interchangeable rank-0
+#     sources," not rank-paired transfers (TEST_PLAN row 5.2).
 #
-# Consequence for the CI wiring: this job runs with tp_size=1. The source
-# publishes a single rank-0 CR, and the target's DP cores each pull the full
-# rank-0 weight set over RDMA. The per-rank agent assertion expects exactly
-# one distinct source agent (rank 0), which is correct for DP — it is not the
-# TP fan-out.
+# Consequence for the CI wiring: this job runs with tp_size=1, dp_size=2. Each
+# source DP core publishes its OWN rank-0 agent (uuid worker_id suffix), so the
+# source exposes dp_size interchangeable rank-0 agents; the target's dp_size
+# cores each select one at random (default `random` selector). The per-rank
+# agent assertion therefore accepts a distinct-agent count in
+# [tp_size, tp_size*dp_size] = [1, 2] (both cores may converge on one source or
+# split across both), and still pins source_ranks == [0] to catch real rank
+# mis-pairing — it is not the TP fan-out.
 #
 # Differences vs manifest-azure-tp2.yaml:
 #   - --data-parallel-size 2 + --tensor-parallel-size 1 (was --tensor-parallel-size 2)
