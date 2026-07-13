@@ -568,9 +568,6 @@ class MdlLoader:
                 if self._tp_shape_compatible(hf_shape, tuple(expert_data.shape)):
                     return expert_data, fused_name
                 return None
-            if tuple(hf_shape) == tuple(expert_data.shape):
-                # w1/w3 activation scales may intentionally share one value.
-                return expert_data, fused_name
             if not hf_shape:
                 if expert_data.numel() == 1:
                     return expert_data.reshape(()), fused_name
@@ -580,6 +577,21 @@ class MdlLoader:
                 return None
             if len(hf_shape) != expert_data.ndim:
                 return None
+            # w13 stacks gate (w1) and up (w3) in its first dimension. At TP2,
+            # the local stacked destination can have the same shape as one
+            # global HF member (e.g. 768 global gate rows == 2 * 384 local
+            # rows). Treating that as an exact match maps both gate and up to
+            # the entire w13 slot. Always select the member half first, then
+            # let _try_write/_tp_local_tensor choose this TP rank's source
+            # shard. The same collision occurs for block-FP8 scale rows.
+            if shard in ("w1", "w3") and int(expert_data.shape[0]) % 2 == 0:
+                local_size = int(expert_data.shape[0]) // 2
+                offset = 0 if shard == "w1" else local_size
+                destination = expert_data.narrow(0, offset, local_size)
+                if self._tp_shape_compatible(
+                    hf_shape, tuple(destination.shape)
+                ):
+                    return destination, fused_name
             for axis in range(expert_data.ndim):
                 if not all(
                     dim == axis

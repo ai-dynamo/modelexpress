@@ -243,6 +243,100 @@ def test_fp8_tp2_loaderless_is_not_forced_by_default(monkeypatch):
     assert torch.equal(model.proj.weight.float(), global_weight[:2].float())
 
 
+def test_fp8_tp2_expert_gate_up_weight_and_scale_shards(monkeypatch):
+    def build_model():
+        model = _LoaderlessModel()
+        model.model = torch.nn.Module()
+        model.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+        mlp = torch.nn.Module()
+        model.model.layers[0].mlp = mlp
+        mlp.experts = torch.nn.Module()
+        # TP2 collision: each global gate/up tensor has the same shape as the
+        # local fused W13 destination before it is split into gate/up halves.
+        mlp.experts.w13_weight = _parameter((1, 4, 2), dtype=F8)
+        mlp.experts.w2_weight = _parameter((1, 2, 2), dtype=F8)
+        mlp.experts.w13_weight_scale = _parameter((1, 2, 1))
+        mlp.experts.w2_weight_scale = _parameter((1, 1, 1))
+
+        def expert_mapping():
+            prefix = "model.layers.0.mlp."
+            return [
+                (
+                    prefix + "experts.w13_",
+                    prefix + "experts.0.gate_proj.",
+                    0,
+                    "w1",
+                ),
+                (
+                    prefix + "experts.w2_",
+                    prefix + "experts.0.down_proj.",
+                    0,
+                    "w2",
+                ),
+                (
+                    prefix + "experts.w13_",
+                    prefix + "experts.0.up_proj.",
+                    0,
+                    "w3",
+                ),
+            ]
+
+        model.get_expert_mapping = expert_mapping
+        return model, mlp
+
+    gate = torch.tensor(
+        [[1, 2], [3, 4], [5, 6], [7, 8]], dtype=F8
+    )
+    up = torch.tensor(
+        [[11, 12], [13, 14], [15, 16], [17, 18]], dtype=F8
+    )
+    down = torch.tensor([[21, 22, 23, 24], [25, 26, 27, 28]], dtype=F8)
+    gate_scale = torch.tensor([[0.1], [0.2]])
+    up_scale = torch.tensor([[0.3], [0.4]])
+    down_scale = torch.tensor([[0.5, 0.6]])
+    weights = [
+        ("model.layers.0.mlp.experts.0.gate_proj.weight", gate),
+        (
+            "model.layers.0.mlp.experts.0.gate_proj.weight_scale_inv",
+            gate_scale,
+        ),
+        ("model.layers.0.mlp.experts.0.up_proj.weight", up),
+        (
+            "model.layers.0.mlp.experts.0.up_proj.weight_scale_inv",
+            up_scale,
+        ),
+        ("model.layers.0.mlp.experts.0.down_proj.weight", down),
+        (
+            "model.layers.0.mlp.experts.0.down_proj.weight_scale_inv",
+            down_scale,
+        ),
+    ]
+
+    for rank in (0, 1):
+        model, mlp = build_model()
+        _tp_load(model, monkeypatch, weights, tp_size=2, tp_rank=rank)
+        rows = slice(rank * 2, (rank + 1) * 2)
+        cols = slice(rank * 2, (rank + 1) * 2)
+        assert torch.equal(
+            mlp.experts.w13_weight[0, :2].float(), gate[rows].float()
+        )
+        assert torch.equal(
+            mlp.experts.w13_weight[0, 2:].float(), up[rows].float()
+        )
+        assert torch.equal(
+            mlp.experts.w13_weight_scale[0, 0], gate_scale[rank]
+        )
+        assert torch.equal(
+            mlp.experts.w13_weight_scale[0, 1], up_scale[rank]
+        )
+        assert torch.equal(
+            mlp.experts.w2_weight[0].float(), down[:, cols].float()
+        )
+        assert torch.equal(
+            mlp.experts.w2_weight_scale[0], down_scale[:, rank : rank + 1]
+        )
+
+
 def test_loaderless_fp8_coverage_fails_closed(monkeypatch):
     model = _LoaderlessModel()
     model.proj = torch.nn.Module()
