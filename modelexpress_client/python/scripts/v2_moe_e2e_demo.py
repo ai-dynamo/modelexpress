@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """End-to-end NIXL+MX v2 demo for MoE-style weight refit.
 
 Spawns 4 processes via torch.multiprocessing, one per CUDA device.

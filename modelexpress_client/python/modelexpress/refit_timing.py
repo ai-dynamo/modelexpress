@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Structured, normalized timing for ModelExpress refit cycles.
 
 The recorder is deliberately independent of torch and vLLM.  A cycle owner

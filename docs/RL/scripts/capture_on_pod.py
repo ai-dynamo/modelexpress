@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Capture weight and KV cache data from a running PRIME-RL / verl deployment.
 
 Designed to be exec'd inside a trainer pod. Captures four artifacts in the
