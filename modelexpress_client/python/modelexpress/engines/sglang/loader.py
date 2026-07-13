@@ -336,6 +336,7 @@ class MxModelLoader:
                 worker_rank=ctx.worker_rank,
                 transfer_engine_session_id=session_id,
                 tensor_source=tensor_source_metadata(tensors),
+                accelerator=ctx.accelerator_backend.name,
             )
         except Exception:
             logger.exception(

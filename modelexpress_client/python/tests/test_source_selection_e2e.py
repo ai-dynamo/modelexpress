@@ -102,6 +102,10 @@ def _ctx(addr: str, worker_id: str = "target-0", worker_rank: int = 0):
         global_rank=0,
         worker_id=worker_id,
         identity=p2p_pb2.SourceIdentity(model_name=MODEL),
+        # RdmaStrategy filters candidates by ctx.accelerator_backend.name; the
+        # e2e sources publish no accelerator (empty == compatible), so any name
+        # keeps them, exercising the selector ordering rather than the filter.
+        accelerator_backend=SimpleNamespace(name="cuda"),
     )
 
 

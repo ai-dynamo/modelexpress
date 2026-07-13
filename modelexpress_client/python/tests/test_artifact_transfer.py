@@ -861,6 +861,110 @@ def test_discover_artifact_source_matches_node_rank():
     assert source_1.artifact_id == "artifact-1"
 
 
+def _artifact_discovery_client(instances_and_workers):
+    """Build a MagicMock mx_client from (SourceInstanceRef, WorkerMetadata) pairs."""
+    identity = p2p_pb2.SourceIdentity(
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE,
+        model_name="test/model",
+    )
+    metadata = {
+        ref.worker_id: p2p_pb2.GetMetadataResponse(
+            found=True,
+            mx_source_id=ref.mx_source_id,
+            worker_id=ref.worker_id,
+            worker=worker,
+        )
+        for ref, worker in instances_and_workers
+    }
+    mx_client = MagicMock()
+    mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(
+        instances=[ref for ref, _ in instances_and_workers]
+    )
+    mx_client.get_metadata.side_effect = (
+        lambda source_id, worker_id: metadata[worker_id]
+    )
+    return mx_client, identity
+
+
+def _artifact_worker(worker_grpc_endpoint, artifact_id, accelerator=""):
+    return p2p_pb2.WorkerMetadata(
+        worker_grpc_endpoint=worker_grpc_endpoint,
+        accelerator=accelerator,
+        artifact_source=p2p_pb2.ArtifactSourceMetadata(artifact_id=artifact_id),
+    )
+
+
+def test_discover_artifact_source_skips_incompatible_accelerator():
+    # A compatible source listed after an incompatible one must still be
+    # chosen; the incompatible source is dropped before GetMetadata.
+    mx_source_id = compute_mx_source_id(
+        p2p_pb2.SourceIdentity(
+            mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE,
+            model_name="test/model",
+        )
+    )
+    incompatible = p2p_pb2.SourceInstanceRef(
+        mx_source_id=mx_source_id, worker_id="other-0", accelerator="other"
+    )
+    compatible = p2p_pb2.SourceInstanceRef(
+        mx_source_id=mx_source_id, worker_id="cuda-0", accelerator="cuda"
+    )
+    mx_client, identity = _artifact_discovery_client(
+        [
+            (incompatible, _artifact_worker("other-0:6555", "a-other", "other")),
+            (compatible, _artifact_worker("cuda-0:6555", "a-cuda", "cuda")),
+        ]
+    )
+
+    discovered = discover_artifact_source(mx_client, identity, accelerator="cuda")
+
+    assert discovered.worker_id == "cuda-0"
+    # The incompatible source was filtered before its metadata was fetched.
+    mx_client.get_metadata.assert_called_once_with(mx_source_id, "cuda-0")
+
+
+def test_discover_artifact_source_empty_accelerator_is_compatible():
+    # A source whose ref predates the accelerator field (empty) is accepted;
+    # a populated mismatch is still skipped.
+    mx_source_id = compute_mx_source_id(
+        p2p_pb2.SourceIdentity(
+            mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE,
+            model_name="test/model",
+        )
+    )
+    legacy = p2p_pb2.SourceInstanceRef(
+        mx_source_id=mx_source_id, worker_id="legacy-0", accelerator=""
+    )
+    mx_client, identity = _artifact_discovery_client(
+        [(legacy, _artifact_worker("legacy-0:6555", "a-legacy", ""))]
+    )
+
+    discovered = discover_artifact_source(mx_client, identity, accelerator="cuda")
+
+    assert discovered.worker_id == "legacy-0"
+
+
+def test_discover_artifact_source_rechecks_worker_metadata_accelerator():
+    # Defense-in-depth: an empty ref accelerator passes the pre-fetch filter,
+    # but the authoritative WorkerMetadata.accelerator mismatch is caught after
+    # GetMetadata, so no incompatible source is returned.
+    mx_source_id = compute_mx_source_id(
+        p2p_pb2.SourceIdentity(
+            mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE,
+            model_name="test/model",
+        )
+    )
+    drifted = p2p_pb2.SourceInstanceRef(
+        mx_source_id=mx_source_id, worker_id="drift-0", accelerator=""
+    )
+    mx_client, identity = _artifact_discovery_client(
+        [(drifted, _artifact_worker("drift-0:6555", "a-drift", "other"))]
+    )
+
+    with pytest.raises(LookupError, match="no ready artifact source"):
+        discover_artifact_source(mx_client, identity, accelerator="cuda")
+
+
 def test_publish_artifact_source_stops_server_when_refresh_fails(
     tmp_path,
 ):

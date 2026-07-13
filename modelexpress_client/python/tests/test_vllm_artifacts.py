@@ -456,6 +456,7 @@ def test_publish_vllm_cache_artifact_uses_ephemeral_worker_port(tmp_path):
         worker_id="worker-a",
         mx_client=object(),
         nixl_manager=object(),
+        accelerator_backend=SimpleNamespace(name="cuda"),
     )
     published = SimpleNamespace(endpoint=SimpleNamespace(mx_source_id="source-id"))
     worker_server = object()
@@ -472,6 +473,7 @@ def test_publish_vllm_cache_artifact_uses_ephemeral_worker_port(tmp_path):
     publish.assert_called_once()
     assert publish.call_args.kwargs["worker_id"] == "worker-a"
     assert publish.call_args.kwargs["node_rank"] == 2
+    assert publish.call_args.kwargs["accelerator"] == "cuda"
     assert publish.call_args.kwargs["worker_grpc_server"] is worker_server
     artifacts._published_sources.pop(
         (ctx.device_id, transfer.mx_source_type),
@@ -504,7 +506,12 @@ def test_install_vllm_cache_artifact_once_skips_after_marker(monkeypatch, tmp_pa
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE,
         model_name="test/model",
     )
-    ctx = SimpleNamespace(mx_client=object(), nixl_manager=object(), node_rank=2)
+    ctx = SimpleNamespace(
+        mx_client=object(),
+        nixl_manager=object(),
+        node_rank=2,
+        accelerator_backend=SimpleNamespace(name="cuda"),
+    )
 
     first = artifacts._install_vllm_cache_artifact_once(ctx, transfer, identity)
     second = artifacts._install_vllm_cache_artifact_once(ctx, transfer, identity)
@@ -517,6 +524,7 @@ def test_install_vllm_cache_artifact_once_skips_after_marker(monkeypatch, tmp_pa
         ctx.nixl_manager,
         worker_rank=None,
         node_rank=2,
+        accelerator="cuda",
     )
     transfer.install.assert_called_once_with(first)
 
@@ -543,7 +551,12 @@ def test_install_vllm_cache_artifact_once_does_not_retry_after_failure(
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
         model_name="test/model",
     )
-    ctx = SimpleNamespace(mx_client=object(), nixl_manager=object(), node_rank=2)
+    ctx = SimpleNamespace(
+        mx_client=object(),
+        nixl_manager=object(),
+        node_rank=2,
+        accelerator_backend=SimpleNamespace(name="cuda"),
+    )
 
     with pytest.raises(RuntimeError, match="transfer failed"):
         artifacts._install_vllm_cache_artifact_once(ctx, transfer, identity)

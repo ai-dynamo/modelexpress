@@ -18,7 +18,11 @@ from .base import (
     register_tensors,
 )
 from .context import LoadResult
-from ..metadata.payload import worker_tensor_count, worker_tensor_descriptors
+from ..metadata.payload import (
+    accelerators_compatible,
+    worker_tensor_count,
+    worker_tensor_descriptors,
+)
 from ..nixl_transfer import is_nixl_available
 from ..source_selection import (
     configured_policy_label,
@@ -134,6 +138,9 @@ class RdmaStrategy(LoadStrategy):
                 selection_metrics.record_attempt(policy, "metadata_miss")
                 continue
 
+            if not self._accelerator_compatible(ctx, source_worker, worker_id):
+                continue
+
             logger.info(
                 f"[Worker {ctx.global_rank}] Trying source worker {worker_id} "
                 f"({worker_tensor_count(source_worker)} tensors)"
@@ -196,10 +203,20 @@ class RdmaStrategy(LoadStrategy):
                 )
                 return []
 
-            candidates = [
-                inst
-                for inst in list_resp.instances
+            rank_matched = [
+                inst for inst in list_resp.instances
                 if inst.worker_rank == ctx.worker_rank
+            ]
+
+            # Drop accelerator-incompatible sources before ordering and the
+            # retry-cap slice, so the selector only ranks eligible peers and a
+            # compatible source can never be pushed past MAX_SOURCE_RETRIES by
+            # incompatible ones. The post-GetMetadata check in load() stays as
+            # defense-in-depth (empty refs, stale records, metadata drift).
+            target_accelerator = ctx.accelerator_backend.name
+            candidates = [
+                inst for inst in rank_matched
+                if accelerators_compatible(target_accelerator, inst.accelerator)
             ]
 
             selector = get_configured_selector()
@@ -211,7 +228,10 @@ class RdmaStrategy(LoadStrategy):
                 selector.name, "listed", len(list_resp.instances)
             )
             selection_metrics.observe_candidates(
-                selector.name, "rank_matched", len(ordered)
+                selector.name, "rank_matched", len(rank_matched)
+            )
+            selection_metrics.observe_candidates(
+                selector.name, "accelerator_matched", len(candidates)
             )
             selection_metrics.observe_selection_seconds(selector.name, select_seconds)
 
@@ -227,7 +247,8 @@ class RdmaStrategy(LoadStrategy):
                 f"[Worker {ctx.global_rank}] Source selection: "
                 f"source_selector={selector.name} "
                 f"source_candidates_total={len(list_resp.instances)} "
-                f"source_candidates_rank_matched={len(ordered)}"
+                f"source_candidates_rank_matched={len(rank_matched)} "
+                f"source_candidates_accelerator_matched={len(candidates)}"
             )
             if ordered:
                 logger.debug(
@@ -241,6 +262,31 @@ class RdmaStrategy(LoadStrategy):
                 f"[Worker {ctx.global_rank}] Error listing sources, falling through: {e}"
             )
             return []
+
+    def _accelerator_compatible(
+        self,
+        ctx: LoadContext,
+        source_worker: p2p_pb2.WorkerMetadata,
+        worker_id: str,
+    ) -> bool:
+        """Return whether source and target accelerator metadata are compatible.
+
+        Defense-in-depth re-check on the authoritative ``WorkerMetadata`` after
+        GetMetadata: the pre-slice filter in ``_find_source_instances`` uses the
+        lightweight ``SourceInstanceRef.accelerator``, which may be empty on old
+        servers or drift between list and fetch.
+        """
+        target_accelerator = ctx.accelerator_backend.name
+        source_accelerator = source_worker.accelerator
+        if accelerators_compatible(target_accelerator, source_accelerator):
+            return True
+
+        logger.info(
+            f"[Worker {ctx.global_rank}] Skipping source worker {worker_id}: "
+            f"accelerator mismatch source={source_accelerator!r}, "
+            f"target={target_accelerator!r}"
+        )
+        return False
 
     def _fetch_worker_metadata(
         self,
