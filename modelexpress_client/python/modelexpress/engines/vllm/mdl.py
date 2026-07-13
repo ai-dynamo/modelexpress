@@ -48,9 +48,13 @@ Generality / regime:
     gets the warm fast path instead of permanently falling back for tensors
     absent from the first cycle. Fused-group offsets are computed per batch, so
     a subset should carry a fused group's members together.
-  * **Out of regime today (fall back to stock load, correct but slow):** kernel-
-    swizzled / quantized MoE (needs ``--moe-backend triton``; guarded), and any
-    custom loader fusion not expressed in ``stacked_params_mapping``.
+  * **FP8 loaderless refit:** standard Qwen3 MoE ``weight_scale[_inv]`` and
+    optional activation/input scales map across direct, qkv/gate-up fused, and
+    w13/w2 expert layouts. Loaderless updates fail closed unless every incoming
+    tensor and every local FP8/scale parameter has an explicit destination.
+  * **Out of regime today:** kernel-swizzled MoE (needs ``--moe-backend
+    triton``; guarded), and custom loader fusion not expressed in
+    ``stacked_params_mapping``.
 """
 
 from __future__ import annotations
@@ -62,6 +66,8 @@ from typing import Any
 
 import torch
 
+from modelexpress.refit_timing import current_refit_timing
+
 logger = logging.getLogger("modelexpress.engines.vllm.mdl")
 
 # Stacked-param groups: (fused_param_suffix, member_suffix, canonical_order).
@@ -71,6 +77,11 @@ _STACKED_GROUPS = (
     ("qkv_proj", "v_proj", 2),
     ("gate_up_proj", "gate_proj", 0),
     ("gate_up_proj", "up_proj", 1),
+)
+
+_SCALE_NAME_ALIASES = (
+    ("weight_scale_inv", "weight_scale"),
+    ("input_scale", "activation_scale"),
 )
 
 
@@ -91,9 +102,10 @@ class MdlLoader:
         self._model = model
         self._param_cache: dict[str, torch.Tensor] | None = None
         self._direct: dict[str, torch.Tensor] = {}
-        self._fused: dict[str, tuple] = {}
-        self._expert: dict[str, tuple] = {}
+        self._fused: dict[str, torch.Tensor] = {}
+        self._expert: dict[str, torch.Tensor] = {}
         self._moe_module_cache: dict[str, Any] = {}
+        self._covered_params: set[str] = set()
         self._layout_sig: tuple | None = None
         self._cycles = 0
         self._tp_size = 1
@@ -119,6 +131,9 @@ class MdlLoader:
     # ---- public callback ----
     def load_weights(self, weights: list[tuple[str, torch.Tensor]]) -> None:
         mode = os.environ.get("MX_LOAD_MODE", "stock").lower()
+        timing = current_refit_timing()
+        if timing is not None:
+            timing.set_cold(mode != "direct" or self._param_cache is None)
         if mode != "direct":
             self._model.load_weights(weights=weights)
             return
@@ -130,6 +145,17 @@ class MdlLoader:
             self._reset_map()
         if self._param_cache is None:
             t0 = _time.perf_counter()
+            # H1 diagnostic: vLLM's stock FP8 load_weights is not re-entrant and
+            # can block at TP>1. MX_FP8_LOADERLESS=1 skips it, but remains an
+            # explicit opt-in until TP2 block-scale mapping is value-correct.
+            if not self._loaderless and self._should_force_fp8_loaderless():
+                logger.info(
+                    "[mx-mdl] FP8 params detected with tp_size=%d; using loaderless "
+                    "MDL apply from the cold cycle (skipping non-re-entrant stock "
+                    "FP8 load_weights).",
+                    self._tp_size,
+                )
+                self._loaderless = True
             if not self._loaderless:
                 try:
                     self._model.load_weights(weights=weights)
@@ -150,7 +176,7 @@ class MdlLoader:
                 # load_weights didn't apply anything — do it ourselves via the
                 # dest map (same in-place writes the warm path uses).
                 self._warm_load(apply_weights)
-                self._assert_loaderless_coverage()
+                self._assert_loaderless_coverage(apply_weights)
             logger.info(
                 "[mx-mdl] cold-cycle %s load %.2fs; cached %d params",
                 "loaderless" if self._loaderless else "stock",
@@ -185,22 +211,53 @@ class MdlLoader:
                     out.append((mn, t))
             return out
 
-    def _assert_loaderless_coverage(self) -> None:
-        """Fail loud rather than silently serve a half-written model. In
-        loaderless mode MDL is the only thing writing the parameters, so if it
-        couldn't classify most of them (e.g. a quantized model whose scale
-        tensors MDL doesn't yet map), refuse instead of leaving stale bytes."""
-        mapped = len(self._direct) + len(self._fused) + len(self._expert)
-        total = len(self._param_cache or {})
-        if total and mapped < 0.9 * total:
+    def _assert_loaderless_coverage(
+        self, weights: list[tuple[str, torch.Tensor]]
+    ) -> None:
+        """Require exact checkpoint and local FP8/scale destination coverage.
+
+        A percentage threshold is unsafe for MoE: thousands of expert source
+        tensors can hide a missing fused scale destination. Loaderless mode has
+        no stock-loader safety net, so every incoming tensor and every local
+        float8/scale parameter must have an explicit destination.
+        """
+        mapped_names = set(self._direct) | set(self._fused) | set(self._expert)
+        missing_inputs = [name for name, _ in weights if name not in mapped_names]
+        required_params = {
+            name
+            for name, param in (self._param_cache or {}).items()
+            if param.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            or self._is_scale_name(name)
+        }
+        missing_params = sorted(required_params - self._covered_params)
+        if missing_inputs or missing_params:
             raise RuntimeError(
-                f"[mx-mdl] loaderless MDL mapped only {mapped}/{total} parameters "
-                f"— this model's refit path is not fully supported by MDL yet "
-                f"(commonly: fp8/quantized scale tensors, or an unmapped weight "
-                f"name scheme). Refusing to serve a partially-written model. "
-                f"Use a refit-capable (non-quantized, or triton-MoE) config, or "
-                f"extend MDL's quant handling."
+                "[mx-mdl] loaderless coverage incomplete; refusing a "
+                "partially-written model. "
+                f"unmapped checkpoint tensors={missing_inputs[:10]}"
+                f"{' ...' if len(missing_inputs) > 10 else ''}; "
+                f"uncovered local FP8/scale parameters={missing_params[:10]}"
+                f"{' ...' if len(missing_params) > 10 else ''}"
             )
+
+    def _should_force_fp8_loaderless(self) -> bool:
+        """Whether to opt into loaderless mode before the stock FP8 cold load.
+
+        This is deliberately explicit: TP2 block-FP8 installation still needs
+        correct scale-layout resharding, so automatically enabling loaderless
+        mode at TP>1 can produce incorrect model values even when destination
+        coverage is complete. ``MX_FP8_LOADERLESS=1`` is therefore a diagnostic
+        opt-in until the TP2 scale mapping is validated end to end.
+        """
+        if os.environ.get("MX_FP8_LOADERLESS", "0").strip() != "1":
+            return False
+        try:
+            for _name, param in self._model.named_parameters():
+                if param.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    return True
+        except Exception:  # noqa: BLE001
+            return False
+        return False
 
     def _reset_map(self) -> None:
         self._param_cache = None
@@ -208,6 +265,7 @@ class MdlLoader:
         self._fused = {}
         self._expert = {}
         self._moe_module_cache = {}
+        self._covered_params = set()
         self._layout_sig = None
 
     # ---- warm path ----
@@ -265,8 +323,7 @@ class MdlLoader:
         class it was written as (``direct``/``fused``/``expert``) or ``None``."""
         d = self._fused.get(hf_name)
         if d is not None:
-            param, axis, off, sz = d
-            dest = param.data.narrow(axis, off, sz)
+            dest = d
             local = self._tp_local_tensor(tensor, tuple(dest.shape))
             if local is None:
                 return None
@@ -274,8 +331,7 @@ class MdlLoader:
             return "fused"
         e = self._expert.get(hf_name)
         if e is not None:
-            param, eid, axis, off, sz = e
-            dest = param.data[eid].narrow(axis, off, sz)
+            dest = e
             local = self._tp_local_tensor(tensor, tuple(dest.shape))
             if local is None:
                 return None
@@ -320,13 +376,10 @@ class MdlLoader:
                 fallback = still
         if fallback:
             if self._loaderless:
-                # No re-entrant stock loader available for this (quantized)
-                # model; a truly unmapped tensor can't be applied. For a fully
-                # classified model this list is empty; warn if not so it's
-                # visible rather than silently stale.
-                logger.warning(
-                    "[mx-mdl] loaderless: %d tensor(s) unmapped, left unwritten: %s",
-                    len(fallback), [n for n, _ in fallback[:5]],
+                raise RuntimeError(
+                    "[mx-mdl] loaderless update contains unmapped tensor(s); "
+                    "refusing to leave stale bytes: "
+                    f"{[name for name, _ in fallback[:10]]}"
                 )
             else:
                 self._model.load_weights(weights=fallback)
@@ -339,6 +392,36 @@ class MdlLoader:
         )
 
     # ---- map building (additive / incremental) ----
+    @staticmethod
+    def _is_scale_name(name: str) -> bool:
+        return name.endswith(
+            (
+                "weight_scale",
+                "weight_scale_inv",
+                "input_scale",
+                "activation_scale",
+            )
+        )
+
+    @staticmethod
+    def _param_candidates(name: str) -> tuple[str, ...]:
+        candidates = [name]
+        for left, right in _SCALE_NAME_ALIASES:
+            if left in name:
+                candidates.append(name.replace(left, right))
+            if right in name:
+                candidates.append(name.replace(right, left))
+        return tuple(dict.fromkeys(candidates))
+
+    def _find_param(
+        self, name: str, params: dict[str, torch.Tensor]
+    ) -> tuple[str, torch.Tensor] | None:
+        for candidate in self._param_candidates(name):
+            param = params.get(candidate)
+            if param is not None:
+                return candidate, param
+        return None
+
     def _extend_dest_map(self, weights: list[tuple[str, torch.Tensor]]) -> None:
         """Classify + record destination-map entries for any tensors in
         ``weights`` not already mapped. Additive and idempotent, so it serves
@@ -364,74 +447,156 @@ class MdlLoader:
                 logger.info("[mx-mdl] no expert mapping: %s", exc)
 
         stacked_groups = self._stacked_groups()
-        groups: dict[str, list[tuple[int, str, int]]] = {}
+        groups: dict[str, list[tuple[int, str, tuple[int, ...]]]] = {}
         for hf_name in name_to_shape:
-            param = params.get(hf_name)
-            if param is not None and self._tp_shape_compatible(
+            direct = self._find_param(hf_name, params)
+            if direct is not None and self._tp_shape_compatible(
                 name_to_shape[hf_name],
-                tuple(param.shape),
+                tuple(direct[1].shape),
             ):
+                param_name, param = direct
                 self._direct[hf_name] = param
+                self._covered_params.add(param_name)
                 continue
             if ".experts." in hf_name and expert_lookup:
-                dest = self._resolve_expert(hf_name, name_to_shape[hf_name], expert_lookup, params)
-                if dest is not None:
+                resolved = self._resolve_expert(
+                    hf_name, name_to_shape[hf_name], expert_lookup, params
+                )
+                if resolved is not None:
+                    dest, param_name = resolved
                     self._expert[hf_name] = dest
+                    self._covered_params.add(param_name)
                     continue
-            matched = False
             for fused_suf, member_suf, order in stacked_groups:
                 if member_suf + "." in hf_name or hf_name.endswith(member_suf + ".weight"):
-                    fused_name = hf_name.replace(member_suf, fused_suf)
-                    if params.get(fused_name) is None:
+                    requested_name = hf_name.replace(member_suf, fused_suf)
+                    fused = self._find_param(requested_name, params)
+                    if fused is None:
                         continue
+                    fused_name, _ = fused
                     groups.setdefault(fused_name, []).append(
-                        (order, hf_name, name_to_shape[hf_name][0]))
-                    matched = True
+                        (order, hf_name, name_to_shape[hf_name])
+                    )
                     break
             # unmatched -> implicit fallback (not in any map)
         for fused_name, members in groups.items():
             fused_param = params[fused_name]
             members.sort(key=lambda m: m[0])
-            full_rows = sum(rows for _o, _name, rows in members)
-            if (
-                self._tp_size > 1
-                and full_rows == int(fused_param.shape[0]) * self._tp_size
-            ):
-                members = [
-                    (order, name, rows // self._tp_size)
-                    for order, name, rows in members
-                ]
-            off = 0
-            for _o, hf_name, rows in members:
-                self._fused[hf_name] = (fused_param, 0, off, rows)
-                off += rows
-            if off != int(fused_param.shape[0]):
-                logger.warning("[mx-mdl] fused %s rows=%d != param=%d; fallback",
-                               fused_name, off, int(fused_param.shape[0]))
-                for _o, hf_name, _r in members:
-                    self._fused.pop(hf_name, None)
+            destinations = self._fused_destinations(fused_param, members)
+            if destinations is None:
+                logger.warning(
+                    "[mx-mdl] fused %s cannot represent member shapes %s in %s; "
+                    "fallback",
+                    fused_name,
+                    [shape for _order, _name, shape in members],
+                    tuple(fused_param.shape),
+                )
+                continue
+            self._fused.update(destinations)
+            self._covered_params.add(fused_name)
         logger.info("[mx-mdl] dest map: %d direct, %d fused, %d expert",
                     len(self._direct), len(self._fused), len(self._expert))
 
-    def _resolve_expert(self, hf_name, hf_shape, expert_lookup, params) -> tuple | None:
+    def _fused_destinations(
+        self,
+        fused_param: torch.Tensor,
+        members: list[tuple[int, str, tuple[int, ...]]],
+    ) -> dict[str, torch.Tensor] | None:
+        """Return views for qkv/gate-up weights and their scale layouts."""
+        data = fused_param.data
+        if all(not shape for _order, _name, shape in members):
+            if data.numel() == 1:
+                return {name: data.reshape(()) for _order, name, _shape in members}
+            if data.numel() == len(members):
+                flat = data.reshape(-1)
+                return {
+                    name: flat[index].reshape(())
+                    for index, (_order, name, _shape) in enumerate(members)
+                }
+            return None
+
+        if not members or any(len(shape) != data.ndim for _o, _n, shape in members):
+            return None
+        candidates = []
+        for axis in range(data.ndim):
+            if not all(
+                all(
+                    dim == axis or int(shape[dim]) == int(data.shape[dim])
+                    for dim in range(data.ndim)
+                )
+                for _order, _name, shape in members
+            ):
+                continue
+            total = sum(int(shape[axis]) for _order, _name, shape in members)
+            if total == int(data.shape[axis]):
+                candidates.append((axis, 1))
+            elif (
+                self._tp_size > 1
+                and total == int(data.shape[axis]) * self._tp_size
+                and all(int(shape[axis]) % self._tp_size == 0 for _o, _n, shape in members)
+            ):
+                candidates.append((axis, self._tp_size))
+        if not candidates:
+            return None
+        axis, divisor = candidates[0]
+        offset = 0
+        out = {}
+        for _order, name, shape in members:
+            size = int(shape[axis]) // divisor
+            out[name] = data.narrow(axis, offset, size)
+            offset += size
+        return out
+
+    def _resolve_expert(
+        self, hf_name, hf_shape, expert_lookup, params
+    ) -> tuple[torch.Tensor, str] | None:
         for w_suf, (p_suf, eid, shard) in expert_lookup.items():
             if w_suf not in hf_name:
                 continue
-            fused_name = hf_name.replace(w_suf, p_suf)
-            fp = params.get(fused_name)
-            if fp is None or fp.ndim != 3:
+            requested_name = hf_name.replace(w_suf, p_suf)
+            fused = self._find_param(requested_name, params)
+            if fused is None:
+                return None
+            fused_name, fp = fused
+            if fp.ndim < 1:
                 return None
             local = self._map_global_to_local(fused_name, eid)
             if local is None or local < 0 or local >= int(fp.shape[0]):
                 return None
-            if shard == "w1":
-                axis, off, sz = 0, 0, int(fp.shape[1]) // 2
-            elif shard == "w3":
-                local_rows = int(fp.shape[1]) // 2
-                axis, off, sz = 0, local_rows, local_rows
-            else:  # w2
-                axis, off, sz = 0, 0, int(fp.shape[1])
-            return (fp, local, axis, off, sz)
+            expert_data = fp.data[local]
+            if shard == "w2":
+                if self._tp_shape_compatible(hf_shape, tuple(expert_data.shape)):
+                    return expert_data, fused_name
+                return None
+            if tuple(hf_shape) == tuple(expert_data.shape):
+                # w1/w3 activation scales may intentionally share one value.
+                return expert_data, fused_name
+            if not hf_shape:
+                if expert_data.numel() == 1:
+                    return expert_data.reshape(()), fused_name
+                if expert_data.numel() == 2:
+                    index = 0 if shard == "w1" else 1
+                    return expert_data.reshape(-1)[index].reshape(()), fused_name
+                return None
+            if len(hf_shape) != expert_data.ndim:
+                return None
+            for axis in range(expert_data.ndim):
+                if not all(
+                    dim == axis
+                    or int(hf_shape[dim]) == int(expert_data.shape[dim])
+                    for dim in range(expert_data.ndim)
+                ):
+                    continue
+                source = int(hf_shape[axis])
+                dest = int(expert_data.shape[axis])
+                if dest == source * 2:
+                    local_size = source
+                elif self._tp_size > 1 and dest * self._tp_size == source * 2:
+                    local_size = dest // 2
+                else:
+                    continue
+                offset = 0 if shard == "w1" else local_size
+                return expert_data.narrow(axis, offset, local_size), fused_name
         return None
 
     def _map_global_to_local(self, fused_param_name: str, gid: int) -> int | None:

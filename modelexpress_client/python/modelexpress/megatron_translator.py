@@ -53,6 +53,7 @@ from .nemo_rl_v2 import (
     TargetTpLayout,
     V2SourceCandidate,
 )
+from .refit_timing import refit_span
 
 logger = logging.getLogger("modelexpress.megatron_translator")
 
@@ -216,12 +217,20 @@ def assemble_into_destination(
             if expert_id < 0:
                 logger.warning("per_expert source missing expert_id: %r", src)
                 continue
-            buf = torch.empty(plan.target_shape, dtype=target_dtype, device=device)
+            with refit_span(
+                "setup_registration",
+                metadata={"operation": "allocate_assembly_buffer"},
+            ):
+                buf = torch.empty(plan.target_shape, dtype=target_dtype, device=device)
             pull(src, buf)
             results[expert_id] = buf
         return results
 
-    dest = torch.empty(plan.target_shape, dtype=target_dtype, device=device)
+    with refit_span(
+        "setup_registration",
+        metadata={"operation": "allocate_assembly_buffer"},
+    ):
+        dest = torch.empty(plan.target_shape, dtype=target_dtype, device=device)
 
     if plan.assembly == "passthrough":
         if plan.sources:
@@ -483,11 +492,12 @@ def run_refit_cycle(
             role_descriptor=dict(rs.role_descriptor or {}),
         )
 
-    plans = receiver.pick_megatron_slice_plans(
-        candidates,
-        target_tp_layout=context.target_tp_layout,
-        target_tensor_specs=target_specs,
-    )
+    with refit_span("transfer_planning"):
+        plans = receiver.pick_megatron_slice_plans(
+            candidates,
+            target_tp_layout=context.target_tp_layout,
+            target_tensor_specs=target_specs,
+        )
 
     pre = pre_assembled_buffers or {}
     for plan in plans:
@@ -503,12 +513,13 @@ def run_refit_cycle(
             assembled: torch.Tensor | dict[int, torch.Tensor] = pre[plan.tensor_name]
         else:
             assembled = assemble_into_destination(plan, pull=pull, device=device)
-        yield from translate_megatron_to_hf(
-            plan,
-            assembled,
-            transformer_config=context.transformer_config,
-            hf_names=rs.hf_names,
-        )
+        with refit_span("transformation"):
+            yield from translate_megatron_to_hf(
+                plan,
+                assembled,
+                transformer_config=context.transformer_config,
+                hf_names=rs.hf_names,
+            )
 
 
 __all__ = [

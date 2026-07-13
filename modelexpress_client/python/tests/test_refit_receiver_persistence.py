@@ -3,7 +3,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from modelexpress.refit_receiver import _DTYPE_MAP
+
 from modelexpress.refit_receiver import MxRefitReceiver, SourceRef
+from modelexpress.refit_timing import RefitTimingRecorder, use_refit_timing
 
 
 class _Agent:
@@ -73,6 +76,11 @@ def _tensor(name, size=16, dtype="float32"):
     )
 
 
+def test_scratch_dtype_map_supports_fp8_checkpoint_descriptors():
+    assert _DTYPE_MAP["torch.float8_e4m3fn"] is torch.float8_e4m3fn
+    assert _DTYPE_MAP["float8_e4m3fn"] is torch.float8_e4m3fn
+
+
 def _worker(agent_name, tensors=None):
     return SimpleNamespace(
         agent_name="",
@@ -132,6 +140,25 @@ def test_scratch_registration_persists_while_wire_subset_changes(receiver):
         (["a"], "trainer-r0"),
         (["b"], "trainer-r0"),
     ]
+
+
+def test_persistence_cache_status_is_structured(receiver):
+    worker = _worker("trainer-r0")
+    receiver._client = _Client({"worker-0": worker})
+    timing = RefitTimingRecorder(backend="test", version=2)
+
+    with use_refit_timing(timing):
+        list(receiver.receive_weights_scratch(_source("worker-0", "v1")))
+        list(receiver.receive_weights_scratch(_source("worker-0", "v2")))
+
+    setup = timing.as_dict()["stages"]["setup_registration"]
+    assert setup["status"] == "mixed"
+    assert setup["statuses"] == ["cache_miss", "cache_hit"]
+    assert setup["count"] == 4
+    assert setup["metadata"] == {
+        "scratch_buffer_cache": "hit",
+        "remote_agent_cache": "hit",
+    }
 
 
 def test_prune_allows_restarted_worker_to_reuse_agent_name(receiver):

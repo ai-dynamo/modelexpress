@@ -245,6 +245,42 @@ def test_replicated_passthrough(env):
     assert torch.equal(out[0][1], norm)
 
 
+def test_assembly_contributes_setup_timing(env):
+    v2 = env.v2
+    timing_mod = sys.modules["modelexpress.refit_timing"]
+    rcv = v2.MxV2RefitReceiver(
+        agent_name="rcv", device_id=0, mx_server_url="stub:1", worker_rank=0
+    )
+    rcv.initialize(model_tensors=None)
+    source = torch.arange(8, dtype=torch.float32)
+    candidates = [
+        _make_megatron_candidate(env, tp_rank=0, tp_size=1, sid="timed")
+    ]
+    plans = rcv.pick_megatron_slice_plans(
+        candidates,
+        target_tp_layout=v2.TargetTpLayout(tp_size=1, tp_rank=0),
+        target_tensor_specs={
+            "weight": v2.MegatronTensorSpec(
+                role=v2.ROLE_MEGATRON_REPLICATED,
+                target_shape=(8,),
+                target_dtype="float32",
+            )
+        },
+    )
+    timing = timing_mod.RefitTimingRecorder(backend="test", version=1)
+    with timing_mod.use_refit_timing(timing):
+        assembled = env.translator.assemble_into_destination(
+            plans[0],
+            pull=_make_pull_callback({"timed": source}),
+            device="cpu",
+        )
+
+    assert torch.equal(assembled, source)
+    setup = timing.as_dict()["stages"]["setup_registration"]
+    assert setup["status"] == "ok"
+    assert setup["count"] == 1
+
+
 # ---------------------------------------------------------------------------
 # Test 2 — column-parallel matched-TP: assemble across 2 trainer ranks,
 # receiver wants the half its target_rank covers

@@ -142,9 +142,38 @@ class MxWeightTransferEngine(WeightTransferEngine[MxInitInfo, MxUpdateInfo]):
 
                     self._mdl = MdlLoader(model)
                 load_callback = self._mdl.load_weights
+        subset = None
+        if (
+            getattr(update_info, "subset_param_names", None)
+            or getattr(update_info, "subset_layers", None)
+            or getattr(update_info, "subset_layer_groups", None)
+        ):
+            subset = WeightSubset(
+                param_names=getattr(update_info, "subset_param_names", None),
+                layers=getattr(update_info, "subset_layers", None),
+                layer_groups=getattr(update_info, "subset_layer_groups", None),
+            )
+            # The cold cycle must apply the full model so the MDL destination map
+            # covers every parameter; only warm cycles honor the subset. Detect a
+            # not-yet-built map and fall back to a full update for that cycle.
+            map_built = (
+                self._mdl is not None
+                and getattr(self._mdl, "_param_cache", None) is not None
+            )
+            if not map_built:
+                logger.info(
+                    "[mx-wt] subset requested but MDL map not built yet; applying "
+                    "full cold update this cycle (subset honored from next cycle)"
+                )
+                subset = None
         version = int(getattr(update_info, "version", 0))
         self._updater.start_weight_update(version)
-        self._updater.update_weights(update_info, load_callback)
+        self._updater.update_weights(
+            update_info,
+            load_callback,
+            subset=subset,
+            target_model=model if load_callback is load_weights else None,
+        )
         self._updater.finish_weight_update(version)
 
     @staticmethod

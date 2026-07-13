@@ -31,6 +31,7 @@ import torch
 
 from .client import MxClient
 from .nixl_transfer import NixlTransferManager, is_nixl_available
+from .refit_timing import refit_span
 from .types import TensorDescriptor
 from . import p2p_pb2
 
@@ -44,9 +45,13 @@ _DTYPE_MAP: dict[str, torch.dtype] = {
     "torch.bfloat16": torch.bfloat16,
     "torch.float16": torch.float16,
     "torch.float32": torch.float32,
+    "torch.float8_e4m3fn": torch.float8_e4m3fn,
+    "torch.float8_e5m2": torch.float8_e5m2,
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
     "float32": torch.float32,
+    "float8_e4m3fn": torch.float8_e4m3fn,
+    "float8_e5m2": torch.float8_e5m2,
 }
 
 
@@ -269,10 +274,14 @@ class MxRefitReceiver:
         if not self._initialized:
             raise RuntimeError("Call initialize() before receive_weights()")
 
-        meta_resp = self._client.get_metadata(
-            mx_source_id=source.mx_source_id,
-            worker_id=source.worker_id,
-        )
+        with refit_span(
+            "source_preparation",
+            metadata={"operation": "fetch_source_metadata"},
+        ):
+            meta_resp = self._client.get_metadata(
+                mx_source_id=source.mx_source_id,
+                worker_id=source.worker_id,
+            )
         if not meta_resp.found:
             raise RuntimeError(
                 f"Source {source.mx_source_id}/{source.worker_id} not found on MX Server"
@@ -324,12 +333,18 @@ class MxRefitReceiver:
         metadata = bytes(worker.nixl_metadata)
         cached = self._scratch_remote_agents.get(agent_key)
         if cached is not None and cached[1] == metadata:
+            with refit_span(
+                "setup_registration",
+                status="cache_hit",
+                metadata={"remote_agent_cache": "hit"},
+            ):
+                remote_agent = cached[0]
             logger.info(
                 "[refit] reusing remote agent %r for worker %r",
-                cached[0],
+                remote_agent,
                 agent_key,
             )
-            return cached[0]
+            return remote_agent
 
         if cached is not None:
             try:
@@ -337,7 +352,12 @@ class MxRefitReceiver:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("remove_remote_agent(%r) failed: %s", cached[0], exc)
 
-        remote_agent = self._nixl._agent.add_remote_agent(metadata)
+        with refit_span(
+            "setup_registration",
+            status="cache_miss",
+            metadata={"remote_agent_cache": "miss"},
+        ):
+            remote_agent = self._nixl._agent.add_remote_agent(metadata)
         self._scratch_remote_agents[agent_key] = (remote_agent, metadata)
         logger.info(
             "[refit] loaded remote agent %r for worker %r (%s)",
@@ -407,10 +427,14 @@ class MxRefitReceiver:
         if not self._initialized:
             raise RuntimeError("Call initialize() before receive_weights_scratch()")
 
-        meta_resp = self._client.get_metadata(
-            mx_source_id=source.mx_source_id,
-            worker_id=source.worker_id,
-        )
+        with refit_span(
+            "source_preparation",
+            metadata={"operation": "fetch_source_metadata"},
+        ):
+            meta_resp = self._client.get_metadata(
+                mx_source_id=source.mx_source_id,
+                worker_id=source.worker_id,
+            )
         if not meta_resp.found:
             raise RuntimeError(
                 f"Source {source.mx_source_id}/{source.worker_id} not found on MX Server"
@@ -446,15 +470,20 @@ class MxRefitReceiver:
             sorted((td.name, int(td.size), td.dtype) for td in all_source_tensors)
         )
         if self._scratch_sig is None:
-            scratch_tensors: dict[str, torch.Tensor] = {}
-            for td in all_source_tensors:
-                dt = _DTYPE_MAP.get(td.dtype, torch.bfloat16)
-                elem_size = torch.tensor([], dtype=dt).element_size()
-                numel = td.size // elem_size
-                scratch_tensors[td.name] = torch.empty(
-                    numel, dtype=dt, device=f"cuda:{self._device_id}"
-                )
-            self._nixl.register_tensors(scratch_tensors)
+            with refit_span(
+                "setup_registration",
+                status="cache_miss",
+                metadata={"scratch_buffer_cache": "miss"},
+            ):
+                scratch_tensors: dict[str, torch.Tensor] = {}
+                for td in all_source_tensors:
+                    dt = _DTYPE_MAP.get(td.dtype, torch.bfloat16)
+                    elem_size = torch.tensor([], dtype=dt).element_size()
+                    numel = td.size // elem_size
+                    scratch_tensors[td.name] = torch.empty(
+                        numel, dtype=dt, device=f"cuda:{self._device_id}"
+                    )
+                self._nixl.register_tensors(scratch_tensors)
             self._scratch_tensors = scratch_tensors
             self._scratch_sig = sig
             logger.info(
@@ -472,7 +501,12 @@ class MxRefitReceiver:
                 "reinitialize the MX receiver before loading the new layout"
             )
         else:
-            self._nixl.rebind_tensors(self._scratch_tensors)
+            with refit_span(
+                "setup_registration",
+                status="cache_hit",
+                metadata={"scratch_buffer_cache": "hit"},
+            ):
+                self._nixl.rebind_tensors(self._scratch_tensors)
             logger.info(
                 "Reusing %d persistent scratch buffers",
                 len(self._scratch_tensors),

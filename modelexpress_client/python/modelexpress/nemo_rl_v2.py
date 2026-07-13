@@ -39,6 +39,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import time
 from dataclasses import dataclass, field
 from typing import Iterator
 
@@ -756,6 +758,8 @@ class MxV2RefitReceiver:
         same_rank_only: bool = True,
         include_replicas: bool = True,
         prefer_replicas: bool = False,
+        max_metadata_fetches: int | None = None,
+        max_source_age_seconds: float | None = None,
     ) -> list[V2SourceCandidate]:
         """List candidate v2 sources, filtering and sorting per the v2 rules.
 
@@ -769,6 +773,11 @@ class MxV2RefitReceiver:
                 have already received and republished. Combined with
                 ``same_rank_only``, this means "same-rank trainer + any
                 same-rank inference replica".
+            max_metadata_fetches: hard bound on follow-up ``get_metadata``
+                calls. Defaults to ``MX_V2_MAX_METADATA_FETCHES`` (64).
+            max_source_age_seconds: when ``list_sources`` exposes
+                ``updated_at``, skip older rows before fetching metadata.
+                Defaults to ``MX_V2_MAX_SOURCE_AGE_SECONDS`` (24 hours).
 
         Returns:
             Candidates sorted by freshness (largest ``updated_at`` first).
@@ -787,11 +796,59 @@ class MxV2RefitReceiver:
             logger.warning("list_sources failed: %s", e)
             return []
 
-        candidates: list[V2SourceCandidate] = []
+        if max_metadata_fetches is None:
+            max_metadata_fetches = int(
+                os.environ.get("MX_V2_MAX_METADATA_FETCHES", "64")
+            )
+        if max_metadata_fetches <= 0:
+            raise ValueError("max_metadata_fetches must be positive")
+        if max_source_age_seconds is None:
+            max_source_age_seconds = float(
+                os.environ.get("MX_V2_MAX_SOURCE_AGE_SECONDS", "86400")
+            )
+
+        # SourceInstanceRef already carries model_name + worker_rank in the
+        # current protocol. Newer servers also return training_step and
+        # updated_at. Apply every available lightweight predicate here, before
+        # the expensive tensor-metadata RPC, and newest-first so the bounded
+        # window retains the most useful rows when a benchmark has left many
+        # historical READY entries behind.
+        now_ms = int(time.time() * 1000)
+        lightweight: list[tuple[int, object]] = []
+        seen_refs: set[tuple[str, str]] = set()
         for instance in response.instances:
             if instance.model_name != model_name:
                 continue
+            if same_rank_only and hasattr(instance, "worker_rank"):
+                if int(instance.worker_rank) != self._worker_rank:
+                    continue
 
+            listed_version = self._listed_int(
+                instance, "training_step", "version"
+            )
+            if listed_version is not None and listed_version < min_version:
+                continue
+
+            listed_updated_at = self._listed_int(instance, "updated_at")
+            if (
+                listed_updated_at is not None
+                and max_source_age_seconds > 0
+                and now_ms - self._timestamp_ms(listed_updated_at)
+                > max_source_age_seconds * 1000
+            ):
+                continue
+
+            key = (instance.mx_source_id, instance.worker_id)
+            if key in seen_refs:
+                continue
+            seen_refs.add(key)
+            lightweight.append((listed_updated_at or 0, instance))
+
+        lightweight.sort(key=lambda item: item[0], reverse=True)
+        lightweight = lightweight[:max_metadata_fetches]
+
+        candidates: list[V2SourceCandidate] = []
+        for _listed_updated_at, instance in lightweight:
             # Resolve the full identity to read v2 metadata.
             try:
                 meta = client.get_metadata(
@@ -936,7 +993,33 @@ class MxV2RefitReceiver:
                     -c.updated_at,
                 )
             )
+
+        # Bound the process-local NIXL remote-agent cache to workers that are
+        # still eligible. This only releases local handles; it never mutates
+        # or deletes catalog rows, so active production publishers are safe.
+        prune = getattr(self._receiver, "prune_scratch_remote_agents", None)
+        if callable(prune):
+            prune({candidate.ref.worker_id for candidate in candidates})
         return candidates
+
+    @staticmethod
+    def _listed_int(instance: object, *names: str) -> int | None:
+        for name in names:
+            if not hasattr(instance, name):
+                continue
+            value = getattr(instance, name)
+            if value in (None, ""):
+                continue
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    @staticmethod
+    def _timestamp_ms(value: int) -> int:
+        # Accommodate both epoch-seconds and epoch-milliseconds list APIs.
+        return value * 1000 if value < 100_000_000_000 else value
 
     def pick_best_source(
         self,

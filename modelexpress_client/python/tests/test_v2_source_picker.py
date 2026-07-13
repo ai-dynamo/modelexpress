@@ -126,6 +126,7 @@ def v2():
             self._nixl = MagicMock()
             self._agent_name = kw.get("agent_name", "stub")
             self._worker_id = "stub-worker"
+            self.prune_scratch_remote_agents = MagicMock()
 
         def initialize(self, model_tensors=None):
             pass
@@ -186,10 +187,27 @@ def v2():
     return v2
 
 
-def _fake_instance(model_name, mx_source_id, worker_id):
-    return types.SimpleNamespace(
-        model_name=model_name, mx_source_id=mx_source_id, worker_id=worker_id
-    )
+def _fake_instance(
+    model_name,
+    mx_source_id,
+    worker_id,
+    *,
+    worker_rank=None,
+    training_step=None,
+    updated_at=None,
+):
+    values = {
+        "model_name": model_name,
+        "mx_source_id": mx_source_id,
+        "worker_id": worker_id,
+    }
+    if worker_rank is not None:
+        values["worker_rank"] = worker_rank
+    if training_step is not None:
+        values["training_step"] = training_step
+    if updated_at is not None:
+        values["updated_at"] = updated_at
+    return types.SimpleNamespace(**values)
 
 
 def _fake_meta(role, worker_rank, training_step, updated_at, registry_blob=""):
@@ -291,6 +309,80 @@ def test_min_version_filter(v2):
     cands = receiver.discover_v2_sources(model_name="m", min_version=5)
     versions = sorted(c.ref.training_step for c in cands)
     assert versions == [5, 7]
+
+
+def test_list_fields_prune_before_bounded_metadata_fetch(v2):
+    receiver = v2.MxV2RefitReceiver(
+        agent_name="t", device_id=0, mx_server_url="x", worker_rank=2
+    )
+    receiver.initialize()
+    now_ms = 2_000_000_000_000
+    response = MagicMock()
+    response.instances = [
+        *[
+            _fake_instance(
+                "other", f"other-{i}", f"other-worker-{i}",
+                worker_rank=2, training_step=9, updated_at=now_ms,
+            )
+            for i in range(50)
+        ],
+        _fake_instance(
+            "m", "wrong-rank", "wrong-rank-worker",
+            worker_rank=1, training_step=9, updated_at=now_ms,
+        ),
+        _fake_instance(
+            "m", "old-version", "old-version-worker",
+            worker_rank=2, training_step=3, updated_at=now_ms,
+        ),
+        _fake_instance(
+            "m", "stale", "stale-worker",
+            worker_rank=2, training_step=9, updated_at=now_ms - 90_000,
+        ),
+        _fake_instance(
+            "m", "fresh-1", "fresh-worker-1",
+            worker_rank=2, training_step=9, updated_at=now_ms - 10,
+        ),
+        _fake_instance(
+            "m", "fresh-2", "fresh-worker-2",
+            worker_rank=2, training_step=10, updated_at=now_ms,
+        ),
+        _fake_instance(
+            "m", "fresh-3", "fresh-worker-3",
+            worker_rank=2, training_step=11, updated_at=now_ms - 20,
+        ),
+    ]
+    receiver._receiver._client.list_sources.return_value = response
+    metas = {
+        f"fresh-worker-{i}": _fake_meta("trainer", 2, 8 + i, now_ms - i)
+        for i in range(1, 4)
+    }
+    fetched = []
+
+    def _get_metadata(_source_id, worker_id):
+        fetched.append(worker_id)
+        return metas[worker_id]
+
+    receiver._receiver._client.get_metadata = _get_metadata
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(v2.time, "time", lambda: now_ms / 1000)
+        candidates = receiver.discover_v2_sources(
+            model_name="m",
+            min_version=5,
+            same_rank_only=True,
+            max_metadata_fetches=2,
+            max_source_age_seconds=60,
+        )
+
+    assert fetched == ["fresh-worker-2", "fresh-worker-1"]
+    assert [candidate.ref.worker_id for candidate in candidates] == [
+        "fresh-worker-1",
+        "fresh-worker-2",
+    ]
+    assert receiver._receiver.prune_scratch_remote_agents.call_args.args[0] == {
+        "fresh-worker-1",
+        "fresh-worker-2",
+    }
 
 
 def test_non_v2_sources_ignored(v2):

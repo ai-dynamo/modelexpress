@@ -27,6 +27,7 @@ from .accelerators import (
     AcceleratorBackend,
     CudaAcceleratorBackend,
 )
+from .refit_timing import add_refit_bytes, refit_span
 from .types import ManifestMismatchError, TensorDescriptor
 
 if TYPE_CHECKING:
@@ -662,7 +663,11 @@ class NixlTransferManager:
 
         if remote_agent_name is None:
             add_start = time.perf_counter()
-            remote_agent_name = self._agent.add_remote_agent(source_metadata)
+            with refit_span(
+                "setup_registration",
+                metadata={"operation": "add_remote_agent"},
+            ):
+                remote_agent_name = self._agent.add_remote_agent(source_metadata)
             add_time = time.perf_counter() - add_start
             logger.info(
                 f"[TIMING] add_remote_agent: {add_time:.3f}s "
@@ -678,33 +683,37 @@ class NixlTransferManager:
         local_descs: list[tuple[int, int, int]] = []
         total_bytes = 0
 
-        for src_tensor in source_tensors:
-            local_tensor = self._tensors.get(src_tensor.name)
-            if local_tensor is None:
-                continue
-            local_size = local_tensor.numel() * local_tensor.element_size()
-            if local_size != src_tensor.size:
-                raise ManifestMismatchError(
-                    f"Tensor '{src_tensor.name}' size mismatch: "
-                    f"source={src_tensor.size} bytes, local={local_size} bytes"
+        with refit_span(
+            "transfer_planning",
+            metadata={"operation": "match_tensors"},
+        ):
+            for src_tensor in source_tensors:
+                local_tensor = self._tensors.get(src_tensor.name)
+                if local_tensor is None:
+                    continue
+                local_size = local_tensor.numel() * local_tensor.element_size()
+                if local_size != src_tensor.size:
+                    raise ManifestMismatchError(
+                        f"Tensor '{src_tensor.name}' size mismatch: "
+                        f"source={src_tensor.size} bytes, local={local_size} bytes"
+                    )
+                local_dtype = str(local_tensor.dtype)
+                if local_dtype != src_tensor.dtype:
+                    raise ManifestMismatchError(
+                        f"Tensor '{src_tensor.name}' dtype mismatch: "
+                        f"source={src_tensor.dtype!r}, local={local_dtype!r}"
+                    )
+                remote_descs.append(
+                    (src_tensor.addr, src_tensor.size, src_tensor.device_id)
                 )
-            local_dtype = str(local_tensor.dtype)
-            if local_dtype != src_tensor.dtype:
-                raise ManifestMismatchError(
-                    f"Tensor '{src_tensor.name}' dtype mismatch: "
-                    f"source={src_tensor.dtype!r}, local={local_dtype!r}"
+                local_descs.append(
+                    (
+                        local_tensor.data_ptr(),
+                        local_size,
+                        self._device_id,
+                    )
                 )
-            remote_descs.append(
-                (src_tensor.addr, src_tensor.size, src_tensor.device_id)
-            )
-            local_descs.append(
-                (
-                    local_tensor.data_ptr(),
-                    local_size,
-                    self._device_id,
-                )
-            )
-            total_bytes += src_tensor.size
+                total_bytes += src_tensor.size
 
         matched_tensors = len(remote_descs)
         match_time = time.perf_counter() - match_start
@@ -724,51 +733,61 @@ class NixlTransferManager:
         # this receiver allocated its dest buffers (see
         # self._local_mem_type, set by register_tensors).
         prep_start = time.perf_counter()
-        src_prepped = self._agent.prep_xfer_dlist(
-            agent_name=remote_agent_name,
-            xfer_list=remote_descs,
-            mem_type=self._accelerator_backend.nixl_mem_type,
-            backends=self._backends,
-        )
-        dst_prepped = self._agent.prep_xfer_dlist(
-            agent_name="",
-            xfer_list=local_descs,
-            # Local side uses our dynamic memtype (cuda for GPU buffers, cpu
-            # for the Phase-0.5 host path); falls back to the backend default.
-            mem_type=self._local_mem_type or self._accelerator_backend.nixl_mem_type,
-            backends=self._backends,
-        )
+        with refit_span(
+            "transfer_planning",
+            metadata={"operation": "prepare_descriptors"},
+        ):
+            src_prepped = self._agent.prep_xfer_dlist(
+                agent_name=remote_agent_name,
+                xfer_list=remote_descs,
+                mem_type=self._accelerator_backend.nixl_mem_type,
+                backends=self._backends,
+            )
+            dst_prepped = self._agent.prep_xfer_dlist(
+                agent_name="",
+                xfer_list=local_descs,
+                # Local side uses our dynamic memtype (cuda for GPU buffers, cpu
+                # for the Phase-0.5 host path); falls back to the backend default.
+                mem_type=self._local_mem_type
+                or self._accelerator_backend.nixl_mem_type,
+                backends=self._backends,
+            )
         prep_time = time.perf_counter() - prep_start
         logger.info(f"[TIMING] prep_xfer_dlist: {prep_time:.3f}s")
 
         indices = list(range(len(remote_descs)))
 
         # Execute transfer
-        handle = self._agent.make_prepped_xfer(
-            operation="READ",
-            local_xfer_side=dst_prepped,
-            local_indices=indices,
-            remote_xfer_side=src_prepped,
-            remote_indices=indices,
-            backends=self._backends,
-        )
-        self._agent.transfer(handle)
+        with refit_span("wire_transfer"):
+            handle = self._agent.make_prepped_xfer(
+                operation="READ",
+                local_xfer_side=dst_prepped,
+                local_indices=indices,
+                remote_xfer_side=src_prepped,
+                remote_indices=indices,
+                backends=self._backends,
+            )
+            self._agent.transfer(handle)
 
-        # Wait for completion
-        start_wait = time.perf_counter()
-        while True:
-            if timeout_seconds is not None and time.perf_counter() - start_wait >= timeout_seconds:
-                self._agent.release_xfer_handle(handle)
-                raise TimeoutError("Transfer timed out")
+            # Wait for completion
+            start_wait = time.perf_counter()
+            while True:
+                if (
+                    timeout_seconds is not None
+                    and time.perf_counter() - start_wait >= timeout_seconds
+                ):
+                    self._agent.release_xfer_handle(handle)
+                    raise TimeoutError("Transfer timed out")
 
-            status = self._agent.check_xfer_state(handle)
-            if status in ("DONE", "SUCCESS"):
-                self._agent.release_xfer_handle(handle)
-                break
-            if status in ("ERR", "ERROR", "FAIL"):
-                self._agent.release_xfer_handle(handle)
-                raise RuntimeError(f"Transfer failed with status {status}")
-            time.sleep(0.001)
+                status = self._agent.check_xfer_state(handle)
+                if status in ("DONE", "SUCCESS"):
+                    self._agent.release_xfer_handle(handle)
+                    break
+                if status in ("ERR", "ERROR", "FAIL"):
+                    self._agent.release_xfer_handle(handle)
+                    raise RuntimeError(f"Transfer failed with status {status}")
+                time.sleep(0.001)
+        add_refit_bytes(total_bytes)
 
         # CRITICAL: Synchronize the device to ensure RDMA writes are visible.
         # GPUDirect RDMA writes bypass torch streams, so we must sync — but
@@ -776,7 +795,8 @@ class NixlTransferManager:
         # path RDMA hits host memory directly, so no device sync is required
         # (and skipping lets CPU-only unit tests exercise this path).
         if self._local_mem_type == "cuda":
-            self._accelerator_backend.synchronize(self._device_id)
+            with refit_span("receive_sync"):
+                self._accelerator_backend.synchronize(self._device_id)
 
         duration = time.perf_counter() - start_time
         bandwidth_gbps = (total_bytes * 8) / (duration * 1e9) if duration > 0 else 0.0

@@ -40,6 +40,11 @@ from typing import Any, Callable
 
 import torch
 
+from modelexpress.refit_timing import (
+    RefitTimingRecorder,
+    refit_span,
+    use_refit_timing,
+)
 from vllm.distributed.weight_transfer.base import (
     WeightTransferInitInfo,
     WeightTransferUpdateInfo,
@@ -94,6 +99,12 @@ class MxUpdateInfo(WeightTransferUpdateInfo):
     use_arena: bool | None = None
     # verify
     verify_gt_path: str | None = None
+    # Partial / subset refit selectors (map onto WeightSubset). Any set => the
+    # warm cycles pull and install only the matching tensors. The cold cycle is
+    # always applied in full so the destination map covers every parameter.
+    subset_param_names: list[str] | None = None
+    subset_layers: list[int] | None = None
+    subset_layer_groups: list[str] | None = None
 
 
 @dataclass
@@ -211,57 +222,125 @@ class MxVllmWeightUpdater:
         update_info: MxUpdateInfo,
         load_weights: Callable[[list[tuple[str, torch.Tensor]]], Any],
         subset: WeightSubset | None = None,
+        target_model: Any | None = None,
     ) -> None:
         if self._receiver is None:
             raise RuntimeError("initialize_weight_update_setup must be called first")
         cycle_start = time.perf_counter()
-
-        model_name = self._init_info.model_name
-        cands = self._receiver.discover_v2_sources(
-            model_name=model_name,
-            min_version=update_info.min_version,
-            same_rank_only=self._init_info.same_rank_only,
-            include_replicas=False,
-        )
-        if not cands:
-            raise RuntimeError(
-                f"[mx-wt] no MX source for {model_name} v>={update_info.min_version}"
-            )
-
-        is_megatron = any(getattr(c, "megatron_meta", None) is not None for c in cands)
-        if is_megatron:
-            weights = self._receive_megatron(cands, update_info, subset)
-        else:
-            weights = self._receive_dtensor(cands, update_info, subset)
-        receive_elapsed = time.perf_counter() - cycle_start
-
-        if update_info.verify_gt_path or os.environ.get("MX_VERIFY_BYTE_IDENTITY"):
-            self._verify(
-                weights,
-                update_info.verify_gt_path or os.environ["MX_VERIFY_BYTE_IDENTITY"],
-            )
-
-        load_start = time.perf_counter()
-        loaded = load_weights(weights)
-        load_elapsed = time.perf_counter() - load_start
-        loaded_count = len(loaded) if isinstance(loaded, set) else None
-        logger.info(
-            "[mx-wt] phase timing: receive_translate=%.3fs load=%.3fs "
-            "total=%.3fs incoming_hf=%d loaded_params=%s",
-            receive_elapsed,
-            load_elapsed,
-            time.perf_counter() - cycle_start,
-            len(weights),
-            loaded_count if loaded_count is not None else "unknown",
+        timing = RefitTimingRecorder(
+            backend="vllm",
+            version=int(update_info.version),
+            rank=int(self._init_info.worker_rank),
+            tp_rank=int(update_info.tp_rank),
+            tp_size=int(update_info.tp_world_size),
+            ep_rank=int(update_info.ep_rank),
+            ep_size=int(update_info.ep_world_size),
+            cold=self._buffers is None,
         )
 
-        if self._init_info.tree_scale_out:
+        with use_refit_timing(timing):
             try:
-                self._receiver.publish_self_as_source(
-                    version=int(update_info.version), model_name=model_name
+                model_name = self._init_info.model_name
+                with timing.span("control_discovery"):
+                    cands = self._receiver.discover_v2_sources(
+                        model_name=model_name,
+                        min_version=update_info.min_version,
+                        same_rank_only=self._init_info.same_rank_only,
+                        include_replicas=False,
+                    )
+                if not cands:
+                    raise RuntimeError(
+                        f"[mx-wt] no MX source for {model_name} "
+                        f"v>={update_info.min_version}"
+                    )
+
+                with timing.span("source_preparation"):
+                    is_megatron = any(
+                        getattr(c, "megatron_meta", None) is not None for c in cands
+                    )
+                if is_megatron:
+                    weights = self._receive_megatron(cands, update_info, subset)
+                else:
+                    timing.mark_not_applicable(
+                        "transformation",
+                        reason="DTensor source names already match loader input",
+                    )
+                    weights = self._receive_dtensor(cands, update_info, subset)
+                receive_elapsed = time.perf_counter() - cycle_start
+
+                if (
+                    update_info.verify_gt_path
+                    or os.environ.get("MX_VERIFY_BYTE_IDENTITY")
+                ):
+                    self._verify(
+                        weights,
+                        update_info.verify_gt_path
+                        or os.environ["MX_VERIFY_BYTE_IDENTITY"],
+                    )
+
+                load_start = time.perf_counter()
+                with timing.span(
+                    "installation",
+                    metadata={"incoming_tensors": len(weights)},
+                ):
+                    if (
+                        not is_megatron
+                        and update_info.tp_world_size > 1
+                        and os.environ.get("MX_LOAD_MODE", "stock").lower()
+                        == "stock"
+                    ):
+                        self._validate_stock_tp_weights(
+                            weights,
+                            update_info,
+                            target_model
+                            or getattr(load_weights, "__self__", None),
+                        )
+                    loaded = load_weights(weights)
+                if torch.cuda.is_available():
+                    with timing.span(
+                        "post_install",
+                        metadata={"operation": "cuda_synchronize"},
+                    ):
+                        torch.cuda.synchronize(self._init_info.device_id)
+                load_elapsed = time.perf_counter() - load_start
+                loaded_count = len(loaded) if isinstance(loaded, set) else None
+                logger.info(
+                    "[mx-wt] phase timing: receive_translate=%.3fs load=%.3fs "
+                    "total=%.3fs incoming_hf=%d loaded_params=%s",
+                    receive_elapsed,
+                    load_elapsed,
+                    time.perf_counter() - cycle_start,
+                    len(weights),
+                    loaded_count if loaded_count is not None else "unknown",
                 )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[mx-wt] tree_scale_out republish failed: %s", exc)
+
+                if self._init_info.tree_scale_out:
+                    try:
+                        with timing.span(
+                            "post_install",
+                            metadata={"operation": "tree_scale_out_publish"},
+                        ):
+                            self._receiver.publish_self_as_source(
+                                version=int(update_info.version), model_name=model_name
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "[mx-wt] tree_scale_out republish failed: %s", exc
+                        )
+                elif not timing.has_measurements("post_install"):
+                    timing.mark_not_applicable(
+                        "post_install",
+                        reason=(
+                            "no CUDA device synchronization or tree scale-out "
+                            "publishing was required"
+                        ),
+                    )
+                timing.mark_not_applicable(
+                    "rollout_readiness",
+                    reason="vLLM engine owns pause/resume and KV-cache readiness",
+                )
+            finally:
+                timing.emit(logger)
 
     # ---- lifecycle: finish (close cycle) ----
     def finish_weight_update(self, version: int) -> None:
@@ -376,14 +455,22 @@ class MxVllmWeightUpdater:
             install_pluggable_allocator()
             arena = VmmArena(total_bytes=80 * (1024 ** 3), device=self._init_info.device_id,
                              backend=CudaVmmBackend(device=self._init_info.device_id))
-            with use_arena(arena, device):
-                _alloc()
-            nixl.register_arena(arena, buffers)
+            with refit_span(
+                "setup_registration",
+                metadata={"buffer_cache": "cold", "registration": "arena"},
+            ):
+                with use_arena(arena, device):
+                    _alloc()
+                nixl.register_arena(arena, buffers)
             self._arena = arena
             logger.info("[mx-wt] arena-registered %d megatron buffers (1 region)", len(buffers))
         else:
-            _alloc()
-            nixl.register_tensors(buffers)
+            with refit_span(
+                "setup_registration",
+                metadata={"buffer_cache": "cold", "registration": "per_tensor"},
+            ):
+                _alloc()
+                nixl.register_tensors(buffers)
             logger.info("[mx-wt] per-tensor-registered %d megatron buffers on %s",
                         len(buffers), buf_dev.type)
 
@@ -614,15 +701,180 @@ class MxVllmWeightUpdater:
     def _receive_dtensor(
         self, cands: list[Any], upd: MxUpdateInfo, subset: WeightSubset | None = None
     ) -> list[tuple[str, torch.Tensor]]:
-        """HF/DTensor path: pull by name into scratch, yield (name, tensor)."""
+        """HF/DTensor path: restore checkpoint shapes in scratch buffers.
+
+        ``receive_weights_scratch`` allocates flat buffers from byte counts.
+        vLLM's stock loaders require checkpoint-rank shapes so they can select
+        their TP shard (notably VocabParallelEmbedding checks dimension 0).
+        The v2 registry is authoritative for that reshape.
+        """
         active = subset is not None and not subset.is_empty()
+        registry = cands[0].registry or {}
+        descriptors = {
+            td.name: td
+            for td in registry.get("tensors", [])
+            if not td.name.startswith("__mx_")
+        }
+        if not descriptors:
+            raise RuntimeError(
+                "[mx-wt] DTensor/HF source has no v2 shape registry; refusing "
+                "to pass flat scratch tensors to the stock vLLM loader"
+            )
+
+        tensor_shapes: dict[str, tuple[int, ...]] = {}
+        for name, td in descriptors.items():
+            shape = [int(dim) for dim in td.global_shape]
+            if td.placement_kind == "SHARD":
+                if td.local_shard_range is None:
+                    raise RuntimeError(
+                        f"[mx-wt] sharded tensor {name!r} has no local_shard_range"
+                    )
+                axis = int(td.shard_axis)
+                if not 0 <= axis < len(shape):
+                    raise RuntimeError(
+                        f"[mx-wt] sharded tensor {name!r} has invalid axis {axis}"
+                    )
+                lo, hi = (int(v) for v in td.local_shard_range)
+                if lo < 0 or hi <= lo or hi > shape[axis]:
+                    raise RuntimeError(
+                        f"[mx-wt] sharded tensor {name!r} has invalid range "
+                        f"({lo}, {hi}) for global shape {tuple(shape)}"
+                    )
+                shape[axis] = hi - lo
+            tensor_shapes[name] = tuple(shape)
+
         out: list[tuple[str, torch.Tensor]] = []
         for name, t in self._receiver._receiver.receive_weights_scratch(
-            cands[0].ref, timeout_seconds=upd.timeout_seconds
+            cands[0].ref,
+            timeout_seconds=upd.timeout_seconds,
+            tensor_shapes=tensor_shapes,
         ):
             if not active or subset.matches(name):
+                expected = tensor_shapes.get(name)
+                if expected is None:
+                    raise RuntimeError(
+                        f"[mx-wt] received tensor {name!r} is absent from the "
+                        "v2 shape registry"
+                    )
+                if tuple(t.shape) != expected:
+                    raise RuntimeError(
+                        f"[mx-wt] tensor {name!r} shape {tuple(t.shape)} does "
+                        f"not match registry shape {expected}"
+                    )
                 out.append((name, t))
         return out
+
+    @staticmethod
+    def _validate_stock_tp_weights(
+        weights: list[tuple[str, torch.Tensor]],
+        upd: MxUpdateInfo,
+        model: Any | None,
+    ) -> None:
+        """Validate the global-HF contract consumed by stock vLLM TP loaders.
+
+        The stock loader owns installation and name fusion. We only prove that
+        exact-name vocab and ordinary TP parameters can produce this rank's
+        local slice; passing an already-local shard would make stock slice it
+        a second time, so that case fails loudly.
+        """
+        if model is None or not hasattr(model, "named_parameters"):
+            logger.warning(
+                "[mx-wt] cannot validate TP stock-load shapes without live "
+                "vLLM model metadata"
+            )
+            return
+
+        params = dict(model.named_parameters())
+        vocab_modules: dict[str, Any] = {}
+        param_modules: dict[str, Any] = {}
+        for module_name, module in model.named_modules():
+            prefix = f"{module_name}." if module_name else ""
+            for param_name, _param in module.named_parameters(recurse=False):
+                param_modules[prefix + param_name] = module
+            if not hasattr(module, "org_vocab_size") or not hasattr(
+                module, "shard_indices"
+            ):
+                continue
+            for param_name, _param in module.named_parameters(recurse=False):
+                vocab_modules[prefix + param_name] = module
+
+        tp_size = int(upd.tp_world_size)
+        tp_rank = int(upd.tp_rank)
+        for name, tensor in weights:
+            param = params.get(name)
+            if param is None or tensor.ndim != param.ndim:
+                continue
+
+            local_shape = tuple(int(dim) for dim in param.shape)
+            loaded_shape = tuple(int(dim) for dim in tensor.shape)
+            vocab = vocab_modules.get(name)
+            if vocab is not None:
+                axis = int(getattr(param, "output_dim", 0))
+                expected_vocab = int(vocab.org_vocab_size)
+                if loaded_shape[axis] != expected_vocab:
+                    raise RuntimeError(
+                        f"[mx-wt] {name!r} has vocab extent "
+                        f"{loaded_shape[axis]}, expected global HF vocab "
+                        f"{expected_vocab}; registry/source layout is invalid"
+                    )
+                indices = vocab.shard_indices
+                start = int(indices.org_vocab_start_index)
+                end = int(indices.org_vocab_end_index)
+                local = tensor.narrow(axis, start, end - start)
+                if local.shape[axis] > local_shape[axis] or any(
+                    int(local.shape[dim]) != local_shape[dim]
+                    for dim in range(tensor.ndim)
+                    if dim != axis
+                ):
+                    raise RuntimeError(
+                        f"[mx-wt] {name!r} TP{tp_size} rank {tp_rank} vocab "
+                        f"slice {tuple(local.shape)} cannot load into "
+                        f"{local_shape}"
+                    )
+                continue
+
+            if hasattr(param, "packed_dim") or hasattr(param, "pack_factor"):
+                continue
+            axes = []
+            for attr in ("output_dim", "input_dim"):
+                value = getattr(param, attr, None)
+                if isinstance(value, int) and value not in axes:
+                    axes.append(value)
+            if not axes:
+                continue
+            matching = [
+                axis
+                for axis in axes
+                if loaded_shape[axis] == local_shape[axis] * tp_size
+                and all(
+                    dim == axis or loaded_shape[dim] == local_shape[dim]
+                    for dim in range(tensor.ndim)
+                )
+            ]
+            if len(matching) == 1:
+                axis = matching[0]
+                local = tensor.narrow(
+                    axis, tp_rank * local_shape[axis], local_shape[axis]
+                )
+                if tuple(local.shape) != local_shape:
+                    raise RuntimeError(
+                        f"[mx-wt] {name!r} produced invalid TP-local shape "
+                        f"{tuple(local.shape)}, expected {local_shape}"
+                    )
+            elif loaded_shape == local_shape:
+                module = param_modules.get(name)
+                if module is not None and "Replicated" in type(module).__name__:
+                    continue
+                raise RuntimeError(
+                    f"[mx-wt] {name!r} is already TP-local ({loaded_shape}); "
+                    "stock vLLM expects a global HF tensor and would shard it "
+                    "again. Use a replicated/global source or MX_LOAD_MODE=direct."
+                )
+            elif loaded_shape != local_shape:
+                raise RuntimeError(
+                    f"[mx-wt] {name!r} global shape {loaded_shape} is not a "
+                    f"valid TP{tp_size} source for local shape {local_shape}"
+                )
 
     def _apply_ep_filter(self, specs: dict, upd: MxUpdateInfo) -> None:
         from modelexpress.rl_expert_layout import compute_local_expert_ids
