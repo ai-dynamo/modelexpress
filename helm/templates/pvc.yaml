@@ -6,6 +6,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: {{ include "modelexpress.fullname" . }}-pvc
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "modelexpress.labels" . | nindent 4 }}
 spec:
