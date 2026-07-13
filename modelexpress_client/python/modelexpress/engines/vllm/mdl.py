@@ -241,15 +241,25 @@ class MdlLoader:
             )
 
     def _should_force_fp8_loaderless(self) -> bool:
-        """Whether to opt into loaderless mode before the stock FP8 cold load.
+        """Whether to use loaderless mode before the stock FP8 cold load.
 
-        This is deliberately explicit: TP2 block-FP8 installation still needs
-        correct scale-layout resharding, so automatically enabling loaderless
-        mode at TP>1 can produce incorrect model values even when destination
-        coverage is complete. ``MX_FP8_LOADERLESS=1`` is therefore a diagnostic
-        opt-in until the TP2 scale mapping is validated end to end.
+        Default: force loaderless when the model carries FP8 parameters and
+        ``tp_size > 1`` — the regime where vLLM's stock FP8 ``load_weights`` can
+        hang instead of raising. TP2 block-FP8 value correctness (including
+        W13 gate/up scale resharding) is validated by
+        ``fp8_h1_test.py`` (TP1 and TP2 corrupt->refit->generate). Override with
+        ``MX_FP8_LOADERLESS``: ``1`` forces it on for any TP size, ``0`` disables
+        the guard entirely (e.g. to fall back to the stock loader).
         """
-        if os.environ.get("MX_FP8_LOADERLESS", "0").strip() != "1":
+        override = os.environ.get("MX_FP8_LOADERLESS")
+        if override is not None:
+            override = override.strip()
+            if override == "0":
+                return False
+            force_any_tp = override == "1"
+        else:
+            force_any_tp = False
+        if self._tp_size <= 1 and not force_any_tp:
             return False
         try:
             for _name, param in self._model.named_parameters():

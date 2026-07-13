@@ -189,8 +189,8 @@ def _tp_load(model, monkeypatch, weights, *, tp_size, tp_rank=0, env=None):
     return loader
 
 
-def test_fp8_tp2_loaderless_opt_in_skips_stock_call(monkeypatch):
-    """The diagnostic opt-in skips the non-re-entrant stock FP8 cold load."""
+def test_fp8_tp2_loaderless_forced_by_default_skips_stock_call(monkeypatch):
+    """FP8 at TP>1 goes loaderless by default (validated correct by fp8_h1_test)."""
     model = _RecordingModel()
     model.proj = torch.nn.Module()
     # Local (already TP-sharded) destination slots for tp_rank 0 of a tp_size=2
@@ -210,7 +210,6 @@ def test_fp8_tp2_loaderless_opt_in_skips_stock_call(monkeypatch):
         ],
         tp_size=2,
         tp_rank=0,
-        env={"MX_FP8_LOADERLESS": "1"},
     )
 
     assert model.load_weights_calls == 0
@@ -219,8 +218,8 @@ def test_fp8_tp2_loaderless_opt_in_skips_stock_call(monkeypatch):
     assert torch.equal(model.proj.weight_scale, global_scale[:1])
 
 
-def test_fp8_tp2_loaderless_is_not_forced_by_default(monkeypatch):
-    """TP2 stays on the legacy path until scale-layout resharding is correct."""
+def test_fp8_loaderless_env_zero_disables_guard(monkeypatch):
+    """MX_FP8_LOADERLESS=0 forces the legacy stock-first path even at TP2."""
     model = _RecordingModel()
     model.proj = torch.nn.Module()
     model.proj.weight = _parameter((2, 2), dtype=F8)
@@ -237,6 +236,7 @@ def test_fp8_tp2_loaderless_is_not_forced_by_default(monkeypatch):
         ],
         tp_size=2,
         tp_rank=0,
+        env={"MX_FP8_LOADERLESS": "0"},
     )
 
     # Guard disabled: stock load_weights is attempted (and fails), then the
@@ -244,6 +244,28 @@ def test_fp8_tp2_loaderless_is_not_forced_by_default(monkeypatch):
     assert model.load_weights_calls == 1
     assert loader._loaderless is True
     assert torch.equal(model.proj.weight.float(), global_weight[:2].float())
+
+
+def test_fp8_tp1_not_forced_loaderless_by_default(monkeypatch):
+    """At TP1 the default keeps the stock-first path (loaderless only on failure)."""
+    model = _RecordingModel()
+    model.proj = torch.nn.Module()
+    model.proj.weight = _parameter((2, 2), dtype=F8)
+    model.proj.weight_scale = _parameter((2, 1))
+
+    loader = _tp_load(
+        model,
+        monkeypatch,
+        [
+            ("proj.weight", torch.ones((2, 2), dtype=F8)),
+            ("proj.weight_scale_inv", torch.ones((2, 1))),
+        ],
+        tp_size=1,
+        tp_rank=0,
+    )
+
+    assert model.load_weights_calls == 1
+    assert loader._loaderless is True
 
 
 def test_fp8_tp2_expert_gate_up_weight_and_scale_shards(monkeypatch):
