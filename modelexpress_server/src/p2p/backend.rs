@@ -328,6 +328,36 @@ pub trait MetadataBackend: Send + Sync {
         status_filter: Option<SourceStatus>,
     ) -> MetadataResult<Vec<SourceInstanceInfo>>;
 
+    /// List workers with lightweight discovery predicates applied before the
+    /// caller fetches full tensor metadata. Backends may override this to push
+    /// filtering and batching into their storage engine.
+    async fn list_workers_filtered(
+        &self,
+        source_id: Option<String>,
+        status_filter: Option<SourceStatus>,
+        model_name_filter: Option<String>,
+        worker_rank_filter: Option<u32>,
+        min_training_step: Option<u64>,
+        min_updated_at: Option<i64>,
+        limit: Option<usize>,
+    ) -> MetadataResult<Vec<SourceInstanceInfo>> {
+        let mut workers = self.list_workers(source_id, status_filter).await?;
+        workers.retain(|worker| {
+            model_name_filter
+                .as_ref()
+                .is_none_or(|model| worker.model_name == *model)
+                && worker_rank_filter.is_none_or(|rank| worker.worker_rank == rank)
+                && min_training_step
+                    .is_none_or(|step| worker.training_step.is_some_and(|v| v >= step))
+                && min_updated_at.is_none_or(|timestamp| worker.updated_at >= timestamp)
+        });
+        workers.sort_by_key(|worker| std::cmp::Reverse(worker.updated_at));
+        if let Some(limit) = limit.filter(|value| *value > 0) {
+            workers.truncate(limit);
+        }
+        Ok(workers)
+    }
+
     /// Remove all workers of a source by mx_source_id
     async fn remove_metadata(&self, source_id: &str) -> MetadataResult<()>;
 

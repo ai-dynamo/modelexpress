@@ -729,6 +729,13 @@ class MxV2RefitReceiver:
         self._worker_rank = worker_rank
         self._initialized = False
         self._registered_buffers: dict[str, torch.Tensor] = {}
+        # Shape/role metadata is stable for a publisher process even though
+        # training_step changes its mx_source_id every cycle. Cache that
+        # expensive metadata by worker identity and combine it with the fresh
+        # lightweight SourceInstanceRef returned by ListSources.
+        self._discovery_template_cache: dict[
+            tuple[str, str], V2SourceCandidate
+        ] = {}
 
     @property
     def worker_rank(self) -> int:
@@ -788,14 +795,6 @@ class MxV2RefitReceiver:
 
         client = self._receiver._client
         assert client is not None, "_receiver._client must be set after initialize()"
-        try:
-            response = client.list_sources(
-                status_filter=p2p_pb2.SOURCE_STATUS_READY,
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning("list_sources failed: %s", e)
-            return []
-
         if max_metadata_fetches is None:
             max_metadata_fetches = int(
                 os.environ.get("MX_V2_MAX_METADATA_FETCHES", "64")
@@ -806,6 +805,30 @@ class MxV2RefitReceiver:
             max_source_age_seconds = float(
                 os.environ.get("MX_V2_MAX_SOURCE_AGE_SECONDS", "86400")
             )
+        now_ms = int(time.time() * 1000)
+        min_updated_at = (
+            now_ms - int(max_source_age_seconds * 1000)
+            if max_source_age_seconds > 0
+            else None
+        )
+        try:
+            response = client.list_sources(
+                status_filter=p2p_pb2.SOURCE_STATUS_READY,
+                model_name_filter=model_name,
+                worker_rank_filter=self._worker_rank if same_rank_only else None,
+                min_training_step=min_version,
+                min_updated_at=min_updated_at,
+                limit=max_metadata_fetches,
+            )
+        except TypeError:
+            # Compatibility with older/in-process client implementations that
+            # predate server-side discovery predicates.
+            response = client.list_sources(
+                status_filter=p2p_pb2.SOURCE_STATUS_READY,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("list_sources failed: %s", e)
+            return []
 
         # SourceInstanceRef already carries model_name + worker_rank in the
         # current protocol. Newer servers also return training_step and
@@ -813,7 +836,6 @@ class MxV2RefitReceiver:
         # the expensive tensor-metadata RPC, and newest-first so the bounded
         # window retains the most useful rows when a benchmark has left many
         # historical READY entries behind.
-        now_ms = int(time.time() * 1000)
         lightweight: list[tuple[int, object]] = []
         seen_refs: set[tuple[str, str]] = set()
         for instance in response.instances:
@@ -850,6 +872,33 @@ class MxV2RefitReceiver:
 
         candidates: list[V2SourceCandidate] = []
         for _listed_updated_at, instance in lightweight:
+            listed_version = self._listed_int(
+                instance, "training_step", "version"
+            )
+            cache_key = (instance.model_name, instance.worker_id)
+            cached = self._discovery_template_cache.get(cache_key)
+            if cached is not None and listed_version is not None:
+                if cached.role == ROLE_INFERENCE_REPLICA and not include_replicas:
+                    continue
+                candidates.append(
+                    V2SourceCandidate(
+                        ref=SourceRef(
+                            mx_source_id=instance.mx_source_id,
+                            worker_id=instance.worker_id,
+                            model_name=instance.model_name,
+                            worker_rank=cached.worker_rank,
+                            training_step=listed_version,
+                        ),
+                        role=cached.role,
+                        worker_rank=cached.worker_rank,
+                        registry=cached.registry,
+                        owned_experts_per_layer=cached.owned_experts_per_layer,
+                        updated_at=_listed_updated_at or cached.updated_at,
+                        megatron_meta=cached.megatron_meta,
+                    )
+                )
+                continue
+
             # Resolve the full identity to read v2 metadata.
             try:
                 meta = client.get_metadata(
@@ -947,8 +996,7 @@ class MxV2RefitReceiver:
 
             megatron_meta = _extract_megatron_meta(extra)
 
-            candidates.append(
-                V2SourceCandidate(
+            candidate = V2SourceCandidate(
                     ref=SourceRef(
                         mx_source_id=instance.mx_source_id,
                         worker_id=instance.worker_id,
@@ -963,7 +1011,8 @@ class MxV2RefitReceiver:
                     updated_at=updated_at,
                     megatron_meta=megatron_meta,
                 )
-            )
+            candidates.append(candidate)
+            self._discovery_template_cache[cache_key] = candidate
 
         # Source-role ordering.
         #

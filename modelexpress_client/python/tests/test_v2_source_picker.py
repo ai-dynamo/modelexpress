@@ -375,6 +375,14 @@ def test_list_fields_prune_before_bounded_metadata_fetch(v2):
         )
 
     assert fetched == ["fresh-worker-2", "fresh-worker-1"]
+    receiver._receiver._client.list_sources.assert_called_once_with(
+        status_filter=v2.p2p_pb2.SOURCE_STATUS_READY,
+        model_name_filter="m",
+        worker_rank_filter=2,
+        min_training_step=5,
+        min_updated_at=now_ms - 60_000,
+        limit=2,
+    )
     assert [candidate.ref.worker_id for candidate in candidates] == [
         "fresh-worker-1",
         "fresh-worker-2",
@@ -403,6 +411,42 @@ def test_listed_int_respects_optional_proto_presence(v2):
     instance.HasField = lambda name: name == "training_step"
     instance.training_step = 42
     assert v2.MxV2RefitReceiver._listed_int(instance, "training_step") == 42
+
+
+def test_discovery_reuses_stable_worker_metadata_across_versions(v2):
+    receiver = v2.MxV2RefitReceiver(
+        agent_name="t", device_id=0, mx_server_url="x", worker_rank=0
+    )
+    receiver.initialize()
+    response = MagicMock()
+    response.instances = [
+        _fake_instance(
+            "m", "source-v10", "stable-worker",
+            worker_rank=0, training_step=10, updated_at=100,
+        )
+    ]
+    receiver._receiver._client.list_sources.return_value = response
+    receiver._receiver._client.get_metadata = MagicMock(
+        return_value=_fake_meta("trainer", 0, 10, 100)
+    )
+
+    first = receiver.discover_v2_sources(
+        model_name="m", min_version=10, max_source_age_seconds=0
+    )
+    response.instances = [
+        _fake_instance(
+            "m", "source-v11", "stable-worker",
+            worker_rank=0, training_step=11, updated_at=200,
+        )
+    ]
+    second = receiver.discover_v2_sources(
+        model_name="m", min_version=11, max_source_age_seconds=0
+    )
+
+    assert first[0].ref.mx_source_id == "source-v10"
+    assert second[0].ref.mx_source_id == "source-v11"
+    assert second[0].ref.training_step == 11
+    assert receiver._receiver._client.get_metadata.call_count == 1
 
 
 def test_non_v2_sources_ignored(v2):

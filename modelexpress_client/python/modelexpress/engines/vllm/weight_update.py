@@ -554,6 +554,9 @@ class MxVllmWeightUpdater:
         # NOTE: assumes non-expert coverage is complete on a single source (true
         # for PP=1; a PP-split trainer would need per-pp_rank non-expert handling).
         seen_nonexpert: set[str] = set()
+        descriptor_pairs = 0
+        pulled_bytes = 0
+        translated_seconds = 0.0
         for cand in ordered:
             specs: dict[str, ReceiveSpec] = {}
             nm_c = dict(name_map)
@@ -645,6 +648,7 @@ class MxVllmWeightUpdater:
                 hf_name_map=nm_c, receive_specs=specs,
             )
             pre: dict[str, torch.Tensor] = {}
+            descriptor_pairs += len(specs)
             # include_names prunes the RDMA pull to exactly this source's kept
             # tensors (experts owned by this rollout rank after the EP filter +
             # non-expert only from the first source), instead of the source's
@@ -655,6 +659,8 @@ class MxVllmWeightUpdater:
             ):
                 if n in specs:
                     pre[n] = t
+                    pulled_bytes += t.numel() * t.element_size()
+            translate_start = time.perf_counter()
             for hf_name, hf_t in run_refit_cycle(
                 self._receiver, candidates=[cand], context=ctx,
                 pull=lambda _s, _d: None, device=device, pre_assembled_buffers=pre,
@@ -667,6 +673,16 @@ class MxVllmWeightUpdater:
                     # legacy EP-gather path; TP-local/direct destinations can
                     # replace this staging in the optimized path.
                     hf_results[hf_name] = hf_t.detach().to("cpu")
+            translated_seconds += time.perf_counter() - translate_start
+        logger.info(
+            "[mx-wt] EP-gather transfer policy: sources=%d descriptor_pairs=%d "
+            "wire_bytes=%d local_translate_seconds=%.6f policy=full-contiguous-"
+            "tensor-plus-local-TP-slice",
+            len(ordered),
+            descriptor_pairs,
+            pulled_bytes,
+            translated_seconds,
+        )
         def _load_order(item: tuple[str, torch.Tensor]) -> tuple[int, int, str]:
             name = item[0]
             match = re.search(r"\.layers\.(\d+)\.", name)

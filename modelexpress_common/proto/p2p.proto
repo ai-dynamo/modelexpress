@@ -529,6 +529,17 @@ message ListSourcesRequest {
 
   // Filter by worker status. Not set = return workers in all statuses.
   optional SourceStatus status_filter = 2;
+
+  // Lightweight discovery filters. Unlike identity, these do not require the
+  // caller to know every source-identity field and can therefore be applied
+  // before fetching MB-scale worker metadata.
+  optional string model_name_filter = 3;
+  optional uint32 worker_rank_filter = 4;
+  optional uint64 min_training_step = 5;
+  optional int64 min_updated_at = 6;
+
+  // Return newest workers first and cap the response. Zero/unset means no cap.
+  optional uint32 limit = 7;
 }
 
 message ListSourcesResponse {

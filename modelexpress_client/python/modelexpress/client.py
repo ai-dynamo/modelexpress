@@ -54,6 +54,12 @@ class MxClientBase(ABC):
         self,
         identity: "p2p_pb2.SourceIdentity | None" = None,
         status_filter: "p2p_pb2.SourceStatus | None" = None,
+        *,
+        model_name_filter: str | None = None,
+        worker_rank_filter: int | None = None,
+        min_training_step: int | None = None,
+        min_updated_at: int | None = None,
+        limit: int | None = None,
     ) -> "p2p_pb2.ListSourcesResponse":
         """List candidate source workers matching the given identity."""
 
@@ -186,11 +192,25 @@ class MxClient(MxClientBase):
         self,
         identity: "p2p_pb2.SourceIdentity | None" = None,
         status_filter: "p2p_pb2.SourceStatus | None" = None,
+        *,
+        model_name_filter: str | None = None,
+        worker_rank_filter: int | None = None,
+        min_training_step: int | None = None,
+        min_updated_at: int | None = None,
+        limit: int | None = None,
     ) -> "p2p_pb2.ListSourcesResponse":
         """List available source workers, optionally filtered by identity and status."""
+        fields = {
+            "identity": identity,
+            "status_filter": status_filter,
+            "model_name_filter": model_name_filter,
+            "worker_rank_filter": worker_rank_filter,
+            "min_training_step": min_training_step,
+            "min_updated_at": min_updated_at,
+            "limit": limit,
+        }
         request = p2p_pb2.ListSourcesRequest(
-            identity=identity,
-            status_filter=status_filter,
+            **{name: value for name, value in fields.items() if value is not None}
         )
         return self.stub.ListSources(request, timeout=30)
 

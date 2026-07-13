@@ -130,6 +130,12 @@ class MxK8sServiceClient(MxClientBase):
         self,
         identity: "p2p_pb2.SourceIdentity | None" = None,
         status_filter: "p2p_pb2.SourceStatus | None" = None,
+        *,
+        model_name_filter: str | None = None,
+        worker_rank_filter: int | None = None,
+        min_training_step: int | None = None,
+        min_updated_at: int | None = None,
+        limit: int | None = None,
     ) -> "p2p_pb2.ListSourcesResponse":
         """Return a single synthetic source pointing at the rank-matched Service.
 
@@ -144,6 +150,14 @@ class MxK8sServiceClient(MxClientBase):
                 "list_sources requires an identity so mx_source_id can "
                 "be computed locally without a central coordinator"
             )
+        del (
+            status_filter,
+            model_name_filter,
+            worker_rank_filter,
+            min_training_step,
+            min_updated_at,
+            limit,
+        )
         if self._worker_rank is None:
             raise RuntimeError(
                 "MxK8sServiceClient needs a worker_rank before "

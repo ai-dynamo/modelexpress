@@ -155,7 +155,15 @@ impl P2pService for P2pServiceImpl {
 
         let workers: Vec<SourceInstanceInfo> = match self
             .state
-            .list_workers(source_id_filter, status_filter)
+            .list_workers_filtered(
+                source_id_filter,
+                status_filter,
+                req.model_name_filter,
+                req.worker_rank_filter,
+                req.min_training_step,
+                req.min_updated_at,
+                req.limit.map(|value| value as usize),
+            )
             .await
         {
             Ok(v) => v,
