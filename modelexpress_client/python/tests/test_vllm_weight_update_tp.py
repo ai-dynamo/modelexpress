@@ -85,6 +85,120 @@ def test_dtensor_receive_restores_embedding_lm_head_and_tp_shapes(weight_update)
     assert {name: tuple(tensor.shape) for name, tensor in received.items()} == names
 
 
+def test_dtensor_receive_prunes_wire_manifest_for_subset(weight_update):
+    names = {
+        "model.embed_tokens.weight": (10, 4),
+        "model.layers.0.mlp.down_proj.weight": (4, 8),
+        "model.layers.1.mlp.down_proj.weight": (4, 8),
+        "model.layers.5.mlp.down_proj.weight": (4, 8),
+        "model.layers.6.mlp.down_proj.weight": (4, 8),
+    }
+    captured = {}
+
+    class Scratch:
+        def receive_weights_scratch(
+            self, _ref, *, tensor_shapes, include_names=None, **_kwargs
+        ):
+            captured["tensor_shapes"] = tensor_shapes
+            captured["include_names"] = include_names
+            for name in include_names or tensor_shapes:
+                yield name, torch.empty(tensor_shapes[name])
+
+    updater = weight_update.MxVllmWeightUpdater()
+    updater._receiver = types.SimpleNamespace(_receiver=Scratch())
+    candidate = types.SimpleNamespace(
+        ref=object(),
+        registry={
+            "tensors": [
+                _descriptor(name, shape) for name, shape in names.items()
+            ]
+        },
+    )
+    subset = weight_update.WeightSubset(layers=[0, 1, 5])
+
+    received = dict(
+        updater._receive_dtensor(
+            [candidate],
+            weight_update.MxUpdateInfo(timeout_seconds=1),
+            subset=subset,
+        )
+    )
+    expected = {
+        "model.layers.0.mlp.down_proj.weight",
+        "model.layers.1.mlp.down_proj.weight",
+        "model.layers.5.mlp.down_proj.weight",
+    }
+    assert captured["tensor_shapes"] == names
+    assert captured["include_names"] == expected
+    assert set(received) == expected
+
+
+def test_dtensor_receive_does_not_filter_wire_without_subset(weight_update):
+    names = {
+        "model.embed_tokens.weight": (10, 4),
+        "model.layers.0.mlp.down_proj.weight": (4, 8),
+    }
+    captured = {}
+
+    class Scratch:
+        def receive_weights_scratch(
+            self, _ref, *, tensor_shapes, include_names=None, **_kwargs
+        ):
+            captured["include_names"] = include_names
+            for name, shape in tensor_shapes.items():
+                yield name, torch.empty(shape)
+
+    updater = weight_update.MxVllmWeightUpdater()
+    updater._receiver = types.SimpleNamespace(_receiver=Scratch())
+    candidate = types.SimpleNamespace(
+        ref=object(),
+        registry={
+            "tensors": [
+                _descriptor(name, shape) for name, shape in names.items()
+            ]
+        },
+    )
+
+    received = dict(
+        updater._receive_dtensor(
+            [candidate], weight_update.MxUpdateInfo(timeout_seconds=1)
+        )
+    )
+    assert captured["include_names"] is None
+    assert set(received) == set(names)
+
+
+def test_dtensor_receive_empty_subset_skips_wire(weight_update):
+    called = False
+
+    class Scratch:
+        def receive_weights_scratch(self, *_args, **_kwargs):
+            nonlocal called
+            called = True
+            yield from ()
+
+    updater = weight_update.MxVllmWeightUpdater()
+    updater._receiver = types.SimpleNamespace(_receiver=Scratch())
+    candidate = types.SimpleNamespace(
+        ref=object(),
+        registry={
+            "tensors": [
+                _descriptor(
+                    "model.layers.0.mlp.down_proj.weight", (4, 8)
+                )
+            ]
+        },
+    )
+
+    received = updater._receive_dtensor(
+        [candidate],
+        weight_update.MxUpdateInfo(timeout_seconds=1),
+        subset=weight_update.WeightSubset(layers=[99]),
+    )
+    assert received == []
+    assert called is False
+
+
 def test_dtensor_receive_uses_local_wire_shape_for_sharded_tensor(weight_update):
     descriptor = _descriptor(
         "model.layers.0.self_attn.q_proj.weight",

@@ -743,11 +743,26 @@ class MxVllmWeightUpdater:
                 shape[axis] = hi - lo
             tensor_shapes[name] = tuple(shape)
 
+        include_names: set[str] | None = None
+        if active:
+            assert subset is not None
+            include_names = {
+                name for name in descriptors if subset.matches(name)
+            }
+            logger.info(
+                "[mx-wt] subset wire pull: kept %d tensors, pruned %d",
+                len(include_names),
+                len(descriptors) - len(include_names),
+            )
+            if not include_names:
+                return []
+
         out: list[tuple[str, torch.Tensor]] = []
         for name, t in self._receiver._receiver.receive_weights_scratch(
             cands[0].ref,
             timeout_seconds=upd.timeout_seconds,
             tensor_shapes=tensor_shapes,
+            include_names=include_names,
         ):
             if not active or subset.matches(name):
                 expected = tensor_shapes.get(name)
