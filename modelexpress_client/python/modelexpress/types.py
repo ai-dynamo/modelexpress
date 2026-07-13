@@ -14,6 +14,20 @@ class TensorDescriptor:
     size: int
     device_id: int
     dtype: str
+    shape: list[int] | None = None
+    stride: list[int] | None = None
+    storage_offset: int = 0
+    storage_nbytes: int = 0
+    layout_kind: str = ""
+    original_shape: list[int] | None = None
+    original_dtype: str = ""
+    original_nbytes: int = 0
+    tensor_kind: str = ""
+    owner_module: str = ""
+    owner_class: str = ""
+    quant_method: str = ""
+    runtime_role: str = ""
+    replace_policy: str = ""
 
 
 @dataclass

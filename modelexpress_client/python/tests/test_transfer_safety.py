@@ -118,6 +118,25 @@ class TestCheckTransferAllowed:
         allowed, reason = check_transfer_allowed(config)
         assert allowed
 
+    def test_humming_quantization_allowed(self):
+        config = FakeConfig(
+            model_type="kimi_k25",
+            kv_lora_rank=512,
+            quantization="humming",
+        )
+        allowed, reason = check_transfer_allowed(config)
+        assert allowed
+        assert reason == "allowed"
+
+    def test_non_humming_quantization_still_allowed(self):
+        config = FakeConfig(
+            model_type="llama",
+            quantization="awq",
+        )
+        allowed, reason = check_transfer_allowed(config)
+        assert allowed
+        assert reason == "allowed"
+
     def test_deepseek_mla_allowed(self):
         config = FakeConfig(
             model_type="deepseek_v2",

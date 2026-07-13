@@ -15,6 +15,11 @@ from modelexpress.nixl_transfer import (
     NixlTransferManager,
     _pool_reg_enabled,
 )
+from modelexpress.tensor_utils import (
+    debug_tensor_enabled,
+    tensor_debug_summary,
+    tensor_descriptor_layout,
+)
 from modelexpress.types import ManifestMismatchError, TensorDescriptor
 
 
@@ -88,6 +93,40 @@ class TestPoolRegEnabled:
     def test_explicit_zero_is_off(self, monkeypatch):
         monkeypatch.setenv("MX_POOL_REG", "0")
         assert _pool_reg_enabled() is False
+
+
+class TestDebugTensorLogging:
+    def test_debug_tensor_name_matches_substrings(self, monkeypatch):
+        monkeypatch.setenv(
+            "MX_DEBUG_TENSOR_NAME",
+            "vision_tower.encoder.blocks.0.mlp.fc0.bias, other",
+        )
+
+        assert debug_tensor_enabled("vision_tower.encoder.blocks.0.mlp.fc0.bias")
+        assert debug_tensor_enabled("prefix.other.suffix")
+        assert not debug_tensor_enabled("language_model.layers.0.weight")
+
+    def test_tensor_debug_summary_contains_layout(self):
+        tensor = torch.empty((2, 3), dtype=torch.float16)
+
+        summary = tensor_debug_summary("w", tensor)
+
+        assert "name='w'" in summary
+        assert "shape=[2, 3]" in summary
+        assert "dtype=torch.float16" in summary
+        assert "nbytes=12" in summary
+        assert "is_contiguous=True" in summary
+
+    def test_tensor_descriptor_layout_contains_shape_and_storage(self):
+        tensor = torch.empty((2, 3), dtype=torch.float16)
+
+        layout = tensor_descriptor_layout(tensor, "contiguous")
+
+        assert layout["shape"] == [2, 3]
+        assert layout["stride"] == [3, 1]
+        assert layout["storage_offset"] == 0
+        assert layout["storage_nbytes"] == 12
+        assert layout["layout_kind"] == "contiguous"
 
     def test_one_is_on(self, monkeypatch):
         monkeypatch.setenv("MX_POOL_REG", "1")
@@ -225,6 +264,27 @@ class TestReceiveFromSourceManifestValidation:
             name="w", addr=0x1000, size=40, device_id=0, dtype="torch.bfloat16",
         )
         with pytest.raises(ManifestMismatchError, match="dtype mismatch"):
+            mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=[bogus],
+                remote_agent_name="dummy",
+            )
+
+    def test_shape_mismatch_raises_manifest_mismatch(self, monkeypatch):
+        local = torch.zeros((2, 5), dtype=torch.float32)
+        mgr = self._make_manager(monkeypatch, {"w": local})
+        bogus = TensorDescriptor(
+            name="w",
+            addr=0x1000,
+            size=40,
+            device_id=0,
+            dtype=str(local.dtype),
+            shape=[10],
+            stride=[1],
+            storage_nbytes=40,
+            layout_kind="contiguous",
+        )
+        with pytest.raises(ManifestMismatchError, match="shape mismatch"):
             mgr.receive_from_source(
                 source_metadata=b"",
                 source_tensors=[bogus],

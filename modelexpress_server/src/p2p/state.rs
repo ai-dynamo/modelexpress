@@ -221,6 +221,15 @@ mod tests {
             size: 1024 * 1024 * 1024,
             device_id: 0,
             dtype: "bfloat16".to_string(),
+            shape: vec![1024, 1024],
+            stride: vec![1024, 1],
+            storage_offset: 0,
+            storage_nbytes: 1024 * 1024 * 1024,
+            layout_kind: "contiguous".to_string(),
+            original_shape: vec![1024, 1024],
+            original_dtype: "bfloat16".to_string(),
+            original_nbytes: 1024 * 1024 * 1024,
+            ..Default::default()
         };
 
         let record = TensorRecord::from(desc.clone());
@@ -245,6 +254,7 @@ mod tests {
                 size: 4096,
                 device_id: 3,
                 dtype: "float16".to_string(),
+                ..Default::default()
             }],
             status: SourceStatus::Initializing as i32,
             updated_at: 1234567890000,
@@ -281,6 +291,7 @@ mod tests {
                 size: 8192,
                 device_id: 0,
                 dtype: "float16".to_string(),
+                ..Default::default()
             }],
             status: 0,
             updated_at: 0,
@@ -350,6 +361,15 @@ mod tests {
                         size: 1_000_000,
                         device_id: 0,
                         dtype: "bfloat16".to_string(),
+                        shape: Vec::new(),
+                        stride: Vec::new(),
+                        storage_offset: 0,
+                        storage_nbytes: 0,
+                        layout_kind: String::new(),
+                        original_shape: Vec::new(),
+                        original_dtype: String::new(),
+                        original_nbytes: 0,
+                        ..Default::default()
                     }],
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
@@ -366,6 +386,15 @@ mod tests {
                         size: 1_000_000,
                         device_id: 1,
                         dtype: "bfloat16".to_string(),
+                        shape: Vec::new(),
+                        stride: Vec::new(),
+                        storage_offset: 0,
+                        storage_nbytes: 0,
+                        layout_kind: String::new(),
+                        original_shape: Vec::new(),
+                        original_dtype: String::new(),
+                        original_nbytes: 0,
+                        ..Default::default()
                     }],
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,

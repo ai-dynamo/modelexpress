@@ -6,12 +6,198 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
 
+from .quantization_providers import (
+    SOURCE_MANIFEST_TENSOR_NAMES_ATTR,
+    get_quantization_provider,
+)
+from .quantization_providers.humming import (
+    HUMMING_RUNTIME_TENSORS_ATTR,
+    capture_runtime_tensors as _provider_capture_humming_runtime_tensors,
+    capture_runtime_tensors_from_model as _provider_capture_humming_runtime_tensors_from_model,
+)
+
 logger = logging.getLogger("modelexpress.tensor_utils")
+
+
+def _debug_tensor_patterns() -> list[str]:
+    raw = os.environ.get("MX_DEBUG_TENSOR_NAME", "").strip()
+    if not raw:
+        return []
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def debug_tensor_enabled(name: str) -> bool:
+    """Return whether verbose manifest logging is enabled for this tensor."""
+    patterns = _debug_tensor_patterns()
+    return any(pattern in name for pattern in patterns)
+
+
+def tensor_debug_summary(name: str, tensor: torch.Tensor) -> str:
+    """Build a compact layout summary for manifest mismatch diagnostics."""
+    try:
+        storage_nbytes = tensor.untyped_storage().nbytes()
+    except Exception as e:
+        storage_nbytes = f"err:{e}"
+    try:
+        stride = list(tensor.stride())
+    except Exception as e:
+        stride = f"err:{e}"
+    try:
+        storage_offset = tensor.storage_offset()
+    except Exception as e:
+        storage_offset = f"err:{e}"
+    return (
+        f"name={name!r} shape={list(tensor.shape)} dtype={tensor.dtype} "
+        f"numel={tensor.numel()} element_size={tensor.element_size()} "
+        f"nbytes={tensor.numel() * tensor.element_size()} "
+        f"is_contiguous={tensor.is_contiguous()} stride={stride} "
+        f"storage_offset={storage_offset} storage_nbytes={storage_nbytes} "
+        f"data_ptr=0x{tensor.data_ptr():x}"
+    )
+
+
+def tensor_descriptor_layout(tensor: torch.Tensor, layout_kind: str = "") -> dict[str, object]:
+    """Return optional manifest fields that describe tensor layout."""
+    try:
+        storage_nbytes = int(tensor.untyped_storage().nbytes())
+    except Exception:
+        storage_nbytes = int(tensor.numel() * tensor.element_size())
+    layout = {
+        "shape": [int(dim) for dim in tensor.shape],
+        "stride": [int(dim) for dim in tensor.stride()],
+        "storage_offset": int(tensor.storage_offset()),
+        "storage_nbytes": storage_nbytes,
+        "layout_kind": layout_kind or ("contiguous" if tensor.is_contiguous() else "view"),
+    }
+    layout.update(tensor_original_layout(tensor))
+    layout.update(tensor_runtime_metadata(tensor))
+    return layout
+
+
+def tensor_original_layout(tensor: torch.Tensor) -> dict[str, object]:
+    """Best-effort original pre-quantization layout metadata.
+
+    Quantization implementations may attach framework-specific attributes to
+    tensors. ModelExpress treats these as optional diagnostics/compatibility
+    hints; empty/zero means unknown and callers must still verify the final
+    registered layout before RDMA.
+    """
+    original_shape = _first_attr(tensor, (
+        "mx_original_shape",
+        "original_shape",
+        "_original_shape",
+        "input_shape",
+        "logical_shape",
+    ))
+    original_dtype = _first_attr(tensor, (
+        "mx_original_dtype",
+        "original_dtype",
+        "_original_dtype",
+        "input_dtype",
+        "logical_dtype",
+    ))
+    original_nbytes = _first_attr(tensor, (
+        "mx_original_nbytes",
+        "original_nbytes",
+        "_original_nbytes",
+        "input_nbytes",
+        "logical_nbytes",
+    ))
+
+    shape_list: list[int] = []
+    if original_shape is not None:
+        try:
+            shape_list = [int(dim) for dim in original_shape]
+        except TypeError:
+            shape_list = []
+
+    dtype_str = "" if original_dtype is None else str(original_dtype)
+    try:
+        nbytes = int(original_nbytes or 0)
+    except (TypeError, ValueError):
+        nbytes = 0
+
+    return {
+        "original_shape": shape_list,
+        "original_dtype": dtype_str,
+        "original_nbytes": nbytes,
+    }
+
+
+def tensor_runtime_metadata(tensor: torch.Tensor) -> dict[str, object]:
+    """Return optional runtime/quantization metadata attached during discovery."""
+    return {
+        "tensor_kind": str(getattr(tensor, "mx_tensor_kind", "") or ""),
+        "owner_module": str(getattr(tensor, "mx_owner_module", "") or ""),
+        "owner_class": str(getattr(tensor, "mx_owner_class", "") or ""),
+        "quant_method": str(getattr(tensor, "mx_quant_method", "") or ""),
+        "runtime_role": str(getattr(tensor, "mx_runtime_role", "") or ""),
+        "replace_policy": str(getattr(tensor, "mx_replace_policy", "") or ""),
+    }
+
+
+def _first_attr(obj: object, names: tuple[str, ...]) -> object | None:
+    for name in names:
+        if hasattr(obj, name):
+            return getattr(obj, name)
+    return None
+
+
+def _attach_runtime_metadata(
+    tensor: torch.Tensor,
+    *,
+    tensor_kind: str,
+    owner_module: str,
+    owner_class: str,
+    quant_method: str,
+    runtime_role: str,
+    replace_policy: str,
+) -> None:
+    tensor.mx_tensor_kind = tensor_kind
+    tensor.mx_owner_module = owner_module
+    tensor.mx_owner_class = owner_class
+    tensor.mx_quant_method = quant_method
+    tensor.mx_runtime_role = runtime_role
+    tensor.mx_replace_policy = replace_policy
+
+
+def _quant_method_name(module: nn.Module) -> str:
+    quant_method = getattr(module, "quant_method", None)
+    if quant_method is None:
+        return ""
+    cls = type(quant_method)
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def capture_humming_runtime_tensors_from_model(model: nn.Module) -> int:
+    """Best-effort local module pass after vLLM Humming post-load completes."""
+    return _provider_capture_humming_runtime_tensors_from_model(model)
+
+
+def _manifest_tensor_for_module_leaf(
+    module: nn.Module,
+    leaf: str,
+    tensor: torch.Tensor,
+    quantization: str = "",
+) -> tuple[torch.Tensor, str, str]:
+    runtime_role = leaf
+    replace_policy = "structural_replace"
+    provider = get_quantization_provider(quantization)
+    decision = provider.resolve_manifest_tensor(
+        module,
+        leaf,
+        tensor,
+        quantization=quantization,
+    )
+    if decision is None:
+        return tensor, runtime_role, replace_policy
+    return decision.tensor, decision.runtime_role, decision.replace_policy
 
 
 def safe_checksum(tensor: torch.Tensor) -> str:
@@ -76,6 +262,19 @@ def capture_tensor_attrs():
         nn.Module.__setattr__ = original_setattr
 
 
+@contextmanager
+def capture_humming_runtime_tensors(enabled: bool = True):
+    """Record Humming runtime tensors as they are attached to vLLM layers.
+
+    Humming's post-load path prepares kernel-ready packed tensors and writes
+    them with ``HummingLayerMethod.may_set_param``. ModelExpress needs those
+    final runtime tensors in the RDMA manifest, not the dense checkpoint
+    parameter that may still be visible as ``*.weight``.
+    """
+    with _provider_capture_humming_runtime_tensors(enabled=enabled):
+        yield
+
+
 def _find_hidden_cuda_tensors(
     obj: object, visited: set[int], depth: int = 0,
 ) -> list[tuple[str, torch.Tensor]]:
@@ -137,6 +336,8 @@ def adopt_hidden_tensors(model: nn.Module) -> int:
     adopted = 0
     for _module_name, module in model.named_modules():
         for attr_name in list(vars(module)):
+            if attr_name == HUMMING_RUNTIME_TENSORS_ATTR:
+                continue
             attr_val = getattr(module, attr_name, None)
             if attr_val is None:
                 continue
@@ -224,7 +425,11 @@ def storage_view(tensor: torch.Tensor) -> torch.Tensor:
     )
 
 
-def collect_module_tensors(model: nn.Module) -> dict[str, torch.Tensor]:
+def collect_module_tensors(
+    model: nn.Module,
+    *,
+    quantization: str = "",
+) -> dict[str, torch.Tensor]:
     """Collect all CUDA tensors from a module tree into a flat dict.
 
     Uses iter_module_tensors (named_parameters + named_buffers) to find
@@ -244,11 +449,53 @@ def collect_module_tensors(model: nn.Module) -> dict[str, torch.Tensor]:
     """
     tensors: dict[str, torch.Tensor] = {}
     seen_ptrs: set[int] = set()
+    modules = dict(model.named_modules())
+    allowed_names = getattr(model, SOURCE_MANIFEST_TENSOR_NAMES_ATTR, None)
+    if allowed_names is not None:
+        allowed_names = set(allowed_names)
+    provider = get_quantization_provider(quantization)
     storage_view_count = 0
     skipped_duplicate = 0
     for name, tensor, _tensor_type in iter_module_tensors(model):
+        if allowed_names is not None and (
+            name not in allowed_names and f"{name}.__storage" not in allowed_names
+        ):
+            logger.debug(
+                "Skipping tensor '%s' because it is absent from source RDMA manifest",
+                name,
+            )
+            continue
         t = tensor.data if hasattr(tensor, "data") else tensor
-
+        module_name, _, leaf = name.rpartition(".")
+        if provider.skip_manifest_tensor(name, leaf or name, _tensor_type):
+            logger.debug("Skipping runtime-only tensor '%s' from RDMA manifest", name)
+            continue
+        owner_module = module_name
+        owner = modules.get(module_name) if module_name else model
+        owner_class = type(owner).__name__ if owner is not None else ""
+        quant_method = _quant_method_name(owner) if owner is not None else ""
+        runtime_role = leaf or name
+        replace_policy = "structural_replace"
+        if owner is not None and leaf:
+            t, runtime_role, replace_policy = _manifest_tensor_for_module_leaf(
+                owner, leaf, t, quantization,
+            )
+        _attach_runtime_metadata(
+            t,
+            tensor_kind=_tensor_type,
+            owner_module=owner_module,
+            owner_class=owner_class,
+            quant_method=quant_method,
+            runtime_role=runtime_role,
+            replace_policy=replace_policy,
+        )
+        if not t.is_cuda or t.numel() == 0 or t.data_ptr() == 0:
+            logger.debug(
+                "Skipping non-RDMA tensor '%s' "
+                "(is_cuda=%s, numel=%s, data_ptr=0x%x)",
+                name, t.is_cuda, t.numel(), t.data_ptr(),
+            )
+            continue
         if t.is_contiguous():
             ptr = t.data_ptr()
             if ptr in seen_ptrs:
@@ -257,14 +504,30 @@ def collect_module_tensors(model: nn.Module) -> dict[str, torch.Tensor]:
                 continue
             seen_ptrs.add(ptr)
             tensors[name] = t
+            if debug_tensor_enabled(name):
+                logger.warning("Collected manifest tensor: %s", tensor_debug_summary(name, t))
         else:
             sv = storage_view(t)
             ptr = sv.data_ptr()
             if ptr in seen_ptrs:
                 skipped_duplicate += 1
                 continue
+            storage_name = f"{name}.__storage"
+            if allowed_names is not None and storage_name not in allowed_names:
+                logger.debug(
+                    "Skipping storage tensor '%s' because it is absent from "
+                    "source RDMA manifest",
+                    storage_name,
+                )
+                continue
             seen_ptrs.add(ptr)
-            tensors[f"{name}.__storage"] = sv
+            tensors[storage_name] = sv
+            if debug_tensor_enabled(name) or debug_tensor_enabled(storage_name):
+                logger.warning(
+                    "Collected non-contiguous manifest tensor: original=%s storage=%s",
+                    tensor_debug_summary(name, t),
+                    tensor_debug_summary(storage_name, sv),
+                )
             storage_view_count += 1
 
     if storage_view_count:

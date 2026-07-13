@@ -76,6 +76,10 @@ class LoadStrategyChain:
         logger.info(f"Eligible loaders: {[s.name for s in eligible]}")
 
         result = LoadResult(value=model, model=model)
+        # From here on, LoadResult owns the model reference. Keeping this
+        # argument alive prevents retry cleanup from releasing CUDA weight
+        # storage before adapter.reinit_for_retry() builds a replacement.
+        model = None
         with tracer.start_as_current_span("Load model") as span:
             span.set_attribute("model_name", ctx.identity.model_name)
             span.set_attribute("global_rank", ctx.global_rank)

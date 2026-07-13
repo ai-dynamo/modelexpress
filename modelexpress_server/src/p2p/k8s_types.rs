@@ -185,7 +185,7 @@ impl ModelMetadataStatus {
 }
 
 /// Tensor descriptor stored in ConfigMap
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct TensorDescriptorJson {
     pub name: String,
     /// Serialized as string to avoid precision loss
@@ -194,6 +194,34 @@ pub struct TensorDescriptorJson {
     pub size: String,
     pub device_id: u32,
     pub dtype: String,
+    #[serde(default)]
+    pub shape: Vec<i64>,
+    #[serde(default)]
+    pub stride: Vec<i64>,
+    #[serde(default)]
+    pub storage_offset: i64,
+    #[serde(default)]
+    pub storage_nbytes: String,
+    #[serde(default)]
+    pub layout_kind: String,
+    #[serde(default)]
+    pub original_shape: Vec<i64>,
+    #[serde(default)]
+    pub original_dtype: String,
+    #[serde(default)]
+    pub original_nbytes: String,
+    #[serde(default)]
+    pub tensor_kind: String,
+    #[serde(default)]
+    pub owner_module: String,
+    #[serde(default)]
+    pub owner_class: String,
+    #[serde(default)]
+    pub quant_method: String,
+    #[serde(default)]
+    pub runtime_role: String,
+    #[serde(default)]
+    pub replace_policy: String,
 }
 
 /// Sanitize model name to be a valid Kubernetes resource name
@@ -294,6 +322,20 @@ mod tests {
             size: "134217728".to_string(),
             device_id: 0,
             dtype: "bfloat16".to_string(),
+            shape: vec![1024, 65536],
+            stride: vec![65536, 1],
+            storage_offset: 0,
+            storage_nbytes: "134217728".to_string(),
+            layout_kind: "contiguous".to_string(),
+            original_shape: vec![1024, 65536],
+            original_dtype: "bfloat16".to_string(),
+            original_nbytes: "134217728".to_string(),
+            tensor_kind: "parameter".to_string(),
+            owner_module: "model.layers.0".to_string(),
+            owner_class: "Linear".to_string(),
+            quant_method: "humming".to_string(),
+            runtime_role: "humming_packed_weight".to_string(),
+            replace_policy: "no_structural_replace".to_string(),
         };
 
         let json = serde_json::to_string(&original).expect("serialize");
@@ -304,6 +346,13 @@ mod tests {
         assert_eq!(parsed.size, original.size);
         assert_eq!(parsed.device_id, original.device_id);
         assert_eq!(parsed.dtype, original.dtype);
+        assert_eq!(parsed.shape, original.shape);
+        assert_eq!(parsed.stride, original.stride);
+        assert_eq!(parsed.storage_nbytes, original.storage_nbytes);
+        assert_eq!(parsed.layout_kind, original.layout_kind);
+        assert_eq!(parsed.original_shape, original.original_shape);
+        assert_eq!(parsed.original_dtype, original.original_dtype);
+        assert_eq!(parsed.original_nbytes, original.original_nbytes);
 
         let addr: u64 = parsed.addr.parse().expect("addr should parse as u64");
         assert_eq!(addr, 139948187451390);
@@ -319,6 +368,15 @@ mod tests {
             size: u64::MAX.to_string(),
             device_id: 7,
             dtype: "float16".to_string(),
+            shape: Vec::new(),
+            stride: Vec::new(),
+            storage_offset: 0,
+            storage_nbytes: String::new(),
+            layout_kind: String::new(),
+            original_shape: Vec::new(),
+            original_dtype: String::new(),
+            original_nbytes: String::new(),
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&desc).expect("serialize");

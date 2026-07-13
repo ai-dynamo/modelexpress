@@ -3,18 +3,26 @@
 
 """Tests for tensor_utils: hidden tensor adoption, capture_tensor_attrs, checksums."""
 
+import sys
+import types
+
 import torch
 import torch.nn as nn
 import pytest
 
 from modelexpress.tensor_utils import (
+    SOURCE_MANIFEST_TENSOR_NAMES_ATTR,
     _find_hidden_cuda_tensors,
     adopt_hidden_tensors,
+    capture_humming_runtime_tensors_from_model,
+    capture_humming_runtime_tensors,
     capture_tensor_attrs,
     collect_module_tensors,
     safe_checksum,
     storage_view,
+    tensor_descriptor_layout,
 )
+from modelexpress.quantization_providers.humming import HummingManifestProvider
 
 
 # ---------------------------------------------------------------------------
@@ -67,9 +75,286 @@ class ModuleWithNested(nn.Module):
         self.nested = NestedObj(device="cpu")
 
 
+class FakeCudaTensor:
+    is_cuda = True
+    dtype = torch.float32
+    shape = torch.Size([1])
+    data = None
+
+    def __init__(self, ptr):
+        self._ptr = ptr
+        self.data = self
+
+    def numel(self):
+        return 1
+
+    def element_size(self):
+        return 4
+
+    def data_ptr(self):
+        return self._ptr
+
+    def is_contiguous(self):
+        return True
+
+
 # ---------------------------------------------------------------------------
 # _find_hidden_cuda_tensors
 # ---------------------------------------------------------------------------
+
+
+def test_tensor_descriptor_layout_includes_runtime_metadata():
+    tensor = torch.empty(4)
+    tensor.mx_tensor_kind = "parameter"
+    tensor.mx_owner_module = "block"
+    tensor.mx_owner_class = "FakeLinear"
+    tensor.mx_quant_method = "humming.HummingMethod"
+    tensor.mx_runtime_role = "humming_packed_weight"
+    tensor.mx_replace_policy = "no_structural_replace"
+
+    layout = tensor_descriptor_layout(tensor)
+
+    assert layout["tensor_kind"] == "parameter"
+    assert layout["owner_module"] == "block"
+    assert layout["owner_class"] == "FakeLinear"
+    assert layout["quant_method"] == "humming.HummingMethod"
+    assert layout["runtime_role"] == "humming_packed_weight"
+    assert layout["replace_policy"] == "no_structural_replace"
+
+
+def test_humming_may_set_param_capture_records_runtime_tensor(monkeypatch):
+    humming_pkg = types.ModuleType("humming")
+    humming_layer = types.ModuleType("humming.layer")
+
+    class FakeHummingLayerMethod:
+        @classmethod
+        def may_set_param(cls, layer, name, value):
+            setattr(layer, name, value)
+
+    humming_layer.HummingLayerMethod = FakeHummingLayerMethod
+    monkeypatch.setitem(sys.modules, "humming", humming_pkg)
+    monkeypatch.setitem(sys.modules, "humming.layer", humming_layer)
+
+    layer = nn.Module()
+    packed = torch.empty(8, dtype=torch.int32)
+
+    with capture_humming_runtime_tensors(enabled=True):
+        FakeHummingLayerMethod.may_set_param(layer, "weight", packed)
+
+    assert layer._mx_rdma_tensors["weight"] is packed
+    assert packed.mx_runtime_role == "humming_packed_weight"
+    assert packed.mx_replace_policy == "no_structural_replace"
+
+
+def test_vllm_humming_postload_capture_records_runtime_weight(monkeypatch):
+    module_name = "vllm.model_executor.layers.quantization.humming"
+    vllm_humming = types.ModuleType(module_name)
+
+    class HummingLinearMethod:
+        def process_weights_after_loading(self, layer):
+            layer.weight = torch.empty(8, dtype=torch.int32)
+
+    vllm_humming.HummingLinearMethod = HummingLinearMethod
+    monkeypatch.setitem(sys.modules, module_name, vllm_humming)
+
+    method = HummingLinearMethod()
+    layer = nn.Module()
+
+    with capture_humming_runtime_tensors(enabled=True):
+        method.process_weights_after_loading(layer)
+
+    assert layer._mx_rdma_tensors["weight"] is layer.weight
+    assert layer.weight.mx_runtime_role == "humming_packed_weight"
+    assert layer.weight.mx_replace_policy == "no_structural_replace"
+
+
+def test_vllm_humming_postload_capture_ignores_dense_weight(monkeypatch):
+    module_name = "vllm.model_executor.layers.quantization.humming"
+    vllm_humming = types.ModuleType(module_name)
+
+    class HummingLinearMethod:
+        def process_weights_after_loading(self, layer):
+            layer.weight = nn.Parameter(torch.empty(8, dtype=torch.bfloat16))
+
+    vllm_humming.HummingLinearMethod = HummingLinearMethod
+    monkeypatch.setitem(sys.modules, module_name, vllm_humming)
+
+    method = HummingLinearMethod()
+    layer = nn.Module()
+
+    with capture_humming_runtime_tensors(enabled=True):
+        method.process_weights_after_loading(layer)
+
+    assert not hasattr(layer, "_mx_rdma_tensors")
+
+
+def test_humming_model_capture_records_unique_direct_packed_weight():
+    layer = nn.Module()
+    layer.weight = nn.Parameter(torch.empty(16, 16, dtype=torch.bfloat16))
+    layer.register_buffer("runtime_weight", torch.empty(8, dtype=torch.int32))
+    model = nn.Module()
+    model.layer = layer
+
+    recorded = capture_humming_runtime_tensors_from_model(model)
+
+    assert recorded == 1
+    assert layer._mx_rdma_tensors["weight"] is layer.runtime_weight
+
+
+def test_humming_model_capture_does_not_treat_locks_as_packed_weight():
+    layer = nn.Module()
+    layer.weight = nn.Parameter(torch.empty(16, 16, dtype=torch.bfloat16))
+    layer.register_buffer("locks", torch.empty(1024, dtype=torch.int32))
+    model = nn.Module()
+    model.layer = layer
+
+    recorded = capture_humming_runtime_tensors_from_model(model)
+
+    assert recorded == 0
+    assert not hasattr(layer, "_mx_rdma_tensors")
+
+
+def test_humming_locks_are_skipped_from_manifest_collection():
+    provider = HummingManifestProvider()
+
+    assert provider.skip_manifest_tensor("layer.locks", "locks", "buffer")
+    assert not provider.skip_manifest_tensor("layer.weight", "weight", "parameter")
+
+
+def test_humming_model_capture_prefers_humming_meta_weight_name():
+    class Meta:
+        weight_name = "runtime_weight"
+
+    layer = nn.Module()
+    layer.weight = nn.Parameter(torch.empty(16, 16, dtype=torch.bfloat16))
+    layer.runtime_weight = nn.Parameter(torch.empty(8, dtype=torch.int32), requires_grad=False)
+    layer.humming_metas = {"": Meta()}
+    model = nn.Module()
+    model.layer = layer
+
+    recorded = capture_humming_runtime_tensors_from_model(model)
+
+    assert recorded == 1
+    assert layer._mx_rdma_tensors["runtime_weight"] is layer.runtime_weight
+    assert layer._mx_rdma_tensors["weight"] is layer.runtime_weight
+
+
+def test_humming_model_capture_records_moe_meta_weights_without_locks():
+    class Meta:
+        def __init__(self, weight_name):
+            self.weight_name = weight_name
+
+    layer = nn.Module()
+    layer.w13_weight = nn.Parameter(torch.empty(2, 3, 4, dtype=torch.int32), requires_grad=False)
+    layer.w2_weight = nn.Parameter(torch.empty(2, 4, 3, dtype=torch.int32), requires_grad=False)
+    layer.register_buffer("locks", torch.empty(1024, dtype=torch.int32))
+    layer.humming_metas = {
+        "w13": Meta("w13_weight"),
+        "w2": Meta("w2_weight"),
+    }
+    model = nn.Module()
+    model.layer = layer
+
+    recorded = capture_humming_runtime_tensors_from_model(model)
+
+    assert recorded == 1
+    assert layer._mx_rdma_tensors["w13_weight"] is layer.w13_weight
+    assert layer._mx_rdma_tensors["w2_weight"] is layer.w2_weight
+    assert "locks" not in layer._mx_rdma_tensors
+    assert "weight" not in layer._mx_rdma_tensors
+
+
+def test_humming_model_capture_rejects_ambiguous_direct_packed_weights():
+    layer = nn.Module()
+    layer.weight = nn.Parameter(torch.empty(16, 16, dtype=torch.bfloat16))
+    layer.register_buffer("runtime_weight_a", torch.empty(8, dtype=torch.int32))
+    layer.register_buffer("runtime_weight_b", torch.empty(8, dtype=torch.int32))
+    model = nn.Module()
+    model.layer = layer
+
+    recorded = capture_humming_runtime_tensors_from_model(model)
+
+    assert recorded == 0
+    assert not hasattr(layer, "_mx_rdma_tensors")
+
+
+def test_humming_runtime_mapping_weight_is_preferred():
+    from modelexpress.tensor_utils import _manifest_tensor_for_module_leaf
+
+    module = nn.Module()
+    module.weight = nn.Parameter(torch.randn(538, 1152, dtype=torch.bfloat16))
+    packed = torch.empty(1024, dtype=torch.int32)
+    module._mx_rdma_tensors = {"weight": packed}
+
+    tensor, runtime_role, replace_policy = _manifest_tensor_for_module_leaf(
+        module,
+        "weight",
+        module.weight.data,
+        "humming",
+    )
+
+    assert tensor.data_ptr() == packed.data_ptr()
+    assert runtime_role == "humming_packed_weight"
+    assert replace_policy == "no_structural_replace"
+
+
+def test_global_humming_unquantized_weight_uses_structural_replace():
+    from modelexpress.tensor_utils import _manifest_tensor_for_module_leaf
+
+    module = nn.Module()
+    module.weight = nn.Parameter(torch.randn(538, 1152, dtype=torch.bfloat16))
+
+    tensor, runtime_role, replace_policy = _manifest_tensor_for_module_leaf(
+        module,
+        "weight",
+        module.weight.data,
+        "humming",
+    )
+
+    assert tensor.data_ptr() == module.weight.data.data_ptr()
+    assert runtime_role == "weight"
+    assert replace_policy == "structural_replace"
+
+
+def test_humming_dense_weight_rejects_mismatch_when_mapping_missing():
+    from modelexpress.tensor_utils import _manifest_tensor_for_module_leaf
+
+    class FakeHummingMethod:
+        pass
+
+    FakeHummingMethod.__module__ = "vllm.model_executor.layers.quantization.humming"
+
+    module = nn.Module()
+    module.quant_method = FakeHummingMethod()
+    module.weight = nn.Parameter(torch.randn(538, 1152, dtype=torch.bfloat16))
+
+    tensor, runtime_role, replace_policy = _manifest_tensor_for_module_leaf(
+        module,
+        "weight",
+        module.weight.data,
+        "humming",
+    )
+
+    assert tensor.data_ptr() == module.weight.data.data_ptr()
+    assert runtime_role == "humming_dense_weight"
+    assert replace_policy == "reject_if_mismatch"
+
+
+def test_collect_module_tensors_filters_to_source_manifest_names(monkeypatch):
+    model = nn.Module()
+    setattr(model, SOURCE_MANIFEST_TENSOR_NAMES_ATTR, {"keep.weight"})
+
+    monkeypatch.setattr(
+        "modelexpress.tensor_utils.iter_module_tensors",
+        lambda module: [
+            ("keep.weight", FakeCudaTensor(1), "parameter"),
+            ("target.only", FakeCudaTensor(2), "buffer"),
+        ],
+    )
+
+    tensors = collect_module_tensors(model)
+
+    assert list(tensors) == ["keep.weight"]
 
 
 class TestFindHiddenCudaTensors:
@@ -177,6 +462,23 @@ class TestAdoptHiddenTensors:
         module = ModuleWithQuant()  # CPU tensors by default
         count = adopt_hidden_tensors(module)
         assert count == 0
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_collect_uses_runtime_packed_weight_when_global_humming(self):
+        module = nn.Module()
+        module.weight = nn.Parameter(
+            torch.randn(538, 1152, dtype=torch.bfloat16, device="cuda")
+        )
+        packed = torch.empty(1024, dtype=torch.int32, device="cuda")
+        module._mx_rdma_tensors = {"weight": packed}
+
+        tensors = collect_module_tensors(module, quantization="humming")
+
+        assert tensors["weight"] is packed
+        assert tensors["weight"].shape == torch.Size([1024])
+        assert tensors["weight"].dtype == torch.int32
+        assert tensors["weight"].mx_runtime_role == "humming_packed_weight"
+        assert tensors["weight"].mx_replace_policy == "no_structural_replace"
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_buffer_name_collisions_disambiguated(self):

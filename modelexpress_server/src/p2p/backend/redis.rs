@@ -111,6 +111,34 @@ struct TensorRecordJson {
     pub size: u64,
     pub device_id: u32,
     pub dtype: String,
+    #[serde(default)]
+    pub shape: Vec<i64>,
+    #[serde(default)]
+    pub stride: Vec<i64>,
+    #[serde(default)]
+    pub storage_offset: i64,
+    #[serde(default)]
+    pub storage_nbytes: u64,
+    #[serde(default)]
+    pub layout_kind: String,
+    #[serde(default)]
+    pub original_shape: Vec<i64>,
+    #[serde(default)]
+    pub original_dtype: String,
+    #[serde(default)]
+    pub original_nbytes: u64,
+    #[serde(default)]
+    pub tensor_kind: String,
+    #[serde(default)]
+    pub owner_module: String,
+    #[serde(default)]
+    pub owner_class: String,
+    #[serde(default)]
+    pub quant_method: String,
+    #[serde(default)]
+    pub runtime_role: String,
+    #[serde(default)]
+    pub replace_policy: String,
 }
 
 fn serialize_u64_as_string<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
@@ -173,6 +201,20 @@ impl From<TensorRecord> for TensorRecordJson {
             size: record.size,
             device_id: record.device_id,
             dtype: record.dtype,
+            shape: record.shape,
+            stride: record.stride,
+            storage_offset: record.storage_offset,
+            storage_nbytes: record.storage_nbytes,
+            layout_kind: record.layout_kind,
+            original_shape: record.original_shape,
+            original_dtype: record.original_dtype,
+            original_nbytes: record.original_nbytes,
+            tensor_kind: record.tensor_kind,
+            owner_module: record.owner_module,
+            owner_class: record.owner_class,
+            quant_method: record.quant_method,
+            runtime_role: record.runtime_role,
+            replace_policy: record.replace_policy,
         }
     }
 }
@@ -185,6 +227,20 @@ impl From<TensorRecordJson> for TensorRecord {
             size: json.size,
             device_id: json.device_id,
             dtype: json.dtype,
+            shape: json.shape,
+            stride: json.stride,
+            storage_offset: json.storage_offset,
+            storage_nbytes: json.storage_nbytes,
+            layout_kind: json.layout_kind,
+            original_shape: json.original_shape,
+            original_dtype: json.original_dtype,
+            original_nbytes: json.original_nbytes,
+            tensor_kind: json.tensor_kind,
+            owner_module: json.owner_module,
+            owner_class: json.owner_class,
+            quant_method: json.quant_method,
+            runtime_role: json.runtime_role,
+            replace_policy: json.replace_policy,
         }
     }
 }
@@ -594,6 +650,15 @@ mod tests {
             size: 1_073_741_824,
             device_id: 3,
             dtype: "bfloat16".to_string(),
+            shape: vec![4096, 4096],
+            stride: vec![4096, 1],
+            storage_offset: 0,
+            storage_nbytes: 1_073_741_824,
+            layout_kind: "contiguous".to_string(),
+            original_shape: vec![4096, 4096],
+            original_dtype: "bfloat16".to_string(),
+            original_nbytes: 1_073_741_824,
+            ..Default::default()
         };
         let json_record = TensorRecordJson::from(record.clone());
         let json = serde_json::to_string(&json_record).expect("serialize");
@@ -608,6 +673,13 @@ mod tests {
         assert_eq!(back.size, record.size);
         assert_eq!(back.device_id, record.device_id);
         assert_eq!(back.dtype, record.dtype);
+        assert_eq!(back.shape, record.shape);
+        assert_eq!(back.stride, record.stride);
+        assert_eq!(back.storage_nbytes, record.storage_nbytes);
+        assert_eq!(back.layout_kind, record.layout_kind);
+        assert_eq!(back.original_shape, record.original_shape);
+        assert_eq!(back.original_dtype, record.original_dtype);
+        assert_eq!(back.original_nbytes, record.original_nbytes);
     }
 
     #[test]
@@ -648,6 +720,15 @@ mod tests {
                 size: 512,
                 device_id: 2,
                 dtype: "float16".to_string(),
+                shape: Vec::new(),
+                stride: Vec::new(),
+                storage_offset: 0,
+                storage_nbytes: 0,
+                layout_kind: String::new(),
+                original_shape: Vec::new(),
+                original_dtype: String::new(),
+                original_nbytes: 0,
+                ..Default::default()
             }],
             status: 2, // SOURCE_STATUS_READY
             updated_at: 1_700_000_000_000,

@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import random
+import socket
 import time
 
 import torch
@@ -23,7 +24,7 @@ from .base import (
 from .context import LoadResult
 from ..nixl_transfer import is_nixl_available
 from ..transfer_safety import check_transfer_allowed
-from ..types import TensorDescriptor
+from ..types import ManifestMismatchError, TensorDescriptor
 from .. import p2p_pb2
 
 logger = logging.getLogger("modelexpress.strategy_rdma")
@@ -81,11 +82,11 @@ class RdmaStrategy(LoadStrategy):
     def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
         """Load from a READY source or raise StrategyFailed for fallback.
 
-        Source discovery and metadata misses do not mutate the target model and
-        therefore raise clean StrategyFailed errors. Once _load_as_target()
-        prepares target storage, failures are treated as mutated because the
-        engine may have initialized or transformed model tensors, and those
-        failures are raised immediately instead of trying another source.
+        Source discovery and metadata misses do not mutate the target model.
+        Source transfer and manifest failures after target preparation are
+        cleaned up by reinitializing the engine model before trying the next
+        candidate. If no source works, the chain falls through with a clean
+        fresh model so the next strategy can load locally.
         """
         result = _as_load_result(result)
         candidates = self._find_source_instances(ctx)
@@ -93,6 +94,7 @@ class RdmaStrategy(LoadStrategy):
             logger.info(f"[Worker {ctx.global_rank}] No RDMA source available, skipping")
             raise StrategyFailed("No RDMA source available", mutated=False)
 
+        target_prepared = False
         for instance in candidates[:MAX_SOURCE_RETRIES]:
             mx_source_id = instance.mx_source_id
             worker_id = instance.worker_id
@@ -110,28 +112,73 @@ class RdmaStrategy(LoadStrategy):
 
             if source_worker is None:
                 continue
+            if self._is_local_worker_metadata(ctx, source_worker):
+                logger.info(
+                    f"[Worker {ctx.global_rank}] Skipping local stale RDMA "
+                    f"source worker {worker_id} ({source_worker.worker_grpc_endpoint or source_worker.metadata_endpoint})"
+                )
+                continue
 
             logger.info(
                 f"[Worker {ctx.global_rank}] Trying source worker {worker_id} "
                 f"({len(source_worker.tensors)} tensors)"
             )
 
-            # Do not try another source after target preparation starts. The
-            # adapter may have initialized or transformed model tensors, and a
-            # failed receive may have partially written weights. The chain will
-            # re-initialize the model before trying the next loading strategy.
-            return self._load_as_target(
-                result, ctx, source_worker, mx_source_id, worker_id,
-            )
+            try:
+                return self._load_as_target(
+                    result, ctx, source_worker, mx_source_id, worker_id,
+                )
+            except StrategyFailed as e:
+                if self._has_cause(e, ManifestMismatchError):
+                    target_prepared = True
+                    logger.warning(
+                        f"[Worker {ctx.global_rank}] Rejecting RDMA source worker "
+                        f"{worker_id}: {e}. Trying next source without rebuilding "
+                        "target because no RDMA transfer was started."
+                    )
+                    continue
+                if self._has_cause(e, SourceTransferError):
+                    logger.warning(
+                        f"[Worker {ctx.global_rank}] Rejecting RDMA source worker "
+                        f"{worker_id}: {e}. Aborting RDMA because target may have "
+                        "partial RDMA writes."
+                    )
+                    self.rollback(ctx)
+                    raise StrategyFailed(str(e), mutated=True) from e
+                if not e.mutated or not self._is_retryable_source_failure(e):
+                    raise
+                logger.warning(
+                    f"[Worker {ctx.global_rank}] Rejecting RDMA source worker "
+                    f"{worker_id}: {e}. Cleaning target and trying next source."
+                )
+                self.rollback(ctx)
+                result = ctx.adapter.reinit_for_retry(result)
+                continue
 
         tried = min(len(candidates), MAX_SOURCE_RETRIES)
         logger.warning(
             f"[Worker {ctx.global_rank}] Tried {tried} of {len(candidates)} source workers "
             f"(max retries={MAX_SOURCE_RETRIES}), falling through"
         )
-        # Only pre-target metadata/discovery misses reach here. Failures after
-        # target preparation are raised from _load_as_target() as mutated=True.
+        if target_prepared:
+            raise StrategyFailed("No RDMA source had a compatible manifest", mutated=True)
         raise StrategyFailed("No RDMA source succeeded", mutated=False)
+
+    @staticmethod
+    def _is_retryable_source_failure(exc: BaseException) -> bool:
+        return (
+            RdmaStrategy._has_cause(exc, SourceTransferError)
+            or RdmaStrategy._has_cause(exc, ManifestMismatchError)
+        )
+
+    @staticmethod
+    def _has_cause(exc: BaseException, typ: type[BaseException]) -> bool:
+        current: BaseException | None = exc
+        while current is not None:
+            if isinstance(current, typ):
+                return True
+            current = current.__cause__
+        return False
 
     def _find_source_instances(
         self, ctx: LoadContext,
@@ -195,6 +242,30 @@ class RdmaStrategy(LoadStrategy):
         )
         return worker
 
+    @staticmethod
+    def _is_local_worker_metadata(ctx: LoadContext, worker) -> bool:
+        """Return true for metadata that points at this worker's fixed ports.
+
+        During source pod restart the central server can briefly retain READY
+        metadata from the previous process. The replacement process has the
+        same worker rank and fixed P2P ports, so without this guard it treats
+        its own stale endpoint as an RDMA source and falls into target retry.
+        """
+        grpc_base = int(os.environ.get("MX_WORKER_GRPC_PORT", "6555"))
+        metadata_base = int(os.environ.get("MX_METADATA_PORT", "5555"))
+        local_ports = {
+            grpc_base + ctx.device_id,
+            metadata_base + ctx.device_id,
+        }
+        local_hosts = _local_endpoint_hosts()
+        for endpoint in (
+            getattr(worker, "worker_grpc_endpoint", ""),
+            getattr(worker, "metadata_endpoint", ""),
+        ):
+            if _endpoint_matches(endpoint, local_hosts, local_ports):
+                return True
+        return False
+
     def _load_as_target(
         self,
         result: LoadResult,
@@ -211,6 +282,10 @@ class RdmaStrategy(LoadStrategy):
             return ctx.adapter.after_rdma_receive(result)
         except StrategyFailed:
             raise
+        except ManifestMismatchError as e:
+            raise StrategyFailed(
+                f"RDMA source manifest incompatible: {e}", mutated=True
+            ) from e
         except Exception as e:
             raise StrategyFailed(str(e), mutated=True) from e
 
@@ -223,7 +298,6 @@ class RdmaStrategy(LoadStrategy):
     ) -> None:
         """Receive fully-processed tensors via RDMA from the detected source."""
         receive_start = time.perf_counter()
-        register_tensors(result, ctx)
 
         is_p2p = bool(source_worker.worker_grpc_endpoint)
         remote_agent_name_override = None
@@ -242,10 +316,7 @@ class RdmaStrategy(LoadStrategy):
             )
             manifest_time = time.perf_counter() - manifest_start
             source_tensors = [
-                TensorDescriptor(
-                    name=t.name, addr=t.addr, size=t.size,
-                    device_id=t.device_id, dtype=t.dtype,
-                )
+                _tensor_descriptor_from_proto(t)
                 for t in tensor_protos
             ]
             logger.info(
@@ -254,6 +325,16 @@ class RdmaStrategy(LoadStrategy):
                 f"{manifest_bytes} bytes)"
             )
 
+        else:
+            source_tensors = [
+                _tensor_descriptor_from_proto(t)
+                for t in source_worker.tensors
+            ]
+
+        result = ctx.adapter.prepare_rdma_target_from_manifest(result, source_tensors)
+        register_tensors(result, ctx)
+
+        if is_p2p:
             nixl_fetch_start = time.perf_counter()
             ep = source_worker.metadata_endpoint
             host, port_str = ep.rsplit(":", 1)
@@ -268,14 +349,6 @@ class RdmaStrategy(LoadStrategy):
                 f"{nixl_fetch_time:.3f}s"
             )
             remote_agent_name_override = source_worker.agent_name
-        else:
-            source_tensors = [
-                TensorDescriptor(
-                    name=t.name, addr=t.addr, size=t.size,
-                    device_id=t.device_id, dtype=t.dtype,
-                )
-                for t in source_worker.tensors
-            ]
 
         logger.info(
             f"[Worker {ctx.global_rank}] Receiving {len(source_tensors)} tensors from source"
@@ -290,6 +363,8 @@ class RdmaStrategy(LoadStrategy):
                 timeout_seconds=300.0,
                 remote_agent_name=remote_agent_name_override,
             )
+        except ManifestMismatchError:
+            raise
         except Exception as e:
             raise SourceTransferError(f"RDMA receive failed: {e}") from e
         transfer_time = time.perf_counter() - transfer_start
@@ -305,3 +380,59 @@ class RdmaStrategy(LoadStrategy):
 
         total_time = time.perf_counter() - receive_start
         logger.info(f"[Worker {ctx.global_rank}] [TIMING] Total receive time: {total_time:.2f}s")
+
+
+def _local_endpoint_hosts() -> set[str]:
+    hosts = {
+        value
+        for value in (
+            os.environ.get("MX_WORKER_HOST", ""),
+            os.environ.get("POD_IP", ""),
+            os.environ.get("NODE_IP", ""),
+        )
+        if value
+    }
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.connect(("8.8.8.8", 80))
+        host = sock.getsockname()[0]
+        sock.close()
+        if host and not host.startswith("127."):
+            hosts.add(host)
+    except Exception:
+        pass
+    return hosts
+
+
+def _endpoint_matches(endpoint: str, hosts: set[str], ports: set[int]) -> bool:
+    if not endpoint:
+        return False
+    try:
+        host, port_str = endpoint.rsplit(":", 1)
+        return host in hosts and int(port_str) in ports
+    except (TypeError, ValueError):
+        return False
+
+
+def _tensor_descriptor_from_proto(t) -> TensorDescriptor:
+    return TensorDescriptor(
+        name=t.name,
+        addr=t.addr,
+        size=t.size,
+        device_id=t.device_id,
+        dtype=t.dtype,
+        shape=list(getattr(t, "shape", [])),
+        stride=list(getattr(t, "stride", [])),
+        storage_offset=getattr(t, "storage_offset", 0),
+        storage_nbytes=getattr(t, "storage_nbytes", 0),
+        layout_kind=getattr(t, "layout_kind", ""),
+        original_shape=list(getattr(t, "original_shape", [])),
+        original_dtype=getattr(t, "original_dtype", ""),
+        original_nbytes=getattr(t, "original_nbytes", 0),
+        tensor_kind=getattr(t, "tensor_kind", ""),
+        owner_module=getattr(t, "owner_module", ""),
+        owner_class=getattr(t, "owner_class", ""),
+        quant_method=getattr(t, "quant_method", ""),
+        runtime_role=getattr(t, "runtime_role", ""),
+        replace_policy=getattr(t, "replace_policy", ""),
+    )

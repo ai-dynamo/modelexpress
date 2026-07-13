@@ -107,6 +107,38 @@ message TensorDescriptor {
 
   // Data type (e.g., "float16", "bfloat16")
   string dtype = 5;
+
+  // Logical tensor shape at registration time.
+  repeated int64 shape = 6;
+
+  // Logical tensor stride at registration time.
+  repeated int64 stride = 7;
+
+  // Storage offset in elements. Non-zero values are important for
+  // post-load quantization views and storage-level transfers.
+  int64 storage_offset = 8;
+
+  // Full underlying storage size in bytes. This can differ from size for
+  // views and storage-backed descriptors.
+  uint64 storage_nbytes = 9;
+
+  // Registration layout: "contiguous" or "storage_view".
+  string layout_kind = 10;
+
+  // Optional original checkpoint/logical tensor metadata before online
+  // quantization or packing. Zero/empty means unknown.
+  repeated int64 original_shape = 11;
+  string original_dtype = 12;
+  uint64 original_nbytes = 13;
+
+  // Optional runtime ownership and quantization metadata. Empty strings mean
+  // unknown/backward-compatible default behavior.
+  string tensor_kind = 14;
+  string owner_module = 15;
+  string owner_class = 16;
+  string quant_method = 17;
+  string runtime_role = 18;
+  string replace_policy = 19;
 }
 
 // ============================================================================

@@ -69,6 +69,20 @@ impl KubernetesBackend {
                 size: t.size.to_string(),
                 device_id: t.device_id,
                 dtype: t.dtype.clone(),
+                shape: t.shape.clone(),
+                stride: t.stride.clone(),
+                storage_offset: t.storage_offset,
+                storage_nbytes: t.storage_nbytes.to_string(),
+                layout_kind: t.layout_kind.clone(),
+                original_shape: t.original_shape.clone(),
+                original_dtype: t.original_dtype.clone(),
+                original_nbytes: t.original_nbytes.to_string(),
+                tensor_kind: t.tensor_kind.clone(),
+                owner_module: t.owner_module.clone(),
+                owner_class: t.owner_class.clone(),
+                quant_method: t.quant_method.clone(),
+                runtime_role: t.runtime_role.clone(),
+                replace_policy: t.replace_policy.clone(),
             })
             .collect();
 
@@ -153,12 +167,46 @@ impl KubernetesBackend {
                 let size = t.size.parse::<u64>().map_err(|e| {
                     format!("Invalid tensor size '{}' for '{}': {}", t.size, t.name, e)
                 })?;
+                let storage_nbytes = if t.storage_nbytes.is_empty() {
+                    0
+                } else {
+                    t.storage_nbytes.parse::<u64>().map_err(|e| {
+                        format!(
+                            "Invalid tensor storage_nbytes '{}' for '{}': {}",
+                            t.storage_nbytes, t.name, e
+                        )
+                    })?
+                };
+                let original_nbytes = if t.original_nbytes.is_empty() {
+                    0
+                } else {
+                    t.original_nbytes.parse::<u64>().map_err(|e| {
+                        format!(
+                            "Invalid tensor original_nbytes '{}' for '{}': {}",
+                            t.original_nbytes, t.name, e
+                        )
+                    })?
+                };
                 Ok(TensorRecord {
                     name: t.name,
                     addr,
                     size,
                     device_id: t.device_id,
                     dtype: t.dtype,
+                    shape: t.shape,
+                    stride: t.stride,
+                    storage_offset: t.storage_offset,
+                    storage_nbytes,
+                    layout_kind: t.layout_kind,
+                    original_shape: t.original_shape,
+                    original_dtype: t.original_dtype,
+                    original_nbytes,
+                    tensor_kind: t.tensor_kind,
+                    owner_module: t.owner_module,
+                    owner_class: t.owner_class,
+                    quant_method: t.quant_method,
+                    runtime_role: t.runtime_role,
+                    replace_policy: t.replace_policy,
                 })
             })
             .collect::<MetadataResult<Vec<_>>>()?;

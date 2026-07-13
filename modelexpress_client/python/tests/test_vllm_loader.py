@@ -1029,18 +1029,70 @@ class TestRdmaStrategyLoad:
         assert isinstance(result, LoadResult)
         assert attempts == ["w-1"]
 
-    def test_propagates_strategy_failed_after_target_mutation(self):
+    def test_rejects_manifest_mismatch_and_tries_next_candidate_without_reinit(self):
         ctx = _make_load_context()
         candidates = [
             _make_instance_ref(worker_id="w-1"),
             _make_instance_ref(worker_id="w-2"),
         ]
-        strategy, attempts = self._setup(
-            ctx, candidates,
-            [_make_metadata_resp(rank=0, worker_id="w-1"),
-             _make_metadata_resp(rank=0, worker_id="w-2")],
-            load_raises_for={"w-1"},
+        from modelexpress.load_strategy.rdma_strategy import (
+            ManifestMismatchError,
+            RdmaStrategy,
         )
+
+        strategy = RdmaStrategy()
+        ctx.mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(
+            instances=candidates
+        )
+        ctx.mx_client.get_metadata.side_effect = [
+            _make_metadata_resp(rank=0, worker_id="w-1"),
+            _make_metadata_resp(rank=0, worker_id="w-2"),
+        ]
+        attempts = []
+
+        def fake_load_as_target(_result, _ctx, _worker, _mx_id, worker_id):
+            attempts.append(worker_id)
+            if worker_id == "w-1":
+                raise StrategyFailed("manifest mismatch: w-1", mutated=True) from ManifestMismatchError("layout")
+            return _result
+
+        strategy._load_as_target = fake_load_as_target
+        ctx.adapter.reinit_for_retry = MagicMock(side_effect=lambda result: result)
+
+        with patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True), \
+             patch("modelexpress.load_strategy.rdma_strategy.random.shuffle"):
+            result = strategy.load(MagicMock(), ctx)
+
+        assert isinstance(result, LoadResult)
+        assert attempts == ["w-1", "w-2"]
+        ctx.adapter.reinit_for_retry.assert_not_called()
+
+    def test_source_transfer_error_aborts_rdma_as_mutated(self):
+        ctx = _make_load_context()
+        candidates = [
+            _make_instance_ref(worker_id="w-1"),
+            _make_instance_ref(worker_id="w-2"),
+        ]
+        from modelexpress.load_strategy.rdma_strategy import (
+            RdmaStrategy,
+            SourceTransferError,
+        )
+
+        strategy = RdmaStrategy()
+        ctx.mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(
+            instances=candidates
+        )
+        ctx.mx_client.get_metadata.side_effect = [
+            _make_metadata_resp(rank=0, worker_id="w-1"),
+            _make_metadata_resp(rank=0, worker_id="w-2"),
+        ]
+        attempts = []
+
+        def fake_load_as_target(_result, _ctx, _worker, _mx_id, worker_id):
+            attempts.append(worker_id)
+            raise StrategyFailed("transfer failed: w-1", mutated=True) from SourceTransferError("rdma")
+
+        strategy._load_as_target = fake_load_as_target
 
         with patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True), \
              patch("modelexpress.load_strategy.rdma_strategy.random.shuffle"):

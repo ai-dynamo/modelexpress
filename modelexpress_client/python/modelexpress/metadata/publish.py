@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -16,6 +17,11 @@ import torch
 from .heartbeat import HeartbeatThread
 from ..client import MxClient
 from .. import p2p_pb2
+from ..tensor_utils import (
+    debug_tensor_enabled,
+    tensor_debug_summary,
+    tensor_descriptor_layout,
+)
 
 if TYPE_CHECKING:
     from ..nixl_transfer import NixlTransferManager
@@ -33,6 +39,8 @@ PUBLISH_METADATA_RETRYABLE_STATUS_CODES = {
 # Global storage for heartbeat threads and worker servers, keyed by device_id.
 _heartbeat_threads: dict[int, HeartbeatThread] = {}
 _worker_servers: dict[int, "WorkerGrpcServer"] = {}  # P2P mode only
+MX_MANIFEST_SCHEMA_VERSION = "2"
+MX_TENSOR_DISCOVERY_VERSION = "2"
 
 
 def build_source_identity(
@@ -55,7 +63,7 @@ def build_source_identity(
     dtype = str(model_config.dtype).replace("torch.", "")
     quantization = model_config.quantization or ""
 
-    return p2p_pb2.SourceIdentity(
+    identity = p2p_pb2.SourceIdentity(
         mx_version=mx_version,
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
         model_name=model_config.model,
@@ -67,6 +75,27 @@ def build_source_identity(
         quantization=quantization,
         revision=_resolve_model_revision(model_config),
     )
+    identity.extra_parameters.update(_build_vllm_identity_extra_parameters(vllm_config))
+    return identity
+
+
+def _build_vllm_identity_extra_parameters(vllm_config) -> dict[str, str]:
+    """Return vLLM config fragments that affect post-load tensor layout."""
+    params = {
+        "mx_manifest_schema_version": MX_MANIFEST_SCHEMA_VERSION,
+        "mx_tensor_discovery_version": MX_TENSOR_DISCOVERY_VERSION,
+    }
+    load_config = getattr(vllm_config, "load_config", None)
+    extra_config = getattr(load_config, "model_loader_extra_config", None)
+    if not extra_config:
+        return params
+    params["vllm_model_loader_extra_config"] = json.dumps(
+        extra_config,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return params
 
 
 def _resolve_model_revision(model_config) -> str:
@@ -94,7 +123,13 @@ def build_tensor_protos(
     global_rank: int,
 ) -> list["p2p_pb2.TensorDescriptor"]:
     """Build per-tensor descriptor protos from registered tensors."""
-    del global_rank  # unused, kept for caller-symmetry with publish_metadata_and_ready
+    for name, tensor in tensors.items():
+        if debug_tensor_enabled(name):
+            logger.warning(
+                "[Worker %s] Source manifest tensor: %s",
+                global_rank,
+                tensor_debug_summary(name, tensor),
+            )
     return [
         p2p_pb2.TensorDescriptor(
             name=name,
@@ -102,6 +137,10 @@ def build_tensor_protos(
             size=t.numel() * t.element_size(),
             device_id=device_id,
             dtype=str(t.dtype),
+            **tensor_descriptor_layout(
+                t,
+                "storage_view" if name.endswith(".__storage") else "contiguous",
+            ),
         )
         for name, t in tensors.items()
     ]

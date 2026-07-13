@@ -21,6 +21,11 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from . import ucx_utils
+from .tensor_utils import (
+    debug_tensor_enabled,
+    tensor_debug_summary,
+    tensor_descriptor_layout,
+)
 from .types import ManifestMismatchError, TensorDescriptor
 
 if TYPE_CHECKING:
@@ -69,6 +74,20 @@ def _pool_reg_enabled() -> bool:
     call time so tests can toggle the env var without re-importing.
     """
     return os.environ.get("MX_POOL_REG", "0") == "1"
+
+
+def _source_tensor_summary(desc: TensorDescriptor) -> str:
+    return (
+        f"name={desc.name!r} dtype={desc.dtype} nbytes={desc.size} "
+        f"shape={desc.shape or []} stride={desc.stride or []} "
+        f"storage_offset={desc.storage_offset} "
+        f"storage_nbytes={desc.storage_nbytes} "
+        f"original_shape={desc.original_shape or []} "
+        f"original_dtype={desc.original_dtype!r} "
+        f"original_nbytes={desc.original_nbytes} "
+        f"layout_kind={desc.layout_kind!r} addr=0x{desc.addr:x} "
+        f"device={desc.device_id}"
+    )
 
 
 class NixlTransferManager:
@@ -209,6 +228,10 @@ class NixlTransferManager:
                 size=tensor.numel() * tensor.element_size(),
                 device_id=self._device_id,
                 dtype=str(tensor.dtype),
+                **tensor_descriptor_layout(
+                    tensor,
+                    "storage_view" if name.endswith(".__storage") else "contiguous",
+                ),
             ))
         self._tensor_descriptors = tensor_descriptors
         return tensor_descriptors
@@ -490,22 +513,70 @@ class NixlTransferManager:
         remote_descs: list[tuple[int, int, int]] = []
         local_descs: list[tuple[int, int, int]] = []
         total_bytes = 0
+        source_names = {t.name for t in source_tensors}
+        local_names = set(self._tensors)
+        common_names = source_names & local_names
+        if len(source_names) != len(local_names):
+            logger.warning(
+                "Tensor manifest count differs before RDMA: source=%d local=%d "
+                "common=%d source_only=%d local_only=%d",
+                len(source_names),
+                len(local_names),
+                len(common_names),
+                len(source_names - local_names),
+                len(local_names - source_names),
+            )
 
         for src_tensor in source_tensors:
             local_tensor = self._tensors.get(src_tensor.name)
             if local_tensor is None:
                 continue
             local_size = local_tensor.numel() * local_tensor.element_size()
+            if debug_tensor_enabled(src_tensor.name):
+                logger.warning(
+                    "Target manifest tensor: %s | source_addr=0x%x "
+                    "source_size=%d source_dtype=%s source_device=%d",
+                    tensor_debug_summary(src_tensor.name, local_tensor),
+                    src_tensor.addr,
+                    src_tensor.size,
+                    src_tensor.dtype,
+                    src_tensor.device_id,
+                )
             if local_size != src_tensor.size:
                 raise ManifestMismatchError(
                     f"Tensor '{src_tensor.name}' size mismatch: "
-                    f"source={src_tensor.size} bytes, local={local_size} bytes"
+                    f"source={src_tensor.size} bytes, local={local_size} bytes; "
+                    f"source_layout=({_source_tensor_summary(src_tensor)}); "
+                    f"local_layout=({tensor_debug_summary(src_tensor.name, local_tensor)})"
                 )
             local_dtype = str(local_tensor.dtype)
             if local_dtype != src_tensor.dtype:
                 raise ManifestMismatchError(
                     f"Tensor '{src_tensor.name}' dtype mismatch: "
                     f"source={src_tensor.dtype!r}, local={local_dtype!r}"
+                )
+            local_layout = tensor_descriptor_layout(
+                local_tensor,
+                "storage_view" if src_tensor.name.endswith(".__storage") else "contiguous",
+            )
+            if src_tensor.shape and list(src_tensor.shape) != local_layout["shape"]:
+                raise ManifestMismatchError(
+                    f"Tensor '{src_tensor.name}' shape mismatch: "
+                    f"source={list(src_tensor.shape)}, local={local_layout['shape']}"
+                )
+            if src_tensor.stride and list(src_tensor.stride) != local_layout["stride"]:
+                raise ManifestMismatchError(
+                    f"Tensor '{src_tensor.name}' stride mismatch: "
+                    f"source={list(src_tensor.stride)}, local={local_layout['stride']}"
+                )
+            if (
+                src_tensor.storage_nbytes
+                and src_tensor.storage_nbytes != local_layout["storage_nbytes"]
+            ):
+                raise ManifestMismatchError(
+                    f"Tensor '{src_tensor.name}' storage size mismatch: "
+                    f"source={src_tensor.storage_nbytes} bytes, "
+                    f"local={local_layout['storage_nbytes']} bytes"
                 )
             remote_descs.append(
                 (src_tensor.addr, src_tensor.size, src_tensor.device_id)

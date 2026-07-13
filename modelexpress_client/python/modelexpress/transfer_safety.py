@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 
 import torch
@@ -62,9 +63,8 @@ def detect_model_features(model_config) -> dict[str, str]:
 def check_transfer_allowed(model_config) -> tuple[bool, str]:
     """Check if P2P weight transfer is allowed for this model.
 
-    No feature combination is currently blocked; the function logs detected
-    features and always returns allowed. Kept as a hook so future safety
-    gates can be added in one place.
+    No feature combination is currently blocked here. Target-side layout
+    compatibility is resolved from the source manifest in the engine adapter.
 
     Returns (allowed, reason).
     """

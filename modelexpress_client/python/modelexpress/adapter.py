@@ -163,6 +163,14 @@ class EngineAdapter:
         """Run engine post-processing needed before RDMA writes into tensors."""
         return result
 
+    def prepare_rdma_target_from_manifest(
+        self,
+        result: LoadResult,
+        source_tensors,
+    ) -> LoadResult:
+        """Adjust target tensor layout based on the source manifest."""
+        return result
+
     def after_rdma_receive(self, result: LoadResult) -> LoadResult:
         """Run engine post-processing after RDMA weights have been received."""
         return result
@@ -173,4 +181,8 @@ class EngineAdapter:
 
     def after_native_load(self, result: LoadResult) -> LoadResult:
         """Run engine post-processing after load_via_native() succeeds."""
+        return result
+
+    def release_failed_load(self, result: LoadResult) -> LoadResult:
+        """Release engine-owned state before retrying after a failed strategy."""
         return result

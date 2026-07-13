@@ -120,13 +120,27 @@ pub struct WorkerRecord {
 }
 
 /// Tensor descriptor record
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TensorRecord {
     pub name: String,
     pub addr: u64,
     pub size: u64,
     pub device_id: u32,
     pub dtype: String,
+    pub shape: Vec<i64>,
+    pub stride: Vec<i64>,
+    pub storage_offset: i64,
+    pub storage_nbytes: u64,
+    pub layout_kind: String,
+    pub original_shape: Vec<i64>,
+    pub original_dtype: String,
+    pub original_nbytes: u64,
+    pub tensor_kind: String,
+    pub owner_module: String,
+    pub owner_class: String,
+    pub quant_method: String,
+    pub runtime_role: String,
+    pub replace_policy: String,
 }
 
 // Conversions from gRPC types
@@ -161,6 +175,20 @@ impl From<modelexpress_common::grpc::p2p::TensorDescriptor> for TensorRecord {
             size: desc.size,
             device_id: desc.device_id,
             dtype: desc.dtype,
+            shape: desc.shape,
+            stride: desc.stride,
+            storage_offset: desc.storage_offset,
+            storage_nbytes: desc.storage_nbytes,
+            layout_kind: desc.layout_kind,
+            original_shape: desc.original_shape,
+            original_dtype: desc.original_dtype,
+            original_nbytes: desc.original_nbytes,
+            tensor_kind: desc.tensor_kind,
+            owner_module: desc.owner_module,
+            owner_class: desc.owner_class,
+            quant_method: desc.quant_method,
+            runtime_role: desc.runtime_role,
+            replace_policy: desc.replace_policy,
         }
     }
 }
@@ -201,6 +229,20 @@ impl From<TensorRecord> for modelexpress_common::grpc::p2p::TensorDescriptor {
             size: record.size,
             device_id: record.device_id,
             dtype: record.dtype,
+            shape: record.shape,
+            stride: record.stride,
+            storage_offset: record.storage_offset,
+            storage_nbytes: record.storage_nbytes,
+            layout_kind: record.layout_kind,
+            original_shape: record.original_shape,
+            original_dtype: record.original_dtype,
+            original_nbytes: record.original_nbytes,
+            tensor_kind: record.tensor_kind,
+            owner_module: record.owner_module,
+            owner_class: record.owner_class,
+            quant_method: record.quant_method,
+            runtime_role: record.runtime_role,
+            replace_policy: record.replace_policy,
         }
     }
 }
