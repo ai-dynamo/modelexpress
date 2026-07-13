@@ -385,6 +385,26 @@ def test_list_fields_prune_before_bounded_metadata_fetch(v2):
     }
 
 
+def test_listed_int_respects_optional_proto_presence(v2):
+    class Instance:
+        training_step = 0
+        updated_at = 0
+
+        @staticmethod
+        def HasField(name):
+            if name == "training_step":
+                return False
+            raise ValueError("field has no presence")
+
+    instance = Instance()
+    assert v2.MxV2RefitReceiver._listed_int(instance, "training_step") is None
+    assert v2.MxV2RefitReceiver._listed_int(instance, "updated_at") == 0
+
+    instance.HasField = lambda name: name == "training_step"
+    instance.training_step = 42
+    assert v2.MxV2RefitReceiver._listed_int(instance, "training_step") == 42
+
+
 def test_non_v2_sources_ignored(v2):
     """Sources lacking ``mx_v2`` marker are ignored entirely."""
     receiver = v2.MxV2RefitReceiver(

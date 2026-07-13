@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use modelexpress_common::grpc::p2p::{
     ArtifactSourceMetadata, SourceIdentity, SourceStatus, TensorSourceMetadata, WorkerMetadata,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub mod kubernetes;
@@ -60,6 +61,15 @@ pub struct SourceInstanceInfo {
     pub status: i32,
     /// Timestamp of last status update (unix millis).
     pub updated_at: i64,
+    /// Training step/version from SourceIdentity.extra_parameters, when present.
+    pub training_step: Option<u64>,
+}
+
+pub(crate) fn parse_training_step(extra_parameters: &HashMap<String, String>) -> Option<u64> {
+    extra_parameters
+        .get("training_step")
+        .or_else(|| extra_parameters.get("version"))
+        .and_then(|value| value.parse::<u64>().ok())
 }
 
 /// Backend-specific metadata for a worker
@@ -360,5 +370,24 @@ pub async fn create_backend(config: BackendConfig) -> MetadataResult<Arc<dyn Met
             backend.connect().await?;
             Ok(Arc::new(backend) as Arc<dyn MetadataBackend>)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_training_step;
+    use std::collections::HashMap;
+
+    #[test]
+    fn parses_training_step_with_version_fallback() {
+        let mut values = HashMap::new();
+        values.insert("version".to_string(), "41".to_string());
+        assert_eq!(parse_training_step(&values), Some(41));
+
+        values.insert("training_step".to_string(), "42".to_string());
+        assert_eq!(parse_training_step(&values), Some(42));
+
+        values.insert("training_step".to_string(), "not-a-number".to_string());
+        assert_eq!(parse_training_step(&values), None);
     }
 }

@@ -174,6 +174,8 @@ impl P2pService for P2pServiceImpl {
                 worker_id: info.worker_id,
                 model_name: info.model_name,
                 worker_rank: info.worker_rank,
+                updated_at: info.updated_at,
+                training_step: info.training_step,
             })
             .collect();
 
@@ -651,6 +653,7 @@ mod tests {
                     worker_rank: 0,
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
+                    training_step: Some(42),
                 },
                 SourceInstanceInfo {
                     source_id: "abc123def456abcd".to_string(),
@@ -659,6 +662,7 @@ mod tests {
                     worker_rank: 1,
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
+                    training_step: Some(42),
                 },
             ])
         });
@@ -675,6 +679,8 @@ mod tests {
         assert_eq!(resp.instances.len(), 2);
         assert_eq!(resp.instances[0].worker_id, "w1");
         assert_eq!(resp.instances[0].worker_rank, 0);
+        assert_eq!(resp.instances[0].updated_at, 1234567890000);
+        assert_eq!(resp.instances[0].training_step, Some(42));
         assert_eq!(resp.instances[1].worker_id, "w2");
         assert_eq!(resp.instances[1].worker_rank, 1);
     }
@@ -698,6 +704,7 @@ mod tests {
                     worker_rank: 0,
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
+                    training_step: None,
                 }])
             });
 

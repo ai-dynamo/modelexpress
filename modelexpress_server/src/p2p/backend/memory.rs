@@ -28,6 +28,7 @@ struct WorkerEntry {
 #[derive(Default)]
 struct SourceEntry {
     model_name: String,
+    extra_parameters: HashMap<String, String>,
     workers: HashMap<String, WorkerEntry>,
 }
 
@@ -67,6 +68,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
         let mut sources = self.lock();
         let source = sources.entry(source_id).or_default();
         source.model_name = identity.model_name.clone();
+        source.extra_parameters = identity.extra_parameters.clone();
         let entry = source.workers.entry(worker_id.to_string()).or_default();
         entry.ranks.insert(rank, record);
         entry.index_rank = rank;
@@ -128,6 +130,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
                     worker_rank: entry.index_rank,
                     status,
                     updated_at,
+                    training_step: super::parse_training_step(&source.extra_parameters),
                 });
             }
         }
@@ -323,7 +326,9 @@ mod tests {
     #[tokio::test]
     async fn list_workers_reports_index_rank() {
         let backend = InMemoryMetadataBackend::new();
-        let id = identity("m");
+        let mut id = identity("m");
+        id.extra_parameters
+            .insert("training_step".to_string(), "42".to_string());
         let source_id = compute_mx_source_id(&id);
 
         backend
@@ -342,6 +347,7 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].worker_rank, 3, "reports the last-published rank");
         assert_eq!(listed[0].status, SourceStatus::Ready as i32);
+        assert_eq!(listed[0].training_step, Some(42));
     }
 
     // update_status patches an existing rank and errors on a missing rank or worker

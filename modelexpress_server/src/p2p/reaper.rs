@@ -129,6 +129,7 @@ mod tests {
                 worker_rank: 0,
                 status: SourceStatus::Ready as i32,
                 updated_at: old_time,
+                training_step: None,
             }])
         });
         mock.expect_update_status()
@@ -158,6 +159,7 @@ mod tests {
                 worker_rank: 0,
                 status: SourceStatus::Stale as i32,
                 updated_at: very_old,
+                training_step: None,
             }])
         });
         mock.expect_remove_worker()
@@ -185,6 +187,7 @@ mod tests {
                 worker_rank: 0,
                 status: SourceStatus::Ready as i32,
                 updated_at: recent,
+                training_step: None,
             }])
         });
         // No update_status or remove_worker calls expected

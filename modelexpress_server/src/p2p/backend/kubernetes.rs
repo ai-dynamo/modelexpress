@@ -549,6 +549,9 @@ impl MetadataBackend for KubernetesBackend {
                 worker_rank,
                 status,
                 updated_at,
+                // The current CRD list shape does not round-trip
+                // SourceIdentity.extra_parameters.
+                training_step: None,
             });
         }
 

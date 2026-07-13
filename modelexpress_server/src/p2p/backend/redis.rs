@@ -543,11 +543,12 @@ impl MetadataBackend for RedisBackend {
             let instance_map: std::collections::HashMap<String, String> =
                 conn.hgetall(&source_key).await?;
 
-            let model_name = instance_map
+            let attributes = instance_map
                 .get(keys::ATTRIBUTES_FIELD)
                 .and_then(|v| serde_json::from_str::<SourceAttributesJson>(v).ok())
-                .map(|a| a.model_name)
                 .unwrap_or_default();
+            let model_name = attributes.model_name.clone();
+            let training_step = super::parse_training_step(&attributes.extra_parameters);
 
             for (iid, rank_str) in instance_map
                 .iter()
@@ -585,6 +586,7 @@ impl MetadataBackend for RedisBackend {
                     worker_rank,
                     status,
                     updated_at,
+                    training_step,
                 });
             }
         }

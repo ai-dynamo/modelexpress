@@ -832,6 +832,7 @@ class MxV2RefitReceiver:
             listed_updated_at = self._listed_int(instance, "updated_at")
             if (
                 listed_updated_at is not None
+                and listed_updated_at > 0
                 and max_source_age_seconds > 0
                 and now_ms - self._timestamp_ms(listed_updated_at)
                 > max_source_age_seconds * 1000
@@ -1007,6 +1008,15 @@ class MxV2RefitReceiver:
         for name in names:
             if not hasattr(instance, name):
                 continue
+            has_field = getattr(instance, "HasField", None)
+            if callable(has_field):
+                try:
+                    if not has_field(name):
+                        continue
+                except (TypeError, ValueError):
+                    # Proto3 scalars without explicit presence raise ValueError;
+                    # their zero/nonzero value remains meaningful below.
+                    pass
             value = getattr(instance, name)
             if value in (None, ""):
                 continue

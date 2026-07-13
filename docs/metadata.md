@@ -120,6 +120,8 @@ SourceInstanceRef {
   worker_id: string       // Unique worker identifier
   model_name: string      // Human-readable
   worker_rank: uint32     // Global rank for peer matching
+  updated_at: int64       // Last status update (unix millis; 0 = unknown)
+  training_step: uint64?  // Optional version for pre-metadata filtering
 }
 ```
 

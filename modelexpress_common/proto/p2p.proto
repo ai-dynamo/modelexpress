@@ -512,6 +512,14 @@ message SourceInstanceRef {
   // Global rank of this worker within the instance.
   // Clients filter on this field to find a peer with a matching rank.
   uint32 worker_rank = 4;
+
+  // Timestamp of the worker's last status update (unix milliseconds).
+  // Zero means unknown for records created by older servers/backends.
+  int64 updated_at = 5;
+
+  // Training step/version lifted from SourceIdentity.extra_parameters.
+  // Presence matters: an absent value must not be interpreted as step zero.
+  optional uint64 training_step = 6;
 }
 
 message ListSourcesRequest {

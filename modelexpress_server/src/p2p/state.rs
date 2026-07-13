@@ -561,6 +561,7 @@ mod tests {
                     worker_rank: 0,
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
+                    training_step: None,
                 }])
             });
 
