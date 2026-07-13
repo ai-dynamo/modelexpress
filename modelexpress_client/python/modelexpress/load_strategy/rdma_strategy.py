@@ -51,12 +51,7 @@ class RdmaStrategy(LoadStrategy):
     def rollback(self, ctx: LoadContext) -> None:
         """Clean up NIXL state from a failed RDMA target attempt."""
         if ctx.nixl_manager is not None:
-            try:
-                ctx.nixl_manager.shutdown()
-            except Exception as e:
-                logger.warning(
-                    f"[Worker {ctx.global_rank}] Failed to shut down NIXL manager: {e}"
-                )
+            ctx.nixl_manager.shutdown()
         ctx.tensors = {}
         ctx.nixl_manager = None
 
@@ -165,7 +160,14 @@ class RdmaStrategy(LoadStrategy):
                     f"[Worker {ctx.global_rank}] RDMA source worker {worker_id} "
                     f"failed: {e}. Trying next candidate."
                 )
-                self.rollback(ctx)
+                try:
+                    self.rollback(ctx)
+                except Exception as cleanup_error:
+                    raise StrategyFailed(
+                        f"Failed to clean up target after source worker "
+                        f"{worker_id} failed: {cleanup_error}",
+                        mutated=True,
+                    ) from cleanup_error
                 if e.mutated:
                     try:
                         result = ctx.adapter.reinit_for_retry(result)
@@ -317,7 +319,7 @@ class RdmaStrategy(LoadStrategy):
                 f"and no P2P endpoint, skipping"
             )
             return None
-        if worker.worker_grpc_endpoint and worker_id:
+        if worker.worker_grpc_endpoint:
             # Validate the selected endpoint before target preparation. Keep
             # the fetched descriptors for _receive_from_peer() to reuse.
             self._prefetch_tensor_manifest(ctx, worker, mx_source_id, worker_id)
@@ -348,6 +350,7 @@ class RdmaStrategy(LoadStrategy):
         )
         # Store the validated descriptors on the metadata object so the
         # transfer can reuse them without a second manifest RPC.
+        source_worker.tensor_source.ClearField("tensors")
         source_worker.tensor_source.tensors.extend(tensor_protos)
         manifest_time = time.perf_counter() - manifest_start
         logger.info(

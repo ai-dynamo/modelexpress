@@ -466,9 +466,11 @@ def fetch_tensor_manifest(
     request = p2p_pb2.GetTensorManifestRequest(mx_source_id=mx_source_id)
     if worker_id:
         request.worker_id = worker_id
-    response = stub.GetTensorManifest(request, timeout=timeout)
+    try:
+        response = stub.GetTensorManifest(request, timeout=timeout)
+    finally:
+        channel.close()
     response_bytes = response.ByteSize()
-    channel.close()
     if (
         worker_id
         and response.HasField("worker_id")

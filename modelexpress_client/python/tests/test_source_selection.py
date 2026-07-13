@@ -319,7 +319,12 @@ def test_load_generation_mismatch_tries_next_candidate(monkeypatch):
     strat._find_source_instances = MagicMock(return_value=cands)
     workers = [
         p2p_pb2.WorkerMetadata(worker_grpc_endpoint="source:6555"),
-        p2p_pb2.WorkerMetadata(worker_grpc_endpoint="source:6556"),
+        p2p_pb2.WorkerMetadata(
+            worker_grpc_endpoint="source:6556",
+            tensor_source=p2p_pb2.TensorSourceMetadata(
+                tensors=[p2p_pb2.TensorDescriptor(name="stale")],
+            ),
+        ),
     ]
     strat._load_as_target = MagicMock(return_value="loaded")
     manifest = [p2p_pb2.TensorDescriptor(name="weight")]
@@ -360,6 +365,30 @@ def test_load_generation_mismatch_tries_next_candidate(monkeypatch):
     assert [tensor.name for tensor in selected_worker.tensor_source.tensors] == [
         "weight"
     ]
+
+
+def test_fetch_worker_metadata_prefetches_legacy_endpoint(monkeypatch):
+    strat = RdmaStrategy()
+    worker = p2p_pb2.WorkerMetadata(worker_grpc_endpoint="source:6555")
+    ctx = MagicMock(global_rank=0)
+    ctx.mx_client.get_metadata.return_value = p2p_pb2.GetMetadataResponse(
+        found=True,
+        worker=worker,
+    )
+    fetch_manifest = MagicMock(return_value=([], 0))
+    monkeypatch.setattr(
+        "modelexpress.metadata.worker_server.fetch_tensor_manifest",
+        fetch_manifest,
+    )
+
+    result = strat._fetch_worker_metadata(ctx, "source-123", "")
+
+    assert result is not None
+    fetch_manifest.assert_called_once_with(
+        endpoint="source:6555",
+        mx_source_id="source-123",
+        worker_id="",
+    )
 
 
 def test_load_transfer_failure_reinitializes_and_tries_next_source():
@@ -435,6 +464,27 @@ def test_load_reinit_failure_remains_mutated():
         strat.load(MagicMock(), ctx)
 
     assert exc.value.mutated is True
+
+
+def test_load_cleanup_failure_aborts_before_reinit():
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(2))
+    strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
+    strat._load_as_target = MagicMock(
+        side_effect=StrategyFailed("receive failed", mutated=True)
+    )
+    ctx = MagicMock(global_rank=0)
+    manager = MagicMock()
+    manager.shutdown.side_effect = RuntimeError("shutdown failed")
+    ctx.nixl_manager = manager
+
+    with pytest.raises(StrategyFailed, match="shutdown failed") as exc:
+        strat.load(MagicMock(), ctx)
+
+    assert exc.value.mutated is True
+    assert strat._load_as_target.call_count == 1
+    assert ctx.nixl_manager is manager
+    ctx.adapter.reinit_for_retry.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

@@ -195,6 +195,24 @@ def test_fetch_tensor_manifest_default_timeout_is_five_seconds(monkeypatch):
     fetch_tensor_manifest("source:6555", "source-123")
 
     assert stub.GetTensorManifest.call_args.kwargs["timeout"] == 5.0
+    channel.close.assert_called_once()
+
+
+def test_fetch_tensor_manifest_closes_channel_on_rpc_error(monkeypatch):
+    channel = MagicMock()
+    stub = MagicMock()
+    stub.GetTensorManifest.side_effect = grpc.RpcError("manifest failed")
+    monkeypatch.setattr(grpc, "insecure_channel", MagicMock(return_value=channel))
+    monkeypatch.setattr(
+        p2p_pb2_grpc,
+        "WorkerServiceStub",
+        MagicMock(return_value=stub),
+    )
+
+    with pytest.raises(grpc.RpcError, match="manifest failed"):
+        fetch_tensor_manifest("source:6555", "source-123")
+
+    channel.close.assert_called_once()
 
 
 def test_fetch_tensor_manifest_accepts_legacy_source_without_worker_id():
@@ -211,6 +229,26 @@ def test_fetch_tensor_manifest_accepts_legacy_source_without_worker_id():
             f"127.0.0.1:{port}",
             "source-123",
             worker_id="selected-generation",
+            timeout=1.0,
+        )
+    finally:
+        server.stop(grace=None)
+
+    assert tensors == []
+
+
+def test_new_server_accepts_legacy_request_without_worker_id():
+    servicer = WorkerServiceServicer(
+        tensor_protos=[],
+        mx_source_id="source-123",
+        worker_id="new-generation",
+    )
+    server, port = _start_server(servicer)
+
+    try:
+        tensors, _ = fetch_tensor_manifest(
+            f"127.0.0.1:{port}",
+            "source-123",
             timeout=1.0,
         )
     finally:
