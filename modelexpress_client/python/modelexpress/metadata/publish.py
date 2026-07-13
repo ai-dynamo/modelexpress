@@ -151,6 +151,7 @@ def publish_metadata_and_ready(
             agent_name=nixl_manager.agent_name,
             worker_rank=worker_rank,
             accelerator=accelerator,
+            worker_id=worker_id,
         )
         actual_port = grpc_server.start()
         _worker_servers[device_id] = grpc_server
