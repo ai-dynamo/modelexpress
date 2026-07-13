@@ -428,6 +428,7 @@ def test_load_clean_transfer_failure_tries_next_source_without_reinit():
         side_effect=[StrategyFailed("clean failure", mutated=False), "loaded"]
     )
     ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""
 
     assert strat.load(MagicMock(), ctx) == "loaded"
     ctx.adapter.reinit_for_retry.assert_not_called()
@@ -441,6 +442,7 @@ def test_load_is_clean_after_reinit_then_metadata_miss():
         side_effect=StrategyFailed("receive failed", mutated=True)
     )
     ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""
     ctx.adapter.reinit_for_retry.return_value = MagicMock(name="retry-result")
 
     with pytest.raises(StrategyFailed) as exc:
@@ -458,6 +460,7 @@ def test_load_reinit_failure_remains_mutated():
         side_effect=StrategyFailed("receive failed", mutated=True)
     )
     ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""
     ctx.adapter.reinit_for_retry.side_effect = RuntimeError("reinit failed")
 
     with pytest.raises(StrategyFailed, match="reinit failed") as exc:
@@ -474,6 +477,7 @@ def test_load_cleanup_failure_aborts_before_reinit():
         side_effect=StrategyFailed("receive failed", mutated=True)
     )
     ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""
     manager = MagicMock()
     manager.shutdown.side_effect = RuntimeError("shutdown failed")
     ctx.nixl_manager = manager
@@ -594,6 +598,7 @@ def test_load_records_transfer_retry_metrics(monkeypatch):
         side_effect=[StrategyFailed("receive failed", mutated=True), "loaded"]
     )
     ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""
     ctx.adapter.reinit_for_retry.return_value = MagicMock(name="retry-result")
 
     assert strat.load(MagicMock(), ctx) == "loaded"
