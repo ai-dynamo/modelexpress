@@ -18,6 +18,7 @@ from modelexpress.accelerators import (
 from modelexpress.adapter import EngineAdapter
 from modelexpress.load_strategy.context import LoadResult
 from modelexpress.nixl_transfer import NixlTransferManager
+from modelexpress.refit_timing import RefitTimingRecorder, use_refit_timing
 from modelexpress.types import TensorDescriptor
 
 
@@ -117,6 +118,7 @@ class TestAcceleratorCapabilityGates:
 
         mgr._agent.register_memory.assert_called_once_with(
             [tensor],
+            mem_type="cpu",
             backends=["UCX"],
         )
 
@@ -136,6 +138,7 @@ class TestAcceleratorCapabilityGates:
 
         mgr._agent.register_memory.assert_called_once_with(
             [tensor],
+            mem_type="cpu",
             backends=["UCX"],
         )
 
@@ -151,24 +154,31 @@ class TestAcceleratorCapabilityGates:
         mgr._agent.make_prepped_xfer.return_value = "handle"
         mgr._agent.check_xfer_state.return_value = "DONE"
 
-        bytes_transferred, tensor_count, _ = mgr.receive_from_source(
-            source_metadata=b"",
-            source_tensors=[
-                TensorDescriptor(
-                    name="w",
-                    addr=0x1000,
-                    size=local.numel() * local.element_size(),
-                    device_id=0,
-                    dtype=str(local.dtype),
-                )
-            ],
-            remote_agent_name="source",
-        )
+        timing = RefitTimingRecorder(backend="test", version=1)
+        with use_refit_timing(timing):
+            bytes_transferred, tensor_count, _ = mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=[
+                    TensorDescriptor(
+                        name="w",
+                        addr=0x1000,
+                        size=local.numel() * local.element_size(),
+                        device_id=0,
+                        dtype=str(local.dtype),
+                    )
+                ],
+                remote_agent_name="source",
+            )
 
         assert bytes_transferred == local.numel() * local.element_size()
         assert tensor_count == 1
         assert backend.set_device_calls == [0]
         assert backend.synchronize_calls == [0]
+        payload = timing.as_dict()
+        assert payload["bytes"] == bytes_transferred
+        assert payload["stages"]["transfer_planning"]["count"] == 2
+        assert payload["stages"]["wire_transfer"]["status"] == "ok"
+        assert payload["stages"]["receive_sync"]["status"] == "ok"
 
     def test_gds_strategy_unavailable_when_backend_does_not_support_gds(
         self,

@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 480" fill="none">
+  <defs>
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;600;700&amp;family=Space+Mono:wght@400;700&amp;display=swap');
+      text { font-family: 'DM Sans', sans-serif; }
+      .mono { font-family: 'Space Mono', monospace; }
+    </style>
+  </defs>
+
+  <!-- Background -->
+  <rect width="960" height="480" rx="16" fill="#0f1420"/>
+
+  <!-- Title -->
+  <text x="480" y="32" text-anchor="middle" fill="#76b900" font-size="13" font-weight="700" class="mono" letter-spacing="3">RL REFIT TRANSFER FLOW (ONE TRAINING STEP)</text>
+
+  <!-- Column headers -->
+  <rect x="60" y="50" width="220" height="30" rx="6" fill="#76b90020"/>
+  <text x="170" y="70" text-anchor="middle" fill="#76b900" font-size="12" font-weight="700" class="mono">Training (rank k)</text>
+
+  <rect x="370" y="50" width="220" height="30" rx="6" fill="#00bcd420"/>
+  <text x="480" y="70" text-anchor="middle" fill="#00bcd4" font-size="12" font-weight="700" class="mono">MX Server</text>
+
+  <rect x="680" y="50" width="220" height="30" rx="6" fill="#9c27b020"/>
+  <text x="790" y="70" text-anchor="middle" fill="#9c27b0" font-size="12" font-weight="700" class="mono">Inference (rank k)</text>
+
+  <!-- Vertical lifelines -->
+  <line x1="170" y1="85" x2="170" y2="455" stroke="#76b90030" stroke-width="1.5"/>
+  <line x1="480" y1="85" x2="480" y2="455" stroke="#00bcd430" stroke-width="1.5"/>
+  <line x1="790" y1="85" x2="790" y2="455" stroke="#9c27b030" stroke-width="1.5"/>
+
+  <!-- Step 1: optimizer.step() -->
+  <rect x="80" y="95" width="180" height="28" rx="5" fill="#76b90015" stroke="#76b900" stroke-width="1"/>
+  <text x="170" y="114" text-anchor="middle" fill="#76b900" font-size="12" font-weight="600">optimizer.step()</text>
+
+  <!-- Step 2: WeightExtractor -->
+  <rect x="80" y="132" width="180" height="28" rx="5" fill="#1e293b"/>
+  <text x="170" y="151" text-anchor="middle" fill="#e8eaf0" font-size="12">WeightExtractor.extract()</text>
+
+  <!-- Step 3: PublishMetadata arrow -->
+  <line x1="260" y1="180" x2="370" y2="180" stroke="#00bcd4" stroke-width="1.5" stroke-dasharray="5,3"/>
+  <polygon points="366,176 374,180 366,184" fill="#00bcd4"/>
+  <text x="315" y="173" text-anchor="middle" fill="#00bcd4" font-size="10" class="mono">PublishMetadata(step=N)</text>
+
+  <!-- Step 4: UpdateStatus -->
+  <line x1="260" y1="210" x2="370" y2="210" stroke="#00bcd4" stroke-width="1.5" stroke-dasharray="5,3"/>
+  <polygon points="366,206 374,210 366,214" fill="#00bcd4"/>
+  <text x="315" y="203" text-anchor="middle" fill="#00bcd4" font-size="10" class="mono">UpdateStatus(READY)</text>
+
+  <!-- Inference: serving rollout -->
+  <rect x="700" y="95" width="180" height="28" rx="5" fill="#9c27b015" stroke="#9c27b0" stroke-width="1" stroke-dasharray="4,3"/>
+  <text x="790" y="114" text-anchor="middle" fill="#9c27b0" font-size="11" font-style="italic">serving rollout...</text>
+
+  <!-- Step 5: Inference polls -->
+  <line x1="680" y1="240" x2="590" y2="240" stroke="#00bcd4" stroke-width="1.5" stroke-dasharray="5,3"/>
+  <polygon points="594,236 586,240 594,244" fill="#00bcd4"/>
+  <text x="635" y="233" text-anchor="middle" fill="#00bcd4" font-size="10" class="mono">poll_for_update()</text>
+
+  <!-- Step 6: GetMetadata -->
+  <line x1="680" y1="268" x2="590" y2="268" stroke="#00bcd4" stroke-width="1.5" stroke-dasharray="5,3"/>
+  <polygon points="594,264 586,268 594,272" fill="#00bcd4"/>
+  <text x="635" y="261" text-anchor="middle" fill="#00bcd4" font-size="10" class="mono">GetMetadata(rank k)</text>
+
+  <!-- Step 7: add_remote_agent -->
+  <rect x="700" y="285" width="180" height="22" rx="4" fill="#1e293b"/>
+  <text x="790" y="301" text-anchor="middle" fill="#8892a4" font-size="10">add_remote_agent(NIXL blob)</text>
+
+  <!-- Step 8: RDMA WRITE -->
+  <rect x="190" y="318" width="580" height="32" rx="6" fill="#76b90012" stroke="#76b900" stroke-width="2"/>
+  <line x1="260" y1="334" x2="680" y2="334" stroke="#76b900" stroke-width="3"/>
+  <polygon points="674,327 688,334 674,341" fill="#76b900"/>
+  <text x="470" y="338" text-anchor="middle" fill="#76b900" font-size="13" font-weight="700" class="mono">RDMA WRITE (bucket_0)</text>
+
+  <!-- Step 9: Apply weights -->
+  <rect x="700" y="360" width="180" height="26" rx="5" fill="#9c27b015" stroke="#9c27b0" stroke-width="1"/>
+  <text x="790" y="378" text-anchor="middle" fill="#9c27b0" font-size="11" font-weight="600">apply_weights(bucket_0)</text>
+
+  <!-- Step 10: Repeat for more buckets -->
+  <rect x="190" y="395" width="580" height="24" rx="4" fill="#1e293b" stroke="#4a5568" stroke-width="1" stroke-dasharray="4,3"/>
+  <text x="480" y="412" text-anchor="middle" fill="#4a5568" font-size="11" class="mono" font-style="italic">repeat for bucket_1 ... bucket_N (bounded GPU memory)</text>
+
+  <!-- Step 11: Done -->
+  <rect x="700" y="428" width="180" height="24" rx="5" fill="#76b90018" stroke="#76b900" stroke-width="1"/>
+  <text x="790" y="445" text-anchor="middle" fill="#76b900" font-size="12" font-weight="700">resume_inference()</text>
+
+  <!-- Left side: done marker -->
+  <rect x="80" y="428" width="180" height="24" rx="5" fill="#76b90018" stroke="#76b900" stroke-width="1"/>
+  <text x="170" y="445" text-anchor="middle" fill="#76b900" font-size="12" font-weight="700">next training step</text>
+</svg>

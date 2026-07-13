@@ -362,6 +362,13 @@ def _resolve_nic_pin(device_id: int) -> str | None:
 
     Modes:
       - unset / "off" / "0" / "false" / "no": returns None (no pinning).
+      - "stripe": enumerates all compute-rate NICs and returns a
+        comma-separated list — every rank sees every NIC, so UCX can
+        stripe RMA traffic across all of them. On multi-NIC nodes
+        this can lift the per-receiver bandwidth roof from single-NIC
+        (~400 Gbps ideal, ~316 Gbps observed on GB200) toward N *
+        single-NIC. Also bumps UCX_MAX_RMA_RAILS to len(NICs) so UCX
+        actually uses the rails rather than picking one.
       - explicit comma-separated list: indexed by device_id, like the
         original hardcoded shape. Useful for unusual topologies where
         the auto-probe heuristic doesn't fit (e.g. fabrics outside the
@@ -376,6 +383,56 @@ def _resolve_nic_pin(device_id: int) -> str | None:
     raw = envs.MX_RDMA_NIC_PIN
     if raw == "" or raw.lower() in ("off", "0", "false", "no"):
         return None
+
+    if raw.lower() == "stripe":
+        # Enumerate ALL compute-rate NICs and hand them all to UCX.
+        # Rate filter defaults to max-rate auto-detect so slower
+        # side-fabric NICs (mgmt / storage) are stripped, matching
+        # auto mode's filter.
+        raw_min = os.environ.get("MX_RDMA_NIC_PIN_MIN_RATE_GBPS")
+        try:
+            min_rate = float(raw_min) if raw_min else None
+        except ValueError:
+            min_rate = None
+        nics = _list_compute_ib_nics(min_rate_gbps=min_rate)
+        if not nics:
+            logger.warning(
+                "MX_RDMA_NIC_PIN=stripe: no compute-rate NICs found; "
+                "skipping pin"
+            )
+            return None
+        # Format each NIC as ``<name>:1`` to match UCX's device
+        # syntax. UCX picks the port from :1 (all IB NICs have their
+        # single port at index 1).
+        pinned = ",".join(f"{name}:1" for name, _numa, _rate, _path in nics)
+        # Keep a routable Ethernet device in the list so UCX still has a tcp
+        # transport for the NIXL control/AM lane (cross-pod metadata exchange +
+        # connection setup). IB-only pinning drops the tcp path, so the receiver
+        # can't reach the publisher's CM address ("no active messages transport
+        # ... rc_mlx5 - no route to <ip>") and stripe fails at loadRemoteMD.
+        # rc still carries the RMA data across the mlx5 rails; eth0 only serves
+        # control. Overridable via MX_RDMA_STRIPE_CM_DEV; set to "" to disable.
+        cm_dev = os.environ.get("MX_RDMA_STRIPE_CM_DEV", "eth0")
+        if cm_dev and cm_dev not in pinned.split(","):
+            pinned = f"{pinned},{cm_dev}"
+            logger.info(
+                f"MX_RDMA_NIC_PIN=stripe: keeping {cm_dev} for the tcp control/AM lane"
+            )
+        # Bump UCX_MAX_RMA_RAILS so UCX actually multiplexes RMA
+        # traffic across the pinned NICs. Default is 1 (single rail);
+        # setting to len(nics) lets the striping happen. Callers can
+        # pre-set UCX_MAX_RMA_RAILS to override.
+        if "UCX_MAX_RMA_RAILS" not in os.environ:
+            os.environ["UCX_MAX_RMA_RAILS"] = str(len(nics))
+            logger.info(
+                f"MX_RDMA_NIC_PIN=stripe: set UCX_MAX_RMA_RAILS="
+                f"{len(nics)} (was unset)"
+            )
+        logger.info(
+            f"MX_RDMA_NIC_PIN=stripe: pinning device {device_id} to "
+            f"{len(nics)} NICs -> {pinned}"
+        )
+        return pinned
 
     if "," in raw:
         nic_list = [n.strip() for n in raw.split(",") if n.strip()]
@@ -393,7 +450,7 @@ def _resolve_nic_pin(device_id: int) -> str | None:
 
     raw_min = envs.MX_RDMA_NIC_PIN_MIN_RATE_GBPS
     if raw_min is None or raw_min.strip() == "":
-        min_rate: float | None = None
+        min_rate = None
     else:
         try:
             min_rate = float(raw_min)

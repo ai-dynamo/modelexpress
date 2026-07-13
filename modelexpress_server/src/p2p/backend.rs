@@ -36,6 +36,15 @@ pub struct ModelMetadataRecord {
     pub model_name: String,
     pub workers: Vec<WorkerRecord>,
     pub published_at: i64,
+    /// Full SourceIdentity that produced ``source_id``.
+    ///
+    /// Older records (written before this field was added) leave it ``None``.
+    /// New v2 RL clients (NemoRL `update_weights_via_mx`) read framework-level
+    /// state from `identity.extra_parameters` (training_step, role, shape
+    /// registry, dirty experts). Backends are responsible for round-tripping
+    /// the entire SourceIdentity message; pre-existing records continue to
+    /// work because the field is optional.
+    pub identity: Option<SourceIdentity>,
 }
 
 /// Lightweight reference to a source worker (no tensor metadata).

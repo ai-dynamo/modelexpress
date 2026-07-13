@@ -21,6 +21,14 @@ class ModelExpressWorker(Worker):
         # Register loaders before parent initialization.
         # This imports the vLLM engine package, which registers MxModelLoader.
         from modelexpress import register_modelexpress_loaders
+        from modelexpress.engines.vllm.weight_transfer import (
+            register as register_mx_weight_transfer,
+        )
 
         register_modelexpress_loaders()
+        # Loader registration may happen while vLLM's transfer factory is
+        # still importing and is intentionally best-effort there. Worker
+        # construction is the deterministic last point before load_model()
+        # asks the factory for backend="mx".
+        register_mx_weight_transfer()
         super().__init__(*args, **kwargs)
