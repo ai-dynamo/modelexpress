@@ -947,7 +947,9 @@ mod tests {
                 }))
             });
         // Two ready workers of the same rank; only w1 gets selected below.
+        // Fresh updated_at so the READY heartbeat-freshness filter keeps them.
         mock.expect_list_workers().times(1).returning(|_, _| {
+            let now = chrono::Utc::now().timestamp_millis();
             Ok(vec![
                 SourceInstanceInfo {
                     source_id: "srcaaaabbbbccccd".to_string(),
@@ -955,7 +957,7 @@ mod tests {
                     model_name: "my-model".to_string(),
                     worker_rank: 0,
                     status: SourceStatus::Ready as i32,
-                    updated_at: 1234567890000,
+                    updated_at: now,
                 },
                 SourceInstanceInfo {
                     source_id: "srcaaaabbbbccccd".to_string(),
@@ -963,7 +965,7 @@ mod tests {
                     model_name: "my-model".to_string(),
                     worker_rank: 0,
                     status: SourceStatus::Ready as i32,
-                    updated_at: 1234567890000,
+                    updated_at: now,
                 },
             ])
         });
@@ -1031,7 +1033,9 @@ mod tests {
             model_name: "my-model".to_string(),
             worker_rank: 0,
             status: SourceStatus::Ready as i32,
-            updated_at: 1234567890000,
+            // Fresh so the READY heartbeat-freshness filter (added in #491)
+            // keeps this source in list_sources.
+            updated_at: chrono::Utc::now().timestamp_millis(),
         }]
     }
 
