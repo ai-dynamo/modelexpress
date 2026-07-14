@@ -190,6 +190,8 @@ impl MetadataBackend for KubernetesBackend {
         identity: &SourceIdentity,
         worker_id: &str,
         worker: WorkerMetadata,
+        pod_name: &str,
+        pod_uid: &str,
     ) -> MetadataResult<()> {
         let source_id = crate::p2p::source_identity::compute_mx_source_id(identity);
         let source_id = source_id.as_str();
@@ -202,6 +204,7 @@ impl MetadataBackend for KubernetesBackend {
 
         // First, ensure the CR exists
         let existing = api.get_opt(&cr_name).await?;
+        let has_pod_name_and_uid = !pod_name.is_empty() && !pod_uid.is_empty();
 
         if existing.is_none() {
             let new_cr = ModelMetadata {
@@ -220,6 +223,20 @@ impl MetadataBackend for KubernetesBackend {
                         );
                         labels
                     }),
+                    owner_references: if has_pod_name_and_uid {
+                        Some(vec![
+                            k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                                api_version: "v1".to_string(),
+                                kind: "Pod".to_string(),
+                                name: pod_name.to_string(),
+                                uid: pod_uid.to_string(),
+                                controller: Some(false),
+                                block_owner_deletion: Some(false),
+                            },
+                        ])
+                    } else {
+                        None
+                    },
                     ..Default::default()
                 },
                 spec: ModelMetadataSpec {

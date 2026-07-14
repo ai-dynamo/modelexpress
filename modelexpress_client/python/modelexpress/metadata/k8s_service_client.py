@@ -104,6 +104,8 @@ class MxK8sServiceClient(MxClientBase):
         identity: "p2p_pb2.SourceIdentity",
         worker: "p2p_pb2.WorkerMetadata",
         worker_id: str,
+        pod_name: str = "",
+        pod_uid: str = "",
     ) -> str:
         """Compute mx_source_id locally - there is no central store to hit.
 

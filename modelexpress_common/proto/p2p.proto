@@ -499,6 +499,15 @@ message PublishMetadataRequest {
   // Differentiates multiple replicas with identical SourceIdentity.
   // If empty, the server rejects the request.
   string worker_id = 3;
+
+  // Kubernetes pod name of the calling worker, set via the downward API.
+  // Used with pod_uid to set an ownerReference on the ModelMetadata CR
+  // so K8s garbage-collects it when the pod is deleted.
+  // When empty, no ownerReference is set.
+  string pod_name = 4;
+
+  // Kubernetes pod UID of the calling worker, set via the downward API.
+  string pod_uid = 5;
 }
 
 message PublishMetadataResponse {
