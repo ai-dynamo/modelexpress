@@ -49,6 +49,15 @@ inputs:
   manifest:
     description: 'Repo-root-relative path to the source K8s manifest (e.g. ci/k8s/client/vllm/manifest-azure.yaml). Envsubst is run on it before apply.'
     required: true
+  mx_p2p_metadata:
+    description: |
+      Value for the ${MX_P2P_METADATA} substitution in manifests that template
+      it (currently vllm/manifest-azure.yaml). Defaults to "1" (P2P metadata).
+      This test targets the reaper/heartbeat path, not the metadata publish
+      path, so the default is the only value CI exercises here; the input
+      exists so the shared manifest's templated var never blanks.
+    required: false
+    default: '1'
   test_script:
     description: 'Repo-root-relative path to the pytest file to run'
     required: false
@@ -166,6 +175,7 @@ runs:
         NAMESPACE: ${{ inputs.namespace }}
         WORKER_PORT: ${{ inputs.source_port }}
         MANIFEST: ${{ inputs.manifest }}
+        MX_P2P_METADATA: ${{ inputs.mx_p2p_metadata }}
       run: |
         echo "::group::Apply source-only manifest (JOB_NAME=mx-source, WORKER_PORT=${WORKER_PORT})"
         # JOB_NAME=mx-source identifies the Job as a "source" for the
@@ -173,6 +183,9 @@ runs:
         # job-name=mx-source). The existing per-framework manifests are
         # parameterized by JOB_NAME so we reuse them as-is.
         export JOB_NAME=mx-source
+        # manifest-azure.yaml templates ${MX_P2P_METADATA}; this action's
+        # envsubst is unbounded, so an unset value would blank it and flip the
+        # source to non-P2P mode. The mx_p2p_metadata input defaults it to "1".
         envsubst < "${MANIFEST}" | kubectl apply -n ${NAMESPACE} -f -
         echo "::endgroup::"
 

@@ -58,6 +58,17 @@ inputs:
         S3_BUCKET=my-model-bucket
     required: false
     default: ''
+  mx_p2p_metadata:
+    description: |
+      Value for the ${MX_P2P_METADATA} substitution in manifests that
+      template it (currently vllm/manifest-azure.yaml). "1" (default) keeps
+      the P2P-metadata path (source serves the tensor manifest on-demand via
+      a WorkerGrpcServer). "0" exercises the non-P2P embedded-metadata path
+      (tensors carried in the WorkerMetadata proto) — the path where the
+      MX-396 dropped-tensors regression surfaces. Applied to both source and
+      target manifest applies.
+    required: false
+    default: '1'
   source_port:
     description: 'Port the source worker listens on — exported as WORKER_PORT for the source manifest and passed to pytest as --source-port'
     required: false
@@ -195,6 +206,7 @@ runs:
         WORKER_PORT: ${{ inputs.source_port }}
         SOURCE_EXTRA_ENV: ${{ inputs.source_extra_env }}
         MANIFEST: ${{ inputs.manifest }}
+        MX_P2P_METADATA: ${{ inputs.mx_p2p_metadata }}
       run: |
         echo "::group::Apply source manifest (WORKER_PORT=${WORKER_PORT})"
         while IFS= read -r line; do
@@ -212,7 +224,7 @@ runs:
         # trt-llm source/target split) goes on the list too — otherwise
         # the literal `${VAR}` survives into the pod env, which Python
         # sees as a non-empty truthy string and reads as "set."
-        envsubst '${WORKER_IMAGE} ${MX_SERVER_IMAGE} ${MX_CI_MODEL} ${WORKER_PORT} ${NAMESPACE} ${JOB_NAME} ${MODEL_EXPRESS_SOURCE}' \
+        envsubst '${WORKER_IMAGE} ${MX_SERVER_IMAGE} ${MX_CI_MODEL} ${WORKER_PORT} ${NAMESPACE} ${JOB_NAME} ${MODEL_EXPRESS_SOURCE} ${MX_P2P_METADATA}' \
           < "${MANIFEST}" | kubectl apply -n ${NAMESPACE} -f -
         echo "::endgroup::"
 
@@ -344,13 +356,15 @@ runs:
         WORKER_PORT: ${{ inputs.worker_port }}
         EXTRA_ENV: ${{ inputs.extra_env }}
         MANIFEST: ${{ inputs.manifest }}
+        MX_P2P_METADATA: ${{ inputs.mx_p2p_metadata }}
       run: |
         echo "::group::Apply ${MANIFEST} (WORKER_PORT=${WORKER_PORT})"
         while IFS= read -r line; do
           [ -n "$line" ] && export "$line"
         done <<< "${EXTRA_ENV}"
-        # See same-named source-apply step above for allowlist rationale.
-        envsubst '${WORKER_IMAGE} ${MX_SERVER_IMAGE} ${MX_CI_MODEL} ${WORKER_PORT} ${NAMESPACE} ${JOB_NAME} ${MODEL_EXPRESS_SOURCE}' \
+        # See same-named source-apply step above for the allowlist rationale;
+        # ${MX_P2P_METADATA} defaults to "1" via the mx_p2p_metadata input.
+        envsubst '${WORKER_IMAGE} ${MX_SERVER_IMAGE} ${MX_CI_MODEL} ${WORKER_PORT} ${NAMESPACE} ${JOB_NAME} ${MODEL_EXPRESS_SOURCE} ${MX_P2P_METADATA}' \
           < "${MANIFEST}" | kubectl apply -n ${NAMESPACE} -f -
         echo "::endgroup::"
 

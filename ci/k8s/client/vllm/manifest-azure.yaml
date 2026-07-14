@@ -115,8 +115,14 @@ spec:
               value: "0"
             - name: MX_RDMA_NIC_PIN
               value: "auto"
+            # Substituted per-apply; both consuming actions default it to "1"
+            # (P2P metadata: source serves the tensor manifest on-demand via a
+            # WorkerGrpcServer), so an unset value == current behavior. The
+            # embedded-metadata jobs override to "0" to exercise the non-P2P
+            # publish path (tensors embedded in the WorkerMetadata proto) where
+            # the MX-396 dropped-tensors regression lives.
             - name: MX_P2P_METADATA
-              value: "1"
+              value: "${MX_P2P_METADATA}"
             - name: MX_ARTIFACT_TRANSFER
               value: "1"
             - name: MX_ARTIFACT_READY_URL
