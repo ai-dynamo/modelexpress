@@ -520,6 +520,11 @@ message SourceInstanceRef {
   // Training step/version lifted from SourceIdentity.extra_parameters.
   // Presence matters: an absent value must not be interpreted as step zero.
   optional uint64 training_step = 6;
+
+  // Stable digest of topology, tensor registry, and translation metadata.
+  // Unlike training_step this remains constant across versions and changes
+  // whenever cached layout metadata must be rebuilt.
+  optional string layout_signature = 7;
 }
 
 message ListSourcesRequest {

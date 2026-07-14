@@ -63,6 +63,8 @@ pub struct SourceInstanceInfo {
     pub updated_at: i64,
     /// Training step/version from SourceIdentity.extra_parameters, when present.
     pub training_step: Option<u64>,
+    /// Stable topology/registry digest, when published by the source.
+    pub layout_signature: Option<String>,
 }
 
 pub(crate) fn parse_training_step(extra_parameters: &HashMap<String, String>) -> Option<u64> {
@@ -70,6 +72,15 @@ pub(crate) fn parse_training_step(extra_parameters: &HashMap<String, String>) ->
         .get("training_step")
         .or_else(|| extra_parameters.get("version"))
         .and_then(|value| value.parse::<u64>().ok())
+}
+
+pub(crate) fn parse_layout_signature(
+    extra_parameters: &HashMap<String, String>,
+) -> Option<String> {
+    extra_parameters
+        .get("layout_signature")
+        .filter(|value| !value.is_empty())
+        .cloned()
 }
 
 /// Backend-specific metadata for a worker
@@ -405,7 +416,7 @@ pub async fn create_backend(config: BackendConfig) -> MetadataResult<Arc<dyn Met
 
 #[cfg(test)]
 mod tests {
-    use super::parse_training_step;
+    use super::{parse_layout_signature, parse_training_step};
     use std::collections::HashMap;
 
     #[test]
@@ -419,5 +430,18 @@ mod tests {
 
         values.insert("training_step".to_string(), "not-a-number".to_string());
         assert_eq!(parse_training_step(&values), None);
+    }
+
+    #[test]
+    fn parses_non_empty_layout_signature() {
+        let mut values = HashMap::new();
+        assert_eq!(parse_layout_signature(&values), None);
+        values.insert("layout_signature".to_string(), String::new());
+        assert_eq!(parse_layout_signature(&values), None);
+        values.insert("layout_signature".to_string(), "abc123".to_string());
+        assert_eq!(
+            parse_layout_signature(&values).as_deref(),
+            Some("abc123")
+        );
     }
 }

@@ -552,6 +552,7 @@ impl MetadataBackend for KubernetesBackend {
                 // The current CRD list shape does not round-trip
                 // SourceIdentity.extra_parameters.
                 training_step: None,
+                layout_signature: None,
             });
         }
 

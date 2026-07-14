@@ -184,6 +184,7 @@ impl P2pService for P2pServiceImpl {
                 worker_rank: info.worker_rank,
                 updated_at: info.updated_at,
                 training_step: info.training_step,
+                layout_signature: info.layout_signature,
             })
             .collect();
 
@@ -652,7 +653,9 @@ mod tests {
     #[tokio::test]
     async fn test_list_sources_returns_instances() {
         let mut mock = MockMetadataBackend::new();
-        mock.expect_list_workers().once().returning(|_, _| {
+        mock.expect_list_workers_filtered()
+            .once()
+            .returning(|_, _, _, _, _, _, _| {
             Ok(vec![
                 SourceInstanceInfo {
                     source_id: "abc123def456abcd".to_string(),
@@ -662,6 +665,7 @@ mod tests {
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
                     training_step: Some(42),
+                    layout_signature: Some("layout-a".to_string()),
                 },
                 SourceInstanceInfo {
                     source_id: "abc123def456abcd".to_string(),
@@ -671,6 +675,7 @@ mod tests {
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
                     training_step: Some(42),
+                    layout_signature: Some("layout-a".to_string()),
                 },
             ])
         });
@@ -680,6 +685,7 @@ mod tests {
             .list_sources(Request::new(ListSourcesRequest {
                 identity: Some(test_identity()),
                 status_filter: Some(SourceStatus::Ready as i32),
+                ..Default::default()
             }))
             .await
             .expect("rpc")
@@ -689,6 +695,10 @@ mod tests {
         assert_eq!(resp.instances[0].worker_rank, 0);
         assert_eq!(resp.instances[0].updated_at, 1234567890000);
         assert_eq!(resp.instances[0].training_step, Some(42));
+        assert_eq!(
+            resp.instances[0].layout_signature.as_deref(),
+            Some("layout-a")
+        );
         assert_eq!(resp.instances[1].worker_id, "w2");
         assert_eq!(resp.instances[1].worker_rank, 1);
     }
@@ -698,13 +708,13 @@ mod tests {
         let identity = test_artifact_identity();
         let expected_source_id = compute_mx_source_id(&identity);
         let mut mock = MockMetadataBackend::new();
-        mock.expect_list_workers()
-            .withf(move |source_id, status_filter| {
+        mock.expect_list_workers_filtered()
+            .withf(move |source_id, status_filter, _, _, _, _, _| {
                 source_id.as_deref() == Some(expected_source_id.as_str())
                     && *status_filter == Some(SourceStatus::Ready)
             })
             .once()
-            .returning(|source_id, _| {
+            .returning(|source_id, _, _, _, _, _, _| {
                 Ok(vec![SourceInstanceInfo {
                     source_id: source_id.expect("source id"),
                     worker_id: "artifact-worker".to_string(),
@@ -713,6 +723,7 @@ mod tests {
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
                     training_step: None,
+                    layout_signature: None,
                 }])
             });
 
@@ -721,6 +732,7 @@ mod tests {
             .list_sources(Request::new(ListSourcesRequest {
                 identity: Some(identity),
                 status_filter: Some(SourceStatus::Ready as i32),
+                ..Default::default()
             }))
             .await
             .expect("rpc")
@@ -761,6 +773,7 @@ mod tests {
                         ),
                     }],
                     published_at: 1234567890,
+                    identity: Some(test_artifact_identity()),
                 }))
             });
 
@@ -786,15 +799,16 @@ mod tests {
     #[tokio::test]
     async fn test_list_sources_no_identity() {
         let mut mock = MockMetadataBackend::new();
-        mock.expect_list_workers()
+        mock.expect_list_workers_filtered()
             .once()
-            .returning(|_, _| Ok(vec![]));
+            .returning(|_, _, _, _, _, _, _| Ok(vec![]));
 
         let svc = make_service(mock);
         let resp = svc
             .list_sources(Request::new(ListSourcesRequest {
                 identity: None,
                 status_filter: None,
+                ..Default::default()
             }))
             .await
             .expect("rpc")
@@ -805,15 +819,16 @@ mod tests {
     #[tokio::test]
     async fn test_list_sources_backend_error_returns_empty() {
         let mut mock = MockMetadataBackend::new();
-        mock.expect_list_workers()
+        mock.expect_list_workers_filtered()
             .once()
-            .returning(|_, _| Err("backend down".into()));
+            .returning(|_, _, _, _, _, _, _| Err("backend down".into()));
 
         let svc = make_service(mock);
         let resp = svc
             .list_sources(Request::new(ListSourcesRequest {
                 identity: Some(test_identity()),
                 status_filter: None,
+                ..Default::default()
             }))
             .await
             .expect("rpc")
@@ -824,10 +839,10 @@ mod tests {
     #[tokio::test]
     async fn test_list_sources_empty_model_name_no_filter() {
         let mut mock = MockMetadataBackend::new();
-        mock.expect_list_workers()
-            .withf(|source_id, _| source_id.is_none())
+        mock.expect_list_workers_filtered()
+            .withf(|source_id, _, _, _, _, _, _| source_id.is_none())
             .once()
-            .returning(|_, _| Ok(vec![]));
+            .returning(|_, _, _, _, _, _, _| Ok(vec![]));
 
         let svc = make_service(mock);
         let mut id = test_identity();
@@ -836,6 +851,7 @@ mod tests {
             .list_sources(Request::new(ListSourcesRequest {
                 identity: Some(id),
                 status_filter: None,
+                ..Default::default()
             }))
             .await
             .expect("rpc")

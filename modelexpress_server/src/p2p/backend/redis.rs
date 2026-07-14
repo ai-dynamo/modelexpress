@@ -563,6 +563,8 @@ impl MetadataBackend for RedisBackend {
                 .unwrap_or_default();
             let model_name = attributes.model_name.clone();
             let training_step = super::parse_training_step(&attributes.extra_parameters);
+            let layout_signature =
+                super::parse_layout_signature(&attributes.extra_parameters);
 
             for (iid, rank_str) in instance_map
                 .iter()
@@ -605,6 +607,7 @@ impl MetadataBackend for RedisBackend {
                     status,
                     updated_at,
                     training_step,
+                    layout_signature: layout_signature.clone(),
                 });
             }
         }
@@ -662,6 +665,8 @@ impl MetadataBackend for RedisBackend {
                 continue;
             }
             let training_step = super::parse_training_step(&attributes.extra_parameters);
+            let layout_signature =
+                super::parse_layout_signature(&attributes.extra_parameters);
             if min_training_step
                 .is_some_and(|minimum| training_step.is_none_or(|step| step < minimum))
             {
@@ -694,6 +699,7 @@ impl MetadataBackend for RedisBackend {
                         status: summary.status,
                         updated_at: summary.updated_at,
                         training_step,
+                        layout_signature: layout_signature.clone(),
                     });
                 } else {
                     legacy_selected.push((
@@ -702,6 +708,7 @@ impl MetadataBackend for RedisBackend {
                         worker_rank,
                         attributes.model_name.clone(),
                         training_step,
+                        layout_signature.clone(),
                     ));
                 }
             }
@@ -718,8 +725,17 @@ impl MetadataBackend for RedisBackend {
             let worker_hashes: Vec<Vec<(String, String)>> =
                 worker_pipe.query_async(&mut conn).await?;
 
-            for ((sid, worker_id, worker_rank, model_name, training_step), pairs) in
-                legacy_selected.into_iter().zip(worker_hashes)
+            for (
+                (
+                    sid,
+                    worker_id,
+                    worker_rank,
+                    model_name,
+                    training_step,
+                    layout_signature,
+                ),
+                pairs,
+            ) in legacy_selected.into_iter().zip(worker_hashes)
             {
                 let fields: std::collections::HashMap<String, String> =
                     pairs.into_iter().collect();
@@ -750,6 +766,7 @@ impl MetadataBackend for RedisBackend {
                     status,
                     updated_at,
                     training_step,
+                    layout_signature,
                 });
             }
         }

@@ -29,6 +29,7 @@ struct WorkerEntry {
 struct SourceEntry {
     model_name: String,
     extra_parameters: HashMap<String, String>,
+    identity: Option<SourceIdentity>,
     workers: HashMap<String, WorkerEntry>,
 }
 
@@ -69,6 +70,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
         let source = sources.entry(source_id).or_default();
         source.model_name = identity.model_name.clone();
         source.extra_parameters = identity.extra_parameters.clone();
+        source.identity = Some(identity.clone());
         let entry = source.workers.entry(worker_id.to_string()).or_default();
         entry.ranks.insert(rank, record);
         entry.index_rank = rank;
@@ -96,6 +98,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
             model_name: source.model_name.clone(),
             workers: entry.ranks.values().cloned().collect(),
             published_at: 0,
+            identity: source.identity.clone(),
         }))
     }
 
@@ -131,6 +134,9 @@ impl MetadataBackend for InMemoryMetadataBackend {
                     status,
                     updated_at,
                     training_step: super::parse_training_step(&source.extra_parameters),
+                    layout_signature: super::parse_layout_signature(
+                        &source.extra_parameters,
+                    ),
                 });
             }
         }

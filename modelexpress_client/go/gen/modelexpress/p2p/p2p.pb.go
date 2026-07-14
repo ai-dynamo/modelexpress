@@ -2040,9 +2040,13 @@ type SourceInstanceRef struct {
 	UpdatedAt int64 `protobuf:"varint,5,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
 	// Training step/version lifted from SourceIdentity.extra_parameters.
 	// Presence matters: an absent value must not be interpreted as step zero.
-	TrainingStep  *uint64 `protobuf:"varint,6,opt,name=training_step,json=trainingStep,proto3,oneof" json:"training_step,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	TrainingStep *uint64 `protobuf:"varint,6,opt,name=training_step,json=trainingStep,proto3,oneof" json:"training_step,omitempty"`
+	// Stable digest of topology, tensor registry, and translation metadata.
+	// Unlike training_step this remains constant across versions and changes
+	// whenever cached layout metadata must be rebuilt.
+	LayoutSignature *string `protobuf:"bytes,7,opt,name=layout_signature,json=layoutSignature,proto3,oneof" json:"layout_signature,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *SourceInstanceRef) Reset() {
@@ -2115,6 +2119,13 @@ func (x *SourceInstanceRef) GetTrainingStep() uint64 {
 		return *x.TrainingStep
 	}
 	return 0
+}
+
+func (x *SourceInstanceRef) GetLayoutSignature() string {
+	if x != nil && x.LayoutSignature != nil {
+		return *x.LayoutSignature
+	}
+	return ""
 }
 
 type ListSourcesRequest struct {
@@ -2706,7 +2717,7 @@ const file_p2p_proto_rawDesc = "" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12 \n" +
 	"\fmx_source_id\x18\x03 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
-	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"\xed\x01\n" +
+	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"\xb2\x02\n" +
 	"\x11SourceInstanceRef\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
@@ -2717,8 +2728,10 @@ const file_p2p_proto_rawDesc = "" +
 	"workerRank\x12\x1d\n" +
 	"\n" +
 	"updated_at\x18\x05 \x01(\x03R\tupdatedAt\x12(\n" +
-	"\rtraining_step\x18\x06 \x01(\x04H\x00R\ftrainingStep\x88\x01\x01B\x10\n" +
-	"\x0e_training_step\"\xeb\x03\n" +
+	"\rtraining_step\x18\x06 \x01(\x04H\x00R\ftrainingStep\x88\x01\x01\x12.\n" +
+	"\x10layout_signature\x18\a \x01(\tH\x01R\x0flayoutSignature\x88\x01\x01B\x10\n" +
+	"\x0e_training_stepB\x13\n" +
+	"\x11_layout_signature\"\xeb\x03\n" +
 	"\x12ListSourcesRequest\x12=\n" +
 	"\bidentity\x18\x01 \x01(\v2!.model_express.p2p.SourceIdentityR\bidentity\x12I\n" +
 	"\rstatus_filter\x18\x02 \x01(\x0e2\x1f.model_express.p2p.SourceStatusH\x00R\fstatusFilter\x88\x01\x01\x12/\n" +

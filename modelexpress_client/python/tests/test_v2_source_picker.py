@@ -195,6 +195,7 @@ def _fake_instance(
     worker_rank=None,
     training_step=None,
     updated_at=None,
+    layout_signature=None,
 ):
     values = {
         "model_name": model_name,
@@ -207,6 +208,8 @@ def _fake_instance(
         values["training_step"] = training_step
     if updated_at is not None:
         values["updated_at"] = updated_at
+    if layout_signature is not None:
+        values["layout_signature"] = layout_signature
     return types.SimpleNamespace(**values)
 
 
@@ -423,11 +426,15 @@ def test_discovery_reuses_stable_worker_metadata_across_versions(v2):
         _fake_instance(
             "m", "source-v10", "stable-worker",
             worker_rank=0, training_step=10, updated_at=100,
+            layout_signature="layout-a",
         )
     ]
     receiver._receiver._client.list_sources.return_value = response
     receiver._receiver._client.get_metadata = MagicMock(
-        return_value=_fake_meta("trainer", 0, 10, 100)
+        side_effect=[
+            _fake_meta("trainer", 0, 10, 100),
+            _fake_meta("trainer", 0, 12, 300),
+        ]
     )
 
     first = receiver.discover_v2_sources(
@@ -437,6 +444,7 @@ def test_discovery_reuses_stable_worker_metadata_across_versions(v2):
         _fake_instance(
             "m", "source-v11", "stable-worker",
             worker_rank=0, training_step=11, updated_at=200,
+            layout_signature="layout-a",
         )
     ]
     second = receiver.discover_v2_sources(
@@ -447,6 +455,64 @@ def test_discovery_reuses_stable_worker_metadata_across_versions(v2):
     assert second[0].ref.mx_source_id == "source-v11"
     assert second[0].ref.training_step == 11
     assert receiver._receiver._client.get_metadata.call_count == 1
+
+    # Same process, new topology/registry signature: force a metadata refresh.
+    response.instances = [
+        _fake_instance(
+            "m", "source-v12", "stable-worker",
+            worker_rank=0, training_step=12, updated_at=300,
+            layout_signature="layout-b",
+        )
+    ]
+    third = receiver.discover_v2_sources(
+        model_name="m", min_version=12, max_source_age_seconds=0
+    )
+    assert third[0].ref.mx_source_id == "source-v12"
+    assert receiver._receiver._client.get_metadata.call_count == 2
+    assert list(receiver._discovery_template_cache) == [
+        ("m", "stable-worker", "layout-b")
+    ]
+
+
+def test_layout_signature_is_stable_and_topology_sensitive(v2):
+    descriptor = v2.TensorDescriptorV2(
+        name="model.layers.0.weight",
+        global_shape=(8, 4),
+        dtype="bfloat16",
+        placement_kind="SHARD",
+        shard_axis=0,
+        local_shard_range=(0, 4),
+    )
+    layout = v2.TrainerWorldLayout(
+        fsdp_world_size=1,
+        tp_world_size=2,
+        pp_world_size=1,
+        ep_world_size=1,
+    )
+
+    def signature(**overrides):
+        values = {
+            "descriptors": [descriptor],
+            "world_layout": layout,
+            "worker_rank": 0,
+            "tp_rank": 0,
+            "pp_rank": 0,
+            "ep_rank": 0,
+            "megatron_sidecar": {"name_map": ["a", "b"]},
+        }
+        values.update(overrides)
+        return v2._compute_layout_signature(**values)
+
+    assert signature() == signature()
+    changed_layout = v2.TrainerWorldLayout(
+        fsdp_world_size=1,
+        tp_world_size=1,
+        pp_world_size=1,
+        ep_world_size=2,
+    )
+    assert signature(world_layout=changed_layout) != signature()
+    assert signature(tp_rank=1) != signature()
+    assert signature(megatron_sidecar={"name_map": ["different"]}) != signature()
 
 
 def test_non_v2_sources_ignored(v2):

@@ -37,12 +37,13 @@ MX server, with full TopologyScheduler logic in Rust. See
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Iterator
+from typing import Any, Iterator
 
 import torch
 
@@ -107,6 +108,41 @@ _MEGATRON_ROLE_SET = frozenset({
     ROLE_MEGATRON_EXPERT_COLUMN,
     ROLE_MEGATRON_EXPERT_ROW,
 })
+
+
+def _compute_layout_signature(
+    *,
+    descriptors: list[TensorDescriptorV2],
+    world_layout: "TrainerWorldLayout",
+    worker_rank: int,
+    tp_rank: int,
+    pp_rank: int,
+    ep_rank: int,
+    megatron_sidecar: dict[str, Any],
+) -> str:
+    """Return a version-independent topology and registry digest."""
+
+    payload = {
+        "world_layout": world_layout.encode(),
+        "worker_rank": int(worker_rank),
+        "mesh_position": {
+            "tp_rank": int(tp_rank),
+            "pp_rank": int(pp_rank),
+            "ep_rank": int(ep_rank),
+        },
+        "tensors": [
+            descriptor.to_dict()
+            for descriptor in sorted(descriptors, key=lambda item: item.name)
+        ],
+        "megatron_sidecar": megatron_sidecar,
+    }
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode()
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def _extract_megatron_meta(extra: dict[str, str]) -> "MegatronSourceMeta | None":
@@ -412,6 +448,15 @@ class MxV2TrainingPublisher:
             trainer_world_layout=self._world_layout.encode(),
             extras=registry_extras or None,
         )
+        layout_signature = _compute_layout_signature(
+            descriptors=self._registry,
+            world_layout=self._world_layout,
+            worker_rank=self._worker_rank,
+            tp_rank=self._megatron_tp_rank,
+            pp_rank=self._megatron_pp_rank,
+            ep_rank=self._megatron_ep_rank,
+            megatron_sidecar=self._megatron_sidecar,
+        )
 
         # Fold the v2 metadata into the underlying publisher's
         # extra_parameters via a monkey-patched _build_identity (the
@@ -430,6 +475,7 @@ class MxV2TrainingPublisher:
             ident.extra_parameters["worker_rank"] = str(self._worker_rank)
             ident.extra_parameters["shape_registry"] = registry_blob
             ident.extra_parameters["world_layout"] = self._world_layout.encode()
+            ident.extra_parameters["layout_signature"] = layout_signature
             # If any registered tensor carries a megatron_role, stamp the
             # source as Megatron-shaped so receivers can route through the
             # Megatron slice planner. Per-source rank-position metadata
@@ -459,6 +505,7 @@ class MxV2TrainingPublisher:
             "world_layout": self._world_layout.encode(),
             "framework": "nemo_rl",
             "shape_registry": registry_blob,
+            "layout_signature": layout_signature,
         }
         if any(d.megatron_role is not None for d in self._registry):
             wl = self._world_layout
@@ -729,12 +776,11 @@ class MxV2RefitReceiver:
         self._worker_rank = worker_rank
         self._initialized = False
         self._registered_buffers: dict[str, torch.Tensor] = {}
-        # Shape/role metadata is stable for a publisher process even though
-        # training_step changes its mx_source_id every cycle. Cache that
-        # expensive metadata by worker identity and combine it with the fresh
-        # lightweight SourceInstanceRef returned by ListSources.
+        # Shape/role metadata is stable across training steps. The publisher
+        # advertises a layout signature so in-place TP/PP/EP or registry changes
+        # invalidate the cache even when worker_id stays constant.
         self._discovery_template_cache: dict[
-            tuple[str, str], V2SourceCandidate
+            tuple[str, str, str], V2SourceCandidate
         ] = {}
 
     @property
@@ -875,8 +921,23 @@ class MxV2RefitReceiver:
             listed_version = self._listed_int(
                 instance, "training_step", "version"
             )
-            cache_key = (instance.model_name, instance.worker_id)
-            cached = self._discovery_template_cache.get(cache_key)
+            listed_layout_signature = str(
+                getattr(instance, "layout_signature", "") or ""
+            )
+            cache_key = (
+                (
+                    instance.model_name,
+                    instance.worker_id,
+                    listed_layout_signature,
+                )
+                if listed_layout_signature
+                else None
+            )
+            cached = (
+                self._discovery_template_cache.get(cache_key)
+                if cache_key is not None
+                else None
+            )
             if cached is not None and listed_version is not None:
                 if cached.role == ROLE_INFERENCE_REPLICA and not include_replicas:
                     continue
@@ -1012,7 +1073,15 @@ class MxV2RefitReceiver:
                     megatron_meta=megatron_meta,
                 )
             candidates.append(candidate)
-            self._discovery_template_cache[cache_key] = candidate
+            if cache_key is not None:
+                # Bound stale signatures for a hot-reconfigured worker.
+                for old_key in list(self._discovery_template_cache):
+                    if (
+                        old_key[:2] == cache_key[:2]
+                        and old_key != cache_key
+                    ):
+                        self._discovery_template_cache.pop(old_key, None)
+                self._discovery_template_cache[cache_key] = candidate
 
         # Source-role ordering.
         #
