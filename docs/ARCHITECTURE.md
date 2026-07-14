@@ -134,6 +134,8 @@ ModelExpress/
 │       ├── vllm_loader.py              # Compatibility shim for engines.vllm.loader
 │       ├── metadata/                   # Metadata clients, publishing, heartbeat, worker manifest service
 │       │   ├── __init__.py
+│       │   ├── artifact_lifecycle.py   # Engine-agnostic cache-artifact lifecycle
+│       │   ├── artifact_transfer.py    # Tar/NIXL artifact transfer primitives
 │       │   ├── publish.py              # Source identity + metadata publication
 │       │   ├── publisher.py            # Source publication and heartbeat signaling
 │       │   ├── worker_server.py        # WorkerGrpcServer (P2P tensor/artifact manifests)
@@ -535,7 +537,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
 | `adapter.py` | `EngineAdapter` lifecycle hooks and strategy retry errors |
 | `vllm_loader.py` | Compatibility shim for `modelexpress.engines.vllm.loader` |
-| `metadata/` | Metadata publishing, source identity, heartbeat, worker manifest serving, metadata client selection |
+| `metadata/` | Metadata publishing, source identity, heartbeat, worker manifest serving, metadata client selection, and engine-agnostic cache-artifact transfer |
 | `load_strategy/` | Engine-neutral loading strategy chain: `RdmaStrategy`, `ModelStreamerStrategy` (S3/GCS/Azure/local), `GdsStrategy`, `DefaultStrategy` |
 | `engines/vllm/` | `VllmAdapter` and `MxModelLoader` - maps strategy hooks to vLLM loader APIs and post-load lifecycle |
 | `engines/sglang/` | `SglangAdapter` and `MxModelLoader` - maps strategy hooks to SGLang's `remote_instance` backend |

@@ -9,6 +9,38 @@ from unittest.mock import MagicMock
 
 from modelexpress import p2p_pb2
 from modelexpress.engines.sglang import artifacts
+from modelexpress.engines.vllm import artifacts as vllm_artifacts
+
+
+def test_artifact_publisher_state_is_isolated_from_vllm():
+    assert artifacts._published_sources is not vllm_artifacts._published_sources
+    assert artifacts._scheduled_publishers is not vllm_artifacts._scheduled_publishers
+
+
+def test_publish_sglang_artifact_passes_engine_context(monkeypatch):
+    published = object()
+    publish_artifact = MagicMock(return_value=published)
+    monkeypatch.setattr(
+        artifacts._common_artifacts,
+        "publish_artifact",
+        publish_artifact,
+    )
+    ctx = SimpleNamespace(accelerator_backend=SimpleNamespace(name="cuda"))
+    transfer = object()
+    identity = object()
+
+    assert (
+        artifacts._publish_sglang_cache_artifact(ctx, transfer, identity) is published
+    )
+    publish_artifact.assert_called_once_with(
+        ctx,
+        transfer,
+        identity,
+        engine_label="SGLang",
+        accelerator="cuda",
+        published_sources=artifacts._published_sources,
+        log=artifacts.logger,
+    )
 
 
 def test_sglang_torch_compile_artifact_identity_uses_sglang_criteria(monkeypatch):
@@ -16,17 +48,17 @@ def test_sglang_torch_compile_artifact_identity_uses_sglang_criteria(monkeypatch
     monkeypatch.setattr(artifacts, "_sglang_version", lambda: "0.5.13")
     monkeypatch.setattr(
         artifacts._common_artifacts,
-        "_triton_version",
+        "triton_version",
         lambda: "3.4.0",
     )
     monkeypatch.setattr(
         artifacts._common_artifacts,
-        "_triton_key",
+        "triton_key",
         lambda: "triton-key",
     )
     monkeypatch.setattr(
         artifacts._common_artifacts,
-        "_gpu_arch",
+        "gpu_arch",
         lambda device_id: f"sm90-{device_id}",
     )
     ctx = SimpleNamespace(
@@ -81,12 +113,12 @@ def test_sglang_artifact_transfers_use_sglang_backend(monkeypatch, tmp_path):
     monkeypatch.setattr(artifacts, "_sglang_version", lambda: "0.5.13")
     monkeypatch.setattr(
         artifacts._common_artifacts,
-        "_triton_key",
+        "triton_key",
         lambda: "triton-key",
     )
     monkeypatch.setattr(
         artifacts._common_artifacts,
-        "_gpu_arch",
+        "gpu_arch",
         lambda device_id: "sm90",
     )
     ctx = SimpleNamespace(
@@ -171,7 +203,7 @@ def test_sglang_artifact_ready_fn_uses_sglang_health(monkeypatch):
     shared_ready_fn = MagicMock(return_value=ready_fn)
     monkeypatch.setattr(
         artifacts._common_artifacts,
-        "_vllm_artifact_ready_fn",
+        "artifact_ready_fn",
         shared_ready_fn,
     )
 
