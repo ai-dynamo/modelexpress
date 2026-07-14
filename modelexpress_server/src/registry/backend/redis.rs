@@ -342,7 +342,7 @@ impl RegistryBackend for RedisRegistryBackend {
         }
         let hashes: Vec<Vec<(String, String)>> = pipe.query_async(&mut conn).await?;
         let mut records: Vec<ModelRecord> = Vec::with_capacity(keys.len());
-        for (key, pairs) in keys.iter().zip(hashes.into_iter()) {
+        for (key, pairs) in keys.iter().zip(hashes) {
             if pairs.is_empty() {
                 // Deleted between SCAN and HGETALL; skip defensively.
                 continue;
