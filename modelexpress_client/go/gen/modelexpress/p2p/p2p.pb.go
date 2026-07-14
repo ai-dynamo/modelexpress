@@ -1085,7 +1085,10 @@ func (*WorkerMetadata_ArtifactSource) isWorkerMetadata_SourcePayload() {}
 type GetTensorManifestRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// mx_source_id for validation (catches stale discovery)
-	MxSourceId    string `protobuf:"bytes,1,opt,name=mx_source_id,json=mxSourceId,proto3" json:"mx_source_id,omitempty"`
+	MxSourceId string `protobuf:"bytes,1,opt,name=mx_source_id,json=mxSourceId,proto3" json:"mx_source_id,omitempty"`
+	// Runtime generation selected from discovery metadata. The serving endpoint
+	// rejects the request if it belongs to a different worker process.
+	WorkerId      *string `protobuf:"bytes,2,opt,name=worker_id,json=workerId,proto3,oneof" json:"worker_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1127,6 +1130,13 @@ func (x *GetTensorManifestRequest) GetMxSourceId() string {
 	return ""
 }
 
+func (x *GetTensorManifestRequest) GetWorkerId() string {
+	if x != nil && x.WorkerId != nil {
+		return *x.WorkerId
+	}
+	return ""
+}
+
 type GetTensorManifestResponse struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Tensors []*TensorDescriptor    `protobuf:"bytes,1,rep,name=tensors,proto3" json:"tensors,omitempty"`
@@ -1140,7 +1150,10 @@ type GetTensorManifestResponse struct {
 	WorkerRank uint32 `protobuf:"varint,5,opt,name=worker_rank,json=workerRank,proto3" json:"worker_rank,omitempty"`
 	// Runtime accelerator family for compatibility filtering (e.g. "cuda").
 	// Empty means unknown and must be accepted for backward compatibility.
-	Accelerator   string `protobuf:"bytes,6,opt,name=accelerator,proto3" json:"accelerator,omitempty"`
+	Accelerator string `protobuf:"bytes,6,opt,name=accelerator,proto3" json:"accelerator,omitempty"`
+	// Runtime generation of the process serving this manifest. New sources
+	// always set it; absence identifies a legacy source during rolling upgrade.
+	WorkerId      *string `protobuf:"bytes,7,opt,name=worker_id,json=workerId,proto3,oneof" json:"worker_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1213,6 +1226,13 @@ func (x *GetTensorManifestResponse) GetWorkerRank() uint32 {
 func (x *GetTensorManifestResponse) GetAccelerator() string {
 	if x != nil {
 		return x.Accelerator
+	}
+	return ""
+}
+
+func (x *GetTensorManifestResponse) GetWorkerId() string {
+	if x != nil && x.WorkerId != nil {
+		return *x.WorkerId
 	}
 	return ""
 }
@@ -2579,10 +2599,13 @@ const file_p2p_proto_rawDesc = "" +
 	"\rtensor_source\x18\x14 \x01(\v2'.model_express.p2p.TensorSourceMetadataH\x01R\ftensorSource\x12T\n" +
 	"\x0fartifact_source\x18\x15 \x01(\v2).model_express.p2p.ArtifactSourceMetadataH\x01R\x0eartifactSourceB\x12\n" +
 	"\x10backend_metadataB\x10\n" +
-	"\x0esource_payload\"<\n" +
+	"\x0esource_payload\"l\n" +
 	"\x18GetTensorManifestRequest\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
-	"mxSourceId\"\x8b\x02\n" +
+	"mxSourceId\x12 \n" +
+	"\tworker_id\x18\x02 \x01(\tH\x00R\bworkerId\x88\x01\x01B\f\n" +
+	"\n" +
+	"_worker_id\"\xbb\x02\n" +
 	"\x19GetTensorManifestResponse\x12=\n" +
 	"\atensors\x18\x01 \x03(\v2#.model_express.p2p.TensorDescriptorR\atensors\x12 \n" +
 	"\fmx_source_id\x18\x02 \x01(\tR\n" +
@@ -2592,7 +2615,10 @@ const file_p2p_proto_rawDesc = "" +
 	"agent_name\x18\x04 \x01(\tR\tagentName\x12\x1f\n" +
 	"\vworker_rank\x18\x05 \x01(\rR\n" +
 	"workerRank\x12 \n" +
-	"\vaccelerator\x18\x06 \x01(\tR\vaccelerator\"e\n" +
+	"\vaccelerator\x18\x06 \x01(\tR\vaccelerator\x12 \n" +
+	"\tworker_id\x18\a \x01(\tH\x00R\bworkerId\x88\x01\x01B\f\n" +
+	"\n" +
+	"_worker_id\"e\n" +
 	" GetArtifactManifestHeaderRequest\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1f\n" +
@@ -2857,6 +2883,8 @@ func file_p2p_proto_init() {
 		(*WorkerMetadata_TensorSource)(nil),
 		(*WorkerMetadata_ArtifactSource)(nil),
 	}
+	file_p2p_proto_msgTypes[8].OneofWrappers = []any{}
+	file_p2p_proto_msgTypes[9].OneofWrappers = []any{}
 	file_p2p_proto_msgTypes[22].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{

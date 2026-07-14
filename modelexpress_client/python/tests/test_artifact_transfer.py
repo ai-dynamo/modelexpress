@@ -118,6 +118,7 @@ def test_worker_grpc_server_shares_port_for_tensor_and_artifact_sources(tmp_path
         metadata_endpoint="127.0.0.1:5555",
         agent_name="source-agent",
         worker_rank=0,
+        worker_id="weight-generation",
     )
     port = server.start()
     endpoint = f"127.0.0.1:{port}"
@@ -130,7 +131,12 @@ def test_worker_grpc_server_shares_port_for_tensor_and_artifact_sources(tmp_path
     )
 
     try:
-        tensors, _ = fetch_tensor_manifest(endpoint, "weight-source", timeout=1.0)
+        tensors, _ = fetch_tensor_manifest(
+            endpoint,
+            "weight-source",
+            timeout=1.0,
+            worker_id="weight-generation",
+        )
         header, _ = artifact_transfer_module.fetch_artifact_manifest_header(
             endpoint,
             "artifact-source",
@@ -150,6 +156,105 @@ def test_worker_grpc_server_shares_port_for_tensor_and_artifact_sources(tmp_path
     assert [tensor.name for tensor in tensors] == ["weight"]
     assert header.mx_source_id == "artifact-source"
     assert header.artifact_id == artifact_id
+
+
+def test_fetch_tensor_manifest_rejects_stale_worker_generation():
+    servicer = WorkerServiceServicer(
+        tensor_protos=[],
+        mx_source_id="source-123",
+        worker_id="new-generation",
+    )
+    server, port = _start_server(servicer)
+
+    try:
+        with pytest.raises(grpc.RpcError) as exc_info:
+            fetch_tensor_manifest(
+                f"127.0.0.1:{port}",
+                "source-123",
+                worker_id="old-generation",
+                timeout=1.0,
+            )
+    finally:
+        server.stop(grace=None)
+
+    assert exc_info.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+    assert "worker_id mismatch" in exc_info.value.details()
+
+
+def test_fetch_tensor_manifest_default_timeout_is_five_seconds(monkeypatch):
+    channel = MagicMock()
+    stub = MagicMock()
+    stub.GetTensorManifest.return_value = p2p_pb2.GetTensorManifestResponse()
+    monkeypatch.setattr(grpc, "insecure_channel", MagicMock(return_value=channel))
+    monkeypatch.setattr(
+        p2p_pb2_grpc,
+        "WorkerServiceStub",
+        MagicMock(return_value=stub),
+    )
+
+    fetch_tensor_manifest("source:6555", "source-123")
+
+    assert stub.GetTensorManifest.call_args.kwargs["timeout"] == 5.0
+    channel.close.assert_called_once()
+
+
+def test_fetch_tensor_manifest_closes_channel_on_rpc_error(monkeypatch):
+    channel = MagicMock()
+    stub = MagicMock()
+    stub.GetTensorManifest.side_effect = grpc.RpcError("manifest failed")
+    monkeypatch.setattr(grpc, "insecure_channel", MagicMock(return_value=channel))
+    monkeypatch.setattr(
+        p2p_pb2_grpc,
+        "WorkerServiceStub",
+        MagicMock(return_value=stub),
+    )
+
+    with pytest.raises(grpc.RpcError, match="manifest failed"):
+        fetch_tensor_manifest("source:6555", "source-123")
+
+    channel.close.assert_called_once()
+
+
+def test_fetch_tensor_manifest_accepts_legacy_source_without_worker_id():
+    class LegacyServicer(p2p_pb2_grpc.WorkerServiceServicer):
+        def GetTensorManifest(self, request, context):
+            return p2p_pb2.GetTensorManifestResponse(
+                mx_source_id=request.mx_source_id,
+            )
+
+    server, port = _start_server(LegacyServicer())
+
+    try:
+        tensors, _ = fetch_tensor_manifest(
+            f"127.0.0.1:{port}",
+            "source-123",
+            worker_id="selected-generation",
+            timeout=1.0,
+        )
+    finally:
+        server.stop(grace=None)
+
+    assert tensors == []
+
+
+def test_new_server_accepts_legacy_request_without_worker_id():
+    servicer = WorkerServiceServicer(
+        tensor_protos=[],
+        mx_source_id="source-123",
+        worker_id="new-generation",
+    )
+    server, port = _start_server(servicer)
+
+    try:
+        tensors, _ = fetch_tensor_manifest(
+            f"127.0.0.1:{port}",
+            "source-123",
+            timeout=1.0,
+        )
+    finally:
+        server.stop(grace=None)
+
+    assert tensors == []
 
 
 def test_transfer_artifact_from_worker_retries_after_source_buffer_exhaustion(

@@ -317,6 +317,10 @@ service WorkerService {
 message GetTensorManifestRequest {
   // mx_source_id for validation (catches stale discovery)
   string mx_source_id = 1;
+
+  // Runtime generation selected from discovery metadata. The serving endpoint
+  // rejects the request if it belongs to a different worker process.
+  optional string worker_id = 2;
 }
 
 message GetTensorManifestResponse {
@@ -341,6 +345,10 @@ message GetTensorManifestResponse {
   // Runtime accelerator family for compatibility filtering (e.g. "cuda").
   // Empty means unknown and must be accepted for backward compatibility.
   string accelerator = 6;
+
+  // Runtime generation of the process serving this manifest. New sources
+  // always set it; absence identifies a legacy source during rolling upgrade.
+  optional string worker_id = 7;
 }
 
 message GetArtifactManifestHeaderRequest {
