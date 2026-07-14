@@ -1109,8 +1109,9 @@ class TestRdmaStrategyLoad:
         assert isinstance(result, LoadResult)
         assert attempts == ["w-1"]
 
-    def test_propagates_strategy_failed_after_target_mutation(self):
+    def test_transfer_failure_reinitializes_and_tries_next_source(self):
         ctx = _make_load_context()
+        ctx.adapter.reinit_for_retry = MagicMock(side_effect=lambda result: result)
         candidates = [
             _make_instance_ref(worker_id="w-1"),
             _make_instance_ref(worker_id="w-2"),
@@ -1124,11 +1125,11 @@ class TestRdmaStrategyLoad:
 
         with patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True), \
              patch("modelexpress.load_strategy.rdma_strategy.get_configured_selector", return_value=_IdentitySelector()):
-            with pytest.raises(StrategyFailed, match="transfer failed: w-1") as exc:
-                strategy.load(MagicMock(), ctx)
+            result = strategy.load(MagicMock(), ctx)
 
-        assert exc.value.mutated is True
-        assert attempts == ["w-1"]
+        assert isinstance(result, LoadResult)
+        assert attempts == ["w-1", "w-2"]
+        ctx.adapter.reinit_for_retry.assert_called_once()
 
     def test_raises_strategy_failed_when_no_candidates(self):
         ctx = _make_load_context()
