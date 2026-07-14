@@ -329,7 +329,7 @@ jobs:
   # parallel execution in the future (remove max-parallel: 1 to enable).
   # ---------------------------------------------------------------------------
   test-p2p:
-    name: P2P test (${{ matrix.framework }})
+    name: P2P test (${{ matrix.label || matrix.framework }})
     runs-on: prod-modelexpress-builder-amd-v1
     needs: [build-client, build-server, ensure-vcluster]
     permissions:
@@ -385,6 +385,39 @@ jobs:
             extra_env: "JOB_NAME=mx-target"
             source_port: "8007"
             worker_port: "8008"
+          # Full tensor-manifest publish path (MX_P2P_METADATA=0): the source
+          # embeds the full tensor manifest in the WorkerMetadata proto it
+          # publishes, instead of serving it on-demand. The mixed-version entry
+          # (client @ this commit vs the last released server) is a proto
+          # backward-compatibility guard — it catches client-side proto changes
+          # that break older servers (e.g. dropping the legacy `tensors`
+          # field). same-version only guards the path against future same-build
+          # breaks.
+          - framework: vllm
+            label: vllm full-manifest same-version
+            namespace: mx-ci-full-manifest-same-${{ github.run_id }}
+            manifest: ci/k8s/client/vllm/manifest-azure.yaml
+            test_script: ci/k8s/client/test_p2p_k8s.py
+            source_extra_env: "JOB_NAME=mx-source"
+            extra_env: "JOB_NAME=mx-target"
+            source_port: "8021"
+            worker_port: "8022"
+            mx_p2p_metadata: "0"
+          - framework: vllm
+            label: vllm full-manifest mixed-version
+            namespace: mx-ci-full-manifest-mixed-${{ github.run_id }}
+            manifest: ci/k8s/client/vllm/manifest-azure.yaml
+            test_script: ci/k8s/client/test_p2p_k8s.py
+            source_extra_env: "JOB_NAME=mx-source"
+            extra_env: "JOB_NAME=mx-target"
+            source_port: "8023"
+            worker_port: "8024"
+            mx_p2p_metadata: "0"
+            # TODO: resolve this dynamically to the latest released
+            # modelexpress-server tag instead of hardcoding, so the guard
+            # tracks "newest client vs latest released server" without a
+            # manual bump each release.
+            server_image: nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.4.0
 
     steps:
       - name: Checkout
@@ -405,7 +438,9 @@ jobs:
         with:
           kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
           namespace: ${{ matrix.namespace }}
-          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          # Defaults to this commit's server; matrix.server_image overrides it
+          # (e.g. the mixed-version embedded-metadata entry pins a released tag).
+          server_image: ${{ matrix.server_image || format('{0}/mx-server:{1}', env.MX_IMAGE_REPO, github.sha) }}
           manifest: ${{ matrix.manifest }}
           test_script: ${{ matrix.test_script }}
           worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
@@ -413,6 +448,7 @@ jobs:
           ngc_api_key: ${{ secrets.NGC_API_KEY }}
           model: ${{ env.MX_CI_MODEL }}
           hf_token: ${{ secrets.HF_TOKEN }}
+          mx_p2p_metadata: ${{ matrix.mx_p2p_metadata || '1' }}
           source_extra_env: ${{ matrix.source_extra_env }}
           extra_env: ${{ matrix.extra_env }}
           source_port: ${{ matrix.source_port }}

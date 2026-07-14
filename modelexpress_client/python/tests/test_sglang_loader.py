@@ -493,6 +493,7 @@ def test_transfer_engine_publish_starts_non_nixl_heartbeat():
         device_id=1,
         identity=p2p_pb2.SourceIdentity(model_name="sglang-model"),
         mx_client=SimpleNamespace(),
+        accelerator_backend=SimpleNamespace(name="cuda"),
     )
     published = {}
 
@@ -528,6 +529,7 @@ def test_transfer_engine_publish_starts_non_nixl_heartbeat():
 
     assert published_ok
     assert published["worker"].transfer_engine_session_id == "te-session"
+    assert published["worker"].accelerator == "cuda"
     assert published["status"]["status"] == p2p_pb2.SOURCE_STATUS_READY
     assert published["heartbeat"]["nixl_manager"] is None
     assert published["heartbeat_started"]
@@ -541,6 +543,7 @@ def test_transfer_engine_publish_failure_is_non_fatal():
         worker_id="worker-id",
         device_id=1,
         identity=p2p_pb2.SourceIdentity(model_name="sglang-model"),
+        accelerator_backend=SimpleNamespace(name="cuda"),
         mx_client=SimpleNamespace(
             publish_metadata=lambda *args: (_ for _ in ()).throw(
                 RuntimeError("metadata down")

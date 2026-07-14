@@ -1109,8 +1109,9 @@ class TestRdmaStrategyLoad:
         assert isinstance(result, LoadResult)
         assert attempts == ["w-1"]
 
-    def test_propagates_strategy_failed_after_target_mutation(self):
+    def test_transfer_failure_reinitializes_and_tries_next_source(self):
         ctx = _make_load_context()
+        ctx.adapter.reinit_for_retry = MagicMock(side_effect=lambda result: result)
         candidates = [
             _make_instance_ref(worker_id="w-1"),
             _make_instance_ref(worker_id="w-2"),
@@ -1124,11 +1125,11 @@ class TestRdmaStrategyLoad:
 
         with patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True), \
              patch("modelexpress.load_strategy.rdma_strategy.get_configured_selector", return_value=_IdentitySelector()):
-            with pytest.raises(StrategyFailed, match="transfer failed: w-1") as exc:
-                strategy.load(MagicMock(), ctx)
+            result = strategy.load(MagicMock(), ctx)
 
-        assert exc.value.mutated is True
-        assert attempts == ["w-1"]
+        assert isinstance(result, LoadResult)
+        assert attempts == ["w-1", "w-2"]
+        ctx.adapter.reinit_for_retry.assert_called_once()
 
     def test_raises_strategy_failed_when_no_candidates(self):
         ctx = _make_load_context()
@@ -1158,6 +1159,26 @@ class TestRdmaStrategyLoad:
                 strategy.load(MagicMock(), ctx)
 
         assert exc.value.mutated is False
+
+    def test_skips_mismatched_accelerator_before_target(
+        self,
+        mock_accelerator_backend_cls,
+    ):
+        ctx = _make_load_context(
+            accelerator_backend=mock_accelerator_backend_cls(name="xpu"),
+        )
+        source_resp = _make_metadata_resp(rank=0, worker_id="w-1")
+        source_resp.worker.accelerator = "cuda"
+        candidates = [_make_instance_ref(worker_id="w-1")]
+        strategy, attempts = self._setup(ctx, candidates, [source_resp])
+
+        with patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True), \
+             patch("modelexpress.load_strategy.rdma_strategy.get_configured_selector", return_value=_IdentitySelector()):
+            with pytest.raises(StrategyFailed, match="No RDMA source succeeded") as exc:
+                strategy.load(MagicMock(), ctx)
+
+        assert exc.value.mutated is False
+        assert attempts == []
 
     def test_load_as_target_marks_post_prepare_failure_as_mutated(self):
         from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
@@ -1237,7 +1258,48 @@ class TestPublishMetadataAndReady:
         mx_client.publish_metadata.assert_called_once()
         call_args = mx_client.publish_metadata.call_args
         assert call_args.args[0] is identity
+        assert call_args.args[1].accelerator == "cuda"
         assert call_args.args[2] == "inst-uuid"
+
+    def test_full_manifest_publish_dual_writes_tensor_fields(self):
+        """On the full tensor-manifest publish path (MX_P2P_METADATA=0, source
+        embeds the full manifest in the published WorkerMetadata), both the
+        legacy `tensors` field and the newer `tensor_source` must be populated.
+        Servers predating the tensor_source oneof read only `tensors`; dropping
+        it leaves them with 0 tensors and targets fall back to disk load."""
+        from modelexpress.metadata.publish import publish_metadata_and_ready
+
+        mx_client = MagicMock()
+        nixl_manager = MagicMock()
+        nixl_manager.nixl_metadata = b"nixl-data"
+
+        tensors = {}
+        for i in range(3):
+            t = MagicMock(spec=torch.Tensor)
+            t.data_ptr.return_value = 0x1000 + i * 1024
+            t.numel.return_value = 256
+            t.element_size.return_value = 2
+            t.dtype = torch.bfloat16
+            tensors[f"layer.{i}.weight"] = t
+
+        identity = _make_identity("my-model")
+        mock_publisher = MagicMock()
+        with patch.dict(os.environ, {"MX_P2P_METADATA": "0"}), \
+             patch("modelexpress.metadata.publish.PublisherThread", return_value=mock_publisher) as publisher_cls:
+            publish_metadata_and_ready(mx_client, nixl_manager, tensors, worker_rank=0, device_id=0, identity=identity, worker_id="inst-uuid")
+            publisher_cls.call_args.kwargs["publish_fn"]()
+
+        worker = mx_client.publish_metadata.call_args.args[1]
+        # Legacy field — servers predating tensor_source read only from here.
+        assert len(worker.tensors) == 3
+        # New field — current servers read from here.
+        assert len(worker.tensor_source.tensors) == 3
+        assert {t.name for t in worker.tensors} == {
+            "layer.0.weight", "layer.1.weight", "layer.2.weight",
+        }
+        assert {t.name for t in worker.tensor_source.tensors} == {
+            "layer.0.weight", "layer.1.weight", "layer.2.weight",
+        }
 
     def test_publish_fn_retries_publish(self):
         from modelexpress.metadata.publish import publish_metadata_and_ready

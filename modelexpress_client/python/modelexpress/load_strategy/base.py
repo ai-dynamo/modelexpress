@@ -232,6 +232,7 @@ def publish_metadata(ctx: LoadContext) -> None:
         publish_metadata_and_ready(
             ctx.mx_client, ctx.nixl_manager, ctx.tensors,
             ctx.worker_rank, ctx.device_id, ctx.identity, ctx.worker_id,
+            accelerator=ctx.accelerator_backend.name,
         )
     except Exception as e:
         logger.warning(

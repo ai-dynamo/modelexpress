@@ -127,10 +127,14 @@ def publish_model_params(torch_model: Any) -> None:
         for name, tensor in param_tensors.items()
     ]
 
+    # Dual-write legacy `tensors` alongside `tensor_source` for servers that
+    # predate the tensor_source oneof (see publish.py for the full rationale).
     worker = p2p_pb2.WorkerMetadata(
         worker_rank=mpi_rank,
         nixl_metadata=nixl_mgr.nixl_metadata,
+        tensors=tensor_protos,
         tensor_source=tensor_source_metadata(tensor_protos),
+        accelerator="cuda",
     )
 
     identity = _build_trtllm_identity(model_name=model_name)
@@ -243,10 +247,14 @@ def publish_from_worker(worker: Any) -> None:
         for name, tensor in param_tensors.items()
     ]
 
+    # Dual-write legacy `tensors` alongside `tensor_source` for servers that
+    # predate the tensor_source oneof (see publish.py for the full rationale).
     my_worker = p2p_pb2.WorkerMetadata(
         worker_rank=mpi_rank,
         nixl_metadata=nixl_mgr.nixl_metadata,
+        tensors=tensor_protos,
         tensor_source=tensor_source_metadata(tensor_protos),
+        accelerator="cuda",
     )
 
     identity = _build_trtllm_identity(model_name=model_name)
