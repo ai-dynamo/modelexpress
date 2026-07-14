@@ -637,7 +637,7 @@ Each GPU worker generates a unique `worker_id` (`uuid4().hex[:8]`) at init and p
 
 ### Tensor Discovery
 
-The loader uses `iter_module_tensors()` (in `tensor_utils.py`) to walk the full PyTorch module tree via `named_parameters()` and `named_buffers()`, keeping tensors accepted by the active `AcceleratorBackend.is_accel_tensor()` predicate after post-processing. CUDA is the only concrete backend today, so current behavior still collects CUDA tensors. This discovers three categories:
+The loader uses `iter_module_tensors()` (in `tensor_utils.py`) to walk the full PyTorch module tree via `named_parameters()` and `named_buffers()`, keeping tensors accepted by the active `AcceleratorBackend.is_accel_tensor()` predicate after post-processing. `CudaAcceleratorBackend` and `XpuAcceleratorBackend` are the concrete backends today, so collection targets CUDA or XPU tensors depending on the active backend. This discovers three categories:
 
 | Category | Source | Example |
 |----------|--------|---------|
