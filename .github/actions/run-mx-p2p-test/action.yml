@@ -58,6 +58,16 @@ inputs:
         S3_BUCKET=my-model-bucket
     required: false
     default: ''
+  mx_p2p_metadata:
+    description: |
+      Value for the ${MX_P2P_METADATA} substitution in manifests that
+      template it (currently vllm/manifest-azure.yaml). "1" (default) serves
+      the tensor manifest on-demand via a WorkerGrpcServer. "0" exercises the
+      full tensor-manifest publish path, where the source embeds the full
+      tensor manifest in the WorkerMetadata proto it publishes. Applied to
+      both source and target manifest applies.
+    required: false
+    default: '1'
   source_port:
     description: 'Port the source worker listens on — exported as WORKER_PORT for the source manifest and passed to pytest as --source-port'
     required: false
@@ -195,6 +205,7 @@ runs:
         WORKER_PORT: ${{ inputs.source_port }}
         SOURCE_EXTRA_ENV: ${{ inputs.source_extra_env }}
         MANIFEST: ${{ inputs.manifest }}
+        MX_P2P_METADATA: ${{ inputs.mx_p2p_metadata }}
       run: |
         echo "::group::Apply source manifest (WORKER_PORT=${WORKER_PORT})"
         while IFS= read -r line; do
@@ -212,7 +223,7 @@ runs:
         # trt-llm source/target split) goes on the list too — otherwise
         # the literal `${VAR}` survives into the pod env, which Python
         # sees as a non-empty truthy string and reads as "set."
-        envsubst '${WORKER_IMAGE} ${MX_SERVER_IMAGE} ${MX_CI_MODEL} ${WORKER_PORT} ${NAMESPACE} ${JOB_NAME} ${MODEL_EXPRESS_SOURCE}' \
+        envsubst '${WORKER_IMAGE} ${MX_SERVER_IMAGE} ${MX_CI_MODEL} ${WORKER_PORT} ${NAMESPACE} ${JOB_NAME} ${MODEL_EXPRESS_SOURCE} ${MX_P2P_METADATA}' \
           < "${MANIFEST}" | kubectl apply -n ${NAMESPACE} -f -
         echo "::endgroup::"
 
@@ -237,8 +248,14 @@ runs:
             | awk '$1 != "weights" && $2 == "Ready" && $3 != "" { count++ } END { print count + 0 }'
         }
         count_weight_sources() {
+          # Count weight sources. `sourceType` is a newer CR field; servers
+          # predating it (e.g. the released image the mixed-version
+          # full-manifest entry runs against) publish weight CRs with no
+          # sourceType, so an empty value is treated as a weight source too.
+          # Current servers always set sourceType on non-weight (artifact)
+          # sources, so this never miscounts an artifact source as a weight one.
           kubectl get modelmetadata -n "${NAMESPACE}" -o jsonpath='{range .items[*]}{.spec.sourceType}{"\n"}{end}' 2>/dev/null \
-            | awk '$1 == "weights" { count++ } END { print count + 0 }'
+            | awk '$1 == "weights" || $1 == "" { count++ } END { print count + 0 }'
         }
         wait_for_artifact_sources() {
           local expected="$1"
@@ -344,13 +361,15 @@ runs:
         WORKER_PORT: ${{ inputs.worker_port }}
         EXTRA_ENV: ${{ inputs.extra_env }}
         MANIFEST: ${{ inputs.manifest }}
+        MX_P2P_METADATA: ${{ inputs.mx_p2p_metadata }}
       run: |
         echo "::group::Apply ${MANIFEST} (WORKER_PORT=${WORKER_PORT})"
         while IFS= read -r line; do
           [ -n "$line" ] && export "$line"
         done <<< "${EXTRA_ENV}"
-        # See same-named source-apply step above for allowlist rationale.
-        envsubst '${WORKER_IMAGE} ${MX_SERVER_IMAGE} ${MX_CI_MODEL} ${WORKER_PORT} ${NAMESPACE} ${JOB_NAME} ${MODEL_EXPRESS_SOURCE}' \
+        # See same-named source-apply step above for the allowlist rationale;
+        # ${MX_P2P_METADATA} defaults to "1" via the mx_p2p_metadata input.
+        envsubst '${WORKER_IMAGE} ${MX_SERVER_IMAGE} ${MX_CI_MODEL} ${WORKER_PORT} ${NAMESPACE} ${JOB_NAME} ${MODEL_EXPRESS_SOURCE} ${MX_P2P_METADATA}' \
           < "${MANIFEST}" | kubectl apply -n ${NAMESPACE} -f -
         echo "::endgroup::"
 
