@@ -497,7 +497,13 @@ mod tests {
         let manager = P2pStateManager::with_backend(Arc::new(mock));
         assert!(
             manager
-                .publish_metadata(&test_identity(), "a1b2c3d4", WorkerMetadata::default(), "", "")
+                .publish_metadata(
+                    &test_identity(),
+                    "a1b2c3d4",
+                    WorkerMetadata::default(),
+                    "",
+                    ""
+                )
                 .await
                 .is_err()
         );

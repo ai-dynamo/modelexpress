@@ -215,8 +215,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ATTENTION_BACKEND": lambda: os.environ.get("VLLM_ATTENTION_BACKEND", "auto"),
     "HOSTNAME": lambda: os.environ.get("HOSTNAME", ""),
     "POD_NAMESPACE": lambda: os.environ.get("POD_NAMESPACE", ""),
-    "POD_NAME": lambda: os.environ.get("POD_NAME",""),
-    "POD_UID": lambda: os.environ.get("POD_UID","")
+    "POD_NAME": lambda: os.environ.get("POD_NAME", ""),
+    "POD_UID": lambda: os.environ.get("POD_UID", "")
 }
 
 
