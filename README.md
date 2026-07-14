@@ -36,6 +36,7 @@ ModelExpress is a Rust-based service that manages the complete model weight life
 | LLM serving problem | How ModelExpress helps |
 |---------------------|------------------------|
 | **Models take too long to load** | GPU-to-GPU transfer via NIXL/RDMA instead of loading from storage. In P2P mode, weights already serving inference act as the cache—no extra storage. |
+| **JIT warmup dominates startup** | Compatible vLLM TorchInductor, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches transfer from a ready replica instead of being rebuilt. |
 | **Many nodes need the same model** | Metadata backends (Redis, K8s CRD) coordinate sharing: one node loads; others receive via P2P or local paths. |
 
 ### How ModelExpress manages weights in the cluster
@@ -56,6 +57,7 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 - **Cold start reduction** — GPU-to-GPU P2P transfer over InfiniBand instead of disk load
 - **HuggingFace caching** — PVC-backed cache, `HF_HUB_OFFLINE`, `ignore_weights`, `get_model_path` for Dynamo
 - **P2P GPU transfer** — vLLM `modelexpress` loader (`mx` alias) and TRT-LLM `PRESHARDED` loader with NVIDIA NIXL over RDMA
+- **JIT cache transfer** — Reuse compatible vLLM compilation caches when replicas scale out
 - **Metadata backends** — In-memory, Redis, or Kubernetes CRD (layered write-through for HA)
 - **Kubernetes** — Helm chart, CRDs/Redis for P2P, no-shared-storage support
 - **CLI** — Health, download, list, validate, clear; init-container support for pre-warming
@@ -67,7 +69,7 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 
 | Runtime | Integration |
 |---------|-------------|
-| vLLM | `--load-format modelexpress` for P2P weight transfer; `mx` is a backward-compatible alias |
+| vLLM | Native `--load-format modelexpress` in 0.23.0+ for P2P weight and JIT cache transfer; older versions use the ModelExpress plugin, and `mx` is a backward-compatible alias |
 | NVIDIA Dynamo (vLLM) | `get_model_path` API; [Dynamo model cache K8s example](examples/dynamo_model_cache_k8s/README.md) |
 | TensorRT-LLM | `LoadFormat.PRESHARDED` with `MxLiveCheckpointLoader` for P2P weight transfer (beta) — [TRT-LLM examples](examples/p2p_transfer_k8s/client/trtllm/) |
 | SGLang | `remote_instance` + `modelexpress` backend with `transport=nixl` or `transport=transfer_engine` — see [`docs/SGLANG.md`](docs/SGLANG.md) |
@@ -151,14 +153,14 @@ Override [values-production.yaml](helm/values-production.yaml) for your env. Ful
 
 ### P2P GPU Transfer (vLLM)
 
-```python
-from modelexpress import register_modelexpress_loaders
-register_modelexpress_loaders()
-# vllm serve <model> --load-format modelexpress
-# The mx load format is kept as a backward-compatible alias.
+```bash
+vllm serve deepseek-ai/DeepSeek-V4-Pro \
+  --load-format modelexpress \
+  --tensor-parallel-size 8 \
+  --trust-remote-code
 ```
 
-First instance loads from disk; subsequent instances receive via RDMA. [P2P guide](examples/p2p_transfer_k8s/README.md) · [Server setup](examples/p2p_transfer_k8s/server/README.md).
+vLLM 0.23.0 recognizes the load format natively; the ModelExpress Python package must still be installed in the runtime image. The first instance loads from disk, while subsequent instances receive weights via RDMA. Set `MX_ARTIFACT_TRANSFER=1` to transfer compatible JIT caches as well. [P2P guide](examples/p2p_transfer_k8s/README.md) · [Server setup](examples/p2p_transfer_k8s/server/README.md).
 
 ### ModelStreamer on Kubernetes
 
@@ -235,8 +237,8 @@ cargo bench
 ## Known Issues
 
 - **NIXL_ERR_REMOTE_DISCONNECT** — Source restarts invalidate rkeys. Flush Redis, redeploy.
-- **Long source warmup** — DeepSeek-V3 (DeepGemm, CUDA graphs) can take significant time; targets wait via coordination.
 - **Large model gRPC stream** — May not close automatically; use client timeout.
+- **GDS loader does not scale with TP** — Each TP rank reads full checkpoint tensors and vLLM shards them afterward, so GDS/disk reads scale with TP degree. This can reduce or reverse expected GDS speedups versus the default mmap-based disk loader; TP-aware range reads are needed for a full fix. See [GDS Reads Full Checkpoint Tensors Under TP](docs/ARCHITECTURE.md#gds-reads-full-checkpoint-tensors-under-tp).
 
 ---
 
@@ -244,7 +246,6 @@ cargo bench
 
 ### Priorities Under Development
 
-- **P2P compile/warmup caching**: torch.compile/deepGEMM cache for follower workers. Leader performs full warmup; followers consume caches and skip full warmup.
 - **DRAM and NVMe-resident shard streaming**: Stream shards across workers while keeping weights in DRAM and host local high-speed NVMe.
 - **RL workloads**: Explore fast P2P transfers to optimize RL refit phase and support for weight resharding.
 - **Earlier weight availability**: Bring weights to prefill earlier; identify prefill workers that can act as strong source nodes.

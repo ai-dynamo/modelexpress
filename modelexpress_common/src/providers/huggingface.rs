@@ -2,39 +2,37 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    Utils,
     cache::{ModelInfo, ProviderCache, directory_size},
-    constants,
+    constants, envs,
     models::ModelProvider,
     providers::ModelProviderTrait,
 };
 use anyhow::{Context, Result};
-use hf_hub::Cache;
+use futures::StreamExt;
 use hf_hub::api::tokio::{ApiBuilder, ApiError};
+use hf_hub::{Cache, Repo, RepoType};
 use std::collections::HashSet;
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
 
-const HF_TOKEN_ENV_VAR: &str = "HF_TOKEN";
-const HF_HUB_CACHE_ENV_VAR: &str = "HF_HUB_CACHE";
-const MODEL_EXPRESS_CACHE_ENV_VAR: &str = "MODEL_EXPRESS_CACHE_DIRECTORY";
-const HF_HUB_OFFLINE_ENV_VAR: &str = "HF_HUB_OFFLINE";
+const HF_FALLBACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const HF_FALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Check if offline mode is enabled via HF_HUB_OFFLINE environment variable.
-/// The variable is considered enabled if its value is one of: "1", "ON", "YES", "TRUE" (case-insensitive).
+/// Check if offline mode is enabled via `HF_HUB_OFFLINE`.
+/// See [`crate::envs::hf_offline`] for the accepted truthy values.
 fn is_offline_mode() -> bool {
-    env::var(HF_HUB_OFFLINE_ENV_VAR)
-        .map(|v| matches!(v.to_uppercase().as_str(), "1" | "ON" | "YES" | "TRUE"))
-        .unwrap_or(false)
+    envs::hf_offline()
 }
 
 /// Get the cache directory for Hugging Face models
 /// Priority order:
 /// 1. Provided cache_dir parameter
-/// 2. HF_HUB_CACHE environment variable
-/// 3. Default location (~/.cache/huggingface/hub)
+/// 2. MODEL_EXPRESS_CACHE_DIRECTORY environment variable
+/// 3. HF_HUB_CACHE environment variable
+/// 4. Default location (~/.cache/huggingface/hub)
 fn get_cache_dir(cache_dir: Option<PathBuf>) -> PathBuf {
     // Use provided cache directory if available
     if let Some(dir) = cache_dir {
@@ -42,18 +40,17 @@ fn get_cache_dir(cache_dir: Option<PathBuf>) -> PathBuf {
     }
 
     // Try MODEL_EXPRESS_CACHE_DIRECTORY environment variable first
-    if let Ok(cache_path) = env::var(MODEL_EXPRESS_CACHE_ENV_VAR) {
-        return PathBuf::from(cache_path);
+    if let Some(cache_path) = envs::cache_directory() {
+        return cache_path;
     }
 
-    // Try environment variable
-    if let Ok(cache_path) = env::var(HF_HUB_CACHE_ENV_VAR) {
-        return PathBuf::from(cache_path);
+    // Try HF_HUB_CACHE environment variable
+    if let Some(cache_path) = envs::hf_hub_cache() {
+        return cache_path;
     }
 
     // Fall back to default location
-    let home = Utils::get_home_dir().unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(constants::DEFAULT_HF_CACHE_PATH)
+    envs::home_dir_or_cwd().join(constants::DEFAULT_HF_CACHE_PATH)
 }
 
 /// Hugging Face model provider implementation
@@ -178,6 +175,134 @@ impl HuggingFaceProvider {
     fn is_subdirectory_file(filename: &str) -> bool {
         Path::new(filename).components().count() > 1
     }
+
+    fn is_missing_content_range_error(error: &ApiError) -> bool {
+        matches!(
+            error,
+            ApiError::MissingHeader(header)
+                if header.as_str().eq_ignore_ascii_case("content-range")
+        )
+    }
+
+    async fn download_full_body_file(
+        url: &str,
+        cache_dir: &Path,
+        model_name: &str,
+        commit_hash: &str,
+        filename: &str,
+        token: Option<&str>,
+    ) -> Result<PathBuf> {
+        // Compatibility shim for mirrors/CDNs that ignore hf-hub's range metadata probe.
+        // Long term, this should live in hf-hub so ModelExpress can return to repo.get().
+        let client = reqwest::Client::builder()
+            .connect_timeout(HF_FALLBACK_CONNECT_TIMEOUT)
+            .read_timeout(HF_FALLBACK_READ_TIMEOUT)
+            .build()
+            .context("Failed to build Hugging Face fallback HTTP client")?;
+        let mut request = client.get(url).header(
+            "user-agent",
+            format!("modelexpress/{}", env!("CARGO_PKG_VERSION")),
+        );
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("Failed to request Hugging Face file '{filename}'"))?
+            .error_for_status()
+            .with_context(|| format!("Failed to download Hugging Face file '{filename}'"))?;
+
+        let response_commit = response
+            .headers()
+            .get("x-repo-commit")
+            .ok_or_else(|| {
+                anyhow::anyhow!("Full-body response for '{filename}' is missing x-repo-commit")
+            })?
+            .to_str()
+            .with_context(|| format!("Invalid x-repo-commit header for '{filename}'"))?;
+        if response_commit != commit_hash {
+            anyhow::bail!(
+                "Full-body response for '{filename}' came from commit '{response_commit}', expected '{commit_hash}'"
+            );
+        }
+
+        let expected_size = response.content_length().ok_or_else(|| {
+            anyhow::anyhow!("Full-body response for '{filename}' is missing content-length")
+        })?;
+
+        let repo_root = HuggingFaceProviderCache::repo_root(cache_dir, model_name);
+        let pointer_path = repo_root.join("snapshots").join(commit_hash).join(filename);
+        let snapshot_dir = pointer_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Invalid Hugging Face snapshot path"))?;
+        fs::create_dir_all(snapshot_dir)
+            .with_context(|| format!("Failed to create snapshot cache for '{model_name}'"))?;
+
+        // Write through a temp file and verify the byte count before publishing the snapshot.
+        // A truncated full-body response must not become a trusted cache hit on later runs.
+        let temp_file = tempfile::Builder::new()
+            .prefix(".modelexpress-")
+            .tempfile_in(snapshot_dir)
+            .with_context(|| {
+                format!(
+                    "Failed to create temp cache file in '{}'",
+                    snapshot_dir.display()
+                )
+            })?;
+        let tmp_path = temp_file.path().to_path_buf();
+        let mut file =
+            tokio::fs::File::from_std(temp_file.reopen().with_context(|| {
+                format!("Failed to open temp cache file '{}'", tmp_path.display())
+            })?);
+        let mut downloaded = 0_u64;
+        let mut stream = response.bytes_stream();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.with_context(|| {
+                format!("Failed while streaming Hugging Face file '{filename}'")
+            })?;
+            file.write_all(&chunk)
+                .await
+                .with_context(|| format!("Failed to write cache file '{}'", tmp_path.display()))?;
+            downloaded = downloaded
+                .checked_add(u64::try_from(chunk.len())?)
+                .ok_or_else(|| anyhow::anyhow!("Downloaded byte count overflowed"))?;
+        }
+
+        file.flush()
+            .await
+            .with_context(|| format!("Failed to flush cache file '{}'", tmp_path.display()))?;
+        drop(file);
+
+        if downloaded != expected_size {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            anyhow::bail!(
+                "Downloaded {downloaded} bytes for '{filename}', expected {expected_size}"
+            );
+        }
+
+        match temp_file.persist(&pointer_path) {
+            Ok(_) => {}
+            Err(_) if pointer_path.exists() => {}
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to commit cache file '{}': {}",
+                    pointer_path.display(),
+                    error.error
+                ));
+            }
+        }
+        Cache::new(cache_dir.to_path_buf())
+            .model(model_name.to_string())
+            .create_ref(commit_hash)
+            .with_context(|| {
+                format!("Failed to create Hugging Face cache ref for '{model_name}'")
+            })?;
+
+        Ok(pointer_path)
+    }
 }
 
 #[async_trait::async_trait]
@@ -200,7 +325,7 @@ impl ModelProviderTrait for HuggingFaceProvider {
             return self.get_model_path(model_name, cache_dir).await;
         }
 
-        let token = env::var(HF_TOKEN_ENV_VAR).ok();
+        let token = envs::hf_token();
 
         info!("Using cache directory: {:?}", cache_dir);
         // High CPU download
@@ -211,9 +336,9 @@ impl ModelProviderTrait for HuggingFaceProvider {
         // this may help saturate the bandwidth (>500MB/s) better.
         let api = ApiBuilder::from_env()
             .with_progress(true)
-            .with_token(token)
+            .with_token(token.clone())
             .high()
-            .with_cache_dir(cache_dir)
+            .with_cache_dir(cache_dir.clone())
             .build()?;
         let model_name = model_name.to_string();
 
@@ -228,6 +353,11 @@ impl ModelProviderTrait for HuggingFaceProvider {
             anyhow::bail!("Model '{model_name}' exists but contains no downloadable files.");
         }
 
+        let pinned_repo = api.repo(Repo::with_revision(
+            model_name.clone(),
+            RepoType::Model,
+            info.sha.clone(),
+        ));
         let mut p = PathBuf::new();
         let mut files_downloaded = false;
 
@@ -246,10 +376,32 @@ impl ModelProviderTrait for HuggingFaceProvider {
                 continue;
             }
 
-            match repo.get(&sib.rfilename).await {
-                Ok(path) => {
-                    p = path;
-                    files_downloaded = true;
+            let path = match repo.get(&sib.rfilename).await {
+                Ok(path) => path,
+                Err(e) if HuggingFaceProvider::is_missing_content_range_error(&e) => {
+                    // hf-hub requires Content-Range for its size probe. Some HF mirrors return a
+                    // complete 200 OK body instead, so retry this file without Range headers.
+                    warn!(
+                        "Hugging Face range metadata missing for '{}' from model '{}'; retrying with full-body download",
+                        sib.rfilename, model_name
+                    );
+                    HuggingFaceProvider::download_full_body_file(
+                        &pinned_repo.url(&sib.rfilename),
+                        &cache_dir,
+                        &model_name,
+                        &info.sha,
+                        &sib.rfilename,
+                        token.as_deref(),
+                    )
+                    .await
+                    .map_err(|fallback_error| {
+                        anyhow::anyhow!(
+                            "Failed to download file '{sib}' from model '{model_name}': {e}; full-body fallback also failed: {fallback_error:#}",
+                            sib = sib.rfilename,
+                            model_name = model_name,
+                            e = e
+                        )
+                    })?
                 }
                 Err(e) => {
                     // HTTP 416 (Range Not Satisfiable) occurs for empty files (0 bytes)
@@ -270,7 +422,10 @@ impl ModelProviderTrait for HuggingFaceProvider {
                         e = e
                     ));
                 }
-            }
+            };
+
+            p = path;
+            files_downloaded = true;
         }
 
         if !files_downloaded {
@@ -292,7 +447,7 @@ impl ModelProviderTrait for HuggingFaceProvider {
     /// Returns Ok(()) if the model was successfully deleted or didn't exist
     async fn delete_model(&self, model_name: &str, cache_dir: PathBuf) -> Result<()> {
         info!("Deleting model from Hugging Face cache: {model_name}");
-        let token = env::var(HF_TOKEN_ENV_VAR).ok();
+        let token = envs::hf_token();
         let api = ApiBuilder::from_env()
             .with_token(token)
             .with_cache_dir(cache_dir.clone())
@@ -400,7 +555,7 @@ impl ModelProviderTrait for HuggingFaceProvider {
         }
 
         // Check against the latest commit hash from HF
-        let token = env::var(HF_TOKEN_ENV_VAR).ok();
+        let token = envs::hf_token();
         let api = ApiBuilder::from_env().with_token(token).build()?;
         let repo = api.model(model_name.to_string());
         let info = repo.info().await.map_err(|e| {
@@ -503,7 +658,8 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let hf_endpoint_guard = EnvVarGuard::set(env_lock, "HF_ENDPOINT", &server.uri());
+            let hf_endpoint_guard =
+                EnvVarGuard::set(env_lock, crate::envs::HF_ENDPOINT, &server.uri());
 
             Self {
                 _server: server,
@@ -550,6 +706,75 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
+    async fn test_download_accepts_full_body_response_without_content_range() {
+        let env_lock = acquire_env_mutex();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let server = MockServer::start().await;
+        let model_name = "test/model";
+        let file_contents = b"license";
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/models/test/model(?:/.*)?$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                 "id": model_name,
+                 "sha": "def5678",
+                 "siblings": [
+                     {"rfilename": "LICENSE"}
+                 ]
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/test/model/resolve/main/LICENSE$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"license-etag\"")
+                    .insert_header("x-repo-commit", "def5678")
+                    .insert_header("accept-ranges", "bytes")
+                    .insert_header("content-length", file_contents.len().to_string())
+                    .set_body_bytes(file_contents.to_vec()),
+            )
+            .expect(1)
+            .named("hf-hub range probe without content-range")
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/test/model/resolve/def5678/LICENSE$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"license-etag\"")
+                    .insert_header("x-repo-commit", "def5678")
+                    .insert_header("accept-ranges", "bytes")
+                    .insert_header("content-length", file_contents.len().to_string())
+                    .set_body_bytes(file_contents.to_vec()),
+            )
+            .expect(1)
+            .named("commit-pinned full-body fallback")
+            .mount(&server)
+            .await;
+
+        let _hf_endpoint_guard = EnvVarGuard::set(&env_lock, "HF_ENDPOINT", &server.uri());
+
+        let snapshot = HuggingFaceProvider
+            .download_model(model_name, Some(temp_dir.path().to_path_buf()), false)
+            .await
+            .expect("Download should accept full-body responses");
+
+        assert_eq!(
+            fs::read(snapshot.join("LICENSE")).expect("Expected downloaded file"),
+            file_contents
+        );
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("models--test--model/refs/main"))
+                .expect("Expected cache ref"),
+            "def5678"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn test_delete_model_prefers_explicit_cache_dir_over_env() {
         let env_lock = acquire_env_mutex();
         let mock_server = MockHFServer::new(&env_lock).await;
@@ -584,9 +809,13 @@ mod tests {
         );
 
         let env_cache_path = env_cache.path().to_str().expect("Expected env cache path");
-        let _model_express_cache_guard =
-            EnvVarGuard::set(&env_lock, MODEL_EXPRESS_CACHE_ENV_VAR, env_cache_path);
-        let _hf_hub_cache_guard = EnvVarGuard::set(&env_lock, HF_HUB_CACHE_ENV_VAR, env_cache_path);
+        let _model_express_cache_guard = EnvVarGuard::set(
+            &env_lock,
+            crate::envs::MODEL_EXPRESS_CACHE_DIRECTORY,
+            env_cache_path,
+        );
+        let _hf_hub_cache_guard =
+            EnvVarGuard::set(&env_lock, crate::envs::HF_HUB_CACHE, env_cache_path);
 
         let delete_result = provider
             .delete_model("test/model", explicit_cache.path().to_path_buf())
@@ -653,9 +882,13 @@ mod tests {
             .await;
 
         let temp_cache_path = temp_cache.path().to_str().expect("Expected cache path");
-        let _model_express_cache_guard =
-            EnvVarGuard::set(&env_lock, MODEL_EXPRESS_CACHE_ENV_VAR, temp_cache_path);
-        let _hf_endpoint_guard = EnvVarGuard::set(&env_lock, "HF_ENDPOINT", &server.uri());
+        let _model_express_cache_guard = EnvVarGuard::set(
+            &env_lock,
+            crate::envs::MODEL_EXPRESS_CACHE_DIRECTORY,
+            temp_cache_path,
+        );
+        let _hf_endpoint_guard =
+            EnvVarGuard::set(&env_lock, crate::envs::HF_ENDPOINT, &server.uri());
 
         let result = provider
             .delete_model(model_name, temp_cache.path().to_path_buf())
@@ -772,7 +1005,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let _hf_endpoint_guard = EnvVarGuard::set(&env_lock, "HF_ENDPOINT", &server.uri());
+        let _hf_endpoint_guard =
+            EnvVarGuard::set(&env_lock, crate::envs::HF_ENDPOINT, &server.uri());
 
         let provider = HuggingFaceProvider;
         let result = provider
@@ -789,17 +1023,17 @@ mod tests {
     fn test_is_offline_mode() {
         let env_lock = acquire_env_mutex();
         {
-            let _offline_guard = EnvVarGuard::set(&env_lock, HF_HUB_OFFLINE_ENV_VAR, "1");
+            let _offline_guard = EnvVarGuard::set(&env_lock, crate::envs::HF_HUB_OFFLINE, "1");
             assert!(is_offline_mode());
         }
 
         {
-            let _offline_guard = EnvVarGuard::set(&env_lock, HF_HUB_OFFLINE_ENV_VAR, "0");
+            let _offline_guard = EnvVarGuard::set(&env_lock, crate::envs::HF_HUB_OFFLINE, "0");
             assert!(!is_offline_mode());
         }
 
         {
-            let _offline_guard = EnvVarGuard::remove(&env_lock, HF_HUB_OFFLINE_ENV_VAR);
+            let _offline_guard = EnvVarGuard::remove(&env_lock, crate::envs::HF_HUB_OFFLINE);
             assert!(!is_offline_mode());
         }
     }
@@ -816,7 +1050,7 @@ mod tests {
             .join("abc1234");
         std::fs::create_dir_all(&snapshots_path).expect("Failed to create directory");
 
-        let _offline_guard = EnvVarGuard::set(&env_lock, HF_HUB_OFFLINE_ENV_VAR, "1");
+        let _offline_guard = EnvVarGuard::set(&env_lock, crate::envs::HF_HUB_OFFLINE, "1");
 
         let result = HuggingFaceProvider
             .download_model("test/model", Some(temp_dir.path().into()), false)
@@ -832,7 +1066,7 @@ mod tests {
         let env_lock = acquire_env_mutex();
         let temp_dir = TempDir::new().expect("Failed to create temporary directory");
 
-        let _offline_guard = EnvVarGuard::set(&env_lock, HF_HUB_OFFLINE_ENV_VAR, "1");
+        let _offline_guard = EnvVarGuard::set(&env_lock, crate::envs::HF_HUB_OFFLINE, "1");
 
         let result = HuggingFaceProvider
             .download_model("nonexistent/model", Some(temp_dir.path().into()), false)

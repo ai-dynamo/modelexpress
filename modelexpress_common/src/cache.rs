@@ -73,7 +73,7 @@ impl CacheConfig {
         }
 
         // Try environment variable
-        if let Ok(path) = env::var("MODEL_EXPRESS_CACHE_DIRECTORY") {
+        if let Some(path) = crate::envs::cache_directory() {
             return Self::from_path(path);
         }
 
@@ -216,10 +216,7 @@ impl CacheConfig {
 
     /// Get default server endpoint
     fn get_default_server_endpoint() -> String {
-        normalize_grpc_endpoint(
-            env::var("MODEL_EXPRESS_SERVER_ENDPOINT")
-                .unwrap_or_else(|_| format!("http://localhost:{}", constants::DEFAULT_GRPC_PORT)),
-        )
+        normalize_grpc_endpoint(crate::envs::server_endpoint_or_default())
     }
 
     /// Get configuration file path

@@ -46,6 +46,9 @@ impl ModelMetadataSpec {
             Ok(MxSourceType::TorchCompileCache) => "torch_compile_cache",
             Ok(MxSourceType::TritonCache) => "triton_cache",
             Ok(MxSourceType::DeepGemmCache) => "deep_gemm_cache",
+            Ok(MxSourceType::TilelangCache) => "tilelang_cache",
+            Ok(MxSourceType::CuteDslCache) => "cute_dsl_cache",
+            Ok(MxSourceType::FlashinferCache) => "flashinfer_cache",
             Err(_) => "unknown",
         }
         .to_string()
@@ -119,6 +122,10 @@ pub struct WorkerStatus {
     #[serde(rename = "workerGrpcEndpoint", default)]
     pub worker_grpc_endpoint: String,
 
+    /// Runtime accelerator family for compatibility filtering.
+    #[serde(default)]
+    pub accelerator: String,
+
     /// Small discovery summary for file-backed artifact sources.
     #[serde(rename = "artifactSource", default)]
     pub artifact_source: Option<ArtifactSourceStatus>,
@@ -143,6 +150,10 @@ pub struct ArtifactSourceStatus {
     /// Number of transfer chunks in the sealed artifact manifest.
     #[serde(rename = "chunkCount")]
     pub chunk_count: u32,
+
+    /// Distributed node rank that owns this node-scoped artifact.
+    #[serde(rename = "nodeRank", default)]
+    pub node_rank: u32,
 }
 
 impl WorkerStatus {
@@ -274,6 +285,18 @@ mod tests {
         assert_eq!(
             ModelMetadataSpec::source_type_name_from_proto(5),
             "deep_gemm_cache"
+        );
+        assert_eq!(
+            ModelMetadataSpec::source_type_name_from_proto(6),
+            "tilelang_cache"
+        );
+        assert_eq!(
+            ModelMetadataSpec::source_type_name_from_proto(7),
+            "cute_dsl_cache"
+        );
+        assert_eq!(
+            ModelMetadataSpec::source_type_name_from_proto(8),
+            "flashinfer_cache"
         );
         assert_eq!(
             ModelMetadataSpec::source_type_name_from_proto(99),

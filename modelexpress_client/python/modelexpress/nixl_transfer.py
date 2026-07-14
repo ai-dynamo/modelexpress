@@ -21,7 +21,12 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from . import envs
 from . import ucx_utils
+from .accelerators import (
+    AcceleratorBackend,
+    CudaAcceleratorBackend,
+)
 from .types import ManifestMismatchError, TensorDescriptor
 
 if TYPE_CHECKING:
@@ -42,7 +47,6 @@ except ImportError:
 
 SUPPORTED_NIXL_BACKENDS = ("UCX", "LIBFABRIC")
 DEFAULT_NIXL_BACKEND = "UCX"
-NIXL_ACCELERATOR_MEM_TYPE = "VRAM"
 NIXL_DRAM_MEM_TYPE = "DRAM"
 
 
@@ -56,7 +60,7 @@ def _resolve_nixl_backend() -> str:
 
     Defaults to UCX. Set MX_NIXL_BACKEND=LIBFABRIC on AWS EFA.
     """
-    raw = os.environ.get("MX_NIXL_BACKEND", DEFAULT_NIXL_BACKEND).strip().upper()
+    raw = envs.MX_NIXL_BACKEND
     if raw not in SUPPORTED_NIXL_BACKENDS:
         raise ValueError(
             f"MX_NIXL_BACKEND={raw!r} is not supported. "
@@ -71,7 +75,7 @@ def _pool_reg_enabled() -> bool:
     MX_POOL_REG=1 enables it; default is per-tensor registration. Read at
     call time so tests can toggle the env var without re-importing.
     """
-    return os.environ.get("MX_POOL_REG", "0") == "1"
+    return envs.MX_POOL_REG
 
 
 class NixlTransferManager:
@@ -89,10 +93,17 @@ class NixlTransferManager:
         device_id: GPU device ID for this worker
     """
 
-    def __init__(self, agent_name: str, device_id: int, listen_port: int | None = None):
+    def __init__(
+        self,
+        agent_name: str,
+        device_id: int,
+        listen_port: int | None = None,
+        accelerator_backend: AcceleratorBackend | None = None,
+    ):
         self._agent_name = agent_name
         self._device_id = device_id
         self._listen_port = listen_port
+        self._accelerator_backend = accelerator_backend or CudaAcceleratorBackend()
 
         self._backend = _resolve_nixl_backend()
         self._backends = [self._backend]
@@ -135,13 +146,13 @@ class NixlTransferManager:
         if self._agent is not None:
             return
 
-        torch.cuda.set_device(self._device_id)
+        self._accelerator_backend.set_device(self._device_id)
 
         # Let UCX auto-detect transports (RoCE, TCP, etc).
         # OMPI_MCA_pml=ob1 keeps MPI on TCP independently.
         # Only override UCX_TLS if explicitly set to "tcp" (legacy compat).
-        saved_ucx_tls = os.environ.get("UCX_TLS")
-        nixl_ucx_tls = os.environ.get("NIXL_UCX_TLS")
+        saved_ucx_tls = envs.UCX_TLS
+        nixl_ucx_tls = envs.NIXL_UCX_TLS
         if nixl_ucx_tls:
             os.environ["UCX_TLS"] = nixl_ucx_tls
             logger.info(f"NIXL UCX_TLS override: {nixl_ucx_tls} (was: {saved_ucx_tls})")
@@ -177,7 +188,7 @@ class NixlTransferManager:
         finally:
             if saved_ucx_tls is not None:
                 os.environ["UCX_TLS"] = saved_ucx_tls
-            elif "UCX_TLS" in os.environ:
+            elif envs.is_set("UCX_TLS"):
                 os.environ.pop("UCX_TLS")
 
     def _build_tensor_descriptors(
@@ -256,7 +267,15 @@ class NixlTransferManager:
         # Phase 1: Discover CUDA allocation boundaries (if pool reg enabled)
         alloc_discovery_start = time.perf_counter()
         if _pool_reg_enabled():
-            allocations = self._find_cuda_allocations(tensor_descriptors)
+            if self._accelerator_backend.supports_pool_reg():
+                allocations = self._find_cuda_allocations(tensor_descriptors)
+            else:
+                allocations = None
+                logger.warning(
+                    "MX_POOL_REG=1 set but %s does not support pool "
+                    "registration; using per-tensor registration",
+                    self._accelerator_backend.name,
+                )
         else:
             allocations = None
             logger.info("Pool registration disabled (MX_POOL_REG != '1'), using per-tensor registration")
@@ -271,7 +290,7 @@ class NixlTransferManager:
             ]
             self._agent.register_memory(
                 alloc_tuples,
-                mem_type=NIXL_ACCELERATOR_MEM_TYPE,
+                mem_type=self._accelerator_backend.nixl_mem_type,
                 backends=self._backends,
             )
             reg_count = len(allocations)
@@ -343,10 +362,18 @@ class NixlTransferManager:
             )
             return self.register_tensors(tensors)
 
+        if not self._accelerator_backend.supports_vmm():
+            logger.warning(
+                "%s does not support VMM arena registration; falling back "
+                "to per-tensor registration",
+                self._accelerator_backend.name,
+            )
+            return self.register_tensors(tensors)
+
         nixl_reg_start = time.perf_counter()
         self._agent.register_memory(
             [(base, used, self._device_id, "")],
-            mem_type=NIXL_ACCELERATOR_MEM_TYPE,
+            mem_type=self._accelerator_backend.nixl_mem_type,
             backends=self._backends,
         )
         nixl_reg_time = time.perf_counter() - nixl_reg_start
@@ -491,7 +518,7 @@ class NixlTransferManager:
             raise RuntimeError("NIXL agent not initialized")
 
         start_time = time.perf_counter()
-        torch.cuda.set_device(self._device_id)
+        self._accelerator_backend.set_device(self._device_id)
 
         if remote_agent_name is None:
             add_start = time.perf_counter()
@@ -542,6 +569,19 @@ class NixlTransferManager:
         matched_tensors = len(remote_descs)
         match_time = time.perf_counter() - match_start
 
+        # Name-set diff between the source manifest and the locally registered
+        # tensors.
+        src_names = {s.name for s in source_tensors}
+        local_only = sorted(set(self._tensors) - src_names)
+        source_only = sorted(src_names - set(self._tensors))
+        if local_only or source_only:
+            logger.warning(
+                "Tensor name mismatch between source manifest and local "
+                "registration: %d local-only, %d source-only",
+                len(local_only),
+                len(source_only),
+            )
+
         if not remote_descs:
             logger.warning("No matching tensors found for transfer")
             return 0, 0, 0.0
@@ -556,13 +596,13 @@ class NixlTransferManager:
         src_prepped = self._agent.prep_xfer_dlist(
             agent_name=remote_agent_name,
             xfer_list=remote_descs,
-            mem_type=NIXL_ACCELERATOR_MEM_TYPE,
+            mem_type=self._accelerator_backend.nixl_mem_type,
             backends=self._backends,
         )
         dst_prepped = self._agent.prep_xfer_dlist(
             agent_name="",
             xfer_list=local_descs,
-            mem_type=NIXL_ACCELERATOR_MEM_TYPE,
+            mem_type=self._accelerator_backend.nixl_mem_type,
             backends=self._backends,
         )
         prep_time = time.perf_counter() - prep_start
@@ -597,9 +637,9 @@ class NixlTransferManager:
                 raise RuntimeError(f"Transfer failed with status {status}")
             time.sleep(0.001)
 
-        # CRITICAL: Synchronize CUDA to ensure RDMA writes are visible.
-        # GPUDirect RDMA writes bypass CUDA streams, so we must sync.
-        torch.cuda.synchronize(self._device_id)
+        # CRITICAL: Synchronize the device to ensure RDMA writes are visible.
+        # GPUDirect RDMA writes bypass torch streams, so we must sync.
+        self._accelerator_backend.synchronize(self._device_id)
 
         duration = time.perf_counter() - start_time
         bandwidth_gbps = (total_bytes * 8) / (duration * 1e9) if duration > 0 else 0.0

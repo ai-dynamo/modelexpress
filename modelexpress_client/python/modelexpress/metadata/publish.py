@@ -6,14 +6,14 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 from typing import TYPE_CHECKING
 
 import grpc
 import torch
 
-from .heartbeat import HeartbeatThread
+from .. import envs
+from .publisher import PublisherThread
 from .payload import tensor_source_metadata
 from ..client import MxClient
 from .. import p2p_pb2
@@ -32,8 +32,12 @@ PUBLISH_METADATA_RETRYABLE_STATUS_CODES = {
 }
 
 # Global storage for heartbeat threads and worker servers, keyed by device_id.
-_heartbeat_threads: dict[int, HeartbeatThread] = {}
+_heartbeat_threads: dict[int, PublisherThread] = {}
 _worker_servers: dict[int, "WorkerGrpcServer"] = {}  # P2P mode only
+
+
+def _get_worker_server(device_id: int) -> "WorkerGrpcServer | None":
+    return _worker_servers.get(device_id)
 
 
 def build_source_identity(
@@ -82,7 +86,7 @@ def _resolve_model_revision(model_config) -> str:
        identity fields only, and decentralized deployments lose the
        bit-identical guarantee).
     """
-    override = os.environ.get("MX_MODEL_REVISION", "")
+    override = envs.MX_MODEL_REVISION
     if override:
         return override
     revision = getattr(model_config, "revision", None)
@@ -116,10 +120,11 @@ def publish_metadata_and_ready(
     device_id: int,
     identity: "p2p_pb2.SourceIdentity",
     worker_id: str,
+    accelerator: str = "cuda",
 ) -> None:
-    """Publish tensor metadata and ready flag to the ModelExpress server."""
+    """Prepare tensor metadata publication and start the publisher thread."""
     logger.info(
-        f"[Worker {worker_rank}] Publishing {len(tensors)} tensors for model '{identity.model_name}'"
+        f"[Worker {worker_rank}] Preparing {len(tensors)} tensors for model '{identity.model_name}'"
     )
 
     tensor_protos = build_tensor_protos(tensors, device_id, worker_rank)
@@ -127,32 +132,26 @@ def publish_metadata_and_ready(
     if _is_p2p_metadata_enabled(mx_client):
         from .worker_server import WorkerGrpcServer
 
+        if nixl_manager._listen_port is None:
+            raise RuntimeError(
+                "P2P metadata exchange requires a NIXL listen port, "
+                "but the NIXL manager was initialized without one."
+            )
+
         host = _get_worker_host()
 
-        grpc_base = int(os.environ.get("MX_WORKER_GRPC_PORT", "6555"))
+        grpc_base = envs.MX_WORKER_GRPC_PORT
         worker_grpc_port = grpc_base + device_id
-
-        worker = p2p_pb2.WorkerMetadata(
-            worker_rank=worker_rank,
-            metadata_endpoint=f"{host}:{nixl_manager._listen_port}",
-            agent_name=nixl_manager.agent_name,
-            worker_grpc_endpoint="",
-        )
-        mx_source_id = _publish_metadata_to_server(
-            mx_client=mx_client,
-            identity=identity,
-            worker=worker,
-            worker_id=worker_id,
-            worker_rank=worker_rank,
-        )
 
         grpc_server = WorkerGrpcServer(
             tensor_protos=tensor_protos,
-            mx_source_id=mx_source_id,
+            mx_source_id=None,
             port=worker_grpc_port,
             metadata_endpoint=f"{host}:{nixl_manager._listen_port}",
             agent_name=nixl_manager.agent_name,
             worker_rank=worker_rank,
+            accelerator=accelerator,
+            worker_id=worker_id,
         )
         actual_port = grpc_server.start()
         _worker_servers[device_id] = grpc_server
@@ -162,45 +161,68 @@ def publish_metadata_and_ready(
             metadata_endpoint=f"{host}:{nixl_manager._listen_port}",
             agent_name=nixl_manager.agent_name,
             worker_grpc_endpoint=f"{host}:{actual_port}",
+            accelerator=accelerator,
         )
-        mx_source_id = _publish_metadata_to_server(
-            mx_client=mx_client,
-            identity=identity,
-            worker=worker,
-            worker_id=worker_id,
-            worker_rank=worker_rank,
-        )
-        logger.info(
-            f"[Worker {worker_rank}] Published P2P metadata to MX server "
-            f"(mx_source_id={mx_source_id}, worker_grpc={host}:{actual_port})"
-        )
+
+        def publish_fn() -> str:
+            mx_source_id = _publish_metadata_to_server(
+                mx_client=mx_client,
+                identity=identity,
+                worker=worker,
+                worker_id=worker_id,
+                worker_rank=worker_rank,
+            )
+            grpc_server.set_mx_source_id(mx_source_id)
+            logger.info(
+                f"[Worker {worker_rank}] Published P2P metadata to MX server "
+                f"(mx_source_id={mx_source_id}, worker_grpc={host}:{actual_port})"
+            )
+            return mx_source_id
+
+        def cleanup_fn() -> None:
+            if _worker_servers.get(device_id) is grpc_server:
+                _worker_servers.pop(device_id, None)
+            grpc_server.stop()
     else:
+        # Dual-write the legacy `tensors` field alongside `tensor_source`.
+        # Server builds predating the `tensor_source` oneof read only
+        # `tensors`; without it they store 0 tensors and targets fall back to
+        # disk. The server does the same dual-write on its WorkerRecord ->
+        # WorkerMetadata round-trip.
         worker = p2p_pb2.WorkerMetadata(
             worker_rank=worker_rank,
             nixl_metadata=nixl_manager.nixl_metadata,
+            tensors=tensor_protos,
             tensor_source=tensor_source_metadata(tensor_protos),
-        )
-        mx_source_id = _publish_metadata_to_server(
-            mx_client=mx_client,
-            identity=identity,
-            worker=worker,
-            worker_id=worker_id,
-            worker_rank=worker_rank,
-        )
-        logger.info(
-            f"[Worker {worker_rank}] Published metadata to MX server "
-            f"(mx_source_id={mx_source_id}, worker_id={worker_id})"
+            accelerator=accelerator,
         )
 
-    heartbeat = HeartbeatThread(
+        def publish_fn() -> str:
+            mx_source_id = _publish_metadata_to_server(
+                mx_client=mx_client,
+                identity=identity,
+                worker=worker,
+                worker_id=worker_id,
+                worker_rank=worker_rank,
+            )
+            logger.info(
+                f"[Worker {worker_rank}] Published metadata to MX server "
+                f"(mx_source_id={mx_source_id}, worker_id={worker_id})"
+            )
+            return mx_source_id
+
+        cleanup_fn = None
+
+    publisher = PublisherThread(
         mx_client=mx_client,
-        mx_source_id=mx_source_id,
         worker_id=worker_id,
         worker_rank=worker_rank,
         nixl_manager=nixl_manager,
+        publish_fn=publish_fn,
+        cleanup_fn=cleanup_fn,
     )
-    heartbeat.start()
-    _heartbeat_threads[worker_rank] = heartbeat
+    publisher.start()
+    _heartbeat_threads[worker_rank] = publisher
 
 
 def _publish_metadata_to_server(
@@ -249,15 +271,14 @@ def _is_p2p_metadata_enabled(mx_client) -> bool:
     function returns True for them unconditionally.
 
     For backends that DON'T force it (``MxClient`` backed by the
-    central server), the ``MX_P2P_METADATA`` env var controls
-    whether the source publishes lightweight pointers (and serves
-    the full metadata itself) or full metadata to the server.
+    central server), P2P metadata is enabled by default. Set
+    ``MX_P2P_METADATA=0`` to publish full metadata to the server.
     """
     # Strict identity check against True so MagicMock's auto-attribute
     # (and any other non-literal truthy value) doesn't accidentally
     # force the P2P path in tests or misconfigured clients.
     if getattr(mx_client, "REQUIRES_P2P_METADATA", False) is True:
-        env_value = os.environ.get("MX_P2P_METADATA", "")
+        env_value = envs.MX_P2P_METADATA
         if env_value not in ("", "1"):
             logger.warning(
                 "MX_P2P_METADATA=%r is ignored for backend %s which "
@@ -265,7 +286,7 @@ def _is_p2p_metadata_enabled(mx_client) -> bool:
                 env_value, type(mx_client).__name__,
             )
         return True
-    return os.environ.get("MX_P2P_METADATA", "0") == "1"
+    return envs.MX_P2P_METADATA == "1"
 
 
 def _get_worker_host() -> str:
@@ -275,7 +296,7 @@ def _get_worker_host() -> str:
     Falls back to FQDN. Rejects localhost variants.
     """
     import socket
-    explicit = os.environ.get("MX_WORKER_HOST", "")
+    explicit = envs.MX_WORKER_HOST
     if explicit:
         return explicit
     try:

@@ -55,22 +55,41 @@ MX_SERVER_REMOTE_PORT = 8000
 SOURCE_JOB_NAME = "mx-source"
 
 
-def _list_ready_sources(stub: "p2p_pb2_grpc.P2pServiceStub") -> list:
-    """Return every READY source the server knows about.
+def _list_ready_sources_by_kind(
+    stub: "p2p_pb2_grpc.P2pServiceStub",
+) -> tuple[list, list]:
+    """Return READY sources split into weight and artifact metadata.
 
     No identity filter on purpose: the server's `list_sources` computes
     `mx_source_id` as a SHA256 over all 11 identity fields (model_name,
     tp/pp/ep size, dtype, revision, mx_version, …) and compares against
     that hash. A partial identity from outside the engine doesn't produce
     a matching hash, so the only honest "all sources for this test" query
-    is one with no identity set — relying on status_filter and the test
-    namespace's single-tenant invariant (one source pod per run).
+    is one with no identity set. Artifact transfer publishes additional READY
+    metadata in the same namespace, so classify both source kinds explicitly.
     """
     request = p2p_pb2.ListSourcesRequest(
         status_filter=p2p_pb2.SOURCE_STATUS_READY,
     )
     response = stub.ListSources(request, timeout=30)
-    return list(response.instances)
+    weight_sources = []
+    artifact_sources = []
+    for source in response.instances:
+        metadata = stub.GetMetadata(
+            p2p_pb2.GetMetadataRequest(
+                mx_source_id=source.mx_source_id,
+                worker_id=source.worker_id,
+            ),
+            timeout=30,
+        )
+        payload = metadata.worker.WhichOneof("source_payload")
+        if not metadata.found:
+            continue
+        if payload == "artifact_source":
+            artifact_sources.append(source)
+        else:
+            weight_sources.append(source)
+    return weight_sources, artifact_sources
 
 
 def test_stale_metadata_excluded_after_heartbeat_timeout(
@@ -98,28 +117,42 @@ def test_stale_metadata_excluded_after_heartbeat_timeout(
         channel = grpc.insecure_channel(f"localhost:{port}")
         stub = p2p_pb2_grpc.P2pServiceStub(channel)
 
-        live = _list_ready_sources(stub)
-        print(f"[before-kill] {len(live)} READY source(s): {[s.worker_id for s in live]}")
-        assert len(live) == 1, (
-            f"Expected exactly 1 READY source before kill, got {len(live)}. "
+        live_weights, live_artifacts = _list_ready_sources_by_kind(stub)
+        print(
+            f"[before-kill] {len(live_weights)} READY weight source(s): "
+            f"{[s.worker_id for s in live_weights]}; "
+            f"{len(live_artifacts)} READY artifact source(s): "
+            f"{[s.worker_id for s in live_artifacts]}"
+        )
+        assert len(live_weights) == 1, (
+            f"Expected exactly 1 READY weight source before kill, got {len(live_weights)}. "
             f"This means the source either never published or there are leftover "
             f"sources from a previous test run."
         )
 
-        # Force-delete the source Job (not just its pod). Deleting only the
-        # pod via label would leave the Job controller active — it would
-        # spawn a replacement pod that re-publishes metadata, defeating the
-        # whole point of the test. --cascade=foreground makes kubectl wait
-        # for the child pod to terminate before considering the Job deleted.
-        # --grace-period=0 simulates sudden death (no graceful shutdown =
-        # the modelexpress client can't deregister itself with the server,
-        # which is exactly the failure mode the reaper is supposed to handle).
-        result = subprocess.run(
-            ["kubectl", "-n", namespace, "delete", "job", SOURCE_JOB_NAME,
-             "--grace-period=0", "--cascade=foreground", "--timeout=30s"],
-            capture_output=True, text=True, check=True, timeout=60,
+        # Delete the Job so the controller cannot spawn a replacement, then
+        # force-delete its pod. Do not wait for foreground cascading: on busy
+        # vCluster runs, pod termination can outlive kubectl's timeout even
+        # though the source process is already stopping, which is enough for
+        # this heartbeat-staleness test.
+        job_delete = subprocess.run(
+            [
+                "kubectl", "-n", namespace, "delete", "job", SOURCE_JOB_NAME,
+                "--cascade=orphan", "--ignore-not-found", "--wait=false",
+            ],
+            capture_output=True, text=True, check=True, timeout=30,
         )
-        print(f"[kill] {result.stdout.strip()}")
+        pod_delete = subprocess.run(
+            [
+                "kubectl", "-n", namespace, "delete", "pod",
+                "-l", f"job-name={SOURCE_JOB_NAME}",
+                "--grace-period=0", "--force",
+                "--ignore-not-found", "--wait=false",
+            ],
+            capture_output=True, text=True, check=True, timeout=30,
+        )
+        print(f"[kill-job] {job_delete.stdout.strip()}")
+        print(f"[kill-pod] {pod_delete.stdout.strip()}")
 
         # Wait for the heartbeat-timeout + one reaper scan + a buffer scan.
         # The reaper polls on a fixed interval, so a missed deadline can
@@ -130,11 +163,22 @@ def test_stale_metadata_excluded_after_heartbeat_timeout(
         )
         time.sleep(wait_secs)
 
-        stale = _list_ready_sources(stub)
-        print(f"[after-wait] {len(stale)} READY source(s): {[s.worker_id for s in stale]}")
-        assert len(stale) == 0, (
-            f"Expected 0 READY sources after {wait_secs}s with no live source, "
-            f"got {len(stale)}: {[s.worker_id for s in stale]}. "
+        stale_weights, stale_artifacts = _list_ready_sources_by_kind(stub)
+        print(
+            f"[after-wait] {len(stale_weights)} READY weight source(s): "
+            f"{[s.worker_id for s in stale_weights]}; "
+            f"{len(stale_artifacts)} READY artifact source(s): "
+            f"{[s.worker_id for s in stale_artifacts]}"
+        )
+        assert len(stale_weights) == 0, (
+            f"Expected 0 READY weight sources after {wait_secs}s with no live source, "
+            f"got {len(stale_weights)}: {[s.worker_id for s in stale_weights]}. "
             f"The reaper failed to transition the dead source from READY → STALE "
+            f"within the configured heartbeat window."
+        )
+        assert len(stale_artifacts) == 0, (
+            f"Expected 0 READY artifact sources after {wait_secs}s with no live source, "
+            f"got {len(stale_artifacts)}: {[s.worker_id for s in stale_artifacts]}. "
+            f"The reaper failed to transition artifact sources from READY → STALE "
             f"within the configured heartbeat window."
         )

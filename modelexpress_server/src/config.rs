@@ -21,27 +21,27 @@ pub struct ServerArgs {
     pub config: Option<PathBuf>,
 
     /// Server port
-    #[arg(short, long, env = "MODEL_EXPRESS_SERVER_PORT")]
+    #[arg(short, long, env = modelexpress_common::envs::MODEL_EXPRESS_SERVER_PORT)]
     pub port: Option<NonZeroU16>,
 
     /// Server host address
-    #[arg(long, env = "MODEL_EXPRESS_SERVER_HOST")]
+    #[arg(long, env = modelexpress_common::envs::MODEL_EXPRESS_SERVER_HOST)]
     pub host: Option<String>,
 
     /// Log level
-    #[arg(short, long, env = "MODEL_EXPRESS_LOG_LEVEL", value_enum)]
+    #[arg(short, long, env = modelexpress_common::envs::MODEL_EXPRESS_LOG_LEVEL, value_enum)]
     pub log_level: Option<LogLevel>,
 
     /// Log format
-    #[arg(long, env = "MODEL_EXPRESS_LOG_FORMAT", value_enum)]
+    #[arg(long, env = modelexpress_common::envs::MODEL_EXPRESS_LOG_FORMAT, value_enum)]
     pub log_format: Option<LogFormat>,
 
     /// Cache directory path
-    #[arg(long, env = "MODEL_EXPRESS_CACHE_DIRECTORY")]
+    #[arg(long, env = modelexpress_common::envs::MODEL_EXPRESS_CACHE_DIRECTORY)]
     pub cache_directory: Option<PathBuf>,
 
     /// Enable cache eviction
-    #[arg(long, env = "MODEL_EXPRESS_CACHE_EVICTION_ENABLED")]
+    #[arg(long, env = modelexpress_common::envs::MODEL_EXPRESS_CACHE_EVICTION_ENABLED)]
     pub cache_eviction_enabled: Option<bool>,
 
     /// Validate configuration and exit
@@ -144,7 +144,11 @@ impl ServerConfig {
             }
         } else {
             // Use layered config loading with fallbacks to defaults
-            load_layered_config(args.config.clone(), "MODEL_EXPRESS", Self::default())?
+            load_layered_config(
+                args.config.clone(),
+                modelexpress_common::envs::MODEL_EXPRESS_PREFIX,
+                Self::default(),
+            )?
         };
 
         // Apply command line overrides (same for both modes)

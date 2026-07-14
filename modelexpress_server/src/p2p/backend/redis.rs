@@ -238,6 +238,9 @@ struct WorkerRecordJson {
     /// P2P: Worker gRPC endpoint for tensor manifest
     #[serde(default)]
     pub worker_grpc_endpoint: String,
+    /// Runtime accelerator family for compatibility filtering.
+    #[serde(default)]
+    pub accelerator: String,
     /// Small discovery summary for file-backed artifact sources.
     #[serde(default)]
     pub artifact_source: Option<ArtifactSourceMetadataJson>,
@@ -254,6 +257,8 @@ struct ArtifactSourceMetadataJson {
     pub total_size: u64,
     pub file_count: u32,
     pub chunk_count: u32,
+    #[serde(default)]
+    pub node_rank: u32,
 }
 
 impl WorkerRecordJson {
@@ -279,6 +284,7 @@ impl WorkerRecordJson {
             metadata_endpoint: record.metadata_endpoint,
             agent_name: record.agent_name,
             worker_grpc_endpoint: record.worker_grpc_endpoint,
+            accelerator: record.accelerator,
             artifact_source: record.artifact_source.map(ArtifactSourceMetadataJson::from),
         }
     }
@@ -299,6 +305,7 @@ impl From<WorkerRecordJson> for WorkerRecord {
             metadata_endpoint: json.metadata_endpoint,
             agent_name: json.agent_name,
             worker_grpc_endpoint: json.worker_grpc_endpoint,
+            accelerator: json.accelerator,
             artifact_source: json.artifact_source.map(ArtifactSourceMetadataRecord::from),
         }
     }
@@ -311,6 +318,7 @@ impl From<ArtifactSourceMetadataRecord> for ArtifactSourceMetadataJson {
             total_size: record.total_size,
             file_count: record.file_count,
             chunk_count: record.chunk_count,
+            node_rank: record.node_rank,
         }
     }
 }
@@ -322,6 +330,7 @@ impl From<ArtifactSourceMetadataJson> for ArtifactSourceMetadataRecord {
             total_size: json.total_size,
             file_count: json.file_count,
             chunk_count: json.chunk_count,
+            node_rank: json.node_rank,
         }
     }
 }
@@ -531,11 +540,11 @@ impl MetadataBackend for RedisBackend {
                     }
                 }
 
-                let (status, updated_at) = fields
+                let (status, updated_at, accelerator) = fields
                     .get(&worker_rank.to_string())
                     .and_then(|v| serde_json::from_str::<WorkerRecordJson>(v).ok())
-                    .map(|j| (j.status, j.updated_at))
-                    .unwrap_or((0, 0));
+                    .map(|j| (j.status, j.updated_at, j.accelerator))
+                    .unwrap_or((0, 0, String::new()));
 
                 result.push(super::SourceInstanceInfo {
                     source_id: sid.clone(),
@@ -544,6 +553,7 @@ impl MetadataBackend for RedisBackend {
                     worker_rank,
                     status,
                     updated_at,
+                    accelerator,
                 });
             }
         }
@@ -718,11 +728,13 @@ mod tests {
             metadata_endpoint: String::new(),
             agent_name: String::new(),
             worker_grpc_endpoint: String::new(),
+            accelerator: "cuda".to_string(),
             artifact_source: Some(ArtifactSourceMetadataRecord {
                 artifact_id: "artifact123".to_string(),
                 total_size: 1_099_511_627_776,
                 file_count: 7,
                 chunk_count: 128,
+                node_rank: 2,
             }),
         };
 
@@ -736,6 +748,7 @@ mod tests {
         assert_eq!(back.status, record.status);
         assert_eq!(back.updated_at, record.updated_at);
         assert_eq!(back.tensors.len(), 1);
+        assert_eq!(back.accelerator, record.accelerator);
         assert_eq!(back.artifact_source, record.artifact_source);
         assert!(
             json.contains(r#""total_size":"#),

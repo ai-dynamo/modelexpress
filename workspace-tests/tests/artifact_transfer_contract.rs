@@ -81,6 +81,7 @@ fn artifact_payload_does_not_publish_weight_tensors() {
             total_size: 1_099_511_627_776,
             file_count: 42,
             chunk_count: 4096,
+            node_rank: 2,
         })),
         ..Default::default()
     };
@@ -99,6 +100,7 @@ fn artifact_payload_does_not_publish_weight_tensors() {
     assert_eq!(artifact.total_size, 1_099_511_627_776);
     assert_eq!(artifact.file_count, 42);
     assert_eq!(artifact.chunk_count, 4096);
+    assert_eq!(artifact.node_rank, 2);
 
     let back: WorkerMetadata = record.into();
     assert!(back.tensors.is_empty());
@@ -107,6 +109,7 @@ fn artifact_payload_does_not_publish_weight_tensors() {
         Some(SourcePayload::ArtifactSource(ref artifact))
             if artifact.artifact_id == "artifact-manifest"
                 && artifact.total_size == 1_099_511_627_776
+                && artifact.node_rank == 2
                 && artifact.file_count == 42
                 && artifact.chunk_count == 4096
     ));
@@ -181,6 +184,18 @@ fn k8s_metadata_contract_carries_artifact_source_type_and_summary() {
         ModelMetadataSpec::source_type_name_from_proto(MxSourceType::DeepGemmCache as i32),
         "deep_gemm_cache"
     );
+    assert_eq!(
+        ModelMetadataSpec::source_type_name_from_proto(MxSourceType::TilelangCache as i32),
+        "tilelang_cache"
+    );
+    assert_eq!(
+        ModelMetadataSpec::source_type_name_from_proto(MxSourceType::CuteDslCache as i32),
+        "cute_dsl_cache"
+    );
+    assert_eq!(
+        ModelMetadataSpec::source_type_name_from_proto(MxSourceType::FlashinferCache as i32),
+        "flashinfer_cache"
+    );
 
     let worker = WorkerStatus {
         worker_rank: 0,
@@ -191,6 +206,7 @@ fn k8s_metadata_contract_carries_artifact_source_type_and_summary() {
             total_size: 1_099_511_627_776,
             file_count: 42,
             chunk_count: 4096,
+            node_rank: 2,
         }),
         ..Default::default()
     };
@@ -202,4 +218,5 @@ fn k8s_metadata_contract_carries_artifact_source_type_and_summary() {
     assert_eq!(json["artifactSource"]["totalSize"], 1_099_511_627_776_u64);
     assert_eq!(json["artifactSource"]["fileCount"], 42);
     assert_eq!(json["artifactSource"]["chunkCount"], 4096);
+    assert_eq!(json["artifactSource"]["nodeRank"], 2);
 }

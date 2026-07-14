@@ -1,0 +1,147 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Single-node SGLang deployment with ModelExpress P2P weight transfer over
+# Mooncake TransferEngine.
+#
+# Prerequisites:
+#   - ModelExpress server deployed (see ../../server/)
+#   - SGLang image built with:
+#       docker build -f examples/p2p_transfer_k8s/client/sglang/Dockerfile \
+#         --build-arg INSTALL_MOONCAKE=true \
+#         -t <your-registry>/sglang-modelexpress-mooncake:latest .
+#   - PVC with model weights pre-downloaded
+#   - kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-sglang-transfer-engine
+  labels:
+    app: mx-sglang-transfer-engine
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8000
+      targetPort: 8000
+      name: http
+  selector:
+    app: mx-sglang-transfer-engine
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-sglang-transfer-engine
+  labels:
+    app: mx-sglang-transfer-engine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mx-sglang-transfer-engine
+  template:
+    metadata:
+      labels:
+        app: mx-sglang-transfer-engine
+    spec:
+      containers:
+        - name: sglang
+          # Build an SGLang + ModelExpress + Mooncake image using
+          # examples/p2p_transfer_k8s/client/sglang/Dockerfile with
+          # --build-arg INSTALL_MOONCAKE=true.
+          image: <your-registry>/sglang-modelexpress-mooncake:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          command:
+            - python3
+            - -m
+            - sglang.launch_server
+          args:
+            - --model-path
+            - $(MODEL_NAME)
+            # SGLang defaults to 127.0.0.1:30000; bind the advertised Service port.
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "8000"
+            - --load-format
+            - remote_instance
+            - --remote-instance-weight-loader-backend
+            - modelexpress
+            - --modelexpress-config
+            - '{"transport":"transfer_engine"}'
+            - --tp-size
+            - "8"
+            - --context-length
+            - "128000"
+            - --reasoning-parser
+            - kimi_k2
+            - --trust-remote-code
+          ports:
+            - containerPort: 8000
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            timeoutSeconds: 10
+          env:
+            - name: HF_HOME
+              value: "/models"
+            - name: MODEL_NAME
+              value: "nvidia/Kimi-K2.5-NVFP4"
+            - name: MX_SERVER_ADDRESS
+              value: "modelexpress-server:8001"
+            - name: MX_CONTIGUOUS_REG
+              value: "0"
+            - name: MX_RDMA_NIC_PIN
+              value: "auto"
+            # Optional: pin Mooncake to a specific RDMA device if auto-discovery
+            # is not correct for the target node pool.
+            # - name: MOONCAKE_DEVICE
+            #   value: "mlx5_0"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_LOG_LEVEL
+              value: "INFO"
+            - name: UCX_RNDV_SCHEME
+              value: "get_zcopy"
+            - name: UCX_RNDV_THRESH
+              value: "0"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          resources:
+            limits:
+              cpu: "64"
+              memory: 1200Gi
+              nvidia.com/gpu: "8"
+              rdma/ib: "8"
+            requests:
+              cpu: "64"
+              memory: 1200Gi
+              nvidia.com/gpu: "8"
+              rdma/ib: "8"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: model-cache
+              mountPath: /models
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 512Gi
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule

@@ -16,11 +16,13 @@ Environment variables:
 from __future__ import annotations
 
 import logging
-import os
 import time
 from typing import Any
 
 import torch
+
+from . import envs
+from .accelerators import AcceleratorBackend
 
 logger = logging.getLogger("modelexpress.gds_transfer")
 
@@ -92,15 +94,16 @@ class GdsTransferManager:
     a single NIXL transfer so GDS_MT threads work in parallel.
 
     Usage as context manager:
-        with GdsTransferManager(agent_name="mx-gds-0") as gds:
+        with GdsTransferManager(agent_name="mx-gds-0", accelerator_backend=backend) as gds:
             gds.batch_load_file(fd, file_size, tensor_list, device)
     """
 
-    def __init__(self, agent_name: str):
+    def __init__(self, agent_name: str, accelerator_backend: AcceleratorBackend):
         self._agent_name = agent_name
         self._device_id: int | None = None
         self._agent: Any = None
-        override = os.environ.get("MX_GDS_MAX_CHUNK_KB")
+        self._accelerator_backend = accelerator_backend
+        override = envs.MX_GDS_MAX_CHUNK_KB
         self._max_chunk_size = int(override) * 1024 if override else _DEFAULT_MAX_CHUNK
 
     def __enter__(self) -> GdsTransferManager:
@@ -124,9 +127,9 @@ class GdsTransferManager:
         if self._agent is not None:
             return
 
-        self._device_id = torch.cuda.current_device()
+        self._device_id = self._accelerator_backend.current_device()
 
-        thread_count = int(os.environ.get("MX_GDS_THREADS", "8"))
+        thread_count = envs.MX_GDS_THREADS
         config = NixlAgentConfig(backends=["GDS_MT"], num_threads=thread_count)
         self._agent = NixlAgent(self._agent_name, config)
 
@@ -202,7 +205,7 @@ class GdsTransferManager:
             raise RuntimeError("GDS batch transfer failed")
 
         # Phase 4: Wait for completion
-        timeout = float(os.environ.get("MX_GDS_TIMEOUT", "120"))
+        timeout = envs.MX_GDS_TIMEOUT
         t0 = time.perf_counter()
         spins = 0
         while True:

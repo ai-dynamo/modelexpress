@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import logging
-import random
 import time
 from typing import TYPE_CHECKING
 
@@ -16,10 +15,11 @@ import torch.nn as nn
 from ... import p2p_pb2
 from ...load_strategy import LoadContext, LoadStrategyChain
 from ...load_strategy.context import LoadResult
-from ...metadata.heartbeat import HeartbeatThread
+from ...metadata.publisher import PublisherThread
 from ...metadata.payload import tensor_source_metadata, worker_tensor_descriptors
 from ...metadata.publish import _heartbeat_threads
 from ...nixl_transfer import NixlTransferManager
+from ...source_selection import get_configured_selector
 from .adapter import build_sglang_load_context
 
 logger = logging.getLogger("modelexpress.engines.sglang.loader")
@@ -217,7 +217,19 @@ class MxModelLoader:
         candidates = [
             inst for inst in response.instances if inst.worker_rank == ctx.worker_rank
         ]
-        random.shuffle(candidates)
+        # The nixl transport (and vLLM) order sources in the shared
+        # RdmaStrategy; this is SGLang's separate transfer_engine path, which
+        # discovers sources itself, so it applies the same selector here.
+        selector = get_configured_selector()
+        candidates = selector.order(candidates, ctx)
+        logger.info(
+            "[Worker %s] TransferEngine source selection: source_selector=%s "
+            "source_candidates_total=%d source_candidates_rank_matched=%d",
+            ctx.global_rank,
+            selector.name,
+            len(response.instances),
+            len(candidates),
+        )
         for source_ref in candidates:
             metadata = ctx.mx_client.get_metadata(
                 mx_source_id=source_ref.mx_source_id,
@@ -324,6 +336,7 @@ class MxModelLoader:
                 worker_rank=ctx.worker_rank,
                 transfer_engine_session_id=session_id,
                 tensor_source=tensor_source_metadata(tensors),
+                accelerator=ctx.accelerator_backend.name,
             )
         except Exception:
             logger.exception(
@@ -367,7 +380,7 @@ class MxModelLoader:
             )
             return False
         try:
-            heartbeat = HeartbeatThread(
+            heartbeat = PublisherThread(
                 mx_client=ctx.mx_client,
                 mx_source_id=mx_source_id,
                 worker_id=ctx.worker_id,

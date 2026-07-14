@@ -6,20 +6,20 @@
 from __future__ import annotations
 
 import logging
-import os
 import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, ClassVar
 
-import torch
 import torch.nn as nn
 
+from .. import envs
 from ..nixl_transfer import is_nixl_available
 from ..tensor_utils import log_tensor_summary
 from ..metadata.publish import publish_metadata_and_ready
 from .context import LoadContext, LoadResult
 
 if TYPE_CHECKING:
+    from ..accelerators import AcceleratorBackend
     from ..nixl_transfer import NixlTransferManager
 
 logger = logging.getLogger("modelexpress.load_strategy")
@@ -82,7 +82,11 @@ class LoadStrategy(ABC):
 
 
 def _init_nixl_manager(
-    global_rank: int, device_id: int, role: str, listen_port: int = 0,
+    global_rank: int,
+    device_id: int,
+    role: str,
+    listen_port: int = 0,
+    accelerator_backend: AcceleratorBackend | None = None,
 ) -> NixlTransferManager:
     """Create and initialize a NIXL transfer manager."""
     from ..nixl_transfer import NixlTransferManager
@@ -93,6 +97,7 @@ def _init_nixl_manager(
         agent_name=agent_name,
         device_id=device_id,
         listen_port=listen_port,
+        accelerator_backend=accelerator_backend,
     )
     manager.initialize()
     logger.debug(f"[Worker {global_rank}] NIXL manager initialized")
@@ -107,7 +112,7 @@ def _as_load_result(result_or_model: LoadResult | nn.Module) -> LoadResult:
 
 def _metadata_publication_configured(ctx: LoadContext) -> bool:
     """Return whether this worker has a metadata path for P2P serving."""
-    server_addr = os.environ.get("MODEL_EXPRESS_URL") or os.environ.get("MX_SERVER_ADDRESS")
+    server_addr = envs.MODEL_EXPRESS_URL or envs.MX_SERVER_ADDRESS
     if server_addr:
         return True
     return getattr(ctx.mx_client, "REQUIRES_P2P_METADATA", False) is True
@@ -178,10 +183,14 @@ def register_tensors(
             log_tensor_summary(ctx.tensors, ctx.global_rank, "Registering tensors")
 
         if ctx.nixl_manager is None:
-            base_port = int(os.environ.get("MX_METADATA_PORT", "5555"))
+            base_port = envs.MX_METADATA_PORT
             listen_port = base_port + ctx.device_id
             ctx.nixl_manager = _init_nixl_manager(
-                ctx.global_rank, ctx.device_id, "auto", listen_port
+                ctx.global_rank,
+                ctx.device_id,
+                "auto",
+                listen_port,
+                ctx.accelerator_backend,
             )
 
         if not ctx.nixl_manager.tensor_descriptors:
@@ -223,6 +232,7 @@ def publish_metadata(ctx: LoadContext) -> None:
         publish_metadata_and_ready(
             ctx.mx_client, ctx.nixl_manager, ctx.tensors,
             ctx.worker_rank, ctx.device_id, ctx.identity, ctx.worker_id,
+            accelerator=ctx.accelerator_backend.name,
         )
     except Exception as e:
         logger.warning(

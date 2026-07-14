@@ -4,10 +4,12 @@
 """Tests for the vLLM engine adapter."""
 
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
+import torch.nn as nn
 
 from modelexpress.engines.vllm.adapter import (
     VllmAdapter,
@@ -15,6 +17,7 @@ from modelexpress.engines.vllm.adapter import (
     _get_vllm_worker_rank,
     build_vllm_load_context,
 )
+from modelexpress.load_strategy.context import LoadResult
 
 
 def _vllm_config(*, rank: int, tp_size: int, pp_size: int):
@@ -24,6 +27,14 @@ def _vllm_config(*, rank: int, tp_size: int, pp_size: int):
             tensor_parallel_size=tp_size,
             pipeline_parallel_size=pp_size,
         )
+    )
+
+
+@pytest.fixture(autouse=True)
+def _stub_accelerator_backend_selection(monkeypatch, mock_accelerator_backend_cls):
+    monkeypatch.setattr(
+        "modelexpress.engines.vllm.adapter.accelerator_backend_for",
+        lambda device: mock_accelerator_backend_cls(),
     )
 
 
@@ -77,16 +88,41 @@ def test_vllm_device_id_uses_current_platform_device(monkeypatch):
     assert _get_vllm_device_id(torch.device("cuda")) == 2
 
 
-def test_vllm_is_cuda_alike_uses_current_platform(monkeypatch):
+def test_vllm_is_cuda_alike_uses_current_platform(
+    monkeypatch,
+    mock_accelerator_backend_cls,
+):
     fake_platforms = SimpleNamespace(
         current_platform=SimpleNamespace(
             is_cuda_alike=lambda: True,
         ),
     )
     monkeypatch.setitem(sys.modules, "vllm.platforms", fake_platforms)
+    monkeypatch.setattr(
+        "modelexpress.engines.vllm.adapter.accelerator_backend_for",
+        lambda device: mock_accelerator_backend_cls(),
+    )
     adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
 
     assert adapter.is_cuda_alike() is True
+
+
+def test_vllm_adapter_discovery_uses_backend_predicate(
+    monkeypatch,
+    mock_accelerator_backend_cls,
+):
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    monkeypatch.setattr(
+        "modelexpress.engines.vllm.adapter.accelerator_backend_for",
+        lambda device: backend,
+    )
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    model = nn.Module()
+    model.weight = nn.Parameter(torch.randn(4, 3))
+
+    tensors = adapter.discover_tensors(SimpleNamespace(model=model))
+
+    assert list(tensors) == ["weight"]
 
 
 def test_build_vllm_load_context_uses_current_platform_for_bare_cuda(monkeypatch):
@@ -113,6 +149,58 @@ def test_build_vllm_load_context_keeps_explicit_cuda_index(monkeypatch):
     assert ctx.device_id == ctx.target_device.index
 
 
+def test_build_vllm_load_context_uses_node_rank_as_node_rank(monkeypatch):
+    _stub_metadata_client(monkeypatch)
+    vllm_config = _context_config(load_device="cuda:0")
+    vllm_config.parallel_config.node_rank = 1
+
+    ctx = build_vllm_load_context(vllm_config, _model_config())
+
+    assert ctx.node_rank == 1
+
+
+def test_before_rdma_receive_runs_model_specific_finalizers(monkeypatch):
+    events = []
+
+    def process_weights_after_loading(model, model_config, target_device):
+        events.append(("process", target_device))
+
+    _stub_vllm_process_weights_after_loading(monkeypatch, process_weights_after_loading)
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    model = _TopLevelModel(events)
+
+    result = adapter.before_rdma_receive(LoadResult(value=model, model=model))
+
+    assert result.model is model
+    assert events == [
+        ("finalize", "model", "finalize_mega_moe_weights"),
+        ("process", torch.device("cpu")),
+    ]
+
+
+def test_finalize_model_specific_weights_requires_model():
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+
+    with pytest.raises(RuntimeError, match="RDMA post-load processing"):
+        adapter._finalize_model_specific_weights(LoadResult(value=object()))
+
+
+def test_after_weight_iter_load_does_not_rerun_model_specific_finalizers(monkeypatch):
+    events = []
+
+    def process_weights_after_loading(model, model_config, target_device):
+        events.append(("process", target_device))
+
+    _stub_vllm_process_weights_after_loading(monkeypatch, process_weights_after_loading)
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    model = _TopLevelModel(events)
+
+    result = adapter.after_weight_iter_load(LoadResult(value=model, model=model))
+
+    assert result.model is model
+    assert events == [("process", torch.device("cpu"))]
+
+
 def _stub_vllm_current_device(monkeypatch, *, current_device: int) -> None:
     fake_platforms = SimpleNamespace(
         current_platform=SimpleNamespace(
@@ -120,6 +208,22 @@ def _stub_vllm_current_device(monkeypatch, *, current_device: int) -> None:
         ),
     )
     monkeypatch.setitem(sys.modules, "vllm.platforms", fake_platforms)
+
+
+def _stub_vllm_process_weights_after_loading(monkeypatch, process_fn) -> None:
+    packages = [
+        "vllm",
+        "vllm.model_executor",
+        "vllm.model_executor.model_loader",
+    ]
+    for name in packages:
+        module = ModuleType(name)
+        module.__path__ = []
+        monkeypatch.setitem(sys.modules, name, module)
+
+    utils = ModuleType("vllm.model_executor.model_loader.utils")
+    utils.process_weights_after_loading = process_fn
+    monkeypatch.setitem(sys.modules, utils.__name__, utils)
 
 
 def _stub_metadata_client(monkeypatch) -> None:
@@ -148,3 +252,55 @@ def _model_config():
         quantization=None,
         revision=None,
     )
+
+
+class _TopLevelModel(torch.nn.Module):
+    def __init__(self, events):
+        super().__init__()
+        self.model = _MegaMoeModel(events)
+        self.standalone = _StandaloneFinalizer(events)
+
+
+class _MegaMoeModel(torch.nn.Module):
+    def __init__(self, events):
+        super().__init__()
+        self.events = events
+        self.layer = _MegaMoeLayer(events)
+
+    def finalize_mega_moe_weights(self) -> None:
+        self.events.append(("finalize", "model", "finalize_mega_moe_weights"))
+
+
+class _MegaMoeLayer(torch.nn.Module):
+    def __init__(self, events):
+        super().__init__()
+        self.events = events
+
+    def finalize_mega_moe_weights(self) -> None:
+        self.events.append(("finalize", "layer", "finalize_mega_moe_weights"))
+
+
+class _StandaloneFinalizer(torch.nn.Module):
+    def __init__(self, events):
+        super().__init__()
+        self.events = events
+
+    def finalize_weights(self) -> None:
+        self.events.append(("finalize", "standalone", "finalize_weights"))
+
+    def finalize_weight(self) -> None:
+        self.events.append(("finalize", "standalone", "finalize_weight"))
+
+    def post_load_weights(self) -> None:
+        self.events.append(("finalize", "standalone", "post_load_weights"))
+
+    def finalize_cache(self) -> None:
+        self.events.append(("finalize", "standalone", "finalize_cache"))
+
+    def finalize_cache_weights(self) -> None:
+        self.events.append(("finalize", "standalone", "finalize_cache_weights"))
+
+    def finalize_requires_arg_weights(self, context) -> None:
+        self.events.append(
+            ("finalize", "standalone", "finalize_requires_arg_weights", context)
+        )

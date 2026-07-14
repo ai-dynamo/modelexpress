@@ -13,16 +13,23 @@ For ModelStreamer-only examples that load from Azure Blob Storage, S3, or a loca
 
 ## vLLM Deployments
 
+The vLLM image is pinned to 0.23.0. These manifests use vLLM's native `modelexpress` load format and do not require `VLLM_PLUGINS`.
+
 | Topology | Manifest | Model | Configuration |
 |----------|----------|-------|---------------|
-| **Single-node** | [`vllm/vllm-single-node.yaml`](vllm/vllm-single-node.yaml) | Llama-3.1-405B-Instruct | TP=8, 1 node (8 GPUs) |
-| **Multi-node** | [`vllm/vllm-multi-node.yaml`](vllm/vllm-multi-node.yaml) | Kimi-K2.5-NVFP4 | TP=4, PP=2, 2 nodes (8 GPUs) |
+| **Single-node** | [`vllm/vllm-single-node.yaml`](vllm/vllm-single-node.yaml) | DeepSeek-V4-Pro | TP=8, P2P weights + JIT caches |
+| **Multi-node** | [`vllm/vllm-multi-node.yaml`](vllm/vllm-multi-node.yaml) | DeepSeek-V4-Pro | TP=4, PP=2, P2P weights + JIT caches |
 
 ## SGLang Deployments
 
 | Topology | Manifest | Model | Configuration |
 |----------|----------|-------|---------------|
-| **Single-node** | [`sglang/sglang-single-node-p2p.yaml`](sglang/sglang-single-node-p2p.yaml) | Kimi-K2.5-NVFP4 | TP=8, 1 node (8 GPUs) |
+| **Single-node NIXL** | [`sglang/sglang-single-node-p2p.yaml`](sglang/sglang-single-node-p2p.yaml) | Kimi-K2.5-NVFP4 | TP=8, 1 node (8 GPUs) |
+| **Single-node Mooncake TransferEngine** | [`sglang/sglang-single-node-transfer-engine.yaml`](sglang/sglang-single-node-transfer-engine.yaml) | Kimi-K2.5-NVFP4 | TP=8, 1 node (8 GPUs) |
+
+The SGLang manifests use the same `remote_instance` command for the first and
+later replicas. `modelexpress-config` selects `nixl` or `transfer_engine`; the
+ModelExpress server endpoint is provided through `MX_SERVER_ADDRESS`.
 
 ## How It Works
 

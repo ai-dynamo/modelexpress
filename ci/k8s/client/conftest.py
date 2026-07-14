@@ -52,6 +52,17 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="Tensor-parallel size — the per-rank transfer test expects this many distinct ranks.",
     )
     parser.addoption(
+        "--dp-size",
+        default=_positive_int(os.environ.get("DP_SIZE", "1")),
+        type=_positive_int,
+        help=(
+            "Data-parallel size — DP replicas are interchangeable full copies "
+            "at the same worker_rank, so the per-rank transfer test accepts a "
+            "distinct-agent count anywhere in [tp_size, tp_size * dp_size] "
+            "instead of exactly tp_size. Defaults to 1 (pure TP / single copy)."
+        ),
+    )
+    parser.addoption(
         "--transport",
         default=os.environ.get("TRANSPORT", "nixl"),
         help=(
@@ -59,6 +70,26 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "NIXL agent assertion (add_remote_agent log lines). For "
             "'transfer_engine' (Mooncake) that assertion is skipped — the "
             "Mooncake path does not register NIXL agents."
+        ),
+    )
+    parser.addoption(
+        "--require-artifact-transfer",
+        action="store_true",
+        default=os.environ.get("REQUIRE_ARTIFACT_TRANSFER", "").lower() in {"1", "true", "yes"},
+        help="Assert that a vLLM artifact source was published and installed by the target.",
+    )
+    parser.addoption(
+        "--expected-artifact-sources",
+        default=_nonnegative_int(os.environ.get("EXPECTED_ARTIFACT_SOURCES", "0")),
+        type=_nonnegative_int,
+        help="Minimum ready non-weight artifact ModelMetadata CRs expected at pytest time.",
+    )
+    parser.addoption(
+        "--expected-artifact-source-types",
+        default=os.environ.get("EXPECTED_ARTIFACT_SOURCE_TYPES", ""),
+        help=(
+            "Comma-separated artifact sourceType values expected to be ready "
+            "and installed, for example 'torch_compile_cache,triton_cache'."
         ),
     )
     parser.addoption(
@@ -136,8 +167,29 @@ def tp_size(request: pytest.FixtureRequest) -> int:
 
 
 @pytest.fixture(scope="session")
+def dp_size(request: pytest.FixtureRequest) -> int:
+    return request.config.getoption("--dp-size")
+
+
+@pytest.fixture(scope="session")
 def transport(request: pytest.FixtureRequest) -> str:
     return request.config.getoption("--transport")
+
+
+@pytest.fixture(scope="session")
+def require_artifact_transfer(request: pytest.FixtureRequest) -> bool:
+    return request.config.getoption("--require-artifact-transfer")
+
+
+@pytest.fixture(scope="session")
+def expected_artifact_sources(request: pytest.FixtureRequest) -> int:
+    return request.config.getoption("--expected-artifact-sources")
+
+
+@pytest.fixture(scope="session")
+def expected_artifact_source_types(request: pytest.FixtureRequest) -> set[str]:
+    raw = request.config.getoption("--expected-artifact-source-types")
+    return {item.strip() for item in raw.split(",") if item.strip()}
 
 
 @pytest.fixture(scope="session")

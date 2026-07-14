@@ -19,9 +19,10 @@ runs after the load body returns.
 from __future__ import annotations
 
 import logging
-import os
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Iterator
+
+from .. import envs
 
 if TYPE_CHECKING:
     from ..load_strategy.context import LoadContext
@@ -103,7 +104,17 @@ def maybe_enter_vmm_arena(ctx: "LoadContext") -> Iterator[None]:
       allocation, not peak live size. With 16 TiB reserved, this is
       bounded only by HBM (we never exhaust VA).
     """
-    if os.environ.get("MX_VMM_ARENA") != "1":
+    if not envs.MX_VMM_ARENA:
+        yield
+        return
+
+    if not ctx.accelerator_backend.supports_vmm():
+        logger.warning(
+            "[Worker %d] MX_VMM_ARENA=1 set but %s does not support VMM "
+            "arena; falling back to the non-arena load path.",
+            ctx.global_rank,
+            ctx.accelerator_backend.name,
+        )
         yield
         return
 
@@ -114,7 +125,7 @@ def maybe_enter_vmm_arena(ctx: "LoadContext") -> Iterator[None]:
     # the old env vars forward from a pre-refactor manifest sees one
     # clear message rather than silent behavior change.
     for stale_var in ("MX_VMM_ARENA_BYTES", "MX_VMM_ARENA_CHUNK_BYTES"):
-        if os.environ.get(stale_var):
+        if envs.is_set(stale_var):
             logger.warning(
                 "[Worker %d] %s is set but no longer honored; the new VMM "
                 "arena reserves 16 TiB of VA unconditionally and uses one "

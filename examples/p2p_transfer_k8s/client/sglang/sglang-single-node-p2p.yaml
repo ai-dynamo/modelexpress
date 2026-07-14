@@ -66,7 +66,7 @@ spec:
             - --remote-instance-weight-loader-backend
             - modelexpress
             - --modelexpress-config
-            - '{"url":"$(MODEL_EXPRESS_URL)","transport":"nixl"}'
+            - '{"transport":"nixl"}'
             - --tp-size
             - "8"
             - --context-length
@@ -89,7 +89,7 @@ spec:
               value: "/models"
             - name: MODEL_NAME
               value: "nvidia/Kimi-K2.5-NVFP4"
-            - name: MODEL_EXPRESS_URL
+            - name: MX_SERVER_ADDRESS
               value: "modelexpress-server:8001"
             - name: MX_CONTIGUOUS_REG
               value: "0"

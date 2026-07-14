@@ -27,7 +27,6 @@ dependencies = [
     "grpcio>=1.66.2",
     "google-crc32c>=1.5.0",
     "huggingface_hub>=0.20.0",
-    "nixl[cu12]; sys_platform == 'linux'",
     "numpy>=1.24.0",
     "protobuf>=5.27.0,<6.0.0", # protobuf 5.x compatibility
     "pydantic>=2.0.0",
@@ -46,6 +45,11 @@ dev = [
 ]
 otel = [
     "opentelemetry-api>=1.20.0",
+]
+# Opt-in Prometheus metrics collector (MX_METRICS_ENABLED=1).
+# Lazily imported; not required for normal operation.
+metrics = [
+    "prometheus-client>=0.20.0",
 ]
 # Required for the VmmArena allocator (CudaVmmBackend uses cuMem* APIs).
 # The pure-Python VmmArena tests don't need it; CudaVmmBackend does.

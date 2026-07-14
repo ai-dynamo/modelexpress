@@ -13,6 +13,7 @@ import torch.nn as nn
 
 from .. import p2p_pb2
 from ..client import MxClientBase
+from ..accelerators import AcceleratorBackend, CudaAcceleratorBackend
 
 if TYPE_CHECKING:
     from ..adapter import EngineAdapter
@@ -60,7 +61,9 @@ class LoadContext:
     identity: p2p_pb2.SourceIdentity
     mx_client: MxClientBase
     worker_id: str
+    node_rank: int = 0
     adapter: EngineAdapter | None = None
+    accelerator_backend: AcceleratorBackend = field(default_factory=CudaAcceleratorBackend)
     nixl_manager: NixlTransferManager | None = None
     tensors: dict[str, torch.Tensor] = field(default_factory=dict)
     # When MX_VMM_ARENA=1, maybe_enter_vmm_arena populates this with the

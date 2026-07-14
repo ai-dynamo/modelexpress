@@ -8,6 +8,7 @@ from types import ModuleType
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -15,7 +16,6 @@ from modelexpress import p2p_pb2
 from modelexpress.engines.sglang.adapter import (
     SglangAdapter,
     build_sglang_load_context,
-    collect_sglang_tensors,
 )
 from modelexpress.engines.sglang.loader import MxModelLoader
 
@@ -44,6 +44,14 @@ def _device_config(**overrides):
     defaults = dict(device="cpu", gpu_id=0)
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
+
+
+@pytest.fixture(autouse=True)
+def _stub_accelerator_backend_selection(monkeypatch, mock_accelerator_backend_cls):
+    monkeypatch.setattr(
+        "modelexpress.engines.sglang.adapter.accelerator_backend_for",
+        lambda device: mock_accelerator_backend_cls(),
+    )
 
 
 def test_sglang_adapter_builds_identity_from_sglang_configs():
@@ -122,25 +130,53 @@ def test_sglang_is_cuda_alike_uses_sglang_platform_helper(monkeypatch):
     assert adapter.is_cuda_alike() is True
 
 
-def test_collect_sglang_tensors_preserves_non_contiguous_storage_names():
+def test_collect_sglang_tensors_preserves_non_contiguous_storage_names(
+    mock_accelerator_backend_cls,
+):
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    adapter.accelerator_backend = backend
     model = nn.Module()
     model.weight_t = nn.Parameter(torch.randn(4, 3).T)
 
-    tensors = collect_sglang_tensors(model)
+    tensors = adapter._collect_tensors(model)
 
     assert "weight_t.__storage" in tensors
     assert tensors["weight_t.__storage"].dtype == torch.uint8
 
 
-def test_collect_sglang_tensors_deduplicates_tied_parameters():
+def test_collect_sglang_tensors_deduplicates_tied_parameters(
+    mock_accelerator_backend_cls,
+):
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    adapter.accelerator_backend = backend
     model = nn.Module()
     shared = nn.Parameter(torch.randn(4, 3))
     model.first = shared
     model.second = shared
 
-    tensors = collect_sglang_tensors(model)
+    tensors = adapter._collect_tensors(model)
 
     assert list(tensors) == ["first"]
+
+
+def test_sglang_adapter_discovery_uses_backend_predicate(
+    monkeypatch,
+    mock_accelerator_backend_cls,
+):
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    monkeypatch.setattr(
+        "modelexpress.engines.sglang.adapter.accelerator_backend_for",
+        lambda device: backend,
+    )
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    model = nn.Module()
+    model.weight = nn.Parameter(torch.randn(4, 3))
+
+    tensors = adapter.discover_tensors(SimpleNamespace(model=model))
+
+    assert list(tensors) == ["weight"]
 
 
 def test_sglang_adapter_post_load_delegates_to_child_module():
@@ -157,7 +193,7 @@ def test_sglang_adapter_post_load_delegates_to_child_module():
     model = nn.Module()
     model.child = ChildModel()
 
-    adapter.after_rdma_receive(SimpleNamespace(model=model))
+    adapter._post_load_weights(SimpleNamespace(model=model))
 
     assert model.child.post_load_called
 
@@ -181,7 +217,7 @@ def test_sglang_adapter_post_load_prefers_top_level_hook():
     model = TopLevelModel()
     model.child.post_load_weights = child_post_load_weights
 
-    adapter.after_rdma_receive(SimpleNamespace(model=model))
+    adapter._post_load_weights(SimpleNamespace(model=model))
 
     assert model.post_load_called
     assert not model.child.post_load_called
@@ -457,6 +493,7 @@ def test_transfer_engine_publish_starts_non_nixl_heartbeat():
         device_id=1,
         identity=p2p_pb2.SourceIdentity(model_name="sglang-model"),
         mx_client=SimpleNamespace(),
+        accelerator_backend=SimpleNamespace(name="cuda"),
     )
     published = {}
 
@@ -473,7 +510,7 @@ def test_transfer_engine_publish_starts_non_nixl_heartbeat():
     ctx.mx_client.publish_metadata = publish_metadata
     ctx.mx_client.update_status = update_status
 
-    class FakeHeartbeat:
+    class FakePublisher:
         def __init__(self, **kwargs):
             published["heartbeat"] = kwargs
 
@@ -481,8 +518,8 @@ def test_transfer_engine_publish_starts_non_nixl_heartbeat():
             published["heartbeat_started"] = True
 
     with patch(
-        "modelexpress.engines.sglang.loader.HeartbeatThread",
-        FakeHeartbeat,
+        "modelexpress.engines.sglang.loader.PublisherThread",
+        FakePublisher,
     ):
         published_ok = loader._publish_transfer_engine_source(
             ctx=ctx,
@@ -492,6 +529,7 @@ def test_transfer_engine_publish_starts_non_nixl_heartbeat():
 
     assert published_ok
     assert published["worker"].transfer_engine_session_id == "te-session"
+    assert published["worker"].accelerator == "cuda"
     assert published["status"]["status"] == p2p_pb2.SOURCE_STATUS_READY
     assert published["heartbeat"]["nixl_manager"] is None
     assert published["heartbeat_started"]
@@ -505,6 +543,7 @@ def test_transfer_engine_publish_failure_is_non_fatal():
         worker_id="worker-id",
         device_id=1,
         identity=p2p_pb2.SourceIdentity(model_name="sglang-model"),
+        accelerator_backend=SimpleNamespace(name="cuda"),
         mx_client=SimpleNamespace(
             publish_metadata=lambda *args: (_ for _ in ()).throw(
                 RuntimeError("metadata down")
@@ -517,3 +556,110 @@ def test_transfer_engine_publish_failure_is_non_fatal():
         session_id="te-session",
         weight_info={"weight": (1000, 4, 2)},
     )
+
+
+# ---------------------------------------------------------------------------
+# _find_transfer_engine_source: source-selector wiring
+# ---------------------------------------------------------------------------
+
+
+def _te_ref(sid, wid, rank=0):
+    return p2p_pb2.SourceInstanceRef(
+        mx_source_id=sid, worker_id=wid, model_name="m", worker_rank=rank
+    )
+
+
+def _te_ctx(instances):
+    ctx = SimpleNamespace()
+    ctx.global_rank = 0
+    ctx.worker_rank = 0
+    ctx.worker_id = "tgt-0"
+    ctx.identity = SimpleNamespace(model_name="m")
+    ctx.mx_client = MagicMock()
+    ctx.mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(
+        instances=instances
+    )
+    return ctx
+
+
+def _te_meta(found=True, transfer_engine=False):
+    if not found:
+        return SimpleNamespace(found=False, worker=None)
+    worker = (
+        p2p_pb2.WorkerMetadata(worker_rank=0, transfer_engine_session_id="te")
+        if transfer_engine
+        else p2p_pb2.WorkerMetadata(worker_rank=0)
+    )
+    return SimpleNamespace(found=True, worker=worker)
+
+
+def test_te_find_source_filters_rank_and_returns_transfer_engine(monkeypatch):
+    monkeypatch.delenv("MX_P2P_SOURCE_SELECTOR", raising=False)
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+    ctx = _te_ctx(
+        [
+            _te_ref("s0aaaaaaaaaaaaaa", "w0", rank=0),
+            _te_ref("s1aaaaaaaaaaaaaa", "w1", rank=1),  # wrong rank -> filtered out
+            _te_ref("s2aaaaaaaaaaaaaa", "w2", rank=0),
+        ]
+    )
+    ctx.mx_client.get_metadata.side_effect = lambda mx_source_id, worker_id: _te_meta(
+        transfer_engine=(worker_id == "w2")
+    )
+
+    worker = loader._find_transfer_engine_source(ctx)
+    assert worker is not None
+    assert worker.WhichOneof("backend_metadata") == "transfer_engine_session_id"
+    queried = {c.kwargs["worker_id"] for c in ctx.mx_client.get_metadata.call_args_list}
+    assert "w1" not in queried  # rank-mismatched source never queried
+
+
+def test_te_find_source_iterates_in_selector_order_and_none_when_no_match(monkeypatch):
+    class _ReverseSelector:
+        name = "reverse"
+
+        def order(self, candidates, context):
+            return list(reversed(candidates))
+
+    monkeypatch.setattr(
+        "modelexpress.engines.sglang.loader.get_configured_selector",
+        lambda: _ReverseSelector(),
+    )
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+    ctx = _te_ctx([_te_ref(f"s{i}aaaaaaaaaaaaaa", f"w{i}", rank=0) for i in range(3)])
+    ctx.mx_client.get_metadata.side_effect = lambda mx_source_id, worker_id: _te_meta(
+        transfer_engine=False
+    )
+
+    # No transfer_engine source -> None, and iteration follows the selector order.
+    assert loader._find_transfer_engine_source(ctx) is None
+    order = [c.kwargs["worker_id"] for c in ctx.mx_client.get_metadata.call_args_list]
+    assert order == ["w2", "w1", "w0"]
+
+
+def test_te_find_source_skips_not_found(monkeypatch):
+    # Force identity order so w0 (not-found) is queried first and the
+    # `if not metadata.found: continue` branch is actually exercised.
+    class _IdentitySelector:
+        name = "identity"
+
+        def order(self, candidates, context):
+            return list(candidates)
+
+    monkeypatch.setattr(
+        "modelexpress.engines.sglang.loader.get_configured_selector",
+        lambda: _IdentitySelector(),
+    )
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+    ctx = _te_ctx(
+        [_te_ref("s0aaaaaaaaaaaaaa", "w0"), _te_ref("s1aaaaaaaaaaaaaa", "w1")]
+    )
+    ctx.mx_client.get_metadata.side_effect = lambda mx_source_id, worker_id: _te_meta(
+        found=(worker_id == "w1"), transfer_engine=(worker_id == "w1")
+    )
+    worker = loader._find_transfer_engine_source(ctx)
+    assert worker is not None
+    assert worker.WhichOneof("backend_metadata") == "transfer_engine_session_id"
+    assert [
+        c.kwargs["worker_id"] for c in ctx.mx_client.get_metadata.call_args_list
+    ] == ["w0", "w1"]

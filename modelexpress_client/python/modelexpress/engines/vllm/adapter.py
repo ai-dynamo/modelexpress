@@ -7,13 +7,14 @@ from __future__ import annotations
 
 import copy
 import logging
-import os
 import uuid
 from typing import TYPE_CHECKING, Iterator
 
 import torch
 
+from ... import envs
 from ...adapter import EngineAdapter
+from ...accelerators import accelerator_backend_for
 from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
 from ...metadata.publish import build_source_identity
@@ -21,6 +22,13 @@ from ...rank_utils import get_global_rank
 from ...tensor_utils import adopt_hidden_tensors, capture_tensor_attrs, collect_module_tensors
 
 logger = logging.getLogger("modelexpress.engines.vllm.adapter")
+
+_VLLM_POST_LOAD_FINALIZER_NAMES = (
+    # DeepSeek V4 finalizes MegaMoE expert layouts from load_weights().
+    # The RDMA target path uses vLLM's dummy loader, which bypasses the
+    # model load_weights() method, so mirror the model-level hook here.
+    "finalize_mega_moe_weights",
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -34,6 +42,7 @@ class VllmAdapter(EngineAdapter):
         self.model_config = model_config
         self.load_config = vllm_config.load_config
         self.target_device = self._resolve_target_device()
+        self.accelerator_backend = accelerator_backend_for(self.target_device)
 
     def build_identity(self):
         return build_source_identity(self.vllm_config, self.model_config)
@@ -58,8 +67,8 @@ class VllmAdapter(EngineAdapter):
     def discover_tensors(self, result: LoadResult) -> dict[str, torch.Tensor]:
         if result.model is None:
             raise RuntimeError("vLLM tensor discovery requires result.model")
-        adopt_hidden_tensors(result.model)
-        return collect_module_tensors(result.model)
+        adopt_hidden_tensors(result.model, self.accelerator_backend)
+        return collect_module_tensors(result.model, self.accelerator_backend)
 
     def prepare_rdma_target(self, result: LoadResult) -> LoadResult:
         if result.model is None:
@@ -76,6 +85,11 @@ class VllmAdapter(EngineAdapter):
         return result
 
     def before_rdma_receive(self, result: LoadResult) -> LoadResult:
+        # Native vLLM load_weights() runs model-specific finalizers before
+        # post-load processing. RDMA targets use the dummy loader, so run
+        # those hooks before receiving tensors to expose the same target
+        # tensor layout and hidden buffers that the source published.
+        result = self._finalize_model_specific_weights(result)
         return self._process_weights_after_loading(result)
 
     def apply_weight_iter(
@@ -135,7 +149,7 @@ class VllmAdapter(EngineAdapter):
         result.value = None
         result.model = None
         del old_value
-        torch.cuda.empty_cache()
+        self.accelerator_backend.empty_cache()
         self._reset_compilation_state()
         logger.info(
             "[Worker %s] Re-initializing vLLM model after failed strategy",
@@ -148,16 +162,60 @@ class VllmAdapter(EngineAdapter):
             )
         return LoadResult(value=model, model=model, publishable=result.publishable)
 
-    def _process_weights_after_loading(self, result: LoadResult) -> LoadResult:
+    def _process_weights_after_loading(
+        self,
+        result: LoadResult,
+    ) -> LoadResult:
         if result.model is None:
             raise RuntimeError("vLLM post-load processing requires result.model")
 
         from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
-        with capture_tensor_attrs():
+        with capture_tensor_attrs(self.accelerator_backend):
             process_weights_after_loading(
-                result.model, self.model_config, self.target_device,
+                result.model,
+                self.model_config,
+                self.target_device,
             )
+        return result
+
+    def _finalize_model_specific_weights(
+        self,
+        result: LoadResult,
+    ) -> LoadResult:
+        """Run model finalizers that vLLM normally calls in load_weights()."""
+
+        if result.model is None:
+            raise RuntimeError("vLLM RDMA post-load processing requires result.model")
+
+        finalized_prefixes: list[str] = []
+        with capture_tensor_attrs(self.accelerator_backend):
+            for name, module in result.model.named_modules():
+                # Some vLLM finalizers are model-level hooks that recursively
+                # transform child layers. If a parent ran one, do not call another
+                # matching hook on its descendants and risk duplicate repacking.
+                if any(
+                    _is_same_or_descendant(name, prefix)
+                    for prefix in finalized_prefixes
+                ):
+                    continue
+
+                module_finalized = False
+                for finalizer_name in _VLLM_POST_LOAD_FINALIZER_NAMES:
+                    finalizer = getattr(module, finalizer_name, None)
+                    if not callable(finalizer):
+                        continue
+
+                    logger.info(
+                        "Running vLLM model-specific post-load finalizer %s on %s",
+                        finalizer_name,
+                        name or type(module).__name__,
+                    )
+                    finalizer()
+                    module_finalized = True
+
+                if module_finalized:
+                    finalized_prefixes.append(name)
         return result
 
     def _resolve_target_device(self) -> torch.device:
@@ -188,7 +246,7 @@ class VllmAdapter(EngineAdapter):
         tp_size = getattr(self.vllm_config.parallel_config, "tensor_parallel_size", 1)
         return (
             tp_size > 1
-            and os.environ.get("MX_MS_DISTRIBUTED", "0").lower() in ("1", "true")
+            and envs.MX_MS_DISTRIBUTED
         )
 
 
@@ -197,6 +255,10 @@ def _set_load_config_extra_config(load_config, extra_config: dict) -> None:
         load_config.model_loader_extra_config = extra_config
     except AttributeError:
         object.__setattr__(load_config, "model_loader_extra_config", extra_config)
+
+
+def _is_same_or_descendant(name: str, prefix: str) -> bool:
+    return prefix == "" or name == prefix or name.startswith(f"{prefix}.")
 
 
 def _get_vllm_worker_rank(
@@ -245,5 +307,7 @@ def build_vllm_load_context(vllm_config, model_config) -> LoadContext:
         identity=adapter.build_identity(),
         mx_client=create_metadata_client(worker_rank=worker_rank),
         worker_id=uuid.uuid4().hex[:8],
+        node_rank=int(getattr(vllm_config.parallel_config, "node_rank", 0)),
         adapter=adapter,
+        accelerator_backend=adapter.accelerator_backend,
     )

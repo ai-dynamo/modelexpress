@@ -115,6 +115,18 @@ spec:
               value: "0"
             - name: MX_RDMA_NIC_PIN
               value: "auto"
+            # Substituted per-apply; both consuming actions default it to "1"
+            # (tensor manifest served on-demand: the source stands up a
+            # WorkerGrpcServer and serves the manifest on request), so an unset
+            # value == current behavior. The full-tensor-manifest jobs override
+            # to "0", where the source instead embeds the full tensor manifest
+            # in the WorkerMetadata proto it publishes.
+            - name: MX_P2P_METADATA
+              value: "${MX_P2P_METADATA}"
+            - name: MX_ARTIFACT_TRANSFER
+              value: "1"
+            - name: MX_ARTIFACT_READY_URL
+              value: "http://127.0.0.1:${WORKER_PORT}/health"
             - name: UCX_RNDV_SCHEME
               value: "get_zcopy"
             - name: UCX_RNDV_THRESH

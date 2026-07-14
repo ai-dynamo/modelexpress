@@ -57,6 +57,19 @@ def _make_instance_ref(mx_source_id="abc123def456abcd", worker_id="inst-1", mode
     )
 
 
+class _IdentitySelector:
+    """Deterministic passthrough selector: preserves input candidate order.
+
+    Replaces the old ``random.shuffle`` no-op patch so candidate ordering is
+    stable for assertions that depend on attempt order.
+    """
+
+    name = "random"
+
+    def order(self, candidates, context):
+        return list(candidates)
+
+
 class _FakeAdapter(EngineAdapter):
     def build_identity(self):
         return _make_identity()
@@ -274,6 +287,51 @@ class TestAbstractMethodCompleteness:
         finally:
             loader_mod._nixl_managers.pop(3, None)
             loader_mod._tensor_registry.pop(3, None)
+
+    def test_load_model_installs_and_schedules_vllm_artifacts(self):
+        loader = _make_loader()
+        model = MagicMock()
+        ctx = _make_load_context(device_id=3)
+        events = []
+
+        def install(ctx_arg):
+            assert ctx_arg is ctx
+            events.append("install")
+
+        def initialize_model(**_kwargs):
+            events.append("initialize")
+            return model
+
+        def run(model_arg, ctx_arg):
+            assert model_arg is model
+            assert ctx_arg is ctx
+            events.append("load")
+            return model_arg
+
+        def schedule(ctx_arg):
+            assert ctx_arg is ctx
+            events.append("schedule")
+
+        with patch(
+            "modelexpress.engines.vllm.loader.build_vllm_load_context",
+            return_value=ctx,
+        ), patch(
+            "modelexpress.engines.vllm.loader.install_vllm_cache_artifacts",
+            side_effect=install,
+        ), patch(
+            "modelexpress.engines.vllm.loader.initialize_model",
+            side_effect=initialize_model,
+        ), patch(
+            "modelexpress.engines.vllm.loader.LoadStrategyChain.run",
+            side_effect=run,
+        ), patch(
+            "modelexpress.engines.vllm.loader.schedule_vllm_cache_artifact_publish",
+            side_effect=schedule,
+        ):
+            loaded = loader.load_model(MagicMock(), MagicMock(dtype=torch.float32))
+
+        assert loaded is model.eval.return_value
+        assert events == ["install", "initialize", "load", "schedule"]
 
     def test_loader_import_does_not_register_mx(self, monkeypatch):
         import importlib
@@ -877,6 +935,28 @@ class TestRdmaStrategyAvailability:
         assert strategy.is_available(ctx) is False
 
     @patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True)
+    def test_unavailable_when_backend_lacks_rdma_p2p(
+        self, _mock, mock_accelerator_backend_cls
+    ):
+        strategy = self._make_strategy()
+        ctx = _make_load_context(
+            accelerator_backend=mock_accelerator_backend_cls(rdma_p2p=False)
+        )
+        with patch.dict("os.environ", {"MX_SERVER_ADDRESS": "server:8001"}):
+            assert strategy.is_available(ctx) is False
+
+    @patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True)
+    def test_available_when_backend_supports_rdma_p2p(
+        self, _mock, mock_accelerator_backend_cls
+    ):
+        strategy = self._make_strategy()
+        ctx = _make_load_context(
+            accelerator_backend=mock_accelerator_backend_cls(rdma_p2p=True)
+        )
+        with patch.dict("os.environ", {"MX_SERVER_ADDRESS": "server:8001"}):
+            assert strategy.is_available(ctx) is True
+
+    @patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True)
     def test_available_when_decentralized_backend_and_no_server_address(self, _mock):
         # Decentralized backends (REQUIRES_P2P_METADATA=True) don't need
         # a central server, so the "no server configured" gate shouldn't
@@ -939,7 +1019,7 @@ class TestFindSourceInstances:
             _make_instance_ref(worker_id="w-2", worker_rank=0),
         ]
         ctx.mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(instances=insts)
-        with patch("modelexpress.load_strategy.rdma_strategy.random.shuffle"):
+        with patch("modelexpress.load_strategy.rdma_strategy.get_configured_selector", return_value=_IdentitySelector()):
             result = strategy._find_source_instances(ctx)
         assert len(result) == 2
         assert all(r.worker_rank == 0 for r in result)
@@ -949,7 +1029,7 @@ class TestFindSourceInstances:
         ctx = _make_load_context()
         inst = _make_instance_ref()
         ctx.mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(instances=[inst])
-        with patch("modelexpress.load_strategy.rdma_strategy.random.shuffle"):
+        with patch("modelexpress.load_strategy.rdma_strategy.get_configured_selector", return_value=_IdentitySelector()):
             result = strategy._find_source_instances(ctx)
         assert len(result) == 1
         assert result[0].mx_source_id == inst.mx_source_id
@@ -1023,14 +1103,15 @@ class TestRdmaStrategyLoad:
         strategy, attempts = self._setup(ctx, candidates, [_make_metadata_resp(rank=0, worker_id="w-1")])
 
         with patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True), \
-             patch("modelexpress.load_strategy.rdma_strategy.random.shuffle"):
+             patch("modelexpress.load_strategy.rdma_strategy.get_configured_selector", return_value=_IdentitySelector()):
             result = strategy.load(MagicMock(), ctx)
 
         assert isinstance(result, LoadResult)
         assert attempts == ["w-1"]
 
-    def test_propagates_strategy_failed_after_target_mutation(self):
+    def test_transfer_failure_reinitializes_and_tries_next_source(self):
         ctx = _make_load_context()
+        ctx.adapter.reinit_for_retry = MagicMock(side_effect=lambda result: result)
         candidates = [
             _make_instance_ref(worker_id="w-1"),
             _make_instance_ref(worker_id="w-2"),
@@ -1043,12 +1124,12 @@ class TestRdmaStrategyLoad:
         )
 
         with patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True), \
-             patch("modelexpress.load_strategy.rdma_strategy.random.shuffle"):
-            with pytest.raises(StrategyFailed, match="transfer failed: w-1") as exc:
-                strategy.load(MagicMock(), ctx)
+             patch("modelexpress.load_strategy.rdma_strategy.get_configured_selector", return_value=_IdentitySelector()):
+            result = strategy.load(MagicMock(), ctx)
 
-        assert exc.value.mutated is True
-        assert attempts == ["w-1"]
+        assert isinstance(result, LoadResult)
+        assert attempts == ["w-1", "w-2"]
+        ctx.adapter.reinit_for_retry.assert_called_once()
 
     def test_raises_strategy_failed_when_no_candidates(self):
         ctx = _make_load_context()
@@ -1073,11 +1154,31 @@ class TestRdmaStrategyLoad:
         )
 
         with patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True), \
-             patch("modelexpress.load_strategy.rdma_strategy.random.shuffle"):
+             patch("modelexpress.load_strategy.rdma_strategy.get_configured_selector", return_value=_IdentitySelector()):
             with pytest.raises(StrategyFailed, match="No RDMA source succeeded") as exc:
                 strategy.load(MagicMock(), ctx)
 
         assert exc.value.mutated is False
+
+    def test_skips_mismatched_accelerator_before_target(
+        self,
+        mock_accelerator_backend_cls,
+    ):
+        ctx = _make_load_context(
+            accelerator_backend=mock_accelerator_backend_cls(name="xpu"),
+        )
+        source_resp = _make_metadata_resp(rank=0, worker_id="w-1")
+        source_resp.worker.accelerator = "cuda"
+        candidates = [_make_instance_ref(worker_id="w-1")]
+        strategy, attempts = self._setup(ctx, candidates, [source_resp])
+
+        with patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True), \
+             patch("modelexpress.load_strategy.rdma_strategy.get_configured_selector", return_value=_IdentitySelector()):
+            with pytest.raises(StrategyFailed, match="No RDMA source succeeded") as exc:
+                strategy.load(MagicMock(), ctx)
+
+        assert exc.value.mutated is False
+        assert attempts == []
 
     def test_load_as_target_marks_post_prepare_failure_as_mutated(self):
         from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
@@ -1118,7 +1219,7 @@ class TestRdmaStrategyLoad:
 
 
 class TestPublishMetadataAndReady:
-    def test_calls_publish_and_starts_heartbeat(self):
+    def test_starts_publisher_with_publish_fn(self):
         from modelexpress.metadata.publish import publish_metadata_and_ready
 
         mx_client = MagicMock()
@@ -1137,25 +1238,70 @@ class TestPublishMetadataAndReady:
             tensors[f"layer.{i}.weight"] = t
 
         identity = _make_identity("my-model")
-        mock_hb = MagicMock()
-        with patch("modelexpress.metadata.publish.HeartbeatThread", return_value=mock_hb) as hb_cls:
+        mock_publisher = MagicMock()
+        with patch.dict(os.environ, {"MX_P2P_METADATA": "0"}), \
+             patch("modelexpress.metadata.publish.PublisherThread", return_value=mock_publisher) as publisher_cls:
             publish_metadata_and_ready(mx_client, nixl_manager, tensors, worker_rank=2, device_id=0, identity=identity, worker_id="inst-uuid")
 
+        mx_client.publish_metadata.assert_not_called()
+        publisher_cls.assert_called_once()
+        publisher_kwargs = publisher_cls.call_args.kwargs
+        assert publisher_kwargs["mx_client"] is mx_client
+        assert publisher_kwargs["worker_id"] == "inst-uuid"
+        assert publisher_kwargs["worker_rank"] == 2
+        assert publisher_kwargs["nixl_manager"] is nixl_manager
+        assert callable(publisher_kwargs["publish_fn"])
+        mock_publisher.start.assert_called_once()
+
+        result = publisher_kwargs["publish_fn"]()
+        assert result == "abc123def456abcd"
         mx_client.publish_metadata.assert_called_once()
         call_args = mx_client.publish_metadata.call_args
         assert call_args.args[0] is identity
+        assert call_args.args[1].accelerator == "cuda"
         assert call_args.args[2] == "inst-uuid"
 
-        hb_cls.assert_called_once_with(
-            mx_client=mx_client,
-            mx_source_id="abc123def456abcd",
-            worker_id="inst-uuid",
-            worker_rank=2,
-            nixl_manager=nixl_manager,
-        )
-        mock_hb.start.assert_called_once()
+    def test_full_manifest_publish_dual_writes_tensor_fields(self):
+        """On the full tensor-manifest publish path (MX_P2P_METADATA=0, source
+        embeds the full manifest in the published WorkerMetadata), both the
+        legacy `tensors` field and the newer `tensor_source` must be populated.
+        Servers predating the tensor_source oneof read only `tensors`; dropping
+        it leaves them with 0 tensors and targets fall back to disk load."""
+        from modelexpress.metadata.publish import publish_metadata_and_ready
 
-    def test_retries_publish_before_starting_heartbeat(self):
+        mx_client = MagicMock()
+        nixl_manager = MagicMock()
+        nixl_manager.nixl_metadata = b"nixl-data"
+
+        tensors = {}
+        for i in range(3):
+            t = MagicMock(spec=torch.Tensor)
+            t.data_ptr.return_value = 0x1000 + i * 1024
+            t.numel.return_value = 256
+            t.element_size.return_value = 2
+            t.dtype = torch.bfloat16
+            tensors[f"layer.{i}.weight"] = t
+
+        identity = _make_identity("my-model")
+        mock_publisher = MagicMock()
+        with patch.dict(os.environ, {"MX_P2P_METADATA": "0"}), \
+             patch("modelexpress.metadata.publish.PublisherThread", return_value=mock_publisher) as publisher_cls:
+            publish_metadata_and_ready(mx_client, nixl_manager, tensors, worker_rank=0, device_id=0, identity=identity, worker_id="inst-uuid")
+            publisher_cls.call_args.kwargs["publish_fn"]()
+
+        worker = mx_client.publish_metadata.call_args.args[1]
+        # Legacy field — servers predating tensor_source read only from here.
+        assert len(worker.tensors) == 3
+        # New field — current servers read from here.
+        assert len(worker.tensor_source.tensors) == 3
+        assert {t.name for t in worker.tensors} == {
+            "layer.0.weight", "layer.1.weight", "layer.2.weight",
+        }
+        assert {t.name for t in worker.tensor_source.tensors} == {
+            "layer.0.weight", "layer.1.weight", "layer.2.weight",
+        }
+
+    def test_publish_fn_retries_publish(self):
         from modelexpress.metadata.publish import publish_metadata_and_ready
 
         mx_client = MagicMock()
@@ -1169,9 +1315,10 @@ class TestPublishMetadataAndReady:
         nixl_manager.nixl_metadata = b"data"
 
         identity = _make_identity()
-        mock_hb = MagicMock()
-        with patch("modelexpress.metadata.publish.time.sleep") as sleep_mock, \
-             patch("modelexpress.metadata.publish.HeartbeatThread", return_value=mock_hb) as hb_cls:
+        mock_publisher = MagicMock()
+        with patch.dict(os.environ, {"MX_P2P_METADATA": "0"}), \
+             patch("modelexpress.metadata.publish.time.sleep") as sleep_mock, \
+             patch("modelexpress.metadata.publish.PublisherThread", return_value=mock_publisher) as publisher_cls:
             publish_metadata_and_ready(
                 mx_client,
                 nixl_manager,
@@ -1181,20 +1328,15 @@ class TestPublishMetadataAndReady:
                 identity=identity,
                 worker_id="w-1",
             )
+            publish_fn = publisher_cls.call_args.kwargs["publish_fn"]
+            result = publish_fn()
 
+        assert result == "abc123def456abcd"
         assert mx_client.publish_metadata.call_count == 3
         assert sleep_mock.call_args_list == [call(1.0), call(2.0)]
-        hb_cls.assert_called_once_with(
-            mx_client=mx_client,
-            mx_source_id="abc123def456abcd",
-            worker_id="w-1",
-            worker_rank=0,
-            nixl_manager=nixl_manager,
-        )
-        mock_hb.start.assert_called_once()
+        mock_publisher.start.assert_called_once()
 
-    def test_publish_failure_after_retries_raises_runtime_error(self):
-        """If publish_metadata keeps failing, heartbeat should not be started."""
+    def test_publish_fn_failure_after_retries_raises_runtime_error(self):
         from modelexpress.metadata.publish import publish_metadata_and_ready
 
         mx_client = MagicMock()
@@ -1208,25 +1350,28 @@ class TestPublishMetadataAndReady:
         nixl_manager.nixl_metadata = b"data"
 
         identity = _make_identity()
-        mock_hb = MagicMock()
-        with patch("modelexpress.metadata.publish.time.sleep") as sleep_mock, \
-             patch("modelexpress.metadata.publish.HeartbeatThread", return_value=mock_hb) as hb_cls:
+        mock_publisher = MagicMock()
+        with patch.dict(os.environ, {"MX_P2P_METADATA": "0"}), \
+             patch("modelexpress.metadata.publish.time.sleep") as sleep_mock, \
+             patch("modelexpress.metadata.publish.PublisherThread", return_value=mock_publisher) as publisher_cls:
+            publish_metadata_and_ready(
+                mx_client,
+                nixl_manager,
+                {},
+                worker_rank=0,
+                device_id=0,
+                identity=identity,
+                worker_id="w-1",
+            )
+            publish_fn = publisher_cls.call_args.kwargs["publish_fn"]
             with pytest.raises(RuntimeError, match="Failed to publish metadata after 3 attempts"):
-                publish_metadata_and_ready(
-                    mx_client,
-                    nixl_manager,
-                    {},
-                    worker_rank=0,
-                    device_id=0,
-                    identity=identity,
-                    worker_id="w-1",
-                )
+                publish_fn()
 
         assert mx_client.publish_metadata.call_count == 3
         assert sleep_mock.call_args_list == [call(1.0), call(2.0)]
-        hb_cls.assert_not_called()
+        mock_publisher.start.assert_called_once()
 
-    def test_non_retryable_grpc_failure_fails_immediately(self):
+    def test_publish_fn_non_retryable_grpc_failure_fails_immediately(self):
         from modelexpress.metadata.publish import publish_metadata_and_ready
 
         mx_client = MagicMock()
@@ -1239,23 +1384,63 @@ class TestPublishMetadataAndReady:
         nixl_manager.nixl_metadata = b"data"
 
         identity = _make_identity()
-        mock_hb = MagicMock()
-        with patch("modelexpress.metadata.publish.time.sleep") as sleep_mock, \
-             patch("modelexpress.metadata.publish.HeartbeatThread", return_value=mock_hb) as hb_cls:
+        mock_publisher = MagicMock()
+        with patch.dict(os.environ, {"MX_P2P_METADATA": "0"}), \
+             patch("modelexpress.metadata.publish.time.sleep") as sleep_mock, \
+             patch("modelexpress.metadata.publish.PublisherThread", return_value=mock_publisher) as publisher_cls:
+            publish_metadata_and_ready(
+                mx_client,
+                nixl_manager,
+                {},
+                worker_rank=0,
+                device_id=0,
+                identity=identity,
+                worker_id="w-1",
+            )
+            publish_fn = publisher_cls.call_args.kwargs["publish_fn"]
             with pytest.raises(_FakeRpcError, match="permission denied"):
-                publish_metadata_and_ready(
-                    mx_client,
-                    nixl_manager,
-                    {},
-                    worker_rank=0,
-                    device_id=0,
-                    identity=identity,
-                    worker_id="w-1",
-                )
+                publish_fn()
 
         assert mx_client.publish_metadata.call_count == 1
         assert sleep_mock.call_args_list == []
-        hb_cls.assert_not_called()
+        mock_publisher.start.assert_called_once()
+
+    def test_p2p_mode_starts_grpc_server_before_publish(self):
+        from modelexpress.metadata.publish import publish_metadata_and_ready
+
+        mx_client = MagicMock()
+        mx_client.publish_metadata.return_value = "abc123def456abcd"
+
+        nixl_manager = MagicMock()
+        nixl_manager._listen_port = 5555
+        nixl_manager.agent_name = "test-agent"
+
+        mock_grpc_server = MagicMock()
+        mock_grpc_server.start.return_value = 6555
+        mock_publisher = MagicMock()
+
+        with patch.dict(os.environ, {"MX_P2P_METADATA": "1", "MX_WORKER_HOST": "10.0.0.1"}), \
+             patch("modelexpress.metadata.worker_server.WorkerGrpcServer", return_value=mock_grpc_server) as grpc_cls, \
+             patch("modelexpress.metadata.publish.PublisherThread", return_value=mock_publisher) as publisher_cls:
+            publish_metadata_and_ready(
+                mx_client,
+                nixl_manager,
+                {},
+                worker_rank=0,
+                device_id=0,
+                identity=_make_identity(),
+                worker_id="w-1",
+            )
+
+            mx_client.publish_metadata.assert_not_called()
+            grpc_cls.assert_called_once()
+            mock_grpc_server.start.assert_called_once()
+
+            publish_fn = publisher_cls.call_args.kwargs["publish_fn"]
+            publish_fn()
+
+        mx_client.publish_metadata.assert_called_once()
+        mock_grpc_server.set_mx_source_id.assert_called_once_with("abc123def456abcd")
 
 
 # ---------------------------------------------------------------------------
@@ -1446,12 +1631,12 @@ class TestConfigureVllmLogging:
             self._reset_mx_logger()
             configure_vllm_logging()
 
-            child = logging.getLogger("modelexpress.metadata.heartbeat")
+            child = logging.getLogger("modelexpress.metadata.publisher")
             child.info("Heartbeat started")
 
             assert len(buf.buffer) == 1
             assert "Heartbeat started" in buf.buffer[0].getMessage()
-            assert buf.buffer[0].name == "modelexpress.metadata.heartbeat"
+            assert buf.buffer[0].name == "modelexpress.metadata.publisher"
         finally:
             vllm_logger.removeHandler(buf)
             self._cleanup(vllm_logger)

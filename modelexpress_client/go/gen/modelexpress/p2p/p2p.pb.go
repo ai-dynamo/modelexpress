@@ -87,6 +87,9 @@ const (
 	MxSourceType_MX_SOURCE_TYPE_TORCH_COMPILE_CACHE MxSourceType = 3 // torch.compile cache files
 	MxSourceType_MX_SOURCE_TYPE_TRITON_CACHE        MxSourceType = 4 // Triton cache files
 	MxSourceType_MX_SOURCE_TYPE_DEEP_GEMM_CACHE     MxSourceType = 5 // DeepGEMM kernel cache files
+	MxSourceType_MX_SOURCE_TYPE_TILELANG_CACHE      MxSourceType = 6 // TileLang JIT kernel cache files
+	MxSourceType_MX_SOURCE_TYPE_CUTE_DSL_CACHE      MxSourceType = 7 // CuTe DSL compiled kernel cache files
+	MxSourceType_MX_SOURCE_TYPE_FLASHINFER_CACHE    MxSourceType = 8 // FlashInfer JIT workspace cache files
 )
 
 // Enum value maps for MxSourceType.
@@ -98,6 +101,9 @@ var (
 		3: "MX_SOURCE_TYPE_TORCH_COMPILE_CACHE",
 		4: "MX_SOURCE_TYPE_TRITON_CACHE",
 		5: "MX_SOURCE_TYPE_DEEP_GEMM_CACHE",
+		6: "MX_SOURCE_TYPE_TILELANG_CACHE",
+		7: "MX_SOURCE_TYPE_CUTE_DSL_CACHE",
+		8: "MX_SOURCE_TYPE_FLASHINFER_CACHE",
 	}
 	MxSourceType_value = map[string]int32{
 		"MX_SOURCE_TYPE_WEIGHTS":             0,
@@ -106,6 +112,9 @@ var (
 		"MX_SOURCE_TYPE_TORCH_COMPILE_CACHE": 3,
 		"MX_SOURCE_TYPE_TRITON_CACHE":        4,
 		"MX_SOURCE_TYPE_DEEP_GEMM_CACHE":     5,
+		"MX_SOURCE_TYPE_TILELANG_CACHE":      6,
+		"MX_SOURCE_TYPE_CUTE_DSL_CACHE":      7,
+		"MX_SOURCE_TYPE_FLASHINFER_CACHE":    8,
 	}
 )
 
@@ -486,7 +495,9 @@ type ArtifactSourceMetadata struct {
 	// Number of files in the sealed artifact manifest.
 	FileCount uint32 `protobuf:"varint,3,opt,name=file_count,json=fileCount,proto3" json:"file_count,omitempty"`
 	// Number of transfer chunks in the sealed artifact manifest.
-	ChunkCount    uint32 `protobuf:"varint,4,opt,name=chunk_count,json=chunkCount,proto3" json:"chunk_count,omitempty"`
+	ChunkCount uint32 `protobuf:"varint,4,opt,name=chunk_count,json=chunkCount,proto3" json:"chunk_count,omitempty"`
+	// Distributed node rank that owns this node-scoped artifact.
+	NodeRank      uint32 `protobuf:"varint,5,opt,name=node_rank,json=nodeRank,proto3" json:"node_rank,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -545,6 +556,13 @@ func (x *ArtifactSourceMetadata) GetFileCount() uint32 {
 func (x *ArtifactSourceMetadata) GetChunkCount() uint32 {
 	if x != nil {
 		return x.ChunkCount
+	}
+	return 0
+}
+
+func (x *ArtifactSourceMetadata) GetNodeRank() uint32 {
+	if x != nil {
+		return x.NodeRank
 	}
 	return 0
 }
@@ -877,6 +895,10 @@ type WorkerMetadata struct {
 	// host:port for the worker's gRPC WorkerService, used for tensor manifests,
 	// artifact manifests, and artifact chunk transfer coordination.
 	WorkerGrpcEndpoint string `protobuf:"bytes,8,opt,name=worker_grpc_endpoint,json=workerGrpcEndpoint,proto3" json:"worker_grpc_endpoint,omitempty"`
+	// Runtime accelerator family for compatibility filtering (e.g. "cuda").
+	// This is runtime metadata, not SourceIdentity hash material. Empty means
+	// unknown and must be accepted for backward compatibility with old writers.
+	Accelerator string `protobuf:"bytes,9,opt,name=accelerator,proto3" json:"accelerator,omitempty"`
 	// Source-type-specific bounded metadata. This selects the metadata payload
 	// shape, not a transfer endpoint. Readers should prefer tensor_source over
 	// deprecated tensors when both are present, and fall back to tensors for old
@@ -996,6 +1018,13 @@ func (x *WorkerMetadata) GetWorkerGrpcEndpoint() string {
 	return ""
 }
 
+func (x *WorkerMetadata) GetAccelerator() string {
+	if x != nil {
+		return x.Accelerator
+	}
+	return ""
+}
+
 func (x *WorkerMetadata) GetSourcePayload() isWorkerMetadata_SourcePayload {
 	if x != nil {
 		return x.SourcePayload
@@ -1056,7 +1085,10 @@ func (*WorkerMetadata_ArtifactSource) isWorkerMetadata_SourcePayload() {}
 type GetTensorManifestRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// mx_source_id for validation (catches stale discovery)
-	MxSourceId    string `protobuf:"bytes,1,opt,name=mx_source_id,json=mxSourceId,proto3" json:"mx_source_id,omitempty"`
+	MxSourceId string `protobuf:"bytes,1,opt,name=mx_source_id,json=mxSourceId,proto3" json:"mx_source_id,omitempty"`
+	// Runtime generation selected from discovery metadata. The serving endpoint
+	// rejects the request if it belongs to a different worker process.
+	WorkerId      *string `protobuf:"bytes,2,opt,name=worker_id,json=workerId,proto3,oneof" json:"worker_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1098,6 +1130,13 @@ func (x *GetTensorManifestRequest) GetMxSourceId() string {
 	return ""
 }
 
+func (x *GetTensorManifestRequest) GetWorkerId() string {
+	if x != nil && x.WorkerId != nil {
+		return *x.WorkerId
+	}
+	return ""
+}
+
 type GetTensorManifestResponse struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Tensors []*TensorDescriptor    `protobuf:"bytes,1,rep,name=tensors,proto3" json:"tensors,omitempty"`
@@ -1108,7 +1147,13 @@ type GetTensorManifestResponse struct {
 	// NIXL agent name for the serving worker
 	AgentName string `protobuf:"bytes,4,opt,name=agent_name,json=agentName,proto3" json:"agent_name,omitempty"`
 	// Rank of the serving worker (for rank-matched transfers)
-	WorkerRank    uint32 `protobuf:"varint,5,opt,name=worker_rank,json=workerRank,proto3" json:"worker_rank,omitempty"`
+	WorkerRank uint32 `protobuf:"varint,5,opt,name=worker_rank,json=workerRank,proto3" json:"worker_rank,omitempty"`
+	// Runtime accelerator family for compatibility filtering (e.g. "cuda").
+	// Empty means unknown and must be accepted for backward compatibility.
+	Accelerator string `protobuf:"bytes,6,opt,name=accelerator,proto3" json:"accelerator,omitempty"`
+	// Runtime generation of the process serving this manifest. New sources
+	// always set it; absence identifies a legacy source during rolling upgrade.
+	WorkerId      *string `protobuf:"bytes,7,opt,name=worker_id,json=workerId,proto3,oneof" json:"worker_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1176,6 +1221,20 @@ func (x *GetTensorManifestResponse) GetWorkerRank() uint32 {
 		return x.WorkerRank
 	}
 	return 0
+}
+
+func (x *GetTensorManifestResponse) GetAccelerator() string {
+	if x != nil {
+		return x.Accelerator
+	}
+	return ""
+}
+
+func (x *GetTensorManifestResponse) GetWorkerId() string {
+	if x != nil && x.WorkerId != nil {
+		return *x.WorkerId
+	}
+	return ""
 }
 
 type GetArtifactManifestHeaderRequest struct {
@@ -2016,7 +2075,12 @@ type SourceInstanceRef struct {
 	ModelName string `protobuf:"bytes,3,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
 	// Global rank of this worker within the instance.
 	// Clients filter on this field to find a peer with a matching rank.
-	WorkerRank    uint32 `protobuf:"varint,4,opt,name=worker_rank,json=workerRank,proto3" json:"worker_rank,omitempty"`
+	WorkerRank uint32 `protobuf:"varint,4,opt,name=worker_rank,json=workerRank,proto3" json:"worker_rank,omitempty"`
+	// Runtime accelerator family for compatibility filtering (e.g. "cuda").
+	// Lets clients drop incompatible sources before GetMetadata and before
+	// the retry-cap slice. Empty means unknown (treated as compatible for
+	// rolling upgrades and sources that predate this field).
+	Accelerator   string `protobuf:"bytes,5,opt,name=accelerator,proto3" json:"accelerator,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2077,6 +2141,13 @@ func (x *SourceInstanceRef) GetWorkerRank() uint32 {
 		return x.WorkerRank
 	}
 	return 0
+}
+
+func (x *SourceInstanceRef) GetAccelerator() string {
+	if x != nil {
+		return x.Accelerator
+	}
+	return ""
 }
 
 type ListSourcesRequest struct {
@@ -2462,7 +2533,7 @@ const file_p2p_proto_rawDesc = "" +
 	"\x04addr\x18\x02 \x01(\x04R\x04addr\x12\x12\n" +
 	"\x04size\x18\x03 \x01(\x04R\x04size\x12\x1b\n" +
 	"\tdevice_id\x18\x04 \x01(\rR\bdeviceId\x12\x14\n" +
-	"\x05dtype\x18\x05 \x01(\tR\x05dtype\"\x98\x01\n" +
+	"\x05dtype\x18\x05 \x01(\tR\x05dtype\"\xb5\x01\n" +
 	"\x16ArtifactSourceMetadata\x12\x1f\n" +
 	"\vartifact_id\x18\x01 \x01(\tR\n" +
 	"artifactId\x12\x1d\n" +
@@ -2471,7 +2542,8 @@ const file_p2p_proto_rawDesc = "" +
 	"\n" +
 	"file_count\x18\x03 \x01(\rR\tfileCount\x12\x1f\n" +
 	"\vchunk_count\x18\x04 \x01(\rR\n" +
-	"chunkCount\"U\n" +
+	"chunkCount\x12\x1b\n" +
+	"\tnode_rank\x18\x05 \x01(\rR\bnodeRank\"U\n" +
 	"\x14TensorSourceMetadata\x12=\n" +
 	"\atensors\x18\x01 \x03(\v2#.model_express.p2p.TensorDescriptorR\atensors\"\xa4\x02\n" +
 	"\x10ArtifactManifest\x12)\n" +
@@ -2495,7 +2567,7 @@ const file_p2p_proto_rawDesc = "" +
 	"\vfile_offset\x18\x03 \x01(\x04R\n" +
 	"fileOffset\x12\x16\n" +
 	"\x06length\x18\x04 \x01(\x04R\x06length\x12\x1a\n" +
-	"\bchecksum\x18\x05 \x01(\tR\bchecksum\"\xfc\x04\n" +
+	"\bchecksum\x18\x05 \x01(\tR\bchecksum\"\x9e\x05\n" +
 	"\x0eWorkerMetadata\x12\x1f\n" +
 	"\vworker_rank\x18\x01 \x01(\rR\n" +
 	"workerRank\x12%\n" +
@@ -2509,14 +2581,18 @@ const file_p2p_proto_rawDesc = "" +
 	"\x11metadata_endpoint\x18\x06 \x01(\tR\x10metadataEndpoint\x12\x1d\n" +
 	"\n" +
 	"agent_name\x18\a \x01(\tR\tagentName\x120\n" +
-	"\x14worker_grpc_endpoint\x18\b \x01(\tR\x12workerGrpcEndpoint\x12N\n" +
+	"\x14worker_grpc_endpoint\x18\b \x01(\tR\x12workerGrpcEndpoint\x12 \n" +
+	"\vaccelerator\x18\t \x01(\tR\vaccelerator\x12N\n" +
 	"\rtensor_source\x18\x14 \x01(\v2'.model_express.p2p.TensorSourceMetadataH\x01R\ftensorSource\x12T\n" +
 	"\x0fartifact_source\x18\x15 \x01(\v2).model_express.p2p.ArtifactSourceMetadataH\x01R\x0eartifactSourceB\x12\n" +
 	"\x10backend_metadataB\x10\n" +
-	"\x0esource_payload\"<\n" +
+	"\x0esource_payload\"l\n" +
 	"\x18GetTensorManifestRequest\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
-	"mxSourceId\"\xe9\x01\n" +
+	"mxSourceId\x12 \n" +
+	"\tworker_id\x18\x02 \x01(\tH\x00R\bworkerId\x88\x01\x01B\f\n" +
+	"\n" +
+	"_worker_id\"\xbb\x02\n" +
 	"\x19GetTensorManifestResponse\x12=\n" +
 	"\atensors\x18\x01 \x03(\v2#.model_express.p2p.TensorDescriptorR\atensors\x12 \n" +
 	"\fmx_source_id\x18\x02 \x01(\tR\n" +
@@ -2525,7 +2601,11 @@ const file_p2p_proto_rawDesc = "" +
 	"\n" +
 	"agent_name\x18\x04 \x01(\tR\tagentName\x12\x1f\n" +
 	"\vworker_rank\x18\x05 \x01(\rR\n" +
-	"workerRank\"e\n" +
+	"workerRank\x12 \n" +
+	"\vaccelerator\x18\x06 \x01(\tR\vaccelerator\x12 \n" +
+	"\tworker_id\x18\a \x01(\tH\x00R\bworkerId\x88\x01\x01B\f\n" +
+	"\n" +
+	"_worker_id\"e\n" +
 	" GetArtifactManifestHeaderRequest\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1f\n" +
@@ -2610,7 +2690,7 @@ const file_p2p_proto_rawDesc = "" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12 \n" +
 	"\fmx_source_id\x18\x03 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
-	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"\x92\x01\n" +
+	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"\xb4\x01\n" +
 	"\x11SourceInstanceRef\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
@@ -2618,7 +2698,8 @@ const file_p2p_proto_rawDesc = "" +
 	"\n" +
 	"model_name\x18\x03 \x01(\tR\tmodelName\x12\x1f\n" +
 	"\vworker_rank\x18\x04 \x01(\rR\n" +
-	"workerRank\"\xb0\x01\n" +
+	"workerRank\x12 \n" +
+	"\vaccelerator\x18\x05 \x01(\tR\vaccelerator\"\xb0\x01\n" +
 	"\x12ListSourcesRequest\x12=\n" +
 	"\bidentity\x18\x01 \x01(\v2!.model_express.p2p.SourceIdentityR\bidentity\x12I\n" +
 	"\rstatus_filter\x18\x02 \x01(\x0e2\x1f.model_express.p2p.SourceStatusH\x00R\fstatusFilter\x88\x01\x01B\x10\n" +
@@ -2649,14 +2730,17 @@ const file_p2p_proto_rawDesc = "" +
 	"\x19BACKEND_FRAMEWORK_UNKNOWN\x10\x00\x12\x1a\n" +
 	"\x16BACKEND_FRAMEWORK_VLLM\x10\x01\x12\x1c\n" +
 	"\x18BACKEND_FRAMEWORK_SGLANG\x10\x02\x12\x1d\n" +
-	"\x19BACKEND_FRAMEWORK_TRT_LLM\x10\x03*\xcf\x01\n" +
+	"\x19BACKEND_FRAMEWORK_TRT_LLM\x10\x03*\xba\x02\n" +
 	"\fMxSourceType\x12\x1a\n" +
 	"\x16MX_SOURCE_TYPE_WEIGHTS\x10\x00\x12\x17\n" +
 	"\x13MX_SOURCE_TYPE_LORA\x10\x01\x12\x1d\n" +
 	"\x19MX_SOURCE_TYPE_CUDA_GRAPH\x10\x02\x12&\n" +
 	"\"MX_SOURCE_TYPE_TORCH_COMPILE_CACHE\x10\x03\x12\x1f\n" +
 	"\x1bMX_SOURCE_TYPE_TRITON_CACHE\x10\x04\x12\"\n" +
-	"\x1eMX_SOURCE_TYPE_DEEP_GEMM_CACHE\x10\x05*{\n" +
+	"\x1eMX_SOURCE_TYPE_DEEP_GEMM_CACHE\x10\x05\x12!\n" +
+	"\x1dMX_SOURCE_TYPE_TILELANG_CACHE\x10\x06\x12!\n" +
+	"\x1dMX_SOURCE_TYPE_CUTE_DSL_CACHE\x10\a\x12#\n" +
+	"\x1fMX_SOURCE_TYPE_FLASHINFER_CACHE\x10\b*{\n" +
 	"\fSourceStatus\x12\x19\n" +
 	"\x15SOURCE_STATUS_UNKNOWN\x10\x00\x12\x1e\n" +
 	"\x1aSOURCE_STATUS_INITIALIZING\x10\x01\x12\x17\n" +
@@ -2785,6 +2869,8 @@ func file_p2p_proto_init() {
 		(*WorkerMetadata_TensorSource)(nil),
 		(*WorkerMetadata_ArtifactSource)(nil),
 	}
+	file_p2p_proto_msgTypes[8].OneofWrappers = []any{}
+	file_p2p_proto_msgTypes[9].OneofWrappers = []any{}
 	file_p2p_proto_msgTypes[22].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{

@@ -283,6 +283,7 @@ impl MetadataBackend for KubernetesBackend {
             metadata_endpoint: worker_record.metadata_endpoint.clone(),
             agent_name: worker_record.agent_name.clone(),
             worker_grpc_endpoint: worker_record.worker_grpc_endpoint.clone(),
+            accelerator: worker_record.accelerator.clone(),
             artifact_source: worker_record
                 .artifact_source
                 .clone()
@@ -433,6 +434,7 @@ impl MetadataBackend for KubernetesBackend {
                 metadata_endpoint: worker_status.metadata_endpoint.clone(),
                 agent_name: worker_status.agent_name.clone(),
                 worker_grpc_endpoint: worker_status.worker_grpc_endpoint.clone(),
+                accelerator: worker_status.accelerator.clone(),
                 artifact_source: worker_status
                     .artifact_source
                     .clone()
@@ -537,6 +539,13 @@ impl MetadataBackend for KubernetesBackend {
                 })
                 .unwrap_or((0, 0));
 
+            let accelerator = cr
+                .status
+                .as_ref()
+                .and_then(|s| s.worker.as_ref())
+                .map(|w| w.accelerator.clone())
+                .unwrap_or_default();
+
             result.push(super::SourceInstanceInfo {
                 source_id: sid,
                 worker_id: iid,
@@ -544,6 +553,7 @@ impl MetadataBackend for KubernetesBackend {
                 worker_rank,
                 status,
                 updated_at,
+                accelerator,
             });
         }
 
@@ -743,6 +753,7 @@ impl TryFrom<ArtifactSourceMetadataRecord> for ArtifactSourceStatus {
             total_size,
             file_count: record.file_count,
             chunk_count: record.chunk_count,
+            node_rank: record.node_rank,
         })
     }
 }
@@ -766,6 +777,7 @@ impl TryFrom<ArtifactSourceStatus> for ArtifactSourceMetadataRecord {
             total_size,
             file_count: status.file_count,
             chunk_count: status.chunk_count,
+            node_rank: status.node_rank,
         })
     }
 }
@@ -781,6 +793,7 @@ mod tests {
             total_size: i64::MAX as u64 + 1,
             file_count: 1,
             chunk_count: 1,
+            node_rank: 0,
         };
 
         assert!(ArtifactSourceStatus::try_from(record).is_err());
@@ -793,6 +806,7 @@ mod tests {
             total_size: -1,
             file_count: 1,
             chunk_count: 1,
+            node_rank: 0,
         };
 
         assert!(ArtifactSourceMetadataRecord::try_from(status).is_err());

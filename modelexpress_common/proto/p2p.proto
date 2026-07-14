@@ -45,6 +45,9 @@ enum MxSourceType {
   MX_SOURCE_TYPE_TORCH_COMPILE_CACHE = 3; // torch.compile cache files
   MX_SOURCE_TYPE_TRITON_CACHE = 4;        // Triton cache files
   MX_SOURCE_TYPE_DEEP_GEMM_CACHE = 5;     // DeepGEMM kernel cache files
+  MX_SOURCE_TYPE_TILELANG_CACHE = 6;      // TileLang JIT kernel cache files
+  MX_SOURCE_TYPE_CUTE_DSL_CACHE = 7;      // CuTe DSL compiled kernel cache files
+  MX_SOURCE_TYPE_FLASHINFER_CACHE = 8;    // FlashInfer JIT workspace cache files
 }
 
 // All fields that affect source compatibility for reusable model material.
@@ -155,6 +158,9 @@ message ArtifactSourceMetadata {
 
   // Number of transfer chunks in the sealed artifact manifest.
   uint32 chunk_count = 4;
+
+  // Distributed node rank that owns this node-scoped artifact.
+  uint32 node_rank = 5;
 }
 
 // Tensor source payload for the source_payload migration. Writers populate this
@@ -262,7 +268,7 @@ message WorkerMetadata {
   // Timestamp of last status update (unix millis)
   int64 updated_at = 5;
 
-  // P2P metadata exchange fields (opt-in via MX_P2P_METADATA=1).
+  // P2P metadata exchange fields (disable via MX_P2P_METADATA=0).
   // When populated, targets fetch NIXL metadata and tensor manifests
   // directly from the source worker instead of from the central server.
 
@@ -275,6 +281,11 @@ message WorkerMetadata {
   // host:port for the worker's gRPC WorkerService, used for tensor manifests,
   // artifact manifests, and artifact chunk transfer coordination.
   string worker_grpc_endpoint = 8;
+
+  // Runtime accelerator family for compatibility filtering (e.g. "cuda").
+  // This is runtime metadata, not SourceIdentity hash material. Empty means
+  // unknown and must be accepted for backward compatibility with old writers.
+  string accelerator = 9;
 
   // Source-type-specific bounded metadata. This selects the metadata payload
   // shape, not a transfer endpoint. Readers should prefer tensor_source over
@@ -306,6 +317,10 @@ service WorkerService {
 message GetTensorManifestRequest {
   // mx_source_id for validation (catches stale discovery)
   string mx_source_id = 1;
+
+  // Runtime generation selected from discovery metadata. The serving endpoint
+  // rejects the request if it belongs to a different worker process.
+  optional string worker_id = 2;
 }
 
 message GetTensorManifestResponse {
@@ -326,6 +341,14 @@ message GetTensorManifestResponse {
 
   // Rank of the serving worker (for rank-matched transfers)
   uint32 worker_rank = 5;
+
+  // Runtime accelerator family for compatibility filtering (e.g. "cuda").
+  // Empty means unknown and must be accepted for backward compatibility.
+  string accelerator = 6;
+
+  // Runtime generation of the process serving this manifest. New sources
+  // always set it; absence identifies a legacy source during rolling upgrade.
+  optional string worker_id = 7;
 }
 
 message GetArtifactManifestHeaderRequest {
@@ -506,6 +529,12 @@ message SourceInstanceRef {
   // Global rank of this worker within the instance.
   // Clients filter on this field to find a peer with a matching rank.
   uint32 worker_rank = 4;
+
+  // Runtime accelerator family for compatibility filtering (e.g. "cuda").
+  // Lets clients drop incompatible sources before GetMetadata and before
+  // the retry-cap slice. Empty means unknown (treated as compatible for
+  // rolling upgrades and sources that predate this field).
+  string accelerator = 5;
 }
 
 message ListSourcesRequest {

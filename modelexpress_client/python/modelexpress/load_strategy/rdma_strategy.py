@@ -6,12 +6,9 @@
 from __future__ import annotations
 
 import logging
-import os
-import random
 import time
 
-import torch
-
+from .. import envs
 from ..adapter import EngineAdapter, StrategyFailed
 from .base import (
     LoadContext,
@@ -21,8 +18,17 @@ from .base import (
     register_tensors,
 )
 from .context import LoadResult
-from ..metadata.payload import worker_tensor_count, worker_tensor_descriptors
+from ..metadata.payload import (
+    accelerators_compatible,
+    worker_tensor_count,
+    worker_tensor_descriptors,
+)
 from ..nixl_transfer import is_nixl_available
+from ..source_selection import (
+    configured_policy_label,
+    get_configured_selector,
+)
+from ..metrics import metrics as selection_metrics
 from ..transfer_safety import check_transfer_allowed
 from ..types import TensorDescriptor
 from .. import p2p_pb2
@@ -45,12 +51,7 @@ class RdmaStrategy(LoadStrategy):
     def rollback(self, ctx: LoadContext) -> None:
         """Clean up NIXL state from a failed RDMA target attempt."""
         if ctx.nixl_manager is not None:
-            try:
-                ctx.nixl_manager.shutdown()
-            except Exception as e:
-                logger.warning(
-                    f"[Worker {ctx.global_rank}] Failed to shut down NIXL manager: {e}"
-                )
+            ctx.nixl_manager.shutdown()
         ctx.tensors = {}
         ctx.nixl_manager = None
 
@@ -60,11 +61,18 @@ class RdmaStrategy(LoadStrategy):
         if not is_nixl_available():
             return False
 
+        if not ctx.accelerator_backend.supports_rdma_p2p():
+            logger.info(
+                f"[Worker {ctx.global_rank}] Backend "
+                f"{ctx.accelerator_backend.name} does not support RDMA P2P, skipping"
+            )
+            return False
+
         # Decentralized backends (k8s-service) serve their own
         # metadata; skip the central-server precondition for them.
         # Strict `is True` check so MagicMock's auto-attribute doesn't
         # masquerade as the flag in tests.
-        server_addr = os.environ.get("MODEL_EXPRESS_URL") or os.environ.get("MX_SERVER_ADDRESS")
+        server_addr = envs.MODEL_EXPRESS_URL or envs.MX_SERVER_ADDRESS
         requires_p2p = getattr(ctx.mx_client, "REQUIRES_P2P_METADATA", False) is True
         if not server_addr and not requires_p2p:
             logger.info(f"[Worker {ctx.global_rank}] No MX server configured, skipping RDMA")
@@ -82,11 +90,9 @@ class RdmaStrategy(LoadStrategy):
     def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
         """Load from a READY source or raise StrategyFailed for fallback.
 
-        Source discovery and metadata misses do not mutate the target model and
-        therefore raise clean StrategyFailed errors. Once _load_as_target()
-        prepares target storage, failures are treated as mutated because the
-        engine may have initialized or transformed model tensors, and those
-        failures are raised immediately instead of trying another source.
+        Source discovery and metadata misses do not mutate the target model.
+        A failed transfer retries the next candidate. If it may have mutated
+        the model, the adapter first replaces the model with a fresh instance.
         """
         result = _as_load_result(result)
         candidates = self._find_source_instances(ctx)
@@ -94,9 +100,17 @@ class RdmaStrategy(LoadStrategy):
             logger.info(f"[Worker {ctx.global_rank}] No RDMA source available, skipping")
             raise StrategyFailed("No RDMA source available", mutated=False)
 
-        for instance in candidates[:MAX_SOURCE_RETRIES]:
+        attempts = candidates[:MAX_SOURCE_RETRIES]
+        policy = configured_policy_label()
+        needs_outer_reinit = False
+        for attempt_index, instance in enumerate(attempts):
             mx_source_id = instance.mx_source_id
             worker_id = instance.worker_id
+            logger.info(
+                f"[Worker {ctx.global_rank}] Source attempt: "
+                f"source_attempt_index={attempt_index} "
+                f"source_worker_id={worker_id} mx_source_id={mx_source_id}"
+            )
 
             try:
                 source_worker = self._fetch_worker_metadata(
@@ -107,9 +121,15 @@ class RdmaStrategy(LoadStrategy):
                     f"[Worker {ctx.global_rank}] Failed to fetch metadata for worker {worker_id}: {e}. "
                     f"Trying next candidate."
                 )
+                selection_metrics.record_metadata_failure(policy)
+                selection_metrics.record_attempt(policy, "metadata_miss")
                 continue
 
             if source_worker is None:
+                selection_metrics.record_attempt(policy, "metadata_miss")
+                continue
+
+            if not self._accelerator_compatible(ctx, source_worker, worker_id):
                 continue
 
             logger.info(
@@ -117,27 +137,84 @@ class RdmaStrategy(LoadStrategy):
                 f"({worker_tensor_count(source_worker)} tensors)"
             )
 
-            # Do not try another source after target preparation starts. The
-            # adapter may have initialized or transformed model tensors, and a
-            # failed receive may have partially written weights. The chain will
-            # re-initialize the model before trying the next loading strategy.
-            return self._load_as_target(
-                result, ctx, source_worker, mx_source_id, worker_id,
+            selection_metrics.record_selection(policy, worker_id)
+            transfer_start = time.perf_counter()
+            try:
+                out = self._load_as_target(
+                    result, ctx, source_worker, mx_source_id, worker_id,
+                )
+            except StrategyFailed as e:
+                has_next_candidate = attempt_index + 1 < len(attempts)
+                selection_metrics.observe_transfer_seconds(
+                    policy,
+                    "retry" if has_next_candidate else "fallback",
+                    time.perf_counter() - transfer_start,
+                )
+                selection_metrics.record_attempt(
+                    policy,
+                    "transfer_retry" if has_next_candidate else "transfer_fallback",
+                )
+                if not has_next_candidate:
+                    if needs_outer_reinit and not e.mutated:
+                        raise StrategyFailed(str(e), mutated=True) from e
+                    raise
+
+                logger.warning(
+                    f"[Worker {ctx.global_rank}] RDMA source worker {worker_id} "
+                    f"failed: {e}. Trying next candidate."
+                )
+                try:
+                    self.rollback(ctx)
+                except Exception as cleanup_error:
+                    raise StrategyFailed(
+                        f"Failed to clean up target after source worker "
+                        f"{worker_id} failed: {cleanup_error}",
+                        mutated=True,
+                    ) from cleanup_error
+                if e.mutated:
+                    try:
+                        result = ctx.adapter.reinit_for_retry(result)
+                    except Exception as reinit_error:
+                        raise StrategyFailed(
+                            f"Failed to reinitialize target after source worker "
+                            f"{worker_id} failed: {reinit_error}",
+                            mutated=True,
+                        ) from reinit_error
+                    needs_outer_reinit = True
+                continue
+            except BaseException:
+                selection_metrics.observe_transfer_seconds(
+                    policy, "fallback", time.perf_counter() - transfer_start
+                )
+                selection_metrics.record_attempt(policy, "transfer_fallback")
+                raise
+            selection_metrics.observe_transfer_seconds(
+                policy, "success", time.perf_counter() - transfer_start
             )
+            selection_metrics.record_attempt(policy, "success")
+            return out
 
         tried = min(len(candidates), MAX_SOURCE_RETRIES)
         logger.warning(
             f"[Worker {ctx.global_rank}] Tried {tried} of {len(candidates)} source workers "
             f"(max retries={MAX_SOURCE_RETRIES}), falling through"
         )
-        # Only pre-target metadata/discovery misses reach here. Failures after
-        # target preparation are raised from _load_as_target() as mutated=True.
-        raise StrategyFailed("No RDMA source succeeded", mutated=False)
+        # An internal reinit returns a new result, but the outer strategy chain
+        # still owns the original result that the adapter cleared.
+        raise StrategyFailed(
+            "No RDMA source succeeded", mutated=needs_outer_reinit,
+        )
 
     def _find_source_instances(
         self, ctx: LoadContext,
     ) -> list[p2p_pb2.SourceInstanceRef]:
-        """Return all READY source instances (shuffled for load balancing)."""
+        """Return READY source instances ranked by the configured selector.
+
+        Filters listed instances to the target's worker_rank, then delegates
+        ordering to the policy named by MX_P2P_SOURCE_SELECTOR (default
+        ``random``). The retry slice (MAX_SOURCE_RETRIES) is applied by the
+        caller in load(), so the selector controls ordering only.
+        """
         try:
             list_resp = ctx.mx_client.list_sources(
                 identity=ctx.identity,
@@ -147,21 +224,82 @@ class RdmaStrategy(LoadStrategy):
                 logger.debug(f"[Worker {ctx.global_rank}] No ready source instances found")
                 return []
 
-            candidates = [
+            rank_matched = [
                 inst for inst in list_resp.instances
                 if inst.worker_rank == ctx.worker_rank
             ]
-            random.shuffle(candidates)
-            logger.info(
-                f"[Worker {ctx.global_rank}] Found {len(candidates)} ready source worker(s)"
+
+            # Drop accelerator-incompatible sources before ordering and the
+            # retry-cap slice, so the selector only ranks eligible peers and a
+            # compatible source can never be pushed past MAX_SOURCE_RETRIES by
+            # incompatible ones. The post-GetMetadata check in load() stays as
+            # defense-in-depth (empty refs, stale records, metadata drift).
+            target_accelerator = ctx.accelerator_backend.name
+            candidates = [
+                inst for inst in rank_matched
+                if accelerators_compatible(target_accelerator, inst.accelerator)
+            ]
+
+            selector = get_configured_selector()
+            select_start = time.perf_counter()
+            ordered = selector.order(candidates, ctx)
+            select_seconds = time.perf_counter() - select_start
+
+            selection_metrics.observe_candidates(
+                selector.name, "listed", len(list_resp.instances)
             )
-            return candidates
+            selection_metrics.observe_candidates(
+                selector.name, "rank_matched", len(rank_matched)
+            )
+            selection_metrics.observe_candidates(
+                selector.name, "accelerator_matched", len(candidates)
+            )
+            selection_metrics.observe_selection_seconds(selector.name, select_seconds)
+
+            logger.info(
+                f"[Worker {ctx.global_rank}] Source selection: "
+                f"source_selector={selector.name} "
+                f"source_candidates_total={len(list_resp.instances)} "
+                f"source_candidates_rank_matched={len(rank_matched)} "
+                f"source_candidates_accelerator_matched={len(candidates)}"
+            )
+            if ordered:
+                logger.debug(
+                    f"[Worker {ctx.global_rank}] Ranked source workers: "
+                    f"{[inst.worker_id for inst in ordered]}"
+                )
+            return ordered
 
         except Exception as e:
             logger.warning(
                 f"[Worker {ctx.global_rank}] Error listing sources, falling through: {e}"
             )
             return []
+
+    def _accelerator_compatible(
+        self,
+        ctx: LoadContext,
+        source_worker: p2p_pb2.WorkerMetadata,
+        worker_id: str,
+    ) -> bool:
+        """Return whether source and target accelerator metadata are compatible.
+
+        Defense-in-depth re-check on the authoritative ``WorkerMetadata`` after
+        GetMetadata: the pre-slice filter in ``_find_source_instances`` uses the
+        lightweight ``SourceInstanceRef.accelerator``, which may be empty on old
+        servers or drift between list and fetch.
+        """
+        target_accelerator = ctx.accelerator_backend.name
+        source_accelerator = source_worker.accelerator
+        if accelerators_compatible(target_accelerator, source_accelerator):
+            return True
+
+        logger.info(
+            f"[Worker {ctx.global_rank}] Skipping source worker {worker_id}: "
+            f"accelerator mismatch source={source_accelerator!r}, "
+            f"target={target_accelerator!r}"
+        )
+        return False
 
     def _fetch_worker_metadata(
         self,
@@ -181,12 +319,18 @@ class RdmaStrategy(LoadStrategy):
             )
             return None
         worker = metadata_resp.worker
-        if not worker_tensor_descriptors(worker) and not worker.worker_grpc_endpoint:
+        has_tensor_descriptors = bool(worker_tensor_descriptors(worker))
+        if not has_tensor_descriptors and not worker.worker_grpc_endpoint:
             logger.debug(
                 f"[Worker {ctx.global_rank}] Worker {worker_id} has no tensors "
                 f"and no P2P endpoint, skipping"
             )
             return None
+        # A worker ID requires endpoint validation. Without one, fetch only
+        # when the metadata response did not already include the manifest.
+        needs_manifest_prefetch = worker_id != "" or not has_tensor_descriptors
+        if worker.worker_grpc_endpoint and needs_manifest_prefetch:
+            self._prefetch_tensor_manifest(ctx, worker, mx_source_id, worker_id)
         fetch_time = time.perf_counter() - fetch_start
         mode = "P2P (lightweight)" if worker.worker_grpc_endpoint else "centralized"
         tensor_count = worker_tensor_count(worker)
@@ -195,6 +339,33 @@ class RdmaStrategy(LoadStrategy):
             f"{fetch_time:.3f}s, {tensor_count} tensors"
         )
         return worker
+
+    def _prefetch_tensor_manifest(
+        self,
+        ctx: LoadContext,
+        source_worker: p2p_pb2.WorkerMetadata,
+        mx_source_id: str,
+        worker_id: str,
+    ) -> None:
+        """Fetch once before target preparation and retain it for the transfer."""
+        from ..metadata.worker_server import fetch_tensor_manifest
+
+        manifest_start = time.perf_counter()
+        tensor_protos, manifest_bytes = fetch_tensor_manifest(
+            endpoint=source_worker.worker_grpc_endpoint,
+            mx_source_id=mx_source_id,
+            worker_id=worker_id,
+        )
+        # Store the validated descriptors on the metadata object so the
+        # transfer can reuse them without a second manifest RPC.
+        source_worker.tensor_source.ClearField("tensors")
+        source_worker.tensor_source.tensors.extend(tensor_protos)
+        manifest_time = time.perf_counter() - manifest_start
+        logger.info(
+            f"[Worker {ctx.global_rank}] [TIMING] P2P tensor manifest: "
+            f"{manifest_time:.3f}s ({len(tensor_protos)} tensors, "
+            f"{manifest_bytes} bytes)"
+        )
 
     def _load_as_target(
         self,
@@ -230,18 +401,9 @@ class RdmaStrategy(LoadStrategy):
         remote_agent_name_override = None
 
         if is_p2p:
-            from ..metadata.worker_server import fetch_tensor_manifest
-
-            manifest_start = time.perf_counter()
-            logger.info(
-                f"[Worker {ctx.global_rank}] P2P mode: fetching tensor manifest from "
-                f"{source_worker.worker_grpc_endpoint}"
-            )
-            tensor_protos, manifest_bytes = fetch_tensor_manifest(
-                endpoint=source_worker.worker_grpc_endpoint,
-                mx_source_id=mx_source_id,
-            )
-            manifest_time = time.perf_counter() - manifest_start
+            # _fetch_worker_metadata() prefetched and generation-validated
+            # this manifest before _load_as_target() prepared target tensors.
+            tensor_protos = worker_tensor_descriptors(source_worker)
             source_tensors = [
                 TensorDescriptor(
                     name=t.name, addr=t.addr, size=t.size,
@@ -249,12 +411,6 @@ class RdmaStrategy(LoadStrategy):
                 )
                 for t in tensor_protos
             ]
-            logger.info(
-                f"[Worker {ctx.global_rank}] [TIMING] P2P tensor manifest: "
-                f"{manifest_time:.3f}s ({len(source_tensors)} tensors, "
-                f"{manifest_bytes} bytes)"
-            )
-
             nixl_fetch_start = time.perf_counter()
             ep = source_worker.metadata_endpoint
             host, port_str = ep.rsplit(":", 1)
@@ -302,7 +458,7 @@ class RdmaStrategy(LoadStrategy):
             f"{transfer_time:.3f}s, {bandwidth_gbps:.1f} Gbps"
         )
 
-        torch.cuda.synchronize()
+        ctx.accelerator_backend.synchronize()
 
         total_time = time.perf_counter() - receive_start
         logger.info(f"[Worker {ctx.global_rank}] [TIMING] Total receive time: {total_time:.2f}s")

@@ -43,7 +43,7 @@ spec:
                   description: Full model name (e.g., meta-llama/Llama-3.1-405B-Instruct)
                 sourceType:
                   type: string
-                  description: Source type from SourceIdentity (e.g., weights, torch_compile_cache)
+                  description: Source type from SourceIdentity (for example, weights or a JIT cache type)
             status:
               type: object
               properties:
@@ -84,6 +84,9 @@ spec:
                     workerGrpcEndpoint:
                       type: string
                       description: P2P worker gRPC endpoint for tensor manifest (host:port)
+                    accelerator:
+                      type: string
+                      description: Runtime accelerator family for compatibility filtering
                     artifactSource:
                       type: object
                       description: Small discovery summary for file-backed artifact sources
@@ -104,6 +107,10 @@ spec:
                           type: integer
                           minimum: 0
                           description: Number of transfer chunks in the sealed artifact manifest
+                        nodeRank:
+                          type: integer
+                          minimum: 0
+                          description: Distributed node rank that owns this node-scoped artifact
                     status:
                       type: string
                       description: Worker lifecycle status

@@ -28,6 +28,8 @@ import re
 
 import torch
 
+from . import envs
+
 logger = logging.getLogger("modelexpress.ucx_utils")
 
 
@@ -371,7 +373,7 @@ def _resolve_nic_pin(device_id: int) -> str | None:
         number). MX_RDMA_NIC_PIN_MIN_RATE_GBPS overrides with an
         explicit absolute lower bound when needed.
     """
-    raw = os.environ.get("MX_RDMA_NIC_PIN", "").strip()
+    raw = envs.MX_RDMA_NIC_PIN
     if raw == "" or raw.lower() in ("off", "0", "false", "no"):
         return None
 
@@ -389,7 +391,7 @@ def _resolve_nic_pin(device_id: int) -> str | None:
         )
         return None
 
-    raw_min = os.environ.get("MX_RDMA_NIC_PIN_MIN_RATE_GBPS")
+    raw_min = envs.MX_RDMA_NIC_PIN_MIN_RATE_GBPS
     if raw_min is None or raw_min.strip() == "":
         min_rate: float | None = None
     else:
@@ -418,7 +420,7 @@ def apply_nic_pin_for_device(device_id: int) -> None:
     """
     pinned = _resolve_nic_pin(device_id)
     if pinned:
-        prev = os.environ.get("UCX_NET_DEVICES")
+        prev = envs.UCX_NET_DEVICES
         os.environ["UCX_NET_DEVICES"] = pinned
         logger.info(
             f"NIXL NIC pin: device {device_id} -> "

@@ -107,7 +107,7 @@ Edit [`vllm-single-node-streamer-azure.yaml`](vllm-single-node-streamer-azure.ya
 - Keep `MX_MS_DISTRIBUTED=1` for tensor-parallel deployments with TP > 1. It is ignored for TP1.
 - Tune `RUNAI_STREAMER_CONCURRENCY` for the storage account, network, and model size.
 
-Optional: if the pod should publish its loaded weights as a P2P source for later pods, set `MX_SERVER_ADDRESS` and add RDMA resources and UCX settings. See [`vllm-single-node-p2p.yaml`](../../../p2p_transfer_k8s/client/vllm/vllm-single-node-p2p.yaml) for the RDMA resource pattern.
+Optional: if the pod should publish its loaded weights as a P2P source for later pods, set `MX_SERVER_ADDRESS` and add RDMA resources and UCX settings. See [`vllm-single-node.yaml`](../../../p2p_transfer_k8s/client/vllm/vllm-single-node.yaml) for the RDMA resource pattern.
 
 ### Deploy
 

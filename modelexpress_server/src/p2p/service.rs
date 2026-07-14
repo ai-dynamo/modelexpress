@@ -30,6 +30,19 @@ impl P2pServiceImpl {
     }
 }
 
+fn ready_source_is_fresh(
+    info: &SourceInstanceInfo,
+    now_ms: i64,
+    heartbeat_timeout_ms: u64,
+) -> bool {
+    if info.updated_at <= 0 {
+        return false;
+    }
+
+    let age_ms = now_ms.saturating_sub(info.updated_at).max(0) as u64;
+    age_ms <= heartbeat_timeout_ms
+}
+
 fn worker_tensor_count(worker: &WorkerMetadata) -> usize {
     use modelexpress_common::grpc::p2p::worker_metadata::SourcePayload;
 
@@ -167,6 +180,18 @@ impl P2pService for P2pServiceImpl {
             }
         };
 
+        let workers = if status_filter == Some(SourceStatus::Ready) {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let heartbeat_timeout_ms =
+                modelexpress_common::envs::heartbeat_timeout_secs().saturating_mul(1000);
+            workers
+                .into_iter()
+                .filter(|info| ready_source_is_fresh(info, now_ms, heartbeat_timeout_ms))
+                .collect()
+        } else {
+            workers
+        };
+
         let refs: Vec<SourceInstanceRef> = workers
             .into_iter()
             .map(|info| SourceInstanceRef {
@@ -174,6 +199,7 @@ impl P2pService for P2pServiceImpl {
                 worker_id: info.worker_id,
                 model_name: info.model_name,
                 worker_rank: info.worker_rank,
+                accelerator: info.accelerator,
             })
             .collect();
 
@@ -496,6 +522,7 @@ mod tests {
                         metadata_endpoint: String::new(),
                         agent_name: String::new(),
                         worker_grpc_endpoint: String::new(),
+                        accelerator: String::new(),
                         artifact_source: None,
                     }],
                     published_at: 1234567890,
@@ -634,8 +661,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_sources_returns_instances() {
+        let now = chrono::Utc::now().timestamp_millis();
         let mut mock = MockMetadataBackend::new();
-        mock.expect_list_workers().once().returning(|_, _| {
+        mock.expect_list_workers().once().returning(move |_, _| {
             Ok(vec![
                 SourceInstanceInfo {
                     source_id: "abc123def456abcd".to_string(),
@@ -643,7 +671,8 @@ mod tests {
                     model_name: "my-model".to_string(),
                     worker_rank: 0,
                     status: SourceStatus::Ready as i32,
-                    updated_at: 1234567890000,
+                    updated_at: now,
+                    accelerator: "cuda".to_string(),
                 },
                 SourceInstanceInfo {
                     source_id: "abc123def456abcd".to_string(),
@@ -651,7 +680,8 @@ mod tests {
                     model_name: "my-model".to_string(),
                     worker_rank: 1,
                     status: SourceStatus::Ready as i32,
-                    updated_at: 1234567890000,
+                    updated_at: now,
+                    accelerator: "cuda".to_string(),
                 },
             ])
         });
@@ -674,6 +704,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_sources_filters_artifact_sources_by_worker_status() {
+        let now = chrono::Utc::now().timestamp_millis();
         let identity = test_artifact_identity();
         let expected_source_id = compute_mx_source_id(&identity);
         let mut mock = MockMetadataBackend::new();
@@ -683,14 +714,15 @@ mod tests {
                     && *status_filter == Some(SourceStatus::Ready)
             })
             .once()
-            .returning(|source_id, _| {
+            .returning(move |source_id, _| {
                 Ok(vec![SourceInstanceInfo {
                     source_id: source_id.expect("source id"),
                     worker_id: "artifact-worker".to_string(),
                     model_name: "my-model".to_string(),
                     worker_rank: 0,
                     status: SourceStatus::Ready as i32,
-                    updated_at: 1234567890000,
+                    updated_at: now,
+                    accelerator: "cuda".to_string(),
                 }])
             });
 
@@ -706,6 +738,50 @@ mod tests {
 
         assert_eq!(resp.instances.len(), 1);
         assert_eq!(resp.instances[0].worker_id, "artifact-worker");
+    }
+
+    #[tokio::test]
+    async fn test_list_sources_ready_filter_excludes_expired_heartbeats() {
+        let now = chrono::Utc::now().timestamp_millis();
+        let expired_updated_at =
+            now - ((modelexpress_common::envs::heartbeat_timeout_secs() + 1) * 1000) as i64;
+
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_list_workers().once().returning(move |_, _| {
+            Ok(vec![
+                SourceInstanceInfo {
+                    source_id: "abc123def456abcd".to_string(),
+                    worker_id: "fresh-worker".to_string(),
+                    model_name: "my-model".to_string(),
+                    worker_rank: 0,
+                    status: SourceStatus::Ready as i32,
+                    updated_at: now,
+                    accelerator: "cuda".to_string(),
+                },
+                SourceInstanceInfo {
+                    source_id: "abc123def456abcd".to_string(),
+                    worker_id: "expired-worker".to_string(),
+                    model_name: "my-model".to_string(),
+                    worker_rank: 1,
+                    status: SourceStatus::Ready as i32,
+                    updated_at: expired_updated_at,
+                    accelerator: "cuda".to_string(),
+                },
+            ])
+        });
+
+        let svc = make_service(mock);
+        let resp = svc
+            .list_sources(Request::new(ListSourcesRequest {
+                identity: Some(test_identity()),
+                status_filter: Some(SourceStatus::Ready as i32),
+            }))
+            .await
+            .expect("rpc")
+            .into_inner();
+
+        assert_eq!(resp.instances.len(), 1);
+        assert_eq!(resp.instances[0].worker_id, "fresh-worker");
     }
 
     #[tokio::test]
@@ -727,12 +803,14 @@ mod tests {
                         metadata_endpoint: "10.0.0.1:5555".to_string(),
                         agent_name: "artifact-agent".to_string(),
                         worker_grpc_endpoint: "10.0.0.1:6555".to_string(),
+                        accelerator: "cuda".to_string(),
                         artifact_source: Some(
                             ArtifactSourceMetadata {
                                 artifact_id: "sha256:artifact".to_string(),
                                 total_size: 1024,
                                 file_count: 1,
                                 chunk_count: 2,
+                                node_rank: 0,
                             }
                             .into(),
                         ),

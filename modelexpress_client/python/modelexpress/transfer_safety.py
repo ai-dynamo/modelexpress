@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 
 import torch
 
+from . import envs
+
 logger = logging.getLogger("modelexpress.transfer_safety")
 
 # ---------------------------------------------------------------------------
@@ -104,7 +106,7 @@ def _get_attention_backend() -> str:
                 return getattr(cache_config, "attention_backend", "unknown") or "unknown"
     except Exception:
         pass
-    return os.environ.get("VLLM_ATTENTION_BACKEND", "auto")
+    return envs.VLLM_ATTENTION_BACKEND
 
 
 def get_deep_gemm_version() -> str:
