@@ -183,9 +183,15 @@ def publish_metadata_and_ready(
                 _worker_servers.pop(device_id, None)
             grpc_server.stop()
     else:
+        # Dual-write the legacy `tensors` field alongside `tensor_source`.
+        # Server builds predating the `tensor_source` oneof read only
+        # `tensors`; without it they store 0 tensors and targets fall back to
+        # disk. The server does the same dual-write on its WorkerRecord ->
+        # WorkerMetadata round-trip.
         worker = p2p_pb2.WorkerMetadata(
             worker_rank=worker_rank,
             nixl_metadata=nixl_manager.nixl_metadata,
+            tensors=tensor_protos,
             tensor_source=tensor_source_metadata(tensor_protos),
             accelerator=accelerator,
         )

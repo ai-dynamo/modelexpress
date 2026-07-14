@@ -385,16 +385,17 @@ jobs:
             extra_env: "JOB_NAME=mx-target"
             source_port: "8007"
             worker_port: "8008"
-          # Non-P2P embedded-metadata path (MX_P2P_METADATA=0): the source
-          # embeds the tensor manifest in the WorkerMetadata proto. The
-          # mixed-version entry (client @ this commit vs the last released
-          # server) is a proto backward-compatibility guard — it catches
-          # client-side proto changes that break older servers (e.g. MX-396,
-          # dropping the legacy `tensors` field). same-version only guards the
-          # path against future same-build breaks.
+          # Full tensor-manifest publish path (MX_P2P_METADATA=0): the source
+          # embeds the full tensor manifest in the WorkerMetadata proto it
+          # publishes, instead of serving it on-demand. The mixed-version entry
+          # (client @ this commit vs the last released server) is a proto
+          # backward-compatibility guard — it catches client-side proto changes
+          # that break older servers (e.g. dropping the legacy `tensors`
+          # field). same-version only guards the path against future same-build
+          # breaks.
           - framework: vllm
-            label: vllm embedded same-version
-            namespace: mx-ci-embedded-same-${{ github.run_id }}
+            label: vllm full-manifest same-version
+            namespace: mx-ci-full-manifest-same-${{ github.run_id }}
             manifest: ci/k8s/client/vllm/manifest-azure.yaml
             test_script: ci/k8s/client/test_p2p_k8s.py
             source_extra_env: "JOB_NAME=mx-source"
@@ -403,8 +404,8 @@ jobs:
             worker_port: "8022"
             mx_p2p_metadata: "0"
           - framework: vllm
-            label: vllm embedded mixed-version
-            namespace: mx-ci-embedded-mixed-${{ github.run_id }}
+            label: vllm full-manifest mixed-version
+            namespace: mx-ci-full-manifest-mixed-${{ github.run_id }}
             manifest: ci/k8s/client/vllm/manifest-azure.yaml
             test_script: ci/k8s/client/test_p2p_k8s.py
             source_extra_env: "JOB_NAME=mx-source"

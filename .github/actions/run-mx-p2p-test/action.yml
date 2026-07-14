@@ -61,12 +61,11 @@ inputs:
   mx_p2p_metadata:
     description: |
       Value for the ${MX_P2P_METADATA} substitution in manifests that
-      template it (currently vllm/manifest-azure.yaml). "1" (default) keeps
-      the P2P-metadata path (source serves the tensor manifest on-demand via
-      a WorkerGrpcServer). "0" exercises the non-P2P embedded-metadata path
-      (tensors carried in the WorkerMetadata proto) — the path where the
-      MX-396 dropped-tensors regression surfaces. Applied to both source and
-      target manifest applies.
+      template it (currently vllm/manifest-azure.yaml). "1" (default) serves
+      the tensor manifest on-demand via a WorkerGrpcServer. "0" exercises the
+      full tensor-manifest publish path, where the source embeds the full
+      tensor manifest in the WorkerMetadata proto it publishes. Applied to
+      both source and target manifest applies.
     required: false
     default: '1'
   source_port:
@@ -249,8 +248,14 @@ runs:
             | awk '$1 != "weights" && $2 == "Ready" && $3 != "" { count++ } END { print count + 0 }'
         }
         count_weight_sources() {
+          # Count weight sources. `sourceType` is a newer CR field; servers
+          # predating it (e.g. the released image the mixed-version
+          # full-manifest entry runs against) publish weight CRs with no
+          # sourceType, so an empty value is treated as a weight source too.
+          # Current servers always set sourceType on non-weight (artifact)
+          # sources, so this never miscounts an artifact source as a weight one.
           kubectl get modelmetadata -n "${NAMESPACE}" -o jsonpath='{range .items[*]}{.spec.sourceType}{"\n"}{end}' 2>/dev/null \
-            | awk '$1 == "weights" { count++ } END { print count + 0 }'
+            | awk '$1 == "weights" || $1 == "" { count++ } END { print count + 0 }'
         }
         wait_for_artifact_sources() {
           local expected="$1"

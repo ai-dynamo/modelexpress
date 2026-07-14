@@ -52,10 +52,10 @@ inputs:
   mx_p2p_metadata:
     description: |
       Value for the ${MX_P2P_METADATA} substitution in manifests that template
-      it (currently vllm/manifest-azure.yaml). Defaults to "1" (P2P metadata).
-      This test targets the reaper/heartbeat path, not the metadata publish
-      path, so the default is the only value CI exercises here; the input
-      exists so the shared manifest's templated var never blanks.
+      it (currently vllm/manifest-azure.yaml). Defaults to "1" (tensor manifest
+      served on-demand). This test targets the reaper/heartbeat path, not the
+      metadata publish path, so the default is the only value CI exercises
+      here; the input exists so the shared manifest's templated var never blanks.
     required: false
     default: '1'
   test_script:
