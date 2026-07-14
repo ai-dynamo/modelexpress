@@ -40,6 +40,7 @@ from ..vllm import artifacts as _common_artifacts
 
 logger = logging.getLogger("modelexpress.engines.sglang.artifacts")
 
+_DEFAULT_READY_URL = "http://127.0.0.1:30000/health"
 _READY_POLL_SECS = 5
 
 _published_sources: dict[tuple[int, int], PublishedArtifactSource] = {}
@@ -263,13 +264,20 @@ def _sglang_artifact_transfers(
     ctx: LoadContext,
 ) -> list[tuple[P2PArtifactTransfer, p2p_pb2.SourceIdentity]]:
     bundle_root = _bundle_root(ctx)
-    flashinfer_cache_root = _flashinfer_cache_root()
-    flashinfer_autotune_cache_root = _flashinfer_autotune_cache_root()
+    torch_compile_cache_root = _torch_compile_cache_root()
+    triton_cache_root = _common_artifacts._triton_cache_root()
+    deep_gemm_cache_root = _deep_gemm_cache_root()
+    tilelang_cache_root = _common_artifacts._tilelang_cache_root()
+    cute_dsl_cache_root = _common_artifacts._cute_dsl_cache_root()
+    flashinfer_cache_root = _common_artifacts._flashinfer_cache_root()
+    flashinfer_autotune_cache_root = (
+        _common_artifacts._flashinfer_autotune_cache_root()
+    )
     return [
         (
             torch_compile_cache_artifact_transfer(
-                _torch_compile_cache_root(),
-                _torch_compile_cache_root(),
+                torch_compile_cache_root,
+                torch_compile_cache_root,
                 bundle_root / "torch_compile_cache",
             ),
             _artifact_identity(
@@ -279,32 +287,32 @@ def _sglang_artifact_transfers(
         ),
         (
             triton_cache_artifact_transfer(
-                _triton_cache_root(),
-                _triton_cache_root(),
+                triton_cache_root,
+                triton_cache_root,
                 bundle_root / "triton_cache",
             ),
             _artifact_identity(ctx, p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE),
         ),
         (
             deep_gemm_cache_artifact_transfer(
-                _deep_gemm_cache_root(),
-                _deep_gemm_cache_root(),
+                deep_gemm_cache_root,
+                deep_gemm_cache_root,
                 bundle_root / "deep_gemm_cache",
             ),
             _artifact_identity(ctx, p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE),
         ),
         (
             tilelang_cache_artifact_transfer(
-                _tilelang_cache_root(),
-                _tilelang_cache_root(),
+                tilelang_cache_root,
+                tilelang_cache_root,
                 bundle_root / "tilelang_cache",
             ),
             _artifact_identity(ctx, p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE),
         ),
         (
             cute_dsl_cache_artifact_transfer(
-                _cute_dsl_cache_root(),
-                _cute_dsl_cache_root(),
+                cute_dsl_cache_root,
+                cute_dsl_cache_root,
                 bundle_root / "cute_dsl_cache",
             ),
             _artifact_identity(ctx, p2p_pb2.MX_SOURCE_TYPE_CUTE_DSL_CACHE),
@@ -344,28 +352,11 @@ def _torch_compile_cache_root() -> Path:
         return Path(tempfile.gettempdir()) / f"torchinductor_{user}"
 
 
-def _triton_cache_root() -> Path:
-    return _common_artifacts._triton_cache_root()
-
-
 def _deep_gemm_cache_root() -> Path:
-    return _common_artifacts._deep_gemm_cache_root()
-
-
-def _tilelang_cache_root() -> Path:
-    return _common_artifacts._tilelang_cache_root()
-
-
-def _cute_dsl_cache_root() -> Path:
-    return _common_artifacts._cute_dsl_cache_root()
-
-
-def _flashinfer_cache_root() -> Path:
-    return _common_artifacts._flashinfer_cache_root()
-
-
-def _flashinfer_autotune_cache_root() -> Path:
-    return _common_artifacts._flashinfer_autotune_cache_root()
+    configured = envs.SGLANG_DG_CACHE_DIR
+    if configured:
+        return Path(configured)
+    return Path.home() / ".cache" / "deep_gemm"
 
 
 def _bundle_root(ctx: LoadContext) -> Path:
@@ -373,7 +364,7 @@ def _bundle_root(ctx: LoadContext) -> Path:
     if configured:
         return Path(configured) / f"rank-{ctx.worker_rank}"
     return (
-        Path(_common_artifacts.tempfile.gettempdir())
+        Path(tempfile.gettempdir())
         / "modelexpress-artifacts"
         / f"worker-{ctx.worker_id}"
         / f"rank-{ctx.worker_rank}"
@@ -413,11 +404,11 @@ def _torch_compile_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         backend_framework_version=_sglang_version(),
         torch_version=torch.__version__,
         cuda_version=torch.version.cuda or "",
-        triton_version=_triton_version(),
-        gpu_arch=_gpu_arch(ctx.device_id),
+        triton_version=_common_artifacts._triton_version(),
+        gpu_arch=_common_artifacts._gpu_arch(ctx.device_id),
         compile_config_digest=envs.MX_ARTIFACT_COMPILE_CONFIG_DIGEST,
     )
-    _set_extra_if_present(identity, "triton_key", _triton_key())
+    _set_extra_if_present(identity, "triton_key", _common_artifacts._triton_key())
     return identity
 
 
@@ -427,10 +418,10 @@ def _triton_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         model_name=ctx.identity.model_name,
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
         cuda_version=torch.version.cuda or "",
-        triton_version=_triton_version(),
-        gpu_arch=_gpu_arch(ctx.device_id),
+        triton_version=_common_artifacts._triton_version(),
+        gpu_arch=_common_artifacts._gpu_arch(ctx.device_id),
     )
-    _set_extra_if_present(identity, "triton_key", _triton_key())
+    _set_extra_if_present(identity, "triton_key", _common_artifacts._triton_key())
     return identity
 
 
@@ -440,9 +431,13 @@ def _deep_gemm_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         model_name=ctx.identity.model_name,
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
         cuda_version=torch.version.cuda or "",
-        gpu_arch=_gpu_arch(ctx.device_id),
+        gpu_arch=_common_artifacts._gpu_arch(ctx.device_id),
     )
-    _set_extra_if_present(identity, "deep_gemm_jit_key", _deep_gemm_jit_key())
+    _set_extra_if_present(
+        identity,
+        "deep_gemm_jit_key",
+        _common_artifacts._deep_gemm_jit_key(),
+    )
     return identity
 
 
@@ -452,9 +447,13 @@ def _tilelang_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         model_name=ctx.identity.model_name,
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
         cuda_version=torch.version.cuda or "",
-        gpu_arch=_gpu_arch(ctx.device_id),
+        gpu_arch=_common_artifacts._gpu_arch(ctx.device_id),
     )
-    _set_extra_if_present(identity, "tilelang_version", _tilelang_version())
+    _set_extra_if_present(
+        identity,
+        "tilelang_version",
+        _common_artifacts._tilelang_version(),
+    )
     return identity
 
 
@@ -464,9 +463,13 @@ def _cute_dsl_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         model_name=ctx.identity.model_name,
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
         cuda_version=torch.version.cuda or "",
-        gpu_arch=_gpu_arch(ctx.device_id),
+        gpu_arch=_common_artifacts._gpu_arch(ctx.device_id),
     )
-    _set_extra_if_present(identity, "cutlass_dsl_version", _cutlass_dsl_version())
+    _set_extra_if_present(
+        identity,
+        "cutlass_dsl_version",
+        _common_artifacts._cutlass_dsl_version(),
+    )
     return identity
 
 
@@ -477,9 +480,13 @@ def _flashinfer_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
         torch_version=torch.__version__,
         cuda_version=torch.version.cuda or "",
-        gpu_arch=_gpu_arch(ctx.device_id),
+        gpu_arch=_common_artifacts._gpu_arch(ctx.device_id),
     )
-    _set_extra_if_present(identity, "flashinfer_version", _flashinfer_version())
+    _set_extra_if_present(
+        identity,
+        "flashinfer_version",
+        _common_artifacts._flashinfer_version(),
+    )
     return identity
 
 
@@ -493,7 +500,28 @@ def _set_extra_if_present(
 
 
 def _sglang_artifact_ready_fn(source_roots: tuple[ArtifactCacheRoot, ...]):
-    return _common_artifacts._vllm_artifact_ready_fn(source_roots)
+    return _common_artifacts._vllm_artifact_ready_fn(
+        source_roots,
+        _sglang_health_ready,
+    )
+
+
+def _sglang_health_ready() -> bool:
+    return _common_artifacts._artifact_health_ready(_sglang_health_url())
+
+
+def _sglang_health_url() -> str:
+    configured = envs.MX_ARTIFACT_READY_URL.strip()
+    fallback = (
+        _common_artifacts._statefulset_head_health_url(port=30000)
+        or _DEFAULT_READY_URL
+    )
+    if not configured or configured == _DEFAULT_READY_URL:
+        return fallback
+    if _common_artifacts._is_http_url(configured):
+        return configured
+    logger.warning("Invalid MX_ARTIFACT_READY_URL=%r; using %s", configured, fallback)
+    return fallback
 
 
 def _sglang_version() -> str:
@@ -504,36 +532,8 @@ def _sglang_version() -> str:
         if isinstance(version, str) and version:
             return version
     except Exception:
-        pass
+        logger.debug("Failed to read SGLang package version", exc_info=True)
     try:
         return pkg_version("sglang")
     except Exception:
         return ""
-
-
-def _triton_version() -> str:
-    return _common_artifacts._triton_version()
-
-
-def _triton_key() -> str:
-    return _common_artifacts._triton_key()
-
-
-def _deep_gemm_jit_key() -> str:
-    return _common_artifacts._deep_gemm_jit_key()
-
-
-def _tilelang_version() -> str:
-    return _common_artifacts._tilelang_version()
-
-
-def _cutlass_dsl_version() -> str:
-    return _common_artifacts._cutlass_dsl_version()
-
-
-def _flashinfer_version() -> str:
-    return _common_artifacts._flashinfer_version()
-
-
-def _gpu_arch(device_id: int) -> str:
-    return _common_artifacts._gpu_arch(device_id)

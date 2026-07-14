@@ -18,7 +18,7 @@ from getpass import getuser
 from hashlib import sha256
 from importlib.metadata import version as pkg_version
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 import torch
 
@@ -639,7 +639,10 @@ def _has_files(path: Path) -> bool:
     return any(child.is_file() for child in path.rglob("*"))
 
 
-def _vllm_artifact_ready_fn(source_roots: tuple[ArtifactCacheRoot, ...]):
+def _vllm_artifact_ready_fn(
+    source_roots: tuple[ArtifactCacheRoot, ...],
+    health_ready_fn: Callable[[], bool] | None = None,
+):
     server_ready = False
     stable_since: float | None = None
     last_signature: tuple[int, int, int] | None = None
@@ -647,7 +650,7 @@ def _vllm_artifact_ready_fn(source_roots: tuple[ArtifactCacheRoot, ...]):
     def ready() -> bool:
         nonlocal server_ready, stable_since, last_signature
         if not server_ready:
-            if not _vllm_health_ready():
+            if not (health_ready_fn or _vllm_health_ready)():
                 stable_since = None
                 last_signature = None
                 return False
@@ -701,7 +704,10 @@ def _cache_signature(
 
 
 def _vllm_health_ready() -> bool:
-    url = _vllm_health_url()
+    return _artifact_health_ready(_vllm_health_url())
+
+
+def _artifact_health_ready(url: str) -> bool:
     try:
         with urllib.request.urlopen(url, timeout=1.0) as response:
             return 200 <= response.status < 400
@@ -725,7 +731,7 @@ def _is_http_url(url: str) -> bool:
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
-def _statefulset_head_health_url() -> str | None:
+def _statefulset_head_health_url(port: int = 8000) -> str | None:
     pod_name, _, ordinal = envs.HOSTNAME.rpartition("-")
     if not pod_name or not ordinal.isdigit() or ordinal == "0":
         return None
@@ -733,7 +739,7 @@ def _statefulset_head_health_url() -> str | None:
     host = f"{pod_name}-0.{pod_name}"
     if namespace:
         host = f"{host}.{namespace}.svc"
-    return f"http://{host}:8000/health"
+    return f"http://{host}:{port}/health"
 
 
 def _vllm_version() -> str:

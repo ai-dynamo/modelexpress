@@ -127,10 +127,12 @@ JIT cache artifacts before SGLang initializes the model. The source publishes
 cache artifacts after the SGLang `/health` endpoint is ready and the cache
 directories have stopped changing briefly. Supported cache roots are
 `TORCHINDUCTOR_CACHE_DIR` (or PyTorch Inductor's runtime `cache_dir()`),
-`TRITON_CACHE_DIR`, `DG_JIT_CACHE_DIR`, `TILELANG_CACHE_DIR`,
+`TRITON_CACHE_DIR`, `SGLANG_DG_CACHE_DIR`, `TILELANG_CACHE_DIR`,
 `CUTE_DSL_CACHE_DIR`, and `FLASHINFER_WORKSPACE_BASE`. This path requires
 `MX_P2P_METADATA=1` and a central-coordinator metadata backend (`redis` or
-`kubernetes`) for artifact discovery.
+`kubernetes`) for artifact discovery. Artifact readiness defaults to SGLang's
+`http://127.0.0.1:30000/health`; set `MX_ARTIFACT_READY_URL` when using another
+server port.
 
 For Mooncake TransferEngine, use the same command shape and change only the
 transport. The SGLang image must include `mooncake-transfer-engine-cuda13`.

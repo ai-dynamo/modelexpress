@@ -96,6 +96,7 @@ if TYPE_CHECKING:
     TRITON_CACHE_DIR: Optional[str]
     DG_JIT_CACHE_DIR: Optional[str]
     DEEP_GEMM_CACHE_DIR: Optional[str]
+    SGLANG_DG_CACHE_DIR: Optional[str]
     TILELANG_CACHE_DIR: Optional[str]
     CUTE_DSL_CACHE_DIR: Optional[str]
     FLASHINFER_WORKSPACE_BASE: Optional[str]
@@ -203,6 +204,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TRITON_CACHE_DIR": lambda: os.environ.get("TRITON_CACHE_DIR"),
     "DG_JIT_CACHE_DIR": lambda: os.environ.get("DG_JIT_CACHE_DIR"),
     "DEEP_GEMM_CACHE_DIR": lambda: os.environ.get("DEEP_GEMM_CACHE_DIR"),
+    "SGLANG_DG_CACHE_DIR": lambda: os.environ.get("SGLANG_DG_CACHE_DIR"),
     "TILELANG_CACHE_DIR": lambda: os.environ.get("TILELANG_CACHE_DIR"),
     "CUTE_DSL_CACHE_DIR": lambda: os.environ.get("CUTE_DSL_CACHE_DIR"),
     "FLASHINFER_WORKSPACE_BASE": lambda: os.environ.get("FLASHINFER_WORKSPACE_BASE"),
