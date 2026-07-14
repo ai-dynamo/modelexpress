@@ -18,6 +18,7 @@ import pytest
 
 from modelexpress import p2p_pb2
 from modelexpress.adapter import StrategyFailed
+from modelexpress.load_strategy.base import LoadResult
 from modelexpress.load_strategy.rdma_strategy import MAX_SOURCE_RETRIES, RdmaStrategy
 from modelexpress.source_selection import (
     ENV_SELECTOR,
@@ -391,6 +392,31 @@ def test_fetch_worker_metadata_prefetches_legacy_endpoint(monkeypatch):
     )
 
 
+def test_fetch_worker_metadata_reuses_empty_worker_id_manifest(monkeypatch):
+    strat = RdmaStrategy()
+    worker = p2p_pb2.WorkerMetadata(
+        worker_grpc_endpoint="service:6555",
+        tensor_source=p2p_pb2.TensorSourceMetadata(
+            tensors=[p2p_pb2.TensorDescriptor(name="weight")],
+        ),
+    )
+    ctx = MagicMock(global_rank=0)
+    ctx.mx_client.get_metadata.return_value = p2p_pb2.GetMetadataResponse(
+        found=True,
+        worker=worker,
+    )
+    fetch_manifest = MagicMock()
+    monkeypatch.setattr(
+        "modelexpress.metadata.worker_server.fetch_tensor_manifest",
+        fetch_manifest,
+    )
+
+    result = strat._fetch_worker_metadata(ctx, "source-123", "")
+
+    assert [tensor.name for tensor in result.tensor_source.tensors] == ["weight"]
+    fetch_manifest.assert_not_called()
+
+
 def test_load_transfer_failure_reinitializes_and_tries_next_source():
     strat = RdmaStrategy()
     cands = _sources(3)
@@ -434,7 +460,7 @@ def test_load_clean_transfer_failure_tries_next_source_without_reinit():
     ctx.adapter.reinit_for_retry.assert_not_called()
 
 
-def test_load_is_clean_after_reinit_then_metadata_miss():
+def test_load_requires_outer_reinit_after_reinit_then_metadata_miss():
     strat = RdmaStrategy()
     strat._find_source_instances = MagicMock(return_value=_sources(2))
     strat._fetch_worker_metadata = MagicMock(side_effect=[MagicMock(), None])
@@ -443,12 +469,43 @@ def test_load_is_clean_after_reinit_then_metadata_miss():
     )
     ctx = MagicMock(global_rank=0)
     ctx.accelerator_backend.name = ""
-    ctx.adapter.reinit_for_retry.return_value = MagicMock(name="retry-result")
+    original_model = MagicMock(name="original-model")
+    original_result = LoadResult(value=original_model, model=original_model)
+
+    def reinit(result):
+        result.value = None
+        result.model = None
+        retry_model = MagicMock(name="retry-model")
+        return LoadResult(value=retry_model, model=retry_model)
+
+    ctx.adapter.reinit_for_retry.side_effect = reinit
 
     with pytest.raises(StrategyFailed) as exc:
+        strat.load(original_result, ctx)
+
+    assert exc.value.mutated is True
+    assert original_result.model is None
+    ctx.adapter.reinit_for_retry.assert_called_once()
+
+
+def test_load_requires_outer_reinit_after_reinit_then_clean_failure():
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(2))
+    strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
+    strat._load_as_target = MagicMock(
+        side_effect=[
+            StrategyFailed("mutated failure", mutated=True),
+            StrategyFailed("clean failure", mutated=False),
+        ]
+    )
+    ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""
+    ctx.adapter.reinit_for_retry.return_value = MagicMock(name="retry-result")
+
+    with pytest.raises(StrategyFailed, match="clean failure") as exc:
         strat.load(MagicMock(), ctx)
 
-    assert exc.value.mutated is False
+    assert exc.value.mutated is True
     ctx.adapter.reinit_for_retry.assert_called_once()
 
 

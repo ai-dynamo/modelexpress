@@ -102,6 +102,7 @@ class RdmaStrategy(LoadStrategy):
 
         attempts = candidates[:MAX_SOURCE_RETRIES]
         policy = configured_policy_label()
+        needs_outer_reinit = False
         for attempt_index, instance in enumerate(attempts):
             mx_source_id = instance.mx_source_id
             worker_id = instance.worker_id
@@ -154,6 +155,8 @@ class RdmaStrategy(LoadStrategy):
                     "transfer_retry" if has_next_candidate else "transfer_fallback",
                 )
                 if not has_next_candidate:
+                    if needs_outer_reinit and not e.mutated:
+                        raise StrategyFailed(str(e), mutated=True) from e
                     raise
 
                 logger.warning(
@@ -177,6 +180,7 @@ class RdmaStrategy(LoadStrategy):
                             f"{worker_id} failed: {reinit_error}",
                             mutated=True,
                         ) from reinit_error
+                    needs_outer_reinit = True
                 continue
             except BaseException:
                 selection_metrics.observe_transfer_seconds(
@@ -195,9 +199,11 @@ class RdmaStrategy(LoadStrategy):
             f"[Worker {ctx.global_rank}] Tried {tried} of {len(candidates)} source workers "
             f"(max retries={MAX_SOURCE_RETRIES}), falling through"
         )
-        # Reaching here means every attempted transfer either failed cleanly or
-        # was followed by a successful reinitialization, so the model is clean.
-        raise StrategyFailed("No RDMA source succeeded", mutated=False)
+        # An internal reinit returns a new result, but the outer strategy chain
+        # still owns the original result that the adapter cleared.
+        raise StrategyFailed(
+            "No RDMA source succeeded", mutated=needs_outer_reinit,
+        )
 
     def _find_source_instances(
         self, ctx: LoadContext,
@@ -313,15 +319,17 @@ class RdmaStrategy(LoadStrategy):
             )
             return None
         worker = metadata_resp.worker
-        if not worker_tensor_descriptors(worker) and not worker.worker_grpc_endpoint:
+        has_tensor_descriptors = bool(worker_tensor_descriptors(worker))
+        if not has_tensor_descriptors and not worker.worker_grpc_endpoint:
             logger.debug(
                 f"[Worker {ctx.global_rank}] Worker {worker_id} has no tensors "
                 f"and no P2P endpoint, skipping"
             )
             return None
-        if worker.worker_grpc_endpoint:
-            # Validate the selected endpoint before target preparation. Keep
-            # the fetched descriptors for _receive_from_peer() to reuse.
+        # A worker ID requires endpoint validation. Without one, fetch only
+        # when the metadata response did not already include the manifest.
+        needs_manifest_prefetch = worker_id != "" or not has_tensor_descriptors
+        if worker.worker_grpc_endpoint and needs_manifest_prefetch:
             self._prefetch_tensor_manifest(ctx, worker, mx_source_id, worker_id)
         fetch_time = time.perf_counter() - fetch_start
         mode = "P2P (lightweight)" if worker.worker_grpc_endpoint else "centralized"
