@@ -536,6 +536,19 @@ class MxVllmWeightUpdater:
         inner = self._receiver._receiver
         hf_results: dict[str, torch.Tensor] = {}
         expected_hf: set[str] = set()
+        staging_mode = os.environ.get("MX_EP_GATHER_STAGING", "host").lower()
+        if staging_mode not in {"host", "device"}:
+            raise ValueError(
+                "MX_EP_GATHER_STAGING must be 'host' or 'device', got "
+                f"{staging_mode!r}"
+            )
+        device_staging = staging_mode == "device"
+        gpu_staging_cache: dict[str, torch.Tensor] = (
+            getattr(self, "_ep_gather_gpu_results", {})
+            if device_staging
+            else {}
+        )
+        active_gpu_staging_names: set[str] = set()
         # Dedupe by ep_rank keeping the MOST RECENT source: the MX server can
         # retain stale registrations from prior (torn-down) trainers with the same
         # model name; connecting to a dead agent yields NIXL_ERR_REMOTE_DISCONNECT.
@@ -666,14 +679,45 @@ class MxVllmWeightUpdater:
                 pull=lambda _s, _d: None, device=device, pre_assembled_buffers=pre,
             ):
                 if hf_name not in hf_results:
-                    # Translation outputs are commonly views into the
-                    # persistent scratch buffers. The next EP source reuses
-                    # and overwrites those buffers, so retain an owned copy.
-                    # CPU staging bounds rollout HBM and matches the proven
-                    # legacy EP-gather path; TP-local/direct destinations can
-                    # replace this staging in the optimized path.
-                    hf_results[hf_name] = hf_t.detach().to("cpu")
+                    # Translation outputs are commonly views into persistent
+                    # scratch that the next EP source overwrites. Host staging
+                    # bounds HBM. Device staging keeps persistent owned GPU
+                    # buffers and removes the GPU->CPU->GPU round trip on
+                    # high-memory receivers such as GB200.
+                    if device_staging:
+                        staged = gpu_staging_cache.get(hf_name)
+                        if (
+                            staged is None
+                            or staged.shape != hf_t.shape
+                            or staged.dtype != hf_t.dtype
+                            or staged.device != device
+                        ):
+                            staged = torch.empty_like(hf_t, device=device)
+                            gpu_staging_cache[hf_name] = staged
+                        staged.copy_(hf_t)
+                        hf_results[hf_name] = staged
+                        active_gpu_staging_names.add(hf_name)
+                    else:
+                        hf_results[hf_name] = hf_t.detach().to("cpu")
+            if device_staging:
+                # NIXL may write the shared scratch independently of PyTorch's
+                # current stream. Finish owned copies before receiving the next
+                # EP source into those same scratch slots.
+                torch.cuda.current_stream(device).synchronize()
             translated_seconds += time.perf_counter() - translate_start
+        if device_staging:
+            self._ep_gather_gpu_results = {
+                name: gpu_staging_cache[name]
+                for name in active_gpu_staging_names
+            }
+            logger.info(
+                "[mx-wt] EP-gather persistent GPU staging: tensors=%d bytes=%d",
+                len(self._ep_gather_gpu_results),
+                sum(
+                    tensor.numel() * tensor.element_size()
+                    for tensor in self._ep_gather_gpu_results.values()
+                ),
+            )
         logger.info(
             "[mx-wt] EP-gather transfer policy: sources=%d descriptor_pairs=%d "
             "wire_bytes=%d local_translate_seconds=%.6f policy=full-contiguous-"
