@@ -44,6 +44,8 @@ if TYPE_CHECKING:
     MX_SERVER_ADDRESS: Optional[str]
     MODEL_EXPRESS_LOG_LEVEL: str
     MODEL_NAME: Optional[str]
+    # Runtime compatibility
+    MX_DISABLE_PATCHES: bool
     # Metadata / worker
     MX_METADATA_BACKEND: str
     MX_METADATA_PORT: int
@@ -146,6 +148,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_SERVER_ADDRESS": lambda: os.environ.get("MX_SERVER_ADDRESS"),
     "MODEL_EXPRESS_LOG_LEVEL": lambda: os.environ.get("MODEL_EXPRESS_LOG_LEVEL", "").upper(),
     "MODEL_NAME": lambda: os.environ.get("MODEL_NAME"),
+    # ── Runtime compatibility ──────────────────────────────────────────────
+    "MX_DISABLE_PATCHES": lambda: os.environ.get("MX_DISABLE_PATCHES", "").strip().lower()
+    in _TRUTHY,
     # ── Metadata / worker ──────────────────────────────────────────────────
     "MX_METADATA_BACKEND": lambda: os.environ.get("MX_METADATA_BACKEND", "").lower().strip(),
     "MX_METADATA_PORT": lambda: _env_int("MX_METADATA_PORT", 5555),
