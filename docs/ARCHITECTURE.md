@@ -134,6 +134,8 @@ ModelExpress/
 │       ├── vllm_loader.py              # Compatibility shim for engines.vllm.loader
 │       ├── metadata/                   # Metadata clients, publishing, heartbeat, worker manifest service
 │       │   ├── __init__.py
+│       │   ├── artifact_lifecycle.py   # Engine-agnostic cache-artifact lifecycle
+│       │   ├── artifact_transfer.py    # Tar/NIXL artifact transfer primitives
 │       │   ├── publish.py              # Source identity + metadata publication
 │       │   ├── publisher.py            # Source publication and heartbeat signaling
 │       │   ├── worker_server.py        # WorkerGrpcServer (P2P tensor/artifact manifests)
@@ -535,7 +537,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
 | `adapter.py` | `EngineAdapter` lifecycle hooks and strategy retry errors |
 | `vllm_loader.py` | Compatibility shim for `modelexpress.engines.vllm.loader` |
-| `metadata/` | Metadata publishing, source identity, heartbeat, worker manifest serving, metadata client selection |
+| `metadata/` | Metadata publishing, source identity, heartbeat, worker manifest serving, metadata client selection, and engine-agnostic cache-artifact transfer |
 | `load_strategy/` | Engine-neutral loading strategy chain: `RdmaStrategy`, `ModelStreamerStrategy` (S3/GCS/Azure/local), `GdsStrategy`, `DefaultStrategy` |
 | `engines/vllm/` | `VllmAdapter` and `MxModelLoader` - maps strategy hooks to vLLM loader APIs and post-load lifecycle |
 | `engines/sglang/` | `SglangAdapter` and `MxModelLoader` - maps strategy hooks to SGLang's `remote_instance` backend |
@@ -782,9 +784,9 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
 | `MX_WORKER_GRPC_PORT` | `6555` | Base worker gRPC port for P2P tensor and artifact manifest serving; effective port is `MX_WORKER_GRPC_PORT + device_id` |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
-| `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. Requires the P2P metadata path; if `MX_P2P_METADATA=0`, the loader logs a warning and skips artifact transfer |
+| `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. The SGLang NIXL loader uses it for compatible torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer caches. Requires the P2P metadata path; if `MX_P2P_METADATA=0`, the loader logs a warning and skips artifact transfer |
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles |
-| `MX_ARTIFACT_READY_URL` | `http://127.0.0.1:8000/health` | Readiness endpoint polled by the artifact publisher before preparing and publishing cache bundles. Kubernetes StatefulSet vLLM worker pods using the default localhost URL infer pod-0's stable DNS endpoint |
+| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled by the artifact publisher before preparing and publishing cache bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. Kubernetes StatefulSet workers using their framework's default localhost URL infer pod-0's stable DNS endpoint |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time the artifact publisher waits for readiness and successful publication before giving up |
 | `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact checkpoint identifier so `mx_source_id` is content-addressed |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend; `{rank}` is substituted with the worker's own rank. Client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` if the resolved pattern has no explicit port |

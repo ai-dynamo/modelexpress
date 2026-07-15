@@ -76,7 +76,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "--require-artifact-transfer",
         action="store_true",
         default=os.environ.get("REQUIRE_ARTIFACT_TRANSFER", "").lower() in {"1", "true", "yes"},
-        help="Assert that a vLLM artifact source was published and installed by the target.",
+        help="Assert that an artifact source was published and installed by the target.",
     )
     parser.addoption(
         "--expected-artifact-sources",
