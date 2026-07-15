@@ -181,6 +181,28 @@ def test_collect_sglang_tensors_includes_named_buffers(
     assert "w_kc" in tensors
 
 
+def test_capture_then_collect_registers_bare_tensor_assign(
+    mock_accelerator_backend_cls,
+):
+    # End-to-end of the Class H-direct fix: a bare tensor assign made under
+    # capture_tensor_attrs (as the DeepSeek MLA mixin does self_attn.w_kc = t)
+    # is promoted to a non-persistent buffer and then discovered by
+    # _collect_tensors' named_buffers() pass.
+    from modelexpress.tensor_utils import capture_tensor_attrs
+
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    adapter.accelerator_backend = backend
+    model = nn.Module()
+    model.self_attn = nn.Module()
+
+    with capture_tensor_attrs(backend):
+        model.self_attn.w_kc = torch.randn(3, 2)
+
+    assert "w_kc" in dict(model.self_attn.named_buffers())
+    assert "self_attn.w_kc" in adapter._collect_tensors(model)
+
+
 def test_sglang_adapter_discovery_uses_backend_predicate(
     monkeypatch,
     mock_accelerator_backend_cls,
