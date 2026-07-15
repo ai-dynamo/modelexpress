@@ -200,10 +200,7 @@ impl P2pService for P2pServiceImpl {
                 model_name: info.model_name,
                 worker_rank: info.worker_rank,
                 accelerator: info.accelerator,
-                // TODO(load_aware): populate from source-published NIC telemetry
-                // once WorkerMetadata carries it (see PR description). 0.0 means
-                // "idle/unknown", which collapses load_aware to rendezvous_hash.
-                nic_utilization: 0.0,
+                source_load: info.source_load,
             })
             .collect();
 
@@ -306,7 +303,13 @@ impl P2pService for P2pServiceImpl {
 
         match self
             .state
-            .update_worker_status(&req.mx_source_id, &req.worker_id, req.worker_rank, status)
+            .update_worker_status(
+                &req.mx_source_id,
+                &req.worker_id,
+                req.worker_rank,
+                status,
+                req.source_load,
+            )
             .await
         {
             Ok(()) => Ok(Response::new(UpdateStatusResponse {
@@ -527,6 +530,7 @@ mod tests {
                         agent_name: String::new(),
                         worker_grpc_endpoint: String::new(),
                         accelerator: String::new(),
+                        source_load: 0.0,
                         artifact_source: None,
                     }],
                     published_at: 1234567890,
@@ -582,6 +586,7 @@ mod tests {
                 worker_id: "worker-uuid-1".to_string(),
                 worker_rank: 0,
                 status: 99,
+                source_load: 0.0,
             }))
             .await
             .expect("rpc")
@@ -599,6 +604,7 @@ mod tests {
                 worker_id: "worker-uuid-1".to_string(),
                 worker_rank: 0,
                 status: SourceStatus::Ready as i32,
+                source_load: 0.0,
             }))
             .await
             .expect("rpc")
@@ -615,6 +621,7 @@ mod tests {
                 worker_id: String::new(),
                 worker_rank: 0,
                 status: SourceStatus::Ready as i32,
+                source_load: 0.0,
             }))
             .await
             .expect("rpc")
@@ -627,7 +634,7 @@ mod tests {
         let mut mock = MockMetadataBackend::new();
         mock.expect_update_status()
             .once()
-            .returning(|_, _, _, _, _| Ok(()));
+            .returning(|_, _, _, _, _, _| Ok(()));
 
         let svc = make_service(mock);
         let resp = svc
@@ -636,6 +643,7 @@ mod tests {
                 worker_id: "worker-uuid-1".to_string(),
                 worker_rank: 3,
                 status: SourceStatus::Ready as i32,
+                source_load: 0.0,
             }))
             .await
             .expect("rpc")
@@ -677,6 +685,7 @@ mod tests {
                     status: SourceStatus::Ready as i32,
                     updated_at: now,
                     accelerator: "cuda".to_string(),
+                    source_load: 0.0,
                 },
                 SourceInstanceInfo {
                     source_id: "abc123def456abcd".to_string(),
@@ -686,6 +695,7 @@ mod tests {
                     status: SourceStatus::Ready as i32,
                     updated_at: now,
                     accelerator: "cuda".to_string(),
+                    source_load: 0.0,
                 },
             ])
         });
@@ -727,6 +737,7 @@ mod tests {
                     status: SourceStatus::Ready as i32,
                     updated_at: now,
                     accelerator: "cuda".to_string(),
+                    source_load: 0.0,
                 }])
             });
 
@@ -761,6 +772,7 @@ mod tests {
                     status: SourceStatus::Ready as i32,
                     updated_at: now,
                     accelerator: "cuda".to_string(),
+                    source_load: 0.0,
                 },
                 SourceInstanceInfo {
                     source_id: "abc123def456abcd".to_string(),
@@ -770,6 +782,7 @@ mod tests {
                     status: SourceStatus::Ready as i32,
                     updated_at: expired_updated_at,
                     accelerator: "cuda".to_string(),
+                    source_load: 0.0,
                 },
             ])
         });
@@ -808,6 +821,7 @@ mod tests {
                         agent_name: "artifact-agent".to_string(),
                         worker_grpc_endpoint: "10.0.0.1:6555".to_string(),
                         accelerator: "cuda".to_string(),
+                        source_load: 0.0,
                         artifact_source: Some(
                             ArtifactSourceMetadata {
                                 artifact_id: "sha256:artifact".to_string(),
@@ -975,7 +989,7 @@ mod tests {
         let mut mock = MockMetadataBackend::new();
         mock.expect_update_status()
             .once()
-            .returning(|_, _, _, _, _| Err("write failed".into()));
+            .returning(|_, _, _, _, _, _| Err("write failed".into()));
 
         let svc = make_service(mock);
         let resp = svc
@@ -984,6 +998,7 @@ mod tests {
                 worker_id: "worker-uuid-1".to_string(),
                 worker_rank: 0,
                 status: SourceStatus::Ready as i32,
+                source_load: 0.0,
             }))
             .await
             .expect("rpc")

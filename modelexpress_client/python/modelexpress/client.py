@@ -72,6 +72,7 @@ class MxClientBase(ABC):
         worker_id: str,
         worker_rank: int,
         status: "p2p_pb2.SourceStatus",
+        source_load: float = 0.0,
     ) -> bool:
         """Update a source worker's lifecycle status."""
 
@@ -212,6 +213,7 @@ class MxClient(MxClientBase):
         worker_id: str,
         worker_rank: int,
         status: "p2p_pb2.SourceStatus",
+        source_load: float = 0.0,
     ) -> bool:
         """Update worker status.  Returns *True* on success."""
         request = p2p_pb2.UpdateStatusRequest(
@@ -219,6 +221,7 @@ class MxClient(MxClientBase):
             worker_id=worker_id,
             worker_rank=worker_rank,
             status=status,
+            source_load=source_load,
         )
         response = self.stub.UpdateStatus(request, timeout=30)
         if not response.success:

@@ -72,6 +72,7 @@ async fn reap_once(
                     &w.worker_id,
                     w.worker_rank,
                     SourceStatus::Stale,
+                    0.0,
                 )
                 .await
             {
@@ -130,14 +131,15 @@ mod tests {
                 status: SourceStatus::Ready as i32,
                 updated_at: old_time,
                 accelerator: "cuda".into(),
+                source_load: 0.0,
             }])
         });
         mock.expect_update_status()
-            .withf(|sid, wid, rank, status, _| {
+            .withf(|sid, wid, rank, status, _, _| {
                 sid == "src1" && wid == "w1" && *rank == 0 && *status == SourceStatus::Stale
             })
             .once()
-            .returning(|_, _, _, _, _| Ok(()));
+            .returning(|_, _, _, _, _, _| Ok(()));
 
         let state = P2pStateManager::with_backend(Arc::new(mock));
         reap_once(&state, 90_000, 3_600_000)
@@ -160,6 +162,7 @@ mod tests {
                 status: SourceStatus::Stale as i32,
                 updated_at: very_old,
                 accelerator: "cuda".into(),
+                source_load: 0.0,
             }])
         });
         mock.expect_remove_worker()
@@ -188,6 +191,7 @@ mod tests {
                 status: SourceStatus::Ready as i32,
                 updated_at: recent,
                 accelerator: "cuda".into(),
+                source_load: 0.0,
             }])
         });
         // No update_status or remove_worker calls expected

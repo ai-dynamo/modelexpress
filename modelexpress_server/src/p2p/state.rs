@@ -155,11 +155,19 @@ impl P2pStateManager {
         worker_id: &str,
         worker_rank: u32,
         status: modelexpress_common::grpc::p2p::SourceStatus,
+        source_load: f32,
     ) -> MetadataResult<()> {
         let updated_at = chrono::Utc::now().timestamp_millis();
         self.get_backend()
             .await?
-            .update_status(source_id, worker_id, worker_rank, status, updated_at)
+            .update_status(
+                source_id,
+                worker_id,
+                worker_rank,
+                status,
+                updated_at,
+                source_load,
+            )
             .await?;
 
         debug!(
@@ -423,6 +431,7 @@ mod tests {
                     agent_name: String::new(),
                     worker_grpc_endpoint: String::new(),
                     accelerator: String::new(),
+                    source_load: 0.0,
                     artifact_source: None,
                 },
                 WorkerRecord {
@@ -441,6 +450,7 @@ mod tests {
                     agent_name: String::new(),
                     worker_grpc_endpoint: String::new(),
                     accelerator: String::new(),
+                    source_load: 0.0,
                     artifact_source: None,
                 },
             ],
@@ -518,13 +528,14 @@ mod tests {
                 eq(2u32),
                 eq(SourceStatus::Ready),
                 mockall::predicate::always(),
+                mockall::predicate::always(),
             )
             .once()
-            .returning(|_, _, _, _, _| Ok(()));
+            .returning(|_, _, _, _, _, _| Ok(()));
 
         let manager = P2pStateManager::with_backend(Arc::new(mock));
         manager
-            .update_worker_status("abc123def456abcd", "test-instance", 2, SourceStatus::Ready)
+            .update_worker_status("abc123def456abcd", "test-instance", 2, SourceStatus::Ready, 0.0)
             .await
             .expect("update_worker_status failed");
     }
@@ -534,12 +545,12 @@ mod tests {
         let mut mock = MockMetadataBackend::new();
         mock.expect_update_status()
             .once()
-            .returning(|_, _, _, _, _| Err("redis unavailable".into()));
+            .returning(|_, _, _, _, _, _| Err("redis unavailable".into()));
 
         let manager = P2pStateManager::with_backend(Arc::new(mock));
         assert!(
             manager
-                .update_worker_status("abc123def456abcd", "test-instance", 0, SourceStatus::Ready)
+                .update_worker_status("abc123def456abcd", "test-instance", 0, SourceStatus::Ready, 0.0)
                 .await
                 .is_err()
         );
@@ -563,6 +574,7 @@ mod tests {
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
                     accelerator: "cuda".to_string(),
+                    source_load: 0.0,
                 }])
             });
 
@@ -633,18 +645,18 @@ mod tests {
     async fn test_update_worker_status_stores_correct_status() {
         let mut mock = MockMetadataBackend::new();
         mock.expect_update_status()
-            .withf(|source_id, worker_id, worker_rank, status, _updated_at| {
+            .withf(|source_id, worker_id, worker_rank, status, _updated_at, _nic| {
                 source_id == "abc123def456abcd"
                     && worker_id == "test-instance"
                     && *worker_rank == 7
                     && *status == SourceStatus::Ready
             })
             .once()
-            .returning(|_, _, _, _, _| Ok(()));
+            .returning(|_, _, _, _, _, _| Ok(()));
 
         let manager = P2pStateManager::with_backend(Arc::new(mock));
         manager
-            .update_worker_status("abc123def456abcd", "test-instance", 7, SourceStatus::Ready)
+            .update_worker_status("abc123def456abcd", "test-instance", 7, SourceStatus::Ready, 0.0)
             .await
             .expect("update_worker_status failed");
     }

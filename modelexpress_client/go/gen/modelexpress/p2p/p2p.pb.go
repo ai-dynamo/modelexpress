@@ -2081,17 +2081,19 @@ type SourceInstanceRef struct {
 	// the retry-cap slice. Empty means unknown (treated as compatible for
 	// rolling upgrades and sources that predate this field).
 	Accelerator string `protobuf:"bytes,5,opt,name=accelerator,proto3" json:"accelerator,omitempty"`
-	// Source-published estimate of the fraction of this source's RDMA NIC
-	// bandwidth currently in use, in [0, 1]. The source measures its own NIC
-	// (e.g. from RDMA port counters) and publishes it; the server passes it
-	// through. Consumed by the client `load_aware` selector to steer new targets
-	// toward sources with spare NIC headroom, so weight transfers avoid
-	// contending with a source's in-flight inference RDMA. Ordering-only and
-	// advisory; 0 (or unset, for older servers) means idle and collapses
-	// `load_aware` to `rendezvous_hash`.
-	NicUtilization float32 `protobuf:"fixed32,6,opt,name=nic_utilization,json=nicUtilization,proto3" json:"nic_utilization,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Source-published busyness estimate in [0, 1] (0 = idle, 1 = saturated).
+	// The source computes it about itself and publishes it; the server only
+	// passes it through (never accumulates it), keeping servers stateless. The
+	// default provider measures the source's RDMA NIC utilization (from its
+	// own port counters); a runtime provider (e.g. vLLM/SGLang serving load)
+	// can supply it instead behind the same field. Consumed by the client
+	// `load_aware` selector to steer new targets toward sources with spare
+	// headroom, so weight transfers avoid contending with a source's in-flight
+	// inference. Ordering-only and advisory; 0 (or unset, for older servers)
+	// collapses `load_aware` to `rendezvous_hash`.
+	SourceLoad    float32 `protobuf:"fixed32,6,opt,name=source_load,json=sourceLoad,proto3" json:"source_load,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *SourceInstanceRef) Reset() {
@@ -2159,9 +2161,9 @@ func (x *SourceInstanceRef) GetAccelerator() string {
 	return ""
 }
 
-func (x *SourceInstanceRef) GetNicUtilization() float32 {
+func (x *SourceInstanceRef) GetSourceLoad() float32 {
 	if x != nil {
-		return x.NicUtilization
+		return x.SourceLoad
 	}
 	return 0
 }
@@ -2400,7 +2402,11 @@ type UpdateStatusRequest struct {
 	// New status
 	Status SourceStatus `protobuf:"varint,3,opt,name=status,proto3,enum=model_express.p2p.SourceStatus" json:"status,omitempty"`
 	// worker_id returned from PublishMetadata
-	WorkerId      string `protobuf:"bytes,4,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	WorkerId string `protobuf:"bytes,4,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	// Source-published busyness in [0, 1], refreshed on each heartbeat so the
+	// server's SourceInstanceRef.source_load tracks live load. 0 means
+	// idle/unknown. See SourceInstanceRef.source_load.
+	SourceLoad    float32 `protobuf:"fixed32,5,opt,name=source_load,json=sourceLoad,proto3" json:"source_load,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2461,6 +2467,13 @@ func (x *UpdateStatusRequest) GetWorkerId() string {
 		return x.WorkerId
 	}
 	return ""
+}
+
+func (x *UpdateStatusRequest) GetSourceLoad() float32 {
+	if x != nil {
+		return x.SourceLoad
+	}
+	return 0
 }
 
 type UpdateStatusResponse struct {
@@ -2706,7 +2719,7 @@ const file_p2p_proto_rawDesc = "" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12 \n" +
 	"\fmx_source_id\x18\x03 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
-	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"\xdd\x01\n" +
+	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"\xd5\x01\n" +
 	"\x11SourceInstanceRef\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
@@ -2715,8 +2728,9 @@ const file_p2p_proto_rawDesc = "" +
 	"model_name\x18\x03 \x01(\tR\tmodelName\x12\x1f\n" +
 	"\vworker_rank\x18\x04 \x01(\rR\n" +
 	"workerRank\x12 \n" +
-	"\vaccelerator\x18\x05 \x01(\tR\vaccelerator\x12'\n" +
-	"\x0fnic_utilization\x18\x06 \x01(\x02R\x0enicUtilization\"\xb0\x01\n" +
+	"\vaccelerator\x18\x05 \x01(\tR\vaccelerator\x12\x1f\n" +
+	"\vsource_load\x18\x06 \x01(\x02R\n" +
+	"sourceLoad\"\xb0\x01\n" +
 	"\x12ListSourcesRequest\x12=\n" +
 	"\bidentity\x18\x01 \x01(\v2!.model_express.p2p.SourceIdentityR\bidentity\x12I\n" +
 	"\rstatus_filter\x18\x02 \x01(\x0e2\x1f.model_express.p2p.SourceStatusH\x00R\fstatusFilter\x88\x01\x01B\x10\n" +
@@ -2732,14 +2746,16 @@ const file_p2p_proto_rawDesc = "" +
 	"\x06worker\x18\x02 \x01(\v2!.model_express.p2p.WorkerMetadataR\x06worker\x12 \n" +
 	"\fmx_source_id\x18\x03 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
-	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"\xae\x01\n" +
+	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"\xcf\x01\n" +
 	"\x13UpdateStatusRequest\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1f\n" +
 	"\vworker_rank\x18\x02 \x01(\rR\n" +
 	"workerRank\x127\n" +
 	"\x06status\x18\x03 \x01(\x0e2\x1f.model_express.p2p.SourceStatusR\x06status\x12\x1b\n" +
-	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"J\n" +
+	"\tworker_id\x18\x04 \x01(\tR\bworkerId\x12\x1f\n" +
+	"\vsource_load\x18\x05 \x01(\x02R\n" +
+	"sourceLoad\"J\n" +
 	"\x14UpdateStatusResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage*\x8a\x01\n" +

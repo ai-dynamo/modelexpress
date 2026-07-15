@@ -241,6 +241,9 @@ struct WorkerRecordJson {
     /// Runtime accelerator family for compatibility filtering.
     #[serde(default)]
     pub accelerator: String,
+    /// Source-published RDMA NIC utilization in [0, 1].
+    #[serde(default)]
+    pub source_load: f32,
     /// Small discovery summary for file-backed artifact sources.
     #[serde(default)]
     pub artifact_source: Option<ArtifactSourceMetadataJson>,
@@ -285,6 +288,7 @@ impl WorkerRecordJson {
             agent_name: record.agent_name,
             worker_grpc_endpoint: record.worker_grpc_endpoint,
             accelerator: record.accelerator,
+            source_load: record.source_load,
             artifact_source: record.artifact_source.map(ArtifactSourceMetadataJson::from),
         }
     }
@@ -306,6 +310,7 @@ impl From<WorkerRecordJson> for WorkerRecord {
             agent_name: json.agent_name,
             worker_grpc_endpoint: json.worker_grpc_endpoint,
             accelerator: json.accelerator,
+            source_load: json.source_load,
             artifact_source: json.artifact_source.map(ArtifactSourceMetadataRecord::from),
         }
     }
@@ -540,11 +545,11 @@ impl MetadataBackend for RedisBackend {
                     }
                 }
 
-                let (status, updated_at, accelerator) = fields
+                let (status, updated_at, accelerator, source_load) = fields
                     .get(&worker_rank.to_string())
                     .and_then(|v| serde_json::from_str::<WorkerRecordJson>(v).ok())
-                    .map(|j| (j.status, j.updated_at, j.accelerator))
-                    .unwrap_or((0, 0, String::new()));
+                    .map(|j| (j.status, j.updated_at, j.accelerator, j.source_load))
+                    .unwrap_or((0, 0, String::new(), 0.0));
 
                 result.push(super::SourceInstanceInfo {
                     source_id: sid.clone(),
@@ -554,6 +559,7 @@ impl MetadataBackend for RedisBackend {
                     status,
                     updated_at,
                     accelerator,
+                    source_load,
                 });
             }
         }
@@ -625,6 +631,7 @@ impl MetadataBackend for RedisBackend {
         worker_rank: u32,
         status: SourceStatus,
         updated_at: i64,
+        source_load: f32,
     ) -> MetadataResult<()> {
         let mut conn = self.get_conn().await?;
         let key = format!("{}{}:{}", keys::SOURCE_PREFIX, source_id, worker_id);
@@ -641,6 +648,7 @@ impl MetadataBackend for RedisBackend {
         let mut record: WorkerRecordJson = serde_json::from_str(&json_str)?;
         record.status = status as i32;
         record.updated_at = updated_at;
+        record.source_load = source_load;
 
         let updated = serde_json::to_string(&record)?;
         conn.hset::<_, _, _, ()>(&key, &field, &updated).await?;
@@ -729,6 +737,7 @@ mod tests {
             agent_name: String::new(),
             worker_grpc_endpoint: String::new(),
             accelerator: "cuda".to_string(),
+            source_load: 0.0,
             artifact_source: Some(ArtifactSourceMetadataRecord {
                 artifact_id: "artifact123".to_string(),
                 total_size: 1_099_511_627_776,

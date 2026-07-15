@@ -53,6 +53,7 @@ class TestHeartbeatSendsReady:
             worker_id="w1",
             worker_rank=0,
             status=2,  # SOURCE_STATUS_READY
+            source_load=0.0,
         )
 
     def test_skips_when_unhealthy(self, heartbeat, mx_client, nixl_manager):
@@ -69,6 +70,7 @@ class TestHeartbeatSendsReady:
                 worker_id="w1",
                 worker_rank=0,
                 status=2,
+                source_load=0.0,
             )
         ]
         assert len(ready_calls) == 0
@@ -86,6 +88,7 @@ class TestHeartbeatSendsReady:
                 worker_id="w1",
                 worker_rank=0,
                 status=2,
+                source_load=0.0,
             )
         ]
         assert len(ready_calls) >= 2
@@ -111,6 +114,7 @@ class TestPublisherPublishAndReady:
                 worker_id="w1",
                 worker_rank=0,
                 status=2,
+                source_load=0.0,
             )
         ]
 
@@ -168,6 +172,7 @@ class TestHeartbeatStop:
                 worker_id="w1",
                 worker_rank=0,
                 status=3,  # SOURCE_STATUS_STALE
+                source_load=0.0,
             )
         ]
         assert len(stale_calls) == 1
@@ -186,6 +191,7 @@ class TestHeartbeatStop:
                 worker_id="w1",
                 worker_rank=0,
                 status=3,
+                source_load=0.0,
             )
         ]
         assert len(stale_calls) == 0
@@ -203,6 +209,7 @@ class TestHeartbeatStop:
                 worker_id="w1",
                 worker_rank=0,
                 status=3,
+                source_load=0.0,
             )
         ]
         assert len(stale_calls) == 1
@@ -221,6 +228,7 @@ class TestHeartbeatOnExit:
                 worker_id="w1",
                 worker_rank=0,
                 status=3,
+                source_load=0.0,
             )
         ]
         assert len(stale_calls) == 1

@@ -166,23 +166,24 @@ class RendezvousHashSelector(ScoredSelector):
 
 
 class LoadAwareSelector(ScoredSelector):
-    """Bandwidth-aware spreading: rendezvous ordering biased away from busy NICs.
+    """Load-aware spreading: rendezvous ordering biased away from busy sources.
 
-    ``score = unit_hash(target, candidate) - w_load * nic_utilization``
+    ``score = unit_hash(target, candidate) - w_load * source_load``
 
-    ``nic_utilization`` is a source-published estimate in ``[0, 1]`` of how much
-    of that source's RDMA NIC bandwidth is currently in use (measured by the
-    source about itself, e.g. from its RDMA port counters, and surfaced on the
-    candidate). Subtracting it steers new targets toward sources with spare NIC
-    headroom, so pulling weights does not contend with a source's in-flight
-    inference RDMA (e.g. a prefill node streaming KV cache). ``w_load`` comes
-    from ``MX_P2P_LOAD_WEIGHT`` (default 1.0).
+    ``source_load`` is a source-published estimate in ``[0, 1]`` of how busy
+    that source is, measured by the source about itself and surfaced on the
+    candidate. The default provider reads the source's RDMA NIC utilization
+    (from its own port counters); a runtime provider (e.g. vLLM/SGLang serving
+    load) can supply it instead behind the same field. Subtracting it steers
+    new targets toward sources with spare headroom, so pulling weights does not
+    contend with a source's in-flight inference (e.g. a prefill node streaming
+    KV cache). ``w_load`` comes from ``MX_P2P_LOAD_WEIGHT`` (default 1.0).
 
     Statelessness is preserved: the load signal is self-described source
     metadata read off each candidate, not a server-side counter -- so every
     replica ranks identically and MX servers stay stateless behind a load
-    balancer. When utilization is 0 or unset (idle sources, or servers that
-    predate the field), every penalty is 0 and ordering collapses exactly to
+    balancer. When load is 0 or unset (idle sources, or servers that predate
+    the field), every penalty is 0 and ordering collapses exactly to
     ``rendezvous_hash`` -- never worse than the deterministic baseline.
     """
 
@@ -198,9 +199,9 @@ class LoadAwareSelector(ScoredSelector):
     ) -> float:
         # Read defensively: old servers / disabled telemetry omit the field, and
         # a 0 load makes this collapse to rendezvous_hash.
-        util = getattr(candidate, "nic_utilization", 0.0)
-        util = min(1.0, max(0.0, util))
-        return _unit_hash(candidate, ctx) - self.w_load * util
+        load = getattr(candidate, "source_load", 0.0)
+        load = min(1.0, max(0.0, load))
+        return _unit_hash(candidate, ctx) - self.w_load * load
 
 
 # ---------------------------------------------------------------------------

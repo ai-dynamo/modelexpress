@@ -66,6 +66,7 @@ class PublisherThread:
         publish_timeout_secs: int | None = None,
         interval_secs: int | None = None,
         heartbeat_after_publish: bool = True,
+        source_load_provider: Callable[[], float] | None = None,
     ):
         if mx_source_id is None and publish_fn is None:
             raise ValueError("PublisherThread requires mx_source_id or publish_fn")
@@ -77,6 +78,7 @@ class PublisherThread:
         self._worker_id = worker_id
         self._worker_rank = worker_rank
         self._nixl_manager = nixl_manager
+        self._source_load_provider = source_load_provider
         self._publish_fn = publish_fn
         self._ready_fn = ready_fn
         self._cleanup_fn = cleanup_fn
@@ -158,14 +160,26 @@ class PublisherThread:
                 self._started = False
 
     def _update_status(self, status: int) -> None:
-        """Send UpdateStatus RPC."""
+        """Send UpdateStatus RPC, refreshing the source's NIC utilization.
+
+        Sampling here (once per heartbeat) makes the sampling window the
+        heartbeat interval and keeps the server's advertised source_load
+        tracking live load. Any sampler error yields 0.0 (idle).
+        """
         if self._mx_source_id is None:
             return
+        source_load = 0.0
+        if self._source_load_provider is not None:
+            try:
+                source_load = self._source_load_provider()
+            except Exception:  # never let telemetry break the heartbeat
+                source_load = 0.0
         self._mx_client.update_status(
             mx_source_id=self._mx_source_id,
             worker_id=self._worker_id,
             worker_rank=self._worker_rank,
             status=status,
+            source_load=source_load,
         )
 
     def _cleanup(self) -> None:

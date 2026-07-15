@@ -213,6 +213,10 @@ def publish_metadata_and_ready(
 
         cleanup_fn = None
 
+    # Refresh this source's load on each heartbeat so the server advertises
+    # live load for the load_aware selector.
+    from ..nic_metrics import make_source_load_provider
+
     publisher = PublisherThread(
         mx_client=mx_client,
         worker_id=worker_id,
@@ -220,6 +224,7 @@ def publish_metadata_and_ready(
         nixl_manager=nixl_manager,
         publish_fn=publish_fn,
         cleanup_fn=cleanup_fn,
+        source_load_provider=make_source_load_provider(device_id),
     )
     publisher.start()
     _heartbeat_threads[worker_rank] = publisher
