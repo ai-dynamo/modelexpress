@@ -107,6 +107,12 @@ spec:
           env:
             - name: MX_SERVER_ADDRESS
               value: "mx-server:8000"
+            - name: MX_P2P_METADATA
+              value: "${MX_P2P_METADATA}"
+            - name: MX_ARTIFACT_TRANSFER
+              value: "1"
+            - name: MX_ARTIFACT_READY_URL
+              value: "http://127.0.0.1:${WORKER_PORT}/health"
             - name: MX_RDMA_NIC_PIN
               value: "auto"
             - name: UCX_RNDV_SCHEME

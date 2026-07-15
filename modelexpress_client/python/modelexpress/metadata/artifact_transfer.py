@@ -604,11 +604,11 @@ def discover_artifact_source(
     artifact_id: str = "",
     accelerator: str = "",
 ) -> ArtifactSourceEndpoint:
-    """Find a ready artifact source through the MX server.
+    """Find a ready engine artifact source through the MX server.
 
     Artifact sources are not rank-matched by default. Pass node_rank for
     node-scoped artifacts or worker_rank for worker-specific artifacts. Pass
-    accelerator to skip sources published by an incompatible runtime; vLLM
+    accelerator to skip sources published by an incompatible runtime; engine
     JIT/compile caches (Torch compile, Triton, DeepGEMM, FlashInfer, etc.) are
     accelerator-specific, so a cache bundle from a different accelerator family
     must not be installed. Empty means unknown and is accepted for backward

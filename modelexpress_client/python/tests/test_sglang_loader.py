@@ -360,7 +360,11 @@ def test_mx_model_loader_nixl_path_delegates_to_shared_strategy_chain():
     with patch(
         "modelexpress.engines.sglang.loader.LoadStrategyChain.run",
         return_value=model,
-    ) as run:
+    ) as run, patch(
+        "modelexpress.engines.sglang.loader.install_sglang_cache_artifacts",
+    ) as install_artifacts, patch(
+        "modelexpress.engines.sglang.loader.schedule_sglang_cache_artifact_publish",
+    ) as schedule_artifacts:
         loaded = loader._load_model_via_nixl(
             model=model,
             model_config=_model_config(),
@@ -373,6 +377,8 @@ def test_mx_model_loader_nixl_path_delegates_to_shared_strategy_chain():
     ctx = run.call_args.args[1]
     assert ctx.adapter.__class__ is SglangAdapter
     assert ctx.identity.backend_framework == p2p_pb2.BACKEND_FRAMEWORK_SGLANG
+    install_artifacts.assert_called_once_with(ctx)
+    schedule_artifacts.assert_called_once_with(ctx)
 
 
 def test_mx_model_loader_delegates_transfer_engine_transport_in_mx_package():
