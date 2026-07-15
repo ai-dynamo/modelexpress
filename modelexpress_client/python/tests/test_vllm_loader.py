@@ -664,6 +664,23 @@ class TestPublishMetadataErrorHandling:
         with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "localhost:8001"}):
             publish_metadata(ctx)
 
+    @patch("modelexpress.load_strategy.base.publish_metadata_and_ready")
+    def test_publish_uses_accelerator_backend_name(
+        self,
+        mock_publish,
+        mock_accelerator_backend_cls,
+    ):
+        from modelexpress.load_strategy.base import publish_metadata
+
+        ctx = _make_load_context(
+            accelerator_backend=mock_accelerator_backend_cls(name="xpu"),
+        )
+        ctx.nixl_manager = MagicMock()
+        with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "localhost:8001"}):
+            publish_metadata(ctx)
+
+        assert mock_publish.call_args.kwargs["accelerator"] == "xpu"
+
     def test_unpublish_uses_worker_rank_for_heartbeat_lifecycle(self):
         from modelexpress.load_strategy.base import unpublish_metadata
         from modelexpress.metadata.publish import _heartbeat_threads, _worker_servers
@@ -1179,6 +1196,25 @@ class TestRdmaStrategyLoad:
 
         assert exc.value.mutated is False
         assert attempts == []
+
+    def test_accepts_matching_xpu_accelerator(
+        self,
+        mock_accelerator_backend_cls,
+    ):
+        ctx = _make_load_context(
+            accelerator_backend=mock_accelerator_backend_cls(name="xpu"),
+        )
+        source_resp = _make_metadata_resp(rank=0, worker_id="w-1")
+        source_resp.worker.accelerator = "xpu"
+        candidates = [_make_instance_ref(worker_id="w-1")]
+        strategy, attempts = self._setup(ctx, candidates, [source_resp])
+
+        with patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True), \
+             patch("modelexpress.load_strategy.rdma_strategy.get_configured_selector", return_value=_IdentitySelector()):
+            result = strategy.load(MagicMock(), ctx)
+
+        assert isinstance(result, LoadResult)
+        assert attempts == ["w-1"]
 
     def test_load_as_target_marks_post_prepare_failure_as_mutated(self):
         from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
