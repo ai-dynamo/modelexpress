@@ -188,11 +188,27 @@ class SourceLoadSampler:
 def make_source_load_provider(device_id: int) -> Callable[[], float]:
     """Return a zero-arg provider of this source's load in ``[0, 1]``.
 
-    This is the seam for the source-load signal. Today it returns an
+    The seam for the source-load signal. It always includes the physical
     RDMA-NIC-utilization provider (runtime-agnostic; works on any IB/RoCE
-    cluster). A future inference-runtime provider -- e.g. vLLM/SGLang serving
-    load, or a blend that takes the max of NIC and runtime signals -- can be
-    selected here without touching the server, the proto, or the selector,
-    because the wire contract is just the normalized ``source_load`` value.
+    cluster). When ``MX_P2P_RUNTIME_METRICS_URL`` is set, it also reads the
+    co-located inference runtime (vLLM/SGLang serving load) and reports the
+    **max** of the two -- so selection reacts to the NIC being physically hot
+    *and* to an imminent serving spike the counter has not seen yet. Neither
+    path touches the server, proto, or selector; the wire contract is just the
+    normalized ``source_load`` value. Any provider error degrades to 0.0.
     """
-    return SourceLoadSampler(device_id).sample
+    from . import envs
+
+    nic = SourceLoadSampler(device_id).sample
+    url = envs.MX_P2P_RUNTIME_METRICS_URL
+    if not url:
+        return nic
+
+    from .runtime_load import RuntimeLoadProvider
+
+    runtime = RuntimeLoadProvider(url).sample
+
+    def blended() -> float:
+        return max(nic(), runtime())
+
+    return blended
