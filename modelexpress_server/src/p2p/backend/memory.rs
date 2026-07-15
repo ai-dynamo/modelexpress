@@ -368,7 +368,7 @@ mod tests {
             .await
             .expect("publish");
         backend
-            .update_status(&source_id, "w1", 0, SourceStatus::Ready, 123)
+            .update_status(&source_id, "w1", 0, SourceStatus::Ready, 123, 0.0)
             .await
             .expect("patch existing rank");
 
@@ -382,14 +382,14 @@ mod tests {
 
         assert!(
             backend
-                .update_status(&source_id, "w1", 99, SourceStatus::Ready, 1)
+                .update_status(&source_id, "w1", 99, SourceStatus::Ready, 1, 0.0)
                 .await
                 .is_err(),
             "unknown rank errors"
         );
         assert!(
             backend
-                .update_status(&source_id, "ghost", 0, SourceStatus::Ready, 1)
+                .update_status(&source_id, "ghost", 0, SourceStatus::Ready, 1, 0.0)
                 .await
                 .is_err(),
             "unknown worker errors"
