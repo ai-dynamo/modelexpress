@@ -371,6 +371,7 @@ jobs:
             extra_env: "JOB_NAME=mx-target"
             source_port: "8005"
             worker_port: "8006"
+            expected_artifact_sources: "1"
           # Same SGLang P2P test as above, but over the Mooncake TransferEngine
           # transport instead of NIXL. The ModelExpress package loader uses the
           # same remote_instance command on source and target; the first replica

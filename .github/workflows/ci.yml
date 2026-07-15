@@ -109,7 +109,7 @@ jobs:
         python-version: "3.12"
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v5
+      run: pip install uv
 
     - name: Install dependencies
       working-directory: modelexpress_client/python

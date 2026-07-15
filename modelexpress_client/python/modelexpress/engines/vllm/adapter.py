@@ -6,7 +6,10 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
+import os
+import tempfile
 import uuid
 from typing import TYPE_CHECKING, Iterator
 
@@ -30,8 +33,80 @@ _VLLM_POST_LOAD_FINALIZER_NAMES = (
     "finalize_mega_moe_weights",
 )
 
+# MTP draft weights live under an "mtp." prefix in the shared checkpoint. The
+# draft's embedding and lm_head come from the target, so these are all it needs.
+_DRAFT_WEIGHT_PREFIXES: tuple[str, ...] = ("mtp.",)
+
+_SAFETENSORS_INDEX_NAME = "model.safetensors.index.json"
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+
+def _is_speculative_draft(vllm_config, model_config) -> bool:
+    """True for the draft pass of a speculative load.
+
+    vLLM gives the draft ModelConfig runner="draft" and the target "generate".
+    Reading runner_type avoids the ngram/custom_class case where the draft
+    config aliases the target's.
+    """
+    if getattr(vllm_config, "speculative_config", None) is None:
+        return False
+    return getattr(model_config, "runner_type", None) == "draft"
+
+
+def _read_safetensors_index(model_uri: str) -> dict | None:
+    """Read model.safetensors.index.json from a local dir or object store.
+
+    Returns the parsed index, or None if it cannot be read.
+    """
+    local_index = os.path.join(model_uri, _SAFETENSORS_INDEX_NAME)
+    if os.path.isfile(local_index):
+        with open(local_index, encoding="utf-8") as handle:
+            return json.load(handle)
+
+    from runai_model_streamer import pull_files
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pull_files(model_uri, tmp, allow_pattern=[_SAFETENSORS_INDEX_NAME])
+        for root, _dirs, files in os.walk(tmp):
+            if _SAFETENSORS_INDEX_NAME in files:
+                with open(
+                    os.path.join(root, _SAFETENSORS_INDEX_NAME), encoding="utf-8"
+                ) as handle:
+                    return json.load(handle)
+    return None
+
+
+def _select_draft_weight_files(
+    model_uri: str,
+    hf_weights_files: list[str],
+) -> list[str] | None:
+    """Return the shards holding the draft's own weights.
+
+    Keeps shards whose index tensors carry a draft prefix. Returns None to
+    signal the caller to stream every shard, so a checkpoint without a draft
+    head (or without an index) is never truncated to nothing.
+    """
+    try:
+        index = _read_safetensors_index(model_uri)
+        if not index:
+            return None
+        weight_map = index.get("weight_map") or {}
+        wanted = {
+            fname
+            for tname, fname in weight_map.items()
+            if tname.startswith(_DRAFT_WEIGHT_PREFIXES)
+        }
+        if not wanted:
+            return None
+        subset = [f for f in hf_weights_files if os.path.basename(f) in wanted]
+        return subset or None
+    except Exception as exc:
+        logger.warning(
+            "Draft weight-file selection failed (%s); streaming all shards", exc
+        )
+        return None
 
 
 class VllmAdapter(EngineAdapter):
@@ -119,7 +194,39 @@ class VllmAdapter(EngineAdapter):
 
         loader = RunaiModelStreamerLoader(load_config)
         revision = getattr(self.model_config, "revision", None)
-        return loader._get_weights_iterator(model_uri, revision)
+
+        if not _is_speculative_draft(self.vllm_config, self.model_config):
+            return loader._get_weights_iterator(model_uri, revision)
+
+        # An MTP draft shares the target's checkpoint but needs only its own
+        # shards. Stream just those so we do not re-read the whole model from
+        # storage for a small head. Fall back to the full set if unrecognized.
+        from vllm.model_executor.model_loader.weight_utils import (
+            runai_safetensors_weights_iterator,
+        )
+
+        hf_weights_files = loader._prepare_weights(model_uri, revision)
+        subset = _select_draft_weight_files(model_uri, hf_weights_files)
+        if subset is None:
+            logger.info(
+                "[draft] no draft-only shards identified for %s; streaming all "
+                "%d shards",
+                model_uri,
+                len(hf_weights_files),
+            )
+            return loader._get_weights_iterator(model_uri, revision)
+
+        logger.info(
+            "[draft] streaming %d of %d safetensors shards for draft weights: %s",
+            len(subset),
+            len(hf_weights_files),
+            [os.path.basename(f) for f in subset],
+        )
+        return runai_safetensors_weights_iterator(
+            subset,
+            load_config.use_tqdm_on_load,
+            loader._is_distributed,
+        )
 
     def load_via_native(self, result: LoadResult) -> LoadResult:
         if result.model is None:
