@@ -14,7 +14,7 @@ use crate::p2p::k8s_types::{
 };
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use k8s_openapi::api::core::v1::ConfigMap;
+use k8s_openapi::{api::core::v1::ConfigMap, apimachinery::pkg::apis::meta::v1::OwnerReference};
 use kube::{
     Client,
     api::{Api, ListParams, Patch, PatchParams, PostParams},
@@ -48,6 +48,21 @@ impl KubernetesBackend {
     /// Get the API handle for ConfigMaps
     fn configmap_api(&self) -> Api<ConfigMap> {
         Api::namespaced(self.client.clone(), &self.namespace)
+    }
+
+    fn pod_owner_references(pod_name: &str, pod_uid: &str) -> Option<Vec<OwnerReference>> {
+        if pod_name.is_empty() || pod_uid.is_empty() {
+            return None;
+        }
+
+        Some(vec![OwnerReference {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            name: pod_name.to_string(),
+            uid: pod_uid.to_string(),
+            controller: Some(false),
+            block_owner_deletion: Some(false),
+        }])
     }
 
     /// Create or update a ConfigMap with tensor descriptors for a worker.
@@ -204,7 +219,7 @@ impl MetadataBackend for KubernetesBackend {
 
         // First, ensure the CR exists
         let existing = api.get_opt(&cr_name).await?;
-        let has_pod_name_and_uid = !pod_name.is_empty() && !pod_uid.is_empty();
+        let pod_owner_references = Self::pod_owner_references(pod_name, pod_uid);
 
         if existing.is_none() {
             let new_cr = ModelMetadata {
@@ -223,20 +238,7 @@ impl MetadataBackend for KubernetesBackend {
                         );
                         labels
                     }),
-                    owner_references: if has_pod_name_and_uid {
-                        Some(vec![
-                            k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
-                                api_version: "v1".to_string(),
-                                kind: "Pod".to_string(),
-                                name: pod_name.to_string(),
-                                uid: pod_uid.to_string(),
-                                controller: Some(false),
-                                block_owner_deletion: Some(false),
-                            },
-                        ])
-                    } else {
-                        None
-                    },
+                    owner_references: pod_owner_references.clone(),
                     ..Default::default()
                 },
                 spec: ModelMetadataSpec {
@@ -264,6 +266,19 @@ impl MetadataBackend for KubernetesBackend {
 
         // Get CR UID for ownerReferences on ConfigMaps
         let cr = api.get(&cr_name).await?;
+        if let Some(owner_references) = &pod_owner_references
+            && cr.metadata.owner_references.as_ref() != Some(owner_references)
+        {
+            let owner_patch = json!({
+                "metadata": { "ownerReferences": owner_references }
+            });
+            api.patch(
+                &cr_name,
+                &PatchParams::default(),
+                &Patch::Merge(&owner_patch),
+            )
+            .await?;
+        }
         let owner_uid = cr.metadata.uid.as_deref();
         let owner_name = cr.metadata.name.as_deref();
 
@@ -827,5 +842,25 @@ mod tests {
         };
 
         assert!(ArtifactSourceMetadataRecord::try_from(status).is_err());
+    }
+
+    #[test]
+    fn pod_owner_references_require_name_and_uid() {
+        assert!(KubernetesBackend::pod_owner_references("pod-0", "").is_none());
+        assert!(KubernetesBackend::pod_owner_references("", "pod-uid").is_none());
+    }
+
+    #[test]
+    fn pod_owner_references_identify_the_publishing_pod() {
+        let Some(owner_references) = KubernetesBackend::pod_owner_references("pod-0", "pod-uid")
+        else {
+            panic!("pod name and UID should produce an owner reference");
+        };
+
+        assert_eq!(owner_references.len(), 1);
+        assert_eq!(owner_references[0].api_version, "v1");
+        assert_eq!(owner_references[0].kind, "Pod");
+        assert_eq!(owner_references[0].name, "pod-0");
+        assert_eq!(owner_references[0].uid, "pod-uid");
     }
 }

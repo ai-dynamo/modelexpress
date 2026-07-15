@@ -459,11 +459,13 @@ mod tests {
     async fn test_publish_metadata_calls_backend() {
         let mut mock = MockMetadataBackend::new();
         mock.expect_publish_metadata()
-            .withf(|identity, worker_id, worker, _, _| {
+            .withf(|identity, worker_id, worker, pod_name, pod_uid| {
                 identity.model_name == "my-model"
                     && identity.tensor_parallel_size == 8
                     && worker_id == "a1b2c3d4"
                     && worker.worker_rank == 3
+                    && pod_name == "vllm-worker-0"
+                    && pod_uid == "pod-uid-1"
             })
             .once()
             .returning(|_, _, _, _, _| Ok(()));
@@ -480,8 +482,8 @@ mod tests {
                     updated_at: 0,
                     ..Default::default()
                 },
-                "",
-                "",
+                "vllm-worker-0",
+                "pod-uid-1",
             )
             .await
             .expect("publish_metadata failed");

@@ -433,6 +433,9 @@ mod tests {
     async fn test_publish_metadata_success() {
         let mut mock = MockMetadataBackend::new();
         mock.expect_publish_metadata()
+            .withf(|_, _, _, pod_name, pod_uid| {
+                pod_name == "vllm-worker-0" && pod_uid == "pod-uid-1"
+            })
             .once()
             .returning(|_, _, _, _, _| Ok(()));
 
@@ -451,7 +454,8 @@ mod tests {
                     ..Default::default()
                 }),
                 worker_id: "worker-uuid-1".to_string(),
-                ..Default::default()
+                pod_name: "vllm-worker-0".to_string(),
+                pod_uid: "pod-uid-1".to_string(),
             }))
             .await
             .expect("rpc")

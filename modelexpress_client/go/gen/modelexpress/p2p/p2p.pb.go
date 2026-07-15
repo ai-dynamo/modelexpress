@@ -1937,7 +1937,14 @@ type PublishMetadataRequest struct {
 	// Unique identifier for this running instance (UUID).
 	// Differentiates multiple replicas with identical SourceIdentity.
 	// If empty, the server rejects the request.
-	WorkerId      string `protobuf:"bytes,3,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	WorkerId string `protobuf:"bytes,3,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	// Kubernetes pod name of the calling worker, set via the downward API.
+	// Used with pod_uid to set an ownerReference on the ModelMetadata CR
+	// so K8s garbage-collects it when the pod is deleted.
+	// When empty, no ownerReference is set.
+	PodName string `protobuf:"bytes,4,opt,name=pod_name,json=podName,proto3" json:"pod_name,omitempty"`
+	// Kubernetes pod UID of the calling worker, set via the downward API.
+	PodUid        string `protobuf:"bytes,5,opt,name=pod_uid,json=podUid,proto3" json:"pod_uid,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1989,6 +1996,20 @@ func (x *PublishMetadataRequest) GetWorker() *WorkerMetadata {
 func (x *PublishMetadataRequest) GetWorkerId() string {
 	if x != nil {
 		return x.WorkerId
+	}
+	return ""
+}
+
+func (x *PublishMetadataRequest) GetPodName() string {
+	if x != nil {
+		return x.PodName
+	}
+	return ""
+}
+
+func (x *PublishMetadataRequest) GetPodUid() string {
+	if x != nil {
+		return x.PodUid
 	}
 	return ""
 }
@@ -2680,11 +2701,13 @@ const file_p2p_proto_rawDesc = "" +
 	"mxSourceId\x12\x1f\n" +
 	"\vartifact_id\x18\x02 \x01(\tR\n" +
 	"artifactId\x12>\n" +
-	"\x05chunk\x18\x03 \x01(\v2(.model_express.p2p.ArtifactManifestChunkR\x05chunk\"\xaf\x01\n" +
+	"\x05chunk\x18\x03 \x01(\v2(.model_express.p2p.ArtifactManifestChunkR\x05chunk\"\xe3\x01\n" +
 	"\x16PublishMetadataRequest\x12=\n" +
 	"\bidentity\x18\x01 \x01(\v2!.model_express.p2p.SourceIdentityR\bidentity\x129\n" +
 	"\x06worker\x18\x02 \x01(\v2!.model_express.p2p.WorkerMetadataR\x06worker\x12\x1b\n" +
-	"\tworker_id\x18\x03 \x01(\tR\bworkerId\"\x8c\x01\n" +
+	"\tworker_id\x18\x03 \x01(\tR\bworkerId\x12\x19\n" +
+	"\bpod_name\x18\x04 \x01(\tR\apodName\x12\x17\n" +
+	"\apod_uid\x18\x05 \x01(\tR\x06podUid\"\x8c\x01\n" +
 	"\x17PublishMetadataResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12 \n" +
