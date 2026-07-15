@@ -176,12 +176,11 @@ def _deep_gemm_cache_root() -> Path:
 
 
 def _flashinfer_autotune_cache_root() -> Path:
-    # SGLang and vLLM share the FlashInfer autotune cache layout.
-    configured = envs.VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR
+    configured = envs.SGLANG_CACHE_DIR
     return (
-        Path(configured)
+        Path(configured) / "flashinfer" / "autotune"
         if configured
-        else Path.home() / ".cache" / "vllm" / "flashinfer_autotune_cache"
+        else Path.home() / ".cache" / "sglang" / "flashinfer" / "autotune"
     )
 
 

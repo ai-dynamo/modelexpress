@@ -103,6 +103,7 @@ def test_sglang_artifact_transfers_use_sglang_backend(monkeypatch, tmp_path):
     monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / "torchinductor"))
     monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton-cache"))
     monkeypatch.setenv("SGLANG_DG_CACHE_DIR", str(tmp_path / "deep-gemm-cache"))
+    monkeypatch.setenv("SGLANG_CACHE_DIR", str(tmp_path / "sglang-cache"))
     monkeypatch.setenv("TILELANG_CACHE_DIR", str(tmp_path / "tilelang-cache"))
     monkeypatch.setenv("CUTE_DSL_CACHE_DIR", str(tmp_path / "cute-dsl-cache"))
     monkeypatch.setenv(
@@ -187,6 +188,18 @@ def test_sglang_artifact_transfers_use_sglang_backend(monkeypatch, tmp_path):
             Path(tmp_path / "bundles" / "rank-1" / "flashinfer_cache"),
         ),
     ]
+    assert tuple(root.source_root for root in transfers[-1][0].roots) == (
+        Path(tmp_path / "flashinfer-workspace" / ".cache" / "flashinfer"),
+        Path(tmp_path / "sglang-cache" / "flashinfer" / "autotune"),
+    )
+
+
+def test_sglang_flashinfer_autotune_cache_root_uses_sglang_default(monkeypatch):
+    monkeypatch.delenv("SGLANG_CACHE_DIR", raising=False)
+
+    assert artifacts._flashinfer_autotune_cache_root() == (
+        Path.home() / ".cache" / "sglang" / "flashinfer" / "autotune"
+    )
 
 
 def test_sglang_health_url_defaults_to_sglang_port(monkeypatch):

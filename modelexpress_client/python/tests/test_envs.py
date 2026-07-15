@@ -17,6 +17,7 @@ def test_defaults_when_unset(monkeypatch):
         "MX_VMM_ARENA",
         "MX_MS_DISTRIBUTED",
         "VLLM_ATTENTION_BACKEND",
+        "SGLANG_CACHE_DIR",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
         "MODEL_EXPRESS_URL",
         "MX_SERVER_ADDRESS",
@@ -32,6 +33,7 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_VMM_ARENA is False
     assert envs.MX_MS_DISTRIBUTED is False
     assert envs.VLLM_ATTENTION_BACKEND == "auto"
+    assert envs.SGLANG_CACHE_DIR is None
     assert envs.VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR is None
     assert envs.MODEL_EXPRESS_URL is None
     assert envs.MX_SERVER_ADDRESS is None
@@ -94,6 +96,9 @@ def test_raw_optional_passthrough(monkeypatch, tmp_path):
     autotune_root = tmp_path / "flashinfer-autotune"
     monkeypatch.setenv("VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR", str(autotune_root))
     assert envs.VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR == str(autotune_root)
+    sglang_cache_root = tmp_path / "sglang-cache"
+    monkeypatch.setenv("SGLANG_CACHE_DIR", str(sglang_cache_root))
+    assert envs.SGLANG_CACHE_DIR == str(sglang_cache_root)
 
 
 def test_is_set(monkeypatch):
