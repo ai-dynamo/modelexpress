@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+import itertools
 import logging
 import uuid
 from importlib.metadata import version as pkg_version
@@ -19,6 +20,7 @@ from ...adapter import EngineAdapter
 from ...accelerators import accelerator_backend_for
 from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
+from ...tensor_utils import capture_tensor_attrs
 
 logger = logging.getLogger("modelexpress.engines.sglang.adapter")
 
@@ -78,19 +80,25 @@ class SglangAdapter(EngineAdapter):
         return self._collect_tensors(result.model)
 
     def _collect_tensors(self, model) -> dict[str, torch.Tensor]:
-        """Collect SGLang model parameters for NIXL registration.
+        """Collect SGLang model tensors for NIXL registration.
 
         SGLang's current NIXL path registers contiguous parameters directly and
         registers a byte view of the underlying storage for non-contiguous
         parameters. Keep that naming behavior so source and target descriptors
-        match the upstream integration.
+        match the upstream integration. Named buffers are collected alongside
+        parameters so tensors that capture_tensor_attrs promotes during hook
+        execution (e.g. the DeepSeek MLA w_kc/w_vc assigned directly on the
+        attention module) register on both roles and transfer.
         """
         backend = self.accelerator_backend
         tensors: dict[str, torch.Tensor] = {}
         seen_ptrs: set[int] = set()
 
-        for name, param in model.named_parameters():
-            t = param.data
+        named = itertools.chain(
+            ((name, p.data) for name, p in model.named_parameters()),
+            model.named_buffers(),
+        )
+        for name, t in named:
             if not backend.is_accel_tensor(t):
                 continue
             if t.is_contiguous():
@@ -111,8 +119,14 @@ class SglangAdapter(EngineAdapter):
         return tensors
 
     def before_rdma_receive(self, result: LoadResult) -> LoadResult:
-        result = self._post_load_weights(result)
-        return self._process_weights_after_loading(result)
+        # Promote bare accelerator-tensor assigns made by the model hooks (the
+        # DeepSeek MLA mixin assigns w_kc/w_vc directly on the attention module,
+        # invisible to named_parameters()) to non-persistent buffers so they
+        # register and receive the source's derived values instead of the
+        # target's init-derived garbage.
+        with capture_tensor_attrs(self.accelerator_backend):
+            result = self._post_load_weights(result)
+            return self._process_weights_after_loading(result)
 
     def apply_weight_iter(
         self,
@@ -121,7 +135,8 @@ class SglangAdapter(EngineAdapter):
     ) -> LoadResult:
         if result.model is None:
             raise RuntimeError("SGLang weight iterator loading requires result.model")
-        result.model.load_weights(weights_iter)
+        with capture_tensor_attrs(self.accelerator_backend):
+            result.model.load_weights(weights_iter)
         return result
 
     def build_model_streamer_weight_iter(
@@ -152,7 +167,8 @@ class SglangAdapter(EngineAdapter):
         return loader._get_all_weights(stream_model_config, model)
 
     def after_weight_iter_load(self, result: LoadResult) -> LoadResult:
-        return self._process_weights_after_loading(result)
+        with capture_tensor_attrs(self.accelerator_backend):
+            return self._process_weights_after_loading(result)
 
     def load_via_native(self, result: LoadResult) -> LoadResult:
         if result.model is None:
@@ -165,9 +181,12 @@ class SglangAdapter(EngineAdapter):
         disk_config.load_format = LoadFormat.AUTO
         disk_loader = DefaultModelLoader(disk_config)
         weights_iter = disk_loader._get_all_weights(self.model_config, result.model)
-        DefaultModelLoader.load_weights_and_postprocess(
-            result.model, weights_iter, self.target_device,
-        )
+        # Same capture as the target path so the source publishes the derived
+        # MLA tensors under matching buffer names (symmetric manifest).
+        with capture_tensor_attrs(self.accelerator_backend):
+            DefaultModelLoader.load_weights_and_postprocess(
+                result.model, weights_iter, self.target_device,
+            )
         return result
 
     def reinit_for_retry(self, result: LoadResult) -> LoadResult:

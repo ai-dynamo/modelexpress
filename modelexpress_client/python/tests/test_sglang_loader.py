@@ -162,6 +162,25 @@ def test_collect_sglang_tensors_deduplicates_tied_parameters(
     assert list(tensors) == ["first"]
 
 
+def test_collect_sglang_tensors_includes_named_buffers(
+    mock_accelerator_backend_cls,
+):
+    # capture_tensor_attrs promotes bare tensor assigns (e.g. the DeepSeek MLA
+    # w_kc/w_vc) to non-persistent buffers; _collect_tensors must include
+    # named_buffers so they register on both roles and transfer via RDMA.
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    adapter.accelerator_backend = backend
+    model = nn.Module()
+    model.weight = nn.Parameter(torch.randn(4, 3))
+    model.register_buffer("w_kc", torch.randn(3, 2), persistent=False)
+
+    tensors = adapter._collect_tensors(model)
+
+    assert "weight" in tensors
+    assert "w_kc" in tensors
+
+
 def test_sglang_adapter_discovery_uses_backend_predicate(
     monkeypatch,
     mock_accelerator_backend_cls,
