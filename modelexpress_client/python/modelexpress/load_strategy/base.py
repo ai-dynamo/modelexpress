@@ -152,6 +152,8 @@ def register_tensors(
             Falls back to discovery if ``ctx.tensors`` is empty so the
             flag is safe even if the caller misuses it.
     """
+    if not ctx.p2p_enabled:
+        return
     if not _metadata_publication_configured(ctx):
         logger.info(
             f"[Worker {ctx.global_rank}] No MX metadata path configured, "

@@ -428,6 +428,95 @@ class TestAbstractMethodCompleteness:
         assert registered["mx"] is MxModelLoader
 
 
+class TestMtpDrafterSecondLoad:
+    """vLLM loads MTP in two passes on one worker: the target, then the drafter
+    via a second load_model whose draft ModelConfig has runner_type="draft" and
+    reuses the target's device and model name. The test drives both on device 0."""
+
+    def _load(self, loader, vllm_config, model_config, ctx):
+        with patch(
+            "modelexpress.engines.vllm.loader.build_vllm_load_context",
+            return_value=ctx,
+        ), patch(
+            "modelexpress.engines.vllm.loader.install_vllm_cache_artifacts",
+        ), patch(
+            "modelexpress.engines.vllm.loader.initialize_model",
+            return_value=MagicMock(),
+        ), patch(
+            "modelexpress.engines.vllm.loader.LoadStrategyChain.run",
+            side_effect=lambda model, _ctx: model,
+        ), patch(
+            "modelexpress.engines.vllm.loader.schedule_vllm_cache_artifact_publish",
+        ) as schedule:
+            loader.load_model(vllm_config, model_config)
+        return schedule
+
+    def test_drafter_does_not_clobber_target(self):
+        """The drafter's second load leaves the target's device registry and
+        P2P publish untouched."""
+        from modelexpress.engines.vllm import loader as loader_mod
+
+        loader = _make_loader()
+        target_ctx = _make_load_context(device_id=0)
+        target_ctx.tensors = {"target.weight": MagicMock()}
+        target_ctx.nixl_manager = MagicMock()
+        target_config = MagicMock(dtype=torch.float32, runner_type="generate")
+        self._load(loader, MagicMock(), target_config, target_ctx)
+
+        draft_config = MagicMock(dtype=torch.float32, runner_type="draft")
+        draft_vllm_config = MagicMock()
+        draft_ctx = _make_load_context(device_id=0)
+        draft_ctx.tensors = {"drafter.mtp": MagicMock()}
+        draft_ctx.nixl_manager = MagicMock()
+        try:
+            schedule = self._load(loader, draft_vllm_config, draft_config, draft_ctx)
+            assert loader_mod._tensor_registry[0] is target_ctx.tensors
+            assert loader_mod._nixl_managers[0] is target_ctx.nixl_manager
+            schedule.assert_not_called()
+        finally:
+            loader_mod._tensor_registry.pop(0, None)
+            loader_mod._nixl_managers.pop(0, None)
+
+    def test_is_speculative_draft(self):
+        from modelexpress.engines.vllm.loader import _is_speculative_draft
+
+        # No speculative decoding: never a draft.
+        no_spec = MagicMock(speculative_config=None)
+        assert _is_speculative_draft(no_spec, MagicMock(runner_type="generate")) is False
+
+        # Draft model load under speculative decoding.
+        spec = MagicMock()
+        assert _is_speculative_draft(spec, MagicMock(runner_type="draft")) is True
+
+        # Target load with spec on (e.g. ngram aliases draft to the target):
+        # runner_type stays "generate", so the target keeps P2P.
+        assert _is_speculative_draft(spec, MagicMock(runner_type="generate")) is False
+
+    @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=True)
+    @patch("modelexpress.load_strategy.base._init_nixl_manager")
+    def test_register_tensors_skips_when_p2p_disabled(self, mock_init, _avail):
+        from modelexpress.load_strategy.base import register_tensors
+
+        ctx = _make_load_context()
+        ctx.p2p_enabled = False
+        ctx.adapter.discover_tensors = MagicMock(return_value={"w": MagicMock()})
+        with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "localhost:8001"}):
+            register_tensors(MagicMock(), ctx)
+
+        mock_init.assert_not_called()
+        ctx.adapter.discover_tensors.assert_not_called()
+        assert ctx.nixl_manager is None
+
+    @patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True)
+    def test_rdma_unavailable_when_p2p_disabled(self, _mock):
+        from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
+
+        ctx = _make_load_context()
+        ctx.p2p_enabled = False
+        with patch.dict("os.environ", {"MX_SERVER_ADDRESS": "server:8001"}):
+            assert RdmaStrategy().is_available(ctx) is False
+
+
 # ---------------------------------------------------------------------------
 # register_tensors (load_strategy.base)
 # ---------------------------------------------------------------------------
