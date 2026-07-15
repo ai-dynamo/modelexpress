@@ -535,6 +535,16 @@ message SourceInstanceRef {
   // the retry-cap slice. Empty means unknown (treated as compatible for
   // rolling upgrades and sources that predate this field).
   string accelerator = 5;
+
+  // Source-published estimate of the fraction of this source's RDMA NIC
+  // bandwidth currently in use, in [0, 1]. The source measures its own NIC
+  // (e.g. from RDMA port counters) and publishes it; the server passes it
+  // through. Consumed by the client `load_aware` selector to steer new targets
+  // toward sources with spare NIC headroom, so weight transfers avoid
+  // contending with a source's in-flight inference RDMA. Ordering-only and
+  // advisory; 0 (or unset, for older servers) means idle and collapses
+  // `load_aware` to `rendezvous_hash`.
+  float nic_utilization = 6;
 }
 
 message ListSourcesRequest {

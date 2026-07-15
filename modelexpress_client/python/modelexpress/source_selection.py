@@ -105,6 +105,39 @@ class RandomSelector:
         return out
 
 
+def _identity_digest(
+    candidate: p2p_pb2.SourceInstanceRef,
+    ctx: LoadContext,
+) -> int:
+    """Stable 64-bit HRW digest of (target identity, candidate identity).
+
+    Process-independent (blake2b, not Python's salted ``hash()``), so it is
+    stable across restarts and reproducible in tests. Shared by every
+    identity-based policy so they hash the same key.
+    """
+    key = "|".join(
+        str(x)
+        for x in (
+            ctx.identity.model_name,
+            ctx.worker_id,
+            ctx.worker_rank,
+            candidate.mx_source_id,
+            candidate.worker_id,
+            candidate.worker_rank,
+        )
+    )
+    return int.from_bytes(hashlib.blake2b(key.encode(), digest_size=8).digest(), "big")
+
+
+def _unit_hash(candidate: p2p_pb2.SourceInstanceRef, ctx: LoadContext) -> float:
+    """The rendezvous digest mapped into the unit interval ``[0, 1)``.
+
+    Lets a scored policy blend the identity spread with a bounded load term on
+    the same scale (see ``LoadAwareSelector``).
+    """
+    return _identity_digest(candidate, ctx) / 2**64
+
+
 class RendezvousHashSelector(ScoredSelector):
     """Stateless deterministic spreading via rendezvous (HRW) hashing.
 
@@ -129,19 +162,45 @@ class RendezvousHashSelector(ScoredSelector):
         candidate: p2p_pb2.SourceInstanceRef,
         ctx: LoadContext,
     ) -> float:
-        key = "|".join(
-            str(x)
-            for x in (
-                ctx.identity.model_name,
-                ctx.worker_id,
-                ctx.worker_rank,
-                candidate.mx_source_id,
-                candidate.worker_id,
-                candidate.worker_rank,
-            )
-        )
-        digest = hashlib.blake2b(key.encode(), digest_size=8).digest()
-        return int.from_bytes(digest, "big")
+        return _identity_digest(candidate, ctx)
+
+
+class LoadAwareSelector(ScoredSelector):
+    """Bandwidth-aware spreading: rendezvous ordering biased away from busy NICs.
+
+    ``score = unit_hash(target, candidate) - w_load * nic_utilization``
+
+    ``nic_utilization`` is a source-published estimate in ``[0, 1]`` of how much
+    of that source's RDMA NIC bandwidth is currently in use (measured by the
+    source about itself, e.g. from its RDMA port counters, and surfaced on the
+    candidate). Subtracting it steers new targets toward sources with spare NIC
+    headroom, so pulling weights does not contend with a source's in-flight
+    inference RDMA (e.g. a prefill node streaming KV cache). ``w_load`` comes
+    from ``MX_P2P_LOAD_WEIGHT`` (default 1.0).
+
+    Statelessness is preserved: the load signal is self-described source
+    metadata read off each candidate, not a server-side counter -- so every
+    replica ranks identically and MX servers stay stateless behind a load
+    balancer. When utilization is 0 or unset (idle sources, or servers that
+    predate the field), every penalty is 0 and ordering collapses exactly to
+    ``rendezvous_hash`` -- never worse than the deterministic baseline.
+    """
+
+    name = "load_aware"
+
+    def __init__(self) -> None:
+        self.w_load = envs.MX_P2P_LOAD_WEIGHT
+
+    def score(
+        self,
+        candidate: p2p_pb2.SourceInstanceRef,
+        ctx: LoadContext,
+    ) -> float:
+        # Read defensively: old servers / disabled telemetry omit the field, and
+        # a 0 load makes this collapse to rendezvous_hash.
+        util = getattr(candidate, "nic_utilization", 0.0)
+        util = min(1.0, max(0.0, util))
+        return _unit_hash(candidate, ctx) - self.w_load * util
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +222,7 @@ def register_selector(name: str, factory: SelectorFactory) -> None:
 
 register_selector("random", lambda: RandomSelector())
 register_selector("rendezvous_hash", lambda: RendezvousHashSelector())
+register_selector("load_aware", lambda: LoadAwareSelector())
 
 
 def get_selector(name: str) -> SourceSelector:

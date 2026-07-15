@@ -200,6 +200,10 @@ impl P2pService for P2pServiceImpl {
                 model_name: info.model_name,
                 worker_rank: info.worker_rank,
                 accelerator: info.accelerator,
+                // TODO(load_aware): populate from source-published NIC telemetry
+                // once WorkerMetadata carries it (see PR description). 0.0 means
+                // "idle/unknown", which collapses load_aware to rendezvous_hash.
+                nic_utilization: 0.0,
             })
             .collect();
 

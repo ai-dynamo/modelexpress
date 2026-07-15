@@ -22,6 +22,7 @@ from modelexpress.load_strategy.base import LoadResult
 from modelexpress.load_strategy.rdma_strategy import MAX_SOURCE_RETRIES, RdmaStrategy
 from modelexpress.source_selection import (
     ENV_SELECTOR,
+    LoadAwareSelector,
     RandomSelector,
     RendezvousHashSelector,
     configured_policy_label,
@@ -42,13 +43,21 @@ def _ctx(worker_id="target-0", worker_rank=0, model_name="m"):
     )
 
 
-def _ref(mx_source_id, worker_id, worker_rank=0, model_name="m", accelerator=""):
+def _ref(
+    mx_source_id,
+    worker_id,
+    worker_rank=0,
+    model_name="m",
+    accelerator="",
+    nic_utilization=0.0,
+):
     return p2p_pb2.SourceInstanceRef(
         mx_source_id=mx_source_id,
         worker_id=worker_id,
         model_name=model_name,
         worker_rank=worker_rank,
         accelerator=accelerator,
+        nic_utilization=nic_utilization,
     )
 
 
@@ -678,3 +687,95 @@ def test_load_records_metadata_miss_metric(monkeypatch):
     assert m.record_attempt.call_count == MAX_SOURCE_RETRIES
     m.record_attempt.assert_called_with("random", "metadata_miss")
     m.record_selection.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# LoadAwareSelector (bandwidth-aware)
+# ---------------------------------------------------------------------------
+
+
+def test_load_aware_registered():
+    assert get_selector("load_aware").name == "load_aware"
+
+
+def test_load_aware_collapses_to_rendezvous_when_idle(monkeypatch):
+    # With every source's nic_utilization at 0, the load term vanishes and the
+    # ordering must equal rendezvous_hash exactly (safe degradation).
+    monkeypatch.delenv("MX_P2P_LOAD_WEIGHT", raising=False)
+    ctx = _ctx()
+    srcs = _sources(6)
+    load = LoadAwareSelector().order(srcs, ctx)
+    rdv = RendezvousHashSelector().order(srcs, ctx)
+    assert [c.worker_id for c in load] == [c.worker_id for c in rdv]
+
+
+def test_load_aware_steers_away_from_busy_source(monkeypatch):
+    # A source that would win on the hash but is busy must be demoted below an
+    # idle peer when the load penalty outweighs the hash gap.
+    monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "1.0")
+    ctx = _ctx()
+    srcs = _sources(4)
+    rdv_first = RendezvousHashSelector().order(srcs, ctx)[0].worker_id
+    busy = [
+        _ref(c.mx_source_id, c.worker_id, nic_utilization=1.0 if c.worker_id == rdv_first else 0.0)
+        for c in srcs
+    ]
+    ordered = LoadAwareSelector().order(busy, ctx)
+    assert ordered[0].worker_id != rdv_first
+    assert ordered[-1].worker_id == rdv_first
+
+
+def test_load_aware_deterministic(monkeypatch):
+    monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "1.0")
+    ctx = _ctx()
+    srcs = [_ref(f"src{i:04x}aa", f"w{i}", nic_utilization=0.1 * i) for i in range(5)]
+    a = [c.worker_id for c in LoadAwareSelector().order(srcs, ctx)]
+    b = [c.worker_id for c in LoadAwareSelector().order(srcs, ctx)]
+    assert a == b
+
+
+def test_load_aware_weight_monotonic(monkeypatch):
+    # Higher MX_P2P_LOAD_WEIGHT means a busy source is penalized at least as hard:
+    # once it drops to last it stays last as the weight grows.
+    ctx = _ctx()
+    srcs = _sources(4)
+    rdv_first = RendezvousHashSelector().order(srcs, ctx)[0].worker_id
+    busy = [
+        _ref(c.mx_source_id, c.worker_id, nic_utilization=0.9 if c.worker_id == rdv_first else 0.0)
+        for c in srcs
+    ]
+    monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "0.0")
+    assert LoadAwareSelector().order(busy, ctx)[0].worker_id == rdv_first  # weight 0 == rendezvous
+    monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "5.0")
+    assert LoadAwareSelector().order(busy, ctx)[-1].worker_id == rdv_first
+
+
+def test_load_aware_missing_field_treated_as_idle(monkeypatch):
+    # A candidate object without nic_utilization (old server) must not raise and
+    # must behave as load 0.
+    monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "1.0")
+    ctx = _ctx()
+    candidates = [
+        SimpleNamespace(mx_source_id=f"src{i}", worker_id=f"w{i}", worker_rank=0)
+        for i in range(4)
+    ]
+    ordered = LoadAwareSelector().order(candidates, ctx)
+    assert {c.worker_id for c in ordered} == {f"w{i}" for i in range(4)}
+
+
+def test_load_aware_utilization_clamped(monkeypatch):
+    # Out-of-range utilization is clamped, so a garbage value cannot invert the
+    # sign of the penalty or explode the score.
+    monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "1.0")
+    ctx = _ctx()
+    srcs = _sources(3)
+    hi = [_ref(c.mx_source_id, c.worker_id, nic_utilization=42.0) for c in srcs]
+    lo = [_ref(c.mx_source_id, c.worker_id, nic_utilization=-7.0) for c in srcs]
+    # All clamped to the same value -> both collapse to rendezvous ordering.
+    assert [c.worker_id for c in LoadAwareSelector().order(lo, ctx)] == [
+        c.worker_id for c in RendezvousHashSelector().order(srcs, ctx)
+    ]
+    # High-but-equal utilization also collapses to rendezvous (equal penalty).
+    assert [c.worker_id for c in LoadAwareSelector().order(hi, ctx)] == [
+        c.worker_id for c in RendezvousHashSelector().order(srcs, ctx)
+    ]

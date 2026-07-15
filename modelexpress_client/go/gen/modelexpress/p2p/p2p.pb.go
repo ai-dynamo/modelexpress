@@ -2080,9 +2080,18 @@ type SourceInstanceRef struct {
 	// Lets clients drop incompatible sources before GetMetadata and before
 	// the retry-cap slice. Empty means unknown (treated as compatible for
 	// rolling upgrades and sources that predate this field).
-	Accelerator   string `protobuf:"bytes,5,opt,name=accelerator,proto3" json:"accelerator,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Accelerator string `protobuf:"bytes,5,opt,name=accelerator,proto3" json:"accelerator,omitempty"`
+	// Source-published estimate of the fraction of this source's RDMA NIC
+	// bandwidth currently in use, in [0, 1]. The source measures its own NIC
+	// (e.g. from RDMA port counters) and publishes it; the server passes it
+	// through. Consumed by the client `load_aware` selector to steer new targets
+	// toward sources with spare NIC headroom, so weight transfers avoid
+	// contending with a source's in-flight inference RDMA. Ordering-only and
+	// advisory; 0 (or unset, for older servers) means idle and collapses
+	// `load_aware` to `rendezvous_hash`.
+	NicUtilization float32 `protobuf:"fixed32,6,opt,name=nic_utilization,json=nicUtilization,proto3" json:"nic_utilization,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *SourceInstanceRef) Reset() {
@@ -2148,6 +2157,13 @@ func (x *SourceInstanceRef) GetAccelerator() string {
 		return x.Accelerator
 	}
 	return ""
+}
+
+func (x *SourceInstanceRef) GetNicUtilization() float32 {
+	if x != nil {
+		return x.NicUtilization
+	}
+	return 0
 }
 
 type ListSourcesRequest struct {
@@ -2690,7 +2706,7 @@ const file_p2p_proto_rawDesc = "" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12 \n" +
 	"\fmx_source_id\x18\x03 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
-	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"\xb4\x01\n" +
+	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"\xdd\x01\n" +
 	"\x11SourceInstanceRef\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
@@ -2699,7 +2715,8 @@ const file_p2p_proto_rawDesc = "" +
 	"model_name\x18\x03 \x01(\tR\tmodelName\x12\x1f\n" +
 	"\vworker_rank\x18\x04 \x01(\rR\n" +
 	"workerRank\x12 \n" +
-	"\vaccelerator\x18\x05 \x01(\tR\vaccelerator\"\xb0\x01\n" +
+	"\vaccelerator\x18\x05 \x01(\tR\vaccelerator\x12'\n" +
+	"\x0fnic_utilization\x18\x06 \x01(\x02R\x0enicUtilization\"\xb0\x01\n" +
 	"\x12ListSourcesRequest\x12=\n" +
 	"\bidentity\x18\x01 \x01(\v2!.model_express.p2p.SourceIdentityR\bidentity\x12I\n" +
 	"\rstatus_filter\x18\x02 \x01(\x0e2\x1f.model_express.p2p.SourceStatusH\x00R\fstatusFilter\x88\x01\x01B\x10\n" +
