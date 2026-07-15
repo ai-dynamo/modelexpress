@@ -535,7 +535,13 @@ mod tests {
 
         let manager = P2pStateManager::with_backend(Arc::new(mock));
         manager
-            .update_worker_status("abc123def456abcd", "test-instance", 2, SourceStatus::Ready, 0.0)
+            .update_worker_status(
+                "abc123def456abcd",
+                "test-instance",
+                2,
+                SourceStatus::Ready,
+                0.0,
+            )
             .await
             .expect("update_worker_status failed");
     }
@@ -550,7 +556,13 @@ mod tests {
         let manager = P2pStateManager::with_backend(Arc::new(mock));
         assert!(
             manager
-                .update_worker_status("abc123def456abcd", "test-instance", 0, SourceStatus::Ready, 0.0)
+                .update_worker_status(
+                    "abc123def456abcd",
+                    "test-instance",
+                    0,
+                    SourceStatus::Ready,
+                    0.0
+                )
                 .await
                 .is_err()
         );
@@ -645,18 +657,26 @@ mod tests {
     async fn test_update_worker_status_stores_correct_status() {
         let mut mock = MockMetadataBackend::new();
         mock.expect_update_status()
-            .withf(|source_id, worker_id, worker_rank, status, _updated_at, _nic| {
-                source_id == "abc123def456abcd"
-                    && worker_id == "test-instance"
-                    && *worker_rank == 7
-                    && *status == SourceStatus::Ready
-            })
+            .withf(
+                |source_id, worker_id, worker_rank, status, _updated_at, _nic| {
+                    source_id == "abc123def456abcd"
+                        && worker_id == "test-instance"
+                        && *worker_rank == 7
+                        && *status == SourceStatus::Ready
+                },
+            )
             .once()
             .returning(|_, _, _, _, _, _| Ok(()));
 
         let manager = P2pStateManager::with_backend(Arc::new(mock));
         manager
-            .update_worker_status("abc123def456abcd", "test-instance", 7, SourceStatus::Ready, 0.0)
+            .update_worker_status(
+                "abc123def456abcd",
+                "test-instance",
+                7,
+                SourceStatus::Ready,
+                0.0,
+            )
             .await
             .expect("update_worker_status failed");
     }
