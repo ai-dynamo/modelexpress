@@ -46,8 +46,6 @@ class MxClientBase(ABC):
         identity: "p2p_pb2.SourceIdentity",
         worker: "p2p_pb2.WorkerMetadata",
         worker_id: str,
-        pod_name: str = "",
-        pod_uid: str = "",
     ) -> str:
         """Publish worker metadata and return the computed mx_source_id."""
 
@@ -169,8 +167,6 @@ class MxClient(MxClientBase):
         identity: "p2p_pb2.SourceIdentity",
         worker: "p2p_pb2.WorkerMetadata",
         worker_id: str,
-        pod_name: str = "",
-        pod_uid: str = "",
     ) -> str:
         """Publish metadata for one worker so targets can discover this source.
 
@@ -180,8 +176,9 @@ class MxClient(MxClientBase):
             identity=identity,
             worker=worker,
             worker_id=worker_id,
-            pod_name=pod_name,
-            pod_uid=pod_uid,
+            pod_name=envs.POD_NAME,
+            pod_uid=envs.POD_UID,
+            pod_namespace=envs.POD_NAMESPACE,
         )
         response = self.stub.PublishMetadata(request, timeout=30)
         if not response.success:

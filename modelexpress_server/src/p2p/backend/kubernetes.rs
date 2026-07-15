@@ -50,8 +50,17 @@ impl KubernetesBackend {
         Api::namespaced(self.client.clone(), &self.namespace)
     }
 
-    fn pod_owner_references(pod_name: &str, pod_uid: &str) -> Option<Vec<OwnerReference>> {
-        if pod_name.is_empty() || pod_uid.is_empty() {
+    fn pod_owner_references(
+        pod_name: &str,
+        pod_uid: &str,
+        pod_namespace: &str,
+        metadata_namespace: &str,
+    ) -> Option<Vec<OwnerReference>> {
+        if pod_name.is_empty()
+            || pod_uid.is_empty()
+            || pod_namespace.is_empty()
+            || pod_namespace != metadata_namespace
+        {
             return None;
         }
 
@@ -207,6 +216,7 @@ impl MetadataBackend for KubernetesBackend {
         worker: WorkerMetadata,
         pod_name: &str,
         pod_uid: &str,
+        pod_namespace: &str,
     ) -> MetadataResult<()> {
         let source_id = crate::p2p::source_identity::compute_mx_source_id(identity);
         let source_id = source_id.as_str();
@@ -219,7 +229,8 @@ impl MetadataBackend for KubernetesBackend {
 
         // First, ensure the CR exists
         let existing = api.get_opt(&cr_name).await?;
-        let pod_owner_references = Self::pod_owner_references(pod_name, pod_uid);
+        let pod_owner_references =
+            Self::pod_owner_references(pod_name, pod_uid, pod_namespace, &self.namespace);
 
         if existing.is_none() {
             let new_cr = ModelMetadata {
@@ -845,16 +856,21 @@ mod tests {
     }
 
     #[test]
-    fn pod_owner_references_require_name_and_uid() {
-        assert!(KubernetesBackend::pod_owner_references("pod-0", "").is_none());
-        assert!(KubernetesBackend::pod_owner_references("", "pod-uid").is_none());
+    fn pod_owner_references_require_complete_same_namespace_identity() {
+        assert!(KubernetesBackend::pod_owner_references("pod-0", "", "ns", "ns").is_none());
+        assert!(KubernetesBackend::pod_owner_references("", "pod-uid", "ns", "ns").is_none());
+        assert!(KubernetesBackend::pod_owner_references("pod-0", "pod-uid", "", "ns").is_none());
+        assert!(
+            KubernetesBackend::pod_owner_references("pod-0", "pod-uid", "other", "ns").is_none()
+        );
     }
 
     #[test]
     fn pod_owner_references_identify_the_publishing_pod() {
-        let Some(owner_references) = KubernetesBackend::pod_owner_references("pod-0", "pod-uid")
+        let Some(owner_references) =
+            KubernetesBackend::pod_owner_references("pod-0", "pod-uid", "ns", "ns")
         else {
-            panic!("pod name and UID should produce an owner reference");
+            panic!("a complete same-namespace pod identity should produce an owner reference");
         };
 
         assert_eq!(owner_references.len(), 1);

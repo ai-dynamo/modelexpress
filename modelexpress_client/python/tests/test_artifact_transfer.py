@@ -1366,18 +1366,14 @@ class _FakeMxClient:
         self.published_identity = None
         self.published_worker = None
         self.published_worker_id = ""
-        self.published_pod_name = ""
-        self.published_pod_uid = ""
         self.status_updates = []
 
-    def publish_metadata(self, identity, worker, worker_id, pod_name="", pod_uid=""):
+    def publish_metadata(self, identity, worker, worker_id):
         self.published_identity = p2p_pb2.SourceIdentity()
         self.published_identity.CopyFrom(identity)
         self.published_worker = p2p_pb2.WorkerMetadata()
         self.published_worker.CopyFrom(worker)
         self.published_worker_id = worker_id
-        self.published_pod_name = pod_name
-        self.published_pod_uid = pod_uid
         return self.mx_source_id or compute_mx_source_id(identity)
 
     def list_sources(self, identity=None, status_filter=None):

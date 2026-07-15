@@ -298,6 +298,7 @@ pub trait MetadataBackend: Send + Sync {
         worker: WorkerMetadata,
         pod_name: &str,
         pod_uid: &str,
+        pod_namespace: &str,
     ) -> MetadataResult<()>;
 
     /// Get full tensor metadata for one specific worker.

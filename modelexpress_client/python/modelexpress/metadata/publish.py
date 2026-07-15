@@ -127,9 +127,6 @@ def publish_metadata_and_ready(
         f"[Worker {worker_rank}] Preparing {len(tensors)} tensors for model '{identity.model_name}'"
     )
 
-    pod_name = envs.POD_NAME
-    pod_uid = envs.POD_UID
-
     tensor_protos = build_tensor_protos(tensors, device_id, worker_rank)
 
     if _is_p2p_metadata_enabled(mx_client):
@@ -174,8 +171,6 @@ def publish_metadata_and_ready(
                 worker=worker,
                 worker_id=worker_id,
                 worker_rank=worker_rank,
-                pod_name=pod_name,
-                pod_uid=pod_uid,
             )
             grpc_server.set_mx_source_id(mx_source_id)
             logger.info(
@@ -209,8 +204,6 @@ def publish_metadata_and_ready(
                 worker=worker,
                 worker_id=worker_id,
                 worker_rank=worker_rank,
-                pod_name=pod_name,
-                pod_uid=pod_uid,
             )
             logger.info(
                 f"[Worker {worker_rank}] Published metadata to MX server "
@@ -238,18 +231,13 @@ def _publish_metadata_to_server(
     worker: "p2p_pb2.WorkerMetadata",
     worker_id: str,
     worker_rank: int,
-    pod_name: str = "",
-    pod_uid: str = "",
 ) -> str:
     """Publish metadata with bounded retries and exponential backoff."""
     last_error: grpc.RpcError | None = None
 
     for attempt in range(1, PUBLISH_METADATA_MAX_ATTEMPTS + 1):
         try:
-            return mx_client.publish_metadata(
-                identity, worker, worker_id,
-                pod_name=pod_name, pod_uid=pod_uid,
-            )
+            return mx_client.publish_metadata(identity, worker, worker_id)
         except grpc.RpcError as exc:
             if exc.code() not in PUBLISH_METADATA_RETRYABLE_STATUS_CODES:
                 raise
