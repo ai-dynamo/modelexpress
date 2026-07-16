@@ -563,14 +563,18 @@ impl ModelDownloadTracker {
         }
     }
 
+    async fn touch_and_log(&self, model_name: &str) {
+        if let Err(e) = self.registry.touch_model(model_name).await {
+            error!("Failed to touch model {model_name}: {e}");
+        }
+    }
+
     /// Gets the status of a model from the registry, bumping `last_used_at` on hit.
     /// Returns None on lookup failure (error logged) or unknown model.
     pub async fn get_status(&self, model_name: &str) -> Option<ModelStatus> {
         match self.registry.get_status(model_name).await {
             Ok(Some(status)) => {
-                if let Err(e) = self.registry.touch_model(model_name).await {
-                    error!("Failed to touch model {model_name}: {e}");
-                }
+                self.touch_and_log(model_name).await;
                 Some(status)
             }
             Ok(None) => None,
@@ -746,9 +750,7 @@ impl ModelDownloadTracker {
                     }
                     if existing == ModelStatus::DOWNLOADED {
                         // Returning an existing downloaded model is a cache hit for LRU purposes.
-                        if let Err(e) = self.registry.touch_model(model_name).await {
-                            error!("Failed to touch cached model {model_name}: {e}");
-                        }
+                        self.touch_and_log(model_name).await;
                     }
                     break (existing, false);
                 }
