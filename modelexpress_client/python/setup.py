@@ -7,15 +7,14 @@ Project metadata lives in pyproject.toml. This setup.py only adds the
 ext_modules entry that pyproject.toml can't express. Setuptools merges
 the two when both are present.
 
-Pure setuptools build, no CUDA or PyTorch dependency in the extension
-itself: the shim only uses the Python C API and dispatches to Python
-callbacks, so it builds anywhere with a C++ toolchain.
+Pure setuptools build. The VMM shim only uses the Python C API. The optional
+NCCL bootstrap shim includes ``nccl.h`` so ``ncclConfig_t`` always matches the
+NCCL installation used at runtime.
 
-Build-time failure of the C extension is non-fatal: pip install
-succeeds without it, and modelexpress.vmm.hook detects the missing
-extension at runtime and disables the arena allocator. Users without a
-working C++ compiler get the pool-reg path; users with one get the
-arena+pool-reg fast path.
+Build-time failure of an optional extension is non-fatal. VMM detects a
+missing allocator shim and falls back to pool registration. NCCL M2N bootstrap
+detects a missing bootstrap shim and fails closed; it never falls back to
+blocking communicator initialization.
 """
 
 import os
@@ -39,7 +38,7 @@ _OPTIONAL_EXT_ERRORS = (
 class BuildExtension(build_ext):
     """Custom build extension that respects $CXX and is best-effort.
 
-    The modelexpress.vmm._alloc_ext C extension is OPTIONAL. If
+    ModelExpress C extensions are OPTIONAL. If
     compilation fails for any reason (no compiler installed, header
     mismatch, sandbox restrictions), this build_ext catches the error
     and emits a warning instead of aborting the install. The resulting
@@ -64,13 +63,12 @@ class BuildExtension(build_ext):
             self._warn_optional_skip(e, ext_name=ext.name)
 
     @staticmethod
-    def _warn_optional_skip(exc, ext_name="modelexpress.vmm._alloc_ext"):
+    def _warn_optional_skip(exc, ext_name="ModelExpress extension"):
         msg = (
             f"Failed to build optional C extension {ext_name}: "
             f"{type(exc).__name__}: {exc}. "
-            "ModelExpress will install pure-Python; MX_VMM_ARENA will be a "
-            "runtime no-op. Install a C++ compiler (g++ or set $CXX) and "
-            "reinstall to enable the arena allocator fast path."
+            "ModelExpress will install without this native feature. Install "
+            "its headers and a C++ compiler (g++ or set $CXX), then reinstall."
         )
         warnings.warn(msg, stacklevel=2)
         print(f"WARNING: {msg}", file=sys.stderr)
@@ -80,7 +78,7 @@ def _ext_modules():
     if os.environ.get("MX_SKIP_EXT"):
         return []
     extra_compile_args = ["-std=c++17", "-O3", "-fPIC"]
-    return [
+    extensions = [
         Extension(
             name="modelexpress.vmm._alloc_ext",
             sources=["modelexpress/vmm/_alloc_ext.cpp"],
@@ -88,6 +86,30 @@ def _ext_modules():
             optional=True,
         ),
     ]
+
+    if sys.platform.startswith("linux"):
+        include_dirs = []
+        explicit_include = os.environ.get("NCCL_INCLUDE_DIR")
+        nccl_home = os.environ.get("NCCL_HOME") or os.environ.get("NCCL_ROOT")
+        if explicit_include:
+            include_dirs.append(explicit_include)
+        if nccl_home:
+            include_dirs.append(os.path.join(nccl_home, "include"))
+        extensions.append(
+            Extension(
+                name=(
+                    "modelexpress.weight_transfer.transport._nccl_bootstrap_ext"
+                ),
+                sources=[
+                    "modelexpress/weight_transfer/transport/_nccl_bootstrap_ext.cpp"
+                ],
+                include_dirs=include_dirs,
+                libraries=["dl"],
+                extra_compile_args=extra_compile_args,
+                optional=True,
+            )
+        )
+    return extensions
 
 
 setup(
