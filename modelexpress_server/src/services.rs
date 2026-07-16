@@ -744,6 +744,12 @@ impl ModelDownloadTracker {
                         self.delete_status(model_name).await;
                         continue;
                     }
+                    if existing == ModelStatus::DOWNLOADED {
+                        // Returning an existing downloaded model is a cache hit for LRU purposes.
+                        if let Err(e) = self.registry.touch_model(model_name).await {
+                            error!("Failed to touch cached model {model_name}: {e}");
+                        }
+                    }
                     break (existing, false);
                 }
                 Err(e) => {
@@ -934,6 +940,44 @@ mod tests {
         mock.expect_touch_model().once().returning(|_| Ok(()));
         let tracker = tracker_with_mock(mock);
         assert_eq!(tracker.get_status("m").await, Some(ModelStatus::DOWNLOADED));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_tracker_downloaded_cache_hit_bumps_last_used_at() {
+        let env_lock = acquire_env_mutex();
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let _cache_dir_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            temp_dir.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+        let model_dir = temp_dir.path().join("models--test--model/snapshots/abc123");
+        std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");
+        std::fs::write(model_dir.join("config.json"), b"{}").expect("Failed to write config");
+
+        let mut mock = crate::registry::backend::MockRegistryBackend::new();
+        mock.expect_try_claim_for_download()
+            .with(
+                mockall::predicate::eq("test/model"),
+                mockall::predicate::eq(ModelProvider::HuggingFace),
+            )
+            .once()
+            .returning(|_, _| Ok(ClaimOutcome::AlreadyExists(ModelStatus::DOWNLOADED)));
+        mock.expect_touch_model()
+            .with(mockall::predicate::eq("test/model"))
+            .once()
+            .returning(|_| Ok(()));
+        let tracker = tracker_with_mock(mock);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+
+        assert_eq!(
+            tracker
+                .ensure_model_downloaded("test/model", ModelProvider::HuggingFace, &tx, false,)
+                .await,
+            ModelStatus::DOWNLOADED
+        );
     }
 
     #[tokio::test]
