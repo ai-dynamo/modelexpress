@@ -750,6 +750,24 @@ def test_load_aware_weight_monotonic(monkeypatch):
     assert LoadAwareSelector().order(busy, ctx)[-1].worker_id == rdv_first
 
 
+def test_load_aware_negative_weight_clamped_to_zero(monkeypatch):
+    # A negative MX_P2P_LOAD_WEIGHT would invert the policy into preferring busy
+    # sources. envs clamps it to >= 0, so it collapses to rendezvous ordering
+    # rather than rewarding load.
+    from modelexpress import envs as envs_mod
+
+    ctx = _ctx()
+    srcs = _sources(4)
+    rdv = [c.worker_id for c in RendezvousHashSelector().order(srcs, ctx)]
+    busy = [
+        _ref(c.mx_source_id, c.worker_id, source_load=0.9 if c.worker_id == rdv[0] else 0.0)
+        for c in srcs
+    ]
+    monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "-3.0")
+    assert envs_mod.MX_P2P_LOAD_WEIGHT == 0.0
+    assert [c.worker_id for c in LoadAwareSelector().order(busy, ctx)] == rdv
+
+
 def test_load_aware_missing_field_treated_as_idle(monkeypatch):
     # A candidate object without source_load (old server) must not raise and
     # must behave as load 0.

@@ -199,7 +199,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ── P2P source selection ───────────────────────────────────────────────
     # Raw (None when unset); source_selection applies its DEFAULT_SELECTOR fallback.
     "MX_P2P_SOURCE_SELECTOR": lambda: os.environ.get("MX_P2P_SOURCE_SELECTOR"),
-    "MX_P2P_LOAD_WEIGHT": lambda: _env_float("MX_P2P_LOAD_WEIGHT", 1.0),
+    # Clamp to >= 0: a negative weight would invert LoadAwareSelector into
+    # preferring busier sources. 0 disables the load term (== rendezvous_hash).
+    "MX_P2P_LOAD_WEIGHT": lambda: max(0.0, _env_float("MX_P2P_LOAD_WEIGHT", 1.0)),
     "MX_P2P_RUNTIME_METRICS_URL": lambda: os.environ.get("MX_P2P_RUNTIME_METRICS_URL"),
     # ── Opt-in metrics collector ───────────────────────────────────────────
     "MX_METRICS_ENABLED": lambda: os.environ.get("MX_METRICS_ENABLED", "0").strip().lower()

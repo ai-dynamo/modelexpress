@@ -80,11 +80,14 @@ def test_provider_clamps():
 
 def test_make_source_load_provider_blends_when_url_set(monkeypatch):
     # With the runtime URL set, the provider is the max of NIC and runtime; both
-    # degrade to 0 locally (no IB device, unreachable URL), so it must not crash
-    # and must return a valid [0,1] float.
+    # degrade to 0 (no IB device, runtime fetch returns nothing), so it must not
+    # crash and must return a valid [0,1] float. The runtime fetch seam is patched
+    # so the test does no real socket I/O.
+    from modelexpress import runtime_load
     from modelexpress.nic_metrics import make_source_load_provider
 
-    monkeypatch.setenv("MX_P2P_RUNTIME_METRICS_URL", "http://127.0.0.1:1/metrics")
+    monkeypatch.setenv("MX_P2P_RUNTIME_METRICS_URL", "http://runtime.invalid/metrics")
+    monkeypatch.setattr(runtime_load, "_http_get", lambda url, timeout: None)
     provider = make_source_load_provider(0)
     val = provider()
     assert isinstance(val, float) and 0.0 <= val <= 1.0

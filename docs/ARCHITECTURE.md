@@ -556,7 +556,7 @@ gRPC client wrapping the P2P service stubs:
 | `publish_metadata(identity, worker, worker_id)` | Publish worker metadata; returns `mx_source_id` |
 | `list_sources(identity, status_filter)` | List available source workers (lightweight, no tensor data) |
 | `get_metadata(mx_source_id, worker_id)` | Fetch full tensor metadata for one worker (on demand) |
-| `update_status(mx_source_id, worker_id, worker_rank, status)` | Update worker lifecycle status (e.g., `READY`) |
+| `update_status(mx_source_id, worker_id, worker_rank, status, source_load)` | Update worker lifecycle status (e.g., `READY`) and its published `source_load` |
 | `close()` | Close the underlying gRPC channel |
 
 ### NixlTransferManager
@@ -628,7 +628,7 @@ The selector controls ordering only; `RdmaStrategy` enforces the fixed three-can
 
 The two Phase 1 policies were compared two ways. An offline simulation drives the real selector code over synthetic `(target, source)` identity sets; because the score depends only on identity and policy (not on hardware or RDMA), it reproduces the on-cluster `mx_p2p_source_selections_total` distribution without standing up transfers. Across M sources / N targets configs (4×20, 4×40, 8×32), **first-choice balance is equivalent** for both policies (both are uniform hashes — max-source share within a few percent of each other and of the `ceil(N/M)/N` ideal). The difference is elsewhere: `rendezvous_hash` has **0% re-pick churn** on a repeated, unchanged source set (vs `random`'s ~`(M-1)/M`), and removing one source changes only ~`1/M` of the unaffected targets' picks.
 
-On-cluster (8×B200 nodes, InfiniBand RDMA; vLLM `--load-format modelexpress`, TP=1, central-coordinator backend), both policies were run against pre-warmed source pools that grow as targets become sources. Across Qwen2.5-0.5B (0.99 GB) and Qwen2.5-7B (~15 GB), 42 real cross-node NIXL RDMA transfers completed and **bandwidth was policy-independent** (~180 Gbps for the 0.5B transfers, ~211 Gbps for the larger 7B transfers as setup amortizes). So `rendezvous_hash`'s win is determinism and low disruption at no balance or bandwidth cost; the deferred `load_aware` policy is what closes the live-fan-out gap where deterministic hashing can pile onto an always-present source.
+On-cluster (8×B200 nodes, InfiniBand RDMA; vLLM `--load-format modelexpress`, TP=1, central-coordinator backend), both policies were run against pre-warmed source pools that grow as targets become sources. Across Qwen2.5-0.5B (0.99 GB) and Qwen2.5-7B (~15 GB), 42 real cross-node NIXL RDMA transfers completed and **bandwidth was policy-independent** (~180 Gbps for the 0.5B transfers, ~211 Gbps for the larger 7B transfers as setup amortizes). So `rendezvous_hash`'s win is determinism and low disruption at no balance or bandwidth cost; the `load_aware` policy closes the live-fan-out gap where deterministic hashing can pile onto an always-present source, by biasing selection away from sources that publish a high `source_load`.
 
 ### Transfer Safety
 
