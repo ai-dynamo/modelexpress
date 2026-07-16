@@ -168,23 +168,38 @@ class TopologyAwareSelector(ScoredSelector):
     modeled: co-located source/target replicas let NIXL auto-select the NVLink
     backend, so the selector need not.
 
-    Composes with load-aware selection without depending on it: when
-    ``MX_P2P_TOPOLOGY_LOAD_WEIGHT > 0`` the within-tier tiebreak becomes
-    ``unit_hash - w * source_load`` (``source_load`` read defensively off the
-    candidate), so within a locality tier it also steers away from busy sources.
-    With the weight at 0 (default) the tiebreak is the pure jitter and the
-    selector needs nothing from the load-aware feature.
+    Composes with load-aware selection without depending on it: when the
+    within-tier load weight is > 0 the tiebreak becomes ``unit_hash - w *
+    source_load`` (``source_load`` read defensively off the candidate), so within
+    a locality tier it also steers away from busy sources. The weight is
+    ``MX_P2P_TOPOLOGY_LOAD_WEIGHT`` when set, else it falls back to the load_aware
+    weight ``MX_P2P_LOAD_WEIGHT`` when that feature is deployed -- so a single
+    knob turns both on together. With the weight at 0 (default) the tiebreak is
+    the pure jitter and the selector needs nothing from the load-aware feature.
     """
 
     name = "topology_aware"
 
     def __init__(self) -> None:
+        import math
+        import os
+
         from . import envs
         from .topology import local_topology, resolve_levels
 
         self._levels = resolve_levels()
         self._local = local_topology()
-        self.w_load = envs.MX_P2P_TOPOLOGY_LOAD_WEIGHT
+        # Within-tier load blend weight. Use MX_P2P_TOPOLOGY_LOAD_WEIGHT when it
+        # is set; otherwise fall back to the load_aware weight MX_P2P_LOAD_WEIGHT
+        # when that feature is deployed, so a single knob turns on both
+        # topology- and load-aware selection together. Default 0 (pure topology).
+        if os.environ.get("MX_P2P_TOPOLOGY_LOAD_WEIGHT") is not None:
+            w = envs.MX_P2P_TOPOLOGY_LOAD_WEIGHT
+        else:
+            w = getattr(envs, "MX_P2P_LOAD_WEIGHT", 0.0)
+        self.w_load = (
+            w if isinstance(w, (int, float)) and math.isfinite(w) and w >= 0.0 else 0.0
+        )
 
     def _unit_hash(
         self,

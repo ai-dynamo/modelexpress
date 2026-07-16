@@ -264,6 +264,19 @@ def test_non_finite_load_weight_rejected(monkeypatch):
         assert TopologyAwareSelector().w_load == 0.0
 
 
+def test_load_weight_falls_back_to_load_aware_env(monkeypatch):
+    # One knob: when MX_P2P_TOPOLOGY_LOAD_WEIGHT is unset but the load_aware
+    # weight is present (both features deployed), topology_aware uses it; an
+    # explicit topology weight still overrides the shared knob.
+    from modelexpress import envs as envs_mod
+
+    monkeypatch.delenv("MX_P2P_TOPOLOGY_LOAD_WEIGHT", raising=False)
+    monkeypatch.setattr(envs_mod, "MX_P2P_LOAD_WEIGHT", 0.8, raising=False)
+    assert TopologyAwareSelector().w_load == 0.8
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_LOAD_WEIGHT", "0.0")
+    assert TopologyAwareSelector().w_load == 0.0
+
+
 # ---------------------------------------------------------------------------
 # Datacenter-topology simulation (drives the real selector; no GPU hardware)
 # ---------------------------------------------------------------------------
