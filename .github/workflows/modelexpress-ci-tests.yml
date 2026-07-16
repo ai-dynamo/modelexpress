@@ -936,6 +936,74 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
+  # Rolling-update test — five workers, CRD backend, NIXL-over-TCP.
+  # Runs independently of the 15-worker fleet test for both vLLM and SGLang.
+  # The Deployment rolls with maxUnavailable=1/maxSurge=0: one source
+  # terminates while four stay alive.
+  # ---------------------------------------------------------------------------
+  test-rolling-update:
+    name: Rolling-update test (${{ matrix.framework }}, 5 workers)
+    runs-on: prod-modelexpress-builder-amd-v1
+    needs: [build-client, build-server, ensure-vcluster]
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - framework: vllm
+            namespace: mx-ci-rolling-vllm-${{ github.run_id }}
+            manifest: ci/k8s/client/vllm/manifest-azure-rolling-update.yaml
+          - framework: sglang
+            namespace: mx-ci-rolling-sglang-${{ github.run_id }}
+            manifest: ci/k8s/client/sgl/manifest-azure-rolling-update.yaml
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Connect to vCluster
+        id: connect-vcluster
+        uses: ./.github/actions/connect-vcluster
+        with:
+          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Run rolling-update test
+        uses: ./.github/actions/run-mx-fleet-test
+        with:
+          kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
+          namespace: ${{ matrix.namespace }}
+          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
+          worker_registry: nvcr.io
+          ngc_api_key: ${{ secrets.NGC_API_KEY }}
+          model: ${{ env.MX_CI_MODEL }}
+          hf_token: ${{ secrets.HF_TOKEN }}
+          manifest: ${{ matrix.manifest }}
+          test_script: ci/k8s/client/test_rolling_update.py
+          fleet_size: "5"
+          wave_sizes: "5"
+          rolling_update: "true"
+          rollout_timeout_seconds: "600"
+
+      - name: Dump vCluster diagnostics on failure
+        if: failure()
+        uses: ./.github/actions/dump-vcluster-diagnostics
+        with:
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Reap vCluster port-forward
+        if: always()
+        run: |
+          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
+            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
+          fi
+
+  # ---------------------------------------------------------------------------
   # Stale-metadata test (row 18) — single source pod, no target, mx-server
   # deployed with the Redis backend + compressed reaper knobs. After the
   # source publishes, we force-kill it and assert that the server stops
@@ -1095,6 +1163,7 @@ jobs:
       - test-ep
       - test-with-dynamo
       - test-fleet-scale
+      - test-rolling-update
       - test-stale-metadata
       - model-streamer
     if: always()
