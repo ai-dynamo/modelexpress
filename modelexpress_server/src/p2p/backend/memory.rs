@@ -59,6 +59,9 @@ impl MetadataBackend for InMemoryMetadataBackend {
         identity: &SourceIdentity,
         worker_id: &str,
         worker: WorkerMetadata,
+        _pod_name: &str,
+        _pod_uid: &str,
+        _pod_namespace: &str,
     ) -> MetadataResult<()> {
         let source_id = crate::p2p::source_identity::compute_mx_source_id(identity);
         let record = WorkerRecord::from(worker);
@@ -233,7 +236,7 @@ mod tests {
         let source_id = compute_mx_source_id(&id);
 
         backend
-            .publish_metadata(&id, "w1", worker(0, SourceStatus::Ready))
+            .publish_metadata(&id, "w1", worker(0, SourceStatus::Ready), "", "", "")
             .await
             .expect("publish");
         let record = backend
@@ -267,7 +270,7 @@ mod tests {
 
         for rank in [2, 0, 1] {
             backend
-                .publish_metadata(&id, "w1", worker(rank, SourceStatus::Ready))
+                .publish_metadata(&id, "w1", worker(rank, SourceStatus::Ready), "", "", "")
                 .await
                 .expect("publish");
         }
@@ -288,11 +291,11 @@ mod tests {
         let id = identity("m");
 
         backend
-            .publish_metadata(&id, "w1", worker(0, SourceStatus::Initializing))
+            .publish_metadata(&id, "w1", worker(0, SourceStatus::Initializing), "", "", "")
             .await
             .expect("publish r0");
         backend
-            .publish_metadata(&id, "w1", worker(1, SourceStatus::Ready))
+            .publish_metadata(&id, "w1", worker(1, SourceStatus::Ready), "", "", "")
             .await
             .expect("publish r1");
 
@@ -332,11 +335,11 @@ mod tests {
         let source_id = compute_mx_source_id(&id);
 
         backend
-            .publish_metadata(&id, "w1", worker(0, SourceStatus::Initializing))
+            .publish_metadata(&id, "w1", worker(0, SourceStatus::Initializing), "", "", "")
             .await
             .expect("publish r0");
         backend
-            .publish_metadata(&id, "w1", worker(3, SourceStatus::Ready))
+            .publish_metadata(&id, "w1", worker(3, SourceStatus::Ready), "", "", "")
             .await
             .expect("publish r3");
 
@@ -361,7 +364,7 @@ mod tests {
         let source_id = compute_mx_source_id(&id);
 
         backend
-            .publish_metadata(&id, "w1", worker(0, SourceStatus::Initializing))
+            .publish_metadata(&id, "w1", worker(0, SourceStatus::Initializing), "", "", "")
             .await
             .expect("publish");
         backend
@@ -401,11 +404,11 @@ mod tests {
         let source_id = compute_mx_source_id(&id);
 
         backend
-            .publish_metadata(&id, "w1", worker(0, SourceStatus::Ready))
+            .publish_metadata(&id, "w1", worker(0, SourceStatus::Ready), "", "", "")
             .await
             .expect("publish w1");
         backend
-            .publish_metadata(&id, "w2", worker(0, SourceStatus::Ready))
+            .publish_metadata(&id, "w2", worker(0, SourceStatus::Ready), "", "", "")
             .await
             .expect("publish w2");
 
