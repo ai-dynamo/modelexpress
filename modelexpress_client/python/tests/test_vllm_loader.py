@@ -358,7 +358,6 @@ class TestAbstractMethodCompleteness:
         registration = importlib.import_module(
             "modelexpress.engines.vllm.registration"
         )
-        patch_check = MagicMock()
         registered = {}
 
         def fake_register_model_loader(load_format):
@@ -368,7 +367,6 @@ class TestAbstractMethodCompleteness:
 
             return register
 
-        monkeypatch.setattr(registration, "_patch_vllm_s3_format_check", patch_check)
         monkeypatch.setattr(
             registration,
             "register_model_loader",
@@ -379,7 +377,6 @@ class TestAbstractMethodCompleteness:
 
         from modelexpress.engines.vllm.loader import MxModelLoader
 
-        patch_check.assert_called_once_with()
         assert model_loader._LOAD_FORMAT_TO_MODEL_LOADER["modelexpress"] is sentinel
         assert registered["mx"] is MxModelLoader
         assert "modelexpress" not in registered
@@ -398,7 +395,6 @@ class TestAbstractMethodCompleteness:
         registration = importlib.import_module(
             "modelexpress.engines.vllm.registration"
         )
-        patch_check = MagicMock()
         registered = {}
 
         def fake_register_model_loader(load_format):
@@ -410,11 +406,6 @@ class TestAbstractMethodCompleteness:
 
         monkeypatch.setattr(
             registration,
-            "_patch_vllm_s3_format_check",
-            patch_check,
-        )
-        monkeypatch.setattr(
-            registration,
             "register_model_loader",
             fake_register_model_loader,
         )
@@ -423,7 +414,6 @@ class TestAbstractMethodCompleteness:
 
         from modelexpress.engines.vllm.loader import MxModelLoader
 
-        patch_check.assert_called_once_with()
         assert registered["modelexpress"] is MxModelLoader
         assert registered["mx"] is MxModelLoader
 
