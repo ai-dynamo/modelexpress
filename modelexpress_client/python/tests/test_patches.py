@@ -163,6 +163,7 @@ def _install_fake_humming(monkeypatch, version, config_cls):
 
     humming = ModuleType("vllm.model_executor.layers.quantization.humming")
     humming.HummingConfig = config_cls
+    humming.HummingMethod = object
     humming.re = re
     monkeypatch.setitem(sys.modules, humming.__name__, humming)
 
@@ -197,6 +198,24 @@ def test_humming_patch_detects_customer_backport(monkeypatch):
             )
 
     _install_fake_humming(monkeypatch, "0.23.0", HummingConfig)
+
+    assert patch_humming_regex_ignore() is False
+
+
+def test_humming_patch_skips_when_backend_is_unavailable(monkeypatch):
+    class HummingConfig:
+        def __init__(self):
+            raise AssertionError("Humming backend is unavailable")
+
+    monkeypatch.setattr(
+        vllm_patch_version,
+        "package_version",
+        lambda name: "0.23.0",
+    )
+    humming = ModuleType("vllm.model_executor.layers.quantization.humming")
+    humming.HummingConfig = HummingConfig
+    humming.HummingMethod = None
+    monkeypatch.setitem(sys.modules, humming.__name__, humming)
 
     assert patch_humming_regex_ignore() is False
 

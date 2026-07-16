@@ -27,6 +27,9 @@ def patch_humming_regex_ignore() -> bool:
     except ImportError:
         return False
 
+    if getattr(humming, "HummingMethod", None) is None:
+        return False
+
     config_cls = humming.HummingConfig
     original = config_cls.is_layer_skipped
     if getattr(original, "__modelexpress_patched__", False):
