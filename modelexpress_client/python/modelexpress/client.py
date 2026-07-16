@@ -177,6 +177,9 @@ class MxClient(MxClientBase):
             identity=identity,
             worker=worker,
             worker_id=worker_id,
+            pod_name=envs.POD_NAME,
+            pod_uid=envs.POD_UID,
+            pod_namespace=envs.POD_NAMESPACE,
         )
         response = self.stub.PublishMetadata(request, timeout=30)
         if not response.success:

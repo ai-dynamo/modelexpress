@@ -107,6 +107,10 @@ pub const REDIS_PORT: &str = "REDIS_PORT";
 pub const MX_METADATA_NAMESPACE: &str = "MX_METADATA_NAMESPACE";
 /// Kubernetes namespace injected via the downward API for in-cluster pods.
 pub const POD_NAMESPACE: &str = "POD_NAMESPACE";
+/// Kubernetes pod name injected via the downward API (used by clients).
+pub const POD_NAME: &str = "POD_NAME";
+/// Kubernetes pod UID injected via the downward API (used by clients).
+pub const POD_UID: &str = "POD_UID";
 
 // ── Reaper (server) ─────────────────────────────────────────────────────────
 /// Interval (seconds) between reaper scans for stale/GC worker sweeps.
@@ -324,6 +328,8 @@ mod tests {
         assert_eq!(HOME, "HOME");
         assert_eq!(USERPROFILE, "USERPROFILE");
         assert_eq!(KUBECONFIG, "KUBECONFIG");
+        assert_eq!(POD_NAME, "POD_NAME");
+        assert_eq!(POD_UID, "POD_UID");
     }
 
     #[test]

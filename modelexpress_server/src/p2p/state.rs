@@ -95,10 +95,20 @@ impl P2pStateManager {
         identity: &SourceIdentity,
         worker_id: &str,
         worker: WorkerMetadata,
+        pod_name: &str,
+        pod_uid: &str,
+        pod_namespace: &str,
     ) -> MetadataResult<()> {
         self.get_backend()
             .await?
-            .publish_metadata(identity, worker_id, worker)
+            .publish_metadata(
+                identity,
+                worker_id,
+                worker,
+                pod_name,
+                pod_uid,
+                pod_namespace,
+            )
             .await
     }
 
@@ -467,14 +477,19 @@ mod tests {
     async fn test_publish_metadata_calls_backend() {
         let mut mock = MockMetadataBackend::new();
         mock.expect_publish_metadata()
-            .withf(|identity, worker_id, worker| {
-                identity.model_name == "my-model"
-                    && identity.tensor_parallel_size == 8
-                    && worker_id == "a1b2c3d4"
-                    && worker.worker_rank == 3
-            })
+            .withf(
+                |identity, worker_id, worker, pod_name, pod_uid, pod_namespace| {
+                    identity.model_name == "my-model"
+                        && identity.tensor_parallel_size == 8
+                        && worker_id == "a1b2c3d4"
+                        && worker.worker_rank == 3
+                        && pod_name == "vllm-worker-0"
+                        && pod_uid == "pod-uid-1"
+                        && pod_namespace == "default"
+                },
+            )
             .once()
-            .returning(|_, _, _| Ok(()));
+            .returning(|_, _, _, _, _, _| Ok(()));
 
         let manager = P2pStateManager::with_backend(Arc::new(mock));
         manager
@@ -488,6 +503,9 @@ mod tests {
                     updated_at: 0,
                     ..Default::default()
                 },
+                "vllm-worker-0",
+                "pod-uid-1",
+                "default",
             )
             .await
             .expect("publish_metadata failed");
@@ -498,12 +516,19 @@ mod tests {
         let mut mock = MockMetadataBackend::new();
         mock.expect_publish_metadata()
             .once()
-            .returning(|_, _, _| Err("storage unavailable".into()));
+            .returning(|_, _, _, _, _, _| Err("storage unavailable".into()));
 
         let manager = P2pStateManager::with_backend(Arc::new(mock));
         assert!(
             manager
-                .publish_metadata(&test_identity(), "a1b2c3d4", WorkerMetadata::default())
+                .publish_metadata(
+                    &test_identity(),
+                    "a1b2c3d4",
+                    WorkerMetadata::default(),
+                    "",
+                    "",
+                    "",
+                )
                 .await
                 .is_err()
         );

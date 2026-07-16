@@ -105,6 +105,33 @@ reachable.
 
 To use the Kubernetes backend, apply `examples/crds.yaml` at cluster install time (installs both the `ModelMetadata` P2P CRD and the `ModelCacheEntry` registry CRD), then either enable `serviceAccount.rbac.enabled=true` on the Helm chart or apply `examples/p2p_transfer_k8s/server/kubernetes_backend/rbac-modelmetadata.yaml`.
 
+For automatic cleanup of P2P metadata, expose the client Pod identity through
+the Kubernetes Downward API. The checked-in vLLM, SGLang, and Dynamo manifests
+already include these fields:
+
+```yaml
+env:
+  - name: POD_NAME
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.name
+  - name: POD_UID
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.uid
+  - name: POD_NAMESPACE
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.namespace
+```
+
+With the Kubernetes metadata backend, a complete same-namespace identity makes
+the Pod the owner of every weight or artifact `ModelMetadata` CR it publishes.
+Kubernetes then garbage-collects those records when the Pod is deleted. Missing,
+partial, or cross-namespace identity does not block publication; ModelExpress
+omits the owner reference and retains the previous reaper-based lifecycle. Redis
+and non-Kubernetes deployments ignore these fields.
+
 #### Storage access modes
 
 MX has one configurable filesystem path, the model weights cache (`MODEL_EXPRESS_CACHE_DIRECTORY`, default `./cache`). Its access-mode requirement depends on deployment topology, not on MX itself:

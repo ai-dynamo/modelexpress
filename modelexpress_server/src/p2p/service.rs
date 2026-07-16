@@ -116,7 +116,14 @@ impl P2pService for P2pServiceImpl {
 
         match self
             .state
-            .publish_metadata(&identity, &worker_id, worker)
+            .publish_metadata(
+                &identity,
+                &worker_id,
+                worker,
+                &req.pod_name,
+                &req.pod_uid,
+                &req.pod_namespace,
+            )
             .await
         {
             Ok(()) => {
@@ -392,6 +399,7 @@ mod tests {
                 identity: None,
                 worker: None,
                 worker_id: "worker-uuid-1".to_string(),
+                ..Default::default()
             }))
             .await
             .expect("rpc")
@@ -410,6 +418,7 @@ mod tests {
                 identity: Some(id),
                 worker: None,
                 worker_id: "worker-uuid-1".to_string(),
+                ..Default::default()
             }))
             .await
             .expect("rpc")
@@ -425,6 +434,7 @@ mod tests {
                 identity: Some(test_identity()),
                 worker: None,
                 worker_id: String::new(),
+                ..Default::default()
             }))
             .await
             .expect("rpc")
@@ -437,8 +447,11 @@ mod tests {
     async fn test_publish_metadata_success() {
         let mut mock = MockMetadataBackend::new();
         mock.expect_publish_metadata()
+            .withf(|_, _, _, pod_name, pod_uid, pod_namespace| {
+                pod_name == "vllm-worker-0" && pod_uid == "pod-uid-1" && pod_namespace == "default"
+            })
             .once()
-            .returning(|_, _, _| Ok(()));
+            .returning(|_, _, _, _, _, _| Ok(()));
 
         let svc = make_service(mock);
         let resp = svc
@@ -455,6 +468,9 @@ mod tests {
                     ..Default::default()
                 }),
                 worker_id: "worker-uuid-1".to_string(),
+                pod_name: "vllm-worker-0".to_string(),
+                pod_uid: "pod-uid-1".to_string(),
+                pod_namespace: "default".to_string(),
             }))
             .await
             .expect("rpc")
@@ -470,7 +486,7 @@ mod tests {
         let mut mock = MockMetadataBackend::new();
         mock.expect_publish_metadata()
             .once()
-            .returning(|_, _, _| Err("storage unavailable".into()));
+            .returning(|_, _, _, _, _, _| Err("storage unavailable".into()));
 
         let svc = make_service(mock);
         let resp = svc
@@ -485,6 +501,7 @@ mod tests {
                     ..Default::default()
                 }),
                 worker_id: "worker-uuid-1".to_string(),
+                ..Default::default()
             }))
             .await
             .expect("rpc")
@@ -663,6 +680,7 @@ mod tests {
                 identity: Some(test_identity()),
                 worker: None,
                 worker_id: "worker-uuid-1".to_string(),
+                ..Default::default()
             }))
             .await
             .expect("rpc")
