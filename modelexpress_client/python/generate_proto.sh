@@ -14,26 +14,30 @@ SPDX_HEADER="# SPDX-FileCopyrightText: Copyright (c) 2025-${YEAR} NVIDIA CORPORA
 #"
 
 # Generate protobuf files
-echo "Generating protobuf files from ${PROTO_DIR}/p2p.proto..."
-python -m grpc_tools.protoc \
-    "-I${PROTO_DIR}" \
-    "--python_out=${OUT_DIR}" \
-    "--grpc_python_out=${OUT_DIR}" \
-    "${PROTO_DIR}/p2p.proto"
+for proto_name in p2p m2n_bootstrap; do
+    echo "Generating protobuf files from ${PROTO_DIR}/${proto_name}.proto..."
+    python -m grpc_tools.protoc \
+        "-I${PROTO_DIR}" \
+        "--python_out=${OUT_DIR}" \
+        "--grpc_python_out=${OUT_DIR}" \
+        "${PROTO_DIR}/${proto_name}.proto"
 
-# Fix relative import in grpc file
-echo "Fixing imports in p2p_pb2_grpc.py..."
-tmp_file="$(mktemp)"
-sed 's/^import p2p_pb2 as/from . import p2p_pb2 as/' "${OUT_DIR}/p2p_pb2_grpc.py" > "${tmp_file}"
-mv "${tmp_file}" "${OUT_DIR}/p2p_pb2_grpc.py"
+    # grpc_tools emits absolute sibling imports; package modules need relative imports.
+    echo "Fixing imports in ${proto_name}_pb2_grpc.py..."
+    tmp_file="$(mktemp)"
+    sed "s/^import ${proto_name}_pb2 as/from . import ${proto_name}_pb2 as/" \
+        "${OUT_DIR}/${proto_name}_pb2_grpc.py" > "${tmp_file}"
+    mv "${tmp_file}" "${OUT_DIR}/${proto_name}_pb2_grpc.py"
 
-# Add SPDX header to generated files
-for file in "${OUT_DIR}/p2p_pb2.py" "${OUT_DIR}/p2p_pb2_grpc.py"; do
-    echo "Adding SPDX header to ${file}..."
-    tmp_file=$(mktemp)
-    echo "${SPDX_HEADER}" > "${tmp_file}"
-    cat "${file}" >> "${tmp_file}"
-    mv "${tmp_file}" "${file}"
+    # Generated files are checked in, so add the repository SPDX header.
+    for suffix in pb2.py pb2_grpc.py; do
+        file="${OUT_DIR}/${proto_name}_${suffix}"
+        echo "Adding SPDX header to ${file}..."
+        tmp_file="$(mktemp)"
+        echo "${SPDX_HEADER}" > "${tmp_file}"
+        cat "${file}" >> "${tmp_file}"
+        mv "${tmp_file}" "${file}"
+    done
 done
 
 echo "Done."

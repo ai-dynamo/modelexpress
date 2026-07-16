@@ -25,6 +25,7 @@ integration-tests = ["memory-backend"]
 modelexpress-common = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+thiserror = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 config = { workspace = true }

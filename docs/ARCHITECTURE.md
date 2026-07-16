@@ -9,10 +9,11 @@ Detailed reference document for the ModelExpress codebase. For deployment and co
 
 ## Project Overview
 
-ModelExpress is a Rust-based model cache management service and GPU-to-GPU model weight transfer system. It serves two roles:
+ModelExpress is a Rust-based model cache management service and GPU-to-GPU model weight transfer system. It serves three roles:
 
 - **Model Cache Service** - A sidecar alongside inference solutions (vLLM, SGLang, NVIDIA Dynamo) that accelerates model downloads from HuggingFace, NGC, and GCS. Model lifecycle state lives in a distributed registry — Redis or Kubernetes CRDs (`ModelCacheEntry`), selected via `MX_METADATA_BACKEND` — so multiple server replicas can coordinate without a shared-filesystem database. LRU cache eviction runs off the same registry.
 - **P2P Weight Transfer** - GPU-to-GPU model weight transfers between inference replicas using NVIDIA NIXL over RDMA/InfiniBand, enabling ~15-second transfers for 681GB models. The Python client includes engine adapters for vLLM and SGLang.
+- **RL Weight Synchronization** - Coordinates trainer-to-generator weight plans and brokers immutable NCCL M2N communicator bootstrap records for coordinator-defined cohorts. NeMo RL/Dynamo remains responsible for topology, rank assignment, and the all-rank release barrier.
 
 ### Current Status
 
@@ -46,13 +47,20 @@ graph TD
         S2 --> R[(Redis)]
         A -- "RDMA via NIXL" --> B
     end
+
+    subgraph "RL NCCL M2N Bootstrap"
+        C[NeMo RL / Dynamo Coordinator] -->|Frozen cohort descriptors| T[Trainer + Generator Ranks]
+        T -->|Publish / Get UID| S3[ModelExpress Bootstrap Service]
+        S3 --> R3[(Redis / Memory)]
+        T -- "ncclComm_t" --> M[NCCL M2N Reshard]
+    end
 ```
 
 ### Components
 
 | Component | Language | Location | Purpose |
 |-----------|----------|----------|---------|
-| Server | Rust | `modelexpress_server/` | gRPC server: model downloads, cache eviction, P2P coordination |
+| Server | Rust | `modelexpress_server/` | gRPC server: model downloads, cache eviction, P2P/weight-sync coordination, NCCL M2N bootstrap |
 | Rust Client | Rust | `modelexpress_client/src/` | Client library and CLI tool |
 | Python Client | Python | `modelexpress_client/python/` | Inference engine loaders, NIXL transfer manager, gRPC client |
 | Common | Rust | `modelexpress_common/` | Protobuf definitions, shared types, provider trait, config |
@@ -95,6 +103,14 @@ ModelExpress/
 │       │   └── backend/
 │       │       ├── redis.rs            # P2P Redis backend
 │       │       └── kubernetes.rs       # P2P Kubernetes CRD backend
+│       ├── m2n_bootstrap.rs             # NCCL M2N bootstrap module exports
+│       ├── m2n_bootstrap/
+│       │   ├── state.rs                 # Bootstrap state manager
+│       │   ├── service.rs               # Publish/Get/Abort gRPC implementation
+│       │   ├── backend.rs               # Bootstrap state contract and validation
+│       │   └── backend/
+│       │       ├── memory.rs             # Test/local bootstrap backend
+│       │       └── redis.rs              # Atomic Redis bootstrap backend
 │       ├── registry/
 │       │   ├── state.rs                # RegistryManager wrapper
 │       │   ├── backend.rs              # RegistryBackend trait + ModelRecord
@@ -140,6 +156,12 @@ ModelExpress/
 │       │   ├── source_id.py            # Python mx_source_id computation
 │       │   ├── client_factory.py       # Selects central vs k8s-service metadata client
 │       │   └── k8s_service_client.py   # Decentralized k8s-service metadata client
+│       ├── m2n_bootstrap/              # Bootstrap assignment and MX gRPC client
+│       ├── m2n_bootstrap_pb2.py        # Generated bootstrap messages
+│       ├── m2n_bootstrap_pb2_grpc.py   # Generated bootstrap service stubs
+│       ├── weight_transfer/transport/
+│       │   ├── nccl_m2n_bootstrap.py   # Nonblocking NCCL bootstrap orchestration
+│       │   └── _nccl_bootstrap_ext.cpp # NCCL init/error/abort ABI shim
 │       ├── load_strategy/              # Loading strategy chain
 │       │   ├── __init__.py             # LoadStrategyChain.run()
 │       │   ├── context.py              # LoadContext and LoadResult
@@ -167,12 +189,14 @@ ModelExpress/
 │
 ├── modelexpress_common/
 │   ├── Cargo.toml
-│   ├── build.rs                        # tonic-build: compiles all 4 proto files
+│   ├── build.rs                        # tonic-build: compiles all proto files
 │   ├── proto/
 │   │   ├── health.proto                # HealthService
 │   │   ├── api.proto                   # ApiService
 │   │   ├── model.proto                 # ModelService
-│   │   └── p2p.proto                   # P2pService
+│   │   ├── p2p.proto                   # P2pService and WorkerService
+│   │   ├── weight_sync.proto           # WeightSyncService
+│   │   └── m2n_bootstrap.proto         # M2nBootstrapService
 │   └── src/
 │       ├── lib.rs                      # Module exports, gRPC stubs, type conversions
 │       ├── cache.rs                    # CacheEvictionConfig, LruConfig, DurationConfig
@@ -280,7 +304,7 @@ All cargo dependencies are declared in the root `Cargo.toml`. Sub-crates use wor
 
 ## gRPC Services
 
-Four proto files define four services, all compiled via `tonic-build` in `modelexpress_common/build.rs`:
+Six proto files define the server APIs, all compiled via `tonic-build` in `modelexpress_common/build.rs`:
 
 ### health.proto - HealthService
 
@@ -332,6 +356,20 @@ Per-worker gRPC service started when `MX_P2P_METADATA=1`, or unconditionally whe
 
 See [`metadata.md`](metadata.md) for the full metadata architecture including storage schemas and coordination protocol.
 
+### m2n_bootstrap.proto - M2nBootstrapService
+
+| RPC | Request | Response | Purpose |
+|-----|---------|----------|---------|
+| `PublishBootstrap` | `PublishM2nBootstrapRequest` | `PublishM2nBootstrapResponse` | Source NCCL rank 0 publishes one immutable UID and cohort metadata |
+| `GetBootstrap` | `GetM2nBootstrapRequest` | `GetM2nBootstrapResponse` | Participants poll the attempt and fetch the UID |
+| `AbortBootstrap` | `AbortM2nBootstrapRequest` | `AbortM2nBootstrapResponse` | Fence a failed attempt, including before publication |
+
+The external NeMo RL/Dynamo coordinator freezes membership, assigns NCCL ranks,
+and supplies a never-reused UUIDv4 attempt ID. MX does not discover participants
+or release collectives; it provides atomic `PUBLISHED`, `ABORTED`, and `EXPIRED`
+state. Redis is the production-oriented implementation, memory is test/local only,
+and Kubernetes reports this service as not serving until CAS semantics exist.
+
 ## Rust Server
 
 ### Startup Flow
@@ -344,9 +382,10 @@ See [`metadata.md`](metadata.md) for the full metadata architecture including st
 6. Start `CacheEvictionService` background task (reads the same registry)
 7. Connect to the P2P metadata backend (`MX_METADATA_BACKEND`, Redis or Kubernetes CRD)
 8. Start reaper background task for stale source detection and GC
-9. Register 4 gRPC services with tonic (max message size: 100MB)
-10. Listen on configured address (default `0.0.0.0:8001`)
-11. Graceful shutdown on CTRL+C (signals cache eviction service and reaper)
+9. Connect the NCCL M2N bootstrap backend (dedicated Redis keyspace or memory state)
+10. Register standard health plus six application gRPC services with tonic (max message size: 100MB)
+11. Listen on configured address (default `0.0.0.0:8001`)
+12. Graceful shutdown on CTRL+C (signals cache eviction service and reaper)
 
 ### ServerConfig
 
@@ -536,6 +575,9 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `adapter.py` | `EngineAdapter` lifecycle hooks and strategy retry errors |
 | `vllm_loader.py` | Compatibility shim for `modelexpress.engines.vllm.loader` |
 | `metadata/` | Metadata publishing, source identity, heartbeat, worker manifest serving, metadata client selection |
+| `m2n_bootstrap/` | Immutable coordinator assignment and `MxM2nBootstrapClient` Publish/Get/Abort RPC wrapper |
+| `weight_transfer/transport/nccl_m2n_bootstrap.py` | Validate bootstrap metadata, initialize NCCL nonblocking, poll async errors and MX state until deadline |
+| `weight_transfer/transport/_nccl_bootstrap_ext.cpp` | Native `ncclCommInitRankConfig`, `ncclCommGetAsyncError`, and `ncclCommAbort` shim with NCCL DSO/version checks |
 | `load_strategy/` | Engine-neutral loading strategy chain: `RdmaStrategy`, `ModelStreamerStrategy` (S3/GCS/Azure/local), `GdsStrategy`, `DefaultStrategy` |
 | `engines/vllm/` | `VllmAdapter` and `MxModelLoader` - maps strategy hooks to vLLM loader APIs and post-load lifecycle |
 | `engines/sglang/` | `SglangAdapter` and `MxModelLoader` - maps strategy hooks to SGLang's `remote_instance` backend |
@@ -544,6 +586,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `vllm_worker.py` | `ModelExpressWorker` - compatibility worker class for older manual-registration workflows |
 | `types.py` | `TensorDescriptor`, `WorkerMetadata`, `GetMetadataResponse` dataclasses |
 | `p2p_pb2.py` / `p2p_pb2_grpc.py` | Generated protobuf/gRPC stubs |
+| `m2n_bootstrap_pb2.py` / `m2n_bootstrap_pb2_grpc.py` | Generated NCCL M2N bootstrap stubs |
 
 ### MxClient
 
