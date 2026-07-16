@@ -24,6 +24,7 @@ use modelexpress_common::grpc::p2p::{SourceIdentity, SourceStatus};
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
@@ -241,6 +242,9 @@ struct WorkerRecordJson {
     /// Runtime accelerator family for compatibility filtering.
     #[serde(default)]
     pub accelerator: String,
+    /// Datacenter topology domain values keyed by level.
+    #[serde(default)]
+    pub topology: HashMap<String, String>,
     /// Small discovery summary for file-backed artifact sources.
     #[serde(default)]
     pub artifact_source: Option<ArtifactSourceMetadataJson>,
@@ -285,6 +289,7 @@ impl WorkerRecordJson {
             agent_name: record.agent_name,
             worker_grpc_endpoint: record.worker_grpc_endpoint,
             accelerator: record.accelerator,
+            topology: record.topology,
             artifact_source: record.artifact_source.map(ArtifactSourceMetadataJson::from),
         }
     }
@@ -306,6 +311,7 @@ impl From<WorkerRecordJson> for WorkerRecord {
             agent_name: json.agent_name,
             worker_grpc_endpoint: json.worker_grpc_endpoint,
             accelerator: json.accelerator,
+            topology: json.topology,
             artifact_source: json.artifact_source.map(ArtifactSourceMetadataRecord::from),
         }
     }
@@ -540,11 +546,11 @@ impl MetadataBackend for RedisBackend {
                     }
                 }
 
-                let (status, updated_at, accelerator) = fields
+                let (status, updated_at, accelerator, topology) = fields
                     .get(&worker_rank.to_string())
                     .and_then(|v| serde_json::from_str::<WorkerRecordJson>(v).ok())
-                    .map(|j| (j.status, j.updated_at, j.accelerator))
-                    .unwrap_or((0, 0, String::new()));
+                    .map(|j| (j.status, j.updated_at, j.accelerator, j.topology))
+                    .unwrap_or((0, 0, String::new(), HashMap::new()));
 
                 result.push(super::SourceInstanceInfo {
                     source_id: sid.clone(),
@@ -554,6 +560,7 @@ impl MetadataBackend for RedisBackend {
                     status,
                     updated_at,
                     accelerator,
+                    topology,
                 });
             }
         }
@@ -729,6 +736,7 @@ mod tests {
             agent_name: String::new(),
             worker_grpc_endpoint: String::new(),
             accelerator: "cuda".to_string(),
+            topology: HashMap::from([("rack".to_string(), "r3".to_string())]),
             artifact_source: Some(ArtifactSourceMetadataRecord {
                 artifact_id: "artifact123".to_string(),
                 total_size: 1_099_511_627_776,
@@ -749,6 +757,7 @@ mod tests {
         assert_eq!(back.updated_at, record.updated_at);
         assert_eq!(back.tensors.len(), 1);
         assert_eq!(back.accelerator, record.accelerator);
+        assert_eq!(back.topology, record.topology);
         assert_eq!(back.artifact_source, record.artifact_source);
         assert!(
             json.contains(r#""total_size":"#),

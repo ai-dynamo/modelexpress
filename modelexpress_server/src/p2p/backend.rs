@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use modelexpress_common::grpc::p2p::{
     ArtifactSourceMetadata, SourceIdentity, SourceStatus, TensorSourceMetadata, WorkerMetadata,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub mod kubernetes;
@@ -54,6 +55,8 @@ pub struct SourceInstanceInfo {
     /// Runtime accelerator family for compatibility filtering (e.g. "cuda").
     /// Empty when unknown (records that predate the field).
     pub accelerator: String,
+    /// Datacenter topology domain values keyed by level. Empty when unknown.
+    pub topology: HashMap<String, String>,
 }
 
 /// Backend-specific metadata for a worker
@@ -128,6 +131,8 @@ pub struct WorkerRecord {
     pub worker_grpc_endpoint: String,
     /// Runtime accelerator family for compatibility filtering.
     pub accelerator: String,
+    /// Datacenter topology domain values keyed by level. Static per node.
+    pub topology: HashMap<String, String>,
     /// Small discovery summary for file-backed artifact sources.
     pub artifact_source: Option<ArtifactSourceMetadataRecord>,
 }
@@ -183,6 +188,7 @@ impl From<WorkerMetadata> for WorkerRecord {
             agent_name: meta.agent_name,
             worker_grpc_endpoint: meta.worker_grpc_endpoint,
             accelerator: meta.accelerator,
+            topology: meta.topology,
             artifact_source,
         }
     }
@@ -239,6 +245,7 @@ impl From<WorkerRecord> for WorkerMetadata {
             agent_name: record.agent_name,
             worker_grpc_endpoint: record.worker_grpc_endpoint,
             accelerator: record.accelerator,
+            topology: record.topology,
             tensors: legacy_tensors,
             source_payload: Some(source_payload),
         }

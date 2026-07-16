@@ -87,6 +87,11 @@ if TYPE_CHECKING:
     MX_ARTIFACT_TRANSFER_CHUNK_SIZE: Optional[str]
     # P2P source selection
     MX_P2P_SOURCE_SELECTOR: Optional[str]
+    # Topology-aware selection: ordered levels (broad->narrow), this node's
+    # {level: value} JSON map, and the optional within-tier load-blend weight.
+    MX_P2P_TOPOLOGY_LEVELS: Optional[str]
+    MX_P2P_TOPOLOGY: Optional[str]
+    MX_P2P_TOPOLOGY_LOAD_WEIGHT: float
     # Opt-in metrics collector
     MX_METRICS_ENABLED: bool
     MX_METRICS_PORT: Optional[str]
@@ -195,6 +200,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ── P2P source selection ───────────────────────────────────────────────
     # Raw (None when unset); source_selection applies its DEFAULT_SELECTOR fallback.
     "MX_P2P_SOURCE_SELECTOR": lambda: os.environ.get("MX_P2P_SOURCE_SELECTOR"),
+    "MX_P2P_TOPOLOGY_LEVELS": lambda: os.environ.get("MX_P2P_TOPOLOGY_LEVELS"),
+    "MX_P2P_TOPOLOGY": lambda: os.environ.get("MX_P2P_TOPOLOGY"),
+    # Clamp to >= 0: a negative weight would invert the within-tier load blend
+    # into preferring busy sources. 0 (default) keeps the pure rendezvous jitter.
+    "MX_P2P_TOPOLOGY_LOAD_WEIGHT": lambda: max(
+        0.0, _env_float("MX_P2P_TOPOLOGY_LOAD_WEIGHT", 0.0)
+    ),
     # ── Opt-in metrics collector ───────────────────────────────────────────
     "MX_METRICS_ENABLED": lambda: os.environ.get("MX_METRICS_ENABLED", "0").strip().lower()
     in _TRUTHY,

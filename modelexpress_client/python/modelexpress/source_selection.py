@@ -144,6 +144,96 @@ class RendezvousHashSelector(ScoredSelector):
         return int.from_bytes(digest, "big")
 
 
+class TopologyAwareSelector(ScoredSelector):
+    """Locality-first spreading: prefer sources in the narrowest shared RDMA domain.
+
+    ``score = (shared_depth, tiebreak)``. ``shared_depth`` is the index of the
+    narrowest topology level (broad -> narrow) at which the target and the
+    candidate share a domain value; ``order()`` sorts by descending score, so the
+    closest source wins and the tiebreak only decides among equidistant peers.
+    Because MX P2P is NIXL over RDMA between replicas, the relevant locality is
+    the RDMA fabric -- same rail (one leaf hop) -> same rack -> same block ->
+    cross-rack. The level hierarchy is not hard-coded: it comes from
+    ``MX_P2P_TOPOLOGY_LEVELS`` (the cluster's Dynamo ``ClusterTopology``
+    ``spec.levels``), and the per-source domain values from each candidate's
+    published ``topology`` metadata -- so MX consumes existing Dynamo/Grove node
+    labels rather than inventing its own.
+
+    The ``tiebreak`` is the rendezvous jitter, so peers in the same tier still
+    spread instead of piling onto the one nearest source. When no levels are
+    configured, this node has no topology, or nothing is shared, ``shared_depth``
+    is constant and ordering collapses exactly to that jitter (rendezvous order)
+    -- never worse than the deterministic baseline. NVLink is intentionally not
+    modeled: co-located source/target replicas let NIXL auto-select the NVLink
+    backend, so the selector need not.
+
+    Composes with load-aware selection without depending on it: when
+    ``MX_P2P_TOPOLOGY_LOAD_WEIGHT > 0`` the within-tier tiebreak becomes
+    ``unit_hash - w * source_load`` (``source_load`` read defensively off the
+    candidate), so within a locality tier it also steers away from busy sources.
+    With the weight at 0 (default) the tiebreak is the pure jitter and the
+    selector needs nothing from the load-aware feature.
+    """
+
+    name = "topology_aware"
+
+    def __init__(self) -> None:
+        from . import envs
+        from .topology import local_topology, resolve_levels
+
+        self._levels = resolve_levels()
+        self._local = local_topology()
+        self.w_load = envs.MX_P2P_TOPOLOGY_LOAD_WEIGHT
+
+    def _unit_hash(
+        self,
+        candidate: p2p_pb2.SourceInstanceRef,
+        ctx: LoadContext,
+    ) -> float:
+        """Rendezvous digest for (target, candidate), mapped into ``[0, 1)``."""
+        key = "|".join(
+            str(x)
+            for x in (
+                ctx.identity.model_name,
+                ctx.worker_id,
+                ctx.worker_rank,
+                candidate.mx_source_id,
+                candidate.worker_id,
+                candidate.worker_rank,
+            )
+        )
+        digest = hashlib.blake2b(key.encode(), digest_size=8).digest()
+        return int.from_bytes(digest, "big") / 2**64
+
+    def _shared_depth(self, source_topology: dict[str, str]) -> int:
+        """Index of the narrowest level where target and source share a value.
+
+        Later level = narrower = closer; -1 when nothing is shared.
+        """
+        depth = -1
+        for i, level in enumerate(self._levels):
+            local_value = self._local.get(level)
+            if local_value is not None and local_value == source_topology.get(level):
+                depth = i
+        return depth
+
+    def score(  # type: ignore[override]
+        self,
+        candidate: p2p_pb2.SourceInstanceRef,
+        ctx: LoadContext,
+    ) -> tuple[int, float]:
+        # Read defensively so old servers / non-topology candidates degrade to
+        # rendezvous ordering rather than raising.
+        raw = getattr(candidate, "topology", None)
+        source_topology = dict(raw) if raw else {}
+        depth = self._shared_depth(source_topology)
+        tiebreak = self._unit_hash(candidate, ctx)
+        if self.w_load > 0.0:
+            load = min(1.0, max(0.0, getattr(candidate, "source_load", 0.0)))
+            tiebreak -= self.w_load * load
+        return (depth, tiebreak)
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -163,6 +253,7 @@ def register_selector(name: str, factory: SelectorFactory) -> None:
 
 register_selector("random", lambda: RandomSelector())
 register_selector("rendezvous_hash", lambda: RendezvousHashSelector())
+register_selector("topology_aware", lambda: TopologyAwareSelector())
 
 
 def get_selector(name: str) -> SourceSelector:

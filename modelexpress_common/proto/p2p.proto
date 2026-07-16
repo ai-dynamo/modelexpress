@@ -287,6 +287,12 @@ message WorkerMetadata {
   // unknown and must be accepted for backward compatibility with old writers.
   string accelerator = 9;
 
+  // Datacenter topology domain values keyed by level (see
+  // SourceInstanceRef.topology). Static per node, so it is published once at
+  // registration; the server passes it through onto SourceInstanceRef. This is
+  // runtime metadata, not SourceIdentity hash material.
+  map<string, string> topology = 11;
+
   // Source-type-specific bounded metadata. This selects the metadata payload
   // shape, not a transfer endpoint. Readers should prefer tensor_source over
   // deprecated tensors when both are present, and fall back to tensors for old
@@ -535,6 +541,17 @@ message SourceInstanceRef {
   // the retry-cap slice. Empty means unknown (treated as compatible for
   // rolling upgrades and sources that predate this field).
   string accelerator = 5;
+
+  // Field 6 is intentionally left for `source_load` (load-aware selection),
+  // so this feature and that one can land without a numbering collision.
+
+  // Datacenter topology domain values keyed by level, e.g.
+  // {"rack": "r3", "rail": "leaf2", "host": "node7"}. Sourced from the same
+  // node labels Dynamo/Grove already use and published once at registration.
+  // The topology_aware selector prefers sources in the narrowest RDMA-fabric
+  // domain the target and source share. Empty means unknown (the selector
+  // then falls back to rendezvous ordering for that source).
+  map<string, string> topology = 7;
 }
 
 message ListSourcesRequest {
