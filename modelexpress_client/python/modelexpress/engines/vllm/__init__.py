@@ -3,6 +3,7 @@
 
 """vLLM compatibility integration for ModelExpress."""
 
+from ... import configure_vllm_logging
 from ...patches import apply_patches
 from .adapter import VllmAdapter, build_vllm_load_context
 from .patches import PATCHES as VLLM_PATCHES
@@ -17,6 +18,7 @@ def register_modelexpress_loaders() -> None:
         return
     from .registration import register_plugin_model_loader
 
+    configure_vllm_logging()
     apply_patches(VLLM_PATCHES)
 
     # Needed for older vLLM versions before native ModelExpress loader

@@ -45,12 +45,17 @@ def test_apply_patches_can_be_disabled(monkeypatch):
     assert calls == []
 
 
-def test_vllm_entrypoint_applies_patches_before_loader_registration(monkeypatch):
+def test_vllm_entrypoint_configures_logging_before_patches(monkeypatch):
     from modelexpress.engines import vllm as vllm_integration
     from modelexpress.engines.vllm import registration
 
     calls = []
     monkeypatch.setattr(vllm_integration, "_loaders_registered", False)
+    monkeypatch.setattr(
+        vllm_integration,
+        "configure_vllm_logging",
+        lambda: calls.append(("logging", None)),
+    )
     monkeypatch.setattr(
         vllm_integration,
         "apply_patches",
@@ -65,6 +70,7 @@ def test_vllm_entrypoint_applies_patches_before_loader_registration(monkeypatch)
     vllm_integration.register_modelexpress_loaders()
 
     assert calls == [
+        ("logging", None),
         ("patches", vllm_integration.VLLM_PATCHES),
         ("loader", None),
     ]
