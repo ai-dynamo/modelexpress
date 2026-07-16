@@ -15,6 +15,7 @@ Rust-based model cache management service and GPU-to-GPU weight transfer system 
 - Python dependencies go in `pyproject.toml`. Never edit dependency files by hand - use `uv add` so you always get the latest version.
 - `cargo clippy` must pass with no warnings.
 - No emojis in code or comments.
+- No hard-wrapped Markdown. Write each paragraph and list item as one continuous line and rely on soft-wrap. Never add manual line breaks mid-paragraph to hit a column width. Newlines are only for separating paragraphs, list items, headings, code fences, and tables.
 - Do not create markdown files to document code changes or decisions.
 - Do not over-comment code. Removing code is fine without adding comments to explain why.
 - Use mermaid diagrams instead of ASCII art in markdown files.
