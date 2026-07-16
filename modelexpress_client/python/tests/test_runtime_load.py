@@ -14,6 +14,11 @@ vllm:gpu_cache_usage_perc{model_name="Qwen"} 0.62
 vllm:num_requests_running{model_name="Qwen"} 12.0
 """
 
+_VLLM_017 = """
+# vLLM >= 0.17 renamed the KV-cache gauge.
+vllm:kv_cache_usage_perc{model="Qwen"} 0.73
+"""
+
 _SGLANG = """
 sglang:token_usage 0.41
 """
@@ -43,6 +48,12 @@ def test_scrape_gauge_skips_comments():
 def test_provider_reads_vllm_kv_usage():
     p = RuntimeLoadProvider("http://x/metrics", _fetch=lambda u, t: _VLLM)
     assert abs(p.sample() - 0.62) < 1e-9
+
+
+def test_provider_reads_vllm_017_kv_cache_usage():
+    # vLLM >= 0.17 exposes vllm:kv_cache_usage_perc instead of gpu_cache_usage_perc.
+    p = RuntimeLoadProvider("http://x/metrics", _fetch=lambda u, t: _VLLM_017)
+    assert abs(p.sample() - 0.73) < 1e-9
 
 
 def test_provider_reads_sglang_when_vllm_absent():

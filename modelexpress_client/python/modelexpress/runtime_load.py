@@ -27,8 +27,10 @@ from typing import Callable, Optional
 logger = logging.getLogger("modelexpress.runtime_load")
 
 # Metrics already expressed as a [0, 1] utilization ratio, in priority order.
-# vLLM: fraction of KV-cache blocks in use. SGLang: token/KV usage fraction.
+# vLLM: fraction of KV-cache blocks in use (renamed kv_cache_usage_perc in
+# v0.17; gpu_cache_usage_perc on older builds). SGLang: token/KV usage fraction.
 _RATIO_METRICS = (
+    "vllm:kv_cache_usage_perc",
     "vllm:gpu_cache_usage_perc",
     "sglang:token_usage",
     "sglang:cache_usage",
