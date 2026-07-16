@@ -118,6 +118,57 @@ class TestPublisherPublishAndReady:
             )
         ]
 
+    def test_tick_publishes_provider_source_load(self, mx_client, nixl_manager):
+        # A non-zero source_load_provider value is forwarded on update_status.
+        publisher = PublisherThread(
+            mx_client=mx_client,
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            publish_fn=lambda: "abc123",
+            interval_secs=1,
+            source_load_provider=lambda: 0.73,
+        )
+
+        publisher._tick()
+
+        assert mx_client.update_status.call_args_list == [
+            call(
+                mx_source_id="abc123",
+                worker_id="w1",
+                worker_rank=0,
+                status=2,
+                source_load=0.73,
+            )
+        ]
+
+    def test_tick_provider_error_falls_back_to_zero(self, mx_client, nixl_manager):
+        # A provider that raises must not break the heartbeat; it publishes 0.0.
+        def boom() -> float:
+            raise RuntimeError("sampler exploded")
+
+        publisher = PublisherThread(
+            mx_client=mx_client,
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            publish_fn=lambda: "abc123",
+            interval_secs=1,
+            source_load_provider=boom,
+        )
+
+        publisher._tick()
+
+        assert mx_client.update_status.call_args_list == [
+            call(
+                mx_source_id="abc123",
+                worker_id="w1",
+                worker_rank=0,
+                status=2,
+                source_load=0.0,
+            )
+        ]
+
     def test_ready_gate_blocks_publish(self, mx_client, nixl_manager):
         publish = MagicMock(return_value="abc123")
         publisher = PublisherThread(

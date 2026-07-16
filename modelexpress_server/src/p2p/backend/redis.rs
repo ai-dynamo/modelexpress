@@ -737,7 +737,7 @@ mod tests {
             agent_name: String::new(),
             worker_grpc_endpoint: String::new(),
             accelerator: "cuda".to_string(),
-            source_load: 0.0,
+            source_load: 0.625,
             artifact_source: Some(ArtifactSourceMetadataRecord {
                 artifact_id: "artifact123".to_string(),
                 total_size: 1_099_511_627_776,
@@ -758,6 +758,8 @@ mod tests {
         assert_eq!(back.updated_at, record.updated_at);
         assert_eq!(back.tensors.len(), 1);
         assert_eq!(back.accelerator, record.accelerator);
+        assert_eq!(back.source_load, record.source_load);
+        assert_eq!(back.source_load, 0.625);
         assert_eq!(back.artifact_source, record.artifact_source);
         assert!(
             json.contains(r#""total_size":"#),

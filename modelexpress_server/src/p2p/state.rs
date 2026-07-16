@@ -528,7 +528,7 @@ mod tests {
                 eq(2u32),
                 eq(SourceStatus::Ready),
                 mockall::predicate::always(),
-                mockall::predicate::always(),
+                eq(0.5f32),
             )
             .once()
             .returning(|_, _, _, _, _, _| Ok(()));
@@ -540,7 +540,7 @@ mod tests {
                 "test-instance",
                 2,
                 SourceStatus::Ready,
-                0.0,
+                0.5,
             )
             .await
             .expect("update_worker_status failed");

@@ -633,6 +633,8 @@ mod tests {
     async fn test_update_status_success() {
         let mut mock = MockMetadataBackend::new();
         mock.expect_update_status()
+            // Assert the request's source_load reaches the backend unchanged.
+            .withf(|_, _, _, _, _, source_load| (*source_load - 0.42).abs() < f32::EPSILON)
             .once()
             .returning(|_, _, _, _, _, _| Ok(()));
 
@@ -643,7 +645,7 @@ mod tests {
                 worker_id: "worker-uuid-1".to_string(),
                 worker_rank: 3,
                 status: SourceStatus::Ready as i32,
-                source_load: 0.0,
+                source_load: 0.42,
             }))
             .await
             .expect("rpc")
@@ -685,7 +687,7 @@ mod tests {
                     status: SourceStatus::Ready as i32,
                     updated_at: now,
                     accelerator: "cuda".to_string(),
-                    source_load: 0.0,
+                    source_load: 0.25,
                 },
                 SourceInstanceInfo {
                     source_id: "abc123def456abcd".to_string(),
@@ -695,7 +697,7 @@ mod tests {
                     status: SourceStatus::Ready as i32,
                     updated_at: now,
                     accelerator: "cuda".to_string(),
-                    source_load: 0.0,
+                    source_load: 0.75,
                 },
             ])
         });
@@ -712,8 +714,10 @@ mod tests {
         assert_eq!(resp.instances.len(), 2);
         assert_eq!(resp.instances[0].worker_id, "w1");
         assert_eq!(resp.instances[0].worker_rank, 0);
+        assert_eq!(resp.instances[0].source_load, 0.25);
         assert_eq!(resp.instances[1].worker_id, "w2");
         assert_eq!(resp.instances[1].worker_rank, 1);
+        assert_eq!(resp.instances[1].source_load, 0.75);
     }
 
     #[tokio::test]
