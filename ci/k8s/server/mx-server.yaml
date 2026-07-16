@@ -51,8 +51,14 @@ spec:
             # reaping from masking startup and scheduling delays in CI.
             # The stale-metadata test uses mx-server-redis.yaml (its own short
             # reaper knobs), so this does not weaken that coverage.
+            # Both knobs are envsubst-parameterized (defaults set by the
+            # run-mx-p2p-test action: 900s heartbeat, 30s scan) so the FP8
+            # disk-fallback job can widen them further and keep the deleted
+            # source's READY metadata alive across the target's RDMA attempt.
             - name: MX_HEARTBEAT_TIMEOUT_SECS
-              value: "900"
+              value: "${MX_HEARTBEAT_TIMEOUT_SECS}"
+            - name: MX_REAPER_SCAN_INTERVAL_SECS
+              value: "${MX_REAPER_SCAN_INTERVAL_SECS}"
           ports:
             - containerPort: 8000
           resources:

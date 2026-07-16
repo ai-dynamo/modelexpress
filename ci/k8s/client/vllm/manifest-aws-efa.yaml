@@ -1,0 +1,119 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# AWS EFA vLLM Job template for the FP8 disk-fallback test and future AWS P2P tests.
+#
+# Applied by the workflow with envsubst:
+#   Source apply:  JOB_NAME=mx-source  WORKER_PORT=<source_port>
+#   Target apply:  JOB_NAME=mx-target  WORKER_PORT=<worker_port>
+#
+# AWS-specific requirements:
+#   - aws-efa-k8s-device-plugin exposes vpc.amazonaws.com/efa on EFA nodes
+#   - MX_NIXL_BACKEND=LIBFABRIC selects NIXL's AWS EFA path
+#   - FI_PROVIDER=efa and FI_EFA_* steer libfabric onto EFA with GPUDirect RDMA
+#   - nvidia-peermem must be loaded on worker nodes
+#
+# Environment variables substituted by envsubst before apply:
+#   JOB_NAME       - mx-source or mx-target
+#   WORKER_IMAGE   - image built from ci/k8s/client/vllm/Dockerfile.aws-efa
+#   WORKER_PORT    - port the vLLM server listens on
+#   MX_CI_MODEL    - HuggingFace model id
+#   AWS_EFA_COUNT  - EFA resource count per pod, defaults to 4 in workflow
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: mx-p2p-worker
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: worker-registry
+      affinity:
+        # Keep source and target off the same host for normal P2P use. The
+        # disk-fallback test deletes the source before target apply, so this rule is inactive
+        # there but keeps the manifest useful for future AWS EFA P2P coverage.
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mx-p2p-worker
+              topologyKey: kubernetes.io/hostname
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+      containers:
+        - name: ${JOB_NAME}
+          image: ${WORKER_IMAGE}
+          imagePullPolicy: Always
+          securityContext:
+            privileged: true
+            capabilities:
+              add: [IPC_LOCK]
+          command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+          args:
+            - --model
+            - "${MX_CI_MODEL}"
+            - --load-format
+            - mx
+            - --tensor-parallel-size
+            - "1"
+            - --trust-remote-code
+            - --max-model-len
+            - "4096"
+            - --port
+            - "${WORKER_PORT}"
+          env:
+            - name: VLLM_PLUGINS
+              value: "modelexpress"
+            - name: VLLM_RPC_TIMEOUT
+              value: "7200000"
+            - name: MX_SERVER_ADDRESS
+              value: "mx-server:8000"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+            - name: MX_NIXL_BACKEND
+              value: "LIBFABRIC"
+            - name: FI_PROVIDER
+              value: "efa"
+            - name: FI_EFA_USE_DEVICE_RDMA
+              value: "1"
+            - name: FI_EFA_ENABLE_SHM_TRANSFER
+              value: "0"
+            - name: FI_EFA_ENABLE_SHM
+              value: "0"
+            - name: LD_LIBRARY_PATH
+              value: "/opt/amazon/efa/lib:/opt/amazon/efa/lib64:/usr/local/lib:/usr/lib"
+            - name: FI_LOG_LEVEL
+              value: "info"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          ports:
+            - containerPort: ${WORKER_PORT}
+          resources:
+            requests:
+              cpu: "8"
+              memory: "64Gi"
+              nvidia.com/gpu: "1"
+              vpc.amazonaws.com/efa: "${AWS_EFA_COUNT}"
+            limits:
+              nvidia.com/gpu: "1"
+              vpc.amazonaws.com/efa: "${AWS_EFA_COUNT}"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
