@@ -899,10 +899,10 @@ type WorkerMetadata struct {
 	// This is runtime metadata, not SourceIdentity hash material. Empty means
 	// unknown and must be accepted for backward compatibility with old writers.
 	Accelerator string `protobuf:"bytes,9,opt,name=accelerator,proto3" json:"accelerator,omitempty"`
-	// Datacenter topology domain values keyed by level (see
-	// SourceInstanceRef.topology). Static per node, so it is published once at
-	// registration; the server passes it through onto SourceInstanceRef. This is
-	// runtime metadata, not SourceIdentity hash material.
+	// Datacenter topology domain values keyed by Grove ClusterTopology domain
+	// (see SourceInstanceRef.topology). Static per node, so it is published once
+	// at registration; the server passes it through onto SourceInstanceRef. This
+	// is runtime metadata, not SourceIdentity hash material.
 	Topology map[string]string `protobuf:"bytes,11,rep,name=topology,proto3" json:"topology,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Source-type-specific bounded metadata. This selects the metadata payload
 	// shape, not a transfer endpoint. Readers should prefer tensor_source over
@@ -2093,12 +2093,13 @@ type SourceInstanceRef struct {
 	// the retry-cap slice. Empty means unknown (treated as compatible for
 	// rolling upgrades and sources that predate this field).
 	Accelerator string `protobuf:"bytes,5,opt,name=accelerator,proto3" json:"accelerator,omitempty"`
-	// Datacenter topology domain values keyed by level, e.g.
-	// {"rack": "r3", "rail": "leaf2", "host": "node7"}. Sourced from the same
-	// node labels Dynamo/Grove already use and published once at registration.
-	// The topology_aware selector prefers sources in the narrowest RDMA-fabric
-	// domain the target and source share. Empty means unknown (the selector
-	// then falls back to rendezvous ordering for that source).
+	// Datacenter topology domain values keyed by Grove ClusterTopology domain
+	// (region/zone/datacenter/block/rack/host/numa), e.g.
+	// {"block": "b1", "rack": "r3", "host": "node7"}. Populated from the node's
+	// labels via the ClusterTopology domain->key mapping and published once at
+	// registration. The topology_aware selector prefers sources in the narrowest
+	// RDMA-fabric domain the target and source share. Empty means unknown (the
+	// selector then falls back to rendezvous ordering for that source).
 	Topology      map[string]string `protobuf:"bytes,7,rep,name=topology,proto3" json:"topology,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

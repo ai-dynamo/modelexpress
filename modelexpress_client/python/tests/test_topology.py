@@ -10,6 +10,8 @@ from __future__ import annotations
 import statistics
 from types import SimpleNamespace
 
+import pytest
+
 from modelexpress import p2p_pb2
 from modelexpress.source_selection import (
     RendezvousHashSelector,
@@ -18,7 +20,7 @@ from modelexpress.source_selection import (
 )
 from modelexpress.topology import local_topology, resolve_levels
 
-LEVELS = "region,zone,rack,rail,host"
+LEVELS = "region,zone,block,rack,host"  # Grove ClusterTopology domains
 
 
 def _ctx(worker_id="target-0", worker_rank=0, model_name="m"):
@@ -44,6 +46,13 @@ def _set_topology(monkeypatch, levels, local):
     monkeypatch.setenv("MX_P2P_TOPOLOGY", local)
 
 
+@pytest.fixture(autouse=True)
+def _no_dynamo_topology_dir(monkeypatch, tmp_path):
+    # Neutralize the Dynamo topology-dir fallback so tests are hermetic; a test
+    # that wants it points DYN_TOPOLOGY_MOUNT_PATH at a dir it populates.
+    monkeypatch.setenv("DYN_TOPOLOGY_MOUNT_PATH", str(tmp_path / "absent"))
+
+
 # ---------------------------------------------------------------------------
 # Provider
 # ---------------------------------------------------------------------------
@@ -53,9 +62,54 @@ def test_resolve_levels_parses_and_trims():
     assert resolve_levels(" region , zone,rack ") == ["region", "zone", "rack"]
 
 
-def test_resolve_levels_empty_when_unset():
-    assert resolve_levels("") == []
-    assert resolve_levels(None) == [] or isinstance(resolve_levels(None), list)
+def test_resolve_levels_defaults_to_grove_order_when_unset(monkeypatch):
+    from modelexpress.topology import GROVE_TOPOLOGY_DOMAINS
+
+    monkeypatch.delenv("MX_P2P_TOPOLOGY_LEVELS", raising=False)
+    assert resolve_levels() == list(GROVE_TOPOLOGY_DOMAINS)
+    assert resolve_levels("") == list(GROVE_TOPOLOGY_DOMAINS)
+
+
+def test_reads_dynamo_topology_dir(monkeypatch, tmp_path):
+    # No MX_P2P_TOPOLOGY -> read the Dynamo operator's projected dir (one file
+    # per domain, contents = value), the same source Dynamo's KV transfer reads.
+    d = tmp_path / "topo"
+    d.mkdir()
+    (d / "block").write_text("b1\n")
+    (d / "rack").write_text("r3")
+    (d / "host").write_text("node7\n")
+    (d / ".hidden").write_text("ignore")
+    monkeypatch.setenv("DYN_TOPOLOGY_MOUNT_PATH", str(d))
+    monkeypatch.delenv("MX_P2P_TOPOLOGY", raising=False)
+    assert local_topology() == {"block": "b1", "rack": "r3", "host": "node7"}
+
+
+def test_grove_domains_match_cluster_topology_enum():
+    from modelexpress.topology import GROVE_TOPOLOGY_DOMAINS
+
+    # Must match Grove ClusterTopology (clustertopologies.grove.io) spec.levels
+    # domain enum exactly, or this node's map misaligns with the fleet.
+    assert set(GROVE_TOPOLOGY_DOMAINS) == {
+        "region",
+        "zone",
+        "datacenter",
+        "block",
+        "rack",
+        "host",
+        "numa",
+    }
+
+
+def test_resolve_levels_warns_on_non_grove_domain(caplog):
+    import logging
+
+    from modelexpress import topology as topo
+
+    topo._warned_unknown.clear()
+    with caplog.at_level(logging.WARNING, logger="modelexpress.topology"):
+        levels = topo.resolve_levels("rack,rail")  # "rail" is not a Grove domain
+    assert levels == ["rack", "rail"]  # non-Grove domain still used, not dropped
+    assert any("rail" in rec.getMessage() for rec in caplog.records)
 
 
 def test_local_topology_parses_json():
@@ -84,17 +138,17 @@ def test_local_topology_unset_is_empty():
 
 def test_prefers_narrowest_shared_domain(monkeypatch):
     _set_topology(
-        monkeypatch, LEVELS, '{"region":"us","zone":"z1","rack":"r3","rail":"leaf2"}'
+        monkeypatch, LEVELS, '{"region":"us","zone":"z1","block":"b1","rack":"r3"}'
     )
     cands = [
-        _ref("far", {"region": "us", "zone": "z2", "rack": "r9", "rail": "leafX"}),
-        _ref("rack", {"region": "us", "zone": "z1", "rack": "r3", "rail": "leafY"}),
-        _ref("rail", {"region": "us", "zone": "z1", "rack": "r3", "rail": "leaf2"}),
+        _ref("far", {"region": "us", "zone": "z2", "block": "b9", "rack": "r9"}),
+        _ref("block", {"region": "us", "zone": "z1", "block": "b1", "rack": "r9"}),
+        _ref("rack", {"region": "us", "zone": "z1", "block": "b1", "rack": "r3"}),
         _ref("none", {"region": "eu"}),
     ]
     order = [c.mx_source_id for c in TopologyAwareSelector().order(cands, _ctx())]
-    assert order[0] == "rail"  # deepest shared domain wins
-    assert order[1] == "rack"
+    assert order[0] == "rack"  # deepest shared domain wins
+    assert order[1] == "block"
     assert order[-1] == "none"  # shares nothing -> last
 
 
@@ -208,20 +262,20 @@ def test_negative_load_weight_clamped(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _fleet(racks, rails_per_rack, hosts_per_rail):
-    """Synthesize sources spread across a region/rack/rail/host hierarchy."""
+def _fleet(blocks, racks_per_block, hosts_per_rack):
+    """Synthesize sources across a region/block/rack/host Grove hierarchy."""
     sources = []
-    for r in range(racks):
-        for e in range(rails_per_rack):
-            for h in range(hosts_per_rail):
-                sid = f"r{r}-e{e}-h{h}"
+    for b in range(blocks):
+        for r in range(racks_per_block):
+            for h in range(hosts_per_rack):
+                sid = f"b{b}-r{r}-h{h}"
                 sources.append(
                     _ref(
                         sid,
                         {
                             "region": "us",
-                            "rack": f"rack{r}",
-                            "rail": f"rack{r}-rail{e}",
+                            "block": f"block{b}",
+                            "rack": f"block{b}-rack{r}",
                             "host": sid,
                         },
                     )
@@ -230,32 +284,33 @@ def _fleet(racks, rails_per_rack, hosts_per_rail):
 
 
 def test_simulation_topology_localizes_vs_rendezvous(monkeypatch):
-    """Multi-rack/rail sim: topology_aware pulls from same-rack sources far more
+    """Multi-block/rack sim: topology_aware pulls from same-rack sources far more
     often than rendezvous_hash, and never worse on within-rack balance. This is
     the headline the design doc calls out (packed single-rack collapses to
     rendezvous; a topology-diverse spread is where the policy pays off)."""
     monkeypatch.setenv("MX_P2P_TOPOLOGY_LEVELS", LEVELS)
-    sources = _fleet(racks=4, rails_per_rack=2, hosts_per_rail=4)  # 32 sources
+    sources = _fleet(blocks=4, racks_per_block=2, hosts_per_rack=4)  # 32 sources
 
     topo_same_rack = 0
     rdv_same_rack = 0
     picks_by_source_topo: dict[str, int] = {}
     n_targets = 200
     for t in range(n_targets):
-        # each target sits on some rack/rail
-        my_rack = t % 4
-        my_rail = (t // 4) % 2
+        # each target sits on some block/rack
+        my_block = t % 4
+        my_rack = (t // 4) % 2
+        my_rack_id = f"block{my_block}-rack{my_rack}"
         monkeypatch.setenv(
             "MX_P2P_TOPOLOGY",
-            f'{{"region":"us","rack":"rack{my_rack}",'
-            f'"rail":"rack{my_rack}-rail{my_rail}","host":"target-{t}"}}',
+            f'{{"region":"us","block":"block{my_block}",'
+            f'"rack":"{my_rack_id}","host":"target-{t}"}}',
         )
         ctx = _ctx(worker_id=f"target-{t}", worker_rank=t)
         topo_pick = get_selector("topology_aware").order(sources, ctx)[0]
         rdv_pick = get_selector("rendezvous_hash").order(sources, ctx)[0]
-        if topo_pick.topology.get("rack") == f"rack{my_rack}":
+        if topo_pick.topology.get("rack") == my_rack_id:
             topo_same_rack += 1
-        if rdv_pick.topology.get("rack") == f"rack{my_rack}":
+        if rdv_pick.topology.get("rack") == my_rack_id:
             rdv_same_rack += 1
         picks_by_source_topo[topo_pick.mx_source_id] = (
             picks_by_source_topo.get(topo_pick.mx_source_id, 0) + 1

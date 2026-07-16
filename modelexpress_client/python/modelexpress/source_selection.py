@@ -151,13 +151,14 @@ class TopologyAwareSelector(ScoredSelector):
     narrowest topology level (broad -> narrow) at which the target and the
     candidate share a domain value; ``order()`` sorts by descending score, so the
     closest source wins and the tiebreak only decides among equidistant peers.
-    Because MX P2P is NIXL over RDMA between replicas, the relevant locality is
-    the RDMA fabric -- same rail (one leaf hop) -> same rack -> same block ->
-    cross-rack. The level hierarchy is not hard-coded: it comes from
-    ``MX_P2P_TOPOLOGY_LEVELS`` (the cluster's Dynamo ``ClusterTopology``
-    ``spec.levels``), and the per-source domain values from each candidate's
-    published ``topology`` metadata -- so MX consumes existing Dynamo/Grove node
-    labels rather than inventing its own.
+    Because MX P2P is NIXL over RDMA between replicas on different nodes, the
+    relevant locality is the inter-node RDMA fabric -- same rack (one leaf hop)
+    -> same block (spine group) -> same datacenter -> cross-datacenter. The level
+    hierarchy is not hard-coded: it comes from ``MX_P2P_TOPOLOGY_LEVELS``, the
+    ordered Grove ``ClusterTopology`` (``clustertopologies.grove.io``)
+    ``spec.levels`` domains, and the per-source values from each candidate's
+    published ``topology`` metadata -- so MX consumes the same node-label
+    topology Grove/Dynamo already define rather than inventing its own.
 
     The ``tiebreak`` is the rendezvous jitter, so peers in the same tier still
     spread instead of piling onto the one nearest source. When no levels are
