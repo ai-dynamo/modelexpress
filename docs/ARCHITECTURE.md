@@ -126,8 +126,7 @@ ModelExpress/
 │       ├── __init__.py                 # Package init, vLLM loader auto-registration
 │       ├── client.py                   # MxClient gRPC client
 │       ├── nixl_transfer.py            # NixlTransferManager
-│       ├── source_selection.py         # P2P source-ordering policies (random, rendezvous_hash, topology_aware)
-│       ├── topology.py                  # Topology domain signal for topology_aware selection
+│       ├── source_selection.py         # P2P source-ordering policies (random, rendezvous_hash)
 │       ├── metrics.py                   # Opt-in Prometheus metrics collector (source-selection group today)
 │       ├── gds_transfer.py             # GPUDirect Storage transfer support
 │       ├── gds_loader.py               # GDS model loader

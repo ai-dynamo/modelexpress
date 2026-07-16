@@ -821,4 +821,24 @@ mod tests {
 
         assert!(ArtifactSourceMetadataRecord::try_from(status).is_err());
     }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn worker_status_topology_survives_serde_round_trip() {
+        // The k8s backend stores WorkerStatus as CR JSON, so a non-empty
+        // topology must survive the round trip. The deployed CRD schema must
+        // also carry status.worker.topology (examples/crds.yaml and
+        // ci/k8s/server/crd-modelmetadata.yaml) or the API server prunes it.
+        let status = WorkerStatus {
+            topology: std::collections::HashMap::from([
+                ("rack".to_string(), "r3".to_string()),
+                ("block".to_string(), "b1".to_string()),
+            ]),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&status).expect("serialize");
+        let back: WorkerStatus = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.topology, status.topology);
+        assert_eq!(back.topology.get("rack").map(String::as_str), Some("r3"));
+    }
 }
