@@ -335,7 +335,18 @@ Uses `ModelMetadata` CRDs for P2P source metadata, `ConfigMap`s for tensor descr
 
 **ConfigMap name format**: `mx-source-{source_id}-{worker_id}-tensors-worker-{rank}`
 
-ConfigMaps use `ownerReferences` pointing to the parent CRD so they are garbage-collected automatically.
+When a client publishes a complete Kubernetes Pod identity (`POD_NAME`,
+`POD_UID`, and `POD_NAMESPACE`) and the Pod is in the metadata namespace, the
+`ModelMetadata` CR uses that Pod as an owner. This applies to both weight and
+artifact metadata because both use the same `PublishMetadata` RPC. Deleting the
+Pod therefore garbage-collects its `ModelMetadata` CR. Tensor `ConfigMap`s use a
+second owner reference pointing to the parent CR, so they are collected with it.
+
+Kubernetes owner references cannot cross namespaces. If the identity is
+missing, partial, or names a different namespace, publication still succeeds
+without a Pod owner reference. This preserves behavior for older clients and
+non-Kubernetes environments; the server-side stale metadata reaper remains the
+cleanup path in those cases.
 
 **Model lifecycle CRD name format**: `mx-cache-{sanitized-model-name}-{hash}`
 
@@ -353,6 +364,13 @@ apiVersion: modelexpress.nvidia.com/v1alpha1
 kind: ModelMetadata
 metadata:
   name: mx-source-a1b2c3d4e5f67890-f3a2b1c4
+  ownerReferences:
+    - apiVersion: v1
+      kind: Pod
+      name: mx-vllm-7d9f8f6c8b-k2m4p
+      uid: 8c69d55f-3e40-4b6e-a16b-6f0c1168e171
+      controller: false
+      blockOwnerDeletion: false
   labels:
     modelexpress.nvidia.com/mx-source-id: a1b2c3d4e5f67890
     modelexpress.nvidia.com/mx-worker-id: f3a2b1c4
@@ -385,6 +403,13 @@ apiVersion: modelexpress.nvidia.com/v1alpha1
 kind: ModelMetadata
 metadata:
   name: mx-source-b2c3d4e5f67890a1-f3a2b1c4
+  ownerReferences:
+    - apiVersion: v1
+      kind: Pod
+      name: mx-vllm-7d9f8f6c8b-k2m4p
+      uid: 8c69d55f-3e40-4b6e-a16b-6f0c1168e171
+      controller: false
+      blockOwnerDeletion: false
 spec:
   modelName: artifact-transfer-e2e
   sourceType: deep_gemm_cache
