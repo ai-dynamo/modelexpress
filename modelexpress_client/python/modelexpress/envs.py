@@ -31,6 +31,7 @@ Not covered here (intentional exceptions):
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -130,15 +131,24 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _env_float(name: str, default: float) -> float:
-    """Parse a float env var, falling back to ``default`` (and warning) on error."""
+    """Parse a float env var, falling back to ``default`` (and warning) on error.
+
+    Rejects non-finite values (``inf``/``nan``): they are always a misconfig and
+    can poison arithmetic downstream (e.g. ``inf * 0.0 -> nan`` in a selector
+    score, which would break deterministic ordering).
+    """
     raw = os.environ.get(name)
     if raw is None:
         return default
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
         logger.warning("Invalid %s=%r; using default %s", name, raw, default)
         return default
+    if not math.isfinite(value):
+        logger.warning("Non-finite %s=%r; using default %s", name, raw, default)
+        return default
+    return value
 
 
 # One entry per variable. The lambda owns the default and parsing; callers that

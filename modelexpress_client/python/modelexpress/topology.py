@@ -137,7 +137,7 @@ def local_topology(raw: Optional[str] = None) -> dict[str, str]:
         return _read_dynamo_topology_dir()
     try:
         parsed = json.loads(raw)
-    except Exception as e:
+    except json.JSONDecodeError as e:
         logger.warning("Invalid MX_P2P_TOPOLOGY (%r): %s", raw, e)
         return {}
     if not isinstance(parsed, dict):

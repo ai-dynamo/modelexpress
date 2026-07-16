@@ -7,7 +7,6 @@ asserts the locality headline (drives the real selector, no GPU hardware)."""
 
 from __future__ import annotations
 
-import statistics
 from types import SimpleNamespace
 
 import pytest
@@ -257,6 +256,14 @@ def test_negative_load_weight_clamped(monkeypatch):
     assert TopologyAwareSelector().w_load == 0.0
 
 
+def test_non_finite_load_weight_rejected(monkeypatch):
+    # inf/nan would poison score() (inf * 0.0 -> nan) and break ordering; envs
+    # rejects non-finite floats, so the weight falls back to 0.0.
+    for bad in ("inf", "-inf", "nan"):
+        monkeypatch.setenv("MX_P2P_TOPOLOGY_LOAD_WEIGHT", bad)
+        assert TopologyAwareSelector().w_load == 0.0
+
+
 # ---------------------------------------------------------------------------
 # Datacenter-topology simulation (drives the real selector; no GPU hardware)
 # ---------------------------------------------------------------------------
@@ -293,7 +300,8 @@ def test_simulation_topology_localizes_vs_rendezvous(monkeypatch):
 
     topo_same_rack = 0
     rdv_same_rack = 0
-    picks_by_source_topo: dict[str, int] = {}
+    # rack_id -> {source_id -> pick count}, to check balance *within* each rack.
+    picks_by_rack: dict[str, dict[str, int]] = {}
     n_targets = 200
     for t in range(n_targets):
         # each target sits on some block/rack
@@ -312,17 +320,18 @@ def test_simulation_topology_localizes_vs_rendezvous(monkeypatch):
             topo_same_rack += 1
         if rdv_pick.topology.get("rack") == my_rack_id:
             rdv_same_rack += 1
-        picks_by_source_topo[topo_pick.mx_source_id] = (
-            picks_by_source_topo.get(topo_pick.mx_source_id, 0) + 1
-        )
+        rack = picks_by_rack.setdefault(my_rack_id, {})
+        rack[topo_pick.mx_source_id] = rack.get(topo_pick.mx_source_id, 0) + 1
 
     # Headline: topology_aware keeps the pull local (same rack) far more often.
     assert topo_same_rack == n_targets  # every target's first choice is in-rack
     assert rdv_same_rack < n_targets  # rendezvous is topology-blind
-    # Guardrail: within a rack (8 sources), the jitter still spreads picks -- no
-    # single source absorbs everything (each rack serves ~50 targets over 8 hosts).
-    max_share = max(picks_by_source_topo.values())
-    assert max_share <= n_targets / 4  # bounded well below "all onto one source"
-    # sanity: spread is non-degenerate
-    assert len(picks_by_source_topo) >= 8
-    _ = statistics  # keep import meaningful if assertions above are relaxed later
+    # Guardrail: within EACH rack the jitter tiebreak still spreads picks across
+    # that rack's hosts -- no single source absorbs its whole rack. Every rack
+    # (8 racks x ~25 targets each over 4 hosts) must use >= 2 distinct hosts, and
+    # no host may take more than 60% of its rack's targets.
+    assert len(picks_by_rack) == 8  # all racks served
+    for rack_id, per_source in picks_by_rack.items():
+        total = sum(per_source.values())
+        assert len(per_source) >= 2, (rack_id, per_source)
+        assert max(per_source.values()) <= 0.6 * total, (rack_id, per_source)
