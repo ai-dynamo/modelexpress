@@ -539,10 +539,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_metadata_found() {
+        let expected_identity = test_identity();
+        let returned_identity = expected_identity.clone();
         let mut mock = MockMetadataBackend::new();
         mock.expect_get_metadata()
             .once()
-            .returning(|source_id, worker_id| {
+            .returning(move |source_id, worker_id| {
                 Ok(Some(ModelMetadataRecord {
                     source_id: source_id.to_string(),
                     worker_id: worker_id.to_string(),
@@ -560,7 +562,7 @@ mod tests {
                         artifact_source: None,
                     }],
                     published_at: 1234567890,
-                    identity: None,
+                    identity: Some(returned_identity.clone()),
                 }))
             });
 
@@ -581,6 +583,7 @@ mod tests {
         );
         assert_eq!(resp.mx_source_id, "abc123def456abcd");
         assert_eq!(resp.worker_id, "worker-uuid-1");
+        assert_eq!(resp.identity, Some(expected_identity));
     }
 
     #[tokio::test]
@@ -698,8 +701,27 @@ mod tests {
     #[tokio::test]
     async fn test_list_sources_returns_instances() {
         let now = chrono::Utc::now().timestamp_millis();
+        let identity = test_identity();
+        let expected_source_id = compute_mx_source_id(&identity);
         let mut mock = MockMetadataBackend::new();
         mock.expect_list_workers_filtered()
+            .withf(
+                move |source_id,
+                      status_filter,
+                      model_name_filter,
+                      worker_rank_filter,
+                      min_training_step,
+                      min_updated_at,
+                      limit| {
+                    source_id.as_deref() == Some(expected_source_id.as_str())
+                        && *status_filter == Some(SourceStatus::Ready)
+                        && model_name_filter.as_deref() == Some("my-model")
+                        && *worker_rank_filter == Some(1)
+                        && *min_training_step == Some(40)
+                        && *min_updated_at == Some(1_700_000_000_000)
+                        && *limit == Some(2)
+                },
+            )
             .once()
             .returning(move |_, _, _, _, _, _, _| {
                 Ok(vec![
@@ -731,9 +753,13 @@ mod tests {
         let svc = make_service(mock);
         let resp = svc
             .list_sources(Request::new(ListSourcesRequest {
-                identity: Some(test_identity()),
+                identity: Some(identity),
                 status_filter: Some(SourceStatus::Ready as i32),
-                ..Default::default()
+                model_name_filter: Some("my-model".to_string()),
+                worker_rank_filter: Some(1),
+                min_training_step: Some(40),
+                min_updated_at: Some(1_700_000_000_000),
+                limit: Some(2),
             }))
             .await
             .expect("rpc")
