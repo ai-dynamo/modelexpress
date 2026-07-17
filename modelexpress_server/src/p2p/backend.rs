@@ -311,6 +311,7 @@ impl From<ArtifactSourceMetadataRecord> for ArtifactSourceMetadata {
 
 /// Trait for metadata backend implementations
 #[cfg_attr(test, mockall::automock)]
+#[allow(clippy::too_many_arguments)]
 #[async_trait]
 pub trait MetadataBackend: Send + Sync {
     /// Connect to the backend (initialize connections, etc.)
