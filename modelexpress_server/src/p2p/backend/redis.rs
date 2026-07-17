@@ -633,13 +633,13 @@ impl MetadataBackend for RedisBackend {
                     continue;
                 }
 
-                if let Some(required_status) = status_filter {
-                    if !worker_records_match_status(
+                if let Some(required_status) = status_filter
+                    && !worker_records_match_status(
                         fields.values().map(String::as_str),
                         required_status,
-                    ) {
-                        continue;
-                    }
+                    )
+                {
+                    continue;
                 }
 
                 let (status, updated_at, accelerator) = fields
