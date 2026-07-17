@@ -6,6 +6,7 @@
 from ... import configure_vllm_logging
 from ...patches import apply_patches
 from .adapter import VllmAdapter, build_vllm_load_context
+from .mdl import MdlLoader
 from .patches import PATCHES as VLLM_PATCHES
 
 _loaders_registered = False
@@ -29,6 +30,7 @@ def register_modelexpress_loaders() -> None:
 
 
 __all__ = [
+    "MdlLoader",
     "VllmAdapter",
     "build_vllm_load_context",
     "register_modelexpress_loaders",
