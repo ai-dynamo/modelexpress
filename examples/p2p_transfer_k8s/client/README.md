@@ -41,6 +41,16 @@ On startup, the engine-specific ModelExpress loader auto-detects the best loadin
 
 After loading, every worker publishes its metadata so future instances can discover it as an RDMA source.
 
+When the server uses the Kubernetes metadata backend, the example manifests
+also inject `POD_NAME`, `POD_UID`, and `POD_NAMESPACE` through the Downward API.
+ModelExpress uses a complete same-namespace identity to make the Pod the owner
+of each `ModelMetadata` CR it publishes, including artifact metadata. This
+ownership behavior is independent of the inference engine.
+Deleting the Pod then removes its metadata through Kubernetes garbage
+collection. If any identity field is unavailable, publication continues without
+an owner reference so older clients and non-Kubernetes deployments remain
+compatible.
+
 ## Prerequisites
 
 - ModelExpress server deployed (see [`../server/`](../server/))

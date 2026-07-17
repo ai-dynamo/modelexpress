@@ -329,7 +329,7 @@ jobs:
   # parallel execution in the future (remove max-parallel: 1 to enable).
   # ---------------------------------------------------------------------------
   test-p2p:
-    name: P2P test (${{ matrix.framework }})
+    name: P2P test (${{ matrix.label || matrix.framework }})
     runs-on: prod-modelexpress-builder-amd-v1
     needs: [build-client, build-server, ensure-vcluster]
     permissions:
@@ -371,6 +371,7 @@ jobs:
             extra_env: "JOB_NAME=mx-target"
             source_port: "8005"
             worker_port: "8006"
+            expected_artifact_sources: "1"
           # Same SGLang P2P test as above, but over the Mooncake TransferEngine
           # transport instead of NIXL. The ModelExpress package loader uses the
           # same remote_instance command on source and target; the first replica
@@ -385,6 +386,39 @@ jobs:
             extra_env: "JOB_NAME=mx-target"
             source_port: "8007"
             worker_port: "8008"
+          # Full tensor-manifest publish path (MX_P2P_METADATA=0): the source
+          # embeds the full tensor manifest in the WorkerMetadata proto it
+          # publishes, instead of serving it on-demand. The mixed-version entry
+          # (client @ this commit vs the last released server) is a proto
+          # backward-compatibility guard — it catches client-side proto changes
+          # that break older servers (e.g. dropping the legacy `tensors`
+          # field). same-version only guards the path against future same-build
+          # breaks.
+          - framework: vllm
+            label: vllm full-manifest same-version
+            namespace: mx-ci-full-manifest-same-${{ github.run_id }}
+            manifest: ci/k8s/client/vllm/manifest-azure.yaml
+            test_script: ci/k8s/client/test_p2p_k8s.py
+            source_extra_env: "JOB_NAME=mx-source"
+            extra_env: "JOB_NAME=mx-target"
+            source_port: "8021"
+            worker_port: "8022"
+            mx_p2p_metadata: "0"
+          - framework: vllm
+            label: vllm full-manifest mixed-version
+            namespace: mx-ci-full-manifest-mixed-${{ github.run_id }}
+            manifest: ci/k8s/client/vllm/manifest-azure.yaml
+            test_script: ci/k8s/client/test_p2p_k8s.py
+            source_extra_env: "JOB_NAME=mx-source"
+            extra_env: "JOB_NAME=mx-target"
+            source_port: "8023"
+            worker_port: "8024"
+            mx_p2p_metadata: "0"
+            # TODO: resolve this dynamically to the latest released
+            # modelexpress-server tag instead of hardcoding, so the guard
+            # tracks "newest client vs latest released server" without a
+            # manual bump each release.
+            server_image: nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.4.0
 
     steps:
       - name: Checkout
@@ -405,7 +439,9 @@ jobs:
         with:
           kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
           namespace: ${{ matrix.namespace }}
-          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          # Defaults to this commit's server; matrix.server_image overrides it
+          # (e.g. the mixed-version embedded-metadata entry pins a released tag).
+          server_image: ${{ matrix.server_image || format('{0}/mx-server:{1}', env.MX_IMAGE_REPO, github.sha) }}
           manifest: ${{ matrix.manifest }}
           test_script: ${{ matrix.test_script }}
           worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
@@ -413,6 +449,7 @@ jobs:
           ngc_api_key: ${{ secrets.NGC_API_KEY }}
           model: ${{ env.MX_CI_MODEL }}
           hf_token: ${{ secrets.HF_TOKEN }}
+          mx_p2p_metadata: ${{ matrix.mx_p2p_metadata || '1' }}
           source_extra_env: ${{ matrix.source_extra_env }}
           extra_env: ${{ matrix.extra_env }}
           source_port: ${{ matrix.source_port }}
@@ -899,6 +936,74 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
+  # Rolling-update test — five workers, CRD backend, NIXL-over-TCP.
+  # Runs independently of the 15-worker fleet test for both vLLM and SGLang.
+  # The Deployment rolls with maxUnavailable=1/maxSurge=0: one source
+  # terminates while four stay alive.
+  # ---------------------------------------------------------------------------
+  test-rolling-update:
+    name: Rolling-update test (${{ matrix.framework }}, 5 workers)
+    runs-on: prod-modelexpress-builder-amd-v1
+    needs: [build-client, build-server, ensure-vcluster]
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - framework: vllm
+            namespace: mx-ci-rolling-vllm-${{ github.run_id }}
+            manifest: ci/k8s/client/vllm/manifest-azure-rolling-update.yaml
+          - framework: sglang
+            namespace: mx-ci-rolling-sglang-${{ github.run_id }}
+            manifest: ci/k8s/client/sgl/manifest-azure-rolling-update.yaml
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Connect to vCluster
+        id: connect-vcluster
+        uses: ./.github/actions/connect-vcluster
+        with:
+          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Run rolling-update test
+        uses: ./.github/actions/run-mx-fleet-test
+        with:
+          kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
+          namespace: ${{ matrix.namespace }}
+          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
+          worker_registry: nvcr.io
+          ngc_api_key: ${{ secrets.NGC_API_KEY }}
+          model: ${{ env.MX_CI_MODEL }}
+          hf_token: ${{ secrets.HF_TOKEN }}
+          manifest: ${{ matrix.manifest }}
+          test_script: ci/k8s/client/test_rolling_update.py
+          fleet_size: "5"
+          wave_sizes: "5"
+          rolling_update: "true"
+          rollout_timeout_seconds: "600"
+
+      - name: Dump vCluster diagnostics on failure
+        if: failure()
+        uses: ./.github/actions/dump-vcluster-diagnostics
+        with:
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Reap vCluster port-forward
+        if: always()
+        run: |
+          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
+            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
+          fi
+
+  # ---------------------------------------------------------------------------
   # Stale-metadata test (row 18) — single source pod, no target, mx-server
   # deployed with the Redis backend + compressed reaper knobs. After the
   # source publishes, we force-kill it and assert that the server stops
@@ -1058,6 +1163,7 @@ jobs:
       - test-ep
       - test-with-dynamo
       - test-fleet-scale
+      - test-rolling-update
       - test-stale-metadata
       - model-streamer
     if: always()

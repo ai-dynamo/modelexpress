@@ -118,6 +118,7 @@ def test_worker_grpc_server_shares_port_for_tensor_and_artifact_sources(tmp_path
         metadata_endpoint="127.0.0.1:5555",
         agent_name="source-agent",
         worker_rank=0,
+        worker_id="weight-generation",
     )
     port = server.start()
     endpoint = f"127.0.0.1:{port}"
@@ -130,7 +131,12 @@ def test_worker_grpc_server_shares_port_for_tensor_and_artifact_sources(tmp_path
     )
 
     try:
-        tensors, _ = fetch_tensor_manifest(endpoint, "weight-source", timeout=1.0)
+        tensors, _ = fetch_tensor_manifest(
+            endpoint,
+            "weight-source",
+            timeout=1.0,
+            worker_id="weight-generation",
+        )
         header, _ = artifact_transfer_module.fetch_artifact_manifest_header(
             endpoint,
             "artifact-source",
@@ -150,6 +156,105 @@ def test_worker_grpc_server_shares_port_for_tensor_and_artifact_sources(tmp_path
     assert [tensor.name for tensor in tensors] == ["weight"]
     assert header.mx_source_id == "artifact-source"
     assert header.artifact_id == artifact_id
+
+
+def test_fetch_tensor_manifest_rejects_stale_worker_generation():
+    servicer = WorkerServiceServicer(
+        tensor_protos=[],
+        mx_source_id="source-123",
+        worker_id="new-generation",
+    )
+    server, port = _start_server(servicer)
+
+    try:
+        with pytest.raises(grpc.RpcError) as exc_info:
+            fetch_tensor_manifest(
+                f"127.0.0.1:{port}",
+                "source-123",
+                worker_id="old-generation",
+                timeout=1.0,
+            )
+    finally:
+        server.stop(grace=None)
+
+    assert exc_info.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+    assert "worker_id mismatch" in exc_info.value.details()
+
+
+def test_fetch_tensor_manifest_default_timeout_is_five_seconds(monkeypatch):
+    channel = MagicMock()
+    stub = MagicMock()
+    stub.GetTensorManifest.return_value = p2p_pb2.GetTensorManifestResponse()
+    monkeypatch.setattr(grpc, "insecure_channel", MagicMock(return_value=channel))
+    monkeypatch.setattr(
+        p2p_pb2_grpc,
+        "WorkerServiceStub",
+        MagicMock(return_value=stub),
+    )
+
+    fetch_tensor_manifest("source:6555", "source-123")
+
+    assert stub.GetTensorManifest.call_args.kwargs["timeout"] == 5.0
+    channel.close.assert_called_once()
+
+
+def test_fetch_tensor_manifest_closes_channel_on_rpc_error(monkeypatch):
+    channel = MagicMock()
+    stub = MagicMock()
+    stub.GetTensorManifest.side_effect = grpc.RpcError("manifest failed")
+    monkeypatch.setattr(grpc, "insecure_channel", MagicMock(return_value=channel))
+    monkeypatch.setattr(
+        p2p_pb2_grpc,
+        "WorkerServiceStub",
+        MagicMock(return_value=stub),
+    )
+
+    with pytest.raises(grpc.RpcError, match="manifest failed"):
+        fetch_tensor_manifest("source:6555", "source-123")
+
+    channel.close.assert_called_once()
+
+
+def test_fetch_tensor_manifest_accepts_legacy_source_without_worker_id():
+    class LegacyServicer(p2p_pb2_grpc.WorkerServiceServicer):
+        def GetTensorManifest(self, request, context):
+            return p2p_pb2.GetTensorManifestResponse(
+                mx_source_id=request.mx_source_id,
+            )
+
+    server, port = _start_server(LegacyServicer())
+
+    try:
+        tensors, _ = fetch_tensor_manifest(
+            f"127.0.0.1:{port}",
+            "source-123",
+            worker_id="selected-generation",
+            timeout=1.0,
+        )
+    finally:
+        server.stop(grace=None)
+
+    assert tensors == []
+
+
+def test_new_server_accepts_legacy_request_without_worker_id():
+    servicer = WorkerServiceServicer(
+        tensor_protos=[],
+        mx_source_id="source-123",
+        worker_id="new-generation",
+    )
+    server, port = _start_server(servicer)
+
+    try:
+        tensors, _ = fetch_tensor_manifest(
+            f"127.0.0.1:{port}",
+            "source-123",
+            timeout=1.0,
+        )
+    finally:
+        server.stop(grace=None)
+
+    assert tensors == []
 
 
 def test_transfer_artifact_from_worker_retries_after_source_buffer_exhaustion(
@@ -859,6 +964,110 @@ def test_discover_artifact_source_matches_node_rank():
     assert source_1.worker_id == "source-pod-1"
     assert source_1.worker_rank == 7
     assert source_1.artifact_id == "artifact-1"
+
+
+def _artifact_discovery_client(instances_and_workers):
+    """Build a MagicMock mx_client from (SourceInstanceRef, WorkerMetadata) pairs."""
+    identity = p2p_pb2.SourceIdentity(
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE,
+        model_name="test/model",
+    )
+    metadata = {
+        ref.worker_id: p2p_pb2.GetMetadataResponse(
+            found=True,
+            mx_source_id=ref.mx_source_id,
+            worker_id=ref.worker_id,
+            worker=worker,
+        )
+        for ref, worker in instances_and_workers
+    }
+    mx_client = MagicMock()
+    mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(
+        instances=[ref for ref, _ in instances_and_workers]
+    )
+    mx_client.get_metadata.side_effect = (
+        lambda source_id, worker_id: metadata[worker_id]
+    )
+    return mx_client, identity
+
+
+def _artifact_worker(worker_grpc_endpoint, artifact_id, accelerator=""):
+    return p2p_pb2.WorkerMetadata(
+        worker_grpc_endpoint=worker_grpc_endpoint,
+        accelerator=accelerator,
+        artifact_source=p2p_pb2.ArtifactSourceMetadata(artifact_id=artifact_id),
+    )
+
+
+def test_discover_artifact_source_skips_incompatible_accelerator():
+    # A compatible source listed after an incompatible one must still be
+    # chosen; the incompatible source is dropped before GetMetadata.
+    mx_source_id = compute_mx_source_id(
+        p2p_pb2.SourceIdentity(
+            mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE,
+            model_name="test/model",
+        )
+    )
+    incompatible = p2p_pb2.SourceInstanceRef(
+        mx_source_id=mx_source_id, worker_id="other-0", accelerator="other"
+    )
+    compatible = p2p_pb2.SourceInstanceRef(
+        mx_source_id=mx_source_id, worker_id="cuda-0", accelerator="cuda"
+    )
+    mx_client, identity = _artifact_discovery_client(
+        [
+            (incompatible, _artifact_worker("other-0:6555", "a-other", "other")),
+            (compatible, _artifact_worker("cuda-0:6555", "a-cuda", "cuda")),
+        ]
+    )
+
+    discovered = discover_artifact_source(mx_client, identity, accelerator="cuda")
+
+    assert discovered.worker_id == "cuda-0"
+    # The incompatible source was filtered before its metadata was fetched.
+    mx_client.get_metadata.assert_called_once_with(mx_source_id, "cuda-0")
+
+
+def test_discover_artifact_source_empty_accelerator_is_compatible():
+    # A source whose ref predates the accelerator field (empty) is accepted;
+    # a populated mismatch is still skipped.
+    mx_source_id = compute_mx_source_id(
+        p2p_pb2.SourceIdentity(
+            mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE,
+            model_name="test/model",
+        )
+    )
+    legacy = p2p_pb2.SourceInstanceRef(
+        mx_source_id=mx_source_id, worker_id="legacy-0", accelerator=""
+    )
+    mx_client, identity = _artifact_discovery_client(
+        [(legacy, _artifact_worker("legacy-0:6555", "a-legacy", ""))]
+    )
+
+    discovered = discover_artifact_source(mx_client, identity, accelerator="cuda")
+
+    assert discovered.worker_id == "legacy-0"
+
+
+def test_discover_artifact_source_rechecks_worker_metadata_accelerator():
+    # Defense-in-depth: an empty ref accelerator passes the pre-fetch filter,
+    # but the authoritative WorkerMetadata.accelerator mismatch is caught after
+    # GetMetadata, so no incompatible source is returned.
+    mx_source_id = compute_mx_source_id(
+        p2p_pb2.SourceIdentity(
+            mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE,
+            model_name="test/model",
+        )
+    )
+    drifted = p2p_pb2.SourceInstanceRef(
+        mx_source_id=mx_source_id, worker_id="drift-0", accelerator=""
+    )
+    mx_client, identity = _artifact_discovery_client(
+        [(drifted, _artifact_worker("drift-0:6555", "a-drift", "other"))]
+    )
+
+    with pytest.raises(LookupError, match="no ready artifact source"):
+        discover_artifact_source(mx_client, identity, accelerator="cuda")
 
 
 def test_publish_artifact_source_stops_server_when_refresh_fails(

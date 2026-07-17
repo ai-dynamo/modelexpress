@@ -223,10 +223,12 @@ class _FakeWorkerServicer(p2p_pb2_grpc.WorkerServiceServicer):
         mx_source_id: str,
         worker_rank: int,
         *,
+        accelerator: str = "cuda",
         fail_first_n: int = 0,
     ):
         self._mx_source_id = mx_source_id
         self._worker_rank = worker_rank
+        self._accelerator = accelerator
         self._fail_first_n = fail_first_n
         self._calls = 0
         self._lock = threading.Lock()
@@ -251,6 +253,7 @@ class _FakeWorkerServicer(p2p_pb2_grpc.WorkerServiceServicer):
             metadata_endpoint="10.0.0.1:5555",
             agent_name="fake-agent",
             worker_rank=self._worker_rank,
+            accelerator=self._accelerator,
         )
 
 
@@ -278,6 +281,7 @@ def test_get_metadata_success_builds_synthetic_response():
         assert resp.worker.worker_rank == 4
         assert resp.worker.metadata_endpoint == "10.0.0.1:5555"
         assert resp.worker.agent_name == "fake-agent"
+        assert resp.worker.accelerator == "cuda"
         assert resp.worker.status == p2p_pb2.SOURCE_STATUS_READY
         tensors = worker_tensor_descriptors(resp.worker)
         assert len(tensors) == 1

@@ -28,6 +28,7 @@ from .artifact_manifest import (
     artifact_manifest_id,
     build_artifact_manifest,
 )
+from .payload import accelerators_compatible
 from .publisher import PublisherThread
 from .publish import _get_worker_host, _publish_metadata_to_server
 from .worker_server import (
@@ -157,6 +158,7 @@ class P2PArtifactTransfer(Protocol):
         worker_rank: int | None = None,
         node_rank: int | None = None,
         artifact_id: str = "",
+        accelerator: str = "",
         timeout: float = 120.0,
         max_inflight_chunks: int = _DEFAULT_MAX_INFLIGHT_CHUNKS,
     ) -> p2p_pb2.GetArtifactManifestHeaderResponse:
@@ -164,6 +166,7 @@ class P2PArtifactTransfer(Protocol):
 
         By default artifact discovery does not rank-match. Pass node_rank for
         node-scoped artifacts or worker_rank for worker-specific artifacts.
+        Pass accelerator to skip sources published by an incompatible runtime.
         """
 
     def install(
@@ -288,6 +291,7 @@ class TarredP2PArtifactTransfer(P2PArtifactTransfer):
         worker_rank: int | None = None,
         node_rank: int | None = None,
         artifact_id: str = "",
+        accelerator: str = "",
         timeout: float = 120.0,
         max_inflight_chunks: int = _DEFAULT_MAX_INFLIGHT_CHUNKS,
     ) -> p2p_pb2.GetArtifactManifestHeaderResponse:
@@ -297,6 +301,7 @@ class TarredP2PArtifactTransfer(P2PArtifactTransfer):
             worker_rank=worker_rank,
             node_rank=node_rank,
             artifact_id=artifact_id,
+            accelerator=accelerator,
         )
         return self.transfer_from_worker(
             source.worker_grpc_endpoint,
@@ -499,6 +504,7 @@ def publish_artifact_source(
     node_rank: int = 0,
     max_inflight_chunks: int = _DEFAULT_MAX_INFLIGHT_CHUNKS,
     host: str | None = None,
+    accelerator: str = "cuda",
 ) -> PublishedArtifactSource:
     """Publish a prepared artifact source to the MX server for discovery."""
     if identity.mx_source_type != transfer.mx_source_type:
@@ -530,6 +536,7 @@ def publish_artifact_source(
         agent_name=nixl_manager.agent_name,
         worker_grpc_endpoint=worker_grpc_endpoint,
         artifact_source=artifact_source_metadata(bundle.manifest, node_rank=node_rank),
+        accelerator=accelerator,
     )
     try:
         mx_source_id = _publish_metadata_to_server(
@@ -595,11 +602,17 @@ def discover_artifact_source(
     worker_rank: int | None = None,
     node_rank: int | None = None,
     artifact_id: str = "",
+    accelerator: str = "",
 ) -> ArtifactSourceEndpoint:
-    """Find a ready artifact source through the MX server.
+    """Find a ready engine artifact source through the MX server.
 
     Artifact sources are not rank-matched by default. Pass node_rank for
-    node-scoped artifacts or worker_rank for worker-specific artifacts.
+    node-scoped artifacts or worker_rank for worker-specific artifacts. Pass
+    accelerator to skip sources published by an incompatible runtime; engine
+    JIT/compile caches (Torch compile, Triton, DeepGEMM, FlashInfer, etc.) are
+    accelerator-specific, so a cache bundle from a different accelerator family
+    must not be installed. Empty means unknown and is accepted for backward
+    compatibility, matching RDMA tensor source selection.
     """
     sources = mx_client.list_sources(
         identity=identity,
@@ -608,11 +621,18 @@ def discover_artifact_source(
     for source in sources.instances:
         if worker_rank is not None and source.worker_rank != worker_rank:
             continue
+        # Drop accelerator-incompatible sources before GetMetadata using the
+        # lightweight SourceInstanceRef.accelerator; the post-fetch re-check
+        # below covers empty refs on old servers and metadata drift.
+        if not accelerators_compatible(accelerator, source.accelerator):
+            continue
         metadata = mx_client.get_metadata(source.mx_source_id, source.worker_id)
         if not metadata.found:
             continue
         worker = metadata.worker
         if worker.WhichOneof("source_payload") != "artifact_source":
+            continue
+        if not accelerators_compatible(accelerator, worker.accelerator):
             continue
         if node_rank is not None and worker.artifact_source.node_rank != node_rank:
             continue

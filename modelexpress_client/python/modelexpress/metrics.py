@@ -74,7 +74,8 @@ class MetricsCollector:
             self.attempts = Counter(
                 "mx_p2p_source_attempts_total",
                 "Source attempts by result.",
-                ["policy", "scheme", "result"],  # success|metadata_miss|transfer_fallback
+                # success|metadata_miss|transfer_retry|transfer_fallback
+                ["policy", "scheme", "result"],
             )
             self.metadata_failures = Counter(
                 "mx_p2p_metadata_lookup_failures_total",
@@ -84,7 +85,7 @@ class MetricsCollector:
             self.candidates = Histogram(
                 "mx_p2p_candidates",
                 "Candidate count at a selection stage.",
-                ["policy", "scheme", "stage"],  # listed|rank_matched
+                ["policy", "scheme", "stage"],  # listed|rank_matched|accelerator_matched
                 buckets=(0, 1, 2, 4, 8, 16, 32, 64, 128),
             )
             self.selection_seconds = Histogram(
@@ -96,7 +97,7 @@ class MetricsCollector:
             self.transfer_seconds = Histogram(
                 "mx_p2p_transfer_seconds",
                 "End-to-end transfer time in seconds.",
-                ["policy", "scheme", "outcome"],  # success|fallback
+                ["policy", "scheme", "outcome"],  # success|retry|fallback
                 buckets=(0.5, 1, 2, 5, 10, 30, 60, 120, 300),
             )
             self._ready = True

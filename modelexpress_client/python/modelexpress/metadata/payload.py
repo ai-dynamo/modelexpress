@@ -27,3 +27,16 @@ def worker_tensor_descriptors(worker: p2p_pb2.WorkerMetadata):
 
 def worker_tensor_count(worker: p2p_pb2.WorkerMetadata) -> int:
     return len(worker_tensor_descriptors(worker))
+
+
+def accelerators_compatible(target: str, source: str) -> bool:
+    """Return whether ``target`` and ``source`` accelerator families match.
+
+    Empty values mean unknown and are accepted for backward compatibility with
+    workers published before accelerator metadata existed. This is the single
+    compatibility rule shared by RDMA tensor source selection and artifact
+    source discovery, in both their pre-fetch and post-fetch checks.
+    """
+    if not target or not source:
+        return True
+    return target == source

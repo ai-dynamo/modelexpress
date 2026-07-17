@@ -193,7 +193,7 @@ def test_sglang_adapter_post_load_delegates_to_child_module():
     model = nn.Module()
     model.child = ChildModel()
 
-    adapter.after_rdma_receive(SimpleNamespace(model=model))
+    adapter._post_load_weights(SimpleNamespace(model=model))
 
     assert model.child.post_load_called
 
@@ -217,7 +217,7 @@ def test_sglang_adapter_post_load_prefers_top_level_hook():
     model = TopLevelModel()
     model.child.post_load_weights = child_post_load_weights
 
-    adapter.after_rdma_receive(SimpleNamespace(model=model))
+    adapter._post_load_weights(SimpleNamespace(model=model))
 
     assert model.post_load_called
     assert not model.child.post_load_called
@@ -360,7 +360,11 @@ def test_mx_model_loader_nixl_path_delegates_to_shared_strategy_chain():
     with patch(
         "modelexpress.engines.sglang.loader.LoadStrategyChain.run",
         return_value=model,
-    ) as run:
+    ) as run, patch(
+        "modelexpress.engines.sglang.loader.install_sglang_cache_artifacts",
+    ) as install_artifacts, patch(
+        "modelexpress.engines.sglang.loader.schedule_sglang_cache_artifact_publish",
+    ) as schedule_artifacts:
         loaded = loader._load_model_via_nixl(
             model=model,
             model_config=_model_config(),
@@ -373,6 +377,8 @@ def test_mx_model_loader_nixl_path_delegates_to_shared_strategy_chain():
     ctx = run.call_args.args[1]
     assert ctx.adapter.__class__ is SglangAdapter
     assert ctx.identity.backend_framework == p2p_pb2.BACKEND_FRAMEWORK_SGLANG
+    install_artifacts.assert_called_once_with(ctx)
+    schedule_artifacts.assert_called_once_with(ctx)
 
 
 def test_mx_model_loader_delegates_transfer_engine_transport_in_mx_package():
@@ -493,6 +499,7 @@ def test_transfer_engine_publish_starts_non_nixl_heartbeat():
         device_id=1,
         identity=p2p_pb2.SourceIdentity(model_name="sglang-model"),
         mx_client=SimpleNamespace(),
+        accelerator_backend=SimpleNamespace(name="cuda"),
     )
     published = {}
 
@@ -528,6 +535,7 @@ def test_transfer_engine_publish_starts_non_nixl_heartbeat():
 
     assert published_ok
     assert published["worker"].transfer_engine_session_id == "te-session"
+    assert published["worker"].accelerator == "cuda"
     assert published["status"]["status"] == p2p_pb2.SOURCE_STATUS_READY
     assert published["heartbeat"]["nixl_manager"] is None
     assert published["heartbeat_started"]
@@ -541,6 +549,7 @@ def test_transfer_engine_publish_failure_is_non_fatal():
         worker_id="worker-id",
         device_id=1,
         identity=p2p_pb2.SourceIdentity(model_name="sglang-model"),
+        accelerator_backend=SimpleNamespace(name="cuda"),
         mx_client=SimpleNamespace(
             publish_metadata=lambda *args: (_ for _ in ()).throw(
                 RuntimeError("metadata down")

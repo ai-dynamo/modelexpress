@@ -189,7 +189,7 @@ runs:
             --served-model-name "${MODEL}" \
             --hf-config-path "${MODEL}" \
             --tokenizer "${MODEL}" \
-            --load-format mx \
+            --load-format modelexpress \
             --port "${PORT}")
         echo "Container: ${CONTAINER_ID}"
         # Persist CONTAINER_ID for subsequent steps in this composite action.

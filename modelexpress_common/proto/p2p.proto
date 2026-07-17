@@ -282,6 +282,11 @@ message WorkerMetadata {
   // artifact manifests, and artifact chunk transfer coordination.
   string worker_grpc_endpoint = 8;
 
+  // Runtime accelerator family for compatibility filtering (e.g. "cuda").
+  // This is runtime metadata, not SourceIdentity hash material. Empty means
+  // unknown and must be accepted for backward compatibility with old writers.
+  string accelerator = 9;
+
   // Source-type-specific bounded metadata. This selects the metadata payload
   // shape, not a transfer endpoint. Readers should prefer tensor_source over
   // deprecated tensors when both are present, and fall back to tensors for old
@@ -312,6 +317,10 @@ service WorkerService {
 message GetTensorManifestRequest {
   // mx_source_id for validation (catches stale discovery)
   string mx_source_id = 1;
+
+  // Runtime generation selected from discovery metadata. The serving endpoint
+  // rejects the request if it belongs to a different worker process.
+  optional string worker_id = 2;
 }
 
 message GetTensorManifestResponse {
@@ -332,6 +341,14 @@ message GetTensorManifestResponse {
 
   // Rank of the serving worker (for rank-matched transfers)
   uint32 worker_rank = 5;
+
+  // Runtime accelerator family for compatibility filtering (e.g. "cuda").
+  // Empty means unknown and must be accepted for backward compatibility.
+  string accelerator = 6;
+
+  // Runtime generation of the process serving this manifest. New sources
+  // always set it; absence identifies a legacy source during rolling upgrade.
+  optional string worker_id = 7;
 }
 
 message GetArtifactManifestHeaderRequest {
@@ -482,6 +499,19 @@ message PublishMetadataRequest {
   // Differentiates multiple replicas with identical SourceIdentity.
   // If empty, the server rejects the request.
   string worker_id = 3;
+
+  // Kubernetes pod name of the calling worker, set via the downward API.
+  // Used with pod_uid and pod_namespace to set an ownerReference on the
+  // ModelMetadata CR so K8s garbage-collects it when the pod is deleted.
+  string pod_name = 4;
+
+  // Kubernetes pod UID of the calling worker, set via the downward API.
+  string pod_uid = 5;
+
+  // Kubernetes namespace of the calling worker, set via the downward API.
+  // Owner references are only valid when this matches the ModelMetadata
+  // namespace. Empty means no ownerReference is set.
+  string pod_namespace = 6;
 }
 
 message PublishMetadataResponse {
@@ -512,6 +542,12 @@ message SourceInstanceRef {
   // Global rank of this worker within the instance.
   // Clients filter on this field to find a peer with a matching rank.
   uint32 worker_rank = 4;
+
+  // Runtime accelerator family for compatibility filtering (e.g. "cuda").
+  // Lets clients drop incompatible sources before GetMetadata and before
+  // the retry-cap slice. Empty means unknown (treated as compatible for
+  // rolling upgrades and sources that predate this field).
+  string accelerator = 5;
 }
 
 message ListSourcesRequest {

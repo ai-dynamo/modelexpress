@@ -120,6 +120,7 @@ def publish_metadata_and_ready(
     device_id: int,
     identity: "p2p_pb2.SourceIdentity",
     worker_id: str,
+    accelerator: str = "cuda",
 ) -> None:
     """Prepare tensor metadata publication and start the publisher thread."""
     logger.info(
@@ -149,6 +150,8 @@ def publish_metadata_and_ready(
             metadata_endpoint=f"{host}:{nixl_manager._listen_port}",
             agent_name=nixl_manager.agent_name,
             worker_rank=worker_rank,
+            accelerator=accelerator,
+            worker_id=worker_id,
         )
         actual_port = grpc_server.start()
         _worker_servers[device_id] = grpc_server
@@ -158,6 +161,7 @@ def publish_metadata_and_ready(
             metadata_endpoint=f"{host}:{nixl_manager._listen_port}",
             agent_name=nixl_manager.agent_name,
             worker_grpc_endpoint=f"{host}:{actual_port}",
+            accelerator=accelerator,
         )
 
         def publish_fn() -> str:
@@ -180,10 +184,17 @@ def publish_metadata_and_ready(
                 _worker_servers.pop(device_id, None)
             grpc_server.stop()
     else:
+        # Dual-write the legacy `tensors` field alongside `tensor_source`.
+        # Server builds predating the `tensor_source` oneof read only
+        # `tensors`; without it they store 0 tensors and targets fall back to
+        # disk. The server does the same dual-write on its WorkerRecord ->
+        # WorkerMetadata round-trip.
         worker = p2p_pb2.WorkerMetadata(
             worker_rank=worker_rank,
             nixl_metadata=nixl_manager.nixl_metadata,
+            tensors=tensor_protos,
             tensor_source=tensor_source_metadata(tensor_protos),
+            accelerator=accelerator,
         )
 
         def publish_fn() -> str:

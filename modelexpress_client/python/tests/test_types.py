@@ -6,6 +6,7 @@
 import re
 
 from google.protobuf import __version__ as _pb_version
+from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 
 from modelexpress import p2p_pb2
 from modelexpress.metadata.payload import (
@@ -35,6 +36,54 @@ class TestProtobufCompatibility:
             f"--python_out=modelexpress --grpc_python_out=modelexpress "
             f"../../modelexpress_common/proto/p2p.proto"
         )
+
+    def test_publish_request_is_readable_by_0_4_schema(self):
+        legacy_file = descriptor_pb2.FileDescriptorProto(
+            name="modelexpress_0_4_publish_metadata.proto",
+            package="model_express.p2p.compat_0_4",
+            dependency=[p2p_pb2.DESCRIPTOR.name],
+            syntax="proto3",
+        )
+        request = legacy_file.message_type.add(name="PublishMetadataRequest")
+        for name, number, type_name in (
+            ("identity", 1, ".model_express.p2p.SourceIdentity"),
+            ("worker", 2, ".model_express.p2p.WorkerMetadata"),
+        ):
+            request.field.add(
+                name=name,
+                number=number,
+                label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
+                type=descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE,
+                type_name=type_name,
+            )
+        request.field.add(
+            name="worker_id",
+            number=3,
+            label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
+            type=descriptor_pb2.FieldDescriptorProto.TYPE_STRING,
+        )
+
+        pool = descriptor_pool.Default()
+        pool.Add(legacy_file)
+        legacy_request = message_factory.GetMessageClass(
+            pool.FindMessageTypeByName(
+                "model_express.p2p.compat_0_4.PublishMetadataRequest"
+            )
+        )()
+        current_request = p2p_pb2.PublishMetadataRequest(
+            identity=p2p_pb2.SourceIdentity(model_name="model"),
+            worker=p2p_pb2.WorkerMetadata(worker_rank=1),
+            worker_id="worker",
+            pod_name="source-0",
+            pod_uid="pod-uid",
+            pod_namespace="default",
+        )
+
+        legacy_request.ParseFromString(current_request.SerializeToString())
+
+        assert legacy_request.identity.model_name == "model"
+        assert legacy_request.worker.worker_rank == 1
+        assert legacy_request.worker_id == "worker"
 
 
 class TestTensorDescriptor:

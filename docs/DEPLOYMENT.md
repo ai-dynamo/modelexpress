@@ -105,6 +105,33 @@ reachable.
 
 To use the Kubernetes backend, apply `examples/crds.yaml` at cluster install time (installs both the `ModelMetadata` P2P CRD and the `ModelCacheEntry` registry CRD), then either enable `serviceAccount.rbac.enabled=true` on the Helm chart or apply `examples/p2p_transfer_k8s/server/kubernetes_backend/rbac-modelmetadata.yaml`.
 
+For automatic cleanup of P2P metadata, expose the client Pod identity through
+the Kubernetes Downward API. The checked-in vLLM, SGLang, and Dynamo manifests
+already include these fields:
+
+```yaml
+env:
+  - name: POD_NAME
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.name
+  - name: POD_UID
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.uid
+  - name: POD_NAMESPACE
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.namespace
+```
+
+With the Kubernetes metadata backend, a complete same-namespace identity makes
+the Pod the owner of every weight or artifact `ModelMetadata` CR it publishes.
+Kubernetes then garbage-collects those records when the Pod is deleted. Missing,
+partial, or cross-namespace identity does not block publication; ModelExpress
+omits the owner reference and retains the previous reaper-based lifecycle. Redis
+and non-Kubernetes deployments ignore these fields.
+
 #### Storage access modes
 
 MX has one configurable filesystem path, the model weights cache (`MODEL_EXPRESS_CACHE_DIRECTORY`, default `./cache`). Its access-mode requirement depends on deployment topology, not on MX itself:
@@ -409,6 +436,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""`/`server`/`redis`/`kubernetes` (central server), `k8s-service` (decentralized via K8s Service routing), or `dht`/`kademlia` (decentralized via Kademlia DHT). |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Client's gRPC server address (recommended; ignored when client uses `k8s-service` backend) |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated, pending removal in a future release. Still read by all client paths and takes precedence when both are set; keep setting it during the transition. |
+| `MX_DISABLE_PATCHES` | `0` | Emergency escape hatch that skips all runtime compatibility patches. Set to `1`, `true`, `yes`, or `on` if a patch is incompatible with the installed engine. |
 | `MX_P2P_SOURCE_SELECTOR` | `random` | P2P source-ordering policy for the RDMA load path. `random` (behavior-preserving default; local-RNG shuffle) or `rendezvous_hash` (stateless deterministic spreading via HRW hashing; stable across restarts and minimally disrupted by source-set changes). Unknown values log a warning and fall back to `random`. Ordering only — the `MAX_SOURCE_RETRIES=3` retry budget is unchanged. |
 | `MX_METRICS_ENABLED` | `0` | Opt-in Prometheus metrics collector for the client. `1` enables the collectors (requires the `metrics` extra, `prometheus-client`). The P2P source-selection group (`mx_p2p_*`) ships today; the collector is generic so other client metrics can be added later. Off by default; selection signals are always emitted as structured logs regardless. |
 | `MX_METRICS_PORT` | (unset) | With metrics enabled, serve a pull `/metrics` endpoint on this port. |
@@ -425,10 +453,10 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
 | `MX_WORKER_GRPC_PORT` | `6555` | Base worker gRPC port for P2P tensor and artifact manifest serving |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
-| `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. Requires the P2P metadata path; if `MX_P2P_METADATA=0`, the loader logs a warning and skips artifact transfer. |
+| `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. The SGLang NIXL loader uses the same artifact path for compatible torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer caches. Requires the P2P metadata path; if `MX_P2P_METADATA=0`, the loader logs a warning and skips artifact transfer. |
 | `MX_ARTIFACT_TRANSFER_CHUNK_SIZE` | `67108864` | Artifact transfer chunk size in bytes. Default is 64 MiB; maximum is 4 GiB. Larger values reduce manifest/RPC overhead but increase registered DRAM buffer memory, approximately `chunk_size * max_inflight_chunks` per source and target worker. |
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles. |
-| `MX_ARTIFACT_READY_URL` | `http://127.0.0.1:8000/health` | Readiness endpoint polled before source workers prepare and publish cache artifact bundles. Kubernetes StatefulSet vLLM worker pods using the default localhost URL infer pod-0's stable DNS endpoint. |
+| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before source workers prepare and publish cache artifact bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. Kubernetes StatefulSet workers using their framework's default localhost URL infer pod-0's stable DNS endpoint. |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication before giving up. |
 | `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact HF commit SHA / checkpoint version so `mx_source_id` is content-addressed. Required for decentralized backends where no central coordinator tracks versions. |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend. `{rank}` is substituted with the worker's own rank. If the resolved pattern has no `:port`, the client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` (multi-GPU-per-pod shape); if it has an explicit port, that port is used verbatim (1-GPU-per-pod shape). |
@@ -537,7 +565,13 @@ P2P metadata exchange is enabled by default. Source workers expose their own per
 
 Set `MX_METADATA_PORT` and `MX_WORKER_GRPC_PORT` to fixed ports when running in K8s (port 0 picks an ephemeral port). Set `MX_WORKER_HOST` if the pod IP auto-detection doesn't produce a routable address.
 
-For vLLM cache artifact transfer, set `MX_ARTIFACT_TRANSFER=1` on source and target workers. The default P2P metadata path is also required; if it was disabled, set `MX_P2P_METADATA=1`. The loader installs compatible artifacts before model initialization, then schedules publisher threads after successful load. Each publisher waits for readiness before publishing local torch compile (`VLLM_CACHE_ROOT/torch_compile_cache`), Triton (`TRITON_CACHE_DIR`, or `~/.triton/cache`), DeepGEMM (`DG_JIT_CACHE_DIR`, or `VLLM_CACHE_ROOT/deep_gemm`), TileLang (`TILELANG_CACHE_DIR`, or `~/.tilelang/cache`), CuTe DSL (`CUTE_DSL_CACHE_DIR`, or `$TMPDIR/<user>/cutlass_python_cache`), and FlashInfer (`FLASHINFER_WORKSPACE_BASE/.cache/flashinfer`, or `~/.cache/flashinfer`) caches. The FlashInfer artifact also includes vLLM's persistent autotune directory from `VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR`, or `VLLM_CACHE_ROOT/flashinfer_autotune_cache` when unset; ModelExpress does not change either path. In multi-node deployments, artifact metadata records vLLM's `node_rank`, so each target node selects the corresponding source node without making the artifact worker-specific. StatefulSet non-head worker pods infer the pod-0 health endpoint when `MX_ARTIFACT_READY_URL` is unset or left at the default localhost URL. If artifact transfer is enabled while P2P metadata is disabled, the loader logs a warning and skips artifact transfer. Artifact discovery currently requires a central-coordinator backend (`redis` or `kubernetes`), and Kubernetes deployments must use the matching `ModelMetadata` CRD containing `status.worker.artifactSource.nodeRank`.
+For cache artifact transfer, set `MX_ARTIFACT_TRANSFER=1` on source and target workers. The default P2P metadata path is also required; if it was disabled, set `MX_P2P_METADATA=1`. The vLLM and SGLang NIXL loaders install compatible artifacts before model initialization, then schedule publisher threads after successful load. Each publisher waits for readiness before publishing local cache directories and waits for their file count, total size, and max mtime to settle before sealing the artifact.
+
+vLLM publishes torch compile (`VLLM_CACHE_ROOT/torch_compile_cache`), Triton (`TRITON_CACHE_DIR`, or `~/.triton/cache`), DeepGEMM (`DG_JIT_CACHE_DIR`, or `VLLM_CACHE_ROOT/deep_gemm`), TileLang (`TILELANG_CACHE_DIR`, or `~/.tilelang/cache`), CuTe DSL (`CUTE_DSL_CACHE_DIR`, or `$TMPDIR/<user>/cutlass_python_cache`), and FlashInfer (`FLASHINFER_WORKSPACE_BASE/.cache/flashinfer`, or `~/.cache/flashinfer`) caches. The FlashInfer artifact also includes vLLM's persistent autotune directory from `VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR`, or `VLLM_CACHE_ROOT/flashinfer_autotune_cache` when unset; ModelExpress does not change either path.
+
+SGLang's NIXL loader publishes torch compile (`TORCHINDUCTOR_CACHE_DIR`, or PyTorch Inductor's runtime `cache_dir()`), Triton (`TRITON_CACHE_DIR`, or `~/.triton/cache`), DeepGEMM (`SGLANG_DG_CACHE_DIR`, or `~/.cache/deep_gemm`), TileLang (`TILELANG_CACHE_DIR`, or `~/.tilelang/cache`), CuTe DSL (`CUTE_DSL_CACHE_DIR`, or `$TMPDIR/<user>/cutlass_python_cache`), and FlashInfer (`FLASHINFER_WORKSPACE_BASE/.cache/flashinfer`, or `~/.cache/flashinfer`) caches. The FlashInfer artifact also includes SGLang's persistent autotune directory from `SGLANG_CACHE_DIR/flashinfer/autotune`, or `~/.cache/sglang/flashinfer/autotune` when unset. SGLang runs that autotuner only for eligible FlashInfer MoE or FP4 backends; DeepGEMM + DeepEP does not produce an autotune cache. SGLang TransferEngine transport currently remains weight-only for ModelExpress artifact transfer because cache artifact bytes move through the NIXL artifact path.
+
+In multi-node deployments, artifact metadata records the framework `node_rank`, so each target node selects the corresponding source node without making the artifact worker-specific. StatefulSet non-head worker pods infer the pod-0 health endpoint when `MX_ARTIFACT_READY_URL` is unset or left at the default localhost URL. If artifact transfer is enabled while P2P metadata is disabled, the loader logs a warning and skips artifact transfer. Artifact discovery currently requires a central-coordinator backend (`redis` or `kubernetes`), and Kubernetes deployments must use the matching `ModelMetadata` CRD containing `status.worker.artifactSource.nodeRank`.
 
 Cache artifacts may contain executable code. Transfer checksums detect corruption
 but do not authenticate the publishing replica or attest the artifact. Enable
