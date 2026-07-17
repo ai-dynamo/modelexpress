@@ -29,11 +29,16 @@ logger = logging.getLogger("modelexpress.runtime_load")
 # Metrics already expressed as a [0, 1] utilization ratio, in priority order.
 # vLLM: fraction of KV-cache blocks in use (renamed kv_cache_usage_perc in
 # v0.17; gpu_cache_usage_perc on older builds). SGLang: token/KV usage fraction.
+# dynamo_component_gpu_cache_usage_percent is Dynamo's runtime-agnostic re-export
+# of the same GPU KV-cache usage (0.0-1.0); kept last so engine-specific gauges
+# still win on vLLM/SGLang and this only resolves a signal where they are absent
+# (e.g. TRT-LLM behind a Dynamo runtime).
 _RATIO_METRICS = (
     "vllm:kv_cache_usage_perc",
     "vllm:gpu_cache_usage_perc",
     "sglang:token_usage",
     "sglang:cache_usage",
+    "dynamo_component_gpu_cache_usage_percent",
 )
 
 

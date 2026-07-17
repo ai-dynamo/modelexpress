@@ -28,6 +28,17 @@ vllm:gpu_cache_usage_perc{gpu="0"} 0.3
 vllm:gpu_cache_usage_perc{gpu="1"} 0.8
 """
 
+# Dynamo's runtime-agnostic re-export of GPU KV-cache usage. TRT-LLM behind a
+# Dynamo runtime exposes this but no vllm:/sglang: gauge.
+_DYNAMO = """
+dynamo_component_gpu_cache_usage_percent{dynamo_component="backend",dp_rank="0"} 0.55
+"""
+
+_DYNAMO_AND_VLLM = """
+vllm:kv_cache_usage_perc{model="Qwen"} 0.73
+dynamo_component_gpu_cache_usage_percent{dp_rank="0"} 0.55
+"""
+
 
 def test_scrape_gauge_with_labels():
     assert _scrape_gauge(_VLLM, "vllm:gpu_cache_usage_perc") == 0.62
@@ -59,6 +70,19 @@ def test_provider_reads_vllm_017_kv_cache_usage():
 def test_provider_reads_sglang_when_vllm_absent():
     p = RuntimeLoadProvider("http://x/metrics", _fetch=lambda u, t: _SGLANG)
     assert abs(p.sample() - 0.41) < 1e-9
+
+
+def test_provider_reads_dynamo_gauge_when_engine_absent():
+    # TRT-LLM behind a Dynamo runtime: no vllm:/sglang: gauge, fall back to Dynamo's.
+    p = RuntimeLoadProvider("http://x/metrics", _fetch=lambda u, t: _DYNAMO)
+    assert abs(p.sample() - 0.55) < 1e-9
+
+
+def test_engine_gauge_wins_over_dynamo_fallback():
+    # When both are present the higher-priority engine gauge is used, so adding the
+    # Dynamo fallback does not change behavior on vLLM/SGLang deployments.
+    p = RuntimeLoadProvider("http://x/metrics", _fetch=lambda u, t: _DYNAMO_AND_VLLM)
+    assert abs(p.sample() - 0.73) < 1e-9
 
 
 def test_provider_unreachable_returns_zero():
