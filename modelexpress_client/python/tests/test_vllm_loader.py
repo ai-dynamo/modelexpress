@@ -1260,11 +1260,14 @@ class TestRdmaStrategyLoad:
         self,
         mock_accelerator_backend_cls,
     ):
+        # An unproven cross-family pair (xpu target, rocm source) is skipped
+        # even for weights; only cuda<->xpu is enabled for heterogeneous
+        # weight transfer.
         ctx = _make_load_context(
             accelerator_backend=mock_accelerator_backend_cls(name="xpu"),
         )
         source_resp = _make_metadata_resp(rank=0, worker_id="w-1")
-        source_resp.worker.accelerator = "cuda"
+        source_resp.worker.accelerator = "rocm"
         candidates = [_make_instance_ref(worker_id="w-1")]
         strategy, attempts = self._setup(ctx, candidates, [source_resp])
 

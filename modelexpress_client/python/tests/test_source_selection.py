@@ -260,6 +260,51 @@ def test_find_source_instances_empty_accelerator_is_compatible():
     assert {c.worker_id for c in out} == {"legacy"}
 
 
+def test_find_source_instances_accepts_xpu_source_for_cuda_weights():
+    # Heterogeneous weight transfer: a cuda target may pull xpu weights.
+    instances = [
+        _ref("s0aaaaaaaaaaaaaa", "xpu-src", accelerator="xpu"),
+        _ref("s1aaaaaaaaaaaaaa", "rocm-src", accelerator="rocm"),
+    ]
+    ctx = _rdma_ctx(instances)
+    ctx.identity = p2p_pb2.SourceIdentity(
+        model_name="m", mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS
+    )
+    ctx.accelerator_backend.name = "cuda"
+    out = RdmaStrategy()._find_source_instances(ctx)
+    assert {c.worker_id for c in out} == {"xpu-src"}
+
+
+def test_find_source_instances_accepts_cuda_source_for_xpu_weights():
+    # Heterogeneous weight transfer is symmetric: an xpu target pulls cuda.
+    instances = [
+        _ref("s0aaaaaaaaaaaaaa", "cuda-src", accelerator="cuda"),
+        _ref("s1aaaaaaaaaaaaaa", "rocm-src", accelerator="rocm"),
+    ]
+    ctx = _rdma_ctx(instances)
+    ctx.identity = p2p_pb2.SourceIdentity(
+        model_name="m", mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS
+    )
+    ctx.accelerator_backend.name = "xpu"
+    out = RdmaStrategy()._find_source_instances(ctx)
+    assert {c.worker_id for c in out} == {"cuda-src"}
+
+
+def test_find_source_instances_rejects_cross_family_for_non_weight_source():
+    # Non-weight source types (e.g. CUDA graph artifacts) stay strict
+    # same-family even for the cuda/xpu pair.
+    instances = [
+        _ref("s0aaaaaaaaaaaaaa", "xpu-src", accelerator="xpu"),
+    ]
+    ctx = _rdma_ctx(instances)
+    ctx.identity = p2p_pb2.SourceIdentity(
+        model_name="m", mx_source_type=p2p_pb2.MX_SOURCE_TYPE_CUDA_GRAPH
+    )
+    ctx.accelerator_backend.name = "cuda"
+    out = RdmaStrategy()._find_source_instances(ctx)
+    assert out == []
+
+
 def test_find_source_instances_unknown_target_accepts_all():
     # Empty target accelerator (unknown) accepts every source regardless of
     # the source's published accelerator.

@@ -239,7 +239,11 @@ class RdmaStrategy(LoadStrategy):
             target_accelerator = ctx.accelerator_backend.name
             candidates = [
                 inst for inst in rank_matched
-                if accelerators_compatible(target_accelerator, inst.accelerator)
+                if accelerators_compatible(
+                    target_accelerator,
+                    inst.accelerator,
+                    mx_source_type=ctx.identity.mx_source_type,
+                )
             ]
 
             selector = get_configured_selector()
@@ -293,7 +297,11 @@ class RdmaStrategy(LoadStrategy):
         """
         target_accelerator = ctx.accelerator_backend.name
         source_accelerator = source_worker.accelerator
-        if accelerators_compatible(target_accelerator, source_accelerator):
+        if accelerators_compatible(
+            target_accelerator,
+            source_accelerator,
+            mx_source_type=ctx.identity.mx_source_type,
+        ):
             return True
 
         logger.info(
