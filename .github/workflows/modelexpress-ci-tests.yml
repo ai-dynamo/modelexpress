@@ -1076,10 +1076,9 @@ jobs:
   # Covers direct streaming and fallback to the default loader.
   # IRSA provides S3 access; first run uploads safetensors to the bucket.
   #
-  # Matrix over inference engine frameworks. The composite action
-  # (run-mx-streamer-test) currently only knows how to launch vLLM; when
-  # adding a new framework, generalize the action (or add a per-framework
-  # variant) before un-commenting the matrix entry below.
+  # Matrix over inference engine frameworks. The composite action dispatches
+  # the framework-specific loader command while keeping the S3 setup,
+  # readiness, inference, and cleanup checks shared.
   # ---------------------------------------------------------------------------
   model-streamer:
     name: Model Streamer ${{ matrix.mode }} test (${{ matrix.framework }}, S3)
@@ -1097,14 +1096,12 @@ jobs:
           - framework: vllm
             mode: fallback
             test_model_streamer_fallback: 'true'
-          # sglang — blocked on the SGLang streamer path crashing inside
-          # ModelStreamerStrategy.load on `ctx.model_config.model` (a
-          # vLLM-specific attribute). See the workflow header comment.
-          # The composite action also needs to grow a framework-aware
-          # launch command (currently hardcodes
-          # `-m vllm.entrypoints.openai.api_server`). Uncomment once both
-          # are addressed.
-          # - framework: sglang
+          - framework: sglang
+            mode: direct
+            test_model_streamer_fallback: 'false'
+          - framework: sglang
+            mode: fallback
+            test_model_streamer_fallback: 'true'
 
     steps:
       - name: Checkout
@@ -1120,6 +1117,7 @@ jobs:
       - name: Run model streamer test
         uses: ./.github/actions/run-mx-streamer-test
         with:
+          framework: ${{ matrix.framework }}
           worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
           model: ${{ env.MX_CI_MODEL }}
           s3_bucket: ${{ env.MX_CI_S3_BUCKET }}
