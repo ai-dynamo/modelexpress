@@ -141,7 +141,8 @@ impl SourceAttributesJson {
 }
 
 fn source_identity_from_attributes(attr_json: Option<&str>) -> (String, Option<SourceIdentity>) {
-    let attrs = attr_json.and_then(|value| serde_json::from_str::<SourceAttributesJson>(value).ok());
+    let attrs =
+        attr_json.and_then(|value| serde_json::from_str::<SourceAttributesJson>(value).ok());
     let model_name = attrs
         .as_ref()
         .map(|attributes| attributes.model_name.clone())
@@ -1074,7 +1075,10 @@ mod tests {
     fn test_representative_worker_rank_preserves_summary_rank() {
         let summary = r#"{"worker_rank":7,"status":2,"updated_at":1700000000000}"#;
         assert_eq!(representative_worker_rank(Some(summary), 3), 7);
-        assert_eq!(representative_summary_rank_to_update(Some(summary), 3), None);
+        assert_eq!(
+            representative_summary_rank_to_update(Some(summary), 3),
+            None
+        );
         assert_eq!(
             representative_summary_rank_to_update(Some(summary), 7),
             Some(7)
@@ -1090,8 +1094,7 @@ mod tests {
 
     #[test]
     fn test_status_filter_matches_any_rank_record() {
-        let initializing =
-            r#"{"worker_rank":0,"nixl_metadata":[],"tensors":[],"status":1}"#;
+        let initializing = r#"{"worker_rank":0,"nixl_metadata":[],"tensors":[],"status":1}"#;
         let ready = r#"{"worker_rank":1,"nixl_metadata":[],"tensors":[],"status":2}"#;
         assert!(worker_records_match_status(
             [initializing, ready],
