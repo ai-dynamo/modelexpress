@@ -702,31 +702,31 @@ mod tests {
         mock.expect_list_workers_filtered()
             .once()
             .returning(move |_, _, _, _, _, _, _| {
-            Ok(vec![
-                SourceInstanceInfo {
-                    source_id: "abc123def456abcd".to_string(),
-                    worker_id: "w1".to_string(),
-                    model_name: "my-model".to_string(),
-                    worker_rank: 0,
-                    status: SourceStatus::Ready as i32,
-                    updated_at: now,
-                    accelerator: "cuda".to_string(),
-                    training_step: Some(42),
-                    layout_signature: Some("layout-a".to_string()),
-                },
-                SourceInstanceInfo {
-                    source_id: "abc123def456abcd".to_string(),
-                    worker_id: "w2".to_string(),
-                    model_name: "my-model".to_string(),
-                    worker_rank: 1,
-                    status: SourceStatus::Ready as i32,
-                    updated_at: now,
-                    accelerator: "cuda".to_string(),
-                    training_step: Some(42),
-                    layout_signature: Some("layout-a".to_string()),
-                },
-            ])
-        });
+                Ok(vec![
+                    SourceInstanceInfo {
+                        source_id: "abc123def456abcd".to_string(),
+                        worker_id: "w1".to_string(),
+                        model_name: "my-model".to_string(),
+                        worker_rank: 0,
+                        status: SourceStatus::Ready as i32,
+                        updated_at: now,
+                        accelerator: "cuda".to_string(),
+                        training_step: Some(42),
+                        layout_signature: Some("layout-a".to_string()),
+                    },
+                    SourceInstanceInfo {
+                        source_id: "abc123def456abcd".to_string(),
+                        worker_id: "w2".to_string(),
+                        model_name: "my-model".to_string(),
+                        worker_rank: 1,
+                        status: SourceStatus::Ready as i32,
+                        updated_at: now,
+                        accelerator: "cuda".to_string(),
+                        training_step: Some(42),
+                        layout_signature: Some("layout-a".to_string()),
+                    },
+                ])
+            });
 
         let svc = make_service(mock);
         let resp = svc
@@ -803,31 +803,31 @@ mod tests {
         mock.expect_list_workers_filtered()
             .once()
             .returning(move |_, _, _, _, _, _, _| {
-            Ok(vec![
-                SourceInstanceInfo {
-                    source_id: "abc123def456abcd".to_string(),
-                    worker_id: "fresh-worker".to_string(),
-                    model_name: "my-model".to_string(),
-                    worker_rank: 0,
-                    status: SourceStatus::Ready as i32,
-                    updated_at: now,
-                    accelerator: "cuda".to_string(),
-                    training_step: None,
-                    layout_signature: None,
-                },
-                SourceInstanceInfo {
-                    source_id: "abc123def456abcd".to_string(),
-                    worker_id: "expired-worker".to_string(),
-                    model_name: "my-model".to_string(),
-                    worker_rank: 1,
-                    status: SourceStatus::Ready as i32,
-                    updated_at: expired_updated_at,
-                    accelerator: "cuda".to_string(),
-                    training_step: None,
-                    layout_signature: None,
-                },
-            ])
-        });
+                Ok(vec![
+                    SourceInstanceInfo {
+                        source_id: "abc123def456abcd".to_string(),
+                        worker_id: "fresh-worker".to_string(),
+                        model_name: "my-model".to_string(),
+                        worker_rank: 0,
+                        status: SourceStatus::Ready as i32,
+                        updated_at: now,
+                        accelerator: "cuda".to_string(),
+                        training_step: None,
+                        layout_signature: None,
+                    },
+                    SourceInstanceInfo {
+                        source_id: "abc123def456abcd".to_string(),
+                        worker_id: "expired-worker".to_string(),
+                        model_name: "my-model".to_string(),
+                        worker_rank: 1,
+                        status: SourceStatus::Ready as i32,
+                        updated_at: expired_updated_at,
+                        accelerator: "cuda".to_string(),
+                        training_step: None,
+                        layout_signature: None,
+                    },
+                ])
+            });
 
         let svc = make_service(mock);
         let resp = svc

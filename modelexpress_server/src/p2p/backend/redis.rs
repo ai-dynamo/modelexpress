@@ -474,11 +474,7 @@ impl MetadataBackend for RedisBackend {
         let mut pipe = redis::pipe();
         pipe.hset(&worker_key, worker_record.worker_rank.to_string(), &value);
         pipe.hset(&source_key, keys::ATTRIBUTES_FIELD, &attr_json);
-        pipe.hset(
-            &source_key,
-            worker_id,
-            summary,
-        );
+        pipe.hset(&source_key, worker_id, summary);
         pipe.exec_async(&mut conn).await?;
 
         info!(
@@ -574,8 +570,7 @@ impl MetadataBackend for RedisBackend {
                 .unwrap_or_default();
             let model_name = attributes.model_name.clone();
             let training_step = super::parse_training_step(&attributes.extra_parameters);
-            let layout_signature =
-                super::parse_layout_signature(&attributes.extra_parameters);
+            let layout_signature = super::parse_layout_signature(&attributes.extra_parameters);
 
             for (iid, rank_str) in instance_map
                 .iter()
@@ -658,8 +653,7 @@ impl MetadataBackend for RedisBackend {
         for sid in &source_ids {
             source_pipe.hgetall(format!("{}{}", keys::SOURCE_PREFIX, sid));
         }
-        let source_hashes: Vec<Vec<(String, String)>> =
-            source_pipe.query_async(&mut conn).await?;
+        let source_hashes: Vec<Vec<(String, String)>> = source_pipe.query_async(&mut conn).await?;
 
         let mut legacy_selected = Vec::new();
         let mut result = Vec::new();
@@ -677,8 +671,7 @@ impl MetadataBackend for RedisBackend {
                 continue;
             }
             let training_step = super::parse_training_step(&attributes.extra_parameters);
-            let layout_signature =
-                super::parse_layout_signature(&attributes.extra_parameters);
+            let layout_signature = super::parse_layout_signature(&attributes.extra_parameters);
             if min_training_step
                 .is_some_and(|minimum| training_step.is_none_or(|step| step < minimum))
             {
@@ -698,8 +691,7 @@ impl MetadataBackend for RedisBackend {
                 }
                 if let Some(summary) = summary {
                     if status_filter.is_some_and(|required| summary.status != required as i32)
-                        || min_updated_at
-                            .is_some_and(|minimum| summary.updated_at < minimum)
+                        || min_updated_at.is_some_and(|minimum| summary.updated_at < minimum)
                     {
                         continue;
                     }
@@ -739,19 +731,11 @@ impl MetadataBackend for RedisBackend {
                 worker_pipe.query_async(&mut conn).await?;
 
             for (
-                (
-                    sid,
-                    worker_id,
-                    worker_rank,
-                    model_name,
-                    training_step,
-                    layout_signature,
-                ),
+                (sid, worker_id, worker_rank, model_name, training_step, layout_signature),
                 pairs,
             ) in legacy_selected.into_iter().zip(worker_hashes)
             {
-                let fields: std::collections::HashMap<String, String> =
-                    pairs.into_iter().collect();
+                let fields: std::collections::HashMap<String, String> = pairs.into_iter().collect();
                 if fields.is_empty() {
                     continue;
                 }
@@ -1028,10 +1012,9 @@ mod tests {
 
     #[test]
     fn test_worker_summary_defaults_legacy_accelerator() {
-        let parsed: WorkerSummaryJson = serde_json::from_str(
-            r#"{"worker_rank":0,"status":2,"updated_at":1700000000000}"#,
-        )
-        .expect("parse legacy summary");
+        let parsed: WorkerSummaryJson =
+            serde_json::from_str(r#"{"worker_rank":0,"status":2,"updated_at":1700000000000}"#)
+                .expect("parse legacy summary");
         assert!(parsed.accelerator.is_empty());
     }
 

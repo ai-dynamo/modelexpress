@@ -141,9 +141,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
                     updated_at,
                     accelerator,
                     training_step: super::parse_training_step(&source.extra_parameters),
-                    layout_signature: super::parse_layout_signature(
-                        &source.extra_parameters,
-                    ),
+                    layout_signature: super::parse_layout_signature(&source.extra_parameters),
                 });
             }
         }

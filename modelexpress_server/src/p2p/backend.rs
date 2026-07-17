@@ -77,9 +77,7 @@ pub(crate) fn parse_training_step(extra_parameters: &HashMap<String, String>) ->
         .and_then(|value| value.parse::<u64>().ok())
 }
 
-pub(crate) fn parse_layout_signature(
-    extra_parameters: &HashMap<String, String>,
-) -> Option<String> {
+pub(crate) fn parse_layout_signature(extra_parameters: &HashMap<String, String>) -> Option<String> {
     extra_parameters
         .get("layout_signature")
         .filter(|value| !value.is_empty())
@@ -449,9 +447,6 @@ mod tests {
         values.insert("layout_signature".to_string(), String::new());
         assert_eq!(parse_layout_signature(&values), None);
         values.insert("layout_signature".to_string(), "abc123".to_string());
-        assert_eq!(
-            parse_layout_signature(&values).as_deref(),
-            Some("abc123")
-        );
+        assert_eq!(parse_layout_signature(&values).as_deref(), Some("abc123"));
     }
 }
