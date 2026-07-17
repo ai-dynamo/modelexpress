@@ -1,6 +1,6 @@
 # ModelStreamer Kubernetes Examples
 
-These examples deploy vLLM with ModelExpress `--load-format modelexpress` and stream model weights from storage through RunAI ModelStreamer. They do not require a ModelExpress server, RDMA resources, or a model PVC for object storage sources. The `mx` load format is kept as a backward-compatible alias.
+These examples deploy vLLM or SGLang with a ModelExpress loader and stream model weights from storage through RunAI ModelStreamer. They do not require a ModelExpress server, RDMA resources, or a model PVC for object storage sources. The vLLM `mx` load format is kept as a backward-compatible alias.
 
 For P2P RDMA weight transfer between vLLM pods, see [`../p2p_transfer_k8s/`](../p2p_transfer_k8s/).
 
@@ -14,9 +14,19 @@ For P2P RDMA weight transfer between vLLM pods, see [`../p2p_transfer_k8s/`](../
 
 For the Azure Blob end-to-end setup, see [`client/vllm/README.md`](client/vllm/README.md).
 
+## SGLang Examples
+
+| Storage source | Manifest | Notes |
+|---|---|---|
+| Azure Blob Storage | [`client/sglang/sglang-single-node-streamer-azure.yaml`](client/sglang/sglang-single-node-streamer-azure.yaml) | Uses an `az://<container>/<model-prefix>` URI and Azure `DefaultAzureCredential`. |
+| S3 | [`client/sglang/sglang-single-node-streamer-s3.yaml`](client/sglang/sglang-single-node-streamer-s3.yaml) | Uses SGLang `remote_instance` with backend `modelexpress`; `MX_MODEL_URI` activates ModelStreamer. |
+| Local PVC | [`client/sglang/sglang-single-node-streamer-local.yaml`](client/sglang/sglang-single-node-streamer-local.yaml) | Uses a PVC-mounted Hugging Face cache or local model path. |
+
+For build and deployment instructions, see [`client/sglang/README.md`](client/sglang/README.md).
+
 ## Common Configuration
 
-All manifests use:
+The vLLM manifests use:
 
 - `--load-format modelexpress`
 - `VLLM_PLUGINS=modelexpress`
@@ -28,19 +38,22 @@ For tensor parallel deployments with TP > 1, set:
 MX_MS_DISTRIBUTED=1
 ```
 
-This enables vLLM's native distributed ModelStreamer path through the ModelExpress vLLM adapter. TP1 runs ignore this setting.
+The SGLang manifests use `remote_instance` with backend `modelexpress`, while
+`MX_MODEL_URI` selects ModelStreamer inside the shared MX strategy chain.
+
+`MX_MS_DISTRIBUTED=1` enables the engine-native distributed ModelStreamer path
+through the corresponding ModelExpress adapter. TP1 runs ignore this setting.
 
 ## Verify Startup
 
-Check the vLLM logs:
+Check the inference server logs:
 
 ```bash
-kubectl logs deployment/<deployment-name> -c vllm
+kubectl logs deployment/<deployment-name> -c <vllm-or-sglang>
 ```
 
 Expected signals:
 
-- `Registered model loader ... MxModelLoader`
 - `Trying strategy: model_streamer`
 - `Streaming weights from ...`
 - `Model streamer weight loading complete`

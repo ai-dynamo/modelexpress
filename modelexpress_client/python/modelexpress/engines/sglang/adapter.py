@@ -175,6 +175,7 @@ class SglangAdapter(EngineAdapter):
             _get_quantization_config,
             _initialize_model,
         )
+        from sglang.srt.model_loader.utils import set_default_torch_dtype
 
         old_value = result.value
         result.value = None
@@ -187,12 +188,15 @@ class SglangAdapter(EngineAdapter):
             self.get_global_rank(),
         )
         quant_config = _get_quantization_config(self.model_config, self.load_config)
-        with self.target_device:
-            model = _initialize_model(
-                self.model_config,
-                self.load_config,
-                quant_config,
-            )
+        # Match SGLang's initial load path so retry parameters use the model's
+        # configured dtype instead of PyTorch's default float32.
+        with set_default_torch_dtype(self.model_config.dtype):
+            with self.target_device:
+                model = _initialize_model(
+                    self.model_config,
+                    self.load_config,
+                    quant_config,
+                )
         return LoadResult(value=model, model=model, publishable=result.publishable)
 
     def _process_weights_after_loading(self, result: LoadResult) -> LoadResult:

@@ -4,6 +4,7 @@
 """Tests for the SGLang ModelExpress adapter and loader entrypoint."""
 
 import sys
+from contextlib import contextmanager
 from types import ModuleType
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -328,6 +329,56 @@ def test_sglang_model_streamer_requires_initialized_model(monkeypatch):
         assert "requires result.model" in str(exc)
     else:
         raise AssertionError("Expected missing model to fail")
+
+
+def test_sglang_retry_initializes_model_with_configured_dtype(monkeypatch):
+    original_dtype = torch.get_default_dtype()
+    sglang_mod = ModuleType("sglang")
+    srt_mod = ModuleType("sglang.srt")
+    model_loader_mod = ModuleType("sglang.srt.model_loader")
+    loader_mod = ModuleType("sglang.srt.model_loader.loader")
+    model_loader_utils_mod = ModuleType("sglang.srt.model_loader.utils")
+    observed_dtypes = []
+
+    @contextmanager
+    def set_default_torch_dtype(dtype):
+        previous_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(dtype)
+        try:
+            yield
+        finally:
+            torch.set_default_dtype(previous_dtype)
+
+    loader_mod._get_quantization_config = lambda *_: None
+
+    def initialize_model(*_):
+        observed_dtypes.append(torch.get_default_dtype())
+        return nn.Linear(2, 2)
+
+    loader_mod._initialize_model = initialize_model
+    model_loader_utils_mod.set_default_torch_dtype = set_default_torch_dtype
+    monkeypatch.setitem(sys.modules, "sglang", sglang_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt", srt_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.model_loader", model_loader_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.model_loader.loader", loader_mod)
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.model_loader.utils",
+        model_loader_utils_mod,
+    )
+
+    model_config = _model_config(dtype=torch.bfloat16)
+    adapter = SglangAdapter(_load_config(), model_config, _device_config())
+    result = SimpleNamespace(
+        value=nn.Linear(2, 2),
+        model=nn.Linear(2, 2),
+        publishable=True,
+    )
+
+    adapter.reinit_for_retry(result)
+
+    assert observed_dtypes == [torch.bfloat16]
+    assert torch.get_default_dtype() == original_dtype
 
 
 def test_mx_model_loader_delegates_to_shared_strategy_chain():
