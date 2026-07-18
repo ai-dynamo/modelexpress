@@ -22,6 +22,17 @@ Counter path: ``/sys/class/infiniband/<dev>/ports/<port>/counters/{port_xmit_dat
 port_rcv_data}``. Per the IB spec these are in units of 4 octets, so bytes =
 value * 4. Link capacity comes from ``.../ports/<port>/rate`` (e.g.
 ``"400 Gb/sec (4X HDR)"``).
+
+Deployment caveat: with an SR-IOV Virtual Function (the common ``rdma/ib``
+device-plugin setup in Kubernetes) the container sees only the VF, whose
+``ports/<port>/`` sysfs exposes basic attributes (rate/state/gids) but *not*
+the ``counters/`` (or ``hw_counters/``) statistics -- those live on the host
+Physical Function and are not projected into the pod. There the sampler reads a
+nonexistent path and yields ``0.0``, so this provider is inert and the runtime
+provider (``MX_P2P_RUNTIME_METRICS_URL``, vLLM/SGLang/Dynamo serving load)
+becomes the effective ``source_load`` signal. (A netlink-based reader --
+``RDMA_NLDEV_CMD_STAT_GET`` -- would recover the counter in-VF; left as a
+follow-up.)
 """
 
 from __future__ import annotations
@@ -189,8 +200,9 @@ def make_source_load_provider(device_id: int) -> Callable[[], float]:
     """Return a zero-arg provider of this source's load in ``[0, 1]``.
 
     The seam for the source-load signal. It always includes the physical
-    RDMA-NIC-utilization provider (runtime-agnostic; works on any IB/RoCE
-    cluster). When ``MX_P2P_RUNTIME_METRICS_URL`` is set, it also reads the
+    RDMA-NIC-utilization provider (runtime-agnostic; effective wherever the
+    NIC's port-counter sysfs is visible -- it no-ops to ``0.0`` on SR-IOV VF
+    pods, see the module docstring). When ``MX_P2P_RUNTIME_METRICS_URL`` is set, it also reads the
     co-located inference runtime (vLLM/SGLang serving load) and reports the
     **max** of the two -- so selection reacts to the NIC being physically hot
     *and* to an imminent serving spike the counter has not seen yet. Neither
