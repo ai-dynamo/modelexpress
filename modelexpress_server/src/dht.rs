@@ -353,16 +353,8 @@ fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
 fn addr_is_routable(addr: &Multiaddr) -> bool {
     for p in addr.iter() {
         match p {
-            Protocol::Ip4(ip) => {
-                if ip.is_loopback() || ip.is_unspecified() {
-                    return false;
-                }
-            }
-            Protocol::Ip6(ip) => {
-                if ip.is_loopback() || ip.is_unspecified() {
-                    return false;
-                }
-            }
+            Protocol::Ip4(ip) if ip.is_loopback() || ip.is_unspecified() => return false,
+            Protocol::Ip6(ip) if ip.is_loopback() || ip.is_unspecified() => return false,
             _ => {}
         }
     }
