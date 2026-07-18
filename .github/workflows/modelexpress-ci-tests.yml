@@ -59,6 +59,11 @@
 #                        manifest-azure-tp2.yaml + test_p2p_k8s.py as the
 #                        dropped test-tp single-node entry).
 #
+#   test-p2p-mla-model-sglang — SGLang counterpart of test-p2p-mla-model.
+#                        Same DeepSeek MLA + MoE model, full-GPU A100b pool,
+#                        TP=2, and VRAM parity, over the SGLang remote_instance
+#                        + NIXL path (ci/k8s/client/sgl/manifest-azure-tp2.yaml).
+#
 #   test-with-dynamo    — P2P test orchestrated through a DynamoGraphDeployment.
 #                         Matrix over serving topology (aggregated /
 #                         disaggregated). Different shape than test-p2p (DGD CR
@@ -522,6 +527,71 @@ jobs:
           extra_env: "JOB_NAME=mx-target"
           source_port: "8001"
           worker_port: "8002"
+          tp_size: "2"
+          pod_ready_timeout_seconds: "3600"
+          measure_vram: "true"
+
+      - name: Dump vCluster diagnostics on failure
+        if: failure()
+        uses: ./.github/actions/dump-vcluster-diagnostics
+        with:
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Reap vCluster port-forward
+        if: always()
+        run: |
+          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
+            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Dedicated P2P MLA/MoE model test — SGLang.
+  # SGLang counterpart of test-p2p-mla-model (vLLM). Same model
+  # (deepseek-ai/DeepSeek-V2-Lite), same full-GPU A100b pool, TP=2, fixed-small
+  # KV, and the source/target VRAM parity assertions. Gates the SGLang P2P path
+  # for a DeepSeek MLA + MoE model, whose derived w_kc/w_vc attention tensors are
+  # invisible to named_parameters() and must be captured + transferred or the
+  # target serves garbage. See TEST_PLAN row 10.
+  # ---------------------------------------------------------------------------
+  test-p2p-mla-model-sglang:
+    name: P2P MLA model test (sglang TP=2)
+    runs-on: prod-modelexpress-builder-amd-v1
+    # Full-GPU pool is required because VRAM sampling is blocked on MIG slices.
+    needs: [build-client, build-server, ensure-vcluster]
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Connect to vCluster
+        id: connect-vcluster
+        uses: ./.github/actions/connect-vcluster
+        with:
+          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
+
+      - name: Run P2P MLA model test
+        uses: ./.github/actions/run-mx-p2p-test
+        with:
+          kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
+          namespace: mx-ci-sglang-mla-${{ github.run_id }}
+          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          manifest: ci/k8s/client/sgl/manifest-azure-tp2.yaml
+          test_script: ci/k8s/client/test_p2p_k8s.py
+          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-sglang:${{ github.sha }}
+          worker_registry: nvcr.io
+          ngc_api_key: ${{ secrets.NGC_API_KEY }}
+          model: deepseek-ai/DeepSeek-V2-Lite
+          hf_token: ${{ secrets.HF_TOKEN }}
+          source_extra_env: "JOB_NAME=mx-source"
+          extra_env: "JOB_NAME=mx-target"
+          source_port: "8009"
+          worker_port: "8010"
           tp_size: "2"
           pod_ready_timeout_seconds: "3600"
           measure_vram: "true"
@@ -1156,6 +1226,7 @@ jobs:
       - ensure-vcluster
       - test-p2p
       - test-p2p-mla-model
+      - test-p2p-mla-model-sglang
       - test-tp
       - test-dp
       - test-ep
