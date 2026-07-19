@@ -140,7 +140,7 @@ def test_collect_sglang_tensors_preserves_non_contiguous_storage_names(
     model = nn.Module()
     model.weight_t = nn.Parameter(torch.randn(4, 3).T)
 
-    tensors = adapter._collect_tensors(model)
+    tensors = adapter.discover_tensors(SimpleNamespace(model=model))
 
     assert "weight_t.__storage" in tensors
     assert tensors["weight_t.__storage"].dtype == torch.uint8
@@ -157,7 +157,7 @@ def test_collect_sglang_tensors_deduplicates_tied_parameters(
     model.first = shared
     model.second = shared
 
-    tensors = adapter._collect_tensors(model)
+    tensors = adapter.discover_tensors(SimpleNamespace(model=model))
 
     assert list(tensors) == ["first"]
 
@@ -166,7 +166,7 @@ def test_collect_sglang_tensors_includes_named_buffers(
     mock_accelerator_backend_cls,
 ):
     # capture_tensor_attrs promotes bare tensor assigns (e.g. the DeepSeek MLA
-    # w_kc/w_vc) to non-persistent buffers; _collect_tensors must include
+    # w_kc/w_vc) to non-persistent buffers; discovery must include
     # named_buffers so they register on both roles and transfer via RDMA.
     backend = mock_accelerator_backend_cls(torch_device_type="cpu")
     adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
@@ -175,7 +175,7 @@ def test_collect_sglang_tensors_includes_named_buffers(
     model.weight = nn.Parameter(torch.randn(4, 3))
     model.register_buffer("w_kc", torch.randn(3, 2), persistent=False)
 
-    tensors = adapter._collect_tensors(model)
+    tensors = adapter.discover_tensors(SimpleNamespace(model=model))
 
     assert "weight" in tensors
     assert "w_kc" in tensors
@@ -187,7 +187,7 @@ def test_capture_then_collect_registers_bare_tensor_assign(
     # End-to-end of the Class H-direct fix: a bare tensor assign made under
     # capture_tensor_attrs (as the DeepSeek MLA mixin does self_attn.w_kc = t)
     # is promoted to a non-persistent buffer and then discovered by
-    # _collect_tensors' named_buffers() pass.
+    # discover_tensors' named_buffers() pass.
     from modelexpress.tensor_utils import capture_tensor_attrs
 
     backend = mock_accelerator_backend_cls(torch_device_type="cpu")
@@ -200,7 +200,7 @@ def test_capture_then_collect_registers_bare_tensor_assign(
         model.self_attn.w_kc = torch.randn(3, 2)
 
     assert "w_kc" in dict(model.self_attn.named_buffers())
-    assert "self_attn.w_kc" in adapter._collect_tensors(model)
+    assert "self_attn.w_kc" in adapter.discover_tensors(SimpleNamespace(model=model))
 
 
 def test_sglang_adapter_discovery_uses_backend_predicate(

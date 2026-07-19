@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import copy
-import itertools
 import logging
 import uuid
 from importlib.metadata import version as pkg_version
@@ -20,7 +19,10 @@ from ...adapter import EngineAdapter
 from ...accelerators import accelerator_backend_for
 from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
-from ...tensor_utils import capture_tensor_attrs
+from ...tensor_utils import (
+    capture_tensor_attrs,
+    collect_module_tensors,
+)
 
 logger = logging.getLogger("modelexpress.engines.sglang.adapter")
 
@@ -77,53 +79,20 @@ class SglangAdapter(EngineAdapter):
     def discover_tensors(self, result: LoadResult) -> dict[str, torch.Tensor]:
         if result.model is None:
             raise RuntimeError("SGLang tensor discovery requires result.model")
-        return self._collect_tensors(result.model)
-
-    def _collect_tensors(self, model) -> dict[str, torch.Tensor]:
-        """Collect SGLang model tensors for NIXL registration.
-
-        SGLang's current NIXL path registers contiguous parameters directly and
-        registers a byte view of the underlying storage for non-contiguous
-        parameters. Keep that naming behavior so source and target descriptors
-        match the upstream integration. Named buffers are collected alongside
-        parameters so tensors that capture_tensor_attrs promotes during hook
-        execution (e.g. the DeepSeek MLA w_kc/w_vc assigned directly on the
-        attention module) register on both roles and transfer.
-        """
-        backend = self.accelerator_backend
-        tensors: dict[str, torch.Tensor] = {}
-        seen_ptrs: set[int] = set()
-
-        named = itertools.chain(
-            ((name, p.data) for name, p in model.named_parameters()),
-            model.named_buffers(),
-        )
-        for name, t in named:
-            if not backend.is_accel_tensor(t):
-                continue
-            if t.is_contiguous():
-                tensor_name = name
-                registered = t
-            else:
-                tensor_name = f"{name}.__storage"
-                registered = torch.empty(0, dtype=torch.uint8, device=t.device).set_(
-                    t.untyped_storage()
-                )
-
-            ptr = registered.data_ptr()
-            if ptr in seen_ptrs:
-                continue
-            seen_ptrs.add(ptr)
-            tensors[tensor_name] = registered
-
-        return tensors
+        # adopt_hidden_tensors() would also register accelerator tensors stashed
+        # on non-Module objects (e.g. SGLang's MXFP4 FusedMoE quant_method, which
+        # holds swizzled weights after deleting the original params). It is left
+        # commented out for now: it is a no-op for DeepSeek-V2-Lite (whose derived
+        # w_kc/w_vc are direct Tensor attributes, already promoted by
+        # capture_tensor_attrs), and enabling it adds new _mx_* manifest names,
+        # i.e. a transfer-ABI change that needs a version bump to avoid mixed
+        # old/new source/target manifests plus MXFP4 + CUTLASS FP8/W4A8 smoke
+        # tests. Enable it (with those guards) when SGLang nested-object coverage
+        # is in scope.
+        # adopt_hidden_tensors(result.model, self.accelerator_backend)
+        return collect_module_tensors(result.model, self.accelerator_backend)
 
     def before_rdma_receive(self, result: LoadResult) -> LoadResult:
-        # Promote bare accelerator-tensor assigns made by the model hooks (the
-        # DeepSeek MLA mixin assigns w_kc/w_vc directly on the attention module,
-        # invisible to named_parameters()) to non-persistent buffers so they
-        # register and receive the source's derived values instead of the
-        # target's init-derived garbage.
         with capture_tensor_attrs(self.accelerator_backend):
             result = self._post_load_weights(result)
             return self._process_weights_after_loading(result)
