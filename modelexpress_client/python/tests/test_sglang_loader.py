@@ -3,6 +3,7 @@
 
 """Tests for the SGLang ModelExpress adapter and loader entrypoint."""
 
+import os
 import sys
 from contextlib import contextmanager
 from types import ModuleType
@@ -445,11 +446,19 @@ def test_mx_model_loader_delegates_to_shared_strategy_chain():
     )
 
 
-def test_mx_model_loader_nixl_path_delegates_to_shared_strategy_chain():
+@pytest.mark.parametrize(
+    ("ready_url", "health_gated"),
+    [("", False), ("http://127.0.0.1:30000/health", True)],
+)
+def test_mx_model_loader_nixl_path_delegates_to_shared_strategy_chain(
+    ready_url, health_gated
+):
+    from modelexpress.engines.sglang import loader as loader_mod
+
     model = nn.Linear(2, 2)
     loader = MxModelLoader(_load_config(modelexpress_transport="nixl"))
 
-    with patch(
+    with patch.dict(os.environ, {"MX_ARTIFACT_READY_URL": ready_url}), patch(
         "modelexpress.engines.sglang.loader.LoadStrategyChain.run",
         return_value=model,
     ) as run, patch(
@@ -469,6 +478,10 @@ def test_mx_model_loader_nixl_path_delegates_to_shared_strategy_chain():
     ctx = run.call_args.args[1]
     assert ctx.adapter.__class__ is SglangAdapter
     assert ctx.identity.backend_framework == p2p_pb2.BACKEND_FRAMEWORK_SGLANG
+    if health_gated:
+        assert ctx.source_ready_fn is loader_mod._sglang_health_ready
+    else:
+        assert ctx.source_ready_fn is None
     install_artifacts.assert_called_once_with(ctx)
     schedule_artifacts.assert_called_once_with(ctx)
 
@@ -582,7 +595,13 @@ def test_transfer_engine_receive_uses_discovered_tensor_map():
     }
 
 
-def test_transfer_engine_publish_starts_non_nixl_heartbeat():
+@pytest.mark.parametrize(
+    ("ready_url", "health_gated"),
+    [("", False), ("http://127.0.0.1:30000/health", True)],
+)
+def test_transfer_engine_publish_starts_non_nixl_heartbeat(
+    ready_url, health_gated
+):
     loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
     ctx = SimpleNamespace(
         global_rank=9,
@@ -615,7 +634,7 @@ def test_transfer_engine_publish_starts_non_nixl_heartbeat():
         def start(self):
             published["heartbeat_started"] = True
 
-    with patch(
+    with patch.dict(os.environ, {"MX_ARTIFACT_READY_URL": ready_url}), patch(
         "modelexpress.engines.sglang.loader.PublisherThread",
         FakePublisher,
     ):
@@ -626,14 +645,25 @@ def test_transfer_engine_publish_starts_non_nixl_heartbeat():
         )
 
     assert published_ok
-    assert published["worker"].transfer_engine_session_id == "te-session"
-    assert published["worker"].accelerator == "cuda"
-    assert published["status"]["status"] == p2p_pb2.SOURCE_STATUS_READY
+    assert "identity" not in published
+    assert "status" not in published
     assert published["heartbeat"]["nixl_manager"] is None
+    assert callable(published["heartbeat"]["publish_fn"])
+    if health_gated:
+        assert callable(published["heartbeat"]["ready_fn"])
+    else:
+        assert published["heartbeat"]["ready_fn"] is None
     assert published["heartbeat_started"]
 
+    mx_source_id = published["heartbeat"]["publish_fn"]()
 
-def test_transfer_engine_publish_failure_is_non_fatal():
+    assert mx_source_id == "mx-source-id"
+    assert published["worker"].transfer_engine_session_id == "te-session"
+    assert published["worker"].accelerator == "cuda"
+    assert "status" not in published
+
+
+def test_transfer_engine_publish_failure_is_deferred_to_publisher():
     loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
     ctx = SimpleNamespace(
         global_rank=9,
@@ -649,11 +679,27 @@ def test_transfer_engine_publish_failure_is_non_fatal():
         ),
     )
 
-    assert not loader._publish_transfer_engine_source(
-        ctx=ctx,
-        session_id="te-session",
-        weight_info={"weight": (1000, 4, 2)},
-    )
+    scheduled = {}
+
+    class FakePublisher:
+        def __init__(self, **kwargs):
+            scheduled.update(kwargs)
+
+        def start(self):
+            pass
+
+    with patch(
+        "modelexpress.engines.sglang.loader.PublisherThread",
+        FakePublisher,
+    ):
+        assert loader._publish_transfer_engine_source(
+            ctx=ctx,
+            session_id="te-session",
+            weight_info={"weight": (1000, 4, 2)},
+        )
+
+    with pytest.raises(RuntimeError, match="metadata down"):
+        scheduled["publish_fn"]()
 
 
 # ---------------------------------------------------------------------------

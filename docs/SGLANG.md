@@ -122,6 +122,11 @@ All other ModelExpress settings are environment variables, matching vLLM:
 `MX_NIXL_BACKEND`, `MX_RDMA_NIC_PIN`, `MX_METADATA_PORT`,
 `MX_WORKER_GRPC_PORT`, and `MODEL_EXPRESS_LOG_LEVEL`.
 
+Weight-source publication waits for SGLang's health endpoint so another
+instance cannot consume weights during warmup or CUDA graph capture. Readiness
+defaults to `http://127.0.0.1:30000/health`; set `MX_ARTIFACT_READY_URL` when
+using another server port.
+
 Set `MX_ARTIFACT_TRANSFER=1` with the `nixl` transport to transfer compatible
 JIT cache artifacts before SGLang initializes the model. The source publishes
 cache artifacts after the SGLang `/health` endpoint is ready and the cache
@@ -130,9 +135,8 @@ directories have stopped changing briefly. Supported cache roots are
 `TRITON_CACHE_DIR`, `SGLANG_DG_CACHE_DIR`, `TILELANG_CACHE_DIR`,
 `CUTE_DSL_CACHE_DIR`, and `FLASHINFER_WORKSPACE_BASE`. This path requires
 `MX_P2P_METADATA=1` and a central-coordinator metadata backend (`redis` or
-`kubernetes`) for artifact discovery. Artifact readiness defaults to SGLang's
-`http://127.0.0.1:30000/health`; set `MX_ARTIFACT_READY_URL` when using another
-server port.
+`kubernetes`) for artifact discovery. Cache publication uses the same health
+endpoint as weight publication.
 
 For Mooncake TransferEngine, use the same command shape and change only the
 transport. The SGLang image must include `mooncake-transfer-engine-cuda13`.

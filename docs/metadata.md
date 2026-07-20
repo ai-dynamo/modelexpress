@@ -208,6 +208,11 @@ stateDiagram-v2
 - **STALE**: Worker is no longer available. Set by the client `atexit` handler on clean shutdown (SIGTERM), or by the server-side reaper when `updated_at` exceeds `MX_HEARTBEAT_TIMEOUT_SECS` (default 90s)
 - **Deleted**: Reaper garbage-collects stale entries after `MX_GC_TIMEOUT_SECS` (default 3600s)
 
+vLLM and SGLang weight sources wait for the framework health endpoint before
+calling `PublishMetadata`, so they are not discoverable during warmup or CUDA
+graph capture. After publication, the publisher sends the first READY update
+in the same tick.
+
 ## Backend Implementations
 
 Configured via `MX_METADATA_BACKEND` environment variable:
