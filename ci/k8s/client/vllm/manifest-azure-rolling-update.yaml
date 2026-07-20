@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Fleet scale manifest for row 20 (~15 workers, CRD + P2P metadata).
+# Fleet rolling-update manifest for row 21 (5 workers, CRD + P2P metadata).
 # Driven by run-mx-fleet-test, which applies this at replicas=1 then
-# scales the Deployment in waves (e.g. 1 → 5 → 10 → 15).
+# scales the Deployment directly from 1 → 5.
 #
 # Design choices:
 #
@@ -11,16 +11,14 @@
 #   The first replica to start finds no READY source and loads from HF;
 #   subsequent replicas discover it via mx-server and pull via NIXL.
 #
-#   No anti-affinity — the goal is to saturate a100a MIG slices, not
-#   spread replicas across hosts. Multiple workers co-locate on the same
-#   node, each consuming one MIG slice. This is what makes the scale test
-#   feasible on a pool with far fewer physical nodes than workers.
+#   No anti-affinity — the five workers may share a100a hosts because the
+#   test exercises source lifecycle and pairing, not cross-node placement.
 #
 #   NIXL over TCP — MIG slices GPU but not RDMA. Each a100a node has one
 #   IB NIC, so requesting rdma/ib: 1 per pod caps schedulable replicas to
-#   the number of physical nodes, defeating the purpose of MIG. By using
-#   TCP (NIXL_UCX_TLS=tcp) we avoid requesting the rdma/ib device and let
-#   the scheduler pack many MIG-slice pods per node. The "RDMA transfer
+#   the number of physical nodes. By using TCP
+#   (NIXL_UCX_TLS=tcp,cuda_copy) we avoid requesting the rdma/ib device and
+#   let the scheduler pack MIG-slice pods. The "RDMA transfer
 #   complete" log marker still fires — it is a code-level name, not a
 #   physical RDMA indicator.
 #
@@ -40,6 +38,12 @@ metadata:
     app: mx-fleet-worker
 spec:
   replicas: 1
+  progressDeadlineSeconds: 600
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
   selector:
     matchLabels:
       app: mx-fleet-worker
@@ -106,6 +110,13 @@ spec:
                   key: HF_TOKEN
           ports:
             - containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
           resources:
             requests:
               cpu: "4"

@@ -136,6 +136,31 @@ impl P2pStateManager {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_workers_filtered(
+        &self,
+        source_id: Option<String>,
+        status_filter: Option<modelexpress_common::grpc::p2p::SourceStatus>,
+        model_name_filter: Option<String>,
+        worker_rank_filter: Option<u32>,
+        min_training_step: Option<u64>,
+        min_updated_at: Option<i64>,
+        limit: Option<usize>,
+    ) -> MetadataResult<Vec<crate::p2p::backend::SourceInstanceInfo>> {
+        self.get_backend()
+            .await?
+            .list_workers_filtered(
+                source_id,
+                status_filter,
+                model_name_filter,
+                worker_rank_filter,
+                min_training_step,
+                min_updated_at,
+                limit,
+            )
+            .await
+    }
+
     /// Remove metadata by mx_source_id.
     pub async fn remove_metadata(&self, source_id: &str) -> MetadataResult<()> {
         self.get_backend().await?.remove_metadata(source_id).await
@@ -465,6 +490,7 @@ mod tests {
                 },
             ],
             published_at: 1234567890,
+            identity: None,
         };
 
         assert_eq!(record.model_name, "meta-llama/Llama-3.1-70B");
@@ -612,6 +638,8 @@ mod tests {
                     updated_at: 1234567890000,
                     accelerator: "cuda".to_string(),
                     source_load: 0.0,
+                    training_step: None,
+                    layout_signature: None,
                 }])
             });
 

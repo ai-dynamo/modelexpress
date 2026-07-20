@@ -37,6 +37,17 @@ mod keys {
     pub const ATTRIBUTES_FIELD: &str = "__attributes__";
 }
 
+const REMOVE_WORKER_LUA: &str = r#"
+redis.call('DEL', KEYS[1])
+redis.call('HDEL', KEYS[2], ARGV[1])
+
+local remaining = redis.call('HLEN', KEYS[2])
+if remaining == 0 or (remaining == 1 and redis.call('HEXISTS', KEYS[2], ARGV[2]) == 1) then
+    redis.call('DEL', KEYS[2])
+end
+return remaining
+"#;
+
 /// All fields of a SourceIdentity stored once per source in the index hash.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct SourceAttributesJson {
@@ -57,6 +68,12 @@ struct SourceAttributesJson {
     pub dtype: String,
     #[serde(default)]
     pub quantization: String,
+    /// Framework-specific config from `SourceIdentity.extra_parameters`.
+    /// Required by v2 RL clients (NemoRL `update_weights_via_mx`) that stash
+    /// version, role, shape registry, etc. here. Older records (pre-v2)
+    /// deserialize to an empty map via `#[serde(default)]`.
+    #[serde(default)]
+    pub extra_parameters: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub revision: String,
     #[serde(default)]
@@ -85,6 +102,7 @@ impl From<&SourceIdentity> for SourceAttributesJson {
             expert_parallel_size: id.expert_parallel_size,
             dtype: id.dtype.clone(),
             quantization: id.quantization.clone(),
+            extra_parameters: id.extra_parameters.clone(),
             revision: id.revision.clone(),
             backend_framework_version: id.backend_framework_version.clone(),
             torch_version: id.torch_version.clone(),
@@ -94,6 +112,70 @@ impl From<&SourceIdentity> for SourceAttributesJson {
             compile_config_digest: id.compile_config_digest.clone(),
         }
     }
+}
+
+impl SourceAttributesJson {
+    /// Round-trip back to a SourceIdentity proto. Used by GetMetadata to
+    /// populate ``GetMetadataResponse.identity``.
+    fn to_source_identity(&self) -> SourceIdentity {
+        SourceIdentity {
+            mx_version: self.mx_version.clone(),
+            mx_source_type: self.mx_source_type,
+            model_name: self.model_name.clone(),
+            backend_framework: self.backend_framework,
+            tensor_parallel_size: self.tensor_parallel_size,
+            pipeline_parallel_size: self.pipeline_parallel_size,
+            expert_parallel_size: self.expert_parallel_size,
+            dtype: self.dtype.clone(),
+            quantization: self.quantization.clone(),
+            extra_parameters: self.extra_parameters.clone(),
+            revision: self.revision.clone(),
+            backend_framework_version: self.backend_framework_version.clone(),
+            torch_version: self.torch_version.clone(),
+            cuda_version: self.cuda_version.clone(),
+            triton_version: self.triton_version.clone(),
+            gpu_arch: self.gpu_arch.clone(),
+            compile_config_digest: self.compile_config_digest.clone(),
+        }
+    }
+}
+
+fn source_identity_from_attributes(attr_json: Option<&str>) -> (String, Option<SourceIdentity>) {
+    let attrs =
+        attr_json.and_then(|value| serde_json::from_str::<SourceAttributesJson>(value).ok());
+    let model_name = attrs
+        .as_ref()
+        .map(|attributes| attributes.model_name.clone())
+        .unwrap_or_default();
+    let identity = attrs.map(|attributes| attributes.to_source_identity());
+    (model_name, identity)
+}
+
+fn representative_worker_rank(summary: Option<&str>, fallback: u32) -> u32 {
+    summary
+        .and_then(|value| {
+            value.parse().ok().or_else(|| {
+                serde_json::from_str::<WorkerSummaryJson>(value)
+                    .ok()
+                    .map(|summary| summary.worker_rank)
+            })
+        })
+        .unwrap_or(fallback)
+}
+
+fn representative_summary_rank_to_update(summary: Option<&str>, updated_rank: u32) -> Option<u32> {
+    let representative_rank = representative_worker_rank(summary, updated_rank);
+    (summary.is_none() || representative_rank == updated_rank).then_some(representative_rank)
+}
+
+fn worker_records_match_status<'a>(
+    records: impl IntoIterator<Item = &'a str>,
+    required_status: SourceStatus,
+) -> bool {
+    records.into_iter().any(|value| {
+        serde_json::from_str::<WorkerRecordJson>(value)
+            .is_ok_and(|record| record.status == required_status as i32)
+    })
 }
 
 /// Scan Redis for all keys matching `pattern`, iterating through all SCAN cursors.
@@ -247,6 +329,19 @@ struct WorkerRecordJson {
     /// Small discovery summary for file-backed artifact sources.
     #[serde(default)]
     pub artifact_source: Option<ArtifactSourceMetadataJson>,
+}
+
+/// Small worker row stored in the source hash. Legacy rows contain only the
+/// decimal worker rank; readers accept both formats.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkerSummaryJson {
+    worker_rank: u32,
+    status: i32,
+    updated_at: i64,
+    #[serde(default)]
+    accelerator: String,
+    #[serde(default)]
+    source_load: f32,
 }
 
 /// Serializable artifact source summary.
@@ -425,15 +520,18 @@ impl MetadataBackend for RedisBackend {
         let attr_json = serde_json::to_string(&SourceAttributesJson::from(identity))?;
         let json = WorkerRecordJson::from_worker_record(worker_record.clone());
         let value = serde_json::to_string(&json)?;
+        let summary = serde_json::to_string(&WorkerSummaryJson {
+            worker_rank: worker_record.worker_rank,
+            status: worker_record.status,
+            updated_at: worker_record.updated_at,
+            accelerator: worker_record.accelerator.clone(),
+            source_load: worker_record.source_load,
+        })?;
 
         let mut pipe = redis::pipe();
         pipe.hset(&worker_key, worker_record.worker_rank.to_string(), &value);
         pipe.hset(&source_key, keys::ATTRIBUTES_FIELD, &attr_json);
-        pipe.hset(
-            &source_key,
-            worker_id,
-            worker_record.worker_rank.to_string(),
-        );
+        pipe.hset(&source_key, worker_id, summary);
         pipe.exec_async(&mut conn).await?;
 
         info!(
@@ -463,13 +561,12 @@ impl MetadataBackend for RedisBackend {
             return Ok(None);
         }
 
-        // Fetch model_name from the source index key's __attributes__ field.
+        // Fetch the full SourceAttributesJson from the source index key's
+        // __attributes__ field. This carries model_name, framework knobs, and
+        // (for v2 RL clients) extra_parameters.
         let source_key = format!("{}{}", keys::SOURCE_PREFIX, source_id);
         let attr_json: Option<String> = conn.hget(&source_key, keys::ATTRIBUTES_FIELD).await?;
-        let model_name = attr_json
-            .and_then(|v| serde_json::from_str::<SourceAttributesJson>(&v).ok())
-            .map(|a| a.model_name)
-            .unwrap_or_default();
+        let (model_name, identity) = source_identity_from_attributes(attr_json.as_deref());
 
         let mut workers: Vec<WorkerRecord> = Vec::with_capacity(fields.len());
         for value in fields.values() {
@@ -491,6 +588,7 @@ impl MetadataBackend for RedisBackend {
             model_name,
             workers,
             published_at: 0,
+            identity,
         }))
     }
 
@@ -519,17 +617,23 @@ impl MetadataBackend for RedisBackend {
             let instance_map: std::collections::HashMap<String, String> =
                 conn.hgetall(&source_key).await?;
 
-            let model_name = instance_map
+            let attributes = instance_map
                 .get(keys::ATTRIBUTES_FIELD)
                 .and_then(|v| serde_json::from_str::<SourceAttributesJson>(v).ok())
-                .map(|a| a.model_name)
                 .unwrap_or_default();
+            let model_name = attributes.model_name.clone();
+            let training_step = super::parse_training_step(&attributes.extra_parameters);
+            let layout_signature = super::parse_layout_signature(&attributes.extra_parameters);
 
             for (iid, rank_str) in instance_map
                 .iter()
                 .filter(|(k, _)| k.as_str() != keys::ATTRIBUTES_FIELD)
             {
-                let worker_rank: u32 = rank_str.parse().unwrap_or(0);
+                let worker_rank: u32 = rank_str.parse().unwrap_or_else(|_| {
+                    serde_json::from_str::<WorkerSummaryJson>(rank_str)
+                        .map(|summary| summary.worker_rank)
+                        .unwrap_or(0)
+                });
                 let worker_key = format!("{}{}:{}", keys::SOURCE_PREFIX, sid, iid);
                 let fields: std::collections::HashMap<String, String> =
                     conn.hgetall(&worker_key).await?;
@@ -537,15 +641,13 @@ impl MetadataBackend for RedisBackend {
                     continue;
                 }
 
-                if let Some(required_status) = status_filter {
-                    let matches = fields.values().any(|v| {
-                        serde_json::from_str::<WorkerRecordJson>(v)
-                            .map(|j| j.status == required_status as i32)
-                            .unwrap_or(false)
-                    });
-                    if !matches {
-                        continue;
-                    }
+                if let Some(required_status) = status_filter
+                    && !worker_records_match_status(
+                        fields.values().map(String::as_str),
+                        required_status,
+                    )
+                {
+                    continue;
                 }
 
                 let (status, updated_at, accelerator, source_load) = fields
@@ -563,10 +665,182 @@ impl MetadataBackend for RedisBackend {
                     updated_at,
                     accelerator,
                     source_load,
+                    training_step,
+                    layout_signature: layout_signature.clone(),
                 });
             }
         }
 
+        Ok(result)
+    }
+
+    async fn list_workers_filtered(
+        &self,
+        source_id: Option<String>,
+        status_filter: Option<SourceStatus>,
+        model_name_filter: Option<String>,
+        worker_rank_filter: Option<u32>,
+        min_training_step: Option<u64>,
+        min_updated_at: Option<i64>,
+        limit: Option<usize>,
+    ) -> MetadataResult<Vec<super::SourceInstanceInfo>> {
+        let mut conn = self.get_conn().await?;
+        let source_ids: Vec<String> = if let Some(sid) = source_id {
+            vec![sid]
+        } else {
+            scan_keys(&mut conn, keys::SOURCE_SCAN_PATTERN)
+                .await?
+                .into_iter()
+                .map(|key| key[keys::SOURCE_PREFIX.len()..].to_string())
+                .collect()
+        };
+        if source_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // The legacy implementation paid one Redis round-trip per source and
+        // then one per worker. Pipeline both phases so discovery remains bounded
+        // even when historical training steps have left many source keys.
+        let mut source_pipe = redis::pipe();
+        for sid in &source_ids {
+            source_pipe.hgetall(format!("{}{}", keys::SOURCE_PREFIX, sid));
+        }
+        let source_hashes: Vec<Vec<(String, String)>> = source_pipe.query_async(&mut conn).await?;
+
+        let mut detailed_selected = Vec::new();
+        let mut result = Vec::new();
+        for (sid, pairs) in source_ids.iter().zip(source_hashes) {
+            let instance_map: std::collections::HashMap<String, String> =
+                pairs.into_iter().collect();
+            let attributes = instance_map
+                .get(keys::ATTRIBUTES_FIELD)
+                .and_then(|value| serde_json::from_str::<SourceAttributesJson>(value).ok())
+                .unwrap_or_default();
+            if model_name_filter
+                .as_ref()
+                .is_some_and(|model| attributes.model_name != *model)
+            {
+                continue;
+            }
+            let training_step = super::parse_training_step(&attributes.extra_parameters);
+            let layout_signature = super::parse_layout_signature(&attributes.extra_parameters);
+            if min_training_step
+                .is_some_and(|minimum| training_step.is_none_or(|step| step < minimum))
+            {
+                continue;
+            }
+            for (worker_id, rank_text) in instance_map
+                .iter()
+                .filter(|(key, _)| key.as_str() != keys::ATTRIBUTES_FIELD)
+            {
+                let summary = serde_json::from_str::<WorkerSummaryJson>(rank_text).ok();
+                let worker_rank = summary
+                    .as_ref()
+                    .map(|value| value.worker_rank)
+                    .unwrap_or_else(|| rank_text.parse().unwrap_or(0));
+                if worker_rank_filter.is_some_and(|rank| rank != worker_rank) {
+                    continue;
+                }
+                if let Some(summary) = summary {
+                    // A summary describes only the representative rank. Status
+                    // filters must inspect every rank in the worker hash.
+                    if status_filter.is_some() {
+                        detailed_selected.push((
+                            sid.clone(),
+                            worker_id.clone(),
+                            worker_rank,
+                            attributes.model_name.clone(),
+                            training_step,
+                            layout_signature.clone(),
+                        ));
+                    } else {
+                        if min_updated_at.is_some_and(|minimum| summary.updated_at < minimum) {
+                            continue;
+                        }
+                        result.push(super::SourceInstanceInfo {
+                            source_id: sid.clone(),
+                            worker_id: worker_id.clone(),
+                            model_name: attributes.model_name.clone(),
+                            worker_rank,
+                            status: summary.status,
+                            updated_at: summary.updated_at,
+                            accelerator: summary.accelerator,
+                            source_load: summary.source_load,
+                            training_step,
+                            layout_signature: layout_signature.clone(),
+                        });
+                    }
+                } else {
+                    detailed_selected.push((
+                        sid.clone(),
+                        worker_id.clone(),
+                        worker_rank,
+                        attributes.model_name.clone(),
+                        training_step,
+                        layout_signature.clone(),
+                    ));
+                }
+            }
+        }
+        if detailed_selected.is_empty() && result.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if !detailed_selected.is_empty() {
+            let mut worker_pipe = redis::pipe();
+            for (sid, worker_id, ..) in &detailed_selected {
+                worker_pipe.hgetall(format!("{}{}:{}", keys::SOURCE_PREFIX, sid, worker_id));
+            }
+            let worker_hashes: Vec<Vec<(String, String)>> =
+                worker_pipe.query_async(&mut conn).await?;
+
+            for (
+                (sid, worker_id, worker_rank, model_name, training_step, layout_signature),
+                pairs,
+            ) in detailed_selected.into_iter().zip(worker_hashes)
+            {
+                let fields: std::collections::HashMap<String, String> = pairs.into_iter().collect();
+                if fields.is_empty() {
+                    continue;
+                }
+                if status_filter.is_some_and(|required| {
+                    !worker_records_match_status(fields.values().map(String::as_str), required)
+                }) {
+                    continue;
+                }
+                let (status, updated_at, accelerator, source_load) = fields
+                    .get(&worker_rank.to_string())
+                    .and_then(|value| serde_json::from_str::<WorkerRecordJson>(value).ok())
+                    .map(|record| {
+                        (
+                            record.status,
+                            record.updated_at,
+                            record.accelerator,
+                            record.source_load,
+                        )
+                    })
+                    .unwrap_or((0, 0, String::new(), 0.0));
+                if min_updated_at.is_some_and(|minimum| updated_at < minimum) {
+                    continue;
+                }
+                result.push(super::SourceInstanceInfo {
+                    source_id: sid,
+                    worker_id,
+                    model_name,
+                    worker_rank,
+                    status,
+                    updated_at,
+                    accelerator,
+                    source_load,
+                    training_step,
+                    layout_signature,
+                });
+            }
+        }
+        result.sort_by_key(|worker| std::cmp::Reverse(worker.updated_at));
+        if let Some(limit) = limit.filter(|value| *value > 0) {
+            result.truncate(limit);
+        }
         Ok(result)
     }
 
@@ -597,10 +871,13 @@ impl MetadataBackend for RedisBackend {
         let source_key = format!("{}{}", keys::SOURCE_PREFIX, source_id);
         let worker_key = format!("{}{}:{}", keys::SOURCE_PREFIX, source_id, worker_id);
 
-        let mut pipe = redis::pipe();
-        pipe.del(&worker_key);
-        pipe.hdel(&source_key, worker_id);
-        pipe.exec_async(&mut conn).await?;
+        let _: usize = redis::Script::new(REMOVE_WORKER_LUA)
+            .key(&worker_key)
+            .key(&source_key)
+            .arg(worker_id)
+            .arg(keys::ATTRIBUTES_FIELD)
+            .invoke_async(&mut conn)
+            .await?;
 
         info!(
             "Removed worker '{}' from source_id={}",
@@ -654,7 +931,23 @@ impl MetadataBackend for RedisBackend {
         record.source_load = source_load;
 
         let updated = serde_json::to_string(&record)?;
-        conn.hset::<_, _, _, ()>(&key, &field, &updated).await?;
+        let source_key = format!("{}{}", keys::SOURCE_PREFIX, source_id);
+        let existing_summary: Option<String> = conn.hget(&source_key, worker_id).await?;
+        let mut pipe = redis::pipe();
+        pipe.hset(&key, &field, &updated);
+        if let Some(representative_rank) =
+            representative_summary_rank_to_update(existing_summary.as_deref(), worker_rank)
+        {
+            let summary = serde_json::to_string(&WorkerSummaryJson {
+                worker_rank: representative_rank,
+                status: status as i32,
+                updated_at,
+                source_load: record.source_load,
+                accelerator: record.accelerator,
+            })?;
+            pipe.hset(&source_key, worker_id, summary);
+        }
+        pipe.exec_async(&mut conn).await?;
 
         debug!(
             "Updated status for source '{}' worker '{}' rank {} -> {}",
@@ -781,6 +1074,64 @@ mod tests {
         assert_eq!(parsed.artifact_source, None);
     }
 
+    #[test]
+    fn test_worker_summary_preserves_accelerator() {
+        let summary = WorkerSummaryJson {
+            worker_rank: 3,
+            status: SourceStatus::Ready as i32,
+            updated_at: 1_700_000_000_000,
+            accelerator: "cuda".to_string(),
+            source_load: 0.5,
+        };
+        let json = serde_json::to_string(&summary).expect("serialize");
+        let parsed: WorkerSummaryJson = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.accelerator, "cuda");
+        assert_eq!(parsed.source_load, 0.5);
+    }
+
+    #[test]
+    fn test_worker_summary_defaults_legacy_accelerator() {
+        let parsed: WorkerSummaryJson =
+            serde_json::from_str(r#"{"worker_rank":0,"status":2,"updated_at":1700000000000}"#)
+                .expect("parse legacy summary");
+        assert!(parsed.accelerator.is_empty());
+    }
+
+    #[test]
+    fn test_representative_worker_rank_preserves_summary_rank() {
+        let summary = r#"{"worker_rank":7,"status":2,"updated_at":1700000000000}"#;
+        assert_eq!(representative_worker_rank(Some(summary), 3), 7);
+        assert_eq!(
+            representative_summary_rank_to_update(Some(summary), 3),
+            None
+        );
+        assert_eq!(
+            representative_summary_rank_to_update(Some(summary), 7),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn test_representative_worker_rank_supports_legacy_rank() {
+        assert_eq!(representative_worker_rank(Some("5"), 3), 5);
+        assert_eq!(representative_summary_rank_to_update(Some("5"), 3), None);
+        assert_eq!(representative_worker_rank(Some("corrupt"), 3), 3);
+    }
+
+    #[test]
+    fn test_status_filter_matches_any_rank_record() {
+        let initializing = r#"{"worker_rank":0,"nixl_metadata":[],"tensors":[],"status":1}"#;
+        let ready = r#"{"worker_rank":1,"nixl_metadata":[],"tensors":[],"status":2}"#;
+        assert!(worker_records_match_status(
+            [initializing, ready],
+            SourceStatus::Ready
+        ));
+        assert!(!worker_records_match_status(
+            [initializing],
+            SourceStatus::Ready
+        ));
+    }
+
     // ── SourceAttributesJson ────────────────────────────────────────────────
 
     fn test_identity() -> modelexpress_common::grpc::p2p::SourceIdentity {
@@ -869,5 +1220,30 @@ mod tests {
         assert_eq!(attr.expert_parallel_size, 0);
         assert_eq!(attr.dtype, "");
         assert_eq!(attr.quantization, "");
+    }
+
+    #[test]
+    fn test_missing_source_attributes_do_not_fabricate_identity() {
+        let (model_name, identity) = source_identity_from_attributes(None);
+        assert!(model_name.is_empty());
+        assert!(identity.is_none());
+    }
+
+    #[test]
+    fn test_corrupt_source_attributes_do_not_fabricate_identity() {
+        let (model_name, identity) = source_identity_from_attributes(Some("{not-json"));
+        assert!(model_name.is_empty());
+        assert!(identity.is_none());
+    }
+
+    #[test]
+    fn test_legacy_source_attributes_retain_model_name_and_identity() {
+        let (model_name, identity) =
+            source_identity_from_attributes(Some(r#"{"model_name":"legacy-model"}"#));
+        assert_eq!(model_name, "legacy-model");
+        assert_eq!(
+            identity.expect("valid legacy attributes").model_name,
+            "legacy-model"
+        );
     }
 }

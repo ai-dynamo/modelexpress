@@ -507,6 +507,11 @@ impl MetadataBackend for KubernetesBackend {
             model_name: cr.spec.model_name.clone(),
             workers,
             published_at,
+            // K8s CRD backend doesn't yet round-trip the full SourceIdentity.
+            // v2 RL clients fall back to the sidecar transport (synthetic
+            // TensorDescriptor named __mx_v2_meta__) until the CRD schema is
+            // extended; see modelexpress_client/python/modelexpress/nemo_rl_v2.py.
+            identity: None,
         }))
     }
 
@@ -606,6 +611,10 @@ impl MetadataBackend for KubernetesBackend {
                 updated_at,
                 accelerator,
                 source_load,
+                // The current CRD list shape does not round-trip
+                // SourceIdentity.extra_parameters.
+                training_step: None,
+                layout_signature: None,
             });
         }
 
