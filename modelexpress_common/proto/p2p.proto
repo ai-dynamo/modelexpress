@@ -555,8 +555,18 @@ message SourceInstanceRef {
   // rolling upgrades and sources that predate this field).
   string accelerator = 5;
 
-  // Field 6 is intentionally left for `source_load` (load-aware selection),
-  // so this feature and that one can land without a numbering collision.
+  // Timestamp of the worker's last status update (unix milliseconds).
+  // Zero means unknown for records created by older servers/backends.
+  int64 updated_at = 6;
+
+  // Training step/version lifted from SourceIdentity.extra_parameters.
+  // Presence matters: an absent value must not be interpreted as step zero.
+  optional uint64 training_step = 7;
+
+  // Stable digest of topology, tensor registry, and translation metadata.
+  // Unlike training_step this remains constant across versions and changes
+  // whenever cached layout metadata must be rebuilt.
+  optional string layout_signature = 8;
 
   // Datacenter topology domain values keyed by Grove ClusterTopology domain
   // (region/zone/datacenter/block/rack/host/numa), e.g.
@@ -565,7 +575,8 @@ message SourceInstanceRef {
   // registration. The topology_aware selector prefers sources in the narrowest
   // RDMA-fabric domain the target and source share. Empty means unknown (the
   // selector then falls back to rendezvous ordering for that source).
-  map<string, string> topology = 7;
+  // (#519 took fields 6-8; the load-aware PR's `source_load` will rebase to 10.)
+  map<string, string> topology = 9;
 }
 
 message ListSourcesRequest {
@@ -575,6 +586,17 @@ message ListSourcesRequest {
 
   // Filter by worker status. Not set = return workers in all statuses.
   optional SourceStatus status_filter = 2;
+
+  // Lightweight discovery filters. Unlike identity, these do not require the
+  // caller to know every source-identity field and can therefore be applied
+  // before fetching MB-scale worker metadata.
+  optional string model_name_filter = 3;
+  optional uint32 worker_rank_filter = 4;
+  optional uint64 min_training_step = 5;
+  optional int64 min_updated_at = 6;
+
+  // Return newest workers first and cap the response. Zero/unset means no cap.
+  optional uint32 limit = 7;
 }
 
 message ListSourcesResponse {
@@ -605,6 +627,13 @@ message GetMetadataResponse {
 
   // Echoed worker_id
   string worker_id = 4;
+
+  // Source identity (mirrors the SourceIdentity that produced mx_source_id).
+  // Required by v2 (NemoRL) clients that store framework metadata
+  // (training_step, role, shape registry, ...) in extra_parameters.
+  // Pre-v2 clients ignore this field; populating it on existing servers is
+  // backward-compatible.
+  SourceIdentity identity = 5;
 }
 
 // ============================================================================

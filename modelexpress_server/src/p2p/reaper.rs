@@ -131,6 +131,8 @@ mod tests {
                 updated_at: old_time,
                 accelerator: "cuda".into(),
                 topology: Default::default(),
+                training_step: None,
+                layout_signature: None,
             }])
         });
         mock.expect_update_status()
@@ -162,6 +164,8 @@ mod tests {
                 updated_at: very_old,
                 accelerator: "cuda".into(),
                 topology: Default::default(),
+                training_step: None,
+                layout_signature: None,
             }])
         });
         mock.expect_remove_worker()
@@ -191,6 +195,8 @@ mod tests {
                 updated_at: recent,
                 accelerator: "cuda".into(),
                 topology: Default::default(),
+                training_step: None,
+                layout_signature: None,
             }])
         });
         // No update_status or remove_worker calls expected

@@ -1,0 +1,138 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Single-node SGLang deployment with ModelExpress ModelStreamer.
+# Streams weights from Azure Blob Storage via runai-model-streamer; no model PVC.
+#
+# Prerequisites:
+#   - Model weights uploaded to Azure Blob Storage
+#   - An SGLang image with ModelExpress and ModelStreamer support
+#   - Azure credentials available to DefaultAzureCredential, for example:
+#     kubectl create secret generic azure-storage-creds \
+#       --from-literal=AZURE_STORAGE_ACCOUNT_NAME=<storage-account> \
+#       --from-literal=AZURE_CLIENT_ID=<client-id> \
+#       --from-literal=AZURE_TENANT_ID=<tenant-id> \
+#       --from-literal=AZURE_CLIENT_SECRET=<client-secret>
+#
+# The Azure identity needs at least Storage Blob Data Reader on the storage account
+# or container. For AKS workload identity, replace envFrom with the appropriate
+# serviceAccountName/annotations and keep AZURE_STORAGE_ACCOUNT_NAME available.
+#
+# For P2P RDMA serving after Azure Blob load, also set MX_SERVER_ADDRESS
+# and add RDMA resources (rdma/ib), UCX env vars. See the P2P examples under
+# examples/p2p_transfer_k8s/client/sglang/.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-sglang-azure
+  labels:
+    app: mx-sglang-azure
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8000
+      targetPort: 8000
+      name: http
+  selector:
+    app: mx-sglang-azure
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-sglang-azure
+  labels:
+    app: mx-sglang-azure
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mx-sglang-azure
+  template:
+    metadata:
+      labels:
+        app: mx-sglang-azure
+    spec:
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: sglang
+          image: <your-registry>/modelexpress-sglang:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          command:
+            - python3
+            - -m
+            - sglang.launch_server
+          env:
+            - name: MODEL_NAME
+              value: "deepseek-ai/DeepSeek-V3"
+            # Azure Blob path format: az://<container>/<model-prefix>
+            - name: MX_MODEL_URI
+              value: "az://models/models/deepseek-ai/DeepSeek-V3"
+            - name: MX_MS_DISTRIBUTED
+              value: "1"
+            - name: RUNAI_STREAMER_CONCURRENCY
+              value: "32"
+            # Optional: enable P2P serving after Azure Blob load (requires MX server + RDMA)
+            # - name: MX_SERVER_ADDRESS
+            #   value: "modelexpress-server:8001"
+          # Azure credentials for DefaultAzureCredential.
+          # For workload identity, use serviceAccountName/annotations instead.
+          envFrom:
+            - secretRef:
+                name: azure-storage-creds
+          args:
+            - --model-path
+            - $(MODEL_NAME)
+            - --served-model-name
+            - $(MODEL_NAME)
+            - --load-format
+            - remote_instance
+            - --remote-instance-weight-loader-backend
+            - modelexpress
+            - --modelexpress-config
+            - '{"transport":"nixl"}'
+            - --tp
+            - "8"
+            - --dtype
+            - bfloat16
+            - --disable-cuda-graph
+            - --disable-piecewise-cuda-graph
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8000"
+          ports:
+            - containerPort: 8000
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            timeoutSeconds: 10
+            periodSeconds: 10
+          resources:
+            limits:
+              nvidia.com/gpu: "8"
+              # Optional: uncomment for P2P RDMA serving
+              # rdma/ib: "8"
+            requests:
+              nvidia.com/gpu: "8"
+              # rdma/ib: "8"
+              memory: "200Gi"
+              cpu: "16"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret
