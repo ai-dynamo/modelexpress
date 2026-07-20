@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
-from ... import p2p_pb2
+from ... import envs, p2p_pb2
 from ...load_strategy import LoadContext, LoadStrategyChain
 from ...load_strategy.context import LoadResult
 from ...metadata.publisher import PublisherThread
@@ -22,6 +22,7 @@ from ...nixl_transfer import NixlTransferManager
 from ...source_selection import get_configured_selector
 from .adapter import build_sglang_load_context
 from .artifacts import (
+    _sglang_health_ready,
     install_sglang_cache_artifacts,
     schedule_sglang_cache_artifact_publish,
 )
@@ -91,6 +92,8 @@ class MxModelLoader:
             model_config,
             device_config,
         )
+        if envs.MX_ARTIFACT_READY_URL.strip():
+            ctx.source_ready_fn = _sglang_health_ready
         self._ctx = ctx
 
         logger.info(
@@ -354,63 +357,49 @@ class MxModelLoader:
                 ctx.worker_rank,
             )
             return False
-        try:
+        def publish_fn() -> str:
             mx_source_id = ctx.mx_client.publish_metadata(
                 ctx.identity,
                 worker,
                 ctx.worker_id,
             )
-        except Exception:
-            logger.exception(
-                "[Worker %s] TransferEngine publish_metadata failed "
-                "(worker_id=%s, worker_rank=%s)",
-                ctx.global_rank,
-                ctx.worker_id,
-                ctx.worker_rank,
-            )
-            return False
-        try:
-            ctx.mx_client.update_status(
-                mx_source_id=mx_source_id,
-                worker_id=ctx.worker_id,
-                worker_rank=ctx.worker_rank,
-                status=p2p_pb2.SOURCE_STATUS_READY,
-            )
-        except Exception:
-            logger.exception(
-                "[Worker %s] TransferEngine update_status failed "
-                "(mx_source_id=%s, worker_id=%s, worker_rank=%s)",
+            logger.info(
+                "[Worker %s] Published TransferEngine metadata to MX server "
+                "(mx_source_id=%s, worker_id=%s)",
                 ctx.global_rank,
                 mx_source_id,
                 ctx.worker_id,
-                ctx.worker_rank,
             )
-            return False
+            return mx_source_id
+
         try:
             heartbeat = PublisherThread(
                 mx_client=ctx.mx_client,
-                mx_source_id=mx_source_id,
                 worker_id=ctx.worker_id,
                 worker_rank=ctx.worker_rank,
                 nixl_manager=None,
+                publish_fn=publish_fn,
+                ready_fn=(
+                    _sglang_health_ready
+                    if envs.MX_ARTIFACT_READY_URL.strip()
+                    else None
+                ),
             )
             heartbeat.start()
             _heartbeat_threads[ctx.worker_rank] = heartbeat
         except Exception:
             logger.exception(
                 "[Worker %s] TransferEngine heartbeat startup failed "
-                "(mx_source_id=%s, worker_id=%s, worker_rank=%s)",
+                "(worker_id=%s, worker_rank=%s)",
                 ctx.global_rank,
-                mx_source_id,
                 ctx.worker_id,
                 ctx.worker_rank,
             )
             return False
         logger.info(
-            "[Worker %s] Published TransferEngine metadata to MX server "
-            "(mx_source_id=%s, worker_id=%s)",
+            "[Worker %s] Scheduled TransferEngine source publication after "
+            "engine readiness (worker_id=%s)",
             ctx.global_rank,
-            mx_source_id,
             ctx.worker_id,
         )
         return True
