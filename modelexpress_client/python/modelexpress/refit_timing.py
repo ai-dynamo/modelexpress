@@ -77,7 +77,7 @@ class RefitTimingRecorder:
         self._started_at = clock()
         self._finished_at: float | None = None
         self._stages = {name: _Stage() for name in REFIT_TIMING_STAGES}
-        self._emitted = False
+        self._emitted_payload: dict[str, Any] | None = None
 
     @contextlib.contextmanager
     def span(
@@ -216,23 +216,24 @@ class RefitTimingRecorder:
         is set to a non-``0`` value, so benchmark harnesses can reliably grep the
         per-stage record regardless of logger configuration.
         """
+        if self._emitted_payload is not None:
+            return self._emitted_payload
         self.finish()
         payload = self.as_dict()
-        if not self._emitted:
-            line = "%s %s" % (
-                MX_REFIT_TIMING_PREFIX,
-                json.dumps(
-                    payload,
-                    separators=(",", ":"),
-                    sort_keys=False,
-                    default=str,
-                ),
-            )
-            logger.info("%s", line)
-            if os.environ.get("MX_REFIT_TIMING_STDOUT", "0") != "0":
-                print(line, flush=True, file=sys.stdout)
-            self._emitted = True
-        return payload
+        line = "%s %s" % (
+            MX_REFIT_TIMING_PREFIX,
+            json.dumps(
+                payload,
+                separators=(",", ":"),
+                sort_keys=False,
+                default=str,
+            ),
+        )
+        logger.info("%s", line)
+        if os.environ.get("MX_REFIT_TIMING_STDOUT", "0") != "0":
+            print(line, flush=True, file=sys.stdout)
+        self._emitted_payload = payload
+        return self._emitted_payload
 
     @staticmethod
     def _validate_stage(stage: str) -> None:

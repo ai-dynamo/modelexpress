@@ -130,9 +130,9 @@ class MdlLoader:
     def load_weights(self, weights: list[tuple[str, torch.Tensor]]) -> None:
         mode = os.environ.get("MX_LOAD_MODE", "stock").lower()
         timing = current_refit_timing()
-        if timing is not None:
-            timing.set_cold(mode != "direct" or self._param_cache is None)
         if mode != "direct":
+            if timing is not None:
+                timing.set_cold(True)
             self._model.load_weights(weights=weights)
             return
         # H4: if the layout changed since the map was built (param-set change,
@@ -144,6 +144,8 @@ class MdlLoader:
         ):
             logger.info("[mx-mdl] layout changed since map build; forcing cold rebuild")
             self._reset_map()
+        if timing is not None:
+            timing.set_cold(self._param_cache is None)
         if self._param_cache is None:
             t0 = _time.perf_counter()
             # vLLM's stock FP8 load_weights is not re-entrant for some processed
@@ -158,17 +160,7 @@ class MdlLoader:
                 )
                 self._loaderless = True
             if not self._loaderless:
-                try:
-                    self._model.load_weights(weights=weights)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(
-                        "[mx-mdl] model.load_weights failed on cold cycle (%s: %s); "
-                        "switching to loaderless MDL apply (quant/refit-unsupported "
-                        "loader). MDL will write parameter slots in-place instead.",
-                        type(exc).__name__,
-                        str(exc)[:120],
-                    )
-                    self._loaderless = True
+                self._model.load_weights(weights=weights)
             self._check_moe_swizzle()
             self._param_cache = dict(self._model.named_parameters())
             apply_weights = (
@@ -177,10 +169,14 @@ class MdlLoader:
             self._extend_dest_map(apply_weights)
             self._layout_sig = self._layout_signature()
             if self._loaderless:
-                # load_weights didn't apply anything — do it ourselves via the
-                # dest map (same in-place writes the warm path uses).
-                self._warm_load(apply_weights)
-                self._assert_loaderless_coverage(apply_weights)
+                applied = False
+                try:
+                    self._assert_loaderless_coverage(apply_weights)
+                    self._warm_load(apply_weights)
+                    applied = True
+                finally:
+                    if not applied:
+                        self._reset_map()
             logger.info(
                 "[mx-mdl] cold-cycle %s load %.2fs; cached %d params",
                 "loaderless" if self._loaderless else "stock",
@@ -332,62 +328,58 @@ class MdlLoader:
             == int(expected_shape[mismatches[0]]) * self._tp_size
         )
 
-    def _try_write(self, hf_name: str, tensor: torch.Tensor) -> str | None:
-        """In-place write `tensor` into its mapped slot if known; return the
-        class it was written as (``direct``/``fused``/``expert``) or ``None``."""
+    def _resolve_write(
+        self, hf_name: str, tensor: torch.Tensor
+    ) -> tuple[str, torch.Tensor, torch.Tensor] | None:
+        """Resolve one source tensor to a destination and local source view."""
         d = self._fused.get(hf_name)
         if d is not None:
             dest = d
             local = self._tp_local_tensor(tensor, tuple(dest.shape))
             if local is None:
                 return None
-            dest.copy_(local, non_blocking=True)
-            return "fused"
+            return "fused", dest, local
         e = self._expert.get(hf_name)
         if e is not None:
             dest = e
             local = self._tp_local_tensor(tensor, tuple(dest.shape))
             if local is None:
                 return None
-            dest.copy_(local, non_blocking=True)
-            return "expert"
+            return "expert", dest, local
         p = self._direct.get(hf_name)
         if p is not None:
             local = self._tp_local_tensor(tensor, tuple(p.shape))
             if local is not None:
-                p.data.copy_(local, non_blocking=True)
-                return "direct"
+                return "direct", p.data, local
         return None
 
     def _warm_load(self, weights: list[tuple[str, torch.Tensor]]) -> None:
         counts = {"direct": 0, "fused": 0, "expert": 0}
         mapped_late = 0
         fallback: list[tuple[str, torch.Tensor]] = []
+        writes: list[tuple[str, torch.Tensor, torch.Tensor]] = []
         t0 = _time.perf_counter()
-        with torch.no_grad():
-            unmapped: list[tuple[str, torch.Tensor]] = []
-            for hf_name, tensor in weights:
-                cls = self._try_write(hf_name, tensor)
-                if cls is not None:
-                    counts[cls] += 1
+        unresolved: list[tuple[str, torch.Tensor]] = []
+        for hf_name, tensor in weights:
+            resolved = self._resolve_write(hf_name, tensor)
+            if resolved is None:
+                unresolved.append((hf_name, tensor))
+            else:
+                writes.append(resolved)
+
+        # Partial / subset / delta support: classify tensors not present in the
+        # cold cycle on first sight. Complete this pass before any in-place copy
+        # so an unmapped loaderless batch cannot partially modify the model.
+        if unresolved:
+            self._extend_dest_map(unresolved)
+            for hf_name, tensor in unresolved:
+                resolved = self._resolve_write(hf_name, tensor)
+                if resolved is None:
+                    fallback.append((hf_name, tensor))
                 else:
-                    unmapped.append((hf_name, tensor))
-            # Partial / subset / delta support: a tensor not present in the cold
-            # cycle (e.g. an update_weights(subset=...) scoped to new params, or a
-            # layerwise/delta update) is classified + mapped on first sight here,
-            # so it goes warm from the next cycle instead of falling back to the
-            # stock loader every time. Only truly unclassifiable tensors fall back.
-            if unmapped:
-                self._extend_dest_map(unmapped)
-                still: list[tuple[str, torch.Tensor]] = []
-                for hf_name, tensor in unmapped:
-                    cls = self._try_write(hf_name, tensor)
-                    if cls is not None:
-                        counts[cls] += 1
-                        mapped_late += 1
-                    else:
-                        still.append((hf_name, tensor))
-                fallback = still
+                    writes.append(resolved)
+                    mapped_late += 1
+
         if fallback:
             if self._loaderless:
                 raise RuntimeError(
@@ -395,8 +387,13 @@ class MdlLoader:
                     "refusing to leave stale bytes: "
                     f"{[name for name, _ in fallback[:10]]}"
                 )
-            else:
+        with torch.no_grad():
+            if fallback:
                 self._model.load_weights(weights=fallback)
+            for kind, destination, source in writes:
+                destination.copy_(source, non_blocking=True)
+                counts[kind] += 1
+
         self._cycles += 1
         logger.info(
             "[mx-mdl] warm-cycle %d: %d direct + %d fused + %d expert in %.3fs "
@@ -610,7 +607,7 @@ class MdlLoader:
             # global HF member (e.g. 768 global gate rows == 2 * 384 local
             # rows). Treating that as an exact match maps both gate and up to
             # the entire w13 slot. Always select the member half first, then
-            # let _try_write/_tp_local_tensor choose this TP rank's source
+            # let _resolve_write/_tp_local_tensor choose this TP rank's source
             # shard. The same collision occurs for block-FP8 scale rows.
             if shard in ("w1", "w3") and int(expert_data.shape[0]) % 2 == 0:
                 local_size = int(expert_data.shape[0]) // 2
@@ -650,7 +647,7 @@ class MdlLoader:
             try:
                 return int(mod._map_global_expert_id_to_local_expert_id(gid))
             except Exception:  # noqa: BLE001
-                return gid
+                return None
         return gid
 
     def _stacked_groups(self) -> tuple:
@@ -680,29 +677,38 @@ class MdlLoader:
         return tuple(groups) if groups else _STACKED_GROUPS
 
     def _layout_signature(self) -> tuple:
-        """Cheap signature that bumps when the destination map would go stale.
-
-        H4: catches param-set changes and (via ``get_expert_mapping``) static
-        expert-mapping changes. For in-place EPLB rebalances that don't change
-        the global mapping, the framework should bump ``model._mx_layout_version``
-        (or set ``MX_LOAD_LAYOUT_VERSION``) — that's the reliable signal.
-        """
+        """Describe parameter storage and expert mapping used by destinations."""
         ver = getattr(self._model, "_mx_layout_version", None)
         if ver is None:
             ver = os.environ.get("MX_LOAD_LAYOUT_VERSION", "")
-        n = sum(1 for _ in self._model.named_parameters())
-        em_hash = 0
-        if self._expert and hasattr(self._model, "get_expert_mapping"):
+        parameter_layout = tuple(
+            (
+                name,
+                id(param),
+                int(param.data_ptr()),
+                tuple(param.shape),
+                tuple(param.stride()),
+                int(param.storage_offset()),
+                str(param.dtype),
+                str(param.device),
+            )
+            for name, param in self._model.named_parameters()
+        )
+        expert_mapping: tuple = ()
+        get_expert_mapping = getattr(self._model, "get_expert_mapping", None)
+        if callable(get_expert_mapping):
             try:
-                em_hash = hash(
-                    tuple(
-                        (str(p), str(w), int(e), str(s))
-                        for p, w, e, s in self._model.get_expert_mapping()
-                    )
+                expert_mapping = tuple(
+                    (str(param), str(weight), int(expert), str(shard))
+                    for param, weight, expert, shard in get_expert_mapping()
                 )
-            except Exception:  # noqa: BLE001
-                em_hash = 0
-        return (str(ver), n, em_hash)
+            except Exception as exc:  # noqa: BLE001
+                # Some vLLM model adapters expose the method before their
+                # expert mapping is available. Parameter storage and the
+                # explicit layout version still participate in the signature;
+                # changing from unavailable to available also invalidates it.
+                expert_mapping = (("<unavailable>", type(exc).__qualname__),)
+        return str(ver), parameter_layout, expert_mapping
 
     def _check_moe_swizzle(self) -> None:
         for name, param in self._model.named_parameters():

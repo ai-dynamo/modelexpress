@@ -89,6 +89,7 @@ def test_context_helpers_and_emit_once(caplog):
                 pass
         assert current_refit_timing() is None
         first = timing.emit(logger)
+        timing.add_bytes(7)
         second = timing.emit(logger)
 
     lines = [
@@ -98,6 +99,7 @@ def test_context_helpers_and_emit_once(caplog):
     ]
     assert len(lines) == 1
     assert json.loads(lines[0].split(" ", 1)[1]) == first == second
+    assert second["bytes"] == 0
 
 
 def test_unknown_stage_and_negative_bytes_rejected():

@@ -22,6 +22,7 @@ class _LoaderlessModel(torch.nn.Module):
 
 def _load(model, monkeypatch, weights):
     monkeypatch.setenv("MX_LOAD_MODE", "direct")
+    monkeypatch.setenv("MX_FP8_LOADERLESS", "1")
     loader = MdlLoader(model)
     loader.load_weights(weights)
     return loader
@@ -236,23 +237,21 @@ def test_fp8_loaderless_env_zero_disables_guard(monkeypatch):
 
     global_weight = torch.tensor([[1, 2], [3, 4], [5, 6], [7, 8]], dtype=F8)
     global_scale = torch.tensor([[0.25], [0.5]])
-    loader = _tp_load(
-        model,
-        monkeypatch,
-        [
-            ("proj.weight", global_weight),
-            ("proj.weight_scale_inv", global_scale),
-        ],
-        tp_size=2,
-        tp_rank=0,
-        env={"MX_FP8_LOADERLESS": "0"},
-    )
+    with pytest.raises(AttributeError, match="not re-entrant"):
+        _tp_load(
+            model,
+            monkeypatch,
+            [
+                ("proj.weight", global_weight),
+                ("proj.weight_scale_inv", global_scale),
+            ],
+            tp_size=2,
+            tp_rank=0,
+            env={"MX_FP8_LOADERLESS": "0"},
+        )
 
-    # Guard disabled: stock load_weights is attempted (and fails), then the
-    # exception path switches to loaderless — still correct, just not proactive.
     assert model.load_weights_calls == 1
-    assert loader._loaderless is True
-    assert torch.equal(model.proj.weight.float(), global_weight[:2].float())
+    assert torch.count_nonzero(model.proj.weight.float()).item() == 0
 
 
 def test_fp8_tp1_not_forced_loaderless_by_default(monkeypatch):
@@ -262,19 +261,19 @@ def test_fp8_tp1_not_forced_loaderless_by_default(monkeypatch):
     model.proj.weight = _parameter((2, 2), dtype=F8)
     model.proj.weight_scale = _parameter((2, 1))
 
-    loader = _tp_load(
-        model,
-        monkeypatch,
-        [
-            ("proj.weight", torch.ones((2, 2), dtype=F8)),
-            ("proj.weight_scale_inv", torch.ones((2, 1))),
-        ],
-        tp_size=1,
-        tp_rank=0,
-    )
+    with pytest.raises(AttributeError, match="not re-entrant"):
+        _tp_load(
+            model,
+            monkeypatch,
+            [
+                ("proj.weight", torch.ones((2, 2), dtype=F8)),
+                ("proj.weight_scale_inv", torch.ones((2, 1))),
+            ],
+            tp_size=1,
+            tp_rank=0,
+        )
 
     assert model.load_weights_calls == 1
-    assert loader._loaderless is True
 
 
 def test_fp8_tp2_expert_gate_up_weight_and_scale_shards(monkeypatch):
@@ -365,3 +364,71 @@ def test_loaderless_fp8_coverage_fails_closed(monkeypatch):
 
     with pytest.raises(RuntimeError, match="uncovered local FP8/scale parameters"):
         _load(model, monkeypatch, [("proj.weight", torch.ones((2, 2), dtype=F8))])
+    assert torch.count_nonzero(model.proj.weight.float()).item() == 0
+
+
+def test_loaderless_warm_batch_preflights_before_copy(monkeypatch):
+    model = _LoaderlessModel()
+    model.proj = torch.nn.Module()
+    model.proj.weight = _parameter((2, 2), dtype=F8)
+    model.proj.weight_scale = _parameter((2, 1))
+    initial_weight = torch.ones((2, 2), dtype=F8)
+    initial_scale = torch.ones((2, 1))
+    loader = _load(
+        model,
+        monkeypatch,
+        [
+            ("proj.weight", initial_weight),
+            ("proj.weight_scale_inv", initial_scale),
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="unmapped tensor"):
+        loader.load_weights(
+            [
+                ("proj.weight", torch.full((2, 2), 5, dtype=F8)),
+                ("unknown.weight", torch.ones((1,), dtype=F8)),
+            ]
+        )
+
+    assert torch.equal(model.proj.weight.float(), initial_weight.float())
+
+
+def test_expert_id_translation_failure_does_not_use_global_id(monkeypatch):
+    model = _LoaderlessModel()
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+    mlp = torch.nn.Module()
+    model.model.layers[0].mlp = mlp
+    mlp.experts = torch.nn.Module()
+    mlp.experts.w2_weight = _parameter((1, 2, 2), dtype=F8)
+    mlp.experts.w2_weight_scale = _parameter((1, 2, 1))
+
+    def fail_expert_mapping(_gid):
+        raise RuntimeError("unknown expert")
+
+    mlp.experts._map_global_expert_id_to_local_expert_id = fail_expert_mapping
+
+    def expert_mapping():
+        prefix = "model.layers.0.mlp."
+        return [(prefix + "experts.w2_", prefix + "experts.0.down_proj.", 0, "w2")]
+
+    model.get_expert_mapping = expert_mapping
+    monkeypatch.setenv("MX_LOAD_MODE", "direct")
+    monkeypatch.setenv("MX_FP8_LOADERLESS", "1")
+    loader = MdlLoader(model)
+
+    with pytest.raises(RuntimeError, match="unmapped checkpoint tensors"):
+        loader.load_weights(
+            [
+                (
+                    "model.layers.0.mlp.experts.0.down_proj.weight",
+                    torch.ones((2, 2), dtype=F8),
+                ),
+                (
+                    "model.layers.0.mlp.experts.0.down_proj.weight_scale_inv",
+                    torch.ones((2, 1)),
+                ),
+            ]
+        )
+    assert torch.count_nonzero(mlp.experts.w2_weight.float()).item() == 0
