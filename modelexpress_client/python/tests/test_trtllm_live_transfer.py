@@ -3,11 +3,14 @@
 
 """Tests for TensorRT-LLM live-transfer catalog validation."""
 
+import logging
+
 import pytest
 import torch
 from torch import nn
 
 from modelexpress.trtllm_live_transfer import (
+    MxLiveWeightLoader,
     _canonical_named_parameters,
     _require_exact_catalog_match,
 )
@@ -55,3 +58,23 @@ def test_exact_catalog_match_is_accepted():
 def test_incomplete_catalogs_fail_closed(source, target, message):
     with pytest.raises(RuntimeError, match=message):
         _require_exact_catalog_match(source, target)
+
+
+def test_rank_log_handler_is_closed_on_failure(monkeypatch, tmp_path):
+    monkeypatch.setenv("MX_TRANSFER_LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    loader = MxLiveWeightLoader()
+    monkeypatch.setattr(
+        loader,
+        "_load_weights",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("catalog mismatch")),
+    )
+
+    with pytest.raises(RuntimeError, match="catalog mismatch"):
+        loader.load_weights("checkpoint", model=object())
+
+    rank_log = tmp_path / "rank0.log"
+    assert all(
+        getattr(handler, "baseFilename", None) != str(rank_log)
+        for handler in logging.getLogger("modelexpress").handlers
+    )

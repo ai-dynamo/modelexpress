@@ -242,15 +242,9 @@ def publish_from_worker(worker: Any) -> None:
     mx_server = envs.MODEL_EXPRESS_URL or "modelexpress-server:8001"
 
     param_tensors = {}
-    seen_data_ptrs = set()
     total_bytes = 0
-    for name, param in torch_model.named_parameters():
+    for name, param in _canonical_named_parameters(torch_model):
         if param.device.type == "cuda" and param.device.index == device_id:
-            ptr = param.data.data_ptr()
-            if ptr in seen_data_ptrs:
-                logger.debug("Skipping aliased param: %s (ptr=%x)", name, ptr)
-                continue
-            seen_data_ptrs.add(ptr)
             param_tensors[name] = param.data
             total_bytes += param.numel() * param.element_size()
 
@@ -334,6 +328,41 @@ class MxLiveWeightLoader:
         model: Any = None,
         **kwargs,
     ) -> dict[str, Any]:
+        device_id = torch.cuda.current_device()
+        try:
+            from mpi4py import MPI
+            mpi_rank = MPI.COMM_WORLD.Get_rank()
+        except Exception:
+            mpi_rank = device_id
+
+        log_dir = envs.MX_TRANSFER_LOG_DIR
+        os.makedirs(log_dir, exist_ok=True)
+        rank_log = os.path.join(log_dir, f"rank{mpi_rank}.log")
+        fh = logging.FileHandler(rank_log, mode="w")
+        fh.setLevel(logging.INFO)
+        fh.setFormatter(
+            logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
+        )
+        mx_logger = logging.getLogger("modelexpress")
+        mx_logger.addHandler(fh)
+        try:
+            return self._load_weights(
+                checkpoint_dir=checkpoint_dir,
+                mapping=mapping,
+                model=model,
+                **kwargs,
+            )
+        finally:
+            mx_logger.removeHandler(fh)
+            fh.close()
+
+    def _load_weights(
+        self,
+        checkpoint_dir: str,
+        mapping: Any = None,
+        model: Any = None,
+        **kwargs,
+    ) -> dict[str, Any]:
         from .nixl_transfer import NixlTransferManager
         from .types import TensorDescriptor
 
@@ -358,15 +387,6 @@ class MxLiveWeightLoader:
         except Exception:
             mpi_rank = device_id
 
-        # MPI workers' stdout is swallowed by TRT-LLM — write to per-rank file
-        log_dir = envs.MX_TRANSFER_LOG_DIR
-        os.makedirs(log_dir, exist_ok=True)
-        rank_log = os.path.join(log_dir, f"rank{mpi_rank}.log")
-        fh = logging.FileHandler(rank_log, mode="w")
-        fh.setLevel(logging.INFO)
-        fh.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
-        logging.getLogger("modelexpress").addHandler(fh)
-
         logger.info(
             "Live transfer: loading '%s' rank %d (GPU %d)", model_name, mpi_rank, device_id
         )
@@ -386,7 +406,7 @@ class MxLiveWeightLoader:
 
         # 2. Build name→param map from target model
         target_params = {}
-        for name, param in model.named_parameters():
+        for name, param in _canonical_named_parameters(model):
             if param.device.index == device_id:
                 target_params[name] = param.data
 
