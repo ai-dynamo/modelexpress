@@ -101,6 +101,10 @@ class MdlLoader:
         self._param_cache: dict[str, torch.Tensor] | None = None
         self._direct: dict[str, torch.Tensor] = {}
         self._fused: dict[str, torch.Tensor] = {}
+        # Pre-merged column-parallel destinations: checkpoints (e.g. GLM-4) that
+        # ship a single already-fused ``gate_up_proj`` tensor instead of separate
+        # gate/up members. name -> (dest_param_data, num_partitions).
+        self._premerged: dict[str, tuple[torch.Tensor, int]] = {}
         self._expert: dict[str, torch.Tensor] = {}
         self._moe_module_cache: dict[str, Any] = {}
         self._covered_params: set[str] = set()
@@ -222,7 +226,12 @@ class MdlLoader:
         no stock-loader safety net, so every incoming tensor and every local
         float8/scale parameter must have an explicit destination.
         """
-        mapped_names = set(self._direct) | set(self._fused) | set(self._expert)
+        mapped_names = (
+            set(self._direct)
+            | set(self._fused)
+            | set(self._premerged)
+            | set(self._expert)
+        )
         missing_inputs = [name for name, _ in weights if name not in mapped_names]
         required_params = {
             name
@@ -273,6 +282,7 @@ class MdlLoader:
         self._param_cache = None
         self._direct = {}
         self._fused = {}
+        self._premerged = {}
         self._expert = {}
         self._moe_module_cache = {}
         self._covered_params = set()
@@ -361,6 +371,15 @@ class MdlLoader:
         t0 = _time.perf_counter()
         unresolved: list[tuple[str, torch.Tensor]] = []
         for hf_name, tensor in weights:
+            pm = self._premerged.get(hf_name)
+            if pm is not None:
+                sub = self._premerged_writes(pm[0], pm[1], tensor)
+                if sub is None:
+                    unresolved.append((hf_name, tensor))
+                else:
+                    for dst_view, src_view in sub:
+                        writes.append(("fused", dst_view, src_view))
+                continue
             resolved = self._resolve_write(hf_name, tensor)
             if resolved is None:
                 unresolved.append((hf_name, tensor))
@@ -373,6 +392,16 @@ class MdlLoader:
         if unresolved:
             self._extend_dest_map(unresolved)
             for hf_name, tensor in unresolved:
+                pm = self._premerged.get(hf_name)
+                if pm is not None:
+                    sub = self._premerged_writes(pm[0], pm[1], tensor)
+                    if sub is None:
+                        fallback.append((hf_name, tensor))
+                    else:
+                        for dst_view, src_view in sub:
+                            writes.append(("fused", dst_view, src_view))
+                        mapped_late += 1
+                    continue
                 resolved = self._resolve_write(hf_name, tensor)
                 if resolved is None:
                     fallback.append((hf_name, tensor))
@@ -464,8 +493,22 @@ class MdlLoader:
                 logger.info("[mx-mdl] no expert mapping: %s", exc)
 
         stacked_groups = self._stacked_groups()
+        premerge_suffixes = self._premerge_suffixes(stacked_groups)
         groups: dict[str, list[tuple[int, str, tuple[int, ...]]]] = {}
         for hf_name in name_to_shape:
+            # Pre-merged column-parallel source (e.g. GLM-4 ships one fused
+            # ``gate_up_proj`` tensor). At TP>1 this must be split into its
+            # partitions and sharded per-rank, NOT copied as a contiguous slice
+            # (which would give rank 0 all-gate / rank 1 all-up). Detect and
+            # record before the plain-direct classification below.
+            premerged = self._premerged_destination(
+                hf_name, name_to_shape[hf_name], params, premerge_suffixes
+            )
+            if premerged is not None:
+                dest_param, parts, param_name = premerged
+                self._premerged[hf_name] = (dest_param, parts)
+                self._covered_params.add(param_name)
+                continue
             direct = self._find_param(hf_name, params)
             if direct is not None and self._tp_shape_compatible(
                 name_to_shape[hf_name],
@@ -571,6 +614,83 @@ class MdlLoader:
             out[name] = data.narrow(axis, offset, size)
             offset += size
         return out
+
+    @staticmethod
+    def _premerge_suffixes(stacked_groups: tuple) -> dict[str, int]:
+        """Fused suffixes that are single pre-merged column-parallel tensors,
+        mapped to their partition count. Only the even N-way split is safe to
+        reconstruct without extra head metadata, so restrict to gate/up-style
+        2-partition groups (uneven qkv is left to the separate-member path)."""
+        counts: dict[str, int] = {}
+        for fused_suf, _member_suf, _order in stacked_groups:
+            counts[fused_suf] = counts.get(fused_suf, 0) + 1
+        return {suf: n for suf, n in counts.items() if n == 2}
+
+    def _premerged_destination(
+        self,
+        hf_name: str,
+        src_shape: tuple[int, ...],
+        params: dict[str, torch.Tensor],
+        premerge_suffixes: dict[str, int],
+    ) -> tuple[torch.Tensor, int, str] | None:
+        """Detect a single pre-fused column-parallel source (dim0 = gate|up).
+
+        Returns ``(dest_param_data, num_partitions, dest_param_name)`` when
+        ``hf_name`` is itself a merged-column param shipped whole and this rank
+        needs a per-partition TP shard; otherwise ``None`` (falls through to the
+        normal direct/fused/expert classification, incl. the TP1 whole-copy)."""
+        if self._tp_size <= 1 or not src_shape:
+            return None
+        if not any(
+            hf_name.endswith(suf + ".weight") or (suf + ".") in hf_name
+            for suf in premerge_suffixes
+        ):
+            return None
+        found = self._find_param(hf_name, params)
+        if found is None:
+            return None
+        param_name, param = found
+        if param.ndim < 1 or len(src_shape) != param.ndim:
+            return None
+        parts = 2
+        dest0 = int(param.shape[0])
+        src0 = int(src_shape[0])
+        # Full pre-merged source: dim0 == tp * local, evenly divisible into the
+        # partitions on each rank; trailing dims must match exactly.
+        if src0 != dest0 * self._tp_size:
+            return None
+        if dest0 % parts != 0 or src0 % (parts * self._tp_size) != 0:
+            return None
+        if any(
+            int(src_shape[d]) != int(param.shape[d]) for d in range(1, param.ndim)
+        ):
+            return None
+        return param.data, parts, param_name
+
+    def _premerged_writes(
+        self, dest_param: torch.Tensor, parts: int, source: torch.Tensor
+    ) -> list[tuple[torch.Tensor, torch.Tensor]] | None:
+        """Build (dest_view, src_view) copies that place this rank's shard of a
+        pre-merged column-parallel tensor. Source dim0 holds ``parts`` equal
+        partitions ([gate; up]); each partition is column-parallel sharded, so
+        rank r receives ``partition[r*local : (r+1)*local]`` written into its
+        matching slice of the local fused destination."""
+        src0 = int(source.shape[0])
+        dst0 = int(dest_param.shape[0])
+        if src0 % parts != 0 or dst0 % parts != 0:
+            return None
+        part_src = src0 // parts
+        part_dst = dst0 // parts
+        if part_src != part_dst * self._tp_size:
+            return None
+        writes: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for p in range(parts):
+            src_view = source.narrow(
+                0, p * part_src + self._tp_rank * part_dst, part_dst
+            )
+            dst_view = dest_param.narrow(0, p * part_dst, part_dst)
+            writes.append((dst_view, src_view))
+        return writes
 
     def _resolve_expert(
         self, hf_name, hf_shape, expert_lookup, params

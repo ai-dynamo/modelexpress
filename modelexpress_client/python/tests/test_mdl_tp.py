@@ -47,6 +47,40 @@ def test_tp_shape_compatibility_requires_one_sharded_dimension():
     assert not loader._tp_shape_compatible((5, 4), (3, 4))
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+def test_premerged_glm_gate_up_is_sharded_per_member(rank):
+    """GLM checkpoints publish one [gate; up] tensor.
+
+    TP must shard gate and up independently; a contiguous split would give
+    rank 0 only gate rows and rank 1 only up rows.
+    """
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mlp = torch.nn.Module()
+            self.mlp.gate_up_proj = torch.nn.Module()
+            self.mlp.gate_up_proj.weight = torch.nn.Parameter(
+                torch.zeros(4, 2)
+            )
+
+    model = Model()
+    loader = MdlLoader(model)
+    loader._tp_size = 2
+    loader._tp_rank = rank
+    loader._param_cache = dict(model.named_parameters())
+    source = torch.arange(16).reshape(8, 2)
+    name = "mlp.gate_up_proj.weight"
+
+    loader._extend_dest_map([(name, source)])
+    loader._warm_load([(name, source)])
+
+    gate = source[rank * 2 : (rank + 1) * 2]
+    up = source[4 + rank * 2 : 4 + (rank + 1) * 2]
+    assert name in loader._premerged
+    assert torch.equal(model.mlp.gate_up_proj.weight, torch.cat((gate, up)))
+
+
 def test_mdl_reports_cold_then_warm_to_active_timing(monkeypatch):
     class Model:
         def __init__(self):
