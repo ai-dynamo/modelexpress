@@ -138,7 +138,7 @@ python -m sglang.launch_server \
   --modelexpress-config '{"transport": "nixl"}'
 ```
 
-The first replica attempts ModelStreamer when no compatible P2P source is ready. Later replicas prefer P2P RDMA from a serving peer. `MX_MODEL_URI` also accepts `gs://` and `az://` URIs, an absolute local path, or a Hugging Face model ID. `MX_MS_DISTRIBUTED=1` divides reads across CUDA tensor-parallel ranks when TP > 1 and is ignored for TP=1.
+The first replica attempts ModelStreamer when no compatible P2P source is ready. Later replicas prefer P2P RDMA from a serving peer. `MX_MODEL_URI` also accepts `gs://` and `az://` URIs or an absolute local path. `MX_MS_DISTRIBUTED=1` divides reads across CUDA tensor-parallel ranks when TP > 1 and is ignored for TP=1.
 
 Weight-source publication waits for SGLang's health endpoint so another
 instance cannot consume weights during warmup or CUDA graph capture. Readiness

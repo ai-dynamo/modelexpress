@@ -514,7 +514,7 @@ sequenceDiagram
 The `MxModelLoader` (`--load-format modelexpress`; `mx` alias) auto-detects the best loading strategy:
 
 1. **RDMA** -- If `ListSources` returns READY instances with matching rank, and the per-candidate metadata fetch confirms a compatible accelerator, receive weights from a serving peer.
-2. **ModelStreamer** -- If `MX_MODEL_URI` is set and `runai_model_streamer` is installed, pipeline safetensor reads from S3, GCS, Azure Blob Storage, Hugging Face, or a local path through a bounded CPU staging buffer into the engine.
+2. **ModelStreamer** -- If `MX_MODEL_URI` is set and `runai_model_streamer` is installed, pipeline safetensor reads from S3, GCS, Azure Blob Storage, or a local path through a bounded CPU staging buffer into the engine.
 3. **GDS** -- If no higher-priority path succeeds and GPUDirect Storage is available, load directly from local storage to GPU.
 4. **Native loader** -- Use the inference engine's host-staged POSIX I/O path as the final fallback.
 

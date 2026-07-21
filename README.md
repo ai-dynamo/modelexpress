@@ -67,7 +67,7 @@ The ModelExpress control plane discovers compatible sources through Redis, Kuber
 - **Metadata backends** — Redis, Kubernetes CRD, or decentralized Kubernetes Service routing
 - **Kubernetes** — Helm chart, CRDs/Redis for P2P, no-shared-storage support
 - **CLI** — Health, download, list, validate, clear; init-container support for pre-warming
-- **ModelStreamer integration** — Pipeline concurrent reads from S3, Azure Blob, GCS, Hugging Face, or local storage into vLLM and SGLang
+- **ModelStreamer integration** — Pipeline concurrent reads from S3, Azure Blob, GCS, or local storage into vLLM and SGLang
 - **Expanded model pull providers**: NGC catalog and Google Cloud Storage in addition to Hugging Face
 - **GDS (GPUDirect Storage)**: load model weights directly from NVMe into GPU memory, bypassing the CPU/DRAM copy path
 - **Lower NIXL registration overhead** — Opt in to allocation-level pool registration or a single VMM arena registration
@@ -190,7 +190,7 @@ vLLM 0.23.0 recognizes the load format natively; the ModelExpress Python package
 
 ### ModelStreamer on Kubernetes
 
-Set `MX_MODEL_URI` to an `s3://`, `gs://`, or `az://` URI, an absolute local path, or a Hugging Face model ID. For tensor-parallel deployments, set `MX_MS_DISTRIBUTED=1` so participating ranks divide remote reads; TP=1 ignores the setting. [ModelStreamer examples](examples/model_streamer_k8s/README.md) · [vLLM recipes](examples/model_streamer_k8s/client/vllm/README.md).
+Set `MX_MODEL_URI` to an `s3://`, `gs://`, or `az://` URI or an absolute local path. For tensor-parallel deployments, set `MX_MS_DISTRIBUTED=1` so participating ranks divide remote reads; TP=1 ignores the setting. [ModelStreamer examples](examples/model_streamer_k8s/README.md) · [vLLM recipes](examples/model_streamer_k8s/client/vllm/README.md).
 
 ### Docker
 
@@ -212,7 +212,7 @@ docker compose -f docker/docker-compose.yml up --build
 | `REDIS_URL` | (required for `redis`) | Redis connection URL. Alternatively set `MX_REDIS_HOST` + `MX_REDIS_PORT`. No localhost fallback. |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Client-side gRPC server address (P2P). Recommended. |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated, pending removal in a future release. Still read by all client paths and takes precedence when both are set; keep setting it during the transition. |
-| `MX_MODEL_URI` | (unset) | Enable ModelStreamer for an object-store URI, absolute local path, or Hugging Face model ID. |
+| `MX_MODEL_URI` | (unset) | Enable ModelStreamer for an object-store URI or absolute local path. |
 | `MX_MS_DISTRIBUTED` | `0` | Divide ModelStreamer reads across tensor-parallel ranks when TP > 1. |
 | `MX_POOL_REG` | `0` | Register each underlying CUDA allocation once instead of registering every tensor. |
 | `MX_VMM_ARENA` | `0` | Load into a CUDA VMM arena and register the used range once; alternative to `MX_POOL_REG`. |
