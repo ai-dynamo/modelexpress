@@ -144,32 +144,25 @@ The artifact-enabled run reused compatible Triton, DeepGEMM, TileLang, CuTe DSL,
 
 ## Quick Start
 
-**Requirements:** Rust 1.90+, `protoc`, Docker
+**Requirements:** vLLM 0.23.0+, the ModelExpress Python package, NIXL-compatible GPU nodes, and a reachable [metadata backend](examples/p2p_transfer_k8s/server/README.md).
 
 ```bash
 git clone https://github.com/ai-dynamo/modelexpress.git
 cd modelexpress
+python -m pip install ./modelexpress_client/python
 
-# Start a local Redis instance for metadata storage
-docker run -d --name redis -p 6379:6379 redis:8-alpine
+export MX_SERVER_ADDRESS=modelexpress-server:8001
+export MX_ARTIFACT_TRANSFER=1
 
-cargo build
-# REDIS_URL is required; the server does not fall back to localhost:6379.
-REDIS_URL=redis://localhost:6379 MX_METADATA_BACKEND=redis cargo run --bin modelexpress-server
+vllm serve deepseek-ai/DeepSeek-V4-Pro \
+  --load-format modelexpress \
+  --tensor-parallel-size 8 \
+  --trust-remote-code
 ```
 
-Server listens on `0.0.0.0:8001`. In another terminal:
+Start the first replica with weights available through local storage or `MX_MODEL_URI`. After it becomes healthy, launch the same command on another compatible node: ModelExpress discovers the serving replica and transfers its post-processed weights directly over NIXL P2P RDMA. With `MX_ARTIFACT_TRANSFER=1`, it also installs compatible JIT artifacts into the new replica's filesystem caches.
 
-```bash
-# Download a model (shared storage)
-modelexpress-cli model download meta-llama/Llama-3.3-70B-Instruct
-
-# Verify
-modelexpress-cli health
-```
-
-**Without shared storage:** use `--no-shared-storage` for gRPC streaming.  
-**Air-gapped:** with the model already in the local HF cache, `HF_HUB_OFFLINE=1 modelexpress-cli model download <model-id>` resolves it without network access.
+See the [Kubernetes P2P example](examples/p2p_transfer_k8s/README.md) for metadata-server and inference-worker manifests.
 
 ---
 
