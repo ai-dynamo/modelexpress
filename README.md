@@ -269,8 +269,6 @@ cargo bench
 
 ## Known Issues
 
-- **NIXL_ERR_REMOTE_DISCONNECT** — Source restarts invalidate rkeys. Flush Redis, redeploy.
-- **Large model gRPC stream** — May not close automatically; use client timeout.
 - **GDS loader does not scale with TP** — Each TP rank reads full checkpoint tensors and vLLM shards them afterward, so GDS/disk reads scale with TP degree. This can reduce or reverse expected GDS speedups versus the default mmap-based disk loader; TP-aware range reads are needed for a full fix. See [GDS Reads Full Checkpoint Tensors Under TP](docs/ARCHITECTURE.md#gds-reads-full-checkpoint-tensors-under-tp).
 
 ---
@@ -287,7 +285,6 @@ cargo bench
 - **Training checkpoint management**: Cache and reuse CUDA kernel compilations (torch.compile, deepGEMM) and CUDA graphs across restarts.
 - **Metrics and observability**: Cache hit rates, eviction frequency, transfer throughput, and P2P RDMA utilization via Prometheus/OpenTelemetry.
 - **Predictive prefetching**: Pre-warm caches from workload history or scheduling hints.
-- **P2P transfer fault tolerance**: Auto-recovery from stale rkeys on source restart; retry and fallback to storage loading.
 - **Dynamic EPLB (Expert Parallelism Load Balancer)**: Rebalance MoE expert placement across GPUs at runtime via P2P transfer of expert weights as load shifts.
 
 ---
