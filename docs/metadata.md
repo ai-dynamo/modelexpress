@@ -458,7 +458,7 @@ status:
 
 ## Client Workflow
 
-### Source Path (load from disk, publish metadata)
+### Source Path (load from storage, publish metadata)
 
 ```mermaid
 sequenceDiagram
@@ -466,7 +466,7 @@ sequenceDiagram
     participant MX as MX Server
     participant Backend as Redis / K8s
 
-    W->>W: Load weights from disk (or GDS)
+    W->>W: Load via ModelStreamer, GDS, or native loader
     W->>W: process_weights_after_loading()
     W->>W: Collect all post-processed tensors
     W->>W: Initialize NIXL agent, register tensors
@@ -502,21 +502,23 @@ sequenceDiagram
     end
     W->>W: Add remote NIXL agent, execute RDMA transfers
     alt Transfer fails (SourceTransferError / ManifestMismatchError)
-        W->>W: Abandon RDMA, fall through to next strategy (GDS, disk)
+        W->>W: Reinitialize model if target state may be mutated
+        W->>W: Fall through to ModelStreamer, GDS, or native loader
     end
     W->>W: process_weights_after_loading()
     W->>W: Register and publish own metadata (become a source)
 ```
 
-### Three-Tier Loading Strategy
+### Loading Strategy Chain
 
 The `MxModelLoader` (`--load-format modelexpress`; `mx` alias) auto-detects the best loading strategy:
 
-1. **RDMA** -- If `ListSources` returns READY instances with matching rank, and the per-candidate metadata fetch confirms a compatible accelerator, receive weights via NIXL/Mooncake
-2. **GDS** -- If no source available and GPUDirect Storage is available, load directly from file to GPU
-3. **Disk** -- Standard vLLM `DefaultModelLoader` as final fallback
+1. **RDMA** -- If `ListSources` returns READY instances with matching rank, and the per-candidate metadata fetch confirms a compatible accelerator, receive weights from a serving peer.
+2. **ModelStreamer** -- If `MX_MODEL_URI` is set and `runai_model_streamer` is installed, pipeline safetensor reads from S3, GCS, Azure Blob Storage, or a local path through a bounded CPU staging buffer into the engine.
+3. **GDS** -- If no higher-priority path succeeds and GPUDirect Storage is available, load directly from local storage to GPU.
+4. **Native loader** -- Use the inference engine's host-staged POSIX I/O path as the final fallback.
 
-After loading by any path, the worker registers its tensors and publishes metadata so future workers can discover it as an RDMA source.
+The first applicable strategy runs. A failure before model mutation falls through directly; a failure after weights may have landed reinitializes the model before the next strategy runs. After loading by any path, the worker registers its tensors. Server-backed deployments then publish metadata so future workers can discover the worker as an RDMA source; `k8s-service` serves metadata through its decentralized backend.
 
 ## Transfer Backends
 
@@ -583,4 +585,4 @@ kubectl get configmaps -l modelexpress.nvidia.com/mx-source-id=<source_id> -n <n
 | K8s CRs missing | RBAC issue -- check source logs and service account permissions for both `modelmetadatas` and `modelcacheentries` |
 | Stale P2P metadata after redeploy | Reaper marks stale within 90s. For immediate Redis cleanup: delete `mx:source:*` keys or `FLUSHDB` in a dedicated Redis DB |
 | Stale model lifecycle metadata after redeploy | Inspect `mx:model:*` or `modelcacheentries`; delete the stale lifecycle entry if it no longer matches cache contents |
-| Transfer failure with address errors | Source pod restarted -- GPU addresses are invalid. RDMA is aborted and loading falls through to GDS, then disk; the target does not retry another source once transfer has started |
+| Transfer failure with address errors | Source pod restarted, so its GPU addresses are invalid. ModelExpress clears the failed NIXL state, reinitializes a potentially mutated target, and tries the next ranked source within the retry budget. If no source succeeds, the strategy chain continues through ModelStreamer, GDS, and the native loader. |
