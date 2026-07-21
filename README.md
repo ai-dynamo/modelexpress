@@ -76,10 +76,11 @@ The ModelExpress control plane discovers compatible sources through Redis, Kuber
 
 | Runtime | Integration |
 |---------|-------------|
-| vLLM | Native `--load-format modelexpress` in 0.23.0+ for P2P weight and JIT cache transfer; older versions use the ModelExpress plugin, and `mx` is a backward-compatible alias |
-| NVIDIA Dynamo (vLLM) | `get_model_path` API; [Dynamo model cache K8s example](examples/dynamo_model_cache_k8s/README.md) |
-| TensorRT-LLM | `LoadFormat.PRESHARDED` with `MxLiveCheckpointLoader` for P2P weight transfer (beta) — [TRT-LLM examples](examples/p2p_transfer_k8s/client/trtllm/) |
+| vLLM | Native `--load-format modelexpress` in 0.23.0+ for P2P weight and JIT cache transfer; older versions use the ModelExpress plugin |
 | SGLang | `remote_instance` + `modelexpress` backend with `transport=nixl` or `transport=transfer_engine` — see [`docs/SGLANG.md`](docs/SGLANG.md) |
+| TensorRT-LLM | `LoadFormat.PRESHARDED` with `MxLiveCheckpointLoader` for P2P weight transfer (beta) — [TRT-LLM examples](examples/p2p_transfer_k8s/client/trtllm/) |
+| NVIDIA Dynamo vLLM runtime | `--load-format modelexpress` for P2P weight and JIT cache transfer — [Dynamo P2P example](examples/dynamo_p2p_transfer_k8s/README.md) |
+| NVIDIA Dynamo SGLang runtime | `remote_instance` + `modelexpress` backend for P2P weight transfer; `transport=nixl` also supports JIT cache transfer — see [`docs/SGLANG.md`](docs/SGLANG.md) |
 
 ---
 
