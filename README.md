@@ -62,7 +62,7 @@ The ModelExpress control plane discovers compatible sources through Redis, Kuber
 - **Cold start reduction** — GPU-to-GPU P2P transfer over InfiniBand instead of disk load
 - **Capability-driven loading** — Automatic priority chain: P2P RDMA → ModelStreamer → GDS → native loader, with safe fallback
 - **HuggingFace caching** — PVC-backed cache, `HF_HUB_OFFLINE`, `ignore_weights`, `get_model_path` for Dynamo
-- **P2P GPU transfer** — vLLM `modelexpress` loader (`mx` alias) and TRT-LLM `PRESHARDED` loader with NVIDIA NIXL over InfiniBand, RoCE, NVLink, EFA, and other supported fabrics
+- **P2P GPU transfer** — vLLM `modelexpress` loader, SGLang `remote_instance` loader with the `modelexpress` backend, and TRT-LLM `PRESHARDED` loader with NVIDIA NIXL over InfiniBand, RoCE, NVLink, EFA, and other supported fabrics
 - **JIT cache transfer** — Reuse compatible vLLM and SGLang NIXL compilation caches when replicas scale out
 - **Metadata backends** — Redis, Kubernetes CRD, or decentralized Kubernetes Service routing
 - **Kubernetes** — Helm chart, CRDs/Redis for P2P, no-shared-storage support
