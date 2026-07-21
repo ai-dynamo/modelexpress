@@ -15,12 +15,13 @@ SPDX-License-Identifier: Apache-2.0
 <h1 align="center">Dynamo ModelExpress</h1>
 
 <p align="center">
-  <strong>Model weight management for LLM inference</strong> — cache, transfer, and serve weights at scale with GPU-to-GPU RDMA and multi-node coordination.
+  <strong>Move model weights into GPU memory and reusable artifacts into filesystem caches</strong> — through P2P RDMA, streaming, GPUDirect Storage, or host-staged POSIX I/O.
 </p>
 
 <p align="center">
   <a href="#features">Features</a> •
   <a href="#modelexpress-architecture">Architecture</a> •
+  <a href="#benchmarks">Benchmarks</a> •
   <a href="#quick-start">Quick Start</a> •
   <a href="#deployment">Deployment</a> •
   <a href="#documentation">Docs</a> •
@@ -31,7 +32,7 @@ SPDX-License-Identifier: Apache-2.0
 
 ## Overview
 
-ModelExpress is a Rust-based service that manages the complete model weight lifecycle in the cluster—from acquisition to GPU memory. It accelerates LLM inference by caching, routing, and transferring weights through the fastest available path. Deploy standalone or as a sidecar alongside vLLM, NVIDIA Dynamo, and other inference runtimes.
+ModelExpress (MX) starts with a simple question: before loading a model, where does a compatible copy of its weights already live? Rather than treating every replica as an independent cold start, ModelExpress discovers available sources and selects the fastest supported path into GPU memory. Deploy it standalone or alongside vLLM, SGLang, NVIDIA Dynamo, and other inference runtimes.
 
 | LLM serving problem | How ModelExpress helps |
 |---------------------|------------------------|
@@ -39,31 +40,37 @@ ModelExpress is a Rust-based service that manages the complete model weight life
 | **JIT warmup dominates startup** | Compatible vLLM and SGLang NIXL TorchInductor, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches transfer from a ready replica instead of being rebuilt. |
 | **Many nodes need the same model** | Metadata backends (Redis, K8s CRD) coordinate sharing: one node loads; others receive via P2P or local paths. |
 
-### How ModelExpress manages weights in the cluster
+> **Today, ModelExpress transfers DeepSeek-V4-Pro weights and compatible JIT kernel-cache artifacts from a serving replica to a fresh replica in under 10 seconds, reducing process-start-to-API-ready time from 8 minutes 1 second to 1 minute 44 seconds.**
 
-ModelExpress orchestrates the full flow—from download to GPU memory. It ensures only one node downloads a model from external sources (e.g., HuggingFace); other nodes receive weights via P2P or shared storage—eliminating duplicate downloads and reducing cluster ingress.
+### Runtime path selection
 
-1. **Download from HuggingFace** — One node pulls the model; ModelExpress coordinates so no other node duplicates this download, reducing external ingress. In air-gapped mode, serve from cache only (`HF_HUB_OFFLINE=1`).
-2. **Persist to disk** — Store in a cache backed by disk:
-   - **Host-attached disk** — Local disk on the node (single-node or per-node cache).
-   - **PVC** — RWO (ReadWriteOnce) for single-node; RWX (ReadWriteMany) for shared access across nodes.
-3. **Disk to GPU** — Inference engine (vLLM, etc.) loads weights from the cache (disk) into GPU memory.
-4. **P2P transfer** — Additional nodes receive weights via GPU-to-GPU RDMA from the first node instead of reading from disk—no duplicate downloads or disk reads.
+At startup, ModelExpress probes the capabilities available in the environment and tries loading strategies in priority order:
+
+1. **Serving peer → GPU** — Transfer post-processed weights directly from a compatible replica over NIXL P2P RDMA. Each new replica then joins the source pool, turning scale-out into GPU-to-GPU fan-out.
+2. **Remote or local storage → GPU with ModelStreamer** — Fetch safetensor ranges concurrently through a bounded CPU staging buffer while overlapping reads with GPU placement. Tensor-parallel ranks can divide remote reads instead of each downloading the full checkpoint.
+3. **Local storage → GPU with GDS** — Use NIXL's multithreaded GPUDirect Storage backend to bypass host-memory staging when the platform supports it.
+4. **Default loader** — Fall back to the inference engine's host-staged POSIX I/O path.
+
+The first applicable strategy runs. If a strategy fails before changing model state, ModelExpress continues to the next one. If weights may already have landed, it reinitializes the model before continuing so a partially loaded model is never served.
+
+The ModelExpress control plane discovers compatible sources through Redis, Kubernetes CRDs, or the decentralized `k8s-service` backend. Weight bytes stay on the data plane and move directly between storage or source and target. For clusters with a shared disk cache, the Model Cache Service also coordinates a single download so concurrent replicas reuse one cached checkpoint instead of multiplying external ingress.
 
 ---
 
 ## Features
 
 - **Cold start reduction** — GPU-to-GPU P2P transfer over InfiniBand instead of disk load
+- **Capability-driven loading** — Automatic priority chain: P2P RDMA → ModelStreamer → GDS → native loader, with safe fallback
 - **HuggingFace caching** — PVC-backed cache, `HF_HUB_OFFLINE`, `ignore_weights`, `get_model_path` for Dynamo
-- **P2P GPU transfer** — vLLM `modelexpress` loader (`mx` alias) and TRT-LLM `PRESHARDED` loader with NVIDIA NIXL over RDMA
+- **P2P GPU transfer** — vLLM `modelexpress` loader (`mx` alias) and TRT-LLM `PRESHARDED` loader with NVIDIA NIXL over InfiniBand, RoCE, NVLink, EFA, and other supported fabrics
 - **JIT cache transfer** — Reuse compatible vLLM and SGLang NIXL compilation caches when replicas scale out
-- **Metadata backends** — In-memory, Redis, or Kubernetes CRD (layered write-through for HA)
+- **Metadata backends** — Redis, Kubernetes CRD, or decentralized Kubernetes Service routing
 - **Kubernetes** — Helm chart, CRDs/Redis for P2P, no-shared-storage support
 - **CLI** — Health, download, list, validate, clear; init-container support for pre-warming
-- **ModelStreamer integration**: stream weights from object storage (AWS S3, Azure Blob, GCS) with multi-engine support
+- **ModelStreamer integration** — Pipeline concurrent reads from S3, Azure Blob, GCS, Hugging Face, or local storage into vLLM and SGLang
 - **Expanded model pull providers**: NGC catalog and Google Cloud Storage in addition to Hugging Face
 - **GDS (GPUDirect Storage)**: load model weights directly from NVMe into GPU memory, bypassing the CPU/DRAM copy path
+- **Lower NIXL registration overhead** — Opt in to allocation-level pool registration or a single VMM arena registration
 
 ### Integrations
 
@@ -78,34 +85,60 @@ ModelExpress orchestrates the full flow—from download to GPU memory. It ensure
 
 ## ModelExpress Architecture
 
+![ModelExpress runtime paths: metadata stays on the control plane while weights move directly over P2P RDMA, ModelStreamer, GDS, or POSIX I/O](model-express-runtime-paths.png)
+
+*The ModelExpress server brokers metadata only. Weight bytes move directly from a compatible serving peer, object storage, or file storage into the new inference engine.*
+
 ![ModelExpress Architecture: Upload once, then autoscale new pods via NIXL GPUDirect RDMA from seed GPU](model-express-architecture.png)
 
-*Phase 1 — Upload once:* Model Source (HuggingFace Hub, NFS) downloads to the Seed Pod (GPU), which loads and postprocesses weights, registers VRAM with NIXL, and publishes metadata to the MX Server. *Phase 2 — Autoscale:* New pods receive weights via NIXL GPUDirect RDMA (GPU VRAM → GPU VRAM, zero-copy) from the seed GPU, using `--load-format modelexpress` for inference.
-
-```
-                    ┌─────────────────────────────────────────────────────────────────┐
-                    │                    ModelExpress Server                          │
-                    │   Health • Model • P2P Metadata • Redis/K8s CRD backends        │
-                    └──────────────────────┬──────────────────────────────────────────┘
-                                           │
-                         ┌─────────────────┼─────────────────┐
-                         │ metadata        │                 │ metadata
-                         ▼                 │                 ▼
-              ┌──────────────────┐         │       ┌──────────────────┐
-              │  Source (vLLM)   │  RDMA   │       │  Target (vLLM)   │
-              │  mx loader       │════════►│       │  mx loader       │
-              │  Load → NIXL     │  NIXL   │       │  Receive → FP8   │
-              │  Publish metadata│         │       │  Serve inference │
-              └──────────────────┘         │       └──────────────────┘
-```
-
-*Source and Target exchange metadata with the server for coordination; weights transfer directly over RDMA between GPUs.*
+*Phase 1 — Bootstrap once:* The seed pod selects the fastest available storage path, loads and post-processes the weights, registers GPU memory with NIXL, and publishes metadata. *Phase 2 — Scale out:* Compatible pods discover a serving peer through the control plane and receive weights directly over NIXL GPUDirect RDMA; the ModelExpress server never handles the weight bytes.
 
 - **modelexpress_server**: gRPC server with configurable metadata backends (Redis, Kubernetes CRD).
 - **modelexpress_client**: Rust CLI for cache management; Python package with inference engine loaders and `MxClient` for gRPC.
-- **modelexpress_common**: Protobuf definitions, provider trait (HuggingFace), shared configuration.
+- **modelexpress_common**: Protobuf definitions, model-provider traits, and shared configuration.
 
 See [Architecture](docs/ARCHITECTURE.md).
+
+---
+
+## Benchmarks
+
+The following results use DeepSeek-V4-Pro with vLLM 0.23.0 and TP=8 on an 8×B200 GPU node with NVIDIA ConnectX-7 NICs. Runs used `--enable-flashinfer-autotune`; timings are end-to-end startup measurements from the benchmark environment and will vary with storage, network, and runtime configuration.
+
+### Cold-start loading paths
+
+![DeepSeek-V4-Pro cold-start loading benchmark comparing Hugging Face, S3 ModelStreamer, local storage, and P2P RDMA](benchmark-cold-start-loading.png)
+
+| Loading path | Time | Speedup vs. cold Hugging Face pull |
+|--------------|-----:|-----------------------------------:|
+| Cold pull from Hugging Face | 8m 53s | 1× |
+| ModelStreamer from S3 | 3m 16s | 2.7× |
+| High-throughput local storage, cold page cache | 1m 10s | 7.6× |
+| P2P GPU-to-GPU over NIXL/RDMA | 11s | 48× |
+
+### NIXL memory registration
+
+![DeepSeek-V4-Pro NIXL registration benchmark comparing per-tensor, pool, and VMM arena registration](benchmark-nixl-registration.png)
+
+| Registration strategy | Time | Speedup |
+|-----------------------|-----:|--------:|
+| Per tensor (default) | 8.16s | 1× |
+| Pool registration (`MX_POOL_REG=1`) | 1.14s | 7.1× |
+| VMM arena (`MX_VMM_ARENA=1`) | 0.79s | 10.3× |
+
+Pool registration and VMM arena registration are alternatives; enable only one.
+
+### Weight and kernel-artifact transfer
+
+![DeepSeek-V4-Pro startup benchmark comparing storage loading, P2P weights, and P2P weights with kernel artifacts](benchmark-artifact-transfer.png)
+
+| Startup path | API ready | Speedup |
+|--------------|----------:|--------:|
+| Cold start from VAST, no P2P source | 8m 1s | 1× |
+| P2P RDMA weights only | 7m | 1.1× |
+| P2P RDMA weights and kernel artifacts | 1m 44s | 4.6× |
+
+The artifact-enabled run reused compatible Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer caches. ModelExpress transfers these file-backed artifacts between registered host-memory buffers, verifies them, and installs them into the target engine's filesystem cache; they are not loaded into GPU memory.
 
 ---
 
@@ -164,7 +197,7 @@ vLLM 0.23.0 recognizes the load format natively; the ModelExpress Python package
 
 ### ModelStreamer on Kubernetes
 
-Load model weights directly from Azure Blob Storage, S3, or a PVC-backed local path through ModelStreamer. [ModelStreamer examples](examples/model_streamer_k8s/README.md) · [vLLM recipes](examples/model_streamer_k8s/client/vllm/README.md).
+Set `MX_MODEL_URI` to an `s3://`, `gs://`, or `az://` URI, an absolute local path, or a Hugging Face model ID. For tensor-parallel deployments, set `MX_MS_DISTRIBUTED=1` so participating ranks divide remote reads; TP=1 ignores the setting. [ModelStreamer examples](examples/model_streamer_k8s/README.md) · [vLLM recipes](examples/model_streamer_k8s/client/vllm/README.md).
 
 ### Docker
 
@@ -186,6 +219,11 @@ docker compose -f docker/docker-compose.yml up --build
 | `REDIS_URL` | (required for `redis`) | Redis connection URL. Alternatively set `MX_REDIS_HOST` + `MX_REDIS_PORT`. No localhost fallback. |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Client-side gRPC server address (P2P). Recommended. |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated, pending removal in a future release. Still read by all client paths and takes precedence when both are set; keep setting it during the transition. |
+| `MX_MODEL_URI` | (unset) | Enable ModelStreamer for an object-store URI, absolute local path, or Hugging Face model ID. |
+| `MX_MS_DISTRIBUTED` | `0` | Divide ModelStreamer reads across tensor-parallel ranks when TP > 1. |
+| `MX_POOL_REG` | `0` | Register each underlying CUDA allocation once instead of registering every tensor. |
+| `MX_VMM_ARENA` | `0` | Load into a CUDA VMM arena and register the used range once; alternative to `MX_POOL_REG`. |
+| `MX_P2P_SOURCE_SELECTOR` | `random` | Peer ordering policy; set `rendezvous_hash` for deterministic, minimally disruptive selection. |
 
 ```bash
 cargo run --bin config_gen -- --output model-express.yaml
@@ -228,6 +266,7 @@ cargo bench
 |-----|-------------|
 | [Deployment](docs/DEPLOYMENT.md) | Server/client config, Docker, K8s, P2P |
 | [Architecture](docs/ARCHITECTURE.md) | Components, gRPC, NIXL, FP8 |
+| [Benchmarks](docs/BENCHMARKS.md) | Loading paths, NIXL registration, and artifact-transfer results |
 | [CLI](docs/CLI.md) | Full CLI reference |
 | [Metadata](docs/metadata.md) | Redis keys, K8s CRD schema |
 | [Helm](helm/README.md) | Kubernetes configuration |
@@ -247,7 +286,7 @@ cargo bench
 ### Priorities Under Development
 
 - **DRAM and NVMe-resident shard streaming**: Stream shards across workers while keeping weights in DRAM and host local high-speed NVMe.
-- **RL workloads**: Explore fast P2P transfers to optimize RL refit phase and support for weight resharding.
+- **RL post-training refit**: Make updates receiver-driven—trainer ranks publish the shards they own, rollout workers discover and plan against their target layout, then pull, convert, reshard, and load directly over NIXL.
 - **Earlier weight availability**: Bring weights to prefill earlier; identify prefill workers that can act as strong source nodes.
 - **Multi-tier cache hierarchy**: Promote and demote models across DRAM, NVMe, and PVC tiers based on access patterns.
 - **Distributed sharded cache**: Shard large models across nodes using consistent hashing and parallel shard assembly.
