@@ -243,6 +243,8 @@ class RdmaStrategy(LoadStrategy):
                     target_accelerator,
                     inst.accelerator,
                     mx_source_type=ctx.identity.mx_source_type,
+                    quantization=ctx.identity.quantization,
+                    dtype=ctx.identity.dtype,
                 )
             ]
 
@@ -301,6 +303,9 @@ class RdmaStrategy(LoadStrategy):
             target_accelerator,
             source_accelerator,
             mx_source_type=ctx.identity.mx_source_type,
+            quantization=ctx.identity.quantization,
+            dtype=ctx.identity.dtype,
+            defer_unknown=False,
         ):
             return True
 

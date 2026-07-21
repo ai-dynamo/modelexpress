@@ -409,6 +409,42 @@ See [`../examples/dynamo_model_cache_k8s/README.md`](../examples/dynamo_model_ca
 
 ModelExpress supports GPU-to-GPU model weight transfers between supported inference instances using NVIDIA NIXL over RDMA. vLLM 0.23.0 and newer recognize `--load-format modelexpress` natively, which auto-detects whether to load from disk or receive via RDMA; the ModelExpress Python package must still be installed, and `mx` remains a backward-compatible alias. SGLang uses `remote_instance` with the `modelexpress` backend; see [SGLang Clients](#sglang-clients).
 
+### Cross-Vendor (CUDA/XPU) Compatibility
+
+ModelExpress supports cross-family weight transfer between `cuda` and `xpu` only for unquantized model weights.
+
+A weight identity is considered unquantized when:
+
+- `SourceIdentity.quantization` is empty or `none`
+- `SourceIdentity.dtype` is a normal non-quantized dtype, such as:
+  - `bfloat16`
+  - `float16`
+  - `float32`
+
+Quantized models are not transferred across accelerator families. This includes models using quantization methods or storage formats such as:
+
+- `fp8`
+- `fp4`
+- `nvfp4`
+- `mxfp4`
+- `mxfp8`
+- `awq`
+- `gptq`
+- other non-empty quantization methods
+
+The reason is that ModelExpress transfers post-processed in-memory tensor bytes, not raw checkpoint files. For quantized models, the post-processed layout can depend on the accelerator family, GPU architecture, selected kernel, and framework quantization backend. For example, FP8 scale packing or FP4/NVFP4 swizzling may differ between CUDA and XPU kernels. Copying those bytes across vendors can make the transfer succeed while causing silent inference corruption.
+
+If a target finds only cross-family sources for a quantized model, it skips P2P RDMA and falls through to the next load strategy, such as GDS or disk loading. Expect a slower cold start instead of an RDMA receive in mixed CUDA/XPU fleets serving quantized weights.
+
+Same-family transfer is unaffected. Quantized transfer remains allowed for:
+
+- `cuda` to `cuda`
+- `xpu` to `xpu`
+
+because source and target are expected to use the same accelerator-family post-processing layout.
+
+Future work may validate specific quantized CUDA/XPU combinations on hardware. If a specific pair is proven inference-correct after RDMA, ModelExpress may add an explicit allowlist for that quantization/layout pair. ModelExpress does not currently dequantize, requantize, or convert post-processed tensor layouts during transfer. See the accelerator-compatibility rule in [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
 ### Choosing a Metadata Backend
 
 Pick based on workload, not operational preference. The choice has structural consequences for what the system can do.
