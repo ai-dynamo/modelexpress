@@ -4,7 +4,7 @@ SPDX-License-Identifier: Apache-2.0
 -->
 
 <p align="center">
-  <img src="ModelExpressTrainLogo.jpeg" alt="ModelExpress Logo" width="50%">
+  <img src="docs/images/ModelExpressTrainLogo.jpeg" alt="ModelExpress Logo" width="50%">
 </p>
 
 <p align="center">
@@ -86,11 +86,11 @@ The ModelExpress control plane discovers compatible sources through Redis, Kuber
 
 ## ModelExpress Architecture
 
-![ModelExpress runtime paths: metadata stays on the control plane while weights move directly over P2P RDMA, ModelStreamer, GDS, or POSIX I/O](model-express-runtime-paths.png)
+![ModelExpress runtime paths: metadata stays on the control plane while weights move directly over P2P RDMA, ModelStreamer, GDS, or POSIX I/O](docs/images/model-express-runtime-paths.png)
 
 *The ModelExpress server brokers metadata only. Weight bytes move directly from a compatible serving peer, object storage, or file storage into the new inference engine.*
 
-![ModelExpress Architecture: Upload once, then autoscale new pods via NIXL GPUDirect RDMA from seed GPU](model-express-architecture.png)
+![ModelExpress Architecture: Upload once, then autoscale new pods via NIXL GPUDirect RDMA from seed GPU](docs/images/model-express-architecture.png)
 
 *Phase 1 — Bootstrap once:* The seed pod selects the fastest available storage path, loads and post-processes the weights, registers GPU memory with NIXL, and publishes metadata. *Phase 2 — Scale out:* Compatible pods discover a serving peer through the control plane and receive weights directly over NIXL GPUDirect RDMA; the ModelExpress server never handles the weight bytes.
 
@@ -108,7 +108,7 @@ The following results use DeepSeek-V4-Pro with vLLM 0.23.0 and TP=8 on an 8×B20
 
 ### Cold-start loading paths
 
-![DeepSeek-V4-Pro cold-start loading benchmark comparing Hugging Face, S3 ModelStreamer, local storage, and P2P RDMA](benchmark-cold-start-loading.png)
+![DeepSeek-V4-Pro cold-start loading benchmark comparing Hugging Face, S3 ModelStreamer, local storage, and P2P RDMA](docs/images/benchmark-cold-start-loading.png)
 
 | Loading path | Time | Speedup vs. cold Hugging Face pull |
 |--------------|-----:|-----------------------------------:|
@@ -119,7 +119,7 @@ The following results use DeepSeek-V4-Pro with vLLM 0.23.0 and TP=8 on an 8×B20
 
 ### NIXL memory registration
 
-![DeepSeek-V4-Pro NIXL registration benchmark comparing per-tensor, pool, and VMM arena registration](benchmark-nixl-registration.png)
+![DeepSeek-V4-Pro NIXL registration benchmark comparing per-tensor, pool, and VMM arena registration](docs/images/benchmark-nixl-registration.png)
 
 | Registration strategy | Time | Speedup |
 |-----------------------|-----:|--------:|
@@ -131,7 +131,7 @@ Pool registration and VMM arena registration are alternatives; enable only one.
 
 ### Weight and kernel-artifact transfer
 
-![DeepSeek-V4-Pro startup benchmark comparing storage loading, P2P weights, and P2P weights with kernel artifacts](benchmark-artifact-transfer.png)
+![DeepSeek-V4-Pro startup benchmark comparing storage loading, P2P weights, and P2P weights with kernel artifacts](docs/images/benchmark-artifact-transfer.png)
 
 | Startup path | API ready | Speedup |
 |--------------|----------:|--------:|

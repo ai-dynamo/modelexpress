@@ -15,7 +15,7 @@ The cold-start and artifact-transfer runs used DeepSeek-V4-Pro with vLLM 0.23.0,
 
 ## Cold-Start Loading Paths
 
-![DeepSeek-V4-Pro cold-start loading benchmark comparing Hugging Face, S3 ModelStreamer, local storage, and P2P RDMA](../benchmark-cold-start-loading.png)
+![DeepSeek-V4-Pro cold-start loading benchmark comparing Hugging Face, S3 ModelStreamer, local storage, and P2P RDMA](images/benchmark-cold-start-loading.png)
 
 This comparison measures model loading time only.
 
@@ -32,7 +32,7 @@ GDS is not shown in this comparison. With TP > 1, the current GDS loader reads f
 
 ## NIXL Memory Registration
 
-![DeepSeek-V4-Pro NIXL registration benchmark comparing per-tensor, pool, and VMM arena registration](../benchmark-nixl-registration.png)
+![DeepSeek-V4-Pro NIXL registration benchmark comparing per-tensor, pool, and VMM arena registration](images/benchmark-nixl-registration.png)
 
 This comparison measures average NIXL registration time for DeepSeek-V4-Pro with TP=8.
 
@@ -46,7 +46,7 @@ Pool registration discovers and registers each underlying CUDA allocation once i
 
 ## Weight and Kernel-Artifact Transfer
 
-![DeepSeek-V4-Pro startup benchmark comparing storage loading, P2P weights, and P2P weights with kernel artifacts](../benchmark-artifact-transfer.png)
+![DeepSeek-V4-Pro startup benchmark comparing storage loading, P2P weights, and P2P weights with kernel artifacts](images/benchmark-artifact-transfer.png)
 
 This comparison measures total wall-clock startup from process start until the API is ready.
 
