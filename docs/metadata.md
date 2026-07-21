@@ -518,7 +518,7 @@ The `MxModelLoader` (`--load-format modelexpress`; `mx` alias) auto-detects the 
 3. **GDS** -- If no higher-priority path succeeds and GPUDirect Storage is available, load directly from local storage to GPU.
 4. **Native loader** -- Use the inference engine's host-staged POSIX I/O path as the final fallback.
 
-The first applicable strategy runs. A failure before model mutation falls through directly; a failure after weights may have landed reinitializes the model before the next strategy runs. After loading by any path, the worker registers its tensors and publishes metadata so future workers can discover it as an RDMA source.
+The first applicable strategy runs. A failure before model mutation falls through directly; a failure after weights may have landed reinitializes the model before the next strategy runs. After loading by any path, the worker registers its tensors. Server-backed deployments then publish metadata so future workers can discover the worker as an RDMA source; `k8s-service` serves metadata through its decentralized backend.
 
 ## Transfer Backends
 

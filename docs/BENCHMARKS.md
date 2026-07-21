@@ -48,7 +48,7 @@ Pool registration discovers and registers each underlying CUDA allocation once i
 
 ![DeepSeek-V4-Pro startup benchmark comparing storage loading, P2P weights, and P2P weights with kernel artifacts](images/benchmark-artifact-transfer.png)
 
-This comparison measures total wall-clock startup from process start until the API is ready.
+This comparison measures total wall-clock startup from process start until the API is ready. It does not isolate raw artifact-transfer duration; the 1m 44s result includes weight and artifact transfer plus the remaining engine initialization.
 
 | Startup path | API ready time | Speedup |
 |--------------|---------------:|--------:|

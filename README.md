@@ -40,7 +40,7 @@ ModelExpress (MX) starts with a simple question: before loading a model, where d
 | **JIT warmup dominates startup** | Compatible vLLM and SGLang NIXL TorchInductor, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches transfer from a ready replica instead of being rebuilt. |
 | **Many nodes need the same model** | Metadata backends (Redis, K8s CRD) coordinate sharing: one node loads; others receive via P2P or local paths. |
 
-> **Today, ModelExpress transfers DeepSeek-V4-Pro weights and compatible JIT kernel-cache artifacts from a serving replica to a fresh replica in under 10 seconds, reducing process-start-to-API-ready time from 8 minutes 1 second to 1 minute 44 seconds.**
+> **Today, ModelExpress loads DeepSeek-V4-Pro weights from a serving replica in 11 seconds—a 48× speedup over a cold Hugging Face pull. Reusing compatible weights and JIT kernel-cache artifacts reduces process-start-to-API-ready time from 8 minutes 1 second to 1 minute 44 seconds (4.6×).**
 
 ### Runtime path selection
 
@@ -153,6 +153,7 @@ cd modelexpress
 python -m pip install ./modelexpress_client/python
 
 export MX_SERVER_ADDRESS=modelexpress-server:8001
+export MX_P2P_METADATA=1
 export MX_ARTIFACT_TRANSFER=1
 
 vllm serve deepseek-ai/DeepSeek-V4-Pro \
@@ -161,7 +162,9 @@ vllm serve deepseek-ai/DeepSeek-V4-Pro \
   --trust-remote-code
 ```
 
-Start the first replica with weights available through local storage or `MX_MODEL_URI`. After it becomes healthy, launch the same command on another compatible node: ModelExpress discovers the serving replica and transfers its post-processed weights directly over NIXL P2P RDMA. With `MX_ARTIFACT_TRANSFER=1`, it also installs compatible JIT artifacts into the new replica's filesystem caches.
+Start the first replica with weights available through local storage or `MX_MODEL_URI`. After it becomes healthy, launch the same command on another compatible node: ModelExpress discovers the serving replica and transfers its post-processed weights directly over NIXL P2P RDMA.
+
+JIT artifact transfer requires `MX_P2P_METADATA=1`, a central-coordinator backend (`redis` or `kubernetes`), and writable target staging and runtime cache directories. With those prerequisites, `MX_ARTIFACT_TRANSFER=1` installs compatible artifacts into the new replica's filesystem caches. Omit it for weight-only transfer or when using the decentralized `k8s-service` backend.
 
 See the [Kubernetes P2P example](examples/p2p_transfer_k8s/README.md) for metadata-server and inference-worker manifests.
 
@@ -209,7 +212,7 @@ docker compose -f docker/docker-compose.yml up --build
 |----------|---------|-------------|
 | `MODEL_EXPRESS_SERVER_PORT` | `8001` | gRPC port |
 | `MODEL_EXPRESS_CACHE_DIRECTORY` | `./cache` | Cache root |
-| `MX_METADATA_BACKEND` | (required) | `redis` \| `kubernetes` |
+| `MX_METADATA_BACKEND` | Server: required; client: unset | Server: `redis` \| `kubernetes`. Client: unset, `server`, `redis`, or `kubernetes` uses a central coordinator; `k8s-service` enables decentralized Kubernetes Service routing. |
 | `REDIS_URL` | (required for `redis`) | Redis connection URL. Alternatively set `MX_REDIS_HOST` + `MX_REDIS_PORT`. No localhost fallback. |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Client-side gRPC server address (P2P). Recommended. |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated, pending removal in a future release. Still read by all client paths and takes precedence when both are set; keep setting it during the transition. |

@@ -143,7 +143,8 @@ MX has one configurable filesystem path, the model weights cache (`MODEL_EXPRESS
 | Multi-replica MX with `MODEL_EXPRESS_NO_SHARED_STORAGE=true` on clients (gRPC streaming) | RWO per replica OR ephemeral | Needs an MX-aware init container in the client pod; no ready-made vLLM recipe today (tracked MX-290) |
 | ModelStreamer from object storage on clients | none | Clients stream through a bounded CPU staging buffer without landing the checkpoint on local disk |
 | ModelStreamer from a local path on clients | Existing local/PVC path | Reads the configured local checkpoint through the pipelined ModelStreamer path |
-| P2P RDMA receivers | none on receiver | Weights land in GPU HBM; the source may have bootstrapped through ModelStreamer, GDS, or the native loader |
+| P2P RDMA receivers, weights only | none on receiver | Weights land in GPU HBM; the source may have bootstrapped through ModelStreamer, GDS, or the native loader |
+| P2P RDMA receivers, weights and artifacts | Writable local staging and runtime cache paths | Weights land in GPU HBM. File-backed artifacts are staged locally, verified, and installed into the target engine's filesystem caches. |
 
 For new multi-replica deployments, prefer the no-shared-storage row: each MX replica can use its own RWO or ephemeral cache while Redis or Kubernetes coordinates lifecycle state. The RWX row is mainly for existing shared-cache topologies, and the single-replica row is a local/dev simplification.
 
