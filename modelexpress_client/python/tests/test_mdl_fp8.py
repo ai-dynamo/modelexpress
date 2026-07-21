@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-from modelexpress.engines.vllm.mdl import MdlLoader
+from modelexpress.engines.vllm.refit import MdlLoader
 
 
 F8 = torch.float8_e4m3fn

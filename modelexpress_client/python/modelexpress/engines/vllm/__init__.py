@@ -6,8 +6,8 @@
 from ... import configure_vllm_logging
 from ...patches import apply_patches
 from .adapter import VllmAdapter, build_vllm_load_context
-from .mdl import MdlLoader
 from .patches import PATCHES as VLLM_PATCHES
+from .refit import MdlLoader
 
 _loaders_registered = False
 

@@ -126,7 +126,10 @@ ModelExpress/
 │       ├── __init__.py                 # Package init, vLLM loader auto-registration
 │       ├── client.py                   # MxClient gRPC client
 │       ├── nixl_transfer.py            # NixlTransferManager
-│       ├── refit_timing.py             # Structured refit stage timing
+│       ├── refit/                      # Engine-agnostic live-refit primitives
+│       │   ├── __init__.py             # Public refit exports
+│       │   └── timing.py               # Structured refit stage timing
+│       ├── refit_timing.py             # Compatibility shim for refit.timing
 │       ├── source_selection.py         # P2P source-ordering policies (random, rendezvous_hash)
 │       ├── metrics.py                   # Opt-in Prometheus metrics collector (source-selection group today)
 │       ├── gds_transfer.py             # GPUDirect Storage transfer support
@@ -156,7 +159,10 @@ ModelExpress/
 │       │   │   ├── __init__.py         # vLLM loader registration
 │       │   │   ├── adapter.py          # VllmAdapter and context builder
 │       │   │   ├── loader.py           # MxModelLoader implementation
-│       │   │   └── mdl.py              # Mapped Direct Load refit installer
+│       │   │   ├── mdl.py              # Compatibility shim for vLLM refit
+│       │   │   └── refit/
+│       │   │       ├── __init__.py     # vLLM refit exports
+│       │   │       └── installer.py    # Mapped Direct Load installer
 │       │   └── sglang/                 # SGLang integration
 │       │       ├── __init__.py
 │       │       ├── adapter.py          # SglangAdapter and context builder
@@ -535,14 +541,14 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `client.py` | `MxClient` - gRPC client wrapping `PublishMetadata`, `ListSources`, `GetMetadata`, and `UpdateStatus` RPCs |
 | `accelerators/` | `AcceleratorBackend` boundary for accelerator-specific torch device control and fast-path capability gates, split into `base.py` (protocol), `cuda.py` (`CudaAcceleratorBackend`), and `xpu.py` (`XpuAcceleratorBackend`). CUDA and XPU are implemented backends; XPU keeps CUDA-only fast paths (pool registration, VMM arena, GDS) disabled and falls back to generic per-tensor NIXL registration. Further backends can be added behind the same interface |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
-| `refit_timing.py` | `RefitTimingRecorder` - normalized discovery, transfer, transformation, installation, and readiness timing |
+| `refit/` | Engine-agnostic live-refit primitives. `RefitTimingRecorder` provides normalized discovery, transfer, transformation, installation, and readiness timing |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
 | `adapter.py` | `EngineAdapter` lifecycle hooks and strategy retry errors |
 | `vllm_loader.py` | Compatibility shim for `modelexpress.engines.vllm.loader` |
 | `metadata/` | Metadata publishing, source identity, heartbeat, worker manifest serving, metadata client selection, and engine-agnostic cache-artifact transfer |
 | `load_strategy/` | Engine-neutral loading strategy chain: `RdmaStrategy`, `ModelStreamerStrategy` (S3/GCS/Azure/local), `GdsStrategy`, `DefaultStrategy` |
-| `engines/vllm/` | `VllmAdapter`, `MxModelLoader`, and `MdlLoader` - maps strategy hooks to vLLM loader APIs and installs translated refit tensors |
+| `engines/vllm/` | `VllmAdapter` and `MxModelLoader` map strategy hooks to vLLM loader APIs; `refit/` contains vLLM-specific live-refit capture/installation support, currently `MdlLoader` |
 | `engines/sglang/` | `SglangAdapter` and `MxModelLoader` - maps strategy hooks to SGLang's `remote_instance` backend |
 | `tensor_utils.py` | Tensor collection, checksums, storage views, `capture_tensor_attrs` |
 | `rank_utils.py` | `get_global_rank`, `get_worker_rank` |
@@ -587,7 +593,7 @@ Thin orchestration layer that delegates to `LoadStrategyChain.run()`. Builds a `
 
 ### vLLM Refit Installation
 
-`MdlLoader` implements Mapped Direct Load (MDL) for tensors that have already
+`engines/vllm/refit/MdlLoader` implements Mapped Direct Load (MDL) for tensors that have already
 been translated into the inference model's naming and numerical format. The
 first update records validated destinations in the live vLLM model. Later
 updates reuse those destinations for direct parameters, fused query/key/value
@@ -607,6 +613,12 @@ readiness.
 MDL does not discover sources, plan resharding, transfer bytes, or translate
 trainer tensors. Those stages provide the translated tensor stream and use
 `MdlLoader.load_weights()` as the final installation callback.
+
+The package boundary is intentional: timing and future install-plan contracts
+belong in engine-agnostic `modelexpress.refit`, while vLLM loader observation,
+placement, PWAL interaction, and direct installation belong in
+`modelexpress.engines.vllm.refit`. RL-framework orchestration and trainer
+adapters are separate integrations rather than part of this vLLM installer.
 
 ### SGLang Loader
 

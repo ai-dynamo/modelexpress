@@ -4,13 +4,18 @@
 import torch
 import pytest
 
-from modelexpress.engines.vllm.mdl import MdlLoader
-from modelexpress.refit_timing import RefitTimingRecorder, use_refit_timing
+from modelexpress.engines.vllm.refit import MdlLoader
+from modelexpress.engines.vllm.mdl import MdlLoader as CompatibilityMdlLoader
+from modelexpress.refit import RefitTimingRecorder, use_refit_timing
 
 
 class _Model:
     def named_parameters(self):
         return []
+
+
+def test_legacy_mdl_import_is_compatible():
+    assert CompatibilityMdlLoader is MdlLoader
 
 
 def _loader(rank=1):
