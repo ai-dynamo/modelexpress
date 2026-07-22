@@ -32,17 +32,22 @@ The vLLM manifests use:
 - `VLLM_PLUGINS=modelexpress`
 - `MX_MODEL_URI` as the model path passed to vLLM
 
-For tensor parallel deployments with TP > 1, set:
+Distributed streaming is on by default. To disable it for a tensor parallel
+deployment with TP > 1, set the container's `MX_MS_DISTRIBUTED` env var to `0`
+in the manifest (the checked-in manifests set it to `"1"`):
 
-```bash
-MX_MS_DISTRIBUTED=1
+```yaml
+env:
+  - name: MX_MS_DISTRIBUTED
+    value: "0"
 ```
 
 The SGLang manifests use `remote_instance` with backend `modelexpress`, while
 `MX_MODEL_URI` selects ModelStreamer inside the shared MX strategy chain.
 
-`MX_MS_DISTRIBUTED=1` enables the engine-native distributed ModelStreamer path
-through the corresponding ModelExpress adapter. TP1 runs ignore this setting.
+`MX_MS_DISTRIBUTED` (default `1`) enables the engine-native distributed
+ModelStreamer path through the corresponding ModelExpress adapter. TP1 runs
+ignore this setting.
 
 ## Verify Startup
 

@@ -126,6 +126,10 @@ ModelExpress/
 │       ├── __init__.py                 # Package init, vLLM loader auto-registration
 │       ├── client.py                   # MxClient gRPC client
 │       ├── nixl_transfer.py            # NixlTransferManager
+│       ├── refit/                      # Engine-agnostic live-refit primitives
+│       │   ├── __init__.py             # Public refit exports
+│       │   └── timing.py               # Structured refit stage timing
+│       ├── refit_timing.py             # Compatibility shim for refit.timing
 │       ├── source_selection.py         # P2P source-ordering policies (random, rendezvous_hash)
 │       ├── metrics.py                   # Opt-in Prometheus metrics collector (source-selection group today)
 │       ├── gds_transfer.py             # GPUDirect Storage transfer support
@@ -154,7 +158,11 @@ ModelExpress/
 │       │   ├── vllm/                   # vLLM integration
 │       │   │   ├── __init__.py         # vLLM loader registration
 │       │   │   ├── adapter.py          # VllmAdapter and context builder
-│       │   │   └── loader.py           # MxModelLoader implementation
+│       │   │   ├── loader.py           # MxModelLoader implementation
+│       │   │   ├── mdl.py              # Compatibility shim for vLLM refit
+│       │   │   └── refit/
+│       │   │       ├── __init__.py     # vLLM refit exports
+│       │   │       └── installer.py    # Mapped Direct Load installer
 │       │   └── sglang/                 # SGLang integration
 │       │       ├── __init__.py
 │       │       ├── adapter.py          # SglangAdapter and context builder
@@ -533,13 +541,14 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `client.py` | `MxClient` - gRPC client wrapping `PublishMetadata`, `ListSources`, `GetMetadata`, and `UpdateStatus` RPCs |
 | `accelerators/` | `AcceleratorBackend` boundary for accelerator-specific torch device control and fast-path capability gates, split into `base.py` (protocol), `cuda.py` (`CudaAcceleratorBackend`), and `xpu.py` (`XpuAcceleratorBackend`). CUDA and XPU are implemented backends; XPU keeps CUDA-only fast paths (pool registration, VMM arena, GDS) disabled and falls back to generic per-tensor NIXL registration. Further backends can be added behind the same interface |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
+| `refit/` | Engine-agnostic live-refit primitives. `RefitTimingRecorder` provides normalized discovery, transfer, transformation, installation, and readiness timing |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
 | `adapter.py` | `EngineAdapter` lifecycle hooks and strategy retry errors |
 | `vllm_loader.py` | Compatibility shim for `modelexpress.engines.vllm.loader` |
 | `metadata/` | Metadata publishing, source identity, heartbeat, worker manifest serving, metadata client selection, and engine-agnostic cache-artifact transfer |
 | `load_strategy/` | Engine-neutral loading strategy chain: `RdmaStrategy`, `ModelStreamerStrategy` (S3/GCS/Azure/local), `GdsStrategy`, `DefaultStrategy` |
-| `engines/vllm/` | `VllmAdapter` and `MxModelLoader` - maps strategy hooks to vLLM loader APIs and post-load lifecycle |
+| `engines/vllm/` | `VllmAdapter` and `MxModelLoader` map strategy hooks to vLLM loader APIs; `refit/` contains vLLM-specific live-refit capture/installation support, currently `MdlLoader` |
 | `engines/sglang/` | `SglangAdapter` and `MxModelLoader` - maps strategy hooks to SGLang's `remote_instance` backend |
 | `tensor_utils.py` | Tensor collection, checksums, storage views, `capture_tensor_attrs` |
 | `rank_utils.py` | `get_global_rank`, `get_worker_rank` |
@@ -581,6 +590,35 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 Thin orchestration layer that delegates to `LoadStrategyChain.run()`. Builds a `LoadContext` from vLLM config, initializes the model, runs the strategy chain, and updates global registries.
 
 **MTP two-pass load.** Multi-token-prediction models (Qwen3.5 MTP, DeepSeek MTP) call the loader twice on one worker: the target, then the draft head. `_is_speculative_draft()` detects the second pass via `model_config.runner_type == "draft"` and sets `ctx.p2p_enabled = False`. A P2P draft would collide on the target's NIXL metadata port, and since the merged draft shares the target's `SourceIdentity` it could poison source discovery, so registration, publication, and RDMA stay off for the draft while the target keeps serving. The draft loads through the ModelStreamer/default path. To avoid re-reading the whole checkpoint for a small head, `build_model_streamer_weight_iter` streams only the shards holding the draft's tensors: it reads `model.safetensors.index.json` (locally, or via the runai streamer's `pull_files` for object storage) and keeps shards whose tensor names start with `mtp.`. The draft's embedding and `lm_head` come from the target, so they are not streamed. If there is no index or no draft shard, it streams every shard.
+
+### vLLM Refit Installation
+
+`engines/vllm/refit/MdlLoader` implements Mapped Direct Load (MDL) for tensors that have already
+been translated into the inference model's naming and numerical format. The
+first update records validated destinations in the live vLLM model. Later
+updates reuse those destinations for direct parameters, fused query/key/value
+and MLP slices, local experts, tensor-parallel shards, and FP8 scales.
+
+Loaderless FP8 updates resolve the complete batch before the first in-place
+write. Unknown destinations, failed expert-ID translation, and incomplete
+scale coverage reject the update. Stock-loader errors propagate unless the
+FP8 loaderless policy was selected before loading.
+
+The destination-map signature includes parameter names, shapes, strides,
+storage identities, data types, devices, and expert mapping. Replacing or
+reshaping a parameter invalidates the map and records the next update as cold.
+`RefitTimingRecorder` emits one stable timing payload for discovery through
+readiness.
+
+MDL does not discover sources, plan resharding, transfer bytes, or translate
+trainer tensors. Those stages provide the translated tensor stream and use
+`MdlLoader.load_weights()` as the final installation callback.
+
+The package boundary is intentional: timing and future install-plan contracts
+belong in engine-agnostic `modelexpress.refit`, while vLLM loader observation,
+placement, PWAL interaction, and direct installation belong in
+`modelexpress.engines.vllm.refit`. RL-framework orchestration and trainer
+adapters are separate integrations rather than part of this vLLM installer.
 
 ### SGLang Loader
 
