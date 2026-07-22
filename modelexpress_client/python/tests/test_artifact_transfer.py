@@ -34,6 +34,7 @@ from modelexpress.metadata.artifact_transfer import (
     transfer_artifact_from_worker,
     triton_cache_artifact_transfer,
     tilelang_cache_artifact_transfer,
+    tvm_ffi_cache_artifact_transfer,
     torch_compile_cache_artifact_transfer,
 )
 from modelexpress.metadata.source_id import compute_mx_source_id
@@ -744,6 +745,11 @@ def test_tarred_p2p_artifact_transfer_splits_transfer_and_install(tmp_path, capl
             triton_cache_artifact_transfer,
             "triton_cache",
             p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
+        ),
+        (
+            tvm_ffi_cache_artifact_transfer,
+            "tvm_ffi_cache",
+            p2p_pb2.MX_SOURCE_TYPE_TVM_FFI_CACHE,
         ),
         (
             deep_gemm_cache_artifact_transfer,

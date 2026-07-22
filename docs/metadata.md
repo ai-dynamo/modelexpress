@@ -173,6 +173,7 @@ Factory helpers provide the cache source types currently expected by loaders:
 |--------|------------------|--------------------|
 | `torch_compile_cache_artifact_transfer()` | `TORCH_COMPILE_CACHE` | TorchInductor/vLLM torch compile cache directory |
 | `triton_cache_artifact_transfer()` | `TRITON_CACHE` | Triton kernel cache directory |
+| `tvm_ffi_cache_artifact_transfer()` | `TVM_FFI_CACHE` | TVM-FFI compiled SGLang kernel modules (`TVM_FFI_CACHE_DIR`, or `~/.cache/tvm-ffi`) |
 | `deep_gemm_cache_artifact_transfer()` | `DEEP_GEMM_CACHE` | DeepGEMM JIT cache directory (`DG_JIT_CACHE_DIR`, or `VLLM_CACHE_ROOT/deep_gemm`) |
 | `tilelang_cache_artifact_transfer()` | `TILELANG_CACHE` | TileLang JIT cache directory (`TILELANG_CACHE_DIR`, or `~/.tilelang/cache`) |
 | `cute_dsl_cache_artifact_transfer()` | `CUTE_DSL_CACHE` | CuTe DSL compiled-kernel cache directory (`CUTE_DSL_CACHE_DIR`, or `$TMPDIR/<user>/cutlass_python_cache`) |

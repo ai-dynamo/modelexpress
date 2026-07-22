@@ -98,6 +98,7 @@ if TYPE_CHECKING:
     MX_METRICS_SCHEME: str
     # Third-party JIT/compile cache locations read for artifact transfer
     TRITON_CACHE_DIR: Optional[str]
+    TVM_FFI_CACHE_DIR: Optional[str]
     DG_JIT_CACHE_DIR: Optional[str]
     DEEP_GEMM_CACHE_DIR: Optional[str]
     SGLANG_DG_CACHE_DIR: Optional[str]
@@ -217,6 +218,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_METRICS_SCHEME": lambda: os.environ.get("MX_METRICS_SCHEME", ""),
     # ── Third-party JIT/compile cache locations (raw; caller builds path) ──
     "TRITON_CACHE_DIR": lambda: os.environ.get("TRITON_CACHE_DIR"),
+    "TVM_FFI_CACHE_DIR": lambda: os.environ.get("TVM_FFI_CACHE_DIR"),
     "DG_JIT_CACHE_DIR": lambda: os.environ.get("DG_JIT_CACHE_DIR"),
     "DEEP_GEMM_CACHE_DIR": lambda: os.environ.get("DEEP_GEMM_CACHE_DIR"),
     "SGLANG_DG_CACHE_DIR": lambda: os.environ.get("SGLANG_DG_CACHE_DIR"),
