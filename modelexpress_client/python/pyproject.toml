@@ -56,6 +56,9 @@ metrics = [
 vmm = [
     "cuda-python>=12.0",
 ]
+instanttensor = [
+    "instanttensor>=0.1.9 ; sys_platform == 'linux'",
+]
 
 [project.urls]
 Homepage = "https://github.com/ai-dynamo/modelexpress"

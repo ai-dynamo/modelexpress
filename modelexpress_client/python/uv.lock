@@ -771,6 +771,22 @@ wheels = [
 ]
 
 [[package]]
+name = "instanttensor"
+version = "0.1.9"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "torch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/37/69/a4dc4e0f0018a0e558b716e90bcb19cb6a8c7506f68e89a1493608cf5e62/instanttensor-0.1.9.tar.gz", hash = "sha256:d8692b97991c1a5fb2db7905b9a6ae90a7f967c7ddd853d35e41caa146750c02", size = 9618304, upload-time = "2026-05-27T21:33:46.45Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/be/0c/3c757c4030097a70c3de5dc86e3458fef154f6f2433338b0f36dd1f3595e/instanttensor-0.1.9-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:d2e8a2ce8b63f2aadd551bfa35400c439ffae9fcb3df4651c8c7dc39a4de32e0", size = 5801201, upload-time = "2026-05-27T21:33:33.739Z" },
+    { url = "https://files.pythonhosted.org/packages/5a/e5/8d56ef0a9b5caa6fa4e6d430ad4273c112033bf13f1a4cc2dfcc7e729d36/instanttensor-0.1.9-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c07d7a5a8960746ca5732e18afe9da377937601a2fa3eab96124a0f44bc16605", size = 5873197, upload-time = "2026-05-27T21:33:36.314Z" },
+    { url = "https://files.pythonhosted.org/packages/97/01/667438b2c7b9caad3be48fe1363032574bb4a85d8d90b7a6e3ddf9979f53/instanttensor-0.1.9-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:0d957728161ec0d22a74bad3c0feb8fb9105736ab2585b48a0a0da8d330c6ff3", size = 5903991, upload-time = "2026-05-27T21:33:38.634Z" },
+    { url = "https://files.pythonhosted.org/packages/41/90/b50182538f64d59f4711dd902e60d84cdfb55a03e72a4619121a83260f28/instanttensor-0.1.9-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:1f2b2447959d22b9682d45ae75d7a9260485ed5a6763006db9a3735ceced3efa", size = 5901576, upload-time = "2026-05-27T21:33:41.051Z" },
+    { url = "https://files.pythonhosted.org/packages/29/7c/b5cb0ae191bac6de43ea574b7d99a33ad9e680a44741b4f13b15e5e22e2f/instanttensor-0.1.9-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:41725abe03e4282ea3cba5f9f0ed63c9fe2b4776f7d6e9ccba8edee5570749f1", size = 5895517, upload-time = "2026-05-27T21:33:43.41Z" },
+]
+
+[[package]]
 name = "isodate"
 version = "0.7.2"
 source = { registry = "https://pypi.org/simple" }
@@ -914,7 +930,6 @@ dependencies = [
     { name = "google-crc32c" },
     { name = "grpcio" },
     { name = "huggingface-hub" },
-    { name = "nixl", extra = ["cu12"], marker = "sys_platform == 'linux'" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "protobuf" },
@@ -931,6 +946,12 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
 ]
+instanttensor = [
+    { name = "instanttensor", marker = "sys_platform == 'linux'" },
+]
+metrics = [
+    { name = "prometheus-client" },
+]
 otel = [
     { name = "opentelemetry-api" },
 ]
@@ -945,11 +966,12 @@ requires-dist = [
     { name = "grpcio", specifier = ">=1.66.2" },
     { name = "grpcio-tools", marker = "extra == 'dev'", specifier = ">=1.60.0,<=1.66.2" },
     { name = "huggingface-hub", specifier = ">=0.20.0" },
-    { name = "nixl", extras = ["cu12"], marker = "sys_platform == 'linux'" },
+    { name = "instanttensor", marker = "sys_platform == 'linux' and extra == 'instanttensor'", specifier = ">=0.1.9" },
     { name = "numpy", specifier = ">=1.24.0" },
     { name = "opentelemetry-api", marker = "extra == 'dev'", specifier = ">=1.41.1" },
     { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.20.0" },
     { name = "opentelemetry-sdk", marker = "extra == 'dev'", specifier = ">=1.41.1" },
+    { name = "prometheus-client", marker = "extra == 'metrics'", specifier = ">=0.20.0" },
     { name = "protobuf", specifier = ">=5.27.0,<6.0.0" },
     { name = "pydantic", specifier = ">=2.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
@@ -957,7 +979,7 @@ requires-dist = [
     { name = "runai-model-streamer", extras = ["s3", "gcs", "azure"], marker = "sys_platform == 'linux'" },
     { name = "torch", specifier = ">=2.6.0" },
 ]
-provides-extras = ["dev", "otel", "vmm"]
+provides-extras = ["dev", "otel", "metrics", "vmm", "instanttensor"]
 
 [[package]]
 name = "mpmath"
@@ -1018,44 +1040,6 @@ resolution-markers = [
 sdist = { url = "https://files.pythonhosted.org/packages/6a/51/63fe664f3908c97be9d2e4f1158eb633317598cfa6e1fc14af5383f17512/networkx-3.6.1.tar.gz", hash = "sha256:26b7c357accc0c8cde558ad486283728b65b6a95d85ee1cd66bafab4c8168509", size = 2517025, upload-time = "2025-12-08T17:02:39.908Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/9e/c9/b2622292ea83fbb4ec318f5b9ab867d0a28ab43c5717bb85b0a5f6b3b0a4/networkx-3.6.1-py3-none-any.whl", hash = "sha256:d47fbf302e7d9cbbb9e2555a0d267983d2aa476bac30e90dfbe5669bd57f3762", size = 2068504, upload-time = "2025-12-08T17:02:38.159Z" },
-]
-
-[[package]]
-name = "nixl"
-version = "0.10.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "nixl-cu12" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/bb/a4/10e80e623790d3fb070e966b36bced009419d483c92ae0df6645230f606f/nixl-0.10.1-py3-none-any.whl", hash = "sha256:616465673dae5180d296525a03237af4cd5f2c00c3228d185bc06dbe621509b7", size = 6680, upload-time = "2026-03-03T19:55:44.848Z" },
-]
-
-[package.optional-dependencies]
-cu12 = [
-    { name = "nixl-cu12" },
-]
-
-[[package]]
-name = "nixl-cu12"
-version = "0.10.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.4.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "torch" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/e4/33/db0e850acbca1c9f4b6a793d483d9844dedd756f8dc8ab1f91dcf3294d21/nixl_cu12-0.10.1-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:277cde28bc45f706df689ed399327d0cce5432382606a5fc1d19fc470fcc57b4", size = 50217293, upload-time = "2026-03-03T19:55:12.262Z" },
-    { url = "https://files.pythonhosted.org/packages/50/35/3f46dd00810df6aef402a7ee0aabf3257f86978d2df44b09248d810fe985/nixl_cu12-0.10.1-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:0bb1b3532f95c2f376e21008e91e8ec5791304a29af19e75d29fd1bcc754c9bc", size = 51522014, upload-time = "2026-03-03T19:54:59.365Z" },
-    { url = "https://files.pythonhosted.org/packages/f4/1c/4fb9401047fe9af215596c71247b12b3b83b112bbb1d0a827b839e5dfeab/nixl_cu12-0.10.1-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:ba46837abee8e06c8d86bd9b2cd7dab8c3d1e8407e04d52e6db3a9b137478c4b", size = 50219873, upload-time = "2026-03-03T19:55:12.43Z" },
-    { url = "https://files.pythonhosted.org/packages/d6/1c/f5e974ea562fe27194d1591a4187be55f07642df7d7fc6a0f0db334530a3/nixl_cu12-0.10.1-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:48d3d9cc882edaa0a323d0ddfed39e0864b873ef1fa56e774c5a793629bcf083", size = 51524522, upload-time = "2026-03-03T19:55:02.013Z" },
-    { url = "https://files.pythonhosted.org/packages/d4/21/c1f34212a3e612b5c0da389c1aa3557588d9cfc2adf864914b32e270847b/nixl_cu12-0.10.1-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:b4712c6e0f18f57fee34cd970faac01480f0caf12da33d4a40ef4e9096a4caf7", size = 50227261, upload-time = "2026-03-03T19:55:17.177Z" },
-    { url = "https://files.pythonhosted.org/packages/71/32/3fe6bb57de847ab59fb9e36c5a64249fb5674959773faca0aeefb791fd8e/nixl_cu12-0.10.1-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:26e59f9841985cf5b547202865036f84ae6dc23184789446fe5833e7499e21a9", size = 51534091, upload-time = "2026-03-03T19:55:02.199Z" },
-    { url = "https://files.pythonhosted.org/packages/48/7b/054b7521fd4880e991d6e631f80d59cb772f7bf43c8775aea0b2292c2747/nixl_cu12-0.10.1-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:685a0b8c5cdaa9cdbd826ea54cf46b4b3e46b016ee73a919cd2cf489402c56fd", size = 50227352, upload-time = "2026-03-03T19:55:13.197Z" },
-    { url = "https://files.pythonhosted.org/packages/b9/68/488d5d655c3a0cac1b9af95c57fe8fc961321ee7eb511ce206a52ea7af43/nixl_cu12-0.10.1-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:3dde565c9d6e1d5af139a4dca240e902d5dbb32ea622acb31cdca3fb25cb859f", size = 51534426, upload-time = "2026-03-03T19:55:07.345Z" },
-    { url = "https://files.pythonhosted.org/packages/ad/dc/aab37d1a3761ac45a4b34c0eeced4fd3b0b0be4953f869cb50ba8c617b2e/nixl_cu12-0.10.1-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:15376c1527c68d77fff5c6bb7cf7466a16dae0ab3bb32de152a602ba9edaaa9d", size = 50229113, upload-time = "2026-03-03T19:55:37.758Z" },
-    { url = "https://files.pythonhosted.org/packages/cc/99/ae66edc2ed2052042bacd66fa9dae28cc41c01e524fa8d677fb2f974ca64/nixl_cu12-0.10.1-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:7641bc2bd3aeeefcf2ea3a3fd9f940f54a62d985ce2426dde6b3860d0edce13e", size = 51534633, upload-time = "2026-03-03T19:55:14.228Z" },
 ]
 
 [[package]]
@@ -1397,6 +1381,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/f9/e2/3e91f31a7d2b083fe6ef3fa267035b518369d9511ffab804f839851d2779/pluggy-1.6.0.tar.gz", hash = "sha256:7dcc130b76258d33b90f61b658791dede3486c3e6bfb003ee5c9bfb396dd22f3", size = 69412, upload-time = "2025-05-15T12:30:07.975Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/54/20/4d324d65cc6d9205fabedc306948156824eb9f0ee1633355a8f7ec5c66bf/pluggy-1.6.0-py3-none-any.whl", hash = "sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746", size = 20538, upload-time = "2025-05-15T12:30:06.134Z" },
+]
+
+[[package]]
+name = "prometheus-client"
+version = "0.25.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/1b/fb/d9aa83ffe43ce1f19e557c0971d04b90561b0cfd50762aafb01968285553/prometheus_client-0.25.0.tar.gz", hash = "sha256:5e373b75c31afb3c86f1a52fa1ad470c9aace18082d39ec0d2f918d11cc9ba28", size = 86035, upload-time = "2026-04-09T19:53:42.359Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8d/9b/d4b1e644385499c8346fa9b622a3f030dce14cd6ef8a1871c221a17a67e7/prometheus_client-0.25.0-py3-none-any.whl", hash = "sha256:d5aec89e349a6ec230805d0df882f3807f74fd6c1a2fa86864e3c2279059fed1", size = 64154, upload-time = "2026-04-09T19:53:41.324Z" },
 ]
 
 [[package]]
