@@ -19,6 +19,10 @@ from ...adapter import EngineAdapter
 from ...accelerators import accelerator_backend_for
 from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
+from ...tensor_utils import (
+    capture_tensor_attrs,
+    collect_module_tensors,
+)
 
 logger = logging.getLogger("modelexpress.engines.sglang.adapter")
 
@@ -75,44 +79,23 @@ class SglangAdapter(EngineAdapter):
     def discover_tensors(self, result: LoadResult) -> dict[str, torch.Tensor]:
         if result.model is None:
             raise RuntimeError("SGLang tensor discovery requires result.model")
-        return self._collect_tensors(result.model)
-
-    def _collect_tensors(self, model) -> dict[str, torch.Tensor]:
-        """Collect SGLang model parameters for NIXL registration.
-
-        SGLang's current NIXL path registers contiguous parameters directly and
-        registers a byte view of the underlying storage for non-contiguous
-        parameters. Keep that naming behavior so source and target descriptors
-        match the upstream integration.
-        """
-        backend = self.accelerator_backend
-        tensors: dict[str, torch.Tensor] = {}
-        seen_ptrs: set[int] = set()
-
-        for name, param in model.named_parameters():
-            t = param.data
-            if not backend.is_accel_tensor(t):
-                continue
-            if t.is_contiguous():
-                tensor_name = name
-                registered = t
-            else:
-                tensor_name = f"{name}.__storage"
-                registered = torch.empty(0, dtype=torch.uint8, device=t.device).set_(
-                    t.untyped_storage()
-                )
-
-            ptr = registered.data_ptr()
-            if ptr in seen_ptrs:
-                continue
-            seen_ptrs.add(ptr)
-            tensors[tensor_name] = registered
-
-        return tensors
+        # adopt_hidden_tensors() would also register accelerator tensors stashed
+        # on non-Module objects (e.g. SGLang's MXFP4 FusedMoE quant_method, which
+        # holds swizzled weights after deleting the original params). It is left
+        # commented out for now: it is a no-op for DeepSeek-V2-Lite (whose derived
+        # w_kc/w_vc are direct Tensor attributes, already promoted by
+        # capture_tensor_attrs), and enabling it adds new _mx_* manifest names,
+        # i.e. a transfer-ABI change that needs a version bump to avoid mixed
+        # old/new source/target manifests plus MXFP4 + CUTLASS FP8/W4A8 smoke
+        # tests. Enable it (with those guards) when SGLang nested-object coverage
+        # is in scope.
+        # adopt_hidden_tensors(result.model, self.accelerator_backend)
+        return collect_module_tensors(result.model, self.accelerator_backend)
 
     def before_rdma_receive(self, result: LoadResult) -> LoadResult:
-        result = self._post_load_weights(result)
-        return self._process_weights_after_loading(result)
+        with capture_tensor_attrs(self.accelerator_backend):
+            result = self._post_load_weights(result)
+            return self._process_weights_after_loading(result)
 
     def apply_weight_iter(
         self,
@@ -121,7 +104,8 @@ class SglangAdapter(EngineAdapter):
     ) -> LoadResult:
         if result.model is None:
             raise RuntimeError("SGLang weight iterator loading requires result.model")
-        result.model.load_weights(weights_iter)
+        with capture_tensor_attrs(self.accelerator_backend):
+            result.model.load_weights(weights_iter)
         return result
 
     def build_model_streamer_weight_iter(
@@ -152,7 +136,8 @@ class SglangAdapter(EngineAdapter):
         return loader._get_all_weights(stream_model_config, model)
 
     def after_weight_iter_load(self, result: LoadResult) -> LoadResult:
-        return self._process_weights_after_loading(result)
+        with capture_tensor_attrs(self.accelerator_backend):
+            return self._process_weights_after_loading(result)
 
     def load_via_native(self, result: LoadResult) -> LoadResult:
         if result.model is None:
@@ -165,9 +150,12 @@ class SglangAdapter(EngineAdapter):
         disk_config.load_format = LoadFormat.AUTO
         disk_loader = DefaultModelLoader(disk_config)
         weights_iter = disk_loader._get_all_weights(self.model_config, result.model)
-        DefaultModelLoader.load_weights_and_postprocess(
-            result.model, weights_iter, self.target_device,
-        )
+        # Same capture as the target path so the source publishes the derived
+        # MLA tensors under matching buffer names (symmetric manifest).
+        with capture_tensor_attrs(self.accelerator_backend):
+            DefaultModelLoader.load_weights_and_postprocess(
+                result.model, weights_iter, self.target_device,
+            )
         return result
 
     def reinit_for_retry(self, result: LoadResult) -> LoadResult:
@@ -175,6 +163,7 @@ class SglangAdapter(EngineAdapter):
             _get_quantization_config,
             _initialize_model,
         )
+        from sglang.srt.model_loader.utils import set_default_torch_dtype
 
         old_value = result.value
         result.value = None
@@ -187,12 +176,15 @@ class SglangAdapter(EngineAdapter):
             self.get_global_rank(),
         )
         quant_config = _get_quantization_config(self.model_config, self.load_config)
-        with self.target_device:
-            model = _initialize_model(
-                self.model_config,
-                self.load_config,
-                quant_config,
-            )
+        # Match SGLang's initial load path so retry parameters use the model's
+        # configured dtype instead of PyTorch's default float32.
+        with set_default_torch_dtype(self.model_config.dtype):
+            with self.target_device:
+                model = _initialize_model(
+                    self.model_config,
+                    self.load_config,
+                    quant_config,
+                )
         return LoadResult(value=model, model=model, publishable=result.publishable)
 
     def _process_weights_after_loading(self, result: LoadResult) -> LoadResult:

@@ -32,6 +32,62 @@ from . import p2p_pb2
 
 logger = logging.getLogger("modelexpress.trtllm_live_transfer")
 
+_TRTLLM_RUNTIME_ALIAS_COMPONENTS = frozenset(
+    {"next_attn", "next_layer_layernorm"}
+)
+
+
+def _is_trtllm_runtime_alias_name(name: str) -> bool:
+    """Whether a parameter path exists only after TRT-LLM runtime alias setup."""
+    return bool(
+        _TRTLLM_RUNTIME_ALIAS_COMPONENTS.intersection(name.split("."))
+    )
+
+
+def _canonical_named_parameters(torch_model: Any) -> list[tuple[str, torch.Tensor]]:
+    """Return one stable, non-runtime-alias name for each parameter storage."""
+    canonical = []
+    canonical_ptrs = set()
+    alias_names_by_ptr = {}
+    for name, param in torch_model.named_parameters(remove_duplicate=False):
+        ptr = param.data.data_ptr()
+        storage_key = (param.device.type, param.device.index, ptr)
+        if _is_trtllm_runtime_alias_name(name):
+            alias_names_by_ptr.setdefault(storage_key, []).append(name)
+            continue
+        if storage_key in canonical_ptrs:
+            logger.debug("Skipping duplicate canonical param: %s (ptr=%x)", name, ptr)
+            continue
+        canonical_ptrs.add(storage_key)
+        canonical.append((name, param))
+
+    alias_only_ptrs = set(alias_names_by_ptr).difference(canonical_ptrs)
+    if alias_only_ptrs:
+        examples = [alias_names_by_ptr[ptr][0] for ptr in list(alias_only_ptrs)[:3]]
+        raise RuntimeError(
+            "TRT-LLM runtime aliases have no canonical parameter path: "
+            f"{len(alias_only_ptrs)} storages; examples: {examples}"
+        )
+    return canonical
+
+
+def _require_exact_catalog_match(
+    source_descs: dict[str, Any], target_params: dict[str, torch.Tensor]
+) -> None:
+    """Reject P2P unless source and target expose exactly the same names."""
+    source_names = set(source_descs)
+    target_names = set(target_params)
+    absent_from_target = sorted(source_names.difference(target_names))
+    absent_from_source = sorted(target_names.difference(source_names))
+    if absent_from_target or absent_from_source:
+        raise RuntimeError(
+            "MX P2P source/target parameter catalogs do not match: "
+            f"{len(absent_from_target)} source tensors are absent from the target "
+            f"(examples: {absent_from_target[:3]}); "
+            f"{len(absent_from_source)} target tensors are absent from the source "
+            f"(examples: {absent_from_source[:3]})"
+        )
+
 
 def _build_trtllm_identity(
     model_name: str,
@@ -62,8 +118,9 @@ def _build_trtllm_identity(
 def publish_model_params(torch_model: Any) -> None:
     """Publish this rank's model params to ModelExpress directly from a torch model.
 
-    Called from ModelLoader.load() BEFORE post_load_weights() so that targets
-    receive pre-processed weights and can run their own post_load_weights().
+    TensorRT-LLM may call this after post-load transformations. Runtime-only
+    alias paths are excluded so receivers can match the final bytes against
+    their canonical, pre-alias parameter tree.
 
     Each rank publishes independently via MxClient (per-worker API).
     """
@@ -84,15 +141,9 @@ def publish_model_params(torch_model: Any) -> None:
     mx_server = envs.MODEL_EXPRESS_URL or "modelexpress-server:8001"
 
     param_tensors = {}
-    seen_data_ptrs = set()
     total_bytes = 0
-    for name, param in torch_model.named_parameters():
+    for name, param in _canonical_named_parameters(torch_model):
         if param.device.type == "cuda" and param.device.index == device_id:
-            ptr = param.data.data_ptr()
-            if ptr in seen_data_ptrs:
-                logger.debug("Skipping aliased param: %s (ptr=%x)", name, ptr)
-                continue
-            seen_data_ptrs.add(ptr)
             param_tensors[name] = param.data
             total_bytes += param.numel() * param.element_size()
 
@@ -191,15 +242,9 @@ def publish_from_worker(worker: Any) -> None:
     mx_server = envs.MODEL_EXPRESS_URL or "modelexpress-server:8001"
 
     param_tensors = {}
-    seen_data_ptrs = set()
     total_bytes = 0
-    for name, param in torch_model.named_parameters():
+    for name, param in _canonical_named_parameters(torch_model):
         if param.device.type == "cuda" and param.device.index == device_id:
-            ptr = param.data.data_ptr()
-            if ptr in seen_data_ptrs:
-                logger.debug("Skipping aliased param: %s (ptr=%x)", name, ptr)
-                continue
-            seen_data_ptrs.add(ptr)
             param_tensors[name] = param.data
             total_bytes += param.numel() * param.element_size()
 
@@ -283,6 +328,41 @@ class MxLiveWeightLoader:
         model: Any = None,
         **kwargs,
     ) -> dict[str, Any]:
+        device_id = torch.cuda.current_device()
+        try:
+            from mpi4py import MPI
+            mpi_rank = MPI.COMM_WORLD.Get_rank()
+        except Exception:
+            mpi_rank = device_id
+
+        log_dir = envs.MX_TRANSFER_LOG_DIR
+        os.makedirs(log_dir, exist_ok=True)
+        rank_log = os.path.join(log_dir, f"rank{mpi_rank}.log")
+        fh = logging.FileHandler(rank_log, mode="w")
+        fh.setLevel(logging.INFO)
+        fh.setFormatter(
+            logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
+        )
+        mx_logger = logging.getLogger("modelexpress")
+        mx_logger.addHandler(fh)
+        try:
+            return self._load_weights(
+                checkpoint_dir=checkpoint_dir,
+                mapping=mapping,
+                model=model,
+                **kwargs,
+            )
+        finally:
+            mx_logger.removeHandler(fh)
+            fh.close()
+
+    def _load_weights(
+        self,
+        checkpoint_dir: str,
+        mapping: Any = None,
+        model: Any = None,
+        **kwargs,
+    ) -> dict[str, Any]:
         from .nixl_transfer import NixlTransferManager
         from .types import TensorDescriptor
 
@@ -307,15 +387,6 @@ class MxLiveWeightLoader:
         except Exception:
             mpi_rank = device_id
 
-        # MPI workers' stdout is swallowed by TRT-LLM — write to per-rank file
-        log_dir = envs.MX_TRANSFER_LOG_DIR
-        os.makedirs(log_dir, exist_ok=True)
-        rank_log = os.path.join(log_dir, f"rank{mpi_rank}.log")
-        fh = logging.FileHandler(rank_log, mode="w")
-        fh.setLevel(logging.INFO)
-        fh.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
-        logging.getLogger("modelexpress").addHandler(fh)
-
         logger.info(
             "Live transfer: loading '%s' rank %d (GPU %d)", model_name, mpi_rank, device_id
         )
@@ -335,7 +406,7 @@ class MxLiveWeightLoader:
 
         # 2. Build name→param map from target model
         target_params = {}
-        for name, param in model.named_parameters():
+        for name, param in _canonical_named_parameters(model):
             if param.device.index == device_id:
                 target_params[name] = param.data
 
@@ -345,11 +416,11 @@ class MxLiveWeightLoader:
 
         # 3. Build source name→descriptor map
         source_descs = {t.name: t for t in worker_tensor_descriptors(source_worker)}
+        _require_exact_catalog_match(source_descs, target_params)
 
         # 4. Match source and target by name
         matched = []
         dtype_cast_needed = []
-        unmatched_source = []
         for src_name, src_desc in source_descs.items():
             if src_name in target_params:
                 dst_param = target_params[src_name]
@@ -373,15 +444,6 @@ class MxLiveWeightLoader:
                             "Size mismatch for %s: source=%d target=%d (numel src=%d dst=%d)",
                             src_name, src_size, dst_size, src_numel, dst_param.numel(),
                         )
-            else:
-                unmatched_source.append(src_name)
-
-        if unmatched_source:
-            logger.warning(
-                "%d source tensors not found in target: %s...",
-                len(unmatched_source), unmatched_source[:3],
-            )
-
         # For dtype-mismatched tensors, allocate temp buffers at source dtype
         dtype_map = {"torch.bfloat16": torch.bfloat16, "torch.float16": torch.float16,
                      "torch.float32": torch.float32, "torch.uint8": torch.uint8,

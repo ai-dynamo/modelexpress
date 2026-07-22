@@ -28,6 +28,8 @@ struct WorkerEntry {
 #[derive(Default)]
 struct SourceEntry {
     model_name: String,
+    extra_parameters: HashMap<String, String>,
+    identity: Option<SourceIdentity>,
     workers: HashMap<String, WorkerEntry>,
 }
 
@@ -59,6 +61,9 @@ impl MetadataBackend for InMemoryMetadataBackend {
         identity: &SourceIdentity,
         worker_id: &str,
         worker: WorkerMetadata,
+        _pod_name: &str,
+        _pod_uid: &str,
+        _pod_namespace: &str,
     ) -> MetadataResult<()> {
         let source_id = crate::p2p::source_identity::compute_mx_source_id(identity);
         let record = WorkerRecord::from(worker);
@@ -67,6 +72,8 @@ impl MetadataBackend for InMemoryMetadataBackend {
         let mut sources = self.lock();
         let source = sources.entry(source_id).or_default();
         source.model_name = identity.model_name.clone();
+        source.extra_parameters = identity.extra_parameters.clone();
+        source.identity = Some(identity.clone());
         let entry = source.workers.entry(worker_id.to_string()).or_default();
         entry.ranks.insert(rank, record);
         entry.index_rank = rank;
@@ -94,6 +101,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
             model_name: source.model_name.clone(),
             workers: entry.ranks.values().cloned().collect(),
             published_at: 0,
+            identity: source.identity.clone(),
         }))
     }
 
@@ -120,7 +128,10 @@ impl MetadataBackend for InMemoryMetadataBackend {
                     .ranks
                     .get(&entry.index_rank)
                     .or_else(|| entry.ranks.values().next());
-                let (status, updated_at) = reported.map_or((0, 0), |r| (r.status, r.updated_at));
+                let (status, updated_at, accelerator) = reported.map_or_else(
+                    || (0, 0, String::new()),
+                    |r| (r.status, r.updated_at, r.accelerator.clone()),
+                );
                 result.push(SourceInstanceInfo {
                     source_id: sid.clone(),
                     worker_id: worker_id.clone(),
@@ -128,6 +139,9 @@ impl MetadataBackend for InMemoryMetadataBackend {
                     worker_rank: entry.index_rank,
                     status,
                     updated_at,
+                    accelerator,
+                    training_step: super::parse_training_step(&source.extra_parameters),
+                    layout_signature: super::parse_layout_signature(&source.extra_parameters),
                 });
             }
         }
@@ -216,6 +230,7 @@ mod tests {
             backend_metadata: None,
             status: status as i32,
             updated_at: 0,
+            accelerator: "cuda".to_string(),
             ..Default::default()
         }
     }
@@ -228,7 +243,7 @@ mod tests {
         let source_id = compute_mx_source_id(&id);
 
         backend
-            .publish_metadata(&id, "w1", worker(0, SourceStatus::Ready))
+            .publish_metadata(&id, "w1", worker(0, SourceStatus::Ready), "", "", "")
             .await
             .expect("publish");
         let record = backend
@@ -262,7 +277,7 @@ mod tests {
 
         for rank in [2, 0, 1] {
             backend
-                .publish_metadata(&id, "w1", worker(rank, SourceStatus::Ready))
+                .publish_metadata(&id, "w1", worker(rank, SourceStatus::Ready), "", "", "")
                 .await
                 .expect("publish");
         }
@@ -283,11 +298,11 @@ mod tests {
         let id = identity("m");
 
         backend
-            .publish_metadata(&id, "w1", worker(0, SourceStatus::Initializing))
+            .publish_metadata(&id, "w1", worker(0, SourceStatus::Initializing), "", "", "")
             .await
             .expect("publish r0");
         backend
-            .publish_metadata(&id, "w1", worker(1, SourceStatus::Ready))
+            .publish_metadata(&id, "w1", worker(1, SourceStatus::Ready), "", "", "")
             .await
             .expect("publish r1");
 
@@ -323,15 +338,17 @@ mod tests {
     #[tokio::test]
     async fn list_workers_reports_index_rank() {
         let backend = InMemoryMetadataBackend::new();
-        let id = identity("m");
+        let mut id = identity("m");
+        id.extra_parameters
+            .insert("training_step".to_string(), "42".to_string());
         let source_id = compute_mx_source_id(&id);
 
         backend
-            .publish_metadata(&id, "w1", worker(0, SourceStatus::Initializing))
+            .publish_metadata(&id, "w1", worker(0, SourceStatus::Initializing), "", "", "")
             .await
             .expect("publish r0");
         backend
-            .publish_metadata(&id, "w1", worker(3, SourceStatus::Ready))
+            .publish_metadata(&id, "w1", worker(3, SourceStatus::Ready), "", "", "")
             .await
             .expect("publish r3");
 
@@ -342,6 +359,11 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].worker_rank, 3, "reports the last-published rank");
         assert_eq!(listed[0].status, SourceStatus::Ready as i32);
+        assert_eq!(
+            listed[0].accelerator, "cuda",
+            "carries the runtime accelerator"
+        );
+        assert_eq!(listed[0].training_step, Some(42));
     }
 
     // update_status patches an existing rank and errors on a missing rank or worker
@@ -352,7 +374,7 @@ mod tests {
         let source_id = compute_mx_source_id(&id);
 
         backend
-            .publish_metadata(&id, "w1", worker(0, SourceStatus::Initializing))
+            .publish_metadata(&id, "w1", worker(0, SourceStatus::Initializing), "", "", "")
             .await
             .expect("publish");
         backend
@@ -392,11 +414,11 @@ mod tests {
         let source_id = compute_mx_source_id(&id);
 
         backend
-            .publish_metadata(&id, "w1", worker(0, SourceStatus::Ready))
+            .publish_metadata(&id, "w1", worker(0, SourceStatus::Ready), "", "", "")
             .await
             .expect("publish w1");
         backend
-            .publish_metadata(&id, "w2", worker(0, SourceStatus::Ready))
+            .publish_metadata(&id, "w2", worker(0, SourceStatus::Ready), "", "", "")
             .await
             .expect("publish w2");
 

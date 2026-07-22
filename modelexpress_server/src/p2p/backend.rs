@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use modelexpress_common::grpc::p2p::{
     ArtifactSourceMetadata, SourceIdentity, SourceStatus, TensorSourceMetadata, WorkerMetadata,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub mod kubernetes;
@@ -36,6 +37,15 @@ pub struct ModelMetadataRecord {
     pub model_name: String,
     pub workers: Vec<WorkerRecord>,
     pub published_at: i64,
+    /// Full SourceIdentity that produced ``source_id``.
+    ///
+    /// Older records (written before this field was added) leave it ``None``.
+    /// New v2 RL clients (NemoRL `update_weights_via_mx`) read framework-level
+    /// state from `identity.extra_parameters` (training_step, role, shape
+    /// registry, dirty experts). Backends are responsible for round-tripping
+    /// the entire SourceIdentity message; pre-existing records continue to
+    /// work because the field is optional.
+    pub identity: Option<SourceIdentity>,
 }
 
 /// Lightweight reference to a source worker (no tensor metadata).
@@ -51,6 +61,27 @@ pub struct SourceInstanceInfo {
     pub status: i32,
     /// Timestamp of last status update (unix millis).
     pub updated_at: i64,
+    /// Runtime accelerator family for compatibility filtering (e.g. "cuda").
+    /// Empty when unknown (records that predate the field).
+    pub accelerator: String,
+    /// Training step/version from SourceIdentity.extra_parameters, when present.
+    pub training_step: Option<u64>,
+    /// Stable topology/registry digest, when published by the source.
+    pub layout_signature: Option<String>,
+}
+
+pub(crate) fn parse_training_step(extra_parameters: &HashMap<String, String>) -> Option<u64> {
+    extra_parameters
+        .get("training_step")
+        .or_else(|| extra_parameters.get("version"))
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+pub(crate) fn parse_layout_signature(extra_parameters: &HashMap<String, String>) -> Option<String> {
+    extra_parameters
+        .get("layout_signature")
+        .filter(|value| !value.is_empty())
+        .cloned()
 }
 
 /// Backend-specific metadata for a worker
@@ -123,6 +154,8 @@ pub struct WorkerRecord {
     pub agent_name: String,
     /// P2P: Worker gRPC endpoint for tensor manifest (host:port)
     pub worker_grpc_endpoint: String,
+    /// Runtime accelerator family for compatibility filtering.
+    pub accelerator: String,
     /// Small discovery summary for file-backed artifact sources.
     pub artifact_source: Option<ArtifactSourceMetadataRecord>,
 }
@@ -177,6 +210,7 @@ impl From<WorkerMetadata> for WorkerRecord {
             metadata_endpoint: meta.metadata_endpoint,
             agent_name: meta.agent_name,
             worker_grpc_endpoint: meta.worker_grpc_endpoint,
+            accelerator: meta.accelerator,
             artifact_source,
         }
     }
@@ -232,6 +266,7 @@ impl From<WorkerRecord> for WorkerMetadata {
             metadata_endpoint: record.metadata_endpoint,
             agent_name: record.agent_name,
             worker_grpc_endpoint: record.worker_grpc_endpoint,
+            accelerator: record.accelerator,
             tensors: legacy_tensors,
             source_payload: Some(source_payload),
         }
@@ -276,6 +311,7 @@ impl From<ArtifactSourceMetadataRecord> for ArtifactSourceMetadata {
 
 /// Trait for metadata backend implementations
 #[cfg_attr(test, mockall::automock)]
+#[allow(clippy::too_many_arguments)]
 #[async_trait]
 pub trait MetadataBackend: Send + Sync {
     /// Connect to the backend (initialize connections, etc.)
@@ -289,6 +325,9 @@ pub trait MetadataBackend: Send + Sync {
         identity: &SourceIdentity,
         worker_id: &str,
         worker: WorkerMetadata,
+        pod_name: &str,
+        pod_uid: &str,
+        pod_namespace: &str,
     ) -> MetadataResult<()>;
 
     /// Get full tensor metadata for one specific worker.
@@ -308,6 +347,36 @@ pub trait MetadataBackend: Send + Sync {
         source_id: Option<String>,
         status_filter: Option<SourceStatus>,
     ) -> MetadataResult<Vec<SourceInstanceInfo>>;
+
+    /// List workers with lightweight discovery predicates applied before the
+    /// caller fetches full tensor metadata. Backends may override this to push
+    /// filtering and batching into their storage engine.
+    async fn list_workers_filtered(
+        &self,
+        source_id: Option<String>,
+        status_filter: Option<SourceStatus>,
+        model_name_filter: Option<String>,
+        worker_rank_filter: Option<u32>,
+        min_training_step: Option<u64>,
+        min_updated_at: Option<i64>,
+        limit: Option<usize>,
+    ) -> MetadataResult<Vec<SourceInstanceInfo>> {
+        let mut workers = self.list_workers(source_id, status_filter).await?;
+        workers.retain(|worker| {
+            model_name_filter
+                .as_ref()
+                .is_none_or(|model| worker.model_name == *model)
+                && worker_rank_filter.is_none_or(|rank| worker.worker_rank == rank)
+                && min_training_step
+                    .is_none_or(|step| worker.training_step.is_some_and(|v| v >= step))
+                && min_updated_at.is_none_or(|timestamp| worker.updated_at >= timestamp)
+        });
+        workers.sort_by_key(|worker| std::cmp::Reverse(worker.updated_at));
+        if let Some(limit) = limit.filter(|value| *value > 0) {
+            workers.truncate(limit);
+        }
+        Ok(workers)
+    }
 
     /// Remove all workers of a source by mx_source_id
     async fn remove_metadata(&self, source_id: &str) -> MetadataResult<()>;
@@ -351,5 +420,34 @@ pub async fn create_backend(config: BackendConfig) -> MetadataResult<Arc<dyn Met
             backend.connect().await?;
             Ok(Arc::new(backend) as Arc<dyn MetadataBackend>)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_layout_signature, parse_training_step};
+    use std::collections::HashMap;
+
+    #[test]
+    fn parses_training_step_with_version_fallback() {
+        let mut values = HashMap::new();
+        values.insert("version".to_string(), "41".to_string());
+        assert_eq!(parse_training_step(&values), Some(41));
+
+        values.insert("training_step".to_string(), "42".to_string());
+        assert_eq!(parse_training_step(&values), Some(42));
+
+        values.insert("training_step".to_string(), "not-a-number".to_string());
+        assert_eq!(parse_training_step(&values), None);
+    }
+
+    #[test]
+    fn parses_non_empty_layout_signature() {
+        let mut values = HashMap::new();
+        assert_eq!(parse_layout_signature(&values), None);
+        values.insert("layout_signature".to_string(), String::new());
+        assert_eq!(parse_layout_signature(&values), None);
+        values.insert("layout_signature".to_string(), "abc123".to_string());
+        assert_eq!(parse_layout_signature(&values).as_deref(), Some("abc123"));
     }
 }

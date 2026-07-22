@@ -49,14 +49,18 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         metadata_endpoint: str = "",
         agent_name: str = "",
         worker_rank: int = 0,
+        accelerator: str = "",
         artifact_manifests: Mapping[str, p2p_pb2.ArtifactManifest] | None = None,
         artifact_chunk_manager: Any | None = None,
+        worker_id: str = "",
     ):
         self._tensor_protos = tensor_protos
         self._mx_source_id = mx_source_id
         self._metadata_endpoint = metadata_endpoint
         self._agent_name = agent_name
         self._worker_rank = worker_rank
+        self._accelerator = accelerator
+        self._worker_id = worker_id
         self._artifact_sources: dict[str, _ArtifactSource] = {}
         self._artifact_lock = Lock()
         if artifact_manifests and mx_source_id:
@@ -95,14 +99,21 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
                 self._artifact_sources.pop(mx_source_id, None)
 
     def GetTensorManifest(self, request, context):
-        self._validate_tensor_mx_source_id(request.mx_source_id, context)
+        self._validate_tensor_source(
+            request.mx_source_id,
+            request.worker_id if request.HasField("worker_id") else None,
+            context,
+        )
         response = p2p_pb2.GetTensorManifestResponse(
             tensors=self._tensor_protos,
             mx_source_id=self._mx_source_id or "",
             metadata_endpoint=self._metadata_endpoint,
             agent_name=self._agent_name,
             worker_rank=self._worker_rank,
+            accelerator=self._accelerator,
         )
+        if self._worker_id:
+            response.worker_id = self._worker_id
         logger.info(
             f"GetTensorManifest served: {len(self._tensor_protos)} tensors, "
             f"{response.ByteSize()} bytes (worker_rank={self._worker_rank})"
@@ -312,12 +323,22 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
             )
         return mx_source_id, artifact_id, manifest, artifact_chunk_manager
 
-    def _validate_tensor_mx_source_id(self, mx_source_id: str, context) -> None:
+    def _validate_tensor_source(
+        self,
+        mx_source_id: str,
+        worker_id: str | None,
+        context,
+    ) -> None:
         if mx_source_id and mx_source_id != self._mx_source_id:
             context.abort(
                 grpc.StatusCode.FAILED_PRECONDITION,
                 f"mx_source_id mismatch: expected {self._mx_source_id}, "
                 f"got {mx_source_id}",
+            )
+        if worker_id is not None and worker_id != self._worker_id:
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                f"worker_id mismatch: expected {self._worker_id}, got {worker_id}",
             )
 
 
@@ -332,9 +353,11 @@ class WorkerGrpcServer:
         metadata_endpoint: str = "",
         agent_name: str = "",
         worker_rank: int = 0,
+        accelerator: str = "",
         artifact_manifests: Mapping[str, p2p_pb2.ArtifactManifest] | None = None,
         artifact_chunk_manager: Any | None = None,
         max_workers: int = 4,
+        worker_id: str = "",
     ):
         if max_workers <= 0:
             raise ValueError("worker gRPC max_workers must be positive")
@@ -344,9 +367,11 @@ class WorkerGrpcServer:
         self._metadata_endpoint = metadata_endpoint
         self._agent_name = agent_name
         self._worker_rank = worker_rank
+        self._accelerator = accelerator
         self._artifact_manifests = dict(artifact_manifests or {})
         self._artifact_chunk_manager = artifact_chunk_manager
         self._max_workers = max_workers
+        self._worker_id = worker_id
         self._server: grpc.Server | None = None
         self._servicer: WorkerServiceServicer | None = None
         self._port: int | None = None
@@ -393,8 +418,10 @@ class WorkerGrpcServer:
             metadata_endpoint=self._metadata_endpoint,
             agent_name=self._agent_name,
             worker_rank=self._worker_rank,
+            accelerator=self._accelerator,
             artifact_manifests=self._artifact_manifests,
             artifact_chunk_manager=self._artifact_chunk_manager,
+            worker_id=self._worker_id,
         )
         p2p_pb2_grpc.add_WorkerServiceServicer_to_server(self._servicer, self._server)
 
@@ -424,7 +451,9 @@ class WorkerGrpcServer:
 def fetch_tensor_manifest(
     endpoint: str,
     mx_source_id: str,
-    timeout: float = 30.0,
+    timeout: float = 5.0,
+    *,
+    worker_id: str = "",
 ) -> tuple[list[p2p_pb2.TensorDescriptor], int]:
     """Fetch tensor descriptors directly from a source worker's WorkerService.
 
@@ -435,9 +464,21 @@ def fetch_tensor_manifest(
     channel = grpc.insecure_channel(endpoint)
     stub = p2p_pb2_grpc.WorkerServiceStub(channel)
     request = p2p_pb2.GetTensorManifestRequest(mx_source_id=mx_source_id)
-    response = stub.GetTensorManifest(request, timeout=timeout)
+    if worker_id:
+        request.worker_id = worker_id
+    try:
+        response = stub.GetTensorManifest(request, timeout=timeout)
+    finally:
+        channel.close()
     response_bytes = response.ByteSize()
-    channel.close()
+    if (
+        worker_id
+        and response.HasField("worker_id")
+        and response.worker_id != worker_id
+    ):
+        raise RuntimeError(
+            f"worker_id mismatch: expected {worker_id}, got {response.worker_id}"
+        )
     logger.info(
         f"Fetched {len(response.tensors)} tensors from worker at {endpoint} "
         f"({response_bytes} bytes)"

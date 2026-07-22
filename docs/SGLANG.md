@@ -93,10 +93,10 @@ to start one (Docker, Helm, or Kubernetes).
 
 ## 3. Launch SGLang
 
-Use the same command for the first and later replicas. The first replica
-finds no READY source, loads natively through SGLang, and publishes itself.
-Later replicas discover the source and load via the selected ModelExpress
-transport.
+Use the same command for the first and later replicas. When no READY source is
+available, the first replica continues through the configured storage-loading
+strategies and publishes itself. Later replicas discover the source and load
+via the selected ModelExpress transport.
 
 ```bash
 export MX_SERVER_ADDRESS=modelexpress-server:8001
@@ -122,8 +122,44 @@ All other ModelExpress settings are environment variables, matching vLLM:
 `MX_NIXL_BACKEND`, `MX_RDMA_NIC_PIN`, `MX_METADATA_PORT`,
 `MX_WORKER_GRPC_PORT`, and `MODEL_EXPRESS_LOG_LEVEL`.
 
+### Bootstrap with ModelStreamer
+
+Set `MX_MODEL_URI` to select ModelStreamer inside the same ModelExpress loader. Keep `--model-path` as the model identity and configuration source; passing the object-storage URI as `--model-path` bypasses the ModelExpress strategy chain.
+
+```bash
+export MX_SERVER_ADDRESS=modelexpress-server:8001
+export MX_MODEL_URI=s3://my-bucket/path/to/model
+export MX_MS_DISTRIBUTED=1  # Enable for TP > 1
+
+python -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3 --tp 8 --port 30000 \
+  --load-format remote_instance \
+  --remote-instance-weight-loader-backend modelexpress \
+  --modelexpress-config '{"transport": "nixl"}'
+```
+
+The first replica attempts ModelStreamer when no compatible P2P source is ready. Later replicas prefer P2P RDMA from a serving peer. `MX_MODEL_URI` also accepts `gs://` and `az://` URIs or an absolute local path. `MX_MS_DISTRIBUTED=1` divides reads across CUDA tensor-parallel ranks when TP > 1 and is ignored for TP=1.
+
+Weight-source publication waits for SGLang's health endpoint so another
+instance cannot consume weights during warmup or CUDA graph capture. Readiness
+defaults to `http://127.0.0.1:30000/health`; set `MX_ARTIFACT_READY_URL` when
+using another server port.
+
+Set `MX_ARTIFACT_TRANSFER=1` with the `nixl` transport to transfer compatible
+JIT cache artifacts before SGLang initializes the model. The source publishes
+cache artifacts after the SGLang `/health` endpoint is ready and the cache
+directories have stopped changing briefly. Supported cache roots are
+`TORCHINDUCTOR_CACHE_DIR` (or PyTorch Inductor's runtime `cache_dir()`),
+`TRITON_CACHE_DIR`, `SGLANG_DG_CACHE_DIR`, `TILELANG_CACHE_DIR`,
+`CUTE_DSL_CACHE_DIR`, and `FLASHINFER_WORKSPACE_BASE`. This path requires
+`MX_P2P_METADATA=1` and a central-coordinator metadata backend (`redis` or
+`kubernetes`) for artifact discovery. Cache publication uses the same health
+endpoint as weight publication.
+
 For Mooncake TransferEngine, use the same command shape and change only the
 transport. The SGLang image must include `mooncake-transfer-engine-cuda13`.
+ModelExpress artifact transfer is currently implemented on the NIXL transport;
+TransferEngine mode remains weight-only.
 
 ```bash
 export MX_SERVER_ADDRESS=modelexpress-server:8001

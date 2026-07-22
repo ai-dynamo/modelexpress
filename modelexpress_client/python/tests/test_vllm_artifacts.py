@@ -12,6 +12,7 @@ import pytest
 
 from modelexpress import p2p_pb2
 from modelexpress.engines.vllm import artifacts
+from modelexpress.metadata import artifact_lifecycle
 from modelexpress.metadata.artifact_transfer import ArtifactCacheRoot
 
 
@@ -19,7 +20,7 @@ def test_install_vllm_cache_artifacts_is_default_off(monkeypatch):
     monkeypatch.delenv("MX_ARTIFACT_TRANSFER", raising=False)
 
     with patch(
-        "modelexpress.engines.vllm.artifacts.is_nixl_available",
+        "modelexpress.metadata.artifact_lifecycle.is_nixl_available",
     ) as is_nixl_available:
         artifacts.install_vllm_cache_artifacts(SimpleNamespace(global_rank=0))
 
@@ -38,7 +39,7 @@ def test_install_vllm_cache_artifacts_warns_when_p2p_metadata_disabled(
         logging.WARNING,
         logger="modelexpress.engines.vllm.artifacts",
     ), patch(
-        "modelexpress.engines.vllm.artifacts.is_nixl_available",
+        "modelexpress.metadata.artifact_lifecycle.is_nixl_available",
     ) as is_nixl_available:
         artifacts.install_vllm_cache_artifacts(ctx)
 
@@ -52,13 +53,13 @@ def test_install_vllm_cache_artifacts_skips_when_nixl_init_fails(monkeypatch):
     ctx = SimpleNamespace(global_rank=0, device_id=0, nixl_manager=None, mx_client=object())
 
     with patch(
-        "modelexpress.engines.vllm.artifacts._metadata_publication_configured",
+        "modelexpress.metadata.artifact_lifecycle._metadata_publication_configured",
         return_value=True,
     ), patch(
-        "modelexpress.engines.vllm.artifacts.is_nixl_available",
+        "modelexpress.metadata.artifact_lifecycle.is_nixl_available",
         return_value=True,
     ), patch(
-        "modelexpress.engines.vllm.artifacts._init_nixl_manager",
+        "modelexpress.metadata.artifact_lifecycle._init_nixl_manager",
         side_effect=RuntimeError("NIXL_ERR_BACKEND"),
     ), patch(
         "modelexpress.engines.vllm.artifacts._vllm_artifact_transfers",
@@ -106,6 +107,21 @@ def test_torch_compile_artifact_identity_uses_model_cache_criteria(monkeypatch):
     assert identity.compile_config_digest == "compile-digest"
     assert identity.extra_parameters["triton_key"] == "triton-key"
     assert "weight_only" not in identity.extra_parameters
+
+
+def test_artifact_identity_does_not_mask_builder_key_error(monkeypatch):
+    builder_error = KeyError("missing identity field")
+    monkeypatch.setattr(
+        artifacts,
+        "_triton_cache_identity",
+        MagicMock(side_effect=builder_error),
+    )
+
+    with pytest.raises(KeyError, match="missing identity field"):
+        artifacts._artifact_identity(
+            SimpleNamespace(),
+            p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
+        )
 
 
 def test_triton_artifact_identity_uses_runtime_cache_criteria(monkeypatch):
@@ -388,11 +404,11 @@ def test_cute_dsl_cache_root_uses_cute_dsl_cache_dir(monkeypatch, tmp_path):
 @pytest.mark.parametrize("error", [KeyError(), OSError()])
 def test_cute_dsl_cache_root_falls_back_to_uid(monkeypatch, error):
     monkeypatch.delenv("CUTE_DSL_CACHE_DIR", raising=False)
-    monkeypatch.setattr(artifacts, "getuser", MagicMock(side_effect=error))
-    monkeypatch.setattr(artifacts.os, "getuid", lambda: 12345)
+    monkeypatch.setattr(artifact_lifecycle, "getuser", MagicMock(side_effect=error))
+    monkeypatch.setattr(artifact_lifecycle.os, "getuid", lambda: 12345)
 
     assert artifacts._cute_dsl_cache_root() == (
-        Path(artifacts.tempfile.gettempdir()) / "12345" / "cutlass_python_cache"
+        Path(artifact_lifecycle.tempfile.gettempdir()) / "12345" / "cutlass_python_cache"
     )
 
 
@@ -456,15 +472,16 @@ def test_publish_vllm_cache_artifact_uses_ephemeral_worker_port(tmp_path):
         worker_id="worker-a",
         mx_client=object(),
         nixl_manager=object(),
+        accelerator_backend=SimpleNamespace(name="cuda"),
     )
     published = SimpleNamespace(endpoint=SimpleNamespace(mx_source_id="source-id"))
     worker_server = object()
 
     with patch(
-        "modelexpress.engines.vllm.artifacts._get_worker_server",
+        "modelexpress.metadata.artifact_lifecycle._get_worker_server",
         return_value=worker_server,
     ), patch(
-        "modelexpress.engines.vllm.artifacts.publish_artifact_source",
+        "modelexpress.metadata.artifact_lifecycle.publish_artifact_source",
         return_value=published,
     ) as publish:
         assert artifacts._publish_vllm_cache_artifact(ctx, transfer, identity) is published
@@ -472,6 +489,7 @@ def test_publish_vllm_cache_artifact_uses_ephemeral_worker_port(tmp_path):
     publish.assert_called_once()
     assert publish.call_args.kwargs["worker_id"] == "worker-a"
     assert publish.call_args.kwargs["node_rank"] == 2
+    assert publish.call_args.kwargs["accelerator"] == "cuda"
     assert publish.call_args.kwargs["worker_grpc_server"] is worker_server
     artifacts._published_sources.pop(
         (ctx.device_id, transfer.mx_source_type),
@@ -480,7 +498,7 @@ def test_publish_vllm_cache_artifact_uses_ephemeral_worker_port(tmp_path):
 
 
 def test_install_vllm_cache_artifact_once_skips_after_marker(monkeypatch, tmp_path):
-    monkeypatch.setattr(artifacts.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(artifact_lifecycle.tempfile, "gettempdir", lambda: str(tmp_path))
     target_root = tmp_path / "cache"
     transfer = SimpleNamespace(
         name="deep_gemm_cache",
@@ -504,7 +522,12 @@ def test_install_vllm_cache_artifact_once_skips_after_marker(monkeypatch, tmp_pa
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE,
         model_name="test/model",
     )
-    ctx = SimpleNamespace(mx_client=object(), nixl_manager=object(), node_rank=2)
+    ctx = SimpleNamespace(
+        mx_client=object(),
+        nixl_manager=object(),
+        node_rank=2,
+        accelerator_backend=SimpleNamespace(name="cuda"),
+    )
 
     first = artifacts._install_vllm_cache_artifact_once(ctx, transfer, identity)
     second = artifacts._install_vllm_cache_artifact_once(ctx, transfer, identity)
@@ -517,6 +540,7 @@ def test_install_vllm_cache_artifact_once_skips_after_marker(monkeypatch, tmp_pa
         ctx.nixl_manager,
         worker_rank=None,
         node_rank=2,
+        accelerator="cuda",
     )
     transfer.install.assert_called_once_with(first)
 
@@ -525,7 +549,7 @@ def test_install_vllm_cache_artifact_once_does_not_retry_after_failure(
     monkeypatch,
     tmp_path,
 ):
-    monkeypatch.setattr(artifacts.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(artifact_lifecycle.tempfile, "gettempdir", lambda: str(tmp_path))
     transfer = SimpleNamespace(
         name="triton_cache",
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
@@ -543,7 +567,12 @@ def test_install_vllm_cache_artifact_once_does_not_retry_after_failure(
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
         model_name="test/model",
     )
-    ctx = SimpleNamespace(mx_client=object(), nixl_manager=object(), node_rank=2)
+    ctx = SimpleNamespace(
+        mx_client=object(),
+        nixl_manager=object(),
+        node_rank=2,
+        accelerator_backend=SimpleNamespace(name="cuda"),
+    )
 
     with pytest.raises(RuntimeError, match="transfer failed"):
         artifacts._install_vllm_cache_artifact_once(ctx, transfer, identity)
@@ -560,7 +589,7 @@ def test_schedule_vllm_cache_artifact_publish_starts_readiness_gated_publisher(
 ):
     monkeypatch.setenv("MX_ARTIFACT_TRANSFER", "1")
     monkeypatch.setenv("MX_P2P_METADATA", "1")
-    monkeypatch.setattr(artifacts.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(artifact_lifecycle.tempfile, "gettempdir", lambda: str(tmp_path))
     source_root = tmp_path / "torch-cache"
     autotune_root = tmp_path / "autotune-cache"
     transfer = SimpleNamespace(
@@ -590,6 +619,7 @@ def test_schedule_vllm_cache_artifact_publish_starts_readiness_gated_publisher(
         device_id=0,
         mx_client=object(),
         nixl_manager=object(),
+        accelerator_backend=SimpleNamespace(name="cuda"),
     )
     other_ctx = SimpleNamespace(
         global_rank=1,
@@ -601,7 +631,7 @@ def test_schedule_vllm_cache_artifact_publish_starts_readiness_gated_publisher(
     )
     publisher = MagicMock()
     with patch(
-        "modelexpress.engines.vllm.artifacts._metadata_publication_configured",
+        "modelexpress.metadata.artifact_lifecycle._metadata_publication_configured",
         return_value=True,
     ), patch(
         "modelexpress.engines.vllm.artifacts._vllm_artifact_transfers",
@@ -610,7 +640,7 @@ def test_schedule_vllm_cache_artifact_publish_starts_readiness_gated_publisher(
         "modelexpress.engines.vllm.artifacts._publish_vllm_cache_artifact",
         return_value=SimpleNamespace(endpoint=SimpleNamespace(mx_source_id="source-id")),
     ) as publish_one, patch(
-        "modelexpress.engines.vllm.artifacts.PublisherThread",
+        "modelexpress.metadata.artifact_lifecycle.PublisherThread",
         return_value=publisher,
     ) as publisher_cls:
         with caplog.at_level(
@@ -653,7 +683,7 @@ def test_vllm_artifact_ready_fn_waits_for_health_and_stable_cache(
     health_check = MagicMock(side_effect=[False, True])
     now = 100.0
     monkeypatch.setattr(artifacts, "_vllm_health_ready", health_check)
-    monkeypatch.setattr(artifacts.time, "monotonic", lambda: now)
+    monkeypatch.setattr(artifact_lifecycle.time, "monotonic", lambda: now)
 
     autotune_root.mkdir()
     autotune_file = autotune_root / "configs.json"

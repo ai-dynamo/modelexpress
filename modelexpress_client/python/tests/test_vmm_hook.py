@@ -288,6 +288,7 @@ class TestOptionalExtension:
             global_rank = 0
             device_id = 0
             accelerator_backend = _StubBackend()
+            p2p_enabled = True
 
         with caplog.at_level("WARNING", logger=vmm_runtime.logger.name):
             # Entering the context manager must not raise; the body must
@@ -318,11 +319,32 @@ class TestOptionalExtension:
             global_rank = 0
             device_id = 0
             accelerator_backend = _StubBackend()
+            p2p_enabled = True
 
         entered = False
         with vmm_runtime.maybe_enter_vmm_arena(_Ctx()):
             entered = True
         assert entered
+
+    def test_no_op_when_p2p_disabled(self, monkeypatch):
+        """The speculative draft's second load has p2p_enabled=False; the
+        helper must yield without installing arena machinery even with
+        MX_VMM_ARENA=1, so it does not replace the target model's arena."""
+        from modelexpress.vmm import runtime as vmm_runtime
+
+        monkeypatch.setenv("MX_VMM_ARENA", "1")
+
+        class _Ctx:
+            global_rank = 0
+            device_id = 0
+            accelerator_backend = _StubBackend()
+            p2p_enabled = False
+
+        entered = False
+        with vmm_runtime.maybe_enter_vmm_arena(_Ctx()):
+            entered = True
+        assert entered
+        assert 0 not in vmm_runtime._vmm_arenas
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +368,7 @@ class _StubCtx:
     target_device = _StubTargetDevice()
     vmm_arena = None
     accelerator_backend = _StubBackend()
+    p2p_enabled = True
 
 
 class _StubCudaVmmBackend:
