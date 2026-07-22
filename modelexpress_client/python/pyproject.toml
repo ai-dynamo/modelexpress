@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "modelexpress"
-version = "0.5.0"
+version = "0.6.0"
 description = "Python client for ModelExpress P2P GPU transfer service"
 readme = "README.md"
 license = "Apache-2.0"

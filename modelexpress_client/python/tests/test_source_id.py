@@ -17,7 +17,7 @@ from modelexpress.metadata.source_id import compute_mx_source_id
 
 def _base_identity() -> p2p_pb2.SourceIdentity:
     return p2p_pb2.SourceIdentity(
-        mx_version="0.5.0",
+        mx_version="0.6.0",
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
         model_name="deepseek-ai/DeepSeek-V3",
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
@@ -60,7 +60,7 @@ def test_different_revision_gives_different_id():
 
 
 def test_empty_artifact_fields_preserve_existing_id():
-    assert compute_mx_source_id(_base_identity()) == "5a5f555570065064"
+    assert compute_mx_source_id(_base_identity()) == "0de5c484df9b176f"
 
 
 def test_artifact_compatibility_fields_affect_id():
@@ -144,13 +144,13 @@ def test_extra_parameters_sorted():
 # ---------------------------------------------------------------------------
 
 def test_pinned_hash_base_identity():
-    assert compute_mx_source_id(_base_identity()) == "5a5f555570065064"
+    assert compute_mx_source_id(_base_identity()) == "0de5c484df9b176f"
 
 
 def test_pinned_hash_with_revision():
     pinned = _base_identity()
     pinned.revision = "abc123def4567890"
-    assert compute_mx_source_id(pinned) == "d0c184b2a9a34c82"
+    assert compute_mx_source_id(pinned) == "6012b1c57b659ded"
 
 
 def test_case_colliding_extra_parameters_are_deterministic():
@@ -166,4 +166,4 @@ def test_case_colliding_extra_parameters_are_deterministic():
     b.extra_parameters["foo"] = "b"
     b.extra_parameters["Foo"] = "a"
     assert compute_mx_source_id(a) == compute_mx_source_id(b)
-    assert compute_mx_source_id(a) == "bf71fb9340cd940a"
+    assert compute_mx_source_id(a) == "fb4f05e4252f9c24"

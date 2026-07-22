@@ -835,7 +835,7 @@ def test_publish_artifact_source_registers_mx_discovery_metadata(tmp_path):
     )
     bundle = transfer.prepare_source()
     identity = p2p_pb2.SourceIdentity(
-        mx_version="0.5.0",
+        mx_version="0.6.0",
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
         model_name="test/model",
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
@@ -894,7 +894,7 @@ def test_discover_artifact_source_does_not_rank_match_by_default(tmp_path):
     )
     bundle = transfer.prepare_source()
     identity = p2p_pb2.SourceIdentity(
-        mx_version="0.5.0",
+        mx_version="0.6.0",
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
         model_name="test/model",
     )
@@ -1084,7 +1084,7 @@ def test_publish_artifact_source_stops_server_when_refresh_fails(
     )
     bundle = transfer.prepare_source()
     identity = p2p_pb2.SourceIdentity(
-        mx_version="0.5.0",
+        mx_version="0.6.0",
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
         model_name="test/model",
     )
@@ -1125,7 +1125,7 @@ def test_torch_compile_cache_transfer_discovers_source_through_mx_server(tmp_pat
     )
     bundle = transfer.prepare_source()
     identity = p2p_pb2.SourceIdentity(
-        mx_version="0.5.0",
+        mx_version="0.6.0",
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
         model_name="test/model",
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
