@@ -3,6 +3,8 @@
 
 """Tests for the vLLM engine adapter."""
 
+import json
+import os
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
@@ -15,6 +17,7 @@ from modelexpress.engines.vllm.adapter import (
     VllmAdapter,
     _get_vllm_device_id,
     _get_vllm_worker_rank,
+    _select_draft_weight_files,
     build_vllm_load_context,
 )
 from modelexpress.load_strategy.context import LoadResult
@@ -304,3 +307,41 @@ class _StandaloneFinalizer(torch.nn.Module):
         self.events.append(
             ("finalize", "standalone", "finalize_requires_arg_weights", context)
         )
+
+
+class TestDraftWeightFileSelection:
+    """A draft load streams only its own shards, and falls back to the full
+    set when the checkpoint has no draft head."""
+
+    def _write_index(self, tmp_path, weight_map):
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": weight_map}), encoding="utf-8"
+        )
+
+    def test_selects_only_mtp_shard(self, tmp_path):
+        self._write_index(
+            tmp_path,
+            {
+                "model.embed_tokens.weight": "model-00001-of-00002.safetensors",
+                "lm_head.weight": "model-00002-of-00002.safetensors",
+                "mtp.fc.weight": "model-mtp.safetensors",
+            },
+        )
+        files = [
+            os.path.join(str(tmp_path), name)
+            for name in (
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors",
+                "model-mtp.safetensors",
+            )
+        ]
+        assert _select_draft_weight_files(str(tmp_path), files) == [
+            os.path.join(str(tmp_path), "model-mtp.safetensors")
+        ]
+
+    def test_falls_back_without_draft_head(self, tmp_path):
+        self._write_index(
+            tmp_path, {"model.embed_tokens.weight": "model-00001-of-00001.safetensors"}
+        )
+        files = [os.path.join(str(tmp_path), "model-00001-of-00001.safetensors")]
+        assert _select_draft_weight_files(str(tmp_path), files) is None

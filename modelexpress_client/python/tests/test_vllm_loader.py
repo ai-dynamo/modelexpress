@@ -288,7 +288,15 @@ class TestAbstractMethodCompleteness:
             loader_mod._nixl_managers.pop(3, None)
             loader_mod._tensor_registry.pop(3, None)
 
-    def test_load_model_installs_and_schedules_vllm_artifacts(self):
+    @pytest.mark.parametrize(
+        ("ready_url", "health_gated"),
+        [("", False), ("http://127.0.0.1:8000/health", True)],
+    )
+    def test_load_model_installs_and_schedules_vllm_artifacts(
+        self, ready_url, health_gated
+    ):
+        from modelexpress.engines.vllm import loader as loader_mod
+
         loader = _make_loader()
         model = MagicMock()
         ctx = _make_load_context(device_id=3)
@@ -305,6 +313,10 @@ class TestAbstractMethodCompleteness:
         def run(model_arg, ctx_arg):
             assert model_arg is model
             assert ctx_arg is ctx
+            if health_gated:
+                assert ctx_arg.source_ready_fn is loader_mod._vllm_health_ready
+            else:
+                assert ctx_arg.source_ready_fn is None
             events.append("load")
             return model_arg
 
@@ -312,7 +324,7 @@ class TestAbstractMethodCompleteness:
             assert ctx_arg is ctx
             events.append("schedule")
 
-        with patch(
+        with patch.dict(os.environ, {"MX_ARTIFACT_READY_URL": ready_url}), patch(
             "modelexpress.engines.vllm.loader.build_vllm_load_context",
             return_value=ctx,
         ), patch(
@@ -358,7 +370,6 @@ class TestAbstractMethodCompleteness:
         registration = importlib.import_module(
             "modelexpress.engines.vllm.registration"
         )
-        patch_check = MagicMock()
         registered = {}
 
         def fake_register_model_loader(load_format):
@@ -368,7 +379,6 @@ class TestAbstractMethodCompleteness:
 
             return register
 
-        monkeypatch.setattr(registration, "_patch_vllm_s3_format_check", patch_check)
         monkeypatch.setattr(
             registration,
             "register_model_loader",
@@ -379,7 +389,6 @@ class TestAbstractMethodCompleteness:
 
         from modelexpress.engines.vllm.loader import MxModelLoader
 
-        patch_check.assert_called_once_with()
         assert model_loader._LOAD_FORMAT_TO_MODEL_LOADER["modelexpress"] is sentinel
         assert registered["mx"] is MxModelLoader
         assert "modelexpress" not in registered
@@ -398,7 +407,6 @@ class TestAbstractMethodCompleteness:
         registration = importlib.import_module(
             "modelexpress.engines.vllm.registration"
         )
-        patch_check = MagicMock()
         registered = {}
 
         def fake_register_model_loader(load_format):
@@ -410,11 +418,6 @@ class TestAbstractMethodCompleteness:
 
         monkeypatch.setattr(
             registration,
-            "_patch_vllm_s3_format_check",
-            patch_check,
-        )
-        monkeypatch.setattr(
-            registration,
             "register_model_loader",
             fake_register_model_loader,
         )
@@ -423,9 +426,97 @@ class TestAbstractMethodCompleteness:
 
         from modelexpress.engines.vllm.loader import MxModelLoader
 
-        patch_check.assert_called_once_with()
         assert registered["modelexpress"] is MxModelLoader
         assert registered["mx"] is MxModelLoader
+
+
+class TestMtpDrafterSecondLoad:
+    """vLLM loads MTP in two passes on one worker: the target, then the drafter
+    via a second load_model whose draft ModelConfig has runner_type="draft" and
+    reuses the target's device and model name. The test drives both on device 0."""
+
+    def _load(self, loader, vllm_config, model_config, ctx):
+        with patch(
+            "modelexpress.engines.vllm.loader.build_vllm_load_context",
+            return_value=ctx,
+        ), patch(
+            "modelexpress.engines.vllm.loader.install_vllm_cache_artifacts",
+        ), patch(
+            "modelexpress.engines.vllm.loader.initialize_model",
+            return_value=MagicMock(),
+        ), patch(
+            "modelexpress.engines.vllm.loader.LoadStrategyChain.run",
+            side_effect=lambda model, _ctx: model,
+        ), patch(
+            "modelexpress.engines.vllm.loader.schedule_vllm_cache_artifact_publish",
+        ) as schedule:
+            loader.load_model(vllm_config, model_config)
+        return schedule
+
+    def test_drafter_does_not_clobber_target(self):
+        """The drafter's second load leaves the target's device registry and
+        P2P publish untouched."""
+        from modelexpress.engines.vllm import loader as loader_mod
+
+        loader = _make_loader()
+        target_ctx = _make_load_context(device_id=0)
+        target_ctx.tensors = {"target.weight": MagicMock()}
+        target_ctx.nixl_manager = MagicMock()
+        target_config = MagicMock(dtype=torch.float32, runner_type="generate")
+        self._load(loader, MagicMock(), target_config, target_ctx)
+
+        draft_config = MagicMock(dtype=torch.float32, runner_type="draft")
+        draft_vllm_config = MagicMock()
+        draft_ctx = _make_load_context(device_id=0)
+        draft_ctx.tensors = {"drafter.mtp": MagicMock()}
+        draft_ctx.nixl_manager = MagicMock()
+        try:
+            schedule = self._load(loader, draft_vllm_config, draft_config, draft_ctx)
+            assert loader_mod._tensor_registry[0] is target_ctx.tensors
+            assert loader_mod._nixl_managers[0] is target_ctx.nixl_manager
+            schedule.assert_not_called()
+        finally:
+            loader_mod._tensor_registry.pop(0, None)
+            loader_mod._nixl_managers.pop(0, None)
+
+    def test_is_speculative_draft(self):
+        from modelexpress.engines.vllm.loader import _is_speculative_draft
+
+        # No speculative decoding: never a draft.
+        no_spec = MagicMock(speculative_config=None)
+        assert _is_speculative_draft(no_spec, MagicMock(runner_type="generate")) is False
+
+        # Draft model load under speculative decoding.
+        spec = MagicMock()
+        assert _is_speculative_draft(spec, MagicMock(runner_type="draft")) is True
+
+        # Target load with spec on (e.g. ngram aliases draft to the target):
+        # runner_type stays "generate", so the target keeps P2P.
+        assert _is_speculative_draft(spec, MagicMock(runner_type="generate")) is False
+
+    @patch("modelexpress.load_strategy.base.is_nixl_available", return_value=True)
+    @patch("modelexpress.load_strategy.base._init_nixl_manager")
+    def test_register_tensors_skips_when_p2p_disabled(self, mock_init, _avail):
+        from modelexpress.load_strategy.base import register_tensors
+
+        ctx = _make_load_context()
+        ctx.p2p_enabled = False
+        ctx.adapter.discover_tensors = MagicMock(return_value={"w": MagicMock()})
+        with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "localhost:8001"}):
+            register_tensors(MagicMock(), ctx)
+
+        mock_init.assert_not_called()
+        ctx.adapter.discover_tensors.assert_not_called()
+        assert ctx.nixl_manager is None
+
+    @patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True)
+    def test_rdma_unavailable_when_p2p_disabled(self, _mock):
+        from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
+
+        ctx = _make_load_context()
+        ctx.p2p_enabled = False
+        with patch.dict("os.environ", {"MX_SERVER_ADDRESS": "server:8001"}):
+            assert RdmaStrategy().is_available(ctx) is False
 
 
 # ---------------------------------------------------------------------------
@@ -663,6 +754,23 @@ class TestPublishMetadataErrorHandling:
         ctx.nixl_manager = MagicMock()
         with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "localhost:8001"}):
             publish_metadata(ctx)
+
+    @patch("modelexpress.load_strategy.base.publish_metadata_and_ready")
+    def test_publish_uses_accelerator_backend_name(
+        self,
+        mock_publish,
+        mock_accelerator_backend_cls,
+    ):
+        from modelexpress.load_strategy.base import publish_metadata
+
+        ctx = _make_load_context(
+            accelerator_backend=mock_accelerator_backend_cls(name="xpu"),
+        )
+        ctx.nixl_manager = MagicMock()
+        with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "localhost:8001"}):
+            publish_metadata(ctx)
+
+        assert mock_publish.call_args.kwargs["accelerator"] == "xpu"
 
     def test_unpublish_uses_worker_rank_for_heartbeat_lifecycle(self):
         from modelexpress.load_strategy.base import unpublish_metadata
@@ -1180,6 +1288,25 @@ class TestRdmaStrategyLoad:
         assert exc.value.mutated is False
         assert attempts == []
 
+    def test_accepts_matching_xpu_accelerator(
+        self,
+        mock_accelerator_backend_cls,
+    ):
+        ctx = _make_load_context(
+            accelerator_backend=mock_accelerator_backend_cls(name="xpu"),
+        )
+        source_resp = _make_metadata_resp(rank=0, worker_id="w-1")
+        source_resp.worker.accelerator = "xpu"
+        candidates = [_make_instance_ref(worker_id="w-1")]
+        strategy, attempts = self._setup(ctx, candidates, [source_resp])
+
+        with patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True), \
+             patch("modelexpress.load_strategy.rdma_strategy.get_configured_selector", return_value=_IdentitySelector()):
+            result = strategy.load(MagicMock(), ctx)
+
+        assert isinstance(result, LoadResult)
+        assert attempts == ["w-1"]
+
     def test_load_as_target_marks_post_prepare_failure_as_mutated(self):
         from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
 
@@ -1238,10 +1365,20 @@ class TestPublishMetadataAndReady:
             tensors[f"layer.{i}.weight"] = t
 
         identity = _make_identity("my-model")
+        ready_fn = MagicMock(return_value=False)
         mock_publisher = MagicMock()
         with patch.dict(os.environ, {"MX_P2P_METADATA": "0"}), \
              patch("modelexpress.metadata.publish.PublisherThread", return_value=mock_publisher) as publisher_cls:
-            publish_metadata_and_ready(mx_client, nixl_manager, tensors, worker_rank=2, device_id=0, identity=identity, worker_id="inst-uuid")
+            publish_metadata_and_ready(
+                mx_client,
+                nixl_manager,
+                tensors,
+                worker_rank=2,
+                device_id=0,
+                identity=identity,
+                worker_id="inst-uuid",
+                ready_fn=ready_fn,
+            )
 
         mx_client.publish_metadata.assert_not_called()
         publisher_cls.assert_called_once()
@@ -1251,6 +1388,7 @@ class TestPublishMetadataAndReady:
         assert publisher_kwargs["worker_rank"] == 2
         assert publisher_kwargs["nixl_manager"] is nixl_manager
         assert callable(publisher_kwargs["publish_fn"])
+        assert publisher_kwargs["ready_fn"] is ready_fn
         mock_publisher.start.assert_called_once()
 
         result = publisher_kwargs["publish_fn"]()

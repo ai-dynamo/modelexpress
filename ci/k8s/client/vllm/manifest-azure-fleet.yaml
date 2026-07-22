@@ -73,7 +73,7 @@ spec:
             - --model
             - "${MX_CI_MODEL}"
             - --load-format
-            - mx
+            - modelexpress
             - --tensor-parallel-size
             - "1"
             - --max-model-len

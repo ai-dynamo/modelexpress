@@ -49,7 +49,7 @@ graph LR
 - **Frontend**: Dynamo's HTTP entry point; routes to decode workers round-robin.
 - **Workers**: `--load-format modelexpress` means the first replica loads from disk and publishes metadata and compatible JIT caches; every subsequent replica receives weights and caches from a Ready source. The `mx` load format is kept as a backward-compatible alias.
 
-The worker manifests point `MX_ARTIFACT_READY_URL` at Dynamo's pod-local `9090/health` endpoint so cache publication waits for the `generate` endpoint to become healthy.
+The worker manifests point `MX_ARTIFACT_READY_URL` at Dynamo's pod-local `9090/health` endpoint so weight and cache publication wait for the `generate` endpoint to become healthy.
 
 > **ModelExpress server address.** These examples set `MODEL_EXPRESS_URL`. ModelExpress is standardizing on `MX_SERVER_ADDRESS` as the recommended variable going forward, but Dynamo's ModelExpress integration currently uses `MODEL_EXPRESS_URL`. The `modelexpress` plugin loader used here accepts either, so for Dynamo deployments set `MODEL_EXPRESS_URL` for now.
 
