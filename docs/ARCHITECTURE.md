@@ -777,6 +777,99 @@ while agent.check_xfer_state(handle) not in ("DONE", "SUCCESS"):
 agent.release_xfer_handle(handle)
 ```
 
+## Trainer-Inference Weight Sync (WeightSyncService)
+
+ModelExpress includes a `WeightSyncService` gRPC service that coordinates live
+weight synchronization from a sharded trainer to inference workers.  The Python
+client exposes `PullRole` (inference worker pulls from trainer) and `PushRole`
+(trainer pushes to inference workers).
+
+### Protocol Overview
+
+```mermaid
+sequenceDiagram
+    participant T as Trainer
+    participant MX as MX Server (WeightSyncService)
+    participant W as Inference Worker
+
+    T->>MX: PublishTrainerTable(model_key, table)
+    W->>MX: BuildPlan(plan_key, model_key, regions)
+    MX-->>W: BuildPlanResponse(plan_id)
+    W->>MX: GetPlan(plan_id)
+    MX-->>W: GetPlanResponse(ready, descriptors)
+    W->>T: NIXL READ (RdmaDescriptors)
+```
+
+### Planner Abstraction
+
+Three planner implementations live in `modelexpress/weight_transfer/planner/`:
+
+| Class | When to use |
+|-------|-------------|
+| `LocalPlanner` | No MX server available; each worker routes independently. Per-worker cache only. |
+| `ServerPlanner` | MX server available. One worker routes; all workers with the same `plan_key` reuse the cached plan. Falls back to `LocalPlanner` on server error. |
+| `M2nPlanner` | All workers register simultaneously. MX routes all workers' regions in one pass and returns a globally-consistent M2N plan. Falls back to `LocalPlanner` on error. |
+
+### Key Data Flow (PULL)
+
+1. **Bake pass**: `PullRole.initialize()` drives the engine's weight loader with
+   `LazyWeight` tensors that record op chains without materializing data.
+2. **Resolve**: `resolve_copies()` replays op chains on meta tensors to produce
+   `ResolvedRegion` objects (element-run pairs, torch-dependent, client-side only).
+3. **Plan**: A planner converts `ResolvedRegion` lists to `RdmaDescriptor` lists
+   (pure integer arithmetic).
+4. **Execute**: `NixlExecutor.execute()` issues one NIXL READ handle per trainer
+   rank and waits for all to complete.
+5. **Post-process**: Engine adapter runs `post_pull_hook()` (e.g. FP8 scale repack).
+
+### M2N Coordinated Plan (M2nPlanner)
+
+`M2nPlanner` replaces the per-worker `ServerPlanner` with a server-side barrier:
+
+```mermaid
+sequenceDiagram
+    participant W0 as Worker 0
+    participant W1 as Worker 1
+    participant MX as MX Server
+
+    W0->>MX: RegisterM2nWorker(model_key, rank=0, total=2, regions, nixl_metadata)
+    MX-->>W0: RegisterM2nWorkerResponse(m2n_plan_id="")  # barrier not met
+    W1->>MX: RegisterM2nWorker(model_key, rank=1, total=2, regions, nixl_metadata)
+    MX-->>W1: RegisterM2nWorkerResponse(m2n_plan_id=uuid)  # barrier fires, plan built
+    W0->>MX: RegisterM2nWorker(poll)
+    MX-->>W0: RegisterM2nWorkerResponse(m2n_plan_id=uuid)
+    W0->>MX: GetM2nPlan(m2n_plan_id, worker_rank=0)
+    MX-->>W0: GetM2nPlanResponse(ready=true, descriptors=[...])
+    W1->>MX: GetM2nPlan(m2n_plan_id, worker_rank=1)
+    MX-->>W1: GetM2nPlanResponse(ready=true, descriptors=[...])
+```
+
+When the barrier fires (all `total_workers` have registered), the server calls
+`route_all_workers()` in Rust — which routes every worker's regions against the
+shared `TrainerTable` in one pass and tags each descriptor with a
+`dst_agent_index` (the target worker's rank).  The result is stored as
+per-worker slices keyed by `(plan_id, worker_rank)`.
+
+`M2nDescriptor` extends `RdmaDescriptor` with `dst_agent_index`, enabling the
+trainer to issue a single coordinated NIXL M2N WRITE to all workers.
+`M2nDescriptor.to_rdma_descriptor()` converts to a plain `RdmaDescriptor` for
+use with the existing `NixlExecutor` on the worker's PULL path.
+
+`M2nExecutor` groups descriptors by `src_agent_index` and fires one NIXL READ
+handle per trainer rank (all in parallel, same as `NixlExecutor`).  When NIXL
+exposes a native many-to-many transfer API, the inner loop can be replaced with
+a single `make_prepped_m2n_xfer` call for true collective semantics.
+
+### Invalidation
+
+When the trainer reshards (topology change between steps):
+
+| Planner | Invalidation method |
+|---------|---------------------|
+| `LocalPlanner` | `invalidate(plan_key)` evicts local cache |
+| `ServerPlanner` | `invalidate(plan_key)` evicts local cache + calls `InvalidatePlan` on server |
+| `M2nPlanner` | `invalidate(plan_key)` evicts local cache + calls `InvalidateM2nPlan(model_key)` on server, which removes all per-worker slices for that model |
+
 ## FP8 Model Handling (DeepSeek-V3)
 
 vLLM's `process_weights_after_loading()` transforms model weights into kernel-friendly formats (FP8 scale repacking, NVFP4 padding/swizzling, MLA dequantized projections) and may create new tensors as bare attributes, buffers, or on quant method objects.
