@@ -187,6 +187,22 @@ calls the Kubernetes `TokenReview` API in-process.
 - **AuthZ**: that `<namespace>:<serviceaccount>` must exactly match a configured allowlist
   entry.
 
+> **Warning: only enable auth over an encrypted transport.** The server and clients
+> speak plaintext gRPC; neither terminates TLS itself. Without encryption the bearer
+> token crosses the wire in cleartext and anyone who can sniff the traffic can replay
+> it until it expires. Run enforce mode only where the transport is encrypted, e.g. a
+> service mesh providing mTLS (Istio/Linkerd sidecars) or a TLS-terminating proxy in
+> front of the server.
+
+Other properties to be aware of:
+
+- Auth is enforced when each RPC starts. A long-lived streaming RPC that was accepted
+  keeps flowing even if the token expires or the ServiceAccount is revoked mid-stream;
+  revocation takes effect on the next RPC (bounded by the cache TTL below).
+- Rejections are cached per token, so a caller cycling unique invalid tokens sends one
+  `TokenReview` to the Kubernetes API server per token. The gRPC port should not be
+  reachable from untrusted networks.
+
 ### Modes
 
 | Mode | Behavior |
