@@ -156,6 +156,9 @@ def v2():
             for name, tensor in payload.items():
                 yield name, tensor
 
+        def shutdown(self):
+            pass
+
     refit_mod.MxRefitReceiver = _RefitStub
     refit_mod.SourceRef = _SourceRef
     _install("modelexpress.refit_receiver", refit_mod)

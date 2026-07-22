@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -111,6 +112,7 @@ class NixlTransferManager:
         self._metadata: bytes = b""
         self._tensor_descriptors: list[TensorDescriptor] = []
         self._tensors: dict[str, torch.Tensor] = {}
+        self._tensor_registrations: list[Any] = []
 
     @property
     def agent_name(self) -> str:
@@ -190,26 +192,19 @@ class NixlTransferManager:
             elif "UCX_TLS" in os.environ:
                 os.environ.pop("UCX_TLS")
 
-    def _build_tensor_descriptors(
+    def _make_tensor_descriptors(
         self, tensors: dict[str, torch.Tensor]
     ) -> list[TensorDescriptor]:
         """Build NIXL TensorDescriptors from a name -> tensor mapping.
 
         Validates each tensor is contiguous (non-contiguous tensors would
-        require copies that misalign RDMA writes) and records the tensor
-        objects + descriptor list on self for the receiver path to resolve
-        descriptors back by name.
+        require copies that misalign RDMA writes).
 
         CRITICAL: self._tensors must hold the SAME tensor objects as
         param.data in vLLM. Do NOT call .contiguous() here - that would
         create copies and RDMA writes would land in the wrong memory.
 
-        We take a shallow copy of the caller's dict (``dict(tensors)``)
-        so ``shutdown()``'s cleanup cannot mutate the caller's
-        container. The tensor VALUES are the same objects as
-        ``param.data``; only the dict container is owned by the manager.
         """
-        self._tensors = dict(tensors)
         tensor_descriptors = []
         for name, tensor in tensors.items():
             if not tensor.is_contiguous():
@@ -224,8 +219,96 @@ class NixlTransferManager:
                 device_id=self._device_id,
                 dtype=str(tensor.dtype),
             ))
-        self._tensor_descriptors = tensor_descriptors
         return tensor_descriptors
+
+    def _set_tensor_registry(
+        self,
+        tensors: dict[str, torch.Tensor],
+        tensor_descriptors: list[TensorDescriptor],
+    ) -> None:
+        """Record the tensors/descriptors used by receive_from_source."""
+        self._tensors = dict(tensors)
+        self._tensor_descriptors = tensor_descriptors
+
+    def _record_tensor_registration(
+        self,
+        registered: Any,
+        tensors: dict[str, torch.Tensor],
+        tensor_descriptors: list[TensorDescriptor],
+    ) -> None:
+        if registered is not None:
+            self._tensor_registrations.append(registered)
+        self._set_tensor_registry(tensors, tensor_descriptors)
+
+    def _deregister_registered_memory(self, registered: Any) -> None:
+        if registered is not None and self._agent is not None:
+            self._agent.deregister_memory(registered)
+            self._metadata = self._agent.get_agent_metadata()
+
+    def _register_tensor_memory(
+        self,
+        tensors: dict[str, torch.Tensor],
+        tensor_descriptors: list[TensorDescriptor],
+    ) -> Any:
+        """Register tensor memory with NIXL and refresh agent metadata."""
+
+        # Phase 1: Discover CUDA allocation boundaries (if pool reg enabled)
+        alloc_discovery_start = time.perf_counter()
+        if _pool_reg_enabled():
+            if self._accelerator_backend.supports_pool_reg():
+                allocations = self._find_cuda_allocations(tensor_descriptors)
+            else:
+                allocations = None
+                logger.warning(
+                    "MX_POOL_REG=1 set but %s does not support pool "
+                    "registration; using per-tensor registration",
+                    self._accelerator_backend.name,
+                )
+        else:
+            allocations = None
+            logger.info("Pool registration disabled (MX_POOL_REG != '1'), using per-tensor registration")
+        alloc_discovery_time = time.perf_counter() - alloc_discovery_start
+
+        # Phase 2: Register memory with NIXL (ibv_reg_mr kernel calls)
+        nixl_reg_start = time.perf_counter()
+        if allocations:
+            alloc_tuples = [
+                (base, size, self._device_id, "")
+                for base, size in allocations
+            ]
+            registered = self._agent.register_memory(
+                alloc_tuples,
+                mem_type=self._accelerator_backend.nixl_mem_type,
+                backends=self._backends,
+            )
+            reg_count = len(allocations)
+        else:
+            tensor_list = list(tensors.values())
+            registered = self._agent.register_memory(tensor_list, backends=self._backends)
+            reg_count = len(tensor_list)
+        nixl_reg_time = time.perf_counter() - nixl_reg_start
+
+        # Phase 3: Get agent metadata blob
+        metadata_start = time.perf_counter()
+        self._metadata = self._agent.get_agent_metadata()
+        metadata_time = time.perf_counter() - metadata_start
+
+        total_time = alloc_discovery_time + nixl_reg_time + metadata_time
+        reduction = (1 - reg_count / len(tensor_descriptors)) * 100 if tensor_descriptors else 0
+        total_bytes = sum(d.size for d in tensor_descriptors)
+
+        logger.info(
+            f"[TIMING] register_tensors: {total_time:.3f}s total "
+            f"(alloc_discovery={alloc_discovery_time:.3f}s, "
+            f"nixl_register={nixl_reg_time:.3f}s [{reg_count} regions], "
+            f"get_metadata={metadata_time:.3f}s [{len(self._metadata)} bytes])"
+        )
+        logger.info(
+            f"Registered {reg_count} regions from {len(tensor_descriptors)} tensors "
+            f"({reduction:.1f}% reduction), {total_bytes / 1e9:.2f} GB total"
+        )
+
+        return registered
 
     def register_tensors(self, tensors: dict[str, torch.Tensor]) -> bytes:
         """
@@ -261,65 +344,37 @@ class NixlTransferManager:
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
 
-        tensor_descriptors = self._build_tensor_descriptors(tensors)
-
-        # Phase 1: Discover CUDA allocation boundaries (if pool reg enabled)
-        alloc_discovery_start = time.perf_counter()
-        if _pool_reg_enabled():
-            if self._accelerator_backend.supports_pool_reg():
-                allocations = self._find_cuda_allocations(tensor_descriptors)
-            else:
-                allocations = None
-                logger.warning(
-                    "MX_POOL_REG=1 set but %s does not support pool "
-                    "registration; using per-tensor registration",
-                    self._accelerator_backend.name,
-                )
-        else:
-            allocations = None
-            logger.info("Pool registration disabled (MX_POOL_REG != '1'), using per-tensor registration")
-        alloc_discovery_time = time.perf_counter() - alloc_discovery_start
-
-        # Phase 2: Register memory with NIXL (ibv_reg_mr kernel calls)
-        nixl_reg_start = time.perf_counter()
-        if allocations:
-            alloc_tuples = [
-                (base, size, self._device_id, "")
-                for base, size in allocations
-            ]
-            self._agent.register_memory(
-                alloc_tuples,
-                mem_type=self._accelerator_backend.nixl_mem_type,
-                backends=self._backends,
-            )
-            reg_count = len(allocations)
-        else:
-            tensor_list = list(tensors.values())
-            self._agent.register_memory(tensor_list, backends=self._backends)
-            reg_count = len(tensor_list)
-        nixl_reg_time = time.perf_counter() - nixl_reg_start
-
-        # Phase 3: Get agent metadata blob
-        metadata_start = time.perf_counter()
-        self._metadata = self._agent.get_agent_metadata()
-        metadata_time = time.perf_counter() - metadata_start
-
-        total_time = alloc_discovery_time + nixl_reg_time + metadata_time
-        reduction = (1 - reg_count / len(tensor_descriptors)) * 100 if tensor_descriptors else 0
-        total_bytes = sum(d.size for d in tensor_descriptors)
-
-        logger.info(
-            f"[TIMING] register_tensors: {total_time:.3f}s total "
-            f"(alloc_discovery={alloc_discovery_time:.3f}s, "
-            f"nixl_register={nixl_reg_time:.3f}s [{reg_count} regions], "
-            f"get_metadata={metadata_time:.3f}s [{len(self._metadata)} bytes])"
+        tensor_descriptors = self._make_tensor_descriptors(tensors)
+        registered = self._register_tensor_memory(
+            tensors,
+            tensor_descriptors,
         )
-        logger.info(
-            f"Registered {reg_count} regions from {len(tensor_descriptors)} tensors "
-            f"({reduction:.1f}% reduction), {total_bytes / 1e9:.2f} GB total"
-        )
+        self._record_tensor_registration(registered, tensors, tensor_descriptors)
 
         return self._metadata
+
+    @contextmanager
+    def temporary_registered_tensors(self, tensors: dict[str, torch.Tensor]):
+        """Temporarily register tensors for one receive without replacing persistent buffers."""
+        if self._agent is None:
+            raise RuntimeError("NIXL agent not initialized")
+
+        saved_tensors = self._tensors
+        saved_tensor_descriptors = self._tensor_descriptors
+        saved_metadata = self._metadata
+
+        tensor_descriptors = self._make_tensor_descriptors(tensors)
+        registered = self._register_tensor_memory(tensors, tensor_descriptors)
+        self._set_tensor_registry(tensors, tensor_descriptors)
+        try:
+            yield self._metadata
+        finally:
+            try:
+                self._deregister_registered_memory(registered)
+            finally:
+                self._tensors = saved_tensors
+                self._tensor_descriptors = saved_tensor_descriptors
+                self._metadata = saved_metadata
 
     def register_arena(self, arena: VmmArena, tensors: dict[str, torch.Tensor]) -> bytes:
         """Register a VmmArena's full bump range as a single NIXL region.
@@ -351,7 +406,7 @@ class NixlTransferManager:
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
 
-        tensor_descriptors = self._build_tensor_descriptors(tensors)
+        tensor_descriptors = self._make_tensor_descriptors(tensors)
 
         base, used = arena.registered_range()
         if used == 0:
@@ -370,7 +425,7 @@ class NixlTransferManager:
             return self.register_tensors(tensors)
 
         nixl_reg_start = time.perf_counter()
-        self._agent.register_memory(
+        registered = self._agent.register_memory(
             [(base, used, self._device_id, "")],
             mem_type=self._accelerator_backend.nixl_mem_type,
             backends=self._backends,
@@ -393,6 +448,8 @@ class NixlTransferManager:
             f"({reduction:.1f}% reduction), {total_bytes / 1e9:.2f} GB live in "
             f"{used / 1e9:.2f} GB arena bump range"
         )
+
+        self._record_tensor_registration(registered, tensors, tensor_descriptors)
 
         return self._metadata
 
@@ -664,9 +721,7 @@ class NixlTransferManager:
         """Deregister a memory descriptor returned by register_memory."""
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
-        if registered is not None:
-            self._agent.deregister_memory(registered)
-            self._metadata = self._agent.get_agent_metadata()
+        self._deregister_registered_memory(registered)
 
     def receive_dram_into_buffer(
         self,
@@ -758,6 +813,12 @@ class NixlTransferManager:
         aliases ``_tensors`` directly, shutdown will not mutate the
         shared container out from under them.
         """
+        for registered in reversed(self._tensor_registrations):
+            try:
+                self._deregister_registered_memory(registered)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Failed to deregister NIXL tensor memory during shutdown: %s", e)
+        self._tensor_registrations = []
         self._agent = None
         self._metadata = b""
         self._tensor_descriptors = []
