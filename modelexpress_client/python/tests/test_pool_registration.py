@@ -118,9 +118,7 @@ class TestFindCudaAllocations:
     def test_single_tensor_single_allocation(self, fake_driver):
         # Tensor at 0x1100 inside a 4 KiB allocation starting at 0x1000.
         fake = fake_driver([(0x1000, 0x1000)])
-        result = NixlTransferManager._find_cuda_allocations(
-            [_desc("w", 0x1100, 64)]
-        )
+        result = NixlTransferManager._find_cuda_allocations([_desc("w", 0x1100, 64)])
         assert result == [(0x1000, 0x1000)]
         assert fake.calls == 1
 
@@ -140,11 +138,13 @@ class TestFindCudaAllocations:
     def test_multiple_allocations_sorted(self, fake_driver):
         # Three distinct allocations in non-sorted order; result must be
         # sorted by alloc_base.
-        fake_driver([
-            (0x3000, 0x1000),
-            (0x1000, 0x1000),
-            (0x2000, 0x1000),
-        ])
+        fake_driver(
+            [
+                (0x3000, 0x1000),
+                (0x1000, 0x1000),
+                (0x2000, 0x1000),
+            ]
+        )
         descriptors = [
             _desc("w0", 0x3010, 64),
             _desc("w1", 0x1010, 64),
@@ -161,10 +161,12 @@ class TestFindCudaAllocations:
         # Two allocations that happen to be adjacent in virtual address space
         # must remain separate. Merging them is what the (now-removed)
         # MX_CONTIGUOUS_REG path did, and it broke UCX rcache rkey lookup.
-        fake_driver([
-            (0x1000, 0x1000),  # ends at 0x2000
-            (0x2000, 0x1000),  # starts where the previous ends
-        ])
+        fake_driver(
+            [
+                (0x1000, 0x1000),  # ends at 0x2000
+                (0x2000, 0x1000),  # starts where the previous ends
+            ]
+        )
         descriptors = [
             _desc("w0", 0x1010, 64),
             _desc("w1", 0x2010, 64),
@@ -177,18 +179,16 @@ class TestFindCudaAllocations:
 
         fake_driver(allocations=[], err_override=driver.CUresult.CUDA_ERROR_UNKNOWN)
         with pytest.raises(RuntimeError, match="cuMemGetAddressRange failed"):
-            NixlTransferManager._find_cuda_allocations(
-                [_desc("w", 0x1000, 64)]
-            )
+            NixlTransferManager._find_cuda_allocations([_desc("w", 0x1000, 64)])
 
     def test_driver_error_includes_tensor_name(self, fake_driver):
         from cuda.bindings import driver
 
-        fake_driver(allocations=[], err_override=driver.CUresult.CUDA_ERROR_INVALID_VALUE)
+        fake_driver(
+            allocations=[], err_override=driver.CUresult.CUDA_ERROR_INVALID_VALUE
+        )
         with pytest.raises(RuntimeError, match="'w_named'"):
-            NixlTransferManager._find_cuda_allocations(
-                [_desc("w_named", 0x1000, 64)]
-            )
+            NixlTransferManager._find_cuda_allocations([_desc("w_named", 0x1000, 64)])
 
 
 class TestRawDescriptorMemType:
@@ -290,7 +290,11 @@ class TestReceiveFromSourceManifestValidation:
         local = torch.zeros(10, dtype=torch.float32)
         mgr = self._make_manager(monkeypatch, {"w": local})
         bogus = TensorDescriptor(
-            name="w", addr=0x1000, size=80, device_id=0, dtype=str(local.dtype),
+            name="w",
+            addr=0x1000,
+            size=80,
+            device_id=0,
+            dtype=str(local.dtype),
         )
         with pytest.raises(ManifestMismatchError, match="size mismatch"):
             mgr.receive_from_source(
@@ -304,7 +308,11 @@ class TestReceiveFromSourceManifestValidation:
         local = torch.zeros(10, dtype=torch.float32)
         mgr = self._make_manager(monkeypatch, {"w": local})
         bogus = TensorDescriptor(
-            name="w", addr=0x1000, size=40, device_id=0, dtype="torch.bfloat16",
+            name="w",
+            addr=0x1000,
+            size=40,
+            device_id=0,
+            dtype="torch.bfloat16",
         )
         with pytest.raises(ManifestMismatchError, match="dtype mismatch"):
             mgr.receive_from_source(
@@ -334,9 +342,15 @@ class TestReceiveFromSourceManifestValidation:
         # No matching local tensor for the source's "w". Loop should `continue`
         # without raising; the caller decides whether the empty match list is
         # an error. We just verify the validation doesn't fire spuriously.
-        mgr = self._make_manager(monkeypatch, {"x": torch.zeros(1, dtype=torch.float32)})
+        mgr = self._make_manager(
+            monkeypatch, {"x": torch.zeros(1, dtype=torch.float32)}
+        )
         wrong_name = TensorDescriptor(
-            name="w", addr=0x1000, size=4, device_id=0, dtype="torch.float32",
+            name="w",
+            addr=0x1000,
+            size=4,
+            device_id=0,
+            dtype="torch.float32",
         )
         # Empty match -> early-return (0, 0, 0.0); no exception.
         result = mgr.receive_from_source(
@@ -349,9 +363,15 @@ class TestReceiveFromSourceManifestValidation:
     def test_unmatched_name_warns(self, monkeypatch, caplog):
         # Unmatched names stay non-fatal but are surfaced: an unmatched local
         # tensor keeps its init values.
-        mgr = self._make_manager(monkeypatch, {"x": torch.zeros(1, dtype=torch.float32)})
+        mgr = self._make_manager(
+            monkeypatch, {"x": torch.zeros(1, dtype=torch.float32)}
+        )
         wrong_name = TensorDescriptor(
-            name="w", addr=0x1000, size=4, device_id=0, dtype="torch.float32",
+            name="w",
+            addr=0x1000,
+            size=4,
+            device_id=0,
+            dtype="torch.float32",
         )
         with caplog.at_level(logging.WARNING, logger="modelexpress.nixl_transfer"):
             mgr.receive_from_source(
@@ -360,6 +380,24 @@ class TestReceiveFromSourceManifestValidation:
                 remote_agent_name="dummy",
             )
         assert any(
-            "1 local-only, 1 source-only" in rec.getMessage()
-            for rec in caplog.records
+            "1 local-only, 1 source-only" in rec.getMessage() for rec in caplog.records
         )
+
+
+class TestWaitForXfer:
+    @staticmethod
+    def _manager(statuses):
+        manager = object.__new__(NixlTransferManager)
+        manager._agent = MagicMock()
+        manager._agent.check_xfer_state.side_effect = statuses
+        return manager
+
+    def test_returns_on_success(self):
+        manager = self._manager(["PENDING", "SUCCESS"])
+        manager._wait_for_xfer(object(), None, "test transfer")
+        assert manager._agent.check_xfer_state.call_count == 2
+
+    def test_raises_labeled_error(self):
+        manager = self._manager(["ERROR"])
+        with pytest.raises(RuntimeError, match="test transfer failed"):
+            manager._wait_for_xfer(object(), None, "test transfer")
