@@ -4,7 +4,7 @@ SPDX-License-Identifier: Apache-2.0
 -->
 
 <p align="center">
-  <img src="docs/images/model-express-key-visual.jpg" alt="ModelExpress distributes model weights across GPU workers" width="50%">
+  <img src="docs/images/model-express-key-visual.jpg" alt="ModelExpress distributes model weights across GPU workers" width="70%">
 </p>
 
 <p align="center">
