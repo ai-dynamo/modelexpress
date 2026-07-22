@@ -41,6 +41,18 @@ from modelexpress.refit.reshard.types import CaptureResult, UnsupportedReshard
 logger = logging.getLogger("modelexpress.refit.reshard.receiver")
 
 
+def _replay_ops(tensor: torch.Tensor, op_chain: tuple) -> torch.Tensor:
+    """Replay a captured loader view chain on a staged full-source tensor."""
+    value = tensor
+    for op_name, args, frozen_kwargs in op_chain:
+        kwargs = dict(frozen_kwargs)
+        if op_name == "__getitem__":
+            value = value.__getitem__(*args)
+        else:
+            value = getattr(value, op_name)(*args, **kwargs)
+    return value
+
+
 class ReshardReceiver:
     """Pull-mode slice-resharding weight receiver (engine-agnostic).
 
@@ -109,6 +121,8 @@ class ReshardReceiver:
             str, torch.Tensor
         ] = {}  # dtype-convert param -> bf16 staging (RDMA target)
         self._staging_ptr: dict[str, int] = {}
+        self._full_staging: dict[str, torch.Tensor] = {}
+        self._full_staging_ptr: dict[str, int] = {}
         self._param_ptr: dict[
             str, int
         ] = {}  # segment param_name -> receive-buffer data_ptr
@@ -227,6 +241,31 @@ class ReshardReceiver:
             )
             self._staging_ptr = {n: t.data_ptr() for n, t in self._staging.items()}
 
+        # Descriptor-heavy strided copies pull each complete source into one
+        # persistent contiguous staging tensor, then replay captured loader views
+        # locally. Each source shard contributes one bounded descriptor.
+        self._full_staging = {}
+        self._full_staging_ptr = {}
+        if plan.full_pulls:
+            with classic_cuda_alloc():
+                self._full_staging = {
+                    full_pull.src_name: torch.empty(
+                        full_pull.global_shape,
+                        dtype=full_pull.dtype,
+                        device=self._device,
+                    )
+                    for full_pull in plan.full_pulls
+                }
+            self._manager.register_tensors(
+                {
+                    f"__full__{name}": tensor
+                    for name, tensor in self._full_staging.items()
+                }
+            )
+            self._full_staging_ptr = {
+                name: tensor.data_ptr() for name, tensor in self._full_staging.items()
+            }
+
         # Receive buffers: one per captured param at its CAPTURED (load-time)
         # shape/dtype, classic cudaMalloc, registered once. The live params are
         # NOT RDMA targets; _install() writes the buffers into the live params.
@@ -251,10 +290,16 @@ class ReshardReceiver:
                 self._param_ptr[name] = self._recv_buffers[name].data_ptr()
 
         logger.info(
-            "[reshard] prepared: %d segments, %d convert(s), %.1f MB/pull, %d fallback",
-            len(plan.segments),
+            "[reshard] prepared: %d descriptor(s), %d full-pull source(s), "
+            "%d convert(s), %.1f MB/pull, %d descriptor(s) saved, "
+            "%.1f MB extra wire, %d unbounded source(s), %d fallback",
+            plan.descriptor_count(),
+            len(plan.full_pulls),
             len(plan.converts),
             plan.bytes_planned() / 1e6,
+            plan.descriptor_savings(),
+            plan.extra_wire_bytes() / 1e6,
+            len(plan.unbounded_sources),
             len(plan.fallback),
         )
 
@@ -281,6 +326,33 @@ class ReshardReceiver:
             resolve_param_ptr=lambda name: self._param_ptr[name],
             transport=self._transport,
         )
+        if self._plan.full_pulls:
+            full_descriptors = [
+                ReadDescriptor(
+                    session=segment.session,
+                    src_addr=segment.src_addr,
+                    dst_addr=(
+                        self._full_staging_ptr[full_pull.src_name] + segment.dst_byte
+                    ),
+                    nbytes=segment.nbytes,
+                )
+                for full_pull in self._plan.full_pulls
+                for segment in full_pull.segments
+            ]
+            self._transport.read(full_descriptors)
+            for full_pull in self._plan.full_pulls:
+                full_tensor = self._full_staging[full_pull.src_name]
+                for copy in full_pull.copies:
+                    source_view = _replay_ops(full_tensor, copy.op_chain)
+                    receive_buffer = self._recv_buffers[copy.param_name]
+                    destination = receive_buffer.as_strided(
+                        copy.dest_shape,
+                        copy.dest_stride,
+                        receive_buffer.storage_offset() + copy.dest_offset,
+                    )
+                    destination.copy_(source_view)
+            stats["segments"] += len(full_descriptors)
+            stats["bytes"] += sum(descriptor.nbytes for descriptor in full_descriptors)
         if self._plan.converts:
             conv_descs = [
                 ReadDescriptor(
@@ -297,6 +369,8 @@ class ReshardReceiver:
             # op, so the RDMA never crosses dtypes. _install writes the buffer.
             for c in self._plan.converts:
                 self._recv_buffers[c.param_name].copy_(self._staging[c.param_name])
+            stats["segments"] += len(conv_descs)
+            stats["bytes"] += sum(descriptor.nbytes for descriptor in conv_descs)
 
         self._install(self._recv_buffers)
         torch.cuda.synchronize(self._device)
@@ -306,14 +380,25 @@ class ReshardReceiver:
             "bytes_received": stats["bytes"],
             "segments": stats["segments"],
             "converts": len(self._plan.converts),
+            "full_pull_sources": len(self._plan.full_pulls),
+            "exact_descriptors": self._plan.exact_descriptor_count,
+            "descriptor_savings": self._plan.descriptor_savings(),
+            "extra_wire_bytes": self._plan.extra_wire_bytes(),
+            "unbounded_sources": len(self._plan.unbounded_sources),
             "fallback": len(stats["fallback"]),
         }
         logger.info(
-            "[reshard] refit step=%d bytes=%.1fMB segments=%d converts=%d fallback=%d",
+            "[reshard] refit step=%d bytes=%.1fMB descriptors=%d "
+            "(saved=%d, extra_wire=%.1fMB) full_pulls=%d converts=%d "
+            "unbounded=%d fallback=%d",
             step,
             stats["bytes"] / 1e6,
             stats["segments"],
+            self._plan.descriptor_savings(),
+            self._plan.extra_wire_bytes() / 1e6,
+            len(self._plan.full_pulls),
             len(self._plan.converts),
+            len(self._plan.unbounded_sources),
             len(stats["fallback"]),
         )
         return metrics

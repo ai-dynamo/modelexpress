@@ -9,9 +9,10 @@ intersect those slices against the published source shards (slice_plan.py), and
 emit the exact byte segments to RDMA-pull (plan.py). No all-gather and no
 per-model conversion specs - the engine's real loaders define the reshard.
 
-Overlap is arbitrary per-dim (not just dim-0). Any tensor whose slice can't be
-expressed as a box raises ``UnsupportedReshard`` and falls back to a full
-(non-sliced) pull, so a sync never aborts over one awkward tensor.
+Overlap is arbitrary per-dim (not just dim-0). Descriptor-heavy strided copies
+can pull a complete dim-0-sharded source into contiguous staging and replay the
+captured views locally. Unsupported loader operations raise
+``UnsupportedReshard`` until the general fallback path is implemented.
 """
 
 from modelexpress.refit.reshard.geometry import (
@@ -22,6 +23,7 @@ from modelexpress.refit.reshard.geometry import (
     capture_geometry,
 )
 from modelexpress.refit.reshard.transfer_plan import (
+    FullPullSource,
     SourceInfo,
     TransferPlan,
     execute_transfer,
@@ -53,6 +55,7 @@ from modelexpress.refit.reshard.rendezvous import (
 
 __all__ = [
     "InMemoryReferenceTransport",
+    "FullPullSource",
     "LazyWeight",
     "MxReshardRendezvous",
     "NixlReshardTransport",

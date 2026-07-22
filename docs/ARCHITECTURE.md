@@ -639,6 +639,16 @@ plan currently assumes a stable source cohort, shard layout, and registration
 addresses; topology-epoch invalidation is a follow-up requirement before
 elastic production use.
 
+Exact strided TP slices can produce one descriptor per row. When a captured
+copy exceeds `MX_RESHARD_MAX_SEGMENTS_PER_COPY` (default 64), the planner pulls
+each gap-free dim-0 source shard once into persistent contiguous staging and
+replays the captured loader views locally. This bounds descriptors by source
+shard count at the cost of extra wire bytes. Plans and update metrics report
+the exact descriptor count, descriptor savings, and extra bytes. If the
+published layout cannot be reconstructed as a complete dim-0 partition, the
+planner keeps the exact known-correct descriptors rather than changing
+correctness behavior.
+
 ### SGLang Loader
 
 **MxModelLoader** is instantiated by SGLang's `remote_instance` loader when
