@@ -89,6 +89,7 @@ if TYPE_CHECKING:
     MX_ARTIFACT_READY_URL: str
     MX_ARTIFACT_READY_TIMEOUT_SECS: int
     MX_ARTIFACT_TRANSFER_CHUNK_SIZE: Optional[str]
+    MX_TVM_FFI_CACHE_ARTIFACT_MODE: str
     # P2P source selection
     MX_P2P_SOURCE_SELECTOR: Optional[str]
     # Opt-in metrics collector
@@ -207,6 +208,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Raw string: artifact_manifest.artifact_transfer_chunk_size() owns the
     # int parse plus its non-positive/max-bound validation and default param.
     "MX_ARTIFACT_TRANSFER_CHUNK_SIZE": lambda: os.environ.get("MX_ARTIFACT_TRANSFER_CHUNK_SIZE"),
+    "MX_TVM_FFI_CACHE_ARTIFACT_MODE": lambda: os.environ.get(
+        "MX_TVM_FFI_CACHE_ARTIFACT_MODE", "standalone"
+    ).strip().lower(),
     # ── P2P source selection ───────────────────────────────────────────────
     # Raw (None when unset); source_selection applies its DEFAULT_SELECTOR fallback.
     "MX_P2P_SOURCE_SELECTOR": lambda: os.environ.get("MX_P2P_SOURCE_SELECTOR"),

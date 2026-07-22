@@ -241,6 +241,71 @@ def test_sglang_tvm_ffi_identity_includes_runtime_version(monkeypatch):
     assert identity.extra_parameters["tvm_ffi_version"] == "0.1.6"
 
 
+def test_sglang_tvm_ffi_cache_can_share_triton_artifact_for_old_server(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("MX_TVM_FFI_CACHE_ARTIFACT_MODE", "triton")
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton-cache"))
+    monkeypatch.setenv("TVM_FFI_CACHE_DIR", str(tmp_path / "tvm-ffi-cache"))
+    monkeypatch.setattr(
+        artifacts._common_artifacts,
+        "tvm_ffi_version",
+        lambda: "0.1.6",
+    )
+    monkeypatch.setattr(
+        artifacts._common_artifacts,
+        "gpu_arch",
+        lambda device_id: "sm90",
+    )
+    ctx = SimpleNamespace(
+        worker_rank=0,
+        worker_id="worker-a",
+        device_id=0,
+        identity=p2p_pb2.SourceIdentity(
+            model_name="test/model",
+            backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
+            tensor_parallel_size=4,
+            pipeline_parallel_size=1,
+            dtype="bfloat16",
+            quantization="fp8",
+            revision="abc123",
+        ),
+    )
+
+    transfers = artifacts._sglang_artifact_transfers(ctx)
+    triton_transfer, triton_identity = next(
+        item
+        for item in transfers
+        if item[0].mx_source_type == p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE
+    )
+
+    assert not any(
+        transfer.mx_source_type == p2p_pb2.MX_SOURCE_TYPE_TVM_FFI_CACHE
+        for transfer, _ in transfers
+    )
+    assert tuple(root.name for root in triton_transfer.roots) == (
+        "primary",
+        "tvm_ffi",
+    )
+    assert triton_transfer.roots[1].target_root == tmp_path / "tvm-ffi-cache"
+    assert triton_identity.extra_parameters["tvm_ffi_version"] == "0.1.6"
+    assert triton_identity.tensor_parallel_size == 4
+    assert triton_identity.dtype == "bfloat16"
+    assert triton_identity.revision == "abc123"
+
+
+def test_sglang_tvm_ffi_cache_artifact_mode_rejects_unknown_value(monkeypatch):
+    monkeypatch.setenv("MX_TVM_FFI_CACHE_ARTIFACT_MODE", "invalid")
+
+    try:
+        artifacts._tvm_ffi_cache_artifact_mode()
+    except ValueError as exc:
+        assert "must be 'standalone' or 'triton'" in str(exc)
+    else:
+        raise AssertionError("invalid TVM-FFI artifact mode was accepted")
+
+
 def test_sglang_flashinfer_autotune_cache_root_uses_sglang_default(monkeypatch):
     monkeypatch.delenv("SGLANG_CACHE_DIR", raising=False)
 

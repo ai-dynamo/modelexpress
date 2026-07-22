@@ -410,6 +410,7 @@ def triton_cache_artifact_transfer(
     bundle_root: str | Path,
     *,
     chunk_size: int | None = None,
+    additional_roots: tuple[ArtifactCacheRoot, ...] = (),
 ) -> P2PArtifactTransfer:
     return _cache_artifact_transfer(
         "triton_cache",
@@ -418,6 +419,7 @@ def triton_cache_artifact_transfer(
         target_root,
         bundle_root,
         chunk_size=chunk_size,
+        additional_roots=additional_roots,
     )
 
 

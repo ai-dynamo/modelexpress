@@ -96,7 +96,19 @@ def _sglang_artifact_transfers(
     cute_dsl_cache_root = _common_artifacts.cute_dsl_cache_root()
     flashinfer_cache_root = _common_artifacts.flashinfer_cache_root()
     flashinfer_autotune_cache_root = _flashinfer_autotune_cache_root()
-    return [
+    tvm_ffi_mode = _tvm_ffi_cache_artifact_mode()
+    triton_additional_roots = (
+        (
+            ArtifactCacheRoot(
+                name="tvm_ffi",
+                source_root=tvm_ffi_cache_root,
+                target_root=tvm_ffi_cache_root,
+            ),
+        )
+        if tvm_ffi_mode == "triton"
+        else ()
+    )
+    transfers = [
         (
             torch_compile_cache_artifact_transfer(
                 torch_compile_cache_root,
@@ -110,16 +122,9 @@ def _sglang_artifact_transfers(
                 triton_cache_root,
                 triton_cache_root,
                 bundle_root / "triton_cache",
+                additional_roots=triton_additional_roots,
             ),
             _artifact_identity(ctx, p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE),
-        ),
-        (
-            tvm_ffi_cache_artifact_transfer(
-                tvm_ffi_cache_root,
-                tvm_ffi_cache_root,
-                bundle_root / "tvm_ffi_cache",
-            ),
-            _artifact_identity(ctx, p2p_pb2.MX_SOURCE_TYPE_TVM_FFI_CACHE),
         ),
         (
             deep_gemm_cache_artifact_transfer(
@@ -162,6 +167,29 @@ def _sglang_artifact_transfers(
             _artifact_identity(ctx, p2p_pb2.MX_SOURCE_TYPE_FLASHINFER_CACHE),
         ),
     ]
+    if tvm_ffi_mode == "standalone":
+        transfers.insert(
+            2,
+            (
+                tvm_ffi_cache_artifact_transfer(
+                    tvm_ffi_cache_root,
+                    tvm_ffi_cache_root,
+                    bundle_root / "tvm_ffi_cache",
+                ),
+                _artifact_identity(ctx, p2p_pb2.MX_SOURCE_TYPE_TVM_FFI_CACHE),
+            ),
+        )
+    return transfers
+
+
+def _tvm_ffi_cache_artifact_mode() -> str:
+    mode = envs.MX_TVM_FFI_CACHE_ARTIFACT_MODE
+    if mode not in {"standalone", "triton"}:
+        raise ValueError(
+            "MX_TVM_FFI_CACHE_ARTIFACT_MODE must be 'standalone' or 'triton', "
+            f"got {mode!r}"
+        )
+    return mode
 
 
 def _torch_compile_cache_root() -> Path:
@@ -250,15 +278,37 @@ def _torch_compile_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
 
 
 def _triton_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
+    tvm_ffi_compat = _tvm_ffi_cache_artifact_mode() == "triton"
     identity = p2p_pb2.SourceIdentity(
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
         model_name=ctx.identity.model_name,
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
+        tensor_parallel_size=(
+            ctx.identity.tensor_parallel_size if tvm_ffi_compat else 0
+        ),
+        pipeline_parallel_size=(
+            ctx.identity.pipeline_parallel_size if tvm_ffi_compat else 0
+        ),
+        expert_parallel_size=ctx.identity.expert_parallel_size if tvm_ffi_compat else 0,
+        dtype=ctx.identity.dtype if tvm_ffi_compat else "",
+        quantization=ctx.identity.quantization if tvm_ffi_compat else "",
+        revision=ctx.identity.revision if tvm_ffi_compat else "",
+        backend_framework_version=_sglang_version() if tvm_ffi_compat else "",
+        torch_version=torch.__version__ if tvm_ffi_compat else "",
         cuda_version=torch.version.cuda or "",
         triton_version=_common_artifacts.triton_version(),
         gpu_arch=_common_artifacts.gpu_arch(ctx.device_id),
+        compile_config_digest=(
+            envs.MX_ARTIFACT_COMPILE_CONFIG_DIGEST if tvm_ffi_compat else ""
+        ),
     )
     _set_extra_if_present(identity, "triton_key", _common_artifacts.triton_key())
+    if tvm_ffi_compat:
+        _set_extra_if_present(
+            identity,
+            "tvm_ffi_version",
+            _common_artifacts.tvm_ffi_version(),
+        )
     return identity
 
 
