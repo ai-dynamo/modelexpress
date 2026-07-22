@@ -91,7 +91,9 @@ def _get_pool() -> "torch.cuda.MemPool":
         with_cuda=True,
     )
     so_path = Path(module.__file__)
-    _allocator_wrapper = torch.cuda.memory.CUDAPluggableAllocator(str(so_path), "mx_classic_alloc", "mx_classic_free")
+    _allocator_wrapper = torch.cuda.memory.CUDAPluggableAllocator(
+        str(so_path), "mx_classic_alloc", "mx_classic_free"
+    )
     _pool = torch.cuda.MemPool(_allocator_wrapper.allocator())
     return _pool
 

@@ -44,7 +44,11 @@ import itertools
 from dataclasses import dataclass
 from typing import Any
 
-from modelexpress.reshard_refit.types import OpChain, RecordedCopy, UnsupportedReshard
+from modelexpress.refit.reshard.types import (
+    OpChain,
+    RecordedCopy,
+    UnsupportedReshard,
+)
 
 
 @dataclass
@@ -101,14 +105,18 @@ def op_chain_to_box(op_chain: OpChain, global_shape) -> list:
             dim = 0
             for k in keys:
                 if k is Ellipsis:
-                    raise UnsupportedReshard("ellipsis indexing is not box-derivable -> full-pull")
+                    raise UnsupportedReshard(
+                        "ellipsis indexing is not box-derivable -> full-pull"
+                    )
                 if not isinstance(k, slice):
                     # int index collapses a dim; changes rank -> not a plain box scatter.
                     raise UnsupportedReshard(
                         f"integer index {k!r} collapses a dim; not box-derivable -> full-pull"
                     )
                 if k.step not in (None, 1):
-                    raise UnsupportedReshard(f"strided slice step={k.step} is not box-derivable -> full-pull")
+                    raise UnsupportedReshard(
+                        f"strided slice step={k.step} is not box-derivable -> full-pull"
+                    )
                 lo, hi = box[dim]
                 extent = hi - lo
                 start = 0 if k.start is None else int(k.start)
@@ -140,16 +148,26 @@ def _replay_view(op_chain: OpChain, global_shape) -> tuple:
     for op_name, args, kw in op_chain:
         t = getattr(t, op_name)(*args, **dict(kw))
     if not isinstance(t, torch.Tensor):
-        raise UnsupportedReshard(f"op-chain resolved to non-tensor {type(t).__name__} -> full-pull")
+        raise UnsupportedReshard(
+            f"op-chain resolved to non-tensor {type(t).__name__} -> full-pull"
+        )
     # Must remain a pure VIEW of the source (shared storage). A copy resets the
     # base chain; PyTorch collapses view-of-view to the root, so a pure view has
     # ``t._base is src`` (or ``t is src`` for an empty chain).
     if t is not src and t._base is not src:
-        raise UnsupportedReshard("op-chain includes a copy (not a pure view) -> full-pull")
-    return int(t.storage_offset()), tuple(int(s) for s in t.shape), tuple(int(s) for s in t.stride())
+        raise UnsupportedReshard(
+            "op-chain includes a copy (not a pure view) -> full-pull"
+        )
+    return (
+        int(t.storage_offset()),
+        tuple(int(s) for s in t.shape),
+        tuple(int(s) for s in t.stride()),
+    )
 
 
-def _view_to_box_perm(v_offset: int, v_shape: tuple, v_stride: tuple, global_shape) -> tuple:
+def _view_to_box_perm(
+    v_offset: int, v_shape: tuple, v_stride: tuple, global_shape
+) -> tuple:
     """From a replayed strided view ``(offset, shape, stride)``, derive the source
     index box + the view-dim -> source-dim permutation, for a RANK-PRESERVING
     permuted box (transpose/permute/t of a narrowed/sliced region). Raises
@@ -161,7 +179,9 @@ def _view_to_box_perm(v_offset: int, v_shape: tuple, v_stride: tuple, global_sha
     box's per-source-dim start."""
     ndim = len(global_shape)
     if len(v_shape) != ndim:
-        raise UnsupportedReshard(f"rank change {len(v_shape)}!={ndim} (reshape/squeeze) not box-derivable -> full-pull")
+        raise UnsupportedReshard(
+            f"rank change {len(v_shape)}!={ndim} (reshape/squeeze) not box-derivable -> full-pull"
+        )
     gstrides = _row_major_strides(global_shape)
     stride_to_dim: dict = {}
     for s in range(ndim):
@@ -172,7 +192,9 @@ def _view_to_box_perm(v_offset: int, v_shape: tuple, v_stride: tuple, global_sha
             continue  # size-1 dim: stride is ambiguous; assign a leftover dim below
         sdim = stride_to_dim.get(v_stride[d])
         if sdim is None:
-            raise UnsupportedReshard(f"non-permutation stride {v_stride[d]} (dim-merging reshape) -> full-pull")
+            raise UnsupportedReshard(
+                f"non-permutation stride {v_stride[d]} (dim-merging reshape) -> full-pull"
+            )
         perm[d] = sdim
     used = {s for s in perm if s is not None}
     remaining = [s for s in range(ndim) if s not in used]
@@ -182,7 +204,9 @@ def _view_to_box_perm(v_offset: int, v_shape: tuple, v_stride: tuple, global_sha
             perm[d] = remaining[ri]
             ri += 1
     if sorted(perm) != list(range(ndim)):
-        raise UnsupportedReshard("view strides are not a permutation of source dims -> full-pull")
+        raise UnsupportedReshard(
+            "view strides are not a permutation of source dims -> full-pull"
+        )
     box_lo = [(v_offset // gstrides[s]) % global_shape[s] for s in range(ndim)]
     box = [[box_lo[s], box_lo[s]] for s in range(ndim)]
     for d in range(ndim):
@@ -196,7 +220,9 @@ def _view_to_box_perm(v_offset: int, v_shape: tuple, v_stride: tuple, global_sha
     if any(box[s][0] < 0 or box[s][1] > global_shape[s] for s in range(ndim)):
         raise UnsupportedReshard("resolved box exceeds source bounds -> full-pull")
     if sum(box[s][0] * gstrides[s] for s in range(ndim)) != v_offset:
-        raise UnsupportedReshard("view offset does not decompose to a box start -> full-pull")
+        raise UnsupportedReshard(
+            "view offset does not decompose to a box start -> full-pull"
+        )
     return [tuple(b) for b in box], perm
 
 
@@ -227,7 +253,7 @@ def resolve_slice(copy: RecordedCopy, global_shape) -> tuple:
 def intersect(box_a: list, box_b: list):
     """Per-dim overlap of two equal-rank boxes; None if disjoint on any dim."""
     out = []
-    for (a0, a1), (b0, b1) in zip(box_a, box_b):
+    for (a0, a1), (b0, b1) in zip(box_a, box_b, strict=True):
         lo, hi = max(a0, b0), min(a1, b1)
         if lo >= hi:
             return None
@@ -247,14 +273,16 @@ def paired_runs(overlap: list, src_origin, src_strides, dst_origin, dst_strides)
     non-row-major) ``dst_strides`` - the captured real destination strides."""
     ndim = len(overlap)
     sizes = [hi - lo for lo, hi in overlap]
-    src_start = [lo - o for (lo, _), o in zip(overlap, src_origin)]
-    dst_start = [lo - o for (lo, _), o in zip(overlap, dst_origin)]
+    src_start = [lo - o for (lo, _), o in zip(overlap, src_origin, strict=True)]
+    dst_start = [lo - o for (lo, _), o in zip(overlap, dst_origin, strict=True)]
 
     # Grow the coalesced trailing block while dim d is exactly unit-packed
     # (stride == running run length) in both src and dst.
     run_len = 1
     p = ndim
-    while p - 1 >= 0 and src_strides[p - 1] == run_len and dst_strides[p - 1] == run_len:
+    while (
+        p - 1 >= 0 and src_strides[p - 1] == run_len and dst_strides[p - 1] == run_len
+    ):
         run_len *= sizes[p - 1]
         p -= 1
 
@@ -296,12 +324,14 @@ def plan_pull(
 
     segments: list = []
     for sh in shards:
-        shard_box = [(o, o + s) for o, s in zip(sh.shard_offset, sh.shape)]
+        shard_box = [(o, o + s) for o, s in zip(sh.shard_offset, sh.shape, strict=True)]
         overlap = intersect(needed, shard_box)
         if overlap is None:
             continue
         src_strides = _row_major_strides(sh.shape)
-        for s_off, d_off, n in paired_runs(overlap, sh.shard_offset, src_strides, need_origin, dest_strides):
+        for s_off, d_off, n in paired_runs(
+            overlap, sh.shard_offset, src_strides, need_origin, dest_strides
+        ):
             segments.append(
                 PullSegment(
                     session=sh.session,

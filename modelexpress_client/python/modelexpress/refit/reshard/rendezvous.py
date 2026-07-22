@@ -9,7 +9,7 @@ and no per-dim shard geometry. Until the proto has those fields, the trainer pac
 the resharding side-table (per source tensor: full shape + each shard's per-dim
 offset/shape + owning NIXL agent/device/base address) into a self-describing JSON
 blob that rides alongside the NIXL agent metadata; the inference side decodes it
-into the ``modelexpress.reshard_refit`` planning inputs (a ``SourceInfo`` per source +
+into the ``modelexpress.refit.reshard`` planning inputs (a ``SourceInfo`` per source +
 the shard -> owning-agent/device maps). When the proto gains those fields, delete
 the encode/decode here and build the same maps from typed descriptors -
 ``NixlReshardTransport`` and the slice-plan / pull core are untouched.
@@ -42,10 +42,10 @@ from dataclasses import dataclass
 
 from modelexpress import p2p_pb2
 from modelexpress.client import MxClient
-from modelexpress.reshard_refit.transfer_plan import SourceInfo
-from modelexpress.reshard_refit.slice_plan import Shard
+from modelexpress.refit.reshard.slice_plan import Shard
+from modelexpress.refit.reshard.transfer_plan import SourceInfo
 
-logger = logging.getLogger("modelexpress.reshard_refit.rendezvous")
+logger = logging.getLogger("modelexpress.refit.reshard.rendezvous")
 
 _SCHEMA = "mx.reshard.shard_table.v1"
 
@@ -54,11 +54,11 @@ def _mx_version() -> str:
     """The ``modelexpress`` package version, folded into the SourceIdentity hash
     so trainer and inference on the same MX build resolve the same mx_source_id.
     Derived (not a literal) so it tracks the real build."""
-    from importlib.metadata import version as pkg_version
+    from importlib.metadata import PackageNotFoundError, version as pkg_version
 
     try:
         return pkg_version("modelexpress")
-    except Exception:
+    except PackageNotFoundError:
         return "0.0.0"
 
 
@@ -193,7 +193,9 @@ def merge_shard_tables(tables: list) -> list:
         for t in table:
             cur = merged.get(t.name)
             if cur is None:
-                merged[t.name] = PublishedTensor(t.name, t.dtype, t.elsize, t.full_shape, list(t.shards))
+                merged[t.name] = PublishedTensor(
+                    t.name, t.dtype, t.elsize, t.full_shape, list(t.shards)
+                )
                 continue
             if cur.full_shape != t.full_shape or cur.dtype != t.dtype:
                 raise ValueError(
@@ -211,7 +213,9 @@ def merge_shard_tables(tables: list) -> list:
 # shards ride typed descriptors).
 
 
-def wrap_rendezvous_blob(agent_metadata: bytes, agent_name: str, metadata_endpoint: str, tensors: list) -> bytes:
+def wrap_rendezvous_blob(
+    agent_metadata: bytes, agent_name: str, metadata_endpoint: str, tensors: list
+) -> bytes:
     """Pack ``{agent_meta, agent_name, metadata_endpoint, shard_table}`` into one
     JSON blob. ``metadata_endpoint`` (``host:listen_port`` of the trainer's NIXL
     listen thread) is what the receiver's ``fetch_remote_and_wait`` connects to
@@ -236,7 +240,9 @@ def unwrap_rendezvous_blob(blob: bytes) -> tuple:
     agent_metadata = base64.b64decode(payload["agent_meta_b64"])
     agent_name = payload["agent_name"]
     metadata_endpoint = payload.get("metadata_endpoint", "")
-    tensors = decode_shard_table(json.dumps({"schema": _SCHEMA, "tensors": payload["tensors"]}).encode("utf-8"))
+    tensors = decode_shard_table(
+        json.dumps({"schema": _SCHEMA, "tensors": payload["tensors"]}).encode("utf-8")
+    )
     return agent_metadata, agent_name, metadata_endpoint, tensors
 
 
@@ -285,7 +291,9 @@ class MxReshardRendezvous:
     def publish(self, blob: bytes) -> str:
         """Publish this rank's rendezvous blob (agent meta + shard table)."""
         worker = p2p_pb2.WorkerMetadata(worker_rank=self.rank, nixl_metadata=blob)
-        self._mx_source_id = self.client.publish_metadata(self._identity(self.role), worker, self.worker_id)
+        self._mx_source_id = self.client.publish_metadata(
+            self._identity(self.role), worker, self.worker_id
+        )
         return self._mx_source_id
 
     def discover_trainers(
@@ -300,7 +308,10 @@ class MxReshardRendezvous:
         trainer_id = self._identity("trainer")
         deadline = time.monotonic() + timeout
         while True:
-            resp = self.client.list_sources(trainer_id)
+            resp = self.client.list_sources(
+                trainer_id,
+                status_filter=p2p_pb2.SOURCE_STATUS_READY,
+            )
             instances = list(resp.instances)
             if len(instances) >= expected_trainers:
                 break

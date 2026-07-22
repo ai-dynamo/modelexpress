@@ -18,10 +18,14 @@ Run: pytest tests/test_reshard_refit_transfer.py
 
 import torch
 
-from modelexpress.reshard_refit.geometry import capture_geometry
-from modelexpress.reshard_refit.transfer_plan import SourceInfo, execute_transfer, plan_transfer
-from modelexpress.reshard_refit.slice_plan import Shard
-from modelexpress.reshard_refit.transport import InMemoryReferenceTransport
+from modelexpress.refit.reshard.geometry import capture_geometry
+from modelexpress.refit.reshard.slice_plan import Shard
+from modelexpress.refit.reshard.transfer_plan import (
+    SourceInfo,
+    execute_transfer,
+    plan_transfer,
+)
+from modelexpress.refit.reshard.transport import InMemoryReferenceTransport
 
 # Reuse the ToyModel + manifest from the geometry test (same package, same dir).
 from tests.test_reshard_refit_geometry import ToyModel, _manifest
@@ -38,7 +42,9 @@ def _full_sources():
         n = 1
         for s in shape:
             n *= s
-        srcs[name] = (base + torch.arange(n, dtype=torch.float32)).reshape(shape).contiguous()
+        srcs[name] = (
+            (base + torch.arange(n, dtype=torch.float32)).reshape(shape).contiguous()
+        )
         base += n  # keep value ranges disjoint across tensors
     return srcs
 
@@ -73,7 +79,12 @@ def test_reshard_reconstructs_ground_truth():
             addr=tensor.data_ptr(),
             elsize=EL,
         )
-        sources[name] = SourceInfo(global_shape=tuple(tensor.shape), dtype=torch.float32, elsize=EL, shards=[shard])
+        sources[name] = SourceInfo(
+            global_shape=tuple(tensor.shape),
+            dtype=torch.float32,
+            elsize=EL,
+            shards=[shard],
+        )
 
     plan = plan_transfer(capture, sources)
     assert plan.fallback == []
@@ -113,14 +124,22 @@ def test_strided_source_reconstructs_exactly():
     capture = capture_geometry(meta_model, _manifest())
 
     row_src = srcs["row"]
-    shard = Shard(shard_offset=(0, 0), shape=tuple(row_src.shape), session="row", addr=row_src.data_ptr(), elsize=EL)
+    shard = Shard(
+        shard_offset=(0, 0),
+        shape=tuple(row_src.shape),
+        session="row",
+        addr=row_src.data_ptr(),
+        elsize=EL,
+    )
     sources = {"row": SourceInfo(tuple(row_src.shape), torch.float32, EL, [shard])}
 
     # Only the 'row' copy is planned here (others have no source -> fallback).
     plan = plan_transfer(capture, sources)
     execute_transfer(
         plan,
-        resolve_param_ptr=lambda name: dict(recon_model.named_parameters())[name].data_ptr(),
+        resolve_param_ptr=lambda name: dict(recon_model.named_parameters())[
+            name
+        ].data_ptr(),
         transport=InMemoryReferenceTransport(),
     )
     assert torch.equal(recon_row, truth_row)
@@ -137,7 +156,9 @@ def test_unsupported_source_routes_to_fallback():
 
     sources = {}
     for name, tensor in srcs.items():
-        shard = Shard((0,) * tensor.dim(), tuple(tensor.shape), name, tensor.data_ptr(), EL)
+        shard = Shard(
+            (0,) * tensor.dim(), tuple(tensor.shape), name, tensor.data_ptr(), EL
+        )
         sources[name] = SourceInfo(tuple(tensor.shape), torch.float32, EL, [shard])
 
     plan = plan_transfer(capture, sources)

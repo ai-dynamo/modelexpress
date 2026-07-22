@@ -35,7 +35,7 @@ from typing import Any, Callable
 
 import torch
 
-from modelexpress.reshard_refit.types import (
+from modelexpress.refit.reshard.types import (
     CaptureResult,
     OpChain,
     OpSpec,
@@ -103,7 +103,9 @@ class LazyWeight(torch.Tensor):
 
     @staticmethod
     def __new__(cls, name, shape, dtype, device, ops=(), recorder=None):
-        t = torch.Tensor._make_wrapper_subclass(cls, shape, dtype=dtype, device=device, requires_grad=False)
+        t = torch.Tensor._make_wrapper_subclass(
+            cls, shape, dtype=dtype, device=device, requires_grad=False
+        )
         t._name = name
         t._ops = tuple(ops)
         t._recorder = recorder
@@ -114,7 +116,14 @@ class LazyWeight(torch.Tensor):
         return torch.empty(self.shape, dtype=self.dtype, device="meta")
 
     def _child(self, new_shape, new_dtype, *new_ops) -> "LazyWeight":
-        return LazyWeight(self._name, new_shape, new_dtype, self.device, self._ops + new_ops, self._recorder)
+        return LazyWeight(
+            self._name,
+            new_shape,
+            new_dtype,
+            self.device,
+            self._ops + new_ops,
+            self._recorder,
+        )
 
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
@@ -129,13 +138,13 @@ class LazyWeight(torch.Tensor):
                 if rec is not None and rec.current is not None:
                     rec.copies.append(
                         RecordedCopy(
-                            src._name,
-                            src._ops,
-                            rec.current,
-                            dest.storage_offset(),
-                            tuple(dest.shape),
-                            tuple(dest.stride()),
-                            dest.dtype,
+                            src_name=src._name,
+                            op_chain=src._ops,
+                            param_name=rec.current,
+                            dest_offset=dest.storage_offset(),
+                            dest_shape=tuple(dest.shape),
+                            dest_stride=tuple(dest.stride()),
+                            dest_dtype=dest.dtype,
                         )
                     )
                 elif rec is not None:
@@ -166,7 +175,8 @@ class LazyWeight(torch.Tensor):
             # Multi-return (chunk/split): one child per output + a trailing
             # __getitem__ so replay can index back into the result.
             return tuple(
-                self_._child(m.shape, m.dtype, base_op, ("__getitem__", (i,), ())) for i, m in enumerate(meta_result)
+                self_._child(m.shape, m.dtype, base_op, ("__getitem__", (i,), ()))
+                for i, m in enumerate(meta_result)
             )
         raise UnsupportedReshard(
             f"{op_name!r} on lazy {self_._name!r} returned a non-tensor "
@@ -185,7 +195,11 @@ class LazyWeight(torch.Tensor):
         return func(*args, **kwargs)
 
 
-def _install_stamps(model: torch.nn.Module, recorder: _BakeRecorder, default_weight_loader: Callable | None) -> list:
+def _install_stamps(
+    model: torch.nn.Module,
+    recorder: _BakeRecorder,
+    default_weight_loader: Callable | None,
+) -> list:
     """Wrap each param's ``weight_loader`` so it sets ``recorder.current = name``
     around the loader, letting ``copy_`` attribute the write to that param.
     Returns saved ``(param, original_loader)`` pairs (a throwaway twin can skip
@@ -266,4 +280,8 @@ def capture_geometry(
         len(unsupported),
         recorder.unattributed,
     )
-    return CaptureResult(copies=recorder.copies, unsupported=unsupported, unattributed=recorder.unattributed)
+    return CaptureResult(
+        copies=recorder.copies,
+        unsupported=unsupported,
+        unattributed=recorder.unattributed,
+    )

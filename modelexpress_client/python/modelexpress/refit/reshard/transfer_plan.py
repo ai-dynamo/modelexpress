@@ -20,9 +20,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from modelexpress.reshard_refit.slice_plan import _row_major_strides, plan_pull
-from modelexpress.reshard_refit.transport import ReadDescriptor, Transport
-from modelexpress.reshard_refit.types import CaptureResult, RecordedCopy, UnsupportedReshard
+from modelexpress.refit.reshard.slice_plan import _row_major_strides, plan_pull
+from modelexpress.refit.reshard.transport import ReadDescriptor, Transport
+from modelexpress.refit.reshard.types import (
+    CaptureResult,
+    RecordedCopy,
+    UnsupportedReshard,
+)
 
 
 @dataclass
@@ -95,24 +99,32 @@ def plan_transfer(capture: CaptureResult, sources: dict) -> TransferPlan:
             # dtype so plan_pull's dtype/shape checks pass); the caller pulls into
             # staging then casts staging -> the live param.
             staging_copy = RecordedCopy(
-                copy.src_name,
-                copy.op_chain,
-                copy.param_name,
-                0,
-                copy.dest_shape,
-                _row_major_strides(copy.dest_shape),
-                src.dtype,
+                src_name=copy.src_name,
+                op_chain=copy.op_chain,
+                param_name=copy.param_name,
+                dest_offset=0,
+                dest_shape=copy.dest_shape,
+                dest_stride=_row_major_strides(copy.dest_shape),
+                dest_dtype=src.dtype,
             )
             try:
-                segments = plan_pull(staging_copy, src.global_shape, src.dtype, src.elsize, src.shards)
+                segments = plan_pull(
+                    staging_copy, src.global_shape, src.dtype, src.elsize, src.shards
+                )
             except UnsupportedReshard:
                 mark_fallback(copy.src_name)
                 continue
-            plan.converts.append(ConvertSource(copy.param_name, tuple(copy.dest_shape), src.dtype, segments))
+            plan.converts.append(
+                ConvertSource(
+                    copy.param_name, tuple(copy.dest_shape), src.dtype, segments
+                )
+            )
             continue
 
         try:
-            segments = plan_pull(copy, src.global_shape, src.dtype, src.elsize, src.shards)
+            segments = plan_pull(
+                copy, src.global_shape, src.dtype, src.elsize, src.shards
+            )
         except UnsupportedReshard:
             mark_fallback(copy.src_name)
             continue
