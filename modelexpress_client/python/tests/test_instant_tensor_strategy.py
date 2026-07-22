@@ -51,6 +51,16 @@ class _NoInstantTensorAdapter(EngineAdapter):
         return True
 
 
+class _IterOnlyAdapter(EngineAdapter):
+    """Implements the iterator but not apply_weight_iter (should be ineligible)."""
+
+    def is_cuda_alike(self) -> bool:
+        return True
+
+    def build_instanttensor_weight_iter(self, model=None):
+        return iter(())
+
+
 def _make_load_context(**overrides):
     """Return a LoadContext with mocked dependencies."""
     from modelexpress.load_strategy import LoadContext
@@ -122,6 +132,15 @@ class TestInstantTensorIsAvailable:
 
     def test_unavailable_when_adapter_lacks_capability(self):
         ctx = _make_load_context(adapter=_NoInstantTensorAdapter())
+        strategy = _make_strategy()
+        with patch.dict("os.environ", {"MX_INSTANT_TENSOR": "1"}):
+            with patch("importlib.util.find_spec", return_value=MagicMock()):
+                assert strategy.is_available(ctx) is False
+
+    def test_unavailable_when_adapter_lacks_apply_weight_iter(self):
+        # Implements the iterator but not apply_weight_iter: must fall through
+        # cleanly instead of hitting the gated apply_weight_iter default at load.
+        ctx = _make_load_context(adapter=_IterOnlyAdapter())
         strategy = _make_strategy()
         with patch.dict("os.environ", {"MX_INSTANT_TENSOR": "1"}):
             with patch("importlib.util.find_spec", return_value=MagicMock()):

@@ -36,7 +36,10 @@ class InstantTensorStrategy(LoadStrategy):
     """
 
     name = "instant_tensor"
-    requires = (EngineAdapter.build_instanttensor_weight_iter,)
+    requires = (
+        EngineAdapter.apply_weight_iter,
+        EngineAdapter.build_instanttensor_weight_iter,
+    )
 
     def is_available(self, ctx: LoadContext) -> bool:
         if not super().is_available(ctx):

@@ -576,7 +576,7 @@ currently sign cache artifacts.
 
 InstantTensor loads the model's own safetensors directly onto CUDA using distributed loading, pipelined prefetching, and direct I/O, with GPUDirect Storage when the hardware supports it. It sits right after P2P RDMA in the loading chain: when no peer source is already serving, it is the fastest local-disk path before falling back to ModelStreamer, GDS, or the native loader. Unlike ModelStreamer it needs no `MX_MODEL_URI`; it reuses vLLM's built-in `--load-format instanttensor` path, so the engine resolves the model's weight files (downloading from the Hugging Face Hub into the local cache first if they are not already local).
 
-The strategy is enabled by default and activates when the `instanttensor` package is installed on a CUDA device. Install it with `pip install instanttensor` (or `pip install modelexpress[instanttensor]`). When the package is absent the chain simply skips to the next strategy.
+The strategy is enabled by default and activates when the `instanttensor` package is installed on a CUDA device **and the engine adapter implements the InstantTensor capability**. Install the package with `pip install instanttensor` (or `pip install modelexpress[instanttensor]`). Currently only the vLLM adapter implements it; on engines that do not (for example SGLang today), the strategy falls through even when `instanttensor` and a CUDA device are available. When the package is absent the chain likewise skips to the next strategy.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
