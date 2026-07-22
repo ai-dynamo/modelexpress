@@ -228,9 +228,10 @@ Other properties to be aware of:
 - Auth is enforced when each RPC starts. A long-lived streaming RPC that was accepted
   keeps flowing even if the token expires or the ServiceAccount is revoked mid-stream;
   revocation takes effect on the next RPC (bounded by the cache TTL below).
-- Rejections are cached per token, so a caller cycling unique invalid tokens sends one
-  `TokenReview` to the Kubernetes API server per token. The gRPC port should not be
-  reachable from untrusted networks.
+- Definitive rejections are cached per token; backend errors (e.g. an unreachable
+  apiserver) return `UNAVAILABLE` and are not cached. A caller cycling unique invalid
+  tokens sends one `TokenReview` to the Kubernetes API server per token. The gRPC port
+  should not be reachable from untrusted networks.
 
 ### Modes
 
@@ -249,11 +250,14 @@ Other properties to be aware of:
 | `MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS` | `60` | TTL for the verified-token and rejection caches. |
 
 `enforce` fails config validation if either the audience list or the allowlist is empty,
-so a typo can't silently deny-all or accept-any-audience.
+so an omitted list can't silently deny-all or accept-any-audience. Configured values
+still need to be correct.
 
 The server's ServiceAccount needs permission to create `TokenReview`s (a cluster-scoped
-subresource), via a `ClusterRoleBinding` to the built-in `system:auth-delegator` role. The
-Helm chart creates this automatically when `security.enabled=true`:
+subresource), via a `ClusterRoleBinding` to the built-in `system:auth-delegator` role.
+The Helm chart creates this automatically when it also creates the ServiceAccount
+(`serviceAccount.create=true`, the default) and `security.enabled=true`; with an
+existing ServiceAccount, create the equivalent binding separately:
 
 ```yaml
 security:
