@@ -40,6 +40,7 @@ nixl_agent_config = None
 try:
     from nixl._api import nixl_agent as NixlAgent
     from nixl._api import nixl_agent_config
+
     NIXL_AVAILABLE = True
 except ImportError:
     pass
@@ -173,9 +174,7 @@ class NixlTransferManager:
                     enable_listen_thread=True,
                     listen_port=self._listen_port,
                 )
-                logger.info(
-                    f"NIXL listen thread enabled on port {self._listen_port}"
-                )
+                logger.info(f"NIXL listen thread enabled on port {self._listen_port}")
             elif nixl_agent_config:
                 config = nixl_agent_config(backends=self._backends)
             else:
@@ -218,13 +217,15 @@ class NixlTransferManager:
                     f"Tensor '{name}' is not contiguous. "
                     "Non-contiguous tensors cannot be used for RDMA transfers."
                 )
-            tensor_descriptors.append(TensorDescriptor(
-                name=name,
-                addr=tensor.data_ptr(),
-                size=tensor.numel() * tensor.element_size(),
-                device_id=self._device_id,
-                dtype=str(tensor.dtype),
-            ))
+            tensor_descriptors.append(
+                TensorDescriptor(
+                    name=name,
+                    addr=tensor.data_ptr(),
+                    size=tensor.numel() * tensor.element_size(),
+                    device_id=self._device_id,
+                    dtype=str(tensor.dtype),
+                )
+            )
         self._tensor_descriptors = tensor_descriptors
         return tensor_descriptors
 
@@ -278,15 +279,16 @@ class NixlTransferManager:
                 )
         else:
             allocations = None
-            logger.info("Pool registration disabled (MX_POOL_REG != '1'), using per-tensor registration")
+            logger.info(
+                "Pool registration disabled (MX_POOL_REG != '1'), using per-tensor registration"
+            )
         alloc_discovery_time = time.perf_counter() - alloc_discovery_start
 
         # Phase 2: Register memory with NIXL (ibv_reg_mr kernel calls)
         nixl_reg_start = time.perf_counter()
         if allocations:
             alloc_tuples = [
-                (base, size, self._device_id, "")
-                for base, size in allocations
+                (base, size, self._device_id, "") for base, size in allocations
             ]
             self._agent.register_memory(
                 alloc_tuples,
@@ -306,7 +308,9 @@ class NixlTransferManager:
         metadata_time = time.perf_counter() - metadata_start
 
         total_time = alloc_discovery_time + nixl_reg_time + metadata_time
-        reduction = (1 - reg_count / len(tensor_descriptors)) * 100 if tensor_descriptors else 0
+        reduction = (
+            (1 - reg_count / len(tensor_descriptors)) * 100 if tensor_descriptors else 0
+        )
         total_bytes = sum(d.size for d in tensor_descriptors)
 
         logger.info(
@@ -322,7 +326,9 @@ class NixlTransferManager:
 
         return self._metadata
 
-    def register_arena(self, arena: VmmArena, tensors: dict[str, torch.Tensor]) -> bytes:
+    def register_arena(
+        self, arena: VmmArena, tensors: dict[str, torch.Tensor]
+    ) -> bytes:
         """Register a VmmArena's full bump range as a single NIXL region.
 
         The arena owns a contiguous VA range; at end-of-load the bump
@@ -438,6 +444,29 @@ class NixlTransferManager:
 
         return sorted(seen.items())
 
+    def _wait_for_xfer(
+        self,
+        handle: Any,
+        timeout_seconds: float | None,
+        label: str,
+    ) -> None:
+        """Poll a NIXL transfer handle until completion or failure."""
+        if self._agent is None:
+            raise RuntimeError("NIXL agent not initialized")
+        wait_start = time.perf_counter()
+        while True:
+            if (
+                timeout_seconds is not None
+                and time.perf_counter() - wait_start >= timeout_seconds
+            ):
+                raise TimeoutError(f"{label} timed out")
+            status = self._agent.check_xfer_state(handle)
+            if status in ("DONE", "SUCCESS"):
+                return
+            if status in ("ERR", "ERROR", "FAIL"):
+                raise RuntimeError(f"{label} failed with status {status}")
+            time.sleep(0.001)
+
     def fetch_remote_and_wait(
         self,
         remote_agent_name: str,
@@ -453,9 +482,7 @@ class NixlTransferManager:
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
 
-        logger.info(
-            f"Fetching remote metadata from {remote_agent_name} at {ip}:{port}"
-        )
+        logger.info(f"Fetching remote metadata from {remote_agent_name} at {ip}:{port}")
         self._agent.fetch_remote_metadata(remote_agent_name, ip, port)
 
         start = time.perf_counter()
@@ -621,21 +648,10 @@ class NixlTransferManager:
         )
         self._agent.transfer(handle)
 
-        # Wait for completion
-        start_wait = time.perf_counter()
-        while True:
-            if timeout_seconds is not None and time.perf_counter() - start_wait >= timeout_seconds:
-                self._agent.release_xfer_handle(handle)
-                raise TimeoutError("Transfer timed out")
-
-            status = self._agent.check_xfer_state(handle)
-            if status in ("DONE", "SUCCESS"):
-                self._agent.release_xfer_handle(handle)
-                break
-            if status in ("ERR", "ERROR", "FAIL"):
-                self._agent.release_xfer_handle(handle)
-                raise RuntimeError(f"Transfer failed with status {status}")
-            time.sleep(0.001)
+        try:
+            self._wait_for_xfer(handle, timeout_seconds, "Transfer")
+        finally:
+            self._agent.release_xfer_handle(handle)
 
         # CRITICAL: Synchronize the device to ensure RDMA writes are visible.
         # GPUDirect RDMA writes bypass torch streams, so we must sync.
@@ -678,8 +694,13 @@ class NixlTransferManager:
             return 0, 0, 0.0
 
         mem = mem_type or self._accelerator_backend.nixl_mem_type
-        remote_descs = [(remote_addr, nbytes, dev) for (remote_addr, _local, nbytes, dev) in ranges]
-        local_descs = [(local_addr, nbytes, self._device_id) for (_remote, local_addr, nbytes, _dev) in ranges]
+        remote_descs = [
+            (remote_addr, nbytes, dev) for (remote_addr, _local, nbytes, dev) in ranges
+        ]
+        local_descs = [
+            (local_addr, nbytes, self._device_id)
+            for (_remote, local_addr, nbytes, _dev) in ranges
+        ]
 
         # Diagnostic (DEBUG only): what we ask NIXL to READ from the remote.
         # NIXL_ERR_NOT_FOUND at prep means these (addr,size,dev) aren't in a
@@ -726,16 +747,11 @@ class NixlTransferManager:
             )
             self._agent.transfer(handle)
 
-            wait_start = time.perf_counter()
-            while True:
-                if timeout_seconds is not None and time.perf_counter() - wait_start >= timeout_seconds:
-                    raise TimeoutError("NIXL reshard READ batch timed out")
-                status = self._agent.check_xfer_state(handle)
-                if status in ("DONE", "SUCCESS"):
-                    break
-                if status in ("ERR", "ERROR", "FAIL"):
-                    raise RuntimeError(f"NIXL reshard READ batch failed with status {status}")
-                time.sleep(0.001)
+            self._wait_for_xfer(
+                handle,
+                timeout_seconds,
+                "NIXL reshard READ batch",
+            )
         finally:
             if handle is not None:
                 self._agent.release_xfer_handle(handle)
@@ -828,25 +844,18 @@ class NixlTransferManager:
             )
             self._agent.transfer(handle)
 
-            wait_start = time.perf_counter()
-            while True:
-                if (
-                    timeout_seconds is not None
-                    and time.perf_counter() - wait_start >= timeout_seconds
-                ):
-                    raise TimeoutError("NIXL DRAM transfer timed out")
-                status = self._agent.check_xfer_state(handle)
-                if status in ("DONE", "SUCCESS"):
-                    duration = time.perf_counter() - start_time
-                    logger.info(
-                        "NIXL DRAM READ complete: %.2f MiB in %.3fs",
-                        size / (1024 * 1024),
-                        duration,
-                    )
-                    return duration
-                if status in ("ERR", "ERROR", "FAIL"):
-                    raise RuntimeError(f"NIXL DRAM transfer failed with status {status}")
-                time.sleep(0.001)
+            self._wait_for_xfer(
+                handle,
+                timeout_seconds,
+                "NIXL DRAM transfer",
+            )
+            duration = time.perf_counter() - start_time
+            logger.info(
+                "NIXL DRAM READ complete: %.2f MiB in %.3fs",
+                size / (1024 * 1024),
+                duration,
+            )
+            return duration
         finally:
             if handle is not None:
                 self._agent.release_xfer_handle(handle)

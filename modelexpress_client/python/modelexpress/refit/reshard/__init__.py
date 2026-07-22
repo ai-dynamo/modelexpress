@@ -14,20 +14,20 @@ expressed as a box raises ``UnsupportedReshard`` and falls back to a full
 (non-sliced) pull, so a sync never aborts over one awkward tensor.
 """
 
-from modelexpress.reshard_refit.geometry import (
+from modelexpress.refit.reshard.geometry import (
     LazyWeight,
     OpChain,
     RecordedCopy,
     UnsupportedReshard,
     capture_geometry,
 )
-from modelexpress.reshard_refit.transfer_plan import (
+from modelexpress.refit.reshard.transfer_plan import (
     SourceInfo,
     TransferPlan,
     execute_transfer,
     plan_transfer,
 )
-from modelexpress.reshard_refit.slice_plan import (
+from modelexpress.refit.reshard.slice_plan import (
     PullSegment,
     Shard,
     intersect,
@@ -35,15 +35,15 @@ from modelexpress.reshard_refit.slice_plan import (
     paired_runs,
     plan_pull,
 )
-from modelexpress.reshard_refit.transport import (
+from modelexpress.refit.reshard.transport import (
     InMemoryReferenceTransport,
     NixlReshardTransport,
     ReadDescriptor,
     Transport,
 )
-from modelexpress.reshard_refit.cuda_pool import classic_cuda_alloc
-from modelexpress.reshard_refit.receiver import ReshardReceiver
-from modelexpress.reshard_refit.rendezvous import (
+from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
+from modelexpress.refit.reshard.receiver import ReshardReceiver
+from modelexpress.refit.reshard.rendezvous import (
     MxReshardRendezvous,
     PublishedShard,
     PublishedTensor,

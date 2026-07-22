@@ -3,7 +3,8 @@
 #
 """vLLM receiver for the no-gather slice-resharding weight refit.
 
-Implements the two engine hooks of :class:`~modelexpress.reshard_refit.receiver.ReshardReceiver`
+Implements the two engine hooks of
+:class:`~modelexpress.refit.reshard.receiver.ReshardReceiver`
 for vLLM:
 
   * :meth:`_capture` - build a fresh UNQUANTIZED meta twin of the model and drive
@@ -30,17 +31,19 @@ from typing import Any
 import torch
 from torch.nn import Module
 
-from modelexpress.reshard_refit.geometry import capture_geometry
-from modelexpress.reshard_refit.receiver import ReshardReceiver
-from modelexpress.reshard_refit.types import CaptureResult
+from modelexpress.refit.reshard.geometry import capture_geometry
+from modelexpress.refit.reshard.receiver import ReshardReceiver
+from modelexpress.refit.reshard.types import CaptureResult
 
-logger = logging.getLogger("modelexpress.engines.vllm.reshard")
+logger = logging.getLogger("modelexpress.engines.vllm.refit.receiver")
 
 
 class VllmReshardReceiver(ReshardReceiver):
     """Slice-resharding weight receiver for a vLLM model."""
 
-    def __init__(self, *, model: Module, vllm_config: Any, model_config: Any, **base_kwargs: Any) -> None:
+    def __init__(
+        self, *, model: Module, vllm_config: Any, model_config: Any, **base_kwargs: Any
+    ) -> None:
         self._model = model
         self._vllm_config = vllm_config
         self._model_config = model_config
@@ -87,7 +90,9 @@ class VllmReshardReceiver(ReshardReceiver):
         # default (fp32), not the model's bf16 (vLLM's loader wraps init the same).
         with set_default_torch_dtype(self._model_config.dtype), torch.device("meta"):
             twin = initialize_model(twin_config)
-        logger.info("[reshard] built unquantized meta-twin for bf16 load-time geometry capture")
+        logger.info(
+            "[reshard] built unquantized meta-twin for bf16 load-time geometry capture"
+        )
         return twin
 
     def _capture(self, manifest: list) -> "tuple[CaptureResult, dict]":
@@ -99,9 +104,18 @@ class VllmReshardReceiver(ReshardReceiver):
         # Pass default_weight_loader so params WITHOUT a custom weight_loader
         # (norms) are stamped and their copies attributed rather than dropped.
         twin = self._build_meta_twin()
-        capture = capture_geometry(twin, manifest, default_weight_loader=default_weight_loader)
-        logger.info("[reshard] captured %d copies, %d unsupported (quantized=%s)", len(capture.copies), len(capture.unsupported), self._is_quantized)
-        param_layout = {n: (tuple(p.shape), p.dtype) for n, p in twin.named_parameters()}
+        capture = capture_geometry(
+            twin, manifest, default_weight_loader=default_weight_loader
+        )
+        logger.info(
+            "[reshard] captured %d copies, %d unsupported (quantized=%s)",
+            len(capture.copies),
+            len(capture.unsupported),
+            self._is_quantized,
+        )
+        param_layout = {
+            n: (tuple(p.shape), p.dtype) for n, p in twin.named_parameters()
+        }
         return capture, param_layout
 
     # ---------------------------------------------------------------- install
@@ -121,7 +135,9 @@ class VllmReshardReceiver(ReshardReceiver):
         since PWAL is a per-layer op."""
         import torch.nn as nn
         from vllm.config import set_current_vllm_config
-        from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+        from vllm.model_executor.layers.quantization.base_config import (
+            QuantizeMethodBase,
+        )
         from vllm.model_executor.model_loader.reload.layerwise import (
             LAYERWISE_INFO,
             _copy_and_restore_kernel_tensors,
@@ -148,7 +164,9 @@ class VllmReshardReceiver(ReshardReceiver):
         # boot address -> hang. We hold the boot tensors and re-attach after PWAL.
         bare_snapshot: dict = {}
         for module in model.modules():
-            attrs = {n: t for n, t in module.__dict__.items() if isinstance(t, torch.Tensor)}
+            attrs = {
+                n: t for n, t in module.__dict__.items() if isinstance(t, torch.Tensor)
+            }
             if attrs:
                 bare_snapshot[module] = attrs
 
@@ -157,7 +175,11 @@ class VllmReshardReceiver(ReshardReceiver):
             for layer, params in groups.items():
                 info = LAYERWISE_INFO.get(layer)
                 for full, leaf in params:
-                    setattr(layer, leaf, nn.Parameter(recv_buffers[full], requires_grad=False))
+                    setattr(
+                        layer,
+                        leaf,
+                        nn.Parameter(recv_buffers[full], requires_grad=False),
+                    )
                 quant_method = getattr(layer, "quant_method", None)
                 if isinstance(quant_method, QuantizeMethodBase):
                     if hasattr(layer, "_already_called_process_weights_after_loading"):
@@ -184,8 +206,12 @@ class VllmReshardReceiver(ReshardReceiver):
                             logger.error(
                                 "[reshard] bare-attr %s.%s changed shape/dtype across refit "
                                 "(cur %s/%s vs boot %s/%s); skipping copy, re-attaching STALE boot tensor",
-                                type(module).__name__, n, tuple(cur.shape), cur.dtype,
-                                tuple(boot_t.shape), boot_t.dtype,
+                                type(module).__name__,
+                                n,
+                                tuple(cur.shape),
+                                cur.dtype,
+                                tuple(boot_t.shape),
+                                boot_t.dtype,
                             )
                     setattr(module, n, boot_t)
 
@@ -193,7 +219,11 @@ class VllmReshardReceiver(ReshardReceiver):
         # hang cause (replay reads unbacked memory).
         meta = [n for n, p in model.named_parameters() if p.device.type == "meta"]
         if meta:
-            logger.error("[reshard] POST-COMMIT META PARAMS (graph-hang risk): %d %s", len(meta), meta[:10])
+            logger.error(
+                "[reshard] POST-COMMIT META PARAMS (graph-hang risk): %d %s",
+                len(meta),
+                meta[:10],
+            )
 
 
 def _update_mla_absorbed_weights(model: Module) -> None:
@@ -212,11 +242,19 @@ def _update_mla_absorbed_weights(model: Module) -> None:
     off vLLM's own ``process_weights_after_loading`` so any model's derived
     tensors (not just MLA) are refreshed without a bespoke function."""
     for _name, module in model.named_modules():
-        if not (hasattr(module, "W_UV") or hasattr(module, "W_UK_T")) or not hasattr(module, "kv_b_proj"):
+        if not (hasattr(module, "W_UV") or hasattr(module, "W_UK_T")) or not hasattr(
+            module, "kv_b_proj"
+        ):
             continue
-        out_dtype = module.W_UV.dtype if hasattr(module, "W_UV") else module.W_UK_T.dtype
-        kv_b_proj_weight = module.kv_b_proj.weight.view(module.num_heads, module.qk_nope_head_dim + module.v_head_dim, -1)
-        w_uk, w_uv = kv_b_proj_weight.split([module.qk_nope_head_dim, module.v_head_dim], dim=1)
+        out_dtype = (
+            module.W_UV.dtype if hasattr(module, "W_UV") else module.W_UK_T.dtype
+        )
+        kv_b_proj_weight = module.kv_b_proj.weight.view(
+            module.num_heads, module.qk_nope_head_dim + module.v_head_dim, -1
+        )
+        w_uk, w_uv = kv_b_proj_weight.split(
+            [module.qk_nope_head_dim, module.v_head_dim], dim=1
+        )
         if hasattr(module, "W_UV"):
             module.W_UV.copy_(w_uv.transpose(0, 1).to(out_dtype))
         if hasattr(module, "W_UK_T"):

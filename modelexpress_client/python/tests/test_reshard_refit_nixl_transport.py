@@ -13,15 +13,19 @@ Run: pytest tests/test_reshard_refit_nixl_transport.py
 
 import pytest
 
-from modelexpress.reshard_refit.transport import NixlReshardTransport
-from modelexpress.reshard_refit.transport import ReadDescriptor
+from modelexpress.refit.reshard.transport import (
+    NixlReshardTransport,
+    ReadDescriptor,
+)
 
 
 class _StubManager:
     def __init__(self):
         self.calls = []  # (remote_agent_name, ranges, mem_type, timeout)
 
-    def execute_read_batch(self, remote_agent_name, ranges, mem_type=None, timeout_seconds=None):
+    def execute_read_batch(
+        self, remote_agent_name, ranges, mem_type=None, timeout_seconds=None
+    ):
         self.calls.append((remote_agent_name, list(ranges), mem_type, timeout_seconds))
         total = sum(n for (_r, _l, n, _d) in ranges)
         return total, len(ranges), 0.0
@@ -64,14 +68,20 @@ def test_groups_per_session_and_resolves_agent_device():
 def test_missing_agent_raises():
     transport = NixlReshardTransport(manager=_StubManager(), session_to_agent={})
     with pytest.raises(KeyError):
-        transport.read([ReadDescriptor(session="unknown", src_addr=0, dst_addr=0, nbytes=4)])
+        transport.read(
+            [ReadDescriptor(session="unknown", src_addr=0, dst_addr=0, nbytes=4)]
+        )
 
 
-def test_device_defaults_to_zero():
-    mgr = _StubManager()
-    transport = NixlReshardTransport(manager=mgr, session_to_agent={"s": "agent"})  # no device map
-    transport.read([ReadDescriptor(session="s", src_addr=100, dst_addr=200, nbytes=4)])
-    assert mgr.calls[0][1] == [(100, 200, 4, 0)]
+def test_missing_device_mapping_raises():
+    transport = NixlReshardTransport(
+        manager=_StubManager(),
+        session_to_agent={"s": "agent"},
+    )
+    with pytest.raises(KeyError, match="no remote device id"):
+        transport.read(
+            [ReadDescriptor(session="s", src_addr=100, dst_addr=200, nbytes=4)]
+        )
 
 
 if __name__ == "__main__":

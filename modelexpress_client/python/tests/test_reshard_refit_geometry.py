@@ -12,7 +12,7 @@ torch env: pytest tests/test_reshard_refit_geometry.py
 
 import torch
 
-from modelexpress.reshard_refit.geometry import capture_geometry
+from modelexpress.refit.reshard.geometry import capture_geometry
 
 TP_RANK = 0
 
@@ -25,16 +25,24 @@ class ToyModel(torch.nn.Module):
 
     def __init__(self, with_bad: bool = False):
         super().__init__()
-        self.col = torch.nn.Parameter(torch.empty(4, 4))  # ColumnParallel: full out=8 -> [0:4] contiguous
+        self.col = torch.nn.Parameter(
+            torch.empty(4, 4)
+        )  # ColumnParallel: full out=8 -> [0:4] contiguous
         self.col.weight_loader = self._col_loader
-        self.row = torch.nn.Parameter(torch.empty(4, 4))  # RowParallel: full in=8 -> [:,0:4] STRIDED
+        self.row = torch.nn.Parameter(
+            torch.empty(4, 4)
+        )  # RowParallel: full in=8 -> [:,0:4] STRIDED
         self.row.weight_loader = self._row_loader
-        self.qkv = torch.nn.Parameter(torch.empty(8, 4))  # fused q(4)+k(2)+v(2), per-shard dest offsets
+        self.qkv = torch.nn.Parameter(
+            torch.empty(8, 4)
+        )  # fused q(4)+k(2)+v(2), per-shard dest offsets
         self.qkv.weight_loader = self._qkv_loader
         self.norm = torch.nn.Parameter(torch.empty(4))  # unsharded: full copy
         self.norm.weight_loader = lambda param, loaded: param.data.copy_(loaded)
         if with_bad:
-            self.bad = torch.nn.Parameter(torch.empty(4, 4))  # loader uses an unsupported op
+            self.bad = torch.nn.Parameter(
+                torch.empty(4, 4)
+            )  # loader uses an unsupported op
             self.bad.weight_loader = self._bad_loader
 
     def _col_loader(self, param, loaded):
@@ -120,7 +128,7 @@ def test_capture_feeds_slice_plan():
     """Compose capture -> slice-plan: real captured copies drive plan_pull. The
     row-parallel source (full [4,8], need cols [0:4]) is strided -> 4 runs
     covering exactly the needed 16 elements, landing contiguously in the dest."""
-    from modelexpress.reshard_refit.slice_plan import Shard, plan_pull
+    from modelexpress.refit.reshard.slice_plan import Shard, plan_pull
 
     with torch.device("meta"):
         model = ToyModel()
@@ -128,7 +136,9 @@ def test_capture_feeds_slice_plan():
     row = next(c for c in result.copies if c.src_name == "row")
 
     shard = Shard(shard_offset=(0, 0), shape=(4, 8), session="s0", addr=0, elsize=4)
-    segs = plan_pull(row, global_shape=(4, 8), src_dtype=torch.float32, elsize=4, shards=[shard])
+    segs = plan_pull(
+        row, global_shape=(4, 8), src_dtype=torch.float32, elsize=4, shards=[shard]
+    )
 
     assert len(segs) == 4
     assert sum(s.nbytes for s in segs) == 16 * 4  # exactly the needed slice, no waste
@@ -148,7 +158,9 @@ class DefaultLoaderModel(torch.nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.norm = torch.nn.Parameter(torch.empty(4))  # deliberately no weight_loader attr
+        self.norm = torch.nn.Parameter(
+            torch.empty(4)
+        )  # deliberately no weight_loader attr
 
     def load_weights(self, weights):
         params = dict(self.named_parameters())

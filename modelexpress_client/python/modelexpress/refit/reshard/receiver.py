@@ -29,13 +29,16 @@ import torch
 
 from modelexpress.client import MxClient
 from modelexpress.nixl_transfer import NixlTransferManager
-from modelexpress.reshard_refit.cuda_pool import classic_cuda_alloc
-from modelexpress.reshard_refit.transfer_plan import execute_transfer, plan_transfer
-from modelexpress.reshard_refit.rendezvous import gather_sources
-from modelexpress.reshard_refit.transport import NixlReshardTransport, ReadDescriptor
-from modelexpress.reshard_refit.types import CaptureResult, UnsupportedReshard
+from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
+from modelexpress.refit.reshard.rendezvous import gather_sources
+from modelexpress.refit.reshard.transfer_plan import execute_transfer, plan_transfer
+from modelexpress.refit.reshard.transport import (
+    NixlReshardTransport,
+    ReadDescriptor,
+)
+from modelexpress.refit.reshard.types import CaptureResult, UnsupportedReshard
 
-logger = logging.getLogger("modelexpress.reshard_refit.receiver")
+logger = logging.getLogger("modelexpress.refit.reshard.receiver")
 
 
 class ReshardReceiver:
@@ -91,16 +94,24 @@ class ReshardReceiver:
         # transport-bound to NIXL (this manager, NixlReshardTransport, and the
         # fetch_remote_and_wait P2P handshake in _prepare). Abstract these behind
         # a transport interface so non-NIXL backends can plug in.
-        self._manager = NixlTransferManager(agent_name=agent_name, device_id=local_rank, listen_port=listen_port)
+        self._manager = NixlTransferManager(
+            agent_name=agent_name, device_id=local_rank, listen_port=listen_port
+        )
         self._manager.initialize()
         self._mx_client = MxClient(server_url=mx_server)
 
         self._plan = None  # built lazily on the first refit
         self._transport: NixlReshardTransport | None = None
-        self._recv_buffers: dict[str, torch.Tensor] = {}  # param_name -> receive buffer at load-time layout
-        self._staging: dict[str, torch.Tensor] = {}  # dtype-convert param -> bf16 staging (RDMA target)
+        self._recv_buffers: dict[
+            str, torch.Tensor
+        ] = {}  # param_name -> receive buffer at load-time layout
+        self._staging: dict[
+            str, torch.Tensor
+        ] = {}  # dtype-convert param -> bf16 staging (RDMA target)
         self._staging_ptr: dict[str, int] = {}
-        self._param_ptr: dict[str, int] = {}  # segment param_name -> receive-buffer data_ptr
+        self._param_ptr: dict[
+            str, int
+        ] = {}  # segment param_name -> receive-buffer data_ptr
 
         logger.info(
             "[reshard] receiver init: agent=%s global_rank=%d trainer_sources=%d",
@@ -134,7 +145,11 @@ class ReshardReceiver:
     def _prepare(self, timeout: float) -> None:
         """One-time: discover trainer shards, connect their agents, capture load
         geometry, build the pull plan, and allocate + register buffers."""
-        logger.info("[reshard] _prepare: discovering %d trainer source(s) (timeout=%.0fs)", self._num_trainer_sources, timeout)
+        logger.info(
+            "[reshard] _prepare: discovering %d trainer source(s) (timeout=%.0fs)",
+            self._num_trainer_sources,
+            timeout,
+        )
         sources, session_to_agent, session_to_device, agent_endpoints = gather_sources(
             self._mx_client,
             expected_trainers=self._num_trainer_sources,
@@ -143,19 +158,34 @@ class ReshardReceiver:
             rank=self._global_rank,
             timeout=timeout,
         )
-        logger.info("[reshard] _prepare: discovered %d source(s), %d agent(s); P2P-fetching remote metadata", len(sources), len(agent_endpoints))
+        logger.info(
+            "[reshard] _prepare: discovered %d source(s), %d agent(s); P2P-fetching remote metadata",
+            len(sources),
+            len(agent_endpoints),
+        )
         # P2P memory handshake (mirrors MX's vLLM RDMA path): fetch each trainer's
         # NIXL metadata (incl. its memory registrations) via its listen thread, so
         # prep_xfer_dlist can resolve the remote addresses. The central
         # add_remote_agent(blob) path does NOT convey the registrations.
         for agent_name, endpoint in agent_endpoints.items():
             host, port_str = endpoint.rsplit(":", 1)
-            self._manager.fetch_remote_and_wait(agent_name, host, int(port_str), timeout_seconds=timeout)
+            self._manager.fetch_remote_and_wait(
+                agent_name, host, int(port_str), timeout_seconds=timeout
+            )
 
-        manifest = [(name, src.dtype, tuple(src.global_shape)) for name, src in sources.items()]
-        logger.info("[reshard] _prepare: capturing geometry over %d manifest entries", len(manifest))
+        manifest = [
+            (name, src.dtype, tuple(src.global_shape)) for name, src in sources.items()
+        ]
+        logger.info(
+            "[reshard] _prepare: capturing geometry over %d manifest entries",
+            len(manifest),
+        )
         capture, param_layout = self._capture(manifest)
-        logger.info("[reshard] _prepare: captured %d copies, %d unsupported", len(capture.copies), len(capture.unsupported))
+        logger.info(
+            "[reshard] _prepare: captured %d copies, %d unsupported",
+            len(capture.copies),
+            len(capture.unsupported),
+        )
 
         # The plan encodes THIS discovery's topology: each trainer's registered
         # buffer addresses, per-source shard boundaries, and fan-in across ranks.
@@ -173,7 +203,9 @@ class ReshardReceiver:
                 f"full-pull path (unsupported reshard ops); refusing to serve stale "
                 f"weights. Params: {plan.fallback[:10]}"
             )
-        self._transport = NixlReshardTransport(self._manager, session_to_agent, session_to_device, timeout_seconds=timeout)
+        self._transport = NixlReshardTransport(
+            self._manager, session_to_agent, session_to_device, timeout_seconds=timeout
+        )
         self._plan = plan
 
         # dtype-mismatched sources (e.g. a bf16-served router for an fp32 dest):
@@ -185,9 +217,14 @@ class ReshardReceiver:
         if plan.converts:
             with classic_cuda_alloc():
                 self._staging = {
-                    c.param_name: torch.empty(c.dest_shape, dtype=c.src_dtype, device=self._device) for c in plan.converts
+                    c.param_name: torch.empty(
+                        c.dest_shape, dtype=c.src_dtype, device=self._device
+                    )
+                    for c in plan.converts
                 }
-            self._manager.register_tensors({f"__stage__{n}": t for n, t in self._staging.items()})
+            self._manager.register_tensors(
+                {f"__stage__{n}": t for n, t in self._staging.items()}
+            )
             self._staging_ptr = {n: t.data_ptr() for n, t in self._staging.items()}
 
         # Receive buffers: one per captured param at its CAPTURED (load-time)
@@ -202,10 +239,14 @@ class ReshardReceiver:
         with classic_cuda_alloc():
             for name in all_params:
                 shape, dtype = param_layout[name]
-                self._recv_buffers[name] = torch.empty(tuple(shape), dtype=dtype, device=self._device)
+                self._recv_buffers[name] = torch.empty(
+                    tuple(shape), dtype=dtype, device=self._device
+                )
         self._param_ptr = {}
         if seg_params:
-            self._manager.register_tensors({f"__recv__{n}": self._recv_buffers[n] for n in seg_params})
+            self._manager.register_tensors(
+                {f"__recv__{n}": self._recv_buffers[n] for n in seg_params}
+            )
             for name in seg_params:
                 self._param_ptr[name] = self._recv_buffers[name].data_ptr()
 

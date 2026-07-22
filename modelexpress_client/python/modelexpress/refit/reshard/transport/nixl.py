@@ -11,7 +11,7 @@ and adapts it to the reshard ``Transport`` protocol. The reference
 runs unchanged over RDMA here.
 
 The manager is transport machinery only; peer discovery / agent-metadata
-exchange happens out-of-band (see ``reshard_refit.rendezvous``), which yields the
+exchange happens out-of-band (see ``refit.reshard.rendezvous``), which yields the
 ``session -> remote agent name`` and ``session -> remote device id`` maps this
 transport is constructed with. Each ``session`` is one published shard's owning
 agent; descriptors are grouped per session into one batched READ.
@@ -33,7 +33,7 @@ class NixlReshardTransport:
         session_to_agent: map from a ``ReadDescriptor.session`` to the remote
             NIXL agent name to READ from.
         session_to_device: map from session to the remote device id the shard
-            lives on (defaults to 0 when absent).
+            lives on. Every agent session must have a matching device entry.
         mem_type: NIXL memory type override (defaults to the manager's
             accelerator mem type, e.g. VRAM).
         timeout_seconds: per-batch READ timeout.
@@ -63,8 +63,14 @@ class NixlReshardTransport:
         for session, group in by_session.items():
             agent = self._session_to_agent.get(session)
             if agent is None:
-                raise KeyError(f"no remote NIXL agent registered for session {session!r}")
-            device_id = self._session_to_device.get(session, 0)
+                raise KeyError(
+                    f"no remote NIXL agent registered for session {session!r}"
+                )
+            if session not in self._session_to_device:
+                raise KeyError(
+                    f"no remote device id registered for session {session!r}"
+                )
+            device_id = self._session_to_device[session]
             ranges = [(d.src_addr, d.dst_addr, d.nbytes, device_id) for d in group]
             total_bytes, num_reads, _duration = self._manager.execute_read_batch(
                 remote_agent_name=agent,
