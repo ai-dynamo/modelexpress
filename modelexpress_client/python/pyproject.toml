@@ -32,6 +32,7 @@ dependencies = [
     "pydantic>=2.0.0",
     "torch>=2.6.0",
     "runai-model-streamer[s3,gcs,azure]; sys_platform == 'linux'",
+    "instanttensor>=0.1.9 ; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]
@@ -55,9 +56,6 @@ metrics = [
 # The pure-Python VmmArena tests don't need it; CudaVmmBackend does.
 vmm = [
     "cuda-python>=12.0",
-]
-instanttensor = [
-    "instanttensor>=0.1.9 ; sys_platform == 'linux'",
 ]
 
 [project.urls]

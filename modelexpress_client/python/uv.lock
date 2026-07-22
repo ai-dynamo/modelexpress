@@ -930,6 +930,7 @@ dependencies = [
     { name = "google-crc32c" },
     { name = "grpcio" },
     { name = "huggingface-hub" },
+    { name = "instanttensor", marker = "sys_platform == 'linux'" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "protobuf" },
@@ -945,9 +946,6 @@ dev = [
     { name = "opentelemetry-sdk" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
-]
-instanttensor = [
-    { name = "instanttensor", marker = "sys_platform == 'linux'" },
 ]
 metrics = [
     { name = "prometheus-client" },
@@ -966,7 +964,7 @@ requires-dist = [
     { name = "grpcio", specifier = ">=1.66.2" },
     { name = "grpcio-tools", marker = "extra == 'dev'", specifier = ">=1.60.0,<=1.66.2" },
     { name = "huggingface-hub", specifier = ">=0.20.0" },
-    { name = "instanttensor", marker = "sys_platform == 'linux' and extra == 'instanttensor'", specifier = ">=0.1.9" },
+    { name = "instanttensor", marker = "sys_platform == 'linux'", specifier = ">=0.1.9" },
     { name = "numpy", specifier = ">=1.24.0" },
     { name = "opentelemetry-api", marker = "extra == 'dev'", specifier = ">=1.41.1" },
     { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.20.0" },
@@ -979,7 +977,7 @@ requires-dist = [
     { name = "runai-model-streamer", extras = ["s3", "gcs", "azure"], marker = "sys_platform == 'linux'" },
     { name = "torch", specifier = ">=2.6.0" },
 ]
-provides-extras = ["dev", "otel", "metrics", "vmm", "instanttensor"]
+provides-extras = ["dev", "otel", "metrics", "vmm"]
 
 [[package]]
 name = "mpmath"
