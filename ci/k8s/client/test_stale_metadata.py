@@ -48,6 +48,9 @@ from kube_utils import port_forward
 # worth of slack — this is a test-only constant; reaper timing comes from the
 # action via fixtures so the server config and the test stay aligned.
 STALE_DETECTION_BUFFER_SECS = 20
+# Weight publication is health-gated and checked by a background publisher
+# every 30 seconds. Allow one additional interval for the source to appear.
+SOURCE_PUBLICATION_TIMEOUT_SECS = 60
 
 MX_SERVER_LOCAL_PORT = 18001
 MX_SERVER_REMOTE_PORT = 8000
@@ -101,7 +104,7 @@ def test_stale_metadata_excluded_after_heartbeat_timeout(
 
     Run order (gated by `--tb=short` so the assertion message is the
     primary signal):
-      - Before kill: server returns exactly 1 READY source.
+      - Wait for the health-gated publisher, then confirm exactly 1 READY source.
       - After kill + wait_secs: server returns 0 READY sources.
 
     `wait_secs` is computed from the fixture values that the composite
@@ -117,7 +120,13 @@ def test_stale_metadata_excluded_after_heartbeat_timeout(
         channel = grpc.insecure_channel(f"localhost:{port}")
         stub = p2p_pb2_grpc.P2pServiceStub(channel)
 
-        live_weights, live_artifacts = _list_ready_sources_by_kind(stub)
+        publication_deadline = time.monotonic() + SOURCE_PUBLICATION_TIMEOUT_SECS
+        while True:
+            live_weights, live_artifacts = _list_ready_sources_by_kind(stub)
+            if len(live_weights) == 1 or time.monotonic() >= publication_deadline:
+                break
+            time.sleep(2)
+
         print(
             f"[before-kill] {len(live_weights)} READY weight source(s): "
             f"{[s.worker_id for s in live_weights]}; "

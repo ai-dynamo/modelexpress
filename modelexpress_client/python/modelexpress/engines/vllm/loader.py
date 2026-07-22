@@ -30,12 +30,16 @@ import time
 import torch
 import torch.nn as nn
 
-from ... import configure_vllm_logging
+from ... import configure_vllm_logging, envs
 from ...load_strategy import LoadContext, LoadStrategyChain
 from ...nixl_transfer import NixlTransferManager
 from ...vmm.runtime import log_arena_post_load, maybe_enter_vmm_arena
 from .adapter import _is_speculative_draft, build_vllm_load_context
-from .artifacts import install_vllm_cache_artifacts, schedule_vllm_cache_artifact_publish
+from .artifacts import (
+    _vllm_health_ready,
+    install_vllm_cache_artifacts,
+    schedule_vllm_cache_artifact_publish,
+)
 
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
@@ -83,6 +87,8 @@ class MxModelLoader(BaseModelLoader):
 
         ctx = build_vllm_load_context(vllm_config, model_config)
         ctx.p2p_enabled = not _is_speculative_draft(vllm_config, model_config)
+        if envs.MX_ARTIFACT_READY_URL.strip():
+            ctx.source_ready_fn = _vllm_health_ready
         self._ctx = ctx
 
         logger.info(

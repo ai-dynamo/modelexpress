@@ -288,7 +288,15 @@ class TestAbstractMethodCompleteness:
             loader_mod._nixl_managers.pop(3, None)
             loader_mod._tensor_registry.pop(3, None)
 
-    def test_load_model_installs_and_schedules_vllm_artifacts(self):
+    @pytest.mark.parametrize(
+        ("ready_url", "health_gated"),
+        [("", False), ("http://127.0.0.1:8000/health", True)],
+    )
+    def test_load_model_installs_and_schedules_vllm_artifacts(
+        self, ready_url, health_gated
+    ):
+        from modelexpress.engines.vllm import loader as loader_mod
+
         loader = _make_loader()
         model = MagicMock()
         ctx = _make_load_context(device_id=3)
@@ -305,6 +313,10 @@ class TestAbstractMethodCompleteness:
         def run(model_arg, ctx_arg):
             assert model_arg is model
             assert ctx_arg is ctx
+            if health_gated:
+                assert ctx_arg.source_ready_fn is loader_mod._vllm_health_ready
+            else:
+                assert ctx_arg.source_ready_fn is None
             events.append("load")
             return model_arg
 
@@ -312,7 +324,7 @@ class TestAbstractMethodCompleteness:
             assert ctx_arg is ctx
             events.append("schedule")
 
-        with patch(
+        with patch.dict(os.environ, {"MX_ARTIFACT_READY_URL": ready_url}), patch(
             "modelexpress.engines.vllm.loader.build_vllm_load_context",
             return_value=ctx,
         ), patch(
@@ -1353,10 +1365,20 @@ class TestPublishMetadataAndReady:
             tensors[f"layer.{i}.weight"] = t
 
         identity = _make_identity("my-model")
+        ready_fn = MagicMock(return_value=False)
         mock_publisher = MagicMock()
         with patch.dict(os.environ, {"MX_P2P_METADATA": "0"}), \
              patch("modelexpress.metadata.publish.PublisherThread", return_value=mock_publisher) as publisher_cls:
-            publish_metadata_and_ready(mx_client, nixl_manager, tensors, worker_rank=2, device_id=0, identity=identity, worker_id="inst-uuid")
+            publish_metadata_and_ready(
+                mx_client,
+                nixl_manager,
+                tensors,
+                worker_rank=2,
+                device_id=0,
+                identity=identity,
+                worker_id="inst-uuid",
+                ready_fn=ready_fn,
+            )
 
         mx_client.publish_metadata.assert_not_called()
         publisher_cls.assert_called_once()
@@ -1366,6 +1388,7 @@ class TestPublishMetadataAndReady:
         assert publisher_kwargs["worker_rank"] == 2
         assert publisher_kwargs["nixl_manager"] is nixl_manager
         assert callable(publisher_kwargs["publish_fn"])
+        assert publisher_kwargs["ready_fn"] is ready_fn
         mock_publisher.start.assert_called_once()
 
         result = publisher_kwargs["publish_fn"]()
