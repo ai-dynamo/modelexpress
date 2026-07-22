@@ -132,7 +132,7 @@ pub(crate) async fn review_token(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::auth::test_util::{
@@ -144,20 +144,46 @@ mod tests {
     #[test]
     fn extracts_bearer_token_case_insensitively() {
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, "Bearer abc.def".parse().unwrap());
-        assert_eq!(extract_bearer(&headers).unwrap().expose_secret(), "abc.def");
+        headers.insert(
+            AUTHORIZATION,
+            "Bearer abc.def".parse().expect("valid header"),
+        );
+        assert_eq!(
+            extract_bearer(&headers)
+                .expect("bearer found")
+                .expose_secret(),
+            "abc.def"
+        );
 
         let mut lower = HeaderMap::new();
-        lower.insert(AUTHORIZATION, "bearer xyz".parse().unwrap());
-        assert_eq!(extract_bearer(&lower).unwrap().expose_secret(), "xyz");
+        lower.insert(AUTHORIZATION, "bearer xyz".parse().expect("valid header"));
+        assert_eq!(
+            extract_bearer(&lower)
+                .expect("bearer found")
+                .expose_secret(),
+            "xyz"
+        );
 
         let mut upper = HeaderMap::new();
-        upper.insert(AUTHORIZATION, "BEARER token123".parse().unwrap());
-        assert_eq!(extract_bearer(&upper).unwrap().expose_secret(), "token123");
+        upper.insert(
+            AUTHORIZATION,
+            "BEARER token123".parse().expect("valid header"),
+        );
+        assert_eq!(
+            extract_bearer(&upper)
+                .expect("bearer found")
+                .expose_secret(),
+            "token123"
+        );
 
         let mut mixed = HeaderMap::new();
-        mixed.insert(AUTHORIZATION, "BeArEr abc".parse().unwrap());
-        assert_eq!(extract_bearer(&mixed).unwrap().expose_secret(), "abc");
+        mixed.insert(AUTHORIZATION, "BeArEr abc".parse().expect("valid header"));
+        assert_eq!(
+            extract_bearer(&mixed)
+                .expect("bearer found")
+                .expose_secret(),
+            "abc"
+        );
     }
 
     #[test]
@@ -165,15 +191,15 @@ mod tests {
         assert!(extract_bearer(&HeaderMap::new()).is_none());
 
         let mut basic = HeaderMap::new();
-        basic.insert(AUTHORIZATION, "Basic abc".parse().unwrap());
+        basic.insert(AUTHORIZATION, "Basic abc".parse().expect("valid header"));
         assert!(extract_bearer(&basic).is_none());
 
         let mut empty = HeaderMap::new();
-        empty.insert(AUTHORIZATION, "Bearer ".parse().unwrap());
+        empty.insert(AUTHORIZATION, "Bearer ".parse().expect("valid header"));
         assert!(extract_bearer(&empty).is_none());
 
         let mut short = HeaderMap::new();
-        short.insert(AUTHORIZATION, "Bear".parse().unwrap());
+        short.insert(AUTHORIZATION, "Bear".parse().expect("valid header"));
         assert!(extract_bearer(&short).is_none());
     }
 
@@ -204,7 +230,7 @@ mod tests {
             extra: Some(extra),
             ..Default::default()
         };
-        let caller = caller_from_userinfo(&user).unwrap();
+        let caller = caller_from_userinfo(&user).expect("service-account caller");
         assert_eq!(caller.namespace, "ns");
         assert_eq!(caller.service_account, "sa");
         assert_eq!(caller.pod_name.as_deref(), Some("worker-0"));
@@ -217,7 +243,7 @@ mod tests {
             username: Some("system:serviceaccount:ns:sa".to_string()),
             ..Default::default()
         };
-        let caller = caller_from_userinfo(&user).unwrap();
+        let caller = caller_from_userinfo(&user).expect("service-account caller");
         assert!(caller.pod_name.is_none());
         assert!(caller.pod_uid.is_none());
     }
