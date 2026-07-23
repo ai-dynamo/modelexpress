@@ -135,6 +135,30 @@ def test_list_sources_returns_single_synthetic_ref_at_caller_rank():
     assert inst.model_name == identity.model_name
 
 
+def test_list_sources_synthetic_ref_survives_quantized_prefilter():
+    # The synthetic ref carries no accelerator (this backend learns it only from
+    # GetTensorManifest). The pre-fetch accelerator gate must NOT drop it for a
+    # quantized identity, or a same-family quantized k8s-service transfer would
+    # be stranded before its accelerator is known. Regression for the P2P
+    # quantized cross-vendor guard vs the k8s-service empty-accelerator ref.
+    from modelexpress.metadata.payload import accelerators_compatible
+
+    client = MxK8sServiceClient(worker_rank=0)
+    identity = _base_identity()
+    identity.quantization = "fp8"
+    resp = client.list_sources(identity=identity)
+    inst = resp.instances[0]
+    assert inst.accelerator == ""
+    # Pre-fetch gate (default defer_unknown=True) defers the unknown ref.
+    assert accelerators_compatible(
+        "cuda",
+        inst.accelerator,
+        mx_source_type=identity.mx_source_type,
+        quantization=identity.quantization,
+        dtype=identity.dtype,
+    )
+
+
 def test_list_sources_requires_identity():
     client = MxK8sServiceClient(worker_rank=0)
     with pytest.raises(ValueError, match="identity"):

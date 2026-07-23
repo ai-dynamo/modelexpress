@@ -37,7 +37,12 @@ def _make_loader():
 
 
 def _make_identity(model_name="test-model"):
-    return p2p_pb2.SourceIdentity(model_name=model_name)
+    # Realistic identity: unquantized weights with dtype set, matching every
+    # production vLLM/SGLang/TRT-LLM publish path. The accelerator gate treats
+    # an unset dtype as unknown and fails closed for cross-family weights.
+    return p2p_pb2.SourceIdentity(
+        model_name=model_name, quantization="", dtype="bfloat16"
+    )
 
 
 def _make_worker(rank=0, n_tensors=3):
@@ -1272,11 +1277,14 @@ class TestRdmaStrategyLoad:
         self,
         mock_accelerator_backend_cls,
     ):
+        # An unproven cross-family pair (xpu target, rocm source) is skipped
+        # even for weights; only cuda<->xpu is enabled for heterogeneous
+        # weight transfer.
         ctx = _make_load_context(
             accelerator_backend=mock_accelerator_backend_cls(name="xpu"),
         )
         source_resp = _make_metadata_resp(rank=0, worker_id="w-1")
-        source_resp.worker.accelerator = "cuda"
+        source_resp.worker.accelerator = "rocm"
         candidates = [_make_instance_ref(worker_id="w-1")]
         strategy, attempts = self._setup(ctx, candidates, [source_resp])
 
