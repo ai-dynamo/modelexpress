@@ -204,6 +204,95 @@ GCS uses the configured/default ModelExpress cache root; `MODEL_EXPRESS_CACHE_DI
 
 See [`CLI.md`](CLI.md) for full CLI usage documentation.
 
+## ServiceAccount Authentication
+
+Optional, off by default. When enabled, the server authenticates every gRPC caller
+(except health checks) against a Kubernetes ServiceAccount token and authorizes them
+against an exact-match allowlist. No sidecar or service mesh is required: the server
+calls the Kubernetes `TokenReview` API in-process.
+
+- **AuthN**: the caller presents a projected ServiceAccount token; the server verifies it
+  via `TokenReview` and extracts `system:serviceaccount:<namespace>:<serviceaccount>`.
+- **AuthZ**: that `<namespace>:<serviceaccount>` must exactly match a configured allowlist
+  entry.
+
+> **Warning: only enable auth over an encrypted transport.** The server and clients
+> speak plaintext gRPC; neither terminates TLS itself. Without encryption the bearer
+> token crosses the wire in cleartext and anyone who can sniff the traffic can replay
+> it until it expires. Run enforce mode only where the transport is encrypted, e.g. a
+> service mesh providing mTLS (Istio/Linkerd sidecars) or a TLS-terminating proxy in
+> front of the server.
+
+Other properties to be aware of:
+
+- Auth is enforced when each RPC starts. A long-lived streaming RPC that was accepted
+  keeps flowing even if the token expires or the ServiceAccount is revoked mid-stream;
+  revocation takes effect on the next RPC (bounded by the cache TTL below).
+- Definitive rejections are cached per token; backend errors (e.g. an unreachable
+  apiserver) return `UNAVAILABLE` and are not cached. A caller cycling unique invalid
+  tokens sends one `TokenReview` to the Kubernetes API server per token. The gRPC port
+  should not be reachable from untrusted networks.
+
+### Modes
+
+| Mode | Behavior |
+|------|----------|
+| `off` (default) | No auth. Tokens are ignored. |
+| `enforce` | Verify every call and reject unauthenticated or non-allowlisted callers. |
+
+### Server configuration
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `MODEL_EXPRESS_SECURITY_MODE` | `off` | `off` \| `enforce` |
+| `MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES` | (none) | Comma-separated audiences the token must carry. Required for `enforce`. |
+| `MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS` | (none) | Comma-separated `<namespace>:<serviceaccount>` allowlist. Required for `enforce`. |
+| `MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS` | `60` | TTL for the verified-token and rejection caches. |
+
+`enforce` fails config validation if either the audience list or the allowlist is empty,
+so an omitted list can't silently deny-all or accept-any-audience. Configured values
+still need to be correct.
+
+The server's ServiceAccount needs permission to create `TokenReview`s (a cluster-scoped
+subresource), via a `ClusterRoleBinding` to the built-in `system:auth-delegator` role.
+The Helm chart creates this automatically when it also creates the ServiceAccount
+(`serviceAccount.create=true`, the default) and `security.enabled=true`; with an
+existing ServiceAccount, create the equivalent binding separately:
+
+```yaml
+security:
+  enabled: true
+  mode: enforce
+  tokenAudiences: ["modelexpress"]
+  allowedServiceAccounts:
+    - "vllm:worker"
+    - "vllm:router"
+```
+
+### Client configuration
+
+Clients (Rust and Python) attach the token automatically when a projected token file is
+present, and send nothing when it is absent (so the same client works against an `off`
+server, including off-cluster). Mount a projected token into each worker pod with an
+audience that matches the server's, then point the client at it:
+
+```yaml
+volumes:
+  - name: mx-token
+    projected:
+      sources:
+        - serviceAccountToken:
+            path: modelexpress
+            audience: modelexpress
+            expirationSeconds: 3600
+# mounted at /var/run/secrets/tokens/modelexpress
+```
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `MX_AUTH_TOKEN_PATH` | `/var/run/secrets/tokens/modelexpress` | Projected token file path |
+| `MX_AUTH_TOKEN_TTL_SECONDS` | `60` | How often to re-read the token (rotation is also picked up on mtime change) |
+
 ## Docker
 
 ### Production Image
@@ -410,6 +499,51 @@ See [`../examples/dynamo_model_cache_k8s/README.md`](../examples/dynamo_model_ca
 ## P2P GPU Weight Transfers
 
 ModelExpress supports GPU-to-GPU model weight transfers between supported inference instances using NVIDIA NIXL over RDMA. vLLM 0.23.0 and newer recognize `--load-format modelexpress` natively, which runs the priority chain P2P RDMA -> InstantTensor -> ModelStreamer -> GDS -> native loader; the ModelExpress Python package must still be installed, and `mx` remains a backward-compatible alias. SGLang uses `remote_instance` with the `modelexpress` backend; see [SGLang Clients](#sglang-clients).
+
+### Cross-Vendor (CUDA/XPU) Compatibility
+
+ModelExpress supports cross-family weight transfer between `cuda` and `xpu` only for unquantized model weights.
+
+A weight identity is considered unquantized when:
+
+- `SourceIdentity.quantization` is empty or `none`
+- `SourceIdentity.dtype` is on the plain-dtype allowlist (`float16`, `bfloat16`,
+  `float32`, and their aliases). The check is an allowlist, not a denylist: any
+  dtype not on it (for example `int8`, `int4`, `qint8`, `auto`, or an unknown
+  future quantized dtype) fails closed and is treated as quantized, so a
+  hardware-specific layout is never silently admitted cross-vendor.
+
+Quantized models are not transferred across accelerator families. This includes models using quantization methods or storage formats such as:
+
+- `fp8`
+- `fp4`
+- `nvfp4`
+- `mxfp4`
+- `mxfp8`
+- `awq`
+- `gptq`
+- other non-empty quantization methods
+
+The reason is that ModelExpress transfers post-processed in-memory tensor bytes, not raw checkpoint files. For quantized models, the post-processed layout can depend on the accelerator family, GPU architecture, selected kernel, and framework quantization backend. For example, FP8 scale packing or FP4/NVFP4 swizzling may differ between CUDA and XPU kernels. Copying those bytes across vendors can make the transfer succeed while causing silent inference corruption.
+
+If a target finds only cross-family sources for a quantized model, it skips P2P RDMA and falls through to the next load strategy, such as GDS or disk loading. Expect a slower cold start instead of an RDMA receive in mixed CUDA/XPU fleets serving quantized weights.
+
+Same-family transfer is unaffected. Quantized transfer remains allowed for:
+
+- `cuda` to `cuda`
+- `xpu` to `xpu`
+
+because source and target are expected to use the same accelerator-family post-processing layout.
+
+Cross-family transfers also require the source manifest and the target's
+registered tensors to name the exact same set. A tensor-name mismatch (a
+local-only or source-only name) or a zero-match transfer fails closed with a
+`ManifestMismatchError` rather than transferring a subset. This prevents a
+vendor-specific hidden or derived tensor from leaving part of the target at
+dummy values while RDMA reports success. Same-family transfers keep tolerating
+subset transfers (unmatched names are warned, not fatal).
+
+Future work may validate specific quantized CUDA/XPU combinations on hardware. If a specific pair is proven inference-correct after RDMA, ModelExpress may add an explicit allowlist for that quantization/layout pair. ModelExpress does not currently dequantize, requantize, or convert post-processed tensor layouts during transfer. See the accelerator-compatibility rule in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ### Choosing a Metadata Backend
 

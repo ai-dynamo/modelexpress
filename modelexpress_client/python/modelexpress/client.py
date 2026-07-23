@@ -17,6 +17,7 @@ from abc import ABC, abstractmethod
 
 import grpc
 
+from . import auth
 from . import envs
 from . import p2p_pb2
 from . import p2p_pb2_grpc
@@ -149,7 +150,9 @@ class MxClient(MxClientBase):
                 ("grpc.max_send_message_length", self._max_message_size),
                 ("grpc.max_receive_message_length", self._max_message_size),
             ]
-            self._channel = grpc.insecure_channel(self.server_url, options=options)
+            self._channel = auth.with_auth(
+                grpc.insecure_channel(self.server_url, options=options)
+            )
             self._stub = p2p_pb2_grpc.P2pServiceStub(self._channel)
             logger.debug("MxClient connected to %s", self.server_url)
         return self._stub

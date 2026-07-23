@@ -44,6 +44,9 @@ if TYPE_CHECKING:
     MX_SERVER_ADDRESS: Optional[str]
     MODEL_EXPRESS_LOG_LEVEL: str
     MODEL_NAME: Optional[str]
+    # Auth (client)
+    MX_AUTH_TOKEN_PATH: Optional[str]
+    MX_AUTH_TOKEN_TTL_SECONDS: Optional[str]
     # Runtime compatibility
     MX_DISABLE_PATCHES: bool
     # Metadata / worker
@@ -156,6 +159,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_SERVER_ADDRESS": lambda: os.environ.get("MX_SERVER_ADDRESS"),
     "MODEL_EXPRESS_LOG_LEVEL": lambda: os.environ.get("MODEL_EXPRESS_LOG_LEVEL", "").upper(),
     "MODEL_NAME": lambda: os.environ.get("MODEL_NAME"),
+    # ── Auth (client) ──────────────────────────────────────────────────────
+    "MX_AUTH_TOKEN_PATH": lambda: os.environ.get("MX_AUTH_TOKEN_PATH"),
+    "MX_AUTH_TOKEN_TTL_SECONDS": lambda: os.environ.get("MX_AUTH_TOKEN_TTL_SECONDS"),
     # ── Runtime compatibility ──────────────────────────────────────────────
     "MX_DISABLE_PATCHES": lambda: os.environ.get("MX_DISABLE_PATCHES", "").strip().lower()
     in _TRUTHY,
