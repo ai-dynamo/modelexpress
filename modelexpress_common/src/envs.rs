@@ -120,6 +120,23 @@ pub const MX_HEARTBEAT_TIMEOUT_SECS: &str = "MX_HEARTBEAT_TIMEOUT_SECS";
 /// Age (seconds) after which a STALE worker is garbage-collected.
 pub const MX_GC_TIMEOUT_SECS: &str = "MX_GC_TIMEOUT_SECS";
 
+// ── Security / auth (server) ────────────────────────────────────────────────
+/// ServiceAccount auth mode (`off`, `enforce`). Off by default.
+pub const MODEL_EXPRESS_SECURITY_MODE: &str = "MODEL_EXPRESS_SECURITY_MODE";
+/// Comma-separated SA token audiences the caller's token must carry.
+pub const MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES: &str = "MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES";
+/// Comma-separated allowed callers as `<namespace>:<serviceaccount>`.
+pub const MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS: &str =
+    "MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS";
+/// TTL for the verified-token and rejection caches, in seconds.
+pub const MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS: &str = "MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS";
+
+// ── Auth (client) ───────────────────────────────────────────────────────────
+/// Path to the Kubernetes projected ServiceAccount token file.
+pub const MX_AUTH_TOKEN_PATH: &str = "MX_AUTH_TOKEN_PATH";
+/// TTL in seconds for the cached token.
+pub const MX_AUTH_TOKEN_TTL_SECONDS: &str = "MX_AUTH_TOKEN_TTL_SECONDS";
+
 // ── System ──────────────────────────────────────────────────────────────────
 /// Primary source for the user's home directory.
 pub const HOME: &str = "HOME";
@@ -325,6 +342,21 @@ mod tests {
         assert_eq!(MX_REAPER_SCAN_INTERVAL_SECS, "MX_REAPER_SCAN_INTERVAL_SECS");
         assert_eq!(MX_HEARTBEAT_TIMEOUT_SECS, "MX_HEARTBEAT_TIMEOUT_SECS");
         assert_eq!(MX_GC_TIMEOUT_SECS, "MX_GC_TIMEOUT_SECS");
+        assert_eq!(MODEL_EXPRESS_SECURITY_MODE, "MODEL_EXPRESS_SECURITY_MODE");
+        assert_eq!(
+            MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES,
+            "MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES"
+        );
+        assert_eq!(
+            MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS,
+            "MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS"
+        );
+        assert_eq!(
+            MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS,
+            "MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS"
+        );
+        assert_eq!(MX_AUTH_TOKEN_PATH, "MX_AUTH_TOKEN_PATH");
+        assert_eq!(MX_AUTH_TOKEN_TTL_SECONDS, "MX_AUTH_TOKEN_TTL_SECONDS");
         assert_eq!(HOME, "HOME");
         assert_eq!(USERPROFILE, "USERPROFILE");
         assert_eq!(KUBECONFIG, "KUBECONFIG");

@@ -42,3 +42,24 @@ subjects:
     name: {{ include "modelexpress.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
 {{- end }}
+
+# TokenReview access for ServiceAccount auth (security.enabled). The server verifies
+# caller tokens by POSTing TokenReviews, a cluster-scoped subresource, so this needs a
+# ClusterRoleBinding to the built-in system:auth-delegator role.
+{{- if and .Values.serviceAccount.create .Values.security.enabled }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "modelexpress.fullname" . }}-auth-delegator
+  labels:
+    {{- include "modelexpress.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "modelexpress.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
