@@ -152,6 +152,7 @@ ModelExpress/
 │       │   ├── context.py              # LoadContext and LoadResult
 │       │   ├── base.py                 # LoadStrategy ABC and shared helpers
 │       │   ├── rdma_strategy.py        # RdmaStrategy (P2P GPU transfer via NIXL)
+│       │   ├── instant_tensor_strategy.py # InstantTensorStrategy (fast local safetensors)
 │       │   ├── model_streamer_strategy.py # ModelStreamerStrategy (S3/GCS/Azure/local)
 │       │   ├── gds_strategy.py         # GdsStrategy (GPUDirect Storage)
 │       │   └── default_strategy.py     # DefaultStrategy (engine-native fallback)
@@ -549,7 +550,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `adapter.py` | `EngineAdapter` lifecycle hooks and strategy retry errors |
 | `vllm_loader.py` | Compatibility shim for `modelexpress.engines.vllm.loader` |
 | `metadata/` | Metadata publishing, source identity, heartbeat, worker manifest serving, metadata client selection, and engine-agnostic cache-artifact transfer |
-| `load_strategy/` | Engine-neutral loading strategy chain: `RdmaStrategy`, `ModelStreamerStrategy` (S3/GCS/Azure/local), `GdsStrategy`, `DefaultStrategy` |
+| `load_strategy/` | Engine-neutral loading strategy chain: `RdmaStrategy`, `InstantTensorStrategy` (fast local safetensors), `ModelStreamerStrategy` (S3/GCS/Azure/local), `GdsStrategy`, `DefaultStrategy` |
 | `engines/vllm/` | `VllmAdapter` and `MxModelLoader` map strategy hooks to vLLM loader APIs; `refit/` contains the vLLM-specific MDL installer and geometry-capture/PWAL receiver |
 | `engines/sglang/` | `SglangAdapter` and `MxModelLoader` - maps strategy hooks to SGLang's `remote_instance` backend |
 | `tensor_utils.py` | Tensor collection, checksums, storage views, `capture_tensor_attrs` |
@@ -662,9 +663,10 @@ Auto-detects the best loading strategy with a prioritized chain. Each strategy i
 | Priority | Strategy | `is_available()` | Behavior |
 |---|---|---|---|
 | p0 | `RdmaStrategy` | NIXL available | `ListSources(READY)`, filter by `worker_rank` and runtime `accelerator`, order the survivors via the configured `SourceSelector` (`MX_P2P_SOURCE_SELECTOR`: `random` default or `rendezvous_hash`), then try candidates (max 3). Filtering before the retry slice prevents incompatible sources from exhausting the retry budget; a post-`GetMetadata` accelerator check remains as defense-in-depth. Before preparing target tensors, P2P sources must serve a manifest for the selected runtime `worker_id`; generation mismatches and transfer failures retry the next candidate, reinitializing the target first when it may have been mutated. |
-| p1 | `ModelStreamerStrategy` | `MX_MODEL_URI` set + `runai_model_streamer` installed | Stream safetensors to GPU via CPU staging buffer. `MX_MODEL_URI` accepts remote URIs (`s3://`, `gs://`, `az://`), absolute local paths, or HF model IDs (resolved via `HF_HUB_CACHE`). All storage backends (S3, GCS, Azure) included by default. |
-| p2 | `GdsStrategy` | Active accelerator backend supports GDS and GDS hardware is available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. Reads full checkpoint tensors and slices for TP downstream — see [GDS Reads Full Checkpoint Tensors Under TP](#gds-reads-full-checkpoint-tensors-under-tp). |
-| p3 | `DefaultStrategy` | Engine native fallback loader available | Native loader fallback (for vLLM, `DefaultModelLoader`, CPU-staged, auto-downloads from HF Hub). |
+| p1 | `InstantTensorStrategy` | `MX_INSTANT_TENSOR` enabled (default) + `instanttensor` installed + CUDA device + adapter implements `build_instanttensor_weight_iter` (and `apply_weight_iter`) | Load the model's own safetensors directly onto CUDA via the `instanttensor` library (distributed loading, pipelined prefetch, direct I/O, GDS when available). Reuses vLLM's built-in `--load-format instanttensor` path, so it needs no `MX_MODEL_URI`; the engine resolves and (if needed) downloads the weight files. Falls through on failure. |
+| p2 | `ModelStreamerStrategy` | `MX_MODEL_URI` set + `runai_model_streamer` installed | Stream safetensors to GPU via CPU staging buffer. `MX_MODEL_URI` accepts remote URIs (`s3://`, `gs://`, `az://`), absolute local paths, or HF model IDs (resolved via `HF_HUB_CACHE`). All storage backends (S3, GCS, Azure) included by default. |
+| p3 | `GdsStrategy` | Active accelerator backend supports GDS and GDS hardware is available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. Reads full checkpoint tensors and slices for TP downstream — see [GDS Reads Full Checkpoint Tensors Under TP](#gds-reads-full-checkpoint-tensors-under-tp). |
+| p4 | `DefaultStrategy` | Engine native fallback loader available | Native loader fallback (for vLLM, `DefaultModelLoader`, CPU-staged, auto-downloads from HF Hub). |
 
 See [ModelExpress Benchmarks](BENCHMARKS.md) for measured loading-path, NIXL registration, and artifact-transfer results with explicit timing boundaries.
 

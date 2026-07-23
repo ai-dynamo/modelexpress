@@ -13,9 +13,10 @@ are auto-promoted to non-persistent buffers via capture_tensor_attrs().
 
 Uses LoadStrategyChain to auto-detect the best loading strategy:
     1. RDMA (P2P GPU transfer via NIXL) - if a source is already serving
-    2. ModelStreamer (S3/GCS/Azure/local via runai-model-streamer) - set MX_MODEL_URI
-    3. GDS (GPUDirect Storage) - direct file-to-GPU, bypassing CPU
-    4. Default (vLLM DefaultModelLoader) - standard CPU-staged loading
+    2. InstantTensor (fast local safetensors, direct I/O + GDS) - set MX_INSTANT_TENSOR=0 to disable
+    3. ModelStreamer (S3/GCS/Azure/local via runai-model-streamer) - set MX_MODEL_URI
+    4. GDS (GPUDirect Storage) - direct file-to-GPU, bypassing CPU
+    5. Default (vLLM DefaultModelLoader) - standard CPU-staged loading
 
 Usage:
     --load-format modelexpress
