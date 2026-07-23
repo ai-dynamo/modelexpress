@@ -29,6 +29,14 @@ def worker_tensor_count(worker: p2p_pb2.WorkerMetadata) -> int:
     return len(worker_tensor_descriptors(worker))
 
 
+# Accelerator-compatibility policy (fail-closed by construction):
+#   - Same accelerator family: always allowed.
+#   - Different family: allowed only for a hetero-eligible source type, an
+#     allowlisted family pair, and explicitly unquantized weights.
+#   - Unknown (empty) accelerator: deferred on the pre-fetch check, rejected on
+#     the authoritative post-fetch check for a quantized identity.
+# Anything undeclared or unrecognized is treated as the unsafe case.
+
 # Accelerator families whose weight bytes are transferable cross-vendor over
 # NIXL. Weights are plain tensor bytes whose dtype and size are validated on the
 # receive path before any transfer, so they carry across families. Generated
@@ -50,42 +58,51 @@ HETEROGENEOUS_NIXL_SOURCE_TYPES = {
 # is treated as quantized and never gets cross-family compatibility.
 _UNSPECIFIED = object()
 
-# dtype string tokens that indicate quantized stored weights even when the
-# identity's ``quantization`` field is empty (some non-vLLM backends express
-# quantized storage through dtype alone). Matched as substrings after
-# lowercasing.
-_QUANTIZED_DTYPE_TOKENS = (
-    "float8",
-    "fp8",
-    "float4",
-    "fp4",
-    "nvfp4",
-    "mxfp4",
-    "mxfp8",
+# Normalized dtype strings that are known-plain (non-quantized) weight storage.
+# This is an allowlist, not a denylist: only these dtypes enable a cross-family
+# transfer, so an unknown or future quantized dtype fails closed instead of
+# silently admitting a hardware-specific layout. Values are compared after
+# stripping a leading ``torch.`` and lowercasing (see ``_normalize_dtype``).
+_UNQUANTIZED_DTYPES = frozenset(
+    {
+        "float32",
+        "float",
+        "f32",
+        "float16",
+        "half",
+        "f16",
+        "bfloat16",
+        "bf16",
+    }
 )
 
 # Quantization strings that mean "not quantized" (raw bf16/fp16 weights).
 _UNQUANTIZED_QUANTIZATION_VALUES = ("", "none")
 
 
+def _normalize_dtype(dtype: str) -> str:
+    """Lowercase and drop a leading ``torch.`` so ``str(tensor.dtype)`` and the
+    already-stripped identity form both normalize to the same token."""
+    return dtype.strip().lower().removeprefix("torch.")
+
+
 def _is_unquantized(quantization: object, dtype: object) -> bool:
     """Return whether an identity describes plain (non-quantized) weights.
 
-    Primary signal is ``SourceIdentity.quantization``; ``dtype`` is a defensive
-    net for backends that express quantized storage through dtype alone. This is
-    "explicitly unquantized only": an argument left ``_UNSPECIFIED`` or an empty
-    ``dtype`` is unknown and fails closed (treated as quantized), so a call site
-    that does not fully declare the identity cannot silently enable a
-    cross-family quantized transfer.
+    Both signals must affirmatively say "plain": ``SourceIdentity.quantization``
+    must be an unquantized value and ``dtype`` must be an allowlisted plain
+    dtype. This is "explicitly unquantized only" and fail-closed by
+    construction: an argument left ``_UNSPECIFIED``, an empty ``dtype``, or any
+    dtype not on the allowlist (int8/int4/qint8/auto and unknown future
+    quantized dtypes) is treated as quantized, so a call site that does not
+    fully declare a plain identity cannot silently enable a cross-family
+    transfer.
     """
     if quantization is _UNSPECIFIED or dtype is _UNSPECIFIED:
         return False
     if str(quantization).strip().lower() not in _UNQUANTIZED_QUANTIZATION_VALUES:
         return False
-    dtype_norm = str(dtype).strip().lower()
-    if not dtype_norm:
-        return False
-    return not any(token in dtype_norm for token in _QUANTIZED_DTYPE_TOKENS)
+    return _normalize_dtype(str(dtype)) in _UNQUANTIZED_DTYPES
 
 
 def accelerators_compatible(

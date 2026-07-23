@@ -124,6 +124,34 @@ def test_weights_cross_family_quantized_dtype_rejected(dtype):
     )
 
 
+@pytest.mark.parametrize(
+    "dtype", ["int8", "int4", "qint8", "uint4", "auto", "e4m3", "some_future_fp2"]
+)
+def test_weights_cross_family_non_allowlisted_dtype_rejected(dtype):
+    # The plain-dtype gate is an allowlist, not a denylist: quantized integer
+    # dtypes, "auto", and unknown future dtypes are not on the plain allowlist
+    # and must fail closed even with empty quantization, so a hardware-specific
+    # layout is never silently admitted cross-vendor.
+    assert not accelerators_compatible(
+        "cuda", "xpu", mx_source_type=WEIGHTS, quantization="", dtype=dtype
+    )
+    assert not accelerators_compatible(
+        "xpu", "cuda", mx_source_type=WEIGHTS, quantization="", dtype=dtype
+    )
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    ["float32", "torch.float32", "float16", "torch.bfloat16", "bf16", "half", "F32"],
+)
+def test_weights_cross_family_plain_dtype_aliases_allowed(dtype):
+    # Plain dtype aliases and the ``torch.`` prefixed form both normalize onto
+    # the allowlist, so legitimate unquantized weights are not rejected.
+    assert accelerators_compatible(
+        "cuda", "xpu", mx_source_type=WEIGHTS, quantization="", dtype=dtype
+    )
+
+
 @pytest.mark.parametrize("known,unknown", [("cuda", ""), ("", "xpu")])
 def test_weights_unknown_accelerator_quantized_fails_closed_when_not_deferred(
     known, unknown

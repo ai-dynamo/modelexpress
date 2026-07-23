@@ -418,10 +418,11 @@ ModelExpress supports cross-family weight transfer between `cuda` and `xpu` only
 A weight identity is considered unquantized when:
 
 - `SourceIdentity.quantization` is empty or `none`
-- `SourceIdentity.dtype` is a normal non-quantized dtype, such as:
-  - `bfloat16`
-  - `float16`
-  - `float32`
+- `SourceIdentity.dtype` is on the plain-dtype allowlist (`float16`, `bfloat16`,
+  `float32`, and their aliases). The check is an allowlist, not a denylist: any
+  dtype not on it (for example `int8`, `int4`, `qint8`, `auto`, or an unknown
+  future quantized dtype) fails closed and is treated as quantized, so a
+  hardware-specific layout is never silently admitted cross-vendor.
 
 Quantized models are not transferred across accelerator families. This includes models using quantization methods or storage formats such as:
 
@@ -444,6 +445,14 @@ Same-family transfer is unaffected. Quantized transfer remains allowed for:
 - `xpu` to `xpu`
 
 because source and target are expected to use the same accelerator-family post-processing layout.
+
+Cross-family transfers also require the source manifest and the target's
+registered tensors to name the exact same set. A tensor-name mismatch (a
+local-only or source-only name) or a zero-match transfer fails closed with a
+`ManifestMismatchError` rather than transferring a subset. This prevents a
+vendor-specific hidden or derived tensor from leaving part of the target at
+dummy values while RDMA reports success. Same-family transfers keep tolerating
+subset transfers (unmatched names are warned, not fatal).
 
 Future work may validate specific quantized CUDA/XPU combinations on hardware. If a specific pair is proven inference-correct after RDMA, ModelExpress may add an explicit allowlist for that quantization/layout pair. ModelExpress does not currently dequantize, requantize, or convert post-processed tensor layouts during transfer. See the accelerator-compatibility rule in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
