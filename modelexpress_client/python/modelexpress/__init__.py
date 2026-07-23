@@ -15,7 +15,7 @@ Quick Start (vLLM):
     register_modelexpress_loaders()
 
     # vllm serve model --load-format modelexpress
-    # Auto-detects: RDMA -> GDS -> disk
+    # Auto-detects: RDMA -> InstantTensor -> ModelStreamer -> GDS -> disk
 """
 
 import logging
@@ -55,7 +55,7 @@ def register_modelexpress_loaders():
     multiple times safely (idempotent).
 
     Enables:
-        --load-format modelexpress  (auto-detect: RDMA -> GDS -> disk)
+        --load-format modelexpress  (auto-detect: RDMA -> InstantTensor -> ModelStreamer -> GDS -> disk)
         --load-format mx            (backward-compatible alias)
     """
     global _loaders_registered

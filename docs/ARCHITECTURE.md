@@ -126,6 +126,11 @@ ModelExpress/
 │       ├── __init__.py                 # Package init, vLLM loader auto-registration
 │       ├── client.py                   # MxClient gRPC client
 │       ├── nixl_transfer.py            # NixlTransferManager
+│       ├── refit/                      # Engine-agnostic live-refit primitives
+│       │   ├── __init__.py             # Public refit exports
+│       │   ├── timing.py               # Structured refit stage timing
+│       │   └── reshard/                # Geometry capture, planning, rendezvous and transport
+│       ├── refit_timing.py             # Compatibility shim for refit.timing
 │       ├── source_selection.py         # P2P source-ordering policies (random, rendezvous_hash)
 │       ├── metrics.py                   # Opt-in Prometheus metrics collector (source-selection group today)
 │       ├── gds_transfer.py             # GPUDirect Storage transfer support
@@ -147,6 +152,7 @@ ModelExpress/
 │       │   ├── context.py              # LoadContext and LoadResult
 │       │   ├── base.py                 # LoadStrategy ABC and shared helpers
 │       │   ├── rdma_strategy.py        # RdmaStrategy (P2P GPU transfer via NIXL)
+│       │   ├── instant_tensor_strategy.py # InstantTensorStrategy (fast local safetensors)
 │       │   ├── model_streamer_strategy.py # ModelStreamerStrategy (S3/GCS/Azure/local)
 │       │   ├── gds_strategy.py         # GdsStrategy (GPUDirect Storage)
 │       │   └── default_strategy.py     # DefaultStrategy (engine-native fallback)
@@ -154,7 +160,12 @@ ModelExpress/
 │       │   ├── vllm/                   # vLLM integration
 │       │   │   ├── __init__.py         # vLLM loader registration
 │       │   │   ├── adapter.py          # VllmAdapter and context builder
-│       │   │   └── loader.py           # MxModelLoader implementation
+│       │   │   ├── loader.py           # MxModelLoader implementation
+│       │   │   ├── mdl.py              # Compatibility shim for vLLM refit
+│       │   │   └── refit/
+│       │   │       ├── __init__.py     # vLLM refit exports
+│       │   │       ├── installer.py    # Mapped Direct Load installer
+│       │   │       └── receiver.py     # Geometry capture and PWAL installation adapter
 │       │   └── sglang/                 # SGLang integration
 │       │       ├── __init__.py
 │       │       ├── adapter.py          # SglangAdapter and context builder
@@ -533,13 +544,14 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `client.py` | `MxClient` - gRPC client wrapping `PublishMetadata`, `ListSources`, `GetMetadata`, and `UpdateStatus` RPCs |
 | `accelerators/` | `AcceleratorBackend` boundary for accelerator-specific torch device control and fast-path capability gates, split into `base.py` (protocol), `cuda.py` (`CudaAcceleratorBackend`), and `xpu.py` (`XpuAcceleratorBackend`). CUDA and XPU are implemented backends; XPU keeps CUDA-only fast paths (pool registration, VMM arena, GDS) disabled and falls back to generic per-tensor NIXL registration. Further backends can be added behind the same interface |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
+| `refit/` | Engine-agnostic live-refit primitives. `RefitTimingRecorder` provides normalized stage timing; `reshard/` provides loader-observed geometry capture, slice/transfer planning, rendezvous, and transport abstractions |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
 | `adapter.py` | `EngineAdapter` lifecycle hooks and strategy retry errors |
 | `vllm_loader.py` | Compatibility shim for `modelexpress.engines.vllm.loader` |
 | `metadata/` | Metadata publishing, source identity, heartbeat, worker manifest serving, metadata client selection, and engine-agnostic cache-artifact transfer |
-| `load_strategy/` | Engine-neutral loading strategy chain: `RdmaStrategy`, `ModelStreamerStrategy` (S3/GCS/Azure/local), `GdsStrategy`, `DefaultStrategy` |
-| `engines/vllm/` | `VllmAdapter` and `MxModelLoader` - maps strategy hooks to vLLM loader APIs and post-load lifecycle |
+| `load_strategy/` | Engine-neutral loading strategy chain: `RdmaStrategy`, `InstantTensorStrategy` (fast local safetensors), `ModelStreamerStrategy` (S3/GCS/Azure/local), `GdsStrategy`, `DefaultStrategy` |
+| `engines/vllm/` | `VllmAdapter` and `MxModelLoader` map strategy hooks to vLLM loader APIs; `refit/` contains the vLLM-specific MDL installer and geometry-capture/PWAL receiver |
 | `engines/sglang/` | `SglangAdapter` and `MxModelLoader` - maps strategy hooks to SGLang's `remote_instance` backend |
 | `tensor_utils.py` | Tensor collection, checksums, storage views, `capture_tensor_attrs` |
 | `rank_utils.py` | `get_global_rank`, `get_worker_rank` |
@@ -582,6 +594,51 @@ Thin orchestration layer that delegates to `LoadStrategyChain.run()`. Builds a `
 
 **MTP two-pass load.** Multi-token-prediction models (Qwen3.5 MTP, DeepSeek MTP) call the loader twice on one worker: the target, then the draft head. `_is_speculative_draft()` detects the second pass via `model_config.runner_type == "draft"` and sets `ctx.p2p_enabled = False`. A P2P draft would collide on the target's NIXL metadata port, and since the merged draft shares the target's `SourceIdentity` it could poison source discovery, so registration, publication, and RDMA stay off for the draft while the target keeps serving. The draft loads through the ModelStreamer/default path. To avoid re-reading the whole checkpoint for a small head, `build_model_streamer_weight_iter` streams only the shards holding the draft's tensors: it reads `model.safetensors.index.json` (locally, or via the runai streamer's `pull_files` for object storage) and keeps shards whose tensor names start with `mtp.`. The draft's embedding and `lm_head` come from the target, so they are not streamed. If there is no index or no draft shard, it streams every shard.
 
+### vLLM Refit Installation
+
+`engines/vllm/refit/MdlLoader` implements Mapped Direct Load (MDL) for tensors that have already
+been translated into the inference model's naming and numerical format. The
+first update records validated destinations in the live vLLM model. Later
+updates reuse those destinations for direct parameters, fused query/key/value
+and MLP slices, local experts, tensor-parallel shards, and FP8 scales.
+
+Loaderless FP8 updates resolve the complete batch before the first in-place
+write. Unknown destinations, failed expert-ID translation, and incomplete
+scale coverage reject the update. Stock-loader errors propagate unless the
+FP8 loaderless policy was selected before loading.
+
+The destination-map signature includes parameter names, shapes, strides,
+storage identities, data types, devices, and expert mapping. Replacing or
+reshaping a parameter invalidates the map and records the next update as cold.
+`RefitTimingRecorder` emits one stable timing payload for discovery through
+readiness.
+
+MDL does not discover sources, plan resharding, transfer bytes, or translate
+trainer tensors. Those stages provide the translated tensor stream and use
+`MdlLoader.load_weights()` as the final installation callback.
+
+The package boundary is intentional: timing and future install-plan contracts
+belong in engine-agnostic `modelexpress.refit`, while vLLM loader observation,
+placement, PWAL interaction, and direct installation belong in
+`modelexpress.engines.vllm.refit`. RL-framework orchestration and trainer
+adapters are separate integrations rather than part of this vLLM installer.
+
+### No-gather Refit Resharding
+
+`modelexpress.refit.reshard` captures the slices and destination views selected
+by an engine's own weight loader, intersects them with trainer-published
+shards, and compiles one-sided read descriptors without materializing a full
+trainer tensor. Geometry, slice planning, transfer planning, and the transport
+protocol are engine-agnostic.
+
+`engines/vllm/refit/receiver.py` supplies the vLLM-specific boundaries: capture
+on an unquantized meta twin, then installation through vLLM's layerwise reload
+and `process_weights_after_loading` path. Unsupported loader operations fail
+closed because the full-pull fallback is not implemented yet. The compiled
+plan currently assumes a stable source cohort, shard layout, and registration
+addresses; topology-epoch invalidation is a follow-up requirement before
+elastic production use.
+
 ### SGLang Loader
 
 **MxModelLoader** is instantiated by SGLang's `remote_instance` loader when
@@ -606,9 +663,12 @@ Auto-detects the best loading strategy with a prioritized chain. Each strategy i
 | Priority | Strategy | `is_available()` | Behavior |
 |---|---|---|---|
 | p0 | `RdmaStrategy` | NIXL available | `ListSources(READY)`, filter by `worker_rank` and runtime `accelerator`, order the survivors via the configured `SourceSelector` (`MX_P2P_SOURCE_SELECTOR`: `random` default, `rendezvous_hash`, or `topology_aware`), then try candidates (max 3). Filtering before the retry slice prevents incompatible sources from exhausting the retry budget; a post-`GetMetadata` accelerator check remains as defense-in-depth. Before preparing target tensors, P2P sources must serve a manifest for the selected runtime `worker_id`; generation mismatches and transfer failures retry the next candidate, reinitializing the target first when it may have been mutated. |
-| p1 | `ModelStreamerStrategy` | `MX_MODEL_URI` set + `runai_model_streamer` installed | Stream safetensors to GPU via CPU staging buffer. `MX_MODEL_URI` accepts remote URIs (`s3://`, `gs://`, `az://`), absolute local paths, or HF model IDs (resolved via `HF_HUB_CACHE`). All storage backends (S3, GCS, Azure) included by default. |
-| p2 | `GdsStrategy` | Active accelerator backend supports GDS and GDS hardware is available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. Reads full checkpoint tensors and slices for TP downstream — see [GDS Reads Full Checkpoint Tensors Under TP](#gds-reads-full-checkpoint-tensors-under-tp). |
-| p3 | `DefaultStrategy` | Engine native fallback loader available | Native loader fallback (for vLLM, `DefaultModelLoader`, CPU-staged, auto-downloads from HF Hub). |
+| p1 | `InstantTensorStrategy` | `MX_INSTANT_TENSOR` enabled (default) + `instanttensor` installed + CUDA device + adapter implements `build_instanttensor_weight_iter` (and `apply_weight_iter`) | Load the model's own safetensors directly onto CUDA via the `instanttensor` library (distributed loading, pipelined prefetch, direct I/O, GDS when available). Reuses vLLM's built-in `--load-format instanttensor` path, so it needs no `MX_MODEL_URI`; the engine resolves and (if needed) downloads the weight files. Falls through on failure. |
+| p2 | `ModelStreamerStrategy` | `MX_MODEL_URI` set + `runai_model_streamer` installed | Stream safetensors to GPU via CPU staging buffer. `MX_MODEL_URI` accepts remote URIs (`s3://`, `gs://`, `az://`), absolute local paths, or HF model IDs (resolved via `HF_HUB_CACHE`). All storage backends (S3, GCS, Azure) included by default. |
+| p3 | `GdsStrategy` | Active accelerator backend supports GDS and GDS hardware is available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. Reads full checkpoint tensors and slices for TP downstream — see [GDS Reads Full Checkpoint Tensors Under TP](#gds-reads-full-checkpoint-tensors-under-tp). |
+| p4 | `DefaultStrategy` | Engine native fallback loader available | Native loader fallback (for vLLM, `DefaultModelLoader`, CPU-staged, auto-downloads from HF Hub). |
+
+See [ModelExpress Benchmarks](BENCHMARKS.md) for measured loading-path, NIXL registration, and artifact-transfer results with explicit timing boundaries.
 
 Strategies handle the loading path and NIXL tensor registration. `LoadContext.accelerator_backend` centralizes accelerator-specific torch operations and capability gates for fast paths such as pool registration, VMM arena registration, and GDS. Backends that do not support those CUDA-specific paths, such as XPU, leave the gates disabled and use the generic fallback path. XPU transfer deployments still require a UCX/NIXL runtime that can register XPU device memory. Adapter hooks handle engine lifecycle such as vLLM `process_weights_after_loading`, and the chain performs best-effort metadata publication after a successful strategy. New strategies can be added by creating a new file in `load_strategy/` and registering it in `LoadStrategyChain.run()`.
 
@@ -790,7 +850,7 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
 | `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. The SGLang NIXL loader uses it for compatible torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer caches. Requires the P2P metadata path; if `MX_P2P_METADATA=0`, the loader logs a warning and skips artifact transfer |
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles |
-| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled by the artifact publisher before preparing and publishing cache bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. Kubernetes StatefulSet workers using their framework's default localhost URL infer pod-0's stable DNS endpoint |
+| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before publishing weight metadata or preparing and publishing cache bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. Kubernetes StatefulSet workers using their framework's default localhost URL infer pod-0's stable DNS endpoint |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time the artifact publisher waits for readiness and successful publication before giving up |
 | `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact checkpoint identifier so `mx_source_id` is content-addressed |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend; `{rank}` is substituted with the worker's own rank. Client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` if the resolved pattern has no explicit port |

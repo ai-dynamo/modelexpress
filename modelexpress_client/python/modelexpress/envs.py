@@ -75,6 +75,8 @@ if TYPE_CHECKING:
     MX_GDS_TIMEOUT: float
     # Model streamer
     MX_MS_DISTRIBUTED: bool
+    # InstantTensor loader
+    MX_INSTANT_TENSOR: bool
     # TRT-LLM live transfer
     MX_SOURCE_QUERY_TIMEOUT: int
     MX_TRANSFER_TIMEOUT: int
@@ -195,7 +197,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_GDS_THREADS": lambda: _env_int("MX_GDS_THREADS", 8),
     "MX_GDS_TIMEOUT": lambda: _env_float("MX_GDS_TIMEOUT", 120.0),
     # ── Model streamer ─────────────────────────────────────────────────────
-    "MX_MS_DISTRIBUTED": lambda: os.environ.get("MX_MS_DISTRIBUTED", "0").lower() in ("1", "true"),
+    "MX_MS_DISTRIBUTED": lambda: os.environ.get("MX_MS_DISTRIBUTED", "1").lower() in ("1", "true"),
+    # ── InstantTensor loader ───────────────────────────────────────────────
+    # Enabled by default; the strategy is still gated on the instanttensor
+    # package and a CUDA device, so opting out is only needed to force a
+    # different local-load path. Set MX_INSTANT_TENSOR=0 to disable.
+    "MX_INSTANT_TENSOR": lambda: os.environ.get("MX_INSTANT_TENSOR", "1").lower() in ("1", "true"),
     # ── TRT-LLM live transfer ──────────────────────────────────────────────
     "MX_SOURCE_QUERY_TIMEOUT": lambda: _env_int("MX_SOURCE_QUERY_TIMEOUT", 3600),
     "MX_TRANSFER_TIMEOUT": lambda: _env_int("MX_TRANSFER_TIMEOUT", 900),
