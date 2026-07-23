@@ -86,10 +86,12 @@ pub trait ModelProviderTrait: Send + Sync {
 pub mod gcs;
 pub mod huggingface;
 pub mod ngc;
+pub mod s3;
 
 pub use gcs::GcsProvider;
 pub use huggingface::HuggingFaceProvider;
 pub use ngc::NgcProvider;
+pub use s3::S3Provider;
 
 #[cfg(test)]
 mod tests {

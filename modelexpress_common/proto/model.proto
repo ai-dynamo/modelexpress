@@ -60,6 +60,7 @@ enum ModelProvider {
   HUGGING_FACE = 0;
   NGC = 1;
   GCS = 2;
+  S3 = 3;
 }
 
 // Request for streaming model files
