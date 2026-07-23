@@ -143,7 +143,7 @@ MX has one configurable filesystem path, the model weights cache (`MODEL_EXPRESS
 | Multi-replica MX with `MODEL_EXPRESS_NO_SHARED_STORAGE=true` on clients (gRPC streaming) | RWO per replica OR ephemeral | Needs an MX-aware init container in the client pod; no ready-made vLLM recipe today (tracked MX-290) |
 | ModelStreamer from object storage on clients | none | Clients stream through a bounded CPU staging buffer without landing the checkpoint on local disk |
 | ModelStreamer from a local path on clients | Existing local/PVC path | Reads the configured local checkpoint through the pipelined ModelStreamer path |
-| P2P RDMA receivers, weights only | none on receiver | Weights land in GPU HBM; the source may have bootstrapped through ModelStreamer, GDS, or the native loader |
+| P2P RDMA receivers, weights only | none on receiver | Weights land in GPU HBM; the source may have bootstrapped through InstantTensor, ModelStreamer, GDS, or the native loader |
 | P2P RDMA receivers, weights and artifacts | Writable local staging and runtime cache paths | Weights land in GPU HBM. File-backed artifacts are staged locally, verified, and installed into the target engine's filesystem caches. |
 
 For new multi-replica deployments, prefer the no-shared-storage row: each MX replica can use its own RWO or ephemeral cache while Redis or Kubernetes coordinates lifecycle state. The RWX row is mainly for existing shared-cache topologies, and the single-replica row is a local/dev simplification.
@@ -203,6 +203,95 @@ Cache directory resolution for NGC: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `~/.cache
 GCS uses the configured/default ModelExpress cache root; `MODEL_EXPRESS_CACHE_DIRECTORY` overrides it. Cached GCS models are stored under `<cache>/gcs/<bucket>/<object-prefix>`. See [`GCS_PROVIDER.md`](GCS_PROVIDER.md) for provider internals.
 
 See [`CLI.md`](CLI.md) for full CLI usage documentation.
+
+## ServiceAccount Authentication
+
+Optional, off by default. When enabled, the server authenticates every gRPC caller
+(except health checks) against a Kubernetes ServiceAccount token and authorizes them
+against an exact-match allowlist. No sidecar or service mesh is required: the server
+calls the Kubernetes `TokenReview` API in-process.
+
+- **AuthN**: the caller presents a projected ServiceAccount token; the server verifies it
+  via `TokenReview` and extracts `system:serviceaccount:<namespace>:<serviceaccount>`.
+- **AuthZ**: that `<namespace>:<serviceaccount>` must exactly match a configured allowlist
+  entry.
+
+> **Warning: only enable auth over an encrypted transport.** The server and clients
+> speak plaintext gRPC; neither terminates TLS itself. Without encryption the bearer
+> token crosses the wire in cleartext and anyone who can sniff the traffic can replay
+> it until it expires. Run enforce mode only where the transport is encrypted, e.g. a
+> service mesh providing mTLS (Istio/Linkerd sidecars) or a TLS-terminating proxy in
+> front of the server.
+
+Other properties to be aware of:
+
+- Auth is enforced when each RPC starts. A long-lived streaming RPC that was accepted
+  keeps flowing even if the token expires or the ServiceAccount is revoked mid-stream;
+  revocation takes effect on the next RPC (bounded by the cache TTL below).
+- Definitive rejections are cached per token; backend errors (e.g. an unreachable
+  apiserver) return `UNAVAILABLE` and are not cached. A caller cycling unique invalid
+  tokens sends one `TokenReview` to the Kubernetes API server per token. The gRPC port
+  should not be reachable from untrusted networks.
+
+### Modes
+
+| Mode | Behavior |
+|------|----------|
+| `off` (default) | No auth. Tokens are ignored. |
+| `enforce` | Verify every call and reject unauthenticated or non-allowlisted callers. |
+
+### Server configuration
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `MODEL_EXPRESS_SECURITY_MODE` | `off` | `off` \| `enforce` |
+| `MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES` | (none) | Comma-separated audiences the token must carry. Required for `enforce`. |
+| `MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS` | (none) | Comma-separated `<namespace>:<serviceaccount>` allowlist. Required for `enforce`. |
+| `MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS` | `60` | TTL for the verified-token and rejection caches. |
+
+`enforce` fails config validation if either the audience list or the allowlist is empty,
+so an omitted list can't silently deny-all or accept-any-audience. Configured values
+still need to be correct.
+
+The server's ServiceAccount needs permission to create `TokenReview`s (a cluster-scoped
+subresource), via a `ClusterRoleBinding` to the built-in `system:auth-delegator` role.
+The Helm chart creates this automatically when it also creates the ServiceAccount
+(`serviceAccount.create=true`, the default) and `security.enabled=true`; with an
+existing ServiceAccount, create the equivalent binding separately:
+
+```yaml
+security:
+  enabled: true
+  mode: enforce
+  tokenAudiences: ["modelexpress"]
+  allowedServiceAccounts:
+    - "vllm:worker"
+    - "vllm:router"
+```
+
+### Client configuration
+
+Clients (Rust and Python) attach the token automatically when a projected token file is
+present, and send nothing when it is absent (so the same client works against an `off`
+server, including off-cluster). Mount a projected token into each worker pod with an
+audience that matches the server's, then point the client at it:
+
+```yaml
+volumes:
+  - name: mx-token
+    projected:
+      sources:
+        - serviceAccountToken:
+            path: modelexpress
+            audience: modelexpress
+            expirationSeconds: 3600
+# mounted at /var/run/secrets/tokens/modelexpress
+```
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `MX_AUTH_TOKEN_PATH` | `/var/run/secrets/tokens/modelexpress` | Projected token file path |
+| `MX_AUTH_TOKEN_TTL_SECONDS` | `60` | How often to re-read the token (rotation is also picked up on mtime change) |
 
 ## Docker
 
@@ -409,7 +498,7 @@ See [`../examples/dynamo_model_cache_k8s/README.md`](../examples/dynamo_model_ca
 
 ## P2P GPU Weight Transfers
 
-ModelExpress supports GPU-to-GPU model weight transfers between supported inference instances using NVIDIA NIXL over RDMA. vLLM 0.23.0 and newer recognize `--load-format modelexpress` natively, which runs the priority chain P2P RDMA -> ModelStreamer -> GDS -> native loader; the ModelExpress Python package must still be installed, and `mx` remains a backward-compatible alias. SGLang uses `remote_instance` with the `modelexpress` backend; see [SGLang Clients](#sglang-clients).
+ModelExpress supports GPU-to-GPU model weight transfers between supported inference instances using NVIDIA NIXL over RDMA. vLLM 0.23.0 and newer recognize `--load-format modelexpress` natively, which runs the priority chain P2P RDMA -> InstantTensor -> ModelStreamer -> GDS -> native loader; the ModelExpress Python package must still be installed, and `mx` remains a backward-compatible alias. SGLang uses `remote_instance` with the `modelexpress` backend; see [SGLang Clients](#sglang-clients).
 
 ### Choosing a Metadata Backend
 
@@ -582,6 +671,18 @@ but do not authenticate the publishing replica or attest the artifact. Enable
 artifact transfer only within a trusted deployment, and network-isolate the MX
 server and worker gRPC endpoints from untrusted clients. ModelExpress does not
 currently sign cache artifacts.
+
+### InstantTensor (Fast Local Safetensors)
+
+InstantTensor loads the model's own safetensors directly onto CUDA using distributed loading, pipelined prefetching, and direct I/O, with GPUDirect Storage when the hardware supports it. It sits right after P2P RDMA in the loading chain: when no peer source is already serving, it is the fastest local-disk path before falling back to ModelStreamer, GDS, or the native loader. Unlike ModelStreamer it needs no `MX_MODEL_URI`; it reuses vLLM's built-in `--load-format instanttensor` path, so the engine resolves the model's weight files (downloading from the Hugging Face Hub into the local cache first if they are not already local).
+
+The strategy is enabled by default. The `instanttensor` package is a core dependency on Linux (installed automatically alongside `runai-model-streamer`), so no extra install step is needed. The strategy activates on a CUDA device **when the engine adapter implements the InstantTensor capability**. Currently only the vLLM adapter implements it; on engines that do not (for example SGLang today), the strategy falls through even when `instanttensor` and a CUDA device are available. If the package is unavailable (for example on a non-Linux platform) the chain simply skips to the next strategy.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MX_INSTANT_TENSOR` | `1` | Enable the InstantTensor strategy. Set to `0` to disable it and fall through to ModelStreamer/GDS/native loading. |
+
+InstantTensor also honors its own `INSTANTTENSOR_BACKEND` environment variable (`URING`, `AIO`, `CUFILE` for GDS, `MMAP`) for selecting the I/O backend; ModelExpress passes it through unchanged.
 
 ### ModelStreamer (Object Storage & Local Disk)
 

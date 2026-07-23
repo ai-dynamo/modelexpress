@@ -33,6 +33,7 @@ dependencies = [
     "torch>=2.6.0",
     "runai-model-streamer[s3,gcs,azure]; sys_platform == 'linux'",
     "cryptography>=47.0.0",
+    "instanttensor>=0.1.9 ; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]

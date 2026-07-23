@@ -53,6 +53,11 @@ base64 = { workspace = true }
 sha2 = { workspace = true }
 tonic-health = { workspace = true }
 libp2p = { version = "0.56", features = ["tcp", "noise", "yamux", "kad", "identify", "tokio", "macros"] }
+thiserror = { workspace = true }
+tower = { workspace = true }
+http = { workspace = true }
+moka = { workspace = true }
+secrecy = { workspace = true }
 
 [dev-dependencies]
 modelexpress-common = { workspace = true, features = ["test-support"] }
@@ -65,6 +70,11 @@ modelexpress-client.workspace = true
 [[test]]
 name = "in_process_server"
 path = "tests/in_process_server.rs"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "auth_e2e"
+path = "tests/auth_e2e.rs"
 required-features = ["integration-tests"]
 
 [lints]

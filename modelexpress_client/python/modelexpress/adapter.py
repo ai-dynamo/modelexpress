@@ -132,6 +132,22 @@ class EngineAdapter:
         ...
 
     @gated_capability
+    def build_instanttensor_weight_iter(
+        self,
+        model: torch.nn.Module | None = None,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Return the engine-native InstantTensor weight iterator.
+
+        InstantTensor loads the model's local safetensors directly onto CUDA
+        with distributed loading, pipelined prefetching, and direct I/O (with
+        GPUDirect Storage when available). Unlike ModelStreamer it needs no
+        streaming URI; the engine resolves the model's own weight files. Some
+        engine-native loaders need the initialized model to discover secondary
+        weight sources.
+        """
+        ...
+
+    @gated_capability
     def load_via_native(self, result: LoadResult) -> LoadResult:
         """Load the model using the engine's native disk/checkpoint loader."""
         ...

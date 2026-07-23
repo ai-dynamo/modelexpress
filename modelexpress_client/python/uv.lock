@@ -811,6 +811,22 @@ wheels = [
 ]
 
 [[package]]
+name = "instanttensor"
+version = "0.1.9"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "torch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/37/69/a4dc4e0f0018a0e558b716e90bcb19cb6a8c7506f68e89a1493608cf5e62/instanttensor-0.1.9.tar.gz", hash = "sha256:d8692b97991c1a5fb2db7905b9a6ae90a7f967c7ddd853d35e41caa146750c02", size = 9618304, upload-time = "2026-05-27T21:33:46.45Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/be/0c/3c757c4030097a70c3de5dc86e3458fef154f6f2433338b0f36dd1f3595e/instanttensor-0.1.9-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:d2e8a2ce8b63f2aadd551bfa35400c439ffae9fcb3df4651c8c7dc39a4de32e0", size = 5801201, upload-time = "2026-05-27T21:33:33.739Z" },
+    { url = "https://files.pythonhosted.org/packages/5a/e5/8d56ef0a9b5caa6fa4e6d430ad4273c112033bf13f1a4cc2dfcc7e729d36/instanttensor-0.1.9-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c07d7a5a8960746ca5732e18afe9da377937601a2fa3eab96124a0f44bc16605", size = 5873197, upload-time = "2026-05-27T21:33:36.314Z" },
+    { url = "https://files.pythonhosted.org/packages/97/01/667438b2c7b9caad3be48fe1363032574bb4a85d8d90b7a6e3ddf9979f53/instanttensor-0.1.9-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:0d957728161ec0d22a74bad3c0feb8fb9105736ab2585b48a0a0da8d330c6ff3", size = 5903991, upload-time = "2026-05-27T21:33:38.634Z" },
+    { url = "https://files.pythonhosted.org/packages/41/90/b50182538f64d59f4711dd902e60d84cdfb55a03e72a4619121a83260f28/instanttensor-0.1.9-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:1f2b2447959d22b9682d45ae75d7a9260485ed5a6763006db9a3735ceced3efa", size = 5901576, upload-time = "2026-05-27T21:33:41.051Z" },
+    { url = "https://files.pythonhosted.org/packages/29/7c/b5cb0ae191bac6de43ea574b7d99a33ad9e680a44741b4f13b15e5e22e2f/instanttensor-0.1.9-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:41725abe03e4282ea3cba5f9f0ed63c9fe2b4776f7d6e9ccba8edee5570749f1", size = 5895517, upload-time = "2026-05-27T21:33:43.41Z" },
+]
+
+[[package]]
 name = "isodate"
 version = "0.7.2"
 source = { registry = "https://pypi.org/simple" }
@@ -955,6 +971,7 @@ dependencies = [
     { name = "google-crc32c" },
     { name = "grpcio" },
     { name = "huggingface-hub" },
+    { name = "instanttensor", marker = "sys_platform == 'linux'" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "protobuf" },
@@ -971,6 +988,9 @@ dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
 ]
+metrics = [
+    { name = "prometheus-client" },
+]
 otel = [
     { name = "opentelemetry-api" },
 ]
@@ -986,10 +1006,12 @@ requires-dist = [
     { name = "grpcio", specifier = ">=1.66.2" },
     { name = "grpcio-tools", marker = "extra == 'dev'", specifier = ">=1.60.0,<=1.66.2" },
     { name = "huggingface-hub", specifier = ">=0.20.0" },
+    { name = "instanttensor", marker = "sys_platform == 'linux'", specifier = ">=0.1.9" },
     { name = "numpy", specifier = ">=1.24.0" },
     { name = "opentelemetry-api", marker = "extra == 'dev'", specifier = ">=1.41.1" },
     { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.20.0" },
     { name = "opentelemetry-sdk", marker = "extra == 'dev'", specifier = ">=1.41.1" },
+    { name = "prometheus-client", marker = "extra == 'metrics'", specifier = ">=0.20.0" },
     { name = "protobuf", specifier = ">=5.27.0,<6.0.0" },
     { name = "pydantic", specifier = ">=2.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
@@ -997,7 +1019,7 @@ requires-dist = [
     { name = "runai-model-streamer", extras = ["s3", "gcs", "azure"], marker = "sys_platform == 'linux'" },
     { name = "torch", specifier = ">=2.6.0" },
 ]
-provides-extras = ["dev", "otel", "vmm"]
+provides-extras = ["dev", "otel", "metrics", "vmm"]
 
 [[package]]
 name = "mpmath"
@@ -1399,6 +1421,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/f9/e2/3e91f31a7d2b083fe6ef3fa267035b518369d9511ffab804f839851d2779/pluggy-1.6.0.tar.gz", hash = "sha256:7dcc130b76258d33b90f61b658791dede3486c3e6bfb003ee5c9bfb396dd22f3", size = 69412, upload-time = "2025-05-15T12:30:07.975Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/54/20/4d324d65cc6d9205fabedc306948156824eb9f0ee1633355a8f7ec5c66bf/pluggy-1.6.0-py3-none-any.whl", hash = "sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746", size = 20538, upload-time = "2025-05-15T12:30:06.134Z" },
+]
+
+[[package]]
+name = "prometheus-client"
+version = "0.25.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/1b/fb/d9aa83ffe43ce1f19e557c0971d04b90561b0cfd50762aafb01968285553/prometheus_client-0.25.0.tar.gz", hash = "sha256:5e373b75c31afb3c86f1a52fa1ad470c9aace18082d39ec0d2f918d11cc9ba28", size = 86035, upload-time = "2026-04-09T19:53:42.359Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8d/9b/d4b1e644385499c8346fa9b622a3f030dce14cd6ef8a1871c221a17a67e7/prometheus_client-0.25.0-py3-none-any.whl", hash = "sha256:d5aec89e349a6ec230805d0df882f3807f74fd6c1a2fa86864e3c2279059fed1", size = 64154, upload-time = "2026-04-09T19:53:41.324Z" },
 ]
 
 [[package]]

@@ -228,6 +228,28 @@ class VllmAdapter(EngineAdapter):
             loader._is_distributed,
         )
 
+    def build_instanttensor_weight_iter(
+        self,
+        model: torch.nn.Module | None = None,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        if model is None:
+            raise RuntimeError("vLLM InstantTensor loading requires the initialized model")
+
+        from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+
+        # vLLM's DefaultModelLoader selects instanttensor_weights_iterator when
+        # load_format == "instanttensor"; get_all_weights() resolves the model's
+        # own safetensors (and any secondary sources). The iterator handles the
+        # CUDA check and TP process group internally.
+        load_config = copy.copy(self.load_config)
+        try:
+            load_config.load_format = "instanttensor"
+        except AttributeError:
+            object.__setattr__(load_config, "load_format", "instanttensor")
+
+        loader = DefaultModelLoader(load_config)
+        return loader.get_all_weights(self.model_config, model)
+
     def load_via_native(self, result: LoadResult) -> LoadResult:
         if result.model is None:
             raise RuntimeError("vLLM native loading requires result.model")
