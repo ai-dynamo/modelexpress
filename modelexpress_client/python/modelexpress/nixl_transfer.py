@@ -518,6 +518,7 @@ class NixlTransferManager:
         source_tensors: list[TensorDescriptor],
         timeout_seconds: float | None = None,
         remote_agent_name: str | None = None,
+        require_exact_match: bool = False,
     ) -> tuple[int, int, float]:
         """
         Receive weights from a remote source via NIXL RDMA.
@@ -537,9 +538,21 @@ class NixlTransferManager:
             remote_agent_name: If set, use this pre-loaded agent (P2P mode)
                 instead of calling add_remote_agent with source_metadata
                 (centralized mode)
+            require_exact_match: When True, require the source manifest and the
+                locally registered tensors to name the exact same set and reject
+                a zero-match transfer. Used for cross-family (heterogeneous)
+                transfers where a name diff can mean vendor-specific hidden or
+                derived tensors, which would otherwise leave part or all of the
+                target at dummy values while RDMA reports success. Same-family
+                transfers leave this False and tolerate subset transfers.
 
         Returns:
             Tuple of (total_bytes, total_tensors, duration)
+
+        Raises:
+            ManifestMismatchError: On a size/dtype mismatch for a shared tensor,
+                or, when ``require_exact_match`` is set, on any tensor-name
+                mismatch or a zero-match transfer.
         """
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
@@ -602,6 +615,18 @@ class NixlTransferManager:
         local_only = sorted(set(self._tensors) - src_names)
         source_only = sorted(src_names - set(self._tensors))
         if local_only or source_only:
+            if require_exact_match:
+                # Cross-family transfer: a name diff can mean vendor-specific
+                # hidden or derived tensors, so completing the transfer would
+                # leave the local-only tensors at dummy values while reporting
+                # RDMA success. Fail closed instead.
+                raise ManifestMismatchError(
+                    "Tensor name mismatch on heterogeneous transfer: "
+                    f"{len(local_only)} local-only "
+                    f"(first: {local_only[:5]}), "
+                    f"{len(source_only)} source-only "
+                    f"(first: {source_only[:5]})"
+                )
             logger.warning(
                 "Tensor name mismatch between source manifest and local "
                 "registration: %d local-only, %d source-only",
@@ -610,6 +635,10 @@ class NixlTransferManager:
             )
 
         if not remote_descs:
+            if require_exact_match:
+                raise ManifestMismatchError(
+                    "No matching tensors found for heterogeneous transfer"
+                )
             logger.warning("No matching tensors found for transfer")
             return 0, 0, 0.0
 
