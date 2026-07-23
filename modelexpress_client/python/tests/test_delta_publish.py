@@ -128,3 +128,17 @@ def test_s3_client_uses_path_style_and_standard_retries(monkeypatch):
         "max_attempts": 5,
         "mode": "standard",
     }
+
+
+def test_bandwidth_mb_s_edges_and_value():
+    from modelexpress.rl.s3_delta import _bandwidth_mb_s, _mb
+
+    assert _bandwidth_mb_s(0, 0) == 0.0          # no bytes, no time
+    assert _bandwidth_mb_s(1_000_000, 0) == 0.0  # guard against div-by-zero
+    assert _bandwidth_mb_s(0, 1.0) == 0.0        # no bytes
+    # decimal MB: 1e6 bytes == 1.0 MB
+    assert abs(_mb(1_000_000) - 1.0) < 1e-9
+    # 1 MB in 1 s == 1.0 MB/s
+    assert abs(_bandwidth_mb_s(1_000_000, 1.0) - 1.0) < 1e-9
+    # 2 MB in 0.5 s == 4.0 MB/s
+    assert abs(_bandwidth_mb_s(2_000_000, 0.5) - 4.0) < 1e-9

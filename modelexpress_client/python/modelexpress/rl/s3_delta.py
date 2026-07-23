@@ -10,8 +10,21 @@ import os
 import re
 import shutil
 import tempfile
+import time
 
 logger = logging.getLogger("modelexpress.rl.s3_delta")
+
+
+def _mb(num_bytes: int) -> float:
+    """Bytes as decimal megabytes (MB = 1e6 bytes)."""
+    return num_bytes / 1e6
+
+
+def _bandwidth_mb_s(num_bytes: int, elapsed_s: float) -> float:
+    """MB/s over a measured interval; 0.0 when no time or no bytes elapsed."""
+    if elapsed_s <= 0 or num_bytes <= 0:
+        return 0.0
+    return _mb(num_bytes) / elapsed_s
 
 
 def s3_client():
@@ -34,9 +47,16 @@ def _key_prefix(*parts: str) -> str:
 
 
 def upload_version_dir(s3, bucket: str, prefix: str, version_dir: str) -> int:
-    """Upload every completed file in a version directory and return the count."""
+    """Upload every completed file in a version directory and return the count.
+
+    Logs an ``mx_upload`` line with the elapsed wall-clock time, total bytes, and
+    the derived upload bandwidth (MB/s) for the version. This is the S3-client
+    transport time on rank 0, not a per-rank or global figure.
+    """
     version_name = os.path.basename(os.path.normpath(version_dir))
     uploaded = 0
+    uploaded_bytes = 0
+    start = time.perf_counter()
     for root, _, files in os.walk(version_dir):
         for name in files:
             if name.endswith(".tmp"):
@@ -44,8 +64,21 @@ def upload_version_dir(s3, bucket: str, prefix: str, version_dir: str) -> int:
             local_path = os.path.join(root, name)
             relative_path = os.path.relpath(local_path, version_dir).replace(os.sep, "/")
             key = _key_prefix(prefix, version_name, relative_path)
+            uploaded_bytes += os.path.getsize(local_path)
             s3.upload_file(local_path, bucket, key)
             uploaded += 1
+    elapsed = time.perf_counter() - start
+    logger.info(
+        "mx_upload: %s files=%d bytes=%d elapsed_s=%.3f bandwidth_mb_s=%.1f "
+        "to s3://%s/%s",
+        version_name,
+        uploaded,
+        uploaded_bytes,
+        elapsed,
+        _bandwidth_mb_s(uploaded_bytes, elapsed),
+        bucket,
+        _key_prefix(prefix, version_name),
+    )
     return uploaded
 
 
@@ -80,6 +113,7 @@ def download_version_dir(
     try:
         downloaded_files = 0
         downloaded_bytes = 0
+        start = time.perf_counter()
         for obj in _list_objects(s3, bucket, object_prefix):
             relative_path = obj["Key"][len(object_prefix) :]
             if not relative_path:
@@ -89,14 +123,18 @@ def download_version_dir(
             s3.download_file(bucket, obj["Key"], local_path)
             downloaded_files += 1
             downloaded_bytes += int(obj.get("Size", 0))
+        elapsed = time.perf_counter() - start
     except Exception:
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise
     logger.info(
-        "mx_download: version=%d files=%d bytes=%d from s3://%s/%s",
+        "mx_download: version=%d files=%d bytes=%d elapsed_s=%.3f "
+        "bandwidth_mb_s=%.1f from s3://%s/%s",
         version,
         downloaded_files,
         downloaded_bytes,
+        elapsed,
+        _bandwidth_mb_s(downloaded_bytes, elapsed),
         bucket,
         object_prefix.rstrip("/"),
     )
