@@ -2122,8 +2122,20 @@ type SourceInstanceRef struct {
 	// Unlike training_step this remains constant across versions and changes
 	// whenever cached layout metadata must be rebuilt.
 	LayoutSignature *string `protobuf:"bytes,8,opt,name=layout_signature,json=layoutSignature,proto3,oneof" json:"layout_signature,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Source-published busyness estimate in [0, 1] (0 = idle, 1 = saturated).
+	// The source computes it about itself and publishes it; the server only
+	// passes it through (never accumulates it), keeping servers stateless. The
+	// default provider measures the source's RDMA NIC utilization (from its
+	// own port counters); a runtime provider (e.g. vLLM/SGLang serving load)
+	// can supply it instead behind the same field. Consumed by the client
+	// `load_aware` selector to steer new targets toward sources with spare
+	// headroom, so weight transfers avoid contending with a source's in-flight
+	// inference. Ordering-only and advisory; 0 (or unset, for older servers)
+	// collapses `load_aware` to `rendezvous_hash`.
+	// (#519 took fields 6-8; field 9 is reserved for #512's `topology`.)
+	SourceLoad    float32 `protobuf:"fixed32,10,opt,name=source_load,json=sourceLoad,proto3" json:"source_load,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *SourceInstanceRef) Reset() {
@@ -2210,6 +2222,13 @@ func (x *SourceInstanceRef) GetLayoutSignature() string {
 		return *x.LayoutSignature
 	}
 	return ""
+}
+
+func (x *SourceInstanceRef) GetSourceLoad() float32 {
+	if x != nil {
+		return x.SourceLoad
+	}
+	return 0
 }
 
 type ListSourcesRequest struct {
@@ -2503,7 +2522,11 @@ type UpdateStatusRequest struct {
 	// New status
 	Status SourceStatus `protobuf:"varint,3,opt,name=status,proto3,enum=model_express.p2p.SourceStatus" json:"status,omitempty"`
 	// worker_id returned from PublishMetadata
-	WorkerId      string `protobuf:"bytes,4,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	WorkerId string `protobuf:"bytes,4,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	// Source-published busyness in [0, 1], refreshed on each heartbeat so the
+	// server's SourceInstanceRef.source_load tracks live load. 0 means
+	// idle/unknown. See SourceInstanceRef.source_load.
+	SourceLoad    float32 `protobuf:"fixed32,5,opt,name=source_load,json=sourceLoad,proto3" json:"source_load,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2564,6 +2587,13 @@ func (x *UpdateStatusRequest) GetWorkerId() string {
 		return x.WorkerId
 	}
 	return ""
+}
+
+func (x *UpdateStatusRequest) GetSourceLoad() float32 {
+	if x != nil {
+		return x.SourceLoad
+	}
+	return 0
 }
 
 type UpdateStatusResponse struct {
@@ -2812,7 +2842,7 @@ const file_p2p_proto_rawDesc = "" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12 \n" +
 	"\fmx_source_id\x18\x03 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
-	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"\xd4\x02\n" +
+	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"\xf5\x02\n" +
 	"\x11SourceInstanceRef\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
@@ -2825,7 +2855,10 @@ const file_p2p_proto_rawDesc = "" +
 	"\n" +
 	"updated_at\x18\x06 \x01(\x03R\tupdatedAt\x12(\n" +
 	"\rtraining_step\x18\a \x01(\x04H\x00R\ftrainingStep\x88\x01\x01\x12.\n" +
-	"\x10layout_signature\x18\b \x01(\tH\x01R\x0flayoutSignature\x88\x01\x01B\x10\n" +
+	"\x10layout_signature\x18\b \x01(\tH\x01R\x0flayoutSignature\x88\x01\x01\x12\x1f\n" +
+	"\vsource_load\x18\n" +
+	" \x01(\x02R\n" +
+	"sourceLoadB\x10\n" +
 	"\x0e_training_stepB\x13\n" +
 	"\x11_layout_signature\"\xeb\x03\n" +
 	"\x12ListSourcesRequest\x12=\n" +
@@ -2854,14 +2887,16 @@ const file_p2p_proto_rawDesc = "" +
 	"\fmx_source_id\x18\x03 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
 	"\tworker_id\x18\x04 \x01(\tR\bworkerId\x12=\n" +
-	"\bidentity\x18\x05 \x01(\v2!.model_express.p2p.SourceIdentityR\bidentity\"\xae\x01\n" +
+	"\bidentity\x18\x05 \x01(\v2!.model_express.p2p.SourceIdentityR\bidentity\"\xcf\x01\n" +
 	"\x13UpdateStatusRequest\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1f\n" +
 	"\vworker_rank\x18\x02 \x01(\rR\n" +
 	"workerRank\x127\n" +
 	"\x06status\x18\x03 \x01(\x0e2\x1f.model_express.p2p.SourceStatusR\x06status\x12\x1b\n" +
-	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"J\n" +
+	"\tworker_id\x18\x04 \x01(\tR\bworkerId\x12\x1f\n" +
+	"\vsource_load\x18\x05 \x01(\x02R\n" +
+	"sourceLoad\"J\n" +
 	"\x14UpdateStatusResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage*\x8a\x01\n" +

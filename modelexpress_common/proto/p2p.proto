@@ -561,6 +561,19 @@ message SourceInstanceRef {
   // Unlike training_step this remains constant across versions and changes
   // whenever cached layout metadata must be rebuilt.
   optional string layout_signature = 8;
+
+  // Source-published busyness estimate in [0, 1] (0 = idle, 1 = saturated).
+  // The source computes it about itself and publishes it; the server only
+  // passes it through (never accumulates it), keeping servers stateless. The
+  // default provider measures the source's RDMA NIC utilization (from its
+  // own port counters); a runtime provider (e.g. vLLM/SGLang serving load)
+  // can supply it instead behind the same field. Consumed by the client
+  // `load_aware` selector to steer new targets toward sources with spare
+  // headroom, so weight transfers avoid contending with a source's in-flight
+  // inference. Ordering-only and advisory; 0 (or unset, for older servers)
+  // collapses `load_aware` to `rendezvous_hash`.
+  // (#519 took fields 6-8; field 9 is reserved for #512's `topology`.)
+  float source_load = 10;
 }
 
 message ListSourcesRequest {
@@ -636,6 +649,11 @@ message UpdateStatusRequest {
 
   // worker_id returned from PublishMetadata
   string worker_id = 4;
+
+  // Source-published busyness in [0, 1], refreshed on each heartbeat so the
+  // server's SourceInstanceRef.source_load tracks live load. 0 means
+  // idle/unknown. See SourceInstanceRef.source_load.
+  float source_load = 5;
 }
 
 message UpdateStatusResponse {

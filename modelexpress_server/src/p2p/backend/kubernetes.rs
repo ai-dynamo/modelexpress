@@ -327,6 +327,7 @@ impl MetadataBackend for KubernetesBackend {
             agent_name: worker_record.agent_name.clone(),
             worker_grpc_endpoint: worker_record.worker_grpc_endpoint.clone(),
             accelerator: worker_record.accelerator.clone(),
+            source_load: worker_record.source_load,
             artifact_source: worker_record
                 .artifact_source
                 .clone()
@@ -478,6 +479,7 @@ impl MetadataBackend for KubernetesBackend {
                 agent_name: worker_status.agent_name.clone(),
                 worker_grpc_endpoint: worker_status.worker_grpc_endpoint.clone(),
                 accelerator: worker_status.accelerator.clone(),
+                source_load: worker_status.source_load,
                 artifact_source: worker_status
                     .artifact_source
                     .clone()
@@ -593,6 +595,12 @@ impl MetadataBackend for KubernetesBackend {
                 .and_then(|s| s.worker.as_ref())
                 .map(|w| w.accelerator.clone())
                 .unwrap_or_default();
+            let source_load = cr
+                .status
+                .as_ref()
+                .and_then(|s| s.worker.as_ref())
+                .map(|w| w.source_load)
+                .unwrap_or(0.0);
 
             result.push(super::SourceInstanceInfo {
                 source_id: sid,
@@ -602,6 +610,7 @@ impl MetadataBackend for KubernetesBackend {
                 status,
                 updated_at,
                 accelerator,
+                source_load,
                 // The current CRD list shape does not round-trip
                 // SourceIdentity.extra_parameters.
                 training_step: None,
@@ -705,6 +714,7 @@ impl MetadataBackend for KubernetesBackend {
         worker_rank: u32,
         status: SourceStatus,
         updated_at: i64,
+        source_load: f32,
     ) -> MetadataResult<()> {
         let api = self.model_metadata_api();
         let cr_name = format!("mx-source-{}-{}", source_id, worker_id);
@@ -732,6 +742,7 @@ impl MetadataBackend for KubernetesBackend {
 
             worker.status = status_name.clone();
             worker.updated_at = Some(updated_at_rfc3339.clone());
+            worker.source_load = source_load;
 
             crd_status.update_ready_condition(status as i32);
 

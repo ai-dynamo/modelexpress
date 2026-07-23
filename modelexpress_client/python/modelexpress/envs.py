@@ -94,6 +94,10 @@ if TYPE_CHECKING:
     MX_ARTIFACT_TRANSFER_CHUNK_SIZE: Optional[str]
     # P2P source selection
     MX_P2P_SOURCE_SELECTOR: Optional[str]
+    # Weight of the NIC-utilization penalty in the load_aware selector.
+    MX_P2P_LOAD_WEIGHT: float
+    # Optional runtime /metrics URL (vLLM/SGLang) for the source_load signal.
+    MX_P2P_RUNTIME_METRICS_URL: Optional[str]
     # Opt-in metrics collector
     MX_METRICS_ENABLED: bool
     MX_METRICS_PORT: Optional[str]
@@ -215,6 +219,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ── P2P source selection ───────────────────────────────────────────────
     # Raw (None when unset); source_selection applies its DEFAULT_SELECTOR fallback.
     "MX_P2P_SOURCE_SELECTOR": lambda: os.environ.get("MX_P2P_SOURCE_SELECTOR"),
+    # Clamp to >= 0: a negative weight would invert LoadAwareSelector into
+    # preferring busier sources. 0 disables the load term (== rendezvous_hash).
+    "MX_P2P_LOAD_WEIGHT": lambda: max(0.0, _env_float("MX_P2P_LOAD_WEIGHT", 1.0)),
+    "MX_P2P_RUNTIME_METRICS_URL": lambda: os.environ.get("MX_P2P_RUNTIME_METRICS_URL"),
     # ── Opt-in metrics collector ───────────────────────────────────────────
     "MX_METRICS_ENABLED": lambda: os.environ.get("MX_METRICS_ENABLED", "0").strip().lower()
     in _TRUTHY,

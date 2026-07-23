@@ -63,7 +63,7 @@ class MetricsCollector:
         if not _enabled():
             return False
         try:
-            from prometheus_client import Counter, Histogram
+            from prometheus_client import Counter, Gauge, Histogram
 
             # --- P2P source-selection group ---
             self.selections = Counter(
@@ -99,6 +99,11 @@ class MetricsCollector:
                 "End-to-end transfer time in seconds.",
                 ["policy", "scheme", "outcome"],  # success|retry|fallback
                 buckets=(0.5, 1, 2, 5, 10, 30, 60, 120, 300),
+            )
+            self.source_load = Gauge(
+                "mx_p2p_source_load",
+                "Source-published load in [0,1] observed on candidates at selection.",
+                ["scheme", "source_worker_id"],
             )
             self._ready = True
             logger.info("ModelExpress metrics enabled (scheme=%r)", self.scheme)
@@ -164,6 +169,13 @@ class MetricsCollector:
         if self._ensure():
             try:
                 self.selection_seconds.labels(policy, self.scheme).observe(seconds)
+            except Exception:
+                pass
+
+    def set_source_load(self, source_worker_id: str, value: float) -> None:
+        if self._ensure():
+            try:
+                self.source_load.labels(self.scheme, source_worker_id).set(value)
             except Exception:
                 pass
 
