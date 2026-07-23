@@ -44,6 +44,9 @@ if TYPE_CHECKING:
     MX_SERVER_ADDRESS: Optional[str]
     MODEL_EXPRESS_LOG_LEVEL: str
     MODEL_NAME: Optional[str]
+    # Auth (client)
+    MX_AUTH_TOKEN_PATH: Optional[str]
+    MX_AUTH_TOKEN_TTL_SECONDS: Optional[str]
     # Runtime compatibility
     MX_DISABLE_PATCHES: bool
     # Metadata / worker
@@ -74,6 +77,8 @@ if TYPE_CHECKING:
     MX_GDS_TIMEOUT: float
     # Model streamer
     MX_MS_DISTRIBUTED: bool
+    # InstantTensor loader
+    MX_INSTANT_TENSOR: bool
     # TRT-LLM live transfer
     MX_SOURCE_QUERY_TIMEOUT: int
     MX_TRANSFER_TIMEOUT: int
@@ -150,6 +155,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_SERVER_ADDRESS": lambda: os.environ.get("MX_SERVER_ADDRESS"),
     "MODEL_EXPRESS_LOG_LEVEL": lambda: os.environ.get("MODEL_EXPRESS_LOG_LEVEL", "").upper(),
     "MODEL_NAME": lambda: os.environ.get("MODEL_NAME"),
+    # ── Auth (client) ──────────────────────────────────────────────────────
+    "MX_AUTH_TOKEN_PATH": lambda: os.environ.get("MX_AUTH_TOKEN_PATH"),
+    "MX_AUTH_TOKEN_TTL_SECONDS": lambda: os.environ.get("MX_AUTH_TOKEN_TTL_SECONDS"),
     # ── Runtime compatibility ──────────────────────────────────────────────
     "MX_DISABLE_PATCHES": lambda: os.environ.get("MX_DISABLE_PATCHES", "").strip().lower()
     in _TRUTHY,
@@ -181,6 +189,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_GDS_TIMEOUT": lambda: _env_float("MX_GDS_TIMEOUT", 120.0),
     # ── Model streamer ─────────────────────────────────────────────────────
     "MX_MS_DISTRIBUTED": lambda: os.environ.get("MX_MS_DISTRIBUTED", "1").lower() in ("1", "true"),
+    # ── InstantTensor loader ───────────────────────────────────────────────
+    # Enabled by default; the strategy is still gated on the instanttensor
+    # package and a CUDA device, so opting out is only needed to force a
+    # different local-load path. Set MX_INSTANT_TENSOR=0 to disable.
+    "MX_INSTANT_TENSOR": lambda: os.environ.get("MX_INSTANT_TENSOR", "1").lower() in ("1", "true"),
     # ── TRT-LLM live transfer ──────────────────────────────────────────────
     "MX_SOURCE_QUERY_TIMEOUT": lambda: _env_int("MX_SOURCE_QUERY_TIMEOUT", 3600),
     "MX_TRANSFER_TIMEOUT": lambda: _env_int("MX_TRANSFER_TIMEOUT", 900),

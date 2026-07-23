@@ -62,12 +62,14 @@ class LoadStrategyChain:
         Raises RuntimeError if no strategy succeeds.
         """
         from .rdma_strategy import RdmaStrategy
+        from .instant_tensor_strategy import InstantTensorStrategy
         from .model_streamer_strategy import ModelStreamerStrategy
         from .gds_strategy import GdsStrategy
         from .default_strategy import DefaultStrategy
 
         all_strategies: list[LoadStrategy] = [
             RdmaStrategy(),
+            InstantTensorStrategy(),
             ModelStreamerStrategy(),
             GdsStrategy(),
             DefaultStrategy(),
