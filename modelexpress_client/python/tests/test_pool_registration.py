@@ -67,8 +67,11 @@ def fake_driver(monkeypatch):
     The fake is returned so tests can inspect call counts. The real
     `CUresult` enum is preserved so `err.name` formatting in the function
     under test exercises the same code path as production.
+
+    Skips on hosts without the ``cuda`` bindings (e.g. an XPU-only node), where
+    these allocation-discovery tests cannot run.
     """
-    from cuda.bindings import driver
+    driver = pytest.importorskip("cuda.bindings.driver")
 
     def _make(allocations, err_override=None):
         fake = _FakeDriver(allocations, err_override)
