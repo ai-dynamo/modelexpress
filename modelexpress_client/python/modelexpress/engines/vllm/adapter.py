@@ -85,13 +85,21 @@ def _read_safetensors_index(model_uri: str) -> dict | None:
     from runai_model_streamer import pull_files
 
     with tempfile.TemporaryDirectory() as tmp:
-        pull_files(model_uri, tmp, allow_pattern=[_SAFETENSORS_INDEX_NAME])
+        # runai's allow_pattern is a glob matched against the full object key,
+        # so a bare filename never matches; anchor it with a leading wildcard.
+        pull_files(model_uri, tmp, allow_pattern=[f"*{_SAFETENSORS_INDEX_NAME}"])
         for root, _dirs, files in os.walk(tmp):
             if _SAFETENSORS_INDEX_NAME in files:
                 with open(
                     os.path.join(root, _SAFETENSORS_INDEX_NAME), encoding="utf-8"
                 ) as handle:
                     return json.load(handle)
+    logger.warning(
+        "safetensors index %s not found under %s; draft-shard selection will "
+        "fall back to streaming all shards",
+        _SAFETENSORS_INDEX_NAME,
+        model_uri,
+    )
     return None
 
 
