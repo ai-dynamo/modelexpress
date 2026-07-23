@@ -1,7 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Miles post-write hook for publishing delta weights through S3 and MX."""
+"""Miles post-write hook for publishing delta weights through S3.
+
+The POC data plane is S3 only. On a single trainer node the rollout receiver
+discovers versions directly from the S3 key convention (weight_v{N:06d}/) and
+walks the contiguous chain, so no ModelExpress control-plane record is needed to
+tell it which version or lineage to pull. Control-plane publish (list_sources
+discovery + lineage attestation) is deferred to the cross-region design (P1).
+"""
 
 from __future__ import annotations
 
@@ -10,17 +17,11 @@ import logging
 import os
 import shutil
 import socket
-import uuid
 
-from modelexpress import p2p_pb2
-from modelexpress.client import MxClient
-
-from .identity import build_delta_identity, content_digest
 from .s3_delta import s3_client, upload_version_dir
 
 logger = logging.getLogger("modelexpress.rl.delta_publish")
 
-_LAYOUT_SIGNATURE = "miles-disk-delta-v1"
 _baseline_failure: Exception | None = None
 
 
@@ -73,7 +74,7 @@ def _record_baseline(args, version_dir: str) -> None:
 
 
 def publish_delta(args, version_dir: str, rollout_engines=None) -> None:
-    """Publish a completed Miles delta directory from rank 0."""
+    """Publish a completed Miles delta directory to S3 from rank 0."""
     del rollout_engines
     if _rank() != 0:
         return
@@ -88,54 +89,20 @@ def publish_delta(args, version_dir: str, rollout_engines=None) -> None:
     _assert_shared_fs(args, version_dir)
     bucket = os.environ["MX_S3_BUCKET"]
     stream_prefix = os.environ["MX_DELTA_STREAM_PREFIX"]
-    # MODEL_EXPRESS_URL gates the control-plane publish. On a single node Miles
-    # drives target_version directly (list_sources discovery is P1), so the S3
-    # data plane is the POC's load-bearing path. When the URL is unset, upload
-    # and evict without an MX publish; when set, publish with the checked fence.
-    server_url = os.environ.get("MODEL_EXPRESS_URL")
 
     index_path = os.path.join(version_dir, "model.safetensors.index.json")
     with open(index_path) as file:
         metadata = json.load(file)["metadata"]
     training_step = int(metadata["version"])
-    base_version = int(metadata["base_version"])
 
     s3 = s3_client()
     uploaded = upload_version_dir(s3, bucket, stream_prefix, version_dir)
-
-    sid = None
-    if server_url:
-        revision = content_digest(version_dir)
-        model_name = getattr(args, "model_name", None) or getattr(args, "hf" + "_checkpoint")
-        identity = build_delta_identity(
-            model_name,
-            revision,
-            training_step,
-            base_version,
-            _LAYOUT_SIGNATURE,
-        )
-        worker_id = uuid.uuid4().hex[:8]
-        worker = p2p_pb2.WorkerMetadata(worker_rank=0)
-        mx_client = MxClient(server_url)
-        try:
-            sid = mx_client.publish_metadata(identity, worker, worker_id)
-            acknowledged = mx_client.update_status(
-                sid,
-                worker_id,
-                0,
-                p2p_pb2.SOURCE_STATUS_READY,
-            )
-        finally:
-            mx_client.close()
-        if not acknowledged:
-            raise RuntimeError(f"MX did not acknowledge delta publish v{training_step}")
 
     if os.environ.get("MX_DELTA_POC_EVICT_LOCAL") == "1":
         shutil.rmtree(version_dir)
 
     logger.info(
-        "mx_delta_publish: uploaded %d files from weight_v%06d published sid=%s",
+        "mx_delta_publish: uploaded %d files from weight_v%06d",
         uploaded,
         training_step,
-        sid,
     )
