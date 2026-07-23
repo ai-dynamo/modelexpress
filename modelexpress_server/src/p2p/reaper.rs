@@ -130,6 +130,7 @@ mod tests {
                 status: SourceStatus::Ready as i32,
                 updated_at: old_time,
                 accelerator: "cuda".into(),
+                topology: Default::default(),
                 training_step: None,
                 layout_signature: None,
             }])
@@ -162,6 +163,7 @@ mod tests {
                 status: SourceStatus::Stale as i32,
                 updated_at: very_old,
                 accelerator: "cuda".into(),
+                topology: Default::default(),
                 training_step: None,
                 layout_signature: None,
             }])
@@ -192,6 +194,7 @@ mod tests {
                 status: SourceStatus::Ready as i32,
                 updated_at: recent,
                 accelerator: "cuda".into(),
+                topology: Default::default(),
                 training_step: None,
                 layout_signature: None,
             }])

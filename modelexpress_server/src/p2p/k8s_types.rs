@@ -126,6 +126,10 @@ pub struct WorkerStatus {
     #[serde(default)]
     pub accelerator: String,
 
+    /// Datacenter topology domain values keyed by level.
+    #[serde(default)]
+    pub topology: std::collections::HashMap<String, String>,
+
     /// Small discovery summary for file-backed artifact sources.
     #[serde(rename = "artifactSource", default)]
     pub artifact_source: Option<ArtifactSourceStatus>,

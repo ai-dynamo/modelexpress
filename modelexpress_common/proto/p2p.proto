@@ -287,6 +287,12 @@ message WorkerMetadata {
   // unknown and must be accepted for backward compatibility with old writers.
   string accelerator = 9;
 
+  // Datacenter topology domain values keyed by Grove ClusterTopology domain
+  // (see SourceInstanceRef.topology). Static per node, so it is published once
+  // at registration; the server passes it through onto SourceInstanceRef. This
+  // is runtime metadata, not SourceIdentity hash material.
+  map<string, string> topology = 11;
+
   // Source-type-specific bounded metadata. This selects the metadata payload
   // shape, not a transfer endpoint. Readers should prefer tensor_source over
   // deprecated tensors when both are present, and fall back to tensors for old
@@ -561,6 +567,16 @@ message SourceInstanceRef {
   // Unlike training_step this remains constant across versions and changes
   // whenever cached layout metadata must be rebuilt.
   optional string layout_signature = 8;
+
+  // Datacenter topology domain values keyed by Grove ClusterTopology domain
+  // (region/zone/datacenter/block/rack/host/numa), e.g.
+  // {"block": "b1", "rack": "r3", "host": "node7"}. Populated from the node's
+  // labels via the ClusterTopology domain->key mapping and published once at
+  // registration. The topology_aware selector prefers sources in the narrowest
+  // RDMA-fabric domain the target and source share. Empty means unknown (the
+  // selector then falls back to rendezvous ordering for that source).
+  // (#519 took fields 6-8; the load-aware PR's `source_load` will rebase to 10.)
+  map<string, string> topology = 9;
 }
 
 message ListSourcesRequest {

@@ -899,6 +899,11 @@ type WorkerMetadata struct {
 	// This is runtime metadata, not SourceIdentity hash material. Empty means
 	// unknown and must be accepted for backward compatibility with old writers.
 	Accelerator string `protobuf:"bytes,9,opt,name=accelerator,proto3" json:"accelerator,omitempty"`
+	// Datacenter topology domain values keyed by Grove ClusterTopology domain
+	// (see SourceInstanceRef.topology). Static per node, so it is published once
+	// at registration; the server passes it through onto SourceInstanceRef. This
+	// is runtime metadata, not SourceIdentity hash material.
+	Topology map[string]string `protobuf:"bytes,11,rep,name=topology,proto3" json:"topology,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Source-type-specific bounded metadata. This selects the metadata payload
 	// shape, not a transfer endpoint. Readers should prefer tensor_source over
 	// deprecated tensors when both are present, and fall back to tensors for old
@@ -1023,6 +1028,13 @@ func (x *WorkerMetadata) GetAccelerator() string {
 		return x.Accelerator
 	}
 	return ""
+}
+
+func (x *WorkerMetadata) GetTopology() map[string]string {
+	if x != nil {
+		return x.Topology
+	}
+	return nil
 }
 
 func (x *WorkerMetadata) GetSourcePayload() isWorkerMetadata_SourcePayload {
@@ -2122,8 +2134,17 @@ type SourceInstanceRef struct {
 	// Unlike training_step this remains constant across versions and changes
 	// whenever cached layout metadata must be rebuilt.
 	LayoutSignature *string `protobuf:"bytes,8,opt,name=layout_signature,json=layoutSignature,proto3,oneof" json:"layout_signature,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Datacenter topology domain values keyed by Grove ClusterTopology domain
+	// (region/zone/datacenter/block/rack/host/numa), e.g.
+	// {"block": "b1", "rack": "r3", "host": "node7"}. Populated from the node's
+	// labels via the ClusterTopology domain->key mapping and published once at
+	// registration. The topology_aware selector prefers sources in the narrowest
+	// RDMA-fabric domain the target and source share. Empty means unknown (the
+	// selector then falls back to rendezvous ordering for that source).
+	// (#519 took fields 6-8; the load-aware PR's `source_load` will rebase to 10.)
+	Topology      map[string]string `protobuf:"bytes,9,rep,name=topology,proto3" json:"topology,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *SourceInstanceRef) Reset() {
@@ -2210,6 +2231,13 @@ func (x *SourceInstanceRef) GetLayoutSignature() string {
 		return *x.LayoutSignature
 	}
 	return ""
+}
+
+func (x *SourceInstanceRef) GetTopology() map[string]string {
+	if x != nil {
+		return x.Topology
+	}
+	return nil
 }
 
 type ListSourcesRequest struct {
@@ -2686,7 +2714,7 @@ const file_p2p_proto_rawDesc = "" +
 	"\vfile_offset\x18\x03 \x01(\x04R\n" +
 	"fileOffset\x12\x16\n" +
 	"\x06length\x18\x04 \x01(\x04R\x06length\x12\x1a\n" +
-	"\bchecksum\x18\x05 \x01(\tR\bchecksum\"\x9e\x05\n" +
+	"\bchecksum\x18\x05 \x01(\tR\bchecksum\"\xa8\x06\n" +
 	"\x0eWorkerMetadata\x12\x1f\n" +
 	"\vworker_rank\x18\x01 \x01(\rR\n" +
 	"workerRank\x12%\n" +
@@ -2701,9 +2729,13 @@ const file_p2p_proto_rawDesc = "" +
 	"\n" +
 	"agent_name\x18\a \x01(\tR\tagentName\x120\n" +
 	"\x14worker_grpc_endpoint\x18\b \x01(\tR\x12workerGrpcEndpoint\x12 \n" +
-	"\vaccelerator\x18\t \x01(\tR\vaccelerator\x12N\n" +
+	"\vaccelerator\x18\t \x01(\tR\vaccelerator\x12K\n" +
+	"\btopology\x18\v \x03(\v2/.model_express.p2p.WorkerMetadata.TopologyEntryR\btopology\x12N\n" +
 	"\rtensor_source\x18\x14 \x01(\v2'.model_express.p2p.TensorSourceMetadataH\x01R\ftensorSource\x12T\n" +
-	"\x0fartifact_source\x18\x15 \x01(\v2).model_express.p2p.ArtifactSourceMetadataH\x01R\x0eartifactSourceB\x12\n" +
+	"\x0fartifact_source\x18\x15 \x01(\v2).model_express.p2p.ArtifactSourceMetadataH\x01R\x0eartifactSource\x1a;\n" +
+	"\rTopologyEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\x12\n" +
 	"\x10backend_metadataB\x10\n" +
 	"\x0esource_payload\"l\n" +
 	"\x18GetTensorManifestRequest\x12 \n" +
@@ -2812,7 +2844,7 @@ const file_p2p_proto_rawDesc = "" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12 \n" +
 	"\fmx_source_id\x18\x03 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
-	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"\xd4\x02\n" +
+	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"\xe1\x03\n" +
 	"\x11SourceInstanceRef\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
@@ -2825,7 +2857,11 @@ const file_p2p_proto_rawDesc = "" +
 	"\n" +
 	"updated_at\x18\x06 \x01(\x03R\tupdatedAt\x12(\n" +
 	"\rtraining_step\x18\a \x01(\x04H\x00R\ftrainingStep\x88\x01\x01\x12.\n" +
-	"\x10layout_signature\x18\b \x01(\tH\x01R\x0flayoutSignature\x88\x01\x01B\x10\n" +
+	"\x10layout_signature\x18\b \x01(\tH\x01R\x0flayoutSignature\x88\x01\x01\x12N\n" +
+	"\btopology\x18\t \x03(\v22.model_express.p2p.SourceInstanceRef.TopologyEntryR\btopology\x1a;\n" +
+	"\rTopologyEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\x10\n" +
 	"\x0e_training_stepB\x13\n" +
 	"\x11_layout_signature\"\xeb\x03\n" +
 	"\x12ListSourcesRequest\x12=\n" +
@@ -2911,7 +2947,7 @@ func file_p2p_proto_rawDescGZIP() []byte {
 }
 
 var file_p2p_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_p2p_proto_msgTypes = make([]protoimpl.MessageInfo, 29)
+var file_p2p_proto_msgTypes = make([]protoimpl.MessageInfo, 31)
 var file_p2p_proto_goTypes = []any{
 	(BackendFramework)(0),                     // 0: model_express.p2p.BackendFramework
 	(MxSourceType)(0),                         // 1: model_express.p2p.MxSourceType
@@ -2945,6 +2981,8 @@ var file_p2p_proto_goTypes = []any{
 	(*UpdateStatusRequest)(nil),               // 29: model_express.p2p.UpdateStatusRequest
 	(*UpdateStatusResponse)(nil),              // 30: model_express.p2p.UpdateStatusResponse
 	nil,                                       // 31: model_express.p2p.SourceIdentity.ExtraParametersEntry
+	nil,                                       // 32: model_express.p2p.WorkerMetadata.TopologyEntry
+	nil,                                       // 33: model_express.p2p.SourceInstanceRef.TopologyEntry
 }
 var file_p2p_proto_depIdxs = []int32{
 	1,  // 0: model_express.p2p.SourceIdentity.mx_source_type:type_name -> model_express.p2p.MxSourceType
@@ -2956,46 +2994,48 @@ var file_p2p_proto_depIdxs = []int32{
 	9,  // 6: model_express.p2p.ArtifactManifest.chunks:type_name -> model_express.p2p.ArtifactManifestChunk
 	4,  // 7: model_express.p2p.WorkerMetadata.tensors:type_name -> model_express.p2p.TensorDescriptor
 	2,  // 8: model_express.p2p.WorkerMetadata.status:type_name -> model_express.p2p.SourceStatus
-	6,  // 9: model_express.p2p.WorkerMetadata.tensor_source:type_name -> model_express.p2p.TensorSourceMetadata
-	5,  // 10: model_express.p2p.WorkerMetadata.artifact_source:type_name -> model_express.p2p.ArtifactSourceMetadata
-	4,  // 11: model_express.p2p.GetTensorManifestResponse.tensors:type_name -> model_express.p2p.TensorDescriptor
-	1,  // 12: model_express.p2p.GetArtifactManifestHeaderResponse.mx_source_type:type_name -> model_express.p2p.MxSourceType
-	8,  // 13: model_express.p2p.GetArtifactManifestHeaderResponse.files:type_name -> model_express.p2p.ArtifactManifestFile
-	9,  // 14: model_express.p2p.GetArtifactManifestChunksResponse.chunks:type_name -> model_express.p2p.ArtifactManifestChunk
-	9,  // 15: model_express.p2p.PrepareArtifactChunkResponse.chunk:type_name -> model_express.p2p.ArtifactManifestChunk
-	17, // 16: model_express.p2p.PrepareArtifactChunkResponse.source:type_name -> model_express.p2p.ArtifactChunkTransferDescriptor
-	9,  // 17: model_express.p2p.ReleaseArtifactChunkResponse.chunk:type_name -> model_express.p2p.ArtifactManifestChunk
-	3,  // 18: model_express.p2p.PublishMetadataRequest.identity:type_name -> model_express.p2p.SourceIdentity
-	10, // 19: model_express.p2p.PublishMetadataRequest.worker:type_name -> model_express.p2p.WorkerMetadata
-	3,  // 20: model_express.p2p.ListSourcesRequest.identity:type_name -> model_express.p2p.SourceIdentity
-	2,  // 21: model_express.p2p.ListSourcesRequest.status_filter:type_name -> model_express.p2p.SourceStatus
-	24, // 22: model_express.p2p.ListSourcesResponse.instances:type_name -> model_express.p2p.SourceInstanceRef
-	10, // 23: model_express.p2p.GetMetadataResponse.worker:type_name -> model_express.p2p.WorkerMetadata
-	3,  // 24: model_express.p2p.GetMetadataResponse.identity:type_name -> model_express.p2p.SourceIdentity
-	2,  // 25: model_express.p2p.UpdateStatusRequest.status:type_name -> model_express.p2p.SourceStatus
-	22, // 26: model_express.p2p.P2pService.PublishMetadata:input_type -> model_express.p2p.PublishMetadataRequest
-	25, // 27: model_express.p2p.P2pService.ListSources:input_type -> model_express.p2p.ListSourcesRequest
-	27, // 28: model_express.p2p.P2pService.GetMetadata:input_type -> model_express.p2p.GetMetadataRequest
-	29, // 29: model_express.p2p.P2pService.UpdateStatus:input_type -> model_express.p2p.UpdateStatusRequest
-	11, // 30: model_express.p2p.WorkerService.GetTensorManifest:input_type -> model_express.p2p.GetTensorManifestRequest
-	13, // 31: model_express.p2p.WorkerService.GetArtifactManifestHeader:input_type -> model_express.p2p.GetArtifactManifestHeaderRequest
-	15, // 32: model_express.p2p.WorkerService.GetArtifactManifestChunks:input_type -> model_express.p2p.GetArtifactManifestChunksRequest
-	18, // 33: model_express.p2p.WorkerService.PrepareArtifactChunk:input_type -> model_express.p2p.PrepareArtifactChunkRequest
-	20, // 34: model_express.p2p.WorkerService.ReleaseArtifactChunk:input_type -> model_express.p2p.ReleaseArtifactChunkRequest
-	23, // 35: model_express.p2p.P2pService.PublishMetadata:output_type -> model_express.p2p.PublishMetadataResponse
-	26, // 36: model_express.p2p.P2pService.ListSources:output_type -> model_express.p2p.ListSourcesResponse
-	28, // 37: model_express.p2p.P2pService.GetMetadata:output_type -> model_express.p2p.GetMetadataResponse
-	30, // 38: model_express.p2p.P2pService.UpdateStatus:output_type -> model_express.p2p.UpdateStatusResponse
-	12, // 39: model_express.p2p.WorkerService.GetTensorManifest:output_type -> model_express.p2p.GetTensorManifestResponse
-	14, // 40: model_express.p2p.WorkerService.GetArtifactManifestHeader:output_type -> model_express.p2p.GetArtifactManifestHeaderResponse
-	16, // 41: model_express.p2p.WorkerService.GetArtifactManifestChunks:output_type -> model_express.p2p.GetArtifactManifestChunksResponse
-	19, // 42: model_express.p2p.WorkerService.PrepareArtifactChunk:output_type -> model_express.p2p.PrepareArtifactChunkResponse
-	21, // 43: model_express.p2p.WorkerService.ReleaseArtifactChunk:output_type -> model_express.p2p.ReleaseArtifactChunkResponse
-	35, // [35:44] is the sub-list for method output_type
-	26, // [26:35] is the sub-list for method input_type
-	26, // [26:26] is the sub-list for extension type_name
-	26, // [26:26] is the sub-list for extension extendee
-	0,  // [0:26] is the sub-list for field type_name
+	32, // 9: model_express.p2p.WorkerMetadata.topology:type_name -> model_express.p2p.WorkerMetadata.TopologyEntry
+	6,  // 10: model_express.p2p.WorkerMetadata.tensor_source:type_name -> model_express.p2p.TensorSourceMetadata
+	5,  // 11: model_express.p2p.WorkerMetadata.artifact_source:type_name -> model_express.p2p.ArtifactSourceMetadata
+	4,  // 12: model_express.p2p.GetTensorManifestResponse.tensors:type_name -> model_express.p2p.TensorDescriptor
+	1,  // 13: model_express.p2p.GetArtifactManifestHeaderResponse.mx_source_type:type_name -> model_express.p2p.MxSourceType
+	8,  // 14: model_express.p2p.GetArtifactManifestHeaderResponse.files:type_name -> model_express.p2p.ArtifactManifestFile
+	9,  // 15: model_express.p2p.GetArtifactManifestChunksResponse.chunks:type_name -> model_express.p2p.ArtifactManifestChunk
+	9,  // 16: model_express.p2p.PrepareArtifactChunkResponse.chunk:type_name -> model_express.p2p.ArtifactManifestChunk
+	17, // 17: model_express.p2p.PrepareArtifactChunkResponse.source:type_name -> model_express.p2p.ArtifactChunkTransferDescriptor
+	9,  // 18: model_express.p2p.ReleaseArtifactChunkResponse.chunk:type_name -> model_express.p2p.ArtifactManifestChunk
+	3,  // 19: model_express.p2p.PublishMetadataRequest.identity:type_name -> model_express.p2p.SourceIdentity
+	10, // 20: model_express.p2p.PublishMetadataRequest.worker:type_name -> model_express.p2p.WorkerMetadata
+	33, // 21: model_express.p2p.SourceInstanceRef.topology:type_name -> model_express.p2p.SourceInstanceRef.TopologyEntry
+	3,  // 22: model_express.p2p.ListSourcesRequest.identity:type_name -> model_express.p2p.SourceIdentity
+	2,  // 23: model_express.p2p.ListSourcesRequest.status_filter:type_name -> model_express.p2p.SourceStatus
+	24, // 24: model_express.p2p.ListSourcesResponse.instances:type_name -> model_express.p2p.SourceInstanceRef
+	10, // 25: model_express.p2p.GetMetadataResponse.worker:type_name -> model_express.p2p.WorkerMetadata
+	3,  // 26: model_express.p2p.GetMetadataResponse.identity:type_name -> model_express.p2p.SourceIdentity
+	2,  // 27: model_express.p2p.UpdateStatusRequest.status:type_name -> model_express.p2p.SourceStatus
+	22, // 28: model_express.p2p.P2pService.PublishMetadata:input_type -> model_express.p2p.PublishMetadataRequest
+	25, // 29: model_express.p2p.P2pService.ListSources:input_type -> model_express.p2p.ListSourcesRequest
+	27, // 30: model_express.p2p.P2pService.GetMetadata:input_type -> model_express.p2p.GetMetadataRequest
+	29, // 31: model_express.p2p.P2pService.UpdateStatus:input_type -> model_express.p2p.UpdateStatusRequest
+	11, // 32: model_express.p2p.WorkerService.GetTensorManifest:input_type -> model_express.p2p.GetTensorManifestRequest
+	13, // 33: model_express.p2p.WorkerService.GetArtifactManifestHeader:input_type -> model_express.p2p.GetArtifactManifestHeaderRequest
+	15, // 34: model_express.p2p.WorkerService.GetArtifactManifestChunks:input_type -> model_express.p2p.GetArtifactManifestChunksRequest
+	18, // 35: model_express.p2p.WorkerService.PrepareArtifactChunk:input_type -> model_express.p2p.PrepareArtifactChunkRequest
+	20, // 36: model_express.p2p.WorkerService.ReleaseArtifactChunk:input_type -> model_express.p2p.ReleaseArtifactChunkRequest
+	23, // 37: model_express.p2p.P2pService.PublishMetadata:output_type -> model_express.p2p.PublishMetadataResponse
+	26, // 38: model_express.p2p.P2pService.ListSources:output_type -> model_express.p2p.ListSourcesResponse
+	28, // 39: model_express.p2p.P2pService.GetMetadata:output_type -> model_express.p2p.GetMetadataResponse
+	30, // 40: model_express.p2p.P2pService.UpdateStatus:output_type -> model_express.p2p.UpdateStatusResponse
+	12, // 41: model_express.p2p.WorkerService.GetTensorManifest:output_type -> model_express.p2p.GetTensorManifestResponse
+	14, // 42: model_express.p2p.WorkerService.GetArtifactManifestHeader:output_type -> model_express.p2p.GetArtifactManifestHeaderResponse
+	16, // 43: model_express.p2p.WorkerService.GetArtifactManifestChunks:output_type -> model_express.p2p.GetArtifactManifestChunksResponse
+	19, // 44: model_express.p2p.WorkerService.PrepareArtifactChunk:output_type -> model_express.p2p.PrepareArtifactChunkResponse
+	21, // 45: model_express.p2p.WorkerService.ReleaseArtifactChunk:output_type -> model_express.p2p.ReleaseArtifactChunkResponse
+	37, // [37:46] is the sub-list for method output_type
+	28, // [28:37] is the sub-list for method input_type
+	28, // [28:28] is the sub-list for extension type_name
+	28, // [28:28] is the sub-list for extension extendee
+	0,  // [0:28] is the sub-list for field type_name
 }
 
 func init() { file_p2p_proto_init() }
@@ -3019,7 +3059,7 @@ func file_p2p_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_p2p_proto_rawDesc), len(file_p2p_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   29,
+			NumMessages:   31,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

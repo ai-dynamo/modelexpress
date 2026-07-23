@@ -31,6 +31,7 @@ Not covered here (intentional exceptions):
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -94,6 +95,11 @@ if TYPE_CHECKING:
     MX_ARTIFACT_TRANSFER_CHUNK_SIZE: Optional[str]
     # P2P source selection
     MX_P2P_SOURCE_SELECTOR: Optional[str]
+    # Topology-aware selection: ordered levels (broad->narrow), this node's
+    # {level: value} JSON map, and the optional within-tier load-blend weight.
+    MX_P2P_TOPOLOGY_LEVELS: Optional[str]
+    MX_P2P_TOPOLOGY: Optional[str]
+    MX_P2P_TOPOLOGY_LOAD_WEIGHT: float
     # Opt-in metrics collector
     MX_METRICS_ENABLED: bool
     MX_METRICS_PORT: Optional[str]
@@ -134,15 +140,24 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _env_float(name: str, default: float) -> float:
-    """Parse a float env var, falling back to ``default`` (and warning) on error."""
+    """Parse a float env var, falling back to ``default`` (and warning) on error.
+
+    Rejects non-finite values (``inf``/``nan``): they are always a misconfig and
+    can poison arithmetic downstream (e.g. ``inf * 0.0 -> nan`` in a selector
+    score, which would break deterministic ordering).
+    """
     raw = os.environ.get(name)
     if raw is None:
         return default
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
         logger.warning("Invalid %s=%r; using default %s", name, raw, default)
         return default
+    if not math.isfinite(value):
+        logger.warning("Non-finite %s=%r; using default %s", name, raw, default)
+        return default
+    return value
 
 
 # One entry per variable. The lambda owns the default and parsing; callers that
@@ -215,6 +230,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ── P2P source selection ───────────────────────────────────────────────
     # Raw (None when unset); source_selection applies its DEFAULT_SELECTOR fallback.
     "MX_P2P_SOURCE_SELECTOR": lambda: os.environ.get("MX_P2P_SOURCE_SELECTOR"),
+    "MX_P2P_TOPOLOGY_LEVELS": lambda: os.environ.get("MX_P2P_TOPOLOGY_LEVELS"),
+    "MX_P2P_TOPOLOGY": lambda: os.environ.get("MX_P2P_TOPOLOGY"),
+    # Clamp to >= 0: a negative weight would invert the within-tier load blend
+    # into preferring busy sources. 0 (default) keeps the pure rendezvous jitter.
+    "MX_P2P_TOPOLOGY_LOAD_WEIGHT": lambda: max(
+        0.0, _env_float("MX_P2P_TOPOLOGY_LOAD_WEIGHT", 0.0)
+    ),
     # ── Opt-in metrics collector ───────────────────────────────────────────
     "MX_METRICS_ENABLED": lambda: os.environ.get("MX_METRICS_ENABLED", "0").strip().lower()
     in _TRUTHY,
