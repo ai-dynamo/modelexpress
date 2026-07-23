@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import grpc
@@ -121,8 +122,13 @@ def publish_metadata_and_ready(
     identity: "p2p_pb2.SourceIdentity",
     worker_id: str,
     accelerator: str = "cuda",
+    ready_fn: Callable[[], bool] | None = None,
 ) -> None:
-    """Prepare tensor metadata publication and start the publisher thread."""
+    """Prepare tensor metadata publication and start the publisher thread.
+
+    When ``ready_fn`` is provided, metadata remains undiscoverable until the
+    engine has completed initialization and the callback returns ``True``.
+    """
     logger.info(
         f"[Worker {worker_rank}] Preparing {len(tensors)} tensors for model '{identity.model_name}'"
     )
@@ -223,6 +229,7 @@ def publish_metadata_and_ready(
         worker_rank=worker_rank,
         nixl_manager=nixl_manager,
         publish_fn=publish_fn,
+        ready_fn=ready_fn,
         cleanup_fn=cleanup_fn,
         source_load_provider=make_source_load_provider(device_id),
     )
