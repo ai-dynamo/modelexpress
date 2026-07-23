@@ -12,6 +12,152 @@ use tracing::Level;
 
 use crate::cache::CacheEvictionConfig;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMode {
+    #[default]
+    Off,
+    Enforce,
+}
+
+/// A `<namespace>:<serviceaccount>` pair, parsed from `ns:sa`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ServiceAccountRef {
+    pub namespace: String,
+    pub service_account: String,
+}
+
+impl std::fmt::Display for ServiceAccountRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.namespace, self.service_account)
+    }
+}
+
+impl std::str::FromStr for ServiceAccountRef {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (namespace, service_account) = s
+            .split_once(':')
+            .ok_or_else(|| format!("expected '<namespace>:<serviceaccount>', got '{s}'"))?;
+        let namespace = namespace.trim();
+        let service_account = service_account.trim();
+        if namespace.is_empty() || service_account.is_empty() {
+            return Err(format!(
+                "namespace and service account must both be non-empty in '{s}'"
+            ));
+        }
+        Ok(Self {
+            namespace: namespace.to_string(),
+            service_account: service_account.to_string(),
+        })
+    }
+}
+
+/// Comma-separated CLI/env list of `T`, ignoring blank entries.
+#[derive(Debug, Clone)]
+pub struct CommaList<T>(Vec<T>);
+
+impl<T> CommaList<T> {
+    #[must_use]
+    pub fn into_inner(self) -> Vec<T> {
+        self.0
+    }
+}
+
+impl<T: std::str::FromStr> std::str::FromStr for CommaList<T> {
+    type Err = T::Err;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let items = s
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(T::from_str)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self(items))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SecurityConfig {
+    pub mode: Option<AuthMode>,
+    pub token_audiences: Vec<String>,
+    pub allowed_service_accounts: Vec<ServiceAccountRef>,
+    pub cache_ttl_secs: u64,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            mode: None,
+            token_audiences: Vec::new(),
+            allowed_service_accounts: Vec::new(),
+            cache_ttl_secs: 60,
+        }
+    }
+}
+
+impl SecurityConfig {
+    #[must_use]
+    pub fn resolve_mode(&self) -> AuthMode {
+        self.mode.unwrap_or(AuthMode::Off)
+    }
+
+    pub fn validate_resolved(&self, mode: AuthMode) -> Result<(), String> {
+        if mode == AuthMode::Enforce {
+            if self.token_audiences.is_empty() {
+                return Err(
+                    "security mode 'enforce' requires at least one token audience \
+                    (security.token_audiences)"
+                        .to_string(),
+                );
+            }
+            if self.allowed_service_accounts.is_empty() {
+                return Err(
+                    "security mode 'enforce' requires a non-empty service account \
+                    allowlist (security.allowed_service_accounts)"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(clap::Args, Debug, Default)]
+pub struct SecurityArgs {
+    /// ServiceAccount auth mode (off, enforce). Off by default.
+    #[arg(
+        long = "security-mode",
+        env = modelexpress_common::envs::MODEL_EXPRESS_SECURITY_MODE,
+        value_enum
+    )]
+    pub mode: Option<AuthMode>,
+
+    /// Comma-separated SA token audiences the caller's token must carry.
+    #[arg(
+        long = "security-token-audiences",
+        env = modelexpress_common::envs::MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES
+    )]
+    pub token_audiences: Option<CommaList<String>>,
+
+    /// Comma-separated allowed callers as `<namespace>:<serviceaccount>`.
+    #[arg(
+        long = "security-allowed-service-accounts",
+        env = modelexpress_common::envs::MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS
+    )]
+    pub allowed_service_accounts: Option<CommaList<ServiceAccountRef>>,
+
+    /// TTL for the verified-token and rejection caches, in seconds.
+    #[arg(
+        long = "security-cache-ttl-secs",
+        env = modelexpress_common::envs::MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS
+    )]
+    pub cache_ttl_secs: Option<u64>,
+}
+
 /// Command line arguments for the server
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -44,6 +190,9 @@ pub struct ServerArgs {
     #[arg(long, env = modelexpress_common::envs::MODEL_EXPRESS_CACHE_EVICTION_ENABLED)]
     pub cache_eviction_enabled: Option<bool>,
 
+    #[command(flatten)]
+    pub security: SecurityArgs,
+
     /// Validate configuration and exit
     #[arg(long)]
     pub validate_config: bool,
@@ -58,6 +207,8 @@ pub struct ServerConfig {
     pub cache: CacheConfig,
     /// Logging configuration
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 /// Server-specific settings
@@ -177,6 +328,20 @@ impl ServerConfig {
             config.cache.eviction.enabled = cache_eviction_enabled;
         }
 
+        // Apply security overrides
+        if let Some(mode) = args.security.mode {
+            config.security.mode = Some(mode);
+        }
+        if let Some(token_audiences) = args.security.token_audiences {
+            config.security.token_audiences = token_audiences.into_inner();
+        }
+        if let Some(allowed) = args.security.allowed_service_accounts {
+            config.security.allowed_service_accounts = allowed.into_inner();
+        }
+        if let Some(cache_ttl_secs) = args.security.cache_ttl_secs {
+            config.security.cache_ttl_secs = cache_ttl_secs;
+        }
+
         // Validate the final configuration
         config.validate()?;
 
@@ -194,6 +359,11 @@ impl ServerConfig {
                 parent.display()
             )));
         }
+
+        let mode = self.security.resolve_mode();
+        self.security
+            .validate_resolved(mode)
+            .map_err(ConfigError::Message)?;
 
         Ok(())
     }
@@ -232,6 +402,20 @@ impl ServerConfig {
         info!("  Format: {}", self.logging.format);
         info!("  File: {:?}", self.logging.file);
         info!("  Structured: {}", self.logging.structured);
+
+        info!("Security Configuration:");
+        info!("  Mode: {:?}", self.security.resolve_mode());
+        info!("  Token audiences: {:?}", self.security.token_audiences);
+        info!(
+            "  Allowed service accounts: {}",
+            self.security
+                .allowed_service_accounts
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        info!("  Cache TTL: {}s", self.security.cache_ttl_secs);
     }
 }
 
@@ -496,6 +680,7 @@ mod tests {
             log_format: None,
             cache_directory: None,
             cache_eviction_enabled: None,
+            security: SecurityArgs::default(),
             validate_config: false,
         };
 
@@ -535,6 +720,7 @@ mod tests {
             log_format: None,
             cache_directory: None,
             cache_eviction_enabled: None,
+            security: SecurityArgs::default(),
             validate_config: false,
         };
 
@@ -580,6 +766,7 @@ mod tests {
             log_format: Some(LogFormat::Json),
             cache_directory: Some(PathBuf::from("/tmp/override_cache")),
             cache_eviction_enabled: Some(false),
+            security: SecurityArgs::default(),
             validate_config: false,
         };
 
@@ -607,6 +794,7 @@ mod tests {
             log_format: None,
             cache_directory: None,
             cache_eviction_enabled: None,
+            security: SecurityArgs::default(),
             validate_config: false,
         };
 
@@ -618,5 +806,63 @@ mod tests {
         assert_eq!(config.server.host, "localhost");
         assert_eq!(config.server.port.get(), 9001);
         assert_eq!(config.logging.level, LogLevel::Warn);
+    }
+
+    #[test]
+    fn security_defaults_to_off() {
+        let security = SecurityConfig::default();
+        assert_eq!(security.resolve_mode(), AuthMode::Off);
+        assert!(security.token_audiences.is_empty());
+        assert!(security.allowed_service_accounts.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn service_account_ref_parses_namespace_and_sa() {
+        let parsed: ServiceAccountRef = "vllm:worker".parse().expect("valid ns:sa");
+        assert_eq!(parsed.namespace, "vllm");
+        assert_eq!(parsed.service_account, "worker");
+        assert_eq!(parsed.to_string(), "vllm:worker");
+        let trimmed: ServiceAccountRef = "  ns : sa ".parse().expect("trims");
+        assert_eq!(trimmed, "ns:sa".parse().expect("valid"));
+    }
+
+    #[test]
+    fn service_account_ref_rejects_malformed() {
+        assert!("noseparator".parse::<ServiceAccountRef>().is_err());
+        assert!(":sa".parse::<ServiceAccountRef>().is_err());
+        assert!("ns:".parse::<ServiceAccountRef>().is_err());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn comma_list_parses_and_skips_blanks() {
+        let list: CommaList<ServiceAccountRef> =
+            "a:one, b:two ,, c:three".parse().expect("valid list");
+        let items = list.into_inner();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[1].namespace, "b");
+        assert_eq!(items[2].service_account, "three");
+
+        let empty: CommaList<String> = "  ".parse().expect("empty");
+        assert!(empty.into_inner().is_empty());
+    }
+
+    #[test]
+    fn enforce_requires_audience_and_allowlist() {
+        let mut security = SecurityConfig {
+            mode: Some(AuthMode::Enforce),
+            ..SecurityConfig::default()
+        };
+        assert!(security.validate_resolved(AuthMode::Enforce).is_err());
+
+        security.token_audiences = vec!["modelexpress".to_string()];
+        assert!(security.validate_resolved(AuthMode::Enforce).is_err());
+
+        security.allowed_service_accounts = vec![ServiceAccountRef {
+            namespace: "vllm".to_string(),
+            service_account: "worker".to_string(),
+        }];
+        assert!(security.validate_resolved(AuthMode::Enforce).is_ok());
     }
 }

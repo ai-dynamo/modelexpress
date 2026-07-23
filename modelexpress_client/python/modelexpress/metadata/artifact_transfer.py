@@ -624,7 +624,11 @@ def discover_artifact_source(
         # Drop accelerator-incompatible sources before GetMetadata using the
         # lightweight SourceInstanceRef.accelerator; the post-fetch re-check
         # below covers empty refs on old servers and metadata drift.
-        if not accelerators_compatible(accelerator, source.accelerator):
+        if not accelerators_compatible(
+            accelerator,
+            source.accelerator,
+            mx_source_type=identity.mx_source_type,
+        ):
             continue
         metadata = mx_client.get_metadata(source.mx_source_id, source.worker_id)
         if not metadata.found:
@@ -632,7 +636,11 @@ def discover_artifact_source(
         worker = metadata.worker
         if worker.WhichOneof("source_payload") != "artifact_source":
             continue
-        if not accelerators_compatible(accelerator, worker.accelerator):
+        if not accelerators_compatible(
+            accelerator,
+            worker.accelerator,
+            mx_source_type=identity.mx_source_type,
+        ):
             continue
         if node_rank is not None and worker.artifact_source.node_rank != node_rank:
             continue
