@@ -1,0 +1,61 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# RBAC for the self-organizing K8s Leases anchor bootstrap (OPTION A).
+#
+# The dht anchor quorum self-elects over coordination.k8s.io Leases named
+# with the MX_DHT_BOOTSTRAP_LEASES prefix. To take and renew those Leases,
+# each worker pod needs get/list/watch/create/update/patch on Leases in its
+# namespace. This binds those permissions to the mx-dht ServiceAccount that
+# sources-tp2.yaml and target.yaml reference.
+#
+# The RoleBinding subject uses ${NAMESPACE} so envsubst substitutes the
+# correct value before kubectl apply.
+#
+# Apply with:
+#   NAMESPACE=<your-ns> envsubst < examples/dht_sources/lease-rbac.yaml | \
+#     kubectl apply -n <your-ns> -f -
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mx-dht
+  labels:
+    app.kubernetes.io/name: modelexpress
+    app: mx-dht
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mx-dht-lease
+  labels:
+    app.kubernetes.io/name: modelexpress
+    app: mx-dht
+rules:
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mx-dht-lease
+  labels:
+    app.kubernetes.io/name: modelexpress
+    app: mx-dht
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: mx-dht-lease
+subjects:
+  - kind: ServiceAccount
+    name: mx-dht
+    namespace: ${NAMESPACE}

@@ -137,6 +137,27 @@ pub async fn run_server(
         crate::p2p::reaper::run_reaper(reaper_state, reaper_shutdown_rx).await;
     });
 
+    // Optional DHT peer participation. Opt-in via `MX_DHT_LISTEN`; the server
+    // joins the Kademlia mesh used by the `dht` Python client backend so its
+    // node helps with routing and can serve as a stable bootstrap target. No
+    // records are published from this side: this is participation-only.
+    let dht_node = match crate::dht::DhtConfig::from_env() {
+        None => {
+            info!("DHT participation disabled (MX_DHT_LISTEN unset)");
+            None
+        }
+        Some(cfg) => match crate::dht::DhtNode::start(cfg).await {
+            Ok(node) => {
+                info!("DHT peer started (peer_id={})", node.peer_id);
+                Some(node)
+            }
+            Err(err) => {
+                error!("Failed to start DHT peer ({err}); continuing without DHT participation");
+                None
+            }
+        },
+    };
+
     // Fan the caller's shutdown trigger out to the background tasks, then let
     // serve_with_shutdown observe the same trigger to stop accepting connections.
     let shutdown_signal = async move {
@@ -204,6 +225,9 @@ pub async fn run_server(
     }
     if let Err(e) = reaper_handle.await {
         error!("Reaper join error: {e}");
+    }
+    if let Some(node) = dht_node {
+        node.stop().await;
     }
 
     server_result?;

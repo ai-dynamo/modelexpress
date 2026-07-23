@@ -424,9 +424,10 @@ Server-coordinated backends live in the Rust server and are selected via `MX_MET
 - **Redis** (`redis`): Source index hashes (`mx:source:{source_id}`) with an `__attributes__` field storing `SourceIdentity` and `{worker_id}` fields as presence markers. Worker data stored in separate hashes (`mx:source:{source_id}:{worker_id}`). Stale detection and cleanup handled by the server-side reaper.
 - **Kubernetes** (`kubernetes`/`k8s`/`crd`): `ModelMetadata` CRDs (one per worker) with `ConfigMap`s for tensor descriptors. Owner references for automatic garbage collection. Standard Kubernetes `status.conditions` (`Ready`) and `status.observedGeneration` are maintained so that `kubectl wait --for=condition=Ready` works. Stale detection handled by the server-side reaper.
 
-The decentralized backend lives in the Python client and is selected via `MX_METADATA_BACKEND`:
+The decentralized backends are selected via `MX_METADATA_BACKEND`:
 
 - **K8s-service** (`k8s-service`/`service`): each source pool sits behind a Kubernetes Service (one per tensor-parallel rank, label selector pinned to `mx.rank=R`). Clients open a direct gRPC channel to the Service DNS and call `GetTensorManifest`; kube-proxy load-balances across ready backends. No central server is involved. `mx_source_id` is computed client-side via the same canonical JSON + SHA256 scheme and validated on the response. See [`../examples/k8s_service_sources/`](../examples/k8s_service_sources/) for the deployment shape.
+- **DHT** (`dht`/`kademlia`): workers discover each other over a libp2p Kademlia DHT, with no central server and no Kubernetes Service in the data path. Each worker publishes a rank-keyed pointer (`/mx/{mx_source_id}/rank/{rank}`) to its own gRPC endpoint and resolves the publisher for a given rank with a single content-addressed lookup; `mx_source_id` is computed client-side via the same canonical JSON + SHA256 scheme and validated at the `GetTensorManifest` handshake. Bootstrap is the only operator-provided piece, which makes it usable outside Kubernetes (bare metal, Slurm). See [`DHT_BACKEND.md`](DHT_BACKEND.md) and [`../examples/dht_sources/`](../examples/dht_sources/).
 
 Each worker publishes independently. The `mx_source_id` is a 16-char hex key computed from `SHA256(canonical_json(SourceIdentity))` where `SourceIdentity` includes a `revision` field for content-addressed identity (HuggingFace commit SHA, S3 object version, or a deployer-provided string). When `revision` names immutable content, two sources with identical `mx_source_id` are expected to serve bit-identical weight bytes; the ID itself validates declared identity rather than hashing tensor contents, so the guarantee is only as strong as the revision pin and the local cache being intact. Large u64 values (GPU addresses) are serialized as strings to avoid JSON precision loss.
 
@@ -446,6 +447,18 @@ The decentralized `k8s-service` backend lives in the Python client as `MxK8sServ
 **Pool constraint:** every ready pod behind a given Service must serve the same `mx_source_id`. Transient revision skew during rolling updates is handled by client-side retry on `FAILED_PRECONDITION` over fresh gRPC channels, up to `MX_K8S_SOURCE_RETRIES`. Workloads that need per-worker addressability (RL rollouts, live fine-tune refits, mixed-version fleets) must use the central-coordinator backends instead; the k8s-service backend's Service-routing model has no way to express "this specific worker."
 
 See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for design rationale, limitations, and backend-selection guidance.
+
+### DHT Metadata Backend
+
+The decentralized `dht` backend (alias `kademlia`) lives in the Python client as `MxDhtClient` (duck-typed to `MxClientBase`), backed by the in-tree `kademlite` Kademlia implementation; the Rust server can optionally join the same mesh as a participation-only peer. Selected via `MX_METADATA_BACKEND=dht`, the client factory returns `MxDhtClient`. Each worker publishes a small JSON pointer under `/mx/{mx_source_id}/rank/{worker_rank}` carrying its `worker_id`, rank, and gRPC endpoint; a target resolves the publisher for its own rank with one keyspace GET, then calls `GetTensorManifest` and validates `mx_source_id` and rank on the response. There is no central process and no Service object in the path. Server and client mesh together because both speak the same Kademlia protocol id over a TCP + Noise + Yamux transport with Identify.
+
+**Replication and convergence:** Kademlia replicates each record across the `K` nodes nearest its key (`K`=20 by default, the recommended latency knee). Freshly published records and freshly joined nodes need a short window to converge, so GETs retry with backoff (`MX_DHT_GET_RETRIES`, `MX_DHT_GET_BACKOFF_SECONDS`); records republish on the `MX_DHT_RECORD_TTL` cadence to survive churn.
+
+**Bootstrap:** a joining node needs one existing peer. The client checks `MX_DHT_BOOTSTRAP_PEERS` (explicit multiaddrs), then `MX_DHT_BOOTSTRAP_DNS` (headless Service resolving to peer IPs), then `MX_DHT_BOOTSTRAP_SLURM` (hostlist, auto-detected from `SLURM_JOB_NODELIST`); with none set the client falls back to mDNS for local-network development. Server participation is opt-in via `MX_DHT_LISTEN`.
+
+**Pool constraint:** the schema carries one publisher per `(mx_source_id, rank)` key, so the DHT backend does not model a load-balanced pool of replicas for a single rank or per-worker addressability. Workloads needing those (RL rollouts, live refits, mixed-version fleets) use the central-coordinator backends instead.
+
+See [`DHT_BACKEND.md`](DHT_BACKEND.md) for design rationale, limitations, and backend-selection guidance.
 
 ### ModelDownloadTracker
 
@@ -837,7 +850,7 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_SERVER_ADDRESS` | `localhost:8001` | gRPC server address (recommended) |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated, pending removal in a future release. Still read by all client paths and takes precedence when both are set; keep setting it during the transition. |
 | `MX_DISABLE_PATCHES` | `0` | Emergency escape hatch that skips all runtime compatibility patches. Set to `1`, `true`, `yes`, or `on` if a patch is incompatible with the installed engine. |
-| `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""` / `server` / `redis` / `kubernetes` (central server) or `k8s-service` (decentralized via K8s Service routing) |
+| `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""` / `server` / `redis` / `kubernetes` (central server), `k8s-service` (decentralized via K8s Service routing), or `dht`/`kademlia` (decentralized via Kademlia DHT) |
 | `MX_POOL_REG` | `0` | Discover cudaMalloc allocations via `cuMemGetAddressRange` and register each as a single NIXL block instead of registering tensors individually. Reduces NIXL registration count by 80-99% on typical vLLM models, cutting `ibv_reg_mr` time and metadata blob size; transfer semantics unchanged. Not required for `MX_VMM_ARENA=1`, which registers the arena directly |
 | `MX_VMM_ARENA` | `0` | Install a `CUDAPluggableAllocator` that routes weight-loading allocations into a CUDA VMM arena, then registers the used arena range once through dmabuf at end-of-load. Reserves 16.0 TiB of VA by default and commits physical memory only for mapped allocations. See [VMM Arena](#vmm-arena-cudapluggableallocator-hook) |
 | `UCX_CUDA_COPY_REG_WHOLE_ALLOC` | (UCX default) | Set to `off` with `MX_VMM_ARENA=1` until the upstream UCX `cuda_copy_md` length-truncation fix ships. |
@@ -853,6 +866,16 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend; `{rank}` is substituted with the worker's own rank. Client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` if the resolved pattern has no explicit port |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` max retries on `FAILED_PRECONDITION` (rolling-update transients). Fresh gRPC channel per attempt so kube-proxy re-picks a backend |
 | `MX_K8S_SOURCE_BACKOFF_SECONDS` | `0.5` | `k8s-service` sleep between retry attempts |
+| `MX_DHT_LISTEN` | client `0.0.0.0:0` | `host:port` the `dht` node listens on. On the server, presence of this var is the opt-in switch for participation-only DHT membership |
+| `MX_DHT_BOOTSTRAP_PEERS` | (none) | `dht` comma-separated libp2p multiaddrs to dial for initial peers |
+| `MX_DHT_BOOTSTRAP_DNS` | (none) | `dht` headless Service DNS resolving to peer IPs; each dialed at `MX_DHT_BOOTSTRAP_PORT` |
+| `MX_DHT_BOOTSTRAP_SLURM` | `SLURM_JOB_NODELIST` | `dht` Slurm hostlist to expand and dial; auto-detected from the Slurm environment when unset |
+| `MX_DHT_BOOTSTRAP_LEASES` | (none) | `dht` anchor Lease name-prefix; presence enables self-organizing lease bootstrap - workers elect an anchor quorum via `coordination.k8s.io` Leases (no dedicated pods; needs Lease RBAC + `POD_IP`) |
+| `MX_DHT_LEASE_NAMESPACE` | (none) | `dht` override for the auto-detected in-cluster namespace of the anchor Leases |
+| `MX_DHT_BOOTSTRAP_PORT` | `4001` | `dht` port at which DNS- and Slurm-resolved peers are dialed |
+| `MX_DHT_RECORD_TTL` | `86400` | `dht` record republish interval / TTL in seconds |
+| `MX_DHT_GET_RETRIES` | `5` | `dht` GET retries before a lookup fails; tune up for large cold-start fan-in |
+| `MX_DHT_GET_BACKOFF_SECONDS` | `0.5` | `dht` delay between GET retries, in seconds |
 | `MX_HEARTBEAT_INTERVAL_SECS` | `30` | Client heartbeat frequency |
 | `MX_HEARTBEAT_TIMEOUT_SECS` | `90` | Server reaper staleness threshold |
 | `MX_REAPER_SCAN_INTERVAL_SECS` | `30` | Server reaper scan frequency |
