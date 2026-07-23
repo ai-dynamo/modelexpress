@@ -6,8 +6,8 @@
 Feeds captured ``RecordedCopy`` records + published ``Shard``s through
 ``plan_pull`` and checks the emitted byte segments against a hand-computed
 reference. Covers: contiguous column-block, strided column-slice (multi-run),
-fused per-shard dest offset, multi-shard fan-in, disjoint shard skip, and the
-UnsupportedReshard fallbacks (non-box op, dtype mismatch).
+fused per-shard dest offset, multi-shard fan-in, disjoint shard skip, and
+UnsupportedReshard detection (non-box op, dtype mismatch).
 
 Run: pytest tests/test_reshard_refit_slice_plan.py
 """

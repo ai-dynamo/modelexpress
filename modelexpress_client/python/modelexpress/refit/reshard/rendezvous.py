@@ -289,8 +289,18 @@ class MxReshardRendezvous:
         )
 
     def publish(self, blob: bytes) -> str:
-        """Publish this rank's rendezvous blob (agent meta + shard table)."""
-        worker = p2p_pb2.WorkerMetadata(worker_rank=self.rank, nixl_metadata=blob)
+        """Publish a complete rendezvous blob as immediately discoverable.
+
+        Callers build ``blob`` only after the NIXL agent and source buffers are
+        registered, so publication is the readiness boundary for this minimal
+        rendezvous API. Re-publishing refreshes the worker record for the same
+        ``worker_id``.
+        """
+        worker = p2p_pb2.WorkerMetadata(
+            worker_rank=self.rank,
+            nixl_metadata=blob,
+            status=p2p_pb2.SOURCE_STATUS_READY,
+        )
         self._mx_source_id = self.client.publish_metadata(
             self._identity(self.role), worker, self.worker_id
         )
