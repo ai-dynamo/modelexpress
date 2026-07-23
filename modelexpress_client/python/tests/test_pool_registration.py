@@ -324,6 +324,23 @@ class TestReceiveFromSourceManifestValidation:
                 remote_agent_name="dummy",
             )
 
+    def test_size_mismatch_raises_for_heterogeneous_source_device(self, monkeypatch):
+        # Heterogeneous transfer signature: the source tensor lives on a
+        # different device ordinal (e.g. source xpu:2 -> target cuda:0). The
+        # size/dtype validation must fire regardless of the device_id, so
+        # relaxing the accelerator policy can never bypass these checks.
+        local = torch.zeros(10, dtype=torch.float32)
+        mgr = self._make_manager(monkeypatch, {"w": local})
+        hetero_bogus = TensorDescriptor(
+            name="w", addr=0x1000, size=80, device_id=2, dtype=str(local.dtype),
+        )
+        with pytest.raises(ManifestMismatchError, match="size mismatch"):
+            mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=[hetero_bogus],
+                remote_agent_name="dummy",
+            )
+
     def test_unmatched_name_skips_silently(self, monkeypatch):
         # No matching local tensor for the source's "w". Loop should `continue`
         # without raising; the caller decides whether the empty match list is
@@ -368,6 +385,85 @@ class TestReceiveFromSourceManifestValidation:
         assert any(
             "1 local-only, 1 source-only" in rec.getMessage() for rec in caplog.records
         )
+
+    def test_hetero_name_mismatch_raises(self, monkeypatch):
+        # Cross-family transfer: local has a tensor the source manifest omits
+        # (e.g. a vendor-specific derived tensor). require_exact_match must fail
+        # closed rather than transfer a subset and leave "x" at dummy values.
+        mgr = self._make_manager(
+            monkeypatch,
+            {
+                "w": torch.zeros(1, dtype=torch.float32),
+                "x": torch.zeros(1, dtype=torch.float32),
+            },
+        )
+        src = TensorDescriptor(
+            name="w", addr=0x1000, size=4, device_id=0, dtype="torch.float32",
+        )
+        with pytest.raises(ManifestMismatchError, match="heterogeneous transfer"):
+            mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=[src],
+                remote_agent_name="dummy",
+                require_exact_match=True,
+            )
+
+    def test_hetero_source_only_name_mismatch_raises(self, monkeypatch):
+        # Source names a tensor the target never registered.
+        mgr = self._make_manager(
+            monkeypatch, {"w": torch.zeros(1, dtype=torch.float32)}
+        )
+        src = [
+            TensorDescriptor(
+                name="w", addr=0x1000, size=4, device_id=0, dtype="torch.float32",
+            ),
+            TensorDescriptor(
+                name="extra", addr=0x2000, size=4, device_id=0, dtype="torch.float32",
+            ),
+        ]
+        with pytest.raises(ManifestMismatchError, match="heterogeneous transfer"):
+            mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=src,
+                remote_agent_name="dummy",
+                require_exact_match=True,
+            )
+
+    def test_hetero_zero_match_raises(self, monkeypatch):
+        # No overlapping names at all: a zero-match cross-family transfer would
+        # report RDMA success while writing nothing. Fail closed.
+        mgr = self._make_manager(
+            monkeypatch, {"x": torch.zeros(1, dtype=torch.float32)}
+        )
+        src = TensorDescriptor(
+            name="w", addr=0x1000, size=4, device_id=0, dtype="torch.float32",
+        )
+        with pytest.raises(ManifestMismatchError, match="heterogeneous transfer"):
+            mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=[src],
+                remote_agent_name="dummy",
+                require_exact_match=True,
+            )
+
+    def test_hetero_matched_name_passes_guard(self, monkeypatch):
+        # Identical name sets must clear the name-mismatch guard: with only "w"
+        # on both sides and require_exact_match=True, execution proceeds past the
+        # guard to the size check, which here fails on a deliberate size skew.
+        # A ManifestMismatchError about "heterogeneous transfer" would mean the
+        # name guard fired spuriously; a "size mismatch" proves it did not.
+        local = torch.zeros(10, dtype=torch.float32)
+        mgr = self._make_manager(monkeypatch, {"w": local})
+        src = TensorDescriptor(
+            name="w", addr=0x1000, size=80, device_id=0, dtype=str(local.dtype),
+        )
+        with pytest.raises(ManifestMismatchError, match="size mismatch"):
+            mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=[src],
+                remote_agent_name="dummy",
+                require_exact_match=True,
+            )
 
 
 class TestWaitForXfer:
