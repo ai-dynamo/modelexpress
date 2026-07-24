@@ -75,6 +75,13 @@ fn lease_observation_expired(
     now: Instant,
     lease_duration: std::time::Duration,
 ) -> bool {
+    // Kubernetes lease expiry is measured from the first local observation of an
+    // unchanged owner/heartbeat fingerprint, not from the owner's wall-clock deadline.
+    // A waiter must therefore observe the same fingerprint again after `lease_duration`;
+    // restarting this backend clears the observation and restarts that interval. With the
+    // service's 10-second heartbeat and 30-second lease, continuously polling waiters
+    // reclaim about 30 seconds after the final observed heartbeat. Redis instead uses
+    // Redis server time and can reclaim on the first request after the stored deadline.
     match observations.get_mut(cr_name) {
         Some(observation) if observation.fingerprint == fingerprint => {
             now.duration_since(observation.observed_at) >= lease_duration
@@ -802,8 +809,8 @@ impl RegistryBackend for KubernetesRegistryBackend {
         let patch = json!([
             { "op": "test", "path": "/status/phase", "value": phase::DOWNLOADING },
             { "op": "test", "path": "/status/claimId", "value": claim_id },
-            { "op": "replace", "path": "/status/leaseExpiresAt", "value": lease_expires_at },
-            { "op": "replace", "path": "/status/lastUsedAt", "value": now },
+            { "op": "add", "path": "/status/leaseExpiresAt", "value": lease_expires_at },
+            { "op": "add", "path": "/status/lastUsedAt", "value": now },
         ]);
         match self
             .api()
@@ -816,7 +823,10 @@ impl RegistryBackend for KubernetesRegistryBackend {
         {
             Ok(_) => Ok(true),
             Err(kube::Error::Api(e)) if e.code == 404 || e.code == 409 || e.code == 422 => {
-                debug!("Download lease refresh for {cr_name} lost ownership");
+                warn!(
+                    "Download lease refresh for {cr_name} lost ownership: {}: {}",
+                    e.reason, e.message
+                );
                 Ok(false)
             }
             Err(e) => Err(e.into()),
@@ -838,9 +848,9 @@ impl RegistryBackend for KubernetesRegistryBackend {
             { "op": "test", "path": "/status/claimId", "value": claim_id },
             { "op": "replace", "path": "/status/phase", "value": Self::phase_from_status(status) },
             { "op": "add", "path": "/status/message", "value": message },
-            { "op": "replace", "path": "/status/lastUsedAt", "value": now },
-            { "op": "remove", "path": "/status/claimId" },
-            { "op": "remove", "path": "/status/leaseExpiresAt" },
+            { "op": "add", "path": "/status/lastUsedAt", "value": now },
+            { "op": "add", "path": "/status/claimId", "value": null },
+            { "op": "add", "path": "/status/leaseExpiresAt", "value": null },
         ]);
         match self
             .api()

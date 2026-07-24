@@ -402,9 +402,10 @@ impl RegistryBackend for RedisRegistryBackend {
         let key = model_key(provider, model_name);
         let legacy = legacy_model_key(model_name);
         let now = Utc::now().to_rfc3339();
-        // Single atomic EVAL: returns CLAIM_WON_SENTINEL if we created the record, else the
-        // existing status, so callers know which replica owns the download (status alone
-        // can't — both see DOWNLOADING). KEYS[2] is the legacy key for migration (see below).
+        // Single atomic EVAL: returns CLAIM_WON_SENTINEL if we created the record or took
+        // over an expired lease, else the existing status, so callers know which replica
+        // owns the download (status alone can't — both see DOWNLOADING). KEYS[2] is the
+        // legacy key for migration (see below).
         let result: String = redis::Script::new(CLAIM_LUA)
             .key(&key)
             .key(&legacy)

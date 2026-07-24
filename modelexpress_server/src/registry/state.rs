@@ -276,6 +276,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finish_download_claim_delegates_to_backend() {
+        let mut mock = MockRegistryBackend::new();
+        mock.expect_finish_download_claim()
+            .with(
+                eq("m"),
+                eq(ModelProvider::HuggingFace),
+                eq("owner"),
+                eq(ModelStatus::DOWNLOADED),
+                eq(None),
+            )
+            .once()
+            .returning(|_, _, _, _, _| Ok(true));
+        let mgr = RegistryManager::with_backend(Arc::new(mock));
+        let won = mgr
+            .finish_download_claim(
+                "m",
+                ModelProvider::HuggingFace,
+                "owner",
+                ModelStatus::DOWNLOADED,
+                None,
+            )
+            .await
+            .expect("finish");
+        assert!(won);
+    }
+
+    #[tokio::test]
     async fn set_status_propagates_errors() {
         let mut mock = MockRegistryBackend::new();
         mock.expect_set_status()

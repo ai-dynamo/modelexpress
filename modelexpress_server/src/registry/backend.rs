@@ -99,9 +99,10 @@ pub trait RegistryBackend: Send + Sync {
     ) -> RegistryResult<ClaimOutcome>;
 
     /// Atomic compare-and-set: if the current status is `ERROR`, flip it to
-    /// `DOWNLOADING` with `Retrying download...` as the message and return `true`.
-    /// Otherwise return `false` without mutation. Used by the error-retry path so
-    /// only one replica spawns the retry even when multiple observe `ERROR`.
+    /// `DOWNLOADING` with `Retrying download...` as the message, establish `claim_id`
+    /// as the lease owner for `lease_duration`, and return `true`. Otherwise return
+    /// `false` without mutation. Used by the error-retry path so only one replica
+    /// spawns the retry even when multiple observe `ERROR`.
     async fn try_reset_error_for_retry(
         &self,
         model_name: &str,
