@@ -11,7 +11,7 @@ plan that reconstructs correctly here reconstructs correctly on the wire.
 
 Exercises the same layouts as the geometry test: column block (contiguous),
 row-parallel column slice (strided, multi-run), fused qkv (per-shard offsets),
-and full copy - plus the unsupported-op fallback path.
+and full copy - plus unsupported-op detection.
 
 Run: pytest tests/test_reshard_refit_transfer.py
 """
@@ -133,7 +133,7 @@ def test_strided_source_reconstructs_exactly():
     )
     sources = {"row": SourceInfo(tuple(row_src.shape), torch.float32, EL, [shard])}
 
-    # Only the 'row' copy is planned here (others have no source -> fallback).
+    # Only the 'row' copy is planned here; missing sources are marked unsupported.
     plan = plan_transfer(capture, sources)
     execute_transfer(
         plan,
@@ -146,7 +146,7 @@ def test_strided_source_reconstructs_exactly():
     assert row_src.data_ptr()  # keep alive
 
 
-def test_unsupported_source_routes_to_fallback():
+def test_unsupported_source_is_marked_for_fail_closed():
     srcs = _full_sources()
     srcs["bad"] = torch.arange(16, dtype=torch.float32).reshape(4, 4).contiguous()
 
@@ -172,5 +172,5 @@ def test_unsupported_source_routes_to_fallback():
 if __name__ == "__main__":
     test_reshard_reconstructs_ground_truth()
     test_strided_source_reconstructs_exactly()
-    test_unsupported_source_routes_to_fallback()
-    print("OK: reshard reconstructs ground truth + strided + fallback")
+    test_unsupported_source_is_marked_for_fail_closed()
+    print("OK: reshard reconstructs ground truth + strided + fail-closed")
