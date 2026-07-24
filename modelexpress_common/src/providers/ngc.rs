@@ -5,7 +5,7 @@ use crate::{
     cache::{ModelInfo, ProviderCache, directory_size},
     envs,
     models::ModelProvider,
-    providers::ModelProviderTrait,
+    providers::{ModelProviderTrait, lock_file::LockFile},
 };
 use anyhow::{Context, Result};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
@@ -782,55 +782,67 @@ impl ModelProviderTrait for NgcProvider {
         let cache_root = get_cache_dir(cache_dir);
         let id = parse_model_name(model_name)?;
         let dest = model_dir(&cache_root, &id);
+        let relative_dest = dest.strip_prefix(&cache_root).unwrap_or(&dest);
+        let mut lock_name = cache_root
+            .join(".mx/locks")
+            .join(relative_dest)
+            .into_os_string();
+        lock_name.push(".lock");
+        let lock_path = PathBuf::from(lock_name);
 
-        tokio::fs::create_dir_all(&dest)
-            .await
-            .with_context(|| format!("Failed to create model directory {dest:?}"))?;
+        LockFile::with_exclusive(&lock_path, || async move {
+            tokio::fs::create_dir_all(&dest)
+                .await
+                .with_context(|| format!("Failed to create model directory {dest:?}"))?;
 
-        let api_key = get_ngc_api_key()?;
-        let client = reqwest::Client::builder()
-            .build()
-            .context("Failed to build HTTP client")?;
-        let token = fetch_token(&client, &api_key, &id).await?;
-        let auth = bearer_header(&token)?;
+            let api_key = get_ngc_api_key()?;
+            let client = reqwest::Client::builder()
+                .build()
+                .context("Failed to build HTTP client")?;
+            let token = fetch_token(&client, &api_key, &id).await?;
+            let auth = bearer_header(&token)?;
 
-        info!(
-            "Downloading NGC artifact: org={} team={:?} type={} name={} version={}",
-            id.org, id.team, id.artifact_type, id.name, id.version
-        );
+            info!(
+                "Downloading NGC artifact: org={} team={:?} type={} name={} version={}",
+                id.org, id.team, id.artifact_type, id.name, id.version
+            );
 
-        let (urls, paths, needs_auth) = fetch_artifact_files(&client, &auth, &id).await?;
+            let (urls, paths, needs_auth) = fetch_artifact_files(&client, &auth, &id).await?;
 
-        if urls.is_empty() {
-            anyhow::bail!("NGC artifact '{model_name}' has no downloadable files");
-        }
+            if urls.is_empty() {
+                anyhow::bail!("NGC artifact '{model_name}' has no downloadable files");
+            }
 
-        // Presigned manifest URLs carry their own auth, so the Authorization header is
-        // not forwarded and token refresh is unnecessary. Only the UAM checksum-fallback
-        // path downloads via the API and needs the Bearer header (and periodic refresh).
-        let (auth_for_download, token_refresh) = if needs_auth {
-            (Some(auth.clone()), Some((api_key.as_str(), &id)))
-        } else {
-            (None, None)
-        };
+            // Presigned manifest URLs carry their own auth, so the Authorization header is
+            // not forwarded and token refresh is unnecessary. Only the UAM checksum-fallback
+            // path downloads via the API and needs the Bearer header (and periodic refresh).
+            let (auth_for_download, token_refresh) = if needs_auth {
+                (Some(auth.clone()), Some((api_key.as_str(), &id)))
+            } else {
+                (None, None)
+            };
 
-        let downloaded = download_files(
-            &client,
-            auth_for_download.as_ref(),
-            urls,
-            paths,
-            &dest,
-            ignore_weights,
-            token_refresh,
-        )
-        .await?;
+            let downloaded = download_files(
+                &client,
+                auth_for_download.as_ref(),
+                urls,
+                paths,
+                &dest,
+                ignore_weights,
+                token_refresh,
+            )
+            .await?;
 
-        if downloaded == 0 {
-            anyhow::bail!("No files downloaded for '{model_name}' (all filtered by ignore rules)");
-        }
+            if downloaded == 0 {
+                anyhow::bail!(
+                    "No files downloaded for '{model_name}' (all filtered by ignore rules)"
+                );
+            }
 
-        info!("Downloaded {downloaded} files for NGC model {model_name}");
-        Ok(dest)
+            info!("Downloaded {downloaded} files for NGC model {model_name}");
+            Ok(dest)
+        })
+        .await
     }
 
     async fn delete_model(&self, model_name: &str, cache_dir: PathBuf) -> Result<()> {
