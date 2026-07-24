@@ -4,8 +4,8 @@
 //! Kubernetes CRD backend for the model registry.
 //!
 //! One `ModelCacheEntry` CR per (provider, cached model), state in the status subresource.
-//! etcd name-uniqueness gives claim atomicity (first to `create` wins; others see 409), the
-//! analogue of Redis `HSETNX`.
+//! etcd name-uniqueness establishes one record, then a resource-version-fenced status patch
+//! establishes the download owner. This is the analogue of Redis's atomic claim script.
 //!
 //! CR name: `mx-cache-{sanitize(provider/model_name)}` (DNS-1123, sha256 suffix). The
 //! provider is in the name so the same model under different providers maps to distinct CRs;
@@ -23,6 +23,11 @@ use kube::{
 use modelexpress_common::models::{ModelProvider, ModelStatus};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::{
+    collections::HashMap,
+    sync::{Mutex, PoisonError},
+    time::Instant,
+};
 use tracing::{debug, info, warn};
 
 const CR_NAME_PREFIX: &str = "mx-cache-";
@@ -40,6 +45,57 @@ const K8S_NAME_MAX: usize = 253;
 const NAME_BUDGET: usize = K8S_NAME_MAX - CR_NAME_PREFIX.len();
 /// Hex chars of SHA256 suffix appended when the sanitized name exceeds the budget.
 const HASH_SUFFIX_LEN: usize = 12;
+
+#[derive(Default)]
+struct StatusPatch<'a> {
+    phase: Option<&'a str>,
+    last_used_at: Option<&'a str>,
+    created_at: Option<&'a str>,
+    message: Option<Option<&'a str>>,
+    claim_id: Option<Option<&'a str>>,
+    lease_expires_at: Option<Option<&'a str>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LeaseFingerprint {
+    claim_id: Option<String>,
+    lease_expires_at: Option<String>,
+}
+
+#[derive(Debug)]
+struct LeaseObservation {
+    fingerprint: LeaseFingerprint,
+    observed_at: Instant,
+}
+
+fn lease_observation_expired(
+    observations: &mut HashMap<String, LeaseObservation>,
+    cr_name: &str,
+    fingerprint: LeaseFingerprint,
+    now: Instant,
+    lease_duration: std::time::Duration,
+) -> bool {
+    match observations.get_mut(cr_name) {
+        Some(observation) if observation.fingerprint == fingerprint => {
+            now.duration_since(observation.observed_at) >= lease_duration
+        }
+        Some(observation) => {
+            observation.fingerprint = fingerprint;
+            observation.observed_at = now;
+            lease_duration.is_zero()
+        }
+        None => {
+            observations.insert(
+                cr_name.to_string(),
+                LeaseObservation {
+                    fingerprint,
+                    observed_at: now,
+                },
+            );
+            lease_duration.is_zero()
+        }
+    }
+}
 
 /// Sanitize a HuggingFace/NGC model name into a DNS-1123 `metadata.name` component.
 ///
@@ -91,6 +147,7 @@ fn hex_sha256(s: &str) -> String {
 pub struct KubernetesRegistryBackend {
     client: Client,
     namespace: String,
+    lease_observations: Mutex<HashMap<String, LeaseObservation>>,
 }
 
 impl KubernetesRegistryBackend {
@@ -100,6 +157,7 @@ impl KubernetesRegistryBackend {
         Ok(Self {
             client,
             namespace: namespace.to_string(),
+            lease_observations: Mutex::new(HashMap::new()),
         })
     }
 
@@ -177,12 +235,16 @@ impl KubernetesRegistryBackend {
             Ok(_) => {
                 self.patch_status(
                     scoped_name,
-                    Some(Self::phase_from_status(Self::status_from_phase(
-                        &legacy_status.phase,
-                    ))),
-                    legacy_status.last_used_at.as_deref(),
-                    legacy_status.created_at.as_deref(),
-                    Some(legacy_status.message.as_deref()),
+                    StatusPatch {
+                        phase: Some(Self::phase_from_status(Self::status_from_phase(
+                            &legacy_status.phase,
+                        ))),
+                        last_used_at: legacy_status.last_used_at.as_deref(),
+                        created_at: legacy_status.created_at.as_deref(),
+                        message: Some(legacy_status.message.as_deref()),
+                        claim_id: Some(legacy_status.claim_id.as_deref()),
+                        lease_expires_at: Some(legacy_status.lease_expires_at.as_deref()),
+                    },
                 )
                 .await?;
             }
@@ -259,6 +321,39 @@ impl KubernetesRegistryBackend {
             .map_err(|e| format!("invalid RFC3339 in field '{field}' ({s:?}): {e}").into())
     }
 
+    fn lease_deadline(duration: std::time::Duration) -> DateTime<Utc> {
+        let now = Utc::now();
+        chrono::TimeDelta::from_std(duration)
+            .ok()
+            .and_then(|duration| now.checked_add_signed(duration))
+            .unwrap_or(now)
+    }
+
+    fn lease_has_expired(
+        &self,
+        cr_name: &str,
+        status: &crate::registry::k8s_types::ModelCacheEntryStatus,
+        lease_duration: std::time::Duration,
+    ) -> bool {
+        let fingerprint = LeaseFingerprint {
+            claim_id: status.claim_id.clone(),
+            lease_expires_at: status.lease_expires_at.clone(),
+        };
+        let now = Instant::now();
+        let mut observations = self
+            .lease_observations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        lease_observation_expired(&mut observations, cr_name, fingerprint, now, lease_duration)
+    }
+
+    fn clear_lease_observation(&self, cr_name: &str) {
+        self.lease_observations
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(cr_name);
+    }
+
     fn record_from_cr(cr: &ModelCacheEntry) -> RegistryResult<ModelRecord> {
         let status = cr.status.clone().unwrap_or_default();
         let provider = Self::provider_from_str(&cr.spec.provider)?;
@@ -290,26 +385,25 @@ impl KubernetesRegistryBackend {
     /// PATCH /status with a partial ModelCacheEntryStatus. Fields present on the patch
     /// overwrite; fields absent are preserved by the Kubernetes strategic-merge semantics
     /// (merge-patch is fine here because the status object is flat).
-    async fn patch_status(
-        &self,
-        cr_name: &str,
-        new_phase: Option<&str>,
-        last_used_at: Option<&str>,
-        created_at: Option<&str>,
-        message: Option<Option<&str>>,
-    ) -> RegistryResult<()> {
+    async fn patch_status(&self, cr_name: &str, update: StatusPatch<'_>) -> RegistryResult<()> {
         let mut status_patch = serde_json::Map::new();
-        if let Some(p) = new_phase {
+        if let Some(p) = update.phase {
             status_patch.insert("phase".into(), json!(p));
         }
-        if let Some(ts) = last_used_at {
+        if let Some(ts) = update.last_used_at {
             status_patch.insert("lastUsedAt".into(), json!(ts));
         }
-        if let Some(ts) = created_at {
+        if let Some(ts) = update.created_at {
             status_patch.insert("createdAt".into(), json!(ts));
         }
-        if let Some(msg) = message {
+        if let Some(msg) = update.message {
             status_patch.insert("message".into(), json!(msg));
+        }
+        if let Some(id) = update.claim_id {
+            status_patch.insert("claimId".into(), json!(id));
+        }
+        if let Some(expires_at) = update.lease_expires_at {
+            status_patch.insert("leaseExpiresAt".into(), json!(expires_at));
         }
         if status_patch.is_empty() {
             return Ok(());
@@ -326,6 +420,95 @@ impl KubernetesRegistryBackend {
         match self.api().get(cr_name).await {
             Ok(cr) => Ok(Some(cr)),
             Err(kube::Error::Api(e)) if e.code == 404 => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn try_claim_existing(
+        &self,
+        cr: ModelCacheEntry,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
+        claim_uninitialized: bool,
+    ) -> RegistryResult<ClaimOutcome> {
+        let status_missing = cr.status.is_none();
+        let status = cr.status.unwrap_or_default();
+        let current = Self::status_from_phase(&status.phase);
+        if current != ModelStatus::DOWNLOADING {
+            if let Some(cr_name) = cr.metadata.name.as_deref() {
+                self.clear_lease_observation(cr_name);
+            }
+            return Ok(ClaimOutcome::AlreadyExists(current));
+        }
+
+        let cr_name = cr
+            .metadata
+            .name
+            .as_deref()
+            .ok_or("ModelCacheEntry has no name")?;
+        let resource_version = cr
+            .metadata
+            .resource_version
+            .as_deref()
+            .ok_or("ModelCacheEntry has no resourceVersion")?;
+        if !(status_missing && claim_uninitialized)
+            && !self.lease_has_expired(cr_name, &status, lease_duration)
+        {
+            return Ok(ClaimOutcome::AlreadyExists(ModelStatus::DOWNLOADING));
+        }
+        let now = Utc::now().to_rfc3339();
+        let lease_expires_at = Self::lease_deadline(lease_duration).to_rfc3339();
+        let mut patch = vec![
+            json!({ "op": "test", "path": "/metadata/resourceVersion", "value": resource_version }),
+        ];
+        if status_missing {
+            patch.push(json!({
+                "op": "add",
+                "path": "/status",
+                "value": {
+                    "phase": phase::DOWNLOADING,
+                    "createdAt": now,
+                    "lastUsedAt": now,
+                    "message": "Starting download...",
+                    "claimId": claim_id,
+                    "leaseExpiresAt": lease_expires_at,
+                }
+            }));
+        } else {
+            patch.extend([
+                json!({ "op": "test", "path": "/status/phase", "value": phase::DOWNLOADING }),
+                json!({ "op": "add", "path": "/status/claimId", "value": claim_id }),
+                json!({ "op": "add", "path": "/status/leaseExpiresAt", "value": lease_expires_at }),
+                json!({ "op": "add", "path": "/status/message", "value": "Taking over expired download lease..." }),
+                json!({ "op": "add", "path": "/status/lastUsedAt", "value": now }),
+            ]);
+        }
+        match self
+            .api()
+            .patch_status(
+                cr_name,
+                &PatchParams::default(),
+                &Patch::<()>::Json(
+                    serde_json::from_value(serde_json::Value::Array(patch))
+                        .map_err(|e| e.to_string())?,
+                ),
+            )
+            .await
+        {
+            Ok(_) => {
+                self.clear_lease_observation(cr_name);
+                Ok(ClaimOutcome::Claimed)
+            }
+            Err(kube::Error::Api(e)) if e.code == 409 || e.code == 422 => {
+                let current = self
+                    .get_cr(cr_name)
+                    .await?
+                    .and_then(|entry| entry.status)
+                    .map_or(ModelStatus::DOWNLOADING, |status| {
+                        Self::status_from_phase(&status.phase)
+                    });
+                Ok(ClaimOutcome::AlreadyExists(current))
+            }
             Err(e) => Err(e.into()),
         }
     }
@@ -400,10 +583,22 @@ impl RegistryBackend for KubernetesRegistryBackend {
 
         self.patch_status(
             &cr_name,
-            Some(Self::phase_from_status(status)),
-            Some(&now),
-            if needs_created_at { Some(&now) } else { None },
-            Some(message.as_deref()),
+            StatusPatch {
+                phase: Some(Self::phase_from_status(status)),
+                last_used_at: Some(&now),
+                created_at: if needs_created_at { Some(&now) } else { None },
+                message: Some(message.as_deref()),
+                claim_id: if status == ModelStatus::DOWNLOADING {
+                    None
+                } else {
+                    Some(None)
+                },
+                lease_expires_at: if status == ModelStatus::DOWNLOADING {
+                    None
+                } else {
+                    Some(None)
+                },
+            },
         )
         .await?;
         Ok(())
@@ -418,8 +613,14 @@ impl RegistryBackend for KubernetesRegistryBackend {
             return Ok(());
         };
         let now = Utc::now().to_rfc3339();
-        self.patch_status(cr_name, None, Some(&now), None, None)
-            .await?;
+        self.patch_status(
+            cr_name,
+            StatusPatch {
+                last_used_at: Some(&now),
+                ..StatusPatch::default()
+            },
+        )
+        .await?;
         Ok(())
     }
 
@@ -435,6 +636,7 @@ impl RegistryBackend for KubernetesRegistryBackend {
                 Err(kube::Error::Api(e)) if e.code == 404 => {}
                 Err(e) => return Err(e.into()),
             }
+            self.clear_lease_observation(&cr_name);
         }
         Ok(())
     }
@@ -485,14 +687,17 @@ impl RegistryBackend for KubernetesRegistryBackend {
         &self,
         model_name: &str,
         provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
     ) -> RegistryResult<ClaimOutcome> {
         let cr_name = Self::cr_name_for(provider, model_name);
 
         // Fast path (mirrors Redis's scoped-first check): a non-mutating GET returns the
         // existing status without committing a claim, skipping the legacy lookup in steady state.
         if let Some(cr) = self.get_cr(&cr_name).await? {
-            let phase = cr.status.unwrap_or_default().phase;
-            return Ok(ClaimOutcome::AlreadyExists(Self::status_from_phase(&phase)));
+            return self
+                .try_claim_existing(cr, claim_id, lease_duration, false)
+                .await;
         }
 
         // Scoped CR absent: adopt a matching-provider legacy CR if present; a different-provider
@@ -510,42 +715,9 @@ impl RegistryBackend for KubernetesRegistryBackend {
         );
 
         match self.api().create(&PostParams::default(), &cr).await {
-            Ok(_) => {
-                // We won the claim: stamp phase + timestamps on the status subresource.
-                // If patch_status fails, rollback the CR we just created so a retry
-                // can try again and other replicas don't observe a CR with an empty
-                // phase (which status_from_phase treats as DOWNLOADING — a lie).
-                let now = Utc::now().to_rfc3339();
-                if let Err(patch_err) = self
-                    .patch_status(
-                        &cr_name,
-                        Some(phase::DOWNLOADING),
-                        Some(&now),
-                        Some(&now),
-                        Some(Some("Starting download...")),
-                    )
+            Ok(created) => {
+                self.try_claim_existing(created, claim_id, lease_duration, true)
                     .await
-                {
-                    if let Err(delete_err) = self
-                        .api()
-                        .delete(&cr_name, &kube::api::DeleteParams::default())
-                        .await
-                    {
-                        // A CR stranded with empty phase is currently observed as
-                        // DOWNLOADING. MX-287 tracks registry claim reaping so this
-                        // recovery path can clear phantom owners after server/API
-                        // failures.
-                        warn!(
-                            "patch_status failed for {cr_name}; rollback delete also \
-                             failed: {delete_err}. CR may be left with empty phase \
-                             until MX-287 registry claim reaping lands."
-                        );
-                    } else {
-                        debug!("Rolled back {cr_name} after patch_status failure: {patch_err}");
-                    }
-                    return Err(patch_err);
-                }
-                Ok(ClaimOutcome::Claimed)
             }
             Err(kube::Error::Api(e)) if e.code == 409 => {
                 // Lost a race: another replica created the scoped CR between our fast-path
@@ -554,10 +726,8 @@ impl RegistryBackend for KubernetesRegistryBackend {
                     .get_cr(&cr_name)
                     .await?
                     .ok_or("ModelCacheEntry disappeared between 409 and GET")?;
-                let phase_str = existing.status.unwrap_or_default().phase;
-                Ok(ClaimOutcome::AlreadyExists(Self::status_from_phase(
-                    &phase_str,
-                )))
+                self.try_claim_existing(existing, claim_id, lease_duration, false)
+                    .await
             }
             Err(e) => Err(e.into()),
         }
@@ -567,6 +737,8 @@ impl RegistryBackend for KubernetesRegistryBackend {
         &self,
         model_name: &str,
         provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
     ) -> RegistryResult<bool> {
         // Retry only runs after a claim observed AlreadyExists (which already migrated any
         // legacy CR), so the CAS targets the provider-scoped CR directly.
@@ -587,10 +759,50 @@ impl RegistryBackend for KubernetesRegistryBackend {
         // patch with 422 if the status phase was flipped out from under us between
         // GET and PATCH, and we report the CAS miss.
         let now = Utc::now().to_rfc3339();
+        let lease_expires_at = Self::lease_deadline(lease_duration).to_rfc3339();
         let patch = json!([
             { "op": "test", "path": "/status/phase", "value": phase::ERROR },
             { "op": "replace", "path": "/status/phase", "value": phase::DOWNLOADING },
             { "op": "replace", "path": "/status/message", "value": "Retrying download..." },
+            { "op": "replace", "path": "/status/lastUsedAt", "value": now },
+            { "op": "add", "path": "/status/claimId", "value": claim_id },
+            { "op": "add", "path": "/status/leaseExpiresAt", "value": lease_expires_at },
+        ]);
+        match self
+            .api()
+            .patch_status(
+                &cr_name,
+                &PatchParams::default(),
+                &Patch::<()>::Json(serde_json::from_value(patch).map_err(|e| e.to_string())?),
+            )
+            .await
+        {
+            Ok(_) => {
+                self.clear_lease_observation(&cr_name);
+                Ok(true)
+            }
+            Err(kube::Error::Api(e)) if e.code == 422 || e.code == 409 => {
+                debug!("Error-retry CAS for {cr_name} lost to a concurrent write");
+                Ok(false)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn refresh_download_claim(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
+    ) -> RegistryResult<bool> {
+        let cr_name = Self::cr_name_for(provider, model_name);
+        let now = Utc::now().to_rfc3339();
+        let lease_expires_at = Self::lease_deadline(lease_duration).to_rfc3339();
+        let patch = json!([
+            { "op": "test", "path": "/status/phase", "value": phase::DOWNLOADING },
+            { "op": "test", "path": "/status/claimId", "value": claim_id },
+            { "op": "replace", "path": "/status/leaseExpiresAt", "value": lease_expires_at },
             { "op": "replace", "path": "/status/lastUsedAt", "value": now },
         ]);
         match self
@@ -603,8 +815,48 @@ impl RegistryBackend for KubernetesRegistryBackend {
             .await
         {
             Ok(_) => Ok(true),
-            Err(kube::Error::Api(e)) if e.code == 422 || e.code == 409 => {
-                debug!("Error-retry CAS for {cr_name} lost to a concurrent write");
+            Err(kube::Error::Api(e)) if e.code == 404 || e.code == 409 || e.code == 422 => {
+                debug!("Download lease refresh for {cr_name} lost ownership");
+                Ok(false)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn finish_download_claim(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        claim_id: &str,
+        status: ModelStatus,
+        message: Option<String>,
+    ) -> RegistryResult<bool> {
+        let cr_name = Self::cr_name_for(provider, model_name);
+        let now = Utc::now().to_rfc3339();
+        let patch = json!([
+            { "op": "test", "path": "/status/phase", "value": phase::DOWNLOADING },
+            { "op": "test", "path": "/status/claimId", "value": claim_id },
+            { "op": "replace", "path": "/status/phase", "value": Self::phase_from_status(status) },
+            { "op": "add", "path": "/status/message", "value": message },
+            { "op": "replace", "path": "/status/lastUsedAt", "value": now },
+            { "op": "remove", "path": "/status/claimId" },
+            { "op": "remove", "path": "/status/leaseExpiresAt" },
+        ]);
+        match self
+            .api()
+            .patch_status(
+                &cr_name,
+                &PatchParams::default(),
+                &Patch::<()>::Json(serde_json::from_value(patch).map_err(|e| e.to_string())?),
+            )
+            .await
+        {
+            Ok(_) => {
+                self.clear_lease_observation(&cr_name);
+                Ok(true)
+            }
+            Err(kube::Error::Api(e)) if e.code == 404 || e.code == 409 || e.code == 422 => {
+                debug!("Download completion for {cr_name} lost ownership");
                 Ok(false)
             }
             Err(e) => Err(e.into()),
@@ -615,6 +867,50 @@ impl RegistryBackend for KubernetesRegistryBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lease_expires_only_after_unchanged_heartbeat_duration() {
+        let mut observations = HashMap::new();
+        let started = Instant::now();
+        let duration = std::time::Duration::from_secs(30);
+        let first = LeaseFingerprint {
+            claim_id: Some("owner".to_string()),
+            lease_expires_at: Some("heartbeat-1".to_string()),
+        };
+        assert!(!lease_observation_expired(
+            &mut observations,
+            "model",
+            first.clone(),
+            started,
+            duration,
+        ));
+        assert!(!lease_observation_expired(
+            &mut observations,
+            "model",
+            first.clone(),
+            started + std::time::Duration::from_secs(29),
+            duration,
+        ));
+
+        let renewed = LeaseFingerprint {
+            claim_id: Some("owner".to_string()),
+            lease_expires_at: Some("heartbeat-2".to_string()),
+        };
+        assert!(!lease_observation_expired(
+            &mut observations,
+            "model",
+            renewed.clone(),
+            started + duration,
+            duration,
+        ));
+        assert!(lease_observation_expired(
+            &mut observations,
+            "model",
+            renewed,
+            started + duration + duration,
+            duration,
+        ));
+    }
 
     #[test]
     fn sanitize_preserves_readable_prefix() {

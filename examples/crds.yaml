@@ -237,6 +237,13 @@ spec:
                 message:
                   type: string
                   description: Optional human-readable progress or error message
+                claimId:
+                  type: string
+                  description: Opaque identity of the current download owner
+                leaseExpiresAt:
+                  type: string
+                  format: date-time
+                  description: Owner heartbeat marker used by observers to measure lease liveness
       additionalPrinterColumns:
         - name: Model
           type: string

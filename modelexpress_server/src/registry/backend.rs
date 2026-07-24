@@ -36,7 +36,7 @@ pub struct ModelRecord {
 /// `AlreadyExists` must wait on the owner instead of spawning a duplicate download.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ClaimOutcome {
-    /// This call atomically created the registry record with status `DOWNLOADING`.
+    /// This call atomically created the registry record or took over an expired lease.
     /// The caller is the download owner.
     Claimed,
     /// The record already existed when we tried to claim. The caller is a waiter, not
@@ -81,9 +81,10 @@ pub trait RegistryBackend: Send + Sync {
     /// Return (downloading, downloaded, error) counts. Used by the metrics path.
     async fn get_status_counts(&self) -> RegistryResult<(u32, u32, u32)>;
 
-    /// Atomic claim: if the model has no registry record, create one with status
-    /// `DOWNLOADING` and return `ClaimOutcome::Claimed`. Otherwise, return
-    /// `ClaimOutcome::AlreadyExists(status)` without mutation.
+    /// Atomic claim: create a `DOWNLOADING` record when absent, or take over an
+    /// existing `DOWNLOADING` record whose lease expired. Return
+    /// `ClaimOutcome::Claimed` only to the new owner; otherwise return the current
+    /// status without mutation.
     ///
     /// This is the only way multi-replica servers know which one actually owns the
     /// download. Callers MUST NOT infer ownership from the observed status alone —
@@ -93,6 +94,8 @@ pub trait RegistryBackend: Send + Sync {
         &self,
         model_name: &str,
         provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
     ) -> RegistryResult<ClaimOutcome>;
 
     /// Atomic compare-and-set: if the current status is `ERROR`, flip it to
@@ -103,6 +106,28 @@ pub trait RegistryBackend: Send + Sync {
         &self,
         model_name: &str,
         provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
+    ) -> RegistryResult<bool>;
+
+    /// Renew a download lease only while `claim_id` still owns the `DOWNLOADING` record.
+    async fn refresh_download_claim(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
+    ) -> RegistryResult<bool>;
+
+    /// Atomically publish a terminal status only while `claim_id` still owns the
+    /// `DOWNLOADING` record. This fences stale owners after lease takeover.
+    async fn finish_download_claim(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        claim_id: &str,
+        status: ModelStatus,
+        message: Option<String>,
     ) -> RegistryResult<bool>;
 }
 

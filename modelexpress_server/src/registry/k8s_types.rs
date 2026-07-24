@@ -53,6 +53,15 @@ pub struct ModelCacheEntryStatus {
     /// Optional human-readable message (download progress, error reason).
     #[serde(default)]
     pub message: Option<String>,
+
+    /// Opaque identity of the replica that currently owns a download.
+    #[serde(rename = "claimId", default)]
+    pub claim_id: Option<String>,
+
+    /// Owner-generated RFC3339 heartbeat deadline. Observers use changes in this value
+    /// to measure liveness locally instead of comparing clocks across replicas.
+    #[serde(rename = "leaseExpiresAt", default)]
+    pub lease_expires_at: Option<String>,
 }
 
 /// Phase strings used by the CRD. Match `ModelStatus` one-for-one.
@@ -87,5 +96,7 @@ mod tests {
         assert!(status.created_at.is_none());
         assert!(status.last_used_at.is_none());
         assert!(status.message.is_none());
+        assert!(status.claim_id.is_none());
+        assert!(status.lease_expires_at.is_none());
     }
 }
