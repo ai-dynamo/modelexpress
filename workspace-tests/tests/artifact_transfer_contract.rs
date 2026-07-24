@@ -196,6 +196,10 @@ fn k8s_metadata_contract_carries_artifact_source_type_and_summary() {
         ModelMetadataSpec::source_type_name_from_proto(MxSourceType::FlashinferCache as i32),
         "flashinfer_cache"
     );
+    assert_eq!(
+        ModelMetadataSpec::source_type_name_from_proto(MxSourceType::TvmFfiCache as i32),
+        "tvm_ffi_cache"
+    );
 
     let worker = WorkerStatus {
         worker_rank: 0,

@@ -497,6 +497,11 @@ def triton_cache_root() -> Path:
     return Path(configured) if configured else Path.home() / ".triton" / "cache"
 
 
+def tvm_ffi_cache_root() -> Path:
+    configured = envs.TVM_FFI_CACHE_DIR
+    return Path(configured) if configured else Path.home() / ".cache" / "tvm-ffi"
+
+
 def tilelang_cache_root() -> Path:
     configured = envs.TILELANG_CACHE_DIR
     return Path(configured) if configured else Path.home() / ".tilelang" / "cache"
@@ -528,6 +533,21 @@ def triton_version() -> str:
         return version if isinstance(version, str) else str(version)
     except Exception:
         return ""
+
+
+def tvm_ffi_version() -> str:
+    try:
+        import tvm_ffi
+
+        version = getattr(tvm_ffi, "__version__", None)
+        if version:
+            return str(version)
+    except Exception:
+        pass
+    try:
+        return pkg_version("apache-tvm-ffi")
+    except Exception:
+        return "unknown"
 
 
 def triton_key() -> str:
