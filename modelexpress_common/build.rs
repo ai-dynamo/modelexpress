@@ -12,7 +12,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "proto/api.proto",
                 "proto/model.proto",
                 "proto/p2p.proto",
-                "proto/m2n_bootstrap.proto",
                 "proto/weight_sync.proto",
             ],
             &["proto"],

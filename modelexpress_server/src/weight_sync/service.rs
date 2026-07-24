@@ -17,10 +17,12 @@ use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 use modelexpress_common::grpc::weight_sync::{
-    BuildPlanRequest, BuildPlanResponse, GetM2nPlanRequest, GetM2nPlanResponse, GetPlanRequest,
-    GetPlanResponse, GetTrainerTableRequest, GetTrainerTableResponse, InvalidateM2nPlanRequest,
+    BuildPlanRequest, BuildPlanResponse, GetM2nPlanRequest, GetM2nPlanResponse,
+    GetNcclBootstrapRequest, GetNcclBootstrapResponse, GetPlanRequest, GetPlanResponse,
+    GetTrainerTableRequest, GetTrainerTableResponse, InvalidateM2nPlanRequest,
     InvalidateM2nPlanResponse, InvalidatePlanRequest, InvalidatePlanResponse, M2nDescriptorProto,
-    PublishInferenceTableRequest, PublishInferenceTableResponse, PublishTrainerTableRequest,
+    NcclBootstrapRecord, PublishInferenceTableRequest, PublishInferenceTableResponse,
+    PublishNcclBootstrapRequest, PublishNcclBootstrapResponse, PublishTrainerTableRequest,
     PublishTrainerTableResponse, RdmaDescriptorProto, RegisterM2nWorkerRequest,
     RegisterM2nWorkerResponse,
     weight_sync_service_server::WeightSyncService as WeightSyncServiceTrait,
@@ -66,6 +68,8 @@ struct WeightSyncState {
     m2n_pending: HashMap<String, M2nPlanEntry>,
     /// (plan_id, worker_rank) -> this worker's M2N descriptors
     m2n_worker_plans: HashMap<(String, i32), Vec<M2nDescriptorProto>>,
+    /// attempt_id -> coordinator-defined NCCL communicator bootstrap record
+    nccl_bootstraps: HashMap<String, NcclBootstrapRecord>,
 }
 
 impl WeightSyncState {
@@ -77,8 +81,60 @@ impl WeightSyncState {
             inference_tables: HashMap::new(),
             m2n_pending: HashMap::new(),
             m2n_worker_plans: HashMap::new(),
+            nccl_bootstraps: HashMap::new(),
         }
     }
+}
+
+const NCCL_UNIQUE_ID_BYTES: usize = 128;
+const SHA256_BYTES: usize = 32;
+
+fn validate_attempt_id(attempt_id: &str) -> Result<(), Status> {
+    let parsed = Uuid::parse_str(attempt_id).map_err(|_| {
+        Status::invalid_argument(
+            "attempt_id must be a canonical random UUIDv4 and must never be reused",
+        )
+    })?;
+    if parsed.get_version() != Some(uuid::Version::Random)
+        || parsed.hyphenated().to_string() != attempt_id
+    {
+        return Err(Status::invalid_argument(
+            "attempt_id must be a canonical random UUIDv4 and must never be reused",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_nccl_bootstrap_record(record: &NcclBootstrapRecord) -> Result<(), Status> {
+    validate_attempt_id(&record.attempt_id)?;
+    if record.cohort_id.is_empty() {
+        return Err(Status::invalid_argument("cohort_id is required"));
+    }
+    if record.nccl_unique_id.len() != NCCL_UNIQUE_ID_BYTES {
+        return Err(Status::invalid_argument(format!(
+            "nccl_unique_id must be exactly {NCCL_UNIQUE_ID_BYTES} bytes"
+        )));
+    }
+    if record.source_world_size == 0 || record.destination_world_size == 0 {
+        return Err(Status::invalid_argument(
+            "source_world_size and destination_world_size must be non-zero",
+        ));
+    }
+    let expected_world_size = record
+        .source_world_size
+        .checked_add(record.destination_world_size)
+        .ok_or_else(|| Status::invalid_argument("NCCL world size overflow"))?;
+    if record.world_size != expected_world_size {
+        return Err(Status::invalid_argument(
+            "world_size must equal source_world_size + destination_world_size",
+        ));
+    }
+    if record.roster_digest.len() != SHA256_BYTES {
+        return Err(Status::invalid_argument(
+            "roster_digest must be a 32-byte SHA-256 digest",
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +161,44 @@ impl WeightSyncServiceImpl {
 
 #[tonic::async_trait]
 impl WeightSyncServiceTrait for WeightSyncServiceImpl {
+    async fn publish_nccl_bootstrap(
+        &self,
+        request: Request<PublishNcclBootstrapRequest>,
+    ) -> Result<Response<PublishNcclBootstrapResponse>, Status> {
+        let record = request
+            .into_inner()
+            .record
+            .ok_or_else(|| Status::invalid_argument("record is required"))?;
+        validate_nccl_bootstrap_record(&record)?;
+
+        self.state
+            .write()
+            .await
+            .nccl_bootstraps
+            .insert(record.attempt_id.clone(), record);
+        Ok(Response::new(PublishNcclBootstrapResponse { ok: true }))
+    }
+
+    async fn get_nccl_bootstrap(
+        &self,
+        request: Request<GetNcclBootstrapRequest>,
+    ) -> Result<Response<GetNcclBootstrapResponse>, Status> {
+        let attempt_id = request.into_inner().attempt_id;
+        validate_attempt_id(&attempt_id)?;
+
+        let record = self
+            .state
+            .read()
+            .await
+            .nccl_bootstraps
+            .get(&attempt_id)
+            .cloned();
+        Ok(Response::new(GetNcclBootstrapResponse {
+            found: record.is_some(),
+            record,
+        }))
+    }
+
     async fn publish_trainer_table(
         &self,
         request: Request<PublishTrainerTableRequest>,
@@ -383,5 +477,143 @@ impl WeightSyncServiceTrait for WeightSyncServiceImpl {
         }
 
         Ok(Response::new(InvalidateM2nPlanResponse { ok: true }))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    const ATTEMPT_A: &str = "123e4567-e89b-42d3-a456-426614174000";
+    const ATTEMPT_B: &str = "123e4567-e89b-42d3-a456-426614174001";
+
+    fn record(attempt_id: &str, cohort_id: &str, marker: u8) -> NcclBootstrapRecord {
+        NcclBootstrapRecord {
+            cohort_id: cohort_id.to_string(),
+            attempt_id: attempt_id.to_string(),
+            nccl_unique_id: vec![marker; NCCL_UNIQUE_ID_BYTES],
+            source_world_size: 2,
+            destination_world_size: 2,
+            world_size: 4,
+            roster_digest: vec![marker; SHA256_BYTES],
+        }
+    }
+
+    async fn publish(service: &WeightSyncServiceImpl, record: NcclBootstrapRecord) {
+        let response = service
+            .publish_nccl_bootstrap(Request::new(PublishNcclBootstrapRequest {
+                record: Some(record),
+            }))
+            .await
+            .expect("publish")
+            .into_inner();
+        assert!(response.ok);
+    }
+
+    async fn get(
+        service: &WeightSyncServiceImpl,
+        attempt_id: &str,
+    ) -> GetNcclBootstrapResponse {
+        service
+            .get_nccl_bootstrap(Request::new(GetNcclBootstrapRequest {
+                attempt_id: attempt_id.to_string(),
+            }))
+            .await
+            .expect("get")
+            .into_inner()
+    }
+
+    #[tokio::test]
+    async fn nccl_bootstrap_publish_get_and_identical_retry() {
+        let service = WeightSyncServiceImpl::new();
+        let expected = record(ATTEMPT_A, "pp-0", 7);
+
+        publish(&service, expected.clone()).await;
+        publish(&service, expected.clone()).await;
+
+        let response = get(&service, ATTEMPT_A).await;
+        assert!(response.found);
+        assert_eq!(response.record, Some(expected));
+    }
+
+    #[tokio::test]
+    async fn nccl_bootstrap_unknown_attempt_is_not_found() {
+        let response = get(&WeightSyncServiceImpl::new(), ATTEMPT_A).await;
+        assert!(!response.found);
+        assert!(response.record.is_none());
+    }
+
+    #[tokio::test]
+    async fn nccl_bootstrap_attempts_and_cohorts_are_isolated() {
+        let service = WeightSyncServiceImpl::new();
+        let first = record(ATTEMPT_A, "pp-0", 1);
+        let second = record(ATTEMPT_B, "pp-1", 2);
+        publish(&service, first.clone()).await;
+        publish(&service, second.clone()).await;
+
+        assert_eq!(get(&service, ATTEMPT_A).await.record, Some(first));
+        assert_eq!(get(&service, ATTEMPT_B).await.record, Some(second));
+    }
+
+    #[tokio::test]
+    async fn nccl_bootstrap_same_cohort_new_attempt_is_independent() {
+        let service = WeightSyncServiceImpl::new();
+        let first = record(ATTEMPT_A, "pp-0", 1);
+        let retry = record(ATTEMPT_B, "pp-0", 2);
+        publish(&service, first.clone()).await;
+        publish(&service, retry.clone()).await;
+
+        assert_eq!(get(&service, ATTEMPT_A).await.record, Some(first));
+        assert_eq!(get(&service, ATTEMPT_B).await.record, Some(retry));
+    }
+
+    #[tokio::test]
+    async fn nccl_bootstrap_rejects_invalid_records() {
+        let mut cases = Vec::new();
+
+        for invalid_attempt in [
+            "not-a-uuid",
+            "123E4567-E89B-42D3-A456-426614174000",
+            "123e4567-e89b-12d3-a456-426614174000",
+        ] {
+            cases.push(record(invalid_attempt, "pp-0", 1));
+        }
+
+        let mut invalid = record(ATTEMPT_A, "", 1);
+        cases.push(invalid.clone());
+
+        invalid = record(ATTEMPT_A, "pp-0", 1);
+        invalid.nccl_unique_id.pop();
+        cases.push(invalid.clone());
+
+        invalid = record(ATTEMPT_A, "pp-0", 1);
+        invalid.source_world_size = 0;
+        cases.push(invalid.clone());
+
+        invalid = record(ATTEMPT_A, "pp-0", 1);
+        invalid.world_size = 5;
+        cases.push(invalid.clone());
+
+        invalid = record(ATTEMPT_A, "pp-0", 1);
+        invalid.source_world_size = u32::MAX;
+        invalid.destination_world_size = 1;
+        invalid.world_size = u32::MAX;
+        cases.push(invalid.clone());
+
+        invalid = record(ATTEMPT_A, "pp-0", 1);
+        invalid.roster_digest.pop();
+        cases.push(invalid);
+
+        let service = WeightSyncServiceImpl::new();
+        for invalid in cases {
+            let error = service
+                .publish_nccl_bootstrap(Request::new(PublishNcclBootstrapRequest {
+                    record: Some(invalid),
+                }))
+                .await
+                .expect_err("invalid record");
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        }
     }
 }

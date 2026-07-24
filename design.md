@@ -1,246 +1,208 @@
-# NCCL M2N bootstrap through ModelExpress
+# NCCL M2N bootstrap through WeightSyncService
 
-Status: implemented locally as an unpublished follow-up to ModelExpress PR #497.
+Status: follow-up to ModelExpress PR #497. This replaces its Torch/Gloo UID
+broadcast; it does not change #497's NCCL M2N data plane.
 
 ## Decision
 
-Replace PR #497's Torch/Gloo UID broadcast with a dedicated ModelExpress
-bootstrap service. NeMo RL/Dynamo remains topology authority; MX only brokers
-one immutable NCCL UID record.
+Extend the existing `WeightSyncService` with typed publish/get RPCs. The
+external NeMo RL/Dynamo coordinator remains the topology authority. MX stores
+one complete NCCL bootstrap record and does not discover participants, assign
+ranks, run a barrier, or decide when transfers may begin.
 
-This first integration does not add `NcclM2nSession`, `BootstrapProvider`,
-`CreateAttempt`, participant discovery, or rank assignment.
+There is no dedicated bootstrap service, Redis path, CAS, abort tombstone,
+client package, session, provider, or `MxClient` method.
 
-## Terminology and identity
+## Identity
 
-| Term | Meaning | When it changes |
+| Term | Meaning | Change rule |
 |---|---|---|
-| `job_id` | Coordinator-defined training job or run containing one or more logical transfer groups. It is a namespace, not a communicator identity. | New training job or run. |
-| `cohort_id` | Coordinator-defined identity of one logical source/destination group with a fixed ordered membership and NCCL rank mapping inside a job. It names the intended group, not one NCCL initialization. | Membership, role, source/destination partition, or NCCL rank mapping changes. |
-| `attempt_id` | Globally unique UUIDv4 for one concrete attempt to create an NCCL communicator for a cohort. MX uses it as the storage and fencing identity. | Every bootstrap retry, restart, abort, expiry, or communicator rebuild, even if the cohort is unchanged. It is never reused. |
-| roster | Ordered list of all participants in the cohort. Each entry identifies the participant, source/destination role, and assigned NCCL rank. Ordering is NCCL-rank order; source ranks precede destination ranks. | Frozen before an attempt begins. Any roster change requires a new `cohort_id` and `attempt_id`. |
-| `roster_digest` | SHA-256 consistency token for the complete ordered roster. Every rank in an attempt receives identical digest bytes. | Changes whenever any roster entry or its order changes. |
-| `config_digest` | SHA-256 consistency token for immutable M2N/NCCL settings not represented by the roster. | Changes whenever those settings change; applying changed configuration requires a new `attempt_id`. |
+| `cohort_id` | Stable coordinator-defined logical communication group, such as one pipeline-parallel source/destination group. It is metadata, not the storage key. | Different PP groups use different cohort IDs. A cohort may remain stable across membership changes and communicator reconfiguration. |
+| `attempt_id` | Canonical UUIDv4 for one concrete bootstrap or future reconfiguration operation over a specific roster snapshot. It is the MX storage key. | Always create a new value for retry, restart, membership change, or communicator operation. Never reuse it. |
+| roster | Coordinator-owned ordered participants, roles, and NCCL ranks. MX does not store it. | Freeze for one attempt. A change requires a new attempt and digest, but not necessarily a new cohort. |
+| `roster_digest` | 32-byte SHA-256 consistency token for that ordered roster. | Recompute whenever the roster changes. Every participant receives identical bytes. |
 
-One cohort may have multiple sequential attempts. For example, if bootstrap
-times out without changing membership, the coordinator keeps `job_id` and
-`cohort_id`, generates a new `attempt_id`, and creates a fresh UID and
-communicator. Replacing a participant or changing its NCCL rank creates a new
-`cohort_id` as well as a new `attempt_id`. The coordinator must run only one
-active attempt per cohort; MX does not enforce this cross-attempt invariant.
+One cohort may have sequential attempts. Multiple PP groups may bootstrap at
+the same time because each has a different `cohort_id` and `attempt_id`.
+Correctness depends on the trusted coordinator assigning one NCCL rank 0
+publisher and never reusing an attempt ID.
 
-```text
-job_id = training-run-42
-  cohort_id = trainer-A-to-generator-A
-    attempt_id = 550e...   # failed or expired communicator construction
-    attempt_id = b71c...   # retry: same roster, new UID and communicator
-  cohort_id = trainer-A-to-generators-A-plus-B
-    attempt_id = 198a...   # changed roster, therefore new cohort and attempt
-```
+## Flow
 
-The roster itself is coordinator-owned and is not stored or reconstructed by
-MX. The current API accepts `roster_digest` as opaque 32-byte data and checks
-only its length and exact equality across publication/fetch. MX can detect
-that ranks received different digests; it cannot prove that a digest describes
-the real participants or rank mapping. A shared, versioned canonical roster
-serializer and digest helper is required before independent coordinator
-implementations can safely compute this value.
-
-## Current and implemented flows
-
-PR #497:
-
-```text
-launcher -> Torch/Gloo world -> rank 0 ncclGetUniqueId
-         -> Gloo broadcast -> blocking ncclCommInitRank
-```
-
-Implemented flow:
-
-[![Implemented NCCL M2N bootstrap flow](docs/images/nccl-m2n-bootstrap-flow.png)](docs/images/nccl-m2n-bootstrap-flow.svg)
+[![WeightSync-based NCCL M2N bootstrap flow](docs/images/nccl-m2n-bootstrap-flow.png)](docs/images/nccl-m2n-bootstrap-flow.svg)
 
 [Open the full-size SVG](docs/images/nccl-m2n-bootstrap-flow.svg).
 
-No rank may call an M2N collective before coordinator release.
+```mermaid
+flowchart TD
+    C["Coordinator assigns cohort, attempt,<br/>ordered roster, roles, NCCL ranks and sizes"]
+    P["Assigned NCCL rank 0 generates one UID"]
+    W["PublishNcclBootstrap"]
+    G["Every participant polls GetNcclBootstrap"]
+    V["Validate cohort, attempt, sizes,<br/>roster digest, UID and local rank"]
+    N["ncclCommInitRankConfig with blocking = 0"]
+    A["Poll ncclCommGetAsyncError until<br/>success, error, or local deadline"]
+    R["Report local result to coordinator"]
+    S["Coordinator releases all participants"]
+    F["Coordinator terminates the attempt"]
 
-## Assumptions
+    C --> P --> W --> G --> V --> N --> A --> R
+    R -->|"all succeeded"| S
+    R -->|"any failure"| F
+```
 
-- NeMo RL/Dynamo knows exact source and destination participants.
-- Coordinator freezes the ordered roster and immutable M2N/NCCL configuration
-  for one attempt before UID generation.
-- Source ranks occupy `[0, source_size)`; destination ranks follow.
-- Coordinator assigns one process per GPU and permits one active attempt for
-  each fixed cohort.
-- Coordinator supplies a canonical random UUIDv4 `attempt_id`; it never reuses
-  an attempt ID, including after failure or expiry.
-- Source NCCL rank 0 is designated UID publisher; all ranks receive its
-  participant identity.
-- Coordinator invokes every worker, gathers local results, releases all on
-  success, and terminates or restarts the cohort on failure.
-- Communicator may span weight versions; weight version is not bootstrap
-  identity.
-- Initial deployment uses trusted MX control network. Authentication and TLS
-  remain production hardening.
-- Selected M2N build must support a nonblocking NCCL communicator. NCCL
-  management calls made inside M2N must reach async success before M2N reads
-  their outputs.
+All ranks, including rank zero, fetch and validate the stored record before
+NCCL initialization. After that fetch, clients stop reading MX and poll NCCL
+only. No rank may enter an M2N collective before coordinator release.
 
-## Ownership
+## Assumptions and ownership
 
-| Owner | Responsibility |
-|---|---|
-| NeMo RL/Dynamo | Roster, rank mapping, attempt ID, dispatch, all-rank result barrier, release/abort, restart |
-| ModelExpress | Atomic UID publication/read, immutable metadata validation, abort tombstone, expiry |
-| NCCL | Create predetermined communicator |
-| NCCL M2N | Run predetermined reshard collectives on that communicator |
+- Coordinator defines the complete source and destination membership, roles,
+  NCCL ranks, world sizes, `cohort_id`, and never-reused `attempt_id`.
+- Source ranks occupy `[0, source_world_size)` and destination ranks follow.
+- Assigned NCCL rank zero is the only UID publisher and generates one UID.
+- A retry uses a new attempt and UID. A publish timeout fails the attempt; the
+  publisher does not regenerate or automatically republish under the same ID.
+- Coordinator gathers every local initialization result, releases all ranks
+  only after complete success, and terminates all participants on any failure.
+- The initial deployment has one MX server state object and a trusted control
+  network. Authentication and TLS are separate production work.
+- This v1 flow treats membership as fixed for one communicator because current
+  NCCL communicator APIs do. Today, joining or replacing a rank requires a new
+  attempt, UID, and communicator, while `cohort_id` may remain stable when it
+  is still the same logical PP group. This is not an MX restriction.
 
-The `nccl/nccl-extensions` M2N API accepts an existing `ncclComm_t`; its
-benchmarks use MPI only as external rendezvous. MX replaces that rendezvous,
-not M2N communicator or topology ownership.
+## WeightSync API and storage
 
-## Coordinator descriptor
-
-Every rank receives:
+`weight_sync.proto` adds:
 
 ```text
-job_id
-attempt_id
-cohort_id
-participant_id
-uid_publisher_participant_id
-assigned_nccl_rank
-source_world_size
-destination_world_size
-roster_digest
-config_digest
-timeout
+PublishNcclBootstrap(NcclBootstrapRecord) -> ok
+GetNcclBootstrap(attempt_id) -> found, record
 ```
 
-The coordinator sends the same `job_id`, `cohort_id`, `attempt_id`, ordered
-roster digest, and configuration digest to every participant. It sends each
-participant its own `participant_id` and assigned rank. Each rank validates
-the fetched key, sizes, digests, publisher, UID length, and local rank
-assignment before initializing NCCL. MX never discovers participants or
-assigns ranks.
+The record contains `cohort_id`, `attempt_id`, 128-byte `nccl_unique_id`,
+source/destination/total world sizes, and the 32-byte `roster_digest`.
 
-## ModelExpress API
+`WeightSyncState` stores `attempt_id -> NcclBootstrapRecord` in its existing
+process-local `RwLock`. A whole record is inserted or read atomically inside
+one process. The server validates a canonical UUIDv4, nonempty cohort, exact
+UID and digest lengths, positive source/destination sizes, and checked total
+size arithmetic.
 
-Use dedicated `modelexpress_common/proto/m2n_bootstrap.proto` on existing MX
-server and port. Do not extend `p2p.proto`, `WorkerMetadata`, or
-`MxClientBase`.
+The map intentionally has no CAS, conflict detection, fingerprint, TTL,
+deletion, expiry, abort, revision, or publisher field. An identical retry is
+accepted, but MX also permits a conflicting overwrite. The coordinator must
+guarantee one publisher and identical bytes for any same-attempt retry.
 
-```protobuf
-service M2nBootstrapService {
-  rpc PublishBootstrap(PublishM2nBootstrapRequest)
-      returns (PublishM2nBootstrapResponse);
-  rpc GetBootstrap(GetM2nBootstrapRequest)
-      returns (GetM2nBootstrapResponse);
-  rpc AbortBootstrap(AbortM2nBootstrapRequest)
-      returns (AbortM2nBootstrapResponse);
-}
-```
+## Why one MX server instance
 
-States: `PUBLISHED`, `ABORTED`, `EXPIRED`. Publication is write-once;
-retries with the same UID and immutable metadata are idempotent. Abort may
-create a tombstone before
-publication. Terminal attempts reject later publication.
-
-## NCCL initialization and deadlines
-
-Native shim compiles against selected `nccl.h` and exposes:
+Each `run_server` creates a separate `WeightSyncServiceImpl` with a private
+`Arc<RwLock<WeightSyncState>>`. `Arc` shares state only inside that process.
 
 ```text
-ncclCommInitRankConfig
-ncclCommGetAsyncError
-ncclCommAbort
+rank 0 -> replica A -> publish succeeds
+rank 1 -> replica B -> found=false until its deadline
 ```
 
-It sets `ncclConfig_t.blocking = 0`, resolves symbols through exact
-`ctypes.CDLL` handles, verifies selected NCCL, M2N's NCCL dependency, and the
-process-wide NCCL resolve to the same loaded object, and requires exact
-header/runtime NCCL version match. Launcher must preload same NCCL used to
-build M2N before Torch or any other NCCL consumer.
+Therefore every publish and get for an attempt must reach the same state
+object. The supported v1 deployment is one MX replica. Multiple replicas are
+safe only when every independent participant channel is explicitly pinned to
+the same pod; ordinary load balancing or per-client affinity is insufficient.
 
-Polling and RPC timeouts provide cooperative deadline. `ncclCommAbort` itself
-is synchronous and may hang in a broken runtime; a process supervisor is
-required for hard wall-clock termination.
+A server restart before all ranks fetch loses the record and fails the
+attempt. After all ranks fetch, NCCL initialization may continue because MX is
+not read again. Records accumulate until restart. A backend-neutral shared
+ephemeral KV is required before multi-replica or HA claims.
 
-The communicator remains nonblocking after initialization. MX therefore polls
-`ncclCommGetAsyncError` after `ncclCommWindowRegister`, even when registration
-returns `ncclSuccess`, and does not consume the window handle until async
-success. M2N must do the same for its internal NCCL management operations.
-Revision `1623765eadf82b773f1debaa544f4c14d9fd6d80` needs an upstream fix to
-poll completion of `ncclDevCommCreate`; without it, M2N reads an incomplete
-device communicator and reshard fails. This is a merge/runtime prerequisite,
-not an MX bootstrap responsibility.
+## NCCL initialization and failure handling
 
-## Storage
+The ABI-safe native shim calls `ncclCommInitRankConfig` with
+`ncclConfig_t.blocking = 0`, then exposes `ncclCommGetAsyncError` and
+`ncclCommAbort`. Every gRPC call receives the remaining local deadline.
 
-- Memory backend: tests and local development only.
-- Redis backend: Lua scripts atomically publish/get/abort two same-slot keys.
-  UID key expires at bootstrap deadline; record key keeps a 24-hour tombstone.
-- Initial Redis claim assumes one non-failing primary. Production requires
-  durable acknowledged writes and failover semantics that cannot lose fencing
-  tombstones.
-- Kubernetes backend is unsupported until it implements atomic
-  `resourceVersion` compare-and-swap.
+On an immediate or asynchronous NCCL error, or deadline expiry, the client
+best-effort aborts its local communicator and preserves the original error.
+`ncclCommAbort` is synchronous and can hang, so a process supervisor remains
+required for a hard termination deadline.
 
-## Failure rules
+The selected NCCL M2N revision must support a nonblocking communicator,
+including asynchronous completion of its internal `ncclDevCommCreate` before
+using the device communicator. This is an M2N compatibility prerequisite, not
+an MX bootstrap responsibility.
 
-- During communicator bootstrap, any valid-assignment failure calls
-  `AbortBootstrap`; a non-null communicator also gets `ncclCommAbort` best-effort.
-- Abort failures are attached to, never replace, root bootstrap error.
-- Local NCCL success does not imply cohort success.
-- Missing participant, MX abort/expiry, NCCL async error, or deadline failure
-  fails whole cohort.
-- Recovery always creates a new attempt ID, UID, and communicator. It preserves
-  the cohort ID only when ordered membership, roles, and rank mapping remain
-  unchanged.
+## Verification
 
-## Implementation points
+The Python bootstrap suite uses both focused fakes and the real generated
+`WeightSyncServiceStub`. Its in-process gRPC test starts three nonzero ranks
+polling before the publisher, then verifies a two-source/two-destination
+world in which:
 
-- Proto and generated bindings: `m2n_bootstrap.proto`.
-- MX server: dedicated state manager, gRPC service, memory backend, Redis
-  backend.
-- Python control client: `modelexpress.m2n_bootstrap`.
-- NCCL orchestration: `bootstrap_comm_from_mx`.
-- Native ABI shim: `_nccl_bootstrap_ext.cpp`.
-- PR #497 GPU driver: no `torch.distributed`; selected NCCL is preloaded and
-  companion external test coordinator observes exact `ready-*` cohort.
-  Coordinator release and worker failure contend to create one immutable
-  attempt-scoped `decision` containing `release` or `abort:<reason>`; a worker
-  tears down only when abort wins. Release is the gate commit point; its loser
-  continues, while hard failures after release belong to NCCL and the process
-  supervisor.
-- NeMo RL/Dynamo wiring remains external to this repository.
-- Initial GPU validation uses two source plus two destination ranks, matching
-  the smallest configuration in the M2N test matrix.
+- NCCL rank zero generates and publishes exactly one 128-byte UID;
+- all four ranks fetch that record and initialize world size four with their
+  assigned ranks;
+- every rank polls simulated nonblocking NCCL state from `ncclInProgress` to
+  `ncclSuccess`; and
+- no rank aborts on the successful path.
+
+The suite also covers rejected or failed publication, missing and malformed
+records, failed Get RPCs, metadata and rank mismatches before NCCL init,
+remaining-deadline propagation, immediate and asynchronous NCCL failures,
+null communicators, local timeout/abort, abort failure preservation, and no MX
+reads after NCCL initialization begins.
+
+Executed locally:
+
+```text
+uv run --no-sync pytest -q tests/test_m2n_bootstrap.py
+30 passed
+
+uv run --no-sync pytest -q tests/test_m2n_bootstrap.py \
+  tests/test_rl_weight_sync.py tests/test_m2n.py tests/test_e2e_nccl_m2n.py
+89 passed
+```
+
+Rust unit tests cover server-side validation, round-trip retrieval, unknown
+attempts, cohort/attempt isolation, same-cohort retries, and identical
+republish. They were not executed in this shell because `cargo` is unavailable.
+The four-rank test simulates NCCL calls; real GPU/M2N validation must be adapted
+from #497 after the required rebase.
+
+## Future elastic membership
+
+The attempt-keyed MX rendezvous does not prevent elastic NCCL membership. If
+NCCL adds a supported join or reconfiguration API, the coordinator can keep
+the logical `cohort_id` and issue a new, never-reused `attempt_id` for each
+membership operation. That operation would carry the updated roster digest,
+roles, ranks, sizes, and NCCL-provided join or reconfiguration payload.
+
+If NCCL permits a new rank to join transparently, only that participant needs
+to fetch and apply the payload. If NCCL requires existing ranks to participate,
+the coordinator dispatches the operation to the affected roster, collects
+results, and releases or terminates it as it does for initial bootstrap. MX
+would add typed reconfiguration messages or RPCs but would not take ownership
+of membership policy.
+
+Unique operation IDs and coordinator serialization can retain the current
+KV-without-CAS model. Generation fencing or CAS becomes necessary only if MX
+must arbitrate competing reconfigurations for the same cohort.
+
+## Required #497 rebase integration
+
+PR #497 has not landed, so its eight data-plane files are intentionally absent
+from this thin diff. After rebasing onto #497, update its existing
+`_nccl_m2n_bind.M2N` class to expose device selection, UID bytes, the native
+nonblocking init, async-error polling, and local abort methods used by
+`bootstrap_comm_from_mx`. Remove `bootstrap_comm_from_torch` and change
+`tests/gpu/run_reshard_e2e.py` to construct a generated
+`WeightSyncServiceStub` and pass the coordinator assignment. Do not copy those
+files into this PR before the rebase.
 
 ## Out of scope
 
-- Elastic membership or joining ranks to existing communicator
-- Multiple overlapping pipeline-parallel cohorts
-- Generic session/bootstrap-provider abstractions
-- Graceful live communicator replacement
-- Coordinator collective ordering
-
-## Appendix: design choices and rationale
-
-| Choice | Reason |
-|---|---|
-| Add `m2n_bootstrap.proto`; do not extend `p2p.proto` | P2P records describe model sources and worker metadata. Bootstrap attempts need different identity, expiry, immutability, and abort semantics. Separation avoids coupling to `MxClientBase`. |
-| Keep topology ownership in NeMo RL/Dynamo | Existing coordinator already knows participants, roles, and ranks. Re-discovering them in MX would create competing authorities and a larger retry state machine. |
-| Let source NCCL rank 0 generate and publish UID | NCCL requires one UID origin. Fixed publisher identity makes retries and metadata validation deterministic. |
-| Use canonical random UUIDv4 per attempt | Globally unique, never-reused IDs fence stale UID records, retries, and delayed participants without central ID allocation. |
-| Use MX instead of MPI or Torch/Gloo for OOB rendezvous | Disaggregated trainer/generator processes may not share a launcher process group. Reusing MX avoids a second always-on control plane; M2N only needs resulting `ncclComm_t`. |
-| Initialize with `ncclCommInitRankConfig(blocking=0)` | Async polling exposes NCCL errors and permits cooperative deadlines. Blocking fallback would defeat timeout and abort handling. |
-| Keep the communicator nonblocking through window setup and M2N | Creating a blocking child communicator adds lifecycle and topology complexity and weakens deadline handling. MX polls its window operation; M2N must poll its own internal NCCL operations. |
-| Register 4 KiB-aligned symmetric windows with flag `0x01` | These are NCCL `NCCL_WIN_REQUIRED_ALIGNMENT` and `NCCL_WIN_COLL_SYMMETRIC` contracts. Flag `0x02` means strict ordering, not collective symmetry. |
-| Require process supervisor for hard timeout | `ncclCommAbort` is synchronous and may hang after runtime failure. In-process polling cannot guarantee wall-clock termination. |
-| Verify selected, M2N-linked, and process-wide NCCL identity | Loading two NCCL builds in one process can produce ABI mismatch or split communicator state. Exact header/runtime version match fails closed. |
-| Store Redis record and UID under same hash slot | Lua can atomically publish, expire, and abort both keys on Redis Cluster. Short UID TTL limits capability exposure; longer tombstone TTL preserves fencing. |
-| Keep memory backend test-only; mark Kubernetes unsupported | Memory lacks cross-process durability. Kubernetes backend has no atomic compare-and-swap implementation for this state contract yet. |
-| Keep all-rank release outside bootstrap RPCs | MX brokers communicator material; coordinator owns cohort success and collective ordering. This keeps topology policy out of MX. |
-| Serialize test release and abort through one immutable decision | Ready worker can still fail before release. Both outcomes must contend for one commit point; only abort winner tears down, while release winner proceeds. |
-| Start on trusted control network | TLS and participant authorization are required before untrusted deployment, but do not change bootstrap state semantics. |
-| Rebuild communicator for membership change | NCCL communicator membership is immutable. New or restarted generator ranks require new attempt ID, UID, and communicator. |
+- Participant discovery, rank assignment, and tensor-size planning
+- Coordinator result collection, release, or whole-attempt termination
+- Implementing an NCCL elastic-membership API in this v1 integration
+- Multi-replica persistence, cleanup, TTL, and HA
+- A file-based test coordinator
+- `NcclM2nSession`, `BootstrapProvider`, MPI, or Torch/Gloo bootstrap

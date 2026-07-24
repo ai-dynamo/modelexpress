@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 use modelexpress_common::grpc::{
     api::api_service_server::ApiServiceServer, health::health_service_server::HealthServiceServer,
-    m2n_bootstrap::m2n_bootstrap_service_server::M2nBootstrapServiceServer,
     model::model_service_server::ModelServiceServer, p2p::p2p_service_server::P2pServiceServer,
     weight_sync::weight_sync_service_server::WeightSyncServiceServer,
 };
@@ -20,7 +19,6 @@ use tracing::{error, info};
 use crate::backend_config::BackendConfig;
 use crate::cache::CacheEvictionService;
 use crate::config::ServerConfig;
-use crate::m2n_bootstrap::{service::M2nBootstrapServiceImpl, state::M2nBootstrapStateManager};
 use crate::p2p::{service::P2pServiceImpl, state::P2pStateManager};
 use crate::registry::state::RegistryManager;
 use crate::services::{ApiServiceImpl, HealthServiceImpl, ModelDownloadTracker, ModelServiceImpl};
@@ -47,7 +45,6 @@ pub async fn run_server(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("Starting ModelExpress server...");
     config.print_config();
-    let m2n_bootstrap_supported = !matches!(&backend, BackendConfig::Kubernetes { .. });
 
     // Get server address
     let addr = config.socket_addr().map_err(|e| {
@@ -115,18 +112,9 @@ pub async fn run_server(
     health_reporter
         .set_serving::<P2pServiceServer<P2pServiceImpl>>()
         .await;
-    if m2n_bootstrap_supported {
-        health_reporter
-            .set_serving::<M2nBootstrapServiceServer<M2nBootstrapServiceImpl>>()
-            .await;
-    } else {
-        health_reporter
-            .set_not_serving::<M2nBootstrapServiceServer<M2nBootstrapServiceImpl>>()
-            .await;
-    }
 
     // Initialize P2P state manager — fails fast if backend is misconfigured or unreachable
-    let p2p_state = Arc::new(P2pStateManager::with_config(backend.clone()));
+    let p2p_state = Arc::new(P2pStateManager::with_config(backend));
 
     match tokio::time::timeout(std::time::Duration::from_secs(10), p2p_state.connect()).await {
         Ok(Ok(backend_name)) => info!("P2P state manager connected (backend: {backend_name})"),
@@ -140,23 +128,7 @@ pub async fn run_server(
         }
     }
 
-    // M2N bootstrap shares the configured Redis connection details but uses a
-    // dedicated keyspace and atomic state contract. Kubernetes remains explicitly
-    // unsupported until resourceVersion CAS is implemented.
-    let m2n_bootstrap_state = Arc::new(M2nBootstrapStateManager::with_config(backend));
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        m2n_bootstrap_state.connect(),
-    )
-    .await
-    {
-        Ok(Ok(backend_name)) => info!("M2N bootstrap connected (backend: {backend_name})"),
-        Ok(Err(error)) => return Err(error.to_string().into()),
-        Err(_) => return Err("M2N bootstrap backend connection timed out".into()),
-    }
-
     let p2p_service = P2pServiceImpl::new(p2p_state.clone());
-    let m2n_bootstrap_service = M2nBootstrapServiceImpl::new(m2n_bootstrap_state);
     let weight_sync_service = WeightSyncServiceImpl::new();
 
     // Start reaper for stale source detection
@@ -191,11 +163,6 @@ pub async fn run_server(
         .add_service(ModelServiceServer::new(model_service))
         .add_service(
             P2pServiceServer::new(p2p_service)
-                .max_decoding_message_size(MAX_MESSAGE_SIZE)
-                .max_encoding_message_size(MAX_MESSAGE_SIZE),
-        )
-        .add_service(
-            M2nBootstrapServiceServer::new(m2n_bootstrap_service)
                 .max_decoding_message_size(MAX_MESSAGE_SIZE)
                 .max_encoding_message_size(MAX_MESSAGE_SIZE),
         )
