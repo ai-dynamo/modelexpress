@@ -120,6 +120,7 @@ register_modelexpress_loaders()
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | empty | Optional compile-configuration compatibility digest for cache discovery |
 | `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint checked before a source publishes weights or JIT cache artifacts (`http://127.0.0.1:8000/health` for vLLM; `http://127.0.0.1:30000/health` for SGLang) |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication |
+| `MX_RESHARD_HEARTBEAT_S` | `20` | Seconds between idempotent reshard-rendezvous publications; keep comfortably below the server heartbeat timeout |
 
 ### UCX/NIXL Tuning
 

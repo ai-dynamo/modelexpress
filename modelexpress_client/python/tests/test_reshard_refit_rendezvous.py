@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from importlib import metadata
+from threading import Event, Lock
 from types import SimpleNamespace
 
 import pytest
@@ -51,16 +52,24 @@ def test_discovery_filters_for_ready_trainers():
     assert client.status_filter == p2p_pb2.SOURCE_STATUS_READY
 
 
-def test_published_rendezvous_is_ready_and_discoverable():
+def test_published_rendezvous_stays_ready_and_closes_stale(monkeypatch):
     class Client:
         def __init__(self):
             self.worker = None
             self.worker_id = None
             self.status_filter = None
+            self.publish_count = 0
+            self.heartbeat_seen = Event()
+            self.status_updates = []
+            self.lock = Lock()
 
         def publish_metadata(self, _identity, worker, worker_id):
-            self.worker = worker
-            self.worker_id = worker_id
+            with self.lock:
+                self.worker = worker
+                self.worker_id = worker_id
+                self.publish_count += 1
+                if self.publish_count >= 2:
+                    self.heartbeat_seen.set()
             return "source-id"
 
         def list_sources(self, _identity, status_filter=None):
@@ -78,6 +87,11 @@ def test_published_rendezvous_is_ready_and_discoverable():
         def get_metadata(self, _source_id, _worker_id):
             return SimpleNamespace(found=True, worker=self.worker)
 
+        def update_status(self, **kwargs):
+            self.status_updates.append(kwargs)
+            return True
+
+    monkeypatch.setenv("MX_RESHARD_HEARTBEAT_S", "0.01")
     client = Client()
     rendezvous = MxReshardRendezvous(
         client,
@@ -93,9 +107,38 @@ def test_published_rendezvous_is_ready_and_discoverable():
         tensors=[],
     )
 
-    assert rendezvous.publish(blob) == "source-id"
-    assert client.worker.status == p2p_pb2.SOURCE_STATUS_READY
-    assert rendezvous.discover_trainers(expected_trainers=1) == [
-        (b"nixl", "trainer-agent", "trainer:1234", [])
-    ]
-    assert client.status_filter == p2p_pb2.SOURCE_STATUS_READY
+    try:
+        assert rendezvous.publish(blob) == "source-id"
+        assert client.worker.status == p2p_pb2.SOURCE_STATUS_READY
+        assert client.heartbeat_seen.wait(timeout=1.0)
+        assert client.publish_count >= 2
+        assert rendezvous.discover_trainers(expected_trainers=1) == [
+            (b"nixl", "trainer-agent", "trainer:1234", [])
+        ]
+        assert client.status_filter == p2p_pb2.SOURCE_STATUS_READY
+    finally:
+        rendezvous.close()
+
+    assert client.status_updates[-1] == {
+        "mx_source_id": "source-id",
+        "worker_id": "trainer-2",
+        "worker_rank": 2,
+        "status": p2p_pb2.SOURCE_STATUS_STALE,
+    }
+
+
+def test_invalid_heartbeat_period_fails_before_publish(monkeypatch):
+    class Client:
+        def publish_metadata(self, *_args, **_kwargs):
+            raise AssertionError("publish must not run")
+
+    monkeypatch.setenv("MX_RESHARD_HEARTBEAT_S", "0")
+    rendezvous = MxReshardRendezvous(
+        Client(),
+        role="trainer",
+        rank=0,
+        model_name="model",
+    )
+
+    with pytest.raises(ValueError, match="must be positive"):
+        rendezvous.publish(b"registered")

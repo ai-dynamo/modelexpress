@@ -36,6 +36,8 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -48,13 +50,16 @@ from modelexpress.refit.reshard.transfer_plan import SourceInfo
 logger = logging.getLogger("modelexpress.refit.reshard.rendezvous")
 
 _SCHEMA = "mx.reshard.shard_table.v1"
+_HEARTBEAT_ENV = "MX_RESHARD_HEARTBEAT_S"
+_DEFAULT_HEARTBEAT_SECONDS = 20.0
 
 
 def _mx_version() -> str:
     """The ``modelexpress`` package version, folded into the SourceIdentity hash
     so trainer and inference on the same MX build resolve the same mx_source_id.
     Derived (not a literal) so it tracks the real build."""
-    from importlib.metadata import PackageNotFoundError, version as pkg_version
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as pkg_version
 
     try:
         return pkg_version("modelexpress")
@@ -272,8 +277,13 @@ class MxReshardRendezvous:
         self.model_name = model_name
         self.worker_id = worker_id or str(uuid.uuid4())
         self._mx_source_id: str | None = None
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread: threading.Thread | None = None
+        self._heartbeat_worker = None
+        self._heartbeat_lock = threading.Lock()
+        self._heartbeat_period_seconds = _DEFAULT_HEARTBEAT_SECONDS
 
-    def _identity(self, role: str) -> "p2p_pb2.SourceIdentity":
+    def _identity(self, role: str) -> p2p_pb2.SourceIdentity:
         # Only fields BOTH sides derive identically (see module docstring): the
         # shared model_name + mx_version + a fixed framework, with the role in
         # extra_parameters. No dtype here - the receiver builds this identity to
@@ -296,6 +306,7 @@ class MxReshardRendezvous:
         rendezvous API. Re-publishing refreshes the worker record for the same
         ``worker_id``.
         """
+        heartbeat_period = self._heartbeat_period()
         worker = p2p_pb2.WorkerMetadata(
             worker_rank=self.rank,
             nixl_metadata=blob,
@@ -304,7 +315,86 @@ class MxReshardRendezvous:
         self._mx_source_id = self.client.publish_metadata(
             self._identity(self.role), worker, self.worker_id
         )
+        self._start_rendezvous_heartbeat(worker, heartbeat_period)
         return self._mx_source_id
+
+    @staticmethod
+    def _heartbeat_period() -> float:
+        raw = os.environ.get(
+            _HEARTBEAT_ENV,
+            str(_DEFAULT_HEARTBEAT_SECONDS),
+        )
+        try:
+            period = float(raw)
+        except ValueError as exc:
+            raise ValueError(f"{_HEARTBEAT_ENV} must be a number, got {raw!r}") from exc
+        if period <= 0:
+            raise ValueError(f"{_HEARTBEAT_ENV} must be positive, got {period}")
+        return period
+
+    def _start_rendezvous_heartbeat(self, worker, period: float) -> None:
+        """Keep the published source fresh until :meth:`close` is called."""
+        with self._heartbeat_lock:
+            self._heartbeat_worker = worker
+            self._heartbeat_period_seconds = period
+            if self._heartbeat_thread is not None and self._heartbeat_thread.is_alive():
+                return
+            self._heartbeat_stop.clear()
+
+            def _beat() -> None:
+                while not self._heartbeat_stop.wait(period):
+                    with self._heartbeat_lock:
+                        current_worker = self._heartbeat_worker
+                    if current_worker is None:
+                        continue
+                    try:
+                        # Re-publish rather than UpdateStatus so server state
+                        # loss can recover on the next heartbeat.
+                        self.client.publish_metadata(
+                            self._identity(self.role),
+                            current_worker,
+                            self.worker_id,
+                        )
+                    # A transient heartbeat failure must not terminate the
+                    # source process; the next tick re-publishes the full record.
+                    except Exception:
+                        logger.debug(
+                            "reshard rendezvous heartbeat failed",
+                            exc_info=True,
+                        )
+
+            self._heartbeat_thread = threading.Thread(
+                target=_beat,
+                name=f"mx-reshard-heartbeat-{self.rank}",
+                daemon=True,
+            )
+            self._heartbeat_thread.start()
+
+    def close(self) -> None:
+        """Stop heartbeats and best-effort mark the published source STALE."""
+        self._heartbeat_stop.set()
+        with self._heartbeat_lock:
+            thread = self._heartbeat_thread
+            self._heartbeat_thread = None
+            self._heartbeat_worker = None
+        if thread is not None:
+            thread.join(timeout=self._heartbeat_period_seconds + 1.0)
+        if self._mx_source_id is None:
+            return
+        try:
+            self.client.update_status(
+                mx_source_id=self._mx_source_id,
+                worker_id=self.worker_id,
+                worker_rank=self.rank,
+                status=p2p_pb2.SOURCE_STATUS_STALE,
+            )
+        # Shutdown cleanup is best effort; the server reaper remains the
+        # fallback for abrupt or unreachable clients.
+        except Exception:
+            logger.debug(
+                "failed to mark reshard rendezvous STALE",
+                exc_info=True,
+            )
 
     def discover_trainers(
         self,
