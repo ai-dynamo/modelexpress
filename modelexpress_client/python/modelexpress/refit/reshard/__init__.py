@@ -44,6 +44,21 @@ from modelexpress.refit.reshard.transport import (
 )
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
 from modelexpress.refit.reshard.receiver import ReshardReceiver
+from modelexpress.refit.reshard.megatron import (
+    MegatronTargetLayout,
+    MegatronTargetSpec,
+    lower_megatron_target,
+)
+from modelexpress.refit.reshard.megatron_receiver import MegatronReshardReceiver
+from modelexpress.refit.reshard.megatron_aliases import (
+    MegatronAliasInput,
+    build_hf_aliases,
+)
+from modelexpress.refit.reshard.megatron_publisher import (
+    MegatronPublishedTensorSpec,
+    publish_megatron_reshard_view,
+    publish_registered_shard_table,
+)
 from modelexpress.refit.reshard.rendezvous import (
     MxReshardRendezvous,
     PublishedShard,
@@ -55,6 +70,11 @@ from modelexpress.refit.reshard.rendezvous import (
 __all__ = [
     "InMemoryReferenceTransport",
     "LazyWeight",
+    "MegatronAliasInput",
+    "MegatronPublishedTensorSpec",
+    "MegatronReshardReceiver",
+    "MegatronTargetLayout",
+    "MegatronTargetSpec",
     "MxReshardRendezvous",
     "NixlReshardTransport",
     "OpChain",
@@ -69,14 +89,18 @@ __all__ = [
     "Transport",
     "TransferPlan",
     "UnsupportedReshard",
+    "build_hf_aliases",
     "capture_geometry",
     "classic_cuda_alloc",
     "execute_transfer",
     "gather_sources",
     "intersect",
+    "lower_megatron_target",
     "op_chain_to_box",
     "paired_runs",
     "plan_pull",
     "plan_transfer",
+    "publish_megatron_reshard_view",
+    "publish_registered_shard_table",
     "wrap_rendezvous_blob",
 ]
