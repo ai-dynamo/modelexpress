@@ -186,7 +186,9 @@ def build_sources(tensors: list) -> tuple:
 
 def merge_shard_tables(tables: list) -> list:
     """Merge per-rank ``list[PublishedTensor]`` into one, concatenating shards
-    for the same source across ranks (reshard fans in cross-rank). full_shape /
+    for the same source across ranks (reshard fans in cross-rank). Replica
+    publishers can advertise the same geometric shard through DP/EP replication;
+    one representative is retained for each exact offset/shape. full_shape /
     dtype / elsize must agree across ranks for a given tensor name."""
     merged: dict = {}
     for table in tables:
@@ -202,7 +204,15 @@ def merge_shard_tables(tables: list) -> list:
                     f"tensor {t.name!r} published with inconsistent shape/dtype across ranks: "
                     f"{cur.full_shape}/{cur.dtype} vs {t.full_shape}/{t.dtype}"
                 )
-            cur.shards.extend(t.shards)
+            existing_geometry = {
+                (tuple(shard.shard_offset), tuple(shard.shape))
+                for shard in cur.shards
+            }
+            for shard in t.shards:
+                geometry = (tuple(shard.shard_offset), tuple(shard.shape))
+                if geometry not in existing_geometry:
+                    cur.shards.append(shard)
+                    existing_geometry.add(geometry)
     return list(merged.values())
 
 

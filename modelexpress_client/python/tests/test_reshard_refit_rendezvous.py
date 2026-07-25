@@ -9,7 +9,10 @@ import pytest
 from modelexpress import p2p_pb2
 from modelexpress.refit.reshard.rendezvous import (
     MxReshardRendezvous,
+    PublishedShard,
+    PublishedTensor,
     _mx_version,
+    merge_shard_tables,
     wrap_rendezvous_blob,
 )
 
@@ -99,3 +102,56 @@ def test_published_rendezvous_is_ready_and_discoverable():
         (b"nixl", "trainer-agent", "trainer:1234", [])
     ]
     assert client.status_filter == p2p_pb2.SOURCE_STATUS_READY
+
+
+def test_merge_deduplicates_dp_replica_geometry():
+    def table(agent: str, address: int):
+        return [
+            PublishedTensor(
+                name="weight",
+                dtype="torch.bfloat16",
+                elsize=2,
+                full_shape=(8, 4),
+                shards=[
+                    PublishedShard(
+                        agent_name=agent,
+                        device_id=0,
+                        addr=address,
+                        shard_offset=(0, 0),
+                        shape=(4, 4),
+                    )
+                ],
+            )
+        ]
+
+    merged = merge_shard_tables([table("dp0", 100), table("dp1", 200)])
+
+    assert len(merged) == 1
+    assert len(merged[0].shards) == 1
+    assert merged[0].shards[0].agent_name == "dp0"
+
+
+def test_merge_keeps_distinct_geometry_from_different_ranks():
+    def table(agent: str, offset: tuple[int, int]):
+        return [
+            PublishedTensor(
+                name="weight",
+                dtype="torch.bfloat16",
+                elsize=2,
+                full_shape=(8, 4),
+                shards=[
+                    PublishedShard(
+                        agent_name=agent,
+                        device_id=0,
+                        addr=100,
+                        shard_offset=offset,
+                        shape=(4, 4),
+                    )
+                ],
+            )
+        ]
+
+    merged = merge_shard_tables([table("tp0", (0, 0)), table("tp1", (4, 0))])
+
+    assert len(merged) == 1
+    assert {s.shard_offset for s in merged[0].shards} == {(0, 0), (4, 0)}
