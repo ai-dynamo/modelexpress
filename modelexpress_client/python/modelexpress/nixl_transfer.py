@@ -120,6 +120,16 @@ class NixlTransferManager:
         return self._agent_name
 
     @property
+    def backends(self) -> list[str]:
+        """NIXL backends this agent was created with (see MX_NIXL_BACKEND).
+
+        Callers that issue their own NIXL calls against :attr:`agent` must pass
+        this rather than a literal, or the transfer is prepared on a backend the
+        agent does not have (e.g. UCX on AWS EFA).
+        """
+        return list(self._backends)
+
+    @property
     def nixl_metadata(self) -> bytes:
         """Get NIXL metadata for this agent."""
         return self._metadata

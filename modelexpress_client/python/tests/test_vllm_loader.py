@@ -370,6 +370,7 @@ class TestAbstractMethodCompleteness:
         registry = dict(model_loader._LOAD_FORMAT_TO_MODEL_LOADER)
         registry["modelexpress"] = sentinel
         registry.pop("mx", None)
+        registry.pop("mx-target", None)
         monkeypatch.setattr(model_loader, "_LOAD_FORMAT_TO_MODEL_LOADER", registry)
 
         registration = importlib.import_module(
@@ -396,6 +397,7 @@ class TestAbstractMethodCompleteness:
 
         assert model_loader._LOAD_FORMAT_TO_MODEL_LOADER["modelexpress"] is sentinel
         assert registered["mx"] is MxModelLoader
+        assert registered["mx-target"] is MxModelLoader
         assert "modelexpress" not in registered
 
     def test_plugin_registration_registers_load_formats_without_native_vllm(
@@ -406,6 +408,7 @@ class TestAbstractMethodCompleteness:
 
         registry = dict(model_loader._LOAD_FORMAT_TO_MODEL_LOADER)
         registry.pop("mx", None)
+        registry.pop("mx-target", None)
         registry.pop("modelexpress", None)
         monkeypatch.setattr(model_loader, "_LOAD_FORMAT_TO_MODEL_LOADER", registry)
 
@@ -433,6 +436,7 @@ class TestAbstractMethodCompleteness:
 
         assert registered["modelexpress"] is MxModelLoader
         assert registered["mx"] is MxModelLoader
+        assert registered["mx-target"] is MxModelLoader
 
 
 class TestMtpDrafterSecondLoad:

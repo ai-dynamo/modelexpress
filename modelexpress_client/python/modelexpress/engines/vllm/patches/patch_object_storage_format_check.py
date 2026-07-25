@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from ._version import installed_vllm_minor
 
-_PLUGIN_LOAD_FORMATS = ("modelexpress", "mx")
+_PLUGIN_LOAD_FORMATS = ("modelexpress", "mx", "mx-target")
 
 # Native ModelExpress object-storage validation shipped in vLLM 0.22.0.
 _LATEST_AFFECTED_MINOR = (0, 21)

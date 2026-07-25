@@ -186,7 +186,9 @@ def build_sources(tensors: list) -> tuple:
 
 def merge_shard_tables(tables: list) -> list:
     """Merge per-rank ``list[PublishedTensor]`` into one, concatenating shards
-    for the same source across ranks (reshard fans in cross-rank). full_shape /
+    for the same source across ranks (reshard fans in cross-rank). Replica
+    publishers can advertise the same geometric shard through DP/EP replication;
+    one representative is retained for each exact offset/shape. full_shape /
     dtype / elsize must agree across ranks for a given tensor name."""
     merged: dict = {}
     for table in tables:
@@ -202,7 +204,15 @@ def merge_shard_tables(tables: list) -> list:
                     f"tensor {t.name!r} published with inconsistent shape/dtype across ranks: "
                     f"{cur.full_shape}/{cur.dtype} vs {t.full_shape}/{t.dtype}"
                 )
-            cur.shards.extend(t.shards)
+            existing_geometry = {
+                (tuple(shard.shard_offset), tuple(shard.shape))
+                for shard in cur.shards
+            }
+            for shard in t.shards:
+                geometry = (tuple(shard.shard_offset), tuple(shard.shape))
+                if geometry not in existing_geometry:
+                    cur.shards.append(shard)
+                    existing_geometry.add(geometry)
     return list(merged.values())
 
 
@@ -290,7 +300,15 @@ class MxReshardRendezvous:
 
     def publish(self, blob: bytes) -> str:
         """Publish this rank's rendezvous blob (agent meta + shard table)."""
-        worker = p2p_pb2.WorkerMetadata(worker_rank=self.rank, nixl_metadata=blob)
+        # The blob is built only after CUDA buffers are registered with NIXL,
+        # so this publication is immediately readable. Discovery is READY-only;
+        # leaving proto3's default UNKNOWN status makes every real receiver wait
+        # until timeout even though all transport metadata is present.
+        worker = p2p_pb2.WorkerMetadata(
+            worker_rank=self.rank,
+            nixl_metadata=blob,
+            status=p2p_pb2.SOURCE_STATUS_READY,
+        )
         self._mx_source_id = self.client.publish_metadata(
             self._identity(self.role), worker, self.worker_id
         )

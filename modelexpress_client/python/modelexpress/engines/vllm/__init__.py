@@ -26,6 +26,15 @@ def register_modelexpress_loaders() -> None:
     # registration is available.
     register_plugin_model_loader()
 
+    # Register the native MX weight-transfer backend when the installed vLLM
+    # exposes WeightTransferEngineFactory. Older releases keep loader support.
+    try:
+        from .weight_transfer import register as register_weight_transfer
+
+        register_weight_transfer()
+    except (ImportError, AttributeError):
+        pass
+
     _loaders_registered = True
 
 
