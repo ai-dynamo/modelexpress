@@ -23,7 +23,10 @@ transport, buffers and the router dtype-cast are shared here.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import time
 
 import torch
 
@@ -39,6 +42,13 @@ from modelexpress.refit.reshard.transport import (
 from modelexpress.refit.reshard.types import CaptureResult, UnsupportedReshard
 
 logger = logging.getLogger("modelexpress.refit.reshard.receiver")
+
+# Batch the per-view re-slice copies of full-pulled sources into one _foreach_copy_.
+# Semantically identical to the copy_() loop; set to "0" to fall back.
+_BATCH_INSTALL = os.environ.get("MX_RESHARD_BATCH_INSTALL", "1") == "1"
+# Benchmarks need the stage split without turning on INFO for every dependency,
+# so the record is emitted at WARNING. Set to "0" to silence.
+_STAGE_RECORD = os.environ.get("MX_REFIT_STAGE_RECORD", "1") == "1"
 
 
 def _replay_ops(tensor: torch.Tensor, op_chain: tuple) -> torch.Tensor:
@@ -319,14 +329,22 @@ class ReshardReceiver:
             self._prepare(timeout)
         assert self._plan is not None and self._transport is not None
 
+        # Stage spans are sequential and non-overlapping, so they may be summed.
+        # Each GPU-work span ends with an explicit sync, otherwise the async
+        # launches would be attributed to whichever stage happens to sync next.
+        stages: dict[str, float] = {}
+
         # RDMA the sliced bf16 into the receive buffers (segments) and per-param
         # staging (dtype-convert / router). No live param is written by RDMA.
+        _t = time.perf_counter()
         stats = execute_transfer(
             self._plan,
             resolve_param_ptr=lambda name: self._param_ptr[name],
             transport=self._transport,
         )
+        stages["wire_exact_s"] = time.perf_counter() - _t
         if self._plan.full_pulls:
+            _t = time.perf_counter()
             full_descriptors = [
                 ReadDescriptor(
                     session=segment.session,
@@ -340,6 +358,15 @@ class ReshardReceiver:
                 for segment in full_pull.segments
             ]
             self._transport.read(full_descriptors)
+            stages["wire_full_s"] = time.perf_counter() - _t
+
+            # Local re-slice of every full-pulled source. One copy_() per captured
+            # view means thousands of individual kernel launches, whose Python and
+            # launch overhead can rival the RDMA itself; _foreach_copy_ issues the
+            # same copies as a single batched op.
+            _t = time.perf_counter()
+            destinations = []
+            source_views = []
             for full_pull in self._plan.full_pulls:
                 full_tensor = self._full_staging[full_pull.src_name]
                 for copy in full_pull.copies:
@@ -350,7 +377,17 @@ class ReshardReceiver:
                         copy.dest_stride,
                         receive_buffer.storage_offset() + copy.dest_offset,
                     )
-                    destination.copy_(source_view)
+                    if _BATCH_INSTALL:
+                        destinations.append(destination)
+                        source_views.append(source_view)
+                    else:
+                        destination.copy_(source_view)
+            if _BATCH_INSTALL and destinations:
+                torch._foreach_copy_(destinations, source_views)
+            torch.cuda.synchronize(self._device)
+            stages["reslice_s"] = time.perf_counter() - _t
+            stages["reslice_copies"] = float(len(self._plan.full_pulls))
+
             stats["segments"] += len(full_descriptors)
             stats["bytes"] += sum(descriptor.nbytes for descriptor in full_descriptors)
         if self._plan.converts:
@@ -364,16 +401,23 @@ class ReshardReceiver:
                 for c in self._plan.converts
                 for seg in c.segments
             ]
+            _t = time.perf_counter()
             self._transport.read(conv_descs)
+            stages["wire_convert_s"] = time.perf_counter() - _t
             # Cast the served bf16 staging into the (fp32) receive buffer - a torch
             # op, so the RDMA never crosses dtypes. _install writes the buffer.
+            _t = time.perf_counter()
             for c in self._plan.converts:
                 self._recv_buffers[c.param_name].copy_(self._staging[c.param_name])
+            torch.cuda.synchronize(self._device)
+            stages["convert_s"] = time.perf_counter() - _t
             stats["segments"] += len(conv_descs)
             stats["bytes"] += sum(descriptor.nbytes for descriptor in conv_descs)
 
+        _t = time.perf_counter()
         self._install(self._recv_buffers)
         torch.cuda.synchronize(self._device)
+        stages["install_s"] = time.perf_counter() - _t
 
         metrics = {
             "step": step,
@@ -401,4 +445,21 @@ class ReshardReceiver:
             len(self._plan.unbounded_sources),
             len(stats["fallback"]),
         )
+        metrics.update({k: round(v, 6) for k, v in stages.items()})
+        if _STAGE_RECORD:
+            accounted = sum(
+                v for k, v in stages.items() if k.endswith("_s")
+            )
+            record = {
+                "schema": "refit-stage-v2",
+                "step": step,
+                "bytes": stats["bytes"],
+                "segments": stats["segments"],
+                "batch_install": _BATCH_INSTALL,
+                "accounted_s": round(accounted, 6),
+                **{k: round(v, 6) for k, v in stages.items()},
+            }
+            # WARNING so benchmark harnesses capture it without enabling INFO
+            # across every dependency.
+            logger.warning("MX_REFIT_STAGE %s", json.dumps(record))
         return metrics

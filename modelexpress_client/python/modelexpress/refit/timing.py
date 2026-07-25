@@ -30,9 +30,19 @@ REFIT_TIMING_STAGES = (
     "wire_transfer",
     "receive_sync",
     "transformation",
+    "target_assembly",
+    "trainer_to_hf_transform",
     "installation",
+    "runtime_mapping",
+    "parameter_copy",
+    "quant_postprocess",
+    "device_sync",
     "post_install",
     "rollout_readiness",
+    "cache_reset",
+    "version_commit",
+    "fleet_ack",
+    "resume_ready",
 )
 _STAGE_SET = frozenset(REFIT_TIMING_STAGES)
 _current_recorder: contextvars.ContextVar["RefitTimingRecorder | None"] = (
