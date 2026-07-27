@@ -44,6 +44,12 @@ runs:
         # Always read from the host kubeconfig written by connect-vcluster.
         KCTL="kubectl --kubeconfig=${{ github.workspace }}/.kubeconfig-host"
 
+        echo "::group::Host cluster Kubernetes version"
+        # Captures the AKS host server version so we can correlate sudden
+        # vCluster sync regressions with host k8s auto-upgrades.
+        ${KCTL} version 2>&1 || true
+        echo "::endgroup::"
+
         echo "::group::vCluster pod summary"
         ${KCTL} get pods -n "${VCLUSTER_NAMESPACE}" -l "${SELECTOR}" \
           -o wide 2>&1 || true
