@@ -89,7 +89,7 @@ class MxModelLoader(BaseModelLoader):
         ctx = build_vllm_load_context(vllm_config, model_config)
         ctx.p2p_enabled = not _is_speculative_draft(vllm_config, model_config)
         if envs.MX_ARTIFACT_READY_URL.strip():
-            ctx.source_ready_fn = _vllm_health_ready
+            ctx.source_ready_fn = lambda: _vllm_health_ready(ctx)
         self._ctx = ctx
 
         logger.info(
