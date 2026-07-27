@@ -109,6 +109,10 @@ if TYPE_CHECKING:
     # Other third-party / system
     VLLM_ATTENTION_BACKEND: str
     HOSTNAME: str
+    # Injected by LeaderWorkerSet into every pod of a group, as
+    # <leader-pod>.<headless-service>.<namespace>. Fallback head address when
+    # the engine does not expose its distributed-init address.
+    LWS_LEADER_ADDRESS: str
     POD_NAMESPACE: str
     POD_NAME: str
     POD_UID: str
@@ -225,6 +229,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ── Other third-party / system ─────────────────────────────────────────
     "VLLM_ATTENTION_BACKEND": lambda: os.environ.get("VLLM_ATTENTION_BACKEND", "auto"),
     "HOSTNAME": lambda: os.environ.get("HOSTNAME", ""),
+    "LWS_LEADER_ADDRESS": lambda: os.environ.get("LWS_LEADER_ADDRESS", ""),
     "POD_NAMESPACE": lambda: os.environ.get("POD_NAMESPACE", ""),
     "POD_NAME": lambda: os.environ.get("POD_NAME", ""),
     "POD_UID": lambda: os.environ.get("POD_UID", "")

@@ -314,7 +314,9 @@ class TestAbstractMethodCompleteness:
             assert model_arg is model
             assert ctx_arg is ctx
             if health_gated:
-                assert ctx_arg.source_ready_fn is loader_mod._vllm_health_ready
+                # Bound to ctx so the URL resolves against this worker's
+                # node_rank and head address, so identity is not asserted.
+                assert callable(ctx_arg.source_ready_fn)
             else:
                 assert ctx_arg.source_ready_fn is None
             events.append("load")

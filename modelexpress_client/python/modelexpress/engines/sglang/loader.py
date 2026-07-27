@@ -93,7 +93,7 @@ class MxModelLoader:
             device_config,
         )
         if envs.MX_ARTIFACT_READY_URL.strip():
-            ctx.source_ready_fn = _sglang_health_ready
+            ctx.source_ready_fn = lambda: _sglang_health_ready(ctx)
         self._ctx = ctx
 
         logger.info(
@@ -380,7 +380,7 @@ class MxModelLoader:
                 nixl_manager=None,
                 publish_fn=publish_fn,
                 ready_fn=(
-                    _sglang_health_ready
+                    (lambda: _sglang_health_ready(ctx))
                     if envs.MX_ARTIFACT_READY_URL.strip()
                     else None
                 ),

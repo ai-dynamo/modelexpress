@@ -479,7 +479,9 @@ def test_mx_model_loader_nixl_path_delegates_to_shared_strategy_chain(
     assert ctx.adapter.__class__ is SglangAdapter
     assert ctx.identity.backend_framework == p2p_pb2.BACKEND_FRAMEWORK_SGLANG
     if health_gated:
-        assert ctx.source_ready_fn is loader_mod._sglang_health_ready
+        # Bound to ctx so the URL resolves against this worker's node_rank
+        # and head address, so identity is not asserted.
+        assert callable(ctx.source_ready_fn)
     else:
         assert ctx.source_ready_fn is None
     install_artifacts.assert_called_once_with(ctx)
