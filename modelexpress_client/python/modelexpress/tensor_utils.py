@@ -293,6 +293,10 @@ def collect_module_tensors(
     for name, tensor, _tensor_type in iter_module_tensors(model, backend):
         t = tensor.data if hasattr(tensor, "data") else tensor
 
+        if t.numel() == 0:
+            tensors[name] = t
+            continue
+
         if t.is_contiguous():
             ptr = t.data_ptr()
             if ptr in seen_ptrs:

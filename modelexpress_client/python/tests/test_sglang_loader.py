@@ -509,6 +509,132 @@ def test_mx_model_loader_delegates_transfer_engine_transport_in_mx_package():
     )
 
 
+def test_transfer_engine_receive_failure_reinitializes_before_native_fallback():
+    transfer_engine = MagicMock()
+    transfer_engine.register_memory.return_value = 0
+    transfer_engine.batch_transfer_sync_read.return_value = -1
+    load_config = _load_config(
+        modelexpress_transport="transfer_engine",
+        remote_instance_weight_loader_transfer_engine=transfer_engine,
+        remote_instance_weight_loader_transfer_engine_session_id="target-session",
+    )
+    loader = MxModelLoader(load_config)
+    initial_model = nn.Linear(2, 2)
+    prepared_model = nn.Linear(2, 2)
+    fresh_model = nn.Linear(2, 2)
+    native_model = nn.Linear(2, 2)
+    target_tensor = torch.randn(2, 3)
+    native_tensor = torch.randn(3, 2)
+    prepared_result = SimpleNamespace(value=prepared_model, model=prepared_model)
+    fresh_result = SimpleNamespace(value=fresh_model, model=fresh_model)
+    native_result = SimpleNamespace(value=native_model, model=native_model)
+    adapter = MagicMock()
+    adapter.before_rdma_receive.return_value = prepared_result
+    adapter.discover_tensors.side_effect = [
+        {"target": target_tensor},
+        {"native": native_tensor},
+    ]
+    adapter.reinit_for_retry.return_value = fresh_result
+    adapter.load_via_native.return_value = native_result
+    ctx = SimpleNamespace(
+        global_rank=0,
+        identity=SimpleNamespace(model_name="model"),
+        adapter=adapter,
+        tensors={},
+    )
+    source_worker = p2p_pb2.WorkerMetadata(
+        transfer_engine_session_id="source-session",
+        tensors=[
+            p2p_pb2.TensorDescriptor(
+                name="target",
+                addr=1234,
+                size=target_tensor.numel() * target_tensor.element_size(),
+            )
+        ],
+    )
+
+    with patch(
+        "modelexpress.engines.sglang.loader.build_sglang_load_context",
+        return_value=ctx,
+    ), patch.object(
+        loader,
+        "_find_transfer_engine_source",
+        return_value=source_worker,
+    ), patch.object(
+        loader,
+        "_publish_transfer_engine_source",
+        return_value=True,
+    ) as publish:
+        loaded = loader._load_model_via_transfer_engine(
+            model=initial_model,
+            model_config=_model_config(),
+            device_config=_device_config(),
+        )
+
+    assert loaded is native_model
+    transfer_engine.unregister_memory.assert_called_once_with(
+        target_tensor.data_ptr()
+    )
+    adapter.reinit_for_retry.assert_called_once_with(prepared_result)
+    adapter.load_via_native.assert_called_once_with(fresh_result)
+    publish.assert_called_once()
+    assert publish.call_args.kwargs["weight_info"] == {
+        "native": (
+            native_tensor.data_ptr(),
+            native_tensor.numel(),
+            native_tensor.element_size(),
+        )
+    }
+
+
+def test_transfer_engine_source_registration_failure_keeps_native_model():
+    transfer_engine = MagicMock()
+    transfer_engine.register_memory.side_effect = [0, -1]
+    load_config = _load_config(
+        modelexpress_transport="transfer_engine",
+        remote_instance_weight_loader_transfer_engine=transfer_engine,
+        remote_instance_weight_loader_transfer_engine_session_id="source-session",
+    )
+    loader = MxModelLoader(load_config)
+    initial_model = nn.Linear(2, 2)
+    native_model = nn.Linear(2, 2)
+    first = torch.randn(2, 3)
+    second = torch.randn(3, 2)
+    native_result = SimpleNamespace(value=native_model, model=native_model)
+    adapter = MagicMock()
+    adapter.load_via_native.return_value = native_result
+    adapter.discover_tensors.return_value = {"first": first, "second": second}
+    ctx = SimpleNamespace(
+        global_rank=0,
+        identity=SimpleNamespace(model_name="model"),
+        adapter=adapter,
+        tensors={},
+    )
+
+    with patch(
+        "modelexpress.engines.sglang.loader.build_sglang_load_context",
+        return_value=ctx,
+    ), patch.object(
+        loader,
+        "_find_transfer_engine_source",
+        return_value=None,
+    ), patch.object(
+        loader,
+        "_publish_transfer_engine_source",
+    ) as publish:
+        loaded = loader._load_model_via_transfer_engine(
+            model=initial_model,
+            model_config=_model_config(),
+            device_config=_device_config(),
+        )
+
+    assert loaded is native_model
+    transfer_engine.unregister_memory.assert_called_once_with(first.data_ptr())
+    adapter.reinit_for_retry.assert_not_called()
+    adapter.load_via_native.assert_called_once()
+    publish.assert_not_called()
+
+
 def test_mx_model_loader_rejects_unknown_transport_in_mx_package():
     loader = MxModelLoader(_load_config(modelexpress_transport="unknown"))
 
@@ -527,6 +653,7 @@ def test_mx_model_loader_rejects_unknown_transport_in_mx_package():
 def test_transfer_engine_registers_discovered_tensor_map():
     loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
     tensor = torch.randn(2, 3)
+    empty = torch.empty(0)
     calls = []
 
     class FakeTransferEngine:
@@ -535,7 +662,7 @@ def test_transfer_engine_registers_discovered_tensor_map():
             return 0
 
     weight_info = loader._register_transfer_engine_tensors(
-        {"weight.__storage": tensor},
+        {"weight.__storage": tensor, "empty": empty},
         FakeTransferEngine(),
     )
 
@@ -545,13 +672,15 @@ def test_transfer_engine_registers_discovered_tensor_map():
             tensor.data_ptr(),
             tensor.numel(),
             tensor.element_size(),
-        )
+        ),
+        "empty": (empty.data_ptr(), empty.numel(), empty.element_size()),
     }
 
 
 def test_transfer_engine_receive_uses_discovered_tensor_map():
     loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
     tensor = torch.randn(2, 3)
+    empty = torch.empty(0)
     ctx = SimpleNamespace(global_rank=0)
     transferred = {}
     source_worker = p2p_pb2.WorkerMetadata(
@@ -562,7 +691,8 @@ def test_transfer_engine_receive_uses_discovered_tensor_map():
                 addr=1234,
                 size=tensor.numel() * tensor.element_size(),
                 device_id=0,
-            )
+            ),
+            p2p_pb2.TensorDescriptor(name="empty", addr=0, size=0, device_id=0),
         ],
     )
 
@@ -581,7 +711,7 @@ def test_transfer_engine_receive_uses_discovered_tensor_map():
             return 0
 
     loader._receive_via_transfer_engine(
-        {"weight.__storage": tensor},
+        {"weight.__storage": tensor, "empty": empty},
         FakeTransferEngine(),
         source_worker,
         ctx,
