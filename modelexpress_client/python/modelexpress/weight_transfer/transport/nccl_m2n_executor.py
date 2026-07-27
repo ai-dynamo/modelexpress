@@ -238,8 +238,11 @@ def build_reshard_params(
     for tt in table.tensors:
         param = named.get(tt.name)
         if param is None:
-            logger.debug("param %s not in local model, skipping", tt.name)
-            continue
+            raise RuntimeError(
+                f"trainer table parameter {tt.name!r} is not present in the local model; "
+                "every rank in a reshard cohort must contribute the same parameter set, "
+                "since reshard and window registration are collectives"
+            )
 
         shard_dim = shard_dim_from_trainer_tensor(tt)
         global_shape = tuple(tt.shape)
