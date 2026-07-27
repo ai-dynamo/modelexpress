@@ -230,7 +230,7 @@ spec:
                 # weight residency instead of vLLM auto-sizing cache around leaks.
                 RAY_ADDRESS=127.0.0.1:6379 exec python3 -m vllm.entrypoints.openai.api_server \
                   --model "${MX_CI_MODEL}" \
-                  --load-format mx \
+                  --load-format modelexpress \
                   --tensor-parallel-size 2 \
                   --distributed-executor-backend ray \
                   --max-model-len 1024 \

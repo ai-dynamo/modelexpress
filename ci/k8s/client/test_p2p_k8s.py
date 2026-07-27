@@ -286,12 +286,12 @@ def test_artifact_transfer(
     )
 
     logs = _all_pod_logs(namespace, "mx-target", "mx-target")
-    install_lines = [line for line in logs.splitlines() if "vLLM artifact install complete" in line]
+    install_lines = [line for line in logs.splitlines() if "artifact install complete" in line]
     print("[mx-target] artifact install lines:\n" + "\n".join(install_lines))
-    assert install_lines, "Target did not log vLLM artifact installation"
+    assert install_lines, "Target did not log artifact installation"
     for source_type in expected_artifact_source_types:
         assert f"name={source_type}" in logs, (
-            f"Target did not log vLLM artifact installation for {source_type}"
+            f"Target did not log artifact installation for {source_type}"
         )
 
 

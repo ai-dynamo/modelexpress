@@ -95,10 +95,20 @@ impl P2pStateManager {
         identity: &SourceIdentity,
         worker_id: &str,
         worker: WorkerMetadata,
+        pod_name: &str,
+        pod_uid: &str,
+        pod_namespace: &str,
     ) -> MetadataResult<()> {
         self.get_backend()
             .await?
-            .publish_metadata(identity, worker_id, worker)
+            .publish_metadata(
+                identity,
+                worker_id,
+                worker,
+                pod_name,
+                pod_uid,
+                pod_namespace,
+            )
             .await
     }
 
@@ -123,6 +133,31 @@ impl P2pStateManager {
         self.get_backend()
             .await?
             .list_workers(source_id, status_filter)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_workers_filtered(
+        &self,
+        source_id: Option<String>,
+        status_filter: Option<modelexpress_common::grpc::p2p::SourceStatus>,
+        model_name_filter: Option<String>,
+        worker_rank_filter: Option<u32>,
+        min_training_step: Option<u64>,
+        min_updated_at: Option<i64>,
+        limit: Option<usize>,
+    ) -> MetadataResult<Vec<crate::p2p::backend::SourceInstanceInfo>> {
+        self.get_backend()
+            .await?
+            .list_workers_filtered(
+                source_id,
+                status_filter,
+                model_name_filter,
+                worker_rank_filter,
+                min_training_step,
+                min_updated_at,
+                limit,
+            )
             .await
     }
 
@@ -422,6 +457,7 @@ mod tests {
                     metadata_endpoint: String::new(),
                     agent_name: String::new(),
                     worker_grpc_endpoint: String::new(),
+                    accelerator: String::new(),
                     artifact_source: None,
                 },
                 WorkerRecord {
@@ -439,10 +475,12 @@ mod tests {
                     metadata_endpoint: String::new(),
                     agent_name: String::new(),
                     worker_grpc_endpoint: String::new(),
+                    accelerator: String::new(),
                     artifact_source: None,
                 },
             ],
             published_at: 1234567890,
+            identity: None,
         };
 
         assert_eq!(record.model_name, "meta-llama/Llama-3.1-70B");
@@ -455,14 +493,19 @@ mod tests {
     async fn test_publish_metadata_calls_backend() {
         let mut mock = MockMetadataBackend::new();
         mock.expect_publish_metadata()
-            .withf(|identity, worker_id, worker| {
-                identity.model_name == "my-model"
-                    && identity.tensor_parallel_size == 8
-                    && worker_id == "a1b2c3d4"
-                    && worker.worker_rank == 3
-            })
+            .withf(
+                |identity, worker_id, worker, pod_name, pod_uid, pod_namespace| {
+                    identity.model_name == "my-model"
+                        && identity.tensor_parallel_size == 8
+                        && worker_id == "a1b2c3d4"
+                        && worker.worker_rank == 3
+                        && pod_name == "vllm-worker-0"
+                        && pod_uid == "pod-uid-1"
+                        && pod_namespace == "default"
+                },
+            )
             .once()
-            .returning(|_, _, _| Ok(()));
+            .returning(|_, _, _, _, _, _| Ok(()));
 
         let manager = P2pStateManager::with_backend(Arc::new(mock));
         manager
@@ -476,6 +519,9 @@ mod tests {
                     updated_at: 0,
                     ..Default::default()
                 },
+                "vllm-worker-0",
+                "pod-uid-1",
+                "default",
             )
             .await
             .expect("publish_metadata failed");
@@ -486,12 +532,19 @@ mod tests {
         let mut mock = MockMetadataBackend::new();
         mock.expect_publish_metadata()
             .once()
-            .returning(|_, _, _| Err("storage unavailable".into()));
+            .returning(|_, _, _, _, _, _| Err("storage unavailable".into()));
 
         let manager = P2pStateManager::with_backend(Arc::new(mock));
         assert!(
             manager
-                .publish_metadata(&test_identity(), "a1b2c3d4", WorkerMetadata::default())
+                .publish_metadata(
+                    &test_identity(),
+                    "a1b2c3d4",
+                    WorkerMetadata::default(),
+                    "",
+                    "",
+                    "",
+                )
                 .await
                 .is_err()
         );
@@ -560,6 +613,9 @@ mod tests {
                     worker_rank: 0,
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
+                    accelerator: "cuda".to_string(),
+                    training_step: None,
+                    layout_signature: None,
                 }])
             });
 

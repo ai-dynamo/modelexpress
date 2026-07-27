@@ -20,7 +20,9 @@ use modelexpress_common::models::{ModelProvider, ModelStatus};
 use modelexpress_server::registry::backend::{
     ClaimOutcome, RegistryBackend, redis::RedisRegistryBackend,
 };
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
+
+const TEST_LEASE_DURATION: Duration = Duration::from_secs(30);
 
 fn redis_url() -> String {
     std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string())
@@ -55,14 +57,24 @@ async fn claim_then_set_then_delete_roundtrip() {
 
     // First claim wins and marks DOWNLOADING.
     let claimed = backend
-        .try_claim_for_download(&name, ModelProvider::HuggingFace)
+        .try_claim_for_download(
+            &name,
+            ModelProvider::HuggingFace,
+            "roundtrip-owner",
+            TEST_LEASE_DURATION,
+        )
         .await
         .expect("claim");
     assert_eq!(claimed, ClaimOutcome::Claimed);
 
     // Second claim observes the existing record without mutation.
     let re_claim = backend
-        .try_claim_for_download(&name, ModelProvider::HuggingFace)
+        .try_claim_for_download(
+            &name,
+            ModelProvider::HuggingFace,
+            "roundtrip-observer",
+            TEST_LEASE_DURATION,
+        )
         .await
         .expect("re-claim");
     assert_eq!(
@@ -113,12 +125,18 @@ async fn concurrent_claims_yield_single_winner() {
     let name = unique_name("concurrent");
 
     let mut handles = Vec::new();
-    for _ in 0..8 {
+    for owner in 0..8 {
         let b = backend.clone();
         let n = name.clone();
+        let claim_id = format!("concurrent-owner-{owner}");
         handles.push(tokio::spawn(async move {
-            b.try_claim_for_download(&n, ModelProvider::HuggingFace)
-                .await
+            b.try_claim_for_download(
+                &n,
+                ModelProvider::HuggingFace,
+                &claim_id,
+                TEST_LEASE_DURATION,
+            )
+            .await
         }));
     }
     // Exactly one `Claimed`; the rest see `AlreadyExists(DOWNLOADING)`. This is the
@@ -166,12 +184,18 @@ async fn concurrent_error_retries_yield_single_winner() {
         .expect("seed ERROR record");
 
     let mut handles = Vec::new();
-    for _ in 0..8 {
+    for owner in 0..8 {
         let b = backend.clone();
         let n = name.clone();
+        let claim_id = format!("retry-owner-{owner}");
         handles.push(tokio::spawn(async move {
-            b.try_reset_error_for_retry(&n, ModelProvider::HuggingFace)
-                .await
+            b.try_reset_error_for_retry(
+                &n,
+                ModelProvider::HuggingFace,
+                &claim_id,
+                TEST_LEASE_DURATION,
+            )
+            .await
         }));
     }
 
@@ -205,7 +229,12 @@ async fn touch_updates_last_used_at() {
     let name = unique_name("touch");
 
     backend
-        .try_claim_for_download(&name, ModelProvider::HuggingFace)
+        .try_claim_for_download(
+            &name,
+            ModelProvider::HuggingFace,
+            "touch-owner",
+            TEST_LEASE_DURATION,
+        )
         .await
         .expect("initial claim");
     let first = backend
@@ -335,7 +364,12 @@ async fn get_status_counts_reflects_stored_records() {
         .await
         .expect("set ERROR");
     backend
-        .try_claim_for_download("m-downloading", ModelProvider::HuggingFace)
+        .try_claim_for_download(
+            "m-downloading",
+            ModelProvider::HuggingFace,
+            "counts-owner",
+            TEST_LEASE_DURATION,
+        )
         .await
         .expect("claim DOWNLOADING");
 
@@ -398,7 +432,7 @@ async fn cross_provider_claims_do_not_collide() {
     let name = unique_name("cross/model");
 
     let first = backend
-        .try_claim_for_download(&name, ModelProvider::Gcs)
+        .try_claim_for_download(&name, ModelProvider::Gcs, "gcs-owner", TEST_LEASE_DURATION)
         .await
         .expect("gcs claim");
     assert_eq!(first, ClaimOutcome::Claimed);
@@ -406,7 +440,12 @@ async fn cross_provider_claims_do_not_collide() {
     // The SAME name under a different provider must win its OWN fresh claim, not observe
     // the GCS record as AlreadyExists.
     let second = backend
-        .try_claim_for_download(&name, ModelProvider::HuggingFace)
+        .try_claim_for_download(
+            &name,
+            ModelProvider::HuggingFace,
+            "hf-owner",
+            TEST_LEASE_DURATION,
+        )
         .await
         .expect("hf claim");
     assert_eq!(
@@ -436,7 +475,12 @@ async fn legacy_record_migrates_on_matching_provider_claim() {
     seed_legacy_record(&name, "Gcs", "DOWNLOADED").await;
 
     let outcome = backend
-        .try_claim_for_download(&name, ModelProvider::Gcs)
+        .try_claim_for_download(
+            &name,
+            ModelProvider::Gcs,
+            "legacy-gcs-owner",
+            TEST_LEASE_DURATION,
+        )
         .await
         .expect("gcs claim over legacy");
     assert_eq!(
@@ -468,7 +512,12 @@ async fn legacy_record_ignored_on_mismatched_provider_claim() {
     seed_legacy_record(&name, "Gcs", "DOWNLOADED").await;
 
     let outcome = backend
-        .try_claim_for_download(&name, ModelProvider::HuggingFace)
+        .try_claim_for_download(
+            &name,
+            ModelProvider::HuggingFace,
+            "legacy-hf-owner",
+            TEST_LEASE_DURATION,
+        )
         .await
         .expect("hf claim over mismatched legacy");
     assert_eq!(outcome, ClaimOutcome::Claimed);

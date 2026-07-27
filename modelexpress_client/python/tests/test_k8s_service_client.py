@@ -135,6 +135,30 @@ def test_list_sources_returns_single_synthetic_ref_at_caller_rank():
     assert inst.model_name == identity.model_name
 
 
+def test_list_sources_synthetic_ref_survives_quantized_prefilter():
+    # The synthetic ref carries no accelerator (this backend learns it only from
+    # GetTensorManifest). The pre-fetch accelerator gate must NOT drop it for a
+    # quantized identity, or a same-family quantized k8s-service transfer would
+    # be stranded before its accelerator is known. Regression for the P2P
+    # quantized cross-vendor guard vs the k8s-service empty-accelerator ref.
+    from modelexpress.metadata.payload import accelerators_compatible
+
+    client = MxK8sServiceClient(worker_rank=0)
+    identity = _base_identity()
+    identity.quantization = "fp8"
+    resp = client.list_sources(identity=identity)
+    inst = resp.instances[0]
+    assert inst.accelerator == ""
+    # Pre-fetch gate (default defer_unknown=True) defers the unknown ref.
+    assert accelerators_compatible(
+        "cuda",
+        inst.accelerator,
+        mx_source_type=identity.mx_source_type,
+        quantization=identity.quantization,
+        dtype=identity.dtype,
+    )
+
+
 def test_list_sources_requires_identity():
     client = MxK8sServiceClient(worker_rank=0)
     with pytest.raises(ValueError, match="identity"):
@@ -223,10 +247,12 @@ class _FakeWorkerServicer(p2p_pb2_grpc.WorkerServiceServicer):
         mx_source_id: str,
         worker_rank: int,
         *,
+        accelerator: str = "cuda",
         fail_first_n: int = 0,
     ):
         self._mx_source_id = mx_source_id
         self._worker_rank = worker_rank
+        self._accelerator = accelerator
         self._fail_first_n = fail_first_n
         self._calls = 0
         self._lock = threading.Lock()
@@ -251,6 +277,7 @@ class _FakeWorkerServicer(p2p_pb2_grpc.WorkerServiceServicer):
             metadata_endpoint="10.0.0.1:5555",
             agent_name="fake-agent",
             worker_rank=self._worker_rank,
+            accelerator=self._accelerator,
         )
 
 
@@ -278,6 +305,7 @@ def test_get_metadata_success_builds_synthetic_response():
         assert resp.worker.worker_rank == 4
         assert resp.worker.metadata_endpoint == "10.0.0.1:5555"
         assert resp.worker.agent_name == "fake-agent"
+        assert resp.worker.accelerator == "cuda"
         assert resp.worker.status == p2p_pb2.SOURCE_STATUS_READY
         tensors = worker_tensor_descriptors(resp.worker)
         assert len(tensors) == 1

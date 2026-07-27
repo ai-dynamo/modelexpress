@@ -895,6 +895,10 @@ type WorkerMetadata struct {
 	// host:port for the worker's gRPC WorkerService, used for tensor manifests,
 	// artifact manifests, and artifact chunk transfer coordination.
 	WorkerGrpcEndpoint string `protobuf:"bytes,8,opt,name=worker_grpc_endpoint,json=workerGrpcEndpoint,proto3" json:"worker_grpc_endpoint,omitempty"`
+	// Runtime accelerator family for compatibility filtering (e.g. "cuda").
+	// This is runtime metadata, not SourceIdentity hash material. Empty means
+	// unknown and must be accepted for backward compatibility with old writers.
+	Accelerator string `protobuf:"bytes,9,opt,name=accelerator,proto3" json:"accelerator,omitempty"`
 	// Source-type-specific bounded metadata. This selects the metadata payload
 	// shape, not a transfer endpoint. Readers should prefer tensor_source over
 	// deprecated tensors when both are present, and fall back to tensors for old
@@ -1014,6 +1018,13 @@ func (x *WorkerMetadata) GetWorkerGrpcEndpoint() string {
 	return ""
 }
 
+func (x *WorkerMetadata) GetAccelerator() string {
+	if x != nil {
+		return x.Accelerator
+	}
+	return ""
+}
+
 func (x *WorkerMetadata) GetSourcePayload() isWorkerMetadata_SourcePayload {
 	if x != nil {
 		return x.SourcePayload
@@ -1074,7 +1085,10 @@ func (*WorkerMetadata_ArtifactSource) isWorkerMetadata_SourcePayload() {}
 type GetTensorManifestRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// mx_source_id for validation (catches stale discovery)
-	MxSourceId    string `protobuf:"bytes,1,opt,name=mx_source_id,json=mxSourceId,proto3" json:"mx_source_id,omitempty"`
+	MxSourceId string `protobuf:"bytes,1,opt,name=mx_source_id,json=mxSourceId,proto3" json:"mx_source_id,omitempty"`
+	// Runtime generation selected from discovery metadata. The serving endpoint
+	// rejects the request if it belongs to a different worker process.
+	WorkerId      *string `protobuf:"bytes,2,opt,name=worker_id,json=workerId,proto3,oneof" json:"worker_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1116,6 +1130,13 @@ func (x *GetTensorManifestRequest) GetMxSourceId() string {
 	return ""
 }
 
+func (x *GetTensorManifestRequest) GetWorkerId() string {
+	if x != nil && x.WorkerId != nil {
+		return *x.WorkerId
+	}
+	return ""
+}
+
 type GetTensorManifestResponse struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Tensors []*TensorDescriptor    `protobuf:"bytes,1,rep,name=tensors,proto3" json:"tensors,omitempty"`
@@ -1126,7 +1147,13 @@ type GetTensorManifestResponse struct {
 	// NIXL agent name for the serving worker
 	AgentName string `protobuf:"bytes,4,opt,name=agent_name,json=agentName,proto3" json:"agent_name,omitempty"`
 	// Rank of the serving worker (for rank-matched transfers)
-	WorkerRank    uint32 `protobuf:"varint,5,opt,name=worker_rank,json=workerRank,proto3" json:"worker_rank,omitempty"`
+	WorkerRank uint32 `protobuf:"varint,5,opt,name=worker_rank,json=workerRank,proto3" json:"worker_rank,omitempty"`
+	// Runtime accelerator family for compatibility filtering (e.g. "cuda").
+	// Empty means unknown and must be accepted for backward compatibility.
+	Accelerator string `protobuf:"bytes,6,opt,name=accelerator,proto3" json:"accelerator,omitempty"`
+	// Runtime generation of the process serving this manifest. New sources
+	// always set it; absence identifies a legacy source during rolling upgrade.
+	WorkerId      *string `protobuf:"bytes,7,opt,name=worker_id,json=workerId,proto3,oneof" json:"worker_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1194,6 +1221,20 @@ func (x *GetTensorManifestResponse) GetWorkerRank() uint32 {
 		return x.WorkerRank
 	}
 	return 0
+}
+
+func (x *GetTensorManifestResponse) GetAccelerator() string {
+	if x != nil {
+		return x.Accelerator
+	}
+	return ""
+}
+
+func (x *GetTensorManifestResponse) GetWorkerId() string {
+	if x != nil && x.WorkerId != nil {
+		return *x.WorkerId
+	}
+	return ""
 }
 
 type GetArtifactManifestHeaderRequest struct {
@@ -1896,7 +1937,17 @@ type PublishMetadataRequest struct {
 	// Unique identifier for this running instance (UUID).
 	// Differentiates multiple replicas with identical SourceIdentity.
 	// If empty, the server rejects the request.
-	WorkerId      string `protobuf:"bytes,3,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	WorkerId string `protobuf:"bytes,3,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	// Kubernetes pod name of the calling worker, set via the downward API.
+	// Used with pod_uid and pod_namespace to set an ownerReference on the
+	// ModelMetadata CR so K8s garbage-collects it when the pod is deleted.
+	PodName string `protobuf:"bytes,4,opt,name=pod_name,json=podName,proto3" json:"pod_name,omitempty"`
+	// Kubernetes pod UID of the calling worker, set via the downward API.
+	PodUid string `protobuf:"bytes,5,opt,name=pod_uid,json=podUid,proto3" json:"pod_uid,omitempty"`
+	// Kubernetes namespace of the calling worker, set via the downward API.
+	// Owner references are only valid when this matches the ModelMetadata
+	// namespace. Empty means no ownerReference is set.
+	PodNamespace  string `protobuf:"bytes,6,opt,name=pod_namespace,json=podNamespace,proto3" json:"pod_namespace,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1948,6 +1999,27 @@ func (x *PublishMetadataRequest) GetWorker() *WorkerMetadata {
 func (x *PublishMetadataRequest) GetWorkerId() string {
 	if x != nil {
 		return x.WorkerId
+	}
+	return ""
+}
+
+func (x *PublishMetadataRequest) GetPodName() string {
+	if x != nil {
+		return x.PodName
+	}
+	return ""
+}
+
+func (x *PublishMetadataRequest) GetPodUid() string {
+	if x != nil {
+		return x.PodUid
+	}
+	return ""
+}
+
+func (x *PublishMetadataRequest) GetPodNamespace() string {
+	if x != nil {
+		return x.PodNamespace
 	}
 	return ""
 }
@@ -2034,9 +2106,24 @@ type SourceInstanceRef struct {
 	ModelName string `protobuf:"bytes,3,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
 	// Global rank of this worker within the instance.
 	// Clients filter on this field to find a peer with a matching rank.
-	WorkerRank    uint32 `protobuf:"varint,4,opt,name=worker_rank,json=workerRank,proto3" json:"worker_rank,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	WorkerRank uint32 `protobuf:"varint,4,opt,name=worker_rank,json=workerRank,proto3" json:"worker_rank,omitempty"`
+	// Runtime accelerator family for compatibility filtering (e.g. "cuda").
+	// Lets clients drop incompatible sources before GetMetadata and before
+	// the retry-cap slice. Empty means unknown (treated as compatible for
+	// rolling upgrades and sources that predate this field).
+	Accelerator string `protobuf:"bytes,5,opt,name=accelerator,proto3" json:"accelerator,omitempty"`
+	// Timestamp of the worker's last status update (unix milliseconds).
+	// Zero means unknown for records created by older servers/backends.
+	UpdatedAt int64 `protobuf:"varint,6,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
+	// Training step/version lifted from SourceIdentity.extra_parameters.
+	// Presence matters: an absent value must not be interpreted as step zero.
+	TrainingStep *uint64 `protobuf:"varint,7,opt,name=training_step,json=trainingStep,proto3,oneof" json:"training_step,omitempty"`
+	// Stable digest of topology, tensor registry, and translation metadata.
+	// Unlike training_step this remains constant across versions and changes
+	// whenever cached layout metadata must be rebuilt.
+	LayoutSignature *string `protobuf:"bytes,8,opt,name=layout_signature,json=layoutSignature,proto3,oneof" json:"layout_signature,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *SourceInstanceRef) Reset() {
@@ -2097,13 +2184,50 @@ func (x *SourceInstanceRef) GetWorkerRank() uint32 {
 	return 0
 }
 
+func (x *SourceInstanceRef) GetAccelerator() string {
+	if x != nil {
+		return x.Accelerator
+	}
+	return ""
+}
+
+func (x *SourceInstanceRef) GetUpdatedAt() int64 {
+	if x != nil {
+		return x.UpdatedAt
+	}
+	return 0
+}
+
+func (x *SourceInstanceRef) GetTrainingStep() uint64 {
+	if x != nil && x.TrainingStep != nil {
+		return *x.TrainingStep
+	}
+	return 0
+}
+
+func (x *SourceInstanceRef) GetLayoutSignature() string {
+	if x != nil && x.LayoutSignature != nil {
+		return *x.LayoutSignature
+	}
+	return ""
+}
+
 type ListSourcesRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Filter by source identity — server computes mx_source_id.
 	// If not set, instances across all sources are returned.
 	Identity *SourceIdentity `protobuf:"bytes,1,opt,name=identity,proto3" json:"identity,omitempty"`
 	// Filter by worker status. Not set = return workers in all statuses.
-	StatusFilter  *SourceStatus `protobuf:"varint,2,opt,name=status_filter,json=statusFilter,proto3,enum=model_express.p2p.SourceStatus,oneof" json:"status_filter,omitempty"`
+	StatusFilter *SourceStatus `protobuf:"varint,2,opt,name=status_filter,json=statusFilter,proto3,enum=model_express.p2p.SourceStatus,oneof" json:"status_filter,omitempty"`
+	// Lightweight discovery filters. Unlike identity, these do not require the
+	// caller to know every source-identity field and can therefore be applied
+	// before fetching MB-scale worker metadata.
+	ModelNameFilter  *string `protobuf:"bytes,3,opt,name=model_name_filter,json=modelNameFilter,proto3,oneof" json:"model_name_filter,omitempty"`
+	WorkerRankFilter *uint32 `protobuf:"varint,4,opt,name=worker_rank_filter,json=workerRankFilter,proto3,oneof" json:"worker_rank_filter,omitempty"`
+	MinTrainingStep  *uint64 `protobuf:"varint,5,opt,name=min_training_step,json=minTrainingStep,proto3,oneof" json:"min_training_step,omitempty"`
+	MinUpdatedAt     *int64  `protobuf:"varint,6,opt,name=min_updated_at,json=minUpdatedAt,proto3,oneof" json:"min_updated_at,omitempty"`
+	// Return newest workers first and cap the response. Zero/unset means no cap.
+	Limit         *uint32 `protobuf:"varint,7,opt,name=limit,proto3,oneof" json:"limit,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2150,6 +2274,41 @@ func (x *ListSourcesRequest) GetStatusFilter() SourceStatus {
 		return *x.StatusFilter
 	}
 	return SourceStatus_SOURCE_STATUS_UNKNOWN
+}
+
+func (x *ListSourcesRequest) GetModelNameFilter() string {
+	if x != nil && x.ModelNameFilter != nil {
+		return *x.ModelNameFilter
+	}
+	return ""
+}
+
+func (x *ListSourcesRequest) GetWorkerRankFilter() uint32 {
+	if x != nil && x.WorkerRankFilter != nil {
+		return *x.WorkerRankFilter
+	}
+	return 0
+}
+
+func (x *ListSourcesRequest) GetMinTrainingStep() uint64 {
+	if x != nil && x.MinTrainingStep != nil {
+		return *x.MinTrainingStep
+	}
+	return 0
+}
+
+func (x *ListSourcesRequest) GetMinUpdatedAt() int64 {
+	if x != nil && x.MinUpdatedAt != nil {
+		return *x.MinUpdatedAt
+	}
+	return 0
+}
+
+func (x *ListSourcesRequest) GetLimit() uint32 {
+	if x != nil && x.Limit != nil {
+		return *x.Limit
+	}
+	return 0
 }
 
 type ListSourcesResponse struct {
@@ -2259,7 +2418,13 @@ type GetMetadataResponse struct {
 	// Echoed mx_source_id
 	MxSourceId string `protobuf:"bytes,3,opt,name=mx_source_id,json=mxSourceId,proto3" json:"mx_source_id,omitempty"`
 	// Echoed worker_id
-	WorkerId      string `protobuf:"bytes,4,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	WorkerId string `protobuf:"bytes,4,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	// Source identity (mirrors the SourceIdentity that produced mx_source_id).
+	// Required by v2 (NemoRL) clients that store framework metadata
+	// (training_step, role, shape registry, ...) in extra_parameters.
+	// Pre-v2 clients ignore this field; populating it on existing servers is
+	// backward-compatible.
+	Identity      *SourceIdentity `protobuf:"bytes,5,opt,name=identity,proto3" json:"identity,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2320,6 +2485,13 @@ func (x *GetMetadataResponse) GetWorkerId() string {
 		return x.WorkerId
 	}
 	return ""
+}
+
+func (x *GetMetadataResponse) GetIdentity() *SourceIdentity {
+	if x != nil {
+		return x.Identity
+	}
+	return nil
 }
 
 type UpdateStatusRequest struct {
@@ -2514,7 +2686,7 @@ const file_p2p_proto_rawDesc = "" +
 	"\vfile_offset\x18\x03 \x01(\x04R\n" +
 	"fileOffset\x12\x16\n" +
 	"\x06length\x18\x04 \x01(\x04R\x06length\x12\x1a\n" +
-	"\bchecksum\x18\x05 \x01(\tR\bchecksum\"\xfc\x04\n" +
+	"\bchecksum\x18\x05 \x01(\tR\bchecksum\"\x9e\x05\n" +
 	"\x0eWorkerMetadata\x12\x1f\n" +
 	"\vworker_rank\x18\x01 \x01(\rR\n" +
 	"workerRank\x12%\n" +
@@ -2528,14 +2700,18 @@ const file_p2p_proto_rawDesc = "" +
 	"\x11metadata_endpoint\x18\x06 \x01(\tR\x10metadataEndpoint\x12\x1d\n" +
 	"\n" +
 	"agent_name\x18\a \x01(\tR\tagentName\x120\n" +
-	"\x14worker_grpc_endpoint\x18\b \x01(\tR\x12workerGrpcEndpoint\x12N\n" +
+	"\x14worker_grpc_endpoint\x18\b \x01(\tR\x12workerGrpcEndpoint\x12 \n" +
+	"\vaccelerator\x18\t \x01(\tR\vaccelerator\x12N\n" +
 	"\rtensor_source\x18\x14 \x01(\v2'.model_express.p2p.TensorSourceMetadataH\x01R\ftensorSource\x12T\n" +
 	"\x0fartifact_source\x18\x15 \x01(\v2).model_express.p2p.ArtifactSourceMetadataH\x01R\x0eartifactSourceB\x12\n" +
 	"\x10backend_metadataB\x10\n" +
-	"\x0esource_payload\"<\n" +
+	"\x0esource_payload\"l\n" +
 	"\x18GetTensorManifestRequest\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
-	"mxSourceId\"\xe9\x01\n" +
+	"mxSourceId\x12 \n" +
+	"\tworker_id\x18\x02 \x01(\tH\x00R\bworkerId\x88\x01\x01B\f\n" +
+	"\n" +
+	"_worker_id\"\xbb\x02\n" +
 	"\x19GetTensorManifestResponse\x12=\n" +
 	"\atensors\x18\x01 \x03(\v2#.model_express.p2p.TensorDescriptorR\atensors\x12 \n" +
 	"\fmx_source_id\x18\x02 \x01(\tR\n" +
@@ -2544,7 +2720,11 @@ const file_p2p_proto_rawDesc = "" +
 	"\n" +
 	"agent_name\x18\x04 \x01(\tR\tagentName\x12\x1f\n" +
 	"\vworker_rank\x18\x05 \x01(\rR\n" +
-	"workerRank\"e\n" +
+	"workerRank\x12 \n" +
+	"\vaccelerator\x18\x06 \x01(\tR\vaccelerator\x12 \n" +
+	"\tworker_id\x18\a \x01(\tH\x00R\bworkerId\x88\x01\x01B\f\n" +
+	"\n" +
+	"_worker_id\"e\n" +
 	" GetArtifactManifestHeaderRequest\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1f\n" +
@@ -2619,17 +2799,20 @@ const file_p2p_proto_rawDesc = "" +
 	"mxSourceId\x12\x1f\n" +
 	"\vartifact_id\x18\x02 \x01(\tR\n" +
 	"artifactId\x12>\n" +
-	"\x05chunk\x18\x03 \x01(\v2(.model_express.p2p.ArtifactManifestChunkR\x05chunk\"\xaf\x01\n" +
+	"\x05chunk\x18\x03 \x01(\v2(.model_express.p2p.ArtifactManifestChunkR\x05chunk\"\x88\x02\n" +
 	"\x16PublishMetadataRequest\x12=\n" +
 	"\bidentity\x18\x01 \x01(\v2!.model_express.p2p.SourceIdentityR\bidentity\x129\n" +
 	"\x06worker\x18\x02 \x01(\v2!.model_express.p2p.WorkerMetadataR\x06worker\x12\x1b\n" +
-	"\tworker_id\x18\x03 \x01(\tR\bworkerId\"\x8c\x01\n" +
+	"\tworker_id\x18\x03 \x01(\tR\bworkerId\x12\x19\n" +
+	"\bpod_name\x18\x04 \x01(\tR\apodName\x12\x17\n" +
+	"\apod_uid\x18\x05 \x01(\tR\x06podUid\x12#\n" +
+	"\rpod_namespace\x18\x06 \x01(\tR\fpodNamespace\"\x8c\x01\n" +
 	"\x17PublishMetadataResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12 \n" +
 	"\fmx_source_id\x18\x03 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
-	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"\x92\x01\n" +
+	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"\xd4\x02\n" +
 	"\x11SourceInstanceRef\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
@@ -2637,23 +2820,41 @@ const file_p2p_proto_rawDesc = "" +
 	"\n" +
 	"model_name\x18\x03 \x01(\tR\tmodelName\x12\x1f\n" +
 	"\vworker_rank\x18\x04 \x01(\rR\n" +
-	"workerRank\"\xb0\x01\n" +
+	"workerRank\x12 \n" +
+	"\vaccelerator\x18\x05 \x01(\tR\vaccelerator\x12\x1d\n" +
+	"\n" +
+	"updated_at\x18\x06 \x01(\x03R\tupdatedAt\x12(\n" +
+	"\rtraining_step\x18\a \x01(\x04H\x00R\ftrainingStep\x88\x01\x01\x12.\n" +
+	"\x10layout_signature\x18\b \x01(\tH\x01R\x0flayoutSignature\x88\x01\x01B\x10\n" +
+	"\x0e_training_stepB\x13\n" +
+	"\x11_layout_signature\"\xeb\x03\n" +
 	"\x12ListSourcesRequest\x12=\n" +
 	"\bidentity\x18\x01 \x01(\v2!.model_express.p2p.SourceIdentityR\bidentity\x12I\n" +
-	"\rstatus_filter\x18\x02 \x01(\x0e2\x1f.model_express.p2p.SourceStatusH\x00R\fstatusFilter\x88\x01\x01B\x10\n" +
-	"\x0e_status_filter\"Y\n" +
+	"\rstatus_filter\x18\x02 \x01(\x0e2\x1f.model_express.p2p.SourceStatusH\x00R\fstatusFilter\x88\x01\x01\x12/\n" +
+	"\x11model_name_filter\x18\x03 \x01(\tH\x01R\x0fmodelNameFilter\x88\x01\x01\x121\n" +
+	"\x12worker_rank_filter\x18\x04 \x01(\rH\x02R\x10workerRankFilter\x88\x01\x01\x12/\n" +
+	"\x11min_training_step\x18\x05 \x01(\x04H\x03R\x0fminTrainingStep\x88\x01\x01\x12)\n" +
+	"\x0emin_updated_at\x18\x06 \x01(\x03H\x04R\fminUpdatedAt\x88\x01\x01\x12\x19\n" +
+	"\x05limit\x18\a \x01(\rH\x05R\x05limit\x88\x01\x01B\x10\n" +
+	"\x0e_status_filterB\x14\n" +
+	"\x12_model_name_filterB\x15\n" +
+	"\x13_worker_rank_filterB\x14\n" +
+	"\x12_min_training_stepB\x11\n" +
+	"\x0f_min_updated_atB\b\n" +
+	"\x06_limit\"Y\n" +
 	"\x13ListSourcesResponse\x12B\n" +
 	"\tinstances\x18\x01 \x03(\v2$.model_express.p2p.SourceInstanceRefR\tinstances\"S\n" +
 	"\x12GetMetadataRequest\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
-	"\tworker_id\x18\x02 \x01(\tR\bworkerId\"\xa5\x01\n" +
+	"\tworker_id\x18\x02 \x01(\tR\bworkerId\"\xe4\x01\n" +
 	"\x13GetMetadataResponse\x12\x14\n" +
 	"\x05found\x18\x01 \x01(\bR\x05found\x129\n" +
 	"\x06worker\x18\x02 \x01(\v2!.model_express.p2p.WorkerMetadataR\x06worker\x12 \n" +
 	"\fmx_source_id\x18\x03 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
-	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"\xae\x01\n" +
+	"\tworker_id\x18\x04 \x01(\tR\bworkerId\x12=\n" +
+	"\bidentity\x18\x05 \x01(\v2!.model_express.p2p.SourceIdentityR\bidentity\"\xae\x01\n" +
 	"\x13UpdateStatusRequest\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1f\n" +
@@ -2770,30 +2971,31 @@ var file_p2p_proto_depIdxs = []int32{
 	2,  // 21: model_express.p2p.ListSourcesRequest.status_filter:type_name -> model_express.p2p.SourceStatus
 	24, // 22: model_express.p2p.ListSourcesResponse.instances:type_name -> model_express.p2p.SourceInstanceRef
 	10, // 23: model_express.p2p.GetMetadataResponse.worker:type_name -> model_express.p2p.WorkerMetadata
-	2,  // 24: model_express.p2p.UpdateStatusRequest.status:type_name -> model_express.p2p.SourceStatus
-	22, // 25: model_express.p2p.P2pService.PublishMetadata:input_type -> model_express.p2p.PublishMetadataRequest
-	25, // 26: model_express.p2p.P2pService.ListSources:input_type -> model_express.p2p.ListSourcesRequest
-	27, // 27: model_express.p2p.P2pService.GetMetadata:input_type -> model_express.p2p.GetMetadataRequest
-	29, // 28: model_express.p2p.P2pService.UpdateStatus:input_type -> model_express.p2p.UpdateStatusRequest
-	11, // 29: model_express.p2p.WorkerService.GetTensorManifest:input_type -> model_express.p2p.GetTensorManifestRequest
-	13, // 30: model_express.p2p.WorkerService.GetArtifactManifestHeader:input_type -> model_express.p2p.GetArtifactManifestHeaderRequest
-	15, // 31: model_express.p2p.WorkerService.GetArtifactManifestChunks:input_type -> model_express.p2p.GetArtifactManifestChunksRequest
-	18, // 32: model_express.p2p.WorkerService.PrepareArtifactChunk:input_type -> model_express.p2p.PrepareArtifactChunkRequest
-	20, // 33: model_express.p2p.WorkerService.ReleaseArtifactChunk:input_type -> model_express.p2p.ReleaseArtifactChunkRequest
-	23, // 34: model_express.p2p.P2pService.PublishMetadata:output_type -> model_express.p2p.PublishMetadataResponse
-	26, // 35: model_express.p2p.P2pService.ListSources:output_type -> model_express.p2p.ListSourcesResponse
-	28, // 36: model_express.p2p.P2pService.GetMetadata:output_type -> model_express.p2p.GetMetadataResponse
-	30, // 37: model_express.p2p.P2pService.UpdateStatus:output_type -> model_express.p2p.UpdateStatusResponse
-	12, // 38: model_express.p2p.WorkerService.GetTensorManifest:output_type -> model_express.p2p.GetTensorManifestResponse
-	14, // 39: model_express.p2p.WorkerService.GetArtifactManifestHeader:output_type -> model_express.p2p.GetArtifactManifestHeaderResponse
-	16, // 40: model_express.p2p.WorkerService.GetArtifactManifestChunks:output_type -> model_express.p2p.GetArtifactManifestChunksResponse
-	19, // 41: model_express.p2p.WorkerService.PrepareArtifactChunk:output_type -> model_express.p2p.PrepareArtifactChunkResponse
-	21, // 42: model_express.p2p.WorkerService.ReleaseArtifactChunk:output_type -> model_express.p2p.ReleaseArtifactChunkResponse
-	34, // [34:43] is the sub-list for method output_type
-	25, // [25:34] is the sub-list for method input_type
-	25, // [25:25] is the sub-list for extension type_name
-	25, // [25:25] is the sub-list for extension extendee
-	0,  // [0:25] is the sub-list for field type_name
+	3,  // 24: model_express.p2p.GetMetadataResponse.identity:type_name -> model_express.p2p.SourceIdentity
+	2,  // 25: model_express.p2p.UpdateStatusRequest.status:type_name -> model_express.p2p.SourceStatus
+	22, // 26: model_express.p2p.P2pService.PublishMetadata:input_type -> model_express.p2p.PublishMetadataRequest
+	25, // 27: model_express.p2p.P2pService.ListSources:input_type -> model_express.p2p.ListSourcesRequest
+	27, // 28: model_express.p2p.P2pService.GetMetadata:input_type -> model_express.p2p.GetMetadataRequest
+	29, // 29: model_express.p2p.P2pService.UpdateStatus:input_type -> model_express.p2p.UpdateStatusRequest
+	11, // 30: model_express.p2p.WorkerService.GetTensorManifest:input_type -> model_express.p2p.GetTensorManifestRequest
+	13, // 31: model_express.p2p.WorkerService.GetArtifactManifestHeader:input_type -> model_express.p2p.GetArtifactManifestHeaderRequest
+	15, // 32: model_express.p2p.WorkerService.GetArtifactManifestChunks:input_type -> model_express.p2p.GetArtifactManifestChunksRequest
+	18, // 33: model_express.p2p.WorkerService.PrepareArtifactChunk:input_type -> model_express.p2p.PrepareArtifactChunkRequest
+	20, // 34: model_express.p2p.WorkerService.ReleaseArtifactChunk:input_type -> model_express.p2p.ReleaseArtifactChunkRequest
+	23, // 35: model_express.p2p.P2pService.PublishMetadata:output_type -> model_express.p2p.PublishMetadataResponse
+	26, // 36: model_express.p2p.P2pService.ListSources:output_type -> model_express.p2p.ListSourcesResponse
+	28, // 37: model_express.p2p.P2pService.GetMetadata:output_type -> model_express.p2p.GetMetadataResponse
+	30, // 38: model_express.p2p.P2pService.UpdateStatus:output_type -> model_express.p2p.UpdateStatusResponse
+	12, // 39: model_express.p2p.WorkerService.GetTensorManifest:output_type -> model_express.p2p.GetTensorManifestResponse
+	14, // 40: model_express.p2p.WorkerService.GetArtifactManifestHeader:output_type -> model_express.p2p.GetArtifactManifestHeaderResponse
+	16, // 41: model_express.p2p.WorkerService.GetArtifactManifestChunks:output_type -> model_express.p2p.GetArtifactManifestChunksResponse
+	19, // 42: model_express.p2p.WorkerService.PrepareArtifactChunk:output_type -> model_express.p2p.PrepareArtifactChunkResponse
+	21, // 43: model_express.p2p.WorkerService.ReleaseArtifactChunk:output_type -> model_express.p2p.ReleaseArtifactChunkResponse
+	35, // [35:44] is the sub-list for method output_type
+	26, // [26:35] is the sub-list for method input_type
+	26, // [26:26] is the sub-list for extension type_name
+	26, // [26:26] is the sub-list for extension extendee
+	0,  // [0:26] is the sub-list for field type_name
 }
 
 func init() { file_p2p_proto_init() }
@@ -2807,6 +3009,9 @@ func file_p2p_proto_init() {
 		(*WorkerMetadata_TensorSource)(nil),
 		(*WorkerMetadata_ArtifactSource)(nil),
 	}
+	file_p2p_proto_msgTypes[8].OneofWrappers = []any{}
+	file_p2p_proto_msgTypes[9].OneofWrappers = []any{}
+	file_p2p_proto_msgTypes[21].OneofWrappers = []any{}
 	file_p2p_proto_msgTypes[22].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{

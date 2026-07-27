@@ -4,6 +4,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "modelexpress.fullname" . }}
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "modelexpress.labels" . | nindent 4 }}
 spec:
@@ -46,8 +47,17 @@ spec:
             - name: http
               containerPort: {{ .Values.service.port | default 8001 }}
               protocol: TCP
-          {{- if or .Values.env .Values.extraEnv }}
           env:
+            {{- $hasNsInExtra := false }}
+            {{- range .Values.extraEnv }}
+              {{- if eq .name "MX_METADATA_NAMESPACE" }}
+                {{- $hasNsInExtra = true }}
+              {{- end }}
+            {{- end }}
+            {{- if and (not (hasKey .Values.env "MX_METADATA_NAMESPACE")) (not $hasNsInExtra) }}
+            - name: MX_METADATA_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            {{- end }}
             {{- range $key, $value := .Values.env }}
             - name: {{ $key }}
               value: {{ $value | quote }}
@@ -55,7 +65,28 @@ spec:
             {{- if .Values.extraEnv }}
             {{- toYaml .Values.extraEnv | nindent 12 }}
             {{- end }}
-          {{- end }}
+            {{- if .Values.security.enabled }}
+            {{- if and (eq .Values.security.mode "enforce") (not .Values.security.tokenAudiences) }}
+            {{- fail "security.mode=enforce requires a non-empty security.tokenAudiences" }}
+            {{- end }}
+            {{- if and (eq .Values.security.mode "enforce") (not .Values.security.allowedServiceAccounts) }}
+            {{- fail "security.mode=enforce requires a non-empty security.allowedServiceAccounts" }}
+            {{- end }}
+            - name: MODEL_EXPRESS_SECURITY_MODE
+              value: {{ .Values.security.mode | quote }}
+            {{- with .Values.security.tokenAudiences }}
+            - name: MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with .Values.security.allowedServiceAccounts }}
+            - name: MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- if hasKey .Values.security "cacheTtlSecs" }}
+            - name: MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS
+              value: {{ .Values.security.cacheTtlSecs | quote }}
+            {{- end }}
+            {{- end }}
           {{- if .Values.command }}
           command:
             {{- toYaml .Values.command | nindent 12 }}

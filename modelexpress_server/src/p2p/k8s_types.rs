@@ -122,6 +122,10 @@ pub struct WorkerStatus {
     #[serde(rename = "workerGrpcEndpoint", default)]
     pub worker_grpc_endpoint: String,
 
+    /// Runtime accelerator family for compatibility filtering.
+    #[serde(default)]
+    pub accelerator: String,
+
     /// Small discovery summary for file-backed artifact sources.
     #[serde(rename = "artifactSource", default)]
     pub artifact_source: Option<ArtifactSourceStatus>,

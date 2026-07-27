@@ -1,0 +1,134 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Single-node SGLang deployment with ModelExpress ModelStreamer (local disk).
+# Streams weights from PVC via runai-model-streamer with concurrent I/O.
+#
+# MX_MODEL_URI activates the streamer. Accepts:
+#   - HF model ID: "deepseek-ai/DeepSeek-V3" (resolved via HF_HUB_CACHE)
+#   - Absolute path: "/models/my-model"
+#   - Remote URI: "s3://bucket/model" (see sglang-single-node-streamer-s3.yaml)
+#
+# Keep --model-path on a Hugging Face model ID or local config path so SGLang
+# selects ModelExpress remote_instance rather than its native streamer loader.
+#
+# Prerequisites:
+#   - PVC with model weights pre-downloaded (HF Hub cache layout)
+#
+# For P2P RDMA serving after load, also set MX_SERVER_ADDRESS
+# and add RDMA resources (rdma/ib), UCX env vars. See the P2P examples under
+# examples/p2p_transfer_k8s/client/sglang/.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-sglang-streamer
+  labels:
+    app: mx-sglang-streamer
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8000
+      targetPort: 8000
+      name: http
+  selector:
+    app: mx-sglang-streamer
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-sglang-streamer
+  labels:
+    app: mx-sglang-streamer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mx-sglang-streamer
+  template:
+    metadata:
+      labels:
+        app: mx-sglang-streamer
+    spec:
+      containers:
+        - name: sglang
+          image: <your-registry>/modelexpress-sglang:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          command:
+            - python3
+            - -m
+            - sglang.launch_server
+          env:
+            - name: MODEL_NAME
+              value: "deepseek-ai/DeepSeek-V3"
+            - name: HF_HUB_CACHE
+              value: "/models"
+            # HF model ID — resolved to snapshot path via HF_HUB_CACHE
+            - name: MX_MODEL_URI
+              value: "deepseek-ai/DeepSeek-V3"
+            - name: MX_MS_DISTRIBUTED
+              value: "1"
+            - name: RUNAI_STREAMER_CONCURRENCY
+              value: "32"
+            # Optional: enable P2P serving after load (requires MX server + RDMA)
+            # - name: MX_SERVER_ADDRESS
+            #   value: "modelexpress-server:8001"
+          args:
+            - --model-path
+            - $(MODEL_NAME)
+            - --served-model-name
+            - $(MODEL_NAME)
+            - --load-format
+            - remote_instance
+            - --remote-instance-weight-loader-backend
+            - modelexpress
+            - --modelexpress-config
+            - '{"transport":"nixl"}'
+            - --tp
+            - "8"
+            - --dtype
+            - bfloat16
+            - --disable-cuda-graph
+            - --disable-piecewise-cuda-graph
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8000"
+          ports:
+            - containerPort: 8000
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            timeoutSeconds: 10
+            periodSeconds: 10
+          resources:
+            limits:
+              nvidia.com/gpu: "8"
+              # Optional: uncomment for P2P RDMA serving
+              # rdma/ib: "8"
+            requests:
+              nvidia.com/gpu: "8"
+              # rdma/ib: "8"
+              memory: "200Gi"
+              cpu: "16"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: model-cache
+              mountPath: /models
+              readOnly: true
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: model-cache
+      imagePullSecrets:
+        - name: nvcr-imagepullsecret

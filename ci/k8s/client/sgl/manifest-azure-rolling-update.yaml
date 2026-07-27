@@ -1,0 +1,126 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# SGLang rolling-update manifest for row 21 (5 workers, CRD + P2P metadata).
+# Driven by run-mx-fleet-test, which applies this at replicas=1 then scales
+# the Deployment directly from 1 → 5 before triggering the rollout.
+#
+# The first replica loads from Hugging Face and becomes the initial source.
+# The remaining workers and all rolling replacements load through the shared
+# ModelExpress NIXL strategy. NIXL uses TCP + CUDA staging so the five workers
+# can pack onto a100a MIG nodes without consuming one rdma/ib device per pod.
+#
+# Environment variables substituted by envsubst before apply:
+#   WORKER_IMAGE  — image built from ci/k8s/client/sgl/Dockerfile
+#   MX_CI_MODEL   — HuggingFace model id
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-fleet-workers
+  labels:
+    app: mx-fleet-worker
+spec:
+  replicas: 1
+  progressDeadlineSeconds: 600
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
+  selector:
+    matchLabels:
+      app: mx-fleet-worker
+  template:
+    metadata:
+      labels:
+        app: mx-fleet-worker
+    spec:
+      imagePullSecrets:
+        - name: worker-registry
+      nodeSelector:
+        agentpool: a100a
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: no-datadog
+          operator: Exists
+          effect: NoExecute
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+      containers:
+        - name: worker
+          image: ${WORKER_IMAGE}
+          imagePullPolicy: Always
+          command: ["python3", "-m", "sglang.launch_server"]
+          args:
+            - --model-path
+            - "${MX_CI_MODEL}"
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "30000"
+            - --tp
+            - "1"
+            - --load-format
+            - remote_instance
+            - --remote-instance-weight-loader-backend
+            - modelexpress
+            - --modelexpress-config
+            - '{"transport": "nixl"}'
+          env:
+            - name: MX_SERVER_ADDRESS
+              value: "mx-server:8000"
+            - name: MX_P2P_METADATA
+              value: "1"
+            - name: MX_ARTIFACT_TRANSFER
+              value: "0"
+            - name: MX_CONTIGUOUS_REG
+              value: "0"
+            - name: NIXL_UCX_TLS
+              value: "tcp,cuda_copy"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          ports:
+            - containerPort: 30000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 30000
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+          securityContext:
+            capabilities:
+              add: [IPC_LOCK]
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-fleet-workers
+spec:
+  selector:
+    app: mx-fleet-worker
+  ports:
+    - name: http
+      port: 30000
+      targetPort: 30000

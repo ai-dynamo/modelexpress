@@ -27,7 +27,7 @@ use std::{
 use tokio::io::AsyncReadExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 static START_TIME: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
 
@@ -555,6 +555,9 @@ pub struct ModelDownloadTracker {
     waiting_channels: WaitingChannels,
 }
 
+const DOWNLOAD_LEASE_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
+const DOWNLOAD_HEARTBEAT_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(10);
+
 impl ModelDownloadTracker {
     pub fn new(registry: Arc<RegistryManager>) -> Self {
         Self {
@@ -563,14 +566,18 @@ impl ModelDownloadTracker {
         }
     }
 
+    async fn touch_and_log(&self, model_name: &str) {
+        if let Err(e) = self.registry.touch_model(model_name).await {
+            error!("Failed to touch model {model_name}: {e}");
+        }
+    }
+
     /// Gets the status of a model from the registry, bumping `last_used_at` on hit.
     /// Returns None on lookup failure (error logged) or unknown model.
     pub async fn get_status(&self, model_name: &str) -> Option<ModelStatus> {
         match self.registry.get_status(model_name).await {
             Ok(Some(status)) => {
-                if let Err(e) = self.registry.touch_model(model_name).await {
-                    error!("Failed to touch model {model_name}: {e}");
-                }
+                self.touch_and_log(model_name).await;
                 Some(status)
             }
             Ok(None) => None,
@@ -597,7 +604,16 @@ impl ModelDownloadTracker {
             error!("Failed to update model status in registry: {e}");
             return;
         }
+        self.notify_waiters(model_name, status, provider, message);
+    }
 
+    fn notify_waiters(
+        &self,
+        model_name: String,
+        status: ModelStatus,
+        provider: ModelProvider,
+        message: Option<String>,
+    ) {
         let mut waiting = match self.waiting_channels.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -671,21 +687,52 @@ impl ModelDownloadTracker {
         provider: ModelProvider,
         ignore_weights: bool,
         retry: bool,
+        claim_id: String,
     ) {
         let tracker = self.clone();
         tokio::spawn(async move {
             let cache_dir = get_server_cache_dir();
-            match download::download_model(&model_name, provider, cache_dir, ignore_weights).await {
-                Ok(_path) => {
-                    tracker
-                        .set_status_and_notify(
-                            model_name,
-                            ModelStatus::DOWNLOADED,
-                            provider,
-                            Some("Model download completed successfully".to_string()),
-                        )
-                        .await;
+            let download =
+                download::download_model(&model_name, provider, cache_dir, ignore_weights);
+            tokio::pin!(download);
+            let start = tokio::time::Instant::now()
+                .checked_add(DOWNLOAD_HEARTBEAT_INTERVAL)
+                .unwrap_or_else(tokio::time::Instant::now);
+            let mut heartbeat = tokio::time::interval_at(start, DOWNLOAD_HEARTBEAT_INTERVAL);
+            let result = loop {
+                tokio::select! {
+                    result = &mut download => break result,
+                    _ = heartbeat.tick() => {
+                        match tracker
+                            .registry
+                            .refresh_download_claim(
+                                &model_name,
+                                provider,
+                                &claim_id,
+                                DOWNLOAD_LEASE_DURATION,
+                            )
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                warn!(
+                                    "Stopping download for {model_name}: lease ownership was lost"
+                                );
+                                return;
+                            }
+                            Err(e) => {
+                                warn!("Failed to refresh download lease for {model_name}: {e}");
+                            }
+                        }
+                    }
                 }
+            };
+
+            let (status, message) = match result {
+                Ok(_path) => (
+                    ModelStatus::DOWNLOADED,
+                    Some("Model download completed successfully".to_string()),
+                ),
                 Err(e) => {
                     if retry {
                         error!("Failed to download model {model_name} on retry: {e}");
@@ -697,9 +744,23 @@ impl ModelDownloadTracker {
                     } else {
                         format!("Download failed: {e}")
                     };
-                    tracker
-                        .set_status_and_notify(model_name, ModelStatus::ERROR, provider, Some(msg))
-                        .await;
+                    (ModelStatus::ERROR, Some(msg))
+                }
+            };
+
+            match tracker
+                .registry
+                .finish_download_claim(&model_name, provider, &claim_id, status, message.clone())
+                .await
+            {
+                Ok(true) => {
+                    tracker.notify_waiters(model_name.clone(), status, provider, message);
+                }
+                Ok(false) => {
+                    warn!("Ignoring completion for {model_name}: lease ownership was lost");
+                }
+                Err(e) => {
+                    error!("Failed to finish download claim for {model_name}: {e}");
                 }
             }
         });
@@ -722,12 +783,13 @@ impl ModelDownloadTracker {
         // path runs instead of returning a false success. Bounded to two attempts to
         // avoid looping if the delete or a concurrent re-claim keeps the record around.
         const MAX_CLAIM_ATTEMPTS: usize = 2;
+        let mut claim_id = uuid::Uuid::new_v4().to_string();
         let mut attempt: usize = 0;
         let (status, is_owner) = loop {
             attempt = attempt.saturating_add(1);
             match self
                 .registry
-                .try_claim_for_download(model_name, provider)
+                .try_claim_for_download(model_name, provider, &claim_id, DOWNLOAD_LEASE_DURATION)
                 .await
             {
                 Ok(ClaimOutcome::Claimed) => break (ModelStatus::DOWNLOADING, true),
@@ -743,6 +805,10 @@ impl ModelDownloadTracker {
                         );
                         self.delete_status(model_name).await;
                         continue;
+                    }
+                    if existing == ModelStatus::DOWNLOADED {
+                        // Returning an existing downloaded model is a cache hit for LRU purposes.
+                        self.touch_and_log(model_name).await;
                     }
                     break (existing, false);
                 }
@@ -770,7 +836,7 @@ impl ModelDownloadTracker {
         let (effective_status, is_retry_owner) = if status == ModelStatus::ERROR {
             let won = match self
                 .registry
-                .try_reset_error_for_retry(model_name, provider)
+                .try_reset_error_for_retry(model_name, provider, &claim_id, DOWNLOAD_LEASE_DURATION)
                 .await
             {
                 Ok(won) => won,
@@ -817,16 +883,45 @@ impl ModelDownloadTracker {
             // download) or won the ERROR-retry CAS. Everyone else waits.
             if is_owner || is_retry_owner {
                 let retry = status == ModelStatus::ERROR;
-                self.spawn_download_task(model_name.to_string(), provider, ignore_weights, retry);
+                self.spawn_download_task(
+                    model_name.to_string(),
+                    provider,
+                    ignore_weights,
+                    retry,
+                    claim_id,
+                );
+                claim_id = uuid::Uuid::new_v4().to_string();
             }
 
-            // Wait for completion by polling the registry.
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                if let Some(current_status) = self.get_status(model_name).await
-                    && current_status != ModelStatus::DOWNLOADING
+                match self
+                    .registry
+                    .try_claim_for_download(
+                        model_name,
+                        provider,
+                        &claim_id,
+                        DOWNLOAD_LEASE_DURATION,
+                    )
+                    .await
                 {
-                    return current_status;
+                    Ok(ClaimOutcome::Claimed) => {
+                        self.spawn_download_task(
+                            model_name.to_string(),
+                            provider,
+                            ignore_weights,
+                            false,
+                            claim_id,
+                        );
+                        claim_id = uuid::Uuid::new_v4().to_string();
+                    }
+                    Ok(ClaimOutcome::AlreadyExists(current_status))
+                        if current_status != ModelStatus::DOWNLOADING =>
+                    {
+                        return current_status;
+                    }
+                    Ok(ClaimOutcome::AlreadyExists(_)) => {}
+                    Err(e) => warn!("Failed to poll download lease for {model_name}: {e}"),
                 }
             }
         }
@@ -934,6 +1029,46 @@ mod tests {
         mock.expect_touch_model().once().returning(|_| Ok(()));
         let tracker = tracker_with_mock(mock);
         assert_eq!(tracker.get_status("m").await, Some(ModelStatus::DOWNLOADED));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_tracker_downloaded_cache_hit_bumps_last_used_at() {
+        let env_lock = acquire_env_mutex();
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let _cache_dir_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            temp_dir.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+        let model_dir = temp_dir.path().join("models--test--model/snapshots/abc123");
+        std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");
+        std::fs::write(model_dir.join("config.json"), b"{}").expect("Failed to write config");
+
+        let mut mock = crate::registry::backend::MockRegistryBackend::new();
+        mock.expect_try_claim_for_download()
+            .with(
+                mockall::predicate::eq("test/model"),
+                mockall::predicate::eq(ModelProvider::HuggingFace),
+                mockall::predicate::always(),
+                mockall::predicate::always(),
+            )
+            .once()
+            .returning(|_, _, _, _| Ok(ClaimOutcome::AlreadyExists(ModelStatus::DOWNLOADED)));
+        mock.expect_touch_model()
+            .with(mockall::predicate::eq("test/model"))
+            .once()
+            .returning(|_| Ok(()));
+        let tracker = tracker_with_mock(mock);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+
+        assert_eq!(
+            tracker
+                .ensure_model_downloaded("test/model", ModelProvider::HuggingFace, &tx, false,)
+                .await,
+            ModelStatus::DOWNLOADED
+        );
     }
 
     #[tokio::test]

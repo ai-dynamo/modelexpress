@@ -86,7 +86,7 @@ spec:
             - --model
             - "${MX_CI_MODEL}"
             - --load-format
-            - mx
+            - modelexpress
             - --tensor-parallel-size
             - "2"
             # Keep KV fixed and small so VRAM parity stays sensitive to

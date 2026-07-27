@@ -44,6 +44,11 @@ if TYPE_CHECKING:
     MX_SERVER_ADDRESS: Optional[str]
     MODEL_EXPRESS_LOG_LEVEL: str
     MODEL_NAME: Optional[str]
+    # Auth (client)
+    MX_AUTH_TOKEN_PATH: Optional[str]
+    MX_AUTH_TOKEN_TTL_SECONDS: Optional[str]
+    # Runtime compatibility
+    MX_DISABLE_PATCHES: bool
     # Metadata / worker
     MX_METADATA_BACKEND: str
     MX_METADATA_PORT: int
@@ -72,13 +77,15 @@ if TYPE_CHECKING:
     MX_GDS_TIMEOUT: float
     # Model streamer
     MX_MS_DISTRIBUTED: bool
+    # InstantTensor loader
+    MX_INSTANT_TENSOR: bool
     # TRT-LLM live transfer
     MX_SOURCE_QUERY_TIMEOUT: int
     MX_TRANSFER_TIMEOUT: int
     MX_TRANSFER_LOG_DIR: str
     # VMM arena
     MX_VMM_ARENA: bool
-    # vLLM artifact (JIT cache) transfer
+    # Framework artifact (JIT cache) transfer
     MX_ARTIFACT_TRANSFER: bool
     MX_ARTIFACT_BUNDLE_ROOT: Optional[str]
     MX_ARTIFACT_COMPILE_CONFIG_DIGEST: str
@@ -101,15 +108,20 @@ if TYPE_CHECKING:
     TRITON_CACHE_DIR: Optional[str]
     DG_JIT_CACHE_DIR: Optional[str]
     DEEP_GEMM_CACHE_DIR: Optional[str]
+    SGLANG_DG_CACHE_DIR: Optional[str]
+    SGLANG_CACHE_DIR: Optional[str]
     TILELANG_CACHE_DIR: Optional[str]
     CUTE_DSL_CACHE_DIR: Optional[str]
     FLASHINFER_WORKSPACE_BASE: Optional[str]
+    TORCHINDUCTOR_CACHE_DIR: Optional[str]
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: Optional[str]
     VLLM_CACHE_ROOT: Optional[str]
     # Other third-party / system
     VLLM_ATTENTION_BACKEND: str
     HOSTNAME: str
     POD_NAMESPACE: str
+    POD_NAME: str
+    POD_UID: str
 
 _TRUTHY = {"1", "true", "yes", "on"}
 
@@ -148,6 +160,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_SERVER_ADDRESS": lambda: os.environ.get("MX_SERVER_ADDRESS"),
     "MODEL_EXPRESS_LOG_LEVEL": lambda: os.environ.get("MODEL_EXPRESS_LOG_LEVEL", "").upper(),
     "MODEL_NAME": lambda: os.environ.get("MODEL_NAME"),
+    # ── Auth (client) ──────────────────────────────────────────────────────
+    "MX_AUTH_TOKEN_PATH": lambda: os.environ.get("MX_AUTH_TOKEN_PATH"),
+    "MX_AUTH_TOKEN_TTL_SECONDS": lambda: os.environ.get("MX_AUTH_TOKEN_TTL_SECONDS"),
+    # ── Runtime compatibility ──────────────────────────────────────────────
+    "MX_DISABLE_PATCHES": lambda: os.environ.get("MX_DISABLE_PATCHES", "").strip().lower()
+    in _TRUTHY,
     # ── Metadata / worker ──────────────────────────────────────────────────
     "MX_METADATA_BACKEND": lambda: os.environ.get("MX_METADATA_BACKEND", "").lower().strip(),
     "MX_METADATA_PORT": lambda: _env_int("MX_METADATA_PORT", 5555),
@@ -175,14 +193,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_GDS_THREADS": lambda: _env_int("MX_GDS_THREADS", 8),
     "MX_GDS_TIMEOUT": lambda: _env_float("MX_GDS_TIMEOUT", 120.0),
     # ── Model streamer ─────────────────────────────────────────────────────
-    "MX_MS_DISTRIBUTED": lambda: os.environ.get("MX_MS_DISTRIBUTED", "0").lower() in ("1", "true"),
+    "MX_MS_DISTRIBUTED": lambda: os.environ.get("MX_MS_DISTRIBUTED", "1").lower() in ("1", "true"),
+    # ── InstantTensor loader ───────────────────────────────────────────────
+    # Enabled by default; the strategy is still gated on the instanttensor
+    # package and a CUDA device, so opting out is only needed to force a
+    # different local-load path. Set MX_INSTANT_TENSOR=0 to disable.
+    "MX_INSTANT_TENSOR": lambda: os.environ.get("MX_INSTANT_TENSOR", "1").lower() in ("1", "true"),
     # ── TRT-LLM live transfer ──────────────────────────────────────────────
     "MX_SOURCE_QUERY_TIMEOUT": lambda: _env_int("MX_SOURCE_QUERY_TIMEOUT", 3600),
     "MX_TRANSFER_TIMEOUT": lambda: _env_int("MX_TRANSFER_TIMEOUT", 900),
     "MX_TRANSFER_LOG_DIR": lambda: os.environ.get("MX_TRANSFER_LOG_DIR", "/tmp/mx_logs"),
     # ── VMM arena ──────────────────────────────────────────────────────────
     "MX_VMM_ARENA": lambda: os.environ.get("MX_VMM_ARENA") == "1",
-    # ── vLLM artifact (JIT cache) transfer ─────────────────────────────────
+    # ── Framework artifact (JIT cache) transfer ────────────────────────────
     "MX_ARTIFACT_TRANSFER": lambda: os.environ.get("MX_ARTIFACT_TRANSFER", "").strip().lower()
     in _TRUTHY,
     "MX_ARTIFACT_BUNDLE_ROOT": lambda: os.environ.get("MX_ARTIFACT_BUNDLE_ROOT"),
@@ -212,9 +235,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TRITON_CACHE_DIR": lambda: os.environ.get("TRITON_CACHE_DIR"),
     "DG_JIT_CACHE_DIR": lambda: os.environ.get("DG_JIT_CACHE_DIR"),
     "DEEP_GEMM_CACHE_DIR": lambda: os.environ.get("DEEP_GEMM_CACHE_DIR"),
+    "SGLANG_DG_CACHE_DIR": lambda: os.environ.get("SGLANG_DG_CACHE_DIR"),
+    "SGLANG_CACHE_DIR": lambda: os.environ.get("SGLANG_CACHE_DIR"),
     "TILELANG_CACHE_DIR": lambda: os.environ.get("TILELANG_CACHE_DIR"),
     "CUTE_DSL_CACHE_DIR": lambda: os.environ.get("CUTE_DSL_CACHE_DIR"),
     "FLASHINFER_WORKSPACE_BASE": lambda: os.environ.get("FLASHINFER_WORKSPACE_BASE"),
+    "TORCHINDUCTOR_CACHE_DIR": lambda: os.environ.get("TORCHINDUCTOR_CACHE_DIR"),
     "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": lambda: os.environ.get(
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR"
     ),
@@ -223,6 +249,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ATTENTION_BACKEND": lambda: os.environ.get("VLLM_ATTENTION_BACKEND", "auto"),
     "HOSTNAME": lambda: os.environ.get("HOSTNAME", ""),
     "POD_NAMESPACE": lambda: os.environ.get("POD_NAMESPACE", ""),
+    "POD_NAME": lambda: os.environ.get("POD_NAME", ""),
+    "POD_UID": lambda: os.environ.get("POD_UID", "")
 }
 
 

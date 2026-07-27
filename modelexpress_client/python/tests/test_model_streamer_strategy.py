@@ -367,7 +367,7 @@ class TestVllmModelStreamerIterator:
         native_load_config = loader_cls.call_args.args[0]
         assert native_load_config.model_loader_extra_config == {"concurrency": 4}
 
-    def test_distributed_disabled_by_default_even_with_tp_gt_one(self):
+    def test_distributed_enabled_by_default_when_tp_gt_one(self):
         adapter, _load_config = self._make_adapter(
             tp_size=8,
             extra_config={"concurrency": 4},
@@ -375,6 +375,22 @@ class TestVllmModelStreamerIterator:
         patcher, loader_cls, _loader_instance = self._patch_runai_loader([])
 
         with patcher, patch.dict("os.environ", {}, clear=True):
+            list(adapter.build_model_streamer_weight_iter("az://models/model"))
+
+        native_load_config = loader_cls.call_args.args[0]
+        assert native_load_config.model_loader_extra_config == {
+            "concurrency": 4,
+            "distributed": True,
+        }
+
+    def test_distributed_can_be_disabled_via_env(self):
+        adapter, _load_config = self._make_adapter(
+            tp_size=8,
+            extra_config={"concurrency": 4},
+        )
+        patcher, loader_cls, _loader_instance = self._patch_runai_loader([])
+
+        with patcher, patch.dict("os.environ", {"MX_MS_DISTRIBUTED": "0"}):
             list(adapter.build_model_streamer_weight_iter("az://models/model"))
 
         native_load_config = loader_cls.call_args.args[0]

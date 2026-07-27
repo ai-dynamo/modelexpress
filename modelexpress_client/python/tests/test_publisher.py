@@ -131,6 +131,27 @@ class TestPublisherPublishAndReady:
         publish.assert_not_called()
         mx_client.update_status.assert_not_called()
 
+    def test_ready_gate_is_polled_before_heartbeat_interval(self, mx_client, nixl_manager):
+        publisher = PublisherThread(
+            mx_client=mx_client,
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            publish_fn=MagicMock(return_value="abc123"),
+            ready_fn=lambda: False,
+            interval_secs=30,
+        )
+        waits = []
+
+        def stop_after_wait(timeout):
+            waits.append(timeout)
+            publisher._stop_event.set()
+
+        with patch.object(publisher._stop_event, "wait", side_effect=stop_after_wait):
+            publisher._run()
+
+        assert waits == [5]
+
     def test_can_stop_after_publish_without_heartbeat(self, mx_client, nixl_manager):
         ready = MagicMock(return_value=True)
         publish = MagicMock(return_value="abc123")

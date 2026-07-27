@@ -20,6 +20,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("modelexpress.metadata.publisher")
 
+READY_POLL_SECS = 5
+
 
 class PublisherThread:
     """Background thread that publishes a source and keeps it READY.
@@ -274,4 +276,7 @@ class PublisherThread:
                 logger.exception(
                     f"[Worker {self._worker_rank}] Publisher tick failed"
                 )
-            self._stop_event.wait(timeout=self._interval)
+            interval = self._interval
+            if self._mx_source_id is None and self._ready_fn is not None:
+                interval = min(interval, READY_POLL_SECS)
+            self._stop_event.wait(timeout=interval)

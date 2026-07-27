@@ -104,7 +104,9 @@ def maybe_enter_vmm_arena(ctx: "LoadContext") -> Iterator[None]:
       allocation, not peak live size. With 16 TiB reserved, this is
       bounded only by HBM (we never exhaust VA).
     """
-    if not envs.MX_VMM_ARENA:
+    if not envs.MX_VMM_ARENA or not ctx.p2p_enabled:
+        # p2p_enabled is False for the speculative draft's second load;
+        # skip the arena so it does not replace the target model's.
         yield
         return
 

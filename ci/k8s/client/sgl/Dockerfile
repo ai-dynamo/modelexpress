@@ -29,6 +29,7 @@ RUN pip uninstall -y modelexpress 2>/dev/null || true && \
 
 # Verify the client and the SGLang loader hook imported successfully.
 RUN python3 -c "from modelexpress.client import MxClient; print('MxClient OK')" && \
-    python3 -c "from modelexpress.engines.sglang import MxModelLoader; print('SGLang MxModelLoader OK')"
+    python3 -c "from modelexpress.engines.sglang import MxModelLoader; print('SGLang MxModelLoader OK')" && \
+    python3 -c "import runai_model_streamer; print('ModelStreamer OK')"
 
 WORKDIR /workspace

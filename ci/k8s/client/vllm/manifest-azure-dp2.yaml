@@ -98,7 +98,7 @@ spec:
             - --model
             - "${MX_CI_MODEL}"
             - --load-format
-            - mx
+            - modelexpress
             - --data-parallel-size
             - "2"
             - --tensor-parallel-size

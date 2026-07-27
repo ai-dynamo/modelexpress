@@ -63,6 +63,7 @@ class LoadStrategyChain:
         """
         from .trainer_pull_strategy import TrainerPullStrategy
         from .rdma_strategy import RdmaStrategy
+        from .instant_tensor_strategy import InstantTensorStrategy
         from .model_streamer_strategy import ModelStreamerStrategy
         from .gds_strategy import GdsStrategy
         from .default_strategy import DefaultStrategy
@@ -70,6 +71,7 @@ class LoadStrategyChain:
         all_strategies: list[LoadStrategy] = [
             TrainerPullStrategy(),
             RdmaStrategy(),
+            InstantTensorStrategy(),
             ModelStreamerStrategy(),
             GdsStrategy(),
             DefaultStrategy(),

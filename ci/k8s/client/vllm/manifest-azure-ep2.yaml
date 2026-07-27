@@ -100,7 +100,7 @@ spec:
             - --model
             - "${MX_CI_MODEL}"
             - --load-format
-            - mx
+            - modelexpress
             - --tensor-parallel-size
             - "2"
             # Distribute MoE experts expert-parallel across the TP=2 ranks.

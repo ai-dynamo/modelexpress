@@ -34,6 +34,7 @@ config = { workspace = true }
 futures = { workspace = true }
 jiff = { workspace = true }
 reqwest = { workspace = true }
+tempfile = { workspace = true }
 google-cloud-storage = { workspace = true }
 rustls = { workspace = true }
 crc32c = { workspace = true }
@@ -43,7 +44,6 @@ fd-lock = { workspace = true }
 google-cloud-auth = { version = "1.7.0", default-features = false }
 google-cloud-gax = { workspace = true }
 mockall = "0.13"
-tempfile = { workspace = true }
 tokio-test = "0.4"
 wiremock = "0.6.5"
 
