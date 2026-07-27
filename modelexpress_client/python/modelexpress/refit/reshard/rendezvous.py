@@ -65,13 +65,21 @@ def _mx_version() -> str:
 @dataclass
 class PublishedShard:
     """One published shard of a source tensor: the sub-box it covers and where
-    to READ it from (owning agent / device / base address)."""
+    to READ it from (owning agent / device / base address).
+
+    ``digest`` is an optional position-sensitive digest of the shard's bytes (see
+    ``verify.tensor_digest``), present only when the publisher ran with
+    ``MX_RESHARD_VERIFY=1``. It lets a receiver prove the bytes it pulled are the
+    bytes the trainer holds. Optional and defaulted so a mixed fleet still
+    interoperates: an older publisher simply omits it and the receiver reports the
+    shard as unchecked rather than failing."""
 
     agent_name: str
     device_id: int
     addr: int
     shard_offset: tuple
     shape: tuple
+    digest: str | None = None
 
 
 @dataclass
@@ -103,6 +111,9 @@ def encode_shard_table(tensors: list) -> bytes:
                         "addr": s.addr,
                         "shard_offset": list(s.shard_offset),
                         "shape": list(s.shape),
+                        # Omitted when absent so the blob stays byte-identical to
+                        # the pre-digest schema for publishers not verifying.
+                        **({"digest": s.digest} if s.digest else {}),
                     }
                     for s in t.shards
                 ],
@@ -128,6 +139,7 @@ def decode_shard_table(blob: bytes) -> list:
                 addr=int(s["addr"]),
                 shard_offset=tuple(s["shard_offset"]),
                 shape=tuple(s["shape"]),
+                digest=s.get("digest"),
             )
             for s in t["shards"]
         ]
@@ -171,6 +183,7 @@ def build_sources(tensors: list) -> tuple:
                     session=session,
                     addr=s.addr,
                     elsize=t.elsize,
+                    digest=s.digest,
                 )
             )
             session_to_agent[session] = s.agent_name
@@ -184,25 +197,51 @@ def build_sources(tensors: list) -> tuple:
     return sources, session_to_agent, session_to_device
 
 
-def merge_shard_tables(tables: list) -> list:
+def merge_shard_tables(tables: list, replica_offset: int = 0) -> list:
     """Merge per-rank ``list[PublishedTensor]`` into one, concatenating shards
-    for the same source across ranks (reshard fans in cross-rank). full_shape /
-    dtype / elsize must agree across ranks for a given tensor name."""
+    for the same source across ranks (reshard fans in cross-rank). Replica
+    publishers can advertise the same geometric shard through DP/EP replication;
+    exactly one representative is retained for each exact offset/shape.
+    full_shape / dtype / elsize must agree across ranks for a given tensor name.
+
+    ``replica_offset`` selects *which* representative. With DP8 / EDP2 there are
+    up to 8 byte-identical copies of a shard on distinct ranks and distinct NICs;
+    the default 0 always takes the first publisher seen, which means every
+    receiver in the fleet reads the same shard from the same rank while the other
+    replicas serve nothing. Passing the receiver's global rank rotates the choice
+    so receivers spread their reads over the available replicas. Correctness is
+    unaffected either way: the candidates are replicas of the same weights and are
+    byte-identical by construction.
+
+    Geometry set and ordering are identical for every ``replica_offset``, so only
+    the owning agent and address of each shard change - the resulting plan has the
+    same shape, segment count and byte count.
+    """
     merged: dict = {}
+    # name -> geometry -> candidate shards, insertion-ordered so the retained
+    # geometry sequence is independent of replica_offset.
+    candidates: dict = {}
     for table in tables:
         for t in table:
             cur = merged.get(t.name)
             if cur is None:
                 merged[t.name] = PublishedTensor(
-                    t.name, t.dtype, t.elsize, t.full_shape, list(t.shards)
+                    t.name, t.dtype, t.elsize, t.full_shape, []
                 )
-                continue
-            if cur.full_shape != t.full_shape or cur.dtype != t.dtype:
+                candidates[t.name] = {}
+            elif cur.full_shape != t.full_shape or cur.dtype != t.dtype:
                 raise ValueError(
                     f"tensor {t.name!r} published with inconsistent shape/dtype across ranks: "
                     f"{cur.full_shape}/{cur.dtype} vs {t.full_shape}/{t.dtype}"
                 )
-            cur.shards.extend(t.shards)
+            per_geometry = candidates[t.name]
+            for shard in t.shards:
+                geometry = (tuple(shard.shard_offset), tuple(shard.shape))
+                per_geometry.setdefault(geometry, []).append(shard)
+
+    for name, tensor in merged.items():
+        for offers in candidates[name].values():
+            tensor.shards.append(offers[replica_offset % len(offers)])
     return list(merged.values())
 
 
@@ -290,7 +329,15 @@ class MxReshardRendezvous:
 
     def publish(self, blob: bytes) -> str:
         """Publish this rank's rendezvous blob (agent meta + shard table)."""
-        worker = p2p_pb2.WorkerMetadata(worker_rank=self.rank, nixl_metadata=blob)
+        # The blob is built only after CUDA buffers are registered with NIXL,
+        # so this publication is immediately readable. Discovery is READY-only;
+        # leaving proto3's default UNKNOWN status makes every real receiver wait
+        # until timeout even though all transport metadata is present.
+        worker = p2p_pb2.WorkerMetadata(
+            worker_rank=self.rank,
+            nixl_metadata=blob,
+            status=p2p_pb2.SOURCE_STATUS_READY,
+        )
         self._mx_source_id = self.client.publish_metadata(
             self._identity(self.role), worker, self.worker_id
         )
@@ -307,27 +354,47 @@ class MxReshardRendezvous:
         metadata_endpoint, tensors)]``, one per trainer rank."""
         trainer_id = self._identity("trainer")
         deadline = time.monotonic() + timeout
+        empty = 0
         while True:
             resp = self.client.list_sources(
                 trainer_id,
                 status_filter=p2p_pb2.SOURCE_STATUS_READY,
             )
             instances = list(resp.instances)
+            payloads, empty = [], 0
             if len(instances) >= expected_trainers:
-                break
+                for inst in instances:
+                    meta = self.client.get_metadata(inst.mx_source_id, inst.worker_id)
+                    if not meta.found:
+                        continue
+                    payload = unwrap_rendezvous_blob(meta.worker.nixl_metadata)
+                    # A rank that advertises no tensors has registered nothing to
+                    # read. Counting it toward the quorum lets the receiver stop
+                    # waiting for the ranks that matter and then stall in the P2P
+                    # handshake instead, so it does not count.
+                    if not payload[3]:
+                        empty += 1
+                        continue
+                    payloads.append(payload)
+                if len(payloads) >= expected_trainers:
+                    break
             if time.monotonic() >= deadline:
                 raise TimeoutError(
                     f"timed out after {timeout}s waiting for {expected_trainers} trainer ranks "
-                    f"(saw {len(instances)})"
+                    f"(saw {len(instances)} READY source(s), {len(payloads)} with a "
+                    f"non-empty shard table, {empty} empty)"
                 )
             time.sleep(poll_interval)
 
-        payloads = []
-        for inst in instances:
-            meta = self.client.get_metadata(inst.mx_source_id, inst.worker_id)
-            if not meta.found:
-                continue
-            payloads.append(unwrap_rendezvous_blob(meta.worker.nixl_metadata))
+        logger.info(
+            "[reshard] discovered %d trainer rank(s)%s: %s",
+            len(payloads),
+            f" ({empty} skipped as empty)" if empty else "",
+            ", ".join(
+                f"{name}@{endpoint}[{len(tensors)}]"
+                for (_meta, name, endpoint, tensors) in payloads
+            ),
+        )
         return payloads
 
 
@@ -338,10 +405,14 @@ def gather_sources(
     role: str = "inference",
     rank: int = 0,
     timeout: float = 1200.0,
+    replica_offset: int = 0,
 ) -> tuple:
     """One-call inference helper: discover all trainer ranks, merge their shard
     tables, and build the planning inputs (per-source ``SourceInfo`` + the
     shard -> owning-agent/device maps).
+
+    ``replica_offset`` is forwarded to :func:`merge_shard_tables` to choose which
+    duplicate replica serves each shard; see there for why it matters.
 
     Returns ``(sources, session_to_agent, session_to_device, agent_endpoints)``
     where ``agent_endpoints`` is ``{agent_name: metadata_endpoint}`` for the
@@ -350,6 +421,6 @@ def gather_sources(
     payloads = rdv.discover_trainers(expected_trainers, timeout=timeout)
     tables = [tensors for (_meta, _name, _ep, tensors) in payloads]
     agent_endpoints = {name: ep for (_meta, name, ep, _tensors) in payloads}
-    merged = merge_shard_tables(tables)
+    merged = merge_shard_tables(tables, replica_offset=replica_offset)
     sources, session_to_agent, session_to_device = build_sources(merged)
     return sources, session_to_agent, session_to_device, agent_endpoints

@@ -4,5 +4,6 @@
 """vLLM-specific capture and installation support for live model refit."""
 
 from .installer import MdlLoader
+from .receiver import VllmReshardReceiver
 
-__all__ = ["MdlLoader"]
+__all__ = ["MdlLoader", "VllmReshardReceiver"]

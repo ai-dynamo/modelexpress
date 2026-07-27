@@ -64,6 +64,10 @@ class Shard:
     session: str  # transfer-engine session id
     addr: int  # shard base address (element 0)
     elsize: int  # bytes per element
+    # Optional publisher-computed digest of the shard's bytes, carried through
+    # planning so the verify gate can check received bytes without a second pass
+    # over the shard table. None when the publisher was not verifying.
+    digest: str | None = None
 
 
 @dataclass

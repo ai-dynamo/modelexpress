@@ -1,0 +1,1410 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tier-2: the vLLM-specific weight-update layer.
+
+Owns generator-side **geometry discovery** (reading the live vLLM engine's
+target layout, fused-param and expert mappings) and the **update/load process**
+(receive + translate + place), exposing the base lifecycle:
+
+  * ``initialize_weight_update_setup(init_info)``  — one-time setup.
+  * ``was_weight_update_setup_initialized()``      — idempotency query.
+  * ``start_weight_update(version)``               — open a refit cycle.
+  * ``update_weights(update_info, load_weights, subset=None)`` — pull + convert
+    + load, optionally scoped to a subset of parameters.
+  * ``finish_weight_update(version)``              — close the cycle.
+
+Layering:
+  * **Tier 1** — :class:`modelexpress.MxV2RefitReceiver` is a *generic*,
+    engine-agnostic receiver (source discovery, slice planning, NIXL pull,
+    sidecar-driven translate). It knows nothing about vLLM and is used here.
+  * **Tier 2 (this module)** — the vLLM-specific logic. All the target-layout
+    discovery, buffer allocation/registration, EP filtering, and byte-verify
+    live here, on top of tier 1.
+  * **Tier 3** — :class:`modelexpress.engines.vllm.weight_transfer.MxWeightTransferEngine`
+    is a thin adapter conforming to vLLM's ``WeightTransferEngine`` ABC over
+    this tier. A framework may instead drive this tier directly via its own RPC.
+
+The model *load* stays in vLLM's ``load_weights`` callback (which may be an MDL
+fast-loader) — this tier hands it the ``[(name, tensor)]`` list.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import socket
+import time
+from dataclasses import dataclass
+from typing import Any, Callable
+
+import torch
+
+from modelexpress.refit_timing import (
+    RefitTimingRecorder,
+    refit_span,
+    use_refit_timing,
+)
+from vllm.distributed.weight_transfer.base import (
+    WeightTransferInitInfo,
+    WeightTransferUpdateInfo,
+)
+
+logger = logging.getLogger("modelexpress.engines.vllm.weight_update")
+
+
+# ---------------------------------------------------------------------------
+# Info / config objects (shared with the tier-3 backend)
+#
+# These subclass vLLM's ABC info bases: this is the vLLM-specific layer, so the
+# coupling belongs here (tier-1 stays vLLM-free). The tier-3 backend imports
+# these directly.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MxInitInfo(WeightTransferInitInfo):
+    """One-time init for the MX receiver (per inference worker)."""
+
+    mx_server_url: str = "modelexpress-server:8001"
+    model_name: str = ""
+    worker_rank: int = 0
+    device_id: int = 0
+    nic_pin: str = "auto"
+    same_rank_only: bool = True
+    tree_scale_out: bool = False
+
+
+@dataclass
+class MxUpdateInfo(WeightTransferUpdateInfo):
+    """Per-refit update info + MX feature toggles."""
+
+    version: int = 0
+    min_version: int = 1
+    timeout_seconds: float = 300.0
+    # EP filter
+    moe_expert_filter: bool = False
+    ep_world_size: int = 1
+    ep_rank: int = 0
+    num_experts: int = 0
+    expert_placement: str = "linear"
+    # Receiver tensor-parallel identity. Checkpoint-format weights remain in
+    # full HF shape for vLLM's model-specific loaders to shard correctly, but
+    # the identity is required for slice planning, coverage, and direct-dest
+    # optimizations.
+    tp_world_size: int = 1
+    tp_rank: int = 0
+    # Phase 0.5 / arena (fall back to env if unset here)
+    buffer_loc: str | None = None
+    use_arena: bool | None = None
+    # verify
+    verify_gt_path: str | None = None
+    # Partial / subset refit selectors (map onto WeightSubset). Any set => the
+    # warm cycles pull and install only the matching tensors. The cold cycle is
+    # always applied in full so the destination map covers every parameter.
+    subset_param_names: list[str] | None = None
+    subset_layers: list[int] | None = None
+    subset_layer_groups: list[str] | None = None
+
+
+@dataclass
+class WeightSubset:
+    """Scopes an ``update_weights`` call to part of the model.
+
+    Selectors (a tensor is kept if it matches ANY provided selector; all-None =
+    full update):
+      * ``param_names`` — exact HF/Megatron tensor names.
+      * ``layers`` — transformer layer indices; matches ``.layers.<n>.``.
+      * ``layer_groups`` — name fragments for coarse groups, e.g.
+        ``["self_attn", "mlp"]`` or ``["experts"]``.
+    """
+
+    param_names: list[str] | None = None
+    layers: list[int] | None = None
+    layer_groups: list[str] | None = None
+
+    def is_empty(self) -> bool:
+        return not (self.param_names or self.layers or self.layer_groups)
+
+    def matches(self, *names: str) -> bool:
+        """True if any of ``names`` satisfies any provided selector."""
+        ns = [n for n in names if n]
+        if self.param_names:
+            want = set(self.param_names)
+            if any(n in want for n in ns):
+                return True
+        if self.layers:
+            tags = tuple(f".layers.{i}." for i in self.layers)
+            if any(t in n for n in ns for t in tags):
+                return True
+        if self.layer_groups:
+            if any(g in n for n in ns for g in self.layer_groups):
+                return True
+        return False
+
+
+@dataclass
+class MxTrainerSendArgs:
+    """Trainer-side send args (kept for API symmetry). MX publishes via
+    ``MxV2TrainingPublisher`` in the NeMo-RL Megatron policy worker
+    (``stream_weights_via_mx``), not through this layer."""
+
+    model_name: str = ""
+    version: int = 0
+    mx_server_url: str = "modelexpress-server:8001"
+
+
+# ---------------------------------------------------------------------------
+# Tier-2 weight-update layer
+# ---------------------------------------------------------------------------
+
+
+class MxVllmWeightUpdater:
+    """vLLM-specific weight-update layer over the generic MX receiver."""
+
+    def __init__(self) -> None:
+        self._receiver = None
+        self._init_info: MxInitInfo | None = None
+        self._buffers: dict[str, torch.Tensor] | None = None
+        self._arena = None  # kept alive if arena registration is used
+        self.last_timing_record: dict[str, Any] | None = None
+
+    # ---- lifecycle: initialize ----
+    def initialize_weight_update_setup(
+        self, init_info: MxInitInfo, existing_receiver: Any | None = None
+    ) -> None:
+        """One-time setup: create (or adopt) the generic tier-1 receiver and pin NICs.
+
+        vLLM geometry discovery (target layout, fused-param / expert mappings)
+        is done lazily per update from the live model + source registry, so this
+        stays cheap and idempotent.
+
+        ``existing_receiver``: when a host (e.g. NeMo-RL's vLLM worker extension)
+        already owns an :class:`MxV2RefitReceiver`, pass it in so we reuse the
+        one NIXL agent instead of creating a second one in the same process."""
+        from modelexpress import ucx_utils
+
+        self._init_info = init_info
+        if existing_receiver is not None:
+            self._receiver = existing_receiver
+            logger.info("[mx-wt] setup: adopted existing receiver (model=%s)",
+                        init_info.model_name)
+            return
+
+        from modelexpress import MxV2RefitReceiver
+
+        ucx_utils.apply_nic_pin_for_device(init_info.device_id)
+        rank = init_info.worker_rank
+        self._receiver = MxV2RefitReceiver(
+            agent_name=f"mx-wt-{socket.gethostname()}-r{rank}",
+            device_id=init_info.device_id,
+            mx_server_url=init_info.mx_server_url,
+            worker_rank=rank,
+        )
+        self._receiver.initialize(model_tensors=None)
+        logger.info(
+            "[mx-wt] setup: receiver rank=%d device=%d model=%s",
+            rank, init_info.device_id, init_info.model_name,
+        )
+
+    def was_weight_update_setup_initialized(self) -> bool:
+        return self._receiver is not None
+
+    # ---- lifecycle: start (open cycle) ----
+    def start_weight_update(self, version: int) -> None:
+        """Open a refit cycle. Discovery + pull happen in ``update_weights``;
+        this is the hook for pause/prepare and is a no-op today."""
+        if self._receiver is None:
+            raise RuntimeError("initialize_weight_update_setup must be called first")
+
+    # ---- lifecycle: update (pull + convert + load) ----
+    def update_weights(
+        self,
+        update_info: MxUpdateInfo,
+        load_weights: Callable[[list[tuple[str, torch.Tensor]]], Any],
+        subset: WeightSubset | None = None,
+        target_model: Any | None = None,
+    ) -> None:
+        if self._receiver is None:
+            raise RuntimeError("initialize_weight_update_setup must be called first")
+        cycle_start = time.perf_counter()
+        timing = RefitTimingRecorder(
+            backend="vllm",
+            version=int(update_info.version),
+            rank=int(self._init_info.worker_rank),
+            tp_rank=int(update_info.tp_rank),
+            tp_size=int(update_info.tp_world_size),
+            ep_rank=int(update_info.ep_rank),
+            ep_size=int(update_info.ep_world_size),
+            cold=self._buffers is None,
+        )
+
+        with use_refit_timing(timing):
+            try:
+                model_name = self._init_info.model_name
+                with timing.span("control_discovery"):
+                    cands = self._receiver.discover_v2_sources(
+                        model_name=model_name,
+                        min_version=update_info.min_version,
+                        same_rank_only=self._init_info.same_rank_only,
+                        include_replicas=False,
+                    )
+                if not cands:
+                    raise RuntimeError(
+                        f"[mx-wt] no MX source for {model_name} "
+                        f"v>={update_info.min_version}"
+                    )
+
+                timing.mark_not_applicable(
+                    "source_preparation",
+                    reason=(
+                        "target-side update; trainer source snapshot/conversion "
+                        "must be reported by the publisher"
+                    ),
+                )
+                is_megatron = any(
+                    getattr(c, "megatron_meta", None) is not None for c in cands
+                )
+                if is_megatron:
+                    weights, streamed_install = self._receive_megatron(
+                        cands,
+                        update_info,
+                        subset,
+                        load_weights=load_weights,
+                    )
+                else:
+                    streamed_install = False
+                    timing.mark_not_applicable(
+                        "transformation",
+                        reason="DTensor source names already match loader input",
+                    )
+                    weights = self._receive_dtensor(cands, update_info, subset)
+                receive_elapsed = time.perf_counter() - cycle_start
+
+                if streamed_install:
+                    timing.mark_not_applicable(
+                        "verification",
+                        reason=(
+                            "stream-installed Megatron tensors are verified "
+                            "by coverage before each incremental load"
+                        ),
+                    )
+                elif (
+                    update_info.verify_gt_path
+                    or os.environ.get("MX_VERIFY_BYTE_IDENTITY")
+                ):
+                    with timing.span(
+                        "verification",
+                        metadata={
+                            "kind": "byte_identity",
+                            "tensors": len(weights),
+                        },
+                    ):
+                        self._verify(
+                            weights,
+                            update_info.verify_gt_path
+                            or os.environ["MX_VERIFY_BYTE_IDENTITY"],
+                        )
+                else:
+                    timing.mark_not_applicable(
+                        "verification",
+                        reason="byte-identity verification disabled for this cycle",
+                    )
+
+                load_start = time.perf_counter()
+                with timing.span(
+                    "installation",
+                    metadata={
+                        "incoming_tensors": len(weights),
+                        "streamed": streamed_install,
+                    },
+                ):
+                    if streamed_install:
+                        loaded = None
+                    elif (
+                        not is_megatron
+                        and update_info.tp_world_size > 1
+                        and os.environ.get("MX_LOAD_MODE", "stock").lower()
+                        == "stock"
+                    ):
+                        self._validate_stock_tp_weights(
+                            weights,
+                            update_info,
+                            target_model
+                            or getattr(load_weights, "__self__", None),
+                        )
+                        loaded = load_weights(weights)
+                    else:
+                        loaded = load_weights(weights)
+                if torch.cuda.is_available():
+                    with timing.span(
+                        "post_install",
+                        metadata={"operation": "cuda_synchronize"},
+                    ):
+                        with timing.span(
+                            "device_sync",
+                            metadata={"operation": "post_install_visibility"},
+                        ):
+                            torch.cuda.synchronize(self._init_info.device_id)
+                load_elapsed = time.perf_counter() - load_start
+                loaded_count = len(loaded) if isinstance(loaded, set) else None
+                logger.info(
+                    "[mx-wt] phase timing: receive_translate=%.3fs load=%.3fs "
+                    "total=%.3fs incoming_hf=%d loaded_params=%s",
+                    receive_elapsed,
+                    load_elapsed,
+                    time.perf_counter() - cycle_start,
+                    len(weights),
+                    loaded_count if loaded_count is not None else "unknown",
+                )
+
+                if self._init_info.tree_scale_out:
+                    try:
+                        with timing.span(
+                            "post_install",
+                            metadata={"operation": "tree_scale_out_publish"},
+                        ):
+                            self._receiver.publish_self_as_source(
+                                version=int(update_info.version), model_name=model_name
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "[mx-wt] tree_scale_out republish failed: %s", exc
+                        )
+                elif not timing.has_measurements("post_install"):
+                    timing.mark_not_applicable(
+                        "post_install",
+                        reason=(
+                            "no CUDA device synchronization or tree scale-out "
+                            "publishing was required"
+                        ),
+                    )
+                timing.mark_not_applicable(
+                    "rollout_readiness",
+                    reason="vLLM engine owns pause/resume and KV-cache readiness",
+                )
+                for stage, reason in (
+                    (
+                        "cache_reset",
+                        "vLLM/Dynamo route owns prefix and KV-cache invalidation",
+                    ),
+                    (
+                        "version_commit",
+                        "generation-worker coordinator owns local-rank commit",
+                    ),
+                    (
+                        "fleet_ack",
+                        "RL orchestrator owns required-replica completion",
+                    ),
+                    (
+                        "resume_ready",
+                        "generation service owns resume and request readiness",
+                    ),
+                ):
+                    if not timing.has_measurements(stage):
+                        timing.mark_not_applicable(stage, reason=reason)
+                if not timing.has_measurements("target_assembly"):
+                    timing.mark_not_applicable(
+                        "target_assembly",
+                        reason="transfer landed directly in the requested tensor layout",
+                    )
+                if not timing.has_measurements("trainer_to_hf_transform"):
+                    timing.mark_not_applicable(
+                        "trainer_to_hf_transform",
+                        reason="source already used inference-loader tensor names",
+                    )
+                for stage in ("runtime_mapping", "parameter_copy"):
+                    if not timing.has_measurements(stage):
+                        timing.mark_not_applicable(
+                            stage,
+                            combined_with="installation",
+                            reason="selected loader does not expose this substage",
+                        )
+                if not timing.has_measurements("quant_postprocess"):
+                    timing.mark_not_applicable(
+                        "quant_postprocess",
+                        reason=(
+                            "no separately observable quantization post-processing "
+                            "inside the selected loader"
+                        ),
+                    )
+            finally:
+                self.last_timing_record = timing.emit(logger)
+
+    # ---- lifecycle: finish (close cycle) ----
+    def finish_weight_update(self, version: int) -> None:
+        """Close the refit cycle. Hook for cache-invalidate/resume; the vLLM
+        backend already handles KV-cache reset around this, so it's a no-op."""
+        return
+
+    def shutdown(self) -> None:
+        self._receiver = None
+        self._buffers = None
+        self._arena = None
+
+    # ---- helpers (vLLM-specific) ----
+    def _buffer_device(self, upd: MxUpdateInfo) -> torch.device:
+        loc = (upd.buffer_loc or os.environ.get("MX_MEGATRON_BUFFER_LOC", "device")).lower()
+        if loc == "host":
+            return torch.device("cpu")
+        return torch.device(f"cuda:{self._init_info.device_id}")
+
+    def _arena_enabled(self, upd: MxUpdateInfo) -> bool:
+        if upd.use_arena is not None:
+            return bool(upd.use_arena)
+        return os.environ.get("MX_MEGATRON_ARENA", "0") == "1"
+
+    @staticmethod
+    def _apply_subset(specs: dict, subset: WeightSubset | None) -> None:
+        """Prune receive specs to a subset (in place), by param name, layer index,
+        or layer-group fragment. A spec is kept if its Megatron name or any of its
+        HF names matches any provided selector."""
+        if subset is None or subset.is_empty():
+            return
+        keep = {
+            m: s for m, s in specs.items()
+            if subset.matches(m, *(getattr(s, "hf_names", []) or []))
+        }
+        removed = len(specs) - len(keep)
+        specs.clear()
+        specs.update(keep)
+        logger.info("[mx-wt] subset: kept %d specs, pruned %d", len(keep), removed)
+
+    def _receive_megatron(
+        self,
+        cands: list[Any],
+        upd: MxUpdateInfo,
+        subset: WeightSubset | None = None,
+        load_weights: Callable[[list[tuple[str, torch.Tensor]]], Any] | None = None,
+    ) -> tuple[list[tuple[str, torch.Tensor]], bool]:
+        from modelexpress.nemo_rl_v2 import TargetTpLayout, ROLE_MEGATRON_VOCAB_PARALLEL
+        from modelexpress.megatron_translator import (
+            ReceiveSpec, MegatronReceiverContext, discover_megatron_context,
+            run_refit_cycle,
+        )
+
+        device = torch.device(f"cuda:{self._init_info.device_id}")
+        sidecar_cfg, name_map = discover_megatron_context(cands)
+
+        # EP-gather path: an EP-sharded trainer (sources spanning >1 ep_rank)
+        # publishing to a non-EP / lower-EP rollout must gather experts across
+        # sources and remap each source's local expert names to global. The
+        # matched/TP-assembly path below (single ep_rank) is unchanged.
+        ep_ranks = {c.megatron_meta.ep_rank for c in cands if c.megatron_meta is not None}
+        if len(ep_ranks) > 1:
+            return self._receive_megatron_ep_gather(
+                cands,
+                upd,
+                subset,
+                device,
+                sidecar_cfg,
+                name_map,
+                load_weights=load_weights,
+            )
+
+        specs: dict[str, ReceiveSpec] = {}
+        cand = cands[0]
+        for td in (cand.registry.get("tensors", []) if cand.registry else []):
+            if not td.megatron_role or td.name.startswith("__mx_"):
+                continue
+            specs[td.name] = ReceiveSpec(
+                megatron_name=td.name,
+                hf_names=list(name_map.get(td.name, [td.name])),
+                role=td.megatron_role,
+                target_shape=tuple(int(s) for s in td.global_shape),
+                target_dtype=td.dtype or "bfloat16",
+                shard_axis=int(td.shard_axis),
+                pp_rank=cand.megatron_meta.pp_rank if cand.megatron_meta else 0,
+                role_descriptor=dict(td.megatron_extras or {}),
+            )
+        # Subset scoping (param-name level) before planning.
+        self._apply_subset(specs, subset)
+        # EP filter: prune expert specs to this rank's local set.
+        if upd.moe_expert_filter and upd.num_experts:
+            self._apply_ep_filter(specs, upd)
+
+        ctx = MegatronReceiverContext(
+            target_tp_layout=TargetTpLayout(tp_size=1, tp_rank=0),
+            transformer_config=sidecar_cfg,
+            hf_name_map=name_map,
+            receive_specs=specs,
+        )
+        buf_dev = self._buffer_device(upd)
+        dt_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
+        buffers: dict[str, torch.Tensor] = {}
+        source_tp = next((c.megatron_meta.tp_size for c in cands
+                          if c.megatron_meta and c.megatron_meta.tp_size > 0), 1)
+
+        def _alloc():
+            for spec in specs.values():
+                if spec.role.startswith("expert_"):
+                    continue
+                shape = list(spec.target_shape)
+                if spec.role == ROLE_MEGATRON_VOCAB_PARALLEL:
+                    shape[int(spec.shard_axis)] *= int(source_tp)
+                buffers[spec.megatron_name] = torch.empty(
+                    shape, dtype=dt_map.get(spec.target_dtype, torch.bfloat16), device=buf_dev
+                )
+
+        nixl = self._receiver._receiver._nixl
+        if self._arena_enabled(upd) and buf_dev.type == "cuda":
+            from modelexpress.vmm import (
+                VmmArena, CudaVmmBackend, use_arena, install_pluggable_allocator,
+            )
+            install_pluggable_allocator()
+            arena = VmmArena(total_bytes=80 * (1024 ** 3), device=self._init_info.device_id,
+                             backend=CudaVmmBackend(device=self._init_info.device_id))
+            with refit_span(
+                "setup_registration",
+                metadata={"buffer_cache": "cold", "registration": "arena"},
+            ):
+                with use_arena(arena, device):
+                    _alloc()
+                nixl.register_arena(arena, buffers)
+            self._arena = arena
+            logger.info("[mx-wt] arena-registered %d megatron buffers (1 region)", len(buffers))
+        else:
+            with refit_span(
+                "setup_registration",
+                metadata={"buffer_cache": "cold", "registration": "per_tensor"},
+            ):
+                _alloc()
+                nixl.register_tensors(buffers)
+            logger.info("[mx-wt] per-tensor-registered %d megatron buffers on %s",
+                        len(buffers), buf_dev.type)
+
+        matched = next((c for c in cands if c.megatron_meta
+                        and c.megatron_meta.tp_rank == 0), None)
+        if matched is None:
+            raise RuntimeError("[mx-wt] no matched-TP source (target_tp=1)")
+        nixl.rebind_tensors(buffers)
+        for _n, _t in self._receiver.receive_from(matched, timeout_seconds=upd.timeout_seconds):
+            pass
+
+        def _noop_pull(_src: Any, _dest: torch.Tensor) -> None:
+            return
+
+        weights = list(run_refit_cycle(
+            self._receiver, candidates=cands, context=ctx,
+            pull=_noop_pull, device=device, pre_assembled_buffers=dict(buffers),
+        ))
+        self._buffers = buffers
+        return weights, False
+
+    def _receive_megatron_ep_gather(
+        self, cands: list[Any], upd: MxUpdateInfo, subset: WeightSubset | None,
+        device: torch.device, sidecar_cfg: Any, name_map: dict,
+        load_weights: Callable[[list[tuple[str, torch.Tensor]]], Any] | None,
+    ) -> tuple[list[tuple[str, torch.Tensor]], bool]:
+        """Gather an EP-sharded Megatron trainer -> non-EP / lower-EP rollout.
+
+        Each EP source names its grouped experts LOCALLY (``weight<L>`` ->
+        ``experts.<L>.``), identical across ranks; the publisher advertises the
+        GLOBAL id in ``extras['expert_id']`` (``local_expert_id`` keeps the local
+        one). We process each source with its expert HF names rewritten
+        ``experts.<L>. -> experts.<G>.`` so the gathered experts land in distinct,
+        correct slots (vLLM's loader expects global expert names). Replicated/dense
+        tensors are identical across sources and dedupe by name. The EP filter keeps
+        only the rollout rank's wanted global experts. Delivers full HF weights
+        (target TP1); vLLM slices to the rollout's TP at load.
+        """
+        import re
+        from modelexpress.nemo_rl_v2 import TargetTpLayout
+        from modelexpress.megatron_translator import (
+            ReceiveSpec, MegatronReceiverContext, run_refit_cycle,
+        )
+        from modelexpress.rl_expert_layout import compute_local_expert_ids
+
+        layout = TargetTpLayout(tp_size=1, tp_rank=0)
+        wanted: set[int] | None = None
+        if upd.moe_expert_filter and upd.num_experts:
+            placement = (upd.expert_placement
+                         if upd.expert_placement in ("linear", "round_robin") else "linear")
+            wanted = set(compute_local_expert_ids(
+                ep_rank=upd.ep_rank, ep_world_size=upd.ep_world_size,
+                num_experts=int(upd.num_experts), placement=placement))
+
+        _EXP = re.compile(r"(experts\.)(\d+)(\.)")
+
+        def _globalize(hf: str, local_id: int, global_id: int) -> str:
+            return _EXP.sub(
+                lambda m: (f"{m.group(1)}{global_id}{m.group(3)}"
+                           if int(m.group(2)) == local_id else m.group(0)),
+                hf,
+            )
+
+        inner = self._receiver._receiver
+        hf_results: dict[str, torch.Tensor] = {}
+        expected_hf: set[str] = set()
+        staging_mode = os.environ.get("MX_EP_GATHER_STAGING", "host").lower()
+        if staging_mode not in {"host", "device"}:
+            raise ValueError(
+                "MX_EP_GATHER_STAGING must be 'host' or 'device', got "
+                f"{staging_mode!r}"
+            )
+        device_staging = staging_mode == "device"
+        stream_install = (
+            os.environ.get("MX_EP_GATHER_STREAM_INSTALL", "0") == "1"
+        )
+        if stream_install and load_weights is None:
+            raise RuntimeError(
+                "MX_EP_GATHER_STREAM_INSTALL=1 requires a load_weights callback"
+            )
+        streamed_hf: set[str] = set()
+
+        def _stream_order(
+            item: tuple[str, torch.Tensor],
+        ) -> tuple[int, int, str]:
+            name = item[0]
+            match = re.search(r"\.layers\.(\d+)\.", name)
+            if match:
+                return (1, int(match.group(1)), name)
+            if "embed_tokens" in name:
+                return (0, 0, name)
+            return (2, 0, name)
+
+        def _install_stream(
+            translated_batch: list[tuple[str, torch.Tensor]],
+            *,
+            source: str,
+        ) -> None:
+            if not translated_batch:
+                return
+            ordered_batch = sorted(translated_batch, key=_stream_order)
+            with refit_span(
+                "installation",
+                metadata={
+                    "streamed": True,
+                    "source": source,
+                    "tensors": len(ordered_batch),
+                },
+            ):
+                assert load_weights is not None
+                load_weights(ordered_batch)
+                torch.cuda.synchronize(device)
+            streamed_hf.update(name for name, _tensor in ordered_batch)
+
+        gpu_staging_cache: dict[str, torch.Tensor] = (
+            getattr(self, "_ep_gather_gpu_results", {})
+            if device_staging
+            else {}
+        )
+        active_gpu_staging_names: set[str] = set()
+        # Discovery can temporarily return READY sources from the previous
+        # trainer topology (for example TP2/PP1/EP4 immediately before a
+        # TP1/PP2/EP8 run). Mixing those cohorts makes the coordinate dedupe
+        # infer impossible TP coverage. Select the topology whose newest
+        # publisher is freshest, then dedupe ranks only within that cohort.
+        by_topology: dict[tuple[int, int, int], list[Any]] = {}
+        for c in cands:
+            meta = c.megatron_meta
+            topology = (
+                int(meta.tp_size if meta is not None else 1),
+                int(meta.pp_size if meta is not None else 1),
+                int(meta.ep_size if meta is not None else 1),
+            )
+            by_topology.setdefault(topology, []).append(c)
+        if by_topology:
+            selected_topology, topology_candidates = max(
+                by_topology.items(),
+                key=lambda item: max(
+                    (getattr(c, "updated_at", 0) or 0) for c in item[1]
+                ),
+            )
+            if len(by_topology) > 1:
+                logger.warning(
+                    "[mx-wt] discovery returned mixed trainer topologies %s; "
+                    "selected freshest TP/PP/EP=%s (%d/%d candidates)",
+                    sorted(by_topology),
+                    selected_topology,
+                    len(topology_candidates),
+                    len(cands),
+                )
+            cands = topology_candidates
+        # Dedupe replicated DP publishers by the complete model-parallel
+        # coordinate. EP alone is insufficient: topology A has TP2 inside each
+        # EP group, and dropping one TP coordinate loses half of QKV/MLP/row
+        # tensors. Keep the newest source per (PP, EP, TP) coordinate.
+        by_coord: dict[tuple[int, int, int], Any] = {}
+        for c in sorted(cands, key=lambda c: -(getattr(c, "updated_at", 0) or 0)):
+            meta = c.megatron_meta
+            coord = (
+                int(meta.pp_rank if meta is not None else 0),
+                int(meta.ep_rank if meta is not None else 0),
+                int(meta.tp_rank if meta is not None else 0),
+            )
+            by_coord.setdefault(coord, c)
+        ordered = [by_coord[coord] for coord in sorted(by_coord)]
+        logger.info(
+            "[mx-wt] EP-gather: %d candidates -> %d live model-parallel "
+            "sources (by PP/EP/TP coordinate, newest)",
+            len(cands),
+            len(ordered),
+        )
+        inner.prune_scratch_remote_agents({c.ref.worker_id for c in ordered})
+        # Non-expert / replicated tensors (attention, embeddings, norms, router
+        # gate) are IDENTICAL across every EP source. Pull them from ONE source
+        # only (the first) instead of pulling N copies over the wire and deduping
+        # on keep. Expert tensors are distinct per source and always pulled.
+        # NOTE: assumes non-expert coverage is complete on a single source (true
+        # for PP=1; a PP-split trainer would need per-pp_rank non-expert handling).
+        pending_nonexpert: dict[
+            tuple[int, str],
+            list[tuple[int, Any, ReceiveSpec, torch.Tensor, list[str]]],
+        ] = {}
+        seen_nonexpert_tp: set[tuple[str, int, int]] = set()
+        descriptor_pairs = 0
+        pulled_bytes = 0
+        translated_seconds = 0.0
+        for cand in ordered:
+            specs: dict[str, ReceiveSpec] = {}
+            nm_c = dict(name_map)
+            shapes: dict[str, tuple[int, ...]] = {}
+            for td in (cand.registry.get("tensors", []) if cand.registry else []):
+                if not td.megatron_role or td.name.startswith("__mx_"):
+                    continue
+                extras = dict(td.megatron_extras or {})
+                lookup_name = (
+                    td.name[len("module.") :]
+                    if td.name.startswith("module.")
+                    else td.name
+                )
+                is_expert = td.megatron_role.startswith("expert_")
+                source_tp_rank = int(
+                    cand.megatron_meta.tp_rank
+                    if cand.megatron_meta is not None
+                    else 0
+                )
+                source_ep_rank = int(
+                    cand.megatron_meta.ep_rank
+                    if cand.megatron_meta is not None
+                    else 0
+                )
+                # Megatron TP and EP coordinates may be correlated rather than
+                # Cartesian (for TP2/EP4: tp0/ep0, tp1/ep1, tp0/ep2,
+                # tp1/ep3). Keep every EP coordinate for ETP1 experts. Dense
+                # tensors are EP-replicated but TP-sharded: keep the first
+                # source for each (name, PP, TP), regardless of EP rank.
+                if not is_expert:
+                    pp_rank = int(
+                        cand.megatron_meta.pp_rank
+                        if cand.megatron_meta is not None
+                        else 0
+                    )
+                    dense_key = (td.name, pp_rank, source_tp_rank)
+                    if dense_key in seen_nonexpert_tp:
+                        continue
+                    seen_nonexpert_tp.add(dense_key)
+                gid = int(extras.get("expert_id", -1)) if is_expert else -1
+                lid = (
+                    int(extras.get("local_expert_id", gid))
+                    if is_expert
+                    else -1
+                )
+                # Older publishers advertise local ids in both fields. Recover
+                # the global id from the source's EP coordinate and the live
+                # rollout's global expert count. Newer publishers already
+                # provide a distinct global id and skip this compatibility path.
+                source_ep_size = int(
+                    cand.megatron_meta.ep_size
+                    if cand.megatron_meta is not None
+                    else len(ordered)
+                )
+                if (
+                    is_expert
+                    and gid == lid
+                    and source_ep_size > 1
+                    and upd.num_experts > 0
+                ):
+                    local_count = int(upd.num_experts) // source_ep_size
+                    gid = source_ep_rank * local_count + lid
+                    extras["expert_id"] = str(gid)
+                # Bridge introspection on an EP rank may key the sidecar by
+                # global weight index (weight64) while the published local
+                # parameter is named weight0. Prefer the global key derived
+                # from descriptor extras, then fall back to the local key for
+                # older sidecars.
+                global_lookup = lookup_name
+                if is_expert and gid >= 0 and lid >= 0:
+                    global_lookup = re.sub(
+                        rf"weight{lid}$",
+                        f"weight{gid}",
+                        lookup_name,
+                    )
+                hfs = list(
+                    name_map.get(
+                        global_lookup,
+                        name_map.get(
+                            lookup_name,
+                            name_map.get(td.name, [td.name]),
+                        ),
+                    )
+                )
+                if is_expert:
+                    if wanted is not None and gid not in wanted:
+                        continue
+                    hfs = [_globalize(h, lid, gid) for h in hfs]
+                nm_c[td.name] = hfs
+                local_shape = [int(s) for s in td.global_shape]
+                if (
+                    td.placement_kind == "SHARD"
+                    and td.local_shard_range is not None
+                ):
+                    start, end = td.local_shard_range
+                    local_shape[int(td.shard_axis)] = int(end) - int(start)
+                specs[td.name] = ReceiveSpec(
+                    megatron_name=td.name, hf_names=hfs, role=td.megatron_role,
+                    target_shape=tuple(local_shape),
+                    target_dtype=td.dtype or "bfloat16", shard_axis=int(td.shard_axis),
+                    pp_rank=cand.megatron_meta.pp_rank if cand.megatron_meta else 0,
+                    role_descriptor=extras,
+                )
+                expected_hf.update(hfs)
+                shapes[td.name] = tuple(local_shape)
+            self._apply_subset(specs, subset)
+            if not specs:
+                continue
+            pre: dict[str, torch.Tensor] = {}
+            descriptor_pairs += len(specs)
+            # include_names prunes the RDMA pull to exactly this source's kept
+            # tensors (experts owned by this rollout rank after the EP filter +
+            # non-expert only from the first source), instead of the source's
+            # full published set.
+            for n, t in inner.receive_weights_scratch(
+                cand.ref, timeout_seconds=upd.timeout_seconds,
+                tensor_shapes=shapes, include_names=set(specs.keys()),
+            ):
+                if n in specs:
+                    pre[n] = t
+                    pulled_bytes += t.numel() * t.element_size()
+            expert_specs = {
+                name: spec
+                for name, spec in specs.items()
+                if spec.role.startswith("expert_")
+            }
+            for name, spec in specs.items():
+                if spec.role.startswith("expert_") or name not in pre:
+                    continue
+                pp_rank = int(
+                    cand.megatron_meta.pp_rank
+                    if cand.megatron_meta is not None
+                    else 0
+                )
+                pending_nonexpert.setdefault((pp_rank, name), []).append(
+                    (
+                        int(
+                            cand.megatron_meta.tp_rank
+                            if cand.megatron_meta is not None
+                            else 0
+                        ),
+                        cand,
+                        spec,
+                        (
+                            pre[name]
+                            if device_staging
+                            else pre[name].detach().to("cpu")
+                        ),
+                        list(nm_c[name]),
+                    )
+                )
+            translated: list[tuple[str, torch.Tensor]] = []
+            if expert_specs:
+                expert_names = set(expert_specs)
+                expert_ctx = MegatronReceiverContext(
+                    target_tp_layout=layout,
+                    transformer_config=sidecar_cfg,
+                    hf_name_map={
+                        name: nm_c[name] for name in expert_names
+                    },
+                    receive_specs=expert_specs,
+                )
+                translate_start = time.perf_counter()
+                translated = list(
+                    run_refit_cycle(
+                        self._receiver,
+                        candidates=[cand],
+                        context=expert_ctx,
+                        pull=lambda _s, _d: None,
+                        device=device,
+                        pre_assembled_buffers={
+                            name: (
+                                pre[name]
+                                if device_staging
+                                else pre[name].detach().to("cpu")
+                            )
+                            for name in expert_names
+                            if name in pre
+                        },
+                    )
+                )
+                translated_seconds += time.perf_counter() - translate_start
+            if stream_install:
+                _install_stream(
+                    translated,
+                    source=(
+                        f"pp{cand.megatron_meta.pp_rank}-"
+                        f"ep{cand.megatron_meta.ep_rank}-"
+                        f"tp{cand.megatron_meta.tp_rank}"
+                        if cand.megatron_meta is not None
+                        else "unknown"
+                    ),
+                )
+                translated = []
+            with refit_span(
+                "target_assembly",
+                metadata={
+                    "operation": "ep_gather_staging",
+                    "source_ep_rank": int(
+                        cand.megatron_meta.ep_rank
+                        if cand.megatron_meta is not None
+                        else 0
+                    ),
+                    "staging": staging_mode,
+                    "tensors": len(translated),
+                },
+            ):
+                for hf_name, hf_t in translated:
+                    if hf_name not in hf_results:
+                        # Translation outputs are commonly views into persistent
+                        # scratch that the next EP source overwrites. Host staging
+                        # bounds HBM. Device staging keeps persistent owned GPU
+                        # buffers and removes the GPU->CPU->GPU round trip on
+                        # high-memory receivers such as GB200.
+                        if device_staging:
+                            staged = gpu_staging_cache.get(hf_name)
+                            if (
+                                staged is None
+                                or staged.shape != hf_t.shape
+                                or staged.dtype != hf_t.dtype
+                                or staged.device != device
+                            ):
+                                staged = torch.empty_like(hf_t, device=device)
+                                gpu_staging_cache[hf_name] = staged
+                            staged.copy_(hf_t)
+                            hf_results[hf_name] = staged
+                            active_gpu_staging_names.add(hf_name)
+                        else:
+                            hf_results[hf_name] = hf_t.detach().to("cpu")
+            if device_staging:
+                # NIXL may write the shared scratch independently of PyTorch's
+                # current stream. Finish owned copies before receiving the next
+                # EP source into those same scratch slots.
+                with refit_span(
+                    "device_sync",
+                    metadata={
+                        "operation": "ep_gather_staging_visibility",
+                        "source_ep_rank": int(
+                            cand.megatron_meta.ep_rank
+                            if cand.megatron_meta is not None
+                            else 0
+                        ),
+                    },
+                ):
+                    torch.cuda.current_stream(device).synchronize()
+            else:
+                # Translation intermediates are source-layout-specific and can
+                # leave tens of GiB in the CUDA caching allocator. Host staging
+                # owns the outputs, so release temporary GPU storage before the
+                # next EP/TP source while preserving the persistent scratch
+                # arena registration.
+                del translated
+                del pre
+                torch.cuda.synchronize(device)
+                torch.cuda.empty_cache()
+
+        # Dense/non-expert tensors are EP-replicated but TP-sharded. Assemble
+        # all trainer TP coordinates before Megatron->HF translation; translating
+        # one shard independently produces half-sized QKV/MLP tensors.
+        if pending_nonexpert:
+            pp_ranks = sorted({key[0] for key in pending_nonexpert})
+            for pp_rank in pp_ranks:
+                assembled_specs: dict[str, ReceiveSpec] = {}
+                assembled_pre: dict[str, torch.Tensor] = {}
+                assembled_names: dict[str, list[str]] = {}
+                assembled_candidates: list[Any] = []
+                pp_entries = {
+                    name: entries
+                    for (entry_pp_rank, name), entries in pending_nonexpert.items()
+                    if entry_pp_rank == pp_rank
+                }
+                for name, entries in pp_entries.items():
+                    entries.sort(key=lambda item: item[0])
+                    _tp_rank, candidate, template, _tensor, hfs = entries[0]
+                    assembled_candidates.append(candidate)
+                    axis = int(template.shard_axis)
+                    if len(entries) == 1:
+                        assembled = entries[0][3]
+                    else:
+                        observed_tp = [entry[0] for entry in entries]
+                        expected_tp = list(range(len(entries)))
+                        if observed_tp != expected_tp:
+                            raise RuntimeError(
+                                "[mx-wt] incomplete trainer TP coverage for "
+                                f"pp{pp_rank}:{name}: observed={observed_tp}, "
+                                f"expected={expected_tp}"
+                            )
+                        assembled = torch.cat(
+                            [entry[3] for entry in entries],
+                            dim=axis,
+                        )
+                    assembled_pre[name] = assembled
+                    assembled_names[name] = hfs
+                    assembled_specs[name] = ReceiveSpec(
+                        megatron_name=name,
+                        hf_names=hfs,
+                        role=template.role,
+                        target_shape=tuple(assembled.shape),
+                        target_dtype=template.target_dtype,
+                        shard_axis=axis,
+                        pp_rank=template.pp_rank,
+                        role_descriptor=dict(template.role_descriptor),
+                    )
+                dense_ctx = MegatronReceiverContext(
+                    target_tp_layout=layout,
+                    transformer_config=sidecar_cfg,
+                    hf_name_map=assembled_names,
+                    receive_specs=assembled_specs,
+                )
+                translate_start = time.perf_counter()
+                dense_translated = list(
+                    run_refit_cycle(
+                        self._receiver,
+                        candidates=assembled_candidates,
+                        context=dense_ctx,
+                        pull=lambda _s, _d: None,
+                        device=device,
+                        pre_assembled_buffers=assembled_pre,
+                    )
+                )
+                translated_seconds += time.perf_counter() - translate_start
+                if stream_install:
+                    _install_stream(
+                        dense_translated,
+                        source=f"assembled_dense_tp_pp{pp_rank}",
+                    )
+                    dense_translated = []
+                with refit_span(
+                    "target_assembly",
+                    metadata={
+                        "operation": "trainer_tp_assembly",
+                        "pp_rank": pp_rank,
+                        "tensors": len(dense_translated),
+                        "source_tp_size": max(
+                            len(entries) for entries in pp_entries.values()
+                        ),
+                    },
+                ):
+                    for hf_name, hf_t in dense_translated:
+                        if device_staging:
+                            staged = gpu_staging_cache.get(hf_name)
+                            if (
+                                staged is None
+                                or staged.shape != hf_t.shape
+                                or staged.dtype != hf_t.dtype
+                                or staged.device != device
+                            ):
+                                staged = torch.empty_like(hf_t, device=device)
+                                gpu_staging_cache[hf_name] = staged
+                            staged.copy_(hf_t)
+                            hf_results[hf_name] = staged
+                            active_gpu_staging_names.add(hf_name)
+                        else:
+                            hf_results[hf_name] = hf_t.detach().to("cpu")
+                if device_staging:
+                    with refit_span(
+                        "device_sync",
+                        metadata={
+                            "operation": "trainer_tp_assembly_visibility",
+                            "pp_rank": pp_rank,
+                        },
+                    ):
+                        torch.cuda.current_stream(device).synchronize()
+        if device_staging:
+            self._ep_gather_gpu_results = {
+                name: gpu_staging_cache[name]
+                for name in active_gpu_staging_names
+            }
+            logger.info(
+                "[mx-wt] EP-gather persistent GPU staging: tensors=%d bytes=%d",
+                len(self._ep_gather_gpu_results),
+                sum(
+                    tensor.numel() * tensor.element_size()
+                    for tensor in self._ep_gather_gpu_results.values()
+                ),
+            )
+        logger.info(
+            "[mx-wt] EP-gather transfer policy: sources=%d descriptor_pairs=%d "
+            "wire_bytes=%d local_translate_seconds=%.6f policy=full-contiguous-"
+            "tensor-plus-local-TP-slice",
+            len(ordered),
+            descriptor_pairs,
+            pulled_bytes,
+            translated_seconds,
+        )
+        # vLLM's layerwise reload wrapper only releases temporary module
+        # buffers when a parent layer is complete. EP-source insertion order
+        # interleaves every layer and can retain ~model-size extra HBM; natural
+        # layer order bounds the temporary working set to one layer.
+        weights = (
+            []
+            if stream_install
+            else sorted(hf_results.items(), key=_stream_order)
+        )
+        installed_names = streamed_hf if stream_install else set(hf_results)
+        missing = sorted(expected_hf.difference(installed_names))
+        if missing:
+            sample = ", ".join(missing[:8])
+            raise RuntimeError(
+                "[mx-wt] incomplete Megatron EP-gather coverage: "
+                f"missing {len(missing)}/{len(expected_hf)} expected HF tensors "
+                f"(sample: {sample})"
+            )
+        logger.info(
+            "[mx-wt] megatron EP-gather: %d/%d expected HF tensors from "
+            "%d EP sources%s (target_tp=%d rank=%d, streamed=%s)",
+            len(installed_names), len(expected_hf), len(cands),
+            f", EP-filtered to {len(wanted)} experts" if wanted is not None else "",
+            upd.tp_world_size, upd.tp_rank, stream_install,
+        )
+        return weights, stream_install
+
+    def _receive_dtensor(
+        self, cands: list[Any], upd: MxUpdateInfo, subset: WeightSubset | None = None
+    ) -> list[tuple[str, torch.Tensor]]:
+        """HF/DTensor path: restore checkpoint shapes in scratch buffers.
+
+        ``receive_weights_scratch`` allocates flat buffers from byte counts.
+        vLLM's stock loaders require checkpoint-rank shapes so they can select
+        their TP shard (notably VocabParallelEmbedding checks dimension 0).
+        The v2 registry is authoritative for that reshape.
+        """
+        active = subset is not None and not subset.is_empty()
+        registry = cands[0].registry or {}
+        descriptors = {
+            td.name: td
+            for td in registry.get("tensors", [])
+            if not td.name.startswith("__mx_")
+        }
+        if not descriptors:
+            raise RuntimeError(
+                "[mx-wt] DTensor/HF source has no v2 shape registry; refusing "
+                "to pass flat scratch tensors to the stock vLLM loader"
+            )
+
+        tensor_shapes: dict[str, tuple[int, ...]] = {}
+        for name, td in descriptors.items():
+            shape = [int(dim) for dim in td.global_shape]
+            if td.placement_kind == "SHARD":
+                if td.local_shard_range is None:
+                    raise RuntimeError(
+                        f"[mx-wt] sharded tensor {name!r} has no local_shard_range"
+                    )
+                axis = int(td.shard_axis)
+                if not 0 <= axis < len(shape):
+                    raise RuntimeError(
+                        f"[mx-wt] sharded tensor {name!r} has invalid axis {axis}"
+                    )
+                lo, hi = (int(v) for v in td.local_shard_range)
+                if lo < 0 or hi <= lo or hi > shape[axis]:
+                    raise RuntimeError(
+                        f"[mx-wt] sharded tensor {name!r} has invalid range "
+                        f"({lo}, {hi}) for global shape {tuple(shape)}"
+                    )
+                shape[axis] = hi - lo
+            tensor_shapes[name] = tuple(shape)
+
+        include_names: set[str] | None = None
+        if active:
+            assert subset is not None
+            include_names = {
+                name for name in descriptors if subset.matches(name)
+            }
+            logger.info(
+                "[mx-wt] subset wire pull: kept %d tensors, pruned %d",
+                len(include_names),
+                len(descriptors) - len(include_names),
+            )
+            if not include_names:
+                return []
+
+        out: list[tuple[str, torch.Tensor]] = []
+        for name, t in self._receiver._receiver.receive_weights_scratch(
+            cands[0].ref,
+            timeout_seconds=upd.timeout_seconds,
+            tensor_shapes=tensor_shapes,
+            include_names=include_names,
+        ):
+            if not active or subset.matches(name):
+                expected = tensor_shapes.get(name)
+                if expected is None:
+                    raise RuntimeError(
+                        f"[mx-wt] received tensor {name!r} is absent from the "
+                        "v2 shape registry"
+                    )
+                if tuple(t.shape) != expected:
+                    raise RuntimeError(
+                        f"[mx-wt] tensor {name!r} shape {tuple(t.shape)} does "
+                        f"not match registry shape {expected}"
+                    )
+                out.append((name, t))
+        return out
+
+    @staticmethod
+    def _validate_stock_tp_weights(
+        weights: list[tuple[str, torch.Tensor]],
+        upd: MxUpdateInfo,
+        model: Any | None,
+    ) -> None:
+        """Validate the global-HF contract consumed by stock vLLM TP loaders.
+
+        The stock loader owns installation and name fusion. We only prove that
+        exact-name vocab and ordinary TP parameters can produce this rank's
+        local slice; passing an already-local shard would make stock slice it
+        a second time, so that case fails loudly.
+        """
+        if model is None or not hasattr(model, "named_parameters"):
+            logger.warning(
+                "[mx-wt] cannot validate TP stock-load shapes without live "
+                "vLLM model metadata"
+            )
+            return
+
+        params = dict(model.named_parameters())
+        vocab_modules: dict[str, Any] = {}
+        param_modules: dict[str, Any] = {}
+        for module_name, module in model.named_modules():
+            prefix = f"{module_name}." if module_name else ""
+            for param_name, _param in module.named_parameters(recurse=False):
+                param_modules[prefix + param_name] = module
+            if not hasattr(module, "org_vocab_size") or not hasattr(
+                module, "shard_indices"
+            ):
+                continue
+            for param_name, _param in module.named_parameters(recurse=False):
+                vocab_modules[prefix + param_name] = module
+
+        tp_size = int(upd.tp_world_size)
+        tp_rank = int(upd.tp_rank)
+        for name, tensor in weights:
+            param = params.get(name)
+            if param is None or tensor.ndim != param.ndim:
+                continue
+
+            local_shape = tuple(int(dim) for dim in param.shape)
+            loaded_shape = tuple(int(dim) for dim in tensor.shape)
+            vocab = vocab_modules.get(name)
+            if vocab is not None:
+                axis = int(getattr(param, "output_dim", 0))
+                expected_vocab = int(vocab.org_vocab_size)
+                if loaded_shape[axis] != expected_vocab:
+                    raise RuntimeError(
+                        f"[mx-wt] {name!r} has vocab extent "
+                        f"{loaded_shape[axis]}, expected global HF vocab "
+                        f"{expected_vocab}; registry/source layout is invalid"
+                    )
+                indices = vocab.shard_indices
+                start = int(indices.org_vocab_start_index)
+                end = int(indices.org_vocab_end_index)
+                local = tensor.narrow(axis, start, end - start)
+                if local.shape[axis] > local_shape[axis] or any(
+                    int(local.shape[dim]) != local_shape[dim]
+                    for dim in range(tensor.ndim)
+                    if dim != axis
+                ):
+                    raise RuntimeError(
+                        f"[mx-wt] {name!r} TP{tp_size} rank {tp_rank} vocab "
+                        f"slice {tuple(local.shape)} cannot load into "
+                        f"{local_shape}"
+                    )
+                continue
+
+            if hasattr(param, "packed_dim") or hasattr(param, "pack_factor"):
+                continue
+            axes = []
+            for attr in ("output_dim", "input_dim"):
+                value = getattr(param, attr, None)
+                if isinstance(value, int) and value not in axes:
+                    axes.append(value)
+            if not axes:
+                continue
+            matching = [
+                axis
+                for axis in axes
+                if loaded_shape[axis] == local_shape[axis] * tp_size
+                and all(
+                    dim == axis or loaded_shape[dim] == local_shape[dim]
+                    for dim in range(tensor.ndim)
+                )
+            ]
+            if len(matching) == 1:
+                axis = matching[0]
+                local = tensor.narrow(
+                    axis, tp_rank * local_shape[axis], local_shape[axis]
+                )
+                if tuple(local.shape) != local_shape:
+                    raise RuntimeError(
+                        f"[mx-wt] {name!r} produced invalid TP-local shape "
+                        f"{tuple(local.shape)}, expected {local_shape}"
+                    )
+            elif loaded_shape == local_shape:
+                module = param_modules.get(name)
+                if module is not None and "Replicated" in type(module).__name__:
+                    continue
+                raise RuntimeError(
+                    f"[mx-wt] {name!r} is already TP-local ({loaded_shape}); "
+                    "stock vLLM expects a global HF tensor and would shard it "
+                    "again. Use a replicated/global source or MX_LOAD_MODE=direct."
+                )
+            elif loaded_shape != local_shape:
+                raise RuntimeError(
+                    f"[mx-wt] {name!r} global shape {loaded_shape} is not a "
+                    f"valid TP{tp_size} source for local shape {local_shape}"
+                )
+
+    def _apply_ep_filter(self, specs: dict, upd: MxUpdateInfo) -> None:
+        from modelexpress.rl_expert_layout import compute_local_expert_ids
+        placement = upd.expert_placement if upd.expert_placement in ("linear", "round_robin") else "linear"
+        local = compute_local_expert_ids(
+            ep_rank=upd.ep_rank, ep_world_size=upd.ep_world_size,
+            num_experts=int(upd.num_experts), placement=placement,
+        )
+        local_str = ",".join(str(e) for e in local)
+        n = 0
+        for spec in specs.values():
+            if spec.role.startswith("expert_"):
+                rd = dict(spec.role_descriptor or {})
+                rd["local_expert_ids"] = local_str
+                spec.role_descriptor = rd
+                n += 1
+        logger.info("[mx-wt] EP filter: ep=%d/%d -> %d local experts on %d specs",
+                    upd.ep_rank, upd.ep_world_size, len(local), n)
+
+    def _verify(self, weights: list[tuple[str, torch.Tensor]], gt_path: str) -> None:
+        gt = torch.load(gt_path, map_location="cpu", weights_only=False, mmap=True)
+        gt = gt.get("hf_weights", gt) if isinstance(gt, dict) else gt
+        got = dict(weights)
+        missing = sorted(set(gt).difference(got))
+        extra = sorted(set(got).difference(gt))
+        drift: list[str] = []
+        ok = 0
+        for name in sorted(set(got).intersection(gt)):
+            value = got[name].detach().cpu()
+            expected = gt[name].detach().cpu()
+            if value.shape == expected.shape and torch.equal(value, expected):
+                ok += 1
+            else:
+                drift.append(name)
+        logger.info(
+            "[mx-wt-verify] byte-identity: %d ok / %d drift / %d missing / "
+            "%d extra / %d GT",
+            ok,
+            len(drift),
+            len(missing),
+            len(extra),
+            len(gt),
+        )
+        if missing or drift or extra:
+            raise RuntimeError(
+                "[mx-wt-verify] byte-identity failed: "
+                f"drift={drift[:5]} missing={missing[:5]} extra={extra[:5]}"
+            )

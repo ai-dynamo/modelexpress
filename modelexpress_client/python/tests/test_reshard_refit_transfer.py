@@ -22,8 +22,12 @@ from modelexpress.refit.reshard.geometry import capture_geometry
 from modelexpress.refit.reshard.slice_plan import Shard
 from modelexpress.refit.reshard.transfer_plan import (
     SourceInfo,
+    TransferPlan,
+    exact_descriptors,
     execute_transfer,
+    plan_threshold_curve,
     plan_transfer,
+    session_distribution,
 )
 from modelexpress.refit.reshard.transport import InMemoryReferenceTransport
 
@@ -144,6 +148,135 @@ def test_strided_source_reconstructs_exactly():
     )
     assert torch.equal(recon_row, truth_row)
     assert row_src.data_ptr()  # keep alive
+
+
+def _whole_tensor_sources(srcs):
+    """Publish each full source as one contiguous shard covering the tensor."""
+    sources = {}
+    for name, tensor in srcs.items():
+        shard = Shard(
+            shard_offset=(0,) * tensor.dim(),
+            shape=tuple(tensor.shape),
+            session=name,
+            addr=tensor.data_ptr(),
+            elsize=EL,
+        )
+        sources[name] = SourceInfo(
+            global_shape=tuple(tensor.shape),
+            dtype=torch.float32,
+            elsize=EL,
+            shards=[shard],
+        )
+    return sources
+
+
+def test_threshold_curve_trades_descriptors_for_bytes():
+    """The full-pull threshold trades wire bytes against NIXL descriptors, and
+    the curve has to expose both sides for a cost model to replace the cliff."""
+    srcs = _full_sources()
+    with torch.device("meta"):
+        meta_model = ToyModel()
+    capture = capture_geometry(meta_model, _manifest())
+    sources = _whole_tensor_sources(srcs)
+
+    thresholds = [1, 2, 1024]
+    curve = plan_threshold_curve(capture, sources, thresholds)
+
+    # Order is preserved, so a logged curve reads as requested.
+    assert [row["threshold"] for row in curve] == thresholds
+
+    by_threshold = {row["threshold"]: row for row in curve}
+    tight, loose = by_threshold[1], by_threshold[1024]
+
+    # A tight threshold promotes strided copies to full pulls: fewer descriptors
+    # on the wire, but redundant bytes. A loose one keeps the exact plan.
+    assert tight["full_pulls"] > loose["full_pulls"]
+    assert tight["descriptors"] <= loose["descriptors"]
+    assert tight["extra_wire_bytes"] > loose["extra_wire_bytes"]
+    assert loose["extra_wire_bytes"] == 0
+    assert loose["full_pulls"] == 0
+
+    # The useful payload is invariant across the sweep - only redundancy moves.
+    # This is what makes two sweep points comparable at all.
+    assert len({row["useful_bytes"] for row in curve}) == 1
+
+    # Promotion must not silently drop work.
+    assert all(row["fallback"] == 0 for row in curve)
+
+    assert all(t.data_ptr() for t in srcs.values())  # keep alive
+
+
+def test_threshold_curve_does_not_disturb_the_real_plan():
+    srcs = _full_sources()
+    with torch.device("meta"):
+        meta_model = ToyModel()
+    capture = capture_geometry(meta_model, _manifest())
+    sources = _whole_tensor_sources(srcs)
+
+    before = plan_transfer(capture, sources)
+    plan_threshold_curve(capture, sources, [1, 4, 64, 4096])
+    after = plan_transfer(capture, sources)
+
+    assert before.descriptor_count() == after.descriptor_count()
+    assert before.bytes_planned() == after.bytes_planned()
+    assert before.exact_bytes == after.exact_bytes
+    assert len(before.full_pulls) == len(after.full_pulls)
+
+    assert all(t.data_ptr() for t in srcs.values())  # keep alive
+
+
+def test_session_distribution_accounts_every_planned_byte():
+    srcs = _full_sources()
+    with torch.device("meta"):
+        meta_model = ToyModel()
+    capture = capture_geometry(meta_model, _manifest())
+    sources = _whole_tensor_sources(srcs)
+    plan = plan_transfer(capture, sources)
+
+    dist = session_distribution(plan)
+
+    # Every byte and descriptor the plan will read is attributed to some session.
+    assert sum(v["bytes"] for v in dist.values()) == plan.bytes_planned()
+    assert sum(v["descriptors"] for v in dist.values()) == plan.descriptor_count()
+    # Sessions here are per-tensor, so a multi-source plan must span several.
+    assert len(dist) > 1
+
+    assert all(t.data_ptr() for t in srcs.values())  # keep alive
+
+
+def test_session_distribution_is_empty_for_an_empty_plan():
+    assert session_distribution(TransferPlan()) == {}
+
+
+def test_exact_descriptors_match_what_execute_transfer_reads():
+    """The fused wire path builds descriptors via exact_descriptors() instead of
+    letting execute_transfer read them, so the two must agree exactly."""
+    srcs = _full_sources()
+    with torch.device("meta"):
+        meta_model = ToyModel()
+    capture = capture_geometry(meta_model, _manifest())
+    sources = _whole_tensor_sources(srcs)
+    plan = plan_transfer(capture, sources)
+
+    model = ToyModel()
+    params = dict(model.named_parameters())
+    resolve = lambda name: params[name].data_ptr()  # noqa: E731
+
+    built = exact_descriptors(plan, resolve)
+
+    recorded = []
+
+    class _Recorder:
+        def read(self, descriptors):
+            recorded.extend(descriptors)
+
+    stats = execute_transfer(plan, resolve_param_ptr=resolve, transport=_Recorder())
+
+    assert built == recorded
+    assert stats["segments"] == len(built)
+    assert stats["bytes"] == sum(d.nbytes for d in built)
+
+    assert all(t.data_ptr() for t in srcs.values())  # keep alive
 
 
 def test_unsupported_source_routes_to_fallback():

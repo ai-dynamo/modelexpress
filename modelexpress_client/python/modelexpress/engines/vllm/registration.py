@@ -12,7 +12,7 @@ from vllm.model_executor.model_loader import register_model_loader
 logger = logging.getLogger(__name__)
 
 
-_PLUGIN_LOAD_FORMATS = ("modelexpress", "mx")
+_PLUGIN_LOAD_FORMATS = ("modelexpress", "mx", "mx-target")
 
 
 def register_plugin_model_loader() -> None:

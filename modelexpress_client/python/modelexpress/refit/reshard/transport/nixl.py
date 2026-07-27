@@ -15,12 +15,27 @@ exchange happens out-of-band (see ``refit.reshard.rendezvous``), which yields th
 ``session -> remote agent name`` and ``session -> remote device id`` maps this
 transport is constructed with. Each ``session`` is one published shard's owning
 agent; descriptors are grouped per session into one batched READ.
+
+Those per-session batches are posted **together** and awaited as a set, so a
+receiver pulling from N trainers has N transfers in flight instead of draining
+one peer before starting the next. Set ``MX_RESHARD_SERIAL_READS=1`` to restore
+the one-peer-at-a-time behavior (baseline A/B only).
 """
 
 from __future__ import annotations
 
+import logging
+import os
 from collections import defaultdict
 from typing import Any
+
+logger = logging.getLogger("modelexpress.refit.reshard.transport.nixl")
+
+
+def _serial_reads_enabled() -> bool:
+    """Whether to drain each peer before posting the next. Read at call time so
+    an A/B can toggle it without re-importing."""
+    return os.environ.get("MX_RESHARD_SERIAL_READS", "0") not in ("", "0", "false")
 
 
 class NixlReshardTransport:
@@ -59,24 +74,68 @@ class NixlReshardTransport:
         by_session: dict = defaultdict(list)
         for d in descriptors:
             by_session[d.session].append(d)
+        if not by_session:
+            return
 
-        for session, group in by_session.items():
-            agent = self._session_to_agent.get(session)
-            if agent is None:
-                raise KeyError(
-                    f"no remote NIXL agent registered for session {session!r}"
+        batches = [
+            (self._agent_for(session), self._ranges_for(session, group))
+            for session, group in by_session.items()
+        ]
+
+        if _serial_reads_enabled():
+            for agent, ranges in batches:
+                total_bytes, num_reads, _duration = self._manager.execute_read_batch(
+                    remote_agent_name=agent,
+                    ranges=ranges,
+                    mem_type=self._mem_type,
+                    timeout_seconds=self._timeout,
                 )
-            if session not in self._session_to_device:
-                raise KeyError(
-                    f"no remote device id registered for session {session!r}"
+                self.bytes_moved += total_bytes
+                self.reads_issued += num_reads
+            return
+
+        posted: list = []
+        try:
+            for agent, ranges in batches:
+                posted.append(
+                    self._manager.post_read_batch(
+                        remote_agent_name=agent,
+                        ranges=ranges,
+                        mem_type=self._mem_type,
+                    )
                 )
-            device_id = self._session_to_device[session]
-            ranges = [(d.src_addr, d.dst_addr, d.nbytes, device_id) for d in group]
-            total_bytes, num_reads, _duration = self._manager.execute_read_batch(
-                remote_agent_name=agent,
-                ranges=ranges,
-                mem_type=self._mem_type,
-                timeout_seconds=self._timeout,
-            )
-            self.bytes_moved += total_bytes
-            self.reads_issued += num_reads
+        except Exception:
+            # Batches posted before the failure are in flight and still own
+            # handles. Drain them so nothing leaks, but never let that cleanup
+            # replace the original error.
+            if posted:
+                try:
+                    self._manager.await_read_batches(
+                        posted, timeout_seconds=self._timeout
+                    )
+                except Exception as exc:  # noqa: BLE001 - cleanup must not mask
+                    logger.warning(
+                        "draining %d posted READ batch(es) after a post failure "
+                        "did not complete cleanly: %r",
+                        len(posted),
+                        exc,
+                    )
+            raise
+
+        total_bytes, num_reads, _duration = self._manager.await_read_batches(
+            posted, timeout_seconds=self._timeout
+        )
+        self.bytes_moved += total_bytes
+        self.reads_issued += num_reads
+
+    def _agent_for(self, session: Any) -> str:
+        agent = self._session_to_agent.get(session)
+        if agent is None:
+            raise KeyError(f"no remote NIXL agent registered for session {session!r}")
+        if session not in self._session_to_device:
+            raise KeyError(f"no remote device id registered for session {session!r}")
+        return agent
+
+    def _ranges_for(self, session: Any, group: list) -> list:
+        device_id = self._session_to_device[session]
+        return [(d.src_addr, d.dst_addr, d.nbytes, device_id) for d in group]
