@@ -43,11 +43,12 @@ class RecordedCopy:
 
 @dataclass
 class CaptureResult:
-    """Output of a bake: the recorded copies plus what fell back.
+    """Output of a bake: the recorded copies plus what could not be attributed.
 
     ``unsupported`` = source names whose loader used an unsupported op.
     ``unattributed`` = copy_ calls fired with no active loader stamp. Either
-    condition makes the update fail closed in the current receiver."""
+    condition makes the update fail closed in the current receiver; there is no
+    fallback path that serves those tensors by another route."""
 
     copies: list = field(default_factory=list)
     unsupported: list = field(default_factory=list)
