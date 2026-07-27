@@ -141,6 +141,12 @@ spec:
           # Build using examples/dynamo_p2p_transfer_k8s/Dockerfile
           image: <your-registry>/modelexpress-vllm-runtime:latest
           securityContext:
+            # The dynamo runtime image defaults to the non-root dynamo user.
+            # FlashInfer downloads missing cubins into its installed
+            # flashinfer-cubin package directory under root-owned
+            # site-packages, which fails with EACCES and kills the worker
+            # during EngineCore init. See README "Debugging".
+            runAsUser: 0
             capabilities:
               add:
               - IPC_LOCK
