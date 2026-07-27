@@ -22,7 +22,6 @@ MX_WEIGHT_SYNC_SERVER    If set, use ServerPlanner (routes regions on the
 from __future__ import annotations
 
 import logging
-import os
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -42,8 +41,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger("modelexpress.strategy_trainer_pull")
 
 
+_DISABLED_VALUES = {"", "0", "false", "no", "off"}
+
+
 def _use_server_planner() -> bool:
-    return bool(os.environ.get("MX_WEIGHT_SYNC_SERVER", ""))
+    return (envs.MX_WEIGHT_SYNC_SERVER or "").strip().lower() not in _DISABLED_VALUES
 
 
 def _trainer_table_key(model_name: str) -> str:

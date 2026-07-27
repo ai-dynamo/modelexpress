@@ -485,6 +485,13 @@ class NixlTransferManager:
         )
         return remote_agent_name
 
+    def remove_remote_agent(self, remote_agent_name: str) -> None:
+        """Invalidate a previously loaded remote NIXL agent."""
+        if self._agent is None:
+            raise RuntimeError("NIXL agent not initialized")
+        self._agent.remove_remote_agent(remote_agent_name)
+        logger.info("Removed remote NIXL agent %s", remote_agent_name)
+
     def receive_from_source(
         self,
         source_metadata: bytes,

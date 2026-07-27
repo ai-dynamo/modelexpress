@@ -46,6 +46,7 @@ class PushRole(WeightSyncRole):
 
         self._descriptors: list[RdmaDescriptor] = []
         self._executor: NixlExecutor | None = None
+        self._remote_agents: dict[int, str] = {}
 
     def initialize(
         self,
@@ -72,11 +73,13 @@ class PushRole(WeightSyncRole):
             time.perf_counter() - t0,
         )
 
+        self._remove_remote_agents()
         remote_agents: dict[int, str] = {}
         for i, nixl_bytes in enumerate(inference_table.agents):
             if nixl_bytes:
                 name = self._nixl_manager.add_remote_agent(nixl_bytes)
                 remote_agents[i] = name
+        self._remote_agents = remote_agents
 
         self._executor = NixlExecutor(
             nixl_manager=self._nixl_manager,
@@ -91,7 +94,21 @@ class PushRole(WeightSyncRole):
             raise RuntimeError("PushRole not initialized; call initialize() first")
         self._executor.execute(self._descriptors, operation="WRITE")
 
+    def _remove_remote_agents(self) -> None:
+        for name in self._remote_agents.values():
+            try:
+                self._nixl_manager.remove_remote_agent(name)
+            except Exception as e:
+                logger.warning(
+                    "[Trainer %d] Failed to remove remote agent %s: %s",
+                    self._trainer_rank,
+                    name,
+                    e,
+                )
+        self._remote_agents = {}
+
     def teardown(self) -> None:
+        self._remove_remote_agents()
         self._descriptors = []
         self._executor = None
 

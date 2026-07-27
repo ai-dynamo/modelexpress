@@ -221,14 +221,18 @@ def bake_model(
     weight_iter: Iterator[tuple[str, LazyWeight]],
 ) -> list[RecordedCopy]:
     """Run model.load_weights() with LazyWeights and return recorded copies."""
+    if not hasattr(model, "load_weights"):
+        raise RuntimeError(
+            f"Model {type(model).__name__} has no load_weights(); "
+            "cannot bake a weight transfer plan"
+        )
     recorder = BakeRecorder()
     with recorder:
-        if hasattr(model, "load_weights"):
-            model.load_weights(weight_iter)
-        else:
-            logger.warning(
-                "Model %s has no load_weights(); bake pass may be incomplete",
-                type(model).__name__,
-            )
+        model.load_weights(weight_iter)
+    if not recorder.copies:
+        raise RuntimeError(
+            f"Bake pass for {type(model).__name__} recorded no copies; "
+            "the resulting plan would transfer zero bytes"
+        )
     logger.info("Bake pass recorded %d copies", len(recorder.copies))
     return recorder.copies

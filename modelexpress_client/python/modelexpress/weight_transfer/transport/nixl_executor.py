@@ -70,53 +70,61 @@ class NixlExecutor:
         total_bytes = 0
         handles = []
 
-        for remote_name, descs in by_agent.items():
-            if operation == "READ":
-                src_list = [(d.src_addr, d.nbytes, 0) for d in descs]
-                dst_list = [(d.dst_addr, d.nbytes, self._device_id) for d in descs]
-            else:
-                src_list = [(d.src_addr, d.nbytes, self._device_id) for d in descs]
-                dst_list = [(d.dst_addr, d.nbytes, 0) for d in descs]
+        try:
+            for remote_name, descs in by_agent.items():
+                if operation == "READ":
+                    src_list = [(d.src_addr, d.nbytes, 0) for d in descs]
+                    dst_list = [(d.dst_addr, d.nbytes, self._device_id) for d in descs]
+                else:
+                    src_list = [(d.src_addr, d.nbytes, self._device_id) for d in descs]
+                    dst_list = [(d.dst_addr, d.nbytes, 0) for d in descs]
 
-            indices = list(range(len(descs)))
-            src_prepped = agent.prep_xfer_dlist(
-                agent_name=remote_name if operation == "READ" else "",
-                xfer_list=src_list,
-                mem_type=mem_type,
-                backends=backends,
-            )
-            dst_prepped = agent.prep_xfer_dlist(
-                agent_name="" if operation == "READ" else remote_name,
-                xfer_list=dst_list,
-                mem_type=mem_type,
-                backends=backends,
-            )
-            handle = agent.make_prepped_xfer(
-                operation=operation,
-                local_xfer_side=dst_prepped if operation == "READ" else src_prepped,
-                local_indices=indices,
-                remote_xfer_side=src_prepped if operation == "READ" else dst_prepped,
-                remote_indices=indices,
-                backends=backends,
-            )
-            agent.transfer(handle)
-            handles.append(handle)
-            total_bytes += sum(d.nbytes for d in descs)
+                indices = list(range(len(descs)))
+                src_prepped = agent.prep_xfer_dlist(
+                    agent_name=remote_name if operation == "READ" else "",
+                    xfer_list=src_list,
+                    mem_type=mem_type,
+                    backends=backends,
+                )
+                dst_prepped = agent.prep_xfer_dlist(
+                    agent_name="" if operation == "READ" else remote_name,
+                    xfer_list=dst_list,
+                    mem_type=mem_type,
+                    backends=backends,
+                )
+                handle = agent.make_prepped_xfer(
+                    operation=operation,
+                    local_xfer_side=dst_prepped if operation == "READ" else src_prepped,
+                    local_indices=indices,
+                    remote_xfer_side=src_prepped if operation == "READ" else dst_prepped,
+                    remote_indices=indices,
+                    backends=backends,
+                )
+                agent.transfer(handle)
+                handles.append(handle)
+                total_bytes += sum(d.nbytes for d in descs)
 
-        wait_start = time.monotonic()
-        for handle in handles:
-            while True:
-                if time.monotonic() - wait_start >= self._timeout:
+            wait_start = time.monotonic()
+            for handle in handles:
+                while True:
+                    if time.monotonic() - wait_start >= self._timeout:
+                        raise TimeoutError(
+                            f"NIXL {operation} timed out after {self._timeout}s"
+                        )
+                    status = agent.check_xfer_state(handle)
+                    if status in ("DONE", "SUCCESS"):
+                        break
+                    if status in ("ERR", "ERROR", "FAIL"):
+                        raise RuntimeError(f"NIXL {operation} failed with status {status}")
+                    time.sleep(0.001)
+        finally:
+            # release_xfer_handle aborts any still-outstanding transfer, and may
+            # itself raise; release every handle regardless.
+            for handle in handles:
+                try:
                     agent.release_xfer_handle(handle)
-                    raise TimeoutError(f"NIXL {operation} timed out after {self._timeout}s")
-                status = agent.check_xfer_state(handle)
-                if status in ("DONE", "SUCCESS"):
-                    agent.release_xfer_handle(handle)
-                    break
-                if status in ("ERR", "ERROR", "FAIL"):
-                    agent.release_xfer_handle(handle)
-                    raise RuntimeError(f"NIXL {operation} failed with status {status}")
-                time.sleep(0.001)
+                except Exception as e:
+                    logger.warning("Failed to release NIXL %s handle: %s", operation, e)
 
         self._manager._accelerator_backend.synchronize(self._device_id)
 

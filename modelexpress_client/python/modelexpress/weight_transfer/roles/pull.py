@@ -49,6 +49,7 @@ class PullRole(WeightSyncRole):
         self._executor: NixlExecutor | None = None
         self._plan_key: str = ""
         self._current_step: int = -1
+        self._remote_agents: dict[int, str] = {}
 
     def initialize(self, model: Any, table: TrainerTable) -> None:
         """Bake, resolve, plan, and register remote NIXL agents."""
@@ -83,11 +84,13 @@ class PullRole(WeightSyncRole):
             sum(d.nbytes for d in self._descriptors) / 1e9,
         )
 
+        self._remove_remote_agents()
         remote_agents: dict[int, str] = {}
         for i, nixl_bytes in enumerate(table.agents):
             if nixl_bytes:
                 name = self._nixl_manager.add_remote_agent(nixl_bytes)
                 remote_agents[i] = name
+        self._remote_agents = remote_agents
 
         self._executor = NixlExecutor(
             nixl_manager=self._nixl_manager,
@@ -115,7 +118,21 @@ class PullRole(WeightSyncRole):
         self._planner.invalidate(self._plan_key)
         self.initialize(model, table)
 
+    def _remove_remote_agents(self) -> None:
+        for name in self._remote_agents.values():
+            try:
+                self._nixl_manager.remove_remote_agent(name)
+            except Exception as e:
+                logger.warning(
+                    "[Worker %d] Failed to remove remote agent %s: %s",
+                    self._worker_rank,
+                    name,
+                    e,
+                )
+        self._remote_agents = {}
+
     def teardown(self) -> None:
+        self._remove_remote_agents()
         self._descriptors = []
         self._executor = None
         self._plan_key = ""

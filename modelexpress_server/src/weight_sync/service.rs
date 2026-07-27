@@ -186,7 +186,8 @@ impl WeightSyncServiceTrait for WeightSyncServiceImpl {
             .map_err(|e| Status::internal(format!("Failed to decode TrainerTable: {e}")))?;
 
         // Route the resolved regions in Rust (no torch).
-        let descriptors = route_regions(&req.regions, &table);
+        let descriptors = route_regions(&req.regions, &table)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
         let plan_id = Uuid::new_v4().to_string();
         let mut state = self.state.write().await;
@@ -234,12 +235,26 @@ impl WeightSyncServiceTrait for WeightSyncServiceImpl {
     ) -> Result<Response<RegisterM2nWorkerResponse>, Status> {
         let req = request.into_inner();
 
+        if req.total_workers <= 0 {
+            return Err(Status::invalid_argument(format!(
+                "total_workers must be positive, got {}",
+                req.total_workers
+            )));
+        }
+
         let mut state = self.state.write().await;
 
         // Reuse an existing plan_id if this worker already registered.
         if let Some(entry) = state.m2n_pending.get(&req.model_key)
             && let Some(plan_id) = &entry.plan_id
         {
+            if !entry.registrations.contains_key(&req.worker_rank) {
+                return Err(Status::failed_precondition(format!(
+                    "M2N plan for model_key {:?} was already built without worker_rank {}; \
+                     invalidate the plan before registering additional workers",
+                    req.model_key, req.worker_rank
+                )));
+            }
             return Ok(Response::new(RegisterM2nWorkerResponse {
                 m2n_plan_id: plan_id.clone(),
             }));
@@ -318,7 +333,8 @@ impl WeightSyncServiceTrait for WeightSyncServiceImpl {
             .map(|(r, v)| (*r, v.as_slice()))
             .collect();
 
-        let per_worker = route_all_workers(&worker_refs, &table);
+        let per_worker = route_all_workers(&worker_refs, &table)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
         let plan_id = Uuid::new_v4().to_string();
 

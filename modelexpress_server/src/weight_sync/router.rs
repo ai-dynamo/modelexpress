@@ -13,6 +13,29 @@ use modelexpress_common::grpc::weight_sync::{
 };
 use serde::Deserialize;
 
+/// Error produced while routing regions against a TrainerTable.
+#[derive(Debug)]
+pub enum RouteError {
+    /// A flat element-run list did not contain an even number of entries.
+    OddElemRuns(usize),
+    /// Address or byte-count arithmetic overflowed or went negative.
+    AddressOverflow,
+}
+
+impl std::fmt::Display for RouteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OddElemRuns(len) => write!(
+                f,
+                "element-run list must have an even number of entries, got {len}"
+            ),
+            Self::AddressOverflow => write!(f, "address arithmetic overflowed"),
+        }
+    }
+}
+
+impl std::error::Error for RouteError {}
+
 /// Trainer shard descriptor, mirroring `protocol.types.TrainerShard`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TrainerShard {
@@ -49,7 +72,7 @@ pub struct TrainerTableJson {
 pub fn route_regions(
     regions: &[ResolvedRegionProto],
     table: &TrainerTableJson,
-) -> Vec<RdmaDescriptorProto> {
+) -> Result<Vec<RdmaDescriptorProto>, RouteError> {
     let mut descriptors = Vec::new();
 
     for region in regions {
@@ -67,8 +90,8 @@ pub fn route_regions(
         let mut shards = tensor.shards.clone();
         shards.sort_by_key(|s| s.row_start);
 
-        let src_runs = unpack_runs(&region.src_elem_runs);
-        let dst_runs = unpack_runs(&region.dst_elem_runs);
+        let src_runs = unpack_runs(&region.src_elem_runs)?;
+        let dst_runs = unpack_runs(&region.dst_elem_runs)?;
 
         // Split all src runs across shard boundaries -> (shard, shard_rel_offset, count)
         let src_triples: Vec<(TrainerShard, i64, i64)> = src_runs
@@ -81,11 +104,11 @@ pub fn route_regions(
             &dst_runs,
             region.dst_addr,
             region.element_size as i64,
-        );
+        )?;
         descriptors.extend(new_descs);
     }
 
-    descriptors
+    Ok(descriptors)
 }
 
 /// Route resolved regions for all workers in one pass, returning per-worker
@@ -98,11 +121,11 @@ pub fn route_regions(
 pub fn route_all_workers(
     workers: &[(i32, &[ResolvedRegionProto])],
     table: &TrainerTableJson,
-) -> Vec<(i32, Vec<M2nDescriptorProto>)> {
+) -> Result<Vec<(i32, Vec<M2nDescriptorProto>)>, RouteError> {
     workers
         .iter()
         .map(|(rank, regions)| {
-            let rdma_descs = route_regions(regions, table);
+            let rdma_descs = route_regions(regions, table)?;
             let m2n_descs = rdma_descs
                 .into_iter()
                 .map(|d| M2nDescriptorProto {
@@ -113,7 +136,7 @@ pub fn route_all_workers(
                     nbytes: d.nbytes,
                 })
                 .collect();
-            (*rank, m2n_descs)
+            Ok((*rank, m2n_descs))
         })
         .collect()
 }
@@ -122,8 +145,26 @@ pub fn route_all_workers(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-fn unpack_runs(flat: &[i64]) -> Vec<(i64, i64)> {
-    flat.chunks(2).map(|c| (c[0], c[1])).collect()
+fn unpack_runs(flat: &[i64]) -> Result<Vec<(i64, i64)>, RouteError> {
+    let pairs = flat.chunks_exact(2);
+    if !pairs.remainder().is_empty() {
+        return Err(RouteError::OddElemRuns(flat.len()));
+    }
+    Ok(pairs.map(|c| (c[0], c[1])).collect())
+}
+
+/// Convert an element count to a byte count, rejecting overflow and negatives.
+fn elems_to_bytes(elems: i64, element_size: i64) -> Result<u64, RouteError> {
+    elems
+        .checked_mul(element_size)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or(RouteError::AddressOverflow)
+}
+
+/// Offset a base device address by `elems * element_size` bytes.
+fn offset_addr(base: u64, elems: i64, element_size: i64) -> Result<u64, RouteError> {
+    base.checked_add(elems_to_bytes(elems, element_size)?)
+        .ok_or(RouteError::AddressOverflow)
 }
 
 #[allow(clippy::arithmetic_side_effects)]
@@ -175,7 +216,7 @@ fn zip_src_dst(
     dst_runs: &[(i64, i64)],
     dst_base_addr: u64,
     element_size: i64,
-) -> Vec<RdmaDescriptorProto> {
+) -> Result<Vec<RdmaDescriptorProto>, RouteError> {
     let mut descriptors = Vec::new();
 
     let mut src_iter = src_triples.iter().peekable();
@@ -205,14 +246,15 @@ fn zip_src_dst(
         }
 
         let count = src_rem.min(dst_rem);
-        let src_addr = shard.device_addr + (src_rel * element_size) as u64;
-        let dst_addr = dst_base_addr + (dst_off * element_size) as u64;
+        let src_addr = offset_addr(shard.device_addr, src_rel, element_size)?;
+        let dst_addr = offset_addr(dst_base_addr, dst_off, element_size)?;
+        let nbytes = elems_to_bytes(count, element_size)?;
 
         descriptors.push(RdmaDescriptorProto {
             agent_index: shard.agent_index,
             src_addr,
             dst_addr,
-            nbytes: (count * element_size) as u64,
+            nbytes,
         });
 
         src_rel += count;
@@ -241,5 +283,5 @@ fn zip_src_dst(
         }
     }
 
-    descriptors
+    Ok(descriptors)
 }

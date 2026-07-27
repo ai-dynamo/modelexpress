@@ -32,6 +32,29 @@ def _is_row_only(shards: list[TrainerShard], full_width: int) -> bool:
     )
 
 
+def _check_dense_tiles(
+    shards: list[TrainerShard],
+    full_width: int,
+    element_size: int,
+) -> None:
+    """Reject 2-D tile shards whose row stride is not the dense tile width.
+
+    The local offset math in :func:`_shard_for_elem_2d` addresses a tile as
+    ``shard_width`` contiguous elements per row.  A shard whose ``row_bytes``
+    disagrees is padded or a strided view, and every row after the first
+    would resolve to the wrong address.
+    """
+    for shard in shards:
+        expected = _shard_width(shard, full_width) * element_size
+        if shard.row_bytes != expected:
+            raise ValueError(
+                f"Shard rows {shard.row_start}:{shard.row_end} "
+                f"cols {shard.col_start}:{_resolved_col_end(shard, full_width)} "
+                f"has row_bytes={shard.row_bytes}, expected {expected}; "
+                "2-D tile routing requires densely packed tiles"
+            )
+
+
 def _shard_for_elem_2d(
     row: int,
     col: int,
@@ -213,6 +236,8 @@ def route_regions(
         # Sort shards: primary by row_start, secondary by col_start for 2-D tiles
         shards = sorted(trainer_tensor.shards, key=lambda s: (s.row_start, s.col_start))
         row_only = _is_row_only(shards, full_width)
+        if not row_only:
+            _check_dense_tiles(shards, full_width, region.element_size)
 
         src_runs = _unpack_runs(region.src_elem_runs)
         dst_runs = _unpack_runs(region.dst_elem_runs)
