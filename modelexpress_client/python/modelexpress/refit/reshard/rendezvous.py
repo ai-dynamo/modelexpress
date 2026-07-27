@@ -36,6 +36,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -48,6 +49,11 @@ from modelexpress.refit.reshard.transfer_plan import SourceInfo
 logger = logging.getLogger("modelexpress.refit.reshard.rendezvous")
 
 _SCHEMA = "mx.reshard.shard_table.v1"
+
+# On by default: a same-name/same-geometry pair with different digests is always a
+# defect, and the failure it causes otherwise is silent and undetectable downstream.
+# Costs nothing when publishers omit digests.
+_STRICT_DIGESTS = os.environ.get("MX_RESHARD_STRICT_DIGESTS", "1") not in ("0", "false", "False")
 
 
 def _mx_version() -> str:
@@ -197,7 +203,9 @@ def build_sources(tensors: list) -> tuple:
     return sources, session_to_agent, session_to_device
 
 
-def merge_shard_tables(tables: list, replica_offset: int = 0) -> list:
+def merge_shard_tables(
+    tables: list, replica_offset: int = 0, strict_digests: bool = _STRICT_DIGESTS
+) -> list:
     """Merge per-rank ``list[PublishedTensor]`` into one, concatenating shards
     for the same source across ranks (reshard fans in cross-rank). Replica
     publishers can advertise the same geometric shard through DP/EP replication;
@@ -216,6 +224,16 @@ def merge_shard_tables(tables: list, replica_offset: int = 0) -> list:
     Geometry set and ordering are identical for every ``replica_offset``, so only
     the owning agent and address of each shard change - the resulting plan has the
     same shape, segment count and byte count.
+
+    ``strict_digests`` raises when two publishers offer the same name and geometry
+    with *different* digests. Such offers are not replicas: the name means two
+    different tensors somewhere upstream, and picking either one installs bytes
+    that belong to the other. That is exactly how Bug 8 hid - pipeline-local layer
+    indices made both PP stages publish ``decoder.layers.0..23``, the tiebreak
+    silently dropped one stage's half of the model, and every existing gate passed
+    because bytes that are never requested are never checked. Only offers that
+    carry a digest can be compared, so this is effective when publishers run with
+    ``MX_RESHARD_VERIFY=1``.
     """
     merged: dict = {}
     # name -> geometry -> candidate shards, insertion-ordered so the retained
@@ -240,9 +258,34 @@ def merge_shard_tables(tables: list, replica_offset: int = 0) -> list:
                 per_geometry.setdefault(geometry, []).append(shard)
 
     for name, tensor in merged.items():
-        for offers in candidates[name].values():
+        for geometry, offers in candidates[name].items():
+            if strict_digests and len(offers) > 1:
+                _assert_offers_are_replicas(name, geometry, offers)
             tensor.shards.append(offers[replica_offset % len(offers)])
     return list(merged.values())
+
+
+def _assert_offers_are_replicas(name: str, geometry: tuple, offers: list) -> None:
+    """Raise if competing offers for one name/geometry hold different bytes."""
+    by_digest: dict = {}
+    for shard in offers:
+        if shard.digest:
+            by_digest.setdefault(shard.digest, []).append(shard.agent_name)
+    if len(by_digest) <= 1:
+        return
+    detail = ", ".join(
+        f"{digest[:12]} from {sorted(set(agents))}" for digest, agents in by_digest.items()
+    )
+    offset, shape = geometry
+    raise ValueError(
+        f"tensor {name!r} shard offset={offset} shape={shape} was published by "
+        f"multiple ranks with {len(by_digest)} distinct digests ({detail}). These "
+        f"are not replicas, so the first-writer-wins tiebreak would install one "
+        f"rank's bytes under the other's name. The usual cause is a publisher "
+        f"emitting parallelism-local names - see Bug 8, pipeline-local layer "
+        f"indices. Set MX_RESHARD_STRICT_DIGESTS=0 to downgrade this to the old "
+        f"silent behaviour."
+    )
 
 
 # --- Rendezvous blob (rides in WorkerMetadata.nixl_metadata) -----------------

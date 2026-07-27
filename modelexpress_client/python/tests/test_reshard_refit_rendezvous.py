@@ -297,3 +297,101 @@ def test_merge_still_fans_in_distinct_geometry_across_ranks():
             "r2",
             "r3",
         ]
+
+
+def _colliding_tables(digests: list, name: str = "decoder.layers.0.weight"):
+    """One geometry offered by len(digests) publishers, each with its own digest."""
+    return [
+        [
+            PublishedTensor(
+                name=name,
+                dtype="torch.bfloat16",
+                elsize=2,
+                full_shape=(8, 4),
+                shards=[
+                    PublishedShard(
+                        agent_name=f"pp{i}",
+                        device_id=i,
+                        addr=1000 * (i + 1),
+                        shard_offset=(0, 0),
+                        shape=(4, 4),
+                        digest=digest,
+                    )
+                ],
+            )
+        ]
+        for i, digest in enumerate(digests)
+    ]
+
+
+def test_same_geometry_with_different_digests_is_a_collision_not_a_replica():
+    tables = _colliding_tables(["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"])
+    with pytest.raises(ValueError) as excinfo:
+        merge_shard_tables(tables)
+    message = str(excinfo.value)
+    assert "decoder.layers.0.weight" in message
+    assert "2 distinct digests" in message
+    # The message has to name both sides, otherwise it does not localize the bug.
+    assert "pp0" in message and "pp1" in message
+
+
+def test_matching_digests_are_replicas_and_still_deduplicate():
+    tables = _colliding_tables(["cccccccccccccccc"] * 4)
+    merged = merge_shard_tables(tables)
+    assert len(merged[0].shards) == 1
+    assert merged[0].shards[0].agent_name == "pp0"
+
+
+def test_publishers_without_digests_cannot_be_checked_and_must_not_raise():
+    """A mixed or non-verifying fleet keeps the old behaviour rather than failing."""
+    tables = _colliding_tables([None, None, None])
+    merged = merge_shard_tables(tables)
+    assert merged[0].shards[0].agent_name == "pp0"
+
+
+def test_one_digest_against_one_unknown_is_not_enough_to_accuse():
+    tables = _colliding_tables(["dddddddddddddddd", None])
+    merged = merge_shard_tables(tables)
+    assert merged[0].shards[0].agent_name == "pp0"
+
+
+def test_collision_detection_can_be_disabled_for_the_old_behaviour():
+    tables = _colliding_tables(["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"])
+    merged = merge_shard_tables(tables, strict_digests=False)
+    assert merged[0].shards[0].agent_name == "pp0"
+
+
+def test_collision_is_reported_even_when_replica_offset_would_pick_the_other():
+    """The rotation must not be able to hide the defect on some receivers."""
+    tables = _colliding_tables(["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"])
+    for offset in range(4):
+        with pytest.raises(ValueError):
+            merge_shard_tables(tables, replica_offset=offset)
+
+
+def test_distinct_geometry_with_distinct_digests_is_normal_fan_in():
+    """Real cross-rank fan-in has different bytes per shard by construction."""
+    tables = []
+    for rank in range(4):
+        tables.append(
+            [
+                PublishedTensor(
+                    name="weight",
+                    dtype="torch.bfloat16",
+                    elsize=2,
+                    full_shape=(16, 4),
+                    shards=[
+                        PublishedShard(
+                            agent_name=f"r{rank}",
+                            device_id=rank,
+                            addr=1000 * (rank + 1),
+                            shard_offset=(4 * rank, 0),
+                            shape=(4, 4),
+                            digest=f"digest-{rank}",
+                        )
+                    ],
+                )
+            ]
+        )
+    merged = merge_shard_tables(tables)
+    assert len(merged[0].shards) == 4

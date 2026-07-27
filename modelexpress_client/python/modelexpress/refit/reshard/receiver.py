@@ -76,6 +76,18 @@ _SPREAD_SOURCES = os.environ.get("MX_RESHARD_SPREAD_SOURCES", "0") == "1"
 # the cached-plan TODO in update_weights; costs a full discovery round trip per
 # step, so it is off unless something is being investigated.
 _ADDR_RECHECK = os.environ.get("MX_RESHARD_ADDR_RECHECK", "0") == "1"
+# Refuse a refit that does not cover the engine's parameter bytes. Off by default
+# because partial and subset refit are intended features; benchmark harnesses must
+# turn it on. It is the only gate that can see a param the loader never asked for:
+# every other check compares bytes that arrived against the publisher's digest for
+# the same name, so a tensor that is never requested is never checked.
+_REQUIRE_FULL_COVERAGE = (
+    os.environ.get("MX_RESHARD_REQUIRE_FULL_COVERAGE", "0") == "1"
+)
+# Not 1.0: a handful of engine params are legitimately not refit material (rotary
+# inv_freq and similar non-float buffers that surface as params in some models),
+# and failing a complete refit over a few kilobytes would make the gate unusable.
+_COVERAGE_FLOOR = float(os.environ.get("MX_RESHARD_COVERAGE_FLOOR", "0.995"))
 # Whole-handshake budget across every peer and every retry. A refit timeout is the
 # wrong bound: it lets one unreachable peer consume the entire refit. It must still
 # be generous, because a peer can be unreachable for minutes for a legitimate
@@ -531,6 +543,85 @@ class ReshardReceiver:
             len(plan.unbounded_sources),
             len(plan.fallback),
         )
+        self._log_coverage(capture, param_layout, all_params, plan)
+
+    def _log_coverage(self, capture, param_layout, all_params, plan) -> None:
+        """Report what this rank asked the wire for, against what it will install.
+
+        Emitted at WARNING as JSON. Everything here was already computed and
+        already logged - at INFO, which no benchmark run has ever captured, so
+        `useful_bytes_per_rank` has been *derived* on the analysis side rather
+        than measured. That derivation is what left Topology B unreconcilable:
+        it moves 330 GB across 16 ranks against a first-principles need of
+        488 GB, and with no measured destination footprint there is no way to
+        tell whether the model of the sharding is wrong or the refit is
+        incomplete.
+
+        `unsupported` is the number that answers it. A param the loader wants
+        and the planner cannot serve is silently absent from the wire, so a
+        non-zero count here is a coverage hole - the correctness gate cannot see
+        it, because the gate verifies bytes that arrived and says nothing about
+        bytes that never did.
+        """
+        # `param_layout` is the engine's COMPLETE parameter set; `all_params` is the
+        # subset this refit will write. The ratio is the coverage nothing else
+        # measures, and it needs no engine-specific hook.
+        installed = set(all_params)
+        dest_bytes = 0
+        engine_bytes = 0
+        missed: list[str] = []
+        for name, (shape, dtype) in param_layout.items():
+            count = 1
+            for dim in shape:
+                count *= int(dim)
+            nbytes = count * torch.empty(0, dtype=dtype).element_size()
+            engine_bytes += nbytes
+            if name in installed:
+                dest_bytes += nbytes
+            else:
+                missed.append(name)
+        coverage = (dest_bytes / engine_bytes) if engine_bytes else 0.0
+        unsupported = list(getattr(capture, "unsupported", []) or [])
+        record = {
+            "schema": "refit-coverage-v1",
+            "rank": self._global_rank,
+            "params_installed": len(all_params),
+            "engine_params": len(param_layout),
+            "dest_bytes": dest_bytes,
+            "engine_bytes": engine_bytes,
+            "coverage_pct": round(100.0 * coverage, 4),
+            "params_never_written": len(missed),
+            "params_never_written_sample": sorted(missed)[:10],
+            "copies_captured": len(capture.copies),
+            "unsupported": len(unsupported),
+            "unsupported_sample": [str(u)[:120] for u in unsupported[:10]],
+            "planned_wire_bytes": plan.bytes_planned(),
+            "extra_wire_bytes": plan.extra_wire_bytes(),
+            "descriptors": plan.descriptor_count(),
+            "descriptor_savings": plan.descriptor_savings(),
+            "full_pull_sources": len(plan.full_pulls),
+            "unbounded_sources": len(plan.unbounded_sources),
+            "converts": len(plan.converts),
+            "fallback": len(plan.fallback),
+        }
+        logger.warning("MX_REFIT_COVERAGE %s", json.dumps(record))
+
+        if _REQUIRE_FULL_COVERAGE and coverage < _COVERAGE_FLOOR:
+            # Opt-in rather than always-on: partial and subset refit are intended
+            # features, and for those a coverage below 1.0 is the point. What is
+            # never acceptable is a *benchmark* row measuring an incomplete refit,
+            # because its wire volume and timings are then the wrong magnitude and
+            # get compared against complete ones. Topology B was published as
+            # beating Topology A on every axis while refitting 51% of the model.
+            raise RuntimeError(
+                f"refit covers {100.0 * coverage:.2f}% of the engine's parameter "
+                f"bytes ({dest_bytes} of {engine_bytes}); "
+                f"{len(missed)} of {len(param_layout)} params would keep their "
+                f"previous values, e.g. {sorted(missed)[:5]}. No digest gate can "
+                f"detect this - bytes that are never requested are never checked. "
+                f"Set MX_RESHARD_REQUIRE_FULL_COVERAGE=0 for an intentionally "
+                f"partial refit."
+            )
 
     def _log_session_distribution(self, plan) -> None:
         """Report how this receiver's reads spread over the publishing ranks.
@@ -884,6 +975,17 @@ class ReshardReceiver:
                 "segments": stats["segments"],
                 "batch_install": _BATCH_INSTALL,
                 "accounted_s": round(accounted, 6),
+                # Byte economics travel with the timings. These were INFO-only,
+                # so every published row so far has carried an *estimated*
+                # useful-bytes figure reconstructed after the fact. Wire minus
+                # extra is the measured one.
+                "extra_wire_bytes": self._plan.extra_wire_bytes(),
+                "descriptor_savings": self._plan.descriptor_savings(),
+                "exact_descriptors": self._plan.exact_descriptor_count,
+                "full_pull_sources": len(self._plan.full_pulls),
+                "unbounded_sources": len(self._plan.unbounded_sources),
+                "converts": len(self._plan.converts),
+                "fallback": len(stats["fallback"]),
                 **{k: round(v, 6) for k, v in stages.items()},
             }
             # WARNING so benchmark harnesses capture it without enabling INFO
