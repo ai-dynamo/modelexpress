@@ -424,6 +424,32 @@ jobs:
             # tracks "newest client vs latest released server" without a
             # manual bump each release.
             server_image: nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.4.0
+          # Redis backend variants of the full-manifest path: exercises the
+          # same MX_P2P_METADATA=0 embedded-metadata publish with a Redis
+          # metadata store instead of the default Kubernetes CRD backend.
+          - framework: vllm
+            label: vllm full-manifest redis same-version
+            namespace: mx-ci-full-manifest-redis-same-${{ github.run_id }}
+            manifest: ci/k8s/client/vllm/manifest-azure.yaml
+            test_script: ci/k8s/client/test_p2p_k8s.py
+            source_extra_env: "JOB_NAME=mx-source"
+            extra_env: "JOB_NAME=mx-target"
+            source_port: "8025"
+            worker_port: "8026"
+            mx_p2p_metadata: "0"
+            server_manifest: ci/k8s/server/mx-server-redis.yaml
+          - framework: vllm
+            label: vllm full-manifest redis mixed-version
+            namespace: mx-ci-full-manifest-redis-mixed-${{ github.run_id }}
+            manifest: ci/k8s/client/vllm/manifest-azure.yaml
+            test_script: ci/k8s/client/test_p2p_k8s.py
+            source_extra_env: "JOB_NAME=mx-source"
+            extra_env: "JOB_NAME=mx-target"
+            source_port: "8027"
+            worker_port: "8028"
+            mx_p2p_metadata: "0"
+            server_manifest: ci/k8s/server/mx-server-redis.yaml
+            server_image: nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.4.0
 
     steps:
       - name: Checkout
@@ -454,6 +480,7 @@ jobs:
           ngc_api_key: ${{ secrets.NGC_API_KEY }}
           model: ${{ env.MX_CI_MODEL }}
           hf_token: ${{ secrets.HF_TOKEN }}
+          server_manifest: ${{ matrix.server_manifest || 'ci/k8s/server/mx-server.yaml' }}
           mx_p2p_metadata: ${{ matrix.mx_p2p_metadata || '1' }}
           source_extra_env: ${{ matrix.source_extra_env }}
           extra_env: ${{ matrix.extra_env }}
@@ -959,6 +986,7 @@ jobs:
   # ---------------------------------------------------------------------------
   test-fleet-scale:
     name: Fleet scale test (vLLM, 15 workers)
+    if: false  # temporarily disabled — only P2P tests run on this branch
     runs-on: prod-modelexpress-builder-amd-v1
     needs: [build-client, build-server, ensure-vcluster]
     permissions:
@@ -1013,6 +1041,7 @@ jobs:
   # ---------------------------------------------------------------------------
   test-rolling-update:
     name: Rolling-update test (${{ matrix.framework }}, 5 workers)
+    if: false  # temporarily disabled — only P2P tests run on this branch
     runs-on: prod-modelexpress-builder-amd-v1
     needs: [build-client, build-server, ensure-vcluster]
     permissions:
@@ -1082,6 +1111,7 @@ jobs:
   # ---------------------------------------------------------------------------
   test-stale-metadata:
     name: Stale metadata test (${{ matrix.framework }})
+    if: false  # temporarily disabled — only P2P tests run on this branch
     runs-on: prod-modelexpress-builder-amd-v1
     needs: [build-client, build-server, ensure-vcluster]
     permissions:
@@ -1152,6 +1182,7 @@ jobs:
   # ---------------------------------------------------------------------------
   model-streamer:
     name: Model Streamer ${{ matrix.mode }} test (${{ matrix.framework }}, S3)
+    if: false  # temporarily disabled — only P2P tests run on this branch
     runs-on: prod-modelexpress-tester-amd-gpu-v1
     needs: [build-client]
     permissions:

@@ -130,6 +130,23 @@ runs:
           | tail -30 || true
         echo "::endgroup::"
 
+        echo "::group::vCluster syncer configuration (args + env)"
+        # Print the syncer container's args and env so we can inspect flags
+        # like --sync-interval, --requeue-period, or any reconcile-window
+        # settings that could explain delayed pod-ready propagation.
+        for POD in $(${KCTL} get pods -n "${VCLUSTER_NAMESPACE}" -l "${SELECTOR}" \
+            -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+          echo "--- ${POD} syncer args ---"
+          ${KCTL} get pod -n "${VCLUSTER_NAMESPACE}" "${POD}" \
+            -o jsonpath='{range .spec.containers[?(@.name=="syncer")]}{range .args[*]}{@}{"\n"}{end}{end}' \
+            2>&1 || true
+          echo "--- ${POD} syncer env ---"
+          ${KCTL} get pod -n "${VCLUSTER_NAMESPACE}" "${POD}" \
+            -o jsonpath='{range .spec.containers[?(@.name=="syncer")]}{range .env[*]}{.name}={.value}{"\n"}{end}{end}' \
+            2>&1 || true
+        done
+        echo "::endgroup::"
+
         echo "::group::vCluster syncer error/warn entries (current + previous container)"
         # The syncer logs every reconciliation, so an unfiltered tail is
         # 95% routine INFO chatter and 5% signal. Filter to lines that

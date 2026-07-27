@@ -58,6 +58,10 @@ inputs:
         S3_BUCKET=my-model-bucket
     required: false
     default: ''
+  server_manifest:
+    description: 'Repo-root-relative path to the MX server manifest. Defaults to the Kubernetes CRD backend.'
+    required: false
+    default: 'ci/k8s/server/mx-server.yaml'
   mx_p2p_metadata:
     description: |
       Value for the ${MX_P2P_METADATA} substitution in manifests that
@@ -189,9 +193,15 @@ runs:
       env:
         MX_SERVER_IMAGE: ${{ inputs.server_image }}
         NAMESPACE: ${{ inputs.namespace }}
+        SERVER_MANIFEST: ${{ inputs.server_manifest }}
+        # Used by mx-server-redis.yaml envsubst. Widen the reaper window for
+        # slow cold-starting tests — same intent as the hardcoded value in
+        # mx-server.yaml. Ignored by mx-server.yaml (no ${} substitution there).
+        MX_HEARTBEAT_TIMEOUT_SECS: "900"
+        MX_REAPER_SCAN_INTERVAL_SECS: "30"
       run: |
         echo "::group::Deploy MX server in ${NAMESPACE}"
-        envsubst < ci/k8s/server/mx-server.yaml | kubectl apply -n ${NAMESPACE} -f -
+        envsubst < "${SERVER_MANIFEST}" | kubectl apply -n ${NAMESPACE} -f -
         kubectl rollout status deployment/mx-server -n ${NAMESPACE} --timeout=120s
         echo "::endgroup::"
 
