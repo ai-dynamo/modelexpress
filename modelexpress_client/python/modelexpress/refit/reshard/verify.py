@@ -173,11 +173,30 @@ def _sentinel_fraction(region) -> float:
     return float((raw == SENTINEL_BYTE).sum().item()) / max(1, raw.numel())
 
 
+def _fresh_digest_index(fresh_sources: dict) -> dict:
+    """Index a freshly discovered shard table by (source, session, offset).
+
+    Keyed on session and offset rather than position: discovery order is not
+    stable, and ``merge_shard_tables`` keeps the first offer of each geometry, so
+    two discoveries legitimately pin the same box to different - but byte-identical
+    - replicas. Comparing positionally reports that reshuffle as a change.
+    """
+    index: dict = {}
+    for src_name, info in fresh_sources.items():
+        for shard in getattr(info, "shards", ()):  # tolerate stubs in tests
+            digest = getattr(shard, "digest", None)
+            if digest is None:
+                continue
+            index[(src_name, shard.session, tuple(shard.shard_offset))] = digest
+    return index
+
+
 def verify_full_pulls(
     *,
     full_staging: dict,
     sources: dict,
     max_report: int = 20,
+    fresh_sources: dict | None = None,
 ) -> dict:
     """Recompute digests over received full-pull bytes and compare to the publishers'.
 
@@ -190,8 +209,27 @@ def verify_full_pulls(
     scattered straight into live params, so digesting them would mean digesting the
     destination layout instead of the source shard - a different check, not this one.
 
+    ``fresh_sources`` is the fix for Bug 9. ``sources`` comes from ``_prepare()``,
+    which runs once, so its digests describe the weights as of the *first* refit.
+    Every later step then compares current bytes against a stale expectation, and
+    any parameter training legitimately updated is reported as corruption. That is
+    not hypothetical: on Topology B it produced exactly one mismatch
+    (``model.layers.18.self_attn.o_proj.weight``) whose ``want`` was byte-identical
+    across two runs while ``got`` tracked training - a frozen expectation against a
+    moving reality. Diagnostics confirmed no source address ever moved, so the wire
+    was reading the right memory and delivering current weights the whole time.
+
+    When a freshly discovered table is supplied, its digest wins. The bytes were
+    read from an address that has not moved, so what landed in staging is what the
+    publisher holds *now*, and now is what the fresh table describes.
+
     Returns a report with the counts and the first few mismatches by name.
     """
+    fresh_index = _fresh_digest_index(fresh_sources) if fresh_sources else {}
+    # Sources whose expectation was refreshed. Non-zero means training moved those
+    # weights between prepare and this step - which is normal, and which without
+    # this refresh would have been reported as that many mismatches.
+    refreshed = 0
     checked = 0
     skipped = 0
     # Counted separately from the reported sample. Returning len(detail) conflates
@@ -232,6 +270,13 @@ def verify_full_pulls(
                 )
         for shard in info.shards:
             want = getattr(shard, "digest", None)
+            current = fresh_index.get(
+                (src_name, shard.session, tuple(shard.shard_offset))
+            )
+            if current is not None:
+                if want is not None and current != want:
+                    refreshed += 1
+                want = current
             if want is None:
                 skipped += 1
                 continue
@@ -267,6 +312,10 @@ def verify_full_pulls(
         "detail_truncated": failed > len(mismatches),
         "divergent_replicas": len(divergent_replicas),
         "divergent_detail": divergent_replicas,
+        # 0 with a fresh table supplied means training did not move these weights,
+        # which makes the run a weak test of the gate rather than a strong pass.
+        "digests_refreshed": refreshed,
+        "digest_source": "fresh" if fresh_index else "prepare",
     }
     if FILL_SENTINEL:
         # never_written == mismatches says the wire skipped those regions

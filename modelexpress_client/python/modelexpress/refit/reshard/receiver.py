@@ -76,6 +76,12 @@ _SPREAD_SOURCES = os.environ.get("MX_RESHARD_SPREAD_SOURCES", "0") == "1"
 # the cached-plan TODO in update_weights; costs a full discovery round trip per
 # step, so it is off unless something is being investigated.
 _ADDR_RECHECK = os.environ.get("MX_RESHARD_ADDR_RECHECK", "0") == "1"
+# Verify against digests from a fresh discovery rather than the ones captured at
+# prepare time. On by default because the prepare-time digests are simply wrong for
+# any step past the first; the escape hatch exists to reproduce the old behaviour.
+_VERIFY_FRESH_DIGESTS = (
+    os.environ.get("MX_RESHARD_VERIFY_FRESH_DIGESTS", "1") not in ("0", "false", "False")
+)
 # Refuse a refit that does not cover the engine's parameter bytes. Off by default
 # because partial and subset refit are intended features; benchmark harnesses must
 # turn it on. It is the only gate that can see a param the loader never asked for:
@@ -676,8 +682,25 @@ class ReshardReceiver:
             logger.warning("[reshard] plan-sweep %s", json.dumps(row, sort_keys=True))
 
     # ----------------------------------------------------------- update_weights
+    def _fresh_sources(self, timeout: float) -> dict:
+        """Re-run discovery and return the current shard table.
+
+        Uses the same ``replica_offset`` as ``_prepare`` so the fresh table pins the
+        same replicas the plan did wherever the offers have not changed; otherwise a
+        rotation would look like a difference.
+        """
+        return gather_sources(
+            self._mx_client,
+            expected_trainers=self._num_trainer_sources,
+            model_name=self._model_name,
+            role="inference",
+            rank=self._global_rank,
+            timeout=timeout,
+            replica_offset=self._global_rank if _SPREAD_SOURCES else 0,
+        )[0]
+
     @torch.no_grad()
-    def _recheck_sources(self, step: int, timeout: float) -> None:
+    def _recheck_sources(self, step: int, timeout: float) -> dict:
         """Re-discover and diff this step's publication against the cached one.
 
         Diagnostic for the cached-plan TODO below. ``_prepare`` runs once, so both
@@ -692,19 +715,16 @@ class ReshardReceiver:
           delivered current weights, and the gate is comparing them against the
           first step's digests. A bug in the gate, not in the refit.
 
-        So this counts both rather than assuming either.
+        So this counts both rather than assuming either. On Topology B it returned
+        addr_changed 0 across ~4.4M comparisons with digest_changed 1 on exactly the
+        ranks that reported a mismatch, which settled Bug 9 as the second case.
+
+        Returns the freshly discovered table so the verify gate can compare against
+        current digests instead of prepare-time ones, rather than paying for a
+        second discovery.
         """
-        replica_offset = self._global_rank if _SPREAD_SOURCES else 0
         _t = time.perf_counter()
-        fresh, _agents, _devices, _endpoints = gather_sources(
-            self._mx_client,
-            expected_trainers=self._num_trainer_sources,
-            model_name=self._model_name,
-            role="inference",
-            rank=self._global_rank,
-            timeout=timeout,
-            replica_offset=replica_offset,
-        )
+        fresh = self._fresh_sources(timeout)
         # Keyed by (session, box), never by position. Discovery order is not
         # stable, and merge_shard_tables keeps the first offer of each geometry,
         # so two discoveries legitimately pin the same box to different - but
@@ -755,6 +775,7 @@ class ReshardReceiver:
                 }
             ),
         )
+        return fresh
 
     def update_weights(self, step: int, *, timeout: float | None = None) -> dict:
         """RDMA-pull the needed slices into the receive buffers, cast the
@@ -778,8 +799,16 @@ class ReshardReceiver:
             stages.update(self._prepare_stages)
         assert self._plan is not None and self._transport is not None
 
+        # Current digests for the verify gate. `self._sources` is frozen at
+        # `_prepare()`, so on any step past the first it describes weights the
+        # trainer has since updated, and comparing against it reports training as
+        # corruption (Bug 9). Only paid when verification is on: it costs a
+        # discovery (~0.8-1.6 s at 16 ranks), which a timing run must not absorb.
+        fresh_sources = None
         if _ADDR_RECHECK:
-            self._recheck_sources(step, timeout)
+            fresh_sources = self._recheck_sources(step, timeout)
+        elif VERIFY and _VERIFY_FRESH_DIGESTS and step > 1:
+            fresh_sources = self._fresh_sources(timeout)
 
         # RDMA the sliced bf16 into the receive buffers (segments) and per-param
         # staging (dtype-convert / router). No live param is written by RDMA.
@@ -900,7 +929,9 @@ class ReshardReceiver:
         if VERIFY and self._plan.full_pulls:
             _t = time.perf_counter()
             verify_report = verify_full_pulls(
-                full_staging=self._full_staging, sources=self._sources
+                full_staging=self._full_staging,
+                sources=self._sources,
+                fresh_sources=fresh_sources,
             )
             stages["verify_s"] = time.perf_counter() - _t
 

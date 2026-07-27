@@ -111,6 +111,11 @@ def test_matching_bytes_pass():
         "detail_truncated": False,
         "divergent_replicas": 0,
         "divergent_detail": [],
+        # No fresh table supplied, so the gate fell back to the prepare-time
+        # digests. Reported rather than implied: whether the expectation was
+        # current decides whether a clean report means anything on a later step.
+        "digests_refreshed": 0,
+        "digest_source": "prepare",
     }
 
 
@@ -322,3 +327,148 @@ def test_sentinel_fields_are_absent_by_default():
     )
     assert "never_written" not in report
     assert "mean_sentinel_frac" not in report
+
+
+# -------------------------------------------------- Bug 9: stale expected digests
+#
+# `sources` comes from `_prepare()`, which runs once. Its digests therefore describe
+# the weights as of the FIRST refit, and every later step compares current bytes
+# against that frozen expectation - so a parameter training legitimately updated is
+# reported as corruption.
+#
+# This is measured, not hypothetical. On Topology B (Qwen3-30B-A3B, PP2/EP8/DP8 ->
+# TP2x8) the gate reported exactly one bad tensor,
+# model.layers.18.self_attn.o_proj.weight, and across two runs its `want` was
+# byte-identical while `got` tracked training. The addr-recheck diagnostic showed
+# addr_changed 0 over ~4.4M comparisons with digest_changed 1 on precisely the ranks
+# that flagged it: no source ever moved, the wire delivered current weights, and the
+# gate was wrong.
+def test_a_source_that_changed_since_prepare_is_not_a_mismatch():
+    """The Bug 9 regression.
+
+    Staging holds what the wire delivered - the CURRENT bytes. The prepare-time
+    digest describes the old ones. Verifying against the fresh table must pass.
+    """
+    current = torch.arange(64, dtype=torch.int16)
+    current_digest = tensor_digest(shard_region(current, (64,), (0,), (64,)))
+    stale_digest = tensor_digest(torch.zeros(64, dtype=torch.int16))
+    assert stale_digest != current_digest
+
+    report = verify_full_pulls(
+        full_staging={"w": current},
+        sources={"w": _Source((64,), [_shard((0,), (64,), stale_digest)])},
+        fresh_sources={"w": _Source((64,), [_shard((0,), (64,), current_digest)])},
+    )
+    assert report["mismatches"] == 0
+    assert report["checked"] == 1
+    assert report["digests_refreshed"] == 1
+    assert report["digest_source"] == "fresh"
+
+
+def test_without_the_fresh_table_the_same_case_is_reported_as_corruption():
+    """Pins the old behaviour, so the fix is demonstrably the thing that changed."""
+    current = torch.arange(64, dtype=torch.int16)
+    stale_digest = tensor_digest(torch.zeros(64, dtype=torch.int16))
+    report = verify_full_pulls(
+        full_staging={"w": current},
+        sources={"w": _Source((64,), [_shard((0,), (64,), stale_digest)])},
+    )
+    assert report["mismatches"] == 1
+    assert report["digest_source"] == "prepare"
+    assert report["digests_refreshed"] == 0
+
+
+def test_genuinely_wrong_bytes_still_fail_against_a_fresh_table():
+    """The fix must not become a way to pass by refreshing the expectation.
+
+    Fresh digest describes the publisher's current bytes; staging holds something
+    else. That is a real transport fault and must still fail.
+    """
+    delivered = torch.zeros(64, dtype=torch.int16)
+    publisher = torch.arange(64, dtype=torch.int16)
+    fresh_digest = tensor_digest(shard_region(publisher, (64,), (0,), (64,)))
+    report = verify_full_pulls(
+        full_staging={"w": delivered},
+        sources={"w": _Source((64,), [_shard((0,), (64,), fresh_digest)])},
+        fresh_sources={"w": _Source((64,), [_shard((0,), (64,), fresh_digest)])},
+    )
+    assert report["mismatches"] == 1
+    assert report["detail"][0]["source"] == "w"
+
+
+def test_refresh_is_keyed_by_session_and_offset_not_by_position():
+    """Discovery order is not stable and replicas rotate.
+
+    merge_shard_tables keeps the first offer of each geometry, so two discoveries
+    legitimately pin the same box to different but byte-identical replicas. A
+    positional match would pair a shard with another rank's digest - the mistake the
+    first version of the addr-recheck probe made, which claimed up to 100% of
+    addresses had moved.
+    """
+    current = torch.arange(64, dtype=torch.int16)
+    d = tensor_digest(shard_region(current, (64,), (0,), (64,)))
+    wrong = tensor_digest(torch.ones(64, dtype=torch.int16))
+    # Fresh table lists the same two sessions in the opposite order.
+    report = verify_full_pulls(
+        full_staging={"w": current},
+        sources={"w": _Source((64,), [_shard((0,), (64,), d, session="trainer-r1")])},
+        fresh_sources={
+            "w": _Source(
+                (64,),
+                [
+                    _shard((0,), (64,), wrong, session="trainer-r0"),
+                    _shard((0,), (64,), d, session="trainer-r1"),
+                ],
+            )
+        },
+    )
+    assert report["mismatches"] == 0, "matched the wrong session's digest"
+
+
+def test_a_source_absent_from_the_fresh_table_falls_back_to_prepare():
+    """A shard the fresh discovery does not offer must not become unverifiable.
+
+    Silently skipping it would shrink `checked` without saying so, and `checked` is
+    the number a run is judged on.
+    """
+    current = torch.arange(64, dtype=torch.int16)
+    d = tensor_digest(shard_region(current, (64,), (0,), (64,)))
+    report = verify_full_pulls(
+        full_staging={"w": current},
+        sources={"w": _Source((64,), [_shard((0,), (64,), d)])},
+        fresh_sources={"other": _Source((64,), [_shard((0,), (64,), d)])},
+    )
+    assert report["checked"] == 1
+    assert report["mismatches"] == 0
+    assert report["digests_refreshed"] == 0
+
+
+def test_publishers_without_digests_are_still_skipped_not_invented():
+    current = torch.arange(64, dtype=torch.int16)
+    report = verify_full_pulls(
+        full_staging={"w": current},
+        sources={"w": _Source((64,), [_shard((0,), (64,), None)])},
+        fresh_sources={"w": _Source((64,), [_shard((0,), (64,), None)])},
+    )
+    assert report["checked"] == 0
+    assert report["skipped_no_digest"] == 1
+
+
+def test_digests_refreshed_is_zero_when_nothing_moved():
+    """The weak-evidence signal.
+
+    On the run that resolved Bug 9, exactly 1 of ~18865 sources re-digested between
+    consecutive training steps - a GRPO step with zero advantage produces no policy
+    gradient. A gate run against weights that did not move proves much less than a
+    clean report suggests, so the count is surfaced rather than left implicit.
+    """
+    current = torch.arange(64, dtype=torch.int16)
+    d = tensor_digest(shard_region(current, (64,), (0,), (64,)))
+    report = verify_full_pulls(
+        full_staging={"w": current},
+        sources={"w": _Source((64,), [_shard((0,), (64,), d)])},
+        fresh_sources={"w": _Source((64,), [_shard((0,), (64,), d)])},
+    )
+    assert report["digests_refreshed"] == 0
+    assert report["digest_source"] == "fresh"
+    assert report["mismatches"] == 0
