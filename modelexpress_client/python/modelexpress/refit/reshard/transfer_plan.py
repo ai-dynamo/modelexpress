@@ -291,6 +291,27 @@ def plan_transfer(
     return plan
 
 
+def exact_descriptors(
+    plan: TransferPlan,
+    resolve_param_ptr: Callable[[str], int],
+) -> list[ReadDescriptor]:
+    """Absolute-address ``ReadDescriptor``s for the exact-segment phase.
+
+    Split out from :func:`execute_transfer` so a caller that issues the exact,
+    full-pull and convert phases as one batch can build the descriptors without
+    also performing the read.
+    """
+    return [
+        ReadDescriptor(
+            session=seg.session,
+            src_addr=seg.src_addr,
+            dst_addr=resolve_param_ptr(seg.param_name) + seg.dst_byte,
+            nbytes=seg.nbytes,
+        )
+        for seg in plan.segments
+    ]
+
+
 def execute_transfer(
     plan: TransferPlan,
     resolve_param_ptr: Callable[[str], int],
@@ -302,15 +323,7 @@ def execute_transfer(
 
     Returns a small stats dict; ``fallback`` is passed through so the receiver
     can reject an unsupported plan."""
-    descriptors = [
-        ReadDescriptor(
-            session=seg.session,
-            src_addr=seg.src_addr,
-            dst_addr=resolve_param_ptr(seg.param_name) + seg.dst_byte,
-            nbytes=seg.nbytes,
-        )
-        for seg in plan.segments
-    ]
+    descriptors = exact_descriptors(plan, resolve_param_ptr)
     transport.read(descriptors)
     return {
         "segments": len(descriptors),

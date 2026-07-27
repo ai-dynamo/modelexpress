@@ -24,6 +24,7 @@ transport, buffers and the router dtype-cast are shared here.
 from __future__ import annotations
 
 import logging
+import os
 
 import torch
 
@@ -31,7 +32,11 @@ from modelexpress.client import MxClient
 from modelexpress.nixl_transfer import NixlTransferManager
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
 from modelexpress.refit.reshard.rendezvous import gather_sources
-from modelexpress.refit.reshard.transfer_plan import execute_transfer, plan_transfer
+from modelexpress.refit.reshard.transfer_plan import (
+    exact_descriptors,
+    execute_transfer,
+    plan_transfer,
+)
 from modelexpress.refit.reshard.transport import (
     NixlReshardTransport,
     ReadDescriptor,
@@ -39,6 +44,15 @@ from modelexpress.refit.reshard.transport import (
 from modelexpress.refit.reshard.types import CaptureResult, UnsupportedReshard
 
 logger = logging.getLogger("modelexpress.refit.reshard.receiver")
+
+
+def _fused_wire_enabled() -> bool:
+    """Whether to issue the exact, full-pull and convert reads as one batch.
+
+    Read at call time so an A/B can toggle it without re-importing. Set
+    ``MX_RESHARD_FUSED_WIRE=0`` to drain each phase in turn.
+    """
+    return os.environ.get("MX_RESHARD_FUSED_WIRE", "1") not in ("0", "false")
 
 
 def _replay_ops(tensor: torch.Tensor, op_chain: tuple) -> torch.Tensor:
@@ -321,56 +335,83 @@ class ReshardReceiver:
 
         # RDMA the sliced bf16 into the receive buffers (segments) and per-param
         # staging (dtype-convert / router). No live param is written by RDMA.
-        stats = execute_transfer(
-            self._plan,
-            resolve_param_ptr=lambda name: self._param_ptr[name],
-            transport=self._transport,
+        #
+        # The three read phases target disjoint destinations - exact segments land
+        # in the receive buffers, full pulls in full staging, converts in convert
+        # staging - and every reader of those buffers (the re-slice below, the
+        # dtype cast) runs after all reads complete. So the phases carry no
+        # ordering dependency and are issued as one batch by default. Phased mode
+        # drains each in turn and is kept for the A/B.
+        full_descriptors = [
+            ReadDescriptor(
+                session=segment.session,
+                src_addr=segment.src_addr,
+                dst_addr=(
+                    self._full_staging_ptr[full_pull.src_name] + segment.dst_byte
+                ),
+                nbytes=segment.nbytes,
+            )
+            for full_pull in self._plan.full_pulls
+            for segment in full_pull.segments
+        ]
+        convert_descriptors = [
+            ReadDescriptor(
+                session=segment.session,
+                src_addr=segment.src_addr,
+                dst_addr=self._staging_ptr[convert.param_name] + segment.dst_byte,
+                nbytes=segment.nbytes,
+            )
+            for convert in self._plan.converts
+            for segment in convert.segments
+        ]
+
+        if _fused_wire_enabled():
+            descriptors = exact_descriptors(
+                self._plan, lambda name: self._param_ptr[name]
+            )
+            stats = {
+                "segments": len(descriptors),
+                "bytes": sum(descriptor.nbytes for descriptor in descriptors),
+                "fallback": list(self._plan.fallback),
+            }
+            self._transport.read(descriptors + full_descriptors + convert_descriptors)
+        else:
+            stats = execute_transfer(
+                self._plan,
+                resolve_param_ptr=lambda name: self._param_ptr[name],
+                transport=self._transport,
+            )
+            if full_descriptors:
+                self._transport.read(full_descriptors)
+            if convert_descriptors:
+                self._transport.read(convert_descriptors)
+
+        stats["segments"] += len(full_descriptors) + len(convert_descriptors)
+        stats["bytes"] += sum(
+            descriptor.nbytes
+            for descriptor in (*full_descriptors, *convert_descriptors)
         )
-        if self._plan.full_pulls:
-            full_descriptors = [
-                ReadDescriptor(
-                    session=segment.session,
-                    src_addr=segment.src_addr,
-                    dst_addr=(
-                        self._full_staging_ptr[full_pull.src_name] + segment.dst_byte
-                    ),
-                    nbytes=segment.nbytes,
+
+        # Local re-slice of every full-pulled source into its receive buffer, and
+        # the dtype cast for every converted param. Both read staging written by
+        # the reads above, so both must run after the wire completes.
+        for full_pull in self._plan.full_pulls:
+            full_tensor = self._full_staging[full_pull.src_name]
+            for copy in full_pull.copies:
+                source_view = _replay_ops(full_tensor, copy.op_chain)
+                receive_buffer = self._recv_buffers[copy.param_name]
+                destination = receive_buffer.as_strided(
+                    copy.dest_shape,
+                    copy.dest_stride,
+                    receive_buffer.storage_offset() + copy.dest_offset,
                 )
-                for full_pull in self._plan.full_pulls
-                for segment in full_pull.segments
-            ]
-            self._transport.read(full_descriptors)
-            for full_pull in self._plan.full_pulls:
-                full_tensor = self._full_staging[full_pull.src_name]
-                for copy in full_pull.copies:
-                    source_view = _replay_ops(full_tensor, copy.op_chain)
-                    receive_buffer = self._recv_buffers[copy.param_name]
-                    destination = receive_buffer.as_strided(
-                        copy.dest_shape,
-                        copy.dest_stride,
-                        receive_buffer.storage_offset() + copy.dest_offset,
-                    )
-                    destination.copy_(source_view)
-            stats["segments"] += len(full_descriptors)
-            stats["bytes"] += sum(descriptor.nbytes for descriptor in full_descriptors)
-        if self._plan.converts:
-            conv_descs = [
-                ReadDescriptor(
-                    session=seg.session,
-                    src_addr=seg.src_addr,
-                    dst_addr=self._staging_ptr[c.param_name] + seg.dst_byte,
-                    nbytes=seg.nbytes,
-                )
-                for c in self._plan.converts
-                for seg in c.segments
-            ]
-            self._transport.read(conv_descs)
-            # Cast the served bf16 staging into the (fp32) receive buffer - a torch
-            # op, so the RDMA never crosses dtypes. _install writes the buffer.
-            for c in self._plan.converts:
-                self._recv_buffers[c.param_name].copy_(self._staging[c.param_name])
-            stats["segments"] += len(conv_descs)
-            stats["bytes"] += sum(descriptor.nbytes for descriptor in conv_descs)
+                destination.copy_(source_view)
+        # Cast the served bf16 staging into the (fp32) receive buffer - a torch
+        # op, so the RDMA never crosses dtypes. _install writes the buffer.
+        for convert in self._plan.converts:
+            self._recv_buffers[convert.param_name].copy_(
+                self._staging[convert.param_name]
+            )
 
         self._install(self._recv_buffers)
         torch.cuda.synchronize(self._device)
