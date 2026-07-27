@@ -183,10 +183,33 @@ def plan_transfer(
     sources: dict,
     *,
     max_segments_per_copy: int | None = None,
+    force_full_pull: bool | None = None,
 ) -> TransferPlan:
     """Build a ``TransferPlan`` from captured copies + published ``sources``
     (``{src_name: SourceInfo}``). Sources flagged unsupported at capture, missing
-    from ``sources``, or non-box at ``plan_pull`` fall back to a full pull."""
+    from ``sources``, or non-box at ``plan_pull`` fall back to a full pull.
+
+    ``force_full_pull`` promotes *every* source to a full pull regardless of how few
+    descriptors its exact fetch would need. It exists for verification runs, and it
+    trades wire volume - which a correctness run does not care about - for gate
+    coverage, which it does.
+
+    The reason it is worth having: ``verify_full_pulls`` can only digest sources
+    whose whole shard lands in a staging buffer, because an exact-fetch segment is
+    scattered straight into a live param and digesting it would mean digesting the
+    destination layout instead of the source shard. On Topology B that left 6 192 of
+    18 867 sources checked - the row-parallel tensors that happened to be strided at
+    generator TP2 - and said nothing about the other 12 675, which include every
+    norm, the gate/up projections and all attention except ``o_proj``.
+
+    Read the resulting pass narrowly. It proves the publisher's bytes for every
+    source arrive intact, which is what Bug 6 and Bug 9 were about. It does **not**
+    verify the exact-fetch path itself: forcing full pulls replaces the segment
+    planning under test rather than checking it, so a bug in ``plan_pull``'s
+    slicing would be hidden rather than caught. Verifying that properly means
+    digesting the destination after install against a reference reconstructed from
+    the source shards, which is a different and larger piece of work.
+    """
     plan = TransferPlan()
     fallback_seen: set = set()
     exact_by_source: dict[str, list[tuple[RecordedCopy, list]]] = {}
@@ -197,6 +220,10 @@ def plan_transfer(
         )
     if max_segments_per_copy < 1:
         raise ValueError("max_segments_per_copy must be at least 1")
+    if force_full_pull is None:
+        force_full_pull = (
+            os.environ.get("MX_RESHARD_FORCE_FULL_PULL", "0") == "1"
+        )
 
     def mark_fallback(name: str) -> None:
         if name not in fallback_seen:
@@ -254,7 +281,7 @@ def plan_transfer(
         plan.exact_descriptor_count += len(segments)
         plan.exact_bytes += sum(segment.nbytes for segment in segments)
         exact_by_source.setdefault(copy.src_name, []).append((copy, segments))
-        if len(segments) > max_segments_per_copy:
+        if force_full_pull or len(segments) > max_segments_per_copy:
             full_pull_names.add(copy.src_name)
 
     for src_name, entries in exact_by_source.items():

@@ -307,3 +307,119 @@ if __name__ == "__main__":
     test_strided_source_reconstructs_exactly()
     test_unsupported_source_routes_to_fallback()
     print("OK: reshard reconstructs ground truth + strided + fallback")
+
+
+# ------------------------------------------------- force_full_pull (gate coverage)
+#
+# `verify_full_pulls` can only digest a source whose whole shard lands in a staging
+# buffer, because an exact-fetch segment is scattered straight into a live param and
+# digesting it would mean digesting the destination layout instead of the source
+# shard. On Topology B that left 6192 of 18867 sources checked - the row-parallel
+# tensors that happened to be strided at generator TP2 - and said nothing about the
+# other 12675, which include every norm, the gate/up projections, and all attention
+# except o_proj.
+#
+# force_full_pull buys gate coverage with wire volume: a correctness run can afford
+# that and a timing run cannot, which is why it defaults off and why one of the tests
+# below pins the default.
+#
+# Read a pass under this flag narrowly. It proves the publisher's bytes for every
+# source arrive intact. It does NOT verify the exact-fetch path, because forcing full
+# pulls replaces the segment planning rather than checking it.
+def _every_source_exact():
+    """A case where nothing would be promoted, so promotion is unambiguous.
+
+    The threshold is passed explicitly and loosely rather than left at the default:
+    the point of the baseline is that `full_pulls` is empty for reasons the test
+    controls, not because the toy model happens to sit under the default cliff.
+    """
+    srcs = _full_sources()
+    with torch.device("meta"):
+        meta_model = ToyModel()
+    capture = capture_geometry(meta_model, _manifest())
+    return capture, _whole_tensor_sources(srcs), srcs
+
+
+LOOSE = 1024  # high enough that no copy in the toy model is ever promoted
+
+
+def test_force_full_pull_promotes_what_the_threshold_would_not():
+    capture, sources, srcs = _every_source_exact()
+
+    plain = plan_transfer(capture, sources, max_segments_per_copy=LOOSE)
+    assert plain.full_pulls == [], "baseline must leave everything on the exact path"
+    assert plain.segments, "baseline must actually fetch something"
+
+    forced = plan_transfer(
+        capture, sources, max_segments_per_copy=LOOSE, force_full_pull=True
+    )
+    assert forced.full_pulls, "forced run promoted nothing"
+    assert forced.segments == [], "nothing may remain on the exact path"
+
+    assert all(t.data_ptr() for t in srcs.values())  # keep alive
+
+
+def test_force_full_pull_never_loses_a_source():
+    """Promotion must not drop work: gate coverage is worthless if it narrows the
+    refit. This is the invariant Bug 8 violated by a different route."""
+    capture, sources, srcs = _every_source_exact()
+
+    def covered(plan):
+        """Destination params the plan will fill, by whichever route.
+
+        Keyed on the destination rather than the source: the question is whether
+        the engine ends up with every parameter written, which is what Bug 8
+        broke, and a promoted source serves its copies through
+        ``FullPullSource.copies`` instead of through ``segments``.
+        """
+        return {segment.param_name for segment in plan.segments} | {
+            copy.param_name for fp in plan.full_pulls for copy in fp.copies
+        }
+
+    plain = plan_transfer(capture, sources, max_segments_per_copy=LOOSE)
+    forced = plan_transfer(
+        capture, sources, max_segments_per_copy=LOOSE, force_full_pull=True
+    )
+    assert covered(forced) == covered(plain)
+    assert forced.fallback == []
+    assert all(t.data_ptr() for t in srcs.values())
+
+
+def test_force_full_pull_costs_wire_and_that_is_the_trade():
+    """Pinned so nobody enables this on a timing run without noticing."""
+    capture, sources, srcs = _every_source_exact()
+    plain = plan_transfer(capture, sources, max_segments_per_copy=LOOSE)
+    forced = plan_transfer(
+        capture, sources, max_segments_per_copy=LOOSE, force_full_pull=True
+    )
+    assert forced.bytes_planned() >= plain.bytes_planned()
+    assert forced.extra_wire_bytes() >= plain.extra_wire_bytes()
+    assert all(t.data_ptr() for t in srcs.values())
+
+
+def test_force_full_pull_defaults_off(monkeypatch):
+    """Every published benchmark row depends on this default staying cheap."""
+    monkeypatch.delenv("MX_RESHARD_FORCE_FULL_PULL", raising=False)
+    capture, sources, srcs = _every_source_exact()
+    plan = plan_transfer(capture, sources, max_segments_per_copy=LOOSE)
+    assert plan.full_pulls == []
+    assert all(t.data_ptr() for t in srcs.values())
+
+
+def test_force_full_pull_reads_the_environment(monkeypatch):
+    monkeypatch.setenv("MX_RESHARD_FORCE_FULL_PULL", "1")
+    capture, sources, srcs = _every_source_exact()
+    plan = plan_transfer(capture, sources, max_segments_per_copy=LOOSE)
+    assert plan.full_pulls, "env flag did not take effect"
+    assert all(t.data_ptr() for t in srcs.values())
+
+
+def test_an_explicit_argument_beats_the_environment(monkeypatch):
+    """So a timing harness can hard-disable it regardless of ambient env."""
+    monkeypatch.setenv("MX_RESHARD_FORCE_FULL_PULL", "1")
+    capture, sources, srcs = _every_source_exact()
+    plan = plan_transfer(
+        capture, sources, max_segments_per_copy=LOOSE, force_full_pull=False
+    )
+    assert plan.full_pulls == []
+    assert all(t.data_ptr() for t in srcs.values())

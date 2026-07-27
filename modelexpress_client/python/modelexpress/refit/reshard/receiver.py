@@ -68,6 +68,9 @@ _STAGE_RECORD = os.environ.get("MX_REFIT_STAGE_RECORD", "1") == "1"
 # instead of drained in turn. Set to "0" for the phased path, which is also the
 # only way to recover per-phase wire attribution.
 _FUSED_WIRE = os.environ.get("MX_RESHARD_FUSED_WIRE", "1") == "1"
+# Per-rank fabric ceiling in Gbps. A refit that beats it did not transfer (Bug 10).
+# Zero disables the check: only the operator knows the real limit for their fabric.
+_MAX_GBPS = float(os.environ.get("MX_RESHARD_MAX_GBPS", "0") or 0)
 # Rotate which byte-identical DP/EDP replica serves each shard, per receiver rank,
 # instead of every receiver reading from the first publisher discovered. Off by
 # default until the per-session distribution measurement says it is needed.
@@ -1022,4 +1025,51 @@ class ReshardReceiver:
             # WARNING so benchmark harnesses capture it without enabling INFO
             # across every dependency.
             logger.warning("MX_REFIT_STAGE %s", json.dumps(record))
+        self._check_throughput_ceiling(step, stats["bytes"], stages)
         return metrics
+
+    def _check_throughput_ceiling(self, step: int, wire_bytes: int, stages: dict):
+        """Refuse a wire rate the fabric cannot physically produce.
+
+        Bug 10 delivered nothing and reported the fastest refit we had ever seen:
+        40.61 GB in 0.84 s, or 387 Gbps, on a pod holding two EFAs worth about
+        191 Gbps. Coverage said 100%, fallback said 0, the addresses and digests were
+        stable, and the only signal that dissented was the parameter-equality gate -
+        which timing runs deliberately switch off. Without this check that run would
+        have become the best row in the matrix.
+
+        An impossible rate is not a measurement, so it must abort rather than be
+        recorded with a caveat: the number is evidence that the transport reported
+        completions it did not earn. Off unless a ceiling is configured, because only
+        the operator knows the fabric's real per-rank limit.
+        """
+        if _MAX_GBPS <= 0 or wire_bytes <= 0:
+            return
+        wire_s = stages.get("wire_fused_s")
+        if wire_s is None:
+            wire_s = sum(
+                stages.get(k, 0.0)
+                for k in ("wire_exact_s", "wire_full_s", "wire_convert_s")
+            )
+        if not wire_s or wire_s <= 0:
+            return
+        implied_gbps = wire_bytes * 8 / wire_s / 1e9
+        if implied_gbps <= _MAX_GBPS:
+            return
+        detail = {
+            "schema": "refit-impossible-throughput-v1",
+            "step": step,
+            "wire_bytes": wire_bytes,
+            "wire_s": round(wire_s, 6),
+            "implied_gbps": round(implied_gbps, 1),
+            "ceiling_gbps": _MAX_GBPS,
+        }
+        logger.warning("MX_REFIT_IMPOSSIBLE_THROUGHPUT %s", json.dumps(detail))
+        raise RuntimeError(
+            f"[reshard] step {step} moved {wire_bytes} bytes in {wire_s:.4f}s, an "
+            f"implied {implied_gbps:.1f} Gbps against a per-rank ceiling of "
+            f"{_MAX_GBPS:.1f} Gbps. The fabric cannot do this, so the transport "
+            f"reported completions without delivering payload (see Bug 10: "
+            f"libfabric device selection falling back to devices the pod does not "
+            f"own). Treat this refit as failed, not fast."
+        )
