@@ -38,6 +38,7 @@ ncclBfloat16 = 9
 ncclFloat8e4m3, ncclFloat8e5m2 = 10, 11  # available in recent NCCL
 
 ncclSuccess = 0
+ncclInProgress = 7
 NCCL_WIN_COLL_SYMMETRIC = 2  # window mode flag (see nccl.h / device API)
 NCCL_UNIQUE_ID_BYTES = 128
 
@@ -147,6 +148,12 @@ class M2N:
         self.nccl.ncclCommInitRank.restype = ctypes.c_int
         self.nccl.ncclCommDestroy.argtypes = [ctypes.c_void_p]
         self.nccl.ncclCommDestroy.restype = ctypes.c_int
+        # ncclCommGetAsyncError(ncclComm_t, ncclResult_t*)
+        self.nccl.ncclCommGetAsyncError.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        self.nccl.ncclCommGetAsyncError.restype = ctypes.c_int
 
         # cuda device-to-device staging copy (window base <-> param tile)
         self.cudart.cudaMemcpy.argtypes = [
@@ -179,7 +186,8 @@ class M2N:
     def init(self, max_cta: int | None = None):
         cfg = make_config(max_cta)
         rc = self.m2n.ncclM2nInit(ctypes.byref(cfg))
-        assert rc == ncclSuccess, f"ncclM2nInit rc={rc}"
+        if rc != ncclSuccess:
+            raise RuntimeError(f"ncclM2nInit rc={rc}")
 
     def finalize(self):
         self.m2n.ncclM2nFinalize()
@@ -187,7 +195,8 @@ class M2N:
     def mem_alloc(self, nbytes: int) -> int:
         p = ctypes.c_void_p()
         rc = self.nccl.ncclMemAlloc(ctypes.byref(p), nbytes)
-        assert rc == ncclSuccess, f"ncclMemAlloc rc={rc}"
+        if rc != ncclSuccess:
+            raise RuntimeError(f"ncclMemAlloc rc={rc}")
         return p.value
 
     def mem_free(self, ptr: int):
@@ -198,7 +207,8 @@ class M2N:
         rc = self.nccl.ncclCommWindowRegister(
             comm, ptr, nbytes, ctypes.byref(win), NCCL_WIN_COLL_SYMMETRIC
         )
-        assert rc == ncclSuccess, f"ncclCommWindowRegister rc={rc}"
+        if rc != ncclSuccess:
+            raise RuntimeError(f"ncclCommWindowRegister rc={rc}")
         return win.value
 
     def window_deregister(self, comm: int, win: int):
@@ -206,20 +216,37 @@ class M2N:
 
     def memcpy_dtod(self, dst_ptr: int, src_ptr: int, nbytes: int):
         rc = self.cudart.cudaMemcpy(dst_ptr, src_ptr, nbytes, _CUDA_MEMCPY_DEVICE_TO_DEVICE)
-        assert rc == 0, f"cudaMemcpy rc={rc}"
+        if rc != 0:
+            raise RuntimeError(f"cudaMemcpy rc={rc}")
 
     def device_synchronize(self):
         rc = self.cudart.cudaDeviceSynchronize()
-        assert rc == 0, f"cudaDeviceSynchronize rc={rc}"
+        if rc != 0:
+            raise RuntimeError(f"cudaDeviceSynchronize rc={rc}")
+
+    def set_device(self, device_id: int):
+        rc = self.cudart.cudaSetDevice(device_id)
+        if rc != 0:
+            raise RuntimeError(f"cudaSetDevice({device_id}) rc={rc}")
 
     def comm_init_rank(self, nranks: int, uid: ncclUniqueId, rank: int) -> int:
         comm = ctypes.c_void_p()
         rc = self.nccl.ncclCommInitRank(ctypes.byref(comm), nranks, uid, rank)
-        assert rc == ncclSuccess, f"ncclCommInitRank rc={rc}"
+        if rc != ncclSuccess:
+            raise RuntimeError(f"ncclCommInitRank rc={rc}")
         return comm.value
 
     def comm_destroy(self, comm: int):
         self.nccl.ncclCommDestroy(comm)
+
+    def comm_get_async_error(self, comm: int) -> int:
+        """Block until the comm leaves ncclInProgress, then return its async state."""
+        state = ctypes.c_int(ncclInProgress)
+        while state.value == ncclInProgress:
+            rc = self.nccl.ncclCommGetAsyncError(comm, ctypes.byref(state))
+            if rc != ncclSuccess:
+                raise RuntimeError(f"ncclCommGetAsyncError rc={rc}")
+        return state.value
 
     def reshard(
         self,
@@ -228,10 +255,12 @@ class M2N:
         src: ncclDistTensor_t,
         dst: ncclDistTensor_t,
         stream: int = 0,
-    ) -> int:
-        return self.m2n.ncclReshardWithWindow(
+    ) -> None:
+        rc = self.m2n.ncclReshardWithWindow(
             comm, window, ctypes.byref(src), ctypes.byref(dst), stream
         )
+        if rc != ncclSuccess:
+            raise RuntimeError(f"ncclReshardWithWindow rc={rc}")
 
 
 def make_tensor_desc(data_ptr, local_shape, ndims, dtype, mesh: ncclMesh_t) -> ncclDistTensor_t:
@@ -278,12 +307,13 @@ def bootstrap_comm_from_torch(m2n: M2N, tp_src: int, tp_dst: int, device_id: int
 
     if device_id is None:
         device_id = torch.cuda.current_device()
-    m2n.cudart.cudaSetDevice(device_id)
+    m2n.set_device(device_id)
 
     uid = ncclUniqueId()
     if rank == 0:
         rc = m2n.nccl.ncclGetUniqueId(ctypes.byref(uid))
-        assert rc == ncclSuccess, f"ncclGetUniqueId rc={rc}"
+        if rc != ncclSuccess:
+            raise RuntimeError(f"ncclGetUniqueId rc={rc}")
 
     # Broadcast the 128 uniqueId bytes from rank 0 over torch.distributed.  Use a
     # CPU tensor so the control-plane PG can be gloo -- keeping torch from

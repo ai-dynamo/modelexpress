@@ -92,12 +92,24 @@ class NcclM2nExecutor:
         """
         if self._window is not None and self._window_bytes >= nbytes:
             return
-        if self._window is not None:
-            self._m2n.window_deregister(self._comm, self._window)
-            self._m2n.mem_free(self._window_buf)
+        self._release_window()
         self._window_buf = self._m2n.mem_alloc(nbytes)
         self._window = self._m2n.window_register(self._comm, self._window_buf, nbytes)
         self._window_bytes = nbytes
+
+    def _release_window(self) -> None:
+        if self._window is not None:
+            self._m2n.window_deregister(self._comm, self._window)
+            self._window = None
+        if self._window_buf is not None:
+            self._m2n.mem_free(self._window_buf)
+            self._window_buf = None
+        self._window_bytes = 0
+
+    def _check_async_error(self, name: str) -> None:
+        state = self._m2n.comm_get_async_error(self._comm)
+        if state != binding.ncclSuccess:
+            raise RuntimeError(f"nccl async error after reshard({name!r}): {state}")
 
     def execute(self, params: list[ReshardParam], window_bytes: int) -> tuple[int, float]:
         """Reshard every param.  ``window_bytes`` is the world-consistent window size.
@@ -108,9 +120,27 @@ class NcclM2nExecutor:
             return 0, 0.0
 
         self._ensure_window(window_bytes)
-        assert self._window is not None and self._window_buf is not None
 
         start = time.perf_counter()
+
+        try:
+            total_bytes = self._reshard_all(params)
+        except BaseException:
+            self._release_window()
+            raise
+
+        elapsed = time.perf_counter() - start
+        gbps = (total_bytes * 8) / (elapsed * 1e9) if elapsed > 0 else 0.0
+        logger.info(
+            "reshard complete: %d params, %.2f GB in %.3fs (%.1f Gbps)",
+            len(params),
+            total_bytes / 1e9,
+            elapsed,
+            gbps,
+        )
+        return total_bytes, elapsed
+
+    def _reshard_all(self, params: list[ReshardParam]) -> int:
         total_bytes = 0
 
         for p in params:
@@ -138,36 +168,26 @@ class NcclM2nExecutor:
                 dst_ptr, dst_local, p.ndims, p.dtype_nccl, dst_mesh
             )
 
-            rc = self._m2n.reshard(self._comm, self._window, src_t, dst_t, self._stream)
-            if rc != binding.ncclSuccess:
-                raise RuntimeError(f"ncclReshardWithWindow({p.name!r}) rc={rc}")
+            self._m2n.reshard(self._comm, self._window, src_t, dst_t, self._stream)
 
             # Copy the resharded tile out of the window into the live param.
             if not self._is_src:
                 self._m2n.device_synchronize()
+                self._check_async_error(p.name)
                 self._m2n.memcpy_dtod(p.local_ptr, self._window_buf, p.local_nbytes)
 
             total_bytes += p.local_nbytes
 
         self._m2n.device_synchronize()
-        elapsed = time.perf_counter() - start
-        gbps = (total_bytes * 8) / (elapsed * 1e9) if elapsed > 0 else 0.0
-        logger.info(
-            "reshard complete: %d params, %.2f GB in %.3fs (%.1f Gbps)",
-            len(params),
-            total_bytes / 1e9,
-            elapsed,
-            gbps,
-        )
-        return total_bytes, elapsed
+        if params:
+            self._check_async_error(params[-1].name)
+        return total_bytes
 
     def teardown(self) -> None:
-        if self._window is not None:
-            self._m2n.window_deregister(self._comm, self._window)
-            self._m2n.mem_free(self._window_buf)
-            self._window = None
-            self._window_buf = None
-            self._window_bytes = 0
+        self._release_window()
+        if self._comm is not None:
+            self._m2n.comm_destroy(self._comm)
+            self._comm = None
         self._m2n.finalize()
 
 
@@ -185,6 +205,13 @@ def torch_dtype_to_nccl(dtype) -> int:
         torch.int32: binding.ncclInt32,
         torch.int64: binding.ncclInt64,
     }
+    for attr, enum in (
+        ("float8_e4m3fn", binding.ncclFloat8e4m3),
+        ("float8_e5m2", binding.ncclFloat8e5m2),
+    ):
+        torch_dtype = getattr(torch, attr, None)
+        if torch_dtype is not None:
+            table[torch_dtype] = enum
     if dtype not in table:
         raise ValueError(f"unsupported dtype for reshard: {dtype}")
     return table[dtype]
