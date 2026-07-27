@@ -33,7 +33,7 @@ inputs:
   vcluster_k8s_version:
     description: 'Kubernetes version for the vCluster control plane'
     required: false
-    default: 'v1.32.13'
+    default: 'v1.33.13'
   dynamo_ref:
     description: |
       Git ref of the ai-dynamo/dynamo repo to clone for the helm chart.
@@ -143,7 +143,8 @@ runs:
           --set 'controlPlane.statefulSet.scheduling.nodeSelector.kubernetes\.azure\.com/agentpool=system' \
           --set 'controlPlane.statefulSet.scheduling.tolerations[0].key=CriticalAddonsOnly' \
           --set 'controlPlane.statefulSet.scheduling.tolerations[0].operator=Exists' \
-          --set 'controlPlane.statefulSet.scheduling.tolerations[0].effect=NoSchedule'
+          --set 'controlPlane.statefulSet.scheduling.tolerations[0].effect=NoSchedule' \
+          --set controlPlane.coredns.deployment.image=registry.k8s.io/coredns/coredns:v1.12.0
         echo "::endgroup::"
 
     - name: Wait for vCluster pod to be ready
@@ -235,6 +236,13 @@ runs:
           TAG_OVERRIDE=(--set "dynamo-operator.controllerManager.manager.image.tag=${OPERATOR_TAG}")
         fi
 
+        # No --wait: on a freshly-created vCluster the API server has startup
+        # transients (kine.sock not yet ready, post-start hooks briefly failing)
+        # that delay the Deployment controller from updating availableReplicas.
+        # helm --wait polls that lagged status and times out even though the
+        # operator pod reaches Running within ~1-2 min on the host. The operator
+        # is up well before the Dynamo tests need it (P2P tests run first and
+        # take several minutes), so we don't gate bootstrap on it here.
         helm upgrade --install dynamo-platform . \
           --namespace dynamo-system \
           --set dynamo-operator.controllerManager.manager.image.repository="${OPERATOR_IMAGE}" \
@@ -242,7 +250,7 @@ runs:
           --set dynamo-operator.gpuDiscovery.enabled=false \
           --set global.grove.install=true \
           --set global.kai-scheduler.install=false \
-          --wait --timeout 10m --debug
+          --debug
         echo "::endgroup::"
 
     - name: Debug failure
