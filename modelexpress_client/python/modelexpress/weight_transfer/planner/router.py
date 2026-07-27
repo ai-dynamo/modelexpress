@@ -180,6 +180,14 @@ def _zip_src_dst(
     Both sides are decomposed into element runs of matching total size.
     Walk them in lockstep, splitting at whichever side's boundary comes first.
     """
+    src_total = sum(count for _, _, count in src_triples)
+    dst_total = sum(count for _, count in dst_runs)
+    if src_total != dst_total:
+        raise ValueError(
+            f"source and destination element counts differ ({src_total} != {dst_total}); "
+            "zipping them would emit a partial descriptor list that transfers as success"
+        )
+
     descriptors: list[RdmaDescriptor] = []
 
     src_iter = iter(src_triples)
@@ -230,7 +238,11 @@ def route_regions(
     for region in regions:
         trainer_tensor = table.tensor_by_name(region.tensor_name)
         if trainer_tensor is None:
-            continue
+            raise ValueError(
+                f"no trainer tensor named {region.tensor_name!r} in the trainer table; "
+                "routing it away silently would leave the parameter stale while the "
+                "transfer still reported success"
+            )
 
         full_width = math.prod(trainer_tensor.shape[1:]) if len(trainer_tensor.shape) > 1 else 1
         # Sort shards: primary by row_start, secondary by col_start for 2-D tiles
