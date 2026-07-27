@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -79,6 +80,22 @@ def _pool_reg_enabled() -> bool:
     return envs.MX_POOL_REG
 
 
+@dataclass
+class PostedRead:
+    """A batched RDMA READ that has been posted but not yet waited on.
+
+    Held by the caller between ``post_read_batch`` and ``await_read_batches`` so
+    several peers can have transfers in flight at once. The handle is owned by
+    ``await_read_batches``, which releases it.
+    """
+
+    handle: Any
+    remote_agent_name: str
+    total_bytes: int
+    num_ranges: int
+    posted_at: float = field(default_factory=time.perf_counter)
+
+
 class NixlTransferManager:
     """
     Manages a single NIXL agent and RDMA transfers.
@@ -118,6 +135,16 @@ class NixlTransferManager:
     def agent_name(self) -> str:
         """Get NIXL agent name."""
         return self._agent_name
+
+    @property
+    def backends(self) -> list[str]:
+        """NIXL backends this agent was created with (see MX_NIXL_BACKEND).
+
+        Callers that issue their own NIXL calls against :attr:`agent` must pass
+        this rather than a literal, or the transfer is prepared on a backend the
+        agent does not have (e.g. UCX on AWS EFA).
+        """
+        return list(self._backends)
 
     @property
     def nixl_metadata(self) -> bytes:
@@ -444,6 +471,41 @@ class NixlTransferManager:
 
         return sorted(seen.items())
 
+    def _wait_for_xfers(
+        self,
+        handles: list,
+        timeout_seconds: float | None,
+        label: str,
+    ) -> None:
+        """Poll several NIXL handles until all complete or one fails.
+
+        Sleeps only when a full sweep completed nothing, so the polling slop is
+        paid once for the whole set rather than once per handle.
+        """
+        if self._agent is None:
+            raise RuntimeError("NIXL agent not initialized")
+        pending = list(handles)
+        wait_start = time.perf_counter()
+        while pending:
+            if (
+                timeout_seconds is not None
+                and time.perf_counter() - wait_start >= timeout_seconds
+            ):
+                raise TimeoutError(
+                    f"{label} timed out with {len(pending)} transfer(s) outstanding"
+                )
+            still_pending = []
+            for handle in pending:
+                status = self._agent.check_xfer_state(handle)
+                if status in ("DONE", "SUCCESS"):
+                    continue
+                if status in ("ERR", "ERROR", "FAIL"):
+                    raise RuntimeError(f"{label} failed with status {status}")
+                still_pending.append(handle)
+            if len(still_pending) == len(pending):
+                time.sleep(0.001)
+            pending = still_pending
+
     def _wait_for_xfer(
         self,
         handle: Any,
@@ -714,13 +776,35 @@ class NixlTransferManager:
         exact sub-tensor runs a reshard pull needs - one dest param filled from
         many non-contiguous source segments across a single READ.
 
+        Equivalent to ``post_read_batch`` followed immediately by
+        ``await_read_batches``, i.e. one peer at a time. Prefer posting several
+        batches and awaiting them together when reading from multiple peers.
+
         Returns ``(total_bytes, num_reads, duration)``.
+        """
+        posted = self.post_read_batch(remote_agent_name, ranges, mem_type=mem_type)
+        if posted is None:
+            return 0, 0, 0.0
+        return self.await_read_batches([posted], timeout_seconds=timeout_seconds)
+
+    def post_read_batch(
+        self,
+        remote_agent_name: str,
+        ranges: list[tuple[int, int, int, int]],
+        mem_type: str | None = None,
+    ) -> PostedRead | None:
+        """Prepare and post one batched RDMA READ **without** waiting for it.
+
+        Same ``ranges`` contract as :meth:`execute_read_batch`. Returns ``None``
+        when there are no bytes to move. Every returned :class:`PostedRead` must
+        be handed to :meth:`await_read_batches`, which owns releasing the handle;
+        dropping one leaks it.
         """
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
         ranges = [r for r in ranges if r[2] > 0]
         if not ranges:
-            return 0, 0, 0.0
+            return None
 
         mem = mem_type or self._accelerator_backend.nixl_mem_type
         remote_descs = [
@@ -741,7 +825,7 @@ class NixlTransferManager:
             except Exception as exc:  # noqa: BLE001 - diagnostics must never break the transfer
                 _known = f"n/a ({exc!r})"
             logger.debug(
-                "execute_read_batch: agent=%s mem=%s reads=%d remote_metadata_loaded=%s remote_sample=%s local_dev=%d",
+                "post_read_batch: agent=%s mem=%s reads=%d remote_metadata_loaded=%s remote_sample=%s local_dev=%d",
                 remote_agent_name,
                 mem,
                 len(remote_descs),
@@ -750,7 +834,7 @@ class NixlTransferManager:
                 self._device_id,
             )
 
-        start_time = time.perf_counter()
+        posted_at = time.perf_counter()
         handle = None
         try:
             src_prepped = self._agent.prep_xfer_dlist(
@@ -775,19 +859,62 @@ class NixlTransferManager:
                 backends=self._backends,
             )
             self._agent.transfer(handle)
+        except Exception:
+            # Nothing is in flight for this batch, so drop its handle here rather
+            # than handing a dead batch to await_read_batches.
+            if handle is not None:
+                self._release_xfer_handle(handle)
+            raise
 
-            self._wait_for_xfer(
-                handle,
+        return PostedRead(
+            handle=handle,
+            remote_agent_name=remote_agent_name,
+            total_bytes=sum(nbytes for (_r, _l, nbytes, _d) in ranges),
+            num_ranges=len(ranges),
+            posted_at=posted_at,
+        )
+
+    def _release_xfer_handle(self, handle: Any) -> None:
+        """Release one handle, never raising. Used on cleanup paths where a
+        release failure must not mask the error that got us here."""
+        try:
+            self._agent.release_xfer_handle(handle)
+        except Exception as exc:  # noqa: BLE001 - cleanup must not mask the cause
+            logger.debug("release_xfer_handle failed: %r", exc)
+
+    def await_read_batches(
+        self,
+        posted: list,
+        timeout_seconds: float | None = None,
+    ) -> tuple[int, int, float]:
+        """Wait for posted READ batches to complete, then release every handle.
+
+        Accepts ``None`` entries so callers can pass ``post_read_batch`` results
+        straight through. Releases all handles even when one transfer fails, and
+        synchronizes the device once for the whole set rather than per batch.
+
+        Returns ``(total_bytes, num_reads, duration)`` aggregated over the set.
+        """
+        batches = [p for p in posted if p is not None]
+        if not batches:
+            return 0, 0, 0.0
+
+        try:
+            self._wait_for_xfers(
+                [p.handle for p in batches],
                 timeout_seconds,
                 "NIXL reshard READ batch",
             )
         finally:
-            if handle is not None:
-                self._agent.release_xfer_handle(handle)
+            for batch in batches:
+                self._release_xfer_handle(batch.handle)
 
         self._accelerator_backend.synchronize(self._device_id)
-        total_bytes = sum(nbytes for (_r, _l, nbytes, _d) in ranges)
-        return total_bytes, len(ranges), time.perf_counter() - start_time
+        return (
+            sum(p.total_bytes for p in batches),
+            sum(p.num_ranges for p in batches),
+            time.perf_counter() - min(p.posted_at for p in batches),
+        )
 
     def register_dram_buffer(self, buffer: torch.Tensor) -> Any:
         """Register one CPU buffer as NIXL DRAM and refresh agent metadata."""
