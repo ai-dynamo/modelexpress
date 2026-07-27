@@ -876,11 +876,17 @@ class NixlTransferManager:
 
     def _release_xfer_handle(self, handle: Any) -> None:
         """Release one handle, never raising. Used on cleanup paths where a
-        release failure must not mask the error that got us here."""
+        release failure must not mask the error that got us here.
+
+        Logged at WARNING rather than DEBUG: a refused release leaks the
+        descriptor list backing the transfer, and because every caller is a
+        cleanup path the leak has no other symptom. At DEBUG it is invisible in
+        production, where nobody runs the client at that level.
+        """
         try:
             self._agent.release_xfer_handle(handle)
         except Exception as exc:  # noqa: BLE001 - cleanup must not mask the cause
-            logger.debug("release_xfer_handle failed: %r", exc)
+            logger.warning("release_xfer_handle failed, handle leaked: %r", exc)
 
     def await_read_batches(
         self,
