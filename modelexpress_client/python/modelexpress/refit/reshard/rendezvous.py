@@ -341,9 +341,18 @@ class MxReshardRendezvous:
         timeout: float = 1200.0,
         poll_interval: float = 1.0,
     ) -> list:
-        """Block until ``expected_trainers`` trainer ranks are visible, then
-        fetch + unwrap each. Returns ``list[(agent_metadata, agent_name,
-        metadata_endpoint, tensors)]``, one per trainer rank."""
+        """Block until ``expected_trainers`` trainer ranks are visible **with a
+        non-empty shard table**, then return them.
+
+        Returns ``list[(agent_metadata, agent_name, metadata_endpoint,
+        tensors)]``, one per trainer rank.
+
+        A rank counts toward the quorum only once its published table names at
+        least one tensor. A rank that advertises READY with nothing to read has
+        registered no memory, so satisfying the quorum with it makes the receiver
+        stop waiting for the ranks that do have bytes and then stall in the P2P
+        handshake instead - a timeout attributed to the wrong component.
+        """
         trainer_id = self._identity("trainer")
         deadline = time.monotonic() + timeout
         while True:
@@ -352,21 +361,36 @@ class MxReshardRendezvous:
                 status_filter=p2p_pb2.SOURCE_STATUS_READY,
             )
             instances = list(resp.instances)
+            payloads, empty = [], 0
             if len(instances) >= expected_trainers:
-                break
+                for inst in instances:
+                    meta = self.client.get_metadata(inst.mx_source_id, inst.worker_id)
+                    if not meta.found:
+                        continue
+                    payload = unwrap_rendezvous_blob(meta.worker.nixl_metadata)
+                    if not payload[3]:
+                        empty += 1
+                        continue
+                    payloads.append(payload)
+                if len(payloads) >= expected_trainers:
+                    break
             if time.monotonic() >= deadline:
                 raise TimeoutError(
-                    f"timed out after {timeout}s waiting for {expected_trainers} trainer ranks "
-                    f"(saw {len(instances)})"
+                    f"timed out after {timeout}s waiting for {expected_trainers} "
+                    f"trainer ranks (saw {len(instances)} READY source(s), "
+                    f"{len(payloads)} with a non-empty shard table, {empty} empty)"
                 )
             time.sleep(poll_interval)
 
-        payloads = []
-        for inst in instances:
-            meta = self.client.get_metadata(inst.mx_source_id, inst.worker_id)
-            if not meta.found:
-                continue
-            payloads.append(unwrap_rendezvous_blob(meta.worker.nixl_metadata))
+        logger.info(
+            "[reshard] discovered %d trainer rank(s)%s: %s",
+            len(payloads),
+            f" ({empty} skipped as empty)" if empty else "",
+            ", ".join(
+                f"{name}@{endpoint}[{len(tensors)}]"
+                for (_meta, name, endpoint, tensors) in payloads
+            ),
+        )
         return payloads
 
 

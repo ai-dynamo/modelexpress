@@ -10,9 +10,32 @@ import pytest
 from modelexpress import p2p_pb2
 from modelexpress.refit.reshard.rendezvous import (
     MxReshardRendezvous,
+    PublishedShard,
+    PublishedTensor,
     _mx_version,
     wrap_rendezvous_blob,
 )
+
+
+def _one_tensor(agent_name="trainer-agent"):
+    """The smallest publishable shard table: one tensor, one shard."""
+    return [
+        PublishedTensor(
+            name="weight",
+            dtype="torch.bfloat16",
+            elsize=2,
+            full_shape=(4, 4),
+            shards=[
+                PublishedShard(
+                    agent_name=agent_name,
+                    device_id=0,
+                    addr=4096,
+                    shard_offset=(0, 0),
+                    shape=(4, 4),
+                )
+            ],
+        )
+    ]
 
 
 def test_mx_version_falls_back_only_when_package_is_missing(monkeypatch):
@@ -102,7 +125,7 @@ def test_published_rendezvous_stays_ready_and_closes_stale(monkeypatch):
         agent_metadata=b"nixl",
         agent_name="trainer-agent",
         metadata_endpoint="trainer:1234",
-        tensors=[],
+        tensors=_one_tensor(),
     )
 
     try:
@@ -110,9 +133,11 @@ def test_published_rendezvous_stays_ready_and_closes_stale(monkeypatch):
         assert client.worker.status == p2p_pb2.SOURCE_STATUS_READY
         assert client.heartbeat_seen.wait(timeout=1.0)
         assert client.publish_count == 1
-        assert rendezvous.discover_trainers(expected_trainers=1) == [
-            (b"nixl", "trainer-agent", "trainer:1234", [])
+        discovered = rendezvous.discover_trainers(expected_trainers=1)
+        assert [(meta, name, ep) for (meta, name, ep, _t) in discovered] == [
+            (b"nixl", "trainer-agent", "trainer:1234")
         ]
+        assert [t.name for t in discovered[0][3]] == ["weight"]
         assert client.status_filter == p2p_pb2.SOURCE_STATUS_READY
     finally:
         rendezvous.close()
@@ -123,6 +148,87 @@ def test_published_rendezvous_stays_ready_and_closes_stale(monkeypatch):
         "worker_rank": 2,
         "status": p2p_pb2.SOURCE_STATUS_STALE,
     }
+
+
+class _DiscoveryClient:
+    """Serves a fixed set of READY sources, each with its own shard table."""
+
+    def __init__(self, blobs):
+        self._blobs = list(blobs)
+
+    def list_sources(self, _identity, status_filter=None):
+        return SimpleNamespace(
+            instances=[
+                SimpleNamespace(mx_source_id=f"src-{i}", worker_id=f"w-{i}")
+                for i in range(len(self._blobs))
+            ]
+        )
+
+    def get_metadata(self, source_id, _worker_id):
+        index = int(source_id.rsplit("-", 1)[1])
+        return SimpleNamespace(
+            found=True,
+            worker=SimpleNamespace(nixl_metadata=self._blobs[index]),
+        )
+
+
+def _blob(agent_name, tensors):
+    return wrap_rendezvous_blob(
+        agent_metadata=b"nixl",
+        agent_name=agent_name,
+        metadata_endpoint=f"{agent_name}:1234",
+        tensors=tensors,
+    )
+
+
+def _rendezvous(client):
+    return MxReshardRendezvous(client, role="inference", rank=0, model_name="model")
+
+
+def test_a_publisher_with_no_tensors_does_not_count_toward_the_quorum():
+    """It has registered no memory, so counting it makes the receiver stop
+    waiting for the ranks that do have bytes and then stall in the handshake."""
+    client = _DiscoveryClient(
+        [_blob("empty-rank", []), _blob("real-rank", _one_tensor())]
+    )
+
+    with pytest.raises(TimeoutError) as excinfo:
+        _rendezvous(client).discover_trainers(expected_trainers=2, timeout=0)
+
+    message = str(excinfo.value)
+    assert "2 READY source(s)" in message
+    assert "1 with a non-empty shard table" in message
+    assert "1 empty" in message
+
+
+def test_quorum_is_met_once_every_rank_publishes_tensors():
+    client = _DiscoveryClient(
+        [_blob("rank-0", _one_tensor()), _blob("rank-1", _one_tensor())]
+    )
+
+    discovered = _rendezvous(client).discover_trainers(expected_trainers=2, timeout=0)
+
+    assert [name for (_meta, name, _ep, _tensors) in discovered] == [
+        "rank-0",
+        "rank-1",
+    ]
+
+
+def test_empty_publishers_are_excluded_from_the_returned_payloads():
+    """An extra healthy rank means the quorum is reachable without the empty one,
+    which must still not appear in the plan's sources."""
+    client = _DiscoveryClient(
+        [
+            _blob("rank-0", _one_tensor()),
+            _blob("empty-rank", []),
+            _blob("rank-1", _one_tensor()),
+        ]
+    )
+
+    discovered = _rendezvous(client).discover_trainers(expected_trainers=2, timeout=0)
+
+    assert "empty-rank" not in [name for (_meta, name, _ep, _t) in discovered]
+    assert len(discovered) == 2
 
 
 def test_invalid_heartbeat_period_fails_before_publish(monkeypatch):

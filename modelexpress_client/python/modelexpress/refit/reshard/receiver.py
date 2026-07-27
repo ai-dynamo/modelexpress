@@ -25,6 +25,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import time
+from collections import deque
 
 import torch
 
@@ -49,6 +52,135 @@ from modelexpress.refit.reshard.types import (
 )
 
 logger = logging.getLogger("modelexpress.refit.reshard.receiver")
+
+# Whole-handshake budget across every peer and every retry. A refit timeout is the
+# wrong bound: it lets one unreachable peer consume the entire refit. It must still
+# be generous, because a peer can be unreachable for minutes for a legitimate
+# reason - registering tens of GB with the fabric provider blocks its listen
+# thread - and the receiver's only correct response to that is to keep trying.
+_HANDSHAKE_TIMEOUT_S = float(os.environ.get("MX_RESHARD_HANDSHAKE_TIMEOUT_S", "900"))
+# Ceiling on a single dial. A reachable peer answers in well under a second, so a
+# short attempt costs nothing when things are healthy and, when they are not, frees
+# the budget to try a different peer instead of blocking on one.
+_HANDSHAKE_ATTEMPT_S = float(os.environ.get("MX_RESHARD_HANDSHAKE_ATTEMPT_S", "20"))
+# Pause after a full pass over the pending peers yields no progress, so a transient
+# stall is waited out rather than hammered.
+_HANDSHAKE_BACKOFF_S = float(os.environ.get("MX_RESHARD_HANDSHAKE_BACKOFF_S", "2"))
+
+
+def handshake_with_peers(
+    manager,
+    agent_endpoints: dict,
+    total_timeout: float,
+    attempt_timeout: float | None = None,
+) -> None:
+    """Fetch every trainer's NIXL metadata, bounded, retried and logged per peer.
+
+    Three properties, each earned from a failure mode observed on a live fabric:
+
+    *Bounded overall*, not per peer against the refit timeout. A publisher whose
+    process is gone still has its endpoint in the catalog - the reaper only marks
+    it stale after a heartbeat lapse, and an abandoned run can keep heartbeating -
+    so dialing it blocks. Charging a whole refit timeout to one dead peer hangs
+    the refit long past the driver's own deadline.
+
+    *Retried, and deferred rather than fatal on first failure.* A peer can be
+    listening yet transiently unable to accept: its accept loop is a thread in a
+    process that is busy publishing thousands of tensors, and a listen backlog
+    that never drains silently drops connection attempts. That is
+    indistinguishable from a dead peer within a single dial, but not across
+    several seconds, so a failed peer goes to the back of the queue and the next
+    one is tried instead of aborting the refit.
+
+    *Logged per peer.* Without it the last line in the log reports that remote
+    metadata is being fetched, and there is no way to tell which peer is at
+    fault, or whether it stalled on the first dial or the last.
+    """
+    attempt_timeout = attempt_timeout or _HANDSHAKE_ATTEMPT_S
+    pending = deque(agent_endpoints.items())
+    total = len(pending)
+    attempts: dict = {name: 0 for name in agent_endpoints}
+    last_error: dict = {}
+    deadline = time.monotonic() + total_timeout
+    succeeded = 0
+    # Consecutive failures with no success in between; one full pass over the
+    # pending peers without progress means waiting is better than spinning.
+    stalled = 0
+
+    while pending:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            outstanding = ", ".join(
+                f"{name}@{endpoint} ({attempts[name]} attempt(s), last: "
+                f"{type(last_error.get(name)).__name__}: {last_error.get(name)})"
+                for name, endpoint in pending
+            )
+            raise RuntimeError(
+                f"[reshard] P2P handshake incomplete after {total_timeout:.0f}s: "
+                f"{succeeded} of {total} peer(s) answered. Outstanding: "
+                f"{outstanding}. These publishers are advertised in the MX catalog "
+                f"but did not answer - either the process is gone while something "
+                f"still heartbeats its source, or its NIXL listen thread is not "
+                f"accepting."
+            )
+
+        agent_name, endpoint = pending.popleft()
+        host, port_str = endpoint.rsplit(":", 1)
+        this_timeout = max(1.0, min(attempt_timeout, remaining))
+        attempts[agent_name] += 1
+        logger.info(
+            "[reshard] _prepare: handshake %d/%d %s at %s (attempt %d, timeout=%.0fs)",
+            succeeded + 1,
+            total,
+            agent_name,
+            endpoint,
+            attempts[agent_name],
+            this_timeout,
+        )
+        started = time.perf_counter()
+        try:
+            manager.fetch_remote_and_wait(
+                agent_name, host, int(port_str), timeout_seconds=this_timeout
+            )
+        except Exception as exc:  # noqa: BLE001 - any dial failure is retryable
+            last_error[agent_name] = exc
+            logger.warning(
+                "[reshard] _prepare: handshake %s at %s failed after %.1fs on "
+                "attempt %d (%s: %s); deferring, %d peer(s) still pending",
+                agent_name,
+                endpoint,
+                time.perf_counter() - started,
+                attempts[agent_name],
+                type(exc).__name__,
+                exc,
+                len(pending) + 1,
+            )
+            pending.append((agent_name, endpoint))
+            stalled += 1
+            if stalled >= len(pending):
+                time.sleep(
+                    min(_HANDSHAKE_BACKOFF_S, max(0.0, deadline - time.monotonic()))
+                )
+                stalled = 0
+            continue
+
+        succeeded += 1
+        stalled = 0
+        last_error.pop(agent_name, None)
+        logger.info(
+            "[reshard] _prepare: handshake %d/%d %s ok in %.2fs (attempt %d)",
+            succeeded,
+            total,
+            agent_name,
+            time.perf_counter() - started,
+            attempts[agent_name],
+        )
+
+    retried = {name: count for name, count in attempts.items() if count > 1}
+    if retried:
+        logger.warning(
+            "[reshard] _prepare: handshake completed with retries: %s", retried
+        )
 
 
 def _coverage_floor() -> float:
@@ -226,11 +358,7 @@ class ReshardReceiver:
         # NIXL metadata (incl. its memory registrations) via its listen thread, so
         # prep_xfer_dlist can resolve the remote addresses. The central
         # add_remote_agent(blob) path does NOT convey the registrations.
-        for agent_name, endpoint in agent_endpoints.items():
-            host, port_str = endpoint.rsplit(":", 1)
-            self._manager.fetch_remote_and_wait(
-                agent_name, host, int(port_str), timeout_seconds=timeout
-            )
+        handshake_with_peers(self._manager, agent_endpoints, _HANDSHAKE_TIMEOUT_S)
 
         manifest = [
             (name, src.dtype, tuple(src.global_shape)) for name, src in sources.items()
