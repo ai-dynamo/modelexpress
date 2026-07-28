@@ -633,13 +633,13 @@ protocol are engine-agnostic.
 
 The minimal rendezvous publisher is called only after its NIXL agent and source
 buffers are registered, so `publish()` stores the worker as READY and repeated
-publication refreshes that worker record. It starts a daemon heartbeat that
-re-publishes the latest blob every `MX_RESHARD_HEARTBEAT_S` seconds (20 by
-default), keeping the record fresh for READY-only discovery. `close()` stops the
-heartbeat and best-effort marks the source STALE. Long-lived framework
-integrations still need to call `close()` from their lifecycle; SIGKILL,
-mid-transfer failure recovery, and server-state re-registration remain
-follow-up work.
+publication replaces that worker record. The shared `PublisherThread` sends a
+READY status heartbeat every `MX_HEARTBEAT_INTERVAL_SECS` seconds (30 by
+default), keeping the record fresh for READY-only discovery. `close()` uses the
+same publisher lifecycle to stop the heartbeat and best-effort mark the source
+STALE. Long-lived framework integrations still need to call `close()` from
+their lifecycle; SIGKILL and mid-transfer failure recovery remain follow-up
+work.
 
 `engines/vllm/refit/receiver.py` supplies the vLLM-specific boundaries: capture
 on an unquantized meta twin, then installation through vLLM's layerwise reload

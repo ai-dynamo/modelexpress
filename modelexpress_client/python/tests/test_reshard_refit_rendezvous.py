@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from importlib import metadata
-from threading import Event, Lock
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -61,15 +61,11 @@ def test_published_rendezvous_stays_ready_and_closes_stale(monkeypatch):
             self.publish_count = 0
             self.heartbeat_seen = Event()
             self.status_updates = []
-            self.lock = Lock()
 
         def publish_metadata(self, _identity, worker, worker_id):
-            with self.lock:
-                self.worker = worker
-                self.worker_id = worker_id
-                self.publish_count += 1
-                if self.publish_count >= 2:
-                    self.heartbeat_seen.set()
+            self.worker = worker
+            self.worker_id = worker_id
+            self.publish_count += 1
             return "source-id"
 
         def list_sources(self, _identity, status_filter=None):
@@ -89,9 +85,11 @@ def test_published_rendezvous_stays_ready_and_closes_stale(monkeypatch):
 
         def update_status(self, **kwargs):
             self.status_updates.append(kwargs)
+            if kwargs["status"] == p2p_pb2.SOURCE_STATUS_READY:
+                self.heartbeat_seen.set()
             return True
 
-    monkeypatch.setenv("MX_RESHARD_HEARTBEAT_S", "0.01")
+    monkeypatch.setenv("MX_HEARTBEAT_INTERVAL_SECS", "1")
     client = Client()
     rendezvous = MxReshardRendezvous(
         client,
@@ -111,7 +109,7 @@ def test_published_rendezvous_stays_ready_and_closes_stale(monkeypatch):
         assert rendezvous.publish(blob) == "source-id"
         assert client.worker.status == p2p_pb2.SOURCE_STATUS_READY
         assert client.heartbeat_seen.wait(timeout=1.0)
-        assert client.publish_count >= 2
+        assert client.publish_count == 1
         assert rendezvous.discover_trainers(expected_trainers=1) == [
             (b"nixl", "trainer-agent", "trainer:1234", [])
         ]
@@ -132,7 +130,7 @@ def test_invalid_heartbeat_period_fails_before_publish(monkeypatch):
         def publish_metadata(self, *_args, **_kwargs):
             raise AssertionError("publish must not run")
 
-    monkeypatch.setenv("MX_RESHARD_HEARTBEAT_S", "0")
+    monkeypatch.setenv("MX_HEARTBEAT_INTERVAL_SECS", "0")
     rendezvous = MxReshardRendezvous(
         Client(),
         role="trainer",
