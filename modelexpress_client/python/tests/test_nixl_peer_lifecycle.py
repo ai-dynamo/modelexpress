@@ -48,8 +48,10 @@ class FakeAgent:
         self.removed.append(name)
 
 
-def _manager(agent=None, metadata=b"md"):
-    mgr = NixlTransferManager(agent_name="tgt", device_id=0)
+def _manager(agent=None, metadata=b"md", accelerator=None):
+    mgr = NixlTransferManager(
+        agent_name="tgt", device_id=0, accelerator_backend=accelerator
+    )
     mgr._agent = agent if agent is not None else FakeAgent()
     mgr._metadata = metadata
     return mgr
@@ -68,10 +70,17 @@ class TestTracksLoadedPeers:
         name = mgr.add_remote_agent(b"some-metadata")
         assert mgr._remote_agents == {name: None}
 
-    def test_centralized_receive_tracks_peer_for_shutdown(self):
-        """The receive wrapper must not bypass the manager-owned inventory."""
+    def test_centralized_receive_tracks_peer_for_shutdown(
+        self, mock_accelerator_backend_cls
+    ):
+        """The receive wrapper must not bypass the manager-owned inventory.
+
+        Takes the mock accelerator because ``receive_from_source`` selects a
+        device before transferring, which the real CUDA backend cannot do on a
+        CPU-only runner.
+        """
         agent = FakeAgent()
-        mgr = _manager(agent=agent)
+        mgr = _manager(agent=agent, accelerator=mock_accelerator_backend_cls())
 
         mgr.receive_from_source(b"some-metadata", [])
         mgr.shutdown()
