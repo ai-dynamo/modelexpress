@@ -26,7 +26,22 @@ _logger = logging.getLogger(__name__)
 _loaders_registered = False
 
 
-def configure_vllm_logging():
+def _configure_engine_logging(engine_logger_name: str) -> None:
+    """Attach an engine's Python log handlers to the ModelExpress namespace."""
+    mx_root = logging.getLogger("modelexpress")
+    if mx_root.handlers:
+        return
+    engine_logger = logging.getLogger(engine_logger_name)
+    for handler in engine_logger.handlers:
+        mx_root.addHandler(handler)
+    mx_level = envs.MODEL_EXPRESS_LOG_LEVEL
+    if mx_level and hasattr(logging, mx_level):
+        mx_root.setLevel(getattr(logging, mx_level))
+    elif engine_logger.level != logging.NOTSET:
+        mx_root.setLevel(engine_logger.level)
+
+
+def configure_vllm_logging() -> None:
     """Ensure modelexpress loggers are visible in vLLM worker subprocesses.
 
     vLLM only attaches log handlers to the "vllm" namespace. Without this,
@@ -34,17 +49,12 @@ def configure_vllm_logging():
     processes. Copies vLLM's handlers onto the "modelexpress" parent logger
     so every child inherits them via propagation. Idempotent.
     """
-    mx_root = logging.getLogger("modelexpress")
-    if mx_root.handlers:
-        return
-    vllm_logger = logging.getLogger("vllm")
-    for handler in vllm_logger.handlers:
-        mx_root.addHandler(handler)
-    mx_level = envs.MODEL_EXPRESS_LOG_LEVEL
-    if mx_level and hasattr(logging, mx_level):
-        mx_root.setLevel(getattr(logging, mx_level))
-    elif vllm_logger.level != logging.NOTSET:
-        mx_root.setLevel(vllm_logger.level)
+    _configure_engine_logging("vllm")
+
+
+def configure_trtllm_logging() -> None:
+    """Ensure modelexpress loggers are visible in TRT-LLM worker processes."""
+    _configure_engine_logging("TRT-LLM")
 
 
 def register_modelexpress_loaders():
@@ -80,6 +90,7 @@ __all__ = [
     "MxClient",
     "MxGdsLoader",
     "PublisherThread",
+    "configure_trtllm_logging",
     "configure_vllm_logging",
     "register_modelexpress_loaders",
 ]
