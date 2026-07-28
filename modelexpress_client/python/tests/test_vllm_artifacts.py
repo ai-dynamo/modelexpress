@@ -747,3 +747,190 @@ def test_vllm_health_url_uses_ctx_head_addr(monkeypatch):
     assert artifacts._vllm_health_url(ctx) == (
         "http://mx-vllm-0.mx-vllm.test-ns:9090/health"
     )
+
+
+@pytest.fixture
+def clean_compile_cache_state():
+    """Isolate the module-level install bookkeeping between tests."""
+    artifacts._installed_compile_cache_dirs.clear()
+    yield artifacts._installed_compile_cache_dirs
+    artifacts._installed_compile_cache_dirs.clear()
+
+
+def _compile_check_ctx(cache_dir: str | None):
+    compilation_config = SimpleNamespace(cache_dir=cache_dir)
+    return SimpleNamespace(
+        global_rank=0,
+        device_id=0,
+        adapter=SimpleNamespace(
+            vllm_config=SimpleNamespace(compilation_config=compilation_config)
+        ),
+    )
+
+
+def test_install_records_compile_cache_dirs_created_by_transfer(
+    tmp_path,
+    monkeypatch,
+    clean_compile_cache_state,
+):
+    cache_root = tmp_path / "torch_compile_cache"
+    cache_root.mkdir()
+    (cache_root / "preexisting").mkdir()
+    monkeypatch.setenv("MX_ARTIFACT_TRANSFER", "1")
+    monkeypatch.setattr(artifacts, "_torch_compile_cache_root", lambda: cache_root)
+    ctx = SimpleNamespace(global_rank=0, device_id=3)
+
+    def fake_install(*args, **kwargs):
+        (cache_root / "installed-abc").mkdir()
+
+    with patch.object(
+        artifacts._artifact_lifecycle, "install_artifacts", side_effect=fake_install
+    ):
+        artifacts.install_vllm_cache_artifacts(ctx)
+
+    assert clean_compile_cache_state == {3: frozenset({"installed-abc"})}
+
+
+def test_install_records_nothing_when_no_cache_dir_appears(
+    tmp_path,
+    monkeypatch,
+    clean_compile_cache_state,
+):
+    cache_root = tmp_path / "torch_compile_cache"
+    cache_root.mkdir()
+    (cache_root / "preexisting").mkdir()
+    monkeypatch.setenv("MX_ARTIFACT_TRANSFER", "1")
+    monkeypatch.setattr(artifacts, "_torch_compile_cache_root", lambda: cache_root)
+
+    with patch.object(artifacts._artifact_lifecycle, "install_artifacts"):
+        artifacts.install_vllm_cache_artifacts(SimpleNamespace(global_rank=0, device_id=0))
+
+    assert clean_compile_cache_state == {}
+
+
+def test_install_tolerates_missing_compile_cache_root(
+    tmp_path,
+    monkeypatch,
+    clean_compile_cache_state,
+):
+    monkeypatch.setenv("MX_ARTIFACT_TRANSFER", "1")
+    monkeypatch.setattr(
+        artifacts, "_torch_compile_cache_root", lambda: tmp_path / "absent"
+    )
+
+    with patch.object(artifacts._artifact_lifecycle, "install_artifacts"):
+        artifacts.install_vllm_cache_artifacts(SimpleNamespace(global_rank=0, device_id=0))
+
+    assert clean_compile_cache_state == {}
+
+
+def test_compile_cache_check_warns_when_vllm_selected_another_directory(
+    caplog,
+    clean_compile_cache_state,
+):
+    clean_compile_cache_state[0] = frozenset({"a531dd9a8f"})
+
+    with caplog.at_level(
+        logging.WARNING, logger="modelexpress.engines.vllm.artifacts"
+    ):
+        artifacts._warn_if_compile_cache_unused(
+            _compile_check_ctx("/root/.cache/vllm/torch_compile_cache/0249c1b5c6/rank_0_0")
+        )
+
+    assert "a531dd9a8f" in caplog.text
+    assert "0249c1b5c6" in caplog.text
+    assert "recompiled" in caplog.text
+    assert "MX_ARTIFACT_COMPILE_CONFIG_DIGEST" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "cache_dir",
+    [
+        # Current layout: cache_dir is the hash directory itself.
+        "/root/.cache/vllm/torch_compile_cache/a531dd9a8f",
+        # Releases that append a rank suffix to cache_dir rather than only to
+        # local_cache_dir.
+        "/root/.cache/vllm/torch_compile_cache/a531dd9a8f/rank_0_0",
+        # AOT path, which nests the hash one level deeper.
+        "/root/.cache/vllm/torch_compile_cache/torch_aot_compile/a531dd9a8f/rank_0_0",
+    ],
+)
+def test_compile_cache_check_reports_hit_across_vllm_directory_layouts(
+    cache_dir,
+    caplog,
+    clean_compile_cache_state,
+):
+    clean_compile_cache_state[0] = frozenset({"a531dd9a8f"})
+
+    with caplog.at_level(logging.INFO, logger="modelexpress.engines.vllm.artifacts"):
+        artifacts._warn_if_compile_cache_unused(_compile_check_ctx(cache_dir))
+
+    assert "which ModelExpress installed" in caplog.text
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_compile_cache_check_is_quiet_without_an_install(
+    caplog,
+    clean_compile_cache_state,
+):
+    with caplog.at_level(logging.INFO, logger="modelexpress.engines.vllm.artifacts"):
+        artifacts._warn_if_compile_cache_unused(_compile_check_ctx("/cache/0249c1b5c6"))
+
+    assert caplog.records == []
+
+
+def test_compile_cache_check_is_quiet_without_a_selected_directory(
+    caplog,
+    clean_compile_cache_state,
+):
+    """enforce_eager and compilation-off runs never populate cache_dir."""
+    clean_compile_cache_state[0] = frozenset({"a531dd9a8f"})
+
+    with caplog.at_level(logging.INFO, logger="modelexpress.engines.vllm.artifacts"):
+        artifacts._warn_if_compile_cache_unused(_compile_check_ctx(""))
+
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_publish_runs_compile_cache_check_only_for_compile_artifacts(
+    clean_compile_cache_state,
+):
+    identity = p2p_pb2.SourceIdentity(
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE
+    )
+    transfer = SimpleNamespace(
+        name="triton_cache",
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
+    )
+    ctx = SimpleNamespace(global_rank=0, accelerator_backend=SimpleNamespace(name="cuda"))
+
+    with patch.object(
+        artifacts._artifact_lifecycle, "publish_artifact"
+    ), patch.object(artifacts, "_warn_if_compile_cache_unused") as check:
+        artifacts._publish_vllm_cache_artifact(ctx, transfer, identity)
+
+    check.assert_not_called()
+
+
+def test_publish_survives_a_failing_compile_cache_check(clean_compile_cache_state):
+    """The check runs on the publisher thread; it must never block publication."""
+    identity = p2p_pb2.SourceIdentity(
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE
+    )
+    transfer = SimpleNamespace(
+        name="torch_compile_cache",
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
+    )
+    ctx = SimpleNamespace(global_rank=0, accelerator_backend=SimpleNamespace(name="cuda"))
+    published = object()
+
+    with patch.object(
+        artifacts._artifact_lifecycle, "publish_artifact", return_value=published
+    ), patch.object(
+        artifacts,
+        "_warn_if_compile_cache_unused",
+        side_effect=AttributeError("adapter went away"),
+    ) as check:
+        assert artifacts._publish_vllm_cache_artifact(ctx, transfer, identity) is published
+
+    check.assert_called_once()

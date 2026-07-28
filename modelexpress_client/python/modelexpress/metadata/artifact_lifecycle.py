@@ -36,6 +36,7 @@ from .artifact_transfer import (
 )
 from .publisher import PublisherThread
 from .publish import _get_worker_server, _is_p2p_metadata_enabled
+from .source_id import compute_mx_source_id
 
 logger = logging.getLogger("modelexpress.metadata.artifact_lifecycle")
 
@@ -96,20 +97,28 @@ def install_artifacts(
                 continue
             log.info(
                 "[Worker %s] [TIMING] %s artifact install complete: "
-                "name=%s artifact_id=%s size=%.2f MiB elapsed=%.3fs",
+                "name=%s artifact_id=%s mx_source_id=%s size=%.2f MiB elapsed=%.3fs",
                 ctx.global_rank,
                 engine_label,
                 transfer.name,
                 header.artifact_id,
+                compute_mx_source_id(identity),
                 header.total_size / (1024 * 1024),
                 elapsed,
             )
         except LookupError:
-            log.debug(
-                "[Worker %s] No ready %s artifact source for %s",
+            # Logged at INFO, not DEBUG: a miss here is the difference between a
+            # warm start and a full recompile, and the mx_source_id plus digest
+            # are what an operator needs to diff two pods that fail to pair.
+            log.info(
+                "[Worker %s] No ready %s artifact source for %s "
+                "(mx_source_id=%s compile_config_digest=%r); "
+                "the engine will rebuild this cache locally",
                 ctx.global_rank,
                 engine_label,
                 transfer.name,
+                compute_mx_source_id(identity),
+                identity.compile_config_digest,
             )
         except Exception as exc:
             log.warning(

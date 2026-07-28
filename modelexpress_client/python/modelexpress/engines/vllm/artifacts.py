@@ -36,15 +36,92 @@ _CACHE_SETTLE_SECS = _artifact_lifecycle.CACHE_SETTLE_SECS
 
 _published_sources: dict[tuple[int, int], PublishedArtifactSource] = {}
 _scheduled_publishers: dict[tuple[int, int], PublisherThread] = {}
+# torch.compile cache directories created by an install, keyed by device id.
+# Compared against the directory vLLM actually selects once the engine is up;
+# see _warn_if_compile_cache_unused.
+_installed_compile_cache_dirs: dict[int, frozenset[str]] = {}
 
 
 def install_vllm_cache_artifacts(ctx: LoadContext) -> None:
     """Best-effort install of compatible vLLM cache artifacts before load."""
+    # Snapshot only when transfer is on; the default path should not pay for a
+    # directory scan it will never consult.
+    track = _artifact_transfer_enabled()
+    before = _torch_compile_cache_dir_names() if track else frozenset()
     _artifact_lifecycle.install_artifacts(
         ctx,
         lambda: _vllm_artifact_transfers(ctx),
         engine_label="vLLM",
         log=logger,
+    )
+    if not track:
+        return
+    installed = _torch_compile_cache_dir_names() - before
+    device_id = getattr(ctx, "device_id", None)
+    if installed and device_id is not None:
+        _installed_compile_cache_dirs[device_id] = installed
+
+
+def _torch_compile_cache_dir_names() -> frozenset[str]:
+    """Immediate child directory names under the torch.compile cache root."""
+    try:
+        root = _torch_compile_cache_root()
+        return frozenset(entry.name for entry in root.iterdir() if entry.is_dir())
+    except OSError:
+        return frozenset()
+
+
+def _warn_if_compile_cache_unused(ctx: LoadContext) -> None:
+    """Report whether vLLM selected a torch.compile cache we installed.
+
+    ModelExpress cannot predict vLLM's cache directory at load time: the key
+    mixes a code hash derived from ``compilation_config.traced_files``, which is
+    populated only while Dynamo traces and cleared immediately afterwards. The
+    directory is therefore only observable after the engine has compiled, which
+    is why this runs from the publisher path rather than the loader.
+
+    A mismatch means the installed bundle is inert - vLLM rebuilt its cache. It
+    is not a correctness problem, but it is silent waste worth surfacing.
+    """
+    installed = _installed_compile_cache_dirs.get(ctx.device_id)
+    if not installed:
+        return
+    adapter = getattr(ctx, "adapter", None)
+    vllm_config = getattr(adapter, "vllm_config", None)
+    cache_dir = getattr(
+        getattr(vllm_config, "compilation_config", None), "cache_dir", ""
+    )
+    if not cache_dir:
+        # enforce_eager or compilation disabled: nothing selected a cache dir.
+        logger.debug(
+            "[Worker %s] vLLM reported no torch.compile cache directory; "
+            "skipping artifact effectiveness check",
+            ctx.global_rank,
+        )
+        return
+    selected = Path(cache_dir)
+    if any(part in installed for part in selected.parts):
+        # Matched on a path segment rather than on the basename: vLLM has
+        # appended a rank suffix under the hash directory in some releases, and
+        # the AOT path nests one level deeper still.
+        logger.info(
+            "[Worker %s] vLLM selected torch.compile cache directory %s, "
+            "which ModelExpress installed",
+            ctx.global_rank,
+            cache_dir,
+        )
+        return
+    logger.warning(
+        "[Worker %s] ModelExpress installed torch.compile cache directory/ies %s "
+        "but vLLM selected %s, so the transferred cache was not reused and the "
+        "engine recompiled. This happens when the source worker's compile "
+        "configuration differs from this one (for example max_num_batched_tokens "
+        "or max_model_len). Set MX_ARTIFACT_COMPILE_CONFIG_DIGEST to a distinct "
+        "value per compile configuration so each group discovers only its own "
+        "cache.",
+        ctx.global_rank,
+        sorted(installed),
+        cache_dir,
     )
 
 
@@ -83,6 +160,18 @@ def _publish_vllm_cache_artifact(
     identity: p2p_pb2.SourceIdentity,
 ):
     """Compatibility wrapper for the shared source publication operation."""
+    if transfer.mx_source_type == p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE:
+        # Runs on the publisher thread, which is gated on engine readiness, so
+        # compilation has finished and vLLM's cache_dir is populated. Never let
+        # a diagnostic break publication.
+        try:
+            _warn_if_compile_cache_unused(ctx)
+        except Exception as exc:  # noqa: BLE001 - diagnostic must not propagate
+            logger.debug(
+                "[Worker %s] torch.compile cache effectiveness check failed: %s",
+                ctx.global_rank,
+                exc,
+            )
     return _artifact_lifecycle.publish_artifact(
         ctx,
         transfer,

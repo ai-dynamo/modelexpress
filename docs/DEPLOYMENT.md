@@ -595,6 +595,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles. |
 | `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before source workers publish weight metadata or prepare and publish cache artifact bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim. See [Multi-node readiness](#multi-node-readiness). |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication before giving up. |
+| `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Partitions the torch compile cache artifact source pool by compile configuration. Workers that share a value discover each other's caches; workers with different values do not. Unset removes only compile-configuration partitioning, so workers whose other `SourceIdentity` fields match share one pool regardless of their compile settings. See [Pairing workers by compile configuration](#pairing-workers-by-compile-configuration). |
 | `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact HF commit SHA / checkpoint version so `mx_source_id` is content-addressed. Required for decentralized backends where no central coordinator tracks versions. |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend. `{rank}` is substituted with the worker's own rank. If the resolved pattern has no `:port`, the client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` (multi-GPU-per-pod shape); if it has an explicit port, that port is used verbatim (1-GPU-per-pod shape). |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` backend: max retries on `FAILED_PRECONDITION` (revision mismatch during rolling updates). Each retry opens a fresh gRPC channel so kube-proxy re-picks a backend. |
@@ -697,6 +698,54 @@ For cache artifact transfer, set `MX_ARTIFACT_TRANSFER=1` on source and target w
 vLLM publishes torch compile (`VLLM_CACHE_ROOT/torch_compile_cache`), Triton (`TRITON_CACHE_DIR`, or `~/.triton/cache`), DeepGEMM (`DG_JIT_CACHE_DIR`, or `VLLM_CACHE_ROOT/deep_gemm`), TileLang (`TILELANG_CACHE_DIR`, or `~/.tilelang/cache`), CuTe DSL (`CUTE_DSL_CACHE_DIR`, or `$TMPDIR/<user>/cutlass_python_cache`), and FlashInfer (`FLASHINFER_WORKSPACE_BASE/.cache/flashinfer`, or `~/.cache/flashinfer`) caches. The FlashInfer artifact also includes vLLM's persistent autotune directory from `VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR`, or `VLLM_CACHE_ROOT/flashinfer_autotune_cache` when unset; ModelExpress does not change either path.
 
 SGLang's NIXL loader publishes torch compile (`TORCHINDUCTOR_CACHE_DIR`, or PyTorch Inductor's runtime `cache_dir()`), Triton (`TRITON_CACHE_DIR`, or `~/.triton/cache`), TVM-FFI (`TVM_FFI_CACHE_DIR`, or `~/.cache/tvm-ffi`), DeepGEMM (`SGLANG_DG_CACHE_DIR`, or `~/.cache/deep_gemm`), TileLang (`TILELANG_CACHE_DIR`, or `~/.tilelang/cache`), CuTe DSL (`CUTE_DSL_CACHE_DIR`, or `$TMPDIR/<user>/cutlass_python_cache`), and FlashInfer (`FLASHINFER_WORKSPACE_BASE/.cache/flashinfer`, or `~/.cache/flashinfer`) caches. The FlashInfer artifact also includes SGLang's persistent autotune directory from `SGLANG_CACHE_DIR/flashinfer/autotune`, or `~/.cache/sglang/flashinfer/autotune` when unset. SGLang runs that autotuner only for eligible FlashInfer MoE or FP4 backends; DeepGEMM + DeepEP does not produce an autotune cache. SGLang TransferEngine transport currently remains weight-only for ModelExpress artifact transfer because cache artifact bytes move through the NIXL artifact path.
+
+#### Pairing workers by compile configuration
+
+A torch compile cache is only reusable by a worker whose compile configuration
+matches the one that produced it. vLLM enforces this itself: it derives its own
+cache directory name from a hash that includes scheduler and compilation
+settings, so a worker started with a different `--max-num-batched-tokens` or
+`--max-model-len` looks in a different directory and recompiles from scratch.
+
+ModelExpress cannot reproduce that hash at load time — part of it depends on
+files traced by Dynamo, which are only known after compilation. Artifact
+discovery therefore keys on `MX_ARTIFACT_COMPILE_CONFIG_DIGEST`, and **that
+variable is unset by default**. With it unset, workers whose other
+`SourceIdentity` fields match belong to one source pool that is not partitioned
+by compile configuration, so a worker can be handed a cache built under a
+different compile configuration. The bytes transfer and install successfully;
+vLLM then ignores them and recompiles. The result is wasted transfer, not
+incorrect output.
+
+Set the variable to a distinct value per compile configuration whenever a
+deployment runs more than one — most commonly prefill and decode workers in a
+disaggregated setup, which differ in `max_num_batched_tokens`:
+
+```yaml
+# prefill workers
+- name: MX_ARTIFACT_COMPILE_CONFIG_DIGEST
+  value: "prefill-mnbt8192"
+# decode workers
+- name: MX_ARTIFACT_COMPILE_CONFIG_DIGEST
+  value: "decode-mnbt1024"
+```
+
+The value is opaque to ModelExpress; it only has to be equal across workers that
+should share caches and different across those that should not. Note that this
+partitions the pool but does not by itself make prefill and decode share a
+cache — they cannot, because vLLM's own cache keys already differ.
+
+To check whether a transferred cache was actually used, look for the
+effectiveness line the vLLM loader emits once the engine is up:
+
+```text
+vLLM selected torch.compile cache directory <path>, which ModelExpress installed
+```
+
+A `WARNING` naming a different directory means the installed artifact was inert
+and this worker recompiled — the signal that the pool needs partitioning. You
+can confirm independently by comparing the `Using cache directory:` hash that
+each worker logs.
 
 In multi-node deployments, artifact metadata records the framework `node_rank`, so each target node selects the corresponding source node without making the artifact worker-specific. If artifact transfer is enabled while P2P metadata is disabled, the loader logs a warning and skips artifact transfer. Artifact discovery currently requires a central-coordinator backend (`redis` or `kubernetes`), and Kubernetes deployments must use the matching `ModelMetadata` CRD containing `status.worker.artifactSource.nodeRank`.
 

@@ -293,6 +293,48 @@ def test_artifact_transfer(
             f"Target did not log artifact installation for {source_type}"
         )
 
+    # A successful install only means the bytes arrived. The engine still has to
+    # pick the installed cache, and it will not if the source was compiled under
+    # a different configuration - it silently recompiles instead. Without this
+    # assertion the test passes on a deployment that gets no artifact benefit.
+    unused_lines = [
+        line
+        for line in logs.splitlines()
+        if "was not reused and the engine recompiled" in line
+    ]
+    assert not unused_lines, (
+        "Target installed a torch.compile cache that vLLM did not use, so it "
+        "recompiled. The source and target compile configurations differ; "
+        "partition the artifact source pool with "
+        "MX_ARTIFACT_COMPILE_CONFIG_DIGEST.\n" + "\n".join(unused_lines)
+    )
+    if "vLLM artifact install complete: name=torch_compile_cache" in logs:
+        assert "which ModelExpress installed" in logs, (
+            "Target installed a torch.compile cache but never logged the "
+            "effectiveness check; the engine may not have reached the publish "
+            "path, or the check regressed"
+        )
+
+    # Every target in this fleet runs the same configuration, so each artifact
+    # type must resolve to one identity. Divergence means identity construction
+    # is not deterministic across pods - the failure mode that turns an artifact
+    # pool into a set of singletons.
+    ids_by_type: dict[str, set[str]] = {}
+    for line in install_lines:
+        fields = dict(
+            token.split("=", 1)
+            for token in line.split()
+            if token.count("=") >= 1 and token.split("=", 1)[0] in {"name", "mx_source_id"}
+        )
+        if "name" in fields and "mx_source_id" in fields:
+            ids_by_type.setdefault(fields["name"], set()).add(fields["mx_source_id"])
+    for source_type, source_ids in sorted(ids_by_type.items()):
+        assert len(source_ids) == 1, (
+            f"Targets resolved {len(source_ids)} distinct mx_source_ids for "
+            f"{source_type}: {sorted(source_ids)}. Identically configured "
+            "workers must agree on the artifact identity."
+        )
+
 
 def test_source_inference_produces_output(namespace: str, model: str, source_port: int) -> None:
     """Source server must return a valid completion response."""
