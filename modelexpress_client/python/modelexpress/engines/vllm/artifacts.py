@@ -54,7 +54,7 @@ def schedule_vllm_cache_artifact_publish(ctx: LoadContext) -> None:
         ctx,
         lambda: _vllm_artifact_transfers(ctx),
         engine_label="vLLM",
-        ready_fn_factory=lambda roots: _vllm_artifact_ready_fn(roots),
+        ready_fn_factory=lambda roots: _vllm_artifact_ready_fn(roots, ctx=ctx),
         artifact_publish_fn=lambda transfer, identity: (
             _publish_vllm_cache_artifact(ctx, transfer, identity)
         ),
@@ -336,30 +336,28 @@ def _set_extra_if_present(
 def _vllm_artifact_ready_fn(
     source_roots: tuple[ArtifactCacheRoot, ...],
     health_ready_fn=None,
+    ctx: LoadContext | None = None,
 ):
     if health_ready_fn is None:
         # Resolve the engine hook at call time so existing tests and diagnostics
         # can replace _vllm_health_ready after constructing the readiness check.
-        health_ready_fn = lambda: _vllm_health_ready()
+        health_ready_fn = lambda: _vllm_health_ready(ctx)
     return _artifact_lifecycle.artifact_ready_fn(
         source_roots,
         health_ready_fn,
     )
 
 
-def _vllm_health_ready() -> bool:
-    return _artifact_lifecycle.artifact_health_ready(_vllm_health_url())
+def _vllm_health_ready(ctx: LoadContext | None = None) -> bool:
+    return _artifact_lifecycle.artifact_health_ready(_vllm_health_url(ctx))
 
 
-def _vllm_health_url() -> str:
-    configured = envs.MX_ARTIFACT_READY_URL.strip()
-    fallback = _artifact_lifecycle.statefulset_head_health_url() or _DEFAULT_READY_URL
-    if not configured or configured == _DEFAULT_READY_URL:
-        return fallback
-    if _artifact_lifecycle.is_http_url(configured):
-        return configured
-    logger.warning("Invalid MX_ARTIFACT_READY_URL=%r; using %s", configured, fallback)
-    return fallback
+def _vllm_health_url(ctx: LoadContext | None = None) -> str:
+    return _artifact_lifecycle.resolve_health_url(
+        envs.MX_ARTIFACT_READY_URL,
+        _DEFAULT_READY_URL,
+        getattr(ctx, "head_addr", None),
+    )
 
 
 def _is_http_url(url: str) -> bool:

@@ -118,7 +118,9 @@ spec:
         - name: MX_ARTIFACT_TRANSFER
           value: "1"
         # Dynamo serves worker health on 9090; publish caches only after the
-        # generate endpoint is ready and JIT warmup has completed.
+        # generate endpoint is ready and JIT warmup has completed. Only the head
+        # pod serves 9090, so non-head nodes rewrite this loopback host onto the
+        # head (see "Multi-node readiness" in docs/DEPLOYMENT.md).
         - name: MX_ARTIFACT_READY_URL
           value: "http://127.0.0.1:9090/health"
         # Per-rank IB NIC pinning. Workaround for openucx/ucx#11259.

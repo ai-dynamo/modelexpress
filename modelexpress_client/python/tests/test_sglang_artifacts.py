@@ -221,7 +221,11 @@ def test_sglang_artifact_ready_fn_uses_sglang_health(monkeypatch):
     )
 
     assert artifacts._sglang_artifact_ready_fn(roots) is ready_fn
-    shared_ready_fn.assert_called_once_with(roots, artifacts._sglang_health_ready)
+    shared_ready_fn.assert_called_once()
+    args = shared_ready_fn.call_args.args
+    assert args[0] is roots
+    # Bound to ctx rather than the bare module function.
+    assert callable(args[1])
 
 
 def test_sglang_health_url_honors_config(monkeypatch):
