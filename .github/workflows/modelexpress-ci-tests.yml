@@ -286,7 +286,8 @@ jobs:
           vcluster_name: ${{ env.VCLUSTER_NAME }}
           vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
 
-      - name: Bootstrap vCluster
+      - name: Bootstrap vCluster (first run only)
+        if: steps.vcluster-check.outputs.exists != 'true'
         uses: ./.github/actions/setup-mx-vcluster
         with:
           kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
