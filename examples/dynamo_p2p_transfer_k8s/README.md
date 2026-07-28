@@ -162,3 +162,24 @@ kubectl logs -n <namespace> <pod> -c main | grep "Adopted .* hidden"
 # vLLM's disagg KV-transfer metrics on the decode side
 kubectl logs -n <namespace> <decode-pod> -c main | grep -E "KV Transfer metrics|prefix cache"
 ```
+
+### FlashInfer cubin permission denied
+
+If workers restart during `EngineCore` init with:
+
+```
+[Errno 13] Permission denied:
+  '/usr/local/lib/python3.12/dist-packages/flashinfer_cubin/cubins/flashinfer'
+```
+
+the container is running as the image's default non-root `dynamo` user.
+FlashInfer resolves its cubin directory to the installed `flashinfer-cubin`
+package under root-owned `site-packages`, and downloads any cubin missing for
+the current GPU architecture back into that directory. FP8 MoE models take this
+path by default, so the worker dies before the engine comes up.
+
+The manifests here set `securityContext.runAsUser: 0` on the worker containers
+to avoid this. To stay non-root instead, point `FLASHINFER_CUBIN_DIR` at a
+writable directory - but note that this bypasses the `flashinfer-cubin` package
+entirely, so every cubin is re-downloaded at startup and the pod needs network
+access to the FlashInfer artifact host.
