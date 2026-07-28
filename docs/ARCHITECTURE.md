@@ -639,6 +639,10 @@ plan currently assumes a stable source cohort, shard layout, and registration
 addresses; topology-epoch invalidation is a follow-up requirement before
 elastic production use.
 
+See the [RL weight refit overview](../modelexpress_client/python/modelexpress/refit/README.md)
+for the end-to-end design, integration contract, implementation status, and
+validation requirements.
+
 ### SGLang Loader
 
 **MxModelLoader** is instantiated by SGLang's `remote_instance` loader when

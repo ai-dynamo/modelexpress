@@ -72,7 +72,7 @@ SPDX-License-Identifier: Apache-2.0
   <path d="M905 255 V320" class="edge" stroke="#2E7D32" marker-end="url(#arrow-green)"/>
   <circle cx="685" cy="360" r="20" fill="#2E7D32"/><text x="685" y="366" text-anchor="middle" class="step">2</text>
   <rect x="725" y="325" width="360" height="70" rx="14" fill="#dcfce7" stroke="#2E7D32" stroke-width="2"/>
-  <text x="905" y="355" text-anchor="middle" class="node-title">Discover one version</text>
+  <text x="905" y="355" text-anchor="middle" class="node-title">Discover READY sources</text>
   <text x="905" y="379" text-anchor="middle" class="node-text">Catalog returns ownership metadata</text>
 
   <path d="M905 395 V460" class="edge" stroke="#2E7D32" marker-end="url(#arrow-green)"/>
