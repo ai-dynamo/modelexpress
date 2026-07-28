@@ -82,7 +82,7 @@ The refit path is experimental today. The goal is to remove avoidable full-model
 - **Expanded model pull providers**: NGC catalog and Google Cloud Storage in addition to Hugging Face
 - **GDS (GPUDirect Storage)**: load model weights directly from NVMe into GPU memory, bypassing the CPU/DRAM copy path
 - **Lower NIXL registration overhead** — Opt in to allocation-level pool registration or a single VMM arena registration
-- **RL weight refit (experimental)** — Receiver-driven trainer-to-rollout weight movement and resharding over NIXL; see the [RL refit design and implementation status](modelexpress_client/python/modelexpress/refit/README.md)
+- **RL weight refit (experimental) and delta weight refit (planned)** — Receiver-driven trainer-to-rollout weight movement and resharding over NIXL, with planned selectors to transfer only changed parameters or expert subsets; see the [RL refit design and implementation status](modelexpress_client/python/modelexpress/refit/README.md)
 
 ### Integrations
 
@@ -294,7 +294,7 @@ cargo bench
 ### Priorities Under Development
 
 - **DRAM and NVMe-resident shard streaming**: Stream shards across workers while keeping weights in DRAM and host local high-speed NVMe.
-- **[RL post-training refit](modelexpress_client/python/modelexpress/refit/README.md)**: Make updates receiver-driven—trainer ranks publish the shards they own, rollout workers discover and plan against their target layout, then pull, convert, reshard, and load directly over NIXL.
+- **[RL post-training refit and delta weight refit](modelexpress_client/python/modelexpress/refit/README.md)**: Make updates receiver-driven—trainer ranks publish the shards they own, rollout workers discover and plan against their target layout, then pull, convert, reshard, and load directly over NIXL. Extend the planner with parameter and expert selectors so updates can transfer only changed subsets instead of executing the full cached plan.
 - **Earlier weight availability**: Bring weights to prefill earlier; identify prefill workers that can act as strong source nodes.
 - **Multi-tier cache hierarchy**: Promote and demote models across DRAM, NVMe, and PVC tiers based on access patterns.
 - **Distributed sharded cache**: Shard large models across nodes using consistent hashing and parallel shard assembly.
