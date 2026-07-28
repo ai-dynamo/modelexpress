@@ -23,7 +23,6 @@ reading, but the code that sets them does so inline.
 Not covered here (intentional exceptions):
 - ``MX_SKIP_EXT`` and ``CXX`` are read by ``setup.py`` before the package is
   importable, so they cannot route through this module.
-- ``MODEL_EXPRESS_SOURCE`` only appears in a docstring example, not live code.
 - The deprecated ``MX_VMM_ARENA_BYTES`` / ``MX_VMM_ARENA_CHUNK_BYTES`` are
   presence-only deprecation warnings; check them with :func:`is_set`.
 """

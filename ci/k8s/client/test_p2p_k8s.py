@@ -26,8 +26,7 @@ Invoked by the workflow as:
       [--p2p-marker "framework-specific transfer complete string"]
 
 --p2p-marker defaults:
-  vLLM:    "RDMA transfer complete"             (emitted by vLLM's RdmaStrategy)
-  TRT-LLM: "ModelExpress P2P transfer complete" (printed by trtllm_p2p_launcher.py)
+  vLLM: "RDMA transfer complete" (emitted by vLLM's RdmaStrategy)
 
 --tp-size default is 1 — every existing TP=1 P2P test still asserts exactly
 one source agent, which is the correct expectation and adds a free safety net.
