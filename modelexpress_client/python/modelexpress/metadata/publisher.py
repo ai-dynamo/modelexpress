@@ -31,8 +31,9 @@ class PublisherThread:
     ``mx_source_id``. A ``ready_fn`` can gate publication until the engine has
     finished work that must happen before the source is advertised.
 
-    On clean shutdown (SIGTERM), atexit handler sends UpdateStatus(STALE)
-    for immediate detection without waiting for the reaper timeout.
+    On normal interpreter exit, an atexit handler sends UpdateStatus(STALE)
+    for immediate detection without waiting for the reaper timeout. The default
+    SIGTERM disposition does not run atexit handlers.
 
     Args:
         mx_client: gRPC client for UpdateStatus calls.
@@ -141,35 +142,16 @@ class PublisherThread:
         logger.info(f"[Worker {self._worker_rank}] Publisher thread stopped")
 
     def _on_exit(self) -> None:
-        """atexit handler: mark STALE and disconnect NIXL peers on clean shutdown.
-
-        Note on reach: CPython runs atexit handlers on normal interpreter exit and
-        on SystemExit, but *not* when the default SIGTERM disposition terminates
-        the process. A worker killed by a plain SIGTERM therefore runs none of
-        this, so the engine embedding the client must either install a handler
-        that raises SystemExit or call ``stop()`` itself. Both paths land here.
-        """
+        """Stop the publisher before marking STALE and disconnecting peers."""
         self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self._interval + 5)
         self._mark_stale()
         self._disconnect_nixl_peers()
         self._cleanup()
 
     def _disconnect_nixl_peers(self) -> None:
-        """Disconnect NIXL remote agents this worker loaded, before exiting.
-
-        A worker that pulled weights holds a loaded remote agent - and a live QP -
-        for the source it pulled from. Exiting without invalidating that leaves the
-        source with a half-open connection it cannot clean up on its own, because in
-        P2P the source never loads the reader's metadata and so has no peer record
-        to invalidate. The next reader's connection setup then fails against the
-        source's stale state, and the source stays wedged until it restarts while
-        still heartbeating READY.
-
-        Ordered after ``_mark_stale`` so the registry has already stopped offering
-        this worker before we start tearing its transport down. Best-effort and
-        silent on failure: this runs on exit paths where raising would replace a
-        clean shutdown with a crash.
-        """
+        """Best-effort disconnect after the worker has been marked STALE."""
         if self._nixl_manager is None:
             return
         try:
@@ -221,11 +203,11 @@ class PublisherThread:
                 # ``_unhealthy``: if this worker later goes READY and then breaks,
                 # that is the case worth demoting.
                 return
-            self._unhealthy = True
             reason = getattr(self._nixl_manager, "data_plane_error", None)
             try:
                 from .. import p2p_pb2
                 self._update_status(p2p_pb2.SOURCE_STATUS_STALE)
+                self._unhealthy = True
                 logger.warning(
                     f"[Worker {self._worker_rank}] NIXL agent unhealthy, marked "
                     f"STALE so targets stop selecting it: {reason}"

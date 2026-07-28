@@ -16,6 +16,8 @@ the reported stall three times worse. So it is honoured only when explicitly set
 Run: pytest tests/test_rdma_transfer_timeout.py
 """
 
+import pytest
+
 from modelexpress.load_strategy import rdma_strategy
 from modelexpress.load_strategy.rdma_strategy import (
     DEFAULT_RDMA_TRANSFER_TIMEOUT_S,
@@ -76,6 +78,13 @@ def test_a_negative_value_falls_back(monkeypatch):
 def test_a_non_numeric_value_falls_back(monkeypatch):
     """A bad env var should degrade to the documented default, not crash a load."""
     monkeypatch.setenv("MX_TRANSFER_TIMEOUT", "not-a-number")
+    assert _transfer_timeout_seconds() == 300.0
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_a_non_finite_value_falls_back(monkeypatch, value):
+    """A non-finite budget would make the transfer wait loop unbounded."""
+    monkeypatch.setenv("MX_TRANSFER_TIMEOUT", value)
     assert _transfer_timeout_seconds() == 300.0
 
 

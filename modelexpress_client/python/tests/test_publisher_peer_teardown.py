@@ -83,6 +83,26 @@ class TestDisconnectsPeersOnExit:
         publisher._on_exit()
         nixl_manager.disconnect_remote_agents.assert_called()
 
+    def test_atexit_joins_before_marking_stale(
+        self, publisher, mx_client, nixl_manager
+    ):
+        """An in-flight tick must finish before shutdown publishes STALE."""
+        order = []
+        publisher._thread = MagicMock()
+        publisher._thread.join.side_effect = lambda **_: order.append("join")
+        publisher._started = True
+        mx_client.update_status.side_effect = lambda **kw: order.append(
+            f"status:{kw['status']}"
+        ) or True
+        nixl_manager.disconnect_remote_agents.side_effect = lambda: order.append(
+            "disconnect"
+        ) or 1
+
+        publisher._on_exit()
+
+        assert order == ["join", f"status:{STALE}", "disconnect"]
+        publisher._thread.join.assert_called_once_with(timeout=publisher._interval + 5)
+
     def test_demotion_precedes_disconnection(self, publisher, mx_client, nixl_manager):
         """Order matters: stop being advertised before tearing the transport down,
         so no target selects this worker while its peers are being closed."""
@@ -151,6 +171,20 @@ class TestDemotesUnhealthyWorker:
 
         # One demotion from the unhealthy ticks; stop() adds its own shutdown STALE.
         assert len(_status_calls(mx_client, STALE)) <= 2
+
+    def test_failed_demotion_is_retried(
+        self, publisher, mx_client, nixl_manager
+    ):
+        """A transient RPC failure must not latch the local demotion state."""
+        publisher._started = True
+        mx_client.update_status.side_effect = [RuntimeError("temporary"), True]
+
+        publisher._mark_unhealthy()
+        assert publisher._unhealthy is False
+
+        publisher._mark_unhealthy()
+        assert publisher._unhealthy is True
+        assert mx_client.update_status.call_count == 2
 
     def test_recovery_restores_ready(self, publisher, mx_client, nixl_manager):
         """Demotion is advisory, not terminal: a recovered agent must come back."""

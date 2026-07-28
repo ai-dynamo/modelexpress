@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 
@@ -75,9 +76,9 @@ def _transfer_timeout_seconds() -> float:
             DEFAULT_RDMA_TRANSFER_TIMEOUT_S,
         )
         return DEFAULT_RDMA_TRANSFER_TIMEOUT_S
-    if configured <= 0:
+    if not math.isfinite(configured) or configured <= 0:
         logger.warning(
-            "MX_TRANSFER_TIMEOUT=%r is not positive; using %.1fs for the RDMA "
+            "MX_TRANSFER_TIMEOUT=%r is not finite and positive; using %.1fs for the RDMA "
             "receive budget rather than waiting indefinitely",
             raw,
             DEFAULT_RDMA_TRANSFER_TIMEOUT_S,

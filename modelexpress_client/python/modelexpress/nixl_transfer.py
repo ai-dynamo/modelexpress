@@ -1098,21 +1098,7 @@ class NixlTransferManager:
                 self._agent.release_xfer_handle(handle)
 
     def is_healthy(self) -> bool:
-        """Whether this agent can still be advertised as a transfer source.
-
-        Structural checks plus any data-plane failure this manager has observed on
-        a transfer it issued. The data-plane part matters because the structural
-        checks alone stay true through a broken NIXL stack: ``_agent`` remains
-        non-None and ``_metadata`` non-empty, so a worker whose RDMA is dead keeps
-        heartbeating READY and keeps being selected.
-
-        Known limit, worth stating plainly: this only catches failures on
-        transfers *this* manager issued. A pure P2P source performs no transfers -
-        the reader's one-sided READ is invisible to the source's Python layer - so
-        a source wedged by a departed peer cannot detect itself here. Catching that
-        requires either an active self-probe or the failing reader reporting the
-        source to the registry.
-        """
+        """Whether the agent is initialized and has no observed transfer failure."""
         if self._agent is None or len(self._metadata) == 0:
             return False
         return self._data_plane_error is None
@@ -1123,21 +1109,7 @@ class NixlTransferManager:
         return self._data_plane_error
 
     def shutdown(self) -> None:
-        """Disconnect remote agents, then clean up NIXL resources.
-
-        Disconnecting first is the point, not an ordering detail. Dropping
-        ``_agent`` only releases this process's reference; it tells the peer
-        nothing. In P2P the source cannot invalidate a reader it never loaded, so
-        if the reader exits without disconnecting, the source is left holding a
-        half-open QP that it has no API to clean up, and the next reader's
-        connection setup fails against it.
-
-        Rebinds ``_tensor_descriptors`` and ``_tensors`` to fresh empty
-        containers instead of mutating in place. Belt-and-suspenders:
-        even if a future caller bypasses ``register_tensors`` and
-        aliases ``_tensors`` directly, shutdown will not mutate the
-        shared container out from under them.
-        """
+        """Disconnect remote agents before releasing local NIXL resources."""
         disconnected = self.disconnect_remote_agents()
         self._agent = None
         self._metadata = b""
