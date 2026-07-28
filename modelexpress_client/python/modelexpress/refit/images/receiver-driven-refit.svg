@@ -89,7 +89,7 @@ SPDX-License-Identifier: Apache-2.0
   <rect x="875" y="835" width="240" height="90" rx="13" fill="#ede9fe" stroke="#5E35B1" stroke-width="2"/>
   <text x="995" y="868" text-anchor="middle" class="node-title">Transform and install</text>
   <text x="995" y="892" text-anchor="middle" class="node-text">Preserve live storage</text>
-  <text x="995" y="914" text-anchor="middle" class="node-text">Report rollout ready</text>
+  <text x="995" y="914" text-anchor="middle" class="node-text">Return completion</text>
 
   <rect x="100" y="975" width="1000" height="42" rx="12" fill="#ffffff" stroke="#9E9E9E" stroke-width="2"/>
   <text x="600" y="1002" text-anchor="middle" class="node-text">RL framework owns version timing and barriers - MX owns discovery, coverage planning, transport, and shared timing stages</text>

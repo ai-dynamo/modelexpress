@@ -649,23 +649,10 @@ plan currently assumes a stable source cohort, shard layout, and registration
 addresses; topology-epoch invalidation is a follow-up requirement before
 elastic production use.
 
-Exact strided TP slices can produce one descriptor per row. When a captured
-copy exceeds `MX_RESHARD_MAX_SEGMENTS_PER_COPY` (default 64), the planner pulls
-each gap-free dim-0 source shard once into persistent contiguous staging and
-replays the captured loader views locally. This bounds descriptors by source
-shard count at the cost of extra wire bytes. Plans and update metrics report
-the exact descriptor count, descriptor savings, and extra bytes. If the
-published layout cannot be reconstructed as a complete dim-0 partition, the
-planner keeps the exact known-correct descriptors rather than changing
-correctness behavior.
-
-Each receiver retains one load-time receive buffer per captured destination.
-Parameters whose served dtype differs from the load-time dtype also retain a
-source-dtype conversion staging buffer. These buffers are allocated from
-classic CUDA allocations and registered for the receiver lifetime. PWAL is
-intentional here: the receiver reconstructs load-time tensors, and quantized
-models still require vLLM post-load processing. MDL is appropriate only when
-the incoming tensors already match the validated runtime representation.
+See the [RL weight refit overview](../modelexpress_client/python/modelexpress/refit/README.md)
+for the end-to-end design, integration contract, implementation status, and
+validation requirements, including descriptor bounding for strided slices,
+receive and staging buffer ownership, and when PWAL applies rather than MDL.
 
 ### SGLang Loader
 

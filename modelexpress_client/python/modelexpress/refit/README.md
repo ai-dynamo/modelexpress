@@ -110,6 +110,10 @@ Refit has two independent optimization surfaces:
 
 [`MdlLoader`](../engines/vllm/refit/installer.py) is a separate experimental vLLM installer called Mapped Direct Load (MDL). It caches direct, fused, and expert destination views so warm updates can copy into known slots instead of repeating general loader dispatch. MDL can consume partial input batches, but the reshard transport in this package does not yet expose a selector that reduces wire bytes for partial updates. The two features must not be treated as one end-to-end partial-refit path until that selector is wired and validated.
 
+Each receiver keeps one load-time receive buffer per captured destination, plus a source-dtype conversion staging buffer for any parameter whose served dtype differs from its load-time dtype. Both come from classic CUDA allocations and stay registered for the receiver's lifetime, because re-registering per refit is what the cached plan exists to avoid.
+
+That buffer shape is why the vLLM receiver installs through `process_weights_after_loading` (PWAL) rather than MDL. The receiver reconstructs *load-time* tensors, and a quantized model still needs the engine's post-load processing to derive its runtime representation from them. MDL is appropriate only when the incoming tensors already match the validated runtime representation, which is why it is a separate opt-in path rather than the default.
+
 ## Integration contract
 
 The shared receiver has two engine-specific hooks:
@@ -162,6 +166,7 @@ A trainer restart, reshard, scale event, or buffer replacement requires rediscov
 | vLLM geometry capture and layerwise install | Implemented adapter code | [`engines/vllm/refit/receiver.py`](../engines/vllm/refit/receiver.py) |
 | vLLM mapped direct install | Implemented as a separate opt-in installer | [`engines/vllm/refit/installer.py`](../engines/vllm/refit/installer.py) |
 | Normalized refit timing schema | Implemented | [`timing.py`](timing.py), [`test_refit_timing.py`](../../tests/test_refit_timing.py) |
+| Descriptor bound for strided slices | Implemented for gap-free dim-0 partitions | [`transfer_plan.py`](reshard/transfer_plan.py), [`test_reshard_refit_transfer.py`](../../tests/test_reshard_refit_transfer.py) |
 
 “Implemented” means the code and focused tests are present. It does not by itself mean a framework/model/topology combination has passed distributed end-to-end validation.
 
@@ -169,13 +174,12 @@ A trainer restart, reshard, scale event, or buffer replacement requires rediscov
 
 | Gap | Current behavior |
 |---|---|
-| Full-pull fallback | The planner identifies unsupported tensors, but `ReshardReceiver` fails closed because its full-pull/install fallback is not implemented. |
+| Full-pull fallback for unsupported operations | The planner identifies unsupported tensors, but `ReshardReceiver` fails closed because its full-pull/install fallback is not implemented. This is distinct from the descriptor bound above, which pulls whole source shards for *supported* but descriptor-heavy slices. |
 | Complete coverage gate | The planner does not yet prove that published overlaps cover every requested element before transfer. |
 | Version-atomic multi-rank manifest | Discovery waits for a rank count but does not commit and pin one atomic version across all trainer records. |
 | Topology-change handling | The cached plan is not invalidated after trainer restart, reshard, scaling, or address change. |
 | Partial/subset wire filtering | MDL accepts subset batches, but the reshard receiver currently executes its full cached plan on each update. |
 | Expert-aware wire filtering | Expert destination mapping exists in MDL; the reshard planner has no receiver-owned expert selector. |
-| Descriptor bound for strided slices | Correct strided runs can become too numerous; promotion to a bounded full-tensor pull is not implemented on this branch. |
 | Parameter digest verification | The package has reference equality tests but no distributed source-to-destination digest gate in the live receiver. |
 | Inference-to-inference fan-out | Rollout workers do not republish installed refit buffers through this package. |
 | General engine support | The shared core is engine-neutral, but only a vLLM receiver adapter is present. |
@@ -198,6 +202,12 @@ A trainer restart, reshard, scale event, or buffer replacement requires rediscov
 10. rollout readiness.
 
 Set `MX_REFIT_TIMING_STDOUT=1` when a benchmark harness must collect the normalized `MX_REFIT_TIMING` JSON record from worker stdout. Lower layers add spans only when a recorder is active.
+
+The reshard planner uses this control:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Descriptor budget per captured copy. Above it, the planner pulls whole gap-free dim-0 source shards into contiguous staging instead of issuing one descriptor per strided run. |
 
 vLLM's separate MDL path uses these controls:
 
@@ -242,7 +252,7 @@ Performance claims must identify the exact implementation path. Reference transp
 ## Tradeoffs and failure modes
 
 - **Receiver-driven pull vs. trainer-driven push:** pull lets workers join independently and avoids maintaining a receiver list on trainers. It requires source buffers and registrations to remain alive until receivers finish.
-- **Exact slices vs. descriptor count:** exact slicing reduces bytes but can create many short reads. A practical planner needs a bound that chooses a larger contiguous pull when descriptor overhead dominates.
+- **Exact slices vs. descriptor count:** exact slicing reduces bytes but can create many short reads. The planner bounds this: when a captured copy exceeds `MX_RESHARD_MAX_SEGMENTS_PER_COPY` (default 64) it pulls each gap-free dim-0 source shard once into contiguous staging and replays the captured views locally, trading extra wire bytes for a descriptor count bounded by source shard count. When the published layout is not a complete dim-0 partition it keeps the exact descriptors instead, so the bound never changes correctness behavior.
 - **Cached plan vs. elasticity:** plan reuse removes repeated setup from warm updates. It is unsafe after source membership, ownership, or addresses change unless the receiver detects and rebuilds.
 - **Generic capture vs. explicit adapters:** dry-running the real loader avoids a hand-written reshard specification for every model pair. Unsupported arithmetic, materializing reshapes, and model-specific derived state still require engine adapter work.
 - **Fail closed vs. fallback:** failing on unsupported tensors prevents silently serving mixed model versions. A production fallback must materialize and install those tensors without weakening version and coverage checks.
@@ -261,7 +271,7 @@ Performance claims must identify the exact implementation path. Reference transp
 ### Near term
 
 - Add complete coverage and version-consistency gates.
-- Implement bounded full-pull fallback for unsupported or descriptor-heavy tensors.
+- Implement the full-pull fallback for unsupported loader operations; the descriptor-heavy case is already bounded.
 - Rebuild plans when source topology or registered addresses change.
 - Add a public trainer publisher contract with typed shard geometry.
 
