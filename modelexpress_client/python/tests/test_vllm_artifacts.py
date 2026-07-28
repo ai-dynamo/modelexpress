@@ -738,9 +738,12 @@ def test_vllm_health_url_rejects_non_http_config(monkeypatch):
     assert artifacts._vllm_health_url() == "http://127.0.0.1:8000/health"
 
 
-def test_vllm_health_url_uses_statefulset_head_from_worker_pod(monkeypatch):
-    monkeypatch.setenv("MX_ARTIFACT_READY_URL", "http://127.0.0.1:8000/health")
-    monkeypatch.setenv("HOSTNAME", "mx-vllm-1")
-    monkeypatch.setenv("POD_NAMESPACE", "test-ns")
+def test_vllm_health_url_uses_ctx_head_addr(monkeypatch):
+    """The engine passes its master address through; resolution itself is
+    covered in test_artifact_health_url.py."""
+    monkeypatch.setenv("MX_ARTIFACT_READY_URL", "http://127.0.0.1:9090/health")
+    ctx = SimpleNamespace(head_addr="mx-vllm-0.mx-vllm.test-ns")
 
-    assert artifacts._vllm_health_url() == "http://mx-vllm-0.mx-vllm.test-ns.svc:8000/health"
+    assert artifacts._vllm_health_url(ctx) == (
+        "http://mx-vllm-0.mx-vllm.test-ns:9090/health"
+    )
