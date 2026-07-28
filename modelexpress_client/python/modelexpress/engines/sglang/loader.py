@@ -284,6 +284,10 @@ class MxModelLoader:
                 return worker
         return None
 
+    @staticmethod
+    def _byte_size(numel: int, element_size: int) -> int:
+        return numel * element_size
+
     def _receive_via_transfer_engine(
         self,
         tensors: dict[str, torch.Tensor],
@@ -307,7 +311,7 @@ class MxModelLoader:
                     "in source metadata"
                 )
             seed_ptr, seed_size = weight_info
-            local_size = tensor.numel() * tensor.element_size()
+            local_size = self._byte_size(tensor.numel(), tensor.element_size())
             if seed_size != local_size:
                 raise RuntimeError(
                     f"ModelExpress transfer_engine: size mismatch for {name}: "
@@ -348,7 +352,7 @@ class MxModelLoader:
                 addr = tensor.data_ptr()
                 numel = tensor.numel()
                 element_size = tensor.element_size()
-                size = numel * element_size
+                size = self._byte_size(numel, element_size)
                 weight_info[name] = (addr, numel, element_size)
                 if size == 0:
                     continue
@@ -376,7 +380,7 @@ class MxModelLoader:
         registered_ptrs = {
             tensor.data_ptr()
             for tensor in tensors.values()
-            if tensor.numel() * tensor.element_size() > 0
+            if self._byte_size(tensor.numel(), tensor.element_size()) > 0
         }
         self._unregister_transfer_engine_ptrs(registered_ptrs, transfer_engine)
 
@@ -414,7 +418,7 @@ class MxModelLoader:
                 p2p_pb2.TensorDescriptor(
                     name=name,
                     addr=addr,
-                    size=numel * element_size,
+                    size=self._byte_size(numel, element_size),
                     device_id=ctx.device_id,
                 )
                 for name, (addr, numel, element_size) in weight_info.items()
