@@ -8,11 +8,8 @@ Transfers model weights directly between running TRT-LLM instances via NIXL RDMA
 Source registers its model parameter GPU buffers; target receives into its own
 model parameter buffers. No format conversion, no disk I/O, no CPU round-trip.
 
-Target usage (via checkpoint_loader):
-    from modelexpress.trtllm_live_transfer import MxLiveCheckpointLoader
-    loader = MxLiveCheckpointLoader()
-    llm = LLM(model="Llama-70B", checkpoint_loader=loader,
-              load_format=LoadFormat.PRESHARDED, tp=8)
+TensorRT-LLM's native ``checkpoint_format="MX"`` loader calls
+``publish_model_params`` for sources and ``MxLiveWeightLoader`` for receivers.
 """
 
 from __future__ import annotations
@@ -200,114 +197,6 @@ def publish_model_params(torch_model: Any) -> None:
         mx_client.close()
 
 
-def publish_from_worker(worker: Any) -> None:
-    """Publish this rank's model params to ModelExpress from inside a TRT-LLM executor worker.
-
-    Call this from TensorRT-LLM's BaseWorker.setup_engine() after the engine is created,
-    when MODEL_EXPRESS_SOURCE=1. The worker process has the real model (worker.engine.model_engine.model).
-    Each rank publishes its own NIXL metadata and tensor descriptors to the MX server.
-
-    Requires patching TRT-LLM's base_worker.setup_engine to call this at the end, e.g.:
-
-        if os.environ.get("MODEL_EXPRESS_SOURCE"):
-            try:
-                from modelexpress.trtllm_live_transfer import publish_from_worker
-                publish_from_worker(self)
-            except Exception as e:
-                logger.warning("ModelExpress publish_from_worker failed: %s", e)
-    """
-    from .nixl_transfer import NixlTransferManager
-
-    engine = getattr(worker, "engine", None)
-    if engine is None:
-        logger.warning("publish_from_worker: worker has no engine")
-        return
-    model_engine = getattr(engine, "model_engine", None)
-    if model_engine is None:
-        logger.warning("publish_from_worker: engine has no model_engine (not PyExecutor?)")
-        return
-    torch_model = getattr(model_engine, "model", None)
-    if torch_model is None or not hasattr(torch_model, "named_parameters"):
-        logger.warning("publish_from_worker: model_engine has no torch model")
-        return
-
-    device_id = torch.cuda.current_device()
-    try:
-        from mpi4py import MPI
-        mpi_rank = MPI.COMM_WORLD.Get_rank()
-    except Exception:
-        mpi_rank = getattr(worker, "rank", device_id)
-
-    model_name = envs.MODEL_NAME or "unknown"
-    mx_server = envs.MODEL_EXPRESS_URL or "modelexpress-server:8001"
-
-    param_tensors = {}
-    total_bytes = 0
-    for name, param in _canonical_named_parameters(torch_model):
-        if param.device.type == "cuda" and param.device.index == device_id:
-            param_tensors[name] = param.data
-            total_bytes += param.numel() * param.element_size()
-
-    if not param_tensors:
-        logger.warning("publish_from_worker: no params on device %d (rank %d)", device_id, mpi_rank)
-        return
-
-    logger.info(
-        "ModelExpress worker publish: '%s' rank %d (GPU %d), %d params, %.2f GB",
-        model_name, mpi_rank, device_id, len(param_tensors), total_bytes / 1e9,
-    )
-
-    if logger.isEnabledFor(logging.DEBUG):
-        for name, tensor in list(param_tensors.items())[:5]:
-            val = tensor.to(torch.float32)
-            cksum = val.sum().item()
-            nonzero = (tensor != 0).sum().item()
-            logger.debug(
-                "SOURCE CHECKSUM rank %d: %s shape=%s dtype=%s sum=%.4f nonzero=%d/%d",
-                mpi_rank, name, list(tensor.shape), tensor.dtype,
-                cksum, nonzero, tensor.numel(),
-            )
-
-    nixl_mgr = NixlTransferManager(
-        agent_name=f"trtllm-live-source-rank{mpi_rank}-{os.getpid()}",
-        device_id=device_id,
-    )
-    nixl_mgr.initialize()
-    nixl_mgr.register_tensors(param_tensors)
-
-    worker._mx_nixl_manager = nixl_mgr
-
-    tensor_protos = [
-        p2p_pb2.TensorDescriptor(
-            name=name,
-            addr=tensor.data_ptr(),
-            size=tensor.numel() * tensor.element_size(),
-            device_id=device_id,
-            dtype=str(tensor.dtype),
-        )
-        for name, tensor in param_tensors.items()
-    ]
-
-    my_worker = p2p_pb2.WorkerMetadata(
-        worker_rank=mpi_rank,
-        nixl_metadata=nixl_mgr.nixl_metadata,
-        tensor_source=tensor_source_metadata(tensor_protos),
-    )
-
-    identity = _build_trtllm_identity(model_name=model_name)
-    worker_id = uuid.uuid4().hex[:8]
-    mx_client = MxClient(server_url=mx_server)
-    mx_source_id = mx_client.publish_metadata(
-        identity=identity, worker=my_worker, worker_id=worker_id,
-    )
-    mx_client.close()
-
-    logger.info(
-        "ModelExpress worker rank %d (GPU %d) published %.2f GB (mx_source_id=%s)",
-        mpi_rank, device_id, total_bytes / 1e9, mx_source_id,
-    )
-
-
 class MxLiveWeightLoader:
     """
     Loads weights via NIXL RDMA directly into model parameter buffers.
@@ -373,7 +262,7 @@ class MxLiveWeightLoader:
         if model is None:
             raise RuntimeError(
                 "MxLiveWeightLoader requires model reference. "
-                "Use load_format=LoadFormat.PRESHARDED to pass model."
+                "Use TensorRT-LLM's native checkpoint_format='MX' loader."
             )
 
         device_id = torch.cuda.current_device()
@@ -594,97 +483,3 @@ class MxLiveWeightLoader:
 
         mx_client.close()
         raise TimeoutError(f"Source for '{model_name}' not found after {timeout}s")
-
-
-def _import_trtllm_for_config():
-    from tensorrt_llm._torch.models.checkpoints.hf.config_loader import (
-        HfConfigLoader,
-    )
-
-    return {"HfConfigLoader": HfConfigLoader}
-
-
-class MxConfigLoader:
-    def load(self, checkpoint_dir: str, **kwargs):
-        trtllm = _import_trtllm_for_config()
-        HfConfigLoader = trtllm["HfConfigLoader"]
-
-        logger.info("Loading config from local path: %s", checkpoint_dir)
-        return HfConfigLoader().load(checkpoint_dir, **kwargs)
-
-    def cleanup(self):
-        pass
-
-
-class MxLiveCheckpointLoader:
-    """
-    Checkpoint loader that uses MxLiveWeightLoader for direct param-to-param transfer.
-
-    Combines MxConfigLoader (config from MX server) with MxLiveWeightLoader
-    (direct RDMA into model params).
-    """
-
-    def __init__(self, mx_server: Optional[str] = None):
-        # Pass mx_server to weight loader so it's available even if env var isn't set
-        # when load_weights() is called in a different process context
-        self._weight_loader = MxLiveWeightLoader(mx_server=mx_server)
-        self._config_loader = None  # Lazy init
-        self._weight_mapper = None
-        self._checkpoint_format = "mx-p2p"
-
-    def get_default_weight_loader(self):
-        return MxLiveWeightLoader()
-
-    def get_default_config_loader(self):
-        return MxConfigLoader()
-
-    def cleanup(self):
-        if self._weight_mapper is not None and hasattr(self._weight_mapper, 'cleanup'):
-            self._weight_mapper.cleanup()
-        if self._weight_loader is not None:
-            self._weight_loader.cleanup()
-
-    @property
-    def weight_loader(self):
-        return self._weight_loader
-
-    @property
-    def weight_mapper(self):
-        return self._weight_mapper
-
-    @weight_mapper.setter
-    def weight_mapper(self, value):
-        self._weight_mapper = value
-
-    @property
-    def config_loader(self):
-        if self._config_loader is None:
-            self._config_loader = self.get_default_config_loader()
-        return self._config_loader
-
-    @property
-    def checkpoint_format(self):
-        return self._checkpoint_format
-
-    def load_config(self, checkpoint_dir: str, **kwargs):
-        logger.info("MxLiveCheckpointLoader.load_config(%s)", checkpoint_dir)
-        return self.config_loader.load(checkpoint_dir, **kwargs)
-
-    def load_weights(self, checkpoint_dir: str, mapping=None, model=None, **kwargs):
-        logger.info("MxLiveCheckpointLoader.load_weights(model=%s)", model is not None)
-        return self._weight_loader.load_weights(
-            checkpoint_dir, mapping=mapping, model=model, **kwargs
-        )
-
-    def get_initialized_weight_mapper(self, model, config):
-        from tensorrt_llm._torch.models.checkpoints.auto_mapper import AutoCheckpointMapper
-
-        if config.pretrained_config and config.pretrained_config.architectures:
-            model_arch = config.pretrained_config.architectures[0]
-        else:
-            raise ValueError("Cannot determine model architecture from config")
-
-        weight_mapper = AutoCheckpointMapper.get("HF", model_arch)
-        weight_mapper.init_model_and_config(model, config)
-        self._weight_mapper = weight_mapper
-        return weight_mapper

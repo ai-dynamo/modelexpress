@@ -239,7 +239,13 @@ class RdmaStrategy(LoadStrategy):
             target_accelerator = ctx.accelerator_backend.name
             candidates = [
                 inst for inst in rank_matched
-                if accelerators_compatible(target_accelerator, inst.accelerator)
+                if accelerators_compatible(
+                    target_accelerator,
+                    inst.accelerator,
+                    mx_source_type=ctx.identity.mx_source_type,
+                    quantization=ctx.identity.quantization,
+                    dtype=ctx.identity.dtype,
+                )
             ]
 
             selector = get_configured_selector()
@@ -293,7 +299,14 @@ class RdmaStrategy(LoadStrategy):
         """
         target_accelerator = ctx.accelerator_backend.name
         source_accelerator = source_worker.accelerator
-        if accelerators_compatible(target_accelerator, source_accelerator):
+        if accelerators_compatible(
+            target_accelerator,
+            source_accelerator,
+            mx_source_type=ctx.identity.mx_source_type,
+            quantization=ctx.identity.quantization,
+            dtype=ctx.identity.dtype,
+            defer_unknown=False,
+        ):
             return True
 
         logger.info(
@@ -441,6 +454,18 @@ class RdmaStrategy(LoadStrategy):
             f"{' (P2P)' if is_p2p else ''}"
         )
 
+        # Cross-family (heterogeneous) transfers must name the exact same tensor
+        # set on both sides: a name diff can mean vendor-specific hidden/derived
+        # tensors, which would leave part of the target at dummy values while
+        # RDMA reports success. Same-family transfers tolerate subset transfers.
+        target_accelerator = ctx.accelerator_backend.name
+        source_accelerator = source_worker.accelerator
+        require_exact_match = bool(
+            target_accelerator
+            and source_accelerator
+            and target_accelerator != source_accelerator
+        )
+
         transfer_start = time.perf_counter()
         try:
             bytes_transferred, tensor_count, _ = ctx.nixl_manager.receive_from_source(
@@ -448,6 +473,7 @@ class RdmaStrategy(LoadStrategy):
                 source_tensors=source_tensors,
                 timeout_seconds=300.0,
                 remote_agent_name=remote_agent_name_override,
+                require_exact_match=require_exact_match,
             )
         except Exception as e:
             raise SourceTransferError(f"RDMA receive failed: {e}") from e

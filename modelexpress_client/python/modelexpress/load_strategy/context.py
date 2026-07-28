@@ -63,6 +63,10 @@ class LoadContext:
     mx_client: MxClientBase
     worker_id: str
     node_rank: int = 0
+    # Head address from the engine's own distributed config (for vLLM,
+    # parallel_config.master_addr). Non-head nodes rewrite a pod-local
+    # readiness URL onto this host, since loopback serves nothing there.
+    head_addr: str | None = None
     adapter: EngineAdapter | None = None
     accelerator_backend: AcceleratorBackend = field(default_factory=CudaAcceleratorBackend)
     # False keeps a secondary in-process load (the MTP drafter) out of P2P.

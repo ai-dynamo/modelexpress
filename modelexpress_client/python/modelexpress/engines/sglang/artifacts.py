@@ -53,7 +53,7 @@ def schedule_sglang_cache_artifact_publish(ctx: LoadContext) -> None:
         ctx,
         lambda: _sglang_artifact_transfers(ctx),
         engine_label="SGLang",
-        ready_fn_factory=lambda roots: _sglang_artifact_ready_fn(roots),
+        ready_fn_factory=lambda roots: _sglang_artifact_ready_fn(roots, ctx=ctx),
         artifact_publish_fn=lambda transfer, identity: (
             _publish_sglang_cache_artifact(ctx, transfer, identity)
         ),
@@ -325,26 +325,28 @@ def _set_extra_if_present(
         identity.extra_parameters[key] = value
 
 
-def _sglang_artifact_ready_fn(source_roots: tuple[ArtifactCacheRoot, ...]):
-    return _common_artifacts.artifact_ready_fn(source_roots, _sglang_health_ready)
-
-
-def _sglang_health_ready() -> bool:
-    return _common_artifacts.artifact_health_ready(_sglang_health_url())
-
-
-def _sglang_health_url() -> str:
-    configured = envs.MX_ARTIFACT_READY_URL.strip()
-    fallback = (
-        _common_artifacts.statefulset_head_health_url(port=30000)
-        or _DEFAULT_READY_URL
+def _sglang_artifact_ready_fn(
+    source_roots: tuple[ArtifactCacheRoot, ...],
+    ctx: LoadContext | None = None,
+):
+    return _common_artifacts.artifact_ready_fn(
+        source_roots,
+        lambda: _sglang_health_ready(ctx),
     )
-    if not configured or configured == _DEFAULT_READY_URL:
-        return fallback
-    if _common_artifacts.is_http_url(configured):
-        return configured
-    logger.warning("Invalid MX_ARTIFACT_READY_URL=%r; using %s", configured, fallback)
-    return fallback
+
+
+
+
+def _sglang_health_ready(ctx: LoadContext | None = None) -> bool:
+    return _common_artifacts.artifact_health_ready(_sglang_health_url(ctx))
+
+
+def _sglang_health_url(ctx: LoadContext | None = None) -> str:
+    return _common_artifacts.resolve_health_url(
+        envs.MX_ARTIFACT_READY_URL,
+        _DEFAULT_READY_URL,
+        getattr(ctx, "head_addr", None),
+    )
 
 
 def _sglang_version() -> str:

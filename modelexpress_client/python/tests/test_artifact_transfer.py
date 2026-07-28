@@ -1028,6 +1028,29 @@ def test_discover_artifact_source_skips_incompatible_accelerator():
     mx_client.get_metadata.assert_called_once_with(mx_source_id, "cuda-0")
 
 
+def test_discover_artifact_source_rejects_cross_family_hetero_pair():
+    # cuda<->xpu is enabled for weights but artifacts stay strict same-family:
+    # a cuda target must not install an xpu-published cache bundle.
+    mx_source_id = compute_mx_source_id(
+        p2p_pb2.SourceIdentity(
+            mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE,
+            model_name="test/model",
+        )
+    )
+    xpu_source = p2p_pb2.SourceInstanceRef(
+        mx_source_id=mx_source_id, worker_id="xpu-0", accelerator="xpu"
+    )
+    mx_client, identity = _artifact_discovery_client(
+        [(xpu_source, _artifact_worker("xpu-0:6555", "a-xpu", "xpu"))]
+    )
+
+    with pytest.raises(LookupError):
+        discover_artifact_source(mx_client, identity, accelerator="cuda")
+
+    # The incompatible source was dropped before any metadata fetch.
+    mx_client.get_metadata.assert_not_called()
+
+
 def test_discover_artifact_source_empty_accelerator_is_compatible():
     # A source whose ref predates the accelerator field (empty) is accepted;
     # a populated mismatch is still skipped.

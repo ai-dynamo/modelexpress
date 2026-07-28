@@ -37,7 +37,12 @@ def _make_loader():
 
 
 def _make_identity(model_name="test-model"):
-    return p2p_pb2.SourceIdentity(model_name=model_name)
+    # Realistic identity: unquantized weights with dtype set, matching every
+    # production vLLM/SGLang/TRT-LLM publish path. The accelerator gate treats
+    # an unset dtype as unknown and fails closed for cross-family weights.
+    return p2p_pb2.SourceIdentity(
+        model_name=model_name, quantization="", dtype="bfloat16"
+    )
 
 
 def _make_worker(rank=0, n_tensors=3):
@@ -314,7 +319,9 @@ class TestAbstractMethodCompleteness:
             assert model_arg is model
             assert ctx_arg is ctx
             if health_gated:
-                assert ctx_arg.source_ready_fn is loader_mod._vllm_health_ready
+                # Bound to ctx so the URL resolves against this worker's
+                # node_rank and head address, so identity is not asserted.
+                assert callable(ctx_arg.source_ready_fn)
             else:
                 assert ctx_arg.source_ready_fn is None
             events.append("load")
@@ -1272,11 +1279,14 @@ class TestRdmaStrategyLoad:
         self,
         mock_accelerator_backend_cls,
     ):
+        # An unproven cross-family pair (xpu target, rocm source) is skipped
+        # even for weights; only cuda<->xpu is enabled for heterogeneous
+        # weight transfer.
         ctx = _make_load_context(
             accelerator_backend=mock_accelerator_backend_cls(name="xpu"),
         )
         source_resp = _make_metadata_resp(rank=0, worker_id="w-1")
-        source_resp.worker.accelerator = "cuda"
+        source_resp.worker.accelerator = "rocm"
         candidates = [_make_instance_ref(worker_id="w-1")]
         strategy, attempts = self._setup(ctx, candidates, [source_resp])
 
@@ -1696,6 +1706,15 @@ class TestCollectModuleTensorsStorageViews:
 
 class TestConfigureVllmLogging:
     """Verify modelexpress loggers inherit vLLM handlers in EngineCore subprocess."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_log_level_env(self, monkeypatch):
+        """Clear MODEL_EXPRESS_LOG_LEVEL so the logging tests stay hermetic."""
+        # configure_vllm_logging() reads the var at call time, so an ambient
+        # value (e.g. exported on a dev box) would take the explicit-level
+        # branch instead of inheriting vLLM's level. Clear it so each test
+        # controls the var explicitly; tests that set it do so in their block.
+        monkeypatch.delenv("MODEL_EXPRESS_LOG_LEVEL", raising=False)
 
     def _reset_mx_logger(self):
         """Clear any handlers/level from the modelexpress root logger."""
