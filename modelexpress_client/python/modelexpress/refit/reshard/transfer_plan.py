@@ -7,7 +7,8 @@ Ties the pieces together: take a ``CaptureResult`` and the published source
 shards, run ``plan_pull`` per captured copy, and collect the byte segments into a
 ``TransferPlan``. Any source whose slice can't be expressed as a box
 (``UnsupportedReshard``), or that has no published shards, or that capture
-already flagged, is routed to ``fallback``. Descriptor-heavy but otherwise
+already flagged, is recorded in ``fallback`` as unsupported. The current
+receiver rejects such plans before transfer. Descriptor-heavy but otherwise
 supported strided copies use a separate bounded full-source staging path.
 
 ``execute_transfer`` turns the planned segments into absolute-address
@@ -81,7 +82,9 @@ class TransferPlan:
     """Planned pull: ``segments`` are byte runs READ straight into live params;
     ``converts`` are dtype-mismatched sources to pull into staging then cast;
     ``full_pulls`` bound descriptor-heavy copies through contiguous source
-    staging; and ``fallback`` names unsupported sources that cannot be updated."""
+    staging; and ``fallback`` retains the historical field name for unsupported
+    sources that cannot be updated. The current receiver fails closed when it is
+    non-empty."""
 
     segments: list = field(default_factory=list)
     fallback: list = field(default_factory=list)
@@ -186,7 +189,7 @@ def plan_transfer(
 ) -> TransferPlan:
     """Build a ``TransferPlan`` from captured copies + published ``sources``
     (``{src_name: SourceInfo}``). Sources flagged unsupported at capture, missing
-    from ``sources``, or non-box at ``plan_pull`` fall back to a full pull."""
+    from ``sources``, or non-box at ``plan_pull`` are marked unsupported."""
     plan = TransferPlan()
     fallback_seen: set = set()
     exact_by_source: dict[str, list[tuple[RecordedCopy, list]]] = {}
@@ -297,8 +300,8 @@ def execute_transfer(
     ``data_ptr()`` (via ``resolve_param_ptr``), form absolute-address
     ``ReadDescriptor``s, and execute them on ``transport``.
 
-    Returns a small stats dict; ``fallback`` is passed through for the caller to
-    handle out-of-band (full pull + real loader run)."""
+    Returns a small stats dict; ``fallback`` is passed through so the receiver
+    can reject an unsupported plan."""
     descriptors = [
         ReadDescriptor(
             session=seg.session,

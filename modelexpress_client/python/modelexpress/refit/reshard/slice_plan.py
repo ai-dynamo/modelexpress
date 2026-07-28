@@ -35,7 +35,7 @@ SCOPE: the needed slice must resolve to a permuted axis-aligned box of the sourc
 (narrow/getitem/transpose/permute/t). A copy (``contiguous``/``reshape`` that
 materializes), a rank change (int-index collapse, step != 1 slice), or a
 dim-merging reshape - plus src/dst dtype mismatch - raise ``UnsupportedReshard``
--> the caller full-pulls.
+and make the receiver fail closed.
 """
 
 from __future__ import annotations
@@ -90,7 +90,7 @@ def op_chain_to_box(op_chain: OpChain, global_shape) -> list:
     """Resolve a view/slice op-chain to a per-dim ``[start, stop)`` box in the
     full tensor's index space. Supports ``narrow``, unit-step ``__getitem__``
     slices, and layout-only ``contiguous``. Anything else raises
-    ``UnsupportedReshard`` (caller full-pulls)."""
+    ``UnsupportedReshard`` (current receiver fails the update)."""
     box = [[0, int(g)] for g in global_shape]
     for op_name, args, _kw in op_chain:
         if op_name == "narrow":
@@ -105,17 +105,15 @@ def op_chain_to_box(op_chain: OpChain, global_shape) -> list:
             dim = 0
             for k in keys:
                 if k is Ellipsis:
-                    raise UnsupportedReshard(
-                        "ellipsis indexing is not box-derivable -> full-pull"
-                    )
+                    raise UnsupportedReshard("ellipsis indexing is not box-derivable")
                 if not isinstance(k, slice):
                     # int index collapses a dim; changes rank -> not a plain box scatter.
                     raise UnsupportedReshard(
-                        f"integer index {k!r} collapses a dim; not box-derivable -> full-pull"
+                        f"integer index {k!r} collapses a dim; not box-derivable"
                     )
                 if k.step not in (None, 1):
                     raise UnsupportedReshard(
-                        f"strided slice step={k.step} is not box-derivable -> full-pull"
+                        f"strided slice step={k.step} is not box-derivable"
                     )
                 lo, hi = box[dim]
                 extent = hi - lo
@@ -126,7 +124,7 @@ def op_chain_to_box(op_chain: OpChain, global_shape) -> list:
                 dim += 1
         else:
             raise UnsupportedReshard(
-                f"op {op_name!r} is not box-derivable (transpose/reshape/permute/chunk) -> full-pull"
+                f"op {op_name!r} is not box-derivable (transpose/reshape/permute/chunk)"
             )
     return [tuple(b) for b in box]
 
@@ -148,16 +146,12 @@ def _replay_view(op_chain: OpChain, global_shape) -> tuple:
     for op_name, args, kw in op_chain:
         t = getattr(t, op_name)(*args, **dict(kw))
     if not isinstance(t, torch.Tensor):
-        raise UnsupportedReshard(
-            f"op-chain resolved to non-tensor {type(t).__name__} -> full-pull"
-        )
+        raise UnsupportedReshard(f"op-chain resolved to non-tensor {type(t).__name__}")
     # Must remain a pure VIEW of the source (shared storage). A copy resets the
     # base chain; PyTorch collapses view-of-view to the root, so a pure view has
     # ``t._base is src`` (or ``t is src`` for an empty chain).
     if t is not src and t._base is not src:
-        raise UnsupportedReshard(
-            "op-chain includes a copy (not a pure view) -> full-pull"
-        )
+        raise UnsupportedReshard("op-chain includes a copy (not a pure view)")
     return (
         int(t.storage_offset()),
         tuple(int(s) for s in t.shape),
@@ -172,7 +166,7 @@ def _view_to_box_perm(
     index box + the view-dim -> source-dim permutation, for a RANK-PRESERVING
     permuted box (transpose/permute/t of a narrowed/sliced region). Raises
     ``UnsupportedReshard`` for a rank change or a non-permutation stride (a
-    dim-merging reshape) -> caller full-pulls.
+    dim-merging reshape) and makes the current receiver fail closed.
 
     A permuted box has each ``v_stride[d]`` equal to some source dim's row-major
     stride (the dim that view-dim ``d`` iterates); ``v_offset`` unravels to the
@@ -180,7 +174,7 @@ def _view_to_box_perm(
     ndim = len(global_shape)
     if len(v_shape) != ndim:
         raise UnsupportedReshard(
-            f"rank change {len(v_shape)}!={ndim} (reshape/squeeze) not box-derivable -> full-pull"
+            f"rank change {len(v_shape)}!={ndim} (reshape/squeeze) not box-derivable"
         )
     gstrides = _row_major_strides(global_shape)
     stride_to_dim: dict = {}
@@ -193,7 +187,7 @@ def _view_to_box_perm(
         sdim = stride_to_dim.get(v_stride[d])
         if sdim is None:
             raise UnsupportedReshard(
-                f"non-permutation stride {v_stride[d]} (dim-merging reshape) -> full-pull"
+                f"non-permutation stride {v_stride[d]} (dim-merging reshape)"
             )
         perm[d] = sdim
     used = {s for s in perm if s is not None}
@@ -204,9 +198,7 @@ def _view_to_box_perm(
             perm[d] = remaining[ri]
             ri += 1
     if sorted(perm) != list(range(ndim)):
-        raise UnsupportedReshard(
-            "view strides are not a permutation of source dims -> full-pull"
-        )
+        raise UnsupportedReshard("view strides are not a permutation of source dims")
     box_lo = [(v_offset // gstrides[s]) % global_shape[s] for s in range(ndim)]
     box = [[box_lo[s], box_lo[s]] for s in range(ndim)]
     for d in range(ndim):
@@ -218,11 +210,9 @@ def _view_to_box_perm(
     # into the next dim), and any strided view that isn't actually box-shaped
     # (a dim-merge or L-shaped/overlapping region that slipped the stride check).
     if any(box[s][0] < 0 or box[s][1] > global_shape[s] for s in range(ndim)):
-        raise UnsupportedReshard("resolved box exceeds source bounds -> full-pull")
+        raise UnsupportedReshard("resolved box exceeds source bounds")
     if sum(box[s][0] * gstrides[s] for s in range(ndim)) != v_offset:
-        raise UnsupportedReshard(
-            "view offset does not decompose to a box start -> full-pull"
-        )
+        raise UnsupportedReshard("view offset does not decompose to a box start")
     return [tuple(b) for b in box], perm
 
 
@@ -237,12 +227,13 @@ def resolve_slice(copy: RecordedCopy, global_shape) -> tuple:
     source-dim order so ``paired_runs`` (which walks the overlap in source-dim
     order) maps each source element to the right dest slot. Anything not a pure
     permuted view (a copy, rank change, or dim-merging reshape) raises
-    ``UnsupportedReshard`` -> caller full-pulls."""
+    ``UnsupportedReshard`` and makes the current receiver fail closed."""
     v_off, v_shape, v_stride = _replay_view(copy.op_chain, global_shape)
     box, perm = _view_to_box_perm(v_off, v_shape, v_stride, global_shape)
     if tuple(copy.dest_shape) != tuple(v_shape):
         raise UnsupportedReshard(
-            f"{copy.param_name}: dest {tuple(copy.dest_shape)} != resolved view {tuple(v_shape)} -> full-pull"
+            f"{copy.param_name}: dest {tuple(copy.dest_shape)} "
+            f"!= resolved view {tuple(v_shape)}"
         )
     dest_stride_src = [0] * len(global_shape)
     for d, s in enumerate(perm):
@@ -309,12 +300,12 @@ def plan_pull(
     """For one captured ``copy`` and the published ``shards`` of its source
     tensor, return the ``PullSegment``s that read exactly the needed slice.
 
-    Raises ``UnsupportedReshard`` (caller full-pulls) on dtype mismatch, or an
-    op-chain that isn't a pure permuted view (copy / rank change / dim-merge)."""
+    Raises ``UnsupportedReshard`` on dtype mismatch, or an op-chain that isn't
+    a pure permuted view (copy / rank change / dim-merge)."""
     if src_dtype != copy.dest_dtype:
         raise UnsupportedReshard(
             f"{copy.param_name}: source dtype {src_dtype} != dest dtype {copy.dest_dtype} "
-            "-> convert/full-pull, not a raw byte copy"
+            "-> conversion required, not a raw byte copy"
         )
 
     # Resolve the op-chain (box or transpose/permute) to the source index box +
