@@ -96,8 +96,16 @@ jobs:
       run: cargo test --doc
 
   python-test:
-    name: Python Tests
+    name: Python Tests (protobuf ${{ matrix.protobuf_major }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - protobuf_major: 5
+            protobuf_spec: "protobuf==5.27.2"
+          - protobuf_major: 6
+            protobuf_spec: "protobuf>=6.30.2,<7.0.0"
 
     steps:
     - name: Checkout repository
@@ -115,7 +123,7 @@ jobs:
       working-directory: modelexpress_client/python
       run: |
         uv venv .venv --python 3.12
-        uv pip install -e ".[dev]"
+        uv pip install -e ".[dev]" '${{ matrix.protobuf_spec }}'
 
     - name: Run tests
       working-directory: modelexpress_client/python

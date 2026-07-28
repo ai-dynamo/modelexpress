@@ -28,7 +28,7 @@ dependencies = [
     "google-crc32c>=1.5.0",
     "huggingface_hub>=0.20.0",
     "numpy>=1.24.0",
-    "protobuf>=5.27.0,<6.0.0", # protobuf 5.x compatibility
+    "protobuf>=5.27.2,<7.0.0",
     "pydantic>=2.0.0",
     "torch>=2.6.0",
     "runai-model-streamer[s3,gcs,azure]; sys_platform == 'linux'",
@@ -37,12 +37,14 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    # Use grpcio-tools<=1.66.2 for protobuf 5.x, >=1.67.0 for protobuf 6.x
-    "grpcio-tools>=1.60.0,<=1.66.2",
     "opentelemetry-api>=1.41.1",
     "opentelemetry-sdk>=1.41.1",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
+]
+codegen = [
+    # Keep generated Python stubs compatible with both protobuf 5 and 6.
+    "grpcio-tools==1.66.2",
 ]
 otel = [
     "opentelemetry-api>=1.20.0",
