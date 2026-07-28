@@ -202,7 +202,37 @@ runs:
       run: |
         echo "::group::Deploy MX server in ${NAMESPACE}"
         envsubst < "${SERVER_MANIFEST}" | kubectl apply -n ${NAMESPACE} -f -
-        kubectl rollout status deployment/mx-server -n ${NAMESPACE} --timeout=120s
+        # Gate on the mx-server POD's Ready condition instead of
+        # `kubectl rollout status`, which waits on the Deployment's
+        # availableReplicas. Inside a vCluster those two fields update via
+        # different paths: the pod's Ready condition is copied straight up
+        # from the host by the syncer (one hop), while availableReplicas
+        # additionally needs the vCluster's own controller-manager to
+        # reconcile the Deployment (a second hop that backlogs badly when
+        # many test namespaces spin up mx-server at once). The server is
+        # actually listening within seconds, so poll the pod condition the
+        # syncer reliably propagates rather than the Deployment field it
+        # doesn't. The short loop also avoids the "no matching resources"
+        # race before the pod object exists.
+        deadline=$((SECONDS + 120))
+        while [ $SECONDS -lt $deadline ]; do
+          READY=$(kubectl get pods -n ${NAMESPACE} -l app=mx-server \
+            -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{end}' 2>/dev/null)
+          if [ "${READY}" = "True" ]; then
+            echo "mx-server pod is Ready."
+            break
+          fi
+          echo "mx-server pod not Ready yet (status='${READY}'), retrying in 3s..."
+          sleep 3
+        done
+        READY=$(kubectl get pods -n ${NAMESPACE} -l app=mx-server \
+          -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{end}' 2>/dev/null)
+        if [ "${READY}" != "True" ]; then
+          echo "ERROR: mx-server pod did not become Ready within 120s"
+          kubectl get pods -n ${NAMESPACE} -l app=mx-server -o wide 2>&1 || true
+          kubectl describe pods -n ${NAMESPACE} -l app=mx-server 2>&1 | tail -40 || true
+          exit 1
+        fi
         echo "::endgroup::"
 
     - name: Apply source manifest
