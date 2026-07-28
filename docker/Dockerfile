@@ -34,8 +34,8 @@ COPY --from=builder /app/target/release/modelexpress-cli .
 COPY --from=builder /app/target/release/test_client .
 COPY --from=builder /app/target/release/fallback_test .
 
-# Copy the Attribution files
-COPY ATTRIBUTIONS_Rust.md .
+# Copy the NOTICES files
+COPY NOTICES .
 
 # Expose the default port
 EXPOSE 8001
