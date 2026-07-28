@@ -9,16 +9,17 @@ SPDX-License-Identifier: Apache-2.0
 
 <p align="center">
   <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
-  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-1.90%2B-orange" alt="Rust"></a>
 </p>
 
 <h1 align="center">Dynamo ModelExpress</h1>
 
 <p align="center">
-  <strong>Move model weights into GPU memory and reusable artifacts into filesystem caches</strong> — through P2P RDMA, streaming, GPUDirect Storage, or host-staged POSIX I/O.
+  <strong>Move model weights into GPU memory and reusable artifacts into filesystem caches for inference scale-out and RL post-training refit</strong> — through P2P RDMA, streaming, GPUDirect Storage, or host-staged POSIX I/O.
 </p>
 
 <p align="center">
+  <a href="#inference">Inference</a> •
+  <a href="#rl-post-training-and-weight-refit">RL Refit</a> •
   <a href="#features">Features</a> •
   <a href="#modelexpress-architecture">Architecture</a> •
   <a href="#benchmarks">Benchmarks</a> •
@@ -32,7 +33,11 @@ SPDX-License-Identifier: Apache-2.0
 
 ## Overview
 
-ModelExpress (MX) starts with a simple question: before loading a model, where does a compatible copy of its weights already live? Rather than treating every replica as an independent cold start, ModelExpress discovers available sources and selects the fastest supported path into GPU memory. Deploy it standalone or alongside vLLM, SGLang, NVIDIA Dynamo, and other inference runtimes.
+ModelExpress (MX) is a high-speed movement and management layer for model weights and reusable runtime artifacts across two model lifecycles: serving models efficiently in production and refreshing rollout workers as reinforcement learning (RL) post-training produces new versions.
+
+### Inference
+
+Before loading a model or rebuilding runtime artifacts, MX asks where compatible weights and caches already live. Rather than treating every replica as an independent cold start, MX discovers available sources and selects the fastest supported path into GPU memory or the runtime filesystem cache. Deploy it standalone or alongside vLLM, SGLang, NVIDIA Dynamo, and other inference runtimes.
 
 | LLM serving problem | How ModelExpress helps |
 |---------------------|------------------------|
@@ -55,6 +60,12 @@ The first applicable strategy runs. If a strategy fails before changing model st
 
 The ModelExpress control plane discovers compatible sources through Redis, Kubernetes CRDs, or the decentralized `k8s-service` backend. Weight bytes stay on the data plane and move directly between storage or source and target. For clusters with a shared disk cache, the Model Cache Service also coordinates a single download so concurrent replicas reuse one cached checkpoint instead of multiplying external ingress.
 
+### RL post-training and weight refit
+
+RL post-training repeatedly produces model versions that must move from distributed trainer ranks into rollout workers, often across different Tensor Parallelism (TP), Pipeline Parallelism (PP), and Expert Parallelism (EP) layouts. MX is extending its receiver-driven data path to make this **refit** step faster: trainer ranks publish the shards they already own, and each rollout worker discovers the sources, pulls the ranges required for its target layout, reshards during transfer, and installs the update directly over NIXL. The MX server coordinates discovery while weight bytes stay on the data plane.
+
+The refit path is experimental today. The goal is to remove avoidable full-model gathers and storage round trips from the RL critical path while keeping version barriers and rollout policy under the RL framework's control. See [ModelExpress for RL weight refit](modelexpress_client/python/modelexpress/refit/README.md) for the design, implementation status, integration contract, and current limitations.
+
 ---
 
 ## Features
@@ -71,6 +82,7 @@ The ModelExpress control plane discovers compatible sources through Redis, Kuber
 - **Expanded model pull providers**: NGC catalog and Google Cloud Storage in addition to Hugging Face
 - **GDS (GPUDirect Storage)**: load model weights directly from NVMe into GPU memory, bypassing the CPU/DRAM copy path
 - **Lower NIXL registration overhead** — Opt in to allocation-level pool registration or a single VMM arena registration
+- **RL weight refit (experimental)** — Receiver-driven trainer-to-rollout weight movement and resharding over NIXL; see the [RL refit design and implementation status](modelexpress_client/python/modelexpress/refit/README.md)
 
 ### Integrations
 
