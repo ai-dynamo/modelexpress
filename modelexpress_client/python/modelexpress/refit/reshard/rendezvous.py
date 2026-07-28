@@ -381,10 +381,66 @@ class MxReshardRendezvous:
             nixl_metadata=blob,
             status=p2p_pb2.SOURCE_STATUS_READY,
         )
+        # Hand the heartbeat the newest blob on every publish, before publishing.
+        # See _start_rendezvous_heartbeat for why this assignment is the whole fix.
+        self._hb_worker = worker
         self._mx_source_id = self.client.publish_metadata(
             self._identity(self.role), worker, self.worker_id
         )
+        self._start_rendezvous_heartbeat()
         return self._mx_source_id
+
+    def _start_rendezvous_heartbeat(self) -> None:
+        """Re-publish periodically so the server reaper keeps this source READY.
+
+        The rendezvous publish is one-shot, but the server marks a source STALE once
+        its heartbeat lapses and ``discover_trainers`` filters on READY, so a receiver
+        whose own init runs long would find zero trainers while every trainer is alive
+        and registered.
+
+        What the heartbeat re-publishes is ``self._hb_worker``, re-read on each beat,
+        and that indirection is load-bearing. The first version captured the ``worker``
+        argument in the closure, so the thread re-advertised the blob from the *first*
+        publish for the lifetime of the process. Later publishes still wrote fresh
+        blobs, and the heartbeat then overwrote them with the original - a race decided
+        by whoever wrote last.
+
+        The visible symptom was a refit that verified clean on one rank and reported a
+        digest mismatch on another for the same tensor, because a shard table carries
+        the publisher's digests: a receiver comparing correctly delivered bytes against
+        a step-0 digest sees corruption that is not there. Freezing the table also pins
+        the buffer addresses in it, so the same defect would advertise dead addresses if
+        the registration ever moved. Re-reading the attribute costs nothing and removes
+        both.
+        """
+        import logging as _logging
+        import os as _os
+        import threading as _threading
+
+        period = float(_os.environ.get("MX_RESHARD_HEARTBEAT_S", "30"))
+        if period <= 0 or getattr(self, "_hb_thread", None) is not None:
+            return
+        _log = _logging.getLogger(__name__)
+        stop = _threading.Event()
+
+        def _beat() -> None:
+            while not stop.wait(period):
+                worker = getattr(self, "_hb_worker", None)
+                if worker is None:
+                    continue
+                try:
+                    self.client.publish_metadata(
+                        self._identity(self.role), worker, self.worker_id
+                    )
+                except Exception:
+                    _log.debug("reshard rendezvous heartbeat failed", exc_info=True)
+
+        thread = _threading.Thread(
+            target=_beat, name=f"mx-reshard-hb-{self.rank}", daemon=True
+        )
+        self._hb_stop = stop
+        self._hb_thread = thread
+        thread.start()
 
     def discover_trainers(
         self,

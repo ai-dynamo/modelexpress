@@ -1031,17 +1031,25 @@ class ReshardReceiver:
     def _check_throughput_ceiling(self, step: int, wire_bytes: int, stages: dict):
         """Refuse a wire rate the fabric cannot physically produce.
 
-        Bug 10 delivered nothing and reported the fastest refit we had ever seen:
-        40.61 GB in 0.84 s, or 387 Gbps, on a pod holding two EFAs worth about
-        191 Gbps. Coverage said 100%, fallback said 0, the addresses and digests were
-        stable, and the only signal that dissented was the parameter-equality gate -
-        which timing runs deliberately switch off. Without this check that run would
-        have become the best row in the matrix.
+        An impossible rate is not a measurement: it is evidence the transport reported
+        completions it did not earn, so it must abort rather than be recorded with a
+        caveat. Off unless a ceiling is configured, because only the operator knows
+        their fabric's real limit.
 
-        An impossible rate is not a measurement, so it must abort rather than be
-        recorded with a caveat: the number is evidence that the transport reported
-        completions it did not earn. Off unless a ceiling is configured, because only
-        the operator knows the fabric's real per-rank limit.
+        Set the ceiling to a bound a rank genuinely cannot exceed - normally the whole
+        node's aggregate - and not to an expected or derated rate. On 2026-07-27 this
+        was configured at 381.6 Gbps, being one 400 Gb/s EFA adapter at 95.4%, and it
+        aborted a healthy refit measured at 386.5 Gbps. The rank had two of the node's
+        four adapters available to it, so the rate was legal and the guard was simply
+        wrong. A check that aborts has to be calibrated so that tripping it is proof of
+        a defect; anything tighter costs good runs.
+
+        Note what this therefore does not do. It was written believing it would have
+        caught Bug 10, the silent no-op reads that reported 40.61 GB in 0.84 s while
+        delivering nothing. At a correct ceiling for that hardware it would not have:
+        386.9 Gbps is comfortably legal across two 400 Gb/s adapters. Silent no-op
+        reads are caught by the parameter-equality gate, not by arithmetic. This guard
+        only catches a transport that returns so fast it beats the whole node.
         """
         if _MAX_GBPS <= 0 or wire_bytes <= 0:
             return
