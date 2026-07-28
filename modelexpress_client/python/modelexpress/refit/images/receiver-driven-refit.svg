@@ -1,0 +1,96 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1040" viewBox="0 0 1200 1040"
+     role="img" aria-labelledby="title desc">
+  <title id="title">Receiver-driven ModelExpress refit lifecycle</title>
+  <desc id="desc">A six-step vertical sequence shows trainer ranks publishing shard ownership, the ModelExpress catalog returning metadata, a rollout rank capturing its loader geometry, planning exact reads, pulling with NIXL, and installing into the live inference model.</desc>
+  <defs>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1565C0"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2E7D32"/>
+    </marker>
+    <marker id="arrow-purple" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#5E35B1"/>
+    </marker>
+    <style>
+      .title { font: 700 30px system-ui, sans-serif; fill: #1f2937; }
+      .subtitle { font: 500 17px system-ui, sans-serif; fill: #4b5563; }
+      .column { font: 700 21px system-ui, sans-serif; }
+      .node-title { font: 700 17px system-ui, sans-serif; fill: #111827; }
+      .node-text { font: 500 16px system-ui, sans-serif; fill: #374151; }
+      .step { font: 700 16px system-ui, sans-serif; fill: white; }
+      .edge-label { font: 600 16px system-ui, sans-serif; fill: #374151; }
+      .edge { fill: none; stroke-width: 3; }
+      .life { stroke: #cbd5e1; stroke-width: 3; stroke-dasharray: 8 8; }
+    </style>
+  </defs>
+
+  <rect width="1200" height="1040" rx="24" fill="#f8fafc"/>
+  <text x="600" y="52" text-anchor="middle" class="title">Receiver-driven refit lifecycle</text>
+  <text x="600" y="82" text-anchor="middle" class="subtitle">The RL framework triggers the cycle; ModelExpress discovers, plans, and moves the weight ranges</text>
+
+  <rect x="55" y="115" width="300" height="850" rx="20" fill="#eff6ff" stroke="#64B5F6" stroke-width="2"/>
+  <rect x="450" y="115" width="300" height="850" rx="20" fill="#ecfdf5" stroke="#81C784" stroke-width="2"/>
+  <rect x="845" y="115" width="300" height="850" rx="20" fill="#f5f3ff" stroke="#B39DDB" stroke-width="2"/>
+
+  <text x="205" y="155" text-anchor="middle" class="column" fill="#1565C0">Trainer ranks</text>
+  <text x="600" y="155" text-anchor="middle" class="column" fill="#2E7D32">MX control plane</text>
+  <text x="995" y="155" text-anchor="middle" class="column" fill="#5E35B1">Rollout rank</text>
+
+  <line x1="205" y1="180" x2="205" y2="925" class="life"/>
+  <line x1="600" y1="180" x2="600" y2="925" class="life"/>
+  <line x1="995" y1="180" x2="995" y2="925" class="life"/>
+
+  <!-- Step 1 -->
+  <circle cx="90" cy="225" r="20" fill="#1565C0"/><text x="90" y="231" text-anchor="middle" class="step">1</text>
+  <rect x="105" y="190" width="200" height="70" rx="13" fill="#dbeafe" stroke="#1565C0" stroke-width="2"/>
+  <text x="205" y="219" text-anchor="middle" class="node-title">Register local shards</text>
+  <text x="205" y="243" text-anchor="middle" class="node-text">Keep native layout</text>
+  <path d="M305 225 H490" class="edge" stroke="#1565C0" marker-end="url(#arrow-blue)"/>
+  <text x="405" y="211" text-anchor="middle" class="edge-label">ownership + address</text>
+
+  <!-- Step 2 -->
+  <circle cx="465" cy="350" r="20" fill="#2E7D32"/><text x="465" y="356" text-anchor="middle" class="step">2</text>
+  <rect x="490" y="315" width="220" height="70" rx="13" fill="#dcfce7" stroke="#2E7D32" stroke-width="2"/>
+  <text x="600" y="344" text-anchor="middle" class="node-title">Catalog READY ranks</text>
+  <text x="600" y="368" text-anchor="middle" class="node-text">Metadata only</text>
+  <path d="M875 350 H710" class="edge" stroke="#5E35B1" marker-end="url(#arrow-purple)"/>
+  <text x="802" y="336" text-anchor="middle" class="edge-label">discover trainers</text>
+
+  <!-- Step 3 -->
+  <circle cx="850" cy="475" r="20" fill="#5E35B1"/><text x="850" y="481" text-anchor="middle" class="step">3</text>
+  <rect x="875" y="430" width="240" height="90" rx="13" fill="#ede9fe" stroke="#5E35B1" stroke-width="2"/>
+  <text x="995" y="463" text-anchor="middle" class="node-title">Capture target layout</text>
+  <text x="995" y="487" text-anchor="middle" class="node-text">Dry-run engine loader</text>
+  <text x="995" y="509" text-anchor="middle" class="node-text">No weight bytes move</text>
+
+  <!-- Step 4 -->
+  <circle cx="850" cy="610" r="20" fill="#5E35B1"/><text x="850" y="616" text-anchor="middle" class="step">4</text>
+  <rect x="875" y="565" width="240" height="90" rx="13" fill="#ede9fe" stroke="#5E35B1" stroke-width="2"/>
+  <text x="995" y="598" text-anchor="middle" class="node-title">Build transfer plan</text>
+  <text x="995" y="622" text-anchor="middle" class="node-text">Intersect needed ranges</text>
+  <text x="995" y="644" text-anchor="middle" class="node-text">Cache stable geometry</text>
+
+  <!-- Step 5 -->
+  <circle cx="850" cy="680" r="20" fill="#5E35B1"/><text x="850" y="686" text-anchor="middle" class="step">5</text>
+  <rect x="875" y="700" width="240" height="90" rx="13" fill="#ede9fe" stroke="#5E35B1" stroke-width="2"/>
+  <text x="995" y="733" text-anchor="middle" class="node-title">Pull with NIXL</text>
+  <text x="995" y="757" text-anchor="middle" class="node-text">Batched RDMA READs</text>
+  <text x="995" y="779" text-anchor="middle" class="node-text">Into receive buffers</text>
+  <path d="M305 745 H875" class="edge" stroke="#2E7D32" marker-end="url(#arrow-green)"/>
+  <text x="600" y="728" text-anchor="middle" class="edge-label">receiver initiates reads - bytes bypass the catalog</text>
+
+  <!-- Step 6 -->
+  <circle cx="850" cy="880" r="20" fill="#5E35B1"/><text x="850" y="886" text-anchor="middle" class="step">6</text>
+  <rect x="875" y="835" width="240" height="90" rx="13" fill="#ede9fe" stroke="#5E35B1" stroke-width="2"/>
+  <text x="995" y="868" text-anchor="middle" class="node-title">Transform and install</text>
+  <text x="995" y="892" text-anchor="middle" class="node-text">Preserve live storage</text>
+  <text x="995" y="914" text-anchor="middle" class="node-text">Report rollout ready</text>
+
+  <rect x="100" y="975" width="1000" height="42" rx="12" fill="#ffffff" stroke="#9E9E9E" stroke-width="2"/>
+  <text x="600" y="1002" text-anchor="middle" class="node-text">RL framework owns version timing and barriers - MX owns discovery, coverage planning, transport, and shared timing stages</text>
+</svg>
