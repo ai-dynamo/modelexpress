@@ -31,9 +31,16 @@ inputs:
     required: false
     default: 'mx-ci'
   vcluster_k8s_version:
-    description: 'Kubernetes version for the vCluster control plane'
+    description: |
+      Kubernetes version for the vCluster control plane. Must be >= the host
+      cluster's minor version. Kubernetes 1.34 added the observedGeneration
+      field on pod conditions; if the host is 1.34+ but the vCluster is 1.33 or
+      older, the vCluster API drops that field and the syncer enters an infinite
+      reconcile loop that keeps overwriting Ready=True with stale data, so pods
+      never surface as Ready (Deployment availableReplicas and Service endpoints
+      stay stuck). Keep this at or above the host minor to match schemas.
     required: false
-    default: 'v1.33.13'
+    default: 'v1.34.10'
   dynamo_ref:
     description: |
       Git ref of the ai-dynamo/dynamo repo to clone for the helm chart.

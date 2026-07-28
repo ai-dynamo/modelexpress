@@ -202,15 +202,7 @@ runs:
       run: |
         echo "::group::Deploy MX server in ${NAMESPACE}"
         envsubst < "${SERVER_MANIFEST}" | kubectl apply -n ${NAMESPACE} -f -
-        # Experiment (per node-latency analysis): the rollout timeout tracks
-        # which AKS node mx-server lands on — fast nodes finish in ~10s, slow
-        # nodes have taken up to ~62s, and 120s is too tight when the syncer is
-        # behind. Widen to 600s to see where pods converge: settling around
-        # 3-4 min means throughput and this is the fix; never converging points
-        # at unhealthy nodes (infra, see OPS-7934) rather than CI. The -o wide
-        # pod dumps capture .spec.nodeName so convergence time can be
-        # correlated against the node afterward.
-        kubectl rollout status deployment/mx-server -n ${NAMESPACE} --timeout=600s
+        kubectl rollout status deployment/mx-server -n ${NAMESPACE} --timeout=120s
         echo "::endgroup::"
 
     - name: Apply source manifest
