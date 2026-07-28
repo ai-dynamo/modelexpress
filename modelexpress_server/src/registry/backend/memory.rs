@@ -8,14 +8,26 @@ use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use modelexpress_common::models::{ModelProvider, ModelStatus};
 
 use crate::registry::backend::{ClaimOutcome, ModelRecord, RegistryBackend, RegistryResult};
 
+#[derive(Debug)]
+struct DownloadLease {
+    claim_id: String,
+    expires_at: DateTime<Utc>,
+}
+
+#[derive(Default)]
+struct InMemoryState {
+    models: HashMap<String, ModelRecord>,
+    leases: HashMap<String, DownloadLease>,
+}
+
 #[derive(Default)]
 pub struct InMemoryRegistryBackend {
-    models: Mutex<HashMap<String, ModelRecord>>,
+    state: Mutex<InMemoryState>,
 }
 
 impl InMemoryRegistryBackend {
@@ -24,8 +36,15 @@ impl InMemoryRegistryBackend {
         Self::default()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, ModelRecord>> {
-        self.models.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock(&self) -> std::sync::MutexGuard<'_, InMemoryState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn lease_deadline(now: DateTime<Utc>, duration: std::time::Duration) -> DateTime<Utc> {
+        chrono::TimeDelta::from_std(duration)
+            .ok()
+            .and_then(|duration| now.checked_add_signed(duration))
+            .unwrap_or(now)
     }
 }
 
@@ -36,11 +55,11 @@ impl RegistryBackend for InMemoryRegistryBackend {
     }
 
     async fn get_status(&self, model_name: &str) -> RegistryResult<Option<ModelStatus>> {
-        Ok(self.lock().get(model_name).map(|r| r.status))
+        Ok(self.lock().models.get(model_name).map(|r| r.status))
     }
 
     async fn get_model_record(&self, model_name: &str) -> RegistryResult<Option<ModelRecord>> {
-        Ok(self.lock().get(model_name).cloned())
+        Ok(self.lock().models.get(model_name).cloned())
     }
 
     async fn set_status(
@@ -51,8 +70,9 @@ impl RegistryBackend for InMemoryRegistryBackend {
         message: Option<String>,
     ) -> RegistryResult<()> {
         let now = Utc::now();
-        let mut models = self.lock();
-        models
+        let mut state = self.lock();
+        state
+            .models
             .entry(model_name.to_string())
             .and_modify(|record| {
                 record.provider = provider;
@@ -68,18 +88,23 @@ impl RegistryBackend for InMemoryRegistryBackend {
                 last_used_at: now,
                 message,
             });
+        if status != ModelStatus::DOWNLOADING {
+            state.leases.remove(model_name);
+        }
         Ok(())
     }
 
     async fn touch_model(&self, model_name: &str) -> RegistryResult<()> {
-        if let Some(record) = self.lock().get_mut(model_name) {
+        if let Some(record) = self.lock().models.get_mut(model_name) {
             record.last_used_at = Utc::now();
         }
         Ok(())
     }
 
     async fn delete_model(&self, model_name: &str) -> RegistryResult<()> {
-        self.lock().remove(model_name);
+        let mut state = self.lock();
+        state.models.remove(model_name);
+        state.leases.remove(model_name);
         Ok(())
     }
 
@@ -87,7 +112,7 @@ impl RegistryBackend for InMemoryRegistryBackend {
         &self,
         limit: Option<u32>,
     ) -> RegistryResult<Vec<ModelRecord>> {
-        let mut records: Vec<ModelRecord> = self.lock().values().cloned().collect();
+        let mut records: Vec<ModelRecord> = self.lock().models.values().cloned().collect();
         records.sort_by_key(|r| r.last_used_at);
         if let Some(limit) = limit {
             records.truncate(limit as usize);
@@ -96,11 +121,11 @@ impl RegistryBackend for InMemoryRegistryBackend {
     }
 
     async fn get_status_counts(&self) -> RegistryResult<(u32, u32, u32)> {
-        let models = self.lock();
+        let state = self.lock();
         let mut downloading = 0u32;
         let mut downloaded = 0u32;
         let mut error = 0u32;
-        for record in models.values() {
+        for record in state.models.values() {
             match record.status {
                 ModelStatus::DOWNLOADING => downloading = downloading.saturating_add(1),
                 ModelStatus::DOWNLOADED => downloaded = downloaded.saturating_add(1),
@@ -114,13 +139,33 @@ impl RegistryBackend for InMemoryRegistryBackend {
         &self,
         model_name: &str,
         provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
     ) -> RegistryResult<ClaimOutcome> {
         let now = Utc::now();
-        let mut models = self.lock();
-        match models.get(model_name) {
+        let lease_expires_at = Self::lease_deadline(now, lease_duration);
+        let mut state = self.lock();
+        let expired = state
+            .leases
+            .get(model_name)
+            .is_none_or(|lease| lease.expires_at <= now);
+        match state.models.get_mut(model_name) {
+            Some(existing) if existing.status == ModelStatus::DOWNLOADING && expired => {
+                existing.provider = provider;
+                existing.last_used_at = now;
+                existing.message = Some("Taking over expired download lease...".to_string());
+                state.leases.insert(
+                    model_name.to_string(),
+                    DownloadLease {
+                        claim_id: claim_id.to_string(),
+                        expires_at: lease_expires_at,
+                    },
+                );
+                Ok(ClaimOutcome::Claimed)
+            }
             Some(existing) => Ok(ClaimOutcome::AlreadyExists(existing.status)),
             None => {
-                models.insert(
+                state.models.insert(
                     model_name.to_string(),
                     ModelRecord {
                         model_name: model_name.to_string(),
@@ -129,6 +174,13 @@ impl RegistryBackend for InMemoryRegistryBackend {
                         created_at: now,
                         last_used_at: now,
                         message: None,
+                    },
+                );
+                state.leases.insert(
+                    model_name.to_string(),
+                    DownloadLease {
+                        claim_id: claim_id.to_string(),
+                        expires_at: lease_expires_at,
                     },
                 );
                 Ok(ClaimOutcome::Claimed)
@@ -140,18 +192,95 @@ impl RegistryBackend for InMemoryRegistryBackend {
         &self,
         model_name: &str,
         provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
     ) -> RegistryResult<bool> {
-        let mut models = self.lock();
-        match models.get_mut(model_name) {
+        let mut state = self.lock();
+        let now = Utc::now();
+        let lease_expires_at = Self::lease_deadline(now, lease_duration);
+        match state.models.get_mut(model_name) {
             Some(record) if record.status == ModelStatus::ERROR => {
                 record.provider = provider;
                 record.status = ModelStatus::DOWNLOADING;
                 record.message = Some("Retrying download...".to_string());
-                record.last_used_at = Utc::now();
+                record.last_used_at = now;
+                state.leases.insert(
+                    model_name.to_string(),
+                    DownloadLease {
+                        claim_id: claim_id.to_string(),
+                        expires_at: lease_expires_at,
+                    },
+                );
                 Ok(true)
             }
             _ => Ok(false),
         }
+    }
+
+    async fn refresh_download_claim(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
+    ) -> RegistryResult<bool> {
+        let mut state = self.lock();
+        let now = Utc::now();
+        let lease_expires_at = Self::lease_deadline(now, lease_duration);
+        let owns_claim = state
+            .leases
+            .get(model_name)
+            .is_some_and(|lease| lease.claim_id == claim_id);
+        if !owns_claim
+            || state
+                .models
+                .get(model_name)
+                .is_none_or(|record| record.status != ModelStatus::DOWNLOADING)
+        {
+            return Ok(false);
+        }
+        let InMemoryState { models, leases } = &mut *state;
+        match (models.get_mut(model_name), leases.get_mut(model_name)) {
+            (Some(record), Some(lease)) => {
+                record.provider = provider;
+                record.last_used_at = now;
+                lease.expires_at = lease_expires_at;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn finish_download_claim(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        claim_id: &str,
+        status: ModelStatus,
+        message: Option<String>,
+    ) -> RegistryResult<bool> {
+        let mut state = self.lock();
+        let owns_claim = state
+            .leases
+            .get(model_name)
+            .is_some_and(|lease| lease.claim_id == claim_id);
+        if !owns_claim
+            || state
+                .models
+                .get(model_name)
+                .is_none_or(|record| record.status != ModelStatus::DOWNLOADING)
+        {
+            return Ok(false);
+        }
+        let Some(record) = state.models.get_mut(model_name) else {
+            return Ok(false);
+        };
+        record.provider = provider;
+        record.status = status;
+        record.message = message;
+        record.last_used_at = Utc::now();
+        state.leases.remove(model_name);
+        Ok(true)
     }
 }
 
@@ -180,14 +309,24 @@ mod tests {
 
         assert_eq!(
             backend
-                .try_claim_for_download("fresh", ModelProvider::HuggingFace)
+                .try_claim_for_download(
+                    "fresh",
+                    ModelProvider::HuggingFace,
+                    "owner",
+                    std::time::Duration::from_secs(30),
+                )
                 .await
                 .expect("claim"),
             ClaimOutcome::Claimed
         );
         assert_eq!(
             backend
-                .try_claim_for_download("fresh", ModelProvider::HuggingFace)
+                .try_claim_for_download(
+                    "fresh",
+                    ModelProvider::HuggingFace,
+                    "other",
+                    std::time::Duration::from_secs(30),
+                )
                 .await
                 .expect("claim again"),
             ClaimOutcome::AlreadyExists(ModelStatus::DOWNLOADING)
@@ -307,7 +446,12 @@ mod tests {
         let backend = InMemoryRegistryBackend::new();
         assert!(
             !backend
-                .try_reset_error_for_retry("m", ModelProvider::HuggingFace)
+                .try_reset_error_for_retry(
+                    "m",
+                    ModelProvider::HuggingFace,
+                    "owner",
+                    std::time::Duration::from_secs(30),
+                )
                 .await
                 .expect("reset unknown"),
             "unknown model: nothing to reset"
@@ -324,7 +468,12 @@ mod tests {
             .expect("set downloaded");
         assert!(
             !backend
-                .try_reset_error_for_retry("m", ModelProvider::HuggingFace)
+                .try_reset_error_for_retry(
+                    "m",
+                    ModelProvider::HuggingFace,
+                    "owner",
+                    std::time::Duration::from_secs(30),
+                )
                 .await
                 .expect("reset non-error"),
             "non-error status: no reset"
@@ -341,7 +490,12 @@ mod tests {
             .expect("set error");
         assert!(
             backend
-                .try_reset_error_for_retry("m", ModelProvider::HuggingFace)
+                .try_reset_error_for_retry(
+                    "m",
+                    ModelProvider::HuggingFace,
+                    "owner",
+                    std::time::Duration::from_secs(30),
+                )
                 .await
                 .expect("reset from error"),
             "ERROR flips to DOWNLOADING"
@@ -349,6 +503,64 @@ mod tests {
         assert_eq!(
             backend.get_status("m").await.expect("get"),
             Some(ModelStatus::DOWNLOADING)
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_lease_can_be_reclaimed_and_stale_owner_is_fenced() {
+        let backend = InMemoryRegistryBackend::new();
+        let provider = ModelProvider::HuggingFace;
+        assert_eq!(
+            backend
+                .try_claim_for_download("m", provider, "owner-1", std::time::Duration::ZERO,)
+                .await
+                .expect("initial claim"),
+            ClaimOutcome::Claimed
+        );
+        assert_eq!(
+            backend
+                .try_claim_for_download(
+                    "m",
+                    provider,
+                    "owner-2",
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+                .expect("takeover"),
+            ClaimOutcome::Claimed
+        );
+        assert!(
+            !backend
+                .finish_download_claim("m", provider, "owner-1", ModelStatus::DOWNLOADED, None,)
+                .await
+                .expect("stale finish")
+        );
+        assert!(
+            backend
+                .refresh_download_claim(
+                    "m",
+                    provider,
+                    "owner-2",
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+                .expect("refresh")
+        );
+        assert!(
+            backend
+                .finish_download_claim(
+                    "m",
+                    provider,
+                    "owner-2",
+                    ModelStatus::DOWNLOADED,
+                    Some("done".to_string()),
+                )
+                .await
+                .expect("finish")
+        );
+        assert_eq!(
+            backend.get_status("m").await.expect("get"),
+            Some(ModelStatus::DOWNLOADED)
         );
     }
 }

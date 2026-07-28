@@ -13,7 +13,6 @@ mod cache_manifest;
 mod download_progress;
 mod download_task;
 mod downloader;
-mod lock_file;
 mod model_dir;
 mod model_name;
 mod path_ext;
