@@ -24,10 +24,10 @@ transport, buffers and the router dtype-cast are shared here.
 from __future__ import annotations
 
 import logging
-import os
 
 import torch
 
+from modelexpress import envs
 from modelexpress.client import MxClient
 from modelexpress.nixl_transfer import NixlTransferManager
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
@@ -52,7 +52,7 @@ def _fused_wire_enabled() -> bool:
     Read at call time so an A/B can toggle it without re-importing. Set
     ``MX_RESHARD_FUSED_WIRE=0`` to drain each phase in turn.
     """
-    return os.environ.get("MX_RESHARD_FUSED_WIRE", "1") not in ("0", "false")
+    return envs.MX_RESHARD_FUSED_WIRE
 
 
 def _replay_ops(tensor: torch.Tensor, op_chain: tuple) -> torch.Tensor:
