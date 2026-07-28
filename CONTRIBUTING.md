@@ -151,9 +151,12 @@ docker build -f docker/Dockerfile -t model-express .
 docker compose -f docker/docker-compose.yml up --build
 
 # Build P2P client image
-docker build -f examples/p2p_transfer_k8s/Dockerfile.client \
+docker build -f examples/p2p_transfer_k8s/client/vllm/Dockerfile \
   -t your-registry/IMAGE_NAME:TAG .
 ```
+
+The SGLang build and TensorRT-LLM deployment paths are documented under
+[`examples/p2p_transfer_k8s/client/`](examples/p2p_transfer_k8s/client/).
 
 ### Helm
 

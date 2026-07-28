@@ -7,7 +7,7 @@
 # pods. The first replica finds no READY source on the mx-server, loads
 # weights natively, and publishes its metadata. The second replica
 # discovers the source and loads via NIXL RDMA. No source/target branching
-# at the command/manifest level — unlike TRT-LLM, which needs MODEL_EXPRESS_SOURCE.
+# at the command/manifest level.
 #
 # Applied twice by the workflow with different envsubst values:
 #   Source apply:  JOB_NAME=mx-source  WORKER_PORT=<source_port>

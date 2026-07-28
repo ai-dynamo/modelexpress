@@ -69,6 +69,35 @@ python -m sglang.launch_server \
     --modelexpress-config '{"transport": "nixl"}'
 ```
 
+## Quick Start with TensorRT-LLM
+
+TensorRT-LLM integrates through its native `checkpoint_format="MX"` interface.
+Install ModelExpress in a qualified TensorRT-LLM image, then construct the
+PyTorch backend with the ModelExpress server configuration:
+
+```python
+from tensorrt_llm.llmapi import LLM
+
+llm = LLM(
+    model="/model",
+    checkpoint_format="MX",
+    mx_config={
+        "server_url": "modelexpress-server:8001",
+        "server_query_timeout_s": 600,
+    },
+    tensor_parallel_size=4,
+    backend="pytorch",
+)
+```
+
+The first replica falls back to the Hugging Face checkpoint and publishes its
+post-transform weights; later compatible replicas receive them through
+ModelExpress. The current qualified scope is the `LlamaForCausalLM` family.
+See the
+[TensorRT-LLM P2P example](../../examples/p2p_transfer_k8s/client/trtllm/)
+for the qualified-image requirement and production-style Kubernetes
+deployment.
+
 ## Programmatic Usage
 
 ### MxClient
@@ -141,6 +170,7 @@ register_modelexpress_loaders()
 | `modelexpress.metadata` | Metadata clients, source identity, publishing, and worker manifest serving |
 | `modelexpress.engines.vllm.loader` | `MxModelLoader` -- vLLM integration |
 | `modelexpress.engines.sglang.loader` | `MxModelLoader` -- SGLang `remote_instance` integration |
+| `modelexpress.trtllm_live_transfer` | Weight-loading helpers consumed by TensorRT-LLM's native MX checkpoint loader |
 | `modelexpress.vllm_loader` | Compatibility shim for the vLLM loader |
 | `modelexpress.nixl_transfer` | `NixlTransferManager` -- NIXL agent lifecycle and RDMA transfers |
 | `modelexpress.types` | `TensorDescriptor`, `WorkerMetadata` -- core data types |
