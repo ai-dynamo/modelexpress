@@ -11,7 +11,7 @@ plan that reconstructs correctly here reconstructs correctly on the wire.
 
 Exercises the same layouts as the geometry test: column block (contiguous),
 row-parallel column slice (strided, multi-run), fused qkv (per-shard offsets),
-and full copy - plus the unsupported-op fallback path.
+and full copy - plus unsupported-op detection.
 
 Run: pytest tests/test_reshard_refit_transfer.py
 """
@@ -36,6 +36,19 @@ from modelexpress.refit.reshard.types import CaptureResult, RecordedCopy
 from tests.test_reshard_refit_geometry import ToyModel, _manifest
 
 EL = 4  # float32
+
+
+class _RecordingTransport(InMemoryReferenceTransport):
+    """Reference transport that also records which sessions it was asked to read
+    from, so a test can assert that an unsupported source is never fetched."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sessions: set = set()
+
+    def read(self, descriptors: list) -> None:
+        self.sessions.update(d.session for d in descriptors if d.nbytes)
+        super().read(descriptors)
 
 
 def _full_sources():
@@ -112,8 +125,16 @@ def test_reshard_reconstructs_ground_truth():
 
 def test_strided_source_reconstructs_exactly():
     """Focus the row-parallel case: a strided column-slice must land correctly
-    across its multiple runs (which dim-0-only shard schemes can't serve)."""
+    across its multiple runs (which dim-0-only shard schemes can't serve).
+
+    Captured over a row-only manifest so the plan has an empty ``fallback``.
+    Capturing the whole manifest while publishing only ``row`` would leave the
+    other five sources unsupported, and a plan carrying unsupported sources is
+    one the receiver refuses outright - so executing it here would assert
+    reconstruction against a plan that never reaches a real receiver.
+    """
     srcs = _full_sources()
+    row_manifest = [entry for entry in _manifest() if entry[0] == "row"]
 
     truth_model = ToyModel()
     truth_model.load_weights(list(srcs.items()))
@@ -126,7 +147,7 @@ def test_strided_source_reconstructs_exactly():
 
     with torch.device("meta"):
         meta_model = ToyModel()
-    capture = capture_geometry(meta_model, _manifest())
+    capture = capture_geometry(meta_model, row_manifest)
 
     row_src = srcs["row"]
     shard = Shard(
@@ -138,8 +159,8 @@ def test_strided_source_reconstructs_exactly():
     )
     sources = {"row": SourceInfo(tuple(row_src.shape), torch.float32, EL, [shard])}
 
-    # Only the 'row' copy is planned here (others have no source -> fallback).
     plan = plan_transfer(capture, sources)
+    assert plan.fallback == []
     execute_transfer(
         plan,
         resolve_param_ptr=lambda name: dict(recon_model.named_parameters())[
@@ -241,7 +262,7 @@ def test_non_dim0_source_keeps_exact_descriptors():
     assert plan.extra_wire_bytes() == 0
 
 
-def test_unsupported_source_routes_to_fallback():
+def test_unsupported_source_is_marked_for_fail_closed():
     srcs = _full_sources()
     srcs["bad"] = torch.arange(16, dtype=torch.float32).reshape(4, 4).contiguous()
 
@@ -263,9 +284,68 @@ def test_unsupported_source_routes_to_fallback():
     assert {"col", "row", "qkv", "norm"} <= planned_params
     assert all(t.data_ptr() for t in srcs.values())
 
+    # Fail-closed means the unsupported source is never fetched. `plan_transfer`
+    # records it and plans nothing for it; the refusal itself is the receiver's
+    # policy, not this layer's - see the `if plan.fallback:` guard in
+    # `ReshardReceiver._prepare`, which raises UnsupportedReshard before any
+    # transport call rather than serving stale weights for `bad`.
+    assert "bad" not in planned_params
+
+    recon_model = ToyModel(with_bad=True)
+    for p in recon_model.parameters():
+        torch.nn.init.zeros_(p)
+    recon_ptrs = {n: p.data_ptr() for n, p in recon_model.named_parameters()}
+
+    reads = _RecordingTransport()
+    execute_transfer(
+        plan,
+        resolve_param_ptr=lambda name: recon_ptrs[name],
+        transport=reads,
+    )
+    assert "bad" not in reads.sessions
+    assert reads.sessions  # the supported sources were still fetched
+
+
+def test_execute_transfer_surfaces_fallback_for_the_receiver_to_reject():
+    """`execute_transfer` reports `fallback` rather than acting on it.
+
+    The split is deliberate: this layer stays mechanism and the receiver holds
+    the policy, so the contract that has to hold here is that the list survives
+    into the returned stats. A receiver that cannot see it cannot fail closed.
+    """
+    srcs = _full_sources()
+    srcs["bad"] = torch.arange(16, dtype=torch.float32).reshape(4, 4).contiguous()
+
+    with torch.device("meta"):
+        meta_model = ToyModel(with_bad=True)
+    capture = capture_geometry(meta_model, _manifest(with_bad=True))
+
+    recon_model = ToyModel(with_bad=True)
+    for p in recon_model.parameters():
+        torch.nn.init.zeros_(p)
+    recon_ptrs = {n: p.data_ptr() for n, p in recon_model.named_parameters()}
+
+    sources = {}
+    for name, tensor in srcs.items():
+        shard = Shard(
+            (0,) * tensor.dim(), tuple(tensor.shape), name, tensor.data_ptr(), EL
+        )
+        sources[name] = SourceInfo(tuple(tensor.shape), torch.float32, EL, [shard])
+
+    plan = plan_transfer(capture, sources)
+    stats = execute_transfer(
+        plan,
+        resolve_param_ptr=lambda name: recon_ptrs[name],
+        transport=InMemoryReferenceTransport(),
+    )
+    assert stats["fallback"] == plan.fallback
+    assert "bad" in stats["fallback"]
+    assert all(t.data_ptr() for t in srcs.values())
+
 
 if __name__ == "__main__":
     test_reshard_reconstructs_ground_truth()
     test_strided_source_reconstructs_exactly()
-    test_unsupported_source_routes_to_fallback()
-    print("OK: reshard reconstructs ground truth + strided + fallback")
+    test_unsupported_source_is_marked_for_fail_closed()
+    test_execute_transfer_surfaces_fallback_for_the_receiver_to_reject()
+    print("OK: reshard reconstructs ground truth + strided + fail-closed")

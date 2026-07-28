@@ -40,8 +40,9 @@ import time
 import uuid
 from dataclasses import dataclass
 
-from modelexpress import p2p_pb2
+from modelexpress import envs, p2p_pb2
 from modelexpress.client import MxClient
+from modelexpress.metadata.publisher import PublisherThread
 from modelexpress.refit.reshard.slice_plan import Shard
 from modelexpress.refit.reshard.transfer_plan import SourceInfo
 
@@ -54,7 +55,8 @@ def _mx_version() -> str:
     """The ``modelexpress`` package version, folded into the SourceIdentity hash
     so trainer and inference on the same MX build resolve the same mx_source_id.
     Derived (not a literal) so it tracks the real build."""
-    from importlib.metadata import PackageNotFoundError, version as pkg_version
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as pkg_version
 
     try:
         return pkg_version("modelexpress")
@@ -272,8 +274,9 @@ class MxReshardRendezvous:
         self.model_name = model_name
         self.worker_id = worker_id or str(uuid.uuid4())
         self._mx_source_id: str | None = None
+        self._publisher: PublisherThread | None = None
 
-    def _identity(self, role: str) -> "p2p_pb2.SourceIdentity":
+    def _identity(self, role: str) -> p2p_pb2.SourceIdentity:
         # Only fields BOTH sides derive identically (see module docstring): the
         # shared model_name + mx_version + a fixed framework, with the role in
         # extra_parameters. No dtype here - the receiver builds this identity to
@@ -289,12 +292,48 @@ class MxReshardRendezvous:
         )
 
     def publish(self, blob: bytes) -> str:
-        """Publish this rank's rendezvous blob (agent meta + shard table)."""
-        worker = p2p_pb2.WorkerMetadata(worker_rank=self.rank, nixl_metadata=blob)
+        """Publish a complete rendezvous blob as immediately discoverable.
+
+        Callers build ``blob`` only after the NIXL agent and source buffers are
+        registered, so publication is the readiness boundary for this minimal
+        rendezvous API. Re-publishing refreshes the worker record for the same
+        ``worker_id``.
+        """
+        heartbeat_period = envs.MX_HEARTBEAT_INTERVAL_SECS
+        if heartbeat_period <= 0:
+            raise ValueError(
+                f"MX_HEARTBEAT_INTERVAL_SECS must be positive, got {heartbeat_period}"
+            )
+        if self._publisher is not None:
+            # Stop the old status heartbeat before replacing the publication.
+            # Stopping it afterwards would mark the replacement STALE when the
+            # identity and worker ID resolve to the same source.
+            self._publisher.stop()
+            self._publisher = None
+        worker = p2p_pb2.WorkerMetadata(
+            worker_rank=self.rank,
+            nixl_metadata=blob,
+            status=p2p_pb2.SOURCE_STATUS_READY,
+        )
         self._mx_source_id = self.client.publish_metadata(
             self._identity(self.role), worker, self.worker_id
         )
+        self._publisher = PublisherThread(
+            mx_client=self.client,
+            mx_source_id=self._mx_source_id,
+            worker_id=self.worker_id,
+            worker_rank=self.rank,
+            interval_secs=heartbeat_period,
+        )
+        self._publisher.start()
         return self._mx_source_id
+
+    def close(self) -> None:
+        """Stop heartbeats and best-effort mark the published source STALE."""
+        if self._publisher is not None:
+            self._publisher.stop()
+            self._publisher = None
+        self._mx_source_id = None
 
     def discover_trainers(
         self,

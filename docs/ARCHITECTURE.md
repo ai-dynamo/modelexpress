@@ -631,6 +631,16 @@ shards, and compiles one-sided read descriptors without materializing a full
 trainer tensor. Geometry, slice planning, transfer planning, and the transport
 protocol are engine-agnostic.
 
+The minimal rendezvous publisher is called only after its NIXL agent and source
+buffers are registered, so `publish()` stores the worker as READY and repeated
+publication replaces that worker record. The shared `PublisherThread` sends a
+READY status heartbeat every `MX_HEARTBEAT_INTERVAL_SECS` seconds (30 by
+default), keeping the record fresh for READY-only discovery. `close()` uses the
+same publisher lifecycle to stop the heartbeat and best-effort mark the source
+STALE. Long-lived framework integrations still need to call `close()` from
+their lifecycle; SIGKILL and mid-transfer failure recovery remain follow-up
+work.
+
 `engines/vllm/refit/receiver.py` supplies the vLLM-specific boundaries: capture
 on an unquantized meta twin, then installation through vLLM's layerwise reload
 and `process_weights_after_loading` path. Unsupported loader operations fail
@@ -648,6 +658,14 @@ the exact descriptor count, descriptor savings, and extra bytes. If the
 published layout cannot be reconstructed as a complete dim-0 partition, the
 planner keeps the exact known-correct descriptors rather than changing
 correctness behavior.
+
+Each receiver retains one load-time receive buffer per captured destination.
+Parameters whose served dtype differs from the load-time dtype also retain a
+source-dtype conversion staging buffer. These buffers are allocated from
+classic CUDA allocations and registered for the receiver lifetime. PWAL is
+intentional here: the receiver reconstructs load-time tensors, and quantized
+models still require vLLM post-load processing. MDL is appropriate only when
+the incoming tensors already match the validated runtime representation.
 
 ### SGLang Loader
 
