@@ -14,6 +14,7 @@ also uses the same agent for host DRAM chunk staging.
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import time
@@ -145,6 +146,7 @@ class NixlTransferManager:
         # Last data-plane failure, used by is_healthy(). None means no failure
         # has been observed on a transfer this manager issued.
         self._data_plane_error: str | None = None
+        self._atexit_registered = False
 
     @property
     def agent_name(self) -> str:
@@ -222,6 +224,7 @@ class NixlTransferManager:
             else:
                 config = None
             self._agent = NixlAgent(self._agent_name, config)
+            self._register_atexit()
             logger.info(
                 f"NIXL agent '{self._agent_name}' created on device "
                 f"{self._device_id} (backend={self._backend})"
@@ -231,6 +234,13 @@ class NixlTransferManager:
                 os.environ["UCX_TLS"] = saved_ucx_tls
             elif envs.is_set("UCX_TLS"):
                 os.environ.pop("UCX_TLS")
+
+    def _register_atexit(self) -> None:
+        """Register manager-owned process teardown once."""
+        if self._atexit_registered:
+            return
+        atexit.register(self.shutdown)
+        self._atexit_registered = True
 
     def _build_tensor_descriptors(
         self, tensors: dict[str, torch.Tensor]
@@ -699,7 +709,7 @@ class NixlTransferManager:
 
         if remote_agent_name is None:
             add_start = time.perf_counter()
-            remote_agent_name = self._agent.add_remote_agent(source_metadata)
+            remote_agent_name = self.add_remote_agent(source_metadata)
             add_time = time.perf_counter() - add_start
             logger.info(
                 f"[TIMING] add_remote_agent: {add_time:.3f}s "
@@ -1110,6 +1120,9 @@ class NixlTransferManager:
 
     def shutdown(self) -> None:
         """Disconnect remote agents before releasing local NIXL resources."""
+        if self._atexit_registered:
+            atexit.unregister(self.shutdown)
+            self._atexit_registered = False
         disconnected = self.disconnect_remote_agents()
         self._agent = None
         self._metadata = b""

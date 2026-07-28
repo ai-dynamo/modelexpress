@@ -1,15 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Publisher-side teardown and demotion for a source wedged by a departing reader.
+"""Publisher demotion and manager-owned teardown for a departing reader.
 
-Two behaviours live here because the publisher is the only component that both
-holds the NIXL manager and has a process-exit hook:
+Two related lifecycle behaviours are covered:
 
-1. A worker that pulled weights must disconnect from the source it pulled from
-   before it exits. In P2P the source never loads the reader's metadata, so it has
-   no peer record to invalidate and cannot clean up after a reader that vanishes -
-   it stays wedged, still heartbeating READY, until it restarts.
+1. A publisher marks only its own source STALE. The shared NIXL manager owns
+   process-wide remote-peer disconnection, so routine publisher replacement does
+   not invalidate peers loaded by unrelated receive or artifact paths.
 
 2. A worker whose data plane is broken must be demoted, not merely skipped.
    Skipping the heartbeat only stops refreshing ``updated_at``, so the entry keeps
@@ -68,24 +66,24 @@ def _status_calls(mx_client, status):
     ]
 
 
-class TestDisconnectsPeersOnExit:
-    def test_stop_disconnects_nixl_peers(self, publisher, nixl_manager):
-        """The bug: a departing reader left its source holding a half-open QP."""
+class TestPublisherDoesNotOwnSharedPeers:
+    def test_stop_leaves_manager_peers_connected(self, publisher, nixl_manager):
+        """Routine publisher replacement must not tear down shared receive paths."""
         publisher.start()
         time.sleep(1.5)
         publisher.stop()
-        nixl_manager.disconnect_remote_agents.assert_called()
+        nixl_manager.disconnect_remote_agents.assert_not_called()
 
-    def test_the_atexit_hook_disconnects_peers(self, publisher, nixl_manager):
-        """Covers termination that does not route through stop()."""
+    def test_atexit_leaves_manager_teardown_to_its_owner(
+        self, publisher, nixl_manager
+    ):
+        """The manager's later atexit hook owns process-wide peer teardown."""
         publisher.start()
         time.sleep(1.5)
         publisher._on_exit()
-        nixl_manager.disconnect_remote_agents.assert_called()
+        nixl_manager.disconnect_remote_agents.assert_not_called()
 
-    def test_atexit_joins_before_marking_stale(
-        self, publisher, mx_client, nixl_manager
-    ):
+    def test_atexit_joins_before_marking_stale(self, publisher, mx_client):
         """An in-flight tick must finish before shutdown publishes STALE."""
         order = []
         publisher._thread = MagicMock()
@@ -94,41 +92,11 @@ class TestDisconnectsPeersOnExit:
         mx_client.update_status.side_effect = lambda **kw: order.append(
             f"status:{kw['status']}"
         ) or True
-        nixl_manager.disconnect_remote_agents.side_effect = lambda: order.append(
-            "disconnect"
-        ) or 1
 
         publisher._on_exit()
 
-        assert order == ["join", f"status:{STALE}", "disconnect"]
+        assert order == ["join", f"status:{STALE}"]
         publisher._thread.join.assert_called_once_with(timeout=publisher._interval + 5)
-
-    def test_demotion_precedes_disconnection(self, publisher, mx_client, nixl_manager):
-        """Order matters: stop being advertised before tearing the transport down,
-        so no target selects this worker while its peers are being closed."""
-        order = []
-        mx_client.update_status.side_effect = lambda **kw: order.append(
-            f"status:{kw['status']}"
-        ) or True
-        nixl_manager.disconnect_remote_agents.side_effect = lambda: order.append(
-            "disconnect"
-        ) or 1
-
-        publisher.start()
-        time.sleep(1.5)
-        publisher.stop()
-
-        assert "disconnect" in order
-        assert order.index(f"status:{STALE}") < order.index("disconnect")
-
-    def test_a_failing_disconnect_does_not_break_shutdown(
-        self, publisher, nixl_manager
-    ):
-        """Teardown must not turn a clean exit into a crash."""
-        nixl_manager.disconnect_remote_agents.side_effect = RuntimeError("ucx gone")
-        publisher.start()
-        time.sleep(1.5)
-        publisher.stop()  # must not raise
 
     def test_a_publisher_without_a_nixl_manager_is_fine(self, mx_client):
         """Not every publisher owns a NIXL agent."""

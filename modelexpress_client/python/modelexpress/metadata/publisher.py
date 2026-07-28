@@ -137,36 +137,16 @@ class PublisherThread:
         if self._thread is not None:
             self._thread.join(timeout=self._interval + 5)
         self._mark_stale()
-        self._disconnect_nixl_peers()
         self._cleanup()
         logger.info(f"[Worker {self._worker_rank}] Publisher thread stopped")
 
     def _on_exit(self) -> None:
-        """Stop the publisher before marking STALE and disconnecting peers."""
+        """Stop the publisher before marking it STALE."""
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=self._interval + 5)
         self._mark_stale()
-        self._disconnect_nixl_peers()
         self._cleanup()
-
-    def _disconnect_nixl_peers(self) -> None:
-        """Best-effort disconnect after the worker has been marked STALE."""
-        if self._nixl_manager is None:
-            return
-        try:
-            disconnected = self._nixl_manager.disconnect_remote_agents()
-            if disconnected:
-                logger.info(
-                    f"[Worker {self._worker_rank}] Disconnected "
-                    f"{disconnected} NIXL peer(s) on shutdown"
-                )
-        except Exception:
-            logger.debug(
-                f"[Worker {self._worker_rank}] Failed to disconnect NIXL peers "
-                f"on shutdown",
-                exc_info=True,
-            )
 
     def _mark_stale(self) -> None:
         """Best-effort UpdateStatus(STALE). Swallows all errors."""

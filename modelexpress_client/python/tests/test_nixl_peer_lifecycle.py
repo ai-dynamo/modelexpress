@@ -18,6 +18,8 @@ without disconnecting leaves it holding a QP nothing can clean up.
 Run: pytest tests/test_nixl_peer_lifecycle.py
 """
 
+from unittest.mock import patch
+
 import pytest
 
 from modelexpress.nixl_transfer import NixlTransferManager
@@ -66,6 +68,16 @@ class TestTracksLoadedPeers:
         name = mgr.add_remote_agent(b"some-metadata")
         assert mgr._remote_agents == {name: None}
 
+    def test_centralized_receive_tracks_peer_for_shutdown(self):
+        """The receive wrapper must not bypass the manager-owned inventory."""
+        agent = FakeAgent()
+        mgr = _manager(agent=agent)
+
+        mgr.receive_from_source(b"some-metadata", [])
+        mgr.shutdown()
+
+        assert agent.removed == ["src-from-blob"]
+
     def test_a_failed_fetch_is_not_tracked(self):
         """Tracking a peer we never loaded would make shutdown remove a stranger."""
 
@@ -80,6 +92,19 @@ class TestTracksLoadedPeers:
 
 
 class TestDisconnect:
+    def test_manager_registers_process_exit_teardown_once(self):
+        mgr = _manager()
+        with (
+            patch("modelexpress.nixl_transfer.atexit.register") as register,
+            patch("modelexpress.nixl_transfer.atexit.unregister") as unregister,
+        ):
+            mgr._register_atexit()
+            mgr._register_atexit()
+            register.assert_called_once_with(mgr.shutdown)
+
+            mgr.shutdown()
+            unregister.assert_called_once_with(mgr.shutdown)
+
     def test_shutdown_disconnects_the_source_it_pulled_from(self):
         """The bug: this is what a departing target never did."""
         agent = FakeAgent()
