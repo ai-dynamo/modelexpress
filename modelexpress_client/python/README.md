@@ -135,6 +135,7 @@ register_modelexpress_loaders()
 |--------|-------------|
 | `modelexpress.client` | `MxClient` -- gRPC client for the ModelExpress server |
 | `modelexpress.metadata` | Metadata clients, source identity, publishing, and worker manifest serving |
+| [`modelexpress.refit`](modelexpress/refit/README.md) | Experimental RL weight-refit timing, receiver-driven resharding, and engine adapter contracts |
 | `modelexpress.engines.vllm.loader` | `MxModelLoader` -- vLLM integration |
 | `modelexpress.engines.sglang.loader` | `MxModelLoader` -- SGLang `remote_instance` integration |
 | `modelexpress.vllm_loader` | Compatibility shim for the vLLM loader |
