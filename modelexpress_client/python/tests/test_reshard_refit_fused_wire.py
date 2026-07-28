@@ -64,6 +64,7 @@ class _Harness(ReshardReceiver):
 
     def _install(self, recv_buffers) -> None:
         self._install_order.append("install")
+        self._transport.installed_after.append(len(self._transport.batch_sizes))
 
 
 def _build(transport):
@@ -220,9 +221,15 @@ def test_reconstructs_the_expected_values(monkeypatch):
 
 
 def test_install_runs_after_every_read(monkeypatch):
-    harness, transport, _m, _k = _run(monkeypatch, fused=True)
-    assert harness._install_order == ["install"]
-    assert transport.batch_sizes, "no read was issued"
+    fused, fused_transport, _m, _k = _run(monkeypatch, fused=True)
+    assert fused._install_order == ["install"]
+    assert fused_transport.batch_sizes == [3]
+    assert fused_transport.installed_after == [1]
+
+    phased, phased_transport, _m, _k = _run(monkeypatch, fused=False)
+    assert phased._install_order == ["install"]
+    assert phased_transport.batch_sizes == [1, 1, 1]
+    assert phased_transport.installed_after == [3]
 
 
 def test_accounting_covers_all_three_groups(monkeypatch):
@@ -237,14 +244,16 @@ def test_accounting_covers_all_three_groups(monkeypatch):
 
 def test_empty_full_pull_and_convert_groups_are_skipped(monkeypatch):
     """A plan with only exact segments must still issue exactly one batch."""
-    monkeypatch.setenv("MX_RESHARD_FUSED_WIRE", "0")
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
-    transport = _RecordingTransport()
-    harness, keepalive = _build(transport)
-    harness._plan.full_pulls = []
-    harness._plan.converts = []
 
-    harness.update_weights(step=1)
+    for fused in (True, False):
+        monkeypatch.setenv("MX_RESHARD_FUSED_WIRE", "1" if fused else "0")
+        transport = _RecordingTransport()
+        harness, keepalive = _build(transport)
+        harness._plan.full_pulls = []
+        harness._plan.converts = []
 
-    assert transport.batch_sizes == [1]
-    assert all(t.data_ptr() for t in keepalive)  # keep alive
+        harness.update_weights(step=1)
+
+        assert transport.batch_sizes == [1]
+        assert all(t.data_ptr() for t in keepalive)  # keep alive
