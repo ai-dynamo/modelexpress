@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import logging
+import math
+import os
 import time
 
 from .. import envs
@@ -36,6 +38,53 @@ from .. import p2p_pb2
 logger = logging.getLogger("modelexpress.strategy_rdma")
 
 MAX_SOURCE_RETRIES = 3
+
+# Fallback when MX_TRANSFER_TIMEOUT is unset or unusable. Matches the value this
+# path used when the timeout was hard-coded, so behaviour is unchanged by default.
+DEFAULT_RDMA_TRANSFER_TIMEOUT_S = 300.0
+
+
+def _transfer_timeout_seconds() -> float:
+    """Per-source RDMA receive budget, in seconds.
+
+    Every candidate costs this long when a source is wedged, because a wedged QP
+    produces neither a completion nor an error status - the timeout is the only
+    thing that ends the wait. With MAX_SOURCE_RETRIES candidates the worst case is
+    that multiplied by three before the target falls back to disk, so operators
+    need to be able to size it against their model rather than accept a constant.
+
+    Honours MX_TRANSFER_TIMEOUT only when it is *explicitly set*, and reads
+    os.environ directly to tell that apart from the default. This is deliberate:
+    that variable defaults to 900, so simply adopting ``envs.MX_TRANSFER_TIMEOUT``
+    would triple this path's budget from 300s to 900s and make the stall being
+    fixed three times more expensive for anyone who never configured it.
+
+    A non-positive or unparseable value falls back rather than being honoured. In
+    particular 0 must not become "no timeout": ``receive_from_source`` treats None
+    as wait-forever, which is the failure mode this exists to bound.
+    """
+    raw = os.environ.get("MX_TRANSFER_TIMEOUT")
+    if raw is None:
+        return DEFAULT_RDMA_TRANSFER_TIMEOUT_S
+    try:
+        configured = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "MX_TRANSFER_TIMEOUT=%r is not a number; using %.1fs for the RDMA "
+            "receive budget",
+            raw,
+            DEFAULT_RDMA_TRANSFER_TIMEOUT_S,
+        )
+        return DEFAULT_RDMA_TRANSFER_TIMEOUT_S
+    if not math.isfinite(configured) or configured <= 0:
+        logger.warning(
+            "MX_TRANSFER_TIMEOUT=%r is not finite and positive; using %.1fs for the RDMA "
+            "receive budget rather than waiting indefinitely",
+            raw,
+            DEFAULT_RDMA_TRANSFER_TIMEOUT_S,
+        )
+        return DEFAULT_RDMA_TRANSFER_TIMEOUT_S
+    return configured
 
 
 class RdmaStrategy(LoadStrategy):
@@ -446,7 +495,7 @@ class RdmaStrategy(LoadStrategy):
             bytes_transferred, tensor_count, _ = ctx.nixl_manager.receive_from_source(
                 source_metadata=source_worker.nixl_metadata,
                 source_tensors=source_tensors,
-                timeout_seconds=300.0,
+                timeout_seconds=_transfer_timeout_seconds(),
                 remote_agent_name=remote_agent_name_override,
             )
         except Exception as e:
