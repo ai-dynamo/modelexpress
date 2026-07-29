@@ -173,22 +173,35 @@ def _sentinel_fraction(region) -> float:
     return float((raw == SENTINEL_BYTE).sum().item()) / max(1, raw.numel())
 
 
-def _fresh_digest_index(fresh_sources: dict) -> dict:
-    """Index a freshly discovered shard table by (source, session, offset).
+def _fresh_digest_index(fresh_sources: dict) -> tuple[dict, dict]:
+    """Index a freshly discovered shard table, by exact owner and by box.
 
     Keyed on session and offset rather than position: discovery order is not
     stable, and ``merge_shard_tables`` keeps the first offer of each geometry, so
     two discoveries legitimately pin the same box to different - but byte-identical
     - replicas. Comparing positionally reports that reshuffle as a change.
+
+    Session-keying alone is not enough, which is what let Bug 9 survive its first
+    fix. A replicated box is offered by several ranks, and the two discoveries need
+    not settle on the same one - a live run reselected 867 boxes to a different
+    rank. The exact key then misses, the caller keeps the stale expectation, and
+    the refresh silently does nothing. So a second index maps the box itself to the
+    digests its replicas advertise, letting the caller fall back to a sibling offer.
+    That fallback is only sound while replicas agree, so it is confined to boxes
+    with a single distinct digest; a box whose replicas disagree is a divergence to
+    report, not an expectation to adopt.
     """
-    index: dict = {}
+    exact: dict = {}
+    by_box: dict = {}
     for src_name, info in fresh_sources.items():
         for shard in getattr(info, "shards", ()):  # tolerate stubs in tests
             digest = getattr(shard, "digest", None)
             if digest is None:
                 continue
-            index[(src_name, shard.session, tuple(shard.shard_offset))] = digest
-    return index
+            offset = tuple(shard.shard_offset)
+            exact[(src_name, shard.session, offset)] = digest
+            by_box.setdefault((src_name, offset), set()).add(digest)
+    return exact, by_box
 
 
 def verify_full_pulls(
@@ -225,11 +238,17 @@ def verify_full_pulls(
 
     Returns a report with the counts and the first few mismatches by name.
     """
-    fresh_index = _fresh_digest_index(fresh_sources) if fresh_sources else {}
+    fresh_index, fresh_by_box = (
+        _fresh_digest_index(fresh_sources) if fresh_sources else ({}, {})
+    )
     # Sources whose expectation was refreshed. Non-zero means training moved those
     # weights between prepare and this step - which is normal, and which without
     # this refresh would have been reported as that many mismatches.
     refreshed = 0
+    # Of those, the ones the exact owner key missed and a sibling replica supplied.
+    # Non-zero means the planner reselected the box between the two discoveries, so
+    # an owner-keyed refresh alone would have left a stale expectation in place.
+    refreshed_via_replica = 0
     checked = 0
     skipped = 0
     # Counted separately from the reported sample. Returning len(detail) conflates
@@ -270,12 +289,19 @@ def verify_full_pulls(
                 )
         for shard in info.shards:
             want = getattr(shard, "digest", None)
-            current = fresh_index.get(
-                (src_name, shard.session, tuple(shard.shard_offset))
-            )
+            offset_key = tuple(shard.shard_offset)
+            current = fresh_index.get((src_name, shard.session, offset_key))
+            via_replica = False
+            if current is None:
+                offers = fresh_by_box.get((src_name, offset_key))
+                if offers and len(offers) == 1:
+                    current = next(iter(offers))
+                    via_replica = True
             if current is not None:
                 if want is not None and current != want:
                     refreshed += 1
+                    if via_replica:
+                        refreshed_via_replica += 1
                 want = current
             if want is None:
                 skipped += 1
@@ -315,6 +341,7 @@ def verify_full_pulls(
         # 0 with a fresh table supplied means training did not move these weights,
         # which makes the run a weak test of the gate rather than a strong pass.
         "digests_refreshed": refreshed,
+        "digests_refreshed_via_replica": refreshed_via_replica,
         "digest_source": "fresh" if fresh_index else "prepare",
     }
     if FILL_SENTINEL:

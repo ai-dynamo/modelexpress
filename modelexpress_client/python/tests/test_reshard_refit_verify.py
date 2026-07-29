@@ -115,6 +115,7 @@ def test_matching_bytes_pass():
         # digests. Reported rather than implied: whether the expectation was
         # current decides whether a clean report means anything on a later step.
         "digests_refreshed": 0,
+        "digests_refreshed_via_replica": 0,
         "digest_source": "prepare",
     }
 
@@ -472,3 +473,121 @@ def test_digests_refreshed_is_zero_when_nothing_moved():
     assert report["digests_refreshed"] == 0
     assert report["digest_source"] == "fresh"
     assert report["mismatches"] == 0
+
+
+# --------------------------------------------------- refresh across a reselection
+# Why these exist: the session-keyed refresh above was shipped as the Bug 9 fix and
+# did not hold. Run v43 (Topology B, 4 EFAs, heartbeat fix in place) still reported
+# exactly one bad tensor - model.layers.18.self_attn.o_proj.weight, owner
+# trainer-r1 - while the addr-recheck probe on the same step reported
+# digest_changed 2 and reselected_to_other_rank 867. So the publisher WAS
+# advertising a moved digest and the gate still did not pick it up: the box had been
+# reselected to a different replica, the owner key missed, and the refresh quietly
+# fell back to the prepare-time expectation. digests_refreshed 0 alongside
+# digest_changed 2 is the contradiction that gives this away.
+def test_a_box_reselected_to_another_replica_still_refreshes():
+    """The v43 regression: the owner key misses, a sibling offer must be used."""
+    current = torch.arange(64, dtype=torch.int16)
+    current_digest = tensor_digest(shard_region(current, (64,), (0,), (64,)))
+    stale_digest = tensor_digest(torch.zeros(64, dtype=torch.int16))
+
+    report = verify_full_pulls(
+        full_staging={"w": current},
+        sources={
+            "w": _Source((64,), [_shard((0,), (64,), stale_digest, session="trainer-r1")])
+        },
+        # Same box, now offered only by the replica the planner reselected to.
+        fresh_sources={
+            "w": _Source(
+                (64,), [_shard((0,), (64,), current_digest, session="trainer-r9")]
+            )
+        },
+    )
+    assert report["mismatches"] == 0, "owner-keyed miss left the stale expectation"
+    assert report["digests_refreshed"] == 1
+    assert report["digests_refreshed_via_replica"] == 1
+
+
+def test_the_owner_offer_wins_over_a_sibling_offer():
+    """The fallback must not override a digest the actual owner still advertises."""
+    current = torch.arange(64, dtype=torch.int16)
+    owner_digest = tensor_digest(shard_region(current, (64,), (0,), (64,)))
+    sibling_digest = tensor_digest(torch.ones(64, dtype=torch.int16))
+    assert owner_digest != sibling_digest
+
+    report = verify_full_pulls(
+        full_staging={"w": current},
+        sources={
+            "w": _Source((64,), [_shard((0,), (64,), owner_digest, session="trainer-r1")])
+        },
+        fresh_sources={
+            "w": _Source(
+                (64,),
+                [
+                    _shard((0,), (64,), sibling_digest, session="trainer-r0"),
+                    _shard((0,), (64,), owner_digest, session="trainer-r1"),
+                ],
+            )
+        },
+    )
+    assert report["mismatches"] == 0
+    assert report["digests_refreshed_via_replica"] == 0
+
+
+def test_the_fallback_is_refused_when_the_replicas_disagree():
+    """Adopting one of two disagreeing offers would be guessing.
+
+    Replicas of a box are required to be byte-identical; when they are not, which
+    one is 'current' is undefined, and picking either could turn a real transport
+    fault into a pass. The divergence is reported elsewhere - here the refresh must
+    simply decline, leaving the prepare-time expectation to be judged on its merits.
+    """
+    current = torch.arange(64, dtype=torch.int16)
+    stale_digest = tensor_digest(torch.zeros(64, dtype=torch.int16))
+    one = tensor_digest(torch.ones(64, dtype=torch.int16))
+    two = tensor_digest(torch.full((64,), 2, dtype=torch.int16))
+    assert one != two
+
+    report = verify_full_pulls(
+        full_staging={"w": current},
+        sources={
+            "w": _Source((64,), [_shard((0,), (64,), stale_digest, session="trainer-r1")])
+        },
+        fresh_sources={
+            "w": _Source(
+                (64,),
+                [
+                    _shard((0,), (64,), one, session="trainer-r7"),
+                    _shard((0,), (64,), two, session="trainer-r9"),
+                ],
+            )
+        },
+    )
+    assert report["digests_refreshed"] == 0
+    assert report["digests_refreshed_via_replica"] == 0
+    assert report["mismatches"] == 1, "declining to refresh must not also skip the check"
+
+
+def test_a_reselected_box_at_a_different_offset_is_not_borrowed():
+    """The fallback is per box, not per source.
+
+    Borrowing any digest published under the same tensor name would compare a shard
+    against a different slice of the same tensor and call disagreement corruption.
+    """
+    current = torch.arange(128, dtype=torch.int16)
+    d0 = tensor_digest(shard_region(current, (128,), (0,), (64,)))
+    report = verify_full_pulls(
+        full_staging={"w": current},
+        sources={
+            "w": _Source((128,), [_shard((0,), (64,), d0, session="trainer-r1")])
+        },
+        # Only the OTHER half of the tensor is offered fresh.
+        fresh_sources={
+            "w": _Source(
+                (128,),
+                [_shard((64,), (64,), "deadbeef", session="trainer-r9")],
+            )
+        },
+    )
+    assert report["digests_refreshed"] == 0
+    assert report["mismatches"] == 0, "fell back to prepare, which was correct here"
