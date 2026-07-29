@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+from modelexpress import p2p_pb2
 from modelexpress.refit.reshard.megatron import (
     MegatronTargetLayout,
     MegatronTargetSpec,
@@ -18,7 +19,10 @@ from modelexpress.refit.reshard.megatron_publisher import (
     publish_megatron_reshard_view,
 )
 from modelexpress.refit.reshard.megatron_receiver import MegatronReshardReceiver
-from modelexpress.refit.reshard.rendezvous import unwrap_rendezvous_blob
+from modelexpress.refit.reshard.rendezvous import (
+    MxReshardRendezvous,
+    unwrap_rendezvous_blob,
+)
 from modelexpress.refit.reshard.slice_plan import Shard
 from modelexpress.refit.reshard.transfer_plan import SourceInfo, plan_transfer
 
@@ -190,39 +194,56 @@ def test_receiver_seam_rejects_stale_manifest_geometry():
         )
 
 
+class _PublishClient:
+    """Records the published worker record and accepts heartbeat status updates."""
+
+    def __init__(self):
+        self.worker = None
+        self.status_updates = []
+
+    def publish_metadata(self, _identity, worker, _worker_id):
+        self.worker = worker
+        return "source-id"
+
+    def update_status(self, **kwargs):
+        self.status_updates.append(kwargs)
+        return True
+
+
+class _Manager:
+    agent_name = "trainer-r3"
+    nixl_metadata = b"agent-metadata"
+
+
+def _trainer_rendezvous(client):
+    return MxReshardRendezvous(
+        client, role="trainer", rank=3, model_name="model", worker_id="worker-3"
+    )
+
+
 def test_publisher_seam_reuses_registered_tensor_addresses():
-    class Manager:
-        agent_name = "trainer-r3"
-        nixl_metadata = b"agent-metadata"
-
-    class Client:
-        def __init__(self):
-            self.worker = None
-
-        def publish_metadata(self, _identity, worker, _worker_id):
-            self.worker = worker
-            return "source-id"
-
-    client = Client()
+    client = _PublishClient()
+    rendezvous = _trainer_rendezvous(client)
     tensor = torch.zeros((8, 8), dtype=torch.bfloat16)
 
-    source_id = publish_megatron_reshard_view(
-        manager=Manager(),
-        client=client,
-        model_name="model",
-        worker_rank=3,
-        worker_id="worker-3",
-        tensors={"column": tensor},
-        specs=[
-            MegatronPublishedTensorSpec(
-                name="column",
-                global_shape=(16, 8),
-                shard_axis=0,
-                local_shard_range=(8, 16),
-            )
-        ],
-        metadata_endpoint="10.0.0.3:19003",
-    )
+    try:
+        source_id = publish_megatron_reshard_view(
+            manager=_Manager(),
+            rendezvous=rendezvous,
+            tensors={"column": tensor},
+            specs=[
+                MegatronPublishedTensorSpec(
+                    name="column",
+                    global_shape=(16, 8),
+                    shard_axis=0,
+                    local_shard_range=(8, 16),
+                )
+            ],
+            metadata_endpoint="10.0.0.3:19003",
+        )
+    finally:
+        # The caller owns the rendezvous precisely so its heartbeat can be stopped.
+        rendezvous.close()
 
     assert source_id == "source-id"
     assert client.worker.status > 0
@@ -236,6 +257,46 @@ def test_publisher_seam_reuses_registered_tensor_addresses():
     )
     assert published[0].shards[0].addr == tensor.data_ptr()
     assert published[0].shards[0].shard_offset == (8, 0)
+
+
+def test_publishing_leaves_the_heartbeat_with_its_owner():
+    """Publishing starts the source's READY heartbeat. A rendezvous built inside the
+    seam would leave that thread running with no handle to stop it, so the source
+    would only be marked stale at interpreter exit."""
+    client = _PublishClient()
+    rendezvous = _trainer_rendezvous(client)
+
+    publish_megatron_reshard_view(
+        manager=_Manager(),
+        rendezvous=rendezvous,
+        tensors={"column": torch.zeros((8, 8), dtype=torch.bfloat16)},
+        specs=[MegatronPublishedTensorSpec(name="column", global_shape=(8, 8))],
+        metadata_endpoint="10.0.0.3:19003",
+    )
+    rendezvous.close()
+
+    assert client.status_updates[-1]["status"] == p2p_pb2.SOURCE_STATUS_STALE
+    assert client.status_updates[-1]["worker_id"] == "worker-3"
+
+
+def test_publisher_seam_rejects_duplicate_spec_names():
+    """Last-writer-wins would publish one spec's shard description under a name the
+    other spec owns, and comparing key sets against the tensors cannot see it."""
+
+    class Client:
+        def publish_metadata(self, *_args, **_kwargs):
+            raise AssertionError("publication must not run")
+
+    spec = MegatronPublishedTensorSpec(name="column", global_shape=(8, 8))
+
+    with pytest.raises(ValueError, match="duplicate Megatron publish spec"):
+        publish_megatron_reshard_view(
+            manager=_Manager(),
+            rendezvous=_trainer_rendezvous(Client()),
+            tensors={"column": torch.zeros((8, 8), dtype=torch.bfloat16)},
+            specs=[spec, spec],
+            metadata_endpoint="10.0.0.3:19003",
+        )
 
 
 def test_gated_aliases_split_each_tp_shard_into_hf_gate_and_up():
@@ -263,6 +324,53 @@ def test_gated_aliases_split_each_tp_shard_into_hf_gate_and_up():
     assert gate.shards[0].shard_offset == up.shards[0].shard_offset == (4, 0)
     assert gate.shards[0].addr == fused.data_ptr()
     assert up.shards[0].addr == fused[4:].data_ptr()
+
+
+def test_an_unknown_fused_gate_up_order_is_rejected():
+    """The halves map to `hf_names` positionally, so an up-then-gate layout would
+    publish the gate projection's bytes under the up projection's name. No digest
+    gate can see that: both names receive the bytes their publisher advertised."""
+    fused = torch.arange(32, dtype=torch.bfloat16).reshape(8, 4)
+
+    with pytest.raises(ValueError, match="gated_mlp_order"):
+        build_hf_aliases(
+            [
+                MegatronAliasInput(
+                    name="linear_fc1.weight",
+                    tensor=fused,
+                    role="gated_mlp_column",
+                    hf_names=("gate_proj.weight", "up_proj.weight"),
+                    global_shape=(16, 4),
+                    placement_kind="SHARD",
+                    shard_axis=0,
+                    local_shard_range=(8, 16),
+                    extras={"gated_mlp_order": "up_then_gate"},
+                )
+            ],
+            agent_name="trainer-tp1",
+        )
+
+
+def test_a_missing_fused_gate_up_order_is_rejected():
+    """Absent metadata is not evidence of gate-then-up storage."""
+    fused = torch.arange(32, dtype=torch.bfloat16).reshape(8, 4)
+
+    with pytest.raises(ValueError, match="gated_mlp_order"):
+        build_hf_aliases(
+            [
+                MegatronAliasInput(
+                    name="linear_fc1.weight",
+                    tensor=fused,
+                    role="gated_mlp_column",
+                    hf_names=("gate_proj.weight", "up_proj.weight"),
+                    global_shape=(16, 4),
+                    placement_kind="SHARD",
+                    shard_axis=0,
+                    local_shard_range=(8, 16),
+                )
+            ],
+            agent_name="trainer-tp1",
+        )
 
 
 def test_qkv_aliases_expose_hf_head_ranges_without_copy():

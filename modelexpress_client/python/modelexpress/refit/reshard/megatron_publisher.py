@@ -34,10 +34,7 @@ class MegatronPublishedTensorSpec:
 def publish_megatron_reshard_view(
     *,
     manager: Any,
-    client: Any,
-    model_name: str,
-    worker_rank: int,
-    worker_id: str,
+    rendezvous: MxReshardRendezvous,
     tensors: dict[str, Any],
     specs: list[MegatronPublishedTensorSpec],
     metadata_endpoint: str,
@@ -54,7 +51,15 @@ def publish_megatron_reshard_view(
         raise ValueError(
             "metadata_endpoint must be an explicit host:port reachable by receivers"
         )
-    by_name = {spec.name: spec for spec in specs}
+    by_name: dict[str, MegatronPublishedTensorSpec] = {}
+    for spec in specs:
+        # Last-writer-wins here would publish one spec's shard description under a
+        # name the other spec owns, and the missing/extra check below compares key
+        # sets, so it cannot see it. lower_megatron_target rejects the analogous
+        # duplicate staging_name for the same reason.
+        if spec.name in by_name:
+            raise ValueError(f"duplicate Megatron publish spec for {spec.name!r}")
+        by_name[spec.name] = spec
     missing = sorted(set(by_name).difference(tensors))
     extra = sorted(set(tensors).difference(by_name))
     if missing or extra:
@@ -114,10 +119,7 @@ def publish_megatron_reshard_view(
 
     return publish_registered_shard_table(
         manager=manager,
-        client=client,
-        model_name=model_name,
-        worker_rank=worker_rank,
-        worker_id=worker_id,
+        rendezvous=rendezvous,
         published=published,
         metadata_endpoint=metadata_endpoint,
     )
@@ -126,14 +128,17 @@ def publish_megatron_reshard_view(
 def publish_registered_shard_table(
     *,
     manager: Any,
-    client: Any,
-    model_name: str,
-    worker_rank: int,
-    worker_id: str,
+    rendezvous: MxReshardRendezvous,
     published: list[PublishedTensor],
     metadata_endpoint: str,
 ) -> str:
-    """Publish a validated alias table over already-registered storage."""
+    """Publish a validated alias table over already-registered storage.
+
+    The caller supplies the rendezvous and keeps it for the lifetime of the
+    publication: publishing starts the source's READY heartbeat thread, and only
+    the owner of the rendezvous can stop it and mark the source stale on shutdown.
+    Constructing one here would leave a heartbeat running with no handle to it.
+    """
 
     if not metadata_endpoint or ":" not in metadata_endpoint:
         raise ValueError(
@@ -158,13 +163,6 @@ def publish_registered_shard_table(
         agent_name,
         metadata_endpoint,
         published,
-    )
-    rendezvous = MxReshardRendezvous(
-        client,
-        role="trainer",
-        rank=int(worker_rank),
-        model_name=model_name,
-        worker_id=worker_id,
     )
     return rendezvous.publish(blob)
 

@@ -75,11 +75,25 @@ def _one_shard(
     )
 
 
+GATE_THEN_UP = "gate_then_up"
+
+
 def _build_gated_aliases(
     item: MegatronAliasInput, agent_name: str
 ) -> list[PublishedTensor]:
     if len(item.hf_names) != 2:
         raise ValueError(f"{item.name}: gated tensor requires gate/up HF names")
+    # The halves are assigned to hf_names positionally, so the storage order is
+    # what decides which HF tensor each half becomes. Getting it wrong publishes
+    # the gate projection's bytes under the up projection's name, which no digest
+    # gate can see: both names receive the bytes their publisher advertised. The
+    # order is therefore required rather than assumed.
+    order = item.extras.get("gated_mlp_order")
+    if order != GATE_THEN_UP:
+        raise ValueError(
+            f"{item.name}: fused gate/up aliasing requires extras"
+            f"['gated_mlp_order'] == {GATE_THEN_UP!r}, got {order!r}"
+        )
     axis = int(item.shard_axis if item.shard_axis is not None else 0)
     local_extent = int(item.tensor.shape[axis])
     if local_extent % 2:
