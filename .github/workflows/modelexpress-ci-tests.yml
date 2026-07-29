@@ -290,6 +290,50 @@ jobs:
           vcluster_name: ${{ env.VCLUSTER_NAME }}
           vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
 
+      - name: Guard against host / vCluster version skew
+        # The control-plane version is a pinned constant (vcluster_k8s_version
+        # in setup-mx-vcluster). What broke CI once was the AKS host
+        # auto-upgrading PAST that pin: Kubernetes 1.34 added observedGeneration
+        # on pod conditions, and a vCluster minor below the host makes the
+        # syncer loop, dropping that field and overwriting Ready=True with stale
+        # data so pods never surface as Ready. setup-mx-vcluster is gated (only
+        # runs when the vCluster is absent), so a running cluster silently
+        # skewed after a host bump is never re-checked there. Compare the LIVE
+        # vCluster server minor against the host's on every run and fail loudly
+        # with the fix — so the next host bump is a red step with the answer in
+        # it instead of days of digging. Compares major.minor only (the skew is
+        # a minor-version feature; patch differences are fine). Fails closed on
+        # a confirmed skew and also when either version can't be read.
+        # Incident writeup + context: MX-429.
+        shell: bash
+        run: |
+          # `|| true`: the default GitHub bash runs with `-eo pipefail`, so a
+          # no-match grep would abort the `VAR=$(server_minor ...)` assignment
+          # before the empty-value check runs. Swallow the pipeline status and
+          # let the explicit check below produce the parse-error diagnostic.
+          server_minor() {
+            kubectl --kubeconfig="$1" version 2>/dev/null \
+              | grep -iE 'server version' | grep -oE '[0-9]+\.[0-9]+' | head -1 || true
+          }
+          HOST_MM=$(server_minor "${{ github.workspace }}/.kubeconfig-host")
+          VC_MM=$(server_minor "${{ github.workspace }}/.kubeconfig-vcluster")
+          echo "Host k8s minor: ${HOST_MM:-unknown}; vCluster k8s minor: ${VC_MM:-unknown}"
+          if [ -z "${HOST_MM}" ] || [ -z "${VC_MM}" ]; then
+            # Fail closed: reachability is already verified above, so an
+            # unreadable version means the parse broke, not connectivity. Fail
+            # loudly rather than let the guard silently stop protecting.
+            echo "::error::Could not read host and/or vCluster server version (host='${HOST_MM:-}', vCluster='${VC_MM:-}'). Fix the version parse in this step."
+            exit 1
+          fi
+          HOST_MAJOR=${HOST_MM%.*}; HOST_MINOR=${HOST_MM#*.}
+          VC_MAJOR=${VC_MM%.*};     VC_MINOR=${VC_MM#*.}
+          if [ "${VC_MAJOR}" -lt "${HOST_MAJOR}" ] \
+             || { [ "${VC_MAJOR}" -eq "${HOST_MAJOR}" ] && [ "${VC_MINOR}" -lt "${HOST_MINOR}" ]; }; then
+            echo "::error::vCluster control plane is ${VC_MM} but the AKS host is ${HOST_MM}. A vCluster minor below the host stalls pod-ready propagation (observedGeneration, added in k8s 1.34, makes the syncer overwrite Ready=True). Bump vcluster_k8s_version in .github/actions/setup-mx-vcluster to >= ${HOST_MM}, then recreate the vCluster (delete it so the gated bootstrap rebuilds at the new version)."
+            exit 1
+          fi
+          echo "No host/vCluster version skew (vCluster ${VC_MM} >= host ${HOST_MM})."
+
       - name: vCluster baseline health
         # Snapshot vCluster control-plane state before any test job runs. When
         # downstream jobs fail with "connection refused" mid-run, this baseline
