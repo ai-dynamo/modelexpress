@@ -9,7 +9,6 @@ from modelexpress.refit.reshard.megatron import (
     MegatronTargetSpec,
     lower_megatron_target,
 )
-from modelexpress.refit.reshard.megatron_receiver import MegatronReshardReceiver
 from modelexpress.refit.reshard.megatron_aliases import (
     MegatronAliasInput,
     build_hf_aliases,
@@ -18,6 +17,7 @@ from modelexpress.refit.reshard.megatron_publisher import (
     MegatronPublishedTensorSpec,
     publish_megatron_reshard_view,
 )
+from modelexpress.refit.reshard.megatron_receiver import MegatronReshardReceiver
 from modelexpress.refit.reshard.rendezvous import unwrap_rendezvous_blob
 from modelexpress.refit.reshard.slice_plan import Shard
 from modelexpress.refit.reshard.transfer_plan import SourceInfo, plan_transfer
