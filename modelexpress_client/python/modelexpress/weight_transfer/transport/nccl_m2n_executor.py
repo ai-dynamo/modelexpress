@@ -17,7 +17,15 @@ Window contract: both the src and dst tiles must live at the window base
 a symmetric ``ncclMemAlloc`` buffer:
 
     src rank:  param tile -> window base -> reshard
-    dst rank:  reshard -> window base -> param tile
+    dst rank:  reshard -> window base -> version staging
+
+Destination ranks copy version staging into live parameters only after every
+reshard succeeds.  ``execute`` does not expose separate stage and commit phases,
+so the caller must quiesce serving across the destination cohort before entering
+``execute`` and must not resume until every destination rank reports success.
+Executor poisoning is local transfer state; it does not stop the serving engine.
+On any commit failure, the caller must keep the cohort stopped and reinitialize
+the affected model and executor.
 """
 
 from __future__ import annotations
@@ -83,6 +91,9 @@ class NcclM2nExecutor:
         self._window_buf: int | None = None
         self._window: int | None = None
         self._window_bytes: int = 0
+        self._staging_buf: int | None = None
+        self._staging_bytes: int = 0
+        self._poisoned = False
 
     def _ensure_window(self, nbytes: int) -> None:
         """(Re)allocate the symmetric window if it is too small.
@@ -106,6 +117,20 @@ class NcclM2nExecutor:
             self._window_buf = None
         self._window_bytes = 0
 
+    def _ensure_staging(self, nbytes: int) -> None:
+        """Allocate destination-local storage for one complete model version."""
+        if self._is_src or (self._staging_buf is not None and self._staging_bytes >= nbytes):
+            return
+        self._release_staging()
+        self._staging_buf = self._m2n.mem_alloc(nbytes)
+        self._staging_bytes = nbytes
+
+    def _release_staging(self) -> None:
+        if self._staging_buf is not None:
+            self._m2n.mem_free(self._staging_buf)
+            self._staging_buf = None
+        self._staging_bytes = 0
+
     def _check_async_error(self, name: str) -> None:
         state = self._m2n.comm_get_async_error(self._comm)
         if state != binding.ncclSuccess:
@@ -114,12 +139,25 @@ class NcclM2nExecutor:
     def execute(self, params: list[ReshardParam], window_bytes: int) -> tuple[int, float]:
         """Reshard every param.  ``window_bytes`` is the world-consistent window size.
 
+        On destination ranks, all parameters are staged before any live parameter
+        is changed.  Stage and commit are not separate public phases, so serving
+        must remain quiesced from before this call until every destination rank
+        reports success.  A commit failure makes this executor unusable because
+        the live model may contain a partial version; poisoning this executor does
+        not itself stop the serving engine.
+
         Returns ``(total_bytes_moved, elapsed_seconds)``.
         """
+        if self._poisoned:
+            raise RuntimeError(
+                "nccl_m2n executor is unusable after a failed model commit; "
+                "reinitialize the model and executor before serving or transferring again"
+            )
         if not params:
             return 0, 0.0
 
         self._ensure_window(window_bytes)
+        self._ensure_staging(sum(p.local_nbytes for p in params))
 
         start = time.perf_counter()
 
@@ -142,6 +180,7 @@ class NcclM2nExecutor:
 
     def _reshard_all(self, params: list[ReshardParam]) -> int:
         total_bytes = 0
+        staging_offset = 0
 
         for p in params:
             src_mesh_dc, dst_mesh_dc = build_tp_meshes(p.shard_dim, self._tp_src, self._tp_dst)
@@ -170,21 +209,50 @@ class NcclM2nExecutor:
 
             self._m2n.reshard(self._comm, self._window, src_t, dst_t, self._stream)
 
-            # Copy the resharded tile out of the window into the live param.
+            # Preserve the live model until the complete version is available.
             if not self._is_src:
                 self._m2n.device_synchronize()
                 self._check_async_error(p.name)
-                self._m2n.memcpy_dtod(p.local_ptr, self._window_buf, p.local_nbytes)
+                self._m2n.memcpy_dtod(
+                    self._staging_buf + staging_offset,
+                    self._window_buf,
+                    p.local_nbytes,
+                )
+                staging_offset += p.local_nbytes
 
             total_bytes += p.local_nbytes
 
         self._m2n.device_synchronize()
         if params:
             self._check_async_error(params[-1].name)
+        if not self._is_src:
+            self._commit_staged(params)
         return total_bytes
+
+    def _commit_staged(self, params: list[ReshardParam]) -> None:
+        """Install a complete staged version while serving remains quiesced."""
+        self._poisoned = True
+        staging_offset = 0
+        try:
+            for p in params:
+                self._m2n.memcpy_dtod(
+                    p.local_ptr,
+                    self._staging_buf + staging_offset,
+                    p.local_nbytes,
+                )
+                staging_offset += p.local_nbytes
+            self._m2n.device_synchronize()
+        except BaseException as exc:
+            raise RuntimeError(
+                "failed to commit staged model version; live parameters may contain "
+                "mixed versions, so serving must remain stopped and the model and "
+                "executor must be reinitialized"
+            ) from exc
+        self._poisoned = False
 
     def teardown(self) -> None:
         self._release_window()
+        self._release_staging()
         if self._comm is not None:
             self._m2n.comm_destroy(self._comm)
             self._comm = None
