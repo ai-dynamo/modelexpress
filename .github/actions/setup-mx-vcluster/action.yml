@@ -139,6 +139,16 @@ runs:
         # ("untolerated taint {CriticalAddonsOnly: true}"). The matching
         # toleration below lets it schedule there. operator=Exists avoids
         # helm coercing the string value "true" into a bool.
+        #
+        # CoreDNS image override (--set controlPlane.coredns.deployment.image):
+        # the CoreDNS tag is coupled to the vCluster k8s version — bumping
+        # VCLUSTER_K8S_VERSION also moves the CoreDNS version vCluster wants
+        # (1.33 -> 1.34 pulls coredns v1.12.0). vCluster's default image path
+        # routes through the `dynamoci` ACR mirror, which 401s on this image, so
+        # CoreDNS never starts and the whole vCluster is DNS-dead. Pin to
+        # registry.k8s.io (anonymous, no mirror auth) to bypass that. Keep this
+        # tag in sync when you bump VCLUSTER_K8S_VERSION across a CoreDNS bump.
+        COREDNS_IMAGE="registry.k8s.io/coredns/coredns:v1.12.0"
         vcluster create ${VCLUSTER_NAME} \
           --namespace ${NAMESPACE} \
           --connect=false \
@@ -151,7 +161,7 @@ runs:
           --set 'controlPlane.statefulSet.scheduling.tolerations[0].key=CriticalAddonsOnly' \
           --set 'controlPlane.statefulSet.scheduling.tolerations[0].operator=Exists' \
           --set 'controlPlane.statefulSet.scheduling.tolerations[0].effect=NoSchedule' \
-          --set controlPlane.coredns.deployment.image=registry.k8s.io/coredns/coredns:v1.12.0
+          --set controlPlane.coredns.deployment.image="${COREDNS_IMAGE}"
         echo "::endgroup::"
 
     - name: Wait for vCluster pod to be ready
