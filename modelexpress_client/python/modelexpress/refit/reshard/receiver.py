@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 
 import torch
 
@@ -47,15 +46,24 @@ from modelexpress.refit.reshard.types import CaptureResult, UnsupportedReshard
 
 logger = logging.getLogger("modelexpress.refit.reshard.receiver")
 
-# Opt-in rather than always-on: partial and subset refit are intended features,
-# and for those a coverage below 1.0 is the point. What is never acceptable is a
-# *benchmark* row measuring an incomplete refit, because its wire volume and
-# timings are then the wrong magnitude and get compared against complete ones.
-_REQUIRE_FULL_COVERAGE = os.environ.get("MX_RESHARD_REQUIRE_FULL_COVERAGE", "0") == "1"
-# Deliberately not 1.0. A few engine parameters - rotary `inv_freq` and similar
-# non-float buffers - are legitimately not refit material, so a complete refit
-# lands slightly under full coverage.
-_COVERAGE_FLOOR = float(os.environ.get("MX_RESHARD_COVERAGE_FLOOR", "0.995"))
+
+def _coverage_floor() -> float:
+    """The fraction of engine parameter bytes a gated refit must install.
+
+    Deliberately not 1.0 by default. A few engine parameters - rotary `inv_freq`
+    and similar non-float buffers - are legitimately not refit material, so a
+    complete refit lands slightly under full coverage.
+
+    A negative floor passes every refit, which silently disables the gate the
+    caller just asked for, and a floor above 1.0 rejects every refit including a
+    complete one. Both are rejected rather than honored.
+    """
+    floor = float(envs.MX_RESHARD_COVERAGE_FLOOR)
+    if not 0.0 <= floor <= 1.0:
+        raise ValueError(
+            f"MX_RESHARD_COVERAGE_FLOOR must be a fraction in [0.0, 1.0], got {floor}"
+        )
+    return floor
 
 
 def _fused_wire_enabled() -> bool:
@@ -233,6 +241,11 @@ class ReshardReceiver:
         # update_weights), which assumes the trainer set + their shard layout +
         # their buffer addresses are stable for the run.
         plan = plan_transfer(capture, sources)
+        all_params = sorted({c.param_name for c in capture.copies})
+        # Before the fail-closed rejection below, not after: an unsupported plan is
+        # the case where naming the hole matters most, and raising first would leave
+        # the run with no record of what it was about to miss.
+        self._log_coverage(capture, param_layout, all_params, plan)
         if plan.fallback:
             # Fallback params are dropped from the RDMA plan and never pulled or
             # installed, so they would silently keep their initial (base-model)
@@ -298,7 +311,6 @@ class ReshardReceiver:
         # Segment params (captured == served) are the RDMA targets - register them
         # + point _param_ptr at them. Convert params (router) are captured fp32 ->
         # their bf16 staging is the RDMA target and the refit casts into the buffer.
-        all_params = sorted({c.param_name for c in capture.copies})
         seg_params = {seg.param_name for seg in plan.segments}
         self._recv_buffers = {}
         with classic_cuda_alloc():
@@ -328,7 +340,6 @@ class ReshardReceiver:
             len(plan.unbounded_sources),
             len(plan.fallback),
         )
-        self._log_coverage(capture, param_layout, all_params, plan)
 
     def _log_coverage(self, capture, param_layout, all_params, plan) -> None:
         """Report what this rank asked the wire for, against what it will install.
@@ -393,7 +404,12 @@ class ReshardReceiver:
         }
         logger.warning("MX_REFIT_COVERAGE %s", json.dumps(record))
 
-        if _REQUIRE_FULL_COVERAGE and coverage < _COVERAGE_FLOOR:
+        # Opt-in rather than always-on: partial and subset refit are intended
+        # features, and for those a coverage below 1.0 is the point. What is never
+        # acceptable is a *benchmark* row measuring an incomplete refit, because
+        # its wire volume and timings are then the wrong magnitude and get
+        # compared against complete ones.
+        if envs.MX_RESHARD_REQUIRE_FULL_COVERAGE and coverage < _coverage_floor():
             raise RuntimeError(
                 f"refit covers {100.0 * coverage:.2f}% of the engine's parameter "
                 f"bytes ({dest_bytes} of {engine_bytes}); "

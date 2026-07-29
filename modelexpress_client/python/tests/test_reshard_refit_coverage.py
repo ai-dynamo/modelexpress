@@ -30,6 +30,7 @@ import torch
 
 from modelexpress.refit.reshard import receiver as receiver_mod
 from modelexpress.refit.reshard.receiver import ReshardReceiver
+from modelexpress.refit.reshard.types import UnsupportedReshard
 
 
 class _Plan:
@@ -104,13 +105,9 @@ def _emit(caplog, *, param_layout, all_params, capture=None, plan=None, rank=0):
 
 @pytest.fixture(autouse=True)
 def _gate_off(monkeypatch):
-    """Default the gate off, as it ships.
-
-    The flags are module-level constants read at import, so patching the
-    environment inside a test does nothing; patch the module attributes.
-    """
-    monkeypatch.setattr(receiver_mod, "_REQUIRE_FULL_COVERAGE", False)
-    monkeypatch.setattr(receiver_mod, "_COVERAGE_FLOOR", 0.995)
+    """Default the gate off, as it ships, whatever the ambient environment is."""
+    monkeypatch.delenv("MX_RESHARD_REQUIRE_FULL_COVERAGE", raising=False)
+    monkeypatch.delenv("MX_RESHARD_COVERAGE_FLOOR", raising=False)
 
 
 def test_a_complete_refit_reports_full_coverage(caplog):
@@ -248,7 +245,7 @@ def test_gate_off_by_default_lets_a_partial_refit_through(caplog):
 
 
 def test_gate_on_raises_below_the_floor_and_names_what_is_missing(caplog, monkeypatch):
-    monkeypatch.setattr(receiver_mod, "_REQUIRE_FULL_COVERAGE", True)
+    monkeypatch.setenv("MX_RESHARD_REQUIRE_FULL_COVERAGE", "1")
     engine = [f"layers.{i}.weight" for i in range(48)]
     with pytest.raises(RuntimeError) as ei:
         _emit(
@@ -274,8 +271,8 @@ def test_gate_on_passes_at_the_floor_so_stray_buffers_do_not_fail_a_good_run(
     and similar non-float buffers that surface as params in some models - and
     failing a complete refit over a few kilobytes would make the gate unusable.
     """
-    monkeypatch.setattr(receiver_mod, "_REQUIRE_FULL_COVERAGE", True)
-    monkeypatch.setattr(receiver_mod, "_COVERAGE_FLOOR", 0.995)
+    monkeypatch.setenv("MX_RESHARD_REQUIRE_FULL_COVERAGE", "1")
+    monkeypatch.setenv("MX_RESHARD_COVERAGE_FLOOR", "0.995")
     param_layout = {f"w{i}": ((1000,), torch.bfloat16) for i in range(1000)}
     param_layout["inv_freq"] = ((1,), torch.bfloat16)  # 2 B of 2,000,002
     installed = [f"w{i}" for i in range(1000)]
@@ -288,3 +285,78 @@ def test_an_engine_with_no_parameters_does_not_divide_by_zero(caplog):
     rec = _emit(caplog, param_layout={}, all_params=[])
     assert rec["coverage_pct"] == 0.0
     assert rec["engine_bytes"] == 0
+
+
+@pytest.mark.parametrize("floor", ["-0.1", "1.5"])
+def test_a_floor_outside_zero_to_one_is_rejected(caplog, monkeypatch, floor):
+    """A negative floor passes every refit, silently disabling the gate the caller
+    just asked for; above 1.0 rejects even a complete one. Neither is honored."""
+    monkeypatch.setenv("MX_RESHARD_REQUIRE_FULL_COVERAGE", "1")
+    monkeypatch.setenv("MX_RESHARD_COVERAGE_FLOOR", floor)
+    names = ["a", "b"]
+
+    with pytest.raises(ValueError, match=r"fraction in \[0.0, 1.0\]"):
+        _emit(caplog, param_layout=_layout(names), all_params=names[:1])
+
+
+def test_the_floor_is_read_live_so_the_gate_is_configurable_per_run(
+    caplog, monkeypatch
+):
+    monkeypatch.setenv("MX_RESHARD_REQUIRE_FULL_COVERAGE", "1")
+    monkeypatch.setenv("MX_RESHARD_COVERAGE_FLOOR", "0.4")
+    engine = [f"w{i}" for i in range(10)]
+
+    # 50% coverage clears a 0.4 floor and fails a 0.6 one.
+    assert _emit(caplog, param_layout=_layout(engine), all_params=engine[:5])
+    monkeypatch.setenv("MX_RESHARD_COVERAGE_FLOOR", "0.6")
+    with pytest.raises(RuntimeError):
+        _emit(caplog, param_layout=_layout(engine), all_params=engine[:5])
+
+
+def test_coverage_is_recorded_before_an_unsupported_plan_is_rejected(
+    caplog, monkeypatch
+):
+    """An unsupported plan is the case where the hole most needs naming.
+
+    `_prepare` fails closed on `plan.fallback`, so recording coverage after that
+    raise would mean the runs with a known coverage hole are exactly the runs with
+    no coverage record.
+    """
+    engine = [f"layers.{i}.weight" for i in range(4)]
+    source = types.SimpleNamespace(dtype="torch.bfloat16", global_shape=(4, 8))
+    monkeypatch.setattr(
+        receiver_mod,
+        "gather_sources",
+        lambda *_args, **_kwargs: ({"layers.0.weight": source}, {}, {}, {}),
+    )
+    monkeypatch.setattr(
+        receiver_mod,
+        "plan_transfer",
+        lambda *_args, **_kwargs: _Plan(fallback=["layers.3.weight"]),
+    )
+    stub = types.SimpleNamespace(
+        _global_rank=0,
+        _num_trainer_sources=1,
+        _mx_client=object(),
+        _model_name="model",
+        _manager=types.SimpleNamespace(fetch_remote_and_wait=lambda *a, **k: None),
+        _log_coverage=lambda *args: ReshardReceiver._log_coverage(stub, *args),
+        _capture=lambda _manifest: (
+            types.SimpleNamespace(
+                copies=[types.SimpleNamespace(param_name="layers.0.weight")],
+                unsupported=[],
+            ),
+            _layout(engine),
+        ),
+    )
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        with pytest.raises(UnsupportedReshard):
+            ReshardReceiver._prepare(stub, timeout=1.0)
+
+    records = [r for r in caplog.records if "MX_REFIT_COVERAGE" in r.getMessage()]
+    assert len(records) == 1
+    rec = json.loads(records[0].getMessage().split("MX_REFIT_COVERAGE ", 1)[1])
+    assert rec["fallback"] == 1
+    assert rec["params_never_written"] == 3
