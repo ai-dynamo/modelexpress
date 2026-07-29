@@ -61,6 +61,9 @@ if TYPE_CHECKING:
     MX_RESHARD_FUSED_WIRE: bool
     MX_RESHARD_REQUIRE_FULL_COVERAGE: bool
     MX_RESHARD_COVERAGE_FLOOR: float
+    MX_RESHARD_HANDSHAKE_TIMEOUT_S: float
+    MX_RESHARD_HANDSHAKE_ATTEMPT_S: float
+    MX_RESHARD_HANDSHAKE_BACKOFF_S: float
     # Kubernetes service backend
     MX_K8S_SERVICE_PATTERN: str
     MX_K8S_SOURCE_RETRIES: str
@@ -205,6 +208,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     .lower()
     in _TRUTHY,
     "MX_RESHARD_COVERAGE_FLOOR": lambda: _env_float("MX_RESHARD_COVERAGE_FLOOR", 0.995),
+    # Whole-handshake budget across every peer and every retry, the per-dial
+    # ceiling, and the pause after a full pass over the pending peers makes no
+    # progress. See modelexpress.refit.reshard.receiver.handshake_with_peers.
+    "MX_RESHARD_HANDSHAKE_TIMEOUT_S": lambda: _env_float("MX_RESHARD_HANDSHAKE_TIMEOUT_S", 900.0),
+    "MX_RESHARD_HANDSHAKE_ATTEMPT_S": lambda: _env_float("MX_RESHARD_HANDSHAKE_ATTEMPT_S", 20.0),
+    "MX_RESHARD_HANDSHAKE_BACKOFF_S": lambda: _env_float("MX_RESHARD_HANDSHAKE_BACKOFF_S", 2.0),
     # ── Kubernetes service backend ─────────────────────────────────────────
     "MX_K8S_SERVICE_PATTERN": lambda: os.environ.get("MX_K8S_SERVICE_PATTERN", "mx-sources"),
     "MX_K8S_SOURCE_RETRIES": lambda: os.environ.get("MX_K8S_SOURCE_RETRIES", ""),

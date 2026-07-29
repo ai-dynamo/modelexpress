@@ -352,6 +352,11 @@ class MxReshardRendezvous:
         registered no memory, so satisfying the quorum with it makes the receiver
         stop waiting for the ranks that do have bytes and then stall in the P2P
         handshake instead - a timeout attributed to the wrong component.
+
+        Exactly ``expected_trainers`` ranks are returned. A stale source from an
+        earlier run can still be READY, and every extra rank returned here becomes
+        an extra peer to handshake and an extra set of shards competing to describe
+        the same tensor names.
         """
         trainer_id = self._identity("trainer")
         deadline = time.monotonic() + timeout
@@ -362,18 +367,23 @@ class MxReshardRendezvous:
             )
             instances = list(resp.instances)
             payloads, empty = [], 0
-            if len(instances) >= expected_trainers:
-                for inst in instances:
-                    meta = self.client.get_metadata(inst.mx_source_id, inst.worker_id)
-                    if not meta.found:
-                        continue
-                    payload = unwrap_rendezvous_blob(meta.worker.nixl_metadata)
-                    if not payload[3]:
-                        empty += 1
-                        continue
-                    payloads.append(payload)
+            # Every visible READY source is inspected, whatever the count: with
+            # fewer sources than expected the shard-table state is exactly what a
+            # timeout here has to report, and reaching the quorum on instances
+            # alone says nothing about whether any of them published bytes.
+            for inst in instances:
+                meta = self.client.get_metadata(inst.mx_source_id, inst.worker_id)
+                if not meta.found:
+                    continue
+                payload = unwrap_rendezvous_blob(meta.worker.nixl_metadata)
+                if not payload[3]:
+                    empty += 1
+                    continue
+                payloads.append(payload)
                 if len(payloads) >= expected_trainers:
                     break
+            if len(payloads) >= expected_trainers:
+                break
             if time.monotonic() >= deadline:
                 raise TimeoutError(
                     f"timed out after {timeout}s waiting for {expected_trainers} "

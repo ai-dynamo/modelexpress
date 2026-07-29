@@ -231,6 +231,37 @@ def test_empty_publishers_are_excluded_from_the_returned_payloads():
     assert len(discovered) == 2
 
 
+def test_only_the_requested_number_of_ranks_is_returned():
+    """A stale source from an earlier run stays READY. Returning it adds a peer to
+    handshake and a second set of shards describing the same tensor names."""
+    client = _DiscoveryClient(
+        [
+            _blob("rank-0", _one_tensor()),
+            _blob("rank-1", _one_tensor()),
+            _blob("stale-rank", _one_tensor()),
+        ]
+    )
+
+    discovered = _rendezvous(client).discover_trainers(expected_trainers=2, timeout=0)
+
+    assert [name for (_meta, name, _ep, _t) in discovered] == ["rank-0", "rank-1"]
+
+
+def test_a_partial_ready_set_still_reports_its_shard_tables():
+    """Below the quorum the shard-table state is exactly what the timeout has to
+    report: one READY publisher with nothing to serve is a different failure from
+    one rank that has not come up yet."""
+    client = _DiscoveryClient([_blob("empty-rank", [])])
+
+    with pytest.raises(TimeoutError) as excinfo:
+        _rendezvous(client).discover_trainers(expected_trainers=2, timeout=0)
+
+    message = str(excinfo.value)
+    assert "1 READY source(s)" in message
+    assert "0 with a non-empty shard table" in message
+    assert "1 empty" in message
+
+
 def test_invalid_heartbeat_period_fails_before_publish(monkeypatch):
     class Client:
         def publish_metadata(self, *_args, **_kwargs):

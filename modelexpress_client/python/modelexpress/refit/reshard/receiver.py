@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 from collections import deque
 
@@ -53,19 +52,33 @@ from modelexpress.refit.reshard.types import (
 
 logger = logging.getLogger("modelexpress.refit.reshard.receiver")
 
-# Whole-handshake budget across every peer and every retry. A refit timeout is the
-# wrong bound: it lets one unreachable peer consume the entire refit. It must still
-# be generous, because a peer can be unreachable for minutes for a legitimate
-# reason - registering tens of GB with the fabric provider blocks its listen
-# thread - and the receiver's only correct response to that is to keep trying.
-_HANDSHAKE_TIMEOUT_S = float(os.environ.get("MX_RESHARD_HANDSHAKE_TIMEOUT_S", "900"))
-# Ceiling on a single dial. A reachable peer answers in well under a second, so a
-# short attempt costs nothing when things are healthy and, when they are not, frees
-# the budget to try a different peer instead of blocking on one.
-_HANDSHAKE_ATTEMPT_S = float(os.environ.get("MX_RESHARD_HANDSHAKE_ATTEMPT_S", "20"))
-# Pause after a full pass over the pending peers yields no progress, so a transient
-# stall is waited out rather than hammered.
-_HANDSHAKE_BACKOFF_S = float(os.environ.get("MX_RESHARD_HANDSHAKE_BACKOFF_S", "2"))
+
+def _handshake_seconds(name: str) -> float:
+    """Read a handshake duration from the env registry, rejecting non-positives.
+
+    ``MX_RESHARD_HANDSHAKE_TIMEOUT_S`` is the whole-handshake budget across every
+    peer and every retry. A refit timeout is the wrong bound: it lets one
+    unreachable peer consume the entire refit. It must still be generous, because
+    a peer can be unreachable for minutes for a legitimate reason - registering
+    tens of GB with the fabric provider blocks its listen thread - and the
+    receiver's only correct response to that is to keep trying.
+
+    ``MX_RESHARD_HANDSHAKE_ATTEMPT_S`` is the ceiling on a single dial. A reachable
+    peer answers in well under a second, so a short attempt costs nothing when
+    things are healthy and, when they are not, frees the budget to try a different
+    peer instead of blocking on one.
+
+    ``MX_RESHARD_HANDSHAKE_BACKOFF_S`` is the pause after a full pass over the
+    pending peers yields no progress, so a transient stall is waited out rather
+    than hammered.
+
+    A non-positive value turns the corresponding bound off, which silently
+    reintroduces the failure mode it exists to prevent, so it is rejected.
+    """
+    value = float(getattr(envs, name))
+    if not value > 0.0:
+        raise ValueError(f"{name} must be a positive number of seconds, got {value}")
+    return value
 
 
 def handshake_with_peers(
@@ -96,7 +109,10 @@ def handshake_with_peers(
     metadata is being fetched, and there is no way to tell which peer is at
     fault, or whether it stalled on the first dial or the last.
     """
-    attempt_timeout = attempt_timeout or _HANDSHAKE_ATTEMPT_S
+    attempt_timeout = attempt_timeout or _handshake_seconds(
+        "MX_RESHARD_HANDSHAKE_ATTEMPT_S"
+    )
+    backoff = _handshake_seconds("MX_RESHARD_HANDSHAKE_BACKOFF_S")
     pending = deque(agent_endpoints.items())
     total = len(pending)
     attempts: dict = {name: 0 for name in agent_endpoints}
@@ -125,7 +141,6 @@ def handshake_with_peers(
             )
 
         agent_name, endpoint = pending.popleft()
-        host, port_str = endpoint.rsplit(":", 1)
         this_timeout = max(1.0, min(attempt_timeout, remaining))
         attempts[agent_name] += 1
         logger.info(
@@ -139,6 +154,9 @@ def handshake_with_peers(
         )
         started = time.perf_counter()
         try:
+            # Parsed inside the retry so a malformed entry is reported as this
+            # peer's failure, not raised past every other peer's handshake.
+            host, port_str = endpoint.rsplit(":", 1)
             manager.fetch_remote_and_wait(
                 agent_name, host, int(port_str), timeout_seconds=this_timeout
             )
@@ -158,9 +176,7 @@ def handshake_with_peers(
             pending.append((agent_name, endpoint))
             stalled += 1
             if stalled >= len(pending):
-                time.sleep(
-                    min(_HANDSHAKE_BACKOFF_S, max(0.0, deadline - time.monotonic()))
-                )
+                time.sleep(min(backoff, max(0.0, deadline - time.monotonic())))
                 stalled = 0
             continue
 
@@ -358,7 +374,11 @@ class ReshardReceiver:
         # NIXL metadata (incl. its memory registrations) via its listen thread, so
         # prep_xfer_dlist can resolve the remote addresses. The central
         # add_remote_agent(blob) path does NOT convey the registrations.
-        handshake_with_peers(self._manager, agent_endpoints, _HANDSHAKE_TIMEOUT_S)
+        handshake_with_peers(
+            self._manager,
+            agent_endpoints,
+            _handshake_seconds("MX_RESHARD_HANDSHAKE_TIMEOUT_S"),
+        )
 
         manifest = [
             (name, src.dtype, tuple(src.global_shape)) for name, src in sources.items()

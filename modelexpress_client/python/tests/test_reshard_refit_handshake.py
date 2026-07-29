@@ -13,7 +13,10 @@ Two distinct production failures motivate these:
 
 import pytest
 
-from modelexpress.refit.reshard.receiver import handshake_with_peers
+from modelexpress.refit.reshard.receiver import (
+    _handshake_seconds,
+    handshake_with_peers,
+)
 
 
 class _Manager:
@@ -134,3 +137,32 @@ def test_no_peers_is_not_an_error():
     handshake_with_peers(manager, {}, 300.0)
 
     assert manager.calls == []
+
+
+def test_a_malformed_endpoint_fails_only_its_own_peer():
+    """One unparseable catalog entry must not abort the other peers' handshake -
+    the same fault isolation a refused connection already gets."""
+    manager = _Manager()
+    endpoints = {"trainer-r0": "10.0.0.0-no-port", "trainer-r1": "10.0.0.1:9999"}
+
+    with pytest.raises(RuntimeError) as excinfo:
+        handshake_with_peers(manager, endpoints, 1.0, attempt_timeout=0.5)
+
+    message = str(excinfo.value)
+    assert "1 of 2 peer(s) answered" in message
+    assert "trainer-r0@10.0.0.0-no-port" in message
+    assert manager.dials("trainer-r1")
+
+
+def test_handshake_bounds_come_from_the_env_registry(monkeypatch):
+    monkeypatch.setenv("MX_RESHARD_HANDSHAKE_ATTEMPT_S", "3.5")
+
+    assert _handshake_seconds("MX_RESHARD_HANDSHAKE_ATTEMPT_S") == 3.5
+
+
+def test_a_non_positive_bound_is_rejected(monkeypatch):
+    """Zero or negative turns the bound off, reinstating the hang it prevents."""
+    monkeypatch.setenv("MX_RESHARD_HANDSHAKE_TIMEOUT_S", "0")
+
+    with pytest.raises(ValueError, match="positive number of seconds"):
+        _handshake_seconds("MX_RESHARD_HANDSHAKE_TIMEOUT_S")
