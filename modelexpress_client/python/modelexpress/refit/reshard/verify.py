@@ -146,6 +146,43 @@ def shard_region(full_tensor, global_shape, shard_offset, shape):
     return view.contiguous()
 
 
+# Digest the assembled destination rather than the received source shards. This is
+# the other half of the gate: ``verify_full_pulls`` can only check sources whose
+# whole shard lands in a staging buffer, which on Topology B is 6,192 of 18,867.
+# The other 12,675 arrive as exact segments written straight into the receive
+# buffers and are checked by nothing at all, so a wrong offset or stride in
+# ``plan_pull`` delivers plausible bytes to the right place and every gate passes.
+#
+# Digesting the receive buffers closes that hole because *every* path lands there:
+# exact segments directly, full pulls after the local re-slice, and converts after
+# the cast. What it cannot do alone is say whether those bytes are *right* - a
+# digest is not a reference. It becomes a gate when two runs are compared, one
+# planned normally and one with ``MX_RESHARD_FORCE_FULL_PULL=1``, because the
+# full-pull path's bytes are independently checked against the publishers'
+# digests. A per-parameter difference then localises a segment-planning bug to a
+# named tensor. See :mod:`modelexpress.refit.reshard.dest_digest_report`.
+#
+# The comparison is only valid while the weights hold still between the two runs,
+# so run it against a quiesced publisher (step 1, or with training frozen);
+# otherwise legitimate training updates read as mismatches, which is the same trap
+# Bug 9 fell into.
+DEST_DIGEST = os.environ.get("MX_RESHARD_DEST_DIGEST", "0") == "1"
+
+
+def digest_destination(recv_buffers: dict) -> dict:
+    """Digest each assembled destination buffer, keyed by parameter name.
+
+    Called after re-slice and convert but *before* install, so the result
+    describes what the fetch pipeline produced rather than what an
+    engine-specific installer (which may quantize or derive) made of it. That
+    keeps the digest comparable across engines and across the two plan shapes
+    being differenced.
+
+    Sorted so the emitted record has a stable key order and two runs diff cleanly.
+    """
+    return {name: tensor_digest(buf) for name, buf in sorted(recv_buffers.items())}
+
+
 SENTINEL_BYTE = int(os.environ.get("MX_RESHARD_SENTINEL_BYTE", "165"))  # 0xA5
 
 # Pre-filling the staging buffers with a byte no weight tensor plausibly contains

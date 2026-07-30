@@ -34,6 +34,10 @@ import torch
 from modelexpress.client import MxClient
 from modelexpress.nixl_transfer import NixlTransferManager
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
+from modelexpress.refit.reshard.dest_digest_report import (
+    RECORD_MARKER as _DEST_DIGEST_MARKER,
+)
+from modelexpress.refit.reshard.dest_digest_report import dest_digest_record
 from modelexpress.refit.reshard.rendezvous import gather_sources
 from modelexpress.refit.reshard.transfer_plan import (
     exact_descriptors,
@@ -48,9 +52,11 @@ from modelexpress.refit.reshard.transport import (
 )
 from modelexpress.refit.reshard.types import CaptureResult, UnsupportedReshard
 from modelexpress.refit.reshard.verify import (
+    DEST_DIGEST,
     FILL_SENTINEL,
     VERIFY,
     VERIFY_STRICT,
+    digest_destination,
     fill_sentinel,
     verify_full_pulls,
 )
@@ -938,10 +944,43 @@ class ReshardReceiver:
             )
             stages["verify_s"] = time.perf_counter() - _t
 
+        # Also before install, and for the same reason, but covering the whole
+        # destination rather than the full-pull sources: every fetch path has landed
+        # in the receive buffers by now, so this is the only point where the
+        # exact-segment path is observable at all.
+        dest_digests = None
+        if DEST_DIGEST:
+            _t = time.perf_counter()
+            dest_digests = digest_destination(self._recv_buffers)
+            stages["dest_digest_s"] = time.perf_counter() - _t
+
         _t = time.perf_counter()
         self._install(self._recv_buffers)
         torch.cuda.synchronize(self._device)
         stages["install_s"] = time.perf_counter() - _t
+
+        if dest_digests is not None:
+            # WARNING for the same reason as the verify record: the benchmark
+            # harnesses capture at WARNING. One record per rank per step; the
+            # comparison itself is offline, since a single run has nothing to
+            # compare against.
+            logger.warning(
+                "%s%s",
+                _DEST_DIGEST_MARKER,
+                json.dumps(
+                    dest_digest_record(
+                        step=step,
+                        rank=self._global_rank,
+                        forced_full_pull=self._plan.forced_full_pull,
+                        digests=dest_digests,
+                        # Carried so the comparison can tell where the reference
+                        # arm silently reverted to the exact path it is meant to
+                        # be checking; see dest_digest_record.
+                        unbounded_sources=self._plan.unbounded_sources,
+                        fallback_sources=self._plan.fallback,
+                    )
+                ),
+            )
 
         if verify_report is not None:
             # WARNING so a benchmark harness captures it alongside the stage record.

@@ -90,6 +90,11 @@ class TransferPlan:
     unbounded_sources: list = field(default_factory=list)
     exact_descriptor_count: int = 0
     exact_bytes: int = 0
+    # Which arm of the destination-digest comparison this plan is. Recorded on the
+    # plan rather than re-read from the environment at emit time so a record cannot
+    # claim to be one arm while having been planned as the other - the whole
+    # comparison rests on telling them apart.
+    forced_full_pull: bool = False
 
     def bytes_planned(self) -> int:
         return (
@@ -202,13 +207,21 @@ def plan_transfer(
     generator TP2 - and said nothing about the other 12 675, which include every
     norm, the gate/up projections and all attention except ``o_proj``.
 
-    Read the resulting pass narrowly. It proves the publisher's bytes for every
-    source arrive intact, which is what Bug 6 and Bug 9 were about. It does **not**
-    verify the exact-fetch path itself: forcing full pulls replaces the segment
-    planning under test rather than checking it, so a bug in ``plan_pull``'s
-    slicing would be hidden rather than caught. Verifying that properly means
-    digesting the destination after install against a reference reconstructed from
-    the source shards, which is a different and larger piece of work.
+    Read a pass from this arm *alone* narrowly. It proves the publisher's bytes for
+    every source arrive intact, which is what Bug 6 and Bug 9 were about. On its own
+    it does **not** verify the exact-fetch path, because forcing full pulls replaces
+    the segment planning under test rather than checking it, so a bug in
+    ``plan_pull``'s slicing would be hidden rather than caught.
+
+    What closes that gap is using this arm as the *reference* in a two-run
+    comparison rather than as a gate in itself: run once normally and once forced,
+    digest the assembled destination both times (``MX_RESHARD_DEST_DIGEST=1``), and
+    diff per parameter. Bytes reaching the destination through exact segments are
+    then checked against bytes reaching it through a path whose contents are
+    independently confirmed against the publishers' digests, and a difference names
+    the tensor. See     ``modelexpress.refit.reshard.verify.digest_destination`` and
+    ``modelexpress.refit.reshard.dest_digest_report``. The comparison needs the
+    weights to hold still across the two runs, so it wants a quiesced publisher.
     """
     plan = TransferPlan()
     fallback_seen: set = set()
@@ -224,6 +237,7 @@ def plan_transfer(
         force_full_pull = (
             os.environ.get("MX_RESHARD_FORCE_FULL_PULL", "0") == "1"
         )
+    plan.forced_full_pull = bool(force_full_pull)
 
     def mark_fallback(name: str) -> None:
         if name not in fallback_seen:
