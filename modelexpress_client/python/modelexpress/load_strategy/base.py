@@ -112,7 +112,9 @@ def _as_load_result(result_or_model: LoadResult | nn.Module) -> LoadResult:
 
 def _metadata_publication_configured(ctx: LoadContext) -> bool:
     """Return whether this worker has a metadata path for P2P serving."""
-    server_addr = envs.MODEL_EXPRESS_URL or envs.MX_SERVER_ADDRESS
+    server_addr = (
+        ctx.mx_server_url or envs.MODEL_EXPRESS_URL or envs.MX_SERVER_ADDRESS
+    )
     if server_addr:
         return True
     return getattr(ctx.mx_client, "REQUIRES_P2P_METADATA", False) is True

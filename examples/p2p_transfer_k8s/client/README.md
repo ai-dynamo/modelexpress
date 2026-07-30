@@ -8,7 +8,7 @@ Inference engine instances with ModelExpress P2P weight transfer support.
 |--------|------------|
 | **vLLM** | [`vllm/Dockerfile`](vllm/Dockerfile) |
 | **SGLang** | [`sglang/Dockerfile`](sglang/Dockerfile) |
-| **TensorRT-LLM** | Qualified image with the native MX checkpoint loader; see [`trtllm/README.md`](trtllm/README.md) |
+| **TensorRT-LLM** | [`trtllm/Dockerfile`](trtllm/Dockerfile) |
 
 For ModelStreamer-only examples that load from Azure Blob Storage, S3, or a local PVC without an MX server, see [`../../model_streamer_k8s/`](../../model_streamer_k8s/).
 
@@ -39,8 +39,8 @@ ModelExpress server endpoint is provided through `MX_SERVER_ADDRESS`.
 | **Single-node per replica** | [`trtllm/trtllm-single-node-p2p.yaml`](trtllm/trtllm-single-node-p2p.yaml) | Llama family | TP=4, NIXL P2P weights |
 
 The TensorRT-LLM example uses its native `checkpoint_format="MX"` interface.
-See [`trtllm/README.md`](trtllm/README.md) for the supported scope and image
-requirements.
+See [`trtllm/README.md`](trtllm/README.md) for image build instructions and
+the supported scope.
 
 ## How It Works
 

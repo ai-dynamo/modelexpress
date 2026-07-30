@@ -25,6 +25,7 @@ import torch
 
 from . import envs
 from . import ucx_utils
+from ._nixl import load_nixl_api
 from .accelerators import (
     AcceleratorBackend,
     CudaAcceleratorBackend,
@@ -39,13 +40,11 @@ logger = logging.getLogger("modelexpress.nixl_transfer")
 NIXL_AVAILABLE = False
 NixlAgent = None
 nixl_agent_config = None
-try:
-    from nixl._api import nixl_agent as NixlAgent
-    from nixl._api import nixl_agent_config
-
+_nixl_api = load_nixl_api()
+if _nixl_api is not None:
+    NixlAgent = _nixl_api.nixl_agent
+    nixl_agent_config = _nixl_api.nixl_agent_config
     NIXL_AVAILABLE = True
-except ImportError:
-    pass
 
 
 SUPPORTED_NIXL_BACKENDS = ("UCX", "LIBFABRIC")

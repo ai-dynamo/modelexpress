@@ -171,6 +171,10 @@ class EngineAdapter:
         """Return whether this engine is running on a CUDA-like platform."""
         return False
 
+    def requires_exact_tensor_catalog(self) -> bool:
+        """Return whether RDMA must cover every source and target tensor."""
+        return False
+
     def prepare_rdma_target(self, result: LoadResult) -> LoadResult:
         """Prepare target-side model storage before receiving RDMA weights."""
         return result

@@ -18,12 +18,26 @@ model family.
 | TensorRT-LLM API | Native `checkpoint_format="MX"` |
 | Fallback | Hugging Face cache when no compatible source is ready |
 
-## Image requirement
+## Build the image
 
-Use a qualified TensorRT-LLM image that already contains the native MX
-checkpoint loader, then install the ModelExpress client into that image
-without replacing the CUDA, NIXL, UCX, Torch, or protobuf stack. This example
-does not provide a source overlay, patch bundle, or compatibility image.
+The example Dockerfile starts from a TensorRT-LLM release image containing the
+native MX checkpoint loader and installs the ModelExpress client from this
+checkout without replacing the release image's dependencies:
+
+```bash
+docker build \
+  --build-arg TRTLLM_IMAGE=nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc22 \
+  -f examples/p2p_transfer_k8s/client/trtllm/Dockerfile \
+  -t <your-registry>/trtllm-modelexpress:latest \
+  .
+```
+
+Build from the repository root so `modelexpress_client/python` is in the build
+context. Override `TRTLLM_IMAGE` with another qualified TensorRT-LLM release
+when needed. The Dockerfile uses the release image's matching NIXL Python
+binding and native libraries, so deployments do not need to configure
+`PYTHONPATH` or `LD_LIBRARY_PATH`. It does not install a second NIXL wheel,
+overlay TensorRT-LLM source, or apply patches.
 
 ## Run
 
@@ -45,15 +59,23 @@ kubectl rollout status deployment/mx-trtllm \
 ```
 
 The manifest passes `checkpoint_format: MX` and the ModelExpress server
-configuration to the standard `trtllm-serve --config` interface. The
-source-query timeout is zero, so a replica immediately falls back to the
-shared model cache when no compatible source is ready.
+configuration to the standard `trtllm-serve --config` interface. A replica
+immediately falls back to the shared model cache when no compatible source is
+ready.
 
 ## Verify
 
+| Stage | Expected log |
+|---|---|
+| Loader entry | `TRT-LLM MxModelLoader starting` |
+| Strategy selection | `Eligible loaders` and `Trying strategy` |
+| Source cold load | `Loading weights from disk` |
+| Target transfer | `RDMA transfer complete` |
+| Loader exit | `TRT-LLM MxModelLoader.load_model() COMPLETE` |
+
 ```bash
 kubectl logs -l app=mx-trtllm -c trtllm --prefix |
-  grep "MX P2P weight transfer succeeded"
+  grep "RDMA transfer complete"
 
 kubectl port-forward service/mx-trtllm 8000:8000
 curl http://127.0.0.1:8000/v1/completions \
