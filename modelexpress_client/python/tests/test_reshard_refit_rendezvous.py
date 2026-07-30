@@ -117,7 +117,11 @@ def test_published_rendezvous_stays_ready_and_closes_stale(monkeypatch):
     finally:
         rendezvous.close()
 
-    assert client.status_updates[-1] == {
+    last = client.status_updates[-1]
+    # Compare the identity/status fields under test; the heartbeat also carries
+    # advisory telemetry (source_load) that is not what this test asserts.
+    assert {k: last.get(k) for k in
+            ("mx_source_id", "worker_id", "worker_rank", "status")} == {
         "mx_source_id": "source-id",
         "worker_id": "trainer-2",
         "worker_rank": 2,
