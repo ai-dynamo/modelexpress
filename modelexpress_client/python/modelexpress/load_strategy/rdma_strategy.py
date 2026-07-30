@@ -477,7 +477,7 @@ class RdmaStrategy(LoadStrategy):
         register_tensors(result, ctx)
 
         is_p2p = bool(source_worker.worker_grpc_endpoint)
-        remote_agent_name_override = None
+        remote_agent_name = None
 
         if is_p2p:
             # _fetch_worker_metadata() prefetched and generation-validated
@@ -506,7 +506,7 @@ class RdmaStrategy(LoadStrategy):
                 f"[Worker {ctx.global_rank}] [TIMING] P2P NIXL metadata fetch: "
                 f"{nixl_fetch_time:.3f}s"
             )
-            remote_agent_name_override = source_worker.agent_name
+            remote_agent_name = source_worker.agent_name
         else:
             source_tensors = [
                 TensorDescriptor(
@@ -518,6 +518,16 @@ class RdmaStrategy(LoadStrategy):
                 )
                 for t in worker_tensor_descriptors(source_worker)
             ]
+            # Load the peer here rather than letting receive_from_source do it,
+            # so this method holds the name it is responsible for releasing.
+            add_start = time.perf_counter()
+            remote_agent_name = ctx.nixl_manager.add_remote_agent(
+                source_worker.nixl_metadata
+            )
+            logger.info(
+                f"[Worker {ctx.global_rank}] [TIMING] add_remote_agent: "
+                f"{time.perf_counter() - add_start:.3f}s (agent={remote_agent_name})"
+            )
 
         logger.info(
             f"[Worker {ctx.global_rank}] Receiving {len(source_tensors)} tensors from source"
@@ -542,11 +552,20 @@ class RdmaStrategy(LoadStrategy):
                 source_metadata=source_worker.nixl_metadata,
                 source_tensors=source_tensors,
                 timeout_seconds=_transfer_timeout_seconds(),
-                remote_agent_name=remote_agent_name_override,
+                remote_agent_name=remote_agent_name,
                 require_exact_match=require_exact_match,
             )
         except Exception as e:
             raise SourceTransferError(f"RDMA receive failed: {e}") from e
+        finally:
+            # Release the source now: this is a one-shot weight load, so the QP
+            # has no further use here, and waiting for process exit is what left
+            # sources wedged. The manager's atexit hook does not run when the
+            # engine process is torn down (SIGTERM, SIGKILL, OOM), and the source
+            # cannot invalidate a reader it never loaded - in P2P only the reader
+            # loads the peer - so nothing else can close the pair. Also runs on
+            # failure, where the source is the more likely casualty.
+            ctx.nixl_manager.remove_remote_agent(remote_agent_name)
         transfer_time = time.perf_counter() - transfer_start
 
         bandwidth_gbps = (
