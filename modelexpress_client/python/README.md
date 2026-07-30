@@ -83,7 +83,6 @@ llm = LLM(
     checkpoint_format="MX",
     mx_config={
         "server_url": "modelexpress-server:8001",
-        "server_query_timeout_s": 600,
     },
     tensor_parallel_size=4,
     backend="pytorch",
@@ -170,7 +169,7 @@ register_modelexpress_loaders()
 | `modelexpress.metadata` | Metadata clients, source identity, publishing, and worker manifest serving |
 | `modelexpress.engines.vllm.loader` | `MxModelLoader` -- vLLM integration |
 | `modelexpress.engines.sglang.loader` | `MxModelLoader` -- SGLang `remote_instance` integration |
-| `modelexpress.trtllm_live_transfer` | Weight-loading helpers consumed by TensorRT-LLM's native MX checkpoint loader |
+| `modelexpress.engines.trtllm.loader` | `MxModelLoader` -- TensorRT-LLM shared-strategy integration |
 | `modelexpress.vllm_loader` | Compatibility shim for the vLLM loader |
 | `modelexpress.nixl_transfer` | `NixlTransferManager` -- NIXL agent lifecycle and RDMA transfers |
 | `modelexpress.types` | `TensorDescriptor`, `WorkerMetadata` -- core data types |
