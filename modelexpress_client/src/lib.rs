@@ -27,15 +27,23 @@ use tracing::info;
 use tracing::warn;
 use uuid::Uuid;
 
+pub mod auth;
+
 // Re-export for public use
 pub use modelexpress_common::client_config::{ClientArgs, ClientConfig};
 pub use modelexpress_common::models::ModelProvider;
 
+use auth::{AuthInterceptor, TokenProvider};
+use std::sync::Arc;
+use tonic::service::interceptor::InterceptedService;
+
+type AuthChannel = InterceptedService<Channel, AuthInterceptor>;
+
 /// The main client for interacting with the `modelexpress_server` via gRPC
 pub struct Client {
-    health_client: HealthServiceClient<Channel>,
-    api_client: ApiServiceClient<Channel>,
-    model_client: ModelServiceClient<Channel>,
+    health_client: HealthServiceClient<AuthChannel>,
+    api_client: ApiServiceClient<AuthChannel>,
+    model_client: ModelServiceClient<AuthChannel>,
     cache_config: Option<CacheConfig>,
 }
 
@@ -176,9 +184,11 @@ impl Client {
             .connect()
             .await?;
 
-        let health_client = HealthServiceClient::new(channel.clone());
-        let api_client = ApiServiceClient::new(channel.clone());
-        let model_client = ModelServiceClient::new(channel);
+        let interceptor = AuthInterceptor::new(Arc::new(TokenProvider::from_env()));
+        let health_client =
+            HealthServiceClient::with_interceptor(channel.clone(), interceptor.clone());
+        let api_client = ApiServiceClient::with_interceptor(channel.clone(), interceptor.clone());
+        let model_client = ModelServiceClient::with_interceptor(channel, interceptor);
 
         // Use the cache config from the client configuration
         let cache_config = Some(config.cache.clone());

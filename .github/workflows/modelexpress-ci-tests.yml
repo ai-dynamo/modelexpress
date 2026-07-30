@@ -23,10 +23,9 @@
 #                         build-server, and ensure-vcluster. Each matrix entry
 #                         creates its own isolated namespace, deploys a full
 #                         stack (mx-server + workers), runs pytest, then
-#                         deletes the namespace. Currently sequential
-#                         (max-parallel: 1); remove that line to run in
-#                         parallel once each framework has been validated
-#                         independently.
+#                         deletes the namespace. Runs up to max-parallel: 3
+#                         entries concurrently to bound simultaneous HF model
+#                         downloads and GPU footprint.
 #
 #   test-tp             — TP > 1 variant of test-p2p. Multi-node TP=2 only
 #                         (StatefulSet + Ray, one GPU per pod on a100a, 2 pods
@@ -35,34 +34,24 @@
 #                         and was dropped here to avoid doubling a100b demand.
 #                         See TEST_PLAN row 5.1.
 #
-#   test-dp             — DP > 1 variant of test-p2p. vLLM native data
-#                         parallelism (--data-parallel-size 2): N full model
-#                         copies, not sharded weights. Runs with tp_size=1
-#                         because the ModelExpress identity carries no DP
-#                         dimension and DP cores are interchangeable — the
-#                         target's DP cores each pull the full rank-0 weight
-#                         set over RDMA (N concurrent pulls from one source).
-#                         See TEST_PLAN row 5.2.
+#   test-parallel       — DP > 1 and EP > 1 variants of test-p2p, matrixed and
+#                         serialized (max-parallel: 1) since both are single-node
+#                         full-GPU jobs on the scarce non-MIG pool. DP uses vLLM
+#                         native data parallelism (--data-parallel-size 2, N full
+#                         interchangeable copies at worker_rank 0, tp_size=1); EP
+#                         uses expert parallelism (--enable-expert-parallel over a
+#                         TP=2 MoE world, rank-distinct weights, tp_size=2, the
+#                         identity hash carrying expert_parallel_size > 0). See
+#                         TEST_PLAN rows 5.2 and 5.3.
 #
-#   test-ep             — EP > 1 variant of test-p2p. vLLM expert parallelism
-#                         (--enable-expert-parallel over a TP=2 world) on an
-#                         MoE model (DeepSeek-V2-Lite). EP shards experts per
-#                         rank, so weights stay rank-distinct and transfers are
-#                         rank-paired like TP (tp_size=2). The new coverage is
-#                         the identity hash carrying expert_parallel_size > 0.
-#                         See TEST_PLAN row 5.3.
-#
-#   test-p2p-mla-model — vLLM MLA/MoE P2P test on the full-GPU A100b pool.
-#                        Uses a TP=2 DeepSeek MLA + MoE model and also runs
-#                        the standard source/target VRAM parity assertions.
-#                        Doubles as the single-node TP=2 coverage (same
-#                        manifest-azure-tp2.yaml + test_p2p_k8s.py as the
-#                        dropped test-tp single-node entry).
-#
-#   test-p2p-mla-model-sglang — SGLang counterpart of test-p2p-mla-model.
-#                        Same DeepSeek MLA + MoE model, full-GPU A100b pool,
-#                        TP=2, and VRAM parity, over the SGLang remote_instance
-#                        + NIXL path (ci/k8s/client/sgl/manifest-azure-tp2.yaml).
+#   test-p2p-mla-model — vLLM + SGLang MLA/MoE P2P test on the full-GPU A100b
+#                        pool, matrixed over framework and serialized
+#                        (max-parallel: 1). Uses a TP=2 DeepSeek MLA + MoE model
+#                        and runs the source/target VRAM parity assertions. The
+#                        vLLM entry doubles as the single-node TP=2 coverage
+#                        (same manifest-azure-tp2.yaml + test_p2p_k8s.py as the
+#                        dropped test-tp single-node entry); the SGLang entry
+#                        covers the remote_instance + NIXL path.
 #
 #   test-with-dynamo    — P2P test orchestrated through a DynamoGraphDeployment.
 #                         Matrix over serving topology (aggregated /
@@ -212,8 +201,6 @@ jobs:
         include:
           - framework: vllm
             dockerfile: ci/k8s/client/vllm/Dockerfile
-          - framework: trt-llm
-            dockerfile: ci/k8s/client/trt-llm/Dockerfile
           - framework: sglang
             dockerfile: ci/k8s/client/sgl/Dockerfile
           - framework: sglang-mooncake
@@ -303,6 +290,50 @@ jobs:
           vcluster_name: ${{ env.VCLUSTER_NAME }}
           vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
 
+      - name: Guard against host / vCluster version skew
+        # The control-plane version is a pinned constant (vcluster_k8s_version
+        # in setup-mx-vcluster). What broke CI once was the AKS host
+        # auto-upgrading PAST that pin: Kubernetes 1.34 added observedGeneration
+        # on pod conditions, and a vCluster minor below the host makes the
+        # syncer loop, dropping that field and overwriting Ready=True with stale
+        # data so pods never surface as Ready. setup-mx-vcluster is gated (only
+        # runs when the vCluster is absent), so a running cluster silently
+        # skewed after a host bump is never re-checked there. Compare the LIVE
+        # vCluster server minor against the host's on every run and fail loudly
+        # with the fix — so the next host bump is a red step with the answer in
+        # it instead of days of digging. Compares major.minor only (the skew is
+        # a minor-version feature; patch differences are fine). Fails closed on
+        # a confirmed skew and also when either version can't be read.
+        # Incident writeup + context: MX-429.
+        shell: bash
+        run: |
+          # `|| true`: the default GitHub bash runs with `-eo pipefail`, so a
+          # no-match grep would abort the `VAR=$(server_minor ...)` assignment
+          # before the empty-value check runs. Swallow the pipeline status and
+          # let the explicit check below produce the parse-error diagnostic.
+          server_minor() {
+            kubectl --kubeconfig="$1" version 2>/dev/null \
+              | grep -iE 'server version' | grep -oE '[0-9]+\.[0-9]+' | head -1 || true
+          }
+          HOST_MM=$(server_minor "${{ github.workspace }}/.kubeconfig-host")
+          VC_MM=$(server_minor "${{ github.workspace }}/.kubeconfig-vcluster")
+          echo "Host k8s minor: ${HOST_MM:-unknown}; vCluster k8s minor: ${VC_MM:-unknown}"
+          if [ -z "${HOST_MM}" ] || [ -z "${VC_MM}" ]; then
+            # Fail closed: reachability is already verified above, so an
+            # unreadable version means the parse broke, not connectivity. Fail
+            # loudly rather than let the guard silently stop protecting.
+            echo "::error::Could not read host and/or vCluster server version (host='${HOST_MM:-}', vCluster='${VC_MM:-}'). Fix the version parse in this step."
+            exit 1
+          fi
+          HOST_MAJOR=${HOST_MM%.*}; HOST_MINOR=${HOST_MM#*.}
+          VC_MAJOR=${VC_MM%.*};     VC_MINOR=${VC_MM#*.}
+          if [ "${VC_MAJOR}" -lt "${HOST_MAJOR}" ] \
+             || { [ "${VC_MAJOR}" -eq "${HOST_MAJOR}" ] && [ "${VC_MINOR}" -lt "${HOST_MINOR}" ]; }; then
+            echo "::error::vCluster control plane is ${VC_MM} but the AKS host is ${HOST_MM}. A vCluster minor below the host stalls pod-ready propagation (observedGeneration, added in k8s 1.34, makes the syncer overwrite Ready=True). Bump vcluster_k8s_version in .github/actions/setup-mx-vcluster to >= ${HOST_MM}, then recreate the vCluster (delete it so the gated bootstrap rebuilds at the new version)."
+            exit 1
+          fi
+          echo "No host/vCluster version skew (vCluster ${VC_MM} >= host ${HOST_MM})."
+
       - name: vCluster baseline health
         # Snapshot vCluster control-plane state before any test job runs. When
         # downstream jobs fail with "connection refused" mid-run, this baseline
@@ -341,10 +372,14 @@ jobs:
       contents: read
     strategy:
       fail-fast: false
-      # No max-parallel cap: all P2P framework entries run concurrently. The
-      # a100a pool (where every test-p2p entry's source+target land) has the
-      # headroom for the per-entry 2-GPU footprint; the scarce non-MIG pool
-      # that constrains test-tp is a separate concern handled in that job.
+      # Cap concurrent P2P entries at 3. Running all at once had every
+      # entry's source download the model from HuggingFace simultaneously (no
+      # shared model cache across namespaces), which starved slow sources past
+      # their publish timeout; capping the fan-out cuts the peak concurrent
+      # HF pulls and per-entry GPU footprint. Note this only bounds this job's
+      # matrix — the other P2P jobs (test-tp/dp/ep/mla, test-with-dynamo) are
+      # separate jobs and still run alongside.
+      max-parallel: 3
       matrix:
         include:
           - framework: vllm
@@ -357,17 +392,6 @@ jobs:
             worker_port: "8002"
             expected_artifact_sources: "1"
             expected_artifact_source_types: "torch_compile_cache"
-          - framework: trt-llm
-            namespace: mx-ci-trt-llm-${{ github.run_id }}
-            manifest: ci/k8s/client/trt-llm/manifest-azure.yaml
-            test_script: ci/k8s/client/test_p2p_k8s.py
-            pytest_args: "--p2p-marker 'ModelExpress P2P transfer complete'"
-            source_extra_env: |
-              JOB_NAME=mx-source
-              MODEL_EXPRESS_SOURCE=1
-            extra_env: "JOB_NAME=mx-target"
-            source_port: "8003"
-            worker_port: "8004"
           - framework: sglang
             namespace: mx-ci-sglang-${{ github.run_id }}
             manifest: ci/k8s/client/sgl/manifest-azure.yaml
@@ -485,17 +509,40 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
-  # Dedicated P2P MLA/MoE model test.
-  # Runs on the full-GPU A100b pool with TP=2 and a DeepSeek MLA + MoE model.
-  # It also runs the source/target VRAM parity assertions.
+  # Dedicated P2P MLA/MoE model test (vLLM + SGLang).
+  # Runs on the full-GPU A100b pool with TP=2 and a DeepSeek MLA + MoE model,
+  # plus the source/target VRAM parity assertions. The SGLang variant also gates
+  # the derived w_kc/w_vc attention tensors (invisible to named_parameters()),
+  # which must be captured + transferred or the target serves garbage
+  # (TEST_PLAN row 10).
+  #
+  # Matrix over framework with max-parallel: 1 so the two variants run
+  # back-to-back rather than concurrently — both need 4 full GPUs on the scarce
+  # non-MIG pool, so serializing halves peak demand there. fail-fast: false keeps
+  # their results independent: one framework failing does not skip the other.
   # ---------------------------------------------------------------------------
   test-p2p-mla-model:
-    name: P2P MLA model test (vllm TP=2)
+    name: P2P MLA model test (${{ matrix.framework }} TP=2)
     runs-on: prod-modelexpress-builder-amd-v1
     # Full-GPU pool is required because VRAM sampling is blocked on MIG slices.
     needs: [build-client, build-server, ensure-vcluster]
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - framework: vllm
+            namespace: mx-ci-vllm-mla-${{ github.run_id }}
+            manifest: ci/k8s/client/vllm/manifest-azure-tp2.yaml
+            source_port: "8001"
+            worker_port: "8002"
+          - framework: sglang
+            namespace: mx-ci-sglang-mla-${{ github.run_id }}
+            manifest: ci/k8s/client/sgl/manifest-azure-tp2.yaml
+            source_port: "8009"
+            worker_port: "8010"
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -514,84 +561,19 @@ jobs:
         uses: ./.github/actions/run-mx-p2p-test
         with:
           kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
-          namespace: mx-ci-vllm-mla-${{ github.run_id }}
+          namespace: ${{ matrix.namespace }}
           server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
-          manifest: ci/k8s/client/vllm/manifest-azure-tp2.yaml
+          manifest: ${{ matrix.manifest }}
           test_script: ci/k8s/client/test_p2p_k8s.py
-          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-vllm:${{ github.sha }}
+          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
           worker_registry: nvcr.io
           ngc_api_key: ${{ secrets.NGC_API_KEY }}
           model: deepseek-ai/DeepSeek-V2-Lite
           hf_token: ${{ secrets.HF_TOKEN }}
           source_extra_env: "JOB_NAME=mx-source"
           extra_env: "JOB_NAME=mx-target"
-          source_port: "8001"
-          worker_port: "8002"
-          tp_size: "2"
-          pod_ready_timeout_seconds: "3600"
-          measure_vram: "true"
-
-      - name: Dump vCluster diagnostics on failure
-        if: failure()
-        uses: ./.github/actions/dump-vcluster-diagnostics
-        with:
-          vcluster_name: ${{ env.VCLUSTER_NAME }}
-          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
-
-      - name: Reap vCluster port-forward
-        if: always()
-        run: |
-          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
-            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
-          fi
-
-  # ---------------------------------------------------------------------------
-  # Dedicated P2P MLA/MoE model test — SGLang.
-  # SGLang counterpart of test-p2p-mla-model (vLLM). Same model
-  # (deepseek-ai/DeepSeek-V2-Lite), same full-GPU A100b pool, TP=2, fixed-small
-  # KV, and the source/target VRAM parity assertions. Gates the SGLang P2P path
-  # for a DeepSeek MLA + MoE model, whose derived w_kc/w_vc attention tensors are
-  # invisible to named_parameters() and must be captured + transferred or the
-  # target serves garbage. See TEST_PLAN row 10.
-  # ---------------------------------------------------------------------------
-  test-p2p-mla-model-sglang:
-    name: P2P MLA model test (sglang TP=2)
-    runs-on: prod-modelexpress-builder-amd-v1
-    # Full-GPU pool is required because VRAM sampling is blocked on MIG slices.
-    needs: [build-client, build-server, ensure-vcluster]
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Connect to vCluster
-        id: connect-vcluster
-        uses: ./.github/actions/connect-vcluster
-        with:
-          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
-          vcluster_name: ${{ env.VCLUSTER_NAME }}
-          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
-
-      - name: Run P2P MLA model test
-        uses: ./.github/actions/run-mx-p2p-test
-        with:
-          kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
-          namespace: mx-ci-sglang-mla-${{ github.run_id }}
-          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
-          manifest: ci/k8s/client/sgl/manifest-azure-tp2.yaml
-          test_script: ci/k8s/client/test_p2p_k8s.py
-          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-sglang:${{ github.sha }}
-          worker_registry: nvcr.io
-          ngc_api_key: ${{ secrets.NGC_API_KEY }}
-          model: deepseek-ai/DeepSeek-V2-Lite
-          hf_token: ${{ secrets.HF_TOKEN }}
-          source_extra_env: "JOB_NAME=mx-source"
-          extra_env: "JOB_NAME=mx-target"
-          source_port: "8009"
-          worker_port: "8010"
+          source_port: ${{ matrix.source_port }}
+          worker_port: ${{ matrix.worker_port }}
           tp_size: "2"
           pod_ready_timeout_seconds: "3600"
           measure_vram: "true"
@@ -695,133 +677,55 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
-  # P2P weight transfer with data parallelism > 1 (vLLM native DP).
-  # Single pod, --data-parallel-size 2: two full model copies, each pinned to
-  # one GPU. Unlike TP (which shards weights and pairs ranks), DP cores are
-  # interchangeable full copies, so the ModelExpress identity carries no DP
-  # dimension and every DP core resolves to worker_rank 0. The source publishes
-  # a single rank-0 ModelMetadata CR and the target's DP cores each pull the
-  # full rank-0 weight set over RDMA — N concurrent pulls from one source.
+  # P2P weight transfer with parallelism > 1 beyond plain TP — vLLM data
+  # parallelism (DP=2) and expert parallelism (EP=2), single-node.
   #
-  # Hence tp_size is left at the default 1: the per-rank agent assertion expects
-  # exactly one distinct source agent (rank 0), which is correct for DP. See
+  # DP (--data-parallel-size 2): N full interchangeable model copies, so the
+  # ModelExpress identity carries no DP dimension and every DP core resolves to
+  # worker_rank 0 (tp_size=1). The source publishes one rank-0 CR and the
+  # target's DP cores each pull the full rank-0 weights over RDMA. dp_size=2
+  # widens the per-rank agent assertion to [tp_size, tp_size*dp_size] = [1, 2]
+  # (the two target cores may converge on one source or split across both). See
   # TEST_PLAN row 5.2.
   #
-  # Pinned to the same non-MIG agentpool as test-tp via the nodeSelector in
-  # manifest-azure-dp2.yaml.
+  # EP (--enable-expert-parallel over TP=2, MoE model): experts shard per rank,
+  # so weights stay rank-distinct and transfers are rank-paired like TP
+  # (tp_size=2). The new coverage is the identity hash carrying
+  # expert_parallel_size > 0 (TEST_PLAN row 5.3) — a source/target mismatch there
+  # forces a disk fallback and fails the RDMA marker assertion.
+  #
+  # Both run single-node on the scarce full-GPU non-MIG pool (4 GPUs each), so
+  # matrix max-parallel: 1 serializes them back-to-back to halve peak demand
+  # there; fail-fast: false keeps their results independent (one failing does
+  # not skip the other).
   # ---------------------------------------------------------------------------
-  test-dp:
-    name: P2P DP test (${{ matrix.framework }} DP=${{ matrix.dp_size }} ${{ matrix.topology }})
+  test-parallel:
+    name: P2P ${{ matrix.label }} test (vllm)
     runs-on: prod-modelexpress-builder-amd-v1
     needs: [build-client, build-server, ensure-vcluster]
     permissions:
       contents: read
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         include:
-          - framework: vllm
-            dp_size: 2
-            topology: single-node
+          - label: DP=2
             namespace: mx-ci-vllm-dp2-${{ github.run_id }}
             manifest: ci/k8s/client/vllm/manifest-azure-dp2.yaml
+            tp_size: "1"
+            dp_size: "2"
             source_port: "8001"
             worker_port: "8002"
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Connect to vCluster
-        id: connect-vcluster
-        uses: ./.github/actions/connect-vcluster
-        with:
-          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
-          vcluster_name: ${{ env.VCLUSTER_NAME }}
-          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
-
-      - name: Run P2P RDMA transfer test (DP > 1)
-        uses: ./.github/actions/run-mx-p2p-test
-        with:
-          kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
-          namespace: ${{ matrix.namespace }}
-          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
-          manifest: ${{ matrix.manifest }}
-          test_script: ci/k8s/client/test_p2p_k8s.py
-          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
-          worker_registry: nvcr.io
-          ngc_api_key: ${{ secrets.NGC_API_KEY }}
-          model: ${{ env.MX_CI_MODEL }}
-          hf_token: ${{ secrets.HF_TOKEN }}
-          source_extra_env: "JOB_NAME=mx-source"
-          extra_env: "JOB_NAME=mx-target"
-          source_port: ${{ matrix.source_port }}
-          worker_port: ${{ matrix.worker_port }}
-          # tp_size omitted — defaults to 1. DP cores are full, interchangeable
-          # copies at worker_rank 0, so each DP core publishes its own rank-0
-          # source agent and the target's DP cores each select one at random.
-          # dp_size=2 widens the per-rank agent assertion to [tp_size,
-          # tp_size*dp_size] = [1, 2]: the two target cores may converge on one
-          # source (1 distinct agent) or split across both (2), both valid. The
-          # source_ranks == range(tp_size) check still pins rank pairing to 0.
-          dp_size: "2"
-
-      - name: Dump vCluster diagnostics on failure
-        if: failure()
-        uses: ./.github/actions/dump-vcluster-diagnostics
-        with:
-          vcluster_name: ${{ env.VCLUSTER_NAME }}
-          vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
-
-      - name: Reap vCluster port-forward
-        # connect-vcluster backgrounds a `kubectl port-forward` and exports
-        # VCLUSTER_PF_PID via $GITHUB_ENV. Kill it before the job ends so
-        # the next job on this self-hosted runner doesn't inherit an orphan.
-        if: always()
-        run: |
-          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
-            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
-          fi
-
-  # ---------------------------------------------------------------------------
-  # P2P weight transfer with expert parallelism > 1 (vLLM, MoE model).
-  # Single pod, --tensor-parallel-size 2 --enable-expert-parallel against an
-  # MoE model (deepseek-ai/DeepSeek-V2-Lite). In vLLM, EP layers on top of the
-  # TP world: attention stays TP-sharded while the MoE experts are distributed
-  # expert-parallel across the same ranks. Each rank therefore owns distinct
-  # weights, the source publishes one ModelMetadata CR per rank, and the target
-  # pairs rank-for-rank — so this runs with tp_size=2 just like the TP test.
-  #
-  # The coverage beyond test-tp is the identity hash: enabling EP sets
-  # parallel_config.expert_parallel_size > 0, which build_source_identity folds
-  # into mx_source_id. This is the first job to exercise rank pairing with
-  # expert_parallel_size > 0 (TEST_PLAN row 5.3) — a source/target mismatch in
-  # that field would force a disk fallback and fail the RDMA marker assertion.
-  #
-  # Runs on the full-GPU a100b pool (non-MIG) via the nodeSelector in
-  # manifest-azure-ep2.yaml, with the longer MoE-model pod-ready timeout used
-  # by the MLA model test.
-  # ---------------------------------------------------------------------------
-  test-ep:
-    name: P2P EP test (${{ matrix.framework }} EP=${{ matrix.ep_size }} ${{ matrix.topology }})
-    runs-on: prod-modelexpress-builder-amd-v1
-    needs: [build-client, build-server, ensure-vcluster]
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - framework: vllm
-            ep_size: 2
-            topology: single-node
+          - label: EP=2
             namespace: mx-ci-vllm-ep2-${{ github.run_id }}
             manifest: ci/k8s/client/vllm/manifest-azure-ep2.yaml
             model: deepseek-ai/DeepSeek-V2-Lite
-            source_port: "8001"
-            worker_port: "8002"
+            tp_size: "2"
+            dp_size: "1"
+            pod_ready_timeout_seconds: "3600"
+            source_port: "8003"
+            worker_port: "8004"
 
     steps:
       - name: Checkout
@@ -837,7 +741,7 @@ jobs:
           vcluster_name: ${{ env.VCLUSTER_NAME }}
           vcluster_namespace: ${{ env.VCLUSTER_NAMESPACE }}
 
-      - name: Run P2P RDMA transfer test (EP > 1)
+      - name: Run P2P RDMA transfer test (${{ matrix.label }})
         uses: ./.github/actions/run-mx-p2p-test
         with:
           kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
@@ -845,22 +749,20 @@ jobs:
           server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
           manifest: ${{ matrix.manifest }}
           test_script: ci/k8s/client/test_p2p_k8s.py
-          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
+          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-vllm:${{ github.sha }}
           worker_registry: nvcr.io
           ngc_api_key: ${{ secrets.NGC_API_KEY }}
-          model: ${{ matrix.model }}
+          # DP uses the default dense CI model; EP overrides to an MoE model.
+          model: ${{ matrix.model || env.MX_CI_MODEL }}
           hf_token: ${{ secrets.HF_TOKEN }}
           source_extra_env: "JOB_NAME=mx-source"
           extra_env: "JOB_NAME=mx-target"
           source_port: ${{ matrix.source_port }}
           worker_port: ${{ matrix.worker_port }}
-          # EP shards experts per rank, so each rank owns distinct weights and
-          # the transfer is rank-paired just like TP — expect tp_size distinct
-          # source agents.
-          tp_size: "2"
-          # MoE model is larger than the default dense CI model; give it the
-          # same headroom as the MLA model test.
-          pod_ready_timeout_seconds: "3600"
+          tp_size: ${{ matrix.tp_size }}
+          dp_size: ${{ matrix.dp_size }}
+          # EP's MoE model is larger; give it the same headroom as the MLA job.
+          pod_ready_timeout_seconds: ${{ matrix.pod_ready_timeout_seconds || '900' }}
 
       - name: Dump vCluster diagnostics on failure
         if: failure()
@@ -1226,10 +1128,8 @@ jobs:
       - ensure-vcluster
       - test-p2p
       - test-p2p-mla-model
-      - test-p2p-mla-model-sglang
       - test-tp
-      - test-dp
-      - test-ep
+      - test-parallel
       - test-with-dynamo
       - test-fleet-scale
       - test-rolling-update

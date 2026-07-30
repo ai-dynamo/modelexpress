@@ -204,6 +204,95 @@ GCS uses the configured/default ModelExpress cache root; `MODEL_EXPRESS_CACHE_DI
 
 See [`CLI.md`](CLI.md) for full CLI usage documentation.
 
+## ServiceAccount Authentication
+
+Optional, off by default. When enabled, the server authenticates every gRPC caller
+(except health checks) against a Kubernetes ServiceAccount token and authorizes them
+against an exact-match allowlist. No sidecar or service mesh is required: the server
+calls the Kubernetes `TokenReview` API in-process.
+
+- **AuthN**: the caller presents a projected ServiceAccount token; the server verifies it
+  via `TokenReview` and extracts `system:serviceaccount:<namespace>:<serviceaccount>`.
+- **AuthZ**: that `<namespace>:<serviceaccount>` must exactly match a configured allowlist
+  entry.
+
+> **Warning: only enable auth over an encrypted transport.** The server and clients
+> speak plaintext gRPC; neither terminates TLS itself. Without encryption the bearer
+> token crosses the wire in cleartext and anyone who can sniff the traffic can replay
+> it until it expires. Run enforce mode only where the transport is encrypted, e.g. a
+> service mesh providing mTLS (Istio/Linkerd sidecars) or a TLS-terminating proxy in
+> front of the server.
+
+Other properties to be aware of:
+
+- Auth is enforced when each RPC starts. A long-lived streaming RPC that was accepted
+  keeps flowing even if the token expires or the ServiceAccount is revoked mid-stream;
+  revocation takes effect on the next RPC (bounded by the cache TTL below).
+- Definitive rejections are cached per token; backend errors (e.g. an unreachable
+  apiserver) return `UNAVAILABLE` and are not cached. A caller cycling unique invalid
+  tokens sends one `TokenReview` to the Kubernetes API server per token. The gRPC port
+  should not be reachable from untrusted networks.
+
+### Modes
+
+| Mode | Behavior |
+|------|----------|
+| `off` (default) | No auth. Tokens are ignored. |
+| `enforce` | Verify every call and reject unauthenticated or non-allowlisted callers. |
+
+### Server configuration
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `MODEL_EXPRESS_SECURITY_MODE` | `off` | `off` \| `enforce` |
+| `MODEL_EXPRESS_SECURITY_TOKEN_AUDIENCES` | (none) | Comma-separated audiences the token must carry. Required for `enforce`. |
+| `MODEL_EXPRESS_SECURITY_ALLOWED_SERVICE_ACCOUNTS` | (none) | Comma-separated `<namespace>:<serviceaccount>` allowlist. Required for `enforce`. |
+| `MODEL_EXPRESS_SECURITY_CACHE_TTL_SECS` | `60` | TTL for the verified-token and rejection caches. |
+
+`enforce` fails config validation if either the audience list or the allowlist is empty,
+so an omitted list can't silently deny-all or accept-any-audience. Configured values
+still need to be correct.
+
+The server's ServiceAccount needs permission to create `TokenReview`s (a cluster-scoped
+subresource), via a `ClusterRoleBinding` to the built-in `system:auth-delegator` role.
+The Helm chart creates this automatically when it also creates the ServiceAccount
+(`serviceAccount.create=true`, the default) and `security.enabled=true`; with an
+existing ServiceAccount, create the equivalent binding separately:
+
+```yaml
+security:
+  enabled: true
+  mode: enforce
+  tokenAudiences: ["modelexpress"]
+  allowedServiceAccounts:
+    - "vllm:worker"
+    - "vllm:router"
+```
+
+### Client configuration
+
+Clients (Rust and Python) attach the token automatically when a projected token file is
+present, and send nothing when it is absent (so the same client works against an `off`
+server, including off-cluster). Mount a projected token into each worker pod with an
+audience that matches the server's, then point the client at it:
+
+```yaml
+volumes:
+  - name: mx-token
+    projected:
+      sources:
+        - serviceAccountToken:
+            path: modelexpress
+            audience: modelexpress
+            expirationSeconds: 3600
+# mounted at /var/run/secrets/tokens/modelexpress
+```
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `MX_AUTH_TOKEN_PATH` | `/var/run/secrets/tokens/modelexpress` | Projected token file path |
+| `MX_AUTH_TOKEN_TTL_SECONDS` | `60` | How often to re-read the token (rotation is also picked up on mtime change) |
+
 ## Docker
 
 ### Production Image
@@ -411,6 +500,51 @@ See [`../examples/dynamo_model_cache_k8s/README.md`](../examples/dynamo_model_ca
 
 ModelExpress supports GPU-to-GPU model weight transfers between supported inference instances using NVIDIA NIXL over RDMA. vLLM 0.23.0 and newer recognize `--load-format modelexpress` natively, which runs the priority chain P2P RDMA -> InstantTensor -> ModelStreamer -> GDS -> native loader; the ModelExpress Python package must still be installed, and `mx` remains a backward-compatible alias. SGLang uses `remote_instance` with the `modelexpress` backend; see [SGLang Clients](#sglang-clients).
 
+### Cross-Vendor (CUDA/XPU) Compatibility
+
+ModelExpress supports cross-family weight transfer between `cuda` and `xpu` only for unquantized model weights.
+
+A weight identity is considered unquantized when:
+
+- `SourceIdentity.quantization` is empty or `none`
+- `SourceIdentity.dtype` is on the plain-dtype allowlist (`float16`, `bfloat16`,
+  `float32`, and their aliases). The check is an allowlist, not a denylist: any
+  dtype not on it (for example `int8`, `int4`, `qint8`, `auto`, or an unknown
+  future quantized dtype) fails closed and is treated as quantized, so a
+  hardware-specific layout is never silently admitted cross-vendor.
+
+Quantized models are not transferred across accelerator families. This includes models using quantization methods or storage formats such as:
+
+- `fp8`
+- `fp4`
+- `nvfp4`
+- `mxfp4`
+- `mxfp8`
+- `awq`
+- `gptq`
+- other non-empty quantization methods
+
+The reason is that ModelExpress transfers post-processed in-memory tensor bytes, not raw checkpoint files. For quantized models, the post-processed layout can depend on the accelerator family, GPU architecture, selected kernel, and framework quantization backend. For example, FP8 scale packing or FP4/NVFP4 swizzling may differ between CUDA and XPU kernels. Copying those bytes across vendors can make the transfer succeed while causing silent inference corruption.
+
+If a target finds only cross-family sources for a quantized model, it skips P2P RDMA and falls through to the next load strategy, such as GDS or disk loading. Expect a slower cold start instead of an RDMA receive in mixed CUDA/XPU fleets serving quantized weights.
+
+Same-family transfer is unaffected. Quantized transfer remains allowed for:
+
+- `cuda` to `cuda`
+- `xpu` to `xpu`
+
+because source and target are expected to use the same accelerator-family post-processing layout.
+
+Cross-family transfers also require the source manifest and the target's
+registered tensors to name the exact same set. A tensor-name mismatch (a
+local-only or source-only name) or a zero-match transfer fails closed with a
+`ManifestMismatchError` rather than transferring a subset. This prevents a
+vendor-specific hidden or derived tensor from leaving part of the target at
+dummy values while RDMA reports success. Same-family transfers keep tolerating
+subset transfers (unmatched names are warned, not fatal).
+
+Future work may validate specific quantized CUDA/XPU combinations on hardware. If a specific pair is proven inference-correct after RDMA, ModelExpress may add an explicit allowlist for that quantization/layout pair. ModelExpress does not currently dequantize, requantize, or convert post-processed tensor layouts during transfer. See the accelerator-compatibility rule in [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
 ### Choosing a Metadata Backend
 
 Pick based on workload, not operational preference. The choice has structural consequences for what the system can do.
@@ -459,7 +593,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. The SGLang NIXL loader uses the same artifact path for compatible torch compile, Triton, TVM-FFI, DeepGEMM, TileLang, CuTe DSL, and FlashInfer caches. Requires the P2P metadata path; if `MX_P2P_METADATA=0`, the loader logs a warning and skips artifact transfer. |
 | `MX_ARTIFACT_TRANSFER_CHUNK_SIZE` | `67108864` | Artifact transfer chunk size in bytes. Default is 64 MiB; maximum is 4 GiB. Larger values reduce manifest/RPC overhead but increase registered DRAM buffer memory, approximately `chunk_size * max_inflight_chunks` per source and target worker. |
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles. |
-| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before source workers publish weight metadata or prepare and publish cache artifact bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. Kubernetes StatefulSet workers using their framework's default localhost URL infer pod-0's stable DNS endpoint. |
+| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before source workers publish weight metadata or prepare and publish cache artifact bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim. See [Multi-node readiness](#multi-node-readiness). |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication before giving up. |
 | `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact HF commit SHA / checkpoint version so `mx_source_id` is content-addressed. Required for decentralized backends where no central coordinator tracks versions. |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend. `{rank}` is substituted with the worker's own rank. If the resolved pattern has no `:port`, the client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` (multi-GPU-per-pod shape); if it has an explicit port, that port is used verbatim (1-GPU-per-pod shape). |
@@ -564,7 +698,24 @@ vLLM publishes torch compile (`VLLM_CACHE_ROOT/torch_compile_cache`), Triton (`T
 
 SGLang's NIXL loader publishes torch compile (`TORCHINDUCTOR_CACHE_DIR`, or PyTorch Inductor's runtime `cache_dir()`), Triton (`TRITON_CACHE_DIR`, or `~/.triton/cache`), TVM-FFI (`TVM_FFI_CACHE_DIR`, or `~/.cache/tvm-ffi`), DeepGEMM (`SGLANG_DG_CACHE_DIR`, or `~/.cache/deep_gemm`), TileLang (`TILELANG_CACHE_DIR`, or `~/.tilelang/cache`), CuTe DSL (`CUTE_DSL_CACHE_DIR`, or `$TMPDIR/<user>/cutlass_python_cache`), and FlashInfer (`FLASHINFER_WORKSPACE_BASE/.cache/flashinfer`, or `~/.cache/flashinfer`) caches. The FlashInfer artifact also includes SGLang's persistent autotune directory from `SGLANG_CACHE_DIR/flashinfer/autotune`, or `~/.cache/sglang/flashinfer/autotune` when unset. SGLang runs that autotuner only for eligible FlashInfer MoE or FP4 backends; DeepGEMM + DeepEP does not produce an autotune cache. SGLang TransferEngine transport currently remains weight-only for ModelExpress artifact transfer because cache artifact bytes move through the NIXL artifact path.
 
-In multi-node deployments, artifact metadata records the framework `node_rank`, so each target node selects the corresponding source node without making the artifact worker-specific. StatefulSet non-head worker pods infer the pod-0 health endpoint when `MX_ARTIFACT_READY_URL` is unset or left at the default localhost URL. If artifact transfer is enabled while P2P metadata is disabled, the loader logs a warning and skips artifact transfer. Artifact discovery currently requires a central-coordinator backend (`redis` or `kubernetes`), and Kubernetes deployments must use the matching `ModelMetadata` CRD containing `status.worker.artifactSource.nodeRank`.
+In multi-node deployments, artifact metadata records the framework `node_rank`, so each target node selects the corresponding source node without making the artifact worker-specific. If artifact transfer is enabled while P2P metadata is disabled, the loader logs a warning and skips artifact transfer. Artifact discovery currently requires a central-coordinator backend (`redis` or `kubernetes`), and Kubernetes deployments must use the matching `ModelMetadata` CRD containing `status.worker.artifactSource.nodeRank`.
+
+#### Multi-node readiness
+
+Only the head node of a multi-node engine serves HTTP; the others run headless
+(for vLLM, `--headless`, which starts the executor and no API server), so a
+pod-local address such as `http://127.0.0.1:9090/health` can never be satisfied
+there. Those nodes would never publish, leaving no source with `nodeRank=N` for
+node N of a target replica to install.
+
+The client therefore rewrites a **loopback** readiness host onto the head's
+address, keeping the configured port and path; a configured **non-loopback**
+host is used verbatim. The head address comes from the engine's own
+distributed-init address (for vLLM, `parallel_config.master_addr`, populated
+from `--master-addr` by the orchestrator), falling back to
+`LWS_LEADER_ADDRESS`. Since the distributed process group is already
+established through that address, no extra configuration is needed: the shipped
+multi-node examples work unchanged with their loopback `MX_ARTIFACT_READY_URL`.
 
 Cache artifacts may contain executable code. Transfer checksums detect corruption
 but do not authenticate the publishing replica or attest the artifact. Enable

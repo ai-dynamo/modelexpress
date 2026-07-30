@@ -14,9 +14,11 @@ also uses the same agent for host DRAM chunk staging.
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import time
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -79,6 +81,22 @@ def _pool_reg_enabled() -> bool:
     return envs.MX_POOL_REG
 
 
+@dataclass
+class PostedRead:
+    """A batched RDMA READ that has been posted but not yet waited on.
+
+    Held by the caller between ``post_read_batch`` and ``await_read_batches`` so
+    several peers can have transfers in flight at once. The handle is owned by
+    ``await_read_batches``, which releases it.
+    """
+
+    handle: Any
+    remote_agent_name: str
+    total_bytes: int
+    num_ranges: int
+    posted_at: float = field(default_factory=time.perf_counter)
+
+
 class NixlTransferManager:
     """
     Manages a single NIXL agent and RDMA transfers.
@@ -113,11 +131,37 @@ class NixlTransferManager:
         self._metadata: bytes = b""
         self._tensor_descriptors: list[TensorDescriptor] = []
         self._tensors: dict[str, torch.Tensor] = {}
+        # Remote agents this manager has loaded, so shutdown can disconnect them.
+        # Maps agent name -> (ip, port) for agents reached over the P2P socket, or
+        # None for agents loaded from a metadata blob.
+        #
+        # Tracking exists because NIXL only lets the side that *loaded* a peer
+        # disconnect from it: invalidateRemoteMD looks the peer up in
+        # remoteBackends_ and is a no-op otherwise. In P2P the target loads the
+        # source (it sends NIXLCOMM:SEND and gets back the source's metadata) but
+        # the source never loads the target, so the target is the only side that
+        # can close the pair. Leaving it to process death leaves the source with
+        # a half-open QP it has no way to invalidate.
+        self._remote_agents: dict[str, tuple[str, int] | None] = {}
+        # Last data-plane failure, used by is_healthy(). None means no failure
+        # has been observed on a transfer this manager issued.
+        self._data_plane_error: str | None = None
+        self._atexit_registered = False
 
     @property
     def agent_name(self) -> str:
         """Get NIXL agent name."""
         return self._agent_name
+
+    @property
+    def backends(self) -> list[str]:
+        """NIXL backends this agent was created with (see MX_NIXL_BACKEND).
+
+        Callers that issue their own NIXL calls against :attr:`agent` must pass
+        this rather than a literal, or the transfer is prepared on a backend the
+        agent does not have (e.g. UCX on AWS EFA).
+        """
+        return list(self._backends)
 
     @property
     def nixl_metadata(self) -> bytes:
@@ -180,6 +224,7 @@ class NixlTransferManager:
             else:
                 config = None
             self._agent = NixlAgent(self._agent_name, config)
+            self._register_atexit()
             logger.info(
                 f"NIXL agent '{self._agent_name}' created on device "
                 f"{self._device_id} (backend={self._backend})"
@@ -189,6 +234,13 @@ class NixlTransferManager:
                 os.environ["UCX_TLS"] = saved_ucx_tls
             elif envs.is_set("UCX_TLS"):
                 os.environ.pop("UCX_TLS")
+
+    def _register_atexit(self) -> None:
+        """Register manager-owned process teardown once."""
+        if self._atexit_registered:
+            return
+        atexit.register(self.shutdown)
+        self._atexit_registered = True
 
     def _build_tensor_descriptors(
         self, tensors: dict[str, torch.Tensor]
@@ -444,6 +496,41 @@ class NixlTransferManager:
 
         return sorted(seen.items())
 
+    def _wait_for_xfers(
+        self,
+        handles: list,
+        timeout_seconds: float | None,
+        label: str,
+    ) -> None:
+        """Poll several NIXL handles until all complete or one fails.
+
+        Sleeps only when a full sweep completed nothing, so the polling slop is
+        paid once for the whole set rather than once per handle.
+        """
+        if self._agent is None:
+            raise RuntimeError("NIXL agent not initialized")
+        pending = list(handles)
+        wait_start = time.perf_counter()
+        while pending:
+            if (
+                timeout_seconds is not None
+                and time.perf_counter() - wait_start >= timeout_seconds
+            ):
+                raise TimeoutError(
+                    f"{label} timed out with {len(pending)} transfer(s) outstanding"
+                )
+            still_pending = []
+            for handle in pending:
+                status = self._agent.check_xfer_state(handle)
+                if status in ("DONE", "SUCCESS"):
+                    continue
+                if status in ("ERR", "ERROR", "FAIL"):
+                    raise RuntimeError(f"{label} failed with status {status}")
+                still_pending.append(handle)
+            if len(still_pending) == len(pending):
+                time.sleep(0.001)
+            pending = still_pending
+
     def _wait_for_xfer(
         self,
         handle: Any,
@@ -459,11 +546,27 @@ class NixlTransferManager:
                 timeout_seconds is not None
                 and time.perf_counter() - wait_start >= timeout_seconds
             ):
+                # A timeout here is a data-plane failure even though NIXL never
+                # reported one. When a QP is wedged the READ neither completes nor
+                # transitions to ERR, so the handle stays incomplete and the
+                # timeout is the only evidence that anything went wrong. Recording
+                # it is what lets is_healthy() stop advertising this agent.
+                self._data_plane_error = (
+                    f"{label} timed out after {timeout_seconds:.1f}s with no "
+                    f"completion and no error status from NIXL"
+                )
                 raise TimeoutError(f"{label} timed out")
             status = self._agent.check_xfer_state(handle)
             if status in ("DONE", "SUCCESS"):
+                # A completed transfer is direct proof the data plane works, so it
+                # clears any earlier failure. Without this the flag would latch for
+                # the life of the process and a worker demoted for one transient
+                # timeout could never return to READY, however healthy the fabric
+                # became.
+                self._data_plane_error = None
                 return
             if status in ("ERR", "ERROR", "FAIL"):
+                self._data_plane_error = f"{label} failed with status {status}"
                 raise RuntimeError(f"{label} failed with status {status}")
             time.sleep(0.001)
 
@@ -497,6 +600,7 @@ class NixlTransferManager:
                     f"Remote metadata loaded for {remote_agent_name} "
                     f"({time.perf_counter() - start:.2f}s)"
                 )
+                self._remote_agents[remote_agent_name] = (ip, port)
                 return
             time.sleep(0.01)
 
@@ -510,7 +614,50 @@ class NixlTransferManager:
             remote_agent_name,
             len(source_metadata),
         )
+        self._remote_agents.setdefault(remote_agent_name, None)
         return remote_agent_name
+
+    def remove_remote_agent(self, remote_agent_name: str) -> bool:
+        """Disconnect from a remote agent and drop its cached metadata.
+
+        The counterpart to :meth:`add_remote_agent` and
+        :meth:`fetch_remote_and_wait`. NIXL's ``invalidateRemoteMD`` both frees the
+        cached metadata and disconnects the backend, so this is what returns the
+        QP pair to a clean state instead of leaving it half-open.
+
+        Returns True if NIXL accepted the removal. Never raises: this runs on
+        teardown paths where the interesting failure has usually already happened,
+        and masking it behind a cleanup error would be worse than logging it.
+        """
+        if self._agent is None:
+            return False
+        try:
+            self._agent.remove_remote_agent(remote_agent_name)
+        except Exception as exc:
+            # NOT_FOUND is expected if the peer was already invalidated, e.g. it
+            # sent us NIXLCOMM:INVL on its way out.
+            logger.warning(
+                "Failed to remove remote NIXL agent %s: %s", remote_agent_name, exc
+            )
+            self._remote_agents.pop(remote_agent_name, None)
+            return False
+        self._remote_agents.pop(remote_agent_name, None)
+        logger.info("Disconnected remote NIXL agent %s", remote_agent_name)
+        return True
+
+    def disconnect_remote_agents(self) -> int:
+        """Disconnect every remote agent this manager loaded.
+
+        Returns the number successfully disconnected. Iterates a copy because
+        :meth:`remove_remote_agent` mutates the tracking map.
+        """
+        if self._agent is None or not self._remote_agents:
+            return 0
+        removed = 0
+        for name in list(self._remote_agents):
+            if self.remove_remote_agent(name):
+                removed += 1
+        return removed
 
     def receive_from_source(
         self,
@@ -518,6 +665,7 @@ class NixlTransferManager:
         source_tensors: list[TensorDescriptor],
         timeout_seconds: float | None = None,
         remote_agent_name: str | None = None,
+        require_exact_match: bool = False,
     ) -> tuple[int, int, float]:
         """
         Receive weights from a remote source via NIXL RDMA.
@@ -537,9 +685,21 @@ class NixlTransferManager:
             remote_agent_name: If set, use this pre-loaded agent (P2P mode)
                 instead of calling add_remote_agent with source_metadata
                 (centralized mode)
+            require_exact_match: When True, require the source manifest and the
+                locally registered tensors to name the exact same set and reject
+                a zero-match transfer. Used for cross-family (heterogeneous)
+                transfers where a name diff can mean vendor-specific hidden or
+                derived tensors, which would otherwise leave part or all of the
+                target at dummy values while RDMA reports success. Same-family
+                transfers leave this False and tolerate subset transfers.
 
         Returns:
             Tuple of (total_bytes, total_tensors, duration)
+
+        Raises:
+            ManifestMismatchError: On a size/dtype mismatch for a shared tensor,
+                or, when ``require_exact_match`` is set, on any tensor-name
+                mismatch or a zero-match transfer.
         """
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
@@ -549,7 +709,7 @@ class NixlTransferManager:
 
         if remote_agent_name is None:
             add_start = time.perf_counter()
-            remote_agent_name = self._agent.add_remote_agent(source_metadata)
+            remote_agent_name = self.add_remote_agent(source_metadata)
             add_time = time.perf_counter() - add_start
             logger.info(
                 f"[TIMING] add_remote_agent: {add_time:.3f}s "
@@ -602,6 +762,18 @@ class NixlTransferManager:
         local_only = sorted(set(self._tensors) - src_names)
         source_only = sorted(src_names - set(self._tensors))
         if local_only or source_only:
+            if require_exact_match:
+                # Cross-family transfer: a name diff can mean vendor-specific
+                # hidden or derived tensors, so completing the transfer would
+                # leave the local-only tensors at dummy values while reporting
+                # RDMA success. Fail closed instead.
+                raise ManifestMismatchError(
+                    "Tensor name mismatch on heterogeneous transfer: "
+                    f"{len(local_only)} local-only "
+                    f"(first: {local_only[:5]}), "
+                    f"{len(source_only)} source-only "
+                    f"(first: {source_only[:5]})"
+                )
             logger.warning(
                 "Tensor name mismatch between source manifest and local "
                 "registration: %d local-only, %d source-only",
@@ -610,6 +782,10 @@ class NixlTransferManager:
             )
 
         if not remote_descs:
+            if require_exact_match:
+                raise ManifestMismatchError(
+                    "No matching tensors found for heterogeneous transfer"
+                )
             logger.warning("No matching tensors found for transfer")
             return 0, 0, 0.0
 
@@ -685,13 +861,35 @@ class NixlTransferManager:
         exact sub-tensor runs a reshard pull needs - one dest param filled from
         many non-contiguous source segments across a single READ.
 
+        Equivalent to ``post_read_batch`` followed immediately by
+        ``await_read_batches``, i.e. one peer at a time. Prefer posting several
+        batches and awaiting them together when reading from multiple peers.
+
         Returns ``(total_bytes, num_reads, duration)``.
+        """
+        posted = self.post_read_batch(remote_agent_name, ranges, mem_type=mem_type)
+        if posted is None:
+            return 0, 0, 0.0
+        return self.await_read_batches([posted], timeout_seconds=timeout_seconds)
+
+    def post_read_batch(
+        self,
+        remote_agent_name: str,
+        ranges: list[tuple[int, int, int, int]],
+        mem_type: str | None = None,
+    ) -> PostedRead | None:
+        """Prepare and post one batched RDMA READ **without** waiting for it.
+
+        Same ``ranges`` contract as :meth:`execute_read_batch`. Returns ``None``
+        when there are no bytes to move. Every returned :class:`PostedRead` must
+        be handed to :meth:`await_read_batches`, which owns releasing the handle;
+        dropping one leaks it.
         """
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
         ranges = [r for r in ranges if r[2] > 0]
         if not ranges:
-            return 0, 0, 0.0
+            return None
 
         mem = mem_type or self._accelerator_backend.nixl_mem_type
         remote_descs = [
@@ -712,7 +910,7 @@ class NixlTransferManager:
             except Exception as exc:  # noqa: BLE001 - diagnostics must never break the transfer
                 _known = f"n/a ({exc!r})"
             logger.debug(
-                "execute_read_batch: agent=%s mem=%s reads=%d remote_metadata_loaded=%s remote_sample=%s local_dev=%d",
+                "post_read_batch: agent=%s mem=%s reads=%d remote_metadata_loaded=%s remote_sample=%s local_dev=%d",
                 remote_agent_name,
                 mem,
                 len(remote_descs),
@@ -721,7 +919,7 @@ class NixlTransferManager:
                 self._device_id,
             )
 
-        start_time = time.perf_counter()
+        posted_at = time.perf_counter()
         handle = None
         try:
             src_prepped = self._agent.prep_xfer_dlist(
@@ -746,19 +944,68 @@ class NixlTransferManager:
                 backends=self._backends,
             )
             self._agent.transfer(handle)
+        except Exception:
+            # Nothing is in flight for this batch, so drop its handle here rather
+            # than handing a dead batch to await_read_batches.
+            if handle is not None:
+                self._release_xfer_handle(handle)
+            raise
 
-            self._wait_for_xfer(
-                handle,
+        return PostedRead(
+            handle=handle,
+            remote_agent_name=remote_agent_name,
+            total_bytes=sum(nbytes for (_r, _l, nbytes, _d) in ranges),
+            num_ranges=len(ranges),
+            posted_at=posted_at,
+        )
+
+    def _release_xfer_handle(self, handle: Any) -> None:
+        """Release one handle, never raising. Used on cleanup paths where a
+        release failure must not mask the error that got us here.
+
+        Logged at WARNING rather than DEBUG: a refused release leaks the
+        descriptor list backing the transfer, and because every caller is a
+        cleanup path the leak has no other symptom. At DEBUG it is invisible in
+        production, where nobody runs the client at that level.
+        """
+        try:
+            self._agent.release_xfer_handle(handle)
+        except Exception as exc:  # noqa: BLE001 - cleanup must not mask the cause
+            logger.warning("release_xfer_handle failed, handle leaked: %r", exc)
+
+    def await_read_batches(
+        self,
+        posted: list,
+        timeout_seconds: float | None = None,
+    ) -> tuple[int, int, float]:
+        """Wait for posted READ batches to complete, then release every handle.
+
+        Accepts ``None`` entries so callers can pass ``post_read_batch`` results
+        straight through. Releases all handles even when one transfer fails, and
+        synchronizes the device once for the whole set rather than per batch.
+
+        Returns ``(total_bytes, num_reads, duration)`` aggregated over the set.
+        """
+        batches = [p for p in posted if p is not None]
+        if not batches:
+            return 0, 0, 0.0
+
+        try:
+            self._wait_for_xfers(
+                [p.handle for p in batches],
                 timeout_seconds,
                 "NIXL reshard READ batch",
             )
         finally:
-            if handle is not None:
-                self._agent.release_xfer_handle(handle)
+            for batch in batches:
+                self._release_xfer_handle(batch.handle)
 
         self._accelerator_backend.synchronize(self._device_id)
-        total_bytes = sum(nbytes for (_r, _l, nbytes, _d) in ranges)
-        return total_bytes, len(ranges), time.perf_counter() - start_time
+        return (
+            sum(p.total_bytes for p in batches),
+            sum(p.num_ranges for p in batches),
+            time.perf_counter() - min(p.posted_at for p in batches),
+        )
 
     def register_dram_buffer(self, buffer: torch.Tensor) -> Any:
         """Register one CPU buffer as NIXL DRAM and refresh agent metadata."""
@@ -861,20 +1108,28 @@ class NixlTransferManager:
                 self._agent.release_xfer_handle(handle)
 
     def is_healthy(self) -> bool:
-        """Check if the NIXL agent is initialized and has registered metadata."""
-        return self._agent is not None and len(self._metadata) > 0
+        """Whether the agent is initialized and has no observed transfer failure."""
+        if self._agent is None or len(self._metadata) == 0:
+            return False
+        return self._data_plane_error is None
+
+    @property
+    def data_plane_error(self) -> str | None:
+        """Last data-plane failure observed on a transfer, or None."""
+        return self._data_plane_error
 
     def shutdown(self) -> None:
-        """Clean up NIXL resources.
-
-        Rebinds ``_tensor_descriptors`` and ``_tensors`` to fresh empty
-        containers instead of mutating in place. Belt-and-suspenders:
-        even if a future caller bypasses ``register_tensors`` and
-        aliases ``_tensors`` directly, shutdown will not mutate the
-        shared container out from under them.
-        """
+        """Disconnect remote agents before releasing local NIXL resources."""
+        if self._atexit_registered:
+            atexit.unregister(self.shutdown)
+            self._atexit_registered = False
+        disconnected = self.disconnect_remote_agents()
         self._agent = None
         self._metadata = b""
         self._tensor_descriptors = []
         self._tensors = {}
-        logger.info("NixlTransferManager shutdown complete")
+        self._remote_agents = {}
+        logger.info(
+            "NixlTransferManager shutdown complete (%d remote agent(s) disconnected)",
+            disconnected,
+        )

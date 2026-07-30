@@ -592,7 +592,7 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 
 Thin orchestration layer that delegates to `LoadStrategyChain.run()`. Builds a `LoadContext` from vLLM config, initializes the model, runs the strategy chain, and updates global registries.
 
-**MTP two-pass load.** Multi-token-prediction models (Qwen3.5 MTP, DeepSeek MTP) call the loader twice on one worker: the target, then the draft head. `_is_speculative_draft()` detects the second pass via `model_config.runner_type == "draft"` and sets `ctx.p2p_enabled = False`. A P2P draft would collide on the target's NIXL metadata port, and since the merged draft shares the target's `SourceIdentity` it could poison source discovery, so registration, publication, and RDMA stay off for the draft while the target keeps serving. The draft loads through the ModelStreamer/default path. To avoid re-reading the whole checkpoint for a small head, `build_model_streamer_weight_iter` streams only the shards holding the draft's tensors: it reads `model.safetensors.index.json` (locally, or via the runai streamer's `pull_files` for object storage) and keeps shards whose tensor names start with `mtp.`. The draft's embedding and `lm_head` come from the target, so they are not streamed. If there is no index or no draft shard, it streams every shard.
+**MTP two-pass load.** Multi-token-prediction models (Qwen3.5 MTP, DeepSeek MTP) call the loader twice on one worker: the target, then the draft head. `_is_speculative_draft()` detects the second pass via `model_config.runner_type == "draft"` and sets `ctx.p2p_enabled = False`. A P2P draft would collide on the target's NIXL metadata port, and since the merged draft shares the target's `SourceIdentity` it could poison source discovery, so registration, publication, and RDMA stay off for the draft while the target keeps serving. The draft loads through the ModelStreamer/default path. To avoid re-reading the whole checkpoint for a small head, `build_model_streamer_weight_iter` streams only the shards holding the draft's tensors: it reads `model.safetensors.index.json` from the directory of the shards `_prepare_weights` already resolved, which is what makes a Hugging Face model ID work, and falls back to the model URI itself (local directory, then the runai streamer's `pull_files`) for object storage. It keeps shards whose tensor names start with `mtp.`. The draft's embedding and `lm_head` come from the target, so they are not streamed. An index that holds no `mtp.` tensors is expected on a checkpoint without a draft head and streams every shard; an index that cannot be resolved at all logs a warning and also streams every shard.
 
 ### vLLM Refit Installation
 
@@ -631,6 +631,16 @@ shards, and compiles one-sided read descriptors without materializing a full
 trainer tensor. Geometry, slice planning, transfer planning, and the transport
 protocol are engine-agnostic.
 
+The minimal rendezvous publisher is called only after its NIXL agent and source
+buffers are registered, so `publish()` stores the worker as READY and repeated
+publication replaces that worker record. The shared `PublisherThread` sends a
+READY status heartbeat every `MX_HEARTBEAT_INTERVAL_SECS` seconds (30 by
+default), keeping the record fresh for READY-only discovery. `close()` uses the
+same publisher lifecycle to stop the heartbeat and best-effort mark the source
+STALE. Long-lived framework integrations still need to call `close()` from
+their lifecycle; SIGKILL and mid-transfer failure recovery remain follow-up
+work.
+
 `engines/vllm/refit/receiver.py` supplies the vLLM-specific boundaries: capture
 on an unquantized meta twin, then installation through vLLM's layerwise reload
 and `process_weights_after_loading` path. Unsupported loader operations fail
@@ -638,6 +648,24 @@ closed because the full-pull fallback is not implemented yet. The compiled
 plan currently assumes a stable source cohort, shard layout, and registration
 addresses; topology-epoch invalidation is a follow-up requirement before
 elastic production use.
+
+Exact strided TP slices can produce one descriptor per row. When a captured
+copy exceeds `MX_RESHARD_MAX_SEGMENTS_PER_COPY` (default 64), the planner pulls
+each gap-free dim-0 source shard once into persistent contiguous staging and
+replays the captured loader views locally. This bounds descriptors by source
+shard count at the cost of extra wire bytes. Plans and update metrics report
+the exact descriptor count, descriptor savings, and extra bytes. If the
+published layout cannot be reconstructed as a complete dim-0 partition, the
+planner keeps the exact known-correct descriptors rather than changing
+correctness behavior.
+
+Each receiver retains one load-time receive buffer per captured destination.
+Parameters whose served dtype differs from the load-time dtype also retain a
+source-dtype conversion staging buffer. These buffers are allocated from
+classic CUDA allocations and registered for the receiver lifetime. PWAL is
+intentional here: the receiver reconstructs load-time tensors, and quantized
+models still require vLLM post-load processing. MDL is appropriate only when
+the incoming tensors already match the validated runtime representation.
 
 ### SGLang Loader
 
@@ -673,6 +701,8 @@ See [ModelExpress Benchmarks](BENCHMARKS.md) for measured loading-path, NIXL reg
 Strategies handle the loading path and NIXL tensor registration. `LoadContext.accelerator_backend` centralizes accelerator-specific torch operations and capability gates for fast paths such as pool registration, VMM arena registration, and GDS. Backends that do not support those CUDA-specific paths, such as XPU, leave the gates disabled and use the generic fallback path. XPU transfer deployments still require a UCX/NIXL runtime that can register XPU device memory. Adapter hooks handle engine lifecycle such as vLLM `process_weights_after_loading`, and the chain performs best-effort metadata publication after a successful strategy. New strategies can be added by creating a new file in `load_strategy/` and registering it in `LoadStrategyChain.run()`.
 
 ### Source Selection
+
+Accelerator compatibility (`metadata/payload.py::accelerators_compatible`) is the single rule shared by RDMA tensor source selection and artifact discovery, in both their pre-fetch and post-fetch checks. Empty values are unknown and accepted for backward compatibility. On the authoritative post-fetch check an unknown (empty) accelerator on a quantized weight identity fails closed — an unknown family could be a different vendor whose kernels expect a different quantized layout, so quantized weights ride P2P only on a verified same-family match. The pre-fetch check defers an unknown accelerator instead of rejecting it (the lightweight `SourceInstanceRef` may legitimately omit the accelerator — the `k8s-service` backend publishes a synthetic ref and only learns the real accelerator from `GetTensorManifest`), so a valid same-family quantized source is not stranded before its accelerator is known. Exact family matches are always compatible. Cross-family transfer is allowed only for source types in `HETEROGENEOUS_NIXL_SOURCE_TYPES` and family pairs in `HETEROGENEOUS_NIXL_WEIGHT_PAIRS` — today `MX_SOURCE_TYPE_WEIGHTS` over the `cuda`/`xpu` pair (both directions) — and only for **unquantized** weights. Unquantized weights (`SourceIdentity.quantization` empty/`none` and a non-quantized `dtype`) are plain tensor bytes whose shape and dtype are stable across accelerator families, so they carry cross-vendor. Quantized weights are rejected cross-family: `process_weights_after_loading()` repacks fp8 scales, pads/swizzles fp4/nvfp4, and stashes hidden quant-config tensors into kernel- and hardware-specific layouts, so the same logical weights have different bytes on a different vendor's kernels. Copying them cross-vendor corrupts inference silently — the transfer API succeeds and the tensor manifest and CRC match, but the receiver's kernel misreads the layout. Quantized cross-family transfer stays blocked by default; a future hardware validation may allowlist specific quantization/layout pairs that are proven inference-correct after RDMA (not just that the transfer API succeeds). ModelExpress does not dequantize/requantize or convert post-processed layouts during transfer — the RDMA path overwrites already post-processed target tensors with source bytes, so a proven pair is enabled by allowlisting it, not by correcting weights after transfer. Expressing a quantized allowlist entry would need an extension beyond the family-level `HETEROGENEOUS_NIXL_WEIGHT_PAIRS` (keyed on the accelerator pair plus quantization/dtype/backend/arch facts); it is intentionally not built until a pair is proven. See the FP8 Model Handling section. Generated artifacts (CUDA graphs, torch.compile, Triton, DeepGEMM, TileLang, CuTe, FlashInfer caches) are accelerator/arch-specific and stay strict same-family. The `mx_source_type` argument defaults to `None`, and `quantization`/`dtype` default to a sentinel, so the gate fails closed: a caller that does not explicitly pass a hetero-eligible source type and declare the identity's quantization only ever gets strict same-family compatibility. Same-family transfer is unconditional — quantization never gates it, since source and target run identical post-processing. `MX_SOURCE_TYPE_LORA` is deferred — it has no live tensor publish/transfer path yet, so heterogeneous LoRA is rejected until one exists and is tested (add it to `HETEROGENEOUS_NIXL_SOURCE_TYPES` at that point). Heterogeneous transfer still requires a UCX/NIXL runtime that can register both families' device memory; the Rust server is a pure passthrough of the runtime `accelerator` string and applies no compatibility logic.
 
 After `RdmaStrategy` filters listed READY sources to the target's `worker_rank` and to a compatible runtime `accelerator`, it ranks the surviving candidates through a `SourceSelector` (`source_selection.py`) before slicing to `MAX_SOURCE_RETRIES`. Selectors are scoring-based: `ScoredSelector` subclasses implement `score(candidate, context)` and the base orders by descending score. Two policies ship today, resolved by name through a small registry (`MX_P2P_SOURCE_SELECTOR`, default `random`, unknown values fall back to `random`):
 
@@ -847,7 +877,7 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
 | `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. The SGLang NIXL loader uses it for compatible torch compile, Triton, TVM-FFI, DeepGEMM, TileLang, CuTe DSL, and FlashInfer caches. Requires the P2P metadata path; if `MX_P2P_METADATA=0`, the loader logs a warning and skips artifact transfer |
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles |
-| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before publishing weight metadata or preparing and publishing cache bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. Kubernetes StatefulSet workers using their framework's default localhost URL infer pod-0's stable DNS endpoint |
+| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before publishing weight metadata or preparing and publishing cache bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time the artifact publisher waits for readiness and successful publication before giving up |
 | `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact checkpoint identifier so `mx_source_id` is content-addressed |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend; `{rank}` is substituted with the worker's own rank. Client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` if the resolved pattern has no explicit port |
