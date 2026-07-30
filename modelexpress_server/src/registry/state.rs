@@ -134,10 +134,12 @@ impl RegistryManager {
         &self,
         model_name: &str,
         provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
     ) -> RegistryResult<ClaimOutcome> {
         self.get_backend()
             .await?
-            .try_claim_for_download(model_name, provider)
+            .try_claim_for_download(model_name, provider, claim_id, lease_duration)
             .await
     }
 
@@ -145,10 +147,39 @@ impl RegistryManager {
         &self,
         model_name: &str,
         provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
     ) -> RegistryResult<bool> {
         self.get_backend()
             .await?
-            .try_reset_error_for_retry(model_name, provider)
+            .try_reset_error_for_retry(model_name, provider, claim_id, lease_duration)
+            .await
+    }
+
+    pub async fn refresh_download_claim(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
+    ) -> RegistryResult<bool> {
+        self.get_backend()
+            .await?
+            .refresh_download_claim(model_name, provider, claim_id, lease_duration)
+            .await
+    }
+
+    pub async fn finish_download_claim(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        claim_id: &str,
+        status: ModelStatus,
+        message: Option<String>,
+    ) -> RegistryResult<bool> {
+        self.get_backend()
+            .await?
+            .finish_download_claim(model_name, provider, claim_id, status, message)
             .await
     }
 }
@@ -158,7 +189,7 @@ impl RegistryManager {
 mod tests {
     use super::*;
     use crate::registry::backend::MockRegistryBackend;
-    use mockall::predicate::eq;
+    use mockall::predicate::{always, eq};
 
     #[tokio::test]
     async fn connect_fails_when_no_config() {
@@ -173,12 +204,22 @@ mod tests {
     async fn try_claim_delegates_to_backend() {
         let mut mock = MockRegistryBackend::new();
         mock.expect_try_claim_for_download()
-            .with(eq("m"), eq(ModelProvider::HuggingFace))
+            .with(
+                eq("m"),
+                eq(ModelProvider::HuggingFace),
+                eq("owner"),
+                always(),
+            )
             .once()
-            .returning(|_, _| Ok(ClaimOutcome::Claimed));
+            .returning(|_, _, _, _| Ok(ClaimOutcome::Claimed));
         let mgr = RegistryManager::with_backend(Arc::new(mock));
         let outcome = mgr
-            .try_claim_for_download("m", ModelProvider::HuggingFace)
+            .try_claim_for_download(
+                "m",
+                ModelProvider::HuggingFace,
+                "owner",
+                std::time::Duration::from_secs(30),
+            )
             .await
             .expect("claim");
         assert_eq!(outcome, ClaimOutcome::Claimed);
@@ -188,14 +229,76 @@ mod tests {
     async fn try_reset_error_delegates_to_backend() {
         let mut mock = MockRegistryBackend::new();
         mock.expect_try_reset_error_for_retry()
-            .with(eq("m"), eq(ModelProvider::HuggingFace))
+            .with(
+                eq("m"),
+                eq(ModelProvider::HuggingFace),
+                eq("owner"),
+                always(),
+            )
             .once()
-            .returning(|_, _| Ok(true));
+            .returning(|_, _, _, _| Ok(true));
         let mgr = RegistryManager::with_backend(Arc::new(mock));
         let won = mgr
-            .try_reset_error_for_retry("m", ModelProvider::HuggingFace)
+            .try_reset_error_for_retry(
+                "m",
+                ModelProvider::HuggingFace,
+                "owner",
+                std::time::Duration::from_secs(30),
+            )
             .await
             .expect("retry cas");
+        assert!(won);
+    }
+
+    #[tokio::test]
+    async fn refresh_download_claim_delegates_to_backend() {
+        let mut mock = MockRegistryBackend::new();
+        mock.expect_refresh_download_claim()
+            .with(
+                eq("m"),
+                eq(ModelProvider::HuggingFace),
+                eq("owner"),
+                always(),
+            )
+            .once()
+            .returning(|_, _, _, _| Ok(true));
+        let mgr = RegistryManager::with_backend(Arc::new(mock));
+        let won = mgr
+            .refresh_download_claim(
+                "m",
+                ModelProvider::HuggingFace,
+                "owner",
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            .expect("refresh");
+        assert!(won);
+    }
+
+    #[tokio::test]
+    async fn finish_download_claim_delegates_to_backend() {
+        let mut mock = MockRegistryBackend::new();
+        mock.expect_finish_download_claim()
+            .with(
+                eq("m"),
+                eq(ModelProvider::HuggingFace),
+                eq("owner"),
+                eq(ModelStatus::DOWNLOADED),
+                eq(None),
+            )
+            .once()
+            .returning(|_, _, _, _, _| Ok(true));
+        let mgr = RegistryManager::with_backend(Arc::new(mock));
+        let won = mgr
+            .finish_download_claim(
+                "m",
+                ModelProvider::HuggingFace,
+                "owner",
+                ModelStatus::DOWNLOADED,
+                None,
+            )
+            .await
+            .expect("finish");
         assert!(won);
     }
 

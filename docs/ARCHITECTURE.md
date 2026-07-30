@@ -592,7 +592,7 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 
 Thin orchestration layer that delegates to `LoadStrategyChain.run()`. Builds a `LoadContext` from vLLM config, initializes the model, runs the strategy chain, and updates global registries.
 
-**MTP two-pass load.** Multi-token-prediction models (Qwen3.5 MTP, DeepSeek MTP) call the loader twice on one worker: the target, then the draft head. `_is_speculative_draft()` detects the second pass via `model_config.runner_type == "draft"` and sets `ctx.p2p_enabled = False`. A P2P draft would collide on the target's NIXL metadata port, and since the merged draft shares the target's `SourceIdentity` it could poison source discovery, so registration, publication, and RDMA stay off for the draft while the target keeps serving. The draft loads through the ModelStreamer/default path. To avoid re-reading the whole checkpoint for a small head, `build_model_streamer_weight_iter` streams only the shards holding the draft's tensors: it reads `model.safetensors.index.json` (locally, or via the runai streamer's `pull_files` for object storage) and keeps shards whose tensor names start with `mtp.`. The draft's embedding and `lm_head` come from the target, so they are not streamed. If there is no index or no draft shard, it streams every shard.
+**MTP two-pass load.** Multi-token-prediction models (Qwen3.5 MTP, DeepSeek MTP) call the loader twice on one worker: the target, then the draft head. `_is_speculative_draft()` detects the second pass via `model_config.runner_type == "draft"` and sets `ctx.p2p_enabled = False`. A P2P draft would collide on the target's NIXL metadata port, and since the merged draft shares the target's `SourceIdentity` it could poison source discovery, so registration, publication, and RDMA stay off for the draft while the target keeps serving. The draft loads through the ModelStreamer/default path. To avoid re-reading the whole checkpoint for a small head, `build_model_streamer_weight_iter` streams only the shards holding the draft's tensors: it reads `model.safetensors.index.json` from the directory of the shards `_prepare_weights` already resolved, which is what makes a Hugging Face model ID work, and falls back to the model URI itself (local directory, then the runai streamer's `pull_files`) for object storage. It keeps shards whose tensor names start with `mtp.`. The draft's embedding and `lm_head` come from the target, so they are not streamed. An index that holds no `mtp.` tensors is expected on a checkpoint without a draft head and streams every shard; an index that cannot be resolved at all logs a warning and also streams every shard.
 
 ### vLLM Refit Installation
 
@@ -631,6 +631,16 @@ shards, and compiles one-sided read descriptors without materializing a full
 trainer tensor. Geometry, slice planning, transfer planning, and the transport
 protocol are engine-agnostic.
 
+The minimal rendezvous publisher is called only after its NIXL agent and source
+buffers are registered, so `publish()` stores the worker as READY and repeated
+publication replaces that worker record. The shared `PublisherThread` sends a
+READY status heartbeat every `MX_HEARTBEAT_INTERVAL_SECS` seconds (30 by
+default), keeping the record fresh for READY-only discovery. `close()` uses the
+same publisher lifecycle to stop the heartbeat and best-effort mark the source
+STALE. Long-lived framework integrations still need to call `close()` from
+their lifecycle; SIGKILL and mid-transfer failure recovery remain follow-up
+work.
+
 `engines/vllm/refit/receiver.py` supplies the vLLM-specific boundaries: capture
 on an unquantized meta twin, then installation through vLLM's layerwise reload
 and `process_weights_after_loading` path. Unsupported loader operations fail
@@ -638,6 +648,24 @@ closed because the full-pull fallback is not implemented yet. The compiled
 plan currently assumes a stable source cohort, shard layout, and registration
 addresses; topology-epoch invalidation is a follow-up requirement before
 elastic production use.
+
+Exact strided TP slices can produce one descriptor per row. When a captured
+copy exceeds `MX_RESHARD_MAX_SEGMENTS_PER_COPY` (default 64), the planner pulls
+each gap-free dim-0 source shard once into persistent contiguous staging and
+replays the captured loader views locally. This bounds descriptors by source
+shard count at the cost of extra wire bytes. Plans and update metrics report
+the exact descriptor count, descriptor savings, and extra bytes. If the
+published layout cannot be reconstructed as a complete dim-0 partition, the
+planner keeps the exact known-correct descriptors rather than changing
+correctness behavior.
+
+Each receiver retains one load-time receive buffer per captured destination.
+Parameters whose served dtype differs from the load-time dtype also retain a
+source-dtype conversion staging buffer. These buffers are allocated from
+classic CUDA allocations and registered for the receiver lifetime. PWAL is
+intentional here: the receiver reconstructs load-time tensors, and quantized
+models still require vLLM post-load processing. MDL is appropriate only when
+the incoming tensors already match the validated runtime representation.
 
 ### SGLang Loader
 
@@ -850,9 +878,9 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
 | `MX_WORKER_GRPC_PORT` | `6555` | Base worker gRPC port for P2P tensor and artifact manifest serving; effective port is `MX_WORKER_GRPC_PORT + device_id` |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
-| `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. The SGLang NIXL loader uses it for compatible torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer caches. Requires the P2P metadata path; if `MX_P2P_METADATA=0`, the loader logs a warning and skips artifact transfer |
+| `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. The SGLang NIXL loader uses it for compatible torch compile, Triton, TVM-FFI, DeepGEMM, TileLang, CuTe DSL, and FlashInfer caches. Requires the P2P metadata path; if `MX_P2P_METADATA=0`, the loader logs a warning and skips artifact transfer |
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles |
-| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before publishing weight metadata or preparing and publishing cache bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. Kubernetes StatefulSet workers using their framework's default localhost URL infer pod-0's stable DNS endpoint |
+| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before publishing weight metadata or preparing and publishing cache bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time the artifact publisher waits for readiness and successful publication before giving up |
 | `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact checkpoint identifier so `mx_source_id` is content-addressed |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend; `{rank}` is substituted with the worker's own rank. Client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` if the resolved pattern has no explicit port |

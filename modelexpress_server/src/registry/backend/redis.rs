@@ -101,6 +101,10 @@ fn status_from_str(s: &str) -> RegistryResult<ModelStatus> {
     }
 }
 
+fn lease_duration_millis(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn parse_rfc3339(s: &str, field: &str) -> RegistryResult<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Utc))
@@ -391,14 +395,17 @@ impl RegistryBackend for RedisRegistryBackend {
         &self,
         model_name: &str,
         provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
     ) -> RegistryResult<ClaimOutcome> {
         let mut conn = self.get_conn().await?;
         let key = model_key(provider, model_name);
         let legacy = legacy_model_key(model_name);
         let now = Utc::now().to_rfc3339();
-        // Single atomic EVAL: returns CLAIM_WON_SENTINEL if we created the record, else the
-        // existing status, so callers know which replica owns the download (status alone
-        // can't — both see DOWNLOADING). KEYS[2] is the legacy key for migration (see below).
+        // Single atomic EVAL: returns CLAIM_WON_SENTINEL if we created the record or took
+        // over an expired lease, else the existing status, so callers know which replica
+        // owns the download (status alone can't — both see DOWNLOADING). KEYS[2] is the
+        // legacy key for migration (see below).
         let result: String = redis::Script::new(CLAIM_LUA)
             .key(&key)
             .key(&legacy)
@@ -407,6 +414,9 @@ impl RegistryBackend for RedisRegistryBackend {
             .arg(provider_str(provider))
             .arg(&now)
             .arg("Starting download...")
+            .arg(claim_id)
+            .arg(lease_duration_millis(lease_duration))
+            .arg("Taking over expired download lease...")
             .invoke_async(&mut conn)
             .await?;
         if result == CLAIM_WON_SENTINEL {
@@ -420,6 +430,8 @@ impl RegistryBackend for RedisRegistryBackend {
         &self,
         model_name: &str,
         provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
     ) -> RegistryResult<bool> {
         let mut conn = self.get_conn().await?;
         // Retry only runs after a claim observed AlreadyExists (which already migrated any
@@ -435,6 +447,58 @@ impl RegistryBackend for RedisRegistryBackend {
             .arg(provider_str(provider))
             .arg(&now)
             .arg("Retrying download...")
+            .arg(claim_id)
+            .arg(lease_duration_millis(lease_duration))
+            .invoke_async(&mut conn)
+            .await?;
+        Ok(won == 1)
+    }
+
+    async fn refresh_download_claim(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
+    ) -> RegistryResult<bool> {
+        let mut conn = self.get_conn().await?;
+        let key = model_key(provider, model_name);
+        let now = Utc::now().to_rfc3339();
+        let won: i32 = redis::Script::new(REFRESH_CLAIM_LUA)
+            .key(&key)
+            .arg(status_str(ModelStatus::DOWNLOADING))
+            .arg(claim_id)
+            .arg(lease_duration_millis(lease_duration))
+            .arg(&now)
+            .invoke_async(&mut conn)
+            .await?;
+        Ok(won == 1)
+    }
+
+    async fn finish_download_claim(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        claim_id: &str,
+        status: ModelStatus,
+        message: Option<String>,
+    ) -> RegistryResult<bool> {
+        let mut conn = self.get_conn().await?;
+        let key = model_key(provider, model_name);
+        let now = Utc::now().to_rfc3339();
+        let (msg_flag, msg_value) = match &message {
+            Some(message) => ("1", message.as_str()),
+            None => ("0", ""),
+        };
+        let won: i32 = redis::Script::new(FINISH_CLAIM_LUA)
+            .key(&key)
+            .arg(status_str(ModelStatus::DOWNLOADING))
+            .arg(claim_id)
+            .arg(status_str(status))
+            .arg(provider_str(provider))
+            .arg(&now)
+            .arg(msg_flag)
+            .arg(msg_value)
             .invoke_async(&mut conn)
             .await?;
         Ok(won == 1)
@@ -454,15 +518,32 @@ const CLAIM_WON_SENTINEL: &str = "__MX_CLAIM_WON__";
 ///
 /// TODO(0.5.0 migration): drop the KEYS[2] arm once all deployments have drained legacy keys.
 ///
-/// KEYS = [provider-scoped, legacy]; ARGV = [win_sentinel, status, provider, now, message]
+/// KEYS = [provider-scoped, legacy]
+/// ARGV = [win_sentinel, status, provider, now, message, claim_id, lease_ttl_ms,
+///         takeover_message]
 const CLAIM_LUA: &str = r#"
+local clock = redis.call("TIME")
+local now_ms = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+local lease_expires_at = now_ms + tonumber(ARGV[7])
+local function claim_existing(key, status)
+    if status ~= ARGV[2] then return status end
+    local expires_at = tonumber(redis.call("HGET", key, "lease_expires_at"))
+    if expires_at and expires_at > now_ms then return status end
+    redis.call("HSET", key,
+        "provider", ARGV[3],
+        "last_used_at", ARGV[4],
+        "message", ARGV[8],
+        "claim_id", ARGV[6],
+        "lease_expires_at", lease_expires_at)
+    return ARGV[1]
+end
 local existing = redis.call("HGET", KEYS[1], "status")
-if existing then return existing end
+if existing then return claim_existing(KEYS[1], existing) end
 local legacy_status = redis.call("HGET", KEYS[2], "status")
 if legacy_status then
     if redis.call("HGET", KEYS[2], "provider") == ARGV[3] then
         redis.call("RENAME", KEYS[2], KEYS[1])
-        return legacy_status
+        return claim_existing(KEYS[1], legacy_status)
     end
 end
 redis.call("HSET", KEYS[1],
@@ -470,7 +551,9 @@ redis.call("HSET", KEYS[1],
     "provider", ARGV[3],
     "created_at", ARGV[4],
     "last_used_at", ARGV[4],
-    "message", ARGV[5])
+    "message", ARGV[5],
+    "claim_id", ARGV[6],
+    "lease_expires_at", lease_expires_at)
 return ARGV[1]
 "#;
 
@@ -490,15 +573,50 @@ return 0
 /// provider, last_used_at, message). Returns 1 on win, 0 on miss.
 ///
 /// KEYS[1] = model key
-/// ARGV    = [from_status, to_status, provider, last_used_at, message]
+/// ARGV    = [from_status, to_status, provider, last_used_at, message,
+///            claim_id, lease_ttl_ms]
 const RETRY_CAS_LUA: &str = r#"
 local cur = redis.call("HGET", KEYS[1], "status")
 if cur ~= ARGV[1] then return 0 end
+local clock = redis.call("TIME")
+local now_ms = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
 redis.call("HSET", KEYS[1],
     "status", ARGV[2],
     "provider", ARGV[3],
     "last_used_at", ARGV[4],
-    "message", ARGV[5])
+    "message", ARGV[5],
+    "claim_id", ARGV[6],
+    "lease_expires_at", now_ms + tonumber(ARGV[7]))
+return 1
+"#;
+
+/// Renew only the matching owner. ARGV = [downloading, claim_id, lease_ttl_ms, now]
+const REFRESH_CLAIM_LUA: &str = r#"
+if redis.call("HGET", KEYS[1], "status") ~= ARGV[1] then return 0 end
+if redis.call("HGET", KEYS[1], "claim_id") ~= ARGV[2] then return 0 end
+local clock = redis.call("TIME")
+local now_ms = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+redis.call("HSET", KEYS[1],
+    "lease_expires_at", now_ms + tonumber(ARGV[3]),
+    "last_used_at", ARGV[4])
+return 1
+"#;
+
+/// Publish a terminal state only for the matching owner, then clear lease metadata.
+/// ARGV = [downloading, claim_id, terminal_status, provider, now, msg_flag, msg_value]
+const FINISH_CLAIM_LUA: &str = r#"
+if redis.call("HGET", KEYS[1], "status") ~= ARGV[1] then return 0 end
+if redis.call("HGET", KEYS[1], "claim_id") ~= ARGV[2] then return 0 end
+redis.call("HSET", KEYS[1],
+    "status", ARGV[3],
+    "provider", ARGV[4],
+    "last_used_at", ARGV[5])
+if ARGV[6] == "1" then
+    redis.call("HSET", KEYS[1], "message", ARGV[7])
+else
+    redis.call("HDEL", KEYS[1], "message")
+end
+redis.call("HDEL", KEYS[1], "claim_id", "lease_expires_at")
 return 1
 "#;
 
@@ -521,6 +639,9 @@ else
     redis.call("HDEL", KEYS[1], "message")
 end
 redis.call("HSETNX", KEYS[1], "created_at", ARGV[4])
+if ARGV[1] ~= "DOWNLOADING" then
+    redis.call("HDEL", KEYS[1], "claim_id", "lease_expires_at")
+end
 return 1
 "#;
 
@@ -637,5 +758,95 @@ mod tests {
     fn record_from_hash_rejects_missing_fields() {
         let fields = vec![("status".to_string(), "DOWNLOADED".to_string())];
         assert!(RedisRegistryBackend::record_from_hash("foo/bar", fields).is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Redis at MX_TEST_REDIS_URL"]
+    async fn expired_lease_can_be_reclaimed_and_stale_owner_is_fenced() {
+        let redis_url = std::env::var("MX_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let backend = RedisRegistryBackend::new(&redis_url);
+        backend.connect().await.expect("connect");
+
+        let model_name = format!("lease-test/{}", uuid::Uuid::new_v4());
+        let provider = ModelProvider::HuggingFace;
+
+        assert_eq!(
+            backend
+                .try_claim_for_download(
+                    &model_name,
+                    provider,
+                    "owner-1",
+                    std::time::Duration::ZERO,
+                )
+                .await
+                .expect("claim"),
+            ClaimOutcome::Claimed
+        );
+        assert_eq!(
+            backend
+                .try_claim_for_download(
+                    &model_name,
+                    provider,
+                    "owner-2",
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+                .expect("takeover"),
+            ClaimOutcome::Claimed
+        );
+        assert!(
+            !backend
+                .finish_download_claim(
+                    &model_name,
+                    provider,
+                    "owner-1",
+                    ModelStatus::DOWNLOADED,
+                    None,
+                )
+                .await
+                .expect("stale finish")
+        );
+        assert!(
+            backend
+                .refresh_download_claim(
+                    &model_name,
+                    provider,
+                    "owner-2",
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+                .expect("refresh")
+        );
+        assert_eq!(
+            backend
+                .try_claim_for_download(
+                    &model_name,
+                    provider,
+                    "owner-3",
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+                .expect("claim while renewed"),
+            ClaimOutcome::AlreadyExists(ModelStatus::DOWNLOADING)
+        );
+        assert!(
+            backend
+                .finish_download_claim(
+                    &model_name,
+                    provider,
+                    "owner-2",
+                    ModelStatus::DOWNLOADED,
+                    Some("done".to_string()),
+                )
+                .await
+                .expect("finish")
+        );
+        assert_eq!(
+            backend.get_status(&model_name).await.expect("get"),
+            Some(ModelStatus::DOWNLOADED)
+        );
+
+        backend.delete_model(&model_name).await.expect("cleanup");
     }
 }

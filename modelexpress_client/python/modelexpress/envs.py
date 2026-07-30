@@ -23,7 +23,6 @@ reading, but the code that sets them does so inline.
 Not covered here (intentional exceptions):
 - ``MX_SKIP_EXT`` and ``CXX`` are read by ``setup.py`` before the package is
   importable, so they cannot route through this module.
-- ``MODEL_EXPRESS_SOURCE`` only appears in a docstring example, not live code.
 - The deprecated ``MX_VMM_ARENA_BYTES`` / ``MX_VMM_ARENA_CHUNK_BYTES`` are
   presence-only deprecation warnings; check them with :func:`is_set`.
 """
@@ -107,6 +106,7 @@ if TYPE_CHECKING:
     MX_METRICS_SCHEME: str
     # Third-party JIT/compile cache locations read for artifact transfer
     TRITON_CACHE_DIR: Optional[str]
+    TVM_FFI_CACHE_DIR: Optional[str]
     DG_JIT_CACHE_DIR: Optional[str]
     DEEP_GEMM_CACHE_DIR: Optional[str]
     SGLANG_DG_CACHE_DIR: Optional[str]
@@ -120,6 +120,10 @@ if TYPE_CHECKING:
     # Other third-party / system
     VLLM_ATTENTION_BACKEND: str
     HOSTNAME: str
+    # Injected by LeaderWorkerSet into every pod of a group, as
+    # <leader-pod>.<headless-service>.<namespace>. Fallback head address when
+    # the engine does not expose its distributed-init address.
+    LWS_LEADER_ADDRESS: str
     POD_NAMESPACE: str
     POD_NAME: str
     POD_UID: str
@@ -245,6 +249,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_METRICS_SCHEME": lambda: os.environ.get("MX_METRICS_SCHEME", ""),
     # ── Third-party JIT/compile cache locations (raw; caller builds path) ──
     "TRITON_CACHE_DIR": lambda: os.environ.get("TRITON_CACHE_DIR"),
+    "TVM_FFI_CACHE_DIR": lambda: os.environ.get("TVM_FFI_CACHE_DIR"),
     "DG_JIT_CACHE_DIR": lambda: os.environ.get("DG_JIT_CACHE_DIR"),
     "DEEP_GEMM_CACHE_DIR": lambda: os.environ.get("DEEP_GEMM_CACHE_DIR"),
     "SGLANG_DG_CACHE_DIR": lambda: os.environ.get("SGLANG_DG_CACHE_DIR"),
@@ -260,6 +265,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ── Other third-party / system ─────────────────────────────────────────
     "VLLM_ATTENTION_BACKEND": lambda: os.environ.get("VLLM_ATTENTION_BACKEND", "auto"),
     "HOSTNAME": lambda: os.environ.get("HOSTNAME", ""),
+    "LWS_LEADER_ADDRESS": lambda: os.environ.get("LWS_LEADER_ADDRESS", ""),
     "POD_NAMESPACE": lambda: os.environ.get("POD_NAMESPACE", ""),
     "POD_NAME": lambda: os.environ.get("POD_NAME", ""),
     "POD_UID": lambda: os.environ.get("POD_UID", "")

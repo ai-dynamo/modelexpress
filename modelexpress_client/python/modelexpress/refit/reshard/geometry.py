@@ -18,12 +18,12 @@ pull.
 Design notes:
   * Framework-neutral: the caller supplies the model (ideally a disposable
     ``meta`` twin) and the framework's default weight-loader; no engine import.
-  * Per-source isolation: we bake one source tensor at a time, so a loader that
-    uses an unsupported op knocks out only THAT tensor (-> full-pull fallback),
-    never the whole bake. This is the key robustness property.
+  * Per-source isolation: we bake one source tensor at a time, so unsupported
+    geometry is attributed to the specific source before the receiver fails the
+    update. It never produces an incorrect partial plan.
   * Allowlist of pure view/slice ops; anything else (arithmetic, .to/.float,
     bool-mask indexing) lands in ``__torch_dispatch__`` and raises
-    ``UnsupportedReshard`` for that source -> fallback, not wrong bytes.
+    ``UnsupportedReshard`` for that source, not wrong bytes.
 """
 
 from __future__ import annotations
@@ -261,8 +261,8 @@ def capture_geometry(
     saved = _install_stamps(model, recorder, default_weight_loader)
     unsupported: list[str] = []
     try:
-        # One source at a time: a single unsupported loader knocks out only that
-        # tensor (-> full-pull fallback), never the whole bake. Fused params
+        # One source at a time: a single unsupported loader is attributed only
+        # to that tensor, never the whole bake. Fused params
         # (qkv/gate_up) still resolve - each source writes its own sub-region of
         # the persistent (meta) dest param across separate calls.
         for name, dtype, shape in manifest:

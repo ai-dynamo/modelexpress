@@ -421,6 +421,23 @@ def triton_cache_artifact_transfer(
     )
 
 
+def tvm_ffi_cache_artifact_transfer(
+    source_root: str | Path,
+    target_root: str | Path,
+    bundle_root: str | Path,
+    *,
+    chunk_size: int | None = None,
+) -> P2PArtifactTransfer:
+    return _cache_artifact_transfer(
+        "tvm_ffi_cache",
+        p2p_pb2.MX_SOURCE_TYPE_TVM_FFI_CACHE,
+        source_root,
+        target_root,
+        bundle_root,
+        chunk_size=chunk_size,
+    )
+
+
 def deep_gemm_cache_artifact_transfer(
     source_root: str | Path,
     target_root: str | Path,

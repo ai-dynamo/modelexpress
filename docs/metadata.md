@@ -173,6 +173,7 @@ Factory helpers provide the cache source types currently expected by loaders:
 |--------|------------------|--------------------|
 | `torch_compile_cache_artifact_transfer()` | `TORCH_COMPILE_CACHE` | TorchInductor/vLLM torch compile cache directory |
 | `triton_cache_artifact_transfer()` | `TRITON_CACHE` | Triton kernel cache directory |
+| `tvm_ffi_cache_artifact_transfer()` | `TVM_FFI_CACHE` | TVM-FFI compiled SGLang kernel modules (`TVM_FFI_CACHE_DIR`, or `~/.cache/tvm-ffi`) |
 | `deep_gemm_cache_artifact_transfer()` | `DEEP_GEMM_CACHE` | DeepGEMM JIT cache directory (`DG_JIT_CACHE_DIR`, or `VLLM_CACHE_ROOT/deep_gemm`) |
 | `tilelang_cache_artifact_transfer()` | `TILELANG_CACHE` | TileLang JIT cache directory (`TILELANG_CACHE_DIR`, or `~/.tilelang/cache`) |
 | `cute_dsl_cache_artifact_transfer()` | `CUTE_DSL_CACHE` | CuTe DSL compiled-kernel cache directory (`CUTE_DSL_CACHE_DIR`, or `$TMPDIR/<user>/cutlass_python_cache`) |
@@ -205,7 +206,7 @@ stateDiagram-v2
 
 - **INITIALIZING**: Worker has published metadata but heartbeat hasn't confirmed NIXL health yet
 - **READY**: Worker is healthy and accepting RDMA connections. Heartbeat refreshes `updated_at` every `MX_HEARTBEAT_INTERVAL_SECS` (default 30s)
-- **STALE**: Worker is no longer available. Set by the client `atexit` handler on clean shutdown (SIGTERM), or by the server-side reaper when `updated_at` exceeds `MX_HEARTBEAT_TIMEOUT_SECS` (default 90s)
+- **STALE**: Worker is no longer available. Set by the client `atexit` handler on clean shutdown, by the client when its NIXL data plane fails, or by the server-side reaper when `updated_at` exceeds `MX_HEARTBEAT_TIMEOUT_SECS` (default 90s). A worker demoted for a failed data plane returns to READY on its next healthy heartbeat, so this transition is not terminal. Note that the `atexit` route covers normal interpreter exit and `SystemExit`, but CPython does not run `atexit` handlers when the default `SIGTERM` disposition terminates the process; a worker killed that way is caught by the reaper instead
 - **Deleted**: Reaper garbage-collects stale entries after `MX_GC_TIMEOUT_SECS` (default 3600s)
 
 vLLM and SGLang weight sources wait for the framework health endpoint before
@@ -547,6 +548,7 @@ The `backend_type` discriminator is persisted in storage for unambiguous deseria
 | `MX_REAPER_SCAN_INTERVAL_SECS` | `30` | Server reaper scan frequency |
 | `MX_GC_TIMEOUT_SECS` | `3600` | Time before stale entries are deleted |
 | `MX_POOL_REG` | `0` | Register each unique cudaMalloc allocation instead of each tensor (allocation-level NIXL registration) |
+| `MX_TRANSFER_TIMEOUT` | `300` on the RDMA receive path | Per-candidate budget for receiving weights from one source. Applies **per source**, not per load, so a target trying `MAX_SOURCE_RETRIES` candidates can spend this much three times before falling back to disk. Set it against your model size: the default suits a small model but is long for one that transfers in under a second. Note the RDMA path only honours this variable when it is explicitly set, and otherwise uses 300s rather than the 900s default that other transfer paths use. |
 
 ## Debugging
 

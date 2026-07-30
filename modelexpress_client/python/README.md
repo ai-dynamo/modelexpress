@@ -65,6 +65,35 @@ python -m sglang.launch_server \
     --modelexpress-config '{"transport": "nixl"}'
 ```
 
+## Quick Start with TensorRT-LLM
+
+TensorRT-LLM integrates through its native `checkpoint_format="MX"` interface.
+Install ModelExpress in a qualified TensorRT-LLM image, then construct the
+PyTorch backend with the ModelExpress server configuration:
+
+```python
+from tensorrt_llm.llmapi import LLM
+
+llm = LLM(
+    model="/model",
+    checkpoint_format="MX",
+    mx_config={
+        "server_url": "modelexpress-server:8001",
+        "server_query_timeout_s": 600,
+    },
+    tensor_parallel_size=4,
+    backend="pytorch",
+)
+```
+
+The first replica falls back to the Hugging Face checkpoint and publishes its
+post-transform weights; later compatible replicas receive them through
+ModelExpress. The current qualified scope is the `LlamaForCausalLM` family.
+See the
+[TensorRT-LLM P2P example](../../examples/p2p_transfer_k8s/client/trtllm/)
+for the qualified-image requirement and production-style Kubernetes
+deployment.
+
 ## Programmatic Usage
 
 ### MxClient
@@ -118,8 +147,10 @@ register_modelexpress_loaders()
 | `MX_ARTIFACT_TRANSFER` | `0` | Transfer compatible vLLM TorchInductor, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM |
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles |
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | empty | Optional compile-configuration compatibility digest for cache discovery |
-| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint checked before a source publishes weights or JIT cache artifacts (`http://127.0.0.1:8000/health` for vLLM; `http://127.0.0.1:30000/health` for SGLang) |
+| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint checked before a source publishes weights or JIT cache artifacts (`http://127.0.0.1:8000/health` for vLLM; `http://127.0.0.1:30000/health` for SGLang). On the non-head nodes of a multi-node engine, a loopback host is rewritten onto the head's address (the engine's own distributed-init address, else `LWS_LEADER_ADDRESS`), preserving the configured port and path. A non-loopback host is used verbatim |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication |
+| `MX_HEARTBEAT_INTERVAL_SECS` | `30` | Seconds between READY status heartbeats for published sources, including reshard rendezvous sources; keep below the server heartbeat timeout |
+| `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Maximum exact descriptors for one no-gather refit copy before a compatible dim-0-sharded source is pulled once into contiguous staging and sliced locally |
 
 ### UCX/NIXL Tuning
 
@@ -136,7 +167,9 @@ register_modelexpress_loaders()
 | `modelexpress.client` | `MxClient` -- gRPC client for the ModelExpress server |
 | `modelexpress.metadata` | Metadata clients, source identity, publishing, and worker manifest serving |
 | `modelexpress.engines.vllm.loader` | `MxModelLoader` -- vLLM integration |
+| `modelexpress.refit.reshard` | Engine-agnostic loader-geometry capture and bounded no-gather transfer planning |
 | `modelexpress.engines.sglang.loader` | `MxModelLoader` -- SGLang `remote_instance` integration |
+| `modelexpress.trtllm_live_transfer` | Weight-loading helpers consumed by TensorRT-LLM's native MX checkpoint loader |
 | `modelexpress.vllm_loader` | Compatibility shim for the vLLM loader |
 | `modelexpress.nixl_transfer` | `NixlTransferManager` -- NIXL agent lifecycle and RDMA transfers |
 | `modelexpress.types` | `TensorDescriptor`, `WorkerMetadata` -- core data types |
