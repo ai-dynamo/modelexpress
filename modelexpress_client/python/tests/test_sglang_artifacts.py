@@ -3,9 +3,13 @@
 
 """Tests for SGLang cache artifact integration."""
 
+import sys
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+
+import pytest
 
 from modelexpress import p2p_pb2
 from modelexpress.engines.sglang import artifacts
@@ -102,6 +106,7 @@ def test_sglang_torch_compile_artifact_identity_uses_sglang_criteria(monkeypatch
 def test_sglang_artifact_transfers_use_sglang_backend(monkeypatch, tmp_path):
     monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / "torchinductor"))
     monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton-cache"))
+    monkeypatch.setenv("TVM_FFI_CACHE_DIR", str(tmp_path / "tvm-ffi-cache"))
     monkeypatch.setenv("SGLANG_DG_CACHE_DIR", str(tmp_path / "deep-gemm-cache"))
     monkeypatch.setenv("SGLANG_CACHE_DIR", str(tmp_path / "sglang-cache"))
     monkeypatch.setenv("TILELANG_CACHE_DIR", str(tmp_path / "tilelang-cache"))
@@ -116,6 +121,11 @@ def test_sglang_artifact_transfers_use_sglang_backend(monkeypatch, tmp_path):
         artifacts._common_artifacts,
         "triton_key",
         lambda: "triton-key",
+    )
+    monkeypatch.setattr(
+        artifacts._common_artifacts,
+        "tvm_ffi_version",
+        lambda: "0.1.6",
     )
     monkeypatch.setattr(
         artifacts._common_artifacts,
@@ -160,6 +170,13 @@ def test_sglang_artifact_transfers_use_sglang_backend(monkeypatch, tmp_path):
             Path(tmp_path / "bundles" / "rank-1" / "triton_cache"),
         ),
         (
+            "tvm_ffi_cache",
+            p2p_pb2.MX_SOURCE_TYPE_TVM_FFI_CACHE,
+            p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
+            Path(tmp_path / "tvm-ffi-cache"),
+            Path(tmp_path / "bundles" / "rank-1" / "tvm_ffi_cache"),
+        ),
+        (
             "deep_gemm_cache",
             p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE,
             p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
@@ -192,6 +209,77 @@ def test_sglang_artifact_transfers_use_sglang_backend(monkeypatch, tmp_path):
         Path(tmp_path / "flashinfer-workspace" / ".cache" / "flashinfer"),
         Path(tmp_path / "sglang-cache" / "flashinfer" / "autotune"),
     )
+
+
+def test_sglang_tvm_ffi_identity_includes_runtime_version(monkeypatch):
+    monkeypatch.setattr(artifacts, "_sglang_version", lambda: "0.5.13")
+    monkeypatch.setattr(
+        artifacts._common_artifacts,
+        "tvm_ffi_version",
+        lambda: "0.1.6",
+    )
+    monkeypatch.setattr(
+        artifacts._common_artifacts,
+        "gpu_arch",
+        lambda device_id: "sm90",
+    )
+    ctx = SimpleNamespace(
+        device_id=0,
+        identity=p2p_pb2.SourceIdentity(
+            model_name="test/model",
+            backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
+            tensor_parallel_size=4,
+            pipeline_parallel_size=1,
+            dtype="bfloat16",
+            quantization="fp8",
+            revision="abc123",
+        ),
+    )
+
+    identity = artifacts._artifact_identity(
+        ctx,
+        p2p_pb2.MX_SOURCE_TYPE_TVM_FFI_CACHE,
+    )
+
+    assert identity.mx_source_type == p2p_pb2.MX_SOURCE_TYPE_TVM_FFI_CACHE
+    assert identity.extra_parameters["tvm_ffi_version"] == "0.1.6"
+
+
+def test_tvm_ffi_version_falls_back_to_distribution_metadata(monkeypatch):
+    monkeypatch.setitem(sys.modules, "tvm_ffi", None)
+    pkg_version = MagicMock(return_value="0.1.6")
+    monkeypatch.setattr(
+        artifacts._common_artifacts,
+        "pkg_version",
+        pkg_version,
+    )
+
+    assert artifacts._common_artifacts.tvm_ffi_version() == "0.1.6"
+    pkg_version.assert_called_once_with("apache-tvm-ffi")
+
+
+def test_tvm_ffi_version_propagates_unresolved_distribution(monkeypatch):
+    monkeypatch.setitem(sys.modules, "tvm_ffi", SimpleNamespace())
+    monkeypatch.setattr(
+        artifacts._common_artifacts,
+        "pkg_version",
+        MagicMock(side_effect=PackageNotFoundError("apache-tvm-ffi")),
+    )
+
+    with pytest.raises(PackageNotFoundError):
+        artifacts._common_artifacts.tvm_ffi_version()
+
+
+def test_tvm_ffi_version_propagates_unexpected_version_error(monkeypatch):
+    class BrokenTvmFfi:
+        @property
+        def __version__(self):
+            raise RuntimeError("broken TVM-FFI module")
+
+    monkeypatch.setitem(sys.modules, "tvm_ffi", BrokenTvmFfi())
+
+    with pytest.raises(RuntimeError, match="broken TVM-FFI module"):
+        artifacts._common_artifacts.tvm_ffi_version()
 
 
 def test_sglang_flashinfer_autotune_cache_root_uses_sglang_default(monkeypatch):
