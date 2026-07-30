@@ -529,55 +529,63 @@ class RdmaStrategy(LoadStrategy):
                 f"{time.perf_counter() - add_start:.3f}s (agent={remote_agent_name})"
             )
 
-        logger.info(
-            f"[Worker {ctx.global_rank}] Receiving {len(source_tensors)} tensors from source"
-            f"{' (P2P)' if is_p2p else ''}"
-        )
-
-        # Cross-family (heterogeneous) transfers must name the exact same tensor
-        # set on both sides: a name diff can mean vendor-specific hidden/derived
-        # tensors, which would leave part of the target at dummy values while
-        # RDMA reports success. Same-family transfers tolerate subset transfers.
-        target_accelerator = ctx.accelerator_backend.name
-        source_accelerator = source_worker.accelerator
-        require_exact_match = ctx.adapter.requires_exact_tensor_catalog() or bool(
-            target_accelerator
-            and source_accelerator
-            and target_accelerator != source_accelerator
-        )
-
-        transfer_start = time.perf_counter()
+        # Release the source once the load is done, rather than at process exit:
+        # this is a one-shot load, so the QP has no further use here. Waiting for
+        # interpreter exit is what left sources wedged, because the engine process
+        # is torn down (SIGTERM, SIGKILL, OOM) without running atexit hooks. Only
+        # the reader can do it - in P2P only the reader loads a remote agent, so
+        # the source has no peer record to invalidate. The release covers failures
+        # too, where the source is the more likely casualty, and is last so the
+        # peer outlives every use of the bytes it served.
         try:
-            bytes_transferred, tensor_count, _ = ctx.nixl_manager.receive_from_source(
-                source_metadata=source_worker.nixl_metadata,
-                source_tensors=source_tensors,
-                timeout_seconds=_transfer_timeout_seconds(),
-                remote_agent_name=remote_agent_name,
-                require_exact_match=require_exact_match,
+            logger.info(
+                f"[Worker {ctx.global_rank}] Receiving {len(source_tensors)} tensors from source"
+                f"{' (P2P)' if is_p2p else ''}"
             )
-        except Exception as e:
-            raise SourceTransferError(f"RDMA receive failed: {e}") from e
+
+            # Cross-family (heterogeneous) transfers must name the exact same tensor
+            # set on both sides: a name diff can mean vendor-specific hidden/derived
+            # tensors, which would leave part of the target at dummy values while
+            # RDMA reports success. Same-family transfers tolerate subset transfers.
+            target_accelerator = ctx.accelerator_backend.name
+            source_accelerator = source_worker.accelerator
+            require_exact_match = ctx.adapter.requires_exact_tensor_catalog() or bool(
+                target_accelerator
+                and source_accelerator
+                and target_accelerator != source_accelerator
+            )
+
+            transfer_start = time.perf_counter()
+            try:
+                (
+                    bytes_transferred,
+                    tensor_count,
+                    _,
+                ) = ctx.nixl_manager.receive_from_source(
+                    source_metadata=source_worker.nixl_metadata,
+                    source_tensors=source_tensors,
+                    timeout_seconds=_transfer_timeout_seconds(),
+                    remote_agent_name=remote_agent_name,
+                    require_exact_match=require_exact_match,
+                )
+            except Exception as e:
+                raise SourceTransferError(f"RDMA receive failed: {e}") from e
+            transfer_time = time.perf_counter() - transfer_start
+
+            bandwidth_gbps = (
+                (bytes_transferred * 8) / (transfer_time * 1e9)
+                if transfer_time > 0
+                else 0
+            )
+            logger.info(
+                f"[Worker {ctx.global_rank}] [TIMING] RDMA transfer complete: "
+                f"{tensor_count} tensors, {bytes_transferred / 1e9:.2f} GB, "
+                f"{transfer_time:.3f}s, {bandwidth_gbps:.1f} Gbps"
+            )
+
+            ctx.accelerator_backend.synchronize()
         finally:
-            # Release the source now: this is a one-shot weight load, so the QP
-            # has no further use here, and waiting for process exit is what left
-            # sources wedged. The manager's atexit hook does not run when the
-            # engine process is torn down (SIGTERM, SIGKILL, OOM), and the source
-            # cannot invalidate a reader it never loaded - in P2P only the reader
-            # loads the peer - so nothing else can close the pair. Also runs on
-            # failure, where the source is the more likely casualty.
             ctx.nixl_manager.remove_remote_agent(remote_agent_name)
-        transfer_time = time.perf_counter() - transfer_start
-
-        bandwidth_gbps = (
-            (bytes_transferred * 8) / (transfer_time * 1e9) if transfer_time > 0 else 0
-        )
-        logger.info(
-            f"[Worker {ctx.global_rank}] [TIMING] RDMA transfer complete: "
-            f"{tensor_count} tensors, {bytes_transferred / 1e9:.2f} GB, "
-            f"{transfer_time:.3f}s, {bandwidth_gbps:.1f} Gbps"
-        )
-
-        ctx.accelerator_backend.synchronize()
 
         total_time = time.perf_counter() - receive_start
         logger.info(

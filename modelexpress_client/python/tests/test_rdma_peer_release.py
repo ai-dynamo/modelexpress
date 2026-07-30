@@ -49,15 +49,19 @@ def _manager():
 
 
 def _ctx(manager):
+    # Matching accelerators and an adapter that does not demand an exact catalog
+    # keep require_exact_match off, so these tests exercise peer lifecycle rather
+    # than manifest strictness. Pinned rather than left to MagicMock, whose auto
+    # attributes are truthy and would quietly turn strictness on.
+    adapter = MagicMock()
+    adapter.requires_exact_tensor_catalog.return_value = False
     return SimpleNamespace(
         global_rank=0,
         worker_rank=0,
         worker_id="target-0",
         nixl_manager=manager,
-        # Matching the source's accelerator keeps require_exact_match off, so
-        # these tests exercise peer lifecycle rather than manifest strictness.
         accelerator_backend=SimpleNamespace(name="cuda", synchronize=MagicMock()),
-        adapter=MagicMock(),
+        adapter=adapter,
         identity=SimpleNamespace(model_name="m"),
     )
 
@@ -74,9 +78,8 @@ def _source_worker(p2p: bool):
     )
 
 
-def _receive(manager, p2p=True):
+def _receive(manager, p2p=True, ctx=None):
     strategy = RdmaStrategy()
-    ctx = _ctx(manager)
     with (
         patch("modelexpress.load_strategy.rdma_strategy.register_tensors"),
         patch(
@@ -84,7 +87,9 @@ def _receive(manager, p2p=True):
             return_value=[_descriptor()],
         ),
     ):
-        strategy._receive_from_peer(MagicMock(), ctx, _source_worker(p2p), "src-1")
+        strategy._receive_from_peer(
+            MagicMock(), ctx or _ctx(manager), _source_worker(p2p), "src-1"
+        )
 
 
 class TestReleaseOnTheLoadPath:
@@ -101,18 +106,23 @@ class TestReleaseOnTheLoadPath:
         fetched = mgr.fetch_remote_and_wait.call_args.kwargs["remote_agent_name"]
         assert mgr.remove_remote_agent.call_args.args[0] == fetched
 
-    def test_release_happens_after_the_transfer(self):
-        """Disconnecting first would tear down the QP the READ still needs."""
+    def test_the_peer_outlives_the_transfer_and_the_device_sync(self):
+        """Release has to be last. Disconnecting before the READ completes would
+        tear down the QP under it, and doing so before the device sync would rely
+        on receive_from_source's internal sync staying where it is - a silent
+        corruption if that ever moves, rather than a loud failure."""
         mgr = _manager()
         order = []
         mgr.receive_from_source.side_effect = lambda **_: (
             order.append("transfer") or (128, 1, 0.01)
         )
         mgr.remove_remote_agent.side_effect = lambda *_: order.append("release") or True
+        ctx = _ctx(mgr)
+        ctx.accelerator_backend.synchronize.side_effect = lambda: order.append("sync")
 
-        _receive(mgr, p2p=True)
+        _receive(mgr, p2p=True, ctx=ctx)
 
-        assert order == ["transfer", "release"]
+        assert order == ["transfer", "sync", "release"]
 
 
 class TestReleaseOnFailure:
@@ -127,14 +137,38 @@ class TestReleaseOnFailure:
 
         mgr.remove_remote_agent.assert_called_once_with(P2P_AGENT)
 
-    def test_the_transfer_error_is_not_masked_by_cleanup(self):
-        """Retry and fallback both depend on the original failure propagating."""
+    def test_the_transfer_error_reaches_the_caller(self):
+        """Retry and fallback both depend on the original failure propagating.
+
+        The release cannot get in the way: remove_remote_agent logs and swallows
+        its own failures by contract, so it has nothing to mask this with.
+        """
         mgr = _manager()
         mgr.receive_from_source.side_effect = TimeoutError("Transfer timed out")
-        mgr.remove_remote_agent.side_effect = RuntimeError("invalidate failed")
 
-        with pytest.raises(RuntimeError, match="invalidate failed"):
+        with pytest.raises(SourceTransferError) as raised:
             _receive(mgr, p2p=True)
+
+        assert isinstance(raised.value.__cause__, TimeoutError)
+
+    def test_a_failure_before_the_transfer_still_releases_the_peer(self):
+        """The peer is acquired before the transfer starts, so anything raising in
+        between would leak it - and atexit is exactly what cannot be relied on to
+        collect it."""
+        mgr = _manager()
+
+        class ExplodingBackend:
+            @property
+            def name(self):
+                raise RuntimeError("accelerator backend gone")
+
+        ctx = _ctx(mgr)
+        ctx.accelerator_backend = ExplodingBackend()
+
+        with pytest.raises(RuntimeError, match="accelerator backend gone"):
+            _receive(mgr, p2p=True, ctx=ctx)
+
+        mgr.remove_remote_agent.assert_called_once_with(P2P_AGENT)
 
 
 class TestCentralizedMode:
