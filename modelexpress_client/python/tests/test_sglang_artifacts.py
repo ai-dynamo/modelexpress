@@ -3,9 +3,13 @@
 
 """Tests for SGLang cache artifact integration."""
 
+import sys
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+
+import pytest
 
 from modelexpress import p2p_pb2
 from modelexpress.engines.sglang import artifacts
@@ -239,6 +243,43 @@ def test_sglang_tvm_ffi_identity_includes_runtime_version(monkeypatch):
 
     assert identity.mx_source_type == p2p_pb2.MX_SOURCE_TYPE_TVM_FFI_CACHE
     assert identity.extra_parameters["tvm_ffi_version"] == "0.1.6"
+
+
+def test_tvm_ffi_version_falls_back_to_distribution_metadata(monkeypatch):
+    monkeypatch.setitem(sys.modules, "tvm_ffi", None)
+    pkg_version = MagicMock(return_value="0.1.6")
+    monkeypatch.setattr(
+        artifacts._common_artifacts,
+        "pkg_version",
+        pkg_version,
+    )
+
+    assert artifacts._common_artifacts.tvm_ffi_version() == "0.1.6"
+    pkg_version.assert_called_once_with("apache-tvm-ffi")
+
+
+def test_tvm_ffi_version_propagates_unresolved_distribution(monkeypatch):
+    monkeypatch.setitem(sys.modules, "tvm_ffi", SimpleNamespace())
+    monkeypatch.setattr(
+        artifacts._common_artifacts,
+        "pkg_version",
+        MagicMock(side_effect=PackageNotFoundError("apache-tvm-ffi")),
+    )
+
+    with pytest.raises(PackageNotFoundError):
+        artifacts._common_artifacts.tvm_ffi_version()
+
+
+def test_tvm_ffi_version_propagates_unexpected_version_error(monkeypatch):
+    class BrokenTvmFfi:
+        @property
+        def __version__(self):
+            raise RuntimeError("broken TVM-FFI module")
+
+    monkeypatch.setitem(sys.modules, "tvm_ffi", BrokenTvmFfi())
+
+    with pytest.raises(RuntimeError, match="broken TVM-FFI module"):
+        artifacts._common_artifacts.tvm_ffi_version()
 
 
 def test_sglang_flashinfer_autotune_cache_root_uses_sglang_default(monkeypatch):

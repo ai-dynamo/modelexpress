@@ -581,16 +581,13 @@ def triton_version() -> str:
 def tvm_ffi_version() -> str:
     try:
         import tvm_ffi
-
-        version = getattr(tvm_ffi, "__version__", None)
-        if version:
-            return str(version)
-    except Exception:
-        pass
-    try:
+    except ModuleNotFoundError as exc:
+        if exc.name != "tvm_ffi":
+            raise
         return pkg_version("apache-tvm-ffi")
-    except Exception:
-        return "unknown"
+
+    version = getattr(tvm_ffi, "__version__", None)
+    return str(version) if version else pkg_version("apache-tvm-ffi")
 
 
 def triton_key() -> str:
