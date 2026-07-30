@@ -31,8 +31,9 @@ class PublisherThread:
     ``mx_source_id``. A ``ready_fn`` can gate publication until the engine has
     finished work that must happen before the source is advertised.
 
-    On clean shutdown (SIGTERM), atexit handler sends UpdateStatus(STALE)
-    for immediate detection without waiting for the reaper timeout.
+    On normal interpreter exit, an atexit handler sends UpdateStatus(STALE)
+    for immediate detection without waiting for the reaper timeout. The default
+    SIGTERM disposition does not run atexit handlers.
 
     Args:
         mx_client: gRPC client for UpdateStatus calls.
@@ -94,6 +95,9 @@ class PublisherThread:
         self._publish_started_at: float | None = None
         self._publish_given_up = False
         self._cleaned_up = False
+        # True once we have demoted this worker for an unhealthy data plane, so the
+        # demotion and its log line happen once rather than every interval.
+        self._unhealthy = False
 
         self._interval = (
             interval_secs
@@ -139,8 +143,10 @@ class PublisherThread:
         logger.info(f"[Worker {self._worker_rank}] Publisher thread stopped")
 
     def _on_exit(self) -> None:
-        """atexit handler: mark STALE on clean shutdown (SIGTERM)."""
+        """Stop the publisher before marking it STALE."""
         self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self._interval + 5)
         self._mark_stale()
         self._cleanup()
 
@@ -160,6 +166,40 @@ class PublisherThread:
                     exc_info=True,
                 )
                 self._started = False
+
+    def _mark_unhealthy(self) -> None:
+        """Best-effort UpdateStatus(STALE) for a worker whose data plane is down.
+
+        Distinct from ``_mark_stale``, which is a shutdown path and clears
+        ``_started`` permanently. Here the worker is still running and may recover,
+        so ``_started`` is left alone: the next healthy tick sends READY again, and
+        this method stays quiet after the first demotion so a persistently broken
+        agent does not log once per interval forever.
+        """
+        with self._status_lock:
+            if self._stop_event.is_set() or self._unhealthy:
+                return
+            if not self._started:
+                # Never advertised READY, so no target can have selected us and
+                # there is nothing to demote. Deliberately does not latch
+                # ``_unhealthy``: if this worker later goes READY and then breaks,
+                # that is the case worth demoting.
+                return
+            reason = getattr(self._nixl_manager, "data_plane_error", None)
+            try:
+                from .. import p2p_pb2
+                self._update_status(p2p_pb2.SOURCE_STATUS_STALE)
+                self._unhealthy = True
+                logger.warning(
+                    f"[Worker {self._worker_rank}] NIXL agent unhealthy, marked "
+                    f"STALE so targets stop selecting it: {reason}"
+                )
+            except Exception:
+                logger.debug(
+                    f"[Worker {self._worker_rank}] Failed to mark STALE for "
+                    f"unhealthy agent",
+                    exc_info=True,
+                )
 
     def _update_status(self, status: int) -> None:
         """Send UpdateStatus RPC, refreshing the source's NIC utilization.
@@ -270,12 +310,27 @@ class PublisherThread:
                 return
 
         if self._nixl_manager is not None and not self._nixl_manager.is_healthy():
+            # Demote rather than just skip the update. Skipping only stops
+            # refreshing updated_at, so the entry keeps its last status and stays
+            # selectable until the server's reaper times it out - 90s by default,
+            # during which every target that picks this worker pays a full
+            # transfer timeout. Saying STALE now removes it from the candidate set
+            # immediately. It is not permanent: if the agent recovers, the next
+            # tick puts it back to READY.
+            self._mark_unhealthy()
             return
 
         with self._status_lock:
             if self._stop_event.is_set():
                 return
             self._update_status(p2p_pb2.SOURCE_STATUS_READY)
+            if self._unhealthy:
+                # Recovered: allow a future failure to demote us again.
+                self._unhealthy = False
+                logger.info(
+                    f"[Worker {self._worker_rank}] NIXL agent healthy again, "
+                    f"status -> READY"
+                )
             if not self._started:
                 logger.info(
                     f"[Worker {self._worker_rank}] Status -> READY"

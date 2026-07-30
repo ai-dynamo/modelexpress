@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Supply-chain and ownership policy require DevOps review.
+/.github/CODEOWNERS @ai-dynamo/devops
+/deny.toml            @ai-dynamo/devops

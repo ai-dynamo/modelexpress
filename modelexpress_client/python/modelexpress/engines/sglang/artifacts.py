@@ -26,6 +26,7 @@ from ...metadata.artifact_transfer import (
     flashinfer_cache_artifact_transfer,
     tilelang_cache_artifact_transfer,
     triton_cache_artifact_transfer,
+    tvm_ffi_cache_artifact_transfer,
     torch_compile_cache_artifact_transfer,
 )
 from ...metadata.publisher import PublisherThread
@@ -53,7 +54,7 @@ def schedule_sglang_cache_artifact_publish(ctx: LoadContext) -> None:
         ctx,
         lambda: _sglang_artifact_transfers(ctx),
         engine_label="SGLang",
-        ready_fn_factory=lambda roots: _sglang_artifact_ready_fn(roots),
+        ready_fn_factory=lambda roots: _sglang_artifact_ready_fn(roots, ctx=ctx),
         artifact_publish_fn=lambda transfer, identity: (
             _publish_sglang_cache_artifact(ctx, transfer, identity)
         ),
@@ -89,6 +90,7 @@ def _sglang_artifact_transfers(
     bundle_root = _bundle_root(ctx)
     torch_compile_cache_root = _torch_compile_cache_root()
     triton_cache_root = _common_artifacts.triton_cache_root()
+    tvm_ffi_cache_root = _common_artifacts.tvm_ffi_cache_root()
     deep_gemm_cache_root = _deep_gemm_cache_root()
     tilelang_cache_root = _common_artifacts.tilelang_cache_root()
     cute_dsl_cache_root = _common_artifacts.cute_dsl_cache_root()
@@ -110,6 +112,14 @@ def _sglang_artifact_transfers(
                 bundle_root / "triton_cache",
             ),
             _artifact_identity(ctx, p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE),
+        ),
+        (
+            tvm_ffi_cache_artifact_transfer(
+                tvm_ffi_cache_root,
+                tvm_ffi_cache_root,
+                bundle_root / "tvm_ffi_cache",
+            ),
+            _artifact_identity(ctx, p2p_pb2.MX_SOURCE_TYPE_TVM_FFI_CACHE),
         ),
         (
             deep_gemm_cache_artifact_transfer(
@@ -203,6 +213,7 @@ def _artifact_identity(
     builders = {
         p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE: _torch_compile_cache_identity,
         p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE: _triton_cache_identity,
+        p2p_pb2.MX_SOURCE_TYPE_TVM_FFI_CACHE: _tvm_ffi_cache_identity,
         p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE: _deep_gemm_cache_identity,
         p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE: _tilelang_cache_identity,
         p2p_pb2.MX_SOURCE_TYPE_CUTE_DSL_CACHE: _cute_dsl_cache_identity,
@@ -248,6 +259,31 @@ def _triton_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
         gpu_arch=_common_artifacts.gpu_arch(ctx.device_id),
     )
     _set_extra_if_present(identity, "triton_key", _common_artifacts.triton_key())
+    return identity
+
+
+def _tvm_ffi_cache_identity(ctx: LoadContext) -> p2p_pb2.SourceIdentity:
+    identity = p2p_pb2.SourceIdentity(
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TVM_FFI_CACHE,
+        model_name=ctx.identity.model_name,
+        backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
+        tensor_parallel_size=ctx.identity.tensor_parallel_size,
+        pipeline_parallel_size=ctx.identity.pipeline_parallel_size,
+        expert_parallel_size=ctx.identity.expert_parallel_size,
+        dtype=ctx.identity.dtype,
+        quantization=ctx.identity.quantization,
+        revision=ctx.identity.revision,
+        backend_framework_version=_sglang_version(),
+        torch_version=torch.__version__,
+        cuda_version=torch.version.cuda or "",
+        gpu_arch=_common_artifacts.gpu_arch(ctx.device_id),
+        compile_config_digest=envs.MX_ARTIFACT_COMPILE_CONFIG_DIGEST,
+    )
+    _set_extra_if_present(
+        identity,
+        "tvm_ffi_version",
+        _common_artifacts.tvm_ffi_version(),
+    )
     return identity
 
 
@@ -325,26 +361,28 @@ def _set_extra_if_present(
         identity.extra_parameters[key] = value
 
 
-def _sglang_artifact_ready_fn(source_roots: tuple[ArtifactCacheRoot, ...]):
-    return _common_artifacts.artifact_ready_fn(source_roots, _sglang_health_ready)
-
-
-def _sglang_health_ready() -> bool:
-    return _common_artifacts.artifact_health_ready(_sglang_health_url())
-
-
-def _sglang_health_url() -> str:
-    configured = envs.MX_ARTIFACT_READY_URL.strip()
-    fallback = (
-        _common_artifacts.statefulset_head_health_url(port=30000)
-        or _DEFAULT_READY_URL
+def _sglang_artifact_ready_fn(
+    source_roots: tuple[ArtifactCacheRoot, ...],
+    ctx: LoadContext | None = None,
+):
+    return _common_artifacts.artifact_ready_fn(
+        source_roots,
+        lambda: _sglang_health_ready(ctx),
     )
-    if not configured or configured == _DEFAULT_READY_URL:
-        return fallback
-    if _common_artifacts.is_http_url(configured):
-        return configured
-    logger.warning("Invalid MX_ARTIFACT_READY_URL=%r; using %s", configured, fallback)
-    return fallback
+
+
+
+
+def _sglang_health_ready(ctx: LoadContext | None = None) -> bool:
+    return _common_artifacts.artifact_health_ready(_sglang_health_url(ctx))
+
+
+def _sglang_health_url(ctx: LoadContext | None = None) -> str:
+    return _common_artifacts.resolve_health_url(
+        envs.MX_ARTIFACT_READY_URL,
+        _DEFAULT_READY_URL,
+        getattr(ctx, "head_addr", None),
+    )
 
 
 def _sglang_version() -> str:

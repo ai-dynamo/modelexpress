@@ -150,7 +150,7 @@ JIT cache artifacts before SGLang initializes the model. The source publishes
 cache artifacts after the SGLang `/health` endpoint is ready and the cache
 directories have stopped changing briefly. Supported cache roots are
 `TORCHINDUCTOR_CACHE_DIR` (or PyTorch Inductor's runtime `cache_dir()`),
-`TRITON_CACHE_DIR`, `SGLANG_DG_CACHE_DIR`, `TILELANG_CACHE_DIR`,
+`TRITON_CACHE_DIR`, `TVM_FFI_CACHE_DIR`, `SGLANG_DG_CACHE_DIR`, `TILELANG_CACHE_DIR`,
 `CUTE_DSL_CACHE_DIR`, and `FLASHINFER_WORKSPACE_BASE`. This path requires
 `MX_P2P_METADATA=1` and a central-coordinator metadata backend (`redis` or
 `kubernetes`) for artifact discovery. Cache publication uses the same health

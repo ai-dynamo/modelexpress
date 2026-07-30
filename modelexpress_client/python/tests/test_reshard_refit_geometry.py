@@ -5,8 +5,8 @@
 
 A tiny model with column-parallel, row-parallel, fused (qkv-style), unsharded,
 and one UNSUPPORTED-op weight_loader. Exercises: contiguous/strided/fused-offset
-op-chain capture, full copies, and the per-source graceful fallback (an
-unsupported op knocks out only that source, not the whole bake). Runs in any
+op-chain capture, full copies, and per-source unsupported attribution (an
+unsupported op is identified without producing an incorrect copy). Runs in any
 torch env: pytest tests/test_reshard_refit_geometry.py
 """
 
@@ -58,7 +58,7 @@ class ToyModel(torch.nn.Module):
         param.data.narrow(0, off, size).copy_(loaded)
 
     def _bad_loader(self, param, loaded):
-        # Arithmetic is not a pure view/slice op -> UnsupportedReshard -> fallback.
+        # Arithmetic is not a pure view/slice op -> UnsupportedReshard.
         param.data.copy_(loaded * 2)
 
     def load_weights(self, weights):
@@ -197,4 +197,4 @@ if __name__ == "__main__":
     test_unsupported_op_falls_back_per_source()
     test_capture_feeds_slice_plan()
     test_default_loader_param_needs_default_weight_loader()
-    print("OK: geometry capture + per-source fallback + slice-plan compose")
+    print("OK: geometry capture + unsupported attribution + slice-plan compose")

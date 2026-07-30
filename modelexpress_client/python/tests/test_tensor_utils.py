@@ -329,6 +329,16 @@ class TestCollectModuleTensors:
         # Only one should be collected (same data_ptr)
         assert len(tensors) == 1
 
+    def test_preserves_distinct_empty_parameters(self, mock_accelerator_backend_cls):
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+        model = nn.Module()
+        model.register_parameter("a", nn.Parameter(torch.empty(0)))
+        model.register_parameter("b", nn.Parameter(torch.empty(0)))
+
+        tensors = collect_module_tensors(model, backend)
+
+        assert set(tensors) == {"a", "b"}
+
     def test_non_contiguous_registered_as_storage(self, mock_accelerator_backend_cls):
         backend = mock_accelerator_backend_cls(torch_device_type="cpu")
         model = nn.Module()

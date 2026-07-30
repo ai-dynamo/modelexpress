@@ -319,7 +319,9 @@ class TestAbstractMethodCompleteness:
             assert model_arg is model
             assert ctx_arg is ctx
             if health_gated:
-                assert ctx_arg.source_ready_fn is loader_mod._vllm_health_ready
+                # Bound to ctx so the URL resolves against this worker's
+                # node_rank and head address, so identity is not asserted.
+                assert callable(ctx_arg.source_ready_fn)
             else:
                 assert ctx_arg.source_ready_fn is None
             events.append("load")
@@ -1704,6 +1706,15 @@ class TestCollectModuleTensorsStorageViews:
 
 class TestConfigureVllmLogging:
     """Verify modelexpress loggers inherit vLLM handlers in EngineCore subprocess."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_log_level_env(self, monkeypatch):
+        """Clear MODEL_EXPRESS_LOG_LEVEL so the logging tests stay hermetic."""
+        # configure_vllm_logging() reads the var at call time, so an ambient
+        # value (e.g. exported on a dev box) would take the explicit-level
+        # branch instead of inheriting vLLM's level. Clear it so each test
+        # controls the var explicitly; tests that set it do so in their block.
+        monkeypatch.delenv("MODEL_EXPRESS_LOG_LEVEL", raising=False)
 
     def _reset_mx_logger(self):
         """Clear any handlers/level from the modelexpress root logger."""
