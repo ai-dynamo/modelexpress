@@ -27,6 +27,21 @@ serviceAccount:
     # Required when MX_METADATA_BACKEND=kubernetes.
     enabled: false
 
+# ServiceAccount auth (AuthN via Kubernetes TokenReview + namespace/SA allowlist AuthZ).
+# Disabled by default. When enabled together with serviceAccount.create, the chart also
+# creates a ClusterRoleBinding to system:auth-delegator so the server can POST
+# TokenReviews. If you bring your own ServiceAccount (serviceAccount.create=false), bind
+# it to system:auth-delegator yourself or every request fails closed.
+security:
+  enabled: false
+  # off | enforce. enforce rejects unauthenticated or non-allowlisted callers.
+  mode: enforce
+  # Audiences the caller's projected token must carry. Required for enforce.
+  tokenAudiences: []
+  # Exact-match allowlist of "<namespace>:<serviceaccount>". Required for enforce.
+  allowedServiceAccounts: []
+  # cacheTtlSecs: 60
+
 podAnnotations: {}
 
 podLabels: {}

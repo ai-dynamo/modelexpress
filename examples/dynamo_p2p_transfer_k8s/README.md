@@ -49,7 +49,7 @@ graph LR
 - **Frontend**: Dynamo's HTTP entry point; routes to decode workers round-robin.
 - **Workers**: `--load-format modelexpress` means the first replica loads from disk and publishes metadata and compatible JIT caches; every subsequent replica receives weights and caches from a Ready source. The `mx` load format is kept as a backward-compatible alias.
 
-The worker manifests point `MX_ARTIFACT_READY_URL` at Dynamo's pod-local `9090/health` endpoint so cache publication waits for the `generate` endpoint to become healthy.
+The worker manifests point `MX_ARTIFACT_READY_URL` at Dynamo's pod-local `9090/health` endpoint so weight and cache publication wait for the `generate` endpoint to become healthy.
 
 > **ModelExpress server address.** These examples set `MODEL_EXPRESS_URL`. ModelExpress is standardizing on `MX_SERVER_ADDRESS` as the recommended variable going forward, but Dynamo's ModelExpress integration currently uses `MODEL_EXPRESS_URL`. The `modelexpress` plugin loader used here accepts either, so for Dynamo deployments set `MODEL_EXPRESS_URL` for now.
 
@@ -162,3 +162,24 @@ kubectl logs -n <namespace> <pod> -c main | grep "Adopted .* hidden"
 # vLLM's disagg KV-transfer metrics on the decode side
 kubectl logs -n <namespace> <decode-pod> -c main | grep -E "KV Transfer metrics|prefix cache"
 ```
+
+### FlashInfer cubin permission denied
+
+If workers restart during `EngineCore` init with:
+
+```
+[Errno 13] Permission denied:
+  '/usr/local/lib/python3.12/dist-packages/flashinfer_cubin/cubins/flashinfer'
+```
+
+the container is running as the image's default non-root `dynamo` user.
+FlashInfer resolves its cubin directory to the installed `flashinfer-cubin`
+package under root-owned `site-packages`, and downloads any cubin missing for
+the current GPU architecture back into that directory. FP8 MoE models take this
+path by default, so the worker dies before the engine comes up.
+
+The manifests here set `securityContext.runAsUser: 0` on the worker containers
+to avoid this. To stay non-root instead, point `FLASHINFER_CUBIN_DIR` at a
+writable directory - but note that this bypasses the `flashinfer-cubin` package
+entirely, so every cubin is re-downloaded at startup and the pod needs network
+access to the FlashInfer artifact host.

@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
-from ... import p2p_pb2
+from ... import envs, p2p_pb2
 from ...load_strategy import LoadContext, LoadStrategyChain
 from ...load_strategy.context import LoadResult
 from ...metadata.publisher import PublisherThread
@@ -22,6 +22,7 @@ from ...nixl_transfer import NixlTransferManager
 from ...source_selection import get_configured_selector
 from .adapter import build_sglang_load_context
 from .artifacts import (
+    _sglang_health_ready,
     install_sglang_cache_artifacts,
     schedule_sglang_cache_artifact_publish,
 )
@@ -91,6 +92,8 @@ class MxModelLoader:
             model_config,
             device_config,
         )
+        if envs.MX_ARTIFACT_READY_URL.strip():
+            ctx.source_ready_fn = lambda: _sglang_health_ready(ctx)
         self._ctx = ctx
 
         logger.info(
@@ -165,25 +168,57 @@ class MxModelLoader:
             result = ctx.adapter.load_via_native(result)
             tensors = ctx.adapter.discover_tensors(result)
         else:
-            result = ctx.adapter.before_rdma_receive(result)
-            tensors = ctx.adapter.discover_tensors(result)
-            weight_info = self._register_transfer_engine_tensors(
-                tensors,
-                transfer_engine,
-            )
-            self._receive_via_transfer_engine(
-                tensors,
-                transfer_engine,
-                source_worker,
-                ctx,
-            )
-            result = ctx.adapter.after_rdma_receive(result)
+            registered_tensors = None
+            try:
+                result = ctx.adapter.before_rdma_receive(result)
+                tensors = ctx.adapter.discover_tensors(result)
+                weight_info = self._register_transfer_engine_tensors(
+                    tensors,
+                    transfer_engine,
+                )
+                registered_tensors = tensors
+                self._receive_via_transfer_engine(
+                    tensors,
+                    transfer_engine,
+                    source_worker,
+                    ctx,
+                )
+                result = ctx.adapter.after_rdma_receive(result)
+            except Exception as exc:
+                if registered_tensors is not None:
+                    self._unregister_transfer_engine_tensors(
+                        registered_tensors,
+                        transfer_engine,
+                    )
+                logger.warning(
+                    "[Worker %s] TransferEngine load failed, falling back "
+                    "to native load: %s",
+                    ctx.global_rank,
+                    exc,
+                    exc_info=True,
+                )
+                result = ctx.adapter.reinit_for_retry(result)
+                result = ctx.adapter.load_via_native(result)
+                tensors = ctx.adapter.discover_tensors(result)
+                weight_info = None
 
         if weight_info is None:
-            weight_info = self._register_transfer_engine_tensors(
-                tensors,
-                transfer_engine,
-            )
+            try:
+                weight_info = self._register_transfer_engine_tensors(
+                    tensors,
+                    transfer_engine,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[Worker %s] TransferEngine source registration failed; "
+                    "model load will continue without source publication: %s",
+                    ctx.global_rank,
+                    exc,
+                    exc_info=True,
+                )
+                ctx.tensors = tensors
+                self.remote_instance_transfer_engine_weight_info = {}
+                return result.model.eval()
         ctx.tensors = tensors
         self.remote_instance_transfer_engine_weight_info = weight_info
         publish_ok = self._publish_transfer_engine_source(
@@ -249,6 +284,10 @@ class MxModelLoader:
                 return worker
         return None
 
+    @staticmethod
+    def _byte_size(numel: int, element_size: int) -> int:
+        return numel * element_size
+
     def _receive_via_transfer_engine(
         self,
         tensors: dict[str, torch.Tensor],
@@ -272,12 +311,14 @@ class MxModelLoader:
                     "in source metadata"
                 )
             seed_ptr, seed_size = weight_info
-            local_size = tensor.numel() * tensor.element_size()
+            local_size = self._byte_size(tensor.numel(), tensor.element_size())
             if seed_size != local_size:
                 raise RuntimeError(
                     f"ModelExpress transfer_engine: size mismatch for {name}: "
                     f"source={seed_size} bytes, local={local_size} bytes"
                 )
+            if local_size == 0:
+                continue
             seed_ptr_list.append(seed_ptr)
             client_ptr_list.append(tensor.data_ptr())
             client_len_list.append(local_size)
@@ -306,21 +347,64 @@ class MxModelLoader:
     ) -> dict[str, tuple[int, int, int]]:
         weight_info = {}
         registered_ptrs = set()
-        for name, tensor in tensors.items():
-            addr = tensor.data_ptr()
-            numel = tensor.numel()
-            element_size = tensor.element_size()
-            size = numel * element_size
-            if addr not in registered_ptrs:
-                ret = transfer_engine.register_memory(addr, size)
-                if ret != 0:
-                    raise RuntimeError(
-                        "ModelExpress transfer_engine: register_memory failed "
-                        f"for tensor {name!r}, error={ret}"
-                    )
-                registered_ptrs.add(addr)
-            weight_info[name] = (addr, numel, element_size)
+        try:
+            for name, tensor in tensors.items():
+                addr = tensor.data_ptr()
+                numel = tensor.numel()
+                element_size = tensor.element_size()
+                size = self._byte_size(numel, element_size)
+                weight_info[name] = (addr, numel, element_size)
+                if size == 0:
+                    continue
+                if addr not in registered_ptrs:
+                    ret = transfer_engine.register_memory(addr, size)
+                    if ret != 0:
+                        raise RuntimeError(
+                            "ModelExpress transfer_engine: register_memory failed "
+                            f"for tensor {name!r}, error={ret}"
+                        )
+                    registered_ptrs.add(addr)
+        except Exception:
+            self._unregister_transfer_engine_ptrs(
+                registered_ptrs,
+                transfer_engine,
+            )
+            raise
         return weight_info
+
+    def _unregister_transfer_engine_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        transfer_engine,
+    ) -> None:
+        registered_ptrs = {
+            tensor.data_ptr()
+            for tensor in tensors.values()
+            if self._byte_size(tensor.numel(), tensor.element_size()) > 0
+        }
+        self._unregister_transfer_engine_ptrs(registered_ptrs, transfer_engine)
+
+    def _unregister_transfer_engine_ptrs(
+        self,
+        registered_ptrs: set[int],
+        transfer_engine,
+    ) -> None:
+        for addr in registered_ptrs:
+            try:
+                ret = transfer_engine.unregister_memory(addr)
+                if ret != 0:
+                    logger.warning(
+                        "ModelExpress transfer_engine: unregister_memory failed "
+                        "for address %s, error=%s",
+                        addr,
+                        ret,
+                    )
+            except Exception:
+                logger.exception(
+                    "ModelExpress transfer_engine: unregister_memory raised "
+                    "for address %s",
+                    addr,
+                )
 
     def _publish_transfer_engine_source(
         self,
@@ -334,7 +418,7 @@ class MxModelLoader:
                 p2p_pb2.TensorDescriptor(
                     name=name,
                     addr=addr,
-                    size=numel * element_size,
+                    size=self._byte_size(numel, element_size),
                     device_id=ctx.device_id,
                 )
                 for name, (addr, numel, element_size) in weight_info.items()
@@ -354,63 +438,49 @@ class MxModelLoader:
                 ctx.worker_rank,
             )
             return False
-        try:
+        def publish_fn() -> str:
             mx_source_id = ctx.mx_client.publish_metadata(
                 ctx.identity,
                 worker,
                 ctx.worker_id,
             )
-        except Exception:
-            logger.exception(
-                "[Worker %s] TransferEngine publish_metadata failed "
-                "(worker_id=%s, worker_rank=%s)",
-                ctx.global_rank,
-                ctx.worker_id,
-                ctx.worker_rank,
-            )
-            return False
-        try:
-            ctx.mx_client.update_status(
-                mx_source_id=mx_source_id,
-                worker_id=ctx.worker_id,
-                worker_rank=ctx.worker_rank,
-                status=p2p_pb2.SOURCE_STATUS_READY,
-            )
-        except Exception:
-            logger.exception(
-                "[Worker %s] TransferEngine update_status failed "
-                "(mx_source_id=%s, worker_id=%s, worker_rank=%s)",
+            logger.info(
+                "[Worker %s] Published TransferEngine metadata to MX server "
+                "(mx_source_id=%s, worker_id=%s)",
                 ctx.global_rank,
                 mx_source_id,
                 ctx.worker_id,
-                ctx.worker_rank,
             )
-            return False
+            return mx_source_id
+
         try:
             heartbeat = PublisherThread(
                 mx_client=ctx.mx_client,
-                mx_source_id=mx_source_id,
                 worker_id=ctx.worker_id,
                 worker_rank=ctx.worker_rank,
                 nixl_manager=None,
+                publish_fn=publish_fn,
+                ready_fn=(
+                    (lambda: _sglang_health_ready(ctx))
+                    if envs.MX_ARTIFACT_READY_URL.strip()
+                    else None
+                ),
             )
             heartbeat.start()
             _heartbeat_threads[ctx.worker_rank] = heartbeat
         except Exception:
             logger.exception(
                 "[Worker %s] TransferEngine heartbeat startup failed "
-                "(mx_source_id=%s, worker_id=%s, worker_rank=%s)",
+                "(worker_id=%s, worker_rank=%s)",
                 ctx.global_rank,
-                mx_source_id,
                 ctx.worker_id,
                 ctx.worker_rank,
             )
             return False
         logger.info(
-            "[Worker %s] Published TransferEngine metadata to MX server "
-            "(mx_source_id=%s, worker_id=%s)",
+            "[Worker %s] Scheduled TransferEngine source publication after "
+            "engine readiness (worker_id=%s)",
             ctx.global_rank,
-            mx_source_id,
             ctx.worker_id,
         )
         return True

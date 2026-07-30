@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generic, TypeAlias, TypeVar
 
@@ -62,10 +63,16 @@ class LoadContext:
     mx_client: MxClientBase
     worker_id: str
     node_rank: int = 0
+    # Head address from the engine's own distributed config (for vLLM,
+    # parallel_config.master_addr). Non-head nodes rewrite a pod-local
+    # readiness URL onto this host, since loopback serves nothing there.
+    head_addr: str | None = None
     adapter: EngineAdapter | None = None
     accelerator_backend: AcceleratorBackend = field(default_factory=CudaAcceleratorBackend)
     # False keeps a secondary in-process load (the MTP drafter) out of P2P.
     p2p_enabled: bool = True
+    # Optional engine-level gate checked before weight metadata is advertised.
+    source_ready_fn: Callable[[], bool] | None = None
     nixl_manager: NixlTransferManager | None = None
     tensors: dict[str, torch.Tensor] = field(default_factory=dict)
     # When MX_VMM_ARENA=1, maybe_enter_vmm_arena populates this with the

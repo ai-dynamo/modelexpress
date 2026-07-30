@@ -205,7 +205,12 @@ def _rdma_ctx(instances):
     ctx.global_rank = 0
     ctx.worker_rank = 0
     ctx.worker_id = "target-0"
-    ctx.identity = p2p_pb2.SourceIdentity(model_name="m")
+    # Realistic default identity: unquantized weights with dtype set (every
+    # production vLLM/SGLang/TRT-LLM identity sets dtype). Tests that exercise
+    # the quantization gate override mx_source_type/quantization/dtype below.
+    ctx.identity = p2p_pb2.SourceIdentity(
+        model_name="m", quantization="", dtype="bfloat16"
+    )
     ctx.mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(
         instances=instances
     )
@@ -258,6 +263,164 @@ def test_find_source_instances_empty_accelerator_is_compatible():
     ctx.accelerator_backend.name = "cuda"
     out = RdmaStrategy()._find_source_instances(ctx)
     assert {c.worker_id for c in out} == {"legacy"}
+
+
+def test_find_source_instances_accepts_xpu_source_for_cuda_weights():
+    # Heterogeneous weight transfer: a cuda target may pull xpu weights.
+    instances = [
+        _ref("s0aaaaaaaaaaaaaa", "xpu-src", accelerator="xpu"),
+        _ref("s1aaaaaaaaaaaaaa", "rocm-src", accelerator="rocm"),
+    ]
+    ctx = _rdma_ctx(instances)
+    ctx.identity = p2p_pb2.SourceIdentity(
+        model_name="m",
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
+        quantization="",
+        dtype="bfloat16",
+    )
+    ctx.accelerator_backend.name = "cuda"
+    out = RdmaStrategy()._find_source_instances(ctx)
+    assert {c.worker_id for c in out} == {"xpu-src"}
+
+
+def test_find_source_instances_accepts_cuda_source_for_xpu_weights():
+    # Heterogeneous weight transfer is symmetric: an xpu target pulls cuda.
+    instances = [
+        _ref("s0aaaaaaaaaaaaaa", "cuda-src", accelerator="cuda"),
+        _ref("s1aaaaaaaaaaaaaa", "rocm-src", accelerator="rocm"),
+    ]
+    ctx = _rdma_ctx(instances)
+    ctx.identity = p2p_pb2.SourceIdentity(
+        model_name="m",
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
+        quantization="",
+        dtype="float16",
+    )
+    ctx.accelerator_backend.name = "xpu"
+    out = RdmaStrategy()._find_source_instances(ctx)
+    assert {c.worker_id for c in out} == {"cuda-src"}
+
+
+def test_find_source_instances_rejects_cross_family_quantized_weights():
+    # Quantized weight layouts are hardware/kernel specific and not proven
+    # transferable cross-vendor, so the prefilter drops cross-family sources
+    # when the identity is quantized (here DeepSeek-V3-style fp8 with bf16 dtype).
+    instances = [
+        _ref("s0aaaaaaaaaaaaaa", "xpu-src", accelerator="xpu"),
+    ]
+    ctx = _rdma_ctx(instances)
+    ctx.identity = p2p_pb2.SourceIdentity(
+        model_name="m",
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
+        quantization="fp8",
+        dtype="bfloat16",
+    )
+    ctx.accelerator_backend.name = "cuda"
+    out = RdmaStrategy()._find_source_instances(ctx)
+    assert out == []
+
+
+def test_find_source_instances_defers_empty_accelerator_quantized_to_post_fetch():
+    # An empty (unknown) source accelerator on a quantized identity is NOT
+    # rejected at the prefilter: the lightweight ref may legitimately omit the
+    # accelerator (the k8s-service backend publishes a synthetic ref and only
+    # learns the real accelerator from GetTensorManifest). Dropping it here
+    # would strand a valid same-family quantized source before its accelerator
+    # is known. The authoritative post-fetch check does the strict rejection.
+    instances = [
+        _ref("s0aaaaaaaaaaaaaa", "unknown-src", accelerator=""),
+    ]
+    ctx = _rdma_ctx(instances)
+    ctx.identity = p2p_pb2.SourceIdentity(
+        model_name="m",
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
+        quantization="fp8",
+        dtype="bfloat16",
+    )
+    ctx.accelerator_backend.name = "cuda"
+    out = RdmaStrategy()._find_source_instances(ctx)
+    assert {c.worker_id for c in out} == {"unknown-src"}
+
+
+def test_accelerator_compatible_post_fetch_rejects_cross_family_quantized():
+    # Defense-in-depth re-check on the authoritative WorkerMetadata: a drifted
+    # cross-family quantized source that slipped past the prefilter is still
+    # rejected before target preparation.
+    ctx = MagicMock()
+    ctx.global_rank = 0
+    ctx.identity = p2p_pb2.SourceIdentity(
+        model_name="m",
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
+        quantization="fp8",
+        dtype="bfloat16",
+    )
+    ctx.accelerator_backend.name = "cuda"
+    worker = p2p_pb2.WorkerMetadata(accelerator="xpu")
+    assert not RdmaStrategy()._accelerator_compatible(ctx, worker, "xpu-src")
+
+
+def test_accelerator_compatible_post_fetch_rejects_empty_accelerator_quantized():
+    # Authoritative post-fetch: a still-empty accelerator on a quantized weight
+    # identity fails closed. An unknown family could be a different vendor whose
+    # kernels expect a different fp8 layout, and by this point the real
+    # WorkerMetadata.accelerator would be populated if it were known.
+    ctx = MagicMock()
+    ctx.global_rank = 0
+    ctx.identity = p2p_pb2.SourceIdentity(
+        model_name="m",
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
+        quantization="fp8",
+        dtype="bfloat16",
+    )
+    ctx.accelerator_backend.name = "cuda"
+    worker = p2p_pb2.WorkerMetadata(accelerator="")
+    assert not RdmaStrategy()._accelerator_compatible(ctx, worker, "unknown-src")
+
+
+def test_accelerator_compatible_post_fetch_accepts_same_family_quantized():
+    # The k8s-service path: prefilter deferred the synthetic empty-accel ref,
+    # GetTensorManifest returned the real accelerator (same family), so the
+    # authoritative check allows the quantized same-family transfer.
+    ctx = MagicMock()
+    ctx.global_rank = 0
+    ctx.identity = p2p_pb2.SourceIdentity(
+        model_name="m",
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
+        quantization="fp8",
+        dtype="bfloat16",
+    )
+    ctx.accelerator_backend.name = "cuda"
+    worker = p2p_pb2.WorkerMetadata(accelerator="cuda")
+    assert RdmaStrategy()._accelerator_compatible(ctx, worker, "cuda-src")
+
+
+def test_accelerator_compatible_post_fetch_accepts_cross_family_unquantized():
+    ctx = MagicMock()
+    ctx.global_rank = 0
+    ctx.identity = p2p_pb2.SourceIdentity(
+        model_name="m",
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
+        quantization="",
+        dtype="bfloat16",
+    )
+    ctx.accelerator_backend.name = "cuda"
+    worker = p2p_pb2.WorkerMetadata(accelerator="xpu")
+    assert RdmaStrategy()._accelerator_compatible(ctx, worker, "xpu-src")
+
+
+def test_find_source_instances_rejects_cross_family_for_non_weight_source():
+    # Non-weight source types (e.g. CUDA graph artifacts) stay strict
+    # same-family even for the cuda/xpu pair.
+    instances = [
+        _ref("s0aaaaaaaaaaaaaa", "xpu-src", accelerator="xpu"),
+    ]
+    ctx = _rdma_ctx(instances)
+    ctx.identity = p2p_pb2.SourceIdentity(
+        model_name="m", mx_source_type=p2p_pb2.MX_SOURCE_TYPE_CUDA_GRAPH
+    )
+    ctx.accelerator_backend.name = "cuda"
+    out = RdmaStrategy()._find_source_instances(ctx)
+    assert out == []
 
 
 def test_find_source_instances_unknown_target_accepts_all():

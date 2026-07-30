@@ -11,6 +11,7 @@ import logging
 import os
 import tempfile
 import uuid
+from enum import Enum, auto
 from typing import TYPE_CHECKING, Iterator
 
 import torch
@@ -55,15 +56,31 @@ def _is_speculative_draft(vllm_config, model_config) -> bool:
     return getattr(model_config, "runner_type", None) == "draft"
 
 
+class DraftShardSelection(Enum):
+    """Outcome of picking the draft's own shards out of a checkpoint."""
+
+    SELECTED = auto()
+    NO_DRAFT_WEIGHTS = auto()
+    UNRESOLVED = auto()
+
+
+def _read_local_safetensors_index(directory: str) -> dict | None:
+    """Read model.safetensors.index.json from a local directory."""
+    local_index = os.path.join(directory, _SAFETENSORS_INDEX_NAME)
+    if not os.path.isfile(local_index):
+        return None
+    with open(local_index, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
 def _read_safetensors_index(model_uri: str) -> dict | None:
     """Read model.safetensors.index.json from a local dir or object store.
 
     Returns the parsed index, or None if it cannot be read.
     """
-    local_index = os.path.join(model_uri, _SAFETENSORS_INDEX_NAME)
-    if os.path.isfile(local_index):
-        with open(local_index, encoding="utf-8") as handle:
-            return json.load(handle)
+    index = _read_local_safetensors_index(model_uri)
+    if index is not None:
+        return index
 
     from runai_model_streamer import pull_files
 
@@ -78,20 +95,42 @@ def _read_safetensors_index(model_uri: str) -> dict | None:
     return None
 
 
+def _load_safetensors_index(
+    model_uri: str,
+    hf_weights_files: list[str],
+) -> dict | None:
+    """Read the checkpoint index, preferring the resolved shards' directory.
+
+    _prepare_weights has already resolved model_uri (which may be an HF repo
+    id) to local shard paths, so the index sits next to them. Fall back to
+    model_uri for shards the streamer hands back as remote object-store paths.
+    """
+    seen: set[str] = set()
+    for shard in hf_weights_files:
+        directory = os.path.dirname(shard)
+        if not directory or directory in seen:
+            continue
+        seen.add(directory)
+        index = _read_local_safetensors_index(directory)
+        if index is not None:
+            return index
+    return _read_safetensors_index(model_uri)
+
+
 def _select_draft_weight_files(
     model_uri: str,
     hf_weights_files: list[str],
-) -> list[str] | None:
+) -> tuple[DraftShardSelection, list[str]]:
     """Return the shards holding the draft's own weights.
 
-    Keeps shards whose index tensors carry a draft prefix. Returns None to
-    signal the caller to stream every shard, so a checkpoint without a draft
-    head (or without an index) is never truncated to nothing.
+    Keeps shards whose index tensors carry a draft prefix. Anything other than
+    SELECTED leaves the caller streaming every shard, so a checkpoint without a
+    draft head (or without a readable index) is never truncated to nothing.
     """
     try:
-        index = _read_safetensors_index(model_uri)
+        index = _load_safetensors_index(model_uri, hf_weights_files)
         if not index:
-            return None
+            return DraftShardSelection.UNRESOLVED, []
         weight_map = index.get("weight_map") or {}
         wanted = {
             fname
@@ -99,14 +138,14 @@ def _select_draft_weight_files(
             if tname.startswith(_DRAFT_WEIGHT_PREFIXES)
         }
         if not wanted:
-            return None
+            return DraftShardSelection.NO_DRAFT_WEIGHTS, []
         subset = [f for f in hf_weights_files if os.path.basename(f) in wanted]
-        return subset or None
+        if not subset:
+            return DraftShardSelection.UNRESOLVED, []
+        return DraftShardSelection.SELECTED, subset
     except Exception as exc:
-        logger.warning(
-            "Draft weight-file selection failed (%s); streaming all shards", exc
-        )
-        return None
+        logger.warning("Draft weight-file selection failed: %s", exc)
+        return DraftShardSelection.UNRESOLVED, []
 
 
 class VllmAdapter(EngineAdapter):
@@ -206,11 +245,21 @@ class VllmAdapter(EngineAdapter):
         )
 
         hf_weights_files = loader._prepare_weights(model_uri, revision)
-        subset = _select_draft_weight_files(model_uri, hf_weights_files)
-        if subset is None:
+        selection, subset = _select_draft_weight_files(model_uri, hf_weights_files)
+        if selection is DraftShardSelection.UNRESOLVED:
+            logger.warning(
+                "[draft] could not resolve draft-only shards from %s for %s; "
+                "streaming all %d shards",
+                _SAFETENSORS_INDEX_NAME,
+                model_uri,
+                len(hf_weights_files),
+            )
+            return loader._get_weights_iterator(model_uri, revision)
+        if selection is DraftShardSelection.NO_DRAFT_WEIGHTS:
             logger.info(
-                "[draft] no draft-only shards identified for %s; streaming all "
+                "[draft] %s for %s contains no mtp. tensors; streaming all "
                 "%d shards",
+                _SAFETENSORS_INDEX_NAME,
                 model_uri,
                 len(hf_weights_files),
             )
@@ -227,6 +276,28 @@ class VllmAdapter(EngineAdapter):
             load_config.use_tqdm_on_load,
             loader._is_distributed,
         )
+
+    def build_instanttensor_weight_iter(
+        self,
+        model: torch.nn.Module | None = None,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        if model is None:
+            raise RuntimeError("vLLM InstantTensor loading requires the initialized model")
+
+        from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+
+        # vLLM's DefaultModelLoader selects instanttensor_weights_iterator when
+        # load_format == "instanttensor"; get_all_weights() resolves the model's
+        # own safetensors (and any secondary sources). The iterator handles the
+        # CUDA check and TP process group internally.
+        load_config = copy.copy(self.load_config)
+        try:
+            load_config.load_format = "instanttensor"
+        except AttributeError:
+            object.__setattr__(load_config, "load_format", "instanttensor")
+
+        loader = DefaultModelLoader(load_config)
+        return loader.get_all_weights(self.model_config, model)
 
     def load_via_native(self, result: LoadResult) -> LoadResult:
         if result.model is None:
@@ -415,6 +486,7 @@ def build_vllm_load_context(vllm_config, model_config) -> LoadContext:
         mx_client=create_metadata_client(worker_rank=worker_rank),
         worker_id=uuid.uuid4().hex[:8],
         node_rank=int(getattr(vllm_config.parallel_config, "node_rank", 0)),
+        head_addr=getattr(vllm_config.parallel_config, "master_addr", None),
         adapter=adapter,
         accelerator_backend=adapter.accelerator_backend,
     )

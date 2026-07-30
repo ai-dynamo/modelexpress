@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import logging
+import math
+import os
 import time
 
 from .. import envs
@@ -36,6 +38,53 @@ from .. import p2p_pb2
 logger = logging.getLogger("modelexpress.strategy_rdma")
 
 MAX_SOURCE_RETRIES = 3
+
+# Fallback when MX_TRANSFER_TIMEOUT is unset or unusable. Matches the value this
+# path used when the timeout was hard-coded, so behaviour is unchanged by default.
+DEFAULT_RDMA_TRANSFER_TIMEOUT_S = 300.0
+
+
+def _transfer_timeout_seconds() -> float:
+    """Per-source RDMA receive budget, in seconds.
+
+    Every candidate costs this long when a source is wedged, because a wedged QP
+    produces neither a completion nor an error status - the timeout is the only
+    thing that ends the wait. With MAX_SOURCE_RETRIES candidates the worst case is
+    that multiplied by three before the target falls back to disk, so operators
+    need to be able to size it against their model rather than accept a constant.
+
+    Honours MX_TRANSFER_TIMEOUT only when it is *explicitly set*, and reads
+    os.environ directly to tell that apart from the default. This is deliberate:
+    that variable defaults to 900, so simply adopting ``envs.MX_TRANSFER_TIMEOUT``
+    would triple this path's budget from 300s to 900s and make the stall being
+    fixed three times more expensive for anyone who never configured it.
+
+    A non-positive or unparseable value falls back rather than being honoured. In
+    particular 0 must not become "no timeout": ``receive_from_source`` treats None
+    as wait-forever, which is the failure mode this exists to bound.
+    """
+    raw = os.environ.get("MX_TRANSFER_TIMEOUT")
+    if raw is None:
+        return DEFAULT_RDMA_TRANSFER_TIMEOUT_S
+    try:
+        configured = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "MX_TRANSFER_TIMEOUT=%r is not a number; using %.1fs for the RDMA "
+            "receive budget",
+            raw,
+            DEFAULT_RDMA_TRANSFER_TIMEOUT_S,
+        )
+        return DEFAULT_RDMA_TRANSFER_TIMEOUT_S
+    if not math.isfinite(configured) or configured <= 0:
+        logger.warning(
+            "MX_TRANSFER_TIMEOUT=%r is not finite and positive; using %.1fs for the RDMA "
+            "receive budget rather than waiting indefinitely",
+            raw,
+            DEFAULT_RDMA_TRANSFER_TIMEOUT_S,
+        )
+        return DEFAULT_RDMA_TRANSFER_TIMEOUT_S
+    return configured
 
 
 class RdmaStrategy(LoadStrategy):
@@ -239,7 +288,13 @@ class RdmaStrategy(LoadStrategy):
             target_accelerator = ctx.accelerator_backend.name
             candidates = [
                 inst for inst in rank_matched
-                if accelerators_compatible(target_accelerator, inst.accelerator)
+                if accelerators_compatible(
+                    target_accelerator,
+                    inst.accelerator,
+                    mx_source_type=ctx.identity.mx_source_type,
+                    quantization=ctx.identity.quantization,
+                    dtype=ctx.identity.dtype,
+                )
             ]
 
             selector = get_configured_selector()
@@ -293,7 +348,14 @@ class RdmaStrategy(LoadStrategy):
         """
         target_accelerator = ctx.accelerator_backend.name
         source_accelerator = source_worker.accelerator
-        if accelerators_compatible(target_accelerator, source_accelerator):
+        if accelerators_compatible(
+            target_accelerator,
+            source_accelerator,
+            mx_source_type=ctx.identity.mx_source_type,
+            quantization=ctx.identity.quantization,
+            dtype=ctx.identity.dtype,
+            defer_unknown=False,
+        ):
             return True
 
         logger.info(
@@ -441,13 +503,26 @@ class RdmaStrategy(LoadStrategy):
             f"{' (P2P)' if is_p2p else ''}"
         )
 
+        # Cross-family (heterogeneous) transfers must name the exact same tensor
+        # set on both sides: a name diff can mean vendor-specific hidden/derived
+        # tensors, which would leave part of the target at dummy values while
+        # RDMA reports success. Same-family transfers tolerate subset transfers.
+        target_accelerator = ctx.accelerator_backend.name
+        source_accelerator = source_worker.accelerator
+        require_exact_match = bool(
+            target_accelerator
+            and source_accelerator
+            and target_accelerator != source_accelerator
+        )
+
         transfer_start = time.perf_counter()
         try:
             bytes_transferred, tensor_count, _ = ctx.nixl_manager.receive_from_source(
                 source_metadata=source_worker.nixl_metadata,
                 source_tensors=source_tensors,
-                timeout_seconds=300.0,
+                timeout_seconds=_transfer_timeout_seconds(),
                 remote_agent_name=remote_agent_name_override,
+                require_exact_match=require_exact_match,
             )
         except Exception as e:
             raise SourceTransferError(f"RDMA receive failed: {e}") from e

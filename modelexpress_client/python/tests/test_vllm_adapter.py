@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 
 from modelexpress.engines.vllm.adapter import (
+    DraftShardSelection,
     VllmAdapter,
     _get_vllm_device_id,
     _get_vllm_worker_rank,
@@ -335,13 +336,62 @@ class TestDraftWeightFileSelection:
                 "model-mtp.safetensors",
             )
         ]
-        assert _select_draft_weight_files(str(tmp_path), files) == [
-            os.path.join(str(tmp_path), "model-mtp.safetensors")
+        assert _select_draft_weight_files(str(tmp_path), files) == (
+            DraftShardSelection.SELECTED,
+            [os.path.join(str(tmp_path), "model-mtp.safetensors")],
+        )
+
+    def test_selects_mtp_shard_for_hf_repo_id(self, tmp_path):
+        # model_uri is an HF repo id that only _prepare_weights can resolve;
+        # the index has to be found next to the shards it returned.
+        self._write_index(
+            tmp_path,
+            {
+                "model.embed_tokens.weight": "model-00001-of-00002.safetensors",
+                "lm_head.weight": "model-00002-of-00002.safetensors",
+                "mtp.fc.weight": "model-mtp.safetensors",
+            },
+        )
+        files = [
+            os.path.join(str(tmp_path), name)
+            for name in (
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors",
+                "model-mtp.safetensors",
+            )
         ]
+        assert _select_draft_weight_files("Qwen/Qwen3.5-27B", files) == (
+            DraftShardSelection.SELECTED,
+            [os.path.join(str(tmp_path), "model-mtp.safetensors")],
+        )
 
     def test_falls_back_without_draft_head(self, tmp_path):
         self._write_index(
             tmp_path, {"model.embed_tokens.weight": "model-00001-of-00001.safetensors"}
         )
         files = [os.path.join(str(tmp_path), "model-00001-of-00001.safetensors")]
-        assert _select_draft_weight_files(str(tmp_path), files) is None
+        assert _select_draft_weight_files(str(tmp_path), files) == (
+            DraftShardSelection.NO_DRAFT_WEIGHTS,
+            [],
+        )
+
+    def test_corrupt_index_reports_unresolved(self, tmp_path):
+        (tmp_path / "model.safetensors.index.json").write_text(
+            "{not json", encoding="utf-8"
+        )
+        files = [os.path.join(str(tmp_path), "model-00001-of-00001.safetensors")]
+        assert _select_draft_weight_files("Qwen/Qwen3.5-27B", files) == (
+            DraftShardSelection.UNRESOLVED,
+            [],
+        )
+
+    def test_unreadable_index_reports_unresolved(self, tmp_path):
+        files = [os.path.join(str(tmp_path), "model-00001-of-00001.safetensors")]
+        with patch(
+            "modelexpress.engines.vllm.adapter._read_safetensors_index",
+            return_value=None,
+        ):
+            assert _select_draft_weight_files("Qwen/Qwen3.5-27B", files) == (
+                DraftShardSelection.UNRESOLVED,
+                [],
+            )

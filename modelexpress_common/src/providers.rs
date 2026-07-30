@@ -85,6 +85,7 @@ pub trait ModelProviderTrait: Send + Sync {
 
 pub mod gcs;
 pub mod huggingface;
+pub(crate) mod lock_file;
 pub mod ngc;
 pub mod s3;
 

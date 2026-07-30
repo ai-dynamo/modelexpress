@@ -205,8 +205,13 @@ stateDiagram-v2
 
 - **INITIALIZING**: Worker has published metadata but heartbeat hasn't confirmed NIXL health yet
 - **READY**: Worker is healthy and accepting RDMA connections. Heartbeat refreshes `updated_at` every `MX_HEARTBEAT_INTERVAL_SECS` (default 30s)
-- **STALE**: Worker is no longer available. Set by the client `atexit` handler on clean shutdown (SIGTERM), or by the server-side reaper when `updated_at` exceeds `MX_HEARTBEAT_TIMEOUT_SECS` (default 90s)
+- **STALE**: Worker is no longer available. Set by the client `atexit` handler on clean shutdown, by the client when its NIXL data plane fails, or by the server-side reaper when `updated_at` exceeds `MX_HEARTBEAT_TIMEOUT_SECS` (default 90s). A worker demoted for a failed data plane returns to READY on its next healthy heartbeat, so this transition is not terminal. Note that the `atexit` route covers normal interpreter exit and `SystemExit`, but CPython does not run `atexit` handlers when the default `SIGTERM` disposition terminates the process; a worker killed that way is caught by the reaper instead
 - **Deleted**: Reaper garbage-collects stale entries after `MX_GC_TIMEOUT_SECS` (default 3600s)
+
+vLLM and SGLang weight sources wait for the framework health endpoint before
+calling `PublishMetadata`, so they are not discoverable during warmup or CUDA
+graph capture. After publication, the publisher sends the first READY update
+in the same tick.
 
 ## Backend Implementations
 
@@ -335,7 +340,18 @@ Uses `ModelMetadata` CRDs for P2P source metadata, `ConfigMap`s for tensor descr
 
 **ConfigMap name format**: `mx-source-{source_id}-{worker_id}-tensors-worker-{rank}`
 
-ConfigMaps use `ownerReferences` pointing to the parent CRD so they are garbage-collected automatically.
+When a client publishes a complete Kubernetes Pod identity (`POD_NAME`,
+`POD_UID`, and `POD_NAMESPACE`) and the Pod is in the metadata namespace, the
+`ModelMetadata` CR uses that Pod as an owner. This applies to both weight and
+artifact metadata because both use the same `PublishMetadata` RPC. Deleting the
+Pod therefore garbage-collects its `ModelMetadata` CR. Tensor `ConfigMap`s use a
+second owner reference pointing to the parent CR, so they are collected with it.
+
+Kubernetes owner references cannot cross namespaces. If the identity is
+missing, partial, or names a different namespace, publication still succeeds
+without a Pod owner reference. This preserves behavior for older clients and
+non-Kubernetes environments; the server-side stale metadata reaper remains the
+cleanup path in those cases.
 
 **Model lifecycle CRD name format**: `mx-cache-{sanitized-model-name}-{hash}`
 
@@ -353,6 +369,13 @@ apiVersion: modelexpress.nvidia.com/v1alpha1
 kind: ModelMetadata
 metadata:
   name: mx-source-a1b2c3d4e5f67890-f3a2b1c4
+  ownerReferences:
+    - apiVersion: v1
+      kind: Pod
+      name: mx-vllm-7d9f8f6c8b-k2m4p
+      uid: 8c69d55f-3e40-4b6e-a16b-6f0c1168e171
+      controller: false
+      blockOwnerDeletion: false
   labels:
     modelexpress.nvidia.com/mx-source-id: a1b2c3d4e5f67890
     modelexpress.nvidia.com/mx-worker-id: f3a2b1c4
@@ -385,6 +408,13 @@ apiVersion: modelexpress.nvidia.com/v1alpha1
 kind: ModelMetadata
 metadata:
   name: mx-source-b2c3d4e5f67890a1-f3a2b1c4
+  ownerReferences:
+    - apiVersion: v1
+      kind: Pod
+      name: mx-vllm-7d9f8f6c8b-k2m4p
+      uid: 8c69d55f-3e40-4b6e-a16b-6f0c1168e171
+      controller: false
+      blockOwnerDeletion: false
 spec:
   modelName: artifact-transfer-e2e
   sourceType: deep_gemm_cache
@@ -428,7 +458,7 @@ status:
 
 ## Client Workflow
 
-### Source Path (load from disk, publish metadata)
+### Source Path (load from storage, publish metadata)
 
 ```mermaid
 sequenceDiagram
@@ -436,7 +466,7 @@ sequenceDiagram
     participant MX as MX Server
     participant Backend as Redis / K8s
 
-    W->>W: Load weights from disk (or GDS)
+    W->>W: Load via ModelStreamer, GDS, or native loader
     W->>W: process_weights_after_loading()
     W->>W: Collect all post-processed tensors
     W->>W: Initialize NIXL agent, register tensors
@@ -472,21 +502,23 @@ sequenceDiagram
     end
     W->>W: Add remote NIXL agent, execute RDMA transfers
     alt Transfer fails (SourceTransferError / ManifestMismatchError)
-        W->>W: Abandon RDMA, fall through to next strategy (GDS, disk)
+        W->>W: Reinitialize model if target state may be mutated
+        W->>W: Fall through to ModelStreamer, GDS, or native loader
     end
     W->>W: process_weights_after_loading()
     W->>W: Register and publish own metadata (become a source)
 ```
 
-### Three-Tier Loading Strategy
+### Loading Strategy Chain
 
 The `MxModelLoader` (`--load-format modelexpress`; `mx` alias) auto-detects the best loading strategy:
 
-1. **RDMA** -- If `ListSources` returns READY instances with matching rank, and the per-candidate metadata fetch confirms a compatible accelerator, receive weights via NIXL/Mooncake
-2. **GDS** -- If no source available and GPUDirect Storage is available, load directly from file to GPU
-3. **Disk** -- Standard vLLM `DefaultModelLoader` as final fallback
+1. **RDMA** -- If `ListSources` returns READY instances with matching rank, and the per-candidate metadata fetch confirms a compatible accelerator, receive weights from a serving peer.
+2. **ModelStreamer** -- If `MX_MODEL_URI` is set and `runai_model_streamer` is installed, pipeline safetensor reads from S3, GCS, Azure Blob Storage, or a local path through a bounded CPU staging buffer into the engine.
+3. **GDS** -- If no higher-priority path succeeds and GPUDirect Storage is available, load directly from local storage to GPU.
+4. **Native loader** -- Use the inference engine's host-staged POSIX I/O path as the final fallback.
 
-After loading by any path, the worker registers its tensors and publishes metadata so future workers can discover it as an RDMA source.
+The first applicable strategy runs. A failure before model mutation falls through directly; a failure after weights may have landed reinitializes the model before the next strategy runs. After loading by any path, the worker registers its tensors. Server-backed deployments then publish metadata so future workers can discover the worker as an RDMA source; `k8s-service` serves metadata through its decentralized backend.
 
 ## Transfer Backends
 
@@ -515,6 +547,7 @@ The `backend_type` discriminator is persisted in storage for unambiguous deseria
 | `MX_REAPER_SCAN_INTERVAL_SECS` | `30` | Server reaper scan frequency |
 | `MX_GC_TIMEOUT_SECS` | `3600` | Time before stale entries are deleted |
 | `MX_POOL_REG` | `0` | Register each unique cudaMalloc allocation instead of each tensor (allocation-level NIXL registration) |
+| `MX_TRANSFER_TIMEOUT` | `300` on the RDMA receive path | Per-candidate budget for receiving weights from one source. Applies **per source**, not per load, so a target trying `MAX_SOURCE_RETRIES` candidates can spend this much three times before falling back to disk. Set it against your model size: the default suits a small model but is long for one that transfers in under a second. Note the RDMA path only honours this variable when it is explicitly set, and otherwise uses 300s rather than the 900s default that other transfer paths use. |
 
 ## Debugging
 
@@ -553,4 +586,4 @@ kubectl get configmaps -l modelexpress.nvidia.com/mx-source-id=<source_id> -n <n
 | K8s CRs missing | RBAC issue -- check source logs and service account permissions for both `modelmetadatas` and `modelcacheentries` |
 | Stale P2P metadata after redeploy | Reaper marks stale within 90s. For immediate Redis cleanup: delete `mx:source:*` keys or `FLUSHDB` in a dedicated Redis DB |
 | Stale model lifecycle metadata after redeploy | Inspect `mx:model:*` or `modelcacheentries`; delete the stale lifecycle entry if it no longer matches cache contents |
-| Transfer failure with address errors | Source pod restarted -- GPU addresses are invalid. RDMA is aborted and loading falls through to GDS, then disk; the target does not retry another source once transfer has started |
+| Transfer failure with address errors | Source pod restarted, so its GPU addresses are invalid. ModelExpress clears the failed NIXL state, reinitializes a potentially mutated target, and tries the next ranked source within the retry budget. If no source succeeds, the strategy chain continues through ModelStreamer, GDS, and the native loader. |

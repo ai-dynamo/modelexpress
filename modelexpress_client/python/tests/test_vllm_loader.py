@@ -37,7 +37,12 @@ def _make_loader():
 
 
 def _make_identity(model_name="test-model"):
-    return p2p_pb2.SourceIdentity(model_name=model_name)
+    # Realistic identity: unquantized weights with dtype set, matching every
+    # production vLLM/SGLang/TRT-LLM publish path. The accelerator gate treats
+    # an unset dtype as unknown and fails closed for cross-family weights.
+    return p2p_pb2.SourceIdentity(
+        model_name=model_name, quantization="", dtype="bfloat16"
+    )
 
 
 def _make_worker(rank=0, n_tensors=3):
@@ -288,7 +293,15 @@ class TestAbstractMethodCompleteness:
             loader_mod._nixl_managers.pop(3, None)
             loader_mod._tensor_registry.pop(3, None)
 
-    def test_load_model_installs_and_schedules_vllm_artifacts(self):
+    @pytest.mark.parametrize(
+        ("ready_url", "health_gated"),
+        [("", False), ("http://127.0.0.1:8000/health", True)],
+    )
+    def test_load_model_installs_and_schedules_vllm_artifacts(
+        self, ready_url, health_gated
+    ):
+        from modelexpress.engines.vllm import loader as loader_mod
+
         loader = _make_loader()
         model = MagicMock()
         ctx = _make_load_context(device_id=3)
@@ -305,6 +318,12 @@ class TestAbstractMethodCompleteness:
         def run(model_arg, ctx_arg):
             assert model_arg is model
             assert ctx_arg is ctx
+            if health_gated:
+                # Bound to ctx so the URL resolves against this worker's
+                # node_rank and head address, so identity is not asserted.
+                assert callable(ctx_arg.source_ready_fn)
+            else:
+                assert ctx_arg.source_ready_fn is None
             events.append("load")
             return model_arg
 
@@ -312,7 +331,7 @@ class TestAbstractMethodCompleteness:
             assert ctx_arg is ctx
             events.append("schedule")
 
-        with patch(
+        with patch.dict(os.environ, {"MX_ARTIFACT_READY_URL": ready_url}), patch(
             "modelexpress.engines.vllm.loader.build_vllm_load_context",
             return_value=ctx,
         ), patch(
@@ -358,7 +377,6 @@ class TestAbstractMethodCompleteness:
         registration = importlib.import_module(
             "modelexpress.engines.vllm.registration"
         )
-        patch_check = MagicMock()
         registered = {}
 
         def fake_register_model_loader(load_format):
@@ -368,7 +386,6 @@ class TestAbstractMethodCompleteness:
 
             return register
 
-        monkeypatch.setattr(registration, "_patch_vllm_s3_format_check", patch_check)
         monkeypatch.setattr(
             registration,
             "register_model_loader",
@@ -379,7 +396,6 @@ class TestAbstractMethodCompleteness:
 
         from modelexpress.engines.vllm.loader import MxModelLoader
 
-        patch_check.assert_called_once_with()
         assert model_loader._LOAD_FORMAT_TO_MODEL_LOADER["modelexpress"] is sentinel
         assert registered["mx"] is MxModelLoader
         assert "modelexpress" not in registered
@@ -398,7 +414,6 @@ class TestAbstractMethodCompleteness:
         registration = importlib.import_module(
             "modelexpress.engines.vllm.registration"
         )
-        patch_check = MagicMock()
         registered = {}
 
         def fake_register_model_loader(load_format):
@@ -410,11 +425,6 @@ class TestAbstractMethodCompleteness:
 
         monkeypatch.setattr(
             registration,
-            "_patch_vllm_s3_format_check",
-            patch_check,
-        )
-        monkeypatch.setattr(
-            registration,
             "register_model_loader",
             fake_register_model_loader,
         )
@@ -423,7 +433,6 @@ class TestAbstractMethodCompleteness:
 
         from modelexpress.engines.vllm.loader import MxModelLoader
 
-        patch_check.assert_called_once_with()
         assert registered["modelexpress"] is MxModelLoader
         assert registered["mx"] is MxModelLoader
 
@@ -1270,11 +1279,14 @@ class TestRdmaStrategyLoad:
         self,
         mock_accelerator_backend_cls,
     ):
+        # An unproven cross-family pair (xpu target, rocm source) is skipped
+        # even for weights; only cuda<->xpu is enabled for heterogeneous
+        # weight transfer.
         ctx = _make_load_context(
             accelerator_backend=mock_accelerator_backend_cls(name="xpu"),
         )
         source_resp = _make_metadata_resp(rank=0, worker_id="w-1")
-        source_resp.worker.accelerator = "cuda"
+        source_resp.worker.accelerator = "rocm"
         candidates = [_make_instance_ref(worker_id="w-1")]
         strategy, attempts = self._setup(ctx, candidates, [source_resp])
 
@@ -1363,10 +1375,20 @@ class TestPublishMetadataAndReady:
             tensors[f"layer.{i}.weight"] = t
 
         identity = _make_identity("my-model")
+        ready_fn = MagicMock(return_value=False)
         mock_publisher = MagicMock()
         with patch.dict(os.environ, {"MX_P2P_METADATA": "0"}), \
              patch("modelexpress.metadata.publish.PublisherThread", return_value=mock_publisher) as publisher_cls:
-            publish_metadata_and_ready(mx_client, nixl_manager, tensors, worker_rank=2, device_id=0, identity=identity, worker_id="inst-uuid")
+            publish_metadata_and_ready(
+                mx_client,
+                nixl_manager,
+                tensors,
+                worker_rank=2,
+                device_id=0,
+                identity=identity,
+                worker_id="inst-uuid",
+                ready_fn=ready_fn,
+            )
 
         mx_client.publish_metadata.assert_not_called()
         publisher_cls.assert_called_once()
@@ -1376,6 +1398,7 @@ class TestPublishMetadataAndReady:
         assert publisher_kwargs["worker_rank"] == 2
         assert publisher_kwargs["nixl_manager"] is nixl_manager
         assert callable(publisher_kwargs["publish_fn"])
+        assert publisher_kwargs["ready_fn"] is ready_fn
         mock_publisher.start.assert_called_once()
 
         result = publisher_kwargs["publish_fn"]()
@@ -1683,6 +1706,15 @@ class TestCollectModuleTensorsStorageViews:
 
 class TestConfigureVllmLogging:
     """Verify modelexpress loggers inherit vLLM handlers in EngineCore subprocess."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_log_level_env(self, monkeypatch):
+        """Clear MODEL_EXPRESS_LOG_LEVEL so the logging tests stay hermetic."""
+        # configure_vllm_logging() reads the var at call time, so an ambient
+        # value (e.g. exported on a dev box) would take the explicit-level
+        # branch instead of inheriting vLLM's level. Clear it so each test
+        # controls the var explicitly; tests that set it do so in their block.
+        monkeypatch.delenv("MODEL_EXPRESS_LOG_LEVEL", raising=False)
 
     def _reset_mx_logger(self):
         """Clear any handlers/level from the modelexpress root logger."""

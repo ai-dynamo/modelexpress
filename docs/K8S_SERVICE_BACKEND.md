@@ -9,7 +9,7 @@ A decentralized metadata backend that uses Kubernetes Services for source discov
 
 ## Limitations
 
-The first thing to know: **this backend is for stable-weight inference deployments**. The weights loaded at pod startup don't change for the lifetime of the pod. Reach for the central-coordinator backends (`redis` or `kubernetes`) for anything outside that box.
+The first thing to know: **this backend is for stable-weight inference deployments**. The weights loaded at pod startup don't change for the lifetime of the pod. Workflows that require per-worker addressability need a central-coordinator backend (`redis` or `kubernetes`); receiver-driven RL refit and live fine-tune broadcast are still under development.
 
 What does NOT work on this backend:
 
@@ -27,15 +27,15 @@ Pick based on workload, not operational preference. The choice has structural co
 |--------------------------------------------------------------------------------------------------|-------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Stable-weight inference. Weights fixed at pod startup, no mid-life refit. Simple K8s deployment. | `k8s-service`           | Lowest deployment footprint. No server, no Redis, no CRDs. Matches the homogeneous pool assumption that Service routing requires.                                                                               |
 | MoE inference with static expert placement. Experts pinned to specific ranks at deploy time, no live rebalancing. | `k8s-service`           | Rank-based addressing extends to the `(TP, EP)` coordinate space; declare one Service per coordinate, or one Service with `TP * EP` named ports for the multi-GPU-per-pod shape. See [Expert parallelism: static vs adaptive](#expert-parallelism-static-vs-adaptive). |
-| RL rollouts. Training loop updates weights every step, all inference pods refit in-place.        | `redis` or `kubernetes` | Central store tracks each worker's state individually by `worker_id`. Targets can fetch "worker W as it exists right now" instead of random-sampling a pool. Live refits stay consistent at the per-worker level. |
-| Live fine-tune broadcasts. New checkpoint pushed to all replicas, hot-swapped in place.           | `redis` or `kubernetes` | Same reason as RL. The k8s-service backend can't swap a live pod's source_id without restarting the pod.                                                                                                        |
+| Future RL refit workflows (under development). Training updates weights every step and rollout workers need per-worker sources. | `redis` or `kubernetes` | The central store provides the per-worker addressability required by the planned receiver-driven refit workflow. Selecting this backend does not enable end-to-end live refit today. |
+| Future live fine-tune broadcasts (under development). New checkpoints are pushed to running replicas. | `redis` or `kubernetes` | These workflows require the same per-worker addressability. The `k8s-service` backend cannot swap a live pod's `mx_source_id` without restarting the pod. |
 | Mixed-version fleet. Multiple revisions serving concurrently.                                     | `redis` or `kubernetes` | Central store indexes by `mx_source_id`, multiple identities coexist cleanly. k8s-service requires one Service pool per identity.                                                                               |
 | Heterogeneous hardware. Callers match on topology (H100 vs B200, different TP degrees).          | `redis` or `kubernetes` | Central store carries per-worker metadata including identity fields; k8s-service's pool assumption requires all pods to be interchangeable.                                                                     |
 | Multiple checkpoints in parallel (base + LoRA, fp16 + nvfp4, etc.).                              | Either                  | Different `SourceIdentity` produces different `mx_source_id`. Each identity gets its own Service (k8s-service) or its own source records (central). Both work.                                                   |
 
 ## Why This Backend Exists
 
-The central-coordinator backends (`redis`, `kubernetes`) have been the defaults since MX started shipping. They support the full range of workloads by design - per-worker addressability, live weight updates, heterogeneous fleets. The cost is operational: you deploy and maintain a `modelexpress-server` pod, wire up Redis or K8s CRDs, and treat it as a first-class component of your stack.
+The central-coordinator backends (`redis`, `kubernetes`) have been the defaults since MX started shipping. They provide per-worker addressability and support heterogeneous and mixed-version fleets. They are also the required metadata foundation for receiver-driven live-weight workflows under development. The cost is operational: you deploy and maintain a `modelexpress-server` pod, wire up Redis or K8s CRDs, and treat it as a first-class component of your stack.
 
 A customer ask through the Slack channel (summary: "just expose a Service we can load-balance against, we don't need the rest") motivated a simpler path for the subset of deployments that don't need the rich central-coordinator semantics. The `k8s-service` backend is that path: no central store, no substrate advertisement, routing delegated entirely to kube-proxy, with `mx_source_id` validated at the GetTensorManifest handshake rather than at the metadata-store level.
 
@@ -99,7 +99,7 @@ Rejected for this backend because it undoes the "minimal infrastructure" propert
 
 ### Versus central-coordinator (`redis`, `kubernetes`)
 
-Server-coordinated backends give per-worker addressability. The client-facing RPCs are organized around `(mx_source_id, worker_id)` tuples: `ListSources(identity)` returns each live worker individually; `GetMetadata(mx_source_id, worker_id)` fetches that specific worker's current state. This lets a target pull from "worker W as it exists right now" - which is what RL rollouts, live fine-tune broadcasts, and mixed-version deployments rely on.
+Server-coordinated backends give per-worker addressability. The client-facing RPCs are organized around `(mx_source_id, worker_id)` tuples: `ListSources(identity)` returns each live worker individually; `GetMetadata(mx_source_id, worker_id)` fetches that specific worker's current state. This lets a target pull from "worker W as it exists right now," which mixed-version deployments use today and planned RL refit and live fine-tune workflows will require.
 
 The `k8s-service` backend gives pool-level addressability only. There is no way through the gRPC call to say "I want worker W specifically, not whichever of the N ready pods kube-proxy happened to pick." That's a deliberate simplification - it's what lets the backend work with zero infrastructure beyond the Service itself - but it has hard consequences enumerated in the [Limitations](#limitations) section.
 

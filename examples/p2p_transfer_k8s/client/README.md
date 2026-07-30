@@ -8,6 +8,7 @@ Inference engine instances with ModelExpress P2P weight transfer support.
 |--------|------------|
 | **vLLM** | [`vllm/Dockerfile`](vllm/Dockerfile) |
 | **SGLang** | [`sglang/Dockerfile`](sglang/Dockerfile) |
+| **TensorRT-LLM** | Qualified image with the native MX checkpoint loader; see [`trtllm/README.md`](trtllm/README.md) |
 
 For ModelStreamer-only examples that load from Azure Blob Storage, S3, or a local PVC without an MX server, see [`../../model_streamer_k8s/`](../../model_streamer_k8s/).
 
@@ -31,6 +32,16 @@ The SGLang manifests use the same `remote_instance` command for the first and
 later replicas. `modelexpress-config` selects `nixl` or `transfer_engine`; the
 ModelExpress server endpoint is provided through `MX_SERVER_ADDRESS`.
 
+## TensorRT-LLM Deployments
+
+| Topology | Manifest | Model | Configuration |
+|----------|----------|-------|---------------|
+| **Single-node per replica** | [`trtllm/trtllm-single-node-p2p.yaml`](trtllm/trtllm-single-node-p2p.yaml) | Llama family | TP=4, NIXL P2P weights |
+
+The TensorRT-LLM example uses its native `checkpoint_format="MX"` interface.
+See [`trtllm/README.md`](trtllm/README.md) for the supported scope and image
+requirements.
+
 ## How It Works
 
 On startup, the engine-specific ModelExpress loader auto-detects the best loading strategy:
@@ -40,6 +51,16 @@ On startup, the engine-specific ModelExpress loader auto-detects the best loadin
 3. **Disk** -- Standard engine-native weight loading as final fallback
 
 After loading, every worker publishes its metadata so future instances can discover it as an RDMA source.
+
+When the server uses the Kubernetes metadata backend, the example manifests
+also inject `POD_NAME`, `POD_UID`, and `POD_NAMESPACE` through the Downward API.
+ModelExpress uses a complete same-namespace identity to make the Pod the owner
+of each `ModelMetadata` CR it publishes, including artifact metadata. This
+ownership behavior is independent of the inference engine.
+Deleting the Pod then removes its metadata through Kubernetes garbage
+collection. If any identity field is unavailable, publication continues without
+an owner reference so older clients and non-Kubernetes deployments remain
+compatible.
 
 ## Prerequisites
 

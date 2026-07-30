@@ -16,8 +16,10 @@ description: |
        to that replica count and wait for that many workers to reach Ready.
        Waves serialise scaling so intermediate-size failures are visible
        (wave 1 of 3 failed vs wave 3 of 3 failed).
-    6. Run pytest against ci/k8s/client/test_fleet_scale.py.
-    7. Delete the namespace on exit (pass or fail).
+    6. Optionally roll the Deployment and wait for old generations to become
+       Stale when rolling_update=true.
+    7. Run the selected pytest script.
+    8. Delete the namespace on exit (pass or fail).
 
   Differences from run-mx-dynamo-test:
     - No Dynamo operator or DGD — raw Deployment scaled via kubectl scale.
@@ -37,7 +39,7 @@ inputs:
     description: 'Fully-qualified MX server image (ci/k8s/server/Dockerfile.server)'
     required: true
   worker_image:
-    description: 'Fully-qualified worker image (ci/k8s/client/vllm/Dockerfile)'
+    description: 'Fully-qualified worker image matching the selected manifest'
     required: true
   model:
     description: 'HuggingFace model id'
@@ -52,6 +54,14 @@ inputs:
   ngc_api_key:
     description: 'NGC API key — used to create the worker-registry imagePullSecret'
     required: true
+  manifest:
+    description: 'Worker Deployment manifest'
+    required: false
+    default: 'ci/k8s/client/vllm/manifest-azure-fleet.yaml'
+  test_script:
+    description: 'Pytest script to run after scaling or rolling completes'
+    required: false
+    default: 'ci/k8s/client/test_fleet_scale.py'
   fleet_size:
     description: 'Total number of worker replicas at the end of all waves'
     required: false
@@ -71,6 +81,14 @@ inputs:
     description: 'Seconds to wait per wave for the expected number of ModelMetadata CRs'
     required: false
     default: '900'
+  rolling_update:
+    description: 'Whether to roll every worker after scale-up'
+    required: false
+    default: 'false'
+  rollout_timeout_seconds:
+    description: 'Seconds to wait for the rolling update and metadata transitions'
+    required: false
+    default: '600'
 
 runs:
   using: "composite"
@@ -142,9 +160,10 @@ runs:
         WORKER_IMAGE: ${{ inputs.worker_image }}
         MX_CI_MODEL: ${{ inputs.model }}
         NAMESPACE: ${{ inputs.namespace }}
+        MANIFEST: ${{ inputs.manifest }}
       run: |
         echo "::group::Deploy fleet workers Deployment at replicas=1"
-        envsubst < ci/k8s/client/vllm/manifest-azure-fleet.yaml | \
+        envsubst < "${MANIFEST}" | \
           kubectl apply -n ${NAMESPACE} -f -
         echo "::endgroup::"
 
@@ -247,6 +266,124 @@ runs:
         fi
         echo "All ${FLEET_SIZE} workers are Ready."
 
+    - name: Roll fleet workers
+      if: inputs.rolling_update == 'true'
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+        FLEET_SIZE: ${{ inputs.fleet_size }}
+        TIMEOUT: ${{ inputs.rollout_timeout_seconds }}
+      run: |
+        [[ "${TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || {
+          echo "ERROR: rollout_timeout_seconds must be a positive integer, got '${TIMEOUT}'"
+          exit 1
+        }
+        INITIAL_PODS=$(kubectl get pods -n "${NAMESPACE}" \
+          -l app=mx-fleet-worker \
+          -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | sort)
+        INITIAL_COUNT=$(echo "${INITIAL_PODS}" | grep -c . || true)
+        if [ "${INITIAL_COUNT}" -ne "${FLEET_SIZE}" ]; then
+          echo "ERROR: expected ${FLEET_SIZE} initial pods, got ${INITIAL_COUNT}"
+          echo "${INITIAL_PODS}"
+          exit 1
+        fi
+        PRE_ROLL_READY_CRS=$(kubectl get modelmetadata -n "${NAMESPACE}" \
+          -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.spec.sourceType}{"|"}{.status.worker.status}{"\n"}{end}' 2>/dev/null \
+          | awk -F '|' '($2 == "weights" || $2 == "") && $3 == "Ready" { print $1 }' \
+          | sort)
+        PRE_ROLL_READY_COUNT=$(echo "${PRE_ROLL_READY_CRS}" | grep -c . || true)
+        if [ "${PRE_ROLL_READY_COUNT}" -ne "${FLEET_SIZE}" ]; then
+          echo "ERROR: expected ${FLEET_SIZE} Ready weight CRs before rollout, got ${PRE_ROLL_READY_COUNT}"
+          echo "${PRE_ROLL_READY_CRS}"
+          exit 1
+        fi
+        {
+          echo 'PRE_ROLL_READY_CRS<<__MX_PRE_ROLL_READY_CRS__'
+          echo "${PRE_ROLL_READY_CRS}"
+          echo '__MX_PRE_ROLL_READY_CRS__'
+        } >> "${GITHUB_ENV}"
+
+        echo "::group::Roll ${FLEET_SIZE} fleet workers"
+        ROLLOUT_ID="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-$(date +%s)"
+        kubectl patch deployment/mx-fleet-workers -n "${NAMESPACE}" --type merge \
+          -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"ci.modelexpress.nvidia.com/rollout-id\":\"${ROLLOUT_ID}\"}}}}}"
+        kubectl rollout status deployment/mx-fleet-workers -n "${NAMESPACE}" \
+          --timeout="${TIMEOUT}s"
+        echo "::endgroup::"
+
+        echo "::group::Wait for original pod objects to terminate"
+        deadline=$((SECONDS + TIMEOUT))
+        while [ $SECONDS -lt $deadline ]; do
+          CURRENT_PODS=$(kubectl get pods -n "${NAMESPACE}" \
+            -l app=mx-fleet-worker \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | sort)
+          CURRENT_COUNT=$(echo "${CURRENT_PODS}" | grep -c . || true)
+          ORIGINAL_REMAINING=0
+          while IFS= read -r POD; do
+            if [ -n "${POD}" ] && grep -qx "${POD}" <<< "${INITIAL_PODS}"; then
+              ORIGINAL_REMAINING=$((ORIGINAL_REMAINING + 1))
+            fi
+          done <<< "${CURRENT_PODS}"
+          if [ "${CURRENT_COUNT}" -eq "${FLEET_SIZE}" ] && [ "${ORIGINAL_REMAINING}" -eq 0 ]; then
+            echo "All original pods terminated; ${CURRENT_COUNT} replacements remain."
+            break
+          fi
+          echo "Have ${CURRENT_COUNT}/${FLEET_SIZE} pods and ${ORIGINAL_REMAINING} original pod(s), retrying in 5s..."
+          sleep 5
+        done
+        if [ "${CURRENT_COUNT}" -ne "${FLEET_SIZE}" ] || [ "${ORIGINAL_REMAINING}" -ne 0 ]; then
+          echo "ERROR: rollout left ${CURRENT_COUNT} pods and ${ORIGINAL_REMAINING} original pod(s)"
+          echo "${CURRENT_PODS}"
+          exit 1
+        fi
+        echo "::endgroup::"
+
+        ready_generation_count() {
+          kubectl get modelmetadata -n "${NAMESPACE}" \
+            -o jsonpath='{range .items[*]}{.spec.sourceType}{"|"}{.status.worker.status}{"\n"}{end}' 2>/dev/null \
+            | awk -F '|' '($1 == "weights" || $1 == "") && $2 == "Ready" { count++ } END { print count + 0 }'
+        }
+        captured_stale_count() {
+          STALE_COUNT=0
+          while IFS= read -r CR; do
+            [ -n "${CR}" ] || continue
+            STATUS=$(kubectl get modelmetadata "${CR}" -n "${NAMESPACE}" \
+              -o jsonpath='{.status.worker.status}' 2>/dev/null || true)
+            if [ "${STATUS}" = "Stale" ]; then
+              STALE_COUNT=$((STALE_COUNT + 1))
+            fi
+          done <<< "${PRE_ROLL_READY_CRS}"
+          echo "${STALE_COUNT}"
+        }
+        print_captured_generation_states() {
+          while IFS= read -r CR; do
+            [ -n "${CR}" ] || continue
+            STATUS=$(kubectl get modelmetadata "${CR}" -n "${NAMESPACE}" \
+              -o jsonpath='{.status.worker.status}' 2>/dev/null || true)
+            echo "${CR} ${STATUS:-Missing}"
+          done <<< "${PRE_ROLL_READY_CRS}"
+        }
+        echo "::group::Wait for replacement and terminated generation states"
+        deadline=$((SECONDS + TIMEOUT))
+        while [ $SECONDS -lt $deadline ]; do
+          READY=$(ready_generation_count)
+          CAPTURED_STALE=$(captured_stale_count)
+          if [ "${READY}" -eq "${FLEET_SIZE}" ] && [ "${CAPTURED_STALE}" -eq "${FLEET_SIZE}" ]; then
+            echo "Generation state complete: ${READY} replacements Ready, ${CAPTURED_STALE} captured originals Stale."
+            break
+          fi
+          echo "Have ${READY}/${FLEET_SIZE} replacements Ready and ${CAPTURED_STALE}/${FLEET_SIZE} captured originals Stale, retrying in 10s..."
+          sleep 10
+        done
+        READY=$(ready_generation_count)
+        CAPTURED_STALE=$(captured_stale_count)
+        if [ "${READY}" -ne "${FLEET_SIZE}" ] || [ "${CAPTURED_STALE}" -ne "${FLEET_SIZE}" ]; then
+          echo "ERROR: rolling update left ${READY} replacements Ready and ${CAPTURED_STALE} captured originals Stale"
+          print_captured_generation_states
+          exit 1
+        fi
+        echo "::endgroup::"
+
     - name: Set up Python
       uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
       with:
@@ -262,8 +399,9 @@ runs:
         NAMESPACE: ${{ inputs.namespace }}
         MX_CI_MODEL: ${{ inputs.model }}
         FLEET_SIZE: ${{ inputs.fleet_size }}
+        TEST_SCRIPT: ${{ inputs.test_script }}
       run: |
-        pytest ci/k8s/client/test_fleet_scale.py -v \
+        pytest "${TEST_SCRIPT}" -v \
           --namespace "${NAMESPACE}" \
           --model "${MX_CI_MODEL}" \
           --expected-cr-count "${FLEET_SIZE}"
