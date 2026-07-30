@@ -3,23 +3,14 @@
 
 """A reader must release the source as part of the load, not at process exit.
 
-Regression cover for nvbug 6519532, which reproduced 4/4 on 0.5.0-rc.3 *after*
-the peer-disconnect machinery had already shipped. The machinery was reachable
-only from an ``atexit`` hook, and the NIXL agent lives in vLLM's EngineCore
-subprocess, which dies without running interpreter exit handlers - the retest
-captured ``EngineDeadError`` and zero occurrences of the shutdown log line. So
-the disconnect existed and never ran, the source kept a half-open QP, and every
-later reader stalled for the full transfer budget and fell back to disk.
+Regression cover for nvbug 6519532, which reproduced on 0.5.0-rc.3 *after* the
+peer-disconnect machinery had shipped: it was reachable only from an ``atexit``
+hook, and the NIXL agent lives in a process that dies without running one. The
+disconnect existed and never ran, leaving the source with a half-open QP that
+stalled every later reader.
 
-Releasing on the load path is what makes the cleanup reachable: it happens while
-the process is still healthy, so it does not depend on how the pod is torn down.
-It also covers SIGKILL and OOM, which no signal handler could.
-
-Only the reader can do this. In P2P the reader drives the metadata exchange, so
-only the reader loads a remote agent; the source has no peer record to
-invalidate and cannot detect a graceful departure.
-
-Run: pytest tests/test_rdma_peer_release.py
+These drive ``_receive_from_peer`` rather than calling teardown directly, so
+that reachability is asserted rather than assumed.
 """
 
 from __future__ import annotations
