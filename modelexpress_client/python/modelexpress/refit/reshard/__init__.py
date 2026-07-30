@@ -64,6 +64,7 @@ from modelexpress.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
     gather_sources,
+    gather_sources_with_steps,
     wrap_rendezvous_blob,
 )
 
@@ -95,6 +96,7 @@ __all__ = [
     "build_hf_aliases",
     "execute_transfer",
     "gather_sources",
+    "gather_sources_with_steps",
     "intersect",
     "lower_megatron_target",
     "op_chain_to_box",

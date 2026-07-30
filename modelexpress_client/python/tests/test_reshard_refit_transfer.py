@@ -423,3 +423,121 @@ def test_an_explicit_argument_beats_the_environment(monkeypatch):
     )
     assert plan.full_pulls == []
     assert all(t.data_ptr() for t in srcs.values())
+
+
+def _single_shard_sources(srcs):
+    """Each full source published as one contiguous whole-tensor shard."""
+    sources = {}
+    for name, tensor in srcs.items():
+        sources[name] = SourceInfo(
+            global_shape=tuple(tensor.shape),
+            dtype=torch.float32,
+            elsize=EL,
+            shards=[
+                Shard(
+                    shard_offset=(0,) * tensor.dim(),
+                    shape=tuple(tensor.shape),
+                    session=name,
+                    addr=tensor.data_ptr(),
+                    elsize=EL,
+                )
+            ],
+        )
+    return sources
+
+
+def test_plan_records_which_sources_feed_each_destination():
+    """The plan is the only place this mapping exists whole: by the time planning
+    ends, ``segments`` is a flat list of byte runs and the copy that produced each
+    one is gone. Without it the receiver cannot pair a destination digest with the
+    publisher claims behind it, which is the only way to audit one run on its own."""
+    srcs = _full_sources()
+    with torch.device("meta"):
+        meta_model = ToyModel()
+    capture = capture_geometry(meta_model, _manifest())
+
+    plan = plan_transfer(capture, _single_shard_sources(srcs))
+
+    assert plan.dest_sources, "no destination -> source mapping was recorded"
+    # Every param the plan will write is named, and every source it names is real.
+    for param, names in plan.dest_sources.items():
+        assert names == sorted(names), f"{param} sources are not in stable order"
+        for name in names:
+            assert name in srcs
+    assert all(t.data_ptr() for t in srcs.values())
+
+
+def test_plan_records_the_mapping_for_forced_full_pulls_too():
+    """The reference arm routes everything through the full-pull path. If the
+    mapping were only built for exact segments, that arm would emit no source
+    digests and its audit would silently degrade to no evidence."""
+    srcs = _full_sources()
+    with torch.device("meta"):
+        meta_model = ToyModel()
+    capture = capture_geometry(meta_model, _manifest())
+    sources = _single_shard_sources(srcs)
+
+    exact = plan_transfer(capture, sources, force_full_pull=False)
+    forced = plan_transfer(capture, sources, force_full_pull=True)
+
+    assert forced.dest_sources == exact.dest_sources
+    assert all(t.data_ptr() for t in srcs.values())
+
+
+def test_plan_omits_fallback_sources_from_the_mapping():
+    """Fallbacks are not refit, so they have no publisher claim to pair against and
+    must not appear as covered."""
+    srcs = _full_sources()
+    with torch.device("meta"):
+        meta_model = ToyModel()
+    capture = capture_geometry(meta_model, _manifest())
+
+    sources = _single_shard_sources(srcs)
+    dropped = sorted(sources)[0]
+    del sources[dropped]
+
+    plan = plan_transfer(capture, sources)
+
+    assert dropped in plan.fallback
+    for names in plan.dest_sources.values():
+        assert dropped not in names
+    assert all(t.data_ptr() for t in srcs.values())
+
+
+def test_exact_replay_implies_force_full_pull(monkeypatch):
+    """The replay gate reads the exact plan back out of the staging buffer, so an
+    unstaged source cannot be replayed. Two independent switches would let a run
+    look healthy while reporting `checked: 0`."""
+    monkeypatch.delenv("MX_RESHARD_FORCE_FULL_PULL", raising=False)
+    monkeypatch.setenv("MX_RESHARD_EXACT_REPLAY", "1")
+    srcs = _full_sources()
+    with torch.device("meta"):
+        meta_model = ToyModel()
+    capture = capture_geometry(meta_model, _manifest())
+
+    plan = plan_transfer(capture, _single_shard_sources(srcs), max_segments_per_copy=LOOSE)
+
+    assert plan.forced_full_pull is True
+    assert plan.full_pulls, "nothing was staged, so nothing could be replayed"
+    assert all(t.data_ptr() for t in srcs.values())
+
+
+def test_exact_replay_does_not_override_an_explicit_argument(monkeypatch):
+    """A caller asking for the exact plan outright still gets it; only the
+    environment-derived default is widened."""
+    monkeypatch.setenv("MX_RESHARD_EXACT_REPLAY", "1")
+    srcs = _full_sources()
+    with torch.device("meta"):
+        meta_model = ToyModel()
+    capture = capture_geometry(meta_model, _manifest())
+
+    plan = plan_transfer(
+        capture,
+        _single_shard_sources(srcs),
+        force_full_pull=False,
+        max_segments_per_copy=LOOSE,
+    )
+
+    assert plan.forced_full_pull is False
+    assert plan.full_pulls == []
+    assert all(t.data_ptr() for t in srcs.values())

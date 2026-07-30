@@ -130,6 +130,52 @@ def publish_megatron_reshard_view(
     )
 
 
+# One rendezvous per publishing identity, for the life of the process.
+#
+# This function is called once per refit, and it used to build a fresh
+# MxReshardRendezvous each time. Each rendezvous starts its own heartbeat thread -
+# the idempotence guard in _start_rendezvous_heartbeat is per object - so after k
+# refits, k threads were re-publishing k different snapshots under the *same*
+# (identity, worker_id) key on a timer. Last writer wins, so the shard table the
+# server held reverted to an arbitrary earlier step every heartbeat period.
+#
+# That is the defect fd8a8d0 set out to fix. It removed the closure that pinned one
+# thread to the first blob, but building a new object per publish restores the same
+# behaviour by another route, and the regression test for it cannot see the problem
+# because it publishes twice through one object, which production never does.
+#
+# The cost was real: on 2026-07-30 every mismatch verify_full_pulls reported turned
+# out to have a `want` bit-for-bit equal to the initial checkpoint digest, and
+# VERIFY_STRICT aborted two runs on bytes that were correct.
+#
+# Keyed on the publishing identity rather than on the client, so a reconnected
+# client reuses the same rendezvous instead of stranding its heartbeat.
+_RENDEZVOUS: dict[tuple, MxReshardRendezvous] = {}
+
+
+def _rendezvous_for(
+    client: Any, *, worker_rank: int, model_name: str, worker_id: str
+) -> MxReshardRendezvous:
+    key = ("trainer", int(worker_rank), model_name, worker_id)
+    existing = _RENDEZVOUS.get(key)
+    if existing is not None:
+        if existing.client is client:
+            return existing
+        # A new client for the same identity: the old rendezvous can no longer
+        # publish, and leaving its heartbeat running would keep re-asserting a blob
+        # nothing can refresh.
+        existing.stop_heartbeat()
+    fresh = MxReshardRendezvous(
+        client,
+        role="trainer",
+        rank=int(worker_rank),
+        model_name=model_name,
+        worker_id=worker_id,
+    )
+    _RENDEZVOUS[key] = fresh
+    return fresh
+
+
 def publish_registered_shard_table(
     *,
     manager: Any,
@@ -139,8 +185,14 @@ def publish_registered_shard_table(
     worker_id: str,
     published: list[PublishedTensor],
     metadata_endpoint: str,
+    publisher_step: int | None = None,
 ) -> str:
-    """Publish a validated alias table over already-registered storage."""
+    """Publish a validated alias table over already-registered storage.
+
+    ``publisher_step`` stamps the table with the step whose weights it describes, so a
+    receiver can tell a current table from one a step behind rather than inferring it.
+    See :func:`wrap_rendezvous_blob`.
+    """
 
     if not metadata_endpoint or ":" not in metadata_endpoint:
         raise ValueError(
@@ -165,11 +217,11 @@ def publish_registered_shard_table(
         agent_name,
         metadata_endpoint,
         published,
+        publisher_step=publisher_step,
     )
-    rendezvous = MxReshardRendezvous(
+    rendezvous = _rendezvous_for(
         client,
-        role="trainer",
-        rank=int(worker_rank),
+        worker_rank=int(worker_rank),
         model_name=model_name,
         worker_id=worker_id,
     )

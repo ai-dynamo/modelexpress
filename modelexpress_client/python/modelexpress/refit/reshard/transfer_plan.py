@@ -90,6 +90,18 @@ class TransferPlan:
     unbounded_sources: list = field(default_factory=list)
     exact_descriptor_count: int = 0
     exact_bytes: int = 0
+    # Destination param name -> the source names that feed it, for every source this
+    # plan will actually fetch (fallbacks excluded, since they are not refit).
+    #
+    # The plan is the only place this mapping exists in one piece. ``segments`` is a
+    # flat list of byte runs by the time planning ends, so the copy that produced each
+    # one - and with it the param it lands in - is no longer recoverable downstream.
+    # Recording it here lets the receiver pair each destination digest with the
+    # publisher digests of the shards behind it, which is what separates "this tensor
+    # changed because training moved it" from "this tensor changed because we installed
+    # the wrong bytes". Without that pairing a destination digest is only comparable
+    # against another run, and two runs stop being comparable after one training step.
+    dest_sources: dict = field(default_factory=dict)
     # Which arm of the destination-digest comparison this plan is. Recorded on the
     # plan rather than re-read from the environment at emit time so a record cannot
     # claim to be one arm while having been planned as the other - the whole
@@ -227,6 +239,9 @@ def plan_transfer(
     fallback_seen: set = set()
     exact_by_source: dict[str, list[tuple[RecordedCopy, list]]] = {}
     full_pull_names: set[str] = set()
+    # Sets while building, since several copies of one param can share a source;
+    # normalized to sorted lists on the plan so the emitted record is stable.
+    dest_sources: dict[str, set[str]] = {}
     if max_segments_per_copy is None:
         max_segments_per_copy = int(
             os.environ.get("MX_RESHARD_MAX_SEGMENTS_PER_COPY", "64")
@@ -234,8 +249,20 @@ def plan_transfer(
     if max_segments_per_copy < 1:
         raise ValueError("max_segments_per_copy must be at least 1")
     if force_full_pull is None:
+        # MX_RESHARD_EXACT_REPLAY implies this, and the implication is not a
+        # convenience. The replay gate reconstructs what the exact segment plan
+        # would have written by reading it back out of the full-pull staging
+        # buffer, so a source that was not staged cannot be replayed at all. Left
+        # to two independent switches, the failure mode is a run that looks
+        # healthy, emits records, and reports `checked: 0` - coverage silently
+        # near zero rather than an error. We have already lost a run to gate
+        # variables being set where nothing read them; a gate that states its own
+        # precondition is worth more than one that trusts the operator to.
+        #
+        # An explicit argument still wins over both, which the planner tests pin.
         force_full_pull = (
             os.environ.get("MX_RESHARD_FORCE_FULL_PULL", "0") == "1"
+            or os.environ.get("MX_RESHARD_EXACT_REPLAY", "0") == "1"
         )
     plan.forced_full_pull = bool(force_full_pull)
 
@@ -283,6 +310,7 @@ def plan_transfer(
                     copy.param_name, tuple(copy.dest_shape), src.dtype, segments
                 )
             )
+            dest_sources.setdefault(copy.param_name, set()).add(copy.src_name)
             continue
 
         try:
@@ -295,6 +323,7 @@ def plan_transfer(
         plan.exact_descriptor_count += len(segments)
         plan.exact_bytes += sum(segment.nbytes for segment in segments)
         exact_by_source.setdefault(copy.src_name, []).append((copy, segments))
+        dest_sources.setdefault(copy.param_name, set()).add(copy.src_name)
         if force_full_pull or len(segments) > max_segments_per_copy:
             full_pull_names.add(copy.src_name)
 
@@ -326,6 +355,9 @@ def plan_transfer(
             )
         )
 
+    plan.dest_sources = {
+        param: sorted(names) for param, names in sorted(dest_sources.items())
+    }
     return plan
 
 

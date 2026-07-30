@@ -38,7 +38,10 @@ from modelexpress.refit.reshard.dest_digest_report import (
     RECORD_MARKER as _DEST_DIGEST_MARKER,
 )
 from modelexpress.refit.reshard.dest_digest_report import dest_digest_record
-from modelexpress.refit.reshard.rendezvous import gather_sources
+from modelexpress.refit.reshard.rendezvous import (
+    gather_sources,
+    gather_sources_with_steps,
+)
 from modelexpress.refit.reshard.transfer_plan import (
     exact_descriptors,
     execute_transfer,
@@ -53,11 +56,15 @@ from modelexpress.refit.reshard.transport import (
 from modelexpress.refit.reshard.types import CaptureResult, UnsupportedReshard
 from modelexpress.refit.reshard.verify import (
     DEST_DIGEST,
+    EXACT_REPLAY,
     FILL_SENTINEL,
     VERIFY,
     VERIFY_STRICT,
+    compare_exact_replay,
     digest_destination,
+    exact_replay_digests,
     fill_sentinel,
+    source_expectation_digests,
     verify_full_pulls,
 )
 
@@ -349,9 +356,13 @@ class ReshardReceiver:
         raise NotImplementedError
 
     # ------------------------------------------------------------------ prepare
-    def _prepare(self, timeout: float) -> None:
+    def _prepare(self, timeout: float, step: int | None = None) -> None:
         """One-time: discover trainer shards, connect their agents, capture load
-        geometry, build the pull plan, and allocate + register buffers."""
+        geometry, build the pull plan, and allocate + register buffers.
+
+        ``step`` only labels the publisher step stamps recorded here, so that the later
+        fresh discovery in the same refit compares against the previous refit rather
+        than against this one."""
         # _prepare runs once per receiver process and dominates the cold refit, so
         # every phase is timed and folded into the first stage record. Spans are
         # sequential and non-overlapping, so they may be summed.
@@ -366,7 +377,13 @@ class ReshardReceiver:
         # replicas instead of every receiver hitting the same publisher.
         replica_offset = self._global_rank if _SPREAD_SOURCES else 0
         _t = time.perf_counter()
-        sources, session_to_agent, session_to_device, agent_endpoints = gather_sources(
+        (
+            sources,
+            session_to_agent,
+            session_to_device,
+            agent_endpoints,
+            session_to_step,
+        ) = gather_sources_with_steps(
             self._mx_client,
             expected_trainers=self._num_trainer_sources,
             model_name=self._model_name,
@@ -375,6 +392,10 @@ class ReshardReceiver:
             timeout=timeout,
             replica_offset=replica_offset,
         )
+        # Baseline for the staleness delta. Without one recorded here, the first
+        # re-discovery has nothing to compare against - and that is step 2, the exact
+        # step where the receiver was seen to read the previous step's table.
+        self._note_publisher_steps(session_to_step, step=step)
         # Includes waiting for trainers to publish, so this is partly the
         # trainer's readiness rather than a receiver-side cost.
         self._prepare_stages["prepare_discover_s"] = time.perf_counter() - _t
@@ -691,14 +712,14 @@ class ReshardReceiver:
             logger.warning("[reshard] plan-sweep %s", json.dumps(row, sort_keys=True))
 
     # ----------------------------------------------------------- update_weights
-    def _fresh_sources(self, timeout: float) -> dict:
+    def _fresh_sources(self, timeout: float, step: int | None = None) -> dict:
         """Re-run discovery and return the current shard table.
 
         Uses the same ``replica_offset`` as ``_prepare`` so the fresh table pins the
         same replicas the plan did wherever the offers have not changed; otherwise a
         rotation would look like a difference.
         """
-        return gather_sources(
+        fresh = gather_sources_with_steps(
             self._mx_client,
             expected_trainers=self._num_trainer_sources,
             model_name=self._model_name,
@@ -706,7 +727,53 @@ class ReshardReceiver:
             rank=self._global_rank,
             timeout=timeout,
             replica_offset=self._global_rank if _SPREAD_SOURCES else 0,
-        )[0]
+        )
+        self._note_publisher_steps(fresh[4], step=step)
+        return fresh[0]
+
+    def _note_publisher_steps(self, session_to_step: dict, step: int | None = None):
+        """Record which publishers advanced their step stamp since the *previous refit*.
+
+        Kept as a delta rather than compared against the receiver's own step counter on
+        purpose: the publisher's ``version`` and the receiver's refit ``step`` are
+        separate counters, and assuming they agree would silently invert this check if
+        they were ever offset. "Did this publisher's table move since the last refit?" is
+        the question the staleness verdict actually needs, and it needs no such
+        assumption - only that a publisher publishes once per refit.
+
+        Keyed by refit rather than by call, because a refit discovers more than once: at
+        prepare and again for the fresh table. Both see the same publication, so a
+        per-call delta finds every stamp unchanged and pronounces every publisher stale.
+        Measured on hardware in ``gate-stepstamp-v14``, which flagged all 16 publishers
+        at step 1 - the step whose comparison is cleanest, since the weights are still
+        the freshly loaded checkpoint and no trajectory has diverged. A real mismatch
+        there would have been excused. Recording per step makes repeated discoveries
+        within one refit idempotent.
+
+        A publisher that does not stamp contributes ``None``, which is recorded as
+        unknown and never treated as stale - an absent stamp is not evidence.
+        """
+        history = getattr(self, "_publisher_steps_by_step", None)
+        if history is None:
+            history = self._publisher_steps_by_step = {}
+        current = {
+            session: int(stamp)
+            for session, stamp in session_to_step.items()
+            if stamp is not None
+        }
+        key = -1 if step is None else int(step)
+        previous = history.get(key - 1, {})
+        stale = {
+            session
+            for session, stamp in current.items()
+            if session in previous and stamp <= previous[session]
+        }
+        history[key] = current
+        # Retained for ``stamps_seen``: whether any publisher stamps at all is a
+        # different question from whether any is behind.
+        self._publisher_steps = current
+        # No previous refit means nothing can be shown to have lagged.
+        self._stale_sessions = frozenset(stale) if previous else frozenset()
 
     @torch.no_grad()
     def _recheck_sources(self, step: int, timeout: float) -> dict:
@@ -733,7 +800,7 @@ class ReshardReceiver:
         second discovery.
         """
         _t = time.perf_counter()
-        fresh = self._fresh_sources(timeout)
+        fresh = self._fresh_sources(timeout, step=step)
         # Keyed by (session, box), never by position. Discovery order is not
         # stable, and merge_shard_tables keeps the first offer of each geometry,
         # so two discoveries legitimately pin the same box to different - but
@@ -801,8 +868,13 @@ class ReshardReceiver:
         # launches would be attributed to whichever stage happens to sync next.
         stages: dict[str, float] = {}
 
+        # Whether this call is the one that captured self._sources, which is the only
+        # step on which that table describes current weights. Keyed on the plan rather
+        # than on step == 1, because _prepare() runs on the first refit this receiver
+        # serves and the caller's step numbering is not ours to assume.
+        prepared_this_step = self._plan is None
         if self._plan is None:
-            self._prepare(timeout)
+            self._prepare(timeout, step=step)
             # One-time setup, so it lands only in the cold step's record. Without
             # this the cold step attributes ~2% of its own duration.
             stages.update(self._prepare_stages)
@@ -816,8 +888,15 @@ class ReshardReceiver:
         fresh_sources = None
         if _ADDR_RECHECK:
             fresh_sources = self._recheck_sources(step, timeout)
-        elif VERIFY and _VERIFY_FRESH_DIGESTS and step > 1:
-            fresh_sources = self._fresh_sources(timeout)
+        elif (VERIFY or DEST_DIGEST) and _VERIFY_FRESH_DIGESTS and step > 1:
+            # DEST_DIGEST needs this for the same reason VERIFY does. Its source
+            # fingerprint is only interpretable against current publisher claims; a
+            # table frozen at _prepare() never changes, so every weight training
+            # legitimately moved would read as the destination moving on its own -
+            # the strongest finding the audit has, generated wholesale and wrongly.
+            # Both gates are diagnostic and off by default, so the discovery cost is
+            # acceptable here in a way it would not be on a timing run.
+            fresh_sources = self._fresh_sources(timeout, step=step)
 
         # RDMA the sliced bf16 into the receive buffers (segments) and per-param
         # staging (dtype-convert / router). No live param is written by RDMA.
@@ -941,6 +1020,9 @@ class ReshardReceiver:
                 full_staging=self._full_staging,
                 sources=self._sources,
                 fresh_sources=fresh_sources,
+                step=step,
+                stale_sessions=getattr(self, "_stale_sessions", None),
+                stamps_seen=bool(getattr(self, "_publisher_steps", None)),
             )
             stages["verify_s"] = time.perf_counter() - _t
 
@@ -948,10 +1030,51 @@ class ReshardReceiver:
         # destination rather than the full-pull sources: every fetch path has landed
         # in the receive buffers by now, so this is the only point where the
         # exact-segment path is observable at all.
+        # The in-process differential. Placed with the other pre-install gates and
+        # for the same reason: it reads the assembled destination, and installing
+        # first would leave a difference ambiguous between transfer and install.
+        #
+        # Unlike the two-arm destination-digest comparison, this needs no second run
+        # and makes no assumption that weights held still, because both
+        # implementations consume the bytes this one refit received.
+        replay_report = None
+        if EXACT_REPLAY and self._plan.full_pulls:
+            _t = time.perf_counter()
+            replayed, replay_stats = exact_replay_digests(
+                plan=self._plan,
+                sources=self._sources,
+                full_staging=self._full_staging,
+                recv_buffers=self._recv_buffers,
+            )
+            replay_report = {
+                **compare_exact_replay(
+                    replayed=replayed,
+                    received=digest_destination(self._recv_buffers),
+                ),
+                **replay_stats,
+            }
+            stages["exact_replay_s"] = time.perf_counter() - _t
+
         dest_digests = None
+        source_digests = None
+        source_digest_stats = None
         if DEST_DIGEST:
             _t = time.perf_counter()
             dest_digests = digest_destination(self._recv_buffers)
+            # Paired with the destination digests in the same record and at the same
+            # instant. Taken from the freshly discovered table when there is one, so
+            # the claims describe the weights as of this step rather than as of
+            # _prepare() - the frozen-expectation mistake Bug 9 was.
+            source_digests, source_digest_stats = source_expectation_digests(
+                dest_sources=self._plan.dest_sources,
+                sources=self._sources,
+                fresh_sources=fresh_sources,
+                # self._sources is frozen at _prepare(), so it only describes the
+                # current weights on the step that prepared it.
+                expectation_is_current=(
+                    prepared_this_step or fresh_sources is not None
+                ),
+            )
             stages["dest_digest_s"] = time.perf_counter() - _t
 
         _t = time.perf_counter()
@@ -978,24 +1101,110 @@ class ReshardReceiver:
                         # be checking; see dest_digest_record.
                         unbounded_sources=self._plan.unbounded_sources,
                         fallback_sources=self._plan.fallback,
+                        source_digests=source_digests,
+                        source_digest_stats=source_digest_stats,
                     )
                 ),
             )
+
+        if replay_report is not None:
+            logger.warning(
+                "MX_REFIT_EXACT_REPLAY %s",
+                json.dumps(
+                    {
+                        "schema": "refit-exact-replay-v1",
+                        # Without the rank, 16 receivers' records for one step are
+                        # indistinguishable from one receiver retrying that step,
+                        # and any reader that de-duplicates retries - which it must,
+                        # since a retried refit re-emits the record - would keep one
+                        # and discard fifteen. Coverage then reads at a sixteenth of
+                        # the truth, and a rank that replayed nothing disappears
+                        # behind a rank that did.
+                        "rank": self._global_rank,
+                        "step": step,
+                        **replay_report,
+                    }
+                ),
+            )
+            if replay_report["mismatches"]:
+                raise RuntimeError(
+                    f"[reshard] exact-segment replay FAILED at step {step}: "
+                    f"{replay_report['mismatches']} of {replay_report['checked']} "
+                    f"destination param(s) differ between the exact segment plan and "
+                    f"the staged re-slice, over identical received bytes. Both paths "
+                    f"read the same staging buffer here, so this is a segment "
+                    f"offset/stride defect in plan_pull, not a transfer fault. "
+                    f"First: {replay_report['detail'][:3]}"
+                )
+            if not replay_report["checked"]:
+                message = (
+                    f"[reshard] MX_RESHARD_EXACT_REPLAY is on but 0 destination "
+                    f"params were comparable at step {step}, so the exact path is "
+                    f"UNCHECKED. Zero mismatches here means no evidence, not a pass. "
+                    f"The gate already forces full pulls, so staging is not the "
+                    f"explanation: look instead for every source having taken the "
+                    f"fallback path, or a plan with no exact segments to replay. "
+                    f"stats={ {k: v for k, v in replay_report.items() if k != 'detail'} }"
+                )
+                if VERIFY_STRICT:
+                    raise RuntimeError(message)
+                logger.warning("%s", message)
 
         if verify_report is not None:
             # WARNING so a benchmark harness captures it alongside the stage record.
             logger.warning(
                 "MX_REFIT_VERIFY %s",
-                json.dumps({"schema": "refit-verify-v1", "step": step, **verify_report}),
+                json.dumps(
+                    {
+                        "schema": "refit-verify-v2",
+                        # Same reason the replay record carries one. Without it the
+                        # records from N receiver ranks are indistinguishable, so a
+                        # reader cannot attribute a mismatch to a rank and a reader
+                        # that de-duplicates by step keeps one of N and reports a
+                        # fraction of the coverage as if it were the whole run. That
+                        # is survivable at the two ranks of the small rig and not at
+                        # Topology B's sixteen.
+                        "rank": self._global_rank,
+                        "step": step,
+                        **verify_report,
+                    }
+                ),
             )
-            if verify_report["mismatches"]:
+            # Keyed on the attributable count rather than the raw one. With publisher
+            # step stamps present the two differ: a shard whose publisher is provably a
+            # step behind is excluded, while a mismatch from a current publisher in the
+            # same report still aborts. Falls back to the raw count for a report that
+            # predates the field, so an older receiver's behaviour is unchanged.
+            attributable = verify_report.get("attributable_mismatches")
+            if attributable is None:
+                # A report from a build that predates the field. Reproduce the old
+                # conjunction exactly rather than guessing.
+                attributable = (
+                    verify_report["mismatches"]
+                    if verify_report.get("reference_is_current", True)
+                    else 0
+                )
+            if attributable:
                 raise RuntimeError(
                     f"[reshard] parameter verification FAILED at step {step}: "
-                    f"{verify_report['mismatches']} of {verify_report['checked']} "
+                    f"{attributable} of {verify_report['checked']} "
                     f"checked shard(s) differ from the publisher's digest. The bytes "
                     f"this rank pulled are not the bytes the trainer holds, so the "
                     f"engine would now generate from wrong weights. First: "
                     f"{verify_report['detail'][:3]}"
+                )
+            if verify_report["mismatches"]:
+                # Aborting here would be aborting on a reference we can prove is
+                # older than the bytes. That is what killed two runs on 2026-07-30,
+                # where every `want` turned out to be bit-for-bit the initial
+                # checkpoint digest while `got` tracked training. Loud, and not
+                # fatal: the shards are unverified, which is worth knowing and is
+                # not the same as wrong.
+                logger.warning(
+                    "[reshard] parameter verification is UNATTRIBUTABLE at step "
+                    "%s: %s",
+                    step,
+                    verify_report.get("unattributable_reason", ""),
                 )
             if not verify_report["checked"]:
                 message = (

@@ -296,13 +296,29 @@ def _assert_offers_are_replicas(name: str, geometry: tuple, offers: list) -> Non
 
 
 def wrap_rendezvous_blob(
-    agent_metadata: bytes, agent_name: str, metadata_endpoint: str, tensors: list
+    agent_metadata: bytes,
+    agent_name: str,
+    metadata_endpoint: str,
+    tensors: list,
+    publisher_step: int | None = None,
 ) -> bytes:
     """Pack ``{agent_meta, agent_name, metadata_endpoint, shard_table}`` into one
     JSON blob. ``metadata_endpoint`` (``host:listen_port`` of the trainer's NIXL
     listen thread) is what the receiver's ``fetch_remote_and_wait`` connects to
     for the P2P memory-registration handshake (the central agent-metadata blob
-    alone does not make the registrations resolvable for RDMA reads)."""
+    alone does not make the registrations resolvable for RDMA reads).
+
+    ``publisher_step`` stamps the table with the training step whose weights it
+    describes. A receiver otherwise has no way to tell a current table from one
+    published a step ago, and it needs to: the shard table carries the per-shard
+    digests a receiver verifies against, so a table one step behind makes correctly
+    delivered bytes read as corruption. Inferring freshness instead - "did any digest
+    change since prepare?" - works only when a table is wholly stale or wholly
+    current, and breaks under *partial* propagation across many publishers, where it
+    reports one lagging publisher's shard as a hard defect. The stamp turns that
+    inference into an observation. Omitted rather than null when absent, so an older
+    receiver reading a newer blob is unaffected.
+    """
     payload = {
         "schema": _SCHEMA,
         "agent_name": agent_name,
@@ -310,12 +326,28 @@ def wrap_rendezvous_blob(
         "agent_meta_b64": base64.b64encode(agent_metadata).decode("ascii"),
         "tensors": json.loads(encode_shard_table(tensors).decode("utf-8"))["tensors"],
     }
+    if publisher_step is not None:
+        payload["publisher_step"] = int(publisher_step)
     return json.dumps(payload).encode("utf-8")
 
 
 def unwrap_rendezvous_blob(blob: bytes) -> tuple:
     """Inverse of ``wrap_rendezvous_blob``; returns ``(agent_metadata, agent_name,
-    metadata_endpoint, tensors)``."""
+    metadata_endpoint, tensors)``.
+
+    Arity is preserved for callers that predate the step stamp; use
+    :func:`unwrap_rendezvous_blob_with_step` to read it.
+    """
+    return unwrap_rendezvous_blob_with_step(blob)[:4]
+
+
+def unwrap_rendezvous_blob_with_step(blob: bytes) -> tuple:
+    """As :func:`unwrap_rendezvous_blob`, plus the publisher's step stamp.
+
+    Returns ``(agent_metadata, agent_name, metadata_endpoint, tensors,
+    publisher_step)``, where ``publisher_step`` is ``None`` for a publisher that
+    predates the stamp - which must be read as "unknown", never as step 0.
+    """
     payload = json.loads(blob.decode("utf-8"))
     if payload.get("schema") != _SCHEMA:
         raise ValueError(f"unexpected rendezvous blob schema {payload.get('schema')!r}")
@@ -325,7 +357,9 @@ def unwrap_rendezvous_blob(blob: bytes) -> tuple:
     tensors = decode_shard_table(
         json.dumps({"schema": _SCHEMA, "tensors": payload["tensors"]}).encode("utf-8")
     )
-    return agent_metadata, agent_name, metadata_endpoint, tensors
+    raw_step = payload.get("publisher_step")
+    publisher_step = None if raw_step is None else int(raw_step)
+    return agent_metadata, agent_name, metadata_endpoint, tensors, publisher_step
 
 
 class MxReshardRendezvous:
@@ -442,6 +476,26 @@ class MxReshardRendezvous:
         self._hb_thread = thread
         thread.start()
 
+    def stop_heartbeat(self, timeout: float = 0.0) -> None:
+        """Stop this rendezvous' heartbeat thread, if it has one.
+
+        Needed because the idempotence guard above is *per object*, and a caller
+        that builds a new rendezvous per publish therefore accumulates threads -
+        each one re-asserting the blob it was created with. That reopens exactly the
+        defect ``_hb_worker`` was introduced to close: the server's table reverts to
+        an older snapshot on a timer, and a receiver then checks correctly delivered
+        bytes against a step-0 digest. Whoever replaces a rendezvous must retire the
+        one it replaces.
+        """
+        stop = getattr(self, "_hb_stop", None)
+        thread = getattr(self, "_hb_thread", None)
+        if stop is not None:
+            stop.set()
+        if thread is not None and timeout > 0:
+            thread.join(timeout)
+        self._hb_stop = None
+        self._hb_thread = None
+
     def discover_trainers(
         self,
         expected_trainers: int,
@@ -450,7 +504,28 @@ class MxReshardRendezvous:
     ) -> list:
         """Block until ``expected_trainers`` trainer ranks are visible, then
         fetch + unwrap each. Returns ``list[(agent_metadata, agent_name,
-        metadata_endpoint, tensors)]``, one per trainer rank."""
+        metadata_endpoint, tensors)]``, one per trainer rank.
+
+        Arity preserved for existing callers; see
+        :meth:`discover_trainers_with_steps` for the publisher step stamps.
+        """
+        payloads = self.discover_trainers_with_steps(
+            expected_trainers, timeout=timeout, poll_interval=poll_interval
+        )
+        return [p[:4] for p in payloads]
+
+    def discover_trainers_with_steps(
+        self,
+        expected_trainers: int,
+        timeout: float = 1200.0,
+        poll_interval: float = 1.0,
+    ) -> list:
+        """As :meth:`discover_trainers`, with each publisher's step stamp appended.
+
+        Returns ``list[(agent_metadata, agent_name, metadata_endpoint, tensors,
+        publisher_step)]``. ``publisher_step`` is ``None`` for a publisher that does
+        not stamp.
+        """
         trainer_id = self._identity("trainer")
         deadline = time.monotonic() + timeout
         empty = 0
@@ -466,7 +541,9 @@ class MxReshardRendezvous:
                     meta = self.client.get_metadata(inst.mx_source_id, inst.worker_id)
                     if not meta.found:
                         continue
-                    payload = unwrap_rendezvous_blob(meta.worker.nixl_metadata)
+                    payload = unwrap_rendezvous_blob_with_step(
+                        meta.worker.nixl_metadata
+                    )
                     # A rank that advertises no tensors has registered nothing to
                     # read. Counting it toward the quorum lets the receiver stop
                     # waiting for the ranks that matter and then stall in the P2P
@@ -491,7 +568,8 @@ class MxReshardRendezvous:
             f" ({empty} skipped as empty)" if empty else "",
             ", ".join(
                 f"{name}@{endpoint}[{len(tensors)}]"
-                for (_meta, name, endpoint, tensors) in payloads
+                + ("" if pstep is None else f"@step{pstep}")
+                for (_meta, name, endpoint, tensors, pstep) in payloads
             ),
         )
         return payloads
@@ -515,11 +593,54 @@ def gather_sources(
 
     Returns ``(sources, session_to_agent, session_to_device, agent_endpoints)``
     where ``agent_endpoints`` is ``{agent_name: metadata_endpoint}`` for the
-    caller to ``fetch_remote_and_wait`` (P2P) before pulling."""
+    caller to ``fetch_remote_and_wait`` (P2P) before pulling.
+
+    Arity preserved for external callers; :func:`gather_sources_with_steps` adds the
+    per-publisher step stamps."""
+    return gather_sources_with_steps(
+        client,
+        expected_trainers,
+        model_name,
+        role=role,
+        rank=rank,
+        timeout=timeout,
+        replica_offset=replica_offset,
+    )[:4]
+
+
+def gather_sources_with_steps(
+    client: MxClient,
+    expected_trainers: int,
+    model_name: str,
+    role: str = "inference",
+    rank: int = 0,
+    timeout: float = 1200.0,
+    replica_offset: int = 0,
+) -> tuple:
+    """As :func:`gather_sources`, plus ``session_to_step``.
+
+    ``session_to_step`` maps each session to the training step its publisher stamped
+    on the table, or ``None`` where the publisher does not stamp. Per session rather
+    than one value for the discovery because publishers propagate independently: under
+    partial propagation some sessions are current and others a step behind, and a
+    single flag cannot express that without either excusing a real defect or
+    condemning a healthy shard.
+    """
     rdv = MxReshardRendezvous(client, role=role, rank=rank, model_name=model_name)
-    payloads = rdv.discover_trainers(expected_trainers, timeout=timeout)
-    tables = [tensors for (_meta, _name, _ep, tensors) in payloads]
-    agent_endpoints = {name: ep for (_meta, name, ep, _tensors) in payloads}
+    payloads = rdv.discover_trainers_with_steps(expected_trainers, timeout=timeout)
+    tables = [tensors for (_meta, _name, _ep, tensors, _st) in payloads]
+    agent_endpoints = {name: ep for (_meta, name, ep, _tensors, _st) in payloads}
+    agent_to_step = {name: st for (_meta, name, _ep, _tensors, st) in payloads}
     merged = merge_shard_tables(tables, replica_offset=replica_offset)
     sources, session_to_agent, session_to_device = build_sources(merged)
-    return sources, session_to_agent, session_to_device, agent_endpoints
+    session_to_step = {
+        session: agent_to_step.get(agent)
+        for session, agent in session_to_agent.items()
+    }
+    return (
+        sources,
+        session_to_agent,
+        session_to_device,
+        agent_endpoints,
+        session_to_step,
+    )

@@ -20,10 +20,15 @@ import pytest
 
 from modelexpress.refit.reshard.dest_digest_report import (
     RECORD_MARKER,
+    SCHEMA,
+    SCHEMA_V1,
+    audit_freshness,
     compare,
     dest_digest_record,
     main,
     parse_records,
+    parse_records_with_skips,
+    parse_verify_records,
 )
 
 
@@ -451,9 +456,11 @@ def test_a_step_dirty_in_only_one_arm_is_still_excluded():
 
 
 def test_verify_records_from_other_steps_do_not_exclude_anything():
+    # Step 1 because the trajectory precondition only admits the first refit on a
+    # record with no source digests; the step number is incidental to this test.
     report = compare(
-        [_record(0, 2, {"a": "same"})],
-        [_record(0, 2, {"a": "same"}, forced=True)],
+        [_record(0, 1, {"a": "same"})],
+        [_record(0, 1, {"a": "same"}, forced=True)],
         subject_verify=[_verify(3, 999)],
         reference_verify=[_verify(3, 999)],
     )
@@ -464,8 +471,8 @@ def test_verify_records_from_other_steps_do_not_exclude_anything():
 def test_fail_without_verify_records_is_marked_unattributable():
     """Omitting verify records must not silently restore the old, wrong reading."""
     report = compare(
-        [_record(0, 3, {"a": "x", "b": "same"})],
-        [_record(0, 3, {"a": "y", "b": "same"}, forced=True)],
+        [_record(0, 1, {"a": "x", "b": "same"})],
+        [_record(0, 1, {"a": "y", "b": "same"}, forced=True)],
     )
     assert report["verdict"] == "FAIL"
     assert report["source_verify_checked"] is False
@@ -474,8 +481,8 @@ def test_fail_without_verify_records_is_marked_unattributable():
 
 def test_pass_without_verify_records_carries_no_warning():
     report = compare(
-        [_record(0, 3, {"a": "same"})],
-        [_record(0, 3, {"a": "same"}, forced=True)],
+        [_record(0, 1, {"a": "same"})],
+        [_record(0, 1, {"a": "same"}, forced=True)],
     )
     assert report["verdict"] == "PASS"
     assert "attribution_warning" not in report
@@ -496,3 +503,338 @@ def test_cli_exit_code_distinguishes_unmeasurable_from_failed(tmp_path, capsys):
     code = main([str(subj), str(ref)])
     assert code == 4
     assert json.loads(capsys.readouterr().out)["verdict"] == "INVALID_NO_CLEAN_STEP"
+
+
+# ------------------------------------------------- source digests, single run
+# The cross-run comparison above is only sound where both arms hold identical
+# source weights, which after one training step they do not: two runs differing in
+# nothing disagreed on 10 of 4,350 param-steps, against 1 for the two runs
+# differing in the path under test. These cover the field that lets one run be
+# checked on its own, and they weight heavily toward the false-positive directions,
+# because an audit that cries staleness over ordinary training is worse than none.
+def _rec2(rank, step, digests, source_digests):
+    return dest_digest_record(
+        step=step,
+        rank=rank,
+        forced_full_pull=False,
+        digests=digests,
+        source_digests=source_digests,
+    )
+
+
+def test_record_carries_source_digests_and_stays_v2():
+    record = _rec2(0, 1, {"w": "d"}, {"w": "s"})
+    assert record["schema"] == SCHEMA
+    assert record["source_digests"] == {"w": "s"}
+
+
+def test_v1_record_without_source_digests_still_parses():
+    """The only pairing we have is v1, and re-reading it is how the noise floor
+    was measured; rejecting it would strand that evidence."""
+    v1 = dict(_record(0, 1, {"w": "d"}), schema=SCHEMA_V1)
+    v1.pop("source_digests", None)
+    assert len(parse_records(_log([v1]))) == 1
+
+
+def test_record_not_last_on_line_is_parsed_not_dropped():
+    """A Ray driver log appends its dedup suffix after the JSON. This used to
+    raise and be swallowed, shrinking coverage with no signal."""
+    text = (
+        "WARNING MX_REFIT_DEST_DIGEST "
+        + json.dumps(_rec2(0, 1, {"w": "d"}, {"w": "s"}))
+        + " [repeated 15x across cluster]"
+    )
+    records, skipped = parse_records_with_skips(text)
+    assert len(records) == 1
+    assert skipped == 0
+
+
+def test_audit_passes_when_destination_tracks_its_sources():
+    """Ordinary training: the weight moves and the publisher claim moves with it."""
+    records = [
+        _rec2(0, 1, {"w": "d1"}, {"w": "s1"}),
+        _rec2(0, 2, {"w": "d2"}, {"w": "s2"}),
+        _rec2(0, 3, {"w": "d3"}, {"w": "s3"}),
+    ]
+    report = audit_freshness(records)
+    assert report["verdict"] == "PASS"
+    assert report["params_audited"] == 1
+
+
+def test_audit_passes_when_nothing_moves():
+    """At lr=3e-7 in bf16 most params never move; that is not a finding."""
+    records = [
+        _rec2(0, step, {"w": "d1"}, {"w": "s1"}) for step in (1, 2, 3, 4, 5)
+    ]
+    assert audit_freshness(records)["verdict"] == "PASS"
+
+
+def test_audit_flags_destination_moving_while_sources_hold_still():
+    """Nothing in the superset of readable shards changed, so the assembled bytes
+    had no business changing."""
+    records = [
+        _rec2(0, 1, {"w": "d1"}, {"w": "s1"}),
+        _rec2(0, 2, {"w": "CHANGED"}, {"w": "s1"}),
+    ]
+    report = audit_freshness(records)
+    assert report["verdict"] == "FAIL"
+    assert report["dest_moved_alone_count"] == 1
+    assert report["dest_moved_alone"][0]["param"] == "w"
+
+
+def test_audit_flags_destination_reverting_to_an_earlier_step():
+    """The staleness signature, and the reason this field was added: the v1 schema
+    could not say whether the trainer's own copy had reverted too."""
+    records = [
+        _rec2(0, 3, {"w": "A"}, {"w": "s3"}),
+        _rec2(0, 4, {"w": "B"}, {"w": "s4"}),
+        _rec2(0, 5, {"w": "A"}, {"w": "s5"}),
+    ]
+    report = audit_freshness(records)
+    assert report["verdict"] == "FAIL"
+    assert report["dest_reverted_count"] == 1
+
+
+def test_audit_accepts_reversion_the_sources_also_made():
+    """A bf16 element on a rounding boundary can flip back. If the publisher claim
+    returns to its earlier value too, the destination doing so is correct."""
+    records = [
+        _rec2(0, 3, {"w": "A"}, {"w": "sA"}),
+        _rec2(0, 4, {"w": "B"}, {"w": "sB"}),
+        _rec2(0, 5, {"w": "A"}, {"w": "sA"}),
+    ]
+    assert audit_freshness(records)["verdict"] == "PASS"
+
+
+def test_audit_does_not_fail_on_the_advisory_finding():
+    """A shard changing where this rank does not read looks exactly like a missed
+    update, and the superset fingerprint cannot separate them."""
+    records = [
+        _rec2(0, 1, {"w": "d1"}, {"w": "s1"}),
+        _rec2(0, 2, {"w": "d1"}, {"w": "s2"}),
+    ]
+    report = audit_freshness(records)
+    assert report["verdict"] == "PASS"
+    assert report["source_moved_dest_static_count"] == 1
+    assert "advisory" in report
+
+
+def test_audit_reports_no_evidence_rather_than_passing_a_v1_run():
+    records = [_record(0, 1, {"w": "d1"}), _record(0, 2, {"w": "d2"})]
+    report = audit_freshness(records)
+    assert report["verdict"] == "NO_EVIDENCE"
+    assert report["params_audited"] == 0
+    assert report["no_evidence"] == 1
+
+
+def test_audit_excludes_params_whose_sources_carried_no_digest():
+    """Publishers predating the digest must degrade to no evidence, not a pass."""
+    records = [
+        _rec2(0, 1, {"a": "d1", "b": "e1"}, {"a": "s1", "b": None}),
+        _rec2(0, 2, {"a": "d2", "b": "e2"}, {"a": "s2", "b": None}),
+    ]
+    report = audit_freshness(records)
+    assert report["verdict"] == "PASS"
+    assert report["params_audited"] == 1
+    assert report["no_evidence"] == 1
+
+
+def test_audit_needs_two_steps_to_say_anything():
+    assert audit_freshness([_rec2(0, 1, {"w": "d"}, {"w": "s"})])[
+        "verdict"
+    ] == "NO_EVIDENCE"
+
+
+def test_audit_keeps_ranks_separate():
+    """Rank 0 holding d1 while rank 1 holds d2 is different shards, not a change."""
+    records = [
+        _rec2(0, 1, {"w": "d1"}, {"w": "s1"}),
+        _rec2(1, 1, {"w": "d2"}, {"w": "s2"}),
+        _rec2(0, 2, {"w": "d1"}, {"w": "s1"}),
+        _rec2(1, 2, {"w": "d2"}, {"w": "s2"}),
+    ]
+    assert audit_freshness(records)["verdict"] == "PASS"
+
+
+# --- the trajectory precondition ------------------------------------------------
+# Two arms only test the planner if they were looking at the same weights. On the
+# 2026-07-30 rig they were not: two runs with identical settings disagreed on 10 of
+# 4 350 parameters, against the 1 mismatch the cross-arm comparison reported. These
+# tests pin the gate refusing that comparison instead of attributing it.
+
+
+def _rec_src(rank, step, digests, sources, *, forced=False):
+    return dest_digest_record(
+        step=step,
+        rank=rank,
+        forced_full_pull=forced,
+        digests=digests,
+        source_digests=sources,
+    )
+
+
+def test_a_late_step_is_comparable_when_the_arms_share_their_sources():
+    report = compare(
+        [_rec_src(0, 5, {"a": "same"}, {"a": "src1"})],
+        [_rec_src(0, 5, {"a": "same"}, {"a": "src1"}, forced=True)],
+    )
+
+    assert report["verdict"] == "PASS"
+    assert report["compared_params"] == 1
+    assert report["excluded_unsafe_pairs"] == []
+
+
+def test_a_late_step_is_refused_when_the_arms_sources_moved_apart():
+    """The noise-floor case: both arms clean, both arms different."""
+    report = compare(
+        [_rec_src(0, 5, {"a": "x"}, {"a": "src1"})],
+        [_rec_src(0, 5, {"a": "y"}, {"a": "src2"}, forced=True)],
+    )
+
+    assert report["verdict"] == "INVALID_NO_TRAJECTORY_SAFE_STEP"
+    assert report["mismatches"] == 0
+    assert "indistinguishable from" in report["reason"]
+
+
+def test_a_moved_source_is_not_reported_as_a_planner_defect():
+    """Without this the differing digest reads as FAIL, which is how the first
+    pairing came within one reading of being filed as a plan_pull bug."""
+    report = compare(
+        [_rec_src(0, 5, {"a": "x"}, {"a": "src1"})],
+        [_rec_src(0, 5, {"a": "y"}, {"a": "src2"}, forced=True)],
+    )
+
+    assert report["verdict"] != "FAIL"
+
+
+def test_first_refit_is_comparable_without_source_digests():
+    """The archived v1 evidence is the only pairing we have, and its step 1 result
+    stands: weights are the checkpoint as loaded in both arms."""
+    report = compare(
+        [_record(0, 1, {"a": "same"})],
+        [_record(0, 1, {"a": "same"}, forced=True)],
+    )
+
+    assert report["verdict"] == "PASS"
+
+
+def test_a_v1_late_step_is_refused():
+    report = compare(
+        [_record(0, 4, {"a": "same"})],
+        [_record(0, 4, {"a": "same"}, forced=True)],
+    )
+
+    assert report["verdict"] == "INVALID_NO_TRAJECTORY_SAFE_STEP"
+    assert "schema v1" in report["excluded_unsafe_pairs"][0]["reason"]
+
+
+def test_a_safe_step_still_reports_a_real_mismatch():
+    """The precondition must not become a way for a defect to escape."""
+    report = compare(
+        [_rec_src(0, 5, {"a": "x", "b": "same"}, {"a": "src1", "b": "src1"})],
+        [
+            _rec_src(
+                0, 5, {"a": "y", "b": "same"}, {"a": "src1", "b": "src1"}, forced=True
+            )
+        ],
+    )
+
+    assert report["verdict"] == "FAIL"
+    assert report["mismatches"] == 1
+
+
+def test_surviving_pairs_are_compared_and_the_dropped_ones_named():
+    report = compare(
+        [
+            _rec_src(0, 5, {"a": "same"}, {"a": "src1"}),
+            _rec_src(1, 5, {"a": "x"}, {"a": "src1"}),
+        ],
+        [
+            _rec_src(0, 5, {"a": "same"}, {"a": "src1"}, forced=True),
+            _rec_src(1, 5, {"a": "y"}, {"a": "src9"}, forced=True),
+        ],
+    )
+
+    assert report["verdict"] == "PASS_PARTIAL"
+    assert report["compared_params"] == 1
+    assert report["excluded_unsafe_pairs"][0]["rank"] == 1
+    assert "verified only for the pairs that survived" in report["reason"]
+
+
+def test_arms_sharing_no_source_parameter_are_refused():
+    report = compare(
+        [_rec_src(0, 5, {"a": "same"}, {"a": "src1"})],
+        [_rec_src(0, 5, {"a": "same"}, {"zz": "src1"}, forced=True)],
+    )
+
+    assert report["verdict"] == "INVALID_NO_TRAJECTORY_SAFE_STEP"
+    assert "share no source parameter" in report["excluded_unsafe_pairs"][0]["reason"]
+
+
+def test_trajectory_refusal_exits_four_not_one(tmp_path, capsys):
+    """Exit 1 would file an unmeasurable pairing as a planner defect."""
+    subj = tmp_path / "s.log"
+    ref = tmp_path / "r.log"
+    subj.write_text(_log([_rec_src(0, 5, {"a": "x"}, {"a": "src1"})]))
+    ref.write_text(_log([_rec_src(0, 5, {"a": "y"}, {"a": "src2"}, forced=True)]))
+
+    assert main([str(subj), str(ref)]) == 4
+    assert json.loads(capsys.readouterr().out)["mismatches"] == 0
+
+
+# --- the verify-record reader must not go blind on a busy fleet -----------------
+
+
+def _verify_line(rec, suffix=""):
+    return "MX_REFIT_VERIFY " + json.dumps(rec) + suffix
+
+
+def _vrec(step=1, rank=0, schema="refit-verify-v2", **kw):
+    rec = {"schema": schema, "step": step, "checked": 10, "mismatches": 0, "detail": []}
+    if rank is not None:
+        rec["rank"] = rank
+    rec.update(kw)
+    return rec
+
+
+def test_verify_reader_accepts_the_v2_record_with_a_rank():
+    got = parse_verify_records(_verify_line(_vrec(rank=7)))
+
+    assert len(got) == 1
+    assert got[0]["rank"] == 7
+
+
+def test_verify_reader_still_accepts_a_v1_record():
+    """A fleet is upgraded one image at a time, so mixed-version logs are normal."""
+    got = parse_verify_records(_verify_line(_vrec(schema="refit-verify-v1", rank=None)))
+
+    assert len(got) == 1
+    assert "rank" not in got[0]
+
+
+def test_verify_reader_keeps_a_record_with_a_ray_dedup_suffix():
+    """The regression. json.loads over the rest of the line raises on the suffix and
+    the record vanishes - on exactly the runs with the most ranks."""
+    line = _verify_line(_vrec(rank=3), suffix=" [repeated 15x across cluster]")
+
+    got = parse_verify_records(line)
+
+    assert len(got) == 1, "a Ray-deduplicated verify record was dropped"
+    assert got[0]["rank"] == 3
+
+
+def test_verify_reader_keeps_records_from_every_rank():
+    text = "\n".join(
+        _verify_line(_vrec(step=2, rank=r), suffix=" [repeated 2x across cluster]")
+        for r in range(16)
+    )
+
+    got = parse_verify_records(text)
+
+    assert len({r["rank"] for r in got}) == 16
+
+
+def test_verify_reader_ignores_a_foreign_schema():
+    got = parse_verify_records(_verify_line(_vrec(schema="refit-verify-v99")))
+
+    assert got == []

@@ -571,11 +571,17 @@ class MxV2TrainingPublisher:
             os.environ.get("MX_MEGATRON_RESHARD496", "0") == "1"
             and any(d.megatron_role is not None for d in self._registry)
         ):
-            self._publish_reshard_view()
+            self._publish_reshard_view(publisher_step=int(version))
         return mx_source_id
 
-    def _publish_reshard_view(self) -> str:
-        """Publish the same registered buffers through #496 rendezvous."""
+    def _publish_reshard_view(self, publisher_step: int | None = None) -> str:
+        """Publish the same registered buffers through #496 rendezvous.
+
+        ``publisher_step`` is the training version this table describes. Without it a
+        receiver cannot distinguish a current table from one published a step earlier,
+        and since the table carries the digests it verifies against, a table one step
+        behind makes correctly delivered bytes look like corruption.
+        """
         import socket
 
         from modelexpress.refit.reshard.megatron_aliases import (
@@ -654,6 +660,7 @@ class MxV2TrainingPublisher:
             worker_id=self._publisher.worker_id,
             published=aliases,
             metadata_endpoint=endpoint,
+            publisher_step=publisher_step,
         )
         logger.info(
             "MxV2 #496 HF-alias publish: rank=%d aliases=%d source=%s",

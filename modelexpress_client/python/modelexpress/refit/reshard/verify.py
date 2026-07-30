@@ -183,6 +183,302 @@ def digest_destination(recv_buffers: dict) -> dict:
     return {name: tensor_digest(buf) for name, buf in sorted(recv_buffers.items())}
 
 
+def source_expectation_digests(
+    *,
+    dest_sources: dict,
+    sources: dict,
+    fresh_sources: dict | None = None,
+    expectation_is_current: bool = True,
+) -> tuple[dict, dict]:
+    """Per destination param, a digest over the *publisher* digests behind it.
+
+    This is the counterpart to :func:`digest_destination` and it exists to make a
+    single run self-checking. A destination digest on its own says only "these are
+    the bytes we assembled"; it becomes evidence when compared against something,
+    and the obvious something - the same digest from another run - stops being
+    available after one training step, because training legitimately moves weights
+    and two runs are not bitwise reproducible. Measured, not assumed: two runs
+    differing in nothing disagreed on 10 of 4 350 param-steps, against 1 for the
+    two runs differing in the path under test.
+
+    Pairing each destination digest with a fingerprint of the source shards that
+    fed it removes the second run from the argument. Over consecutive steps of one
+    run the two sequences must move together, which separates the two explanations
+    a changed destination digest otherwise has:
+
+    * source fingerprint changed too - training moved the weights, expected;
+    * source fingerprint held still while the destination moved, or the
+      destination reverted to an earlier value while the source did not - the
+      receiver installed bytes that are not what the publisher currently holds.
+
+    The second is the staleness class of bug, and it is invisible to every other
+    gate here: ``verify_full_pulls`` compares against the publisher's digest for
+    the shard it *thinks* it read, so a stale-but-self-consistent read passes it.
+
+    This is a fingerprint of the publishers' claims, not of received bytes, so it
+    is not a correctness check by itself - a publisher that lies, or a shard table
+    that is stale in the same way, is not caught. It answers "did the thing we were
+    told to copy change" and nothing more.
+
+    Params whose sources did not all carry a digest are reported as ``None`` rather
+    than omitted, so a caller can tell "unchanged" from "no evidence" - the same
+    distinction ``verify_full_pulls`` draws with ``checked == 0``, and for the same
+    reason: a fleet of publishers predating the digest must degrade to no evidence
+    instead of a silent pass.
+
+    ``expectation_is_current`` must be false when ``sources`` describes weights
+    older than the step being recorded and no ``fresh_sources`` was supplied. The
+    whole record is then emitted as no-evidence, because a stale expectation here is
+    worse than none: it cannot change, so every weight training legitimately moved
+    reads as the destination having moved by itself, which is the audit's strongest
+    finding. Bug 9 was that mistake made once already, and it cost a run's
+    correctness verdict; refusing to emit is the only safe response.
+
+    Returns ``(digests, stats)``.
+    """
+    if not expectation_is_current:
+        return (
+            dict.fromkeys(sorted(dest_sources)),
+            {
+                "params": len(dest_sources),
+                "covered": 0,
+                "uncovered": len(dest_sources),
+                "shard_claims_from_fresh_table": 0,
+                "reason": (
+                    "shard table is older than this step and was not refreshed; "
+                    "emitting no evidence rather than a frozen expectation"
+                ),
+            },
+        )
+    fresh_index, fresh_by_box = (
+        _fresh_digest_index(fresh_sources) if fresh_sources else ({}, {})
+    )
+    digests: dict = {}
+    covered = 0
+    uncovered = 0
+    from_fresh = 0
+    for param_name, src_names in sorted(dest_sources.items()):
+        # Sorted by (source, offset) so the fingerprint describes the set of shards
+        # rather than the order the planner happened to visit them in. Replica
+        # reselection between discoveries reorders that visit; it is not a change.
+        claims: list[str] = []
+        missing = False
+        for src_name in sorted(src_names):
+            info = sources.get(src_name)
+            if info is None:
+                missing = True
+                continue
+            for shard in sorted(
+                getattr(info, "shards", ()),
+                key=lambda s: tuple(int(x) for x in s.shard_offset),
+            ):
+                offset = tuple(int(x) for x in shard.shard_offset)
+                fresh = fresh_index.get((src_name, shard.session, offset))
+                if fresh is None:
+                    # Same sibling-replica fallback as verify_full_pulls, and
+                    # confined the same way: only when the replicas agree, since a
+                    # box whose replicas disagree has no single expectation.
+                    offers = fresh_by_box.get((src_name, offset))
+                    if offers and len(offers) == 1:
+                        fresh = next(iter(offers))
+                digest = fresh if fresh is not None else getattr(shard, "digest", None)
+                if digest is None:
+                    missing = True
+                    continue
+                if fresh is not None:
+                    from_fresh += 1
+                claims.append(f"{src_name}|{offset}|{digest}")
+        if missing or not claims:
+            digests[param_name] = None
+            uncovered += 1
+            continue
+        digests[param_name] = hashlib.blake2b(
+            "\n".join(claims).encode(), digest_size=16
+        ).hexdigest()
+        covered += 1
+    return digests, {
+        "params": len(digests),
+        "covered": covered,
+        "uncovered": uncovered,
+        "shard_claims_from_fresh_table": from_fresh,
+    }
+
+
+# The in-process differential. Everything above compares two *runs*, which only
+# works where both hold identical source weights - measured to be step 1 and no
+# further, because training is not bitwise reproducible and the run-to-run noise
+# floor (10 differing params in 4,350) swamped the effect we were measuring (1).
+#
+# This compares the two *implementations* inside a single refit instead, over one
+# set of received bytes, so there is no second run and no trajectory assumption:
+#
+#   full-pull path: stage the whole source contiguously, then slice it locally with
+#                   torch ops driven by the recorded op-chain (``_replay_ops``).
+#   exact path:     compute byte segments from the op-chain and shard table
+#                   (``plan_pull``) and write them straight into the destination.
+#
+# Both consume the same op-chain and produce the same destination bytes if correct,
+# but the arithmetic is independent: one materializes and narrows, the other solves
+# for offsets and strides. Replaying the exact plan's segments *out of the staging
+# buffer* pits them against each other on identical input. A wrong offset or stride
+# in ``plan_pull`` - the failure that had no gate at all, on 12,675 of Topology B's
+# 18,867 sources - shows up as a per-parameter difference.
+#
+# What this does not cover: the exact path's segments are executed here as local
+# copies rather than as RDMA reads, so it tests the descriptor *computation*, not
+# its execution over the wire. Descriptor execution is NIXL's, and is shared - the
+# full-pull path issues reads through the same mechanism, only into staging instead
+# of into live destinations. State that limit rather than claiming the exact path is
+# verified end to end.
+#
+# Needs the source staged, so it wants ``MX_RESHARD_FORCE_FULL_PULL=1`` to reach
+# every bounded source. Without it only the sources that were full-pulled anyway
+# are covered, and the rest are reported uncovered rather than passing silently.
+EXACT_REPLAY = os.environ.get("MX_RESHARD_EXACT_REPLAY", "0") == "1"
+
+
+def exact_replay_digests(
+    *,
+    plan,
+    sources: dict,
+    full_staging: dict,
+    recv_buffers: dict,
+) -> tuple[dict, dict]:
+    """Digest what the exact segment plan would have written, from staged bytes.
+
+    Returns ``(digests, stats)`` where ``digests`` is per destination param and
+    directly comparable to :func:`digest_destination` over the same
+    ``recv_buffers``. A param is present only when every source feeding it was
+    staged; otherwise the scratch buffer would have holes that read as mismatches,
+    so it is omitted and counted in ``uncovered_params``.
+    """
+    import torch
+
+    from modelexpress.refit.reshard.slice_plan import plan_pull
+    from modelexpress.refit.reshard.types import UnsupportedReshard
+
+    # Where each shard's bytes live inside its staging buffer. Read off the plan
+    # rather than recomputed: these are the very segments that filled staging, so
+    # the mapping cannot drift from what actually happened.
+    staged_shards: dict = {}
+    for full_pull in plan.full_pulls:
+        for segment in full_pull.segments:
+            staged_shards.setdefault(full_pull.src_name, []).append(
+                (segment.session, segment.src_addr, segment.nbytes, segment.dst_byte)
+            )
+
+    # Destination params fed entirely by staged sources, with the copies that feed
+    # them. A param whose sources are split between staged and unstaged is dropped.
+    copies_by_param: dict = {}
+    incomplete: set = set()
+    for param, src_names in getattr(plan, "dest_sources", {}).items():
+        if any(name not in staged_shards for name in src_names):
+            incomplete.add(param)
+    for full_pull in plan.full_pulls:
+        for copy in full_pull.copies:
+            copies_by_param.setdefault(copy.param_name, []).append(
+                (full_pull.src_name, copy)
+            )
+
+    digests: dict = {}
+    unplannable = 0
+    unmapped_segments = 0
+    for param, entries in sorted(copies_by_param.items()):
+        buffer = recv_buffers.get(param)
+        if buffer is None or param in incomplete:
+            continue
+        scratch = torch.zeros_like(buffer)
+        scratch_bytes = scratch.reshape(-1).view(torch.uint8)
+        failed = False
+        for src_name, copy in entries:
+            source = sources.get(src_name)
+            if source is None:
+                failed = True
+                break
+            try:
+                segments = plan_pull(
+                    copy,
+                    source.global_shape,
+                    source.dtype,
+                    source.elsize,
+                    source.shards,
+                )
+            except UnsupportedReshard:
+                # The exact path could not plan this copy at all, so there is no
+                # second implementation to compare against for this param.
+                unplannable += 1
+                failed = True
+                break
+            staging = full_staging[src_name].reshape(-1).view(torch.uint8)
+            for segment in segments:
+                offset = _staging_offset(staged_shards[src_name], segment)
+                if offset is None:
+                    unmapped_segments += 1
+                    failed = True
+                    break
+                scratch_bytes[
+                    segment.dst_byte : segment.dst_byte + segment.nbytes
+                ] = staging[offset : offset + segment.nbytes]
+            if failed:
+                break
+        if not failed:
+            digests[param] = tensor_digest(scratch)
+
+    return digests, {
+        "params": len(digests),
+        "uncovered_params": len(recv_buffers) - len(digests),
+        "params_with_unstaged_sources": len(incomplete),
+        "copies_the_exact_path_could_not_plan": unplannable,
+        "segments_outside_any_staged_shard": unmapped_segments,
+        "forced_full_pull": bool(getattr(plan, "forced_full_pull", False)),
+    }
+
+
+def _staging_offset(staged, segment) -> int | None:
+    """Byte offset in the staging buffer for an exact segment's source address.
+
+    ``PullSegment.src_addr`` is absolute in the publisher's address space
+    (``shard.addr`` plus an offset), so the owning shard is found by address range
+    within the matching session, then the offset carries over into staging. Returns
+    ``None`` when no staged shard contains the address, which is a real finding -
+    the exact plan would be reading memory the full-pull plan never covered - and is
+    reported rather than skipped.
+    """
+    for session, addr, nbytes, staging_offset in staged:
+        if session == segment.session and addr <= segment.src_addr < addr + nbytes:
+            delta = segment.src_addr - addr
+            if delta + segment.nbytes > nbytes:
+                return None
+            return staging_offset + delta
+    return None
+
+
+def compare_exact_replay(*, replayed: dict, received: dict) -> dict:
+    """Difference the replayed exact plan against what the full-pull path installed.
+
+    Returns a report with ``mismatches`` and the first few offending params. An
+    empty ``replayed`` is reported as ``checked == 0``, which callers must read as
+    no evidence rather than as a pass - the same rule as
+    :func:`verify_full_pulls`.
+    """
+    detail = []
+    checked = 0
+    for param, digest in sorted(replayed.items()):
+        expected = received.get(param)
+        if expected is None:
+            continue
+        checked += 1
+        if digest != expected:
+            detail.append(
+                {"param": param, "exact_replay": digest, "received": expected}
+            )
+    return {
+        "checked": checked,
+        "mismatches": len(detail),
+        "detail": detail[:20],
+    }
+
+
 SENTINEL_BYTE = int(os.environ.get("MX_RESHARD_SENTINEL_BYTE", "165"))  # 0xA5
 
 # Pre-filling the staging buffers with a byte no weight tensor plausibly contains
@@ -247,6 +543,9 @@ def verify_full_pulls(
     sources: dict,
     max_report: int = 20,
     fresh_sources: dict | None = None,
+    step: int | None = None,
+    stale_sessions: frozenset | set | None = None,
+    stamps_seen: bool = False,
 ) -> dict:
     """Recompute digests over received full-pull bytes and compare to the publishers'.
 
@@ -273,6 +572,36 @@ def verify_full_pulls(
     read from an address that has not moved, so what landed in staging is what the
     publisher holds *now*, and now is what the fresh table describes.
 
+    **That fix is only as good as the freshness of the "fresh" table, and on
+    2026-07-30 it was not fresh at all.** Re-discovery returned a blob identical to
+    the prepare-time one at every step - `addr_changed: 0` *and* `digest_changed: 0`
+    over ~18,432 comparisons - so the digests still described the weights at load
+    time. Digesting the flagged tensors straight out of the HF checkpoint confirmed
+    it: `want` was bit-for-bit the checkpoint value for all three, while `got`
+    tracked training. The gate was therefore failing runs for the one reason it must
+    never fail them - the reference was wrong, not the bytes - and `VERIFY_STRICT`
+    aborted two runs on it.
+
+    So freshness is now something this function *reports on* rather than assumes.
+    ``step`` enables that: past the first refit, some weights have moved, so a fresh
+    table that refreshed nothing cannot be current, and a mismatch against it is
+    unattributable rather than a wire fault. ``reference_is_current`` carries that
+    judgement, and the caller must not abort on a mismatch when it is false.
+
+    A frozen reference is not a pass either. It means those shards are *unverified*,
+    and the report says so rather than quietly reporting zero problems.
+
+    ``stale_sessions`` supersedes that inference where it is available, and is the
+    reason to prefer it. Deducing freshness from "did anything refresh?" is a whole-
+    discovery verdict, and publishers propagate independently: when some publishers'
+    tables for this step have landed and others' have not, *something* refreshed, the
+    reference is pronounced current, and the lagging publisher's shard is then reported
+    as a hard defect. That failure grows with publisher count, so it is a corner case
+    on two receiver ranks and an expected one at sixteen. Passing the set of sessions
+    whose published step did not advance replaces the guess with an observation and
+    localises it to the shards actually affected, leaving a real mismatch elsewhere in
+    the same report fatal.
+
     Returns a report with the counts and the first few mismatches by name.
     """
     fresh_index, fresh_by_box = (
@@ -293,6 +622,10 @@ def verify_full_pulls(
     # is the difference between a handful of bad shards and a systematically wrong
     # plan - which is exactly the judgement this report exists to support.
     failed = 0
+    # Of the failures, the ones whose publisher's step stamp shows its table describes
+    # an earlier step. Those are unattributable; the remainder are real.
+    failed_stale = 0
+    stale_session_set = frozenset(stale_sessions or ())
     mismatches = []
     # Replicated placements (DP, and expert-DP for MoE experts) mean the same box is
     # offered by more than one rank. Those offers must be byte-identical; the planner
@@ -350,6 +683,13 @@ def verify_full_pulls(
             checked += 1
             if got != want:
                 failed += 1
+                # A mismatch is only evidence about the wire if the digest it was
+                # compared against describes this step. When the publisher's own step
+                # stamp says otherwise, the comparison is uninformative for this shard
+                # and only for this shard - other sessions in the same report stay
+                # fully accountable.
+                if stale_session_set and shard.session in stale_session_set:
+                    failed_stale += 1
                 if FILL_SENTINEL:
                     fraction = _sentinel_fraction(region)
                     sentinel_total += fraction
@@ -357,6 +697,9 @@ def verify_full_pulls(
                         never_written += 1
                 if len(mismatches) < max_report:
                     entry = {
+                        "stale_publisher": bool(
+                            stale_session_set and shard.session in stale_session_set
+                        ),
                         "source": src_name,
                         "session": shard.session,
                         "shard_offset": list(shard.shard_offset),
@@ -381,10 +724,68 @@ def verify_full_pulls(
         "digests_refreshed_via_replica": refreshed_via_replica,
         "digest_source": "fresh" if fresh_index else "prepare",
     }
+    # Past the first refit the optimizer has touched something, so a table that
+    # refreshed nothing is describing older weights than the ones just read. Step 1
+    # is exempt: nothing has moved yet, so refreshing nothing is the correct answer
+    # there and the reference is genuinely current.
+    report["mismatches_from_stale_publishers"] = failed_stale
+    report["stale_publisher_sessions"] = sorted(stale_session_set)
+    if stamps_seen or stale_session_set:
+        # An observation beats an inference. With stamps in hand, freshness is decided
+        # per shard above, so the whole-discovery guess is not consulted at all - it is
+        # the guess that mis-handles partial propagation.
+        #
+        # ``stamps_seen`` matters separately from a non-empty stale set: stamps present
+        # with nothing lagging is a positive statement that the reference is current,
+        # whereas the inference would call that same table stale whenever no digest
+        # happened to change - which is exactly the situation at a low learning rate,
+        # where few weights move per step. Treating "no stamps" and "stamps, none
+        # lagging" alike would throw away verification we have earned.
+        report["freshness_evidence"] = "publisher_step_stamp"
+        attributable = failed - failed_stale
+        reference_is_current = not stale_session_set
+    else:
+        report["freshness_evidence"] = "refresh_inference"
+        reference_is_current = bool(step is None or int(step) <= 1 or refreshed > 0)
+        # Without stamps the verdict is all-or-nothing, because the evidence is. A
+        # reference the inference calls stale makes every mismatch in this report
+        # unattributable, not just some - claiming otherwise would contradict
+        # ``reference_is_current`` in the same record.
+        attributable = failed if reference_is_current else 0
+    # The caller's abort signal. It already folds in whichever freshness judgement was
+    # available, so a caller aborting on this alone gets the old behaviour when there
+    # are no stamps and the per-shard behaviour when there are.
+    report["attributable_mismatches"] = attributable
+    report["reference_is_current"] = reference_is_current
+    if failed_stale:
+        report["stale_reference_suspected"] = True
+        report["unattributable_reason"] = (
+            f"{failed_stale} of {failed} mismatching shard(s) at step {step} come from "
+            f"publisher(s) whose own step stamp shows their shard table describes an "
+            f"earlier step: {sorted(stale_session_set)}. Those comparisons say nothing "
+            f"about the wire and those shards are UNVERIFIED, which is not the same as "
+            f"clean. The remaining {failed - failed_stale} mismatch(es), if any, are "
+            f"attributable and are a real finding."
+        )
+    elif failed and not reference_is_current:
+        report["stale_reference_suspected"] = True
+        report["unattributable_reason"] = (
+            f"{failed} shard(s) differ from the publisher's digest at step {step}, "
+            f"but the freshly discovered table refreshed 0 of {checked} digests, so "
+            f"it cannot describe weights the optimizer has already moved. A "
+            f"difference against a stale reference says nothing about the wire. "
+            f"These shards are UNVERIFIED, which is not the same as clean. Confirm "
+            f"by digesting one of them out of the initial checkpoint: if `want` "
+            f"equals the checkpoint value, the reference is frozen, not the bytes. "
+            f"No publisher step stamps were available; a publisher carrying them "
+            f"would make this per-shard instead of a whole-run guess."
+        )
     if FILL_SENTINEL:
         # never_written == mismatches says the wire skipped those regions
         # entirely; never_written == 0 with a mismatch says it wrote the wrong
         # bytes there. Anything in between localises a partial write.
         report["never_written"] = never_written
-        report["mean_sentinel_frac"] = round(sentinel_total / failed, 6) if failed else 0.0
+        report["mean_sentinel_frac"] = (
+            round(sentinel_total / failed, 6) if failed else 0.0
+        )
     return report

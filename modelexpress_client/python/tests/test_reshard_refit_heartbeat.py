@@ -92,6 +92,13 @@ def test_the_heartbeat_resends_the_latest_blob_not_the_first(fast_heartbeat):
 
 def test_a_second_publish_does_not_start_a_second_heartbeat(fast_heartbeat):
     """Two threads would double the publish rate and race each other."""
+    # Counted as a delta, not an absolute. Other tests in the suite leave heartbeat
+    # threads behind, so an absolute count made this fail whenever it ran after one
+    # of them and pass in isolation - which reads as a flaky test and got this one
+    # dismissed as noise for a whole session.
+    before = {
+        t for t in threading.enumerate() if t.name.startswith("mx-reshard-hb-")
+    }
     client = _RecordingClient()
     rz = _rendezvous(client)
     try:
@@ -99,8 +106,12 @@ def test_a_second_publish_does_not_start_a_second_heartbeat(fast_heartbeat):
         first = rz._hb_thread
         rz.publish(b"b")
         assert rz._hb_thread is first
-        beating = [t for t in threading.enumerate() if t.name.startswith("mx-reshard-hb-")]
-        assert len(beating) == 1, f"expected one heartbeat thread, found {len(beating)}"
+        started = [
+            t
+            for t in threading.enumerate()
+            if t.name.startswith("mx-reshard-hb-") and t not in before
+        ]
+        assert len(started) == 1, f"expected one new heartbeat thread, got {started}"
     finally:
         _stop(rz)
 
@@ -190,3 +201,152 @@ def test_the_thread_is_a_daemon_named_for_its_rank(fast_heartbeat):
         assert "mx-reshard-hb-0" == rz._hb_thread.name
     finally:
         _stop(rz)
+
+
+# --- the same defect by another route: one rendezvous per publish ---------------
+# The tests above publish twice through one object, and the guard in
+# _start_rendezvous_heartbeat is per object, so they pass while production reverts.
+# publish_registered_shard_table is called once per refit and used to construct a
+# fresh rendezvous each time, so after k refits k threads were re-asserting k
+# different snapshots under one key. These drive the real entry point.
+
+
+class _Manager:
+    agent_name = "agent-0"
+    nixl_metadata = b"nixl-meta"
+
+
+def _publish_through_the_real_entry_point(client, blob_tag, *, worker_id="w0"):
+    """Call publish_registered_shard_table the way a refit does."""
+    from modelexpress.refit.reshard.megatron_publisher import (
+        publish_registered_shard_table,
+    )
+    from modelexpress.refit.reshard.rendezvous import PublishedShard, PublishedTensor
+
+    published = [
+        PublishedTensor(
+            name="w",
+            dtype="torch.bfloat16",
+            elsize=2,
+            full_shape=(4,),
+            shards=[
+                PublishedShard(
+                    agent_name="agent-0",
+                    device_id=0,
+                    addr=4096,
+                    shard_offset=(0,),
+                    shape=(4,),
+                    digest=blob_tag,
+                )
+            ],
+        )
+    ]
+    return publish_registered_shard_table(
+        manager=_Manager(),
+        client=client,
+        model_name="m",
+        worker_rank=0,
+        worker_id=worker_id,
+        published=published,
+        metadata_endpoint="10.0.0.1:1234",
+    )
+
+
+@pytest.fixture
+def clean_rendezvous_cache():
+    from modelexpress.refit.reshard import megatron_publisher
+
+    megatron_publisher._RENDEZVOUS.clear()
+    yield
+    for rz in megatron_publisher._RENDEZVOUS.values():
+        rz.stop_heartbeat()
+    megatron_publisher._RENDEZVOUS.clear()
+
+
+def _live_heartbeats():
+    return [
+        t
+        for t in threading.enumerate()
+        if t.name.startswith("mx-reshard-hb-") and t.is_alive()
+    ]
+
+
+def test_a_refit_per_step_does_not_accumulate_heartbeat_threads(
+    fast_heartbeat, clean_rendezvous_cache
+):
+    """The bug, stated as a count. Three refits used to mean three threads."""
+    before = len(_live_heartbeats())
+    client = _RecordingClient()
+
+    for step in range(1, 4):
+        _publish_through_the_real_entry_point(client, f"digest-step-{step}")
+
+    assert len(_live_heartbeats()) - before == 1
+
+
+def test_repeated_refits_never_revert_the_published_digest(
+    fast_heartbeat, clean_rendezvous_cache
+):
+    """The consequence, and the reason this mattered: a reverted table makes a
+    receiver check correct bytes against an earlier step's digest."""
+    client = _RecordingClient()
+
+    _publish_through_the_real_entry_point(client, "digest-step-1")
+    time.sleep(SETTLE_S)
+    _publish_through_the_real_entry_point(client, "digest-step-2")
+    time.sleep(SETTLE_S)
+
+    # Everything sent after the second publish must carry step 2. A single
+    # reappearance of step 1 is the defect, because the server keeps the last write.
+    after_second = client.snapshot()
+    tail = after_second[after_second.index(
+        next(b for b in after_second if b"digest-step-2" in b)
+    ):]
+    assert tail, "the second publish should have been sent"
+    assert not [b for b in tail if b"digest-step-1" in b], (
+        "an earlier step's shard table was re-advertised after a later publish"
+    )
+
+
+def test_the_same_identity_reuses_one_rendezvous(
+    fast_heartbeat, clean_rendezvous_cache
+):
+    from modelexpress.refit.reshard import megatron_publisher
+
+    client = _RecordingClient()
+    _publish_through_the_real_entry_point(client, "d1")
+    _publish_through_the_real_entry_point(client, "d2")
+
+    assert len(megatron_publisher._RENDEZVOUS) == 1
+
+
+def test_distinct_workers_keep_distinct_rendezvous(
+    fast_heartbeat, clean_rendezvous_cache
+):
+    """Reuse must be keyed tightly enough that two ranks in one process do not
+    share a publisher identity."""
+    from modelexpress.refit.reshard import megatron_publisher
+
+    client = _RecordingClient()
+    _publish_through_the_real_entry_point(client, "d1", worker_id="w0")
+    _publish_through_the_real_entry_point(client, "d2", worker_id="w1")
+
+    assert len(megatron_publisher._RENDEZVOUS) == 2
+
+
+def test_a_replaced_client_retires_the_heartbeat_it_orphans(
+    fast_heartbeat, clean_rendezvous_cache
+):
+    """A rendezvous whose client is gone cannot refresh its blob, so leaving its
+    heartbeat running would re-assert a snapshot nothing can update."""
+    before = len(_live_heartbeats())
+    _publish_through_the_real_entry_point(_RecordingClient(), "d1")
+    _publish_through_the_real_entry_point(_RecordingClient(), "d2")
+    time.sleep(SETTLE_S)
+
+    assert len(_live_heartbeats()) - before == 1
+
+
+def test_stop_heartbeat_is_safe_before_any_publish():
+    rz = _rendezvous(_RecordingClient())
+    rz.stop_heartbeat()  # must not raise

@@ -18,6 +18,7 @@ torch = pytest.importorskip("torch")
 from modelexpress.refit.reshard.slice_plan import Shard  # noqa: E402
 from modelexpress.refit.reshard.verify import (  # noqa: E402
     shard_region,
+    source_expectation_digests,
     tensor_digest,
     verify_full_pulls,
 )
@@ -117,6 +118,15 @@ def test_matching_bytes_pass():
         "digests_refreshed": 0,
         "digests_refreshed_via_replica": 0,
         "digest_source": "prepare",
+        # No publisher step stamps supplied, so freshness falls back to the inference
+        # over refreshed digests. Named in the report so a reader can tell which of the
+        # two the verdict rests on - they are not equally trustworthy.
+        "mismatches_from_stale_publishers": 0,
+        "attributable_mismatches": 0,
+        "stale_publisher_sessions": [],
+        "freshness_evidence": "refresh_inference",
+        # No step passed, so the gate makes no claim about how old the reference is.
+        "reference_is_current": True,
     }
 
 
@@ -591,3 +601,472 @@ def test_a_reselected_box_at_a_different_offset_is_not_borrowed():
     )
     assert report["digests_refreshed"] == 0
     assert report["mismatches"] == 0, "fell back to prepare, which was correct here"
+
+
+# ------------------------------------------- source expectations, for one run
+# The destination digests these pair with are only comparable across two runs, and
+# two runs stop being comparable after one training step. These cover the pairing
+# that lets a single run be audited, and they lean on the stale-expectation cases,
+# because a frozen expectation here manufactures the audit's strongest finding out
+# of ordinary training - which is Bug 9 wearing a different hat.
+def test_source_expectation_covers_a_param_whose_shards_all_carry_digests():
+    sources = {"src": _Source((4, 2), [_shard([0, 0], [2, 2], digest="a"),
+                                       _shard([2, 0], [2, 2], digest="b")])}
+    digests, stats = source_expectation_digests(
+        dest_sources={"param": ["src"]}, sources=sources
+    )
+    assert digests["param"] is not None
+    assert stats["covered"] == 1
+    assert stats["uncovered"] == 0
+
+
+def test_source_expectation_changes_when_a_shard_digest_changes():
+    def build(second):
+        return {"src": _Source((4, 2), [_shard([0, 0], [2, 2], digest="a"),
+                                        _shard([2, 0], [2, 2], digest=second)])}
+
+    before, _ = source_expectation_digests(
+        dest_sources={"param": ["src"]}, sources=build("b")
+    )
+    after, _ = source_expectation_digests(
+        dest_sources={"param": ["src"]}, sources=build("MOVED")
+    )
+    assert before["param"] != after["param"]
+
+
+def test_source_expectation_ignores_shard_visit_order():
+    """Replica reselection between discoveries reorders the visit; it is not a
+    change, and reporting it as one is how the first fix for Bug 9 failed."""
+    forward = {"src": _Source((4, 2), [_shard([0, 0], [2, 2], digest="a"),
+                                       _shard([2, 0], [2, 2], digest="b")])}
+    reversed_ = {"src": _Source((4, 2), [_shard([2, 0], [2, 2], digest="b"),
+                                         _shard([0, 0], [2, 2], digest="a")])}
+    a, _ = source_expectation_digests(dest_sources={"param": ["src"]}, sources=forward)
+    b, _ = source_expectation_digests(dest_sources={"param": ["src"]}, sources=reversed_)
+    assert a["param"] == b["param"]
+
+
+def test_source_expectation_is_none_when_a_shard_has_no_digest():
+    """Publishers predating the digest must read as no evidence, never as a pass."""
+    sources = {"src": _Source((4, 2), [_shard([0, 0], [2, 2], digest="a"),
+                                       _shard([2, 0], [2, 2])])}
+    digests, stats = source_expectation_digests(
+        dest_sources={"param": ["src"]}, sources=sources
+    )
+    assert digests["param"] is None
+    assert stats["uncovered"] == 1
+
+
+def test_source_expectation_prefers_the_freshly_discovered_digest():
+    """The frozen-expectation fix: the bytes were read from an address that has not
+    moved, so what landed is what the publisher holds now."""
+    stale = {"src": _Source((4, 2), [_shard([0, 0], [4, 2], digest="old")])}
+    fresh = {"src": _Source((4, 2), [_shard([0, 0], [4, 2], digest="new")])}
+    digests, stats = source_expectation_digests(
+        dest_sources={"param": ["src"]}, sources=stale, fresh_sources=fresh
+    )
+    only_stale, _ = source_expectation_digests(
+        dest_sources={"param": ["src"]}, sources=stale
+    )
+    assert digests["param"] != only_stale["param"]
+    assert stats["shard_claims_from_fresh_table"] == 1
+
+
+def test_source_expectation_refuses_to_emit_a_stale_expectation():
+    """Worse than none: a table that cannot change turns every legitimate weight
+    update into 'the destination moved by itself', the audit's strongest finding."""
+    sources = {"src": _Source((4, 2), [_shard([0, 0], [4, 2], digest="a")])}
+    digests, stats = source_expectation_digests(
+        dest_sources={"param": ["src"]},
+        sources=sources,
+        expectation_is_current=False,
+    )
+    assert digests == {"param": None}
+    assert stats["covered"] == 0
+    assert "reason" in stats
+
+
+def test_source_expectation_marks_a_param_whose_source_is_absent():
+    digests, stats = source_expectation_digests(
+        dest_sources={"param": ["missing"]}, sources={}
+    )
+    assert digests["param"] is None
+    assert stats["uncovered"] == 1
+
+
+# --- a frozen reference must not read as a wire fault --------------------------
+# On 2026-07-30 every `want` in a run's mismatches was bit-for-bit the initial
+# checkpoint digest while `got` tracked training, and VERIFY_STRICT aborted two runs
+# on it. A difference against a reference older than the bytes says nothing about
+# the wire, and must not be fatal - nor may it be quietly dropped.
+
+
+def _stale_rig(published_digest="not-the-real-digest"):
+    """One full-pulled source whose staged bytes do not match the advertised digest."""
+    staging = torch.arange(4096, dtype=torch.int32)
+    sources = {
+        "w": _Source(
+            global_shape=tuple(staging.shape),
+            shards=[_shard((0,), tuple(staging.shape), digest=published_digest)],
+        )
+    }
+    return {"w": staging}, sources
+
+
+def test_a_mismatch_at_step_one_is_still_attributable():
+    """Nothing has moved yet at the first refit, so refreshing nothing is the
+    correct answer there and the reference really is current."""
+    staging, sources = _stale_rig()
+
+    report = verify_full_pulls(
+        full_staging=staging, sources=sources, fresh_sources=sources, step=1
+    )
+
+    assert report["mismatches"] == 1
+    assert report["reference_is_current"] is True
+    assert "stale_reference_suspected" not in report
+
+
+def test_a_mismatch_past_step_one_with_nothing_refreshed_is_unattributable():
+    staging, sources = _stale_rig()
+
+    report = verify_full_pulls(
+        full_staging=staging, sources=sources, fresh_sources=sources, step=3
+    )
+
+    assert report["digests_refreshed"] == 0
+    assert report["reference_is_current"] is False
+    assert report["stale_reference_suspected"] is True
+    assert "UNVERIFIED" in report["unattributable_reason"]
+
+
+def test_unattributable_is_not_reported_as_clean():
+    """The opposite failure: swallowing the mismatch so the run looks verified."""
+    staging, sources = _stale_rig()
+
+    report = verify_full_pulls(
+        full_staging=staging, sources=sources, fresh_sources=sources, step=3
+    )
+
+    assert report["mismatches"] == 1, "the mismatch must stay visible"
+    assert report["detail"], "the offending shard must still be named"
+
+
+def test_a_reference_that_did_refresh_stays_attributable_and_fatal():
+    """If the table refreshed something it is tracking the publisher, so a
+    remaining mismatch is a real finding and must not be excused."""
+    staging = torch.arange(4096, dtype=torch.int32)
+    stale = {
+        "w": _Source(
+            global_shape=tuple(staging.shape),
+            shards=[_shard((0,), tuple(staging.shape), digest="old")],
+        )
+    }
+    fresh = {
+        "w": _Source(
+            global_shape=tuple(staging.shape),
+            shards=[_shard((0,), tuple(staging.shape), digest="refreshed-still-wrong")],
+        )
+    }
+
+    report = verify_full_pulls(
+        full_staging={"w": staging}, sources=stale, fresh_sources=fresh, step=3
+    )
+
+    assert report["digests_refreshed"] == 1
+    assert report["reference_is_current"] is True
+    assert report["mismatches"] == 1
+    assert "stale_reference_suspected" not in report
+
+
+def test_step_is_optional_so_existing_callers_keep_their_behaviour():
+    staging, sources = _stale_rig()
+
+    report = verify_full_pulls(full_staging=staging, sources=sources)
+
+    assert report["reference_is_current"] is True
+    assert report["mismatches"] == 1
+
+
+def test_a_clean_run_past_step_one_carries_no_staleness_claim():
+    """The flag explains a mismatch; it does not editorialise on every report."""
+    staging = torch.arange(4096, dtype=torch.int32)
+    sources = {
+        "w": _Source(
+            global_shape=tuple(staging.shape),
+            shards=[
+                _shard((0,), tuple(staging.shape), digest=tensor_digest(staging))
+            ],
+        )
+    }
+
+    report = verify_full_pulls(
+        full_staging={"w": staging}, sources=sources, fresh_sources=sources, step=5
+    )
+
+    assert report["mismatches"] == 0
+    assert "stale_reference_suspected" not in report
+
+
+# ------------------------------------------------- the publisher step stamp
+#
+# The stamp exists because deducing freshness from "did any digest refresh?" is a
+# whole-discovery verdict, and publishers propagate independently. The test that earns
+# its place here is the partial-propagation one: something refreshed, so the inference
+# pronounces the reference current and reports a lagging publisher's shard as a hard
+# defect. That is a false abort, it gets likelier with every publisher added, and it is
+# the failure the stamp removes.
+
+
+def _two_publisher_rig():
+    """One source, two sessions, and one of them mismatching."""
+    full = torch.arange(64, dtype=torch.int16)
+    good = tensor_digest(shard_region(full, (64,), (0,), (64,)))
+    bad = "0" * len(good)
+    return full, good, bad
+
+
+def test_a_lagging_publisher_is_not_reported_as_a_wire_fault():
+    full, _good, bad = _two_publisher_rig()
+
+    report = verify_full_pulls(
+        full_staging={"w": full},
+        sources={"w": _Source((64,), [_shard((0,), (64,), bad, session="r0")])},
+        step=2,
+        stale_sessions={"r0"},
+    )
+
+    assert report["mismatches"] == 1, "the difference must stay visible"
+    assert report["mismatches_from_stale_publishers"] == 1
+    assert report["attributable_mismatches"] == 0
+    assert report["reference_is_current"] is False
+    assert report["stale_reference_suspected"] is True
+    assert report["freshness_evidence"] == "publisher_step_stamp"
+
+
+def test_a_mismatch_from_a_current_publisher_stays_fatal():
+    """The stamp must not become a blanket excuse.
+
+    ``r0`` lags, but the mismatching shard belongs to ``r1``, which does not. The abort
+    signal is ``attributable_mismatches``: it is what the receiver keys on, and it is
+    what must stay non-zero here.
+    """
+    full, _good, bad = _two_publisher_rig()
+
+    report = verify_full_pulls(
+        full_staging={"w": full},
+        sources={"w": _Source((64,), [_shard((0,), (64,), bad, session="r1")])},
+        step=2,
+        stale_sessions={"r0"},
+    )
+
+    assert report["mismatches"] == 1
+    assert report["mismatches_from_stale_publishers"] == 0
+    assert report["attributable_mismatches"] == 1, "must remain fatal for the caller"
+
+
+def test_stamps_with_nothing_lagging_assert_currency_positively():
+    """The reason ``stamps_seen`` is separate from a non-empty stale set.
+
+    Nothing refreshed here, so the inference would call this reference stale and give up
+    on verifying the step. The stamps say every publisher advanced, which is a positive
+    statement that the table is current - so the mismatch is real and fatal.
+    """
+    full, _good, bad = _two_publisher_rig()
+
+    report = verify_full_pulls(
+        full_staging={"w": full},
+        sources={"w": _Source((64,), [_shard((0,), (64,), bad, session="r0")])},
+        step=4,
+        stale_sessions=frozenset(),
+        stamps_seen=True,
+    )
+
+    assert report["digests_refreshed"] == 0, "rig must give the inference nothing to go on"
+    assert report["freshness_evidence"] == "publisher_step_stamp"
+    assert report["reference_is_current"] is True
+    assert report["attributable_mismatches"] == 1, (
+        "verification the stamps earned must not be discarded"
+    )
+
+
+def test_without_stamps_the_same_rig_gives_up():
+    """The contrast, and the cost of having only the inference."""
+    full, _good, bad = _two_publisher_rig()
+
+    report = verify_full_pulls(
+        full_staging={"w": full},
+        sources={"w": _Source((64,), [_shard((0,), (64,), bad, session="r0")])},
+        step=4,
+    )
+
+    assert report["freshness_evidence"] == "refresh_inference"
+    assert report["reference_is_current"] is False
+    assert report["attributable_mismatches"] == 0, "unverifiable, so nothing is claimed"
+
+
+def test_partial_propagation_does_not_condemn_the_lagging_publisher():
+    """The case the inference gets wrong.
+
+    Two publishers, one lagging and mismatching, one current and clean. Some digest
+    refreshed, so ``refreshed > 0`` and the old inference calls the whole reference
+    current - making the lagging publisher's shard look like a real defect. With stamps
+    the lagging shard is excused and the report still says nothing is attributable.
+    """
+    full, good, bad = _two_publisher_rig()
+    sources = {
+        "w": _Source(
+            (64,),
+            [
+                _shard((0,), (64,), bad, session="lagging"),
+                _shard((0,), (64,), good, session="current"),
+            ],
+        )
+    }
+
+    report = verify_full_pulls(
+        full_staging={"w": full},
+        sources=sources,
+        step=4,
+        stale_sessions={"lagging"},
+    )
+
+    assert report["mismatches"] == 1
+    assert report["attributable_mismatches"] == 0, (
+        "a lagging publisher under partial propagation must not read as a wire fault"
+    )
+    assert report["reference_is_current"] is False
+
+
+def _partial_propagation_rig():
+    """The hardware situation, in miniature.
+
+    Two publishers for one shard box. ``current`` has published this step's table, so
+    its digest refreshed against prepare. ``lagging`` has not, so its digest is
+    unchanged and no longer describes the bytes on the wire. That is the state the
+    inference cannot represent: *something* refreshed, so it pronounces the whole
+    reference current, and ``lagging``'s stale comparison is then reported as a real
+    defect - aborting a healthy run.
+    """
+    full = torch.arange(64, dtype=torch.int16)
+    good = tensor_digest(shard_region(full, (64,), (0,), (64,)))
+    stale_digest = "0" * len(good)
+    prepare_digest_for_current = "1" * len(good)
+    sources = {
+        "w": _Source(
+            (64,),
+            [
+                _shard((0,), (64,), stale_digest, session="lagging"),
+                _shard((0,), (64,), prepare_digest_for_current, session="current"),
+            ],
+        )
+    }
+    fresh = {
+        "w": _Source(
+            (64,),
+            [
+                # unchanged since prepare - this publisher has not caught up
+                _shard((0,), (64,), stale_digest, session="lagging"),
+                # refreshed, and matches the bytes actually delivered
+                _shard((0,), (64,), good, session="current"),
+            ],
+        )
+    }
+    return full, sources, fresh
+
+
+def test_the_inference_alone_would_have_aborted_a_healthy_run():
+    """Pins the defect being fixed. No stamps: the run dies on a lagging publisher."""
+    full, sources, fresh = _partial_propagation_rig()
+
+    report = verify_full_pulls(
+        full_staging={"w": full}, sources=sources, fresh_sources=fresh, step=4
+    )
+
+    assert report["digests_refreshed"] > 0, "rig must reproduce partial propagation"
+    assert report["freshness_evidence"] == "refresh_inference"
+    assert report["reference_is_current"] is True, (
+        "the inference is fooled by the one publisher that did refresh"
+    )
+    assert report["attributable_mismatches"] == 1, (
+        "and so the lagging publisher's shard is condemned - the false abort"
+    )
+
+
+def test_the_stamp_prevents_that_abort():
+    """Same rig, same bytes, stamps supplied. Nothing attributable, nothing fatal."""
+    full, sources, fresh = _partial_propagation_rig()
+
+    report = verify_full_pulls(
+        full_staging={"w": full},
+        sources=sources,
+        fresh_sources=fresh,
+        step=4,
+        stale_sessions={"lagging"},
+    )
+
+    assert report["digests_refreshed"] > 0
+    assert report["mismatches"] == 1, "the difference is still reported"
+    assert report["attributable_mismatches"] == 0
+    assert report["reference_is_current"] is False, "so the caller must not abort"
+    assert report["freshness_evidence"] == "publisher_step_stamp"
+
+
+def test_an_unattributable_report_does_not_claim_attributable_mismatches():
+    """The two fields must not contradict each other in one record."""
+    full, _good, bad = _two_publisher_rig()
+
+    report = verify_full_pulls(
+        full_staging={"w": full},
+        sources={"w": _Source((64,), [_shard((0,), (64,), bad, session="r0")])},
+        step=4,
+    )
+
+    assert report["reference_is_current"] is False
+    assert report["attributable_mismatches"] == 0
+
+
+def test_a_clean_run_with_stamps_is_still_clean():
+    """A lagging publisher that nonetheless matches raises nothing.
+
+    ``reference_is_current`` is False because ``r0`` is behind, but there is no mismatch
+    to excuse, so no staleness claim is attached and nothing is attributable.
+    """
+    full, good, _bad = _two_publisher_rig()
+
+    report = verify_full_pulls(
+        full_staging={"w": full},
+        sources={"w": _Source((64,), [_shard((0,), (64,), good, session="r0")])},
+        step=3,
+        stale_sessions={"r0"},
+    )
+
+    assert report["mismatches"] == 0
+    assert report["attributable_mismatches"] == 0
+    assert "stale_reference_suspected" not in report
+
+
+def test_stamps_are_reported_so_a_reader_can_audit_the_verdict():
+    full, good, _bad = _two_publisher_rig()
+
+    report = verify_full_pulls(
+        full_staging={"w": full},
+        sources={"w": _Source((64,), [_shard((0,), (64,), good, session="r0")])},
+        step=3,
+        stale_sessions={"r1", "r0"},
+    )
+
+    assert report["stale_publisher_sessions"] == ["r0", "r1"]
+
+
+def test_the_flagged_shard_names_its_publisher_as_stale():
+    full, _good, bad = _two_publisher_rig()
+
+    report = verify_full_pulls(
+        full_staging={"w": full},
+        sources={"w": _Source((64,), [_shard((0,), (64,), bad, session="r0")])},
+        step=2,
+        stale_sessions={"r0"},
+    )
+
+    assert report["detail"][0]["stale_publisher"] is True
