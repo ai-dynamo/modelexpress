@@ -170,6 +170,32 @@ class TestReleaseOnFailure:
 
         mgr.remove_remote_agent.assert_called_once_with(P2P_AGENT)
 
+    def test_a_half_finished_p2p_fetch_is_released(self):
+        """fetch_remote_and_wait dials the source and only then waits, so a
+        timeout can leave metadata that arrives afterwards. Claiming the name
+        before the dial is what gives that late arrival something to release it."""
+        mgr = _manager()
+        mgr.fetch_remote_and_wait.side_effect = TimeoutError(
+            "Timed out waiting for remote metadata"
+        )
+
+        with pytest.raises(TimeoutError):
+            _receive(mgr, p2p=True)
+
+        mgr.remove_remote_agent.assert_called_once_with(P2P_AGENT)
+
+    def test_a_failed_blob_load_releases_nothing(self):
+        """The centralized name only exists once add_remote_agent returns, so
+        there is no peer to release if it raises. Releasing a name we never got
+        would mean calling the manager with None."""
+        mgr = _manager()
+        mgr.add_remote_agent.side_effect = RuntimeError("bad metadata blob")
+
+        with pytest.raises(RuntimeError, match="bad metadata blob"):
+            _receive(mgr, p2p=False)
+
+        mgr.remove_remote_agent.assert_not_called()
+
 
 class TestCentralizedMode:
     def test_centralized_load_releases_the_peer_it_loaded(self):

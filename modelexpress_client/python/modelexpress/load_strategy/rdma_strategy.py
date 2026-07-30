@@ -479,65 +479,75 @@ class RdmaStrategy(LoadStrategy):
         is_p2p = bool(source_worker.worker_grpc_endpoint)
         remote_agent_name = None
 
-        if is_p2p:
-            # _fetch_worker_metadata() prefetched and generation-validated
-            # this manifest before _load_as_target() prepared target tensors.
-            tensor_protos = worker_tensor_descriptors(source_worker)
-            source_tensors = [
-                TensorDescriptor(
-                    name=t.name,
-                    addr=t.addr,
-                    size=t.size,
-                    device_id=t.device_id,
-                    dtype=t.dtype,
-                )
-                for t in tensor_protos
-            ]
-            nixl_fetch_start = time.perf_counter()
-            ep = source_worker.metadata_endpoint
-            host, port_str = ep.rsplit(":", 1)
-            ctx.nixl_manager.fetch_remote_and_wait(
-                remote_agent_name=source_worker.agent_name,
-                ip=host,
-                port=int(port_str),
-            )
-            nixl_fetch_time = time.perf_counter() - nixl_fetch_start
-            logger.info(
-                f"[Worker {ctx.global_rank}] [TIMING] P2P NIXL metadata fetch: "
-                f"{nixl_fetch_time:.3f}s"
-            )
-            remote_agent_name = source_worker.agent_name
-        else:
-            source_tensors = [
-                TensorDescriptor(
-                    name=t.name,
-                    addr=t.addr,
-                    size=t.size,
-                    device_id=t.device_id,
-                    dtype=t.dtype,
-                )
-                for t in worker_tensor_descriptors(source_worker)
-            ]
-            # Load the peer here rather than letting receive_from_source do it,
-            # so this method holds the name it is responsible for releasing.
-            add_start = time.perf_counter()
-            remote_agent_name = ctx.nixl_manager.add_remote_agent(
-                source_worker.nixl_metadata
-            )
-            logger.info(
-                f"[Worker {ctx.global_rank}] [TIMING] add_remote_agent: "
-                f"{time.perf_counter() - add_start:.3f}s (agent={remote_agent_name})"
-            )
-
         # Release the source once the load is done, rather than at process exit:
         # this is a one-shot load, so the QP has no further use here. Waiting for
         # interpreter exit is what left sources wedged, because the engine process
         # is torn down (SIGTERM, SIGKILL, OOM) without running atexit hooks. Only
         # the reader can do it - in P2P only the reader loads a remote agent, so
-        # the source has no peer record to invalidate. The release covers failures
-        # too, where the source is the more likely casualty, and is last so the
-        # peer outlives every use of the bytes it served.
+        # the source has no peer record to invalidate.
+        #
+        # The scope starts at acquisition and ends after the device sync, so the
+        # peer outlives every use of the bytes it served and no failure in between
+        # can leak it. A half-finished acquisition is the case most worth covering:
+        # fetch_remote_and_wait dials the source first and only then waits, so a
+        # timeout can leave metadata that lands afterwards with nothing to release
+        # it. remove_remote_agent treats an unknown peer as expected, so releasing
+        # one that never finished loading is harmless.
         try:
+            if is_p2p:
+                # _fetch_worker_metadata() prefetched and generation-validated
+                # this manifest before _load_as_target() prepared target tensors.
+                tensor_protos = worker_tensor_descriptors(source_worker)
+                source_tensors = [
+                    TensorDescriptor(
+                        name=t.name,
+                        addr=t.addr,
+                        size=t.size,
+                        device_id=t.device_id,
+                        dtype=t.dtype,
+                    )
+                    for t in tensor_protos
+                ]
+                nixl_fetch_start = time.perf_counter()
+                ep = source_worker.metadata_endpoint
+                host, port_str = ep.rsplit(":", 1)
+                # Claimed before the dial, not after it returns: the name is known
+                # up front here, so a fetch that fails part-way is still covered.
+                remote_agent_name = source_worker.agent_name
+                ctx.nixl_manager.fetch_remote_and_wait(
+                    remote_agent_name=source_worker.agent_name,
+                    ip=host,
+                    port=int(port_str),
+                )
+                nixl_fetch_time = time.perf_counter() - nixl_fetch_start
+                logger.info(
+                    f"[Worker {ctx.global_rank}] [TIMING] P2P NIXL metadata fetch: "
+                    f"{nixl_fetch_time:.3f}s"
+                )
+            else:
+                source_tensors = [
+                    TensorDescriptor(
+                        name=t.name,
+                        addr=t.addr,
+                        size=t.size,
+                        device_id=t.device_id,
+                        dtype=t.dtype,
+                    )
+                    for t in worker_tensor_descriptors(source_worker)
+                ]
+                # Loaded here rather than inside receive_from_source so this method
+                # holds the name it is responsible for releasing. Unlike the P2P
+                # dial the name only exists once this returns, so a failure inside
+                # it leaves nothing to release - hence the guard in the finally.
+                add_start = time.perf_counter()
+                remote_agent_name = ctx.nixl_manager.add_remote_agent(
+                    source_worker.nixl_metadata
+                )
+                logger.info(
+                    f"[Worker {ctx.global_rank}] [TIMING] add_remote_agent: "
+                    f"{time.perf_counter() - add_start:.3f}s (agent={remote_agent_name})"
+                )
+
             logger.info(
                 f"[Worker {ctx.global_rank}] Receiving {len(source_tensors)} tensors from source"
                 f"{' (P2P)' if is_p2p else ''}"
@@ -585,7 +595,8 @@ class RdmaStrategy(LoadStrategy):
 
             ctx.accelerator_backend.synchronize()
         finally:
-            ctx.nixl_manager.remove_remote_agent(remote_agent_name)
+            if remote_agent_name is not None:
+                ctx.nixl_manager.remove_remote_agent(remote_agent_name)
 
         total_time = time.perf_counter() - receive_start
         logger.info(
