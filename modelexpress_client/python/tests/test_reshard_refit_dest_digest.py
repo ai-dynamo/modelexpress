@@ -364,3 +364,135 @@ def test_digest_destination_catches_a_wrongly_placed_write():
         digest_destination({"w": good})["w"] != digest_destination({"w": shifted})["w"]
     )
     assert good.sum() == shifted.sum()  # a checksum would have missed it
+
+
+# ------------------------------------------- source-verify precondition
+# These cover the failure that nearly turned the first real pairing into a filed
+# planner bug: the only step the two arms shared was a step whose *sources* had
+# already failed verify_full_pulls, so localised destination mismatches were being
+# read as mis-sliced tensors.
+def _verify(step, mismatches, *, checked=6192, rank=0):
+    return {
+        "schema": "refit-verify-v1",
+        "step": step,
+        "rank": rank,
+        "checked": checked,
+        "mismatches": mismatches,
+        "detail": [],
+    }
+
+
+def _verify_log(records):
+    return "\n".join(
+        "WARNING 2026-07-29 MX_REFIT_VERIFY " + json.dumps(r) for r in records
+    )
+
+
+def test_parses_verify_records():
+    from modelexpress.refit.reshard.dest_digest_report import parse_verify_records
+
+    text = _verify_log([_verify(1, 0), _verify(3, 118)])
+    parsed = parse_verify_records(text)
+    assert [(r["step"], r["mismatches"]) for r in parsed] == [(1, 0), (3, 118)]
+
+
+def test_parse_verify_ignores_other_schemas():
+    from modelexpress.refit.reshard.dest_digest_report import parse_verify_records
+
+    assert parse_verify_records('MX_REFIT_VERIFY {"schema": "something-else"}') == []
+
+
+def test_dirty_step_is_excluded_and_a_clean_step_still_decides():
+    """A mismatch on a dirty step must not count; a clean step must still be judged."""
+    subject = [
+        _record(0, 1, {"a": "d1"}),
+        _record(0, 3, {"a": "WRONG"}),
+    ]
+    reference = [
+        _record(0, 1, {"a": "d1"}, forced=True),
+        _record(0, 3, {"a": "d3"}, forced=True),
+    ]
+    report = compare(
+        subject,
+        reference,
+        subject_verify=[_verify(1, 0), _verify(3, 360)],
+        reference_verify=[_verify(1, 0), _verify(3, 118)],
+    )
+    assert report["verdict"] == "PASS"
+    assert report["compared_records"] == 1
+    assert [row["step"] for row in report["excluded_dirty_steps"]] == [3]
+    assert report["excluded_dirty_steps"][0]["subject_source_mismatches"] == 360
+    assert report["excluded_dirty_steps"][0]["reference_source_mismatches"] == 118
+
+
+def test_all_shared_steps_dirty_is_invalid_not_a_failure():
+    """The real 2026-07-29 shape: one shared step, and it was dirty in both arms."""
+    report = compare(
+        [_record(0, 3, {"a": "x"})],
+        [_record(0, 3, {"a": "y"}, forced=True)],
+        subject_verify=[_verify(3, 360)],
+        reference_verify=[_verify(3, 118)],
+    )
+    assert report["verdict"] == "INVALID_NO_CLEAN_STEP"
+    assert report["mismatches"] == 0
+    assert "step 3" in report["reason"]
+    assert report["source_verify_checked"] is True
+
+
+def test_a_step_dirty_in_only_one_arm_is_still_excluded():
+    """Inconsistent sources in either arm are enough to make the pair unusable."""
+    report = compare(
+        [_record(0, 4, {"a": "x"})],
+        [_record(0, 4, {"a": "y"}, forced=True)],
+        subject_verify=[_verify(4, 0)],
+        reference_verify=[_verify(4, 7)],
+    )
+    assert report["verdict"] == "INVALID_NO_CLEAN_STEP"
+
+
+def test_verify_records_from_other_steps_do_not_exclude_anything():
+    report = compare(
+        [_record(0, 2, {"a": "same"})],
+        [_record(0, 2, {"a": "same"}, forced=True)],
+        subject_verify=[_verify(3, 999)],
+        reference_verify=[_verify(3, 999)],
+    )
+    assert report["verdict"] == "PASS"
+    assert report["excluded_dirty_steps"] == []
+
+
+def test_fail_without_verify_records_is_marked_unattributable():
+    """Omitting verify records must not silently restore the old, wrong reading."""
+    report = compare(
+        [_record(0, 3, {"a": "x", "b": "same"})],
+        [_record(0, 3, {"a": "y", "b": "same"}, forced=True)],
+    )
+    assert report["verdict"] == "FAIL"
+    assert report["source_verify_checked"] is False
+    assert "not attributable" in report["attribution_warning"]
+
+
+def test_pass_without_verify_records_carries_no_warning():
+    report = compare(
+        [_record(0, 3, {"a": "same"})],
+        [_record(0, 3, {"a": "same"}, forced=True)],
+    )
+    assert report["verdict"] == "PASS"
+    assert "attribution_warning" not in report
+
+
+def test_cli_exit_code_distinguishes_unmeasurable_from_failed(tmp_path, capsys):
+    """Exit 4, not 1: "could not be measured" is not "the planner is wrong"."""
+    subj = tmp_path / "s.log"
+    ref = tmp_path / "r.log"
+    subj.write_text(
+        _log([_record(0, 3, {"a": "x"})]) + "\n" + _verify_log([_verify(3, 360)])
+    )
+    ref.write_text(
+        _log([_record(0, 3, {"a": "y"}, forced=True)])
+        + "\n"
+        + _verify_log([_verify(3, 118)])
+    )
+    code = main([str(subj), str(ref)])
+    assert code == 4
+    assert json.loads(capsys.readouterr().out)["verdict"] == "INVALID_NO_CLEAN_STEP"

@@ -30,6 +30,25 @@ from a mis-sliced one - the trap Bug 9 fell into. Run against a quiesced publish
 When most parameters differ, suspect the setup rather than the planner; the report
 says so explicitly rather than leaving it to the reader.
 
+That warning turned out to be too weak to be useful on its own, because the
+interference is not always wholesale. The first real pairing (2026-07-29, small rig,
+Qwen3-30B) reported FAIL on 8 of 870 parameters - 0.92%, comfortably localised, and
+so exactly the shape a mis-sliced tensor would take. It was not one. The refit had
+gone into a retry loop at step 3, and ``verify_full_pulls`` had independently flagged
+360 source-level mismatches at that same step in the subject arm and 118 in the
+reference, while steps 1, 2, 4 and 5 were clean in both. Step 3 was also the only
+step the two arms had in common, so the gate compared the one step whose *sources*
+were already known to be inconsistent, and dressed the result up as a planner bug.
+One of the eight, ``o_proj``, is a full-pull source at generator TP2 and therefore
+took the same path in both arms - its digests could not have differed for any reason
+this gate is looking for.
+
+So the source-level verdict is now a precondition rather than a footnote: a step is
+only compared when ``verify_full_pulls`` reported zero mismatches for it in *both*
+arms. Steps that fail that test are named and excluded, and a pairing with no clean
+shared step reports ``INVALID_NO_CLEAN_STEP`` rather than a mismatch count nobody
+should act on.
+
 Usage::
 
     python -m modelexpress.refit.reshard.dest_digest_report subject.log reference.log
@@ -42,6 +61,12 @@ import sys
 
 RECORD_MARKER = "MX_REFIT_DEST_DIGEST "
 SCHEMA = "refit-dest-digest-v1"
+
+# The source-level gate, emitted by the same receiver into the same log. Read here so
+# a destination comparison can refuse steps whose sources already disagreed with the
+# publishers, which is otherwise indistinguishable from a slicing bug.
+VERIFY_MARKER = "MX_REFIT_VERIFY "
+VERIFY_SCHEMA = "refit-verify-v1"
 
 # Above this fraction of parameters differing, the finding is reported as a probable
 # setup fault rather than a planner bug. A mis-sliced tensor is a localised defect;
@@ -114,6 +139,42 @@ def parse_records(text: str) -> list[dict]:
     return records
 
 
+def parse_verify_records(text: str) -> list[dict]:
+    """Extract ``refit-verify-v1`` records from the same log text.
+
+    Deliberately separate from :func:`parse_records` so a caller can supply the two
+    kinds from different places, but in practice both come from one receiver log.
+    """
+    records = []
+    for line in text.splitlines():
+        index = line.find(VERIFY_MARKER)
+        if index < 0:
+            continue
+        try:
+            record = json.loads(line[index + len(VERIFY_MARKER) :])
+        except ValueError:
+            continue
+        if record.get("schema") == VERIFY_SCHEMA:
+            records.append(record)
+    return records
+
+
+def _dirty_steps(verify: list[dict]) -> dict:
+    """Sum source-level mismatches per step, keeping only the steps that had any.
+
+    Summed across ranks and across repeated attempts: a retry loop emits many records
+    for one step, and a mismatch in any of them means the sources for that step were
+    not consistent while it was being read.
+    """
+    totals: dict = {}
+    for record in verify:
+        count = int(record.get("mismatches") or 0)
+        if count:
+            step = record.get("step")
+            totals[step] = totals.get(step, 0) + count
+    return totals
+
+
 def _index(records: list[dict]) -> dict:
     """Index records by ``(rank, step)``.
 
@@ -124,13 +185,27 @@ def _index(records: list[dict]) -> dict:
     return {(record.get("rank"), record.get("step")): record for record in records}
 
 
-def compare(subject: list[dict], reference: list[dict]) -> dict:
+def compare(
+    subject: list[dict],
+    reference: list[dict],
+    *,
+    subject_verify: list[dict] | None = None,
+    reference_verify: list[dict] | None = None,
+) -> dict:
     """Compare per-parameter destination digests between the two arms.
 
     Returns a report with a ``verdict`` of ``PASS``, ``FAIL``,
-    ``INVALID_NOT_TWO_ARMS`` or ``NO_COMPARABLE_RECORDS``. The two invalid verdicts
-    exist because this gate's predecessor was undone by exactly that failure: a
-    check that silently cannot run reports zero mismatches and reads as a clean run.
+    ``INVALID_NOT_TWO_ARMS``, ``INVALID_NO_CLEAN_STEP`` or ``NO_COMPARABLE_RECORDS``.
+    The invalid verdicts exist because this gate's predecessor was undone by exactly
+    that failure: a check that silently cannot run reports zero mismatches and reads
+    as a clean run.
+
+    ``subject_verify`` and ``reference_verify`` are ``refit-verify-v1`` records from
+    the same logs. When supplied, any step whose sources did not verify clean in both
+    arms is excluded before comparing - see the module docstring for the run that
+    made this mandatory. They are optional only so the digest logic stays testable in
+    isolation; omitting them on real logs leaves the gate able to blame the planner
+    for a publisher that was moving.
     """
     subject_arms = {bool(r.get("force_full_pull")) for r in subject}
     reference_arms = {bool(r.get("force_full_pull")) for r in reference}
@@ -170,6 +245,51 @@ def compare(subject: list[dict], reference: list[dict]) -> dict:
             "mismatches": 0,
         }
 
+    # Drop steps whose sources were already inconsistent. Done after the shared-key
+    # intersection so the report can say whether anything survived, and which steps
+    # went, rather than silently comparing a smaller set.
+    subject_dirty = _dirty_steps(subject_verify or [])
+    reference_dirty = _dirty_steps(reference_verify or [])
+    dirty = {**subject_dirty}
+    for step, count in reference_dirty.items():
+        dirty[step] = dirty.get(step, 0) + count
+    excluded = sorted(
+        (
+            {
+                "step": step,
+                "subject_source_mismatches": subject_dirty.get(step, 0),
+                "reference_source_mismatches": reference_dirty.get(step, 0),
+            }
+            for step in {k[1] for k in shared_keys} & set(dirty)
+        ),
+        key=lambda row: row["step"] or 0,
+    )
+    excluded_steps = {row["step"] for row in excluded}
+    clean_keys = [key for key in shared_keys if key[1] not in excluded_steps]
+    source_verify_checked = bool(subject_verify or reference_verify)
+
+    if source_verify_checked and not clean_keys:
+        return {
+            "verdict": "INVALID_NO_CLEAN_STEP",
+            "reason": (
+                "every step the two arms share had source-level verify mismatches, so "
+                "the destination digests cannot distinguish a slicing bug from "
+                "publishers that were moving. Excluded: "
+                + ", ".join(
+                    f"step {row['step']} (subject {row['subject_source_mismatches']}, "
+                    f"reference {row['reference_source_mismatches']})"
+                    for row in excluded
+                )
+                + ". Compare a step that verified clean in both arms."
+            ),
+            "compared_records": 0,
+            "compared_params": 0,
+            "mismatches": 0,
+            "source_verify_checked": True,
+            "excluded_dirty_steps": excluded,
+        }
+
+    shared_keys = clean_keys
     compared_params = 0
     mismatches: list[dict] = []
     # A parameter digested by one arm and not the other is a coverage difference,
@@ -240,6 +360,10 @@ def compare(subject: list[dict], reference: list[dict]) -> dict:
         "reference_not_independent_detail": unbounded[:20],
         "fallback_disagreement": len(fallback_differs),
         "fallback_disagreement_detail": fallback_differs[:20],
+        # False means no verify records were supplied, so nothing ruled out a moving
+        # publisher. A PASS is still meaningful; a FAIL is not yet attributable.
+        "source_verify_checked": source_verify_checked,
+        "excluded_dirty_steps": excluded,
     }
     if not mismatches and unbounded:
         report["verdict"] = "PASS_PARTIAL"
@@ -254,6 +378,13 @@ def compare(subject: list[dict], reference: list[dict]) -> dict:
             f"{len(fallback_differs)} source(s) fell back in one arm but not the "
             "other; those parameters are not refit at all in one run, so any "
             "mismatch among them is a planning difference, not a slicing bug"
+        )
+    if mismatches and not source_verify_checked:
+        report["attribution_warning"] = (
+            "no refit-verify-v1 records were supplied, so this FAIL is not "
+            "attributable: a step whose sources disagreed with the publishers "
+            "produces localised destination mismatches that look exactly like a "
+            "slicing bug. Pass the receiver logs so dirty steps can be excluded."
         )
     if mismatches and fraction > _WHOLESALE_FRACTION:
         report["verdict"] = "FAIL_LIKELY_SETUP"
@@ -286,16 +417,27 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    # Both record kinds come from the same receiver log, so read each file once and
+    # parse both rather than asking the caller to pass four paths.
     with open(argv[0]) as handle:
-        subject = parse_records(handle.read())
+        subject_text = handle.read()
     with open(argv[1]) as handle:
-        reference = parse_records(handle.read())
-    report = compare(subject, reference)
+        reference_text = handle.read()
+    report = compare(
+        parse_records(subject_text),
+        parse_records(reference_text),
+        subject_verify=parse_verify_records(subject_text),
+        reference_verify=parse_verify_records(reference_text),
+    )
     print(json.dumps(report, indent=2))
     # Partial coverage gets its own code rather than being folded into either
     # outcome: reporting it as success would overclaim, and as failure would send
     # someone looking for a defect when the finding is a gap in what was checked.
-    return {"PASS": 0, "PASS_PARTIAL": 3}.get(report["verdict"], 1)
+    # "Could not be measured" is likewise not "failed", and conflating the two is how
+    # the first real pairing came within one reading of being filed as a planner bug.
+    return {"PASS": 0, "PASS_PARTIAL": 3, "INVALID_NO_CLEAN_STEP": 4}.get(
+        report["verdict"], 1
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover
