@@ -88,6 +88,14 @@ fn resolve_validation_model_path(cache_root: &Path, model_name: &str) -> (ModelP
     (provider, model_path)
 }
 
+fn resolve_download_options(
+    model_name: &str,
+    default_provider: ModelProvider,
+) -> (ModelProvider, bool) {
+    let provider = ModelProvider::resolve_provider_for_model_name(model_name, default_provider);
+    (provider, provider == ModelProvider::S3)
+}
+
 fn has_huggingface_weights(model_path: &Path) -> bool {
     if model_path.join("pytorch_model.bin").exists() {
         return true;
@@ -202,6 +210,7 @@ async fn download_model(
     config: ClientConfig,
     format: &OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let (provider, ignore_weights) = resolve_download_options(&model_name, provider);
     debug!(
         "Starting model download: {} with provider {:?} and strategy {:?}",
         model_name, provider, strategy
@@ -239,9 +248,14 @@ async fn download_model(
             if let Some(cache_config) = cache_config {
                 config.cache = cache_config;
             }
-            Client::request_model_with_smart_fallback(model_name.clone(), provider, config, false)
-                .await
-                .map(|_| ())
+            Client::request_model_with_smart_fallback(
+                model_name.clone(),
+                provider,
+                config,
+                ignore_weights,
+            )
+            .await
+            .map(|_| ())
         }
         DownloadStrategy::ServerOnly => {
             debug!("Using server-only strategy");
@@ -251,7 +265,7 @@ async fn download_model(
                 Client::new(config.clone()).await?
             };
             client
-                .request_model(&model_name, provider, false)
+                .request_model(&model_name, provider, ignore_weights)
                 .await
                 .map(|_| ())
         }
@@ -261,7 +275,7 @@ async fn download_model(
                 &model_name,
                 provider,
                 cache_config.map(|config| config.local_path),
-                false,
+                ignore_weights,
             )
             .await
             .map(|_| ())
@@ -847,6 +861,19 @@ mod tests {
         let (provider, _) =
             resolve_validation_model_path(Path::new("/tmp/mx-cache"), "NgC://nvidia/model/version");
         assert_eq!(provider, ModelProvider::Ngc);
+    }
+
+    #[test]
+    fn test_s3_download_options_enable_metadata_only_mode() {
+        let (provider, ignore_weights) =
+            resolve_download_options("s3://bucket/org/model", ModelProvider::HuggingFace);
+        assert_eq!(provider, ModelProvider::S3);
+        assert!(ignore_weights);
+
+        let (provider, ignore_weights) =
+            resolve_download_options("org/model", ModelProvider::HuggingFace);
+        assert_eq!(provider, ModelProvider::HuggingFace);
+        assert!(!ignore_weights);
     }
 
     #[test]

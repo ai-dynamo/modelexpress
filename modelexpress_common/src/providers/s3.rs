@@ -8,7 +8,9 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use object_store::{ClientOptions, ObjectStore, aws::AmazonS3Builder, path::Path as ObjectPath};
+use object_store::{
+    ClientOptions, ObjectStore, ObjectStoreExt, aws::AmazonS3Builder, path::Path as ObjectPath,
+};
 use std::{
     fs,
     path::{Component, Path, PathBuf},
@@ -31,9 +33,14 @@ struct S3ModelName {
 
 impl S3ModelName {
     fn parse(model_name: &str) -> Result<Self> {
-        let Some(full_url) = model_name.strip_prefix("s3://") else {
+        let model_name = model_name.trim_start();
+        let Some(scheme) = model_name.get(.."s3://".len()) else {
             anyhow::bail!("S3 model name must be a full s3://<bucket>/<path> URL");
         };
+        if !scheme.eq_ignore_ascii_case("s3://") {
+            anyhow::bail!("S3 model name must be a full s3://<bucket>/<path> URL");
+        }
+        let full_url = &model_name["s3://".len()..];
         let (bucket, object_prefix) = full_url
             .split_once('/')
             .ok_or_else(|| anyhow::anyhow!("S3 model URL must include bucket and object path"))?;
@@ -86,11 +93,7 @@ impl S3Provider {
         !Self::is_ignored(path.to_string_lossy().as_ref()) && !Self::is_image(path)
     }
 
-    fn build_store(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
-        let access_key_id =
-            std::env::var("AWS_ACCESS_KEY_ID").context("AWS_ACCESS_KEY_ID not set")?;
-        let secret_access_key =
-            std::env::var("AWS_SECRET_ACCESS_KEY").context("AWS_SECRET_ACCESS_KEY not set")?;
+    fn build_store_builder(bucket: &str) -> AmazonS3Builder {
         let region = std::env::var("AWS_REGION")
             .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
             .unwrap_or_else(|_| DEFAULT_REGION.to_string());
@@ -103,18 +106,12 @@ impl S3Provider {
             .and_then(|value| value.parse().ok())
             .unwrap_or(DEFAULT_TIMEOUT_SECS);
 
-        let mut builder = AmazonS3Builder::new()
-            .with_access_key_id(access_key_id)
-            .with_secret_access_key(secret_access_key)
+        let mut builder = AmazonS3Builder::from_env()
             .with_region(region)
             .with_bucket_name(bucket)
             .with_client_options(
                 ClientOptions::new().with_timeout(Duration::from_secs(timeout_secs)),
             );
-
-        if let Ok(token) = std::env::var("AWS_SESSION_TOKEN") {
-            builder = builder.with_token(token);
-        }
 
         if let Some(endpoint) = endpoint {
             let allow_http = endpoint.starts_with("http://")
@@ -127,7 +124,11 @@ impl S3Provider {
                 .with_allow_http(allow_http);
         }
 
-        Ok(Arc::new(builder.build()?))
+        builder
+    }
+
+    fn build_store(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
+        Ok(Arc::new(Self::build_store_builder(bucket).build()?))
     }
 
     fn relative_path(model: &S3ModelName, location: &ObjectPath) -> Result<Option<PathBuf>> {
@@ -268,7 +269,7 @@ impl ModelProviderTrait for S3Provider {
     async fn get_model_path(&self, model_name: &str, cache_dir: PathBuf) -> Result<PathBuf> {
         let model = S3ModelName::parse(model_name)?;
         let model_dir = model.model_dir(&cache_dir);
-        if !model_dir.is_dir() {
+        if !model_dir.is_dir() || !model_dir.join(MODEL_MARKER_FILE_NAME).is_file() {
             anyhow::bail!("S3 model '{model_name}' not found in cache");
         }
         Ok(model_dir)
@@ -388,6 +389,49 @@ mod tests {
         assert_eq!(
             model.model_dir(temp_dir.path()),
             temp_dir.path().join("s3/bucket/org/model/rev")
+        );
+    }
+
+    #[test]
+    fn test_model_name_parse_normalizes_scheme() {
+        let model =
+            S3ModelName::parse(" S3://bucket/org/model/rev/").expect("Expected model name parse");
+        assert_eq!(model.to_string(), "s3://bucket/org/model/rev");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn test_s3_builder_supports_default_credential_chain() {
+        S3Provider::build_store_builder("bucket")
+            .build()
+            .expect("Expected S3 builder without static credentials");
+    }
+
+    #[test]
+    fn test_get_model_path_requires_completion_marker() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let model = S3ModelName::parse("s3://bucket/org/model").expect("Expected model name parse");
+        let model_dir = model.model_dir(temp_dir.path());
+        fs::create_dir_all(&model_dir).expect("Failed to create model dir");
+        fs::write(model_dir.join("config.json"), b"{}").expect("Failed to write model file");
+
+        let runtime = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+        runtime
+            .block_on(
+                S3Provider.get_model_path("s3://bucket/org/model", temp_dir.path().to_path_buf()),
+            )
+            .expect_err("Expected incomplete cache to be rejected");
+
+        fs::write(model_dir.join(MODEL_MARKER_FILE_NAME), b"")
+            .expect("Failed to write completion marker");
+        assert_eq!(
+            runtime
+                .block_on(
+                    S3Provider
+                        .get_model_path("s3://bucket/org/model", temp_dir.path().to_path_buf(),)
+                )
+                .expect("Expected complete cache"),
+            model_dir
         );
     }
 
