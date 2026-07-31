@@ -197,7 +197,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # bytes; ReshardReceiver validates its range at the point of use. What a
     # complete refit scores is engine- and model-specific, so the default is set
     # loose enough to pass any complete refit and still catch a gross hole; see
-    # ReshardReceiver._coverage_floor.
+    # modelexpress.refit.reshard.receiver._coverage_floor.
     "MX_RESHARD_REQUIRE_FULL_COVERAGE": lambda: os.environ.get(
         "MX_RESHARD_REQUIRE_FULL_COVERAGE", ""
     )
