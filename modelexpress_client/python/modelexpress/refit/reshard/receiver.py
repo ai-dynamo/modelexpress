@@ -53,34 +53,6 @@ from modelexpress.refit.reshard.types import (
 logger = logging.getLogger("modelexpress.refit.reshard.receiver")
 
 
-def _handshake_seconds(name: str) -> float:
-    """Read a handshake duration from the env registry, rejecting non-positives.
-
-    ``MX_RESHARD_HANDSHAKE_TIMEOUT_S`` is the whole-handshake budget across every
-    peer and every retry. A refit timeout is the wrong bound: it lets one
-    unreachable peer consume the entire refit. It must still be generous, because
-    a peer can be unreachable for minutes for a legitimate reason - registering
-    tens of GB with the fabric provider blocks its listen thread - and the
-    receiver's only correct response to that is to keep trying.
-
-    ``MX_RESHARD_HANDSHAKE_ATTEMPT_S`` is the ceiling on a single dial. A reachable
-    peer answers in well under a second, so a short attempt costs nothing when
-    things are healthy and, when they are not, frees the budget to try a different
-    peer instead of blocking on one.
-
-    ``MX_RESHARD_HANDSHAKE_BACKOFF_S`` is the pause after a full pass over the
-    pending peers yields no progress, so a transient stall is waited out rather
-    than hammered.
-
-    A non-positive value turns the corresponding bound off, which silently
-    reintroduces the failure mode it exists to prevent, so it is rejected.
-    """
-    value = float(getattr(envs, name))
-    if not value > 0.0:
-        raise ValueError(f"{name} must be a positive number of seconds, got {value}")
-    return value
-
-
 def handshake_with_peers(
     manager,
     agent_endpoints: dict,
@@ -109,10 +81,8 @@ def handshake_with_peers(
     metadata is being fetched, and there is no way to tell which peer is at
     fault, or whether it stalled on the first dial or the last.
     """
-    attempt_timeout = attempt_timeout or _handshake_seconds(
-        "MX_RESHARD_HANDSHAKE_ATTEMPT_S"
-    )
-    backoff = _handshake_seconds("MX_RESHARD_HANDSHAKE_BACKOFF_S")
+    attempt_timeout = attempt_timeout or envs.MX_RESHARD_HANDSHAKE_ATTEMPT_S
+    backoff = envs.MX_RESHARD_HANDSHAKE_BACKOFF_S
     pending = deque(agent_endpoints.items())
     total = len(pending)
     attempts: dict = {name: 0 for name in agent_endpoints}
@@ -377,7 +347,7 @@ class ReshardReceiver:
         handshake_with_peers(
             self._manager,
             agent_endpoints,
-            _handshake_seconds("MX_RESHARD_HANDSHAKE_TIMEOUT_S"),
+            envs.MX_RESHARD_HANDSHAKE_TIMEOUT_S,
         )
 
         manifest = [

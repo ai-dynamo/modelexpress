@@ -244,7 +244,20 @@ def test_only_the_requested_number_of_ranks_is_returned():
 
     discovered = _rendezvous(client).discover_trainers(expected_trainers=2, timeout=0)
 
-    assert [name for (_meta, name, _ep, _t) in discovered] == ["rank-0", "rank-1"]
+    assert [p.agent_name for p in discovered] == ["rank-0", "rank-1"]
+
+
+def test_a_discovered_payload_reads_by_field_and_by_position():
+    """Named access is the point of the change; positional access is what every
+    existing caller does, so both have to keep working."""
+    client = _DiscoveryClient([_blob("rank-0", _one_tensor())])
+
+    (payload,) = _rendezvous(client).discover_trainers(expected_trainers=1, timeout=0)
+    agent_metadata, agent_name, endpoint, tensors = payload
+
+    assert (payload.agent_name, payload.metadata_endpoint) == (agent_name, endpoint)
+    assert (payload.agent_metadata, payload.tensors) == (agent_metadata, tensors)
+    assert payload[3] is payload.tensors
 
 
 def test_a_partial_ready_set_still_reports_its_shard_tables():

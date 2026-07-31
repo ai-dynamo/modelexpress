@@ -11,12 +11,12 @@ Two distinct production failures motivate these:
     is busy publishing, which must not be fatal on the first dial.
 """
 
+import logging
+
 import pytest
 
-from modelexpress.refit.reshard.receiver import (
-    _handshake_seconds,
-    handshake_with_peers,
-)
+from modelexpress import envs
+from modelexpress.refit.reshard.receiver import handshake_with_peers
 
 
 class _Manager:
@@ -157,12 +157,21 @@ def test_a_malformed_endpoint_fails_only_its_own_peer():
 def test_handshake_bounds_come_from_the_env_registry(monkeypatch):
     monkeypatch.setenv("MX_RESHARD_HANDSHAKE_ATTEMPT_S", "3.5")
 
-    assert _handshake_seconds("MX_RESHARD_HANDSHAKE_ATTEMPT_S") == 3.5
+    assert envs.MX_RESHARD_HANDSHAKE_ATTEMPT_S == 3.5
 
 
-def test_a_non_positive_bound_is_rejected(monkeypatch):
-    """Zero or negative turns the bound off, reinstating the hang it prevents."""
+def test_a_non_positive_bound_falls_back_to_the_default(monkeypatch, caplog):
+    """Zero or negative is not a smaller bound but an absent one, which reinstates
+    the hang the bound exists to prevent. The documented default is kept instead."""
     monkeypatch.setenv("MX_RESHARD_HANDSHAKE_TIMEOUT_S", "0")
 
-    with pytest.raises(ValueError, match="positive number of seconds"):
-        _handshake_seconds("MX_RESHARD_HANDSHAKE_TIMEOUT_S")
+    with caplog.at_level(logging.WARNING, logger="modelexpress.envs"):
+        assert envs.MX_RESHARD_HANDSHAKE_TIMEOUT_S == 900.0
+
+    assert "must be positive" in caplog.text
+
+
+def test_an_unparseable_bound_falls_back_to_the_default(monkeypatch):
+    monkeypatch.setenv("MX_RESHARD_HANDSHAKE_BACKOFF_S", "soon")
+
+    assert envs.MX_RESHARD_HANDSHAKE_BACKOFF_S == 2.0

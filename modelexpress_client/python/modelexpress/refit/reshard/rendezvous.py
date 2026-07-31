@@ -39,6 +39,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from modelexpress import envs, p2p_pb2
 from modelexpress.client import MxClient
@@ -233,9 +234,22 @@ def wrap_rendezvous_blob(
     return json.dumps(payload).encode("utf-8")
 
 
-def unwrap_rendezvous_blob(blob: bytes) -> tuple:
-    """Inverse of ``wrap_rendezvous_blob``; returns ``(agent_metadata, agent_name,
-    metadata_endpoint, tensors)``."""
+class RendezvousPayload(NamedTuple):
+    """One trainer rank's unwrapped rendezvous blob.
+
+    A plain tuple until now, which read as ``payload[3]`` at the point where the
+    interesting question is asked - whether this rank published any tensors. Being
+    a tuple subclass, it still unpacks and indexes as before.
+    """
+
+    agent_metadata: bytes
+    agent_name: str
+    metadata_endpoint: str
+    tensors: list
+
+
+def unwrap_rendezvous_blob(blob: bytes) -> RendezvousPayload:
+    """Inverse of ``wrap_rendezvous_blob``."""
     payload = json.loads(blob.decode("utf-8"))
     if payload.get("schema") != _SCHEMA:
         raise ValueError(f"unexpected rendezvous blob schema {payload.get('schema')!r}")
@@ -245,7 +259,7 @@ def unwrap_rendezvous_blob(blob: bytes) -> tuple:
     tensors = decode_shard_table(
         json.dumps({"schema": _SCHEMA, "tensors": payload["tensors"]}).encode("utf-8")
     )
-    return agent_metadata, agent_name, metadata_endpoint, tensors
+    return RendezvousPayload(agent_metadata, agent_name, metadata_endpoint, tensors)
 
 
 class MxReshardRendezvous:
@@ -344,8 +358,7 @@ class MxReshardRendezvous:
         """Block until ``expected_trainers`` trainer ranks are visible **with a
         non-empty shard table**, then return them.
 
-        Returns ``list[(agent_metadata, agent_name, metadata_endpoint,
-        tensors)]``, one per trainer rank.
+        Returns ``list[RendezvousPayload]``, one per trainer rank.
 
         A rank counts toward the quorum only once its published table names at
         least one tensor. A rank that advertises READY with nothing to read has
@@ -376,7 +389,7 @@ class MxReshardRendezvous:
                 if not meta.found:
                     continue
                 payload = unwrap_rendezvous_blob(meta.worker.nixl_metadata)
-                if not payload[3]:
+                if not payload.tensors:
                     empty += 1
                     continue
                 payloads.append(payload)
@@ -397,8 +410,8 @@ class MxReshardRendezvous:
             len(payloads),
             f" ({empty} skipped as empty)" if empty else "",
             ", ".join(
-                f"{name}@{endpoint}[{len(tensors)}]"
-                for (_meta, name, endpoint, tensors) in payloads
+                f"{p.agent_name}@{p.metadata_endpoint}[{len(p.tensors)}]"
+                for p in payloads
             ),
         )
         return payloads
@@ -421,8 +434,8 @@ def gather_sources(
     caller to ``fetch_remote_and_wait`` (P2P) before pulling."""
     rdv = MxReshardRendezvous(client, role=role, rank=rank, model_name=model_name)
     payloads = rdv.discover_trainers(expected_trainers, timeout=timeout)
-    tables = [tensors for (_meta, _name, _ep, tensors) in payloads]
-    agent_endpoints = {name: ep for (_meta, name, ep, _tensors) in payloads}
+    tables = [p.tensors for p in payloads]
+    agent_endpoints = {p.agent_name: p.metadata_endpoint for p in payloads}
     merged = merge_shard_tables(tables)
     sources, session_to_agent, session_to_device = build_sources(merged)
     return sources, session_to_agent, session_to_device, agent_endpoints
