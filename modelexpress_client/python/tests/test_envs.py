@@ -24,6 +24,7 @@ def test_defaults_when_unset(monkeypatch):
         "MX_SERVER_ADDRESS",
         "MX_GDS_TIMEOUT",
         "MX_HEARTBEAT_INTERVAL_SECS",
+        "MX_RESHARD_FUSED_WIRE",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -41,6 +42,7 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_SERVER_ADDRESS is None
     assert envs.MX_GDS_TIMEOUT == pytest.approx(120.0)
     assert envs.MX_HEARTBEAT_INTERVAL_SECS == 30
+    assert envs.MX_RESHARD_FUSED_WIRE is True
 
 
 def test_int_and_float_parsing(monkeypatch):
@@ -57,7 +59,7 @@ def test_invalid_int_falls_back_to_default(monkeypatch):
     assert envs.MX_METADATA_PORT == 5555
 
 
-def test_bool_parsing(monkeypatch):
+def test_bool_parsing(monkeypatch, caplog):
     monkeypatch.setenv("MX_POOL_REG", "1")
     assert envs.MX_POOL_REG is True
     monkeypatch.setenv("MX_POOL_REG", "0")
@@ -81,6 +83,16 @@ def test_bool_parsing(monkeypatch):
         assert envs.MX_ARTIFACT_TRANSFER is True
     monkeypatch.setenv("MX_ARTIFACT_TRANSFER", "maybe")
     assert envs.MX_ARTIFACT_TRANSFER is False
+
+    for falsy in ("0", "FALSE", "no", "Off"):
+        monkeypatch.setenv("MX_RESHARD_FUSED_WIRE", falsy)
+        assert envs.MX_RESHARD_FUSED_WIRE is False
+    for truthy in ("1", "TRUE", "yes", "On"):
+        monkeypatch.setenv("MX_RESHARD_FUSED_WIRE", truthy)
+        assert envs.MX_RESHARD_FUSED_WIRE is True
+    monkeypatch.setenv("MX_RESHARD_FUSED_WIRE", "maybe")
+    assert envs.MX_RESHARD_FUSED_WIRE is True
+    assert "Invalid MX_RESHARD_FUSED_WIRE='maybe'; using default True" in caplog.text
 
 
 def test_normalization(monkeypatch):
