@@ -168,10 +168,20 @@ def test_a_non_positive_bound_falls_back_to_the_default(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING, logger="modelexpress.envs"):
         assert envs.MX_RESHARD_HANDSHAKE_TIMEOUT_S == 900.0
 
-    assert "must be positive" in caplog.text
+    assert "must be a finite positive number" in caplog.text
 
 
 def test_an_unparseable_bound_falls_back_to_the_default(monkeypatch):
     monkeypatch.setenv("MX_RESHARD_HANDSHAKE_BACKOFF_S", "soon")
 
     assert envs.MX_RESHARD_HANDSHAKE_BACKOFF_S == 2.0
+
+
+@pytest.mark.parametrize("raw", ["inf", "-inf", "nan"])
+def test_a_non_finite_bound_falls_back_to_the_default(monkeypatch, raw):
+    """`float()` takes these happily and each one defeats the deadline: `now >=
+    inf` is never true, and every comparison against `nan` is false. Both leave
+    the handshake unbounded, which is what the bound is here to prevent."""
+    monkeypatch.setenv("MX_RESHARD_HANDSHAKE_TIMEOUT_S", raw)
+
+    assert envs.MX_RESHARD_HANDSHAKE_TIMEOUT_S == 900.0

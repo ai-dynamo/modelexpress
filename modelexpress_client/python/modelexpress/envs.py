@@ -30,6 +30,7 @@ Not covered here (intentional exceptions):
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -170,18 +171,23 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def _env_positive_float(name: str, default: float) -> float:
-    """As :func:`_env_float`, for a variable where zero and negatives are meaningless.
+    """As :func:`_env_float`, for a variable that has to be a finite positive bound.
 
-    Timeouts, per-attempt ceilings and backoff pauses are all bounds, and a bound of
-    zero or less is not a smaller bound but an absent one: it turns the loop it
-    governs into an unbounded one, which is the failure the variable exists to
-    prevent. Falling back to the documented default keeps the bound in place, and
-    the warning says which value was ignored.
+    Timeouts, per-attempt ceilings and backoff pauses are all bounds, and anything
+    that is not a finite positive number is not a different bound but an absent
+    one: it turns the loop it governs into an unbounded one, which is the failure
+    the variable exists to prevent. Zero and negatives are the obvious cases;
+    ``inf`` and ``nan`` are the ones worth naming, since both parse happily and
+    both make a ``now >= deadline`` test that never fires.
+
+    Falling back to the documented default keeps the bound in place, and the
+    warning says which value was ignored.
     """
     value = _env_float(name, default)
-    if value <= 0.0:
+    if not math.isfinite(value) or value <= 0.0:
         logger.warning(
-            "Invalid %s=%r; a bound must be positive, using default %s",
+            "Invalid %s=%r; a bound must be a finite positive number, using "
+            "default %s",
             name,
             os.environ.get(name),
             default,
