@@ -17,6 +17,7 @@ use modelexpress_common::{
         },
     },
     models::{ModelProvider, ModelStatus},
+    providers::is_weight_file,
 };
 use std::{
     collections::HashMap,
@@ -141,6 +142,7 @@ fn collect_model_files(
     base_path: &Path,
     current_path: &Path,
     file_selector: Option<&ModelFileSelector>,
+    ignore_weights: bool,
 ) -> Vec<(PathBuf, u64)> {
     let mut files = Vec::new();
 
@@ -171,6 +173,10 @@ fn collect_model_files(
                                 path,
                                 relative
                             );
+                        } else if ignore_weights
+                            && is_weight_file(relative.to_string_lossy().as_ref())
+                        {
+                            // Weight file skipped because ignore_weights is set.
                         } else if file_selector.is_none_or(|selector| {
                             selector
                                 .paths
@@ -182,7 +188,12 @@ fn collect_model_files(
                     }
                 }
             } else if path.is_dir() {
-                files.extend(collect_model_files(base_path, &path, file_selector));
+                files.extend(collect_model_files(
+                    base_path,
+                    &path,
+                    file_selector,
+                    ignore_weights,
+                ));
             }
         }
     }
@@ -346,6 +357,7 @@ impl ModelService for ModelServiceImpl {
             &model_path,
             &model_path,
             files_request.file_selector.as_ref(),
+            files_request.ignore_weights,
         );
         ensure_selected_files_exist(&files, files_request.file_selector.as_ref())
             .map_err(Status::not_found)?;
@@ -494,6 +506,7 @@ impl ModelService for ModelServiceImpl {
             &model_path,
             &model_path,
             files_request.file_selector.as_ref(),
+            files_request.ignore_weights,
         );
         ensure_selected_files_exist(&files, files_request.file_selector.as_ref())
             .map_err(Status::not_found)?;
@@ -1237,7 +1250,7 @@ mod tests {
     #[test]
     fn test_collect_model_files_empty_dir() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let files = collect_model_files(temp_dir.path(), temp_dir.path(), None);
+        let files = collect_model_files(temp_dir.path(), temp_dir.path(), None, false);
         assert!(files.is_empty());
     }
 
@@ -1252,7 +1265,7 @@ mod tests {
         let file2_path = temp_dir.path().join("model.bin");
         std::fs::write(&file2_path, vec![0u8; 100]).expect("Failed to write file2");
 
-        let files = collect_model_files(temp_dir.path(), temp_dir.path(), None);
+        let files = collect_model_files(temp_dir.path(), temp_dir.path(), None, false);
 
         assert_eq!(files.len(), 2);
 
@@ -1270,6 +1283,51 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_model_files_ignore_weights() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+
+        // Mix of non-weight and weight files, including a nested weight shard.
+        std::fs::write(temp_dir.path().join("config.json"), "{}").expect("write config");
+        std::fs::write(temp_dir.path().join("tokenizer.json"), "{}").expect("write tokenizer");
+        std::fs::write(temp_dir.path().join("model.safetensors"), vec![0u8; 10])
+            .expect("write safetensors");
+        std::fs::write(temp_dir.path().join("pytorch_model.bin"), vec![0u8; 10])
+            .expect("write bin");
+        let subdir = temp_dir.path().join("subdir");
+        std::fs::create_dir(&subdir).expect("create subdir");
+        std::fs::write(
+            subdir.join("model-00001-of-00002.safetensors"),
+            vec![0u8; 10],
+        )
+        .expect("write nested shard");
+
+        // ignore_weights = false streams everything.
+        let all = collect_model_files(temp_dir.path(), temp_dir.path(), None, false);
+        assert_eq!(all.len(), 5);
+
+        // ignore_weights = true keeps only the non-weight files (config + tokenizer),
+        // dropping weight shards at any depth.
+        let no_weights = collect_model_files(temp_dir.path(), temp_dir.path(), None, true);
+        let names: Vec<String> = no_weights
+            .iter()
+            .map(|(p, _)| p.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            no_weights.len(),
+            2,
+            "expected only non-weight files: {names:?}"
+        );
+        assert!(names.contains(&"config.json".to_string()));
+        assert!(names.contains(&"tokenizer.json".to_string()));
+        assert!(
+            names
+                .iter()
+                .all(|n| !n.ends_with(".safetensors") && !n.ends_with(".bin")),
+            "weight files must be excluded: {names:?}"
+        );
+    }
+
+    #[test]
     fn test_collect_model_files_nested() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
 
@@ -1283,7 +1341,7 @@ mod tests {
         let file2_path = subdir.join("nested_file.txt");
         std::fs::write(&file2_path, "nested content").expect("Failed to write file2");
 
-        let files = collect_model_files(temp_dir.path(), temp_dir.path(), None);
+        let files = collect_model_files(temp_dir.path(), temp_dir.path(), None, false);
 
         assert_eq!(files.len(), 2);
 
@@ -1310,7 +1368,7 @@ mod tests {
         let selector = ModelFileSelector {
             paths: vec!["config.json".to_string(), "subdir/nested.txt".to_string()],
         };
-        let files = collect_model_files(temp_dir.path(), temp_dir.path(), Some(&selector));
+        let files = collect_model_files(temp_dir.path(), temp_dir.path(), Some(&selector), false);
 
         let mut paths: Vec<_> = files
             .iter()
@@ -1330,7 +1388,13 @@ mod tests {
 
         let empty_selector = ModelFileSelector { paths: vec![] };
         assert!(
-            collect_model_files(temp_dir.path(), temp_dir.path(), Some(&empty_selector)).is_empty()
+            collect_model_files(
+                temp_dir.path(),
+                temp_dir.path(),
+                Some(&empty_selector),
+                false
+            )
+            .is_empty()
         );
 
         let nonmatching_selector = ModelFileSelector {
@@ -1340,7 +1404,8 @@ mod tests {
             collect_model_files(
                 temp_dir.path(),
                 temp_dir.path(),
-                Some(&nonmatching_selector)
+                Some(&nonmatching_selector),
+                false
             )
             .is_empty()
         );
@@ -1374,6 +1439,7 @@ mod tests {
             file_selector: Some(ModelFileSelector {
                 paths: vec!["config.json".to_string(), "subdir/nested.txt".to_string()],
             }),
+            ignore_weights: false,
         });
 
         let response = service
@@ -1458,6 +1524,7 @@ mod tests {
             file_selector: Some(ModelFileSelector {
                 paths: vec!["config.json".to_string()],
             }),
+            ignore_weights: false,
         });
 
         let response = service
@@ -1501,6 +1568,7 @@ mod tests {
             file_selector: Some(ModelFileSelector {
                 paths: vec!["config.json".to_string(), "missing.json".to_string()],
             }),
+            ignore_weights: false,
         });
 
         let result = service.stream_model_files(request).await;
@@ -1521,6 +1589,7 @@ mod tests {
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
             chunk_size: 0,
             file_selector: None,
+            ignore_weights: false,
         });
 
         let result = service.list_model_files(request).await;
@@ -1538,6 +1607,7 @@ mod tests {
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
             chunk_size: 1024,
             file_selector: None,
+            ignore_weights: false,
         });
 
         let result = service.stream_model_files(request).await;
@@ -1572,6 +1642,7 @@ mod tests {
             provider: 99,
             chunk_size: 0,
             file_selector: None,
+            ignore_weights: false,
         });
 
         let result = service.list_model_files(request).await;
@@ -1590,6 +1661,7 @@ mod tests {
             provider: 99,
             chunk_size: 1024,
             file_selector: None,
+            ignore_weights: false,
         });
 
         let result = service.stream_model_files(request).await;
@@ -1622,6 +1694,7 @@ mod tests {
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
             chunk_size: 1024,
             file_selector: None,
+            ignore_weights: false,
         });
 
         let response = service
@@ -1663,6 +1736,7 @@ mod tests {
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
             chunk_size: 1024,
             file_selector: None,
+            ignore_weights: false,
         });
 
         let response = service

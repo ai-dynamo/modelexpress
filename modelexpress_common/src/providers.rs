@@ -73,14 +73,22 @@ pub trait ModelProviderTrait: Send + Sync {
     where
         Self: Sized,
     {
-        filename.ends_with(".bin")
-            || filename.ends_with(".safetensors")
-            || filename.ends_with(".h5")
-            || filename.ends_with(".msgpack")
-            || filename.ends_with(".ckpt.index")
-            || filename.ends_with(".iop")
-            || filename.ends_with(".gas")
+        is_weight_file(filename)
     }
+}
+
+/// Provider-agnostic check for whether a file is a model weight file.
+///
+/// Shared by the provider trait's `is_weight_file` default and by the server's
+/// file-streaming path so both use the same definition of "weight file".
+pub fn is_weight_file(filename: &str) -> bool {
+    filename.ends_with(".bin")
+        || filename.ends_with(".safetensors")
+        || filename.ends_with(".h5")
+        || filename.ends_with(".msgpack")
+        || filename.ends_with(".ckpt.index")
+        || filename.ends_with(".iop")
+        || filename.ends_with(".gas")
 }
 
 pub mod gcs;
