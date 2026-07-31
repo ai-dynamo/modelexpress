@@ -146,7 +146,11 @@ def handshake_with_peers(
             )
 
         agent_name, endpoint = pending.popleft()
-        this_timeout = max(1.0, min(attempt_timeout, remaining))
+        # No floor: the deadline check above already guarantees remaining > 0, and
+        # rounding a sub-second remainder up to a second overruns the very budget
+        # this function exists to hold. A dial that gets 10 ms and fails is the
+        # intended outcome there - the next pass reports the bounded error.
+        this_timeout = min(attempt_timeout, remaining)
         attempts[agent_name] += 1
         logger.info(
             "[reshard] _prepare: handshake %d/%d %s at %s (attempt %d, timeout=%.0fs)",

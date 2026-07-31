@@ -80,6 +80,16 @@ def test_attempt_timeout_is_clamped_to_the_remaining_budget():
     assert manager.calls[0][3] == pytest.approx(5.0, abs=0.1)
 
 
+def test_a_sub_second_remainder_does_not_overrun_the_budget():
+    """A one-second floor on the dial timeout would let the last attempt run past
+    the total budget, which is the one thing this function has to hold."""
+    manager = _Manager()
+
+    handshake_with_peers(manager, _endpoints(1), 0.4, attempt_timeout=20.0)
+
+    assert manager.calls[0][3] <= 0.4
+
+
 def test_endpoint_is_split_into_host_and_port():
     manager = _Manager()
 
