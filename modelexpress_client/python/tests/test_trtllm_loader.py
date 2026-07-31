@@ -147,7 +147,9 @@ def test_loader_preserves_native_engine_value(monkeypatch):
 def test_native_publish_uses_existing_context(monkeypatch):
     context = Mock()
     context.adapter.native_loaded = True
+    context.adapter.rdma_loaded = False
     context.adapter.current_model = None
+    manager = context.nixl_manager
     model = Mock()
 
     monkeypatch.setattr(
@@ -163,6 +165,35 @@ def test_native_publish_uses_existing_context(monkeypatch):
     loader.publish_model(model)
 
     context.accelerator_backend.synchronize.assert_called_once()
+    manager.shutdown.assert_not_called()
+    register.assert_called_once()
+    publish.assert_called_once_with(context)
+
+
+def test_rdma_target_rebuilds_registration_before_publish(monkeypatch):
+    context = Mock()
+    context.adapter.rdma_loaded = True
+    context.adapter.current_model = None
+    receive_manager = context.nixl_manager
+    context.tensors = {"receive.weight": Mock()}
+    model = Mock()
+
+    monkeypatch.setattr(
+        "modelexpress.engines.trtllm.loader.build_trtllm_load_context",
+        lambda **kwargs: context,
+    )
+    register = Mock()
+    publish = Mock()
+    monkeypatch.setattr("modelexpress.engines.trtllm.loader.register_tensors", register)
+    monkeypatch.setattr("modelexpress.engines.trtllm.loader.publish_metadata", publish)
+
+    loader = MxModelLoader(**_loader_kwargs())
+    loader.publish_model(model)
+
+    receive_manager.shutdown.assert_called_once_with()
+    assert context.nixl_manager is None
+    assert context.tensors == {}
+    context.accelerator_backend.synchronize.assert_called_once_with()
     register.assert_called_once()
     publish.assert_called_once_with(context)
 

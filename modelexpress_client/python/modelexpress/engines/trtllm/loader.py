@@ -97,11 +97,17 @@ class MxModelLoader:
         return {} if self.p2p_succeeded else value
 
     def publish_model(self, model: torch.nn.Module) -> None:
-        """Publish a native-loaded model after TRT post-load processing."""
+        """Publish the final TRT model after post-load processing."""
         try:
             result = LoadResult(value=model, model=model)
             self.adapter.current_model = model
             self._ctx.accelerator_backend.synchronize()
+            if self.p2p_succeeded and self._ctx.nixl_manager is not None:
+                # The receive-time registration may describe tensors before TRT
+                # finalizes aliases and storage. Rebuild it from the final model.
+                self._ctx.nixl_manager.shutdown()
+                self._ctx.nixl_manager = None
+                self._ctx.tensors = {}
             register_tensors(result, self._ctx)
             publish_metadata(self._ctx)
         except Exception as exc:  # noqa: BLE001 - publish is best effort
