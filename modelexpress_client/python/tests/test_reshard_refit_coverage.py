@@ -30,7 +30,7 @@ import torch
 
 from modelexpress.refit.reshard import receiver as receiver_mod
 from modelexpress.refit.reshard.receiver import ReshardReceiver
-from modelexpress.refit.reshard.types import UnsupportedReshard
+from modelexpress.refit.reshard.types import IncompleteRefit, UnsupportedReshard
 
 
 class _Plan:
@@ -89,7 +89,10 @@ def _emit(caplog, *, param_layout, all_params, capture=None, plan=None, rank=0):
     """
     stub = types.SimpleNamespace(_global_rank=rank)
     caplog.clear()
-    with caplog.at_level("WARNING"):
+    # INFO, because a clean refit reports at INFO and only an incomplete one is
+    # escalated; capturing at WARNING here would see the record for some inputs
+    # and not others.
+    with caplog.at_level("INFO"):
         ReshardReceiver._log_coverage(
             stub,
             capture or _capture(),
@@ -217,24 +220,59 @@ def test_plan_economics_ride_along_on_the_same_record(caplog):
     assert rec["fallback"] == 0
 
 
-def test_the_record_is_machine_readable_at_warning(caplog):
-    """Benchmarks capture WARNING, never INFO.
+def _levels_of(caplog):
+    return [
+        r.levelname for r in caplog.records if "MX_REFIT_COVERAGE" in r.getMessage()
+    ]
 
-    The economics were already computed and already logged before this record
-    existed - at INFO, which no benchmark run captured, which is precisely why
-    useful bytes were derived rather than measured.
+
+def test_the_record_is_machine_readable(caplog):
+    """One record per refit, parseable, carrying the schema and the rank.
+
+    The economics were computed and logged before this record existed, but as
+    prose, which is why useful bytes were derived rather than measured.
     """
     names = ["a"]
     stub = types.SimpleNamespace(_global_rank=7)
     caplog.clear()
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("INFO"):
         ReshardReceiver._log_coverage(stub, _capture(), _layout(names), names, _Plan())
     hits = [r for r in caplog.records if "MX_REFIT_COVERAGE" in r.getMessage()]
     assert len(hits) == 1
-    assert hits[0].levelname == "WARNING"
     rec = json.loads(hits[0].getMessage().split("MX_REFIT_COVERAGE ", 1)[1])
     assert rec["schema"] == "refit-coverage-v1"
     assert rec["rank"] == 7
+
+
+def test_a_clean_refit_reports_at_info(caplog):
+    """It happens on every refit of a healthy run. At WARNING it would teach
+    operators that MX warnings are routine."""
+    names = ["a", "b"]
+    _emit(caplog, param_layout=_layout(names), all_params=names)
+
+    assert _levels_of(caplog) == ["INFO"]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        pytest.param({"all_params": ["a"]}, id="a param was never written"),
+        pytest.param(
+            {"all_params": ["a", "b"], "capture": _capture(unsupported=["a: op"])},
+            id="a source was unsupported",
+        ),
+        pytest.param(
+            {"all_params": ["a", "b"], "plan": _Plan(fallback=["a"])},
+            id="a source fell back",
+        ),
+    ],
+)
+def test_a_refit_with_something_to_look_at_is_escalated(caplog, kwargs):
+    """The severity tracks the content, so a WARNING here always means something."""
+    layout = _layout(["a", "b"])
+    _emit(caplog, param_layout=layout, **kwargs)
+
+    assert _levels_of(caplog) == ["WARNING"]
 
 
 def test_gate_off_by_default_lets_a_partial_refit_through(caplog):
@@ -247,7 +285,7 @@ def test_gate_off_by_default_lets_a_partial_refit_through(caplog):
 def test_gate_on_raises_below_the_floor_and_names_what_is_missing(caplog, monkeypatch):
     monkeypatch.setenv("MX_RESHARD_REQUIRE_FULL_COVERAGE", "1")
     engine = [f"layers.{i}.weight" for i in range(48)]
-    with pytest.raises(RuntimeError) as ei:
+    with pytest.raises(IncompleteRefit) as ei:
         _emit(
             caplog,
             param_layout=_layout(engine),
@@ -260,6 +298,21 @@ def test_gate_on_raises_below_the_floor_and_names_what_is_missing(caplog, monkey
     # first instinct on seeing it is to trust the passing digest gate.
     assert "never requested are never checked" in msg
     assert "MX_RESHARD_REQUIRE_FULL_COVERAGE=0" in msg
+
+
+def test_an_incomplete_refit_is_not_an_unsupported_reshard(caplog, monkeypatch):
+    """`transfer_plan` catches `UnsupportedReshard` per source to drop that source
+    and carry on. A refit that skipped part of the model must not be reachable by
+    a handler written for that meaning, while still being a `RuntimeError` for
+    callers that catch only the builtin."""
+    monkeypatch.setenv("MX_RESHARD_REQUIRE_FULL_COVERAGE", "1")
+    engine = [f"w{i}" for i in range(10)]
+
+    with pytest.raises(IncompleteRefit) as ei:
+        _emit(caplog, param_layout=_layout(engine), all_params=engine[:1])
+
+    assert not isinstance(ei.value, UnsupportedReshard)
+    assert isinstance(ei.value, RuntimeError)
 
 
 def test_gate_on_passes_at_the_floor_so_stray_buffers_do_not_fail_a_good_run(

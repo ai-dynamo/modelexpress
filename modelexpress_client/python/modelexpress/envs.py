@@ -194,7 +194,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_P2P_METADATA": lambda: os.environ.get("MX_P2P_METADATA", "1"),
     "MX_RESHARD_FUSED_WIRE": lambda: _env_bool("MX_RESHARD_FUSED_WIRE", True),
     # Refit coverage gate. The floor is a fraction of the engine's parameter
-    # bytes; ReshardReceiver validates its range at the point of use.
+    # bytes; ReshardReceiver validates its range at the point of use. What a
+    # complete refit scores is engine- and model-specific, so the default is set
+    # loose enough to pass any complete refit and still catch a gross hole; see
+    # ReshardReceiver._coverage_floor.
     "MX_RESHARD_REQUIRE_FULL_COVERAGE": lambda: os.environ.get(
         "MX_RESHARD_REQUIRE_FULL_COVERAGE", ""
     )

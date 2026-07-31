@@ -24,6 +24,17 @@ class UnsupportedReshard(NotImplementedError):
     applying an incomplete model version."""
 
 
+class IncompleteRefit(RuntimeError):
+    """A refit was planned and executed successfully, and still did not write
+    enough of the engine's parameter bytes.
+
+    Deliberately not an ``UnsupportedReshard``. That one means the geometry could
+    not be expressed, and ``transfer_plan`` catches it per source to drop that
+    source and continue; a refit that quietly skipped part of the model must never
+    be swallowed by a handler written for the other meaning. Both derive from
+    ``RuntimeError``, so a caller that catches only that is unaffected."""
+
+
 @dataclass
 class RecordedCopy:
     """One recorded scatter: read ``src_name`` sliced by ``op_chain`` and write it

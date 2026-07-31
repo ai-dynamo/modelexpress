@@ -42,7 +42,11 @@ from modelexpress.refit.reshard.transport import (
     NixlReshardTransport,
     ReadDescriptor,
 )
-from modelexpress.refit.reshard.types import CaptureResult, UnsupportedReshard
+from modelexpress.refit.reshard.types import (
+    CaptureResult,
+    IncompleteRefit,
+    UnsupportedReshard,
+)
 
 logger = logging.getLogger("modelexpress.refit.reshard.receiver")
 
@@ -50,9 +54,16 @@ logger = logging.getLogger("modelexpress.refit.reshard.receiver")
 def _coverage_floor() -> float:
     """The fraction of engine parameter bytes a gated refit must install.
 
-    Deliberately not 1.0 by default. A few engine parameters - rotary `inv_freq`
-    and similar non-float buffers - are legitimately not refit material, so a
-    complete refit lands slightly under full coverage.
+    What a *complete* refit scores is engine- and model-specific, because the
+    denominator is whatever the engine enumerates as its load-time parameters and
+    some of those are legitimately not refit material - rotary `inv_freq` and
+    similar derived buffers. Hence a configurable floor rather than a hard 1.0.
+
+    The default is deliberately loose. It is sized to catch a gross hole, of the
+    order of a missing layer range, expert group or pipeline half, not to encode
+    any one model's parameter accounting; the non-refit remainder is small in
+    bytes even where it is many tensors by count. Tighten it per model once
+    coverage records exist for that model rather than guessing upward here.
 
     A negative floor passes every refit, which silently disables the gate the
     caller just asked for, and a floor above 1.0 rejects every refit including a
@@ -402,7 +413,16 @@ class ReshardReceiver:
             "converts": len(plan.converts),
             "fallback": len(plan.fallback),
         }
-        logger.warning("MX_REFIT_COVERAGE %s", json.dumps(record))
+        # Severity follows the record's content, not the fact that a record exists.
+        # This is emitted once per refit on a healthy run too, and a per-refit line
+        # at WARNING teaches operators that MX warnings are routine, which costs
+        # more than it buys the first time one is not.
+        complete = not missed and not unsupported and not plan.fallback
+        logger.log(
+            logging.INFO if complete else logging.WARNING,
+            "MX_REFIT_COVERAGE %s",
+            json.dumps(record),
+        )
 
         # Opt-in rather than always-on: partial and subset refit are intended
         # features, and for those a coverage below 1.0 is the point. What is never
@@ -410,7 +430,7 @@ class ReshardReceiver:
         # its wire volume and timings are then the wrong magnitude and get
         # compared against complete ones.
         if envs.MX_RESHARD_REQUIRE_FULL_COVERAGE and coverage < _coverage_floor():
-            raise RuntimeError(
+            raise IncompleteRefit(
                 f"refit covers {100.0 * coverage:.2f}% of the engine's parameter "
                 f"bytes ({dest_bytes} of {engine_bytes}); "
                 f"{len(missed)} of {len(param_layout)} params would keep their "
