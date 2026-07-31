@@ -94,27 +94,35 @@ class TransferPlan:
     exact_descriptor_count: int = 0
     exact_bytes: int = 0
 
+    def _all_segments(self):
+        """Every planned segment, wherever it lands.
+
+        Segments live in three places - read straight into live params, into
+        dtype-conversion staging, and into full-pull staging - and any question
+        about the plan as a whole has to ask all three.
+        """
+        yield from self.segments
+        for convert in self.converts:
+            yield from convert.segments
+        for full_pull in self.full_pulls:
+            yield from full_pull.segments
+
     def bytes_planned(self) -> int:
-        return (
-            sum(segment.nbytes for segment in self.segments)
-            + sum(
-                segment.nbytes
-                for convert in self.converts
-                for segment in convert.segments
-            )
-            + sum(
-                segment.nbytes
-                for full_pull in self.full_pulls
-                for segment in full_pull.segments
-            )
-        )
+        return sum(segment.nbytes for segment in self._all_segments())
 
     def descriptor_count(self) -> int:
-        return (
-            len(self.segments)
-            + sum(len(convert.segments) for convert in self.converts)
-            + sum(len(full_pull.segments) for full_pull in self.full_pulls)
-        )
+        return sum(1 for _ in self._all_segments())
+
+    def sessions(self) -> set:
+        """The transport sessions this plan actually reads from.
+
+        A receiver needs every trainer's shard table to build the plan, because it
+        cannot know which trainers hold the bytes it is missing until the slice
+        arithmetic is done. It does not need to *read* from all of them: with
+        enough ranks on both sides, each receiver ends up pulling from a fraction
+        of the trainers. This is that fraction.
+        """
+        return {segment.session for segment in self._all_segments()}
 
     def descriptor_savings(self) -> int:
         return max(0, self.exact_descriptor_count - self.descriptor_count())

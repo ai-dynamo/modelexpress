@@ -53,6 +53,41 @@ from modelexpress.refit.reshard.types import (
 logger = logging.getLogger("modelexpress.refit.reshard.receiver")
 
 
+def handshake_endpoints_for_plan(
+    plan, session_to_agent: dict, agent_endpoints: dict
+) -> dict:
+    """Narrow ``agent_endpoints`` to the trainers ``plan`` reads from.
+
+    Discovery has to collect every trainer's shard table, since which trainers own
+    the bytes a receiver is missing is only known once the slice arithmetic is
+    done. Handshaking with every one of them afterwards is a different matter: the
+    handshake exists to resolve remote memory registrations for reads, so a
+    trainer this rank never reads from costs a dial and buys nothing. Left
+    unnarrowed that is one dial per receiver-trainer pair, which grows as the
+    product of both sides.
+
+    Fails closed when a trainer the plan reads from has no endpoint to dial.
+    Skipping it instead would push the failure into ``prep_xfer_dlist``, which
+    cannot say which peer it was missing.
+    """
+    needed = {
+        session_to_agent[session]
+        for session in plan.sessions()
+        if session in session_to_agent
+    }
+    missing = sorted(needed - set(agent_endpoints))
+    if missing:
+        raise RuntimeError(
+            f"[reshard] {len(missing)} trainer(s) in the transfer plan published no "
+            f"metadata endpoint to handshake with: {missing[:10]}"
+        )
+    return {
+        agent_name: endpoint
+        for agent_name, endpoint in agent_endpoints.items()
+        if agent_name in needed
+    }
+
+
 def handshake_with_peers(
     manager,
     agent_endpoints: dict,
@@ -320,8 +355,8 @@ class ReshardReceiver:
 
     # ------------------------------------------------------------------ prepare
     def _prepare(self, timeout: float) -> None:
-        """One-time: discover trainer shards, connect their agents, capture load
-        geometry, build the pull plan, and allocate + register buffers."""
+        """One-time: discover trainer shards, capture load geometry, build the pull
+        plan, connect the trainers it reads from, and allocate + register buffers."""
         logger.info(
             "[reshard] _prepare: discovering %d trainer source(s) (timeout=%.0fs)",
             self._num_trainer_sources,
@@ -336,20 +371,10 @@ class ReshardReceiver:
             timeout=timeout,
         )
         logger.info(
-            "[reshard] _prepare: discovered %d source(s), %d agent(s); P2P-fetching remote metadata",
+            "[reshard] _prepare: discovered %d source(s), %d agent(s)",
             len(sources),
             len(agent_endpoints),
         )
-        # P2P memory handshake (mirrors MX's vLLM RDMA path): fetch each trainer's
-        # NIXL metadata (incl. its memory registrations) via its listen thread, so
-        # prep_xfer_dlist can resolve the remote addresses. The central
-        # add_remote_agent(blob) path does NOT convey the registrations.
-        handshake_with_peers(
-            self._manager,
-            agent_endpoints,
-            envs.MX_RESHARD_HANDSHAKE_TIMEOUT_S,
-        )
-
         manifest = [
             (name, src.dtype, tuple(src.global_shape)) for name, src in sources.items()
         ]
@@ -385,6 +410,29 @@ class ReshardReceiver:
                 f"full-pull path (unsupported reshard ops); refusing to serve stale "
                 f"weights. Params: {plan.fallback[:10]}"
             )
+        # P2P memory handshake (mirrors MX's vLLM RDMA path): fetch each trainer's
+        # NIXL metadata (incl. its memory registrations) via its listen thread, so
+        # prep_xfer_dlist can resolve the remote addresses. The central
+        # add_remote_agent(blob) path does NOT convey the registrations.
+        #
+        # After planning, for two reasons. It only has to precede the first read,
+        # and by here the plan says which trainers are actually read from, so peers
+        # this rank never touches are not dialed. It also means an unsupported plan
+        # is rejected above without spending the handshake budget first.
+        handshake_endpoints = handshake_endpoints_for_plan(
+            plan, session_to_agent, agent_endpoints
+        )
+        logger.info(
+            "[reshard] _prepare: P2P-fetching remote metadata from %d of %d agent(s)",
+            len(handshake_endpoints),
+            len(agent_endpoints),
+        )
+        handshake_with_peers(
+            self._manager,
+            handshake_endpoints,
+            envs.MX_RESHARD_HANDSHAKE_TIMEOUT_S,
+        )
+
         self._transport = NixlReshardTransport(
             self._manager, session_to_agent, session_to_device, timeout_seconds=timeout
         )

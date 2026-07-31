@@ -2,21 +2,32 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """The P2P metadata handshake must be bounded overall, retry transient failures,
-and say who it is talking to.
+say who it is talking to, and dial only the peers it needs.
 
-Two distinct production failures motivate these:
+Two distinct production failures motivate the bounds:
   * a dead publisher still advertised in the catalog previously hung the whole
     refit for the refit timeout, with no indication of which peer stalled;
   * a *live* publisher can be listening yet transiently unable to accept while it
     is busy publishing, which must not be fatal on the first dial.
+
+The peer selection is a scaling concern rather than a failure: the handshake
+resolves remote memory registrations for reads, so dialing a trainer this rank
+never reads from buys nothing, and unnarrowed that is a dial per
+receiver-trainer pair.
 """
 
 import logging
+import types
 
 import pytest
 
 from modelexpress import envs
-from modelexpress.refit.reshard.receiver import handshake_with_peers
+from modelexpress.refit.reshard.receiver import (
+    handshake_endpoints_for_plan,
+    handshake_with_peers,
+)
+from modelexpress.refit.reshard.slice_plan import PullSegment
+from modelexpress.refit.reshard.transfer_plan import TransferPlan
 
 
 class _Manager:
@@ -185,3 +196,71 @@ def test_a_non_finite_bound_falls_back_to_the_default(monkeypatch, raw):
     monkeypatch.setenv("MX_RESHARD_HANDSHAKE_TIMEOUT_S", raw)
 
     assert envs.MX_RESHARD_HANDSHAKE_TIMEOUT_S == 900.0
+
+
+# --------------------------------------------------- narrowing the peer set
+
+
+def _segment(session):
+    return PullSegment(
+        session=session, src_addr=0, param_name="w", dst_byte=0, nbytes=1024
+    )
+
+
+def _session_to_agent(n):
+    return {f"s{i}": f"trainer-r{i}" for i in range(n)}
+
+
+def test_only_the_trainers_the_plan_reads_from_are_dialed():
+    """Four trainers were discovered, the plan reads from two, so two are dialed."""
+    plan = TransferPlan(segments=[_segment("s1"), _segment("s3")])
+
+    narrowed = handshake_endpoints_for_plan(plan, _session_to_agent(4), _endpoints(4))
+
+    assert set(narrowed) == {"trainer-r1", "trainer-r3"}
+
+
+def test_the_narrowed_endpoints_keep_their_addresses():
+    plan = TransferPlan(segments=[_segment("s2")])
+
+    narrowed = handshake_endpoints_for_plan(plan, _session_to_agent(4), _endpoints(4))
+
+    assert narrowed == {"trainer-r2": "10.0.0.2:9999"}
+
+
+def test_reads_are_counted_from_every_phase_of_the_plan():
+    """Segments land in three places - straight into live params, into
+    dtype-conversion staging, and into full-pull staging. Missing any one of them
+    would drop a peer the plan genuinely reads from, and the failure would surface
+    later as an unresolvable address in prep_xfer_dlist."""
+    plan = TransferPlan(
+        segments=[_segment("s0")],
+        converts=[types.SimpleNamespace(segments=[_segment("s1")])],
+        full_pulls=[types.SimpleNamespace(segments=[_segment("s2")])],
+    )
+
+    assert plan.sessions() == {"s0", "s1", "s2"}
+
+    narrowed = handshake_endpoints_for_plan(plan, _session_to_agent(4), _endpoints(4))
+
+    assert set(narrowed) == {"trainer-r0", "trainer-r1", "trainer-r2"}
+
+
+def test_a_planned_trainer_with_no_endpoint_fails_closed():
+    """Silently skipping it would defer the failure to prep_xfer_dlist, which
+    cannot say which peer it was missing metadata for."""
+    plan = TransferPlan(segments=[_segment("s0"), _segment("s3")])
+    endpoints = {"trainer-r0": "10.0.0.0:9999"}
+
+    with pytest.raises(RuntimeError) as excinfo:
+        handshake_endpoints_for_plan(plan, _session_to_agent(4), endpoints)
+
+    assert "trainer-r3" in str(excinfo.value)
+
+
+def test_an_empty_plan_dials_nobody():
+    narrowed = handshake_endpoints_for_plan(
+        TransferPlan(), _session_to_agent(4), _endpoints(4)
+    )
+
+    assert narrowed == {}
