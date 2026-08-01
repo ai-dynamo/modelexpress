@@ -40,15 +40,6 @@ def _run(monkeypatch, caplog, *, fused=True, enabled=True):
     monkeypatch.setenv("MX_REFIT_STAGE_RECORD", "1" if enabled else "0")
     monkeypatch.delenv("MX_RESHARD_MAX_GBPS", raising=False)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
-    # The module reads the stage-record flag at import, so reload it under the env
-    # the test wants rather than asserting against whatever the process started
-    # with.
-    import importlib
-
-    from modelexpress.refit.reshard import receiver
-
-    importlib.reload(receiver)
-
     transport = _RecordingTransport()
     harness, keepalive = _build(transport)
     with caplog.at_level(logging.WARNING):
