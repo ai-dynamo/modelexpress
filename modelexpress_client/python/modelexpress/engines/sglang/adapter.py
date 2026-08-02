@@ -97,6 +97,34 @@ class SglangAdapter(EngineAdapter):
             result = self._post_load_weights(result)
             return self._process_weights_after_loading(result)
 
+    def after_rdma_receive(self, result: LoadResult) -> LoadResult:
+        """Re-derive engine state that was computed from random-init weights.
+
+        ``before_rdma_receive`` must run the engine's full post-load
+        derivation before the transfer so the model exists with the packed
+        layouts the manifest describes, but at that point every weight buffer
+        still holds random-init values. The transfer only overwrites manifest
+        tensors (parameters and buffers), so anything derived from weight
+        content that the manifest cannot carry -- per-module caches keyed by
+        weight values (e.g. SGLang's ``_attn_res_cw_cache``, which
+        ``get_cw`` short-circuits on) -- stays stale and silently poisons
+        inference on the receiver.
+
+        Reset those value-derived caches and re-run the engine's own
+        model-level post-load derivation from the received weights.
+        ``_process_weights_after_loading`` must NOT be re-run: the received
+        tensors are already post-processed, so re-packing a packed model
+        would corrupt it. Model-level ``post_load_weights`` only computes
+        value-derived views/caches and is idempotent by construction.
+        """
+        if result.model is None:
+            raise RuntimeError("SGLang post-receive derivation requires result.model")
+        for _, module in result.model.named_modules():
+            if getattr(module, "_attn_res_cw_cache", None) is not None:
+                module._attn_res_cw_cache = {}
+        logger.info("re-deriving engine state from received RDMA weights")
+        return self._post_load_weights(result)
+
     def apply_weight_iter(
         self,
         result: LoadResult,
