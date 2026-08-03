@@ -163,10 +163,20 @@ class M2N:
             ctypes.c_int,
         ]
         self.cudart.cudaMemcpy.restype = ctypes.c_int
+        self.cudart.cudaMemcpyAsync.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        self.cudart.cudaMemcpyAsync.restype = ctypes.c_int
         self.cudart.cudaSetDevice.argtypes = [ctypes.c_int]
         self.cudart.cudaSetDevice.restype = ctypes.c_int
         self.cudart.cudaDeviceSynchronize.argtypes = []
         self.cudart.cudaDeviceSynchronize.restype = ctypes.c_int
+        self.cudart.cudaStreamSynchronize.argtypes = [ctypes.c_void_p]
+        self.cudart.cudaStreamSynchronize.restype = ctypes.c_int
 
         # m2n API
         self.m2n.ncclM2nInit.argtypes = [ctypes.POINTER(ncclM2nConfig_t)]
@@ -219,6 +229,19 @@ class M2N:
         if rc != 0:
             raise RuntimeError(f"cudaMemcpy rc={rc}")
 
+    def memcpy_dtod_async(
+        self, dst_ptr: int, src_ptr: int, nbytes: int, stream: int
+    ) -> None:
+        rc = self.cudart.cudaMemcpyAsync(
+            dst_ptr,
+            src_ptr,
+            nbytes,
+            _CUDA_MEMCPY_DEVICE_TO_DEVICE,
+            stream,
+        )
+        if rc != 0:
+            raise RuntimeError(f"cudaMemcpyAsync rc={rc}")
+
     def device_synchronize(self):
         rc = self.cudart.cudaDeviceSynchronize()
         if rc != 0:
@@ -228,6 +251,11 @@ class M2N:
         rc = self.cudart.cudaSetDevice(device_id)
         if rc != 0:
             raise RuntimeError(f"cudaSetDevice({device_id}) rc={rc}")
+
+    def stream_synchronize(self, stream: int) -> None:
+        rc = self.cudart.cudaStreamSynchronize(stream)
+        if rc != 0:
+            raise RuntimeError(f"cudaStreamSynchronize rc={rc}")
 
     def comm_init_rank(self, nranks: int, uid: ncclUniqueId, rank: int) -> int:
         comm = ctypes.c_void_p()

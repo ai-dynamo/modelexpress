@@ -12,6 +12,15 @@ enter together over one shared ``ncclComm_t``.
 Because the library routes internally from the src/dst meshes, the router /
 resolver / RdmaDescriptor machinery is not on this path.
 
+Stream contract: ``stream`` is either 0 or a caller-owned explicit CUDA stream
+for ``device_id``.  MX forwards the token unchanged to every staging copy,
+reshard call, and synchronization.  For stream 0, current M2N bridges its
+internal work stream with caller-readiness and completion events, preserving the
+same logical ordering.  An explicit stream must belong to ``device_id`` and
+remain valid through ``teardown``.  The executor is not concurrent-safe:
+callers must serialize ``execute``, ``teardown``, other host submissions to
+the explicit stream, and destruction of that stream.
+
 Window contract: both the src and dst tiles must live at the window base
 (zero-offset).  Live parameters generally do not, so each param is staged through
 a symmetric ``ncclMemAlloc`` buffer:
@@ -83,9 +92,11 @@ class NcclM2nExecutor:
         self._tp_src = tp_src
         self._tp_dst = tp_dst
         self._device_id = device_id
+        # Preserve the supported caller token: stream 0 or an explicit handle.
         self._stream = stream
         self._is_src = rank < tp_src
 
+        self._m2n.set_device(device_id)
         self._m2n.init(max_cta)
 
         self._window_buf: int | None = None
@@ -94,6 +105,7 @@ class NcclM2nExecutor:
         self._staging_buf: int | None = None
         self._staging_bytes: int = 0
         self._poisoned = False
+        self._stream_failed = False
 
     def _ensure_window(self, nbytes: int) -> None:
         """(Re)allocate the symmetric window if it is too small.
@@ -148,10 +160,17 @@ class NcclM2nExecutor:
 
         Returns ``(total_bytes_moved, elapsed_seconds)``.
         """
+        self._m2n.set_device(self._device_id)
+
         if self._poisoned:
             raise RuntimeError(
                 "nccl_m2n executor is unusable after a failed model commit; "
                 "reinitialize the model and executor before serving or transferring again"
+            )
+        if self._stream_failed:
+            raise RuntimeError(
+                "nccl_m2n executor stream could not be drained after a transfer "
+                "failure; reinitialize the executor before transferring again"
             )
         if not params:
             return 0, 0.0
@@ -164,7 +183,16 @@ class NcclM2nExecutor:
         try:
             total_bytes = self._reshard_all(params)
         except BaseException:
-            self._release_window()
+            try:
+                self._m2n.stream_synchronize(self._stream)
+            except BaseException:
+                self._stream_failed = True
+                logger.exception(
+                    "failed to drain nccl_m2n executor stream; retaining transfer "
+                    "buffers because CUDA work may still reference them"
+                )
+            else:
+                self._release_window()
             raise
 
         elapsed = time.perf_counter() - start
@@ -196,7 +224,12 @@ class NcclM2nExecutor:
 
             # Stage the owned tile into the window base before the collective.
             if self._is_src:
-                self._m2n.memcpy_dtod(self._window_buf, p.local_ptr, p.local_nbytes)
+                self._m2n.memcpy_dtod_async(
+                    self._window_buf,
+                    p.local_ptr,
+                    p.local_nbytes,
+                    self._stream,
+                )
 
             src_ptr = self._window_buf if self._is_src else 0
             dst_ptr = self._window_buf if not self._is_src else 0
@@ -211,20 +244,18 @@ class NcclM2nExecutor:
 
             # Preserve the live model until the complete version is available.
             if not self._is_src:
-                self._m2n.device_synchronize()
-                self._check_async_error(p.name)
-                self._m2n.memcpy_dtod(
+                self._m2n.memcpy_dtod_async(
                     self._staging_buf + staging_offset,
                     self._window_buf,
                     p.local_nbytes,
+                    self._stream,
                 )
                 staging_offset += p.local_nbytes
 
             total_bytes += p.local_nbytes
 
-        self._m2n.device_synchronize()
-        if params:
-            self._check_async_error(params[-1].name)
+        self._m2n.stream_synchronize(self._stream)
+        self._check_async_error(params[-1].name)
         if not self._is_src:
             self._commit_staged(params)
         return total_bytes
@@ -235,13 +266,14 @@ class NcclM2nExecutor:
         staging_offset = 0
         try:
             for p in params:
-                self._m2n.memcpy_dtod(
+                self._m2n.memcpy_dtod_async(
                     p.local_ptr,
                     self._staging_buf + staging_offset,
                     p.local_nbytes,
+                    self._stream,
                 )
                 staging_offset += p.local_nbytes
-            self._m2n.device_synchronize()
+            self._m2n.stream_synchronize(self._stream)
         except BaseException as exc:
             raise RuntimeError(
                 "failed to commit staged model version; live parameters may contain "
@@ -251,6 +283,16 @@ class NcclM2nExecutor:
         self._poisoned = False
 
     def teardown(self) -> None:
+        self._m2n.set_device(self._device_id)
+        try:
+            self._m2n.stream_synchronize(self._stream)
+        except BaseException as exc:
+            self._stream_failed = True
+            raise RuntimeError(
+                "cannot safely tear down nccl_m2n executor because its CUDA stream "
+                "could not be drained; transfer resources were retained"
+            ) from exc
+
         self._release_window()
         self._release_staging()
         if self._comm is not None:
