@@ -58,8 +58,14 @@ def region_elem_runs(
 
     def _collect(base: int, dim: int) -> None:
         if dim == len(shape) - 1:
-            for i in range(shape[dim]):
-                runs.append((base + i * stride[dim], 1))
+            if stride[dim] == 1:
+                # Emit the whole row as one run.  Without this a contiguous
+                # lm_head or embedding builds one tuple per element - hundreds
+                # of millions of them - before the merge pass ever runs.
+                runs.append((base, shape[dim]))
+            else:
+                for i in range(shape[dim]):
+                    runs.append((base + i * stride[dim], 1))
             return
         for i in range(shape[dim]):
             _collect(base + i * stride[dim], dim + 1)
@@ -83,8 +89,10 @@ def resolve_copies(
 ) -> list[ResolvedRegion]:
     """Resolve RecordedCopy objects into ResolvedRegion objects.
 
-    Copies whose source tensor is not in tensor_shapes are skipped
-    (e.g. bias / norm tensors not held by the trainer).
+    Every recorded copy must have a source entry in tensor_shapes/tensor_dtypes:
+    both maps and the lazy weights fed to the bake pass are built from the same
+    TrainerTable, so a miss means the two have drifted apart.  Skipping it would
+    drop the parameter from the plan and still report the transfer as a success.
     """
     regions: list[ResolvedRegion] = []
 
@@ -92,7 +100,12 @@ def resolve_copies(
         shape = tensor_shapes.get(copy.src_name)
         dtype = tensor_dtypes.get(copy.src_name)
         if shape is None or dtype is None:
-            continue
+            raise KeyError(
+                f"recorded copy from {copy.src_name!r} has no "
+                f"{'shape' if shape is None else 'dtype'} in the trainer table; "
+                "dropping it would leave the parameter stale while the transfer "
+                "still reported success"
+            )
 
         src_offset, src_shape, src_stride = resolve_chain_region(
             copy.op_chain, torch.Size(shape), dtype

@@ -4,6 +4,8 @@
 """Unit tests for the weight_transfer package (lazy bake + pull plan)."""
 
 import math
+import time
+
 import pytest
 import torch
 
@@ -26,6 +28,7 @@ from modelexpress.weight_transfer.planner.resolver import (
     apply_chain,
     resolve_chain_region,
     region_elem_runs,
+    resolve_copies,
 )
 from modelexpress.weight_transfer.planner.router import route_regions
 from modelexpress.weight_transfer.protocol.types import ResolvedRegion
@@ -97,6 +100,54 @@ class TestRegionElemRuns:
     def test_2d_contiguous(self):
         runs = region_elem_runs(0, torch.Size([2, 3]), (3, 1))
         assert runs == [(0, 6)]
+
+    def test_row_stride_only_still_splits_rows(self):
+        # Rows are contiguous but padded apart: one run per row, no merging.
+        runs = region_elem_runs(0, torch.Size([3, 2]), (4, 1))
+        assert runs == [(0, 2), (4, 2), (8, 2)]
+
+    def test_last_dim_strided_still_enumerates(self):
+        runs = region_elem_runs(0, torch.Size([2, 3]), (6, 2))
+        assert runs == [(0, 1), (2, 1), (4, 1), (6, 1), (8, 1), (10, 1)]
+
+    def test_large_contiguous_does_not_enumerate_elements(self):
+        # A contiguous lm_head-sized region must cost O(rows), not O(elements).
+        # Enumerating per element here would build ~67M tuples and take minutes.
+        rows, cols = 8192, 8192
+        start = time.monotonic()
+        runs = region_elem_runs(0, torch.Size([rows, cols]), (cols, 1))
+        elapsed = time.monotonic() - start
+        assert runs == [(0, rows * cols)]
+        assert elapsed < 10.0, f"region_elem_runs took {elapsed:.1f}s"
+
+
+class TestResolveCopies:
+    @staticmethod
+    def _copy(src_name: str) -> RecordedCopy:
+        return RecordedCopy(
+            src_name=src_name,
+            op_chain=(),
+            dst_addr=0x1000,
+            dst_shape=(4, 8),
+            dst_stride=(8, 1),
+            dst_dtype=torch.float32,
+            dst_device_id=0,
+        )
+
+    def test_resolves_known_tensor(self):
+        regions = resolve_copies(
+            [self._copy("w")], {"w": (4, 8)}, {"w": torch.float32}
+        )
+        assert len(regions) == 1
+        assert regions[0].tensor_name == "w"
+
+    def test_unknown_source_raises_instead_of_dropping(self):
+        with pytest.raises(KeyError, match="has no shape"):
+            resolve_copies([self._copy("w")], {}, {})
+
+    def test_missing_dtype_raises(self):
+        with pytest.raises(KeyError, match="has no dtype"):
+            resolve_copies([self._copy("w")], {"w": (4, 8)}, {})
 
 
 # ---------------------------------------------------------------------------
