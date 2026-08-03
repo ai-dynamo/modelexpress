@@ -100,8 +100,10 @@ class NixlExecutor:
                     remote_indices=indices,
                     backends=backends,
                 )
-                agent.transfer(handle)
+                # Track the handle before starting it: a throw from transfer()
+                # would otherwise strand an allocated handle with no owner.
                 handles.append(handle)
+                agent.transfer(handle)
                 total_bytes += sum(d.nbytes for d in descs)
 
             wait_start = time.monotonic()

@@ -73,49 +73,61 @@ class M2nExecutor:
         total_bytes = 0
         handles = []
 
-        for remote_name, descs in by_src.items():
-            src_list = [(d.src_addr, d.nbytes, 0) for d in descs]
-            dst_list = [(d.dst_addr, d.nbytes, self._device_id) for d in descs]
-            indices = list(range(len(descs)))
+        try:
+            for remote_name, descs in by_src.items():
+                src_list = [(d.src_addr, d.nbytes, 0) for d in descs]
+                dst_list = [(d.dst_addr, d.nbytes, self._device_id) for d in descs]
+                indices = list(range(len(descs)))
 
-            src_prepped = agent.prep_xfer_dlist(
-                agent_name=remote_name,
-                xfer_list=src_list,
-                mem_type=mem_type,
-                backends=backends,
-            )
-            dst_prepped = agent.prep_xfer_dlist(
-                agent_name="",
-                xfer_list=dst_list,
-                mem_type=mem_type,
-                backends=backends,
-            )
-            handle = agent.make_prepped_xfer(
-                operation="READ",
-                local_xfer_side=dst_prepped,
-                local_indices=indices,
-                remote_xfer_side=src_prepped,
-                remote_indices=indices,
-                backends=backends,
-            )
-            agent.transfer(handle)
-            handles.append(handle)
-            total_bytes += sum(d.nbytes for d in descs)
+                src_prepped = agent.prep_xfer_dlist(
+                    agent_name=remote_name,
+                    xfer_list=src_list,
+                    mem_type=mem_type,
+                    backends=backends,
+                )
+                dst_prepped = agent.prep_xfer_dlist(
+                    agent_name="",
+                    xfer_list=dst_list,
+                    mem_type=mem_type,
+                    backends=backends,
+                )
+                handle = agent.make_prepped_xfer(
+                    operation="READ",
+                    local_xfer_side=dst_prepped,
+                    local_indices=indices,
+                    remote_xfer_side=src_prepped,
+                    remote_indices=indices,
+                    backends=backends,
+                )
+                # Track the handle before starting it: a throw from transfer()
+                # would otherwise strand an allocated handle with no owner.
+                handles.append(handle)
+                agent.transfer(handle)
+                total_bytes += sum(d.nbytes for d in descs)
 
-        wait_start = time.monotonic()
-        for handle in handles:
-            while True:
-                if time.monotonic() - wait_start >= self._timeout:
+            wait_start = time.monotonic()
+            for handle in handles:
+                while True:
+                    if time.monotonic() - wait_start >= self._timeout:
+                        raise TimeoutError(
+                            f"NIXL M2N READ timed out after {self._timeout}s"
+                        )
+                    status = agent.check_xfer_state(handle)
+                    if status in ("DONE", "SUCCESS"):
+                        break
+                    if status in ("ERR", "ERROR", "FAIL"):
+                        raise RuntimeError(f"NIXL M2N READ failed with status {status}")
+                    time.sleep(0.001)
+        finally:
+            # release_xfer_handle aborts any still-outstanding transfer, and may
+            # itself raise; release every handle regardless.  Bailing out early
+            # otherwise leaves the untouched handles running, still writing into
+            # GPU memory we have already given up on.
+            for handle in handles:
+                try:
                     agent.release_xfer_handle(handle)
-                    raise TimeoutError(f"NIXL M2N READ timed out after {self._timeout}s")
-                status = agent.check_xfer_state(handle)
-                if status in ("DONE", "SUCCESS"):
-                    agent.release_xfer_handle(handle)
-                    break
-                if status in ("ERR", "ERROR", "FAIL"):
-                    agent.release_xfer_handle(handle)
-                    raise RuntimeError(f"NIXL M2N READ failed with status {status}")
-                time.sleep(0.001)
+                except Exception as e:
+                    logger.warning("Failed to release NIXL M2N READ handle: %s", e)
 
         self._manager._accelerator_backend.synchronize(self._device_id)
 
