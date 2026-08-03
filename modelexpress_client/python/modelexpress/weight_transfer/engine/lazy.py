@@ -91,11 +91,14 @@ class LazyWeight(torch.Tensor):
         args: tuple = (),
         kwargs: dict | None = None,
     ) -> Any:
-        """ATen-level fallback required by PyTorch ≥2.9 for _make_wrapper_subclass.
+        """ATen-level fallback for ops that bypass __torch_function__.
 
         Primary interception lives in __torch_function__ (Python-level calls
-        like narrow/view/copy_).  copy_ is also handled here so both paths
-        work; all other ops proxy through meta tensors for correct output shape.
+        like narrow/view/copy_), but a wrapper subclass created by
+        _make_wrapper_subclass has no storage, so anything reaching the
+        dispatcher directly lands here.  copy_ is handled in both places so
+        either entry point records; all other ops proxy through meta tensors
+        for correct output shape.
         """
         kwargs = kwargs or {}
         lazy: LazyWeight | None = next(
@@ -141,7 +144,17 @@ class LazyWeight(torch.Tensor):
                 )
             return out
         except Exception:
-            return torch.empty(lazy.shape, dtype=lazy.dtype, device="meta")
+            # Returning a placeholder here used to hide the failure: the
+            # substitute carried the pre-op shape and was a plain Tensor, so
+            # every later op and the final copy_ stopped being recognised as a
+            # LazyWeight and the weight silently vanished from the bake plan.
+            # A visible failure at bake time beats a short plan at serve time.
+            logger.exception(
+                "Failed to proxy op %r for lazy weight %r through a meta tensor",
+                func_name,
+                lazy._lazy_name,
+            )
+            raise
 
     @classmethod
     def __torch_function__(
