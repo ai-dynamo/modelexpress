@@ -23,6 +23,7 @@ from modelexpress.refit.reshard.geometry import (
     UnsupportedReshard,
     capture_geometry,
 )
+from modelexpress.refit.reshard.types import IncompleteRefit
 from modelexpress.refit.reshard.transfer_plan import (
     FullPullSource,
     SourceInfo,
@@ -57,6 +58,7 @@ from modelexpress.refit.reshard.rendezvous import (
 __all__ = [
     "InMemoryReferenceTransport",
     "FullPullSource",
+    "IncompleteRefit",
     "LazyWeight",
     "MxReshardRendezvous",
     "NixlReshardTransport",

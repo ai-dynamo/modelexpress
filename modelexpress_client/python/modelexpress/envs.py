@@ -59,6 +59,8 @@ if TYPE_CHECKING:
     MX_MODEL_URI: Optional[str]
     MX_P2P_METADATA: str
     MX_RESHARD_FUSED_WIRE: bool
+    MX_RESHARD_REQUIRE_FULL_COVERAGE: bool
+    MX_RESHARD_COVERAGE_FLOOR: float
     # Kubernetes service backend
     MX_K8S_SERVICE_PATTERN: str
     MX_K8S_SOURCE_RETRIES: str
@@ -191,6 +193,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_MODEL_URI": lambda: os.environ.get("MX_MODEL_URI"),
     "MX_P2P_METADATA": lambda: os.environ.get("MX_P2P_METADATA", "1"),
     "MX_RESHARD_FUSED_WIRE": lambda: _env_bool("MX_RESHARD_FUSED_WIRE", True),
+    # Refit coverage gate. The floor is a fraction of the engine's parameter
+    # bytes; ReshardReceiver validates its range at the point of use. What a
+    # complete refit scores is engine- and model-specific, so the default is set
+    # loose enough to pass any complete refit and still catch a gross hole; see
+    # modelexpress.refit.reshard.receiver._coverage_floor.
+    "MX_RESHARD_REQUIRE_FULL_COVERAGE": lambda: os.environ.get(
+        "MX_RESHARD_REQUIRE_FULL_COVERAGE", ""
+    )
+    .strip()
+    .lower()
+    in _TRUTHY,
+    "MX_RESHARD_COVERAGE_FLOOR": lambda: _env_float("MX_RESHARD_COVERAGE_FLOOR", 0.995),
     # ── Kubernetes service backend ─────────────────────────────────────────
     "MX_K8S_SERVICE_PATTERN": lambda: os.environ.get("MX_K8S_SERVICE_PATTERN", "mx-sources"),
     "MX_K8S_SOURCE_RETRIES": lambda: os.environ.get("MX_K8S_SOURCE_RETRIES", ""),

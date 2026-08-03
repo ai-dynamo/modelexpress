@@ -23,6 +23,7 @@ transport, buffers and the router dtype-cast are shared here.
 
 from __future__ import annotations
 
+import json
 import logging
 
 import torch
@@ -41,9 +42,39 @@ from modelexpress.refit.reshard.transport import (
     NixlReshardTransport,
     ReadDescriptor,
 )
-from modelexpress.refit.reshard.types import CaptureResult, UnsupportedReshard
+from modelexpress.refit.reshard.types import (
+    CaptureResult,
+    IncompleteRefit,
+    UnsupportedReshard,
+)
 
 logger = logging.getLogger("modelexpress.refit.reshard.receiver")
+
+
+def _coverage_floor() -> float:
+    """The fraction of engine parameter bytes a gated refit must install.
+
+    What a *complete* refit scores is engine- and model-specific, because the
+    denominator is whatever the engine enumerates as its load-time parameters and
+    some of those are legitimately not refit material - rotary `inv_freq` and
+    similar derived buffers. Hence a configurable floor rather than a hard 1.0.
+
+    The default is deliberately loose. It is sized to catch a gross hole, of the
+    order of a missing layer range, expert group or pipeline half, not to encode
+    any one model's parameter accounting; the non-refit remainder is small in
+    bytes even where it is many tensors by count. Tighten it per model once
+    coverage records exist for that model rather than guessing upward here.
+
+    A negative floor passes every refit, which silently disables the gate the
+    caller just asked for, and a floor above 1.0 rejects every refit including a
+    complete one. Both are rejected rather than honored.
+    """
+    floor = float(envs.MX_RESHARD_COVERAGE_FLOOR)
+    if not 0.0 <= floor <= 1.0:
+        raise ValueError(
+            f"MX_RESHARD_COVERAGE_FLOOR must be a fraction in [0.0, 1.0], got {floor}"
+        )
+    return floor
 
 
 def _fused_wire_enabled() -> bool:
@@ -221,6 +252,11 @@ class ReshardReceiver:
         # update_weights), which assumes the trainer set + their shard layout +
         # their buffer addresses are stable for the run.
         plan = plan_transfer(capture, sources)
+        all_params = sorted({c.param_name for c in capture.copies})
+        # Before the fail-closed rejection below, not after: an unsupported plan is
+        # the case where naming the hole matters most, and raising first would leave
+        # the run with no record of what it was about to miss.
+        self._log_coverage(capture, param_layout, all_params, plan)
         if plan.fallback:
             # Fallback params are dropped from the RDMA plan and never pulled or
             # installed, so they would silently keep their initial (base-model)
@@ -286,7 +322,6 @@ class ReshardReceiver:
         # Segment params (captured == served) are the RDMA targets - register them
         # + point _param_ptr at them. Convert params (router) are captured fp32 ->
         # their bf16 staging is the RDMA target and the refit casts into the buffer.
-        all_params = sorted({c.param_name for c in capture.copies})
         seg_params = {seg.param_name for seg in plan.segments}
         self._recv_buffers = {}
         with classic_cuda_alloc():
@@ -316,6 +351,94 @@ class ReshardReceiver:
             len(plan.unbounded_sources),
             len(plan.fallback),
         )
+
+    def _log_coverage(self, capture, param_layout, all_params, plan) -> None:
+        """Report what this rank asked the wire for, against what it will install.
+
+        Emitted at WARNING as JSON so a benchmark harness can recover it without
+        turning on INFO across every dependency. That is the point: everything
+        here was already computed, and already logged at INFO, which no
+        benchmark run has captured. So `useful_bytes_per_rank` has been
+        *derived* analysis-side from an assumed sharding rather than measured,
+        and a derived number cannot distinguish a wrong model of the sharding
+        from an incomplete refit.
+
+        This is also the only check that can see a parameter the loader never
+        asked for. Every other check compares arrived bytes against the
+        publisher's digest for the same name, so bytes that are never requested
+        are never checked. A refit covering half the model passes all of them.
+
+        `unsupported` is the companion signal: a parameter the loader wants and
+        the planner cannot serve is silently absent from the wire, so a non-zero
+        count is a coverage hole by construction.
+        """
+        # `param_layout` is the engine's COMPLETE parameter set; `all_params` is
+        # the subset this refit will write. The ratio is the coverage nothing
+        # else measures, and it needs no engine-specific hook.
+        installed = set(all_params)
+        dest_bytes = 0
+        engine_bytes = 0
+        missed: list[str] = []
+        for name, (shape, dtype) in param_layout.items():
+            count = 1
+            for dim in shape:
+                count *= int(dim)
+            nbytes = count * torch.empty(0, dtype=dtype).element_size()
+            engine_bytes += nbytes
+            if name in installed:
+                dest_bytes += nbytes
+            else:
+                missed.append(name)
+        coverage = (dest_bytes / engine_bytes) if engine_bytes else 0.0
+        unsupported = list(getattr(capture, "unsupported", []) or [])
+        record = {
+            "schema": "refit-coverage-v1",
+            "rank": self._global_rank,
+            "params_installed": len(all_params),
+            "engine_params": len(param_layout),
+            "dest_bytes": dest_bytes,
+            "engine_bytes": engine_bytes,
+            "coverage_pct": round(100.0 * coverage, 4),
+            "params_never_written": len(missed),
+            "params_never_written_sample": sorted(missed)[:10],
+            "copies_captured": len(capture.copies),
+            "unsupported": len(unsupported),
+            "unsupported_sample": [str(u)[:120] for u in unsupported[:10]],
+            "planned_wire_bytes": plan.bytes_planned(),
+            "extra_wire_bytes": plan.extra_wire_bytes(),
+            "descriptors": plan.descriptor_count(),
+            "descriptor_savings": plan.descriptor_savings(),
+            "full_pull_sources": len(plan.full_pulls),
+            "unbounded_sources": len(plan.unbounded_sources),
+            "converts": len(plan.converts),
+            "fallback": len(plan.fallback),
+        }
+        # Severity follows the record's content, not the fact that a record exists.
+        # This is emitted once per refit on a healthy run too, and a per-refit line
+        # at WARNING teaches operators that MX warnings are routine, which costs
+        # more than it buys the first time one is not.
+        complete = not missed and not unsupported and not plan.fallback
+        logger.log(
+            logging.INFO if complete else logging.WARNING,
+            "MX_REFIT_COVERAGE %s",
+            json.dumps(record),
+        )
+
+        # Opt-in rather than always-on: partial and subset refit are intended
+        # features, and for those a coverage below 1.0 is the point. What is never
+        # acceptable is a *benchmark* row measuring an incomplete refit, because
+        # its wire volume and timings are then the wrong magnitude and get
+        # compared against complete ones.
+        if envs.MX_RESHARD_REQUIRE_FULL_COVERAGE and coverage < _coverage_floor():
+            raise IncompleteRefit(
+                f"refit covers {100.0 * coverage:.2f}% of the engine's parameter "
+                f"bytes ({dest_bytes} of {engine_bytes}); "
+                f"{len(missed)} of {len(param_layout)} params would keep their "
+                f"previous values, e.g. {sorted(missed)[:5]}. No digest gate can "
+                f"detect this - bytes that are never requested are never checked. "
+                f"Set MX_RESHARD_REQUIRE_FULL_COVERAGE=0 for an intentionally "
+                f"partial refit."
+            )
 
     # ----------------------------------------------------------- update_weights
     @torch.no_grad()
