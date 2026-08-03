@@ -43,6 +43,9 @@ logger = logging.getLogger("modelexpress.strategy_trainer_pull")
 
 _DISABLED_VALUES = {"", "0", "false", "no", "off"}
 
+# Bound the Redis fallback so it cannot outlive the table-fetch deadline.
+_REDIS_TIMEOUT = 5.0
+
 
 def _use_server_planner() -> bool:
     return (envs.MX_WEIGHT_SYNC_SERVER or "").strip().lower() not in _DISABLED_VALUES
@@ -72,6 +75,7 @@ class TrainerPullStrategy(LoadStrategy):
 
     def __init__(self) -> None:
         self._pull_role: PullRole | None = None
+        self._sync_failed: bool = False
 
     def is_available(self, ctx: LoadContext) -> bool:
         if not super().is_available(ctx):
@@ -91,7 +95,7 @@ class TrainerPullStrategy(LoadStrategy):
             table = self._fetch_table(ctx)
         except Exception as e:
             logger.info("[Worker %d] TrainerTable not available: %s", ctx.global_rank, e)
-            raise StrategyFailed(f"TrainerTable not available: {e}", mutated=False)
+            raise StrategyFailed(f"TrainerTable not available: {e}", mutated=False) from e
 
         if ctx.nixl_manager is None:
             ctx.nixl_manager = _init_nixl_manager(
@@ -136,10 +140,32 @@ class TrainerPullStrategy(LoadStrategy):
 
         Called by the vLLM worker after each training step notification.
         Raises RuntimeError if load() has not been called successfully.
+
+        A sync writes straight into live parameter memory, so a failure partway
+        through leaves the model holding a mix of old and new weights.  There is
+        no cheap undo for that, so the strategy latches into a failed state and
+        refuses further syncs rather than layering another partial update on top
+        of an already-inconsistent model.  Recovery is a reload: rollback() then
+        load() again.
         """
         if self._pull_role is None:
             raise RuntimeError("TrainerPullStrategy not loaded; call load() first")
-        self._pull_role.sync()
+        if self._sync_failed:
+            raise RuntimeError(
+                "TrainerPullStrategy is in a failed state: a previous sync() threw "
+                "partway through writing live parameter memory, so the model holds "
+                "a mix of old and new weights. Reload before syncing again."
+            )
+        try:
+            self._pull_role.sync()
+        except Exception:
+            self._sync_failed = True
+            logger.error(
+                "[Worker %d] Weight sync failed partway through; parameters may be "
+                "partially updated. Refusing further syncs until reload.",
+                ctx.global_rank,
+            )
+            raise
 
     def rollback(self, ctx: LoadContext) -> None:
         if ctx.nixl_manager is not None:
@@ -149,6 +175,7 @@ class TrainerPullStrategy(LoadStrategy):
                 logger.warning("[Worker %d] NIXL shutdown error: %s", ctx.global_rank, e)
         ctx.nixl_manager = None
         self._pull_role = None
+        self._sync_failed = False
 
     def _fetch_table(self, ctx: LoadContext) -> TrainerTable:
         key = _trainer_table_key(ctx.identity.model_name)
@@ -192,7 +219,13 @@ class TrainerPullStrategy(LoadStrategy):
         redis_url = envs.MX_REDIS_URL
         try:
             import redis as redis_lib
-            r = redis_lib.from_url(redis_url)
+            # The caller polls us inside a MX_TRAINER_SYNC_TIMEOUT deadline loop;
+            # an unbounded connect/read here would block past that deadline.
+            r = redis_lib.from_url(
+                redis_url,
+                socket_connect_timeout=_REDIS_TIMEOUT,
+                socket_timeout=_REDIS_TIMEOUT,
+            )
             return r.get(key)
         except ImportError:
             logger.debug("[Worker %d] redis-py not installed", ctx.global_rank)
@@ -226,11 +259,11 @@ class _CtxEngineAdapter:
             yield from model.named_parameters()
 
     def post_pull_hook(self, model: Any) -> None:
+        # Deliberately unguarded: post-processing (e.g. FP8 repack) is part of
+        # making the pulled weights usable.  Swallowing a failure here would let
+        # sync_and_post_process() report success over half-processed weights.
         if self._ctx.adapter is not None and hasattr(self._ctx.adapter, "process_weights_after_loading"):
-            try:
-                self._ctx.adapter.process_weights_after_loading(model)
-            except Exception as e:
-                logger.warning("post_pull_hook failed: %s", e)
+            self._ctx.adapter.process_weights_after_loading(model)
 
     def post_push_hook(self, model: Any) -> None:
         pass
