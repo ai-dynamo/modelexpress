@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
@@ -44,12 +45,22 @@ struct M2nWorkerRegistration {
     _nixl_metadata: Vec<u8>,
 }
 
+/// How long an M2N barrier may sit unsatisfied before it is reaped.
+///
+/// A worker that never registers would otherwise keep every other worker
+/// polling forever and leave the pending entry in memory for the process
+/// lifetime.  Reaping drops the half-built barrier so the next registration
+/// starts a fresh one.
+const M2N_BARRIER_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Pending M2N plan accumulating worker registrations until the barrier fires.
 struct M2nPlanEntry {
     total_workers: i32,
     registrations: HashMap<i32, M2nWorkerRegistration>,
     /// Set once all workers have registered and the plan is built.
     plan_id: Option<String>,
+    /// When this barrier was opened, used to reap barriers that never fire.
+    created_at: Instant,
 }
 
 /// Shared server state (plan cache + raw table blobs).
@@ -78,6 +89,42 @@ impl WeightSyncState {
             m2n_pending: HashMap::new(),
             m2n_worker_plans: HashMap::new(),
         }
+    }
+
+    /// Drop every cached artifact derived from `model_key`'s TrainerTable.
+    ///
+    /// Called when the table is republished (a retarget): the descriptors it
+    /// produced address the previous table's GPU buffers.  Removing only the
+    /// `plan_key -> plan_id` mapping would orphan the `CachedPlan` bodies and
+    /// the per-worker M2N slices, which leaks across every broadcast step.
+    fn invalidate_model(&mut self, model_key: &str) {
+        let stale_plan_ids: Vec<String> = self
+            .plan_key_to_id
+            .iter()
+            .filter(|(plan_key, _)| plan_key.starts_with(model_key))
+            .map(|(_, plan_id)| plan_id.clone())
+            .collect();
+        self.plan_key_to_id
+            .retain(|plan_key, _| !plan_key.starts_with(model_key));
+        for plan_id in stale_plan_ids {
+            self.plans.remove(&plan_id);
+        }
+
+        if let Some(entry) = self.m2n_pending.remove(model_key)
+            && let Some(plan_id) = entry.plan_id
+        {
+            self.m2n_worker_plans.retain(|(pid, _), _| pid != &plan_id);
+        }
+    }
+
+    /// Drop M2N barriers that never reached quorum within the timeout.
+    ///
+    /// Entries that already built a plan are left alone; they are owned by
+    /// `invalidate_m2n_plan` and are still serving `GetM2nPlan`.
+    fn reap_stale_barriers(&mut self) {
+        self.m2n_pending.retain(|_, entry| {
+            entry.plan_id.is_some() || entry.created_at.elapsed() < M2N_BARRIER_TIMEOUT
+        });
     }
 }
 
@@ -114,10 +161,8 @@ impl WeightSyncServiceTrait for WeightSyncServiceImpl {
         state
             .trainer_tables
             .insert(req.model_key.clone(), req.table_payload);
-        // Invalidate any cached plans that used this model's table
-        state
-            .plan_key_to_id
-            .retain(|k, _| !k.starts_with(&req.model_key));
+        // Invalidate every cached artifact derived from the previous table.
+        state.invalidate_model(&req.model_key);
         Ok(Response::new(PublishTrainerTableResponse { ok: true }))
     }
 
@@ -191,6 +236,17 @@ impl WeightSyncServiceTrait for WeightSyncServiceImpl {
 
         let plan_id = Uuid::new_v4().to_string();
         let mut state = self.state.write().await;
+
+        // Recheck under the write lock: a concurrent request for the same
+        // plan_key may have raced past the read-locked lookup above.  Without
+        // this, the loser overwrites plan_key_to_id and its CachedPlan becomes
+        // unreachable from invalidate_plan.
+        if let Some(existing) = state.plan_key_to_id.get(&req.plan_key) {
+            return Ok(Response::new(BuildPlanResponse {
+                plan_id: existing.clone(),
+            }));
+        }
+
         state
             .plans
             .insert(plan_id.clone(), CachedPlan { descriptors });
@@ -244,6 +300,10 @@ impl WeightSyncServiceTrait for WeightSyncServiceImpl {
 
         let mut state = self.state.write().await;
 
+        // Drop barriers that never reached quorum before touching this one.
+        // Workers poll by re-calling this RPC, so this runs on every poll.
+        state.reap_stale_barriers();
+
         // Reuse an existing plan_id if this worker already registered.
         if let Some(entry) = state.m2n_pending.get(&req.model_key)
             && let Some(plan_id) = &entry.plan_id
@@ -278,6 +338,7 @@ impl WeightSyncServiceTrait for WeightSyncServiceImpl {
                     total_workers: req.total_workers,
                     registrations: HashMap::new(),
                     plan_id: None,
+                    created_at: Instant::now(),
                 });
 
             entry.registrations.insert(
