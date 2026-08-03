@@ -30,6 +30,7 @@ Not covered here (intentional exceptions):
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -61,6 +62,9 @@ if TYPE_CHECKING:
     MX_RESHARD_FUSED_WIRE: bool
     MX_RESHARD_REQUIRE_FULL_COVERAGE: bool
     MX_RESHARD_COVERAGE_FLOOR: float
+    MX_RESHARD_HANDSHAKE_TIMEOUT_S: float
+    MX_RESHARD_HANDSHAKE_ATTEMPT_S: float
+    MX_RESHARD_HANDSHAKE_BACKOFF_S: float
     # Kubernetes service backend
     MX_K8S_SERVICE_PATTERN: str
     MX_K8S_SOURCE_RETRIES: str
@@ -166,6 +170,32 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+def _env_positive_float(name: str, default: float) -> float:
+    """As :func:`_env_float`, for a variable that has to be a finite positive bound.
+
+    Timeouts, per-attempt ceilings and backoff pauses are all bounds, and anything
+    that is not a finite positive number is not a different bound but an absent
+    one: it turns the loop it governs into an unbounded one, which is the failure
+    the variable exists to prevent. Zero and negatives are the obvious cases;
+    ``inf`` and ``nan`` are the ones worth naming, since both parse happily and
+    both make a ``now >= deadline`` test that never fires.
+
+    Falling back to the documented default keeps the bound in place, and the
+    warning says which value was ignored.
+    """
+    value = _env_float(name, default)
+    if not math.isfinite(value) or value <= 0.0:
+        logger.warning(
+            "Invalid %s=%r; a bound must be a finite positive number, using "
+            "default %s",
+            name,
+            os.environ.get(name),
+            default,
+        )
+        return default
+    return value
+
+
 # One entry per variable. The lambda owns the default and parsing; callers that
 # need a site-specific default receive the raw value (``None`` when unset) and
 # apply their own fallback.
@@ -205,6 +235,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     .lower()
     in _TRUTHY,
     "MX_RESHARD_COVERAGE_FLOOR": lambda: _env_float("MX_RESHARD_COVERAGE_FLOOR", 0.995),
+    # Bounds for the reshard peer handshake; see
+    # modelexpress.refit.reshard.receiver.handshake_with_peers.
+    #
+    # TIMEOUT_S is the budget across every peer and every retry. A refit timeout is
+    # the wrong bound, since it lets one unreachable peer consume the whole refit,
+    # but it must stay generous: a peer registering tens of GB with the fabric
+    # provider blocks its listen thread for minutes, and waiting is the correct
+    # response to that. ATTEMPT_S caps a single dial, so an unreachable peer frees
+    # the budget for a different one instead of blocking on it. BACKOFF_S is the
+    # pause after a full pass over the pending peers makes no progress.
+    "MX_RESHARD_HANDSHAKE_TIMEOUT_S": lambda: _env_positive_float(
+        "MX_RESHARD_HANDSHAKE_TIMEOUT_S", 900.0
+    ),
+    "MX_RESHARD_HANDSHAKE_ATTEMPT_S": lambda: _env_positive_float(
+        "MX_RESHARD_HANDSHAKE_ATTEMPT_S", 20.0
+    ),
+    "MX_RESHARD_HANDSHAKE_BACKOFF_S": lambda: _env_positive_float(
+        "MX_RESHARD_HANDSHAKE_BACKOFF_S", 2.0
+    ),
     # ── Kubernetes service backend ─────────────────────────────────────────
     "MX_K8S_SERVICE_PATTERN": lambda: os.environ.get("MX_K8S_SERVICE_PATTERN", "mx-sources"),
     "MX_K8S_SOURCE_RETRIES": lambda: os.environ.get("MX_K8S_SOURCE_RETRIES", ""),

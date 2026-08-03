@@ -51,6 +51,7 @@ from modelexpress.refit.reshard.rendezvous import (
     MxReshardRendezvous,
     PublishedShard,
     PublishedTensor,
+    RendezvousPayload,
     gather_sources,
     wrap_rendezvous_blob,
 )
@@ -65,6 +66,7 @@ __all__ = [
     "OpChain",
     "PublishedShard",
     "PublishedTensor",
+    "RendezvousPayload",
     "PullSegment",
     "ReadDescriptor",
     "RecordedCopy",
