@@ -84,6 +84,27 @@ class TestDetectModelFeatures:
         features = detect_model_features(config)
         assert features["model_type"] == "some_new_architecture"
 
+    def test_trtllm_model_config_shape(self):
+        config = type(
+            "TrtllmConfig",
+            (),
+            {
+                "pretrained_config": FakeHfConfig(model_type="llama"),
+                "dtype": None,
+                "torch_dtype": torch.bfloat16,
+                "quant_config": FakeHfConfig(quant_algo="FP8"),
+            },
+        )()
+
+        features = detect_model_features(config)
+
+        assert features == {
+            "model_type": "llama",
+            "dtype": "bfloat16",
+            "quantization": "FP8",
+            "attention": "standard",
+        }
+
 
 # ---------------------------------------------------------------------------
 # Feature checks

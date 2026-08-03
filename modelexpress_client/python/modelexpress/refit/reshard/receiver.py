@@ -23,22 +23,79 @@ transport, buffers and the router dtype-cast are shared here.
 
 from __future__ import annotations
 
+import json
 import logging
 
 import torch
 
+from modelexpress import envs
 from modelexpress.client import MxClient
 from modelexpress.nixl_transfer import NixlTransferManager
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
 from modelexpress.refit.reshard.rendezvous import gather_sources
-from modelexpress.refit.reshard.transfer_plan import execute_transfer, plan_transfer
+from modelexpress.refit.reshard.transfer_plan import (
+    exact_descriptors,
+    execute_transfer,
+    plan_transfer,
+)
 from modelexpress.refit.reshard.transport import (
     NixlReshardTransport,
     ReadDescriptor,
 )
-from modelexpress.refit.reshard.types import CaptureResult, UnsupportedReshard
+from modelexpress.refit.reshard.types import (
+    CaptureResult,
+    IncompleteRefit,
+    UnsupportedReshard,
+)
 
 logger = logging.getLogger("modelexpress.refit.reshard.receiver")
+
+
+def _coverage_floor() -> float:
+    """The fraction of engine parameter bytes a gated refit must install.
+
+    What a *complete* refit scores is engine- and model-specific, because the
+    denominator is whatever the engine enumerates as its load-time parameters and
+    some of those are legitimately not refit material - rotary `inv_freq` and
+    similar derived buffers. Hence a configurable floor rather than a hard 1.0.
+
+    The default is deliberately loose. It is sized to catch a gross hole, of the
+    order of a missing layer range, expert group or pipeline half, not to encode
+    any one model's parameter accounting; the non-refit remainder is small in
+    bytes even where it is many tensors by count. Tighten it per model once
+    coverage records exist for that model rather than guessing upward here.
+
+    A negative floor passes every refit, which silently disables the gate the
+    caller just asked for, and a floor above 1.0 rejects every refit including a
+    complete one. Both are rejected rather than honored.
+    """
+    floor = float(envs.MX_RESHARD_COVERAGE_FLOOR)
+    if not 0.0 <= floor <= 1.0:
+        raise ValueError(
+            f"MX_RESHARD_COVERAGE_FLOOR must be a fraction in [0.0, 1.0], got {floor}"
+        )
+    return floor
+
+
+def _fused_wire_enabled() -> bool:
+    """Whether to issue the exact, full-pull and convert reads as one batch.
+
+    Read at call time so an A/B can toggle it without re-importing. Set
+    ``MX_RESHARD_FUSED_WIRE=0`` to drain each phase in turn.
+    """
+    return envs.MX_RESHARD_FUSED_WIRE
+
+
+def _replay_ops(tensor: torch.Tensor, op_chain: tuple) -> torch.Tensor:
+    """Replay a captured loader view chain on a staged full-source tensor."""
+    value = tensor
+    for op_name, args, frozen_kwargs in op_chain:
+        kwargs = dict(frozen_kwargs)
+        if op_name == "__getitem__":
+            value = value.__getitem__(*args)
+        else:
+            value = getattr(value, op_name)(*args, **kwargs)
+    return value
 
 
 class ReshardReceiver:
@@ -109,6 +166,8 @@ class ReshardReceiver:
             str, torch.Tensor
         ] = {}  # dtype-convert param -> bf16 staging (RDMA target)
         self._staging_ptr: dict[str, int] = {}
+        self._full_staging: dict[str, torch.Tensor] = {}
+        self._full_staging_ptr: dict[str, int] = {}
         self._param_ptr: dict[
             str, int
         ] = {}  # segment param_name -> receive-buffer data_ptr
@@ -193,6 +252,11 @@ class ReshardReceiver:
         # update_weights), which assumes the trainer set + their shard layout +
         # their buffer addresses are stable for the run.
         plan = plan_transfer(capture, sources)
+        all_params = sorted({c.param_name for c in capture.copies})
+        # Before the fail-closed rejection below, not after: an unsupported plan is
+        # the case where naming the hole matters most, and raising first would leave
+        # the run with no record of what it was about to miss.
+        self._log_coverage(capture, param_layout, all_params, plan)
         if plan.fallback:
             # Fallback params are dropped from the RDMA plan and never pulled or
             # installed, so they would silently keep their initial (base-model)
@@ -227,13 +291,37 @@ class ReshardReceiver:
             )
             self._staging_ptr = {n: t.data_ptr() for n, t in self._staging.items()}
 
+        # Descriptor-heavy strided copies pull each complete source into one
+        # persistent contiguous staging tensor, then replay captured loader views
+        # locally. Each source shard contributes one bounded descriptor.
+        self._full_staging = {}
+        self._full_staging_ptr = {}
+        if plan.full_pulls:
+            with classic_cuda_alloc():
+                self._full_staging = {
+                    full_pull.src_name: torch.empty(
+                        full_pull.global_shape,
+                        dtype=full_pull.dtype,
+                        device=self._device,
+                    )
+                    for full_pull in plan.full_pulls
+                }
+            self._manager.register_tensors(
+                {
+                    f"__full__{name}": tensor
+                    for name, tensor in self._full_staging.items()
+                }
+            )
+            self._full_staging_ptr = {
+                name: tensor.data_ptr() for name, tensor in self._full_staging.items()
+            }
+
         # Receive buffers: one per captured param at its CAPTURED (load-time)
         # shape/dtype, classic cudaMalloc, registered once. The live params are
         # NOT RDMA targets; _install() writes the buffers into the live params.
         # Segment params (captured == served) are the RDMA targets - register them
         # + point _param_ptr at them. Convert params (router) are captured fp32 ->
         # their bf16 staging is the RDMA target and the refit casts into the buffer.
-        all_params = sorted({c.param_name for c in capture.copies})
         seg_params = {seg.param_name for seg in plan.segments}
         self._recv_buffers = {}
         with classic_cuda_alloc():
@@ -251,12 +339,106 @@ class ReshardReceiver:
                 self._param_ptr[name] = self._recv_buffers[name].data_ptr()
 
         logger.info(
-            "[reshard] prepared: %d segments, %d convert(s), %.1f MB/pull, %d fallback",
-            len(plan.segments),
+            "[reshard] prepared: %d descriptor(s), %d full-pull source(s), "
+            "%d convert(s), %.1f MB/pull, %d descriptor(s) saved, "
+            "%.1f MB extra wire, %d unbounded source(s), %d fallback",
+            plan.descriptor_count(),
+            len(plan.full_pulls),
             len(plan.converts),
             plan.bytes_planned() / 1e6,
+            plan.descriptor_savings(),
+            plan.extra_wire_bytes() / 1e6,
+            len(plan.unbounded_sources),
             len(plan.fallback),
         )
+
+    def _log_coverage(self, capture, param_layout, all_params, plan) -> None:
+        """Report what this rank asked the wire for, against what it will install.
+
+        Emitted at WARNING as JSON so a benchmark harness can recover it without
+        turning on INFO across every dependency. That is the point: everything
+        here was already computed, and already logged at INFO, which no
+        benchmark run has captured. So `useful_bytes_per_rank` has been
+        *derived* analysis-side from an assumed sharding rather than measured,
+        and a derived number cannot distinguish a wrong model of the sharding
+        from an incomplete refit.
+
+        This is also the only check that can see a parameter the loader never
+        asked for. Every other check compares arrived bytes against the
+        publisher's digest for the same name, so bytes that are never requested
+        are never checked. A refit covering half the model passes all of them.
+
+        `unsupported` is the companion signal: a parameter the loader wants and
+        the planner cannot serve is silently absent from the wire, so a non-zero
+        count is a coverage hole by construction.
+        """
+        # `param_layout` is the engine's COMPLETE parameter set; `all_params` is
+        # the subset this refit will write. The ratio is the coverage nothing
+        # else measures, and it needs no engine-specific hook.
+        installed = set(all_params)
+        dest_bytes = 0
+        engine_bytes = 0
+        missed: list[str] = []
+        for name, (shape, dtype) in param_layout.items():
+            count = 1
+            for dim in shape:
+                count *= int(dim)
+            nbytes = count * torch.empty(0, dtype=dtype).element_size()
+            engine_bytes += nbytes
+            if name in installed:
+                dest_bytes += nbytes
+            else:
+                missed.append(name)
+        coverage = (dest_bytes / engine_bytes) if engine_bytes else 0.0
+        unsupported = list(getattr(capture, "unsupported", []) or [])
+        record = {
+            "schema": "refit-coverage-v1",
+            "rank": self._global_rank,
+            "params_installed": len(all_params),
+            "engine_params": len(param_layout),
+            "dest_bytes": dest_bytes,
+            "engine_bytes": engine_bytes,
+            "coverage_pct": round(100.0 * coverage, 4),
+            "params_never_written": len(missed),
+            "params_never_written_sample": sorted(missed)[:10],
+            "copies_captured": len(capture.copies),
+            "unsupported": len(unsupported),
+            "unsupported_sample": [str(u)[:120] for u in unsupported[:10]],
+            "planned_wire_bytes": plan.bytes_planned(),
+            "extra_wire_bytes": plan.extra_wire_bytes(),
+            "descriptors": plan.descriptor_count(),
+            "descriptor_savings": plan.descriptor_savings(),
+            "full_pull_sources": len(plan.full_pulls),
+            "unbounded_sources": len(plan.unbounded_sources),
+            "converts": len(plan.converts),
+            "fallback": len(plan.fallback),
+        }
+        # Severity follows the record's content, not the fact that a record exists.
+        # This is emitted once per refit on a healthy run too, and a per-refit line
+        # at WARNING teaches operators that MX warnings are routine, which costs
+        # more than it buys the first time one is not.
+        complete = not missed and not unsupported and not plan.fallback
+        logger.log(
+            logging.INFO if complete else logging.WARNING,
+            "MX_REFIT_COVERAGE %s",
+            json.dumps(record),
+        )
+
+        # Opt-in rather than always-on: partial and subset refit are intended
+        # features, and for those a coverage below 1.0 is the point. What is never
+        # acceptable is a *benchmark* row measuring an incomplete refit, because
+        # its wire volume and timings are then the wrong magnitude and get
+        # compared against complete ones.
+        if envs.MX_RESHARD_REQUIRE_FULL_COVERAGE and coverage < _coverage_floor():
+            raise IncompleteRefit(
+                f"refit covers {100.0 * coverage:.2f}% of the engine's parameter "
+                f"bytes ({dest_bytes} of {engine_bytes}); "
+                f"{len(missed)} of {len(param_layout)} params would keep their "
+                f"previous values, e.g. {sorted(missed)[:5]}. No digest gate can "
+                f"detect this - bytes that are never requested are never checked. "
+                f"Set MX_RESHARD_REQUIRE_FULL_COVERAGE=0 for an intentionally "
+                f"partial refit."
+            )
 
     # ----------------------------------------------------------- update_weights
     @torch.no_grad()
@@ -276,27 +458,83 @@ class ReshardReceiver:
 
         # RDMA the sliced bf16 into the receive buffers (segments) and per-param
         # staging (dtype-convert / router). No live param is written by RDMA.
-        stats = execute_transfer(
-            self._plan,
-            resolve_param_ptr=lambda name: self._param_ptr[name],
-            transport=self._transport,
+        #
+        # The three read phases target disjoint destinations - exact segments land
+        # in the receive buffers, full pulls in full staging, converts in convert
+        # staging - and every reader of those buffers (the re-slice below, the
+        # dtype cast) runs after all reads complete. So the phases carry no
+        # ordering dependency and are issued as one batch by default. Phased mode
+        # drains each in turn and is kept for the A/B.
+        full_descriptors = [
+            ReadDescriptor(
+                session=segment.session,
+                src_addr=segment.src_addr,
+                dst_addr=(
+                    self._full_staging_ptr[full_pull.src_name] + segment.dst_byte
+                ),
+                nbytes=segment.nbytes,
+            )
+            for full_pull in self._plan.full_pulls
+            for segment in full_pull.segments
+        ]
+        convert_descriptors = [
+            ReadDescriptor(
+                session=segment.session,
+                src_addr=segment.src_addr,
+                dst_addr=self._staging_ptr[convert.param_name] + segment.dst_byte,
+                nbytes=segment.nbytes,
+            )
+            for convert in self._plan.converts
+            for segment in convert.segments
+        ]
+
+        if _fused_wire_enabled():
+            descriptors = exact_descriptors(
+                self._plan, lambda name: self._param_ptr[name]
+            )
+            stats = {
+                "segments": len(descriptors),
+                "bytes": sum(descriptor.nbytes for descriptor in descriptors),
+                "fallback": list(self._plan.fallback),
+            }
+            self._transport.read(descriptors + full_descriptors + convert_descriptors)
+        else:
+            stats = execute_transfer(
+                self._plan,
+                resolve_param_ptr=lambda name: self._param_ptr[name],
+                transport=self._transport,
+            )
+            if full_descriptors:
+                self._transport.read(full_descriptors)
+            if convert_descriptors:
+                self._transport.read(convert_descriptors)
+
+        stats["segments"] += len(full_descriptors) + len(convert_descriptors)
+        stats["bytes"] += sum(
+            descriptor.nbytes
+            for descriptor in (*full_descriptors, *convert_descriptors)
         )
-        if self._plan.converts:
-            conv_descs = [
-                ReadDescriptor(
-                    session=seg.session,
-                    src_addr=seg.src_addr,
-                    dst_addr=self._staging_ptr[c.param_name] + seg.dst_byte,
-                    nbytes=seg.nbytes,
+
+        # Local re-slice of every full-pulled source into its receive buffer, and
+        # the dtype cast for every converted param. Both read staging written by
+        # the reads above, so both must run after the wire completes.
+        for full_pull in self._plan.full_pulls:
+            full_tensor = self._full_staging[full_pull.src_name]
+            for copy in full_pull.copies:
+                source_view = _replay_ops(full_tensor, copy.op_chain)
+                receive_buffer = self._recv_buffers[copy.param_name]
+                destination = receive_buffer.as_strided(
+                    copy.dest_shape,
+                    copy.dest_stride,
+                    receive_buffer.storage_offset() + copy.dest_offset,
                 )
-                for c in self._plan.converts
-                for seg in c.segments
-            ]
-            self._transport.read(conv_descs)
-            # Cast the served bf16 staging into the (fp32) receive buffer - a torch
-            # op, so the RDMA never crosses dtypes. _install writes the buffer.
-            for c in self._plan.converts:
-                self._recv_buffers[c.param_name].copy_(self._staging[c.param_name])
+                destination.copy_(source_view)
+        # Cast the served bf16 staging into the (fp32) receive buffer - a torch
+        # op, so the RDMA never crosses dtypes. _install writes the buffer.
+        for convert in self._plan.converts:
+            self._recv_buffers[convert.param_name].copy_(
+                self._staging[convert.param_name]
+            )
 
         self._install(self._recv_buffers)
         torch.cuda.synchronize(self._device)
@@ -306,14 +544,25 @@ class ReshardReceiver:
             "bytes_received": stats["bytes"],
             "segments": stats["segments"],
             "converts": len(self._plan.converts),
+            "full_pull_sources": len(self._plan.full_pulls),
+            "exact_descriptors": self._plan.exact_descriptor_count,
+            "descriptor_savings": self._plan.descriptor_savings(),
+            "extra_wire_bytes": self._plan.extra_wire_bytes(),
+            "unbounded_sources": len(self._plan.unbounded_sources),
             "fallback": len(stats["fallback"]),
         }
         logger.info(
-            "[reshard] refit step=%d bytes=%.1fMB segments=%d converts=%d fallback=%d",
+            "[reshard] refit step=%d bytes=%.1fMB descriptors=%d "
+            "(saved=%d, extra_wire=%.1fMB) full_pulls=%d converts=%d "
+            "unbounded=%d fallback=%d",
             step,
             stats["bytes"] / 1e6,
             stats["segments"],
+            self._plan.descriptor_savings(),
+            self._plan.extra_wire_bytes() / 1e6,
+            len(self._plan.full_pulls),
             len(self._plan.converts),
+            len(self._plan.unbounded_sources),
             len(stats["fallback"]),
         )
         return metrics

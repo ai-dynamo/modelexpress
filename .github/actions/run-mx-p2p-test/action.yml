@@ -6,7 +6,7 @@ description: |
   Self-contained action that owns the full lifecycle of a single test namespace:
     1. Create namespace
     2. Apply CRD (idempotent), RBAC, secrets, mx-server
-    3. Deploy source worker, wait for ModelMetadata CR
+    3. Deploy source worker, wait for the source to publish
     4. Deploy target worker, wait for pods to leave Pending
     5. Run pytest against the deployed resources
     6. Delete the namespace on exit (pass or fail)
@@ -45,7 +45,7 @@ inputs:
     description: |
       KEY=VALUE pairs for the source manifest apply (one per line).
       When set, enables P2P mode: source is applied first, the action waits for
-      the ModelMetadata CR, then the target manifest is applied.
+      the source metadata, then the target manifest is applied.
       Example: JOB_NAME=mx-source
     required: false
     default: ''
@@ -58,6 +58,10 @@ inputs:
         S3_BUCKET=my-model-bucket
     required: false
     default: ''
+  server_manifest:
+    description: 'Repo-root-relative path to the MX server manifest. Defaults to the Kubernetes CRD backend; pass ci/k8s/server/mx-server-redis.yaml for the Redis backend.'
+    required: false
+    default: 'ci/k8s/server/mx-server.yaml'
   mx_p2p_metadata:
     description: |
       Value for the ${MX_P2P_METADATA} substitution in manifests that
@@ -114,7 +118,7 @@ inputs:
     required: false
     default: 'false'
   expected_artifact_sources:
-    description: 'Number of ready non-weight artifact ModelMetadata CRs expected before target starts.'
+    description: 'Number of ready non-weight artifact sources expected before target starts.'
     required: false
     default: '0'
   expected_artifact_source_types:
@@ -184,14 +188,47 @@ runs:
           --dry-run=client -o yaml | kubectl apply -f -
         echo "::endgroup::"
 
+    - name: Set up Python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      with:
+        python-version: "3.12"
+
+    - name: Install test deps and generate gRPC stubs
+      shell: bash
+      run: |
+        echo "::group::Install pytest + grpcio and generate p2p_pb2 stubs"
+        # grpcio(-tools) powers the backend-agnostic source-readiness gate
+        # (ci/k8s/client/mx_sources.py queries mx-server's ListSources) and the
+        # protoc stub generation below; pytest runs the test at the end. We
+        # avoid `pip install modelexpress_client/python` — that pulls torch +
+        # nixl just to expose two gRPC stubs.
+        pip install pytest grpcio grpcio-tools
+        # Generate p2p_pb2 / p2p_pb2_grpc into ci/k8s/client/ so mx_sources.py
+        # (used by the gate below) and the pytest tests can import them.
+        python -m grpc_tools.protoc \
+          -I modelexpress_common/proto \
+          --python_out=ci/k8s/client \
+          --grpc_python_out=ci/k8s/client \
+          modelexpress_common/proto/p2p.proto
+        echo "::endgroup::"
+
     - name: Deploy MX server
       shell: bash
       env:
         MX_SERVER_IMAGE: ${{ inputs.server_image }}
         NAMESPACE: ${{ inputs.namespace }}
+        SERVER_MANIFEST: ${{ inputs.server_manifest }}
+        # Used by mx-server-redis.yaml envsubst. Widen the heartbeat timeout for
+        # slow cold-starting tests so the source is never declared stale
+        # mid-run — same intent as the hardcoded 900 in mx-server.yaml. The scan
+        # interval is an ordinary cadence; its value barely matters here since
+        # the long timeout keeps the source READY. Both are ignored by
+        # mx-server.yaml (no ${} substitution there).
+        MX_HEARTBEAT_TIMEOUT_SECS: "900"
+        MX_REAPER_SCAN_INTERVAL_SECS: "30"
       run: |
         echo "::group::Deploy MX server in ${NAMESPACE}"
-        envsubst < ci/k8s/server/mx-server.yaml | kubectl apply -n ${NAMESPACE} -f -
+        envsubst < "${SERVER_MANIFEST}" | kubectl apply -n ${NAMESPACE} -f -
         kubectl rollout status deployment/mx-server -n ${NAMESPACE} --timeout=120s
         echo "::endgroup::"
 
@@ -243,30 +280,27 @@ runs:
         [[ "${MEASURE_VRAM}" == "true" || "${MEASURE_VRAM}" == "false" ]] || { echo "ERROR: measure_vram must be 'true' or 'false', got '${MEASURE_VRAM}'"; exit 1; }
         [[ "${EXPECTED_ARTIFACT_SOURCES}" =~ ^[0-9]+$ ]] || { echo "ERROR: expected_artifact_sources must be a non-negative integer, got '${EXPECTED_ARTIFACT_SOURCES}'"; exit 1; }
         source .github/actions/run-mx-p2p-test/vram-sampling.sh
-        count_ready_artifact_sources() {
-          kubectl get modelmetadata -n "${NAMESPACE}" -o jsonpath='{range .items[*]}{.spec.sourceType}{" "}{.status.worker.status}{" "}{.status.worker.artifactSource.artifactId}{"\n"}{end}' 2>/dev/null \
-            | awk '$1 != "weights" && $2 == "Ready" && $3 != "" { count++ } END { print count + 0 }'
+        # Source-readiness counts come from mx-server's gRPC ListSources rather
+        # than `kubectl get modelmetadata`, so the gate is backend-agnostic: the
+        # Redis backend stores metadata in Redis with no ModelMetadata CRs, so a
+        # CR count is always 0 there. mx_sources.py prints "<weights> <artifacts>"
+        # (both computed in one ListSources pass) and echoes any error to stderr
+        # (visible in the log) while keeping stdout parseable so we retry.
+        mx_source_counts() {
+          python3 ci/k8s/client/mx_sources.py --namespace "${NAMESPACE}" || echo "0 0"
         }
-        count_weight_sources() {
-          # Count weight sources. `sourceType` is a newer CR field; servers
-          # predating it (e.g. the released image the mixed-version
-          # full-manifest entry runs against) publish weight CRs with no
-          # sourceType, so an empty value is treated as a weight source too.
-          # Current servers always set sourceType on non-weight (artifact)
-          # sources, so this never miscounts an artifact source as a weight one.
-          kubectl get modelmetadata -n "${NAMESPACE}" -o jsonpath='{range .items[*]}{.spec.sourceType}{"\n"}{end}' 2>/dev/null \
-            | awk '$1 == "weights" || $1 == "" { count++ } END { print count + 0 }'
-        }
+        count_weight_sources() { mx_source_counts | awk '{print $1 + 0}'; }
+        count_ready_artifact_sources() { mx_source_counts | awk '{print $2 + 0}'; }
         wait_for_artifact_sources() {
           local expected="$1"
           local deadline=$((SECONDS + TIMEOUT))
 
-          echo "Source is healthy; wait for ${expected} artifact ModelMetadata CR(s)."
+          echo "Source is healthy; wait for ${expected} artifact source(s)."
           while [ $SECONDS -lt $deadline ]; do
             local count
             count=$(count_ready_artifact_sources)
             if [ "${count}" -ge "${expected}" ]; then
-              echo "Source published ${count}/${expected} artifact ModelMetadata CR(s)."
+              echo "Source published ${count}/${expected} artifact source(s)."
               return 0
             fi
             local failed
@@ -276,21 +310,20 @@ runs:
               echo "ERROR: source pod failed before publishing artifact metadata: ${failed}"
               return 1
             fi
-            echo "Have ${count}/${expected} artifact ModelMetadata CRs, retrying in 5s..."
+            echo "Have ${count}/${expected} artifact sources, retrying in 5s..."
             sleep 5
           done
 
           local final
           final=$(count_ready_artifact_sources)
           if [ "${final}" -lt "${expected}" ]; then
-            echo "ERROR: source published only ${final}/${expected} artifact ModelMetadata CRs within ${TIMEOUT}s"
-            kubectl get modelmetadata -n ${NAMESPACE} -o wide 2>&1 || true
+            echo "ERROR: source published only ${final}/${expected} artifact sources within ${TIMEOUT}s"
             return 1
           fi
         }
-        echo "::group::Wait for source to publish ${TP_SIZE} weight ModelMetadata CR(s)"
+        echo "::group::Wait for source to publish ${TP_SIZE} weight source(s)"
         # Wait for one CR per source rank. Under TP=N each rank publishes
-        # its own ModelMetadata CR (worker_rank=0..N-1), and the target's
+        # its own source (worker_rank=0..N-1), and the target's
         # rdma_strategy filters source candidates by matching worker_rank.
         # If we apply target before all ranks publish, target's later-
         # numbered ranks find no matching source and fall back to disk
@@ -311,7 +344,7 @@ runs:
           fi
           CR_COUNT=$(count_weight_sources)
           if [ "${CR_COUNT}" -ge "${TP_SIZE}" ]; then
-            echo "Source published ${CR_COUNT}/${TP_SIZE} weight ModelMetadata CRs."
+            echo "Source published ${CR_COUNT}/${TP_SIZE} weight sources."
             break
           fi
           FAILED=$(kubectl get pods -n ${NAMESPACE} -l "job-name=mx-source" --no-headers 2>/dev/null \
@@ -320,7 +353,7 @@ runs:
             echo "ERROR: source pod failed before publishing metadata: ${FAILED}"
             exit 1
           fi
-          echo "Have ${CR_COUNT}/${TP_SIZE} weight ModelMetadata CRs, retrying in 5s..."
+          echo "Have ${CR_COUNT}/${TP_SIZE} weight sources, retrying in 5s..."
           sleep 5
         done
         # The loop exits without error when the deadline fires. Without this
@@ -330,7 +363,7 @@ runs:
         # error instead of the actual root cause.
         FINAL=$(count_weight_sources)
         if [ "${FINAL}" -lt "${TP_SIZE}" ]; then
-          echo "ERROR: source published only ${FINAL}/${TP_SIZE} weight ModelMetadata CRs within ${TIMEOUT}s"
+          echo "ERROR: source published only ${FINAL}/${TP_SIZE} weight sources within ${TIMEOUT}s"
           exit 1
         fi
         if [ "${MEASURE_VRAM}" = "true" ]; then
@@ -433,14 +466,9 @@ runs:
         fi
         echo "::endgroup::"
 
-    - name: Set up Python
-      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
-      with:
-        python-version: "3.12"
-
-    - name: Install test dependencies
-      shell: bash
-      run: pip install pytest
+    # Python + pytest + grpcio and the p2p_pb2 stubs are set up earlier (before
+    # Deploy MX server) because the source-readiness gate needs them; nothing to
+    # install here.
 
     - name: Run tests
       shell: bash

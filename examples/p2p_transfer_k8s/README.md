@@ -20,7 +20,7 @@ graph TD
 
 ### Key Design Points
 
-1. **Engine loader integration**: vLLM 0.23.0 uses its native `--load-format modelexpress`; `mx` is a backward-compatible alias. SGLang uses `remote_instance` with backend `modelexpress`.
+1. **Engine loader integration**: vLLM 0.23.0 uses its native `--load-format modelexpress`; `mx` is a backward-compatible alias. SGLang uses `remote_instance` with backend `modelexpress`. TensorRT-LLM uses native `checkpoint_format="MX"`.
 2. **MxClient**: All gRPC communication goes through `MxClient` (workers never access Redis directly).
 3. **Engine post-load hooks**: The ModelExpress adapter handles engine-specific post-load processing and tensor discovery.
 4. **Tensor Parallelism**: Full TP support with rank-matched transfers. NIXL uses one agent per GPU; TransferEngine publishes one session per SGLang worker.
@@ -53,6 +53,7 @@ See [`client/`](client/) for engine deployment manifests:
 - **Multi-node** (TP + PP): [`client/vllm/vllm-multi-node.yaml`](client/vllm/vllm-multi-node.yaml)
 - **SGLang single-node NIXL**: [`client/sglang/sglang-single-node-p2p.yaml`](client/sglang/sglang-single-node-p2p.yaml)
 - **SGLang single-node Mooncake TransferEngine**: [`client/sglang/sglang-single-node-transfer-engine.yaml`](client/sglang/sglang-single-node-transfer-engine.yaml)
+- **TensorRT-LLM single-node per replica**: [`client/trtllm/trtllm-single-node-p2p.yaml`](client/trtllm/trtllm-single-node-p2p.yaml)
 
 The ModelExpress loader checks the MX server on startup. If a ready source exists, it receives via RDMA. Otherwise it loads from storage and becomes a source for future nodes.
 
@@ -60,6 +61,11 @@ The vLLM client Dockerfile is pinned to vLLM 0.23.0, and the standard single-nod
 
 For SGLang, `lmsysorg/sglang:v0.5.13.post1` is the known-good release image
 with the upstream ModelExpress delegation hook.
+
+For TensorRT-LLM, the current beta path supports `LlamaForCausalLM` with
+TP=4 and native `checkpoint_format="MX"`. See
+[`client/trtllm/README.md`](client/trtllm/README.md) for image build and
+deployment instructions.
 
 For ModelStreamer-only startup examples that stream weights from Azure Blob Storage, S3, or a local PVC, see [`../model_streamer_k8s/`](../model_streamer_k8s/).
 

@@ -20,8 +20,19 @@ OpChain = tuple
 
 class UnsupportedReshard(NotImplementedError):
     """A loader used an op we can't express as a slice / box, or a byte copy
-    isn't valid (dtype mismatch); the affected tensor falls back to a full
-    (non-sliced) pull rather than being captured or copied wrong."""
+    isn't valid (dtype mismatch). The receiver fails the update rather than
+    applying an incomplete model version."""
+
+
+class IncompleteRefit(RuntimeError):
+    """A refit was planned and executed successfully, and still did not write
+    enough of the engine's parameter bytes.
+
+    Deliberately not an ``UnsupportedReshard``. That one means the geometry could
+    not be expressed, and ``transfer_plan`` catches it per source to drop that
+    source and continue; a refit that quietly skipped part of the model must never
+    be swallowed by a handler written for the other meaning. Both derive from
+    ``RuntimeError``, so a caller that catches only that is unaffected."""
 
 
 @dataclass
@@ -43,11 +54,12 @@ class RecordedCopy:
 
 @dataclass
 class CaptureResult:
-    """Output of a bake: the recorded copies plus what fell back.
+    """Output of a bake: the recorded copies plus what could not be attributed.
 
-    ``unsupported`` = source names whose loader used an unsupported op (full-pull
-    those). ``unattributed`` = copy_ calls fired with no active loader stamp (the
-    destination param can't be attributed -> also full-pull)."""
+    ``unsupported`` = source names whose loader used an unsupported op.
+    ``unattributed`` = copy_ calls fired with no active loader stamp. Either
+    condition makes the update fail closed in the current receiver; there is no
+    fallback path that serves those tensors by another route."""
 
     copies: list = field(default_factory=list)
     unsupported: list = field(default_factory=list)

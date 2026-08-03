@@ -6,10 +6,25 @@
 from __future__ import annotations
 
 import logging
+import math
+import os
 import time
 
-from .. import envs
+from .. import envs, p2p_pb2
 from ..adapter import EngineAdapter, StrategyFailed
+from ..metadata.payload import (
+    accelerators_compatible,
+    worker_tensor_count,
+    worker_tensor_descriptors,
+)
+from ..metrics import metrics as selection_metrics
+from ..nixl_transfer import is_nixl_available
+from ..source_selection import (
+    configured_policy_label,
+    get_configured_selector,
+)
+from ..transfer_safety import check_transfer_allowed
+from ..types import TensorDescriptor
 from .base import (
     LoadContext,
     LoadStrategy,
@@ -18,24 +33,57 @@ from .base import (
     register_tensors,
 )
 from .context import LoadResult
-from ..metadata.payload import (
-    accelerators_compatible,
-    worker_tensor_count,
-    worker_tensor_descriptors,
-)
-from ..nixl_transfer import is_nixl_available
-from ..source_selection import (
-    configured_policy_label,
-    get_configured_selector,
-)
-from ..metrics import metrics as selection_metrics
-from ..transfer_safety import check_transfer_allowed
-from ..types import TensorDescriptor
-from .. import p2p_pb2
 
 logger = logging.getLogger("modelexpress.strategy_rdma")
 
 MAX_SOURCE_RETRIES = 3
+
+# Fallback when MX_TRANSFER_TIMEOUT is unset or unusable. Matches the value this
+# path used when the timeout was hard-coded, so behaviour is unchanged by default.
+DEFAULT_RDMA_TRANSFER_TIMEOUT_S = 300.0
+
+
+def _transfer_timeout_seconds() -> float:
+    """Per-source RDMA receive budget, in seconds.
+
+    Every candidate costs this long when a source is wedged, because a wedged QP
+    produces neither a completion nor an error status - the timeout is the only
+    thing that ends the wait. With MAX_SOURCE_RETRIES candidates the worst case is
+    that multiplied by three before the target falls back to disk, so operators
+    need to be able to size it against their model rather than accept a constant.
+
+    Honours MX_TRANSFER_TIMEOUT only when it is *explicitly set*, and reads
+    os.environ directly to tell that apart from the default. This is deliberate:
+    that variable defaults to 900, so simply adopting ``envs.MX_TRANSFER_TIMEOUT``
+    would triple this path's budget from 300s to 900s and make the stall being
+    fixed three times more expensive for anyone who never configured it.
+
+    A non-positive or unparseable value falls back rather than being honoured. In
+    particular 0 must not become "no timeout": ``receive_from_source`` treats None
+    as wait-forever, which is the failure mode this exists to bound.
+    """
+    raw = os.environ.get("MX_TRANSFER_TIMEOUT")
+    if raw is None:
+        return DEFAULT_RDMA_TRANSFER_TIMEOUT_S
+    try:
+        configured = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "MX_TRANSFER_TIMEOUT=%r is not a number; using %.1fs for the RDMA "
+            "receive budget",
+            raw,
+            DEFAULT_RDMA_TRANSFER_TIMEOUT_S,
+        )
+        return DEFAULT_RDMA_TRANSFER_TIMEOUT_S
+    if not math.isfinite(configured) or configured <= 0:
+        logger.warning(
+            "MX_TRANSFER_TIMEOUT=%r is not finite and positive; using %.1fs for the RDMA "
+            "receive budget rather than waiting indefinitely",
+            raw,
+            DEFAULT_RDMA_TRANSFER_TIMEOUT_S,
+        )
+        return DEFAULT_RDMA_TRANSFER_TIMEOUT_S
+    return configured
 
 
 class RdmaStrategy(LoadStrategy):
@@ -74,17 +122,19 @@ class RdmaStrategy(LoadStrategy):
         # metadata; skip the central-server precondition for them.
         # Strict `is True` check so MagicMock's auto-attribute doesn't
         # masquerade as the flag in tests.
-        server_addr = envs.MODEL_EXPRESS_URL or envs.MX_SERVER_ADDRESS
+        server_addr = (
+            ctx.mx_server_url or envs.MODEL_EXPRESS_URL or envs.MX_SERVER_ADDRESS
+        )
         requires_p2p = getattr(ctx.mx_client, "REQUIRES_P2P_METADATA", False) is True
         if not server_addr and not requires_p2p:
-            logger.info(f"[Worker {ctx.global_rank}] No MX server configured, skipping RDMA")
+            logger.info(
+                f"[Worker {ctx.global_rank}] No MX server configured, skipping RDMA"
+            )
             return False
 
         allowed, reason = check_transfer_allowed(ctx.model_config)
         if not allowed:
-            logger.info(
-                f"[Worker {ctx.global_rank}] RDMA transfer disabled: {reason}"
-            )
+            logger.info(f"[Worker {ctx.global_rank}] RDMA transfer disabled: {reason}")
             return False
 
         return True
@@ -99,7 +149,9 @@ class RdmaStrategy(LoadStrategy):
         result = _as_load_result(result)
         candidates = self._find_source_instances(ctx)
         if not candidates:
-            logger.info(f"[Worker {ctx.global_rank}] No RDMA source available, skipping")
+            logger.info(
+                f"[Worker {ctx.global_rank}] No RDMA source available, skipping"
+            )
             raise StrategyFailed("No RDMA source available", mutated=False)
 
         attempts = candidates[:MAX_SOURCE_RETRIES]
@@ -116,7 +168,9 @@ class RdmaStrategy(LoadStrategy):
 
             try:
                 source_worker = self._fetch_worker_metadata(
-                    ctx, mx_source_id, worker_id,
+                    ctx,
+                    mx_source_id,
+                    worker_id,
                 )
             except Exception as e:
                 logger.warning(
@@ -143,7 +197,11 @@ class RdmaStrategy(LoadStrategy):
             transfer_start = time.perf_counter()
             try:
                 out = self._load_as_target(
-                    result, ctx, source_worker, mx_source_id, worker_id,
+                    result,
+                    ctx,
+                    source_worker,
+                    mx_source_id,
+                    worker_id,
                 )
             except StrategyFailed as e:
                 has_next_candidate = attempt_index + 1 < len(attempts)
@@ -204,11 +262,13 @@ class RdmaStrategy(LoadStrategy):
         # An internal reinit returns a new result, but the outer strategy chain
         # still owns the original result that the adapter cleared.
         raise StrategyFailed(
-            "No RDMA source succeeded", mutated=needs_outer_reinit,
+            "No RDMA source succeeded",
+            mutated=needs_outer_reinit,
         )
 
     def _find_source_instances(
-        self, ctx: LoadContext,
+        self,
+        ctx: LoadContext,
     ) -> list[p2p_pb2.SourceInstanceRef]:
         """Return READY source instances ranked by the configured selector.
 
@@ -223,11 +283,14 @@ class RdmaStrategy(LoadStrategy):
                 status_filter=p2p_pb2.SOURCE_STATUS_READY,
             )
             if not list_resp.instances:
-                logger.debug(f"[Worker {ctx.global_rank}] No ready source instances found")
+                logger.debug(
+                    f"[Worker {ctx.global_rank}] No ready source instances found"
+                )
                 return []
 
             rank_matched = [
-                inst for inst in list_resp.instances
+                inst
+                for inst in list_resp.instances
                 if inst.worker_rank == ctx.worker_rank
             ]
 
@@ -238,7 +301,8 @@ class RdmaStrategy(LoadStrategy):
             # defense-in-depth (empty refs, stale records, metadata drift).
             target_accelerator = ctx.accelerator_backend.name
             candidates = [
-                inst for inst in rank_matched
+                inst
+                for inst in rank_matched
                 if accelerators_compatible(
                     target_accelerator,
                     inst.accelerator,
@@ -413,80 +477,116 @@ class RdmaStrategy(LoadStrategy):
         register_tensors(result, ctx)
 
         is_p2p = bool(source_worker.worker_grpc_endpoint)
-        remote_agent_name_override = None
+        remote_agent_name = None
 
-        if is_p2p:
-            # _fetch_worker_metadata() prefetched and generation-validated
-            # this manifest before _load_as_target() prepared target tensors.
-            tensor_protos = worker_tensor_descriptors(source_worker)
-            source_tensors = [
-                TensorDescriptor(
-                    name=t.name, addr=t.addr, size=t.size,
-                    device_id=t.device_id, dtype=t.dtype,
-                )
-                for t in tensor_protos
-            ]
-            nixl_fetch_start = time.perf_counter()
-            ep = source_worker.metadata_endpoint
-            host, port_str = ep.rsplit(":", 1)
-            ctx.nixl_manager.fetch_remote_and_wait(
-                remote_agent_name=source_worker.agent_name,
-                ip=host,
-                port=int(port_str),
-            )
-            nixl_fetch_time = time.perf_counter() - nixl_fetch_start
-            logger.info(
-                f"[Worker {ctx.global_rank}] [TIMING] P2P NIXL metadata fetch: "
-                f"{nixl_fetch_time:.3f}s"
-            )
-            remote_agent_name_override = source_worker.agent_name
-        else:
-            source_tensors = [
-                TensorDescriptor(
-                    name=t.name, addr=t.addr, size=t.size,
-                    device_id=t.device_id, dtype=t.dtype,
-                )
-                for t in worker_tensor_descriptors(source_worker)
-            ]
-
-        logger.info(
-            f"[Worker {ctx.global_rank}] Receiving {len(source_tensors)} tensors from source"
-            f"{' (P2P)' if is_p2p else ''}"
-        )
-
-        # Cross-family (heterogeneous) transfers must name the exact same tensor
-        # set on both sides: a name diff can mean vendor-specific hidden/derived
-        # tensors, which would leave part of the target at dummy values while
-        # RDMA reports success. Same-family transfers tolerate subset transfers.
-        target_accelerator = ctx.accelerator_backend.name
-        source_accelerator = source_worker.accelerator
-        require_exact_match = bool(
-            target_accelerator
-            and source_accelerator
-            and target_accelerator != source_accelerator
-        )
-
-        transfer_start = time.perf_counter()
         try:
-            bytes_transferred, tensor_count, _ = ctx.nixl_manager.receive_from_source(
-                source_metadata=source_worker.nixl_metadata,
-                source_tensors=source_tensors,
-                timeout_seconds=300.0,
-                remote_agent_name=remote_agent_name_override,
-                require_exact_match=require_exact_match,
+            if is_p2p:
+                # _fetch_worker_metadata() prefetched and generation-validated
+                # this manifest before _load_as_target() prepared target tensors.
+                tensor_protos = worker_tensor_descriptors(source_worker)
+                source_tensors = [
+                    TensorDescriptor(
+                        name=t.name,
+                        addr=t.addr,
+                        size=t.size,
+                        device_id=t.device_id,
+                        dtype=t.dtype,
+                    )
+                    for t in tensor_protos
+                ]
+                nixl_fetch_start = time.perf_counter()
+                ep = source_worker.metadata_endpoint
+                host, port_str = ep.rsplit(":", 1)
+                # Claimed before the dial so a fetch that fails part-way, leaving
+                # metadata that lands later, is still released.
+                remote_agent_name = source_worker.agent_name
+                ctx.nixl_manager.fetch_remote_and_wait(
+                    remote_agent_name=source_worker.agent_name,
+                    ip=host,
+                    port=int(port_str),
+                )
+                nixl_fetch_time = time.perf_counter() - nixl_fetch_start
+                logger.info(
+                    f"[Worker {ctx.global_rank}] [TIMING] P2P NIXL metadata fetch: "
+                    f"{nixl_fetch_time:.3f}s"
+                )
+            else:
+                source_tensors = [
+                    TensorDescriptor(
+                        name=t.name,
+                        addr=t.addr,
+                        size=t.size,
+                        device_id=t.device_id,
+                        dtype=t.dtype,
+                    )
+                    for t in worker_tensor_descriptors(source_worker)
+                ]
+                # Loaded here rather than inside receive_from_source so this method
+                # holds the name it is responsible for releasing.
+                add_start = time.perf_counter()
+                remote_agent_name = ctx.nixl_manager.add_remote_agent(
+                    source_worker.nixl_metadata
+                )
+                logger.info(
+                    f"[Worker {ctx.global_rank}] [TIMING] add_remote_agent: "
+                    f"{time.perf_counter() - add_start:.3f}s (agent={remote_agent_name})"
+                )
+
+            logger.info(
+                f"[Worker {ctx.global_rank}] Receiving {len(source_tensors)} tensors from source"
+                f"{' (P2P)' if is_p2p else ''}"
             )
-        except Exception as e:
-            raise SourceTransferError(f"RDMA receive failed: {e}") from e
-        transfer_time = time.perf_counter() - transfer_start
 
-        bandwidth_gbps = (bytes_transferred * 8) / (transfer_time * 1e9) if transfer_time > 0 else 0
-        logger.info(
-            f"[Worker {ctx.global_rank}] [TIMING] RDMA transfer complete: "
-            f"{tensor_count} tensors, {bytes_transferred / 1e9:.2f} GB, "
-            f"{transfer_time:.3f}s, {bandwidth_gbps:.1f} Gbps"
-        )
+            # Cross-family (heterogeneous) transfers must name the exact same tensor
+            # set on both sides: a name diff can mean vendor-specific hidden/derived
+            # tensors, which would leave part of the target at dummy values while
+            # RDMA reports success. Same-family transfers tolerate subset transfers.
+            target_accelerator = ctx.accelerator_backend.name
+            source_accelerator = source_worker.accelerator
+            require_exact_match = ctx.adapter.requires_exact_tensor_catalog() or bool(
+                target_accelerator
+                and source_accelerator
+                and target_accelerator != source_accelerator
+            )
 
-        ctx.accelerator_backend.synchronize()
+            transfer_start = time.perf_counter()
+            try:
+                (
+                    bytes_transferred,
+                    tensor_count,
+                    _,
+                ) = ctx.nixl_manager.receive_from_source(
+                    source_metadata=source_worker.nixl_metadata,
+                    source_tensors=source_tensors,
+                    timeout_seconds=_transfer_timeout_seconds(),
+                    remote_agent_name=remote_agent_name,
+                    require_exact_match=require_exact_match,
+                )
+            except Exception as e:
+                raise SourceTransferError(f"RDMA receive failed: {e}") from e
+            transfer_time = time.perf_counter() - transfer_start
+
+            bandwidth_gbps = (
+                (bytes_transferred * 8) / (transfer_time * 1e9)
+                if transfer_time > 0
+                else 0
+            )
+            logger.info(
+                f"[Worker {ctx.global_rank}] [TIMING] RDMA transfer complete: "
+                f"{tensor_count} tensors, {bytes_transferred / 1e9:.2f} GB, "
+                f"{transfer_time:.3f}s, {bandwidth_gbps:.1f} Gbps"
+            )
+
+            ctx.accelerator_backend.synchronize()
+        finally:
+            # A weight load is one-shot, so release the source here instead of at
+            # process exit: the engine process is torn down without running atexit
+            # hooks, and in P2P only the reader holds a record of the peer to
+            # invalidate. None means acquisition failed with nothing to release.
+            if remote_agent_name is not None:
+                ctx.nixl_manager.remove_remote_agent(remote_agent_name)
 
         total_time = time.perf_counter() - receive_start
-        logger.info(f"[Worker {ctx.global_rank}] [TIMING] Total receive time: {total_time:.2f}s")
+        logger.info(
+            f"[Worker {ctx.global_rank}] [TIMING] Total receive time: {total_time:.2f}s"
+        )

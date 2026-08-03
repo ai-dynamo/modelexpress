@@ -284,6 +284,9 @@ def collect_module_tensors(
     Multiple views into the same storage (e.g. W_UV and W_UK_T sharing
     a dequantized intermediate) are deduplicated by data_ptr so the
     storage is transferred only once.
+
+    Zero-element tensors retain their original names and bypass pointer-based
+    deduplication because distinct empty tensors can share a null data_ptr.
     """
     backend = _resolve_accelerator_backend(accelerator_backend)
     tensors: dict[str, torch.Tensor] = {}
@@ -292,6 +295,10 @@ def collect_module_tensors(
     skipped_duplicate = 0
     for name, tensor, _tensor_type in iter_module_tensors(model, backend):
         t = tensor.data if hasattr(tensor, "data") else tensor
+
+        if t.numel() == 0:
+            tensors[name] = t
+            continue
 
         if t.is_contiguous():
             ptr = t.data_ptr()

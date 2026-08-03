@@ -104,6 +104,16 @@ def test_tilelang_cache_is_separate_artifact_source_type():
     assert compute_mx_source_id(deep_gemm) != compute_mx_source_id(tilelang)
 
 
+def test_tvm_ffi_cache_is_separate_artifact_source_type():
+    triton = _base_identity()
+    triton.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE
+
+    tvm_ffi = _base_identity()
+    tvm_ffi.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_TVM_FFI_CACHE
+
+    assert compute_mx_source_id(triton) != compute_mx_source_id(tvm_ffi)
+
+
 def test_cute_dsl_and_flashinfer_have_separate_artifact_source_types():
     cute_dsl = _base_identity()
     cute_dsl.mx_source_type = p2p_pb2.MX_SOURCE_TYPE_CUTE_DSL_CACHE

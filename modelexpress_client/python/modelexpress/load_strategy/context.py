@@ -10,20 +10,21 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generic, TypeAlias, TypeVar
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from .. import p2p_pb2
-from ..client import MxClientBase
 from ..accelerators import AcceleratorBackend, CudaAcceleratorBackend
+from ..client import MxClientBase
 
 if TYPE_CHECKING:
-    from ..adapter import EngineAdapter
-    from ..nixl_transfer import NixlTransferManager
-    from ..vmm import VmmArena
     from sglang.srt.configs.load_config import LoadConfig as SglangLoadConfig
     from sglang.srt.configs.model_config import ModelConfig as SglangModelConfig
     from vllm.config import ModelConfig as VllmModelConfig
     from vllm.config.load import LoadConfig as VllmLoadConfig
+
+    from ..adapter import EngineAdapter
+    from ..nixl_transfer import NixlTransferManager
+    from ..vmm import VmmArena
 
     EngineModelConfig: TypeAlias = VllmModelConfig | SglangModelConfig
     EngineLoadConfig: TypeAlias = VllmLoadConfig | SglangLoadConfig
@@ -62,9 +63,16 @@ class LoadContext:
     identity: p2p_pb2.SourceIdentity
     mx_client: MxClientBase
     worker_id: str
+    mx_server_url: str | None = None
     node_rank: int = 0
+    # Head address from the engine's own distributed config (for vLLM,
+    # parallel_config.master_addr). Non-head nodes rewrite a pod-local
+    # readiness URL onto this host, since loopback serves nothing there.
+    head_addr: str | None = None
     adapter: EngineAdapter | None = None
-    accelerator_backend: AcceleratorBackend = field(default_factory=CudaAcceleratorBackend)
+    accelerator_backend: AcceleratorBackend = field(
+        default_factory=CudaAcceleratorBackend
+    )
     # False keeps a secondary in-process load (the MTP drafter) out of P2P.
     p2p_enabled: bool = True
     # Optional engine-level gate checked before weight metadata is advertised.

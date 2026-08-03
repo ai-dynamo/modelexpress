@@ -62,7 +62,7 @@ The ModelExpress control plane discovers compatible sources through Redis, Kuber
 - **Cold start reduction** — GPU-to-GPU P2P transfer over InfiniBand instead of disk load
 - **Capability-driven loading** — Automatic priority chain: P2P RDMA → ModelStreamer → GDS → native loader, with safe fallback
 - **HuggingFace caching** — PVC-backed cache, `HF_HUB_OFFLINE`, `ignore_weights`, `get_model_path` for Dynamo
-- **P2P GPU transfer** — vLLM `modelexpress` loader, SGLang `remote_instance` loader with the `modelexpress` backend, and TRT-LLM `PRESHARDED` loader with NVIDIA NIXL over InfiniBand, RoCE, NVLink, EFA, and other supported fabrics
+- **P2P GPU transfer** — vLLM `modelexpress` loader, SGLang `remote_instance` loader with the `modelexpress` backend, and TRT-LLM `checkpoint_format="MX"` with NVIDIA NIXL over InfiniBand, RoCE, NVLink, EFA, and other supported fabrics
 - **JIT cache transfer** — Reuse compatible vLLM and SGLang NIXL compilation caches when replicas scale out
 - **Metadata backends** — Redis, Kubernetes CRD, or decentralized Kubernetes Service routing
 - **Kubernetes** — Helm chart, CRDs/Redis for P2P, no-shared-storage support
@@ -78,7 +78,7 @@ The ModelExpress control plane discovers compatible sources through Redis, Kuber
 |---------|-------------|
 | vLLM | Native `--load-format modelexpress` in 0.23.0+ for P2P weight and JIT cache transfer; older versions use the ModelExpress plugin |
 | SGLang | `remote_instance` + `modelexpress` backend with `transport=nixl` or `transport=transfer_engine` — see [`docs/SGLANG.md`](docs/SGLANG.md) |
-| TensorRT-LLM | `LoadFormat.PRESHARDED` with `MxLiveCheckpointLoader` for P2P weight transfer (beta) — [TRT-LLM examples](examples/p2p_transfer_k8s/client/trtllm/) |
+| TensorRT-LLM | Native `checkpoint_format="MX"` for Llama-family P2P weight transfer (beta) — [TensorRT-LLM example](examples/p2p_transfer_k8s/client/trtllm/) |
 | NVIDIA Dynamo vLLM runtime | `--load-format modelexpress` for P2P weight and JIT cache transfer — [Dynamo P2P example](examples/dynamo_p2p_transfer_k8s/README.md) |
 | NVIDIA Dynamo SGLang runtime | `remote_instance` + `modelexpress` backend for P2P weight transfer; `transport=nixl` also supports JIT cache transfer — see [`docs/SGLANG.md`](docs/SGLANG.md) |
 
@@ -264,6 +264,7 @@ cargo bench
 | [Deployment](docs/DEPLOYMENT.md) | Server/client config, Docker, K8s, P2P |
 | [Architecture](docs/ARCHITECTURE.md) | Components, gRPC, NIXL, FP8 |
 | [Benchmarks](docs/BENCHMARKS.md) | Loading paths, NIXL registration, and artifact-transfer results |
+| [RL weight refit](modelexpress_client/python/modelexpress/refit/README.md) | Receiver-driven trainer-to-rollout resharding design and implementation status |
 | [CLI](docs/CLI.md) | Full CLI reference |
 | [Metadata](docs/metadata.md) | Redis keys, K8s CRD schema |
 | [Helm](helm/README.md) | Kubernetes configuration |
@@ -281,7 +282,7 @@ cargo bench
 ### Priorities Under Development
 
 - **DRAM and NVMe-resident shard streaming**: Stream shards across workers while keeping weights in DRAM and host local high-speed NVMe.
-- **RL post-training refit**: Make updates receiver-driven—trainer ranks publish the shards they own, rollout workers discover and plan against their target layout, then pull, convert, reshard, and load directly over NIXL.
+- **[RL post-training refit](modelexpress_client/python/modelexpress/refit/README.md)**: Make updates receiver-driven—trainer ranks publish the shards they own, rollout workers discover and plan against their target layout, then pull, convert, reshard, and load directly over NIXL.
 - **Earlier weight availability**: Bring weights to prefill earlier; identify prefill workers that can act as strong source nodes.
 - **Multi-tier cache hierarchy**: Promote and demote models across DRAM, NVMe, and PVC tiers based on access patterns.
 - **Distributed sharded cache**: Shard large models across nodes using consistent hashing and parallel shard assembly.

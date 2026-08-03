@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import tempfile
@@ -330,15 +331,57 @@ def artifact_health_ready(url: str) -> bool:
         return False
 
 
-def statefulset_head_health_url(port: int = 8000) -> str | None:
-    pod_name, _, ordinal = envs.HOSTNAME.rpartition("-")
-    if not pod_name or not ordinal.isdigit() or ordinal == "0":
-        return None
-    namespace = envs.POD_NAMESPACE.strip()
-    host = f"{pod_name}-0.{pod_name}"
-    if namespace:
-        host = f"{host}.{namespace}.svc"
-    return f"http://{host}:{port}/health"
+def resolve_health_url(
+    configured: str,
+    default_url: str,
+    head_addr: str | None = None,
+) -> str:
+    """Resolve the health endpoint this worker should probe.
+
+    A pod-local loopback URL is only correct on the node that serves it: the
+    non-head nodes of a multi-node engine run headless and serve no HTTP. So a
+    loopback host is rewritten onto the head, keeping the configured port and
+    path. A configured non-loopback host is left alone.
+
+    ``head_addr`` is the engine's own distributed-init address, which the
+    orchestrator already resolved and torch.distributed already proved
+    reachable. It wins whenever the engine reports one, including a loopback
+    value, which means the head is this node. ``LWS_LEADER_ADDRESS`` is only
+    consulted for engines that expose no address at all.
+    """
+    url = (configured or "").strip() or default_url
+    if not is_http_url(url):
+        logger.warning("Invalid MX_ARTIFACT_READY_URL=%r; using %s", configured, default_url)
+        url = default_url
+
+    parsed = urllib.parse.urlparse(url)
+    if not _is_loopback(parsed.hostname):
+        return url
+
+    # The engine's address is authoritative whenever it reports one: a loopback
+    # value means the head is this node, so the local URL is already correct.
+    # The orchestrator is consulted only when the engine exposes no address.
+    head = (head_addr or "").strip() or envs.LWS_LEADER_ADDRESS.strip()
+    if not head or _is_loopback(head):
+        return url
+    if ":" in head and not head.startswith("["):
+        head = f"[{head}]"  # bare IPv6 literal
+    netloc = head if parsed.port is None else f"{head}:{parsed.port}"
+    return parsed._replace(netloc=netloc).geturl()
+
+
+def _is_loopback(host: str | None) -> bool:
+    """True for hosts only reachable inside the pod that serves them."""
+    if not host:
+        return True
+    candidate = host.strip().strip("[]").lower()
+    if candidate == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        return False
+    return address.is_loopback or address.is_unspecified
 
 
 def is_http_url(url: str) -> bool:
@@ -497,6 +540,11 @@ def triton_cache_root() -> Path:
     return Path(configured) if configured else Path.home() / ".triton" / "cache"
 
 
+def tvm_ffi_cache_root() -> Path:
+    configured = envs.TVM_FFI_CACHE_DIR
+    return Path(configured) if configured else Path.home() / ".cache" / "tvm-ffi"
+
+
 def tilelang_cache_root() -> Path:
     configured = envs.TILELANG_CACHE_DIR
     return Path(configured) if configured else Path.home() / ".tilelang" / "cache"
@@ -528,6 +576,18 @@ def triton_version() -> str:
         return version if isinstance(version, str) else str(version)
     except Exception:
         return ""
+
+
+def tvm_ffi_version() -> str:
+    try:
+        import tvm_ffi
+    except ModuleNotFoundError as exc:
+        if exc.name != "tvm_ffi":
+            raise
+        return pkg_version("apache-tvm-ffi")
+
+    version = getattr(tvm_ffi, "__version__", None)
+    return str(version) if version else pkg_version("apache-tvm-ffi")
 
 
 def triton_key() -> str:

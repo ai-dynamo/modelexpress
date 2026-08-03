@@ -2,7 +2,8 @@
 
 These examples deploy vLLM or SGLang with a ModelExpress loader and stream model weights from storage through RunAI ModelStreamer. They do not require a ModelExpress server, RDMA resources, or a model PVC for object storage sources. The vLLM `mx` load format is kept as a backward-compatible alias.
 
-For P2P RDMA weight transfer between vLLM pods, see [`../p2p_transfer_k8s/`](../p2p_transfer_k8s/).
+For P2P RDMA weight transfer between inference replicas, see
+[`../p2p_transfer_k8s/`](../p2p_transfer_k8s/).
 
 ## vLLM Examples
 
