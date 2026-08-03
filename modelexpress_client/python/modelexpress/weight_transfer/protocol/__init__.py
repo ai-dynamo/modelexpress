@@ -10,6 +10,7 @@ from .types import (
     InferenceTable,
     ResolvedRegion,
     RdmaDescriptor,
+    M2nDescriptor,
     SyncMode,
 )
 from .serialization import (
@@ -21,6 +22,8 @@ from .serialization import (
     decode_resolved_regions,
     encode_rdma_descriptors,
     decode_rdma_descriptors,
+    encode_m2n_descriptors,
+    decode_m2n_descriptors,
 )
 
 __all__ = [
@@ -33,6 +36,7 @@ __all__ = [
     "InferenceTable",
     "ResolvedRegion",
     "RdmaDescriptor",
+    "M2nDescriptor",
     "SyncMode",
     "encode_trainer_table",
     "decode_trainer_table",
@@ -42,4 +46,6 @@ __all__ = [
     "decode_resolved_regions",
     "encode_rdma_descriptors",
     "decode_rdma_descriptors",
+    "encode_m2n_descriptors",
+    "decode_m2n_descriptors",
 ]
