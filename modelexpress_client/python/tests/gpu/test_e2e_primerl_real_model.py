@@ -10,7 +10,6 @@ the full pipeline: bake/resolve/route → RDMA descriptors → cudaMemcpy.
 import ctypes
 import math
 import os
-import sys
 import time
 
 import pytest
@@ -40,8 +39,6 @@ def _cuda_memcpy(lib, src: int, dst: int, n: int) -> None:
     if rc != 0:
         raise RuntimeError(f"cudaMemcpy failed rc={rc}")
 
-
-sys.path.insert(0, os.path.expanduser("~/workspace/modelexpress/modelexpress_client/python"))
 
 from modelexpress.weight_transfer.engine.lazy import BakeRecorder, LazyWeight
 from modelexpress.weight_transfer.planner.local import LocalPlanner

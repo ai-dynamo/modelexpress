@@ -123,7 +123,7 @@ class PushRole(WeightSyncRole):
         for inf_shard in inference_table.shards:
             param = local_params.get(inf_shard.param_name)
             if param is None:
-                logger.debug(
+                logger.warning(
                     "[Trainer %d] Parameter %s not in local params, skipping",
                     self._trainer_rank,
                     inf_shard.param_name,
