@@ -114,8 +114,6 @@ spec:
           env:
             - {name: PYTHONPATH, value: "/opt/probe"}
             - {name: MX_PROBE_OUT, value: "/tmp/mx_receive_probe.jsonl"}
-            - {name: MX_DUMP_ROLE, value: "target"}
-            - {name: MX_DUMP_OUT, value: "/tmp/mx_state_dump.json"}
             - {name: MX_DUMP_ROLE, value: "seed"}
             - {name: MX_DUMP_OUT, value: "/tmp/mx_state_dump.json"}
             - {name: MODEL_EXPRESS_URL, value: "mx-smoke-server:8001"}
@@ -189,6 +187,8 @@ spec:
           env:
             - {name: PYTHONPATH, value: "/opt/probe"}
             - {name: MX_PROBE_OUT, value: "/tmp/mx_receive_probe.jsonl"}
+            - {name: MX_DUMP_ROLE, value: "target"}
+            - {name: MX_DUMP_OUT, value: "/tmp/mx_state_dump.json"}
             - {name: MODEL_EXPRESS_URL, value: "mx-smoke-server:8001"}
             - {name: MODEL_NAME, value: "deepseek-ai/DeepSeek-V2-Lite"}
             - {name: HF_HUB_CACHE, value: "/models/hf"}
