@@ -1,6 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(not(any(feature = "tls-rustls", feature = "tls-native")))]
+compile_error!(
+    "no TLS backend selected: enable `tls-rustls` (default) or `tls-native`/`openssl`. \
+     Without one, reqwest builds with no TLS support and every HTTPS request fails at runtime."
+);
+
 use serde::{Deserialize, Serialize};
 use std::error::Error as StdError;
 
