@@ -505,16 +505,27 @@ class NixlTransferManager:
 
         Sleeps only when a full sweep completed nothing, so the polling slop is
         paid once for the whole set rather than once per handle.
+
+        Records data-plane failures exactly as :meth:`_wait_for_xfer` does, for the
+        same reason: a wedged QP yields neither a completion nor an ERR status, so
+        the timeout is the only evidence anything went wrong, and recording it is
+        what lets ``is_healthy()`` stop advertising this agent.
         """
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
         pending = list(handles)
+        waited_on_something = bool(pending)
         wait_start = time.perf_counter()
         while pending:
             if (
                 timeout_seconds is not None
                 and time.perf_counter() - wait_start >= timeout_seconds
             ):
+                self._data_plane_error = (
+                    f"{label} timed out after {timeout_seconds:.1f}s with "
+                    f"{len(pending)} transfer(s) outstanding and no error status "
+                    f"from NIXL"
+                )
                 raise TimeoutError(
                     f"{label} timed out with {len(pending)} transfer(s) outstanding"
                 )
@@ -524,11 +535,19 @@ class NixlTransferManager:
                 if status in ("DONE", "SUCCESS"):
                     continue
                 if status in ("ERR", "ERROR", "FAIL"):
+                    self._data_plane_error = f"{label} failed with status {status}"
                     raise RuntimeError(f"{label} failed with status {status}")
                 still_pending.append(handle)
             if len(still_pending) == len(pending):
                 time.sleep(0.001)
             pending = still_pending
+        # Only once the whole set has completed, and only if there was a set. Nothing
+        # is proven by waiting on no handles, and clearing per handle would let a
+        # batch that failed on its last one report healthy. Health must not latch
+        # either: a completed batch is proof the data plane works, so a worker
+        # demoted for one transient timeout can return to READY.
+        if waited_on_something:
+            self._data_plane_error = None
 
     def _wait_for_xfer(
         self,
