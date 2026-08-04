@@ -79,9 +79,20 @@ def test_a_new_reader_handles_an_unstamped_publishers_blob():
     assert unwrapped.publisher_step is None
 
 
-def test_an_old_reader_ignores_a_stamped_publishers_blob():
-    """Backward compatibility: the extra key must not be rejected."""
-    assert unwrap_rendezvous_blob(_blob(step=11))[1] == "agent-r0"
+def test_stamping_leaves_every_other_field_untouched():
+    """What actually makes a stamped blob safe for a reader that predates the field.
+
+    Such a reader looks up the keys it knows and ignores the rest, so the property it
+    depends on is that the stamp is purely additive: every other key holds the same
+    value whether or not the stamp is present. Asserting that is honest about what
+    this suite can check. Running a released reader against the blob would be the
+    stronger test and is not something an in-process unit test can do, so it belongs
+    in a version-compatibility run rather than here.
+    """
+    stamped = json.loads(_blob(step=11).decode("utf-8"))
+    unstamped = json.loads(_blob().decode("utf-8"))
+
+    assert {k: v for k, v in stamped.items() if k != "publisher_step"} == unstamped
 
 
 def test_the_stamp_does_not_disturb_the_shard_table():
