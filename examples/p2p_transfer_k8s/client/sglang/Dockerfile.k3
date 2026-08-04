@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# SGLang Kimi-K3 support lives on the sgl-project/sglang `kimi-k3` branch and
+# is not in any published tag. Build it over a released image so the CUDA /
+# torch / flashinfer stack comes from the base and only the Python package is
+# replaced.
+#
+# Build:
+#   docker build -f examples/p2p_transfer_k8s/client/sglang/Dockerfile.k3 \
+#     --build-arg MX_REF=pull/589/head \
+#     -t <registry>/sglang-k3-mx:pr589 .
+#
+# MX_REF selects what ModelExpress client to install:
+#   pull/589/head  -> adopt container-held derived tensors into the manifest
+#   pull/585/head  -> re-derive after the transfer instead
+#   main           -> baseline for A/B runs
+
+ARG SGLANG_IMAGE=lmsysorg/sglang:v0.5.16
+FROM ${SGLANG_IMAGE}
+
+# Pinned tip of the kimi-k3 branch. Repin deliberately: the branch moves and
+# `_attn_res_cw_cache` / `get_cw` are private symbols the MX fix keys off.
+ARG SGLANG_K3_COMMIT=1f9d689b2918b17c2f3876997464ac686978d971
+RUN git clone --filter=blob:none https://github.com/sgl-project/sglang /opt/sglang-k3 && \
+    cd /opt/sglang-k3 && \
+    git checkout ${SGLANG_K3_COMMIT} && \
+    python3 -m pip install --no-cache-dir --no-deps -e python/
+
+RUN python3 -c "from sglang.srt.layers.attn_residual import get_cw; \
+    import inspect; assert '_attn_res_cw_cache' in inspect.getsource(get_cw)"
+
+ARG INSTALL_MOONCAKE=true
+RUN if [ "${INSTALL_MOONCAKE}" = "true" ]; then \
+        python3 -m pip install --no-cache-dir mooncake-transfer-engine-cuda13; \
+    fi
+
+ARG MX_REF=pull/589/head
+RUN python3 -m pip uninstall -y modelexpress 2>/dev/null || true && \
+    rm -rf "$(python3 -c 'import site; print(site.getsitepackages()[0])')"/modelexpress* && \
+    git clone --filter=blob:none https://github.com/ai-dynamo/modelexpress /opt/mx && \
+    cd /opt/mx && \
+    git fetch origin ${MX_REF}:mx-under-test && \
+    git checkout mx-under-test && \
+    python3 -m pip install --no-cache-dir --no-deps ./modelexpress_client/python
+
+# Receive-path diagnostics, auto-imported when /opt/probe is on PYTHONPATH.
+COPY examples/p2p_transfer_k8s/client/sglang/mx_receive_probe.py /opt/probe/sitecustomize.py
+
+WORKDIR /sgl-workspace
