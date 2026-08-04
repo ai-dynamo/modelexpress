@@ -125,7 +125,9 @@ class GrpcRevisionCatalog:
 
     def __init__(self, endpoint: str | None = None, *, stub=None) -> None:
         if (endpoint is None) == (stub is None):
-            raise ValueError("GrpcRevisionCatalog needs exactly one of endpoint or stub")
+            raise ValueError(
+                "GrpcRevisionCatalog needs exactly one of endpoint or stub"
+            )
         self._channel = None
         if stub is None:
             target = endpoint.removeprefix("http://").removeprefix("https://")
@@ -163,9 +165,41 @@ class GrpcRevisionCatalog:
             created=response.created,
         )
 
+    def _publish_revision_with_timeout(
+        self,
+        manifest: RevisionManifest,
+        *,
+        publisher_id: str,
+        publication_mode: PublicationMode | None = None,
+        timeout: float,
+    ) -> PublishedRevision:
+        """Internal bounded mutation used by the concrete Publisher lifecycle."""
+        response = self._stub.PublishRevision(
+            revision_pb2.PublishRevisionRequest(
+                manifest=manifest.to_proto(),
+                publisher_id=publisher_id,
+                **_present(publication_mode=publication_mode),
+            ),
+            timeout=timeout,
+        )
+        return PublishedRevision(
+            revision=RevisionRecord.from_proto(_require(response, "revision")),
+            created=response.created,
+        )
+
     def get_revision(self, model_id: str, version: str) -> RevisionRecord:
         response = self._stub.GetRevision(
             revision_pb2.GetRevisionRequest(model_id=model_id, version=version)
+        )
+        return RevisionRecord.from_proto(_require(response, "revision"))
+
+    def _get_revision_with_timeout(
+        self, model_id: str, version: str, *, timeout: float
+    ) -> RevisionRecord:
+        """Internal bounded poll used by the concrete BLOCK publisher wait."""
+        response = self._stub.GetRevision(
+            revision_pb2.GetRevisionRequest(model_id=model_id, version=version),
+            timeout=timeout,
         )
         return RevisionRecord.from_proto(_require(response, "revision"))
 
@@ -212,7 +246,8 @@ class GrpcRevisionCatalog:
         )
         return RecoveryCandidatePage(
             candidates=tuple(
-                RecoveryCandidate.from_proto(candidate) for candidate in response.candidates
+                RecoveryCandidate.from_proto(candidate)
+                for candidate in response.candidates
             ),
             next_page_token=_page_token(response.next_page_token),
         )

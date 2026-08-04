@@ -128,8 +128,13 @@ ModelExpress/
 │       ├── nixl_transfer.py            # NixlTransferManager
 │       ├── refit/                      # Engine-agnostic live-refit primitives
 │       │   ├── __init__.py             # Public refit exports
+│       │   ├── catalog.py              # Revision catalog client and immutable publication mapping
+│       │   ├── publisher.py            # Concrete exact-base CANONICAL publisher lifecycle
 │       │   ├── timing.py               # Structured refit stage timing
-│       │   └── reshard/                # Geometry capture, planning, rendezvous and transport
+│       │   ├── codec/                  # Versioned XOR delta, compression, and CRC32C codecs
+│       │   ├── source/                 # Bounded FSDP and Megatron-Bridge HF canonical capture
+│       │   ├── transport/              # Verified immutable filesystem and S3 object transports
+│       │   └── reshard/                # Geometry capture, planning, rendezvous and NIXL transport
 │       ├── refit_timing.py             # Compatibility shim for refit.timing
 │       ├── source_selection.py         # P2P source-ordering policies (random, rendezvous_hash)
 │       ├── metrics.py                   # Opt-in Prometheus metrics collector (source-selection group today)
@@ -544,7 +549,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `client.py` | `MxClient` - gRPC client wrapping `PublishMetadata`, `ListSources`, `GetMetadata`, and `UpdateStatus` RPCs |
 | `accelerators/` | `AcceleratorBackend` boundary for accelerator-specific torch device control and fast-path capability gates, split into `base.py` (protocol), `cuda.py` (`CudaAcceleratorBackend`), and `xpu.py` (`XpuAcceleratorBackend`). CUDA and XPU are implemented backends; XPU keeps CUDA-only fast paths (pool registration, VMM arena, GDS) disabled and falls back to generic per-tensor NIXL registration. Further backends can be added behind the same interface |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
-| `refit/` | Engine-agnostic live-refit primitives. `RefitTimingRecorder` provides normalized stage timing; `reshard/` provides loader-observed geometry capture, slice/transfer planning, rendezvous, and transport abstractions |
+| `refit/` | Engine-agnostic live-refit primitives. The concrete `Publisher` owns exact-base CANONICAL publication; `source/` provides bounded FSDP and Megatron-Bridge HF capture, `codec/` provides deterministic delta framing, and `transport/` provides verified immutable filesystem/S3 objects. `RefitTimingRecorder` provides normalized stage timing, while `reshard/` provides loader-observed geometry capture, slice/transfer planning, rendezvous, and NIXL transport abstractions |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
 | `adapter.py` | `EngineAdapter` lifecycle hooks and strategy retry errors |
@@ -620,8 +625,56 @@ trainer tensors. Those stages provide the translated tensor stream and use
 The package boundary is intentional: timing and future install-plan contracts
 belong in engine-agnostic `modelexpress.refit`, while vLLM loader observation,
 placement, PWAL interaction, and direct installation belong in
-`modelexpress.engines.vllm.refit`. RL-framework orchestration and trainer
-adapters are separate integrations rather than part of this vLLM installer.
+`modelexpress.engines.vllm.refit`. RL-framework orchestration remains a
+separate integration rather than part of this vLLM installer. The CANONICAL
+publisher described below has explicit FSDP and Megatron-Bridge capture
+sources; it is not a generic engine or trainer adapter.
+
+### Exact-base CANONICAL Publication
+
+`modelexpress.refit.publisher.Publisher` is the concrete trainer-side owner of
+the Phase 2.1 CANONICAL publication lifecycle. Initialization validates one
+cross-rank configuration and rank 0's exact base, then owns the capture source,
+local base store, immutable object transport, and revision catalog until
+`deregister()`. A publication request must name the current policy-eligible
+exact base and the complete target model. Before capture, rank 0 also matches
+that local base's model/version, format digest, and target digest against the
+catalog lineage; partial layer publication is rejected.
+
+Every trainer rank follows the same bounded capture schedule. The explicit
+sources in `modelexpress.refit.source` convert FSDP state dictionaries or
+Megatron-Bridge conversion tasks into deterministic Hugging Face canonical
+buckets. They validate the declared canonical schema, collective schedule,
+capture-unit boundaries, tensor order, dtype, shape, and complete coverage
+before publication. Bucket limits bound materialization, including grouped
+Megatron conversion units that cannot be split safely.
+
+Rank 0 compares each canonical target bucket with the same bytes from the exact
+base snapshot. Dirty tensors use the versioned tensor-byte XOR codec, optional
+zstd compression, deterministic bucket framing, physical CRC32C checksums, and
+semantic SHA-256 format/base/target digests. Clean tensors still appear in the
+root coverage. The deterministic root index binds all bucket references and
+complete tensor coverage. Every CANONICAL revision publishes exactly one
+rank-0 manifest entry with no per-trainer-rank shards: a dirty entry points at
+the verified root, while a byte-identical target has no transfer reference.
+
+`modelexpress.refit.transport` writes create-only, content-verified objects.
+S3 is the normal Phase 2.1 transport; its locations retain an object version
+when the service supplies one. The confined filesystem transport is enabled
+only for local tests. Both transports verify size and CRC32C on publication and
+fetch, and conflicts at an existing immutable key fail closed.
+
+`PublicationMode.ASYNC` may return when the immutable catalog revision is
+`READY` and observes a later `COMMITTED` transition in the background.
+`PublicationMode.BLOCK` polls read-only until `COMMITTED`; cancellation stops
+only that wait and leaves the revision `READY`. `deregister()` cancels waits,
+drains active publication and observer work, and then closes all publisher-owned
+resources.
+
+This path is deliberately CANONICAL-only. It does not provide rank-local or
+GPU-shard delivery, a generic engine adapter, an inference runtime, receiver
+reconstruction/installation, RecoveryStore execution, full-model anchors, or a
+full normal-delivery payload. Those concerns are outside Phase 2.1.
 
 ### No-gather Refit Resharding
 
