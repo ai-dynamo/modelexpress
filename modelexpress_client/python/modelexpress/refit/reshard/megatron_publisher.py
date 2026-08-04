@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Publish registered native Megatron tensors through #496 rendezvous."""
+"""Publish registered native Megatron tensors through the reshard rendezvous."""
 
 from __future__ import annotations
 
@@ -39,11 +39,11 @@ def publish_megatron_reshard_view(
     specs: list[MegatronPublishedTensorSpec],
     metadata_endpoint: str,
 ) -> str:
-    """Publish a #496 shard table over an existing NIXL registration.
+    """Publish a reshard shard table over an existing NIXL registration.
 
     The framework's normal publisher owns tensor lifetime, registration, and
     listen thread. This seam only describes those same stable addresses in the
-    #496 rendezvous format, avoiding a duplicate NIXL agent or second tensor
+    reshard rendezvous format, avoiding a duplicate NIXL agent or second tensor
     allocation.
     """
 
@@ -74,7 +74,7 @@ def publish_megatron_reshard_view(
         tensor = tensors[name]
         spec = by_name[name]
         if not tensor.is_contiguous():
-            raise ValueError(f"{name}: #496 publication requires contiguous storage")
+            raise ValueError(f"{name}: reshard publication requires contiguous storage")
         local_shape = tuple(int(dim) for dim in tensor.shape)
         if len(local_shape) != len(spec.global_shape):
             raise ValueError(

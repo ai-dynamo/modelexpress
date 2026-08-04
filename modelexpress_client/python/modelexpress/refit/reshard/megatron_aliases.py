@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Expose native Megatron storage as HF-canonical #496 source shards."""
+"""Expose native Megatron storage as HF-canonical reshard source shards."""
 
 from __future__ import annotations
 
@@ -31,6 +31,15 @@ def _source_rank_and_size(item: MegatronAliasInput, axis: int) -> tuple[int, int
     if item.local_shard_range is None:
         raise ValueError(f"{item.name}: SHARD has no local range")
     lo, hi = (int(value) for value in item.local_shard_range)
+    # A range can pass every check below and still lie outside the tensor it
+    # claims part of: (16, 24) against a global extent of 16 has the right width,
+    # divides evenly, and yields source rank 2 of a 2-rank group. The alias that
+    # follows would then address bytes the full tensor does not have.
+    if not 0 <= lo < hi <= global_extent:
+        raise ValueError(
+            f"{item.name}: source shard range {(lo, hi)} is outside the global "
+            f"extent {global_extent} on axis {axis}"
+        )
     if hi - lo != local_extent or global_extent % local_extent:
         raise ValueError(f"{item.name}: inconsistent source shard geometry")
     if lo % local_extent:
@@ -187,6 +196,16 @@ def build_hf_aliases(
 
     aliases = []
     for item in items:
+        # Every alias published below is a base address plus a shape, which tells
+        # a reader the bytes run contiguously from that address. A strided view
+        # satisfies neither, and nothing downstream can detect it: the read simply
+        # lands on whatever sits between the elements the view meant to select.
+        if not item.tensor.is_contiguous():
+            raise ValueError(
+                f"{item.name}: aliasing publishes an address and a shape, which "
+                f"requires contiguous storage; got a non-contiguous tensor of "
+                f"shape {tuple(int(dim) for dim in item.tensor.shape)}"
+            )
         if item.role == "qkv_column":
             aliases.extend(_build_qkv_aliases(item, agent_name))
             continue

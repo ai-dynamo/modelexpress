@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Lower native Megatron tensor geometry into the #496 transfer planner.
+"""Lower native Megatron tensor geometry into the reshard transfer planner.
 
 Megatron publishes rank-local tensors in its native fused representation.
 Translation into HF/vLLM names therefore happens after transfer, but transfer
@@ -108,7 +108,7 @@ def lower_megatron_target(
     specs: list[MegatronTargetSpec],
     layout: MegatronTargetLayout,
 ) -> tuple[CaptureResult, dict[str, tuple[tuple[int, ...], Any]]]:
-    """Create #496 capture records and native staging layouts for one TP rank.
+    """Create reshard capture records and native staging layouts for one TP rank.
 
     Each copy describes a destination-owned narrow of the global native
     Megatron tensor. ``plan_transfer`` then intersects that narrow with the

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""#496 receiver seam for native Megatron staging and translation."""
+"""Reshard receiver seam for native Megatron staging and translation."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ def _dtype_label(dtype: Any) -> str:
 class MegatronReshardReceiver(ReshardReceiver):
     """Pull destination-owned native tensors, then invoke framework translation.
 
-    The generic #496 receiver owns discovery, exact segment planning, NIXL reads,
+    The generic reshard receiver owns discovery, exact segment planning, NIXL reads,
     and persistent buffers. This subclass replaces vLLM loader capture with
     native Megatron target geometry; its install callback translates those
     target-local native buffers into the engine's parameter representation.
