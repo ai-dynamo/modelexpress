@@ -16,7 +16,6 @@ class WeightSyncRole(ABC):
     """One side of a trainer-inference weight sync operation.
 
     PullRole -- inference worker; pulls weights from trainer via NIXL RDMA READ.
-    PushRole  -- trainer; pushes weights to inference workers via NIXL RDMA WRITE.
     """
 
     @abstractmethod

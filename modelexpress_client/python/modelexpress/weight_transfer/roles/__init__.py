@@ -3,6 +3,5 @@
 
 from .base import WeightSyncRole
 from .pull import PullRole
-from .push import PushRole
 
-__all__ = ["WeightSyncRole", "PullRole", "PushRole"]
+__all__ = ["WeightSyncRole", "PullRole"]

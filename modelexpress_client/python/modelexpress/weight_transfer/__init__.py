@@ -16,8 +16,7 @@ planner/     Op-chain resolver (torch) and region router (pure math).
 
 transport/   NixlExecutor: execute pre-built RdmaDescriptor lists via NIXL.
 
-roles/       PullRole (inference pulls from trainer) and
-             PushRole (trainer pushes to inference workers).
+roles/       PullRole (inference pulls from trainer).
 
 adapters/    Model-specific naming bridges (MoEAdapter, etc.).
 
@@ -57,7 +56,7 @@ from .protocol import (
 from .engine import BakeRecorder, LazyWeight, RecordedCopy, WeightLoaderAdapter
 
 # Roles
-from .roles import PullRole, PushRole
+from .roles import PullRole
 
 # Adapters
 from .adapters import MoEAdapter
@@ -85,7 +84,6 @@ __all__ = [
     "WeightLoaderAdapter",
     # roles
     "PullRole",
-    "PushRole",
     # adapters
     "MoEAdapter",
 ]

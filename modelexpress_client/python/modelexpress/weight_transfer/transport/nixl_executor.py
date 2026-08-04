@@ -5,7 +5,7 @@
 
 NixlExecutor wraps a NixlTransferManager and executes a list of
 RdmaDescriptors as one batched NIXL READ or WRITE, grouped by remote agent.
-Shared by PullRole (READ) and PushRole (WRITE).
+Used by PullRole (READ).
 """
 
 from __future__ import annotations
