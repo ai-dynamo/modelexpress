@@ -72,6 +72,9 @@ message ModelFilesRequest {
   uint32 chunk_size = 3;
   // Optional file selector. If unset, all files are streamed.
   ModelFileSelector file_selector = 4;
+  // When true, weight files are skipped and only non-weight files
+  // (config, tokenizer, etc.) are streamed. Mirrors ModelDownloadRequest.
+  bool ignore_weights = 5;
 }
 
 // Selects files within a model directory

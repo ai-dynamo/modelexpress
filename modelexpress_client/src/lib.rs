@@ -367,6 +367,7 @@ impl Client {
         &mut self,
         model_name: &str,
         provider: ModelProvider,
+        ignore_weights: bool,
     ) -> CommonResult<()> {
         let cache_config = self.cache_config.as_ref().ok_or_else(|| {
             modelexpress_common::Error::Server(
@@ -393,6 +394,7 @@ impl Client {
             provider: modelexpress_common::grpc::model::ModelProvider::from(provider) as i32,
             chunk_size,
             file_selector: None,
+            ignore_weights,
         });
 
         let mut stream = self
@@ -728,7 +730,7 @@ impl Client {
                 "Shared storage disabled, streaming files from server for model {}",
                 model_name
             );
-            self.stream_model_files_from_server(&model_name, provider)
+            self.stream_model_files_from_server(&model_name, provider, ignore_weights)
                 .await?;
         }
 
@@ -1345,7 +1347,7 @@ mod tests {
             .expect("Expected test client to connect");
 
         let result = client
-            .stream_model_files_from_server("test/model", ModelProvider::HuggingFace)
+            .stream_model_files_from_server("test/model", ModelProvider::HuggingFace, false)
             .await;
 
         server_handle.abort();
@@ -1382,7 +1384,7 @@ mod tests {
             .expect("Expected test client to connect");
 
         let result = client
-            .stream_model_files_from_server("test/model", ModelProvider::HuggingFace)
+            .stream_model_files_from_server("test/model", ModelProvider::HuggingFace, false)
             .await;
 
         server_handle.abort();
@@ -1429,7 +1431,7 @@ mod tests {
             .expect("Expected test client to connect");
 
         let result = client
-            .stream_model_files_from_server("test/model", ModelProvider::HuggingFace)
+            .stream_model_files_from_server("test/model", ModelProvider::HuggingFace, false)
             .await;
 
         server_handle.abort();
@@ -1476,7 +1478,7 @@ mod tests {
             .expect("Expected test client to connect");
 
         let result = client
-            .stream_model_files_from_server("test/model", ModelProvider::HuggingFace)
+            .stream_model_files_from_server("test/model", ModelProvider::HuggingFace, false)
             .await;
 
         server_handle.abort();

@@ -371,7 +371,10 @@ type ModelFilesRequest struct {
 	// Chunk size in bytes for streaming (0 = use server default)
 	ChunkSize uint32 `protobuf:"varint,3,opt,name=chunk_size,json=chunkSize,proto3" json:"chunk_size,omitempty"`
 	// Optional file selector. If unset, all files are streamed.
-	FileSelector  *ModelFileSelector `protobuf:"bytes,4,opt,name=file_selector,json=fileSelector,proto3" json:"file_selector,omitempty"`
+	FileSelector *ModelFileSelector `protobuf:"bytes,4,opt,name=file_selector,json=fileSelector,proto3" json:"file_selector,omitempty"`
+	// When true, weight files are skipped and only non-weight files
+	// (config, tokenizer, etc.) are streamed. Mirrors ModelDownloadRequest.
+	IgnoreWeights bool `protobuf:"varint,5,opt,name=ignore_weights,json=ignoreWeights,proto3" json:"ignore_weights,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -432,6 +435,13 @@ func (x *ModelFilesRequest) GetFileSelector() *ModelFileSelector {
 		return x.FileSelector
 	}
 	return nil
+}
+
+func (x *ModelFilesRequest) GetIgnoreWeights() bool {
+	if x != nil {
+		return x.IgnoreWeights
+	}
+	return false
 }
 
 // Selects files within a model directory
@@ -725,14 +735,15 @@ const file_model_proto_rawDesc = "" +
 	"\amessage\x18\x03 \x01(\tH\x00R\amessage\x88\x01\x01\x12>\n" +
 	"\bprovider\x18\x04 \x01(\x0e2\".model_express.model.ModelProviderR\bproviderB\n" +
 	"\n" +
-	"\b_message\"\xde\x01\n" +
+	"\b_message\"\x85\x02\n" +
 	"\x11ModelFilesRequest\x12\x1d\n" +
 	"\n" +
 	"model_name\x18\x01 \x01(\tR\tmodelName\x12>\n" +
 	"\bprovider\x18\x02 \x01(\x0e2\".model_express.model.ModelProviderR\bprovider\x12\x1d\n" +
 	"\n" +
 	"chunk_size\x18\x03 \x01(\rR\tchunkSize\x12K\n" +
-	"\rfile_selector\x18\x04 \x01(\v2&.model_express.model.ModelFileSelectorR\ffileSelector\")\n" +
+	"\rfile_selector\x18\x04 \x01(\v2&.model_express.model.ModelFileSelectorR\ffileSelector\x12%\n" +
+	"\x0eignore_weights\x18\x05 \x01(\bR\rignoreWeights\")\n" +
 	"\x11ModelFileSelector\x12\x14\n" +
 	"\x05paths\x18\x01 \x03(\tR\x05paths\"\xf7\x01\n" +
 	"\tFileChunk\x12#\n" +
