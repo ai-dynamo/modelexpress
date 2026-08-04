@@ -23,6 +23,7 @@ from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
 from ...metadata.publish import build_source_identity
 from ...rank_utils import get_global_rank
+from ...topology import ParallelTopology, build_topology
 from ...tensor_utils import adopt_hidden_tensors, capture_tensor_attrs, collect_module_tensors
 
 logger = logging.getLogger("modelexpress.engines.vllm.adapter")
@@ -163,6 +164,9 @@ class VllmAdapter(EngineAdapter):
 
     def get_worker_rank(self) -> int:
         return _get_vllm_worker_rank(self.vllm_config, self.target_device)
+
+    def get_topology(self) -> ParallelTopology:
+        return _get_vllm_topology(self.vllm_config)
 
     def get_global_rank(self) -> int:
         return get_global_rank(self.target_device)
@@ -447,12 +451,82 @@ def _get_vllm_worker_rank(
     Falls back to vllm_config.parallel_config.rank when torch.distributed is
     not initialised and the target device has no index (pre-init / bare-cuda
     test paths), so workers in the same DP still get distinct keys.
+
+    This is deliberately not flat_shard_rank(_get_vllm_topology(...)). The
+    world rank includes the data-parallel axis, which the shard derivation
+    excludes. Under expert parallelism a DP replica owns a different slice
+    of the experts, so pairing DP siblings would transfer the wrong weights.
+    The two values disagree whenever data_parallel_size > 1, and that
+    disagreement is the intended behaviour, not drift to be reconciled.
     """
     worker_rank = get_global_rank(target_device)
     if worker_rank == 0 and target_device.index is None:
         worker_rank = int(vllm_config.parallel_config.rank)
     logger.debug("vLLM worker rank: %d", worker_rank)
     return worker_rank
+
+
+def _int_or_none(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _call_parallel_state(name: str):
+    try:
+        from vllm.distributed import parallel_state
+
+        return getattr(parallel_state, name)()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _group_rank_size(name: str) -> tuple[int | None, int | None]:
+    """Return (rank_in_group, world_size) for a vLLM group coordinator."""
+    group = _call_parallel_state(name)
+    if group is None:
+        return None, None
+    return (
+        _int_or_none(getattr(group, "rank_in_group", None)),
+        _int_or_none(getattr(group, "world_size", None)),
+    )
+
+
+def _get_vllm_topology(vllm_config: VllmConfig) -> ParallelTopology:
+    """Return the vLLM parallel placement from config and live groups.
+
+    Sizes come from ParallelConfig because it is populated before the
+    distributed groups exist, falling back to the live group when the config
+    does not carry that axis. Ranks come from the live groups when they are
+    up, and stay None otherwise rather than being guessed from the world
+    rank, which would need an axis ordering vLLM does not promise.
+    """
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+
+    def size(attr: str, fallback: int | None) -> int | None:
+        value = _int_or_none(getattr(parallel_config, attr, None))
+        if value is None or value < 1:
+            value = fallback
+        return value if value is not None and value >= 1 else None
+
+    tp_rank = _int_or_none(_call_parallel_state("get_tensor_model_parallel_rank"))
+    tp_group_size = _int_or_none(
+        _call_parallel_state("get_tensor_model_parallel_world_size")
+    )
+    pp_rank, pp_group_size = _group_rank_size("get_pp_group")
+    ep_rank, ep_group_size = _group_rank_size("get_ep_group")
+
+    return build_topology(
+        dp_rank=_int_or_none(getattr(parallel_config, "data_parallel_rank", None)),
+        dp_size=size("data_parallel_size", None),
+        tp_rank=tp_rank,
+        tp_size=size("tensor_parallel_size", tp_group_size),
+        pp_rank=pp_rank,
+        pp_size=size("pipeline_parallel_size", pp_group_size),
+        ep_rank=ep_rank,
+        ep_size=size("expert_parallel_size", ep_group_size),
+    )
 
 
 def _get_vllm_device_id(target_device: torch.device) -> int:

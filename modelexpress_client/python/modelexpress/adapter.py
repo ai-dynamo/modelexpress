@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Iterator
 import torch
 
 from . import p2p_pb2
+from .topology import ParallelTopology
 
 if TYPE_CHECKING:
     from .load_strategy.context import LoadResult
@@ -73,12 +74,34 @@ class EngineAdapter:
 
     @gated_capability
     def get_worker_rank(self) -> int:
-        """Return the model-shard key used to pair source and target workers.
+        """Return the key used to pair source and target workers.
 
-        Data-parallel replicas should normally return the same key because
-        their weights are interchangeable. Tensor, pipeline, and expert
-        parallel shards should return distinct keys when they own distinct
-        model weights.
+        The intended key is the model shard: tensor and pipeline shards own
+        distinct weights and get distinct keys, while data-parallel replicas
+        hold interchangeable weights and could share one. The engines do not
+        all keep that intent, and the differences are deliberate:
+
+        - SGLang returns flat_shard_rank() over its topology, so DP replicas
+          collide by design.
+        - vLLM returns the torch.distributed world rank, which includes the
+          data-parallel axis. Under expert parallelism a DP replica does not
+          hold interchangeable weights, so DP siblings must not be paired.
+        - TensorRT-LLM returns Mapping.rank, the world rank, which likewise
+          separates attention-DP replicas.
+
+        Callers that need the placement itself rather than a pairing key
+        should use get_topology().
+        """
+        ...
+
+    @gated_capability
+    def get_topology(self) -> ParallelTopology:
+        """Return this worker's per-axis parallelism placement.
+
+        Implementations read the engine's own distributed state and must not
+        raise on an uninitialized engine, because publish paths call this
+        while the engine is still coming up. They report whatever they can
+        read and leave the rest as rank None.
         """
         ...
 

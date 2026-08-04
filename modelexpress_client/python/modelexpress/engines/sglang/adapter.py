@@ -19,6 +19,7 @@ from ...adapter import EngineAdapter
 from ...accelerators import accelerator_backend_for
 from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
+from ...topology import ParallelTopology, build_topology, flat_shard_rank
 from ...tensor_utils import (
     capture_tensor_attrs,
     collect_module_tensors,
@@ -54,6 +55,9 @@ class SglangAdapter(EngineAdapter):
 
     def get_worker_rank(self) -> int:
         return _get_sglang_worker_rank(self.load_config)
+
+    def get_topology(self) -> ParallelTopology:
+        return _get_sglang_topology()
 
     def get_global_rank(self) -> int:
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -296,15 +300,40 @@ def _get_parallel_size(name: str) -> int:
         return 1
 
 
-def _get_sglang_worker_rank(load_config: LoadConfig) -> int:
-    """Return the SGLang model-parallel shard key, excluding DP replicas."""
+def _get_parallel_value(name: str) -> int | None:
+    """Return an sglang.srt.distributed accessor value, or None if unreadable."""
     try:
         from sglang.srt import distributed
 
-        tp_rank = int(distributed.get_tensor_model_parallel_rank())
-        pp_rank = int(distributed.get_pipeline_model_parallel_rank())
-        tp_size = int(distributed.get_tensor_model_parallel_world_size())
-        return pp_rank * tp_size + tp_rank
+        return int(getattr(distributed, name)())
+    except Exception:
+        return None
+
+
+def _get_sglang_topology() -> ParallelTopology:
+    """Return the SGLang parallel placement from its distributed accessors.
+
+    Unlike _get_parallel_size, which defaults a missing accessor to 1 for
+    identity building, unreadable values stay None here so an axis nobody
+    read is not mistaken for an axis of extent 1.
+    """
+    return build_topology(
+        tp_rank=_get_parallel_value("get_tensor_model_parallel_rank"),
+        tp_size=_get_parallel_value("get_tensor_model_parallel_world_size"),
+        pp_rank=_get_parallel_value("get_pipeline_model_parallel_rank"),
+        pp_size=_get_parallel_value("get_pipeline_model_parallel_world_size"),
+        # get_moe_expert_parallel_rank sits beside its world-size accessor in
+        # sglang.srt.distributed.parallel_state. Older builds predate it, and
+        # there the lookup yields None rather than a fabricated 0.
+        ep_rank=_get_parallel_value("get_moe_expert_parallel_rank"),
+        ep_size=_get_parallel_value("get_moe_expert_parallel_world_size"),
+    )
+
+
+def _get_sglang_worker_rank(load_config: LoadConfig) -> int:
+    """Return the SGLang model-parallel shard key, excluding DP replicas."""
+    try:
+        return flat_shard_rank(_get_sglang_topology())
     except Exception:
         return int(getattr(load_config, "tp_rank", 0) or 0)
 

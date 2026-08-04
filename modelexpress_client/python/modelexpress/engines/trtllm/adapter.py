@@ -18,6 +18,7 @@ from ...accelerators import accelerator_backend_for
 from ...adapter import EngineAdapter
 from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
+from ...topology import ParallelTopology, build_topology
 
 _SOURCE_IDENTITY_KEY = "trtllm_source_identity"
 _WEIGHT_LAYOUT_KEY = "trtllm_weight_layout"
@@ -34,6 +35,44 @@ def _mx_version() -> str:
         return version("modelexpress")
     except PackageNotFoundError:
         return "0.0.0"
+
+
+def _mapping_int(mapping: Any, name: str) -> int | None:
+    try:
+        value = getattr(mapping, name, None)
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _get_trtllm_topology(mapping: Any) -> ParallelTopology:
+    """Return the TRT-LLM parallel placement from its Mapping object.
+
+    Axes the Mapping does not carry are reported as unknown rather than as
+    extent 1. The data-parallel axis is the exception and is deliberately
+    reported as unused: Mapping.dp_size reports tp_size under
+    enable_attention_dp, meaning attention-DP reuses the tensor ranks rather
+    than adding an independent axis, and reporting it separately would
+    describe tp_size * tp_size workers that do not exist.
+    """
+    ep_size = _mapping_int(mapping, "moe_ep_size")
+    if ep_size is not None and ep_size < 1:
+        # Mapping spells "no MoE" as -1, which is the single-group case.
+        ep_size, ep_rank = 1, 0
+    else:
+        ep_rank = _mapping_int(mapping, "moe_ep_rank")
+
+    return build_topology(
+        tp_rank=_mapping_int(mapping, "tp_rank"),
+        tp_size=_mapping_int(mapping, "tp_size"),
+        pp_rank=_mapping_int(mapping, "pp_rank"),
+        pp_size=_mapping_int(mapping, "pp_size"),
+        ep_rank=ep_rank,
+        ep_size=ep_size,
+    )
 
 
 def _normalize_model_identity(model_name: str) -> str:
@@ -156,7 +195,14 @@ class TrtllmAdapter(EngineAdapter):
         return self.identity
 
     def get_worker_rank(self) -> int:
+        # Mapping.rank is the world rank, so it also separates attention-DP
+        # replicas that flat_shard_rank() over get_topology() would merge.
+        # Keeping the world rank is intentional; see get_worker_rank() on
+        # EngineAdapter for why the two values are allowed to disagree.
         return int(getattr(self.mapping, "rank", 0))
+
+    def get_topology(self) -> ParallelTopology:
+        return _get_trtllm_topology(self.mapping)
 
     def get_global_rank(self) -> int:
         return int(getattr(self.mapping, "rank", 0))
