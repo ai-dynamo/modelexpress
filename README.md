@@ -274,6 +274,7 @@ cargo bench
 ## Known Issues
 
 - **GDS loader does not scale with TP** — Each TP rank reads full checkpoint tensors and vLLM shards them afterward, so GDS/disk reads scale with TP degree. This can reduce or reverse expected GDS speedups versus the default mmap-based disk loader; TP-aware range reads are needed for a full fix. See [GDS Reads Full Checkpoint Tensors Under TP](docs/ARCHITECTURE.md#gds-reads-full-checkpoint-tensors-under-tp).
+- **P2P source wedges after a reader is torn down (UCX/InfiniBand)** — Once a reader that pulled from a source is removed, the source can stop serving new readers: their RDMA reads stall to the transfer timeout and fall back to disk, while the source keeps advertising `Ready` and serving inference normally. Loading stays correct, but P2P is effectively lost for that source until the source worker pod is restarted. The cause is NIXL retaining queue-pair state for a peer it holds no record of, so it is not fixable from ModelExpress; tracked as nvbug 6519532. Lower `MX_TRANSFER_TIMEOUT` to bound the stall.
 
 ---
 
