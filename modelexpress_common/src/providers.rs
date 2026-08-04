@@ -87,10 +87,12 @@ pub mod gcs;
 pub mod huggingface;
 pub(crate) mod lock_file;
 pub mod ngc;
+pub mod s3;
 
 pub use gcs::GcsProvider;
 pub use huggingface::HuggingFaceProvider;
 pub use ngc::NgcProvider;
+pub use s3::S3Provider;
 
 #[cfg(test)]
 mod tests {
