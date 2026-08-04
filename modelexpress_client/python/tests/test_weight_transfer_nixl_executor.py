@@ -5,16 +5,15 @@
 
 These assert the exact prep_xfer_dlist / make_prepped_xfer calls that reach the
 agent, rather than anything about how NixlExecutor builds them. That is
-deliberate: the executor is scheduled to be reimplemented on top of
+deliberate: the executor is a thin adapter over
 NixlTransferManager.post_read_batch, and asserting at the agent boundary is what
-makes these tests survive that change and prove it was faithful.
+lets these hold across changing which side issues the calls.
 
-Two things here are load-bearing and enforced nowhere else in the codebase:
+Two things here are load-bearing and enforced nowhere else:
   - remote descriptors carry device id 0, hardcoded, because RdmaDescriptor has
     no field for the remote device;
-  - local descriptors carry the device id the *executor* was built with, which
-    equals the manager's own device id today only because TrainerPullStrategy
-    passes the same ctx.device_id to both.
+  - local descriptors carry the manager's device id, which the executor
+    requires to equal its own.
 
 No NIXL, no GPU. The agent is a MagicMock throughout.
 
@@ -47,28 +46,32 @@ def _executor(mgr, device_id=0, remote_agents=None) -> NixlExecutor:
 
 
 @pytest.fixture
-def backend(mock_accelerator_backend_cls):
-    return mock_accelerator_backend_cls()
+def make_mgr(mock_accelerator_backend_cls):
+    def _make(device_id: int = 0) -> NixlTransferManager:
+        manager = NixlTransferManager(
+            agent_name="test",
+            device_id=device_id,
+            accelerator_backend=mock_accelerator_backend_cls(),
+        )
+        manager._agent = MagicMock()
+        manager._agent.check_xfer_state.return_value = "DONE"
+        return manager
+
+    return _make
 
 
 @pytest.fixture
-def mgr(backend):
-    manager = NixlTransferManager(
-        agent_name="test", device_id=0, accelerator_backend=backend
-    )
-    manager._agent = MagicMock()
-    manager._agent.check_xfer_state.return_value = "DONE"
-    return manager
+def mgr(make_mgr):
+    return make_mgr()
 
 
 class TestReadCallArgs:
-    def test_prep_and_xfer_args_are_exact(self, mgr, backend):
+    def test_prep_and_xfer_args_are_exact(self, mgr):
         mgr._agent.prep_xfer_dlist.side_effect = ["src", "dst"]
         mgr._agent.make_prepped_xfer.return_value = "handle"
 
         total, _elapsed = _executor(mgr).execute(
-            [_desc(0, 0x1000, 0x9000, 64), _desc(0, 0x2000, 0xA000, 128)],
-            operation="READ",
+            [_desc(0, 0x1000, 0x9000, 64), _desc(0, 0x2000, 0xA000, 128)]
         )
 
         assert total == 192
@@ -76,13 +79,13 @@ class TestReadCallArgs:
             call(
                 agent_name="trainer0",
                 xfer_list=[(0x1000, 64, 0), (0x2000, 128, 0)],
-                mem_type=backend.nixl_mem_type,
+                mem_type=mgr._accelerator_backend.nixl_mem_type,
                 backends=mgr._backends,
             ),
             call(
                 agent_name="",
                 xfer_list=[(0x9000, 64, 0), (0xA000, 128, 0)],
-                mem_type=backend.nixl_mem_type,
+                mem_type=mgr._accelerator_backend.nixl_mem_type,
                 backends=mgr._backends,
             ),
         ]
@@ -99,8 +102,8 @@ class TestReadCallArgs:
         mgr._agent.transfer.assert_called_once_with("handle")
         mgr._agent.release_xfer_handle.assert_called_once_with("handle")
 
-    def test_local_descriptors_use_the_executor_device_id(self, mgr):
-        """The substitution a post_read_batch swap would silently make."""
+    def test_local_descriptors_use_the_device_id(self, make_mgr):
+        mgr = make_mgr(3)
         mgr._agent.prep_xfer_dlist.side_effect = ["src", "dst"]
 
         _executor(mgr, device_id=3).execute([_desc(0, 0x1000, 0x9000, 64)])
@@ -108,8 +111,9 @@ class TestReadCallArgs:
         local_call = mgr._agent.prep_xfer_dlist.call_args_list[1]
         assert local_call.kwargs["xfer_list"] == [(0x9000, 64, 3)]
 
-    def test_remote_descriptors_hardcode_device_zero(self, mgr):
+    def test_remote_descriptors_hardcode_device_zero(self, make_mgr):
         """RdmaDescriptor carries no remote device field; 0 is assumed."""
+        mgr = make_mgr(3)
         mgr._agent.prep_xfer_dlist.side_effect = ["src", "dst"]
 
         _executor(mgr, device_id=3).execute([_desc(0, 0x1000, 0x9000, 64)])
@@ -117,12 +121,20 @@ class TestReadCallArgs:
         remote_call = mgr._agent.prep_xfer_dlist.call_args_list[0]
         assert remote_call.kwargs["xfer_list"] == [(0x1000, 64, 0)]
 
-    def test_device_is_synchronized_once_after_the_batch(self, mgr, backend):
+    def test_device_id_disagreeing_with_the_manager_is_refused(self, make_mgr):
+        """The divergence that would silently land weights on the wrong device."""
+        mgr = make_mgr(0)
+
+        with pytest.raises(ValueError, match="does not match"):
+            _executor(mgr, device_id=3)
+
+    def test_device_is_synchronized_once_after_the_batch(self, make_mgr):
+        mgr = make_mgr(3)
         mgr._agent.prep_xfer_dlist.side_effect = ["src", "dst"]
 
         _executor(mgr, device_id=3).execute([_desc(0, 0x1000, 0x9000, 64)])
 
-        assert backend.synchronize_calls == [3]
+        assert mgr._accelerator_backend.synchronize_calls == [3]
 
 
 class TestGroupingByRemoteAgent:
@@ -177,6 +189,13 @@ class TestDegenerateAndFailurePaths:
         mgr._agent.prep_xfer_dlist.assert_not_called()
         mgr._agent.transfer.assert_not_called()
 
+    def test_zero_byte_descriptors_move_nothing(self, mgr):
+        """post_read_batch drops empty ranges and reports the batch as absent."""
+        total, _elapsed = _executor(mgr).execute([_desc(0, 0x1000, 0x9000, 0)])
+
+        assert total == 0
+        mgr._agent.transfer.assert_not_called()
+
     def test_uninitialized_agent_raises(self, mgr):
         mgr._agent = None
 
@@ -204,3 +223,11 @@ class TestDegenerateAndFailurePaths:
             _executor(mgr).execute([_desc(0, 0x1000, 0x9000, 64)])
 
         mgr._agent.release_xfer_handle.assert_called_once()
+
+    def test_failure_message_names_the_weight_sync_caller(self, mgr):
+        """Not the reshard path, which is await_read_batches' default label."""
+        mgr._agent.prep_xfer_dlist.side_effect = ["src", "dst"]
+        mgr._agent.check_xfer_state.return_value = "ERR"
+
+        with pytest.raises(RuntimeError, match="weight-sync"):
+            _executor(mgr).execute([_desc(0, 0x1000, 0x9000, 64)])
