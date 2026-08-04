@@ -746,6 +746,13 @@ class ReshardReceiver:
             for descriptor in (*full_descriptors, *convert_descriptors)
         )
 
+        # Before anything reads the receive buffers, and well before _install
+        # commits them to live parameters. An impossible rate means the transport
+        # reported completions it did not earn, so the buffers cannot be trusted;
+        # checking after the install would document the corruption rather than
+        # prevent it. Everything the check needs is known by this point.
+        self._check_throughput_ceiling(step, stats["bytes"], stages)
+
         # Local re-slice of every full-pulled source into its receive buffer, and
         # the dtype cast for every converted param. Both read staging written by
         # the reads above, so both must run after the wire completes.
@@ -842,7 +849,6 @@ class ReshardReceiver:
             # WARNING so a benchmark harness captures it without turning on INFO
             # across every dependency.
             logger.warning("MX_REFIT_STAGE %s", json.dumps(record))
-        self._check_throughput_ceiling(step, stats["bytes"], stages)
         return metrics
 
     def _check_throughput_ceiling(
@@ -859,8 +865,14 @@ class ReshardReceiver:
 
         An impossible rate is not a fast measurement, it is evidence the transport
         reported completions it did not earn, so this aborts rather than recording
-        the number with a caveat. The record is emitted before the raise so the
-        evidence survives.
+        the number with a caveat. The impossible-throughput record below is emitted
+        before the raise so the evidence survives the abort; the ordinary stage
+        record is not reached, which is the point - the run produced no trustworthy
+        timing to file.
+
+        Called before the receive buffers are read or installed. Running it after
+        the install would leave the guard describing weights it had already let
+        through, which is the one outcome it exists to prevent.
 
         Off unless a ceiling is configured, because only the operator knows the
         real per-rank limit for their fabric.
