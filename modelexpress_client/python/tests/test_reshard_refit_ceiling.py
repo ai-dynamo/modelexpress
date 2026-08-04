@@ -22,6 +22,9 @@ import json
 import logging
 
 import pytest
+import torch
+
+from tests.test_reshard_refit_fused_wire import _build, _RecordingTransport
 
 # The observed record, verbatim.
 OBSERVED_BYTES = 40_611_246_080
@@ -138,3 +141,46 @@ def test_the_failure_is_machine_readable_before_it_raises(monkeypatch, caplog):
     assert payload["wire_bytes"] == OBSERVED_BYTES
     assert payload["ceiling_gbps"] == TWO_ADAPTER_CEILING
     assert payload["implied_gbps"] == pytest.approx(OBSERVED_IMPLIED_GBPS, abs=0.2)
+
+
+# ------------------------------------------- where the guard sits in the refit
+def _refit(monkeypatch, ceiling):
+    """A whole refit through the real update_weights, with the ceiling configured."""
+    monkeypatch.setenv("MX_RESHARD_FUSED_WIRE", "1")
+    monkeypatch.setenv("MX_RESHARD_MAX_GBPS", str(ceiling))
+    monkeypatch.delenv("MX_REFIT_STAGE_RECORD", raising=False)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+    return _build(_RecordingTransport())
+
+
+def test_a_breached_ceiling_blocks_the_install(monkeypatch):
+    """The point of the guard, and the thing calling it after ``_install`` silently
+    gave up.
+
+    An impossible rate means the transport reported completions it did not earn, so
+    the receive buffers hold whatever was there before. Raising after the install
+    documents that the live parameters were overwritten with untrustworthy bytes;
+    raising before it is what actually prevents them from being.
+    """
+    # Low enough that any real rate breaches it, so the test does not depend on
+    # how fast the in-memory transport happens to be.
+    harness, keepalive = _refit(monkeypatch, 0.000001)
+
+    with pytest.raises(RuntimeError, match="failed, not fast"):
+        harness.update_weights(step=1)
+
+    assert harness._install_order == [], (
+        "the ceiling breached, so nothing should have reached live parameters"
+    )
+    assert keepalive is not None
+
+
+def test_a_rate_under_the_ceiling_still_installs(monkeypatch):
+    """The other half: a guard that blocks legitimate refits gets switched off, and
+    then protects nothing."""
+    harness, keepalive = _refit(monkeypatch, 1e9)
+
+    harness.update_weights(step=1)
+
+    assert harness._install_order == ["install"]
+    assert keepalive is not None
