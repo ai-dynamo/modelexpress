@@ -134,9 +134,19 @@ def shard_region(full_tensor, global_shape, shard_offset, shape):
     Here rather than with the comparison gate because it is the inverse of what a
     publisher digests: the publisher hashes its own contiguous shard, and this is how
     a receiver recovers the same box out of the buffer it assembled.
+
+    The three ranks must agree. A short ``shard_offset`` would otherwise stop the
+    narrow loop early and return a larger region than the publisher digested, which
+    surfaces as a mismatch on a shard that transferred correctly - the most expensive
+    kind of wrong answer for a gate whose whole job is to be trusted.
     """
+    if not len(global_shape) == len(shard_offset) == len(shape):
+        raise ValueError(
+            f"rank mismatch: global_shape {tuple(global_shape)}, shard_offset "
+            f"{tuple(shard_offset)} and shape {tuple(shape)} must have equal rank"
+        )
     view = full_tensor.reshape(tuple(global_shape))
-    for axis, (start, extent) in enumerate(zip(shard_offset, shape)):
+    for axis, (start, extent) in enumerate(zip(shard_offset, shape, strict=True)):
         view = view.narrow(axis, int(start), int(extent))
     return view.contiguous()
 

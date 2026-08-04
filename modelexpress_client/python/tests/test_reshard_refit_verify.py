@@ -92,6 +92,24 @@ def test_shard_region_extracts_the_publishers_box():
     assert torch.equal(region, full[1:3, 2:5])
 
 
+@pytest.mark.parametrize(
+    ("global_shape", "offset", "shape"),
+    [
+        ((4, 6), (1,), (2, 3)),  # short offset
+        ((4, 6), (1, 2), (2,)),  # short shape
+        ((4, 6, 2), (1, 2), (2, 3)),  # short against the global rank
+    ],
+)
+def test_a_rank_mismatch_is_rejected_rather_than_truncated(global_shape, offset, shape):
+    """A short coordinate would stop the narrow loop early and return a larger region
+    than the publisher digested, reporting a mismatch on a shard that transferred
+    correctly."""
+    full = torch.arange(48, dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="rank mismatch"):
+        shard_region(full, global_shape, offset, shape)
+
+
 def test_a_region_digests_the_same_as_the_shard_its_publisher_held():
     """The two halves of the eventual comparison have to agree on what they hash.
 
