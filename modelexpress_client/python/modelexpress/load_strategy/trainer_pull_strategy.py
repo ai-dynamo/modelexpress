@@ -17,6 +17,10 @@ MX_TRAINER_SYNC_TIMEOUT  Seconds to wait for trainer table or pull ACK.
 MX_WEIGHT_SYNC_SERVER    If set, use ServerPlanner (routes regions on the
                          MX server in Rust, caches plan for all workers).
                          If unset, use LocalPlanner (client-side routing).
+
+Either MX_WEIGHT_SYNC_SERVER or MX_TRAINER_TABLE_KEY must be set for this
+strategy to be eligible: with neither, the deployment has no trainer to pull
+from.
 """
 
 from __future__ import annotations
@@ -51,6 +55,21 @@ def _use_server_planner() -> bool:
     return (envs.MX_WEIGHT_SYNC_SERVER or "").strip().lower() not in _DISABLED_VALUES
 
 
+def _trainer_sync_configured() -> bool:
+    """Return whether this deployment is set up to pull from a trainer.
+
+    Either variable on its own is a complete configuration: MX_WEIGHT_SYNC_SERVER
+    selects the server-side planner, MX_TRAINER_TABLE_KEY names the table a
+    client-side (LocalPlanner) deployment pulls from. With neither set there is
+    no trainer to wait for, so the strategy must decline rather than spend the
+    whole MX_TRAINER_SYNC_TIMEOUT budget polling for a table that never appears
+    and starving the strategies behind it.
+    """
+    if _use_server_planner():
+        return True
+    return bool((envs.MX_TRAINER_TABLE_KEY or "").strip())
+
+
 def _trainer_table_key(model_name: str) -> str:
     key = envs.MX_TRAINER_TABLE_KEY
     if key:
@@ -79,6 +98,13 @@ class TrainerPullStrategy(LoadStrategy):
 
     def is_available(self, ctx: LoadContext) -> bool:
         if not super().is_available(ctx):
+            return False
+        if not _trainer_sync_configured():
+            logger.info(
+                "[Worker %d] Neither MX_WEIGHT_SYNC_SERVER nor MX_TRAINER_TABLE_KEY "
+                "is set, skipping trainer pull",
+                ctx.global_rank,
+            )
             return False
         if not is_nixl_available():
             return False
