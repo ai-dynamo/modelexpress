@@ -1,0 +1,336 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Full Kimi-K3 verification for MX PR #589 (adopt container-held derived
+# tensors into the RDMA manifest).
+#
+# The decisive check is not inference quality -- a poisoned value cache still
+# produces fluent text for a while. Both roles dump a sha256 digest of every
+# tensor the manifest historically could not carry, and the two dumps are
+# diffed directly:
+#
+#   kubectl cp mx-k3-seed-0:/tmp/mx_state_dump.json   seed.json
+#   kubectl cp mx-k3-target-0:/tmp/mx_state_dump.json target.json
+#   ./mx_compare_state.py seed.json target.json
+#
+# Expected with the fix: the `cw` and `fused_decode` groups are byte-identical
+# alongside the `control` group. Without it, `cw` differs while `control`
+# still matches -- that pairing is the fingerprint of missed derived state
+# rather than a broken transfer.
+#
+# Sizing: TP16 across 2 nodes per replica on B200 (192GB). The checkpoint is
+# ~1.4T on disk, so ~90-120GB/rank leaves room for KV cache. TP32 (4 nodes,
+# the configuration PR #585 reported) halves per-rank residency if nodes are
+# available; raise NODES to 4 and TP to 32 in both roles.
+#
+# Deploy:
+#   kubectl apply -f k3-full-verify.yaml          # seed only
+#   # wait for mx-k3-seed-0 to serve, then:
+#   kubectl scale --replicas=1 lws/mx-k3-target   # (or apply with replicas: 1)
+#
+# Flush Redis between runs; stale source metadata makes a target pick a peer
+# that no longer exists.
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: modelexpress
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mx-k3-launch
+data:
+  launch.sh: |
+    #!/bin/bash
+    # Both roles launch identically. MxModelLoader resolves the role at run
+    # time: the first instance finds no RDMA source, loads from disk and
+    # publishes itself; the second finds it and receives. Only MX_DUMP_ROLE
+    # differs, and only to label the dump.
+    set -x
+    exec python3 -m sglang.launch_server \
+      --model-path "$MODEL_NAME" \
+      --tp "$TP_SIZE" \
+      --nnodes "$NNODES" \
+      --node-rank "${LWS_WORKER_INDEX:-0}" \
+      --dist-init-addr "${LWS_LEADER_ADDRESS:-$POD_IP}:20000" \
+      --port 30000 \
+      --host 0.0.0.0 \
+      --trust-remote-code \
+      --skip-server-warmup \
+      --disable-cuda-graph \
+      --mem-fraction-static 0.85 \
+      --load-format remote_instance \
+      --remote-instance-weight-loader-backend modelexpress \
+      --modelexpress-config '{"url":"mx-k3-server:8001","source":true}'
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-k3-server
+  labels: {app: mx-k3-server}
+spec:
+  type: ClusterIP
+  ports:
+    - {port: 8001, targetPort: 8001, name: grpc}
+  selector: {app: mx-k3-server}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-k3-server
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: mx-k3-server}}
+  template:
+    metadata:
+      labels: {app: mx-k3-server}
+    spec:
+      imagePullSecrets: [{name: nvcr-imagepullsecret}]
+      initContainers:
+        - name: redis
+          image: redis:7-alpine
+          restartPolicy: Always
+          ports: [{containerPort: 6379}]
+          resources:
+            requests: {cpu: 500m, memory: 2Gi}
+            limits: {cpu: "1", memory: 8Gi}
+          startupProbe:
+            tcpSocket: {port: 6379}
+            periodSeconds: 1
+            failureThreshold: 30
+      containers:
+        - name: modelexpress-server
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-server:latest
+          imagePullPolicy: Always
+          ports: [{containerPort: 8001}]
+          env:
+            - {name: MX_METADATA_BACKEND, value: "redis"}
+            - {name: REDIS_URL, value: "redis://localhost:6379"}
+          resources:
+            requests: {cpu: "4", memory: 8Gi}
+            limits: {cpu: "8", memory: 16Gi}
+          readinessProbe:
+            tcpSocket: {port: 8001}
+            initialDelaySeconds: 10
+            periodSeconds: 5
+---
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: mx-k3-seed
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 2
+    restartPolicy: RecreateGroupOnPodRestart
+    leaderTemplate:
+      metadata:
+        labels: {app: mx-k3-seed, role: leader}
+      spec:
+        serviceAccountName: modelexpress
+        imagePullSecrets: [{name: nvcr-imagepullsecret}]
+        tolerations:
+          - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+        containers:
+          - name: sglang
+            image: nvcr.io/nvidian/dynamo-dev/sglang-k3-mx:pr589
+            imagePullPolicy: IfNotPresent
+            securityContext:
+              capabilities: {add: [IPC_LOCK]}
+            command: ["/bin/bash", "-c"]
+            args: ["set -x; ulimit -l unlimited; exec /opt/launch.sh"]
+            env:
+              - {name: MX_DUMP_ROLE, value: "seed"}
+              - {name: MX_DUMP_OUT, value: "/tmp/mx_state_dump.json"}
+              - {name: MX_PROBE_OUT, value: "/tmp/mx_receive_probe.jsonl"}
+              - {name: PYTHONPATH, value: "/opt/probe"}
+              - {name: MODEL_EXPRESS_URL, value: "mx-k3-server:8001"}
+              - {name: MODEL_NAME, value: "moonshotai/Kimi-K3"}
+              - {name: HF_HUB_CACHE, value: "/models/hub"}
+              - {name: TP_SIZE, value: "16"}
+              - {name: NNODES, value: "2"}
+              - {name: MOONCAKE_DEVICE, value: "mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_10,mlx5_11"}
+              - name: HF_TOKEN
+                valueFrom: {secretKeyRef: {name: hf-token-secret, key: HF_TOKEN}}
+              - name: POD_IP
+                valueFrom: {fieldRef: {fieldPath: status.podIP}}
+              - name: NODE_NAME
+                valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+              - name: POD_NAMESPACE
+                valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            ports: [{containerPort: 30000}]
+            resources:
+              limits: {nvidia.com/gpu: "8", rdma/ib: "8"}
+              requests: {nvidia.com/gpu: "8", rdma/ib: "8", memory: "800Gi", cpu: "64"}
+            volumeMounts:
+              - {name: shm, mountPath: /dev/shm}
+              - {name: model-cache, mountPath: /models}
+              - {name: launch, mountPath: /opt/launch.sh, subPath: launch.sh}
+        volumes:
+          - name: shm
+            emptyDir: {medium: Memory, sizeLimit: 256Gi}
+          - name: model-cache
+            persistentVolumeClaim: {claimName: shared-model-cache}
+          - name: launch
+            configMap: {name: mx-k3-launch, defaultMode: 0755}
+    workerTemplate:
+      metadata:
+        labels: {app: mx-k3-seed, role: worker}
+      spec:
+        serviceAccountName: modelexpress
+        imagePullSecrets: [{name: nvcr-imagepullsecret}]
+        tolerations:
+          - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+        containers:
+          - name: sglang
+            image: nvcr.io/nvidian/dynamo-dev/sglang-k3-mx:pr589
+            imagePullPolicy: IfNotPresent
+            securityContext:
+              capabilities: {add: [IPC_LOCK]}
+            command: ["/bin/bash", "-c"]
+            args: ["set -x; ulimit -l unlimited; exec /opt/launch.sh"]
+            env:
+              - {name: MX_DUMP_ROLE, value: "seed"}
+              - {name: MX_DUMP_OUT, value: "/tmp/mx_state_dump.json"}
+              - {name: MX_PROBE_OUT, value: "/tmp/mx_receive_probe.jsonl"}
+              - {name: PYTHONPATH, value: "/opt/probe"}
+              - {name: MODEL_EXPRESS_URL, value: "mx-k3-server:8001"}
+              - {name: MODEL_NAME, value: "moonshotai/Kimi-K3"}
+              - {name: HF_HUB_CACHE, value: "/models/hub"}
+              - {name: TP_SIZE, value: "16"}
+              - {name: NNODES, value: "2"}
+              - {name: MOONCAKE_DEVICE, value: "mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_10,mlx5_11"}
+              - name: HF_TOKEN
+                valueFrom: {secretKeyRef: {name: hf-token-secret, key: HF_TOKEN}}
+              - name: POD_IP
+                valueFrom: {fieldRef: {fieldPath: status.podIP}}
+              - name: NODE_NAME
+                valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+              - name: POD_NAMESPACE
+                valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            ports: [{containerPort: 30000}]
+            resources:
+              limits: {nvidia.com/gpu: "8", rdma/ib: "8"}
+              requests: {nvidia.com/gpu: "8", rdma/ib: "8", memory: "800Gi", cpu: "64"}
+            volumeMounts:
+              - {name: shm, mountPath: /dev/shm}
+              - {name: model-cache, mountPath: /models}
+              - {name: launch, mountPath: /opt/launch.sh, subPath: launch.sh}
+        volumes:
+          - name: shm
+            emptyDir: {medium: Memory, sizeLimit: 256Gi}
+          - name: model-cache
+            persistentVolumeClaim: {claimName: shared-model-cache}
+          - name: launch
+            configMap: {name: mx-k3-launch, defaultMode: 0755}
+---
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: mx-k3-target
+spec:
+  replicas: 0
+  leaderWorkerTemplate:
+    size: 2
+    restartPolicy: RecreateGroupOnPodRestart
+    leaderTemplate:
+      metadata:
+        labels: {app: mx-k3-target, role: leader}
+      spec:
+        serviceAccountName: modelexpress
+        imagePullSecrets: [{name: nvcr-imagepullsecret}]
+        tolerations:
+          - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+        containers:
+          - name: sglang
+            image: nvcr.io/nvidian/dynamo-dev/sglang-k3-mx:pr589
+            imagePullPolicy: IfNotPresent
+            securityContext:
+              capabilities: {add: [IPC_LOCK]}
+            command: ["/bin/bash", "-c"]
+            args: ["set -x; ulimit -l unlimited; exec /opt/launch.sh"]
+            env:
+              - {name: MX_DUMP_ROLE, value: "target"}
+              - {name: MX_DUMP_OUT, value: "/tmp/mx_state_dump.json"}
+              - {name: MX_PROBE_OUT, value: "/tmp/mx_receive_probe.jsonl"}
+              - {name: PYTHONPATH, value: "/opt/probe"}
+              - {name: MODEL_EXPRESS_URL, value: "mx-k3-server:8001"}
+              - {name: MODEL_NAME, value: "moonshotai/Kimi-K3"}
+              - {name: HF_HUB_CACHE, value: "/models/hub"}
+              - {name: TP_SIZE, value: "16"}
+              - {name: NNODES, value: "2"}
+              - {name: MOONCAKE_DEVICE, value: "mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_10,mlx5_11"}
+              - name: HF_TOKEN
+                valueFrom: {secretKeyRef: {name: hf-token-secret, key: HF_TOKEN}}
+              - name: POD_IP
+                valueFrom: {fieldRef: {fieldPath: status.podIP}}
+              - name: NODE_NAME
+                valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+              - name: POD_NAMESPACE
+                valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            ports: [{containerPort: 30000}]
+            resources:
+              limits: {nvidia.com/gpu: "8", rdma/ib: "8"}
+              requests: {nvidia.com/gpu: "8", rdma/ib: "8", memory: "800Gi", cpu: "64"}
+            volumeMounts:
+              - {name: shm, mountPath: /dev/shm}
+              - {name: model-cache, mountPath: /models}
+              - {name: launch, mountPath: /opt/launch.sh, subPath: launch.sh}
+        volumes:
+          - name: shm
+            emptyDir: {medium: Memory, sizeLimit: 256Gi}
+          - name: model-cache
+            persistentVolumeClaim: {claimName: shared-model-cache}
+          - name: launch
+            configMap: {name: mx-k3-launch, defaultMode: 0755}
+    workerTemplate:
+      metadata:
+        labels: {app: mx-k3-target, role: worker}
+      spec:
+        serviceAccountName: modelexpress
+        imagePullSecrets: [{name: nvcr-imagepullsecret}]
+        tolerations:
+          - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+        containers:
+          - name: sglang
+            image: nvcr.io/nvidian/dynamo-dev/sglang-k3-mx:pr589
+            imagePullPolicy: IfNotPresent
+            securityContext:
+              capabilities: {add: [IPC_LOCK]}
+            command: ["/bin/bash", "-c"]
+            args: ["set -x; ulimit -l unlimited; exec /opt/launch.sh"]
+            env:
+              - {name: MX_DUMP_ROLE, value: "target"}
+              - {name: MX_DUMP_OUT, value: "/tmp/mx_state_dump.json"}
+              - {name: MX_PROBE_OUT, value: "/tmp/mx_receive_probe.jsonl"}
+              - {name: PYTHONPATH, value: "/opt/probe"}
+              - {name: MODEL_EXPRESS_URL, value: "mx-k3-server:8001"}
+              - {name: MODEL_NAME, value: "moonshotai/Kimi-K3"}
+              - {name: HF_HUB_CACHE, value: "/models/hub"}
+              - {name: TP_SIZE, value: "16"}
+              - {name: NNODES, value: "2"}
+              - {name: MOONCAKE_DEVICE, value: "mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_10,mlx5_11"}
+              - name: HF_TOKEN
+                valueFrom: {secretKeyRef: {name: hf-token-secret, key: HF_TOKEN}}
+              - name: POD_IP
+                valueFrom: {fieldRef: {fieldPath: status.podIP}}
+              - name: NODE_NAME
+                valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+              - name: POD_NAMESPACE
+                valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            ports: [{containerPort: 30000}]
+            resources:
+              limits: {nvidia.com/gpu: "8", rdma/ib: "8"}
+              requests: {nvidia.com/gpu: "8", rdma/ib: "8", memory: "800Gi", cpu: "64"}
+            volumeMounts:
+              - {name: shm, mountPath: /dev/shm}
+              - {name: model-cache, mountPath: /models}
+              - {name: launch, mountPath: /opt/launch.sh, subPath: launch.sh}
+        volumes:
+          - name: shm
+            emptyDir: {medium: Memory, sizeLimit: 256Gi}
+          - name: model-cache
+            persistentVolumeClaim: {claimName: shared-model-cache}
+          - name: launch
+            configMap: {name: mx-k3-launch, defaultMode: 0755}
