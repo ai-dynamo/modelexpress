@@ -4,8 +4,7 @@
 import grpc
 from google.protobuf import descriptor_pb2
 
-from modelexpress import revision_pb2
-from modelexpress import revision_pb2_grpc
+from modelexpress import p2p_pb2, revision_pb2, revision_pb2_grpc
 
 
 def _file_descriptor_proto() -> descriptor_pb2.FileDescriptorProto:
@@ -39,6 +38,22 @@ def test_revision_catalog_service_has_exact_public_methods():
     ]
     assert not any(method.server_streaming for method in service.methods)
     assert not any(method.client_streaming for method in service.methods)
+
+
+def test_revision_catalog_rpcs_and_states_are_absent_from_p2p_service():
+    p2p_service = p2p_pb2.DESCRIPTOR.services_by_name["P2pService"]
+    revision_methods = {
+        "PublishRevision",
+        "GetRevision",
+        "ListReadyRevisions",
+        "GetRecoveryCandidates",
+        "UpdateReceiverState",
+        "CommitVersion",
+    }
+
+    assert revision_methods.isdisjoint(method.name for method in p2p_service.methods)
+    assert "RevisionRecord" not in p2p_pb2.DESCRIPTOR.message_types_by_name
+    assert "RevisionLifecycleState" not in p2p_pb2.DESCRIPTOR.enum_types_by_name
 
 
 def test_generated_revision_catalog_client_exposes_public_methods():

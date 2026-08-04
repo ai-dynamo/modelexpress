@@ -7,6 +7,7 @@ pub mod cache;
 pub mod config;
 pub mod p2p;
 pub mod registry;
+pub mod revision;
 pub mod server;
 pub mod services;
 

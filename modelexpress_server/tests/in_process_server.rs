@@ -16,6 +16,12 @@ use std::time::Duration;
 use modelexpress_client::Client;
 use modelexpress_common::client_config::ClientConfig;
 use modelexpress_common::config::ConnectionConfig;
+use modelexpress_common::grpc::revision::revision_catalog_service_client::RevisionCatalogServiceClient;
+use modelexpress_common::grpc::revision::{
+    ChangeState, CommitVersionRequest, DeltaLocation, DeltaTransferMethod, GetRevisionRequest,
+    PublishRevisionRequest, RankDelta, RevisionLifecycleState, RevisionManifest, RevisionRank,
+    S3Location, delta_location,
+};
 use modelexpress_server::backend_config::BackendConfig;
 use modelexpress_server::config::ServerConfig;
 use modelexpress_server::run_server;
@@ -89,4 +95,80 @@ async fn server_boots_and_serves_a_client() {
 #[tokio::test]
 async fn another_server_boots_and_serves_a_client() {
     assert_boots_and_serves().await;
+}
+
+#[tokio::test]
+async fn revision_catalog_runs_through_the_real_server_router() {
+    let port = free_port();
+    let (shutdown, handle) = start_server(port);
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let mut client = loop {
+        match RevisionCatalogServiceClient::connect(endpoint.clone()).await {
+            Ok(client) => break client,
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    };
+    let manifest = RevisionManifest {
+        model_id: "model".to_string(),
+        version: "v1".to_string(),
+        base_version: Some("v0".to_string()),
+        transfer_method: DeltaTransferMethod::Canonical as i32,
+        delta_method: Some("xor".to_string()),
+        compression_algorithm: Some("zstd".to_string()),
+        format_digest: "format".to_string(),
+        base_digest: Some("base".to_string()),
+        target_digest: "target".to_string(),
+        ranks: vec![RevisionRank {
+            trainer_rank: 0,
+            producer_id: "producer".to_string(),
+            source_layout_digest: "layout".to_string(),
+            delta: Some(RankDelta {
+                change_state: ChangeState::Dirty as i32,
+                checksum: Some("deadbeef".to_string()),
+                location: Some(DeltaLocation {
+                    transport: Some(delta_location::Transport::S3(S3Location {
+                        bucket: "bucket".to_string(),
+                        key: "model/v1/root.json".to_string(),
+                        object_version: Some("object-v1".to_string()),
+                    })),
+                }),
+                delta_descriptor: None,
+            }),
+            shards: vec![],
+        }],
+    };
+    let published = client
+        .publish_revision(PublishRevisionRequest {
+            manifest: Some(manifest),
+            publisher_id: "trainer".to_string(),
+            publication_mode: None,
+        })
+        .await
+        .expect("publish over network")
+        .into_inner();
+    assert!(published.created);
+
+    let committed = client
+        .commit_version(CommitVersionRequest {
+            model_id: "model".to_string(),
+            version: "v1".to_string(),
+        })
+        .await
+        .expect("commit over network")
+        .into_inner();
+    assert_eq!(
+        committed.revision.as_ref().map(|record| record.state),
+        Some(RevisionLifecycleState::Committed as i32)
+    );
+
+    let fetched = client
+        .get_revision(GetRevisionRequest {
+            model_id: "model".to_string(),
+            version: "v1".to_string(),
+        })
+        .await
+        .expect("get over network")
+        .into_inner();
+    assert_eq!(fetched.revision, committed.revision);
+    stop_and_join(shutdown, handle).await;
 }
