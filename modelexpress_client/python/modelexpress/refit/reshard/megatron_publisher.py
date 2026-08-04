@@ -13,6 +13,7 @@ from modelexpress.refit.reshard.rendezvous import (
     PublishedTensor,
     wrap_rendezvous_blob,
 )
+from modelexpress.refit.reshard.verify import published_digest
 
 
 @dataclass(frozen=True)
@@ -112,6 +113,7 @@ def publish_megatron_reshard_view(
                         addr=int(tensor.data_ptr()),
                         shard_offset=tuple(offset),
                         shape=local_shape,
+                        digest=published_digest(tensor),
                     )
                 ],
             )
