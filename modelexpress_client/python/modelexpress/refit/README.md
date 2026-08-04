@@ -180,7 +180,7 @@ A trainer restart, reshard, scale event, or buffer replacement requires rediscov
 | Topology-change handling | The cached plan is not invalidated after trainer restart, reshard, scaling, or address change. |
 | Partial/subset wire filtering | MDL accepts subset batches, but the reshard receiver currently executes its full cached plan on each update. |
 | Expert-aware wire filtering | Expert destination mapping exists in MDL; the reshard planner has no receiver-owned expert selector. |
-| Parameter digest verification | The package has reference equality tests but no distributed source-to-destination digest gate in the live receiver. |
+| Parameter digest verification | Publishers can stamp each shard with a position-sensitive digest (`MX_RESHARD_PUBLISH_DIGEST`, see `refit/reshard/verify.py`), and it is carried through discovery into the planning inputs, but the live receiver does not yet recompute and compare. The comparison needs a fresh-discovery refresh of the expectation, or ordinary training updates between prepare and a later step read as corruption. |
 | Inference-to-inference fan-out | Rollout workers do not republish installed refit buffers through this package. |
 | General engine support | The shared core is engine-neutral, but only a vLLM receiver adapter is present. |
 | General trainer support | Framework-specific FSDP, DTensor, and Megatron publisher adapters are not present here. |
