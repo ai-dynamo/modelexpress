@@ -20,6 +20,7 @@ from ...accelerators import accelerator_backend_for
 from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
 from ...tensor_utils import (
+    adopt_hidden_tensors,
     capture_tensor_attrs,
     collect_module_tensors,
 )
@@ -79,17 +80,17 @@ class SglangAdapter(EngineAdapter):
     def discover_tensors(self, result: LoadResult) -> dict[str, torch.Tensor]:
         if result.model is None:
             raise RuntimeError("SGLang tensor discovery requires result.model")
-        # adopt_hidden_tensors() would also register accelerator tensors stashed
-        # on non-Module objects (e.g. SGLang's MXFP4 FusedMoE quant_method, which
-        # holds swizzled weights after deleting the original params). It is left
-        # commented out for now: it is a no-op for DeepSeek-V2-Lite (whose derived
-        # w_kc/w_vc are direct Tensor attributes, already promoted by
-        # capture_tensor_attrs), and enabling it adds new _mx_* manifest names,
-        # i.e. a transfer-ABI change that needs a version bump to avoid mixed
-        # old/new source/target manifests plus MXFP4 + CUTLASS FP8/W4A8 smoke
-        # tests. Enable it (with those guards) when SGLang nested-object coverage
-        # is in scope.
-        # adopt_hidden_tensors(result.model, self.accelerator_backend)
+        # Matches the vLLM adapter. capture_tensor_attrs only promotes bare
+        # Tensor attributes, so weight-derived tensors held inside containers or
+        # on non-Module objects stay out of the manifest: SGLang's MXFP4 FusedMoE
+        # quant_method holds swizzled weights after deleting the original params,
+        # and Kimi-K3 keeps `_attn_res_cw_cache` in a dict and
+        # `_k3_fused_decode_args` in a tuple. Those arrive at dummy values on an
+        # RDMA target, which passes every manifest check and then produces
+        # degraded output. adopt_hidden_tensors registers them (the same objects,
+        # so the container entries alias the transferred memory) and the receive
+        # path stays "transfer the final state, derive nothing afterwards".
+        adopt_hidden_tensors(result.model, self.accelerator_backend)
         return collect_module_tensors(result.model, self.accelerator_backend)
 
     def before_rdma_receive(self, result: LoadResult) -> LoadResult:
