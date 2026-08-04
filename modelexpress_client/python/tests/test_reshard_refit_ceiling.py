@@ -53,6 +53,8 @@ def _receiver(monkeypatch, ceiling):
 class _Rig:
     """Just enough object to call the guard as an unbound method."""
 
+    _global_rank = 3
+
 
 def _check(mod, wire_bytes, stages, step=1):
     return mod.ReshardReceiver._check_throughput_ceiling(
@@ -101,6 +103,19 @@ def test_disabled_by_default(monkeypatch):
     assert _check(mod, OBSERVED_BYTES, {"wire_fused_s": OBSERVED_WIRE_S}) is None
 
 
+@pytest.mark.parametrize("value", ["nan", "NaN", "inf", "-inf"])
+def test_a_non_finite_ceiling_disables_rather_than_failing_every_refit(
+    monkeypatch, value
+):
+    """``float("nan")`` parses, and every comparison against NaN is False. So a
+    fat-fingered ceiling would pass the "is it configured" test and then fail the
+    "is this rate acceptable" test, turning the guard into a refit that always
+    aborts. A ceiling nothing can be compared against is not a ceiling."""
+    mod = _receiver(monkeypatch, value)
+
+    assert _check(mod, OBSERVED_BYTES, {"wire_fused_s": OBSERVED_WIRE_S}) is None
+
+
 def test_an_unparseable_ceiling_disables_rather_than_crashes(monkeypatch):
     """A typo in a harness env var must not take down every refit."""
     mod = _receiver(monkeypatch, "not-a-number")
@@ -141,6 +156,17 @@ def test_the_failure_is_machine_readable_before_it_raises(monkeypatch, caplog):
     assert payload["wire_bytes"] == OBSERVED_BYTES
     assert payload["ceiling_gbps"] == TWO_ADAPTER_CEILING
     assert payload["implied_gbps"] == pytest.approx(OBSERVED_IMPLIED_GBPS, abs=0.2)
+
+
+def test_the_failure_names_the_rank_that_saw_it(monkeypatch, caplog):
+    """One rank's adapters being misselected is a different diagnosis from the whole
+    pod's, and every rank emits its own line."""
+    mod = _receiver(monkeypatch, TWO_ADAPTER_CEILING)
+    with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError):
+        _check(mod, OBSERVED_BYTES, {"wire_fused_s": OBSERVED_WIRE_S})
+
+    line = next(m for m in caplog.messages if "MX_REFIT_IMPOSSIBLE_THROUGHPUT" in m)
+    assert json.loads(line.split("MX_REFIT_IMPOSSIBLE_THROUGHPUT ", 1)[1])["rank"] == 3
 
 
 # ------------------------------------------- where the guard sits in the refit

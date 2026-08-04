@@ -137,6 +137,10 @@ def test_setup_costs_land_on_the_step_that_paid_them(monkeypatch, caplog):
     most."""
     monkeypatch.setenv("MX_REFIT_STAGE_RECORD", "1")
     monkeypatch.setenv("MX_RESHARD_FUSED_WIRE", "1")
+    # This test builds the harness directly rather than through _run, so it has to
+    # clear the ceiling itself; a low one inherited from the environment aborts the
+    # refit before any of the record assertions below are reached.
+    monkeypatch.delenv("MX_RESHARD_MAX_GBPS", raising=False)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
     transport = _RecordingTransport()
     harness, keepalive = _build(transport)
@@ -186,6 +190,9 @@ def test_a_skipped_stage_is_absent_rather_than_zero(monkeypatch, caplog):
     which is what a plan with no converts means."""
     monkeypatch.setenv("MX_RESHARD_FUSED_WIRE", "1")
     monkeypatch.setenv("MX_REFIT_STAGE_RECORD", "1")
+    # Built directly rather than through _run, so the ceiling has to be cleared here
+    # too, for the same reason.
+    monkeypatch.delenv("MX_RESHARD_MAX_GBPS", raising=False)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
     transport = _RecordingTransport()
     harness, keepalive = _build(transport)
@@ -200,3 +207,34 @@ def test_a_skipped_stage_is_absent_rather_than_zero(monkeypatch, caplog):
     assert "reslice_s" not in record
     assert "install_s" in record
     assert all(t.data_ptr() for t in keepalive)  # keep the source addresses valid
+
+
+def test_the_record_names_the_rank_that_emitted_it(monkeypatch, caplog):
+    """Every rank writes its own line into the same capture. Without a rank the
+    lines cannot be told apart, and the figure a refit is judged on is the slowest
+    rank rather than the average of an anonymous pile."""
+    _h, _m, _k = _run(monkeypatch, caplog)
+
+    assert _record(caplog)["rank"] == 0
+
+
+def test_an_exact_phase_that_moved_nothing_is_not_timed(monkeypatch, caplog):
+    """A plan can be all converts or all full pulls. A ``wire_exact_s`` for a phase
+    with no descriptors is not a wire duration: it inflates ``accounted_s``, and it
+    drags down the phased implied rate the throughput ceiling is computed from,
+    making the guard less likely to catch a run that deserves it."""
+    monkeypatch.setenv("MX_RESHARD_FUSED_WIRE", "0")
+    monkeypatch.setenv("MX_REFIT_STAGE_RECORD", "1")
+    monkeypatch.delenv("MX_RESHARD_MAX_GBPS", raising=False)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+    harness, keepalive = _build(_RecordingTransport())
+    harness._plan.segments = []
+    harness._plan.exact_descriptor_count = 0
+
+    with caplog.at_level(logging.WARNING):
+        harness.update_weights(step=1)
+
+    record = _record(caplog)
+    assert "wire_exact_s" not in record
+    assert "wire_full_s" in record
+    assert all(t.data_ptr() for t in keepalive)

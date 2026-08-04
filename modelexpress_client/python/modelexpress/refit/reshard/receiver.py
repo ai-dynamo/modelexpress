@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from collections import deque
 
@@ -58,8 +59,22 @@ def _max_gbps() -> float:
 
     Read at call time so a harness can set it per run. Off unless configured
     because only the operator knows the real per-rank limit for their fabric.
+
+    A non-finite ceiling disables the check rather than being compared against.
+    ``float("nan")`` parses happily, and every comparison against NaN is False, so
+    a fat-fingered value would slip past the "is it configured" test and then fail
+    the "is the rate acceptable" test - turning the guard into a refit that always
+    aborts. Infinity is accepted by the comparison but means the same as off.
     """
-    return envs.MX_RESHARD_MAX_GBPS
+    ceiling = envs.MX_RESHARD_MAX_GBPS
+    if not math.isfinite(ceiling):
+        logger.warning(
+            "MX_RESHARD_MAX_GBPS=%r is not a finite number; the throughput ceiling "
+            "is disabled for this run",
+            ceiling,
+        )
+        return 0.0
+    return ceiling
 
 
 def handshake_endpoints_for_plan(
@@ -724,13 +739,25 @@ class ReshardReceiver:
             self._transport.read(descriptors + full_descriptors + convert_descriptors)
             stages["wire_fused_s"] = time.perf_counter() - _t
         else:
-            _t = time.perf_counter()
-            stats = execute_transfer(
-                self._plan,
-                resolve_param_ptr=lambda name: self._param_ptr[name],
-                transport=self._transport,
-            )
-            stages["wire_exact_s"] = time.perf_counter() - _t
+            # A plan can be all converts or all full pulls. Timing an exact phase
+            # that moved nothing records a duration that is not a wire duration: it
+            # inflates accounted_s, and because the phased implied rate divides the
+            # bytes by the summed wire stages, it drags that rate down and makes the
+            # throughput ceiling less likely to catch a run that deserves it.
+            if self._plan.exact_descriptor_count:
+                _t = time.perf_counter()
+                stats = execute_transfer(
+                    self._plan,
+                    resolve_param_ptr=lambda name: self._param_ptr[name],
+                    transport=self._transport,
+                )
+                stages["wire_exact_s"] = time.perf_counter() - _t
+            else:
+                stats = {
+                    "segments": 0,
+                    "bytes": 0,
+                    "fallback": list(self._plan.fallback),
+                }
             if full_descriptors:
                 _t = time.perf_counter()
                 self._transport.read(full_descriptors)
@@ -822,6 +849,10 @@ class ReshardReceiver:
         if envs.MX_REFIT_STAGE_RECORD:
             record = {
                 "schema": "refit-stage-v2",
+                # Every rank emits its own line, so without this a fleet-wide
+                # capture cannot tell them apart - and the number that matters for
+                # a refit is the slowest rank, not the average of an anonymous pile.
+                "rank": self._global_rank,
                 "step": step,
                 "bytes": stats["bytes"],
                 "segments": stats["segments"],
@@ -895,6 +926,9 @@ class ReshardReceiver:
             return
         detail = {
             "schema": "refit-impossible-throughput-v1",
+            # Which rank saw the impossible rate. One rank's adapters being
+            # misselected is a different diagnosis from the whole pod's.
+            "rank": self._global_rank,
             "step": step,
             "wire_bytes": wire_bytes,
             "wire_s": round(wire_s, 6),
