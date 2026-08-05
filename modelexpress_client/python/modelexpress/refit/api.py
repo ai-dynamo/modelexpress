@@ -1,40 +1,26 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Public delta weight-sync contract: configuration, results, and lifecycle.
+"""Minimal public delta weight-sync configuration, results, and lifecycle.
 
-This module freezes *what* a publisher and a receiver agree on; it deliberately
-implements neither. `Publisher` and `Receiver` are structural protocols, so an
-engine-native receiver (SGLang) conforms by shape alone and never inherits from
-or composes a ModelExpress engine abstraction. Source capture, delta encoding,
-byte transfer, reconstruction, engine installation, and recovery execution are
-owned by later phases.
+V0 has one production data path: a canonical exact-base delta stored in S3.
+S3 bucket configuration is explicit rather than selected through a generic
+transport interface. Encoding details live in the self-describing root index,
+not in this public configuration or the revision-catalog API.
 
-Publication contract carried by `PublicationMode`:
-
-- `ASYNC` may return once immutable publication reaches `READY`;
-- `BLOCK` waits read-only for `COMMITTED`;
-- cancelling the wait stops waiting only and leaves the catalog revision
-  `READY`.
-
-The concrete wait, cancellation, and drain behavior is implemented by the
-publisher that owns the data plane, not by this contract.
+``PublicationMode`` remains publisher behavior. ``ASYNC`` may return at
+``READY``; ``BLOCK`` waits by exact-get until an external orchestrator commits
+the revision. A publisher never commits its own revision.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol, runtime_checkable
 
 from .manifest import RevisionState
-
-
-class DeltaTransferMethod(Enum):
-    """Transfer representation enabled by the minimal public path."""
-
-    CANONICAL = "canonical"
 
 
 class PublicationMode(Enum):
@@ -59,40 +45,21 @@ ModelId = str
 VersionId = str
 
 
-class TransportKind(Enum):
-    """Location kinds a delta reference can take on the wire."""
-
-    S3 = "s3"
-    ZEROMQ = "zeromq"
-    FILESYSTEM = "filesystem"
-
-
 @dataclass(frozen=True)
-class TransportConfig:
-    """Normal delivery storage. Its data-plane methods land with the codecs."""
+class S3Config:
+    """Direct S3 destination; credentials are resolved privately by boto3."""
 
-    kind: TransportKind
-    root_uri: str
-
-
-@dataclass(frozen=True)
-class RecoveryStoreConfig:
-    """Durable full anchors and deltas, independent from delivery transport."""
-
-    kind: TransportKind
-    root_uri: str
+    bucket: str
+    prefix: str = ""
+    endpoint_url: str | None = None
+    region_name: str | None = None
 
 
 @dataclass(frozen=True)
 class PublisherConfig:
     model_id: ModelId
     catalog_endpoint: str
-    transport: TransportConfig
-    delta_transfer_method: DeltaTransferMethod = DeltaTransferMethod.CANONICAL
-    recovery_store: RecoveryStoreConfig | None = None
-    delta_method: str | None = None
-    compression_algorithm: str | None = None
-    full_anchor_interval: int | None = None
+    s3: S3Config
     publication_mode: PublicationMode = PublicationMode.BLOCK
 
 
@@ -100,12 +67,7 @@ class PublisherConfig:
 class ReceiverConfig:
     model_id: ModelId
     catalog_endpoint: str
-    transport: TransportConfig
-    delta_transfer_method: DeltaTransferMethod = DeltaTransferMethod.CANONICAL
-    recovery_store: RecoveryStoreConfig | None = None
-    delta_method: str | None = None
-    compression_algorithm: str | None = None
-    max_delta_replay_length: int | None = None
+    s3: S3Config
 
 
 def normalize_layer_scope(layers: Iterable[str] | None) -> tuple[str, ...] | None:
@@ -117,12 +79,7 @@ def normalize_layer_scope(layers: Iterable[str] | None) -> tuple[str, ...] | Non
 
 @dataclass(frozen=True)
 class PreparedUpdate:
-    """Immutable identity of one prepared, exact-base target.
-
-    Every field is revalidated at the engine's mutation boundary before the
-    first weight write. The prepared payload representation stays private to
-    the receiver that produced it and is never part of this identity.
-    """
+    """Immutable identity revalidated at an engine's mutation boundary."""
 
     model_id: ModelId
     base_version: VersionId
@@ -149,7 +106,6 @@ class PublishResult:
     model_id: ModelId
     version: VersionId
     state: RevisionLifecycleState
-    created: bool = True
 
 
 @dataclass(frozen=True)
@@ -180,51 +136,47 @@ class ReceiverStatus:
 
     @property
     def recovery_required(self) -> bool:
-        """`POISONED` receivers must stop serving and recover from a complete model."""
+        """A poisoned receiver must stop serving until replaced or restored."""
         return self.state is ReceiverRevisionState.POISONED
 
 
 @runtime_checkable
-class Publisher(Protocol):
-    """Trainer-side lifecycle. Implemented by the ModelExpress publisher."""
+class PublisherProtocol(Protocol):
+    """Trainer-side lifecycle implemented by the ModelExpress publisher."""
 
     def initialize(self, config: PublisherConfig) -> None:
-        """Initialize catalog, delivery transport, recovery storage, and delta support."""
+        """Initialize launch attestation, catalog access, and direct S3 upload."""
 
     def publish_version(
         self,
         version: VersionId,
-        layers: Sequence[str] | None = None,
         *,
         base_version: VersionId | None = None,
     ) -> PublishResult:
-        """Publish an exact-base CPU delta or a GPU-direct revision."""
+        """Publish launch version 0 or one complete exact-base canonical delta."""
 
     def status(self) -> PublisherStatus:
-        """Return current version, readiness, transfer-reference, and lifetime state."""
+        """Return the most recently observed exact revision state."""
 
     def deregister(self) -> None:
-        """Drain live readers, mark the source stale, and release resources."""
+        """Release client-owned resources while no publication is active."""
 
 
 @runtime_checkable
-class Receiver(Protocol):
-    """Rollout-side lifecycle. Implemented natively by the serving engine."""
+class ReceiverProtocol(Protocol):
+    """Engine-native receiver lifecycle reserved for reset-plan Phase 2.2."""
 
     def initialize(self, config: ReceiverConfig) -> None:
-        """Initialize engine, catalog, delivery transport, and recovery storage."""
+        """Initialize engine-native exact-revision preparation."""
 
     def start_weight_update(self, version: VersionId) -> None:
-        """Select, fetch, verify, and prepare the target without mutating the engine."""
+        """Prepare one exact target without mutating the engine."""
 
     def update_weights(
         self,
-        layers: Sequence[str] | None = None,
+        layers: Iterable[str] | None = None,
     ) -> WeightUpdateResult:
-        """Apply the internally prepared update and install the target version."""
-
-    def recover(self, version: VersionId) -> WeightUpdateResult:
-        """Replace unknown or poisoned state with a verified complete version."""
+        """Install the internally prepared update through native loader mechanics."""
 
     def status(self) -> ReceiverStatus:
-        """Return installed version, health, and recovery state."""
+        """Return installed version and receiver-local health."""

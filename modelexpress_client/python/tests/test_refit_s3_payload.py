@@ -1,0 +1,89 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import base64
+import io
+
+import pytest
+import torch
+from safetensors.torch import save_file
+
+from modelexpress.refit import S3Config
+from modelexpress.refit.s3 import ImmutableS3Conflict, S3Uploader
+from modelexpress.refit.source.canonical import attest_hf_checkpoint
+
+
+class FakeS3:
+    def __init__(self):
+        self.objects = {}
+        self.puts = []
+
+    def put_object(self, **kwargs):
+        self.puts.append(kwargs)
+        identity = (kwargs["Bucket"], kwargs["Key"])
+        if identity in self.objects:
+            error = RuntimeError("precondition failed")
+            error.response = {"Error": {"Code": "PreconditionFailed"}}
+            raise error
+        data = bytes(kwargs["Body"])
+        self.objects[identity] = (data, kwargs["ChecksumCRC32C"], "version-1")
+        return {"VersionId": "version-1"}
+
+    def head_object(self, **kwargs):
+        data, checksum, version = self.objects[(kwargs["Bucket"], kwargs["Key"])]
+        return {
+            "ContentLength": len(data),
+            "ChecksumCRC32C": checksum,
+            "VersionId": version,
+        }
+
+    def get_object(self, **kwargs):
+        data, _checksum, version = self.objects[(kwargs["Bucket"], kwargs["Key"])]
+        return {"Body": io.BytesIO(data), "VersionId": version}
+
+
+def test_s3_uploader_uses_direct_conditional_put_and_returns_verified_object():
+    client = FakeS3()
+    uploader = S3Uploader(S3Config(bucket="bucket", prefix="run"), client=client)
+
+    stored = uploader.put("models/m/revisions/1/root.json", b"root")
+
+    assert stored.object.bucket == "bucket"
+    assert stored.object.key == "run/models/m/revisions/1/root.json"
+    assert stored.object.object_version == "version-1"
+    assert stored.object.checksum.startswith("crc32c:")
+    request = client.puts[0]
+    assert request["IfNoneMatch"] == "*"
+    assert request["ChecksumAlgorithm"] == "CRC32C"
+    assert base64.b64decode(request["ChecksumCRC32C"])
+
+
+def test_s3_uploader_allows_identical_retry_but_rejects_immutable_conflict():
+    client = FakeS3()
+    uploader = S3Uploader(S3Config(bucket="bucket"), client=client)
+
+    first = uploader.put("root.json", b"same")
+    assert uploader.put("root.json", b"same") == first
+    with pytest.raises(ImmutableS3Conflict):
+        uploader.put("root.json", b"different")
+
+
+def test_launch_schema_orders_names_after_canonical_prefix_normalization(tmp_path):
+    checkpoint = tmp_path / "model.safetensors"
+    save_file(
+        {
+            "a.weight": torch.tensor([1.0]),
+            "module.0.weight": torch.tensor([2.0]),
+        },
+        checkpoint,
+    )
+
+    snapshot, _sources = attest_hf_checkpoint(
+        checkpoint,
+        "0",
+        maximum_tensor_bytes=16,
+    )
+
+    assert [tensor.name for tensor in snapshot.tensors] == ["0.weight", "a.weight"]

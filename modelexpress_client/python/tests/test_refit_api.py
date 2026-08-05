@@ -7,33 +7,70 @@ import pytest
 
 from modelexpress import revision_pb2
 from modelexpress.refit import (
-    DeltaTransferMethod,
     PreparedUpdate,
     PublicationMode,
-    Publisher,
     PublisherConfig,
-    Receiver,
+    PublisherProtocol,
+    ReceiverConfig,
+    ReceiverProtocol,
     ReceiverRevisionState,
     ReceiverStatus,
-    TransportConfig,
-    TransportKind,
+    S3Config,
     normalize_layer_scope,
 )
 
 MODEL_ID = "Qwen/Qwen3-30B-A3B"
-S3 = TransportConfig(kind=TransportKind.S3, root_uri="s3://mx-delta/qwen3")
+S3 = S3Config(bucket="mx-delta", prefix="qwen3")
 
 
-def test_publisher_defaults_to_canonical_and_blocking_client_behavior():
+def test_publisher_is_s3_only_and_blocking_by_default():
     config = PublisherConfig(
         model_id=MODEL_ID,
         catalog_endpoint="http://mx:8001",
-        transport=S3,
+        s3=S3,
     )
 
-    assert config.delta_transfer_method is DeltaTransferMethod.CANONICAL
+    assert [field.name for field in dataclasses.fields(config)] == [
+        "model_id",
+        "catalog_endpoint",
+        "s3",
+        "publication_mode",
+    ]
     assert config.publication_mode is PublicationMode.BLOCK
-    assert "publication_mode" not in revision_pb2.PublishRevisionRequest.DESCRIPTOR.fields_by_name
+    assert (
+        "publication_mode"
+        not in revision_pb2.PublishRevisionRequest.DESCRIPTOR.fields_by_name
+    )
+
+
+def test_s3_configs_expose_locations_but_no_transport_or_credential_choices():
+    assert [field.name for field in dataclasses.fields(S3Config)] == [
+        "bucket",
+        "prefix",
+        "endpoint_url",
+        "region_name",
+    ]
+    assert [field.name for field in dataclasses.fields(ReceiverConfig)] == [
+        "model_id",
+        "catalog_endpoint",
+        "s3",
+    ]
+
+
+def test_v0_has_no_generic_transport_recovery_or_codec_knobs():
+    import modelexpress.refit as refit
+
+    for name in (
+        "DeltaTransferMethod",
+        "TransportAdapter",
+        "TransportConfig",
+        "TransportKind",
+        "RecoveryStoreConfig",
+        "RecoveryStore",
+        "DeltaCodec",
+        "CompressionAlgorithm",
+    ):
+        assert not hasattr(refit, name)
 
 
 def test_publication_modes_are_client_behavior_only():
@@ -86,9 +123,10 @@ def test_layer_scope_is_deterministic():
     assert normalize_layer_scope(["b", "a", "b"]) == ("a", "b")
 
 
-def test_publisher_and_receiver_remain_structural_protocols():
-    assert getattr(Publisher, "_is_protocol", False)
-    assert getattr(Receiver, "_is_protocol", False)
+def test_publisher_and_receiver_contracts_remain_structural_protocols():
+    assert getattr(PublisherProtocol, "_is_protocol", False)
+    assert getattr(ReceiverProtocol, "_is_protocol", False)
+    assert not hasattr(ReceiverProtocol, "recover")
 
 
 def test_generic_engine_adapter_frameworks_are_not_public():
@@ -97,8 +135,6 @@ def test_generic_engine_adapter_frameworks_are_not_public():
     for name in (
         "EngineAdapter",
         "LoadResult",
-        "TransportAdapter",
         "SourceAdapter",
-        "DeltaCodec",
     ):
         assert not hasattr(refit, name)
