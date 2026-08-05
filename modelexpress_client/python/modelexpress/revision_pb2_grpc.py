@@ -29,7 +29,8 @@ if _version_not_supported:
 
 
 class RevisionCatalogServiceStub(object):
-    """Stores immutable model-weight revisions and their externally visible state.
+    """Stores immutable model-weight revision metadata. Payload bytes never pass
+    through this service.
     """
 
     def __init__(self, channel):
@@ -41,76 +42,41 @@ class RevisionCatalogServiceStub(object):
         self.PublishRevision = channel.unary_unary(
                 '/model_express.revision.RevisionCatalogService/PublishRevision',
                 request_serializer=revision__pb2.PublishRevisionRequest.SerializeToString,
-                response_deserializer=revision__pb2.PublishRevisionResponse.FromString,
+                response_deserializer=revision__pb2.RevisionRecord.FromString,
                 _registered_method=True)
         self.GetRevision = channel.unary_unary(
                 '/model_express.revision.RevisionCatalogService/GetRevision',
                 request_serializer=revision__pb2.GetRevisionRequest.SerializeToString,
-                response_deserializer=revision__pb2.GetRevisionResponse.FromString,
+                response_deserializer=revision__pb2.RevisionRecord.FromString,
                 _registered_method=True)
-        self.ListReadyRevisions = channel.unary_unary(
-                '/model_express.revision.RevisionCatalogService/ListReadyRevisions',
-                request_serializer=revision__pb2.ListReadyRevisionsRequest.SerializeToString,
-                response_deserializer=revision__pb2.ListReadyRevisionsResponse.FromString,
-                _registered_method=True)
-        self.GetRecoveryCandidates = channel.unary_unary(
-                '/model_express.revision.RevisionCatalogService/GetRecoveryCandidates',
-                request_serializer=revision__pb2.GetRecoveryCandidatesRequest.SerializeToString,
-                response_deserializer=revision__pb2.GetRecoveryCandidatesResponse.FromString,
-                _registered_method=True)
-        self.UpdateReceiverState = channel.unary_unary(
-                '/model_express.revision.RevisionCatalogService/UpdateReceiverState',
-                request_serializer=revision__pb2.UpdateReceiverStateRequest.SerializeToString,
-                response_deserializer=revision__pb2.UpdateReceiverStateResponse.FromString,
-                _registered_method=True)
-        self.CommitVersion = channel.unary_unary(
-                '/model_express.revision.RevisionCatalogService/CommitVersion',
-                request_serializer=revision__pb2.CommitVersionRequest.SerializeToString,
-                response_deserializer=revision__pb2.CommitVersionResponse.FromString,
+        self.CommitRevision = channel.unary_unary(
+                '/model_express.revision.RevisionCatalogService/CommitRevision',
+                request_serializer=revision__pb2.CommitRevisionRequest.SerializeToString,
+                response_deserializer=revision__pb2.RevisionRecord.FromString,
                 _registered_method=True)
 
 
 class RevisionCatalogServiceServicer(object):
-    """Stores immutable model-weight revisions and their externally visible state.
+    """Stores immutable model-weight revision metadata. Payload bytes never pass
+    through this service.
     """
 
     def PublishRevision(self, request, context):
-        """Atomically publishes one immutable, complete revision as READY.
+        """Atomically publishes one immutable revision as READY.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def GetRevision(self, request, context):
-        """Returns one exact revision by model and version.
+        """Returns one exact revision by model and target version.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def ListReadyRevisions(self, request, context):
-        """Lists READY revisions in deterministic version order.
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def GetRecoveryCandidates(self, request, context):
-        """Returns bounded exact-base recovery paths for one target revision.
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def UpdateReceiverState(self, request, context):
-        """Records a receiver's externally visible transfer or install outcome.
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def CommitVersion(self, request, context):
-        """Records orchestrator acceptance after the required receivers verify.
+    def CommitRevision(self, request, context):
+        """Records orchestrator acceptance after the required rollout cohort verifies.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -122,32 +88,17 @@ def add_RevisionCatalogServiceServicer_to_server(servicer, server):
             'PublishRevision': grpc.unary_unary_rpc_method_handler(
                     servicer.PublishRevision,
                     request_deserializer=revision__pb2.PublishRevisionRequest.FromString,
-                    response_serializer=revision__pb2.PublishRevisionResponse.SerializeToString,
+                    response_serializer=revision__pb2.RevisionRecord.SerializeToString,
             ),
             'GetRevision': grpc.unary_unary_rpc_method_handler(
                     servicer.GetRevision,
                     request_deserializer=revision__pb2.GetRevisionRequest.FromString,
-                    response_serializer=revision__pb2.GetRevisionResponse.SerializeToString,
+                    response_serializer=revision__pb2.RevisionRecord.SerializeToString,
             ),
-            'ListReadyRevisions': grpc.unary_unary_rpc_method_handler(
-                    servicer.ListReadyRevisions,
-                    request_deserializer=revision__pb2.ListReadyRevisionsRequest.FromString,
-                    response_serializer=revision__pb2.ListReadyRevisionsResponse.SerializeToString,
-            ),
-            'GetRecoveryCandidates': grpc.unary_unary_rpc_method_handler(
-                    servicer.GetRecoveryCandidates,
-                    request_deserializer=revision__pb2.GetRecoveryCandidatesRequest.FromString,
-                    response_serializer=revision__pb2.GetRecoveryCandidatesResponse.SerializeToString,
-            ),
-            'UpdateReceiverState': grpc.unary_unary_rpc_method_handler(
-                    servicer.UpdateReceiverState,
-                    request_deserializer=revision__pb2.UpdateReceiverStateRequest.FromString,
-                    response_serializer=revision__pb2.UpdateReceiverStateResponse.SerializeToString,
-            ),
-            'CommitVersion': grpc.unary_unary_rpc_method_handler(
-                    servicer.CommitVersion,
-                    request_deserializer=revision__pb2.CommitVersionRequest.FromString,
-                    response_serializer=revision__pb2.CommitVersionResponse.SerializeToString,
+            'CommitRevision': grpc.unary_unary_rpc_method_handler(
+                    servicer.CommitRevision,
+                    request_deserializer=revision__pb2.CommitRevisionRequest.FromString,
+                    response_serializer=revision__pb2.RevisionRecord.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -158,7 +109,8 @@ def add_RevisionCatalogServiceServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class RevisionCatalogService(object):
-    """Stores immutable model-weight revisions and their externally visible state.
+    """Stores immutable model-weight revision metadata. Payload bytes never pass
+    through this service.
     """
 
     @staticmethod
@@ -177,7 +129,7 @@ class RevisionCatalogService(object):
             target,
             '/model_express.revision.RevisionCatalogService/PublishRevision',
             revision__pb2.PublishRevisionRequest.SerializeToString,
-            revision__pb2.PublishRevisionResponse.FromString,
+            revision__pb2.RevisionRecord.FromString,
             options,
             channel_credentials,
             insecure,
@@ -204,7 +156,7 @@ class RevisionCatalogService(object):
             target,
             '/model_express.revision.RevisionCatalogService/GetRevision',
             revision__pb2.GetRevisionRequest.SerializeToString,
-            revision__pb2.GetRevisionResponse.FromString,
+            revision__pb2.RevisionRecord.FromString,
             options,
             channel_credentials,
             insecure,
@@ -216,7 +168,7 @@ class RevisionCatalogService(object):
             _registered_method=True)
 
     @staticmethod
-    def ListReadyRevisions(request,
+    def CommitRevision(request,
             target,
             options=(),
             channel_credentials=None,
@@ -229,90 +181,9 @@ class RevisionCatalogService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/model_express.revision.RevisionCatalogService/ListReadyRevisions',
-            revision__pb2.ListReadyRevisionsRequest.SerializeToString,
-            revision__pb2.ListReadyRevisionsResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def GetRecoveryCandidates(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/model_express.revision.RevisionCatalogService/GetRecoveryCandidates',
-            revision__pb2.GetRecoveryCandidatesRequest.SerializeToString,
-            revision__pb2.GetRecoveryCandidatesResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def UpdateReceiverState(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/model_express.revision.RevisionCatalogService/UpdateReceiverState',
-            revision__pb2.UpdateReceiverStateRequest.SerializeToString,
-            revision__pb2.UpdateReceiverStateResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def CommitVersion(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/model_express.revision.RevisionCatalogService/CommitVersion',
-            revision__pb2.CommitVersionRequest.SerializeToString,
-            revision__pb2.CommitVersionResponse.FromString,
+            '/model_express.revision.RevisionCatalogService/CommitRevision',
+            revision__pb2.CommitRevisionRequest.SerializeToString,
+            revision__pb2.RevisionRecord.FromString,
             options,
             channel_credentials,
             insecure,

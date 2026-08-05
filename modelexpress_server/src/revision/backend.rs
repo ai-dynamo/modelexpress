@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use modelexpress_common::grpc::revision::{ReceiverStateRecord, RevisionRecord};
+use modelexpress_common::grpc::revision::RevisionRecord;
 
 use crate::backend_config::BackendConfig;
 
@@ -38,28 +38,14 @@ pub trait RevisionCatalogBackend: Send + Sync {
     async fn get_revision(
         &self,
         model_id: &str,
-        version: &str,
+        target_version: &str,
     ) -> CatalogResult<Option<RevisionRecord>>;
-
-    async fn list_revisions(&self, model_id: &str) -> CatalogResult<Vec<RevisionRecord>>;
 
     async fn commit_revision(
         &self,
         model_id: &str,
-        version: &str,
-        changed_at_unix_ms: u64,
+        target_version: &str,
     ) -> CatalogResult<CommitOutcome>;
-
-    async fn upsert_receiver_state(
-        &self,
-        record: ReceiverStateRecord,
-    ) -> CatalogResult<ReceiverStateRecord>;
-
-    async fn list_receiver_states(
-        &self,
-        model_id: &str,
-        version: &str,
-    ) -> CatalogResult<Vec<ReceiverStateRecord>>;
 }
 
 pub type DynRevisionCatalogBackend = Arc<dyn RevisionCatalogBackend>;

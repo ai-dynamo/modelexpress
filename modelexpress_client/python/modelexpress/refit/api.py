@@ -28,12 +28,32 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol, runtime_checkable
 
-from .manifest import (
-    DeltaTransferMethod,
-    PublicationMode,
-    ReceiverRevisionState,
-    RevisionLifecycleState,
-)
+from .manifest import RevisionState
+
+
+class DeltaTransferMethod(Enum):
+    """Transfer representation enabled by the minimal public path."""
+
+    CANONICAL = "canonical"
+
+
+class PublicationMode(Enum):
+    """Publisher wait behavior; this is not a server RPC field."""
+
+    BLOCK = "block"
+    ASYNC = "async"
+
+
+class ReceiverRevisionState(Enum):
+    """SGLang-local receiver outcomes, never persisted by the MX server."""
+
+    BYTES_RECEIVED = "bytes_received"
+    VERIFIED = "verified"
+    FAILED = "failed"
+    POISONED = "poisoned"
+
+
+RevisionLifecycleState = RevisionState
 
 ModelId = str
 VersionId = str
@@ -68,7 +88,7 @@ class PublisherConfig:
     model_id: ModelId
     catalog_endpoint: str
     transport: TransportConfig
-    delta_transfer_method: DeltaTransferMethod = DeltaTransferMethod.RANK_LOCAL
+    delta_transfer_method: DeltaTransferMethod = DeltaTransferMethod.CANONICAL
     recovery_store: RecoveryStoreConfig | None = None
     delta_method: str | None = None
     compression_algorithm: str | None = None
@@ -81,7 +101,7 @@ class ReceiverConfig:
     model_id: ModelId
     catalog_endpoint: str
     transport: TransportConfig
-    delta_transfer_method: DeltaTransferMethod = DeltaTransferMethod.RANK_LOCAL
+    delta_transfer_method: DeltaTransferMethod = DeltaTransferMethod.CANONICAL
     recovery_store: RecoveryStoreConfig | None = None
     delta_method: str | None = None
     compression_algorithm: str | None = None

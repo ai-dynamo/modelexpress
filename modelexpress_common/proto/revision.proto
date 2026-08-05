@@ -5,236 +5,56 @@ syntax = "proto3";
 
 package model_express.revision;
 
-// Stores immutable model-weight revisions and their externally visible state.
+// Stores immutable model-weight revision metadata. Payload bytes never pass
+// through this service.
 service RevisionCatalogService {
-  // Atomically publishes one immutable, complete revision as READY.
-  rpc PublishRevision(PublishRevisionRequest) returns (PublishRevisionResponse);
-  // Returns one exact revision by model and version.
-  rpc GetRevision(GetRevisionRequest) returns (GetRevisionResponse);
-  // Lists READY revisions in deterministic version order.
-  rpc ListReadyRevisions(ListReadyRevisionsRequest) returns (ListReadyRevisionsResponse);
-  // Returns bounded exact-base recovery paths for one target revision.
-  rpc GetRecoveryCandidates(GetRecoveryCandidatesRequest) returns (GetRecoveryCandidatesResponse);
-  // Records a receiver's externally visible transfer or install outcome.
-  rpc UpdateReceiverState(UpdateReceiverStateRequest) returns (UpdateReceiverStateResponse);
-  // Records orchestrator acceptance after the required receivers verify.
-  rpc CommitVersion(CommitVersionRequest) returns (CommitVersionResponse);
+  // Atomically publishes one immutable revision as READY.
+  rpc PublishRevision(PublishRevisionRequest) returns (RevisionRecord);
+  // Returns one exact revision by model and target version.
+  rpc GetRevision(GetRevisionRequest) returns (RevisionRecord);
+  // Records orchestrator acceptance after the required rollout cohort verifies.
+  rpc CommitRevision(CommitRevisionRequest) returns (RevisionRecord);
 }
 
-enum ChangeState {
-  CHANGE_STATE_UNSPECIFIED = 0;
-  CHANGE_STATE_CLEAN = 1;
-  CHANGE_STATE_DIRTY = 2;
-}
-
-enum DeltaTransferMethod {
-  DELTA_TRANSFER_METHOD_UNSPECIFIED = 0;
-  DELTA_TRANSFER_METHOD_CANONICAL = 1;
-  DELTA_TRANSFER_METHOD_RANK_LOCAL = 2;
-  DELTA_TRANSFER_METHOD_P2P_CPU_RANK = 3;
-  DELTA_TRANSFER_METHOD_P2P_GPU_SHARD = 4;
-}
-
-enum PublicationMode {
-  PUBLICATION_MODE_BLOCK = 0;
-  PUBLICATION_MODE_ASYNC = 1;
-}
-
-message S3Location {
+message S3Object {
   string bucket = 1;
   string key = 2;
   optional string object_version = 3;
-}
-
-message ZeroMqLocation {
-  string endpoint = 1;
-  string payload_id = 2;
-}
-
-message FilesystemLocation {
-  string path = 1;
-}
-
-message DeltaLocation {
-  oneof transport {
-    S3Location s3 = 1;
-    ZeroMqLocation zeromq = 2;
-    FilesystemLocation filesystem = 3;
-  }
-}
-
-message DeltaDescriptor {
-  uint64 address = 1;
-  uint64 length = 2;
-  string dtype = 3;
-}
-
-message RankDelta {
-  ChangeState change_state = 1;
-  optional string checksum = 2;
-  DeltaLocation location = 3;
-  DeltaDescriptor delta_descriptor = 4;
-}
-
-message TensorDescriptor {
-  string tensor_name = 1;
-  string dtype = 2;
-  uint64 byte_size = 3;
-  optional uint64 address = 4;
-  optional uint32 device_id = 5;
-}
-
-message TensorRegion {
-  repeated uint64 full_shape = 1;
-  repeated uint64 global_offset = 2;
-  repeated uint64 region_shape = 3;
-  string target_digest = 4;
-}
-
-message TensorShard {
-  ChangeState change_state = 1;
-  TensorDescriptor tensor_descriptor = 2;
-  TensorRegion tensor_region = 3;
-}
-
-message RevisionRank {
-  uint32 trainer_rank = 1;
-  string producer_id = 2;
-  string source_layout_digest = 3;
-  RankDelta delta = 4;
-  repeated TensorShard shards = 5;
+  string checksum = 4;
 }
 
 message RevisionManifest {
   string model_id = 1;
-  string version = 2;
+  string target_version = 2;
   optional string base_version = 3;
-  DeltaTransferMethod transfer_method = 4;
-  optional string delta_method = 5;
-  optional string compression_algorithm = 6;
-  string format_digest = 7;
-  optional string base_digest = 8;
-  string target_digest = 9;
-  repeated RevisionRank ranks = 10;
+  optional string base_digest = 4;
+  string target_digest = 5;
+  string format_digest = 6;
+  // Absent only for the metadata-only launch anchor.
+  S3Object payload = 7;
 }
 
-// Revision lifecycle is intentionally limited to the active P0 states.
-enum RevisionLifecycleState {
-  REVISION_LIFECYCLE_STATE_UNSPECIFIED = 0;
-  REVISION_LIFECYCLE_STATE_READY = 1;
-  REVISION_LIFECYCLE_STATE_COMMITTED = 2;
+enum RevisionState {
+  REVISION_STATE_UNSPECIFIED = 0;
+  REVISION_STATE_READY = 1;
+  REVISION_STATE_COMMITTED = 2;
 }
 
 message RevisionRecord {
   RevisionManifest manifest = 1;
-  RevisionLifecycleState state = 2;
-  uint64 created_at_unix_ms = 3;
-  uint64 state_changed_at_unix_ms = 4;
-}
-
-enum RecoveryCandidateKind {
-  RECOVERY_CANDIDATE_KIND_UNSPECIFIED = 0;
-  RECOVERY_CANDIDATE_KIND_DIRECT_DELTA = 1;
-  RECOVERY_CANDIDATE_KIND_DELTA_REPLAY = 2;
-  RECOVERY_CANDIDATE_KIND_FULL_ANCHOR_REPLAY = 3;
-  RECOVERY_CANDIDATE_KIND_FULL_TARGET = 4;
-}
-
-// Revisions are ordered from the receiver's installed base to the target.
-message RecoveryCandidate {
-  RecoveryCandidateKind kind = 1;
-  repeated RevisionRecord revisions = 2;
+  RevisionState state = 2;
 }
 
 message PublishRevisionRequest {
   RevisionManifest manifest = 1;
-  string publisher_id = 2;
-  optional PublicationMode publication_mode = 3;
-}
-
-message PublishRevisionResponse {
-  RevisionRecord revision = 1;
-  bool created = 2;
 }
 
 message GetRevisionRequest {
   string model_id = 1;
-  string version = 2;
+  string target_version = 2;
 }
 
-message GetRevisionResponse {
-  RevisionRecord revision = 1;
-}
-
-message ListReadyRevisionsRequest {
+message CommitRevisionRequest {
   string model_id = 1;
-  optional string page_token = 2;
-  uint32 limit = 3;
-}
-
-message RevisionSummary {
-  string model_id = 1;
-  string version = 2;
-  RevisionLifecycleState state = 3;
-  uint64 ready_at_unix_ms = 4;
-}
-
-message ListReadyRevisionsResponse {
-  repeated RevisionSummary revisions = 1;
-  string next_page_token = 2;
-}
-
-message GetRecoveryCandidatesRequest {
-  string model_id = 1;
-  optional string installed_version = 2;
-  string target_version = 3;
-  optional uint32 max_delta_replay_length = 4;
-  optional string page_token = 5;
-  uint32 limit = 6;
-}
-
-message GetRecoveryCandidatesResponse {
-  repeated RecoveryCandidate candidates = 1;
-  string next_page_token = 2;
-}
-
-// Internal preparation states are intentionally not catalog-visible.
-enum ReceiverRevisionState {
-  RECEIVER_REVISION_STATE_UNSPECIFIED = 0;
-  RECEIVER_REVISION_STATE_BYTES_RECEIVED = 1;
-  RECEIVER_REVISION_STATE_VERIFIED = 2;
-  RECEIVER_REVISION_STATE_FAILED = 3;
-  RECEIVER_REVISION_STATE_POISONED = 4;
-}
-
-message UpdateReceiverStateRequest {
-  string model_id = 1;
-  string version = 2;
-  string receiver_id = 3;
-  ReceiverRevisionState state = 4;
-  optional string installed_version = 5;
-  string detail = 6;
-}
-
-message UpdateReceiverStateResponse {
-  ReceiverStateRecord receiver = 1;
-}
-
-message ReceiverStateRecord {
-  string model_id = 1;
-  string version = 2;
-  string receiver_id = 3;
-  ReceiverRevisionState state = 4;
-  optional string installed_version = 5;
-  string detail = 6;
-  uint64 observed_at_unix_ms = 7;
-}
-
-message CommitVersionRequest {
-  string model_id = 1;
-  string version = 2;
-}
-
-message CommitVersionResponse {
-  RevisionRecord revision = 1;
+  string target_version = 2;
 }
