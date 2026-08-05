@@ -940,8 +940,10 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-dev = [
+codegen = [
     { name = "grpcio-tools" },
+]
+dev = [
     { name = "opentelemetry-api" },
     { name = "opentelemetry-sdk" },
     { name = "pytest" },
@@ -962,7 +964,7 @@ requires-dist = [
     { name = "cuda-python", marker = "extra == 'vmm'", specifier = ">=12.0" },
     { name = "google-crc32c", specifier = ">=1.5.0" },
     { name = "grpcio", specifier = ">=1.66.2" },
-    { name = "grpcio-tools", marker = "extra == 'dev'", specifier = ">=1.60.0,<=1.66.2" },
+    { name = "grpcio-tools", marker = "extra == 'codegen'", specifier = "==1.66.2" },
     { name = "huggingface-hub", specifier = ">=0.20.0" },
     { name = "instanttensor", marker = "sys_platform == 'linux'", specifier = ">=0.1.9" },
     { name = "numpy", specifier = ">=1.24.0" },
@@ -970,14 +972,14 @@ requires-dist = [
     { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.20.0" },
     { name = "opentelemetry-sdk", marker = "extra == 'dev'", specifier = ">=1.41.1" },
     { name = "prometheus-client", marker = "extra == 'metrics'", specifier = ">=0.20.0" },
-    { name = "protobuf", specifier = ">=5.27.0,<6.0.0" },
+    { name = "protobuf", specifier = ">=5.27.2,<7.0.0" },
     { name = "pydantic", specifier = ">=2.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21.0" },
     { name = "runai-model-streamer", extras = ["s3", "gcs", "azure"], marker = "sys_platform == 'linux'" },
     { name = "torch", specifier = ">=2.6.0" },
 ]
-provides-extras = ["dev", "otel", "metrics", "vmm"]
+provides-extras = ["dev", "codegen", "otel", "metrics", "vmm"]
 
 [[package]]
 name = "mpmath"
