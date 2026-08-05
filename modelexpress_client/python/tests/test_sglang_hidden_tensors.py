@@ -134,9 +134,25 @@ def test_manifest_entry_aliases_the_container_entry():
 
 
 def test_non_tensor_container_members_are_ignored():
+    """The scalar in _k3_fused_decode_args must not become a manifest entry.
+
+    Counting the adopted entries rather than type-checking them: the
+    collector returns tensors by construction, so an isinstance check would
+    pass whether or not the scalar was adopted.
+    """
     model = _Layer()
     tensors = _discover(model)
-    assert all(isinstance(t, torch.Tensor) for t in tensors.values())
+
+    adopted = [n for n in tensors if "_k3_fused_decode_args" in n]
+    tensor_members = sum(
+        1 for m in model._k3_fused_decode_args if isinstance(m, torch.Tensor)
+    )
+    assert len(model._k3_fused_decode_args) > tensor_members, (
+        "fixture must hold a non-tensor member for this test to mean anything"
+    )
+    assert len(adopted) == tensor_members, (
+        f"expected {tensor_members} adopted entries, got {len(adopted)}: {adopted}"
+    )
 
 
 def test_parameters_are_not_duplicated():

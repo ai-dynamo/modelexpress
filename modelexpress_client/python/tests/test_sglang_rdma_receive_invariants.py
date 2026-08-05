@@ -71,7 +71,7 @@ def _merge_weights_as_views(mods):
     sizes = [w.shape[0] for w in ws]
     merged = torch.cat(ws, dim=0).contiguous()
     off = 0
-    for m, n in zip(mods, sizes):
+    for m, n in zip(mods, sizes, strict=True):
         m.weight.data = merged[off : off + n]
         off += n
     return merged
