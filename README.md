@@ -41,6 +41,8 @@ ModelExpress (MX) starts with a simple question: before loading a model, where d
 | **Many nodes need the same model** | Metadata backends (Redis, K8s CRD) coordinate sharing: one node loads; others receive via P2P or local paths. |
 
 > **Today, ModelExpress loads DeepSeek-V4-Pro weights from a serving replica in 11 seconds—a 48× speedup over a cold Hugging Face pull. Reusing compatible weights and JIT kernel-cache artifacts reduces process-start-to-API-ready time from 8 minutes 1 second to 1 minute 44 seconds (4.6×).**
+>
+> Measured with vLLM 0.23.0 and TP=8 on an 8×B200 node with NVIDIA ConnectX-7 NICs. The 48× baseline is the cold Hugging Face pull in the same environment, at 8m 53s. See [Benchmarks](#benchmarks) for the full configuration and the intermediate storage paths.
 
 ### Runtime path selection
 
@@ -145,6 +147,8 @@ The artifact-enabled run reused compatible Triton, DeepGEMM, TileLang, CuTe DSL,
 
 ## Quick Start
 
+This Quick Start sets up the P2P path, which is what the benchmarks above measure, so it needs the full NIXL and metadata-backend prerequisites listed below. For a local single-machine setup instead, `docker compose -f docker/docker-compose.yml up --build` brings up the server with a Redis backend and no NIXL, and the `modelexpress-cli` commands in [CLI](docs/CLI.md) exercise it. See [Deployment](docs/DEPLOYMENT.md) for both.
+
 **Requirements:** vLLM 0.23.0+, the ModelExpress Python package, NIXL-compatible GPU nodes, and a reachable [metadata backend](examples/p2p_transfer_k8s/server/README.md).
 
 ```bash
@@ -215,7 +219,7 @@ docker compose -f docker/docker-compose.yml up --build
 | `MX_METADATA_BACKEND` | Server: required; client: unset | Server: `redis` \| `kubernetes`. Client: unset, `server`, `redis`, or `kubernetes` uses a central coordinator; `k8s-service` enables decentralized Kubernetes Service routing. |
 | `REDIS_URL` | (required for `redis`) | Redis connection URL. Alternatively set `MX_REDIS_HOST` + `MX_REDIS_PORT`. No localhost fallback. |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Client-side gRPC server address (P2P). Recommended. |
-| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated, pending removal in a future release. Still read by all client paths and takes precedence when both are set; keep setting it during the transition. |
+| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
 | `MX_MODEL_URI` | (unset) | Enable ModelStreamer for an object-store URI or absolute local path. |
 | `MX_MS_DISTRIBUTED` | `1` | Divide ModelStreamer reads across tensor-parallel ranks when TP > 1. On by default; set to `0` to disable. |
 | `MX_POOL_REG` | `0` | Register each underlying CUDA allocation once instead of registering every tensor. |
@@ -288,7 +292,7 @@ cargo bench
 - **Multi-tier cache hierarchy**: Promote and demote models across DRAM, NVMe, and PVC tiers based on access patterns.
 - **Distributed sharded cache**: Shard large models across nodes using consistent hashing and parallel shard assembly.
 - **Training checkpoint management**: Cache and reuse CUDA kernel compilations (torch.compile, deepGEMM) and CUDA graphs across restarts.
-- **Metrics and observability**: Cache hit rates, eviction frequency, transfer throughput, and P2P RDMA utilization via Prometheus/OpenTelemetry.
+- **Metrics and observability**: Cache hit rates, eviction frequency, and P2P RDMA utilization via Prometheus/OpenTelemetry. Client-side P2P source-selection and transfer-duration metrics ship today behind `MX_METRICS_ENABLED=1` (see [Deployment](docs/DEPLOYMENT.md)); the server currently exposes structured logs only.
 - **Predictive prefetching**: Pre-warm caches from workload history or scheduling hints.
 - **Dynamic EPLB (Expert Parallelism Load Balancer)**: Rebalance MoE expert placement across GPUs at runtime via P2P transfer of expert weights as load shifts.
 
