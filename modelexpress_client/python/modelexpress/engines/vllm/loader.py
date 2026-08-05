@@ -13,10 +13,11 @@ are auto-promoted to non-persistent buffers via capture_tensor_attrs().
 
 Uses LoadStrategyChain to auto-detect the best loading strategy:
     1. RDMA (P2P GPU transfer via NIXL) - if a source is already serving
-    2. InstantTensor (fast local safetensors, direct I/O + GDS) - set MX_INSTANT_TENSOR=0 to disable
-    3. ModelStreamer (S3/GCS/Azure/local via runai-model-streamer) - set MX_MODEL_URI
-    4. GDS (GPUDirect Storage) - direct file-to-GPU, bypassing CPU
-    5. Default (vLLM DefaultModelLoader) - standard CPU-staged loading
+    2. ServerCache (stream weights from ModelExpress Server) - set MODEL_EXPRESS_NO_SHARED_STORAGE=1
+    3. InstantTensor (fast local safetensors, direct I/O + GDS) - set MX_INSTANT_TENSOR=0 to disable
+    4. ModelStreamer (S3/GCS/Azure/local via runai-model-streamer) - set MX_MODEL_URI
+    5. GDS (GPUDirect Storage) - direct file-to-GPU, bypassing CPU
+    6. Default (vLLM DefaultModelLoader) - standard CPU-staged loading
 
 Usage:
     --load-format modelexpress
@@ -31,7 +32,7 @@ import time
 import torch
 import torch.nn as nn
 
-from ... import configure_vllm_logging, envs
+from ... import configure_vllm_logging, envs, model_prefetch
 from ...load_strategy import LoadContext, LoadStrategyChain
 from ...nixl_transfer import NixlTransferManager
 from ...vmm.runtime import log_arena_post_load, maybe_enter_vmm_arena
@@ -130,6 +131,17 @@ class MxModelLoader(BaseModelLoader):
 
     def download_model(self, model_config: ModelConfig) -> None:
         """Download the model so it can be loaded immediately."""
+        if model_prefetch.is_enabled():
+            # Without shared storage this would pull the full weight set from
+            # Hugging Face before any strategy runs, defeating P2P-first and
+            # failing outright when the worker is offline. The strategy chain
+            # decides where the weights come from.
+            logger.info(
+                "MODEL_EXPRESS_NO_SHARED_STORAGE is set; leaving weight "
+                "acquisition to the ModelExpress strategy chain"
+            )
+            return
+
         import copy
 
         disk_config = copy.copy(self.load_config)

@@ -723,6 +723,37 @@ artifact transfer only within a trusted deployment, and network-isolate the MX
 server and worker gRPC endpoints from untrusted clients. ModelExpress does not
 currently sign cache artifacts.
 
+### Server-Backed Model Cache (No Shared Storage)
+
+For workers that cannot reach the Hugging Face Hub themselves, ModelExpress Server can act as the only route to the model. The worker asks the server for repository files; the server downloads the model once on a cold miss and serves every later worker from its own cache.
+
+Weights and everything else are fetched at different times. Config, tokenizer, and index files arrive before the engine starts, because the engine resolves the model path (and fails offline) long before any weight loader runs. Weights stay behind the strategy chain, so a live P2P source is still the first choice and the server is only asked after `RdmaStrategy` finds nothing. Fetching metadata early does not weaken P2P-first — no weight moves on that path.
+
+Enable it on the worker:
+
+```yaml
+MODEL_EXPRESS_URL: http://<model-express-service>:8001
+MODEL_EXPRESS_NO_SHARED_STORAGE: "1"
+MODEL_EXPRESS_CACHE_DIRECTORY: /home/dynamo/.cache/huggingface/hub
+HF_HUB_CACHE: /home/dynamo/.cache/huggingface/hub
+HF_HUB_OFFLINE: "1"
+```
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MODEL_EXPRESS_NO_SHARED_STORAGE` | `0` | Fetch repository files from ModelExpress Server. When unset, nothing changes: no extra RPCs and no change to P2P or local loading. |
+| `MODEL_EXPRESS_CACHE_DIRECTORY` | `HF_HUB_CACHE` | Where the worker installs snapshots. Point it at the same path as `HF_HUB_CACHE` so the engine reads what ModelExpress wrote. |
+| `MODEL_EXPRESS_TRANSFER_CHUNK_SIZE` | `1048576` | gRPC file-stream chunk size in bytes. |
+
+Requirements and limits:
+
+- ModelExpress Server needs a writable cache directory, egress to Hugging Face, and `HF_TOKEN` for private repositories. The worker needs none of these.
+- Mount the cache path as a volume shared by every container that touches it. Without a volume the snapshot lands in the container's writable layer, invisible to other containers and lost on restart.
+- Pinned revisions are not supported yet: the model RPC carries no revision, so the server answers with whatever its cache holds for `main`. A mismatch is logged, and weights whose commit differs from the local snapshot directory are refused rather than mixed in.
+- On a cold server the first worker waits for the complete download, weights included, before it receives anything.
+- The server dedups the upstream download but not the per-worker stream. Concurrent workers on a cold model all wait on one Hugging Face fetch, then each streams its own copy, so N replicas starting together cost N x model size in server egress. Size the server's network accordingly, or stagger large rollouts.
+- An unreachable server costs about 20 seconds per worker before loading falls through to the next strategy. That is the TCP connect timeout; a shorter deadline would abort legitimate cold-cache downloads, which can take minutes.
+
 ### InstantTensor (Fast Local Safetensors)
 
 InstantTensor loads the model's own safetensors directly onto CUDA using distributed loading, pipelined prefetching, and direct I/O, with GPUDirect Storage when the hardware supports it. It sits right after P2P RDMA in the loading chain: when no peer source is already serving, it is the fastest local-disk path before falling back to ModelStreamer, GDS, or the native loader. Unlike ModelStreamer it needs no `MX_MODEL_URI`; it reuses vLLM's built-in `--load-format instanttensor` path, so the engine resolves the model's weight files (downloading from the Hugging Face Hub into the local cache first if they are not already local).
