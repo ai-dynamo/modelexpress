@@ -622,59 +622,34 @@ MDL does not discover sources, plan resharding, transfer bytes, or translate
 trainer tensors. Those stages provide the translated tensor stream and use
 `MdlLoader.load_weights()` as the final installation callback.
 
-The package boundary is intentional: timing and future install-plan contracts
-belong in engine-agnostic `modelexpress.refit`, while vLLM loader observation,
-placement, PWAL interaction, and direct installation belong in
-`modelexpress.engines.vllm.refit`. RL-framework orchestration remains a
-separate integration rather than part of this vLLM installer. The CANONICAL
-publisher described below has explicit FSDP and Megatron-Bridge capture
-sources; it is not a generic engine or trainer adapter.
+The package boundary is intentional: timing, typed lifecycle protocols, and the
+revision-catalog client belong in engine-agnostic `modelexpress.refit`, while
+vLLM loader observation, placement, PWAL interaction, and direct installation
+belong in `modelexpress.engines.vllm.refit`. RL-framework orchestration remains
+a separate integration rather than part of this vLLM installer.
 
-### Exact-base CANONICAL Publication
+### Minimal Revision Catalog
 
-`modelexpress.refit.publisher.Publisher` is the concrete trainer-side owner of
-the Phase 2.1 CANONICAL publication lifecycle. Initialization validates one
-cross-rank configuration and rank 0's exact base, then owns the capture source,
-local base store, immutable object transport, and revision catalog until
-`deregister()`. A publication request must name the current policy-eligible
-exact base and the complete target model. Before capture, rank 0 also matches
-that local base's model/version, format digest, and target digest against the
-catalog lineage; partial layer publication is rejected.
+The revision service is a metadata-only catalog with exactly three operations:
+`PublishRevision`, `GetRevision`, and `CommitRevision`. Records are immutable by
+`(model_id, target_version)`. Publication stores a complete record directly as
+`READY`; a byte-identical retry is idempotent and conflicting metadata is
+rejected. Commit is an idempotent `READY` to `COMMITTED` transition.
 
-Every trainer rank follows the same bounded capture schedule. The explicit
-sources in `modelexpress.refit.source` convert FSDP state dictionaries or
-Megatron-Bridge conversion tasks into deterministic Hugging Face canonical
-buckets. They validate the declared canonical schema, collective schedule,
-capture-unit boundaries, tensor order, dtype, shape, and complete coverage
-before publication. Bucket limits bound materialization, including grouped
-Megatron conversion units that cannot be split safely.
+A revision manifest contains model and version identity, exact-base lineage,
+logical base/format/target digests, and one optional S3 root-index reference.
+Launch version `0` has no base or payload. Every later revision requires both
+exact-base fields and an S3 payload. The server stores this metadata in an
+isolated Redis namespace but never accesses S3, receives S3 credentials,
+transfers model bytes, or tracks receiver and rank state.
 
-Rank 0 compares each canonical target bucket with the same bytes from the exact
-base snapshot. Dirty tensors use the versioned tensor-byte XOR codec, optional
-zstd compression, deterministic bucket framing, physical CRC32C checksums, and
-semantic SHA-256 format/base/target digests. Clean tensors still appear in the
-root coverage. The deterministic root index binds all bucket references and
-complete tensor coverage. Every CANONICAL revision publishes exactly one
-rank-0 manifest entry with no per-trainer-rank shards: a dirty entry points at
-the verified root, while a byte-identical target has no transfer reference.
-
-`modelexpress.refit.transport` writes create-only, content-verified objects.
-S3 is the normal Phase 2.1 transport; its locations retain an object version
-when the service supplies one. The confined filesystem transport is enabled
-only for local tests. Both transports verify size and CRC32C on publication and
-fetch, and conflicts at an existing immutable key fail closed.
-
-`PublicationMode.ASYNC` may return when the immutable catalog revision is
-`READY` and observes a later `COMMITTED` transition in the background.
-`PublicationMode.BLOCK` polls read-only until `COMMITTED`; cancellation stops
-only that wait and leaves the revision `READY`. `deregister()` cancels waits,
-drains active publication and observer work, and then closes all publisher-owned
-resources.
-
-This path is deliberately CANONICAL-only. It does not provide rank-local or
-GPU-shard delivery, a generic engine adapter, an inference runtime, receiver
-reconstruction/installation, RecoveryStore execution, full-model anchors, or a
-full normal-delivery payload. Those concerns are outside Phase 2.1.
+`modelexpress.refit.catalog.GrpcRevisionCatalog` exposes only typed publish,
+exact-get, and commit methods. `modelexpress.refit.manifest` owns the matching
+minimal DTOs and protobuf conversion. Publication mode remains client behavior,
+not a server field. The concrete CANONICAL publisher, capture sources, object
+transport, reconstruction, and serving-engine receiver are not part of this
+minimal catalog snapshot; those components must use the three-RPC contract when
+introduced.
 
 ### No-gather Refit Resharding
 
