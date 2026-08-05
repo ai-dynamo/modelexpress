@@ -97,6 +97,14 @@ class SglangAdapter(EngineAdapter):
             result = self._post_load_weights(result)
             return self._process_weights_after_loading(result)
 
+    def after_rdma_receive(self, result: LoadResult) -> LoadResult:
+        """Refresh Kimi-K3 attention-residual caches after RDMA writes."""
+        if result.model is None:
+            raise RuntimeError("SGLang post-receive derivation requires result.model")
+        if _refresh_kimi_k3_attn_res_cw_caches(result.model):
+            logger.info("refreshed Kimi-K3 attention-residual caches")
+        return result
+
     def apply_weight_iter(
         self,
         result: LoadResult,
@@ -232,6 +240,46 @@ def _call_sglang_post_load_weights(model: torch.nn.Module) -> None:
         post_load_weights = getattr(child, "post_load_weights", None)
         if callable(post_load_weights):
             post_load_weights()
+
+
+def _refresh_kimi_k3_attn_res_cw_caches(model: torch.nn.Module) -> bool:
+    """Refresh Kimi-K3 cache values without changing tensor addresses."""
+    if type(model).__module__ != "sglang.srt.models.kimi_k3":
+        return False
+
+    causal_lm = model.language_model if hasattr(model, "language_model") else model
+    if causal_lm is None:
+        return False
+    backbone = getattr(causal_lm, "model", None)
+    if backbone is None:
+        return False
+
+    refreshed = False
+
+    def refresh_in_place(proj, norm) -> None:
+        nonlocal refreshed
+        cache = getattr(proj, "_attn_res_cw_cache", None)
+        if cache is None:
+            return
+        combined = (norm.weight.float() * proj.weight.squeeze().float()).contiguous()
+        for dtype, cached in cache.items():
+            cached.copy_(combined.to(dtype))
+        refreshed = True
+
+    for layer in backbone.layers:
+        if not getattr(layer, "use_attn_residuals", False):
+            continue
+        refresh_in_place(
+            layer.self_attention_res_proj,
+            layer.self_attention_res_norm,
+        )
+        refresh_in_place(layer.mlp_res_proj, layer.mlp_res_norm)
+    if hasattr(backbone, "output_attn_res_proj"):
+        refresh_in_place(
+            backbone.output_attn_res_proj,
+            backbone.output_attn_res_norm,
+        )
+    return refreshed
 
 
 def build_sglang_source_identity(model_config: ModelConfig) -> p2p_pb2.SourceIdentity:
