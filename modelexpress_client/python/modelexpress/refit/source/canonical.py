@@ -41,6 +41,25 @@ def _checkpoint_files(root: Path) -> list[Path]:
     return sorted(root.glob("*.safetensors"))
 
 
+def _tied_names(root: Path) -> set[str]:
+    """Names HF stores as a redundant copy of another parameter.
+
+    With ``tie_word_embeddings`` the checkpoint serializes the output head as a second
+    copy of the input embedding, but the trainer holds one parameter for both and so
+    never gathers the copy. Counting it would put an unreachable tensor in the canonical
+    set, so both the publisher and the receiver drop it.
+    """
+    config = root / "config.json"
+    if not config.is_file():
+        return set()
+    try:
+        with config.open() as handle:
+            tied = json.load(handle).get("tie_word_embeddings", False)
+    except (OSError, ValueError):
+        return set()
+    return {"lm_head.weight"} if tied else set()
+
+
 def load_hf_snapshot(
     checkpoint: str | Path,
 ) -> tuple[dict[str, np.ndarray], dict[str, dict], str, str]:
@@ -49,11 +68,14 @@ def load_hf_snapshot(
 
     snapshot = {}
     metadata = {}
+    tied = _tied_names(Path(checkpoint))
     for path in _checkpoint_files(Path(checkpoint)):
         with safe_open(str(path), framework="pt", device="cpu") as handle:
             for source_name in handle.keys():
-                tensor = handle.get_tensor(source_name)
                 name = source_name.removeprefix("module.")
+                if name in tied:
+                    continue
+                tensor = handle.get_tensor(source_name)
                 data = _tensor_bytes(tensor)
                 snapshot[name] = np.frombuffer(data, dtype=np.uint8).copy()
                 metadata[name] = {

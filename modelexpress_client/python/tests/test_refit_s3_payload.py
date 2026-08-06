@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import json
 
 import pytest
 import torch
@@ -96,6 +97,30 @@ def test_launch_schema_orders_names_after_canonical_prefix_normalization(tmp_pat
 
     assert sorted(snapshot) == ["0.weight", "a.weight"]
     assert sorted(metadata) == ["0.weight", "a.weight"]
+
+
+@pytest.mark.parametrize(
+    ("tied", "expected"),
+    [
+        (True, ["model.embed_tokens.weight"]),
+        (False, ["lm_head.weight", "model.embed_tokens.weight"]),
+    ],
+)
+def test_tied_output_head_is_dropped_from_the_canonical_set(tmp_path, tied, expected):
+    # HF serializes a tied output head as a second copy of the input embedding, but the
+    # trainer holds one parameter for both and never gathers the copy, so counting it
+    # would leave an unreachable tensor in the canonical set.
+    embedding = torch.arange(4, dtype=torch.float32)
+    save_file(
+        {"lm_head.weight": embedding.clone(), "model.embed_tokens.weight": embedding},
+        tmp_path / "model.safetensors",
+    )
+    (tmp_path / "config.json").write_text(json.dumps({"tie_word_embeddings": tied}))
+
+    snapshot, metadata, _format_digest, _target_digest = load_hf_snapshot(tmp_path)
+
+    assert sorted(snapshot) == expected
+    assert sorted(metadata) == expected
 
 
 def test_pack_source_rank_compressed_delta_into_canonical_bucket(tmp_path):
