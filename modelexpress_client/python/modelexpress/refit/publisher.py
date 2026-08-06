@@ -171,13 +171,16 @@ class Publisher:
                 raise RuntimeError("catalog base does not match the current snapshot")
         self._barrier()
 
+        encode_started = time.monotonic()
         deltas, checksums = self._encode_delta(gather_hf_buckets)
+        encode_seconds = time.monotonic() - encode_started
         self._drop_duplicate_names(deltas, checksums)
         metadata, owners = self._collect_metadata()
         if format_digest(metadata) != self.format_digest:
             raise RuntimeError("canonical format changed during publication")
         target_digest = snapshot_digest(metadata)
-        self._publish_root(
+        publish_started = time.monotonic()
+        wire_bytes = self._publish_root(
             version,
             base_version,
             deltas,
@@ -185,6 +188,23 @@ class Publisher:
             owners,
             target_digest,
         )
+        publish_seconds = time.monotonic() - publish_started
+        phase_metrics = self._gather(
+            (
+                encode_seconds,
+                publish_seconds,
+                sum(metadata[name]["byte_size"] for name in deltas),
+                wire_bytes,
+            )
+        )
+        total_bytes = sum(item["byte_size"] for item in metadata.values())
+        self._metrics = {
+            "perf/update_weights_density": sum(item[2] for item in phase_metrics)
+            / max(total_bytes, 1),
+            "perf/update_weights_wire_bytes": sum(item[3] for item in phase_metrics),
+            "perf/mx_encode_delta": max(item[0] for item in phase_metrics),
+            "perf/mx_publish_time": max(item[1] for item in phase_metrics),
+        }
         self.pending_version = version
         self.pending_digest = target_digest
         self._barrier()
@@ -234,6 +254,10 @@ class Publisher:
         self.target_digest = self.pending_digest
         self.pending_version = None
         self.pending_digest = None
+
+    def pop_metrics(self) -> dict[str, float]:
+        metrics, self._metrics = getattr(self, "_metrics", {}), {}
+        return metrics
 
     def deregister(self) -> None:
         if self.uploader is not None:
@@ -315,7 +339,7 @@ class Publisher:
         metadata,
         owners,
         target_digest,
-    ) -> None:
+    ) -> int:
         local_metadata = {
             name: item for name, item in metadata.items() if owners[name] == self.rank
         }
@@ -370,8 +394,9 @@ class Publisher:
             coverage.append(value)
         all_descriptors = self._gather((self.rank, descriptors))
         all_coverage = self._gather((self.rank, coverage))
+        wire_bytes = sum(item["object"]["size"] for item in descriptors)
         if self.rank != 0:
-            return
+            return wire_bytes
         buckets = sorted(
             (item for _rank, values in all_descriptors for item in values),
             key=lambda item: item["ordinal"],
@@ -408,6 +433,7 @@ class Publisher:
                 payload=payload,
             )
         )
+        return wire_bytes
 
     def _uploader(self):
         if self.uploader is None:

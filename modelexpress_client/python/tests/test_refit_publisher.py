@@ -142,6 +142,12 @@ def test_exact_base_update_uses_miles_hf_buckets_and_uploads_delta(tmp_path):
     publisher.publish_version("1", base_version="0", gather_hf_buckets=gather(target))
     publisher.wait_for_commit("1")
 
+    metrics = publisher.pop_metrics()
+    assert metrics["perf/update_weights_density"] == 0.5
+    assert metrics["perf/update_weights_wire_bytes"] > 0
+    assert metrics["perf/mx_encode_delta"] >= 0
+    assert metrics["perf/mx_publish_time"] >= 0
+    assert publisher.pop_metrics() == {}
     assert publisher.current_version == "1"
     manifest = catalog.published[-1]
     root = json.loads(s3.objects[(manifest.payload.bucket, manifest.payload.key)][0])

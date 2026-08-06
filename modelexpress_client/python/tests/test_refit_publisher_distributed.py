@@ -146,7 +146,10 @@ def test_non_source_ranks_publish_without_holding_any_tensor(tmp_path):
         process.join(60)
         assert process.exitcode == 0
 
-    results = {rank: (puts, version) for rank, puts, version in [queue.get() for _ in processes]}
+    results = {
+        rank: (puts, version)
+        for rank, puts, version in [queue.get() for _ in processes]
+    }
     # The non-source rank uploads nothing yet still advances to the committed revision.
     assert results[1][0] == 0
     assert results[0][1] == "1"
@@ -210,7 +213,7 @@ def _run(rank, world_size, init_file, checkpoint, queue):
         root = json.loads(
             s3.objects[(manifest.payload.bucket, manifest.payload.key)][0]
         )
-    queue.put((rank, s3.puts, root))
+    queue.put((rank, s3.puts, root, publisher.pop_metrics()))
     torch.distributed.destroy_process_group()
 
 
@@ -245,10 +248,21 @@ def test_two_source_ranks_upload_disjoint_s3_buckets_and_one_root(tmp_path):
         assert process.exitcode == 0
 
     results = {
-        rank: (puts, root) for rank, puts, root in [queue.get() for _ in processes]
+        rank: (puts, root, metrics)
+        for rank, puts, root, metrics in [queue.get() for _ in processes]
     }
     assert results[0][0] == 3
     assert results[1][0] == 1
+    assert results[0][2]["perf/update_weights_density"] == 1.0
+    assert results[0][2]["perf/update_weights_wire_bytes"] > 0
+    assert (
+        results[0][2]["perf/update_weights_density"]
+        == results[1][2]["perf/update_weights_density"]
+    )
+    assert (
+        results[0][2]["perf/update_weights_wire_bytes"]
+        == results[1][2]["perf/update_weights_wire_bytes"]
+    )
     root = results[0][1]
     assert [bucket["ordinal"] for bucket in root["buckets"]] == [0, 1, 2]
     assert [tensor["name"] for tensor in root["tensors"]] == [
