@@ -19,6 +19,8 @@ class FakeS3:
     def __init__(self):
         self.objects = {}
         self.puts = []
+        self.head_calls = 0
+        self.get_calls = 0
 
     def put_object(self, **kwargs):
         self.puts.append(kwargs)
@@ -32,6 +34,7 @@ class FakeS3:
         return {"VersionId": "version-1"}
 
     def head_object(self, **kwargs):
+        self.head_calls += 1
         data, checksum, version = self.objects[(kwargs["Bucket"], kwargs["Key"])]
         return {
             "ContentLength": len(data),
@@ -40,24 +43,27 @@ class FakeS3:
         }
 
     def get_object(self, **kwargs):
+        self.get_calls += 1
         data, _checksum, version = self.objects[(kwargs["Bucket"], kwargs["Key"])]
         return {"Body": io.BytesIO(data), "VersionId": version}
 
 
-def test_s3_uploader_uses_direct_conditional_put_and_returns_verified_object():
+def test_s3_uploader_uses_one_conditional_put_and_returns_object():
     client = FakeS3()
     uploader = S3Uploader(S3Config(bucket="bucket", prefix="run"), client=client)
 
     stored = uploader.put("models/m/revisions/1/root.json", b"root")
 
-    assert stored.object.bucket == "bucket"
-    assert stored.object.key == "run/models/m/revisions/1/root.json"
-    assert stored.object.object_version == "version-1"
-    assert stored.object.checksum.startswith("crc32c:")
+    assert stored.bucket == "bucket"
+    assert stored.key == "run/models/m/revisions/1/root.json"
+    assert stored.object_version == "version-1"
+    assert stored.checksum.startswith("crc32c:")
     request = client.puts[0]
     assert request["IfNoneMatch"] == "*"
     assert request["ChecksumAlgorithm"] == "CRC32C"
     assert base64.b64decode(request["ChecksumCRC32C"])
+    assert client.head_calls == 0
+    assert client.get_calls == 0
 
 
 def test_s3_uploader_allows_identical_retry_but_rejects_immutable_conflict():

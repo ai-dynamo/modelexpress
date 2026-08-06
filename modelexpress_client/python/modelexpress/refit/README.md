@@ -328,7 +328,7 @@ Performance claims must identify the exact implementation path. Reference transp
 |---|---|
 | [`publisher.py`](publisher.py) | BLOCK-only exact-base CANONICAL publication lifecycle |
 | [`source/canonical.py`](source/canonical.py) | Launch snapshot and XOR+zstd encoding of Miles-gathered HF buckets |
-| [`s3.py`](s3.py) | Direct immutable S3 publication with CRC32C and readback verification |
+| [`s3.py`](s3.py) | Direct immutable S3 publication with conditional writes and CRC32C |
 | [`timing.py`](timing.py) | Normalized timing stages and context propagation |
 | [`reshard/geometry.py`](reshard/geometry.py) | Record the engine loader's source views and destination writes |
 | [`reshard/slice_plan.py`](reshard/slice_plan.py) | Resolve views, intersect shard boxes, emit contiguous runs |

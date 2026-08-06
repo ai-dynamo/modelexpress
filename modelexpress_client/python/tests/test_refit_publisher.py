@@ -5,11 +5,9 @@ from __future__ import annotations
 
 import io
 import json
-import struct
 
 import pytest
 import torch
-import zstandard
 from safetensors.torch import save_file
 
 from modelexpress.refit import (
@@ -19,7 +17,11 @@ from modelexpress.refit import (
     RevisionState,
     S3Config,
 )
-from modelexpress.refit.source.canonical import CanonicalDeltaEncoder, load_hf_snapshot
+from modelexpress.refit.source.canonical import (
+    CanonicalDeltaEncoder,
+    decode_bucket,
+    load_hf_snapshot,
+)
 
 
 class FakeCatalog:
@@ -149,17 +151,13 @@ def test_exact_base_update_uses_miles_hf_buckets_and_uploads_delta(tmp_path):
     assert root["target_version"] == "1"
     [bucket] = root["buckets"]
     encoded = s3.objects[(bucket["object"]["bucket"], bucket["object"]["key"])][0]
-    header_size = struct.unpack(">I", encoded[7:11])[0]
-    header = json.loads(encoded[11 : 11 + header_size])
-    decoded = zstandard.ZstdDecompressor().decompress(
-        encoded[11 + header_size :], max_output_size=header["decoded_size"]
-    )
-    [entry] = header["entries"]
-    delta = decoded[entry["offset"] : entry["offset"] + entry["byte_size"]]
-    base = launch[entry["name"]].contiguous().view(torch.uint8).numpy().tobytes()
-    recovered = bytes(left ^ right for left, right in zip(base, delta, strict=True))
-    expected = target[entry["name"]].contiguous().view(torch.uint8).numpy().tobytes()
-    assert recovered == expected
+    snapshot, metadata, _format_digest, _base_digest = load_hf_snapshot(hf_path)
+    decode_bucket(encoded, snapshot, metadata)
+    for name, tensor in target.items():
+        assert (
+            snapshot[name].tobytes()
+            == tensor.contiguous().view(torch.uint8).numpy().tobytes()
+        )
 
 
 def test_encoder_is_a_plain_snapshot_diff(tmp_path):
@@ -202,10 +200,10 @@ def test_s3_failure_prevents_catalog_publication(tmp_path):
     class FailingS3(FakeS3):
         fail = False
 
-        def get_object(self, **kwargs):
+        def put_object(self, **kwargs):
             if self.fail:
-                raise RuntimeError("readback unavailable")
-            return super().get_object(**kwargs)
+                raise RuntimeError("upload failed")
+            return super().put_object(**kwargs)
 
     catalog = FakeCatalog()
     s3 = FailingS3()
@@ -221,7 +219,7 @@ def test_s3_failure_prevents_catalog_publication(tmp_path):
     publisher.publish_version("0")
     s3.fail = True
 
-    with pytest.raises(Exception, match="unreadable"):
+    with pytest.raises(Exception, match="upload failed"):
         publisher.publish_version(
             "1",
             base_version="0",

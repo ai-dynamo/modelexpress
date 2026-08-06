@@ -76,7 +76,39 @@ def load_hf_snapshot(
             for item in ordered
         ]
     )
-    return snapshot, metadata, format_digest, _digest(ordered)
+    return snapshot, metadata, format_digest, snapshot_digest(metadata)
+
+
+def snapshot_digest(metadata: dict[str, dict]) -> str:
+    return _digest([metadata[name] for name in sorted(metadata)])
+
+
+def decode_bucket(
+    data: bytes, snapshot: dict[str, np.ndarray], metadata: dict[str, dict]
+) -> dict:
+    if not data.startswith(_BUCKET_MAGIC):
+        raise ValueError("invalid canonical bucket")
+    header_size = struct.unpack(
+        ">I", data[len(_BUCKET_MAGIC) : len(_BUCKET_MAGIC) + 4]
+    )[0]
+    header_start = len(_BUCKET_MAGIC) + 4
+    header = json.loads(data[header_start : header_start + header_size])
+    decoded = zstandard.ZstdDecompressor().decompress(
+        data[header_start + header_size :], max_output_size=header["decoded_size"]
+    )
+    for entry in header["entries"]:
+        name = entry["name"]
+        start = entry["offset"]
+        delta = np.frombuffer(
+            decoded[start : start + entry["byte_size"]], dtype=np.uint8
+        )
+        target = np.bitwise_xor(snapshot[name], delta)
+        digest = f"sha256:{hashlib.sha256(target.tobytes()).hexdigest()}"
+        if digest != entry["target_digest"]:
+            raise ValueError(f"canonical target checksum differs for {name}")
+        snapshot[name] = target
+        metadata[name]["target_digest"] = digest
+    return header
 
 
 class CanonicalDeltaEncoder:
@@ -170,6 +202,4 @@ class CanonicalDeltaEncoder:
 
     def finish(self) -> tuple[str, list[dict]]:
         coverage = [self.coverage[name] for name in sorted(self.coverage)]
-        return _digest(
-            [self.metadata[name] for name in sorted(self.metadata)]
-        ), coverage
+        return snapshot_digest(self.metadata), coverage

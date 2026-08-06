@@ -25,15 +25,15 @@ def _key(model_id: str, version: str, filename: str) -> str:
     )
 
 
-def _object(stored) -> dict[str, object]:
+def _object(stored, size: int) -> dict[str, object]:
     result = {
-        "bucket": stored.object.bucket,
-        "checksum": stored.object.checksum,
-        "key": stored.object.key,
-        "size": stored.size,
+        "bucket": stored.bucket,
+        "checksum": stored.checksum,
+        "key": stored.key,
+        "size": size,
     }
-    if stored.object.object_version is not None:
-        result["object_version"] = stored.object.object_version
+    if stored.object_version is not None:
+        result["object_version"] = stored.object_version
     return result
 
 
@@ -145,7 +145,7 @@ class Publisher:
             uploaded.append(
                 {
                     "decoded_size": decoded_size,
-                    "object": _object(stored),
+                    "object": _object(stored, len(data)),
                     "ordinal": ordinal,
                     "tensors": list(tensors),
                 }
@@ -179,7 +179,7 @@ class Publisher:
                 base_digest=base_digest,
                 target_digest=target_digest,
                 format_digest=self.format_digest,
-                payload=payload.object,
+                payload=payload,
             )
             self.catalog.publish_revision(manifest)
             self._wait_for_commit(manifest)
