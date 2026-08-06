@@ -4,9 +4,9 @@
 """Mesh mapping for the nccl_m2n reshard transport.
 
 Pure-math (no torch) helpers that translate PR #481's ``TrainerTensor`` shard
-layout into the 2-D ``ncclMesh_t`` descriptors ncclReshardWithWindow consumes.
-Mirrors the PoC ``reshard_ref.Mesh`` math and extends it to read the richer
-``TrainerShard`` (row/col tile) layout.
+layout into the 2-D mesh and placement metadata consumed by public
+``nccl.m2n.reshard``. Mirrors the PoC mesh math and extends it to read the
+richer ``TrainerShard`` (row/col tile) layout.
 
 First slice: TP-only, same-dim reshards (one axis SHARD, the other REPLICATE).
 Cross-dim (transpose) and 2-D TP x FSDP tiles are later slices.

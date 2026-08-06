@@ -123,13 +123,13 @@ class PullRole(WeightSyncRole):
 
         Collective semantics: this MUST be co-called by the trainer's
         ``PushRole.reshard()`` in the same step (engine-scheduled).  This
-        generator rank supplies the destination tile; the source dataPtr is NULL.
-        Delegates layout + staging to ``NcclM2nExecutor``.
+        generator rank supplies destination staging; the source is ``None``.
+        Delegates layout and batching to ``NcclM2nExecutor``.
         """
         from ..transport.nccl_m2n_executor import build_reshard_params
 
-        params, window_bytes = build_reshard_params(model, table, tp_src, tp_dst)
-        return executor.execute(params, window_bytes)
+        params = build_reshard_params(model, table, tp_src, tp_dst)
+        return executor.execute(params)
 
     def refresh(self, model: Any, table: TrainerTable) -> None:
         """Invalidate the plan and re-initialize when the trainer reshards."""

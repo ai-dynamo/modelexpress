@@ -1,284 +1,280 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""No-GPU failure-atomicity and stream-ordering tests for nccl_m2n.
-
-The fake validates MX enqueue order and token propagation, not M2N's real CUDA
-ready/done event bridge; that requires a GPU integration test.
-"""
+"""No-GPU version-staging tests for the current NCCL M2N executor."""
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+from dataclasses import dataclass
+from types import SimpleNamespace
+
 import pytest
+import torch
 
 from modelexpress.weight_transfer.planner.mesh import REPLICATE
-from modelexpress.weight_transfer.transport import _nccl_m2n_bind as binding
 from modelexpress.weight_transfer.transport.nccl_m2n_executor import (
     NcclM2nExecutor,
     ReshardParam,
 )
+from modelexpress.weight_transfer.transport.nccl_m2n_runtime import _M2nRuntime
 
 
-class FakeM2N:
-    def __init__(
-        self,
-        payloads: list[bytes],
-        *,
-        fail_reshard_at: int | None = None,
-        fail_live_copy_at: int | None = None,
-        fail_stream_sync: bool = False,
-    ) -> None:
-        self.payloads = payloads
-        self.fail_reshard_at = fail_reshard_at
-        self.fail_live_copy_at = fail_live_copy_at
-        self.fail_stream_sync = fail_stream_sync
-        self.events: list[tuple] = []
-        self.live_ptrs: set[int] = set()
-        self.reshard_calls = 0
-        self.live_copy_calls = 0
-        self._next_ptr = 0x1000
-        self._memory: dict[int, bytearray] = {}
+class FakeStream:
+    def __init__(self, events: list[tuple], *, fail_sync: bool = False) -> None:
+        self.events = events
+        self.fail_sync = fail_sync
+        self.name = "lane-stream"
 
-    def allocate_live(self, contents: bytes) -> int:
-        ptr = self._allocate(len(contents))
-        self._memory[ptr][:] = contents
-        self.live_ptrs.add(ptr)
-        return ptr
-
-    def read(self, ptr: int, nbytes: int) -> bytes:
-        buf, offset = self._find(ptr, nbytes)
-        return bytes(buf[offset : offset + nbytes])
-
-    def _allocate(self, nbytes: int) -> int:
-        ptr = self._next_ptr
-        self._next_ptr += nbytes + 0x100
-        self._memory[ptr] = bytearray(nbytes)
-        return ptr
-
-    def _find(self, ptr: int, nbytes: int) -> tuple[bytearray, int]:
-        for base, buf in self._memory.items():
-            offset = ptr - base
-            if 0 <= offset and offset + nbytes <= len(buf):
-                return buf, offset
-        raise AssertionError(f"unknown pointer range: ptr={ptr:#x}, nbytes={nbytes}")
-
-    def init(self, max_cta: int | None = None) -> None:
-        self.events.append(("init", max_cta))
-
-    def set_device(self, device_id: int) -> None:
-        self.events.append(("set_device", device_id))
-
-    def finalize(self) -> None:
-        self.events.append(("finalize",))
-
-    def mem_alloc(self, nbytes: int) -> int:
-        ptr = self._allocate(nbytes)
-        self.events.append(("alloc", ptr, nbytes))
-        return ptr
-
-    def mem_free(self, ptr: int) -> None:
-        self.events.append(("free", ptr))
-        del self._memory[ptr]
-
-    def window_register(self, comm: int, ptr: int, nbytes: int) -> int:
-        self.events.append(("window_register", ptr, nbytes))
-        return ptr + 1
-
-    def window_deregister(self, comm: int, window: int) -> None:
-        self.events.append(("window_deregister", window))
-
-    def memcpy_dtod_async(
-        self, dst_ptr: int, src_ptr: int, nbytes: int, stream: int
-    ) -> None:
-        self.events.append(("copy_async", dst_ptr, src_ptr, nbytes, stream))
-        if dst_ptr in self.live_ptrs:
-            self.live_copy_calls += 1
-            if self.live_copy_calls == self.fail_live_copy_at:
-                raise RuntimeError("injected live-copy failure")
-        src, src_offset = self._find(src_ptr, nbytes)
-        dst, dst_offset = self._find(dst_ptr, nbytes)
-        dst[dst_offset : dst_offset + nbytes] = src[src_offset : src_offset + nbytes]
-
-    def stream_synchronize(self, stream: int) -> None:
-        self.events.append(("stream_synchronize", stream))
-        if self.fail_stream_sync:
+    def synchronize(self) -> None:
+        self.events.append(("stream_sync",))
+        if self.fail_sync:
             raise RuntimeError("injected stream-sync failure")
 
-    def comm_get_async_error(self, comm: int) -> int:
-        return binding.ncclSuccess
 
-    def reshard(self, comm, window, src, dst, stream=0) -> None:
-        call = self.reshard_calls
-        self.reshard_calls += 1
-        self.events.append(("reshard", call, stream))
-        if call == self.fail_reshard_at:
+class FakeCuda:
+    def __init__(self, events: list[tuple]) -> None:
+        self.events = events
+
+    def set_device(self, device: int) -> None:
+        self.events.append(("set_device", device))
+
+    def stream(self, stream: FakeStream):
+        self.events.append(("stream_context", stream.name))
+        return nullcontext()
+
+
+class FakeComm:
+    def __init__(self, events: list[tuple]) -> None:
+        self.events = events
+
+    def get_async_error(self) -> int:
+        return 0
+
+    def finalize(self) -> None:
+        self.events.append(("comm_finalize",))
+
+    def destroy(self) -> None:
+        self.events.append(("comm_destroy",))
+
+
+@dataclass(frozen=True)
+class FakeConfig:
+    max_cta: int | None = None
+
+
+@dataclass(frozen=True)
+class FakeMesh:
+    dims: tuple[int, int]
+    start_rank: int = 0
+
+
+@dataclass(frozen=True)
+class FakeShard:
+    dim: int
+
+
+@dataclass(frozen=True)
+class FakeReplicate:
+    pass
+
+
+class FakeHandle:
+    def __init__(self, events: list[tuple]) -> None:
+        self.events = events
+
+    def destroy(self) -> None:
+        self.events.append(("handle_destroy",))
+
+
+class FakeM2n:
+    Config = FakeConfig
+    Mesh = FakeMesh
+    Shard = FakeShard
+    Replicate = FakeReplicate
+
+    def __init__(
+        self,
+        events: list[tuple],
+        payloads: list[torch.Tensor],
+        *,
+        fail_reshard_at: int | None = None,
+    ) -> None:
+        self.events = events
+        self.payloads = payloads
+        self.fail_reshard_at = fail_reshard_at
+        self.calls: list[dict] = []
+        self.handle = FakeHandle(events)
+
+    def init(self, config: FakeConfig) -> FakeHandle:
+        self.events.append(("m2n_init", config.max_cta))
+        return self.handle
+
+    def reshard(self, **kwargs) -> None:
+        index = len(self.calls)
+        self.calls.append(kwargs)
+        self.events.append(("reshard", index, kwargs["stream"]))
+        if index == self.fail_reshard_at:
             raise RuntimeError("injected reshard failure")
-        if dst.dataPtr:
-            payload = self.payloads[call]
-            buf, offset = self._find(dst.dataPtr, len(payload))
-            buf[offset : offset + len(payload)] = payload
-
-    def comm_destroy(self, comm: int) -> None:
-        self.events.append(("comm_destroy", comm))
+        if kwargs["dst"] is not None:
+            kwargs["dst"].copy_(self.payloads[index])
 
 
-def _executor(
-    fake: FakeM2N, *, rank: int = 1, stream: int = 0
-) -> NcclM2nExecutor:
-    return NcclM2nExecutor(
-        fake,
-        comm=7,
-        rank=rank,
-        tp_src=1,
-        tp_dst=1,
-        device_id=0,
+class FakeNccl:
+    def get_version(self) -> str:
+        return "2.30.5"
+
+
+def make_executor(
+    payloads: list[torch.Tensor],
+    *,
+    rank: int = 1,
+    fail_reshard_at: int | None = None,
+    fail_stream_sync: bool = False,
+):
+    events: list[tuple] = []
+    m2n = FakeM2n(events, payloads, fail_reshard_at=fail_reshard_at)
+    runtime = _M2nRuntime(
+        0,
+        _m2n_module=m2n,
+        _nccl_module=FakeNccl(),
+        _torch_module=SimpleNamespace(cuda=FakeCuda(events)),
+        _enforce_singleton=False,
+    )
+    stream = FakeStream(events, fail_sync=fail_stream_sync)
+    lane = runtime.register_lane(
+        lane_id="weights",
+        key=(0, 0),
+        communicator=FakeComm(events),
+        nranks=2,
+        comm_rank=rank,
         stream=stream,
     )
+    executor = NcclM2nExecutor(runtime, lane, tp_src=1, tp_dst=1)
+    return executor, runtime, lane, m2n, events
 
 
-def _params(fake: FakeM2N) -> tuple[list[ReshardParam], list[int]]:
-    old_values = [b"old0", b"old"]
-    ptrs = [fake.allocate_live(value) for value in old_values]
-    params = [
+def make_params() -> list[ReshardParam]:
+    return [
         ReshardParam(
-            name=f"p{index}",
-            global_shape=(len(value),),
-            ndims=1,
+            name="p0",
+            global_shape=(4,),
             shard_dim=REPLICATE,
-            dtype_nccl=binding.ncclUint8,
-            local_ptr=ptr,
-            local_nbytes=len(value),
-        )
-        for index, (ptr, value) in enumerate(zip(ptrs, old_values, strict=True))
+            local_tensor=torch.tensor([1, 2, 3, 4], dtype=torch.uint8),
+        ),
+        ReshardParam(
+            name="p1",
+            global_shape=(3,),
+            shard_dim=REPLICATE,
+            local_tensor=torch.tensor([5, 6, 7], dtype=torch.uint8),
+        ),
     ]
-    return params, ptrs
 
 
 def test_destination_commits_only_after_complete_version_is_staged():
-    fake = FakeM2N([b"new0", b"new"])
-    params, _ = _params(fake)
-    executor = _executor(fake)
+    payloads = [
+        torch.tensor([10, 11, 12, 13], dtype=torch.uint8),
+        torch.tensor([20, 21, 22], dtype=torch.uint8),
+    ]
+    executor, runtime, _, m2n, events = make_executor(payloads)
+    params = make_params()
+    original_copy = executor._copy_into_live
 
-    executor.execute(params, window_bytes=4)
+    def logged_copy(param, staged) -> None:
+        events.append(("live_copy", param.name))
+        original_copy(param, staged)
 
-    assert [
-        fake.read(param.local_ptr, param.local_nbytes) for param in params
-    ] == [b"new0", b"new"]
-    second_reshard = max(i for i, event in enumerate(fake.events) if event[0] == "reshard")
-    first_live_copy = min(
-        i
-        for i, event in enumerate(fake.events)
-        if event[0] == "copy_async" and event[1] in fake.live_ptrs
-    )
+    executor._copy_into_live = logged_copy
+    total_bytes, _ = executor.execute(params)
+
+    assert total_bytes == 7
+    assert torch.equal(params[0].local_tensor, payloads[0])
+    assert torch.equal(params[1].local_tensor, payloads[1])
+    second_reshard = max(i for i, event in enumerate(events) if event[0] == "reshard")
+    first_live_copy = min(i for i, event in enumerate(events) if event[0] == "live_copy")
     assert second_reshard < first_live_copy
-    pipeline = [
-        event
-        for event in fake.events
-        if event[0] in ("copy_async", "reshard", "stream_synchronize")
-    ]
-    assert [event[0] for event in pipeline] == [
-        "reshard",
-        "copy_async",
-        "reshard",
-        "copy_async",
-        "stream_synchronize",
-        "copy_async",
-        "copy_async",
-        "stream_synchronize",
-    ]
-    assert all(event[-1] == 0 for event in pipeline)
+    assert all(call["handle"] is runtime.handle for call in m2n.calls)
+    assert all("window" not in call for call in m2n.calls)
+    executor.teardown()
+    runtime.close()
 
 
-def test_reshard_failure_leaves_complete_live_version_unchanged():
-    fake = FakeM2N([b"new0", b"new"], fail_reshard_at=1)
-    params, _ = _params(fake)
-    executor = _executor(fake)
+def test_reshard_failure_leaves_live_version_unchanged_and_poisons_lane():
+    payloads = [
+        torch.tensor([10, 11, 12, 13], dtype=torch.uint8),
+        torch.tensor([20, 21, 22], dtype=torch.uint8),
+    ]
+    executor, runtime, _, m2n, _ = make_executor(payloads, fail_reshard_at=1)
+    params = make_params()
+    originals = [param.local_tensor.clone() for param in params]
 
     with pytest.raises(RuntimeError, match="injected reshard failure"):
-        executor.execute(params, window_bytes=4)
+        executor.execute(params)
 
-    assert [
-        fake.read(param.local_ptr, param.local_nbytes) for param in params
-    ] == [b"old0", b"old"]
-    assert fake.live_copy_calls == 0
-    stream_sync = max(
-        i for i, event in enumerate(fake.events) if event[0] == "stream_synchronize"
+    assert all(
+        torch.equal(param.local_tensor, original)
+        for param, original in zip(params, originals, strict=True)
     )
-    window_release = min(
-        i for i, event in enumerate(fake.events) if event[0] == "window_deregister"
-    )
-    assert stream_sync < window_release
+    with pytest.raises(RuntimeError, match="poisoned"):
+        executor.execute(params)
+    assert len(m2n.calls) == 2
+    runtime.close()
 
 
 def test_commit_failure_poison_executor_until_reinitialized():
-    fake = FakeM2N([b"new0", b"new"], fail_live_copy_at=2)
-    params, _ = _params(fake)
-    executor = _executor(fake)
+    payloads = [
+        torch.tensor([10, 11, 12, 13], dtype=torch.uint8),
+        torch.tensor([20, 21, 22], dtype=torch.uint8),
+    ]
+    executor, runtime, _, m2n, _ = make_executor(payloads)
+    params = make_params()
+    copies = 0
+    original_copy = executor._copy_into_live
 
+    def fail_second_copy(param, staged) -> None:
+        nonlocal copies
+        copies += 1
+        if copies == 2:
+            raise RuntimeError("injected live-copy failure")
+        original_copy(param, staged)
+
+    executor._copy_into_live = fail_second_copy
     with pytest.raises(RuntimeError, match="serving must remain stopped"):
-        executor.execute(params, window_bytes=4)
+        executor.execute(params)
 
-    reshard_calls = fake.reshard_calls
+    calls = len(m2n.calls)
     with pytest.raises(RuntimeError, match="unusable after a failed model commit"):
-        executor.execute(params, window_bytes=4)
-    assert fake.reshard_calls == reshard_calls
+        executor.execute(params)
+    assert len(m2n.calls) == calls
+    runtime.close()
 
 
-def test_default_stream_token_orders_source_pipeline():
-    fake = FakeM2N([])
-    params, _ = _params(fake)
-    executor = _executor(fake, rank=0)
+def test_source_passes_live_tensors_on_one_explicit_lane_stream():
+    executor, runtime, lane, m2n, _ = make_executor([], rank=0)
+    params = make_params()
 
-    executor.execute(params, window_bytes=4)
+    executor.execute(params)
 
-    pipeline = [
-        event
-        for event in fake.events
-        if event[0] in ("copy_async", "reshard", "stream_synchronize")
-    ]
-    assert [event[0] for event in pipeline] == [
-        "copy_async",
-        "reshard",
-        "copy_async",
-        "reshard",
-        "stream_synchronize",
-    ]
-    assert all(event[-1] == 0 for event in pipeline)
-
+    assert all(
+        call["src"] is param.local_tensor
+        for call, param in zip(m2n.calls, params, strict=True)
+    )
+    assert all(call["dst"] is None for call in m2n.calls)
+    assert all(call["stream"] is lane.stream for call in m2n.calls)
     executor.teardown()
+    runtime.close()
 
 
-def test_caller_explicit_stream_is_used():
-    fake = FakeM2N([])
-    params, _ = _params(fake)
-    caller_stream = 0xBEEF
-    executor = _executor(fake, rank=0, stream=caller_stream)
-
-    executor.execute(params, window_bytes=4)
-    executor.teardown()
-
-    pipeline = [
-        event
-        for event in fake.events
-        if event[0] in ("copy_async", "reshard", "stream_synchronize")
+def test_failed_stream_drain_retains_staging_and_disables_lane():
+    payloads = [
+        torch.tensor([10, 11, 12, 13], dtype=torch.uint8),
+        torch.tensor([20, 21, 22], dtype=torch.uint8),
     ]
-    assert all(event[-1] == caller_stream for event in pipeline)
-    assert [event for event in fake.events if event[0] == "set_device"] == [
-        ("set_device", 0),
-        ("set_device", 0),
-        ("set_device", 0),
-    ]
-
-
-def test_failed_stream_drain_retains_in_flight_resources_and_disables_executor():
-    fake = FakeM2N([b"new0", b"new"], fail_stream_sync=True)
-    params, _ = _params(fake)
-    executor = _executor(fake)
+    executor, _, _, _, _ = make_executor(payloads, fail_stream_sync=True)
+    params = make_params()
 
     with pytest.raises(RuntimeError, match="injected stream-sync failure"):
-        executor.execute(params, window_bytes=4)
-
-    assert not any(event[0] == "window_deregister" for event in fake.events)
-    assert not any(event[0] == "free" for event in fake.events)
+        executor.execute(params)
+    assert executor._staged
     with pytest.raises(RuntimeError, match="stream could not be drained"):
-        executor.execute(params, window_bytes=4)
+        executor.execute(params)

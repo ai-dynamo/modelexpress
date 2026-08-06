@@ -52,6 +52,11 @@ otel = [
 metrics = [
     "prometheus-client>=0.20.0",
 ]
+# Current NCCL M2N Python API. Production builds should use an immutable wheel
+# built from validated nccl-extensions revision 28b27f1d.
+nccl-m2n = [
+    "nccl-extensions==0.1.0",
+]
 # Required for the VmmArena allocator (CudaVmmBackend uses cuMem* APIs).
 # The pure-Python VmmArena tests don't need it; CudaVmmBackend does.
 vmm = [

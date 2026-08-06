@@ -4,9 +4,8 @@
 """No-GPU tests for the nccl_m2n reshard transport's layout math.
 
 These validate the pure-math half (mesh inference + tile shapes) against a
-gather+reslice golden reference -- the same semantics verl's current
-gather-to-full + broadcast produces, which ncclReshardWithWindow must match
-byte-for-byte on GPU.  No CUDA / NCCL required.
+gather+reslice golden reference, which ``nccl.m2n.reshard`` must match
+byte-for-byte on GPU. No CUDA or NCCL required.
 """
 
 from __future__ import annotations
