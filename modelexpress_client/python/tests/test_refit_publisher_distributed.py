@@ -253,7 +253,7 @@ def test_two_source_ranks_upload_disjoint_s3_buckets_and_one_root(tmp_path):
     }
     assert results[0][0] == 3
     assert results[1][0] == 1
-    assert results[0][2]["perf/update_weights_density"] == 1.0
+    assert results[0][2]["perf/update_weights_density"] == 0.375
     assert results[0][2]["perf/update_weights_wire_bytes"] > 0
     assert (
         results[0][2]["perf/update_weights_density"]

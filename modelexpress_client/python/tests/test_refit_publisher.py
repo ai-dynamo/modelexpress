@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import io
 import json
+import threading
 
 import pytest
 import torch
@@ -143,7 +144,11 @@ def test_exact_base_update_uses_miles_hf_buckets_and_uploads_delta(tmp_path):
     publisher.wait_for_commit("1")
 
     metrics = publisher.pop_metrics()
-    assert metrics["perf/update_weights_density"] == 0.5
+    old_bytes = launch["model.b.weight"].contiguous().view(torch.uint8).numpy()
+    new_bytes = target["model.b.weight"].contiguous().view(torch.uint8).numpy()
+    changed = int(torch.from_numpy(old_bytes != new_bytes).sum())
+    total = sum(tensor.numel() * tensor.element_size() for tensor in target.values())
+    assert metrics["perf/update_weights_density"] == changed / total
     assert metrics["perf/update_weights_wire_bytes"] > 0
     assert metrics["perf/mx_encode_delta"] >= 0
     assert metrics["perf/mx_publish_time"] >= 0
@@ -167,6 +172,7 @@ def test_exact_base_update_uses_miles_hf_buckets_and_uploads_delta(tmp_path):
 def test_wrong_base_is_rejected_before_gather(tmp_path):
     publisher = make_publisher(tmp_path, FakeCatalog(), FakeS3())
     publisher.publish_version("0")
+    publisher.wait_for_commit("0")
     called = False
 
     def should_not_run(_encode):
@@ -217,3 +223,45 @@ def test_s3_failure_prevents_catalog_publication(tmp_path):
         )
 
     assert [manifest.target_version for manifest in catalog.published] == ["0"]
+    with pytest.raises(RuntimeError, match="publisher is poisoned"):
+        publisher.publish_version(
+            "1", base_version="0", gather_hf_buckets=gather(launch)
+        )
+
+
+def test_bucket_uploads_run_in_parallel(tmp_path):
+    class ConcurrentS3(FakeS3):
+        def __init__(self):
+            super().__init__()
+            self.barrier = threading.Barrier(2)
+            self.threads = set()
+
+        def put_object(self, **kwargs):
+            if kwargs["Key"].endswith(".mxcd"):
+                self.threads.add(threading.get_ident())
+                self.barrier.wait(timeout=5)
+            return super().put_object(**kwargs)
+
+    catalog = FakeCatalog()
+    s3 = ConcurrentS3()
+    hf_path, launch = checkpoint(tmp_path)
+    publisher = Publisher(
+        launch_checkpoint=hf_path,
+        bucket_bytes=8,
+        catalog=catalog,
+        s3_client=s3,
+        sleep=lambda _seconds: None,
+    )
+    publisher.initialize(PublisherConfig("model", "mx:8001", S3Config("bucket", "run")))
+    snapshot, _metadata, _format, _digest = load_hf_snapshot(hf_path)
+    publisher.capture_baseline(gather(launch), lambda name: snapshot[name])
+    publisher.publish_version("0")
+    publisher.wait_for_commit("0")
+
+    publisher.publish_version(
+        "1",
+        base_version="0",
+        gather_hf_buckets=gather({name: tensor + 1 for name, tensor in launch.items()}),
+    )
+
+    assert len(s3.threads) > 1

@@ -155,9 +155,7 @@ def encode_compressed_bucket(
     )
 
 
-def decode_bucket(
-    data: bytes, snapshot: dict[str, np.ndarray], metadata: dict[str, dict]
-) -> dict:
+def bucket_parts(data: bytes) -> tuple[dict, memoryview]:
     if not data.startswith(_BUCKET_MAGIC):
         raise ValueError("invalid canonical bucket")
     header_size = struct.unpack(
@@ -165,9 +163,21 @@ def decode_bucket(
     )[0]
     header_start = len(_BUCKET_MAGIC) + 4
     header = json.loads(data[header_start : header_start + header_size])
+    return header, memoryview(data)[header_start + header_size :]
+
+
+def parse_bucket(data: bytes) -> tuple[dict, bytes]:
+    header, compressed = bucket_parts(data)
     decoded = zstandard.ZstdDecompressor().decompress(
-        data[header_start + header_size :], max_output_size=header["decoded_size"]
+        compressed, max_output_size=header["decoded_size"]
     )
+    return header, decoded
+
+
+def decode_bucket(
+    data: bytes, snapshot: dict[str, np.ndarray], metadata: dict[str, dict]
+) -> dict:
+    header, decoded = parse_bucket(data)
     for entry in header["entries"]:
         name = entry["name"]
         start = entry["offset"]
