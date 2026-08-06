@@ -266,6 +266,61 @@ def test_sglang_adapter_post_load_prefers_top_level_hook():
     assert not model.child.post_load_called
 
 
+def test_sglang_after_rdma_receive_ignores_non_kimi_models():
+    class DeepseekV4Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.post_load_calls = 0
+            self.weight_scale_inv = nn.Parameter(torch.ones(1), requires_grad=False)
+            self._attn_res_cw_cache = {torch.float32: torch.ones(1)}
+
+        def post_load_weights(self):
+            self.post_load_calls += 1
+            self.weight_scale_inv.data = self.weight_scale_inv.data * 2
+
+    model = DeepseekV4Model()
+    scale_ptr = model.weight_scale_inv.data_ptr()
+    cache = model._attn_res_cw_cache
+    result = SimpleNamespace(model=model)
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+
+    assert adapter.after_rdma_receive(result) is result
+    assert model.post_load_calls == 0
+    assert model.weight_scale_inv.data_ptr() == scale_ptr
+    assert model._attn_res_cw_cache is cache
+
+
+def test_sglang_after_rdma_receive_refreshes_kimi_cache_in_place():
+    class KimiK3Model(nn.Module):
+        pass
+
+    KimiK3Model.__module__ = "sglang.srt.models.kimi_k3"
+    model = KimiK3Model()
+    model.layer = nn.Module()
+    proj = nn.Linear(3, 1, bias=False)
+    proj.weight = nn.Parameter(torch.tensor([[1.0, 2.0, 3.0]]))
+    norm = nn.Module()
+    norm.weight = nn.Parameter(torch.tensor([4.0, 5.0, 6.0]))
+    model.layer.self_attention_res_proj = proj
+    model.layer.self_attention_res_norm = norm
+    cache = {
+        dtype: torch.zeros(3, dtype=dtype)
+        for dtype in (torch.float32, torch.bfloat16)
+    }
+    proj._attn_res_cw_cache = cache
+    cache_ptrs = {dtype: value.data_ptr() for dtype, value in cache.items()}
+    result = SimpleNamespace(model=model)
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+
+    assert adapter.after_rdma_receive(result) is result
+    for dtype, cached in cache.items():
+        assert cached.data_ptr() == cache_ptrs[dtype]
+        torch.testing.assert_close(
+            cached,
+            torch.tensor([4.0, 10.0, 18.0], dtype=dtype),
+        )
+
+
 def _install_sglang_runai_loader_modules(monkeypatch, loader_cls, load_format):
     sglang_mod = ModuleType("sglang")
     srt_mod = ModuleType("sglang.srt")
