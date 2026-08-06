@@ -11,7 +11,7 @@ from urllib.parse import quote
 
 import torch
 
-from .api import PublishResult, PublisherConfig, PublisherStatus
+from .api import PublisherConfig
 from .catalog import GrpcRevisionCatalog
 from .manifest import RevisionManifest, RevisionState
 from .s3 import S3Uploader
@@ -65,7 +65,6 @@ class Publisher:
             self.target_digest,
         ) = load_hf_snapshot(self.launch_checkpoint)
         self.current_version = "0"
-        self.state = None
         self.distributed = (
             torch.distributed.is_available() and torch.distributed.is_initialized()
         )
@@ -82,7 +81,7 @@ class Publisher:
         *,
         base_version: str | None = None,
         gather_hf_buckets=None,
-    ) -> PublishResult:
+    ) -> None:
         if version == "0":
             if base_version is not None or self.current_version != "0":
                 raise RuntimeError("version 0 is the launch revision")
@@ -96,8 +95,7 @@ class Publisher:
                 self.catalog.publish_revision(manifest)
                 self._wait_for_commit(manifest)
             self._barrier()
-            self.state = RevisionState.COMMITTED
-            return PublishResult(self.config.model_id, "0", self.state)
+            return
 
         if base_version != self.current_version:
             raise RuntimeError(
@@ -187,15 +185,6 @@ class Publisher:
 
         self._barrier()
         self.current_version = version
-        self.state = RevisionState.COMMITTED
-        return PublishResult(self.config.model_id, version, self.state)
-
-    def status(self) -> PublisherStatus:
-        return PublisherStatus(
-            model_id=self.config.model_id,
-            current_version=self.current_version,
-            state=self.state,
-        )
 
     def deregister(self) -> None:
         if self.uploader is not None:

@@ -4,19 +4,11 @@
 """Engine-agnostic primitives for live model refit."""
 
 from .api import (
-    PreparedUpdate,
-    PublicationMode,
     PublisherConfig,
-    PublisherProtocol,
-    PublisherStatus,
-    PublishResult,
-    ReceiverConfig,
-    ReceiverProtocol,
     ReceiverRevisionState,
     ReceiverStatus,
     S3Config,
     WeightUpdateResult,
-    normalize_layer_scope,
 )
 from .catalog import GrpcRevisionCatalog, RevisionCatalog
 from .manifest import RevisionManifest, RevisionRecord, RevisionState, S3Object
@@ -34,16 +26,9 @@ from .timing import (
 __all__ = [
     "GrpcRevisionCatalog",
     "MX_REFIT_TIMING_PREFIX",
-    "PreparedUpdate",
-    "PublicationMode",
-    "PublishResult",
     "Publisher",
     "PublisherConfig",
-    "PublisherProtocol",
-    "PublisherStatus",
     "REFIT_TIMING_STAGES",
-    "ReceiverConfig",
-    "ReceiverProtocol",
     "ReceiverRevisionState",
     "ReceiverStatus",
     "RefitTimingRecorder",
@@ -56,7 +41,6 @@ __all__ = [
     "WeightUpdateResult",
     "add_refit_bytes",
     "current_refit_timing",
-    "normalize_layer_scope",
     "refit_span",
     "use_refit_timing",
 ]

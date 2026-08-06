@@ -151,9 +151,9 @@ one plain byte snapshot, computes tensor-byte XOR deltas, updates the snapshot,
 and zstd-compresses dirty buckets. The publisher uploads those bytes and the
 root through [`s3.py`](s3.py).
 
-V0 exposes only `PublicationMode.BLOCK`. The publisher waits by exact
-`GetRevision` while Miles installs the rollout cohort and calls
-`CommitRevision`. `deregister()` closes rank-zero catalog and S3 resources.
+V0 publication blocks by exact `GetRevision` while Miles installs the rollout
+cohort and calls `CommitRevision`. `deregister()` closes rank-zero catalog and
+S3 resources.
 
 > [!NOTE]
 > This implementation stops at CANONICAL publication. SGLang reconstruction and

@@ -100,7 +100,7 @@ def _run(rank, world_size, init_file, checkpoint, queue):
     queue.put(
         (
             rank,
-            publisher.status().current_version,
+            publisher.current_version,
             catalog.published if catalog is not None else [],
             s3.puts if s3 is not None else 0,
         )

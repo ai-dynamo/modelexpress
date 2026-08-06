@@ -113,9 +113,8 @@ def test_launch_zero_publishes_metadata_without_weights(tmp_path):
     s3 = FakeS3()
     publisher = make_publisher(tmp_path, catalog, s3)
 
-    result = publisher.publish_version("0")
+    publisher.publish_version("0")
 
-    assert result.state is RevisionState.COMMITTED
     manifest = catalog.published[-1]
     assert manifest.target_version == "0"
     assert manifest.base_version is None
@@ -139,12 +138,9 @@ def test_exact_base_update_uses_miles_hf_buckets_and_uploads_delta(tmp_path):
     publisher.initialize(PublisherConfig("model", "mx:8001", S3Config("bucket", "run")))
     publisher.publish_version("0")
 
-    result = publisher.publish_version(
-        "1", base_version="0", gather_hf_buckets=gather(target)
-    )
+    publisher.publish_version("1", base_version="0", gather_hf_buckets=gather(target))
 
-    assert result.state is RevisionState.COMMITTED
-    assert publisher.status().current_version == "1"
+    assert publisher.current_version == "1"
     manifest = catalog.published[-1]
     root = json.loads(s3.objects[(manifest.payload.bucket, manifest.payload.key)][0])
     assert root["base_version"] == "0"
