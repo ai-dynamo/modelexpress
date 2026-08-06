@@ -85,6 +85,52 @@ def test_digest_handles_a_strided_input():
     assert tensor_digest(strided) == tensor_digest(strided.contiguous())
 
 
+@pytest.mark.parametrize(
+    "half",
+    [
+        pytest.param(1409, id="odd_bf16_split"),
+        pytest.param(17, id="odd_small_split"),
+    ],
+)
+def test_digest_handles_a_contiguous_view_at_an_unaligned_offset(half):
+    """What a publisher actually passes, and what the strided test above does not cover.
+
+    ``narrow`` returns a view that is contiguous *and* offset, so the non-contiguous
+    branch never fires and ``.contiguous()`` would be a no-op. Every odd bf16 split
+    lands here: the gate/up narrow at an odd half, the QKV narrow at an odd row.
+    """
+    fused = torch.arange(2 * half, dtype=torch.bfloat16)
+    view = fused.narrow(0, half, half)
+
+    assert view.is_contiguous(), "precondition: the non-contiguous branch must not fire"
+    assert (view.storage_offset() * view.element_size()) % 4, "precondition: unaligned"
+
+    assert tensor_digest(view) == tensor_digest(view.clone())
+
+
+def test_a_digest_does_not_depend_on_where_the_bytes_sit():
+    """The property the rebase exists to preserve, and the reason it is a copy rather
+    than a skip to the next aligned boundary.
+
+    A publisher digests its shard at whatever offset the fused parent gives it; a
+    receiver digests the same bytes at offset 0 in its own buffer. Those two must
+    agree, which they only do if neither result depends on the offset. Skipping
+    leading bytes to reach alignment would be cheaper and would break exactly this.
+    """
+    payload = torch.arange(1409, dtype=torch.bfloat16)
+
+    at_zero = payload.clone()
+    parent = torch.zeros(3 * 1409, dtype=torch.bfloat16)
+    parent.narrow(0, 1409, 1409).copy_(payload)
+    offset_odd = parent.narrow(0, 1409, 1409)
+    parent_even = torch.zeros(3 * 1409, dtype=torch.bfloat16)
+    parent_even.narrow(0, 1408, 1409).copy_(payload)
+    offset_even = parent_even.narrow(0, 1408, 1409)
+
+    assert tensor_digest(offset_odd) == tensor_digest(at_zero)
+    assert tensor_digest(offset_even) == tensor_digest(at_zero)
+
+
 # -------------------------------------------------------------------- the region
 def test_shard_region_extracts_the_publishers_box():
     full = torch.arange(24, dtype=torch.int32).reshape(4, 6)
