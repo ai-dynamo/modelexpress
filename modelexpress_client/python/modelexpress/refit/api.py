@@ -8,9 +8,9 @@ S3 bucket configuration is explicit rather than selected through a generic
 transport interface. Encoding details live in the self-describing root index,
 not in this public configuration or the revision-catalog API.
 
-``PublicationMode`` remains publisher behavior. ``ASYNC`` may return at
-``READY``; ``BLOCK`` waits by exact-get until an external orchestrator commits
-the revision. A publisher never commits its own revision.
+``PublicationMode`` remains publisher behavior. V0 exposes only ``BLOCK``:
+the publisher waits by exact-get until Miles commits the revision. A publisher
+never commits its own revision.
 """
 
 from __future__ import annotations
@@ -27,7 +27,6 @@ class PublicationMode(Enum):
     """Publisher wait behavior; this is not a server RPC field."""
 
     BLOCK = "block"
-    ASYNC = "async"
 
 
 class ReceiverRevisionState(Enum):
@@ -152,8 +151,9 @@ class PublisherProtocol(Protocol):
         version: VersionId,
         *,
         base_version: VersionId | None = None,
+        gather_hf_buckets=None,
     ) -> PublishResult:
-        """Publish launch version 0 or one complete exact-base canonical delta."""
+        """Publish launch metadata or a delta from Miles-gathered HF buckets."""
 
     def status(self) -> PublisherStatus:
         """Return the most recently observed exact revision state."""

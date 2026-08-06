@@ -12,7 +12,7 @@ from safetensors.torch import save_file
 
 from modelexpress.refit import S3Config
 from modelexpress.refit.s3 import ImmutableS3Conflict, S3Uploader
-from modelexpress.refit.source.canonical import attest_hf_checkpoint
+from modelexpress.refit.source.canonical import load_hf_snapshot
 
 
 class FakeS3:
@@ -80,10 +80,7 @@ def test_launch_schema_orders_names_after_canonical_prefix_normalization(tmp_pat
         checkpoint,
     )
 
-    snapshot, _sources = attest_hf_checkpoint(
-        checkpoint,
-        "0",
-        maximum_tensor_bytes=16,
-    )
+    snapshot, metadata, _format_digest, _target_digest = load_hf_snapshot(checkpoint)
 
-    assert [tensor.name for tensor in snapshot.tensors] == ["0.weight", "a.weight"]
+    assert sorted(snapshot) == ["0.weight", "a.weight"]
+    assert sorted(metadata) == ["0.weight", "a.weight"]

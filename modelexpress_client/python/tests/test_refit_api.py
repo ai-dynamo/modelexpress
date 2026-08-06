@@ -73,8 +73,8 @@ def test_v0_has_no_generic_transport_recovery_or_codec_knobs():
         assert not hasattr(refit, name)
 
 
-def test_publication_modes_are_client_behavior_only():
-    assert [mode.value for mode in PublicationMode] == ["block", "async"]
+def test_publication_mode_is_block_only_client_behavior():
+    assert [mode.value for mode in PublicationMode] == ["block"]
     assert "PublicationMode" not in revision_pb2.DESCRIPTOR.enum_types_by_name
 
 

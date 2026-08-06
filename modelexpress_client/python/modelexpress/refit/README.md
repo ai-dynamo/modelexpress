@@ -18,7 +18,7 @@ SPDX-License-Identifier: Apache-2.0
 </p>
 
 > [!IMPORTANT]
-> The refit package is experimental. It contains framework-neutral resharding primitives, a NIXL transport, normalized timing, vLLM receiver/install code, and a concrete exact-base CANONICAL publisher with bounded FSDP and Megatron-Bridge sources. It does not yet provide a turnkey integration for an RL framework or a CANONICAL inference runtime, and several safety gates listed in [Implementation status](#implementation-status) remain open.
+> The refit package is experimental. Phase 2.1 contains a minimal exact-base CANONICAL publisher that consumes HF buckets gathered by Miles. It does not yet provide the CANONICAL receiver or complete RL-framework integration.
 
 ## Executive summary
 
@@ -97,7 +97,7 @@ The MX server is a directory. It stores source identity and rendezvous metadata,
 | Inference adapter | Interpret names/fusions, install parameters, refresh quantized or derived state |
 | Inference engine | Own live parameters, caches, compiled graphs, and final readiness |
 
-Fully Sharded Data Parallel (FSDP), DTensor, and Megatron integrations belong in trainer adapters; they are not hard-coded into the reshard planner. The CANONICAL publisher has explicit bounded FSDP state-dict and Megatron-Bridge sources, but no generic trainer adapter. The current NIXL rendezvous format carries shard geometry in a JSON side table because the public protobuf does not yet have typed multidimensional ownership fields.
+Fully Sharded Data Parallel (FSDP), DTensor, and Megatron gathering remain trainer-framework responsibilities. The Phase 2.1 CANONICAL publisher consumes the bounded HF buckets that Miles already produces.
 
 ### Transport and installation are separate
 
@@ -139,47 +139,27 @@ This is an adapter contract, not a complete quick start. The repository does not
 
 ### Exact-base CANONICAL publication
 
-[`Publisher`](publisher.py) is a concrete, complete-model publisher for
-`DeltaTransferMethod.CANONICAL`. It validates one cross-rank configuration and
-rank 0's exact local base during `initialize()`. Each `publish_version()` call
-names that policy-eligible base explicitly and, before capture, matches its
-model/version, format digest, and target digest against the catalog lineage. It
-then runs the same bounded capture schedule on all trainer ranks and lets rank
-0 encode and publish the canonical result. Layer-scoped publication is rejected.
+[`Publisher`](publisher.py) implements the single Miles V0 path. During
+`initialize()` every trainer rank attests the existing HF launch checkpoint as
+version `0`; rank 0 alone creates the catalog and S3 clients. A nonzero
+`publish_version(target, base_version=N)` first proves that catalog revision
+`N` is `COMMITTED` and exactly matches the one retained local base.
 
-The sources in [`source/`](source/) convert FSDP state dictionaries or
-Megatron-Bridge conversion tasks into deterministic Hugging Face canonical
-buckets. They fail closed on schema, collective schedule, tensor ordering,
-dtype, shape, capture-unit, memory-bound, or complete-coverage disagreement.
-Grouped Megatron conversion units stay atomic; no generic engine or arbitrary
-trainer-backend adapter is hidden behind this interface.
+For nonzero versions, Miles supplies the same bounded canonical HF buckets used by
+its existing disk-delta path. [`source/canonical.py`](source/canonical.py) keeps
+one plain byte snapshot, computes tensor-byte XOR deltas, updates the snapshot,
+and zstd-compresses dirty buckets. The publisher uploads those bytes and the
+root through [`s3.py`](s3.py).
 
-Rank 0 compares every canonical tensor with the exact base snapshot. Dirty
-tensors use a versioned tensor-byte XOR delta, optional zstd compression,
-deterministic framing, CRC32C checksums for physical objects, and SHA-256
-digests for the format, base, and target. The root index binds ordered bucket
-references and complete clean/dirty tensor coverage. Every CANONICAL revision
-contains exactly one rank-0 manifest entry: a dirty entry points at the verified
-immutable root, while a byte-identical target carries a clean entry with no
-transfer reference.
-
-[`transport/`](transport/) supplies create-only, verified S3 publication and a
-confined filesystem implementation for local tests. Both verify object size
-and CRC32C on publication and fetch; immutable-key conflicts fail closed. S3
-locations retain an object version when the service returns one.
-
-`PublicationMode.ASYNC` may return at `READY` and observes a later `COMMITTED`
-transition in the background. `PublicationMode.BLOCK` waits read-only for
-`COMMITTED`; cancellation stops the wait without deleting or mutating the
-immutable `READY` revision. `deregister()` cancels waits, drains active
-publication and observer work, then closes the source, transport, catalog, and
-base-store resources it owns.
+V0 exposes only `PublicationMode.BLOCK`. The publisher waits by exact
+`GetRevision` while Miles installs the rollout cohort and calls
+`CommitRevision`. `deregister()` closes rank-zero catalog and S3 resources.
 
 > [!NOTE]
-> This implementation stops at CANONICAL publication. It does not provide a
-> Phase 3 inference runtime, receiver reconstruction or installation, a generic
-> engine adapter, rank-local or GPU-shard delivery, RecoveryStore execution,
-> full-model anchors, or a full normal-delivery payload.
+> This implementation stops at CANONICAL publication. SGLang reconstruction and
+> installation and Miles commit orchestration are implemented in later phases.
+> Rank-local, direct-memory, recovery, and independent asynchronous publication
+> are outside this V0 path.
 
 ### Stable-plan assumption
 
@@ -211,11 +191,11 @@ A trainer restart, reshard, scale event, or buffer replacement requires rediscov
 | vLLM mapped direct install | Implemented as a separate opt-in installer | [`engines/vllm/refit/installer.py`](../engines/vllm/refit/installer.py) |
 | Normalized refit timing schema | Implemented | [`timing.py`](timing.py), [`test_refit_timing.py`](../../tests/test_refit_timing.py) |
 | Descriptor bound for strided slices | Implemented for gap-free dim-0 partitions | [`transfer_plan.py`](reshard/transfer_plan.py), [`test_reshard_refit_transfer.py`](../../tests/test_reshard_refit_transfer.py) |
-| Concrete CANONICAL publisher lifecycle | Implemented for BLOCK and ASYNC publication, cancellation, drain, and owned-resource closure | [`publisher.py`](publisher.py), [`test_refit_publisher.py`](../../tests/test_refit_publisher.py) |
-| Bounded HF canonical sources | Implemented for FSDP state dictionaries and Megatron-Bridge conversion tasks | [`source/fsdp.py`](source/fsdp.py), [`source/megatron_bridge.py`](source/megatron_bridge.py), [`test_refit_canonical_sources.py`](../../tests/test_refit_canonical_sources.py) |
-| Exact-base canonical delta and framing | Implemented with deterministic complete coverage, tensor-byte XOR, optional zstd, CRC32C, and SHA-256 attestations | [`source/canonical.py`](source/canonical.py), [`codec/`](codec/), [`test_refit_canonical_codec.py`](../../tests/test_refit_canonical_codec.py) |
-| Verified immutable object publication | Implemented for S3 and local-test filesystem transports | [`transport/`](transport/), [`test_refit_canonical_transport.py`](../../tests/test_refit_canonical_transport.py) |
-| CANONICAL root manifest | Implemented as exactly one rank-0 entry pointing to the verified immutable root for dirty revisions | [`publisher.py`](publisher.py), [`test_refit_publisher.py`](../../tests/test_refit_publisher.py) |
+| Concrete CANONICAL publisher lifecycle | Implemented for BLOCK publication and external Miles commit | [`publisher.py`](publisher.py), [`test_refit_publisher.py`](../../tests/test_refit_publisher.py) |
+| Miles HF bucket input | Implemented by calling the gather callback supplied by Miles | [`publisher.py`](publisher.py), [`test_refit_publisher.py`](../../tests/test_refit_publisher.py) |
+| Exact-base canonical delta encoding | Implemented with one plain byte snapshot and fixed XOR+zstd | [`source/canonical.py`](source/canonical.py), [`test_refit_publisher.py`](../../tests/test_refit_publisher.py) |
+| Verified immutable payload publication | Implemented directly in the publisher through the S3 uploader | [`publisher.py`](publisher.py), [`s3.py`](s3.py), [`test_refit_s3_payload.py`](../../tests/test_refit_s3_payload.py) |
+| CANONICAL root index | Implemented directly in the publisher as the manifest's S3 payload | [`publisher.py`](publisher.py), [`test_refit_publisher.py`](../../tests/test_refit_publisher.py) |
 
 “Implemented” means the code and focused tests are present. It does not by itself mean a framework/model/topology combination has passed distributed end-to-end validation.
 
@@ -232,7 +212,7 @@ A trainer restart, reshard, scale event, or buffer replacement requires rediscov
 | Parameter digest verification in a live receiver | CANONICAL publication emits verified physical checksums and semantic target digests, but no Phase 3 receiver consumes and verifies them at an engine mutation boundary yet. |
 | Inference-to-inference fan-out | Rollout workers do not republish installed refit buffers through this package. |
 | General engine support | The shared core is engine-neutral, but only a vLLM receiver adapter is present. |
-| General trainer support | Explicit bounded FSDP state-dict and Megatron-Bridge CANONICAL sources are present. Arbitrary backends, a generic adapter, and turnkey RL-framework lifecycle wiring are not. |
+| General trainer support | Miles owns trainer gathering and HF conversion for the V0 publisher path. |
 | Transport-neutral receiver | A transport protocol exists for planning tests, but `ReshardReceiver` setup and handshake are currently NIXL-bound. |
 | CANONICAL receiver and recovery execution | Phase 2.1 publishes CANONICAL revisions only. Runtime reconstruction/installation and RecoveryStore execution are not implemented here. |
 
@@ -346,10 +326,9 @@ Performance claims must identify the exact implementation path. Reference transp
 
 | Path | Role |
 |---|---|
-| [`publisher.py`](publisher.py) | Concrete exact-base CANONICAL publication lifecycle |
-| [`source/`](source/) | Bounded FSDP and Megatron-Bridge Hugging Face canonical capture |
-| [`codec/`](codec/) | Versioned tensor-byte delta, compression, checksum, and digest primitives |
-| [`transport/`](transport/) | Verified immutable S3 and local-test filesystem object transports |
+| [`publisher.py`](publisher.py) | BLOCK-only exact-base CANONICAL publication lifecycle |
+| [`source/canonical.py`](source/canonical.py) | Launch snapshot and XOR+zstd encoding of Miles-gathered HF buckets |
+| [`s3.py`](s3.py) | Direct immutable S3 publication with CRC32C and readback verification |
 | [`timing.py`](timing.py) | Normalized timing stages and context propagation |
 | [`reshard/geometry.py`](reshard/geometry.py) | Record the engine loader's source views and destination writes |
 | [`reshard/slice_plan.py`](reshard/slice_plan.py) | Resolve views, intersect shard boxes, emit contiguous runs |
