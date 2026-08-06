@@ -288,6 +288,7 @@ def test_sglang_after_rdma_receive_ignores_non_kimi_models():
     assert model.post_load_calls == 0
     assert model.weight_scale_inv.data_ptr() == scale_ptr
     assert model._attn_res_cw_cache is cache
+    assert torch.equal(cache[torch.float32], torch.ones(1))
 
 
 def test_sglang_after_rdma_receive_refreshes_kimi_cache_in_place():
