@@ -744,7 +744,13 @@ class ReshardReceiver:
             # inflates accounted_s, and because the phased implied rate divides the
             # bytes by the summed wire stages, it drags that rate down and makes the
             # throughput ceiling less likely to catch a run that deserves it.
-            if self._plan.exact_descriptor_count:
+            #
+            # Gated on segments, not exact_descriptor_count. The latter is the
+            # pre-bounding baseline that descriptor_savings() subtracts from, and it
+            # counts every copy including the ones that became full pulls or
+            # converts, so a bounded plan can carry a nonzero count with nothing
+            # left to issue. exact_descriptors() reads segments and nothing else.
+            if self._plan.segments:
                 _t = time.perf_counter()
                 stats = execute_transfer(
                     self._plan,

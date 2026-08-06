@@ -210,3 +210,28 @@ def test_a_rate_under_the_ceiling_still_installs(monkeypatch):
 
     assert harness._install_order == ["install"]
     assert keepalive is not None
+
+
+def test_a_bounded_plan_still_reaches_the_guard(monkeypatch):
+    """A bounded plan - zero segments, nonzero ``exact_descriptor_count`` - is the
+    shape that skips the exact phase entirely, and it must still be checked.
+
+    This pins reachability, not the padding effect. The phased rate divides bytes by
+    the summed wire stages, so a ``wire_exact_s`` recorded for a phase that issued
+    nothing does inflate the denominator, but in this rig that span is microseconds
+    against a ceiling set low enough to breach regardless. The padding is asserted
+    where it is observable, on the stage record itself.
+    """
+    monkeypatch.setenv("MX_RESHARD_FUSED_WIRE", "0")
+    monkeypatch.setenv("MX_RESHARD_MAX_GBPS", "0.000001")
+    monkeypatch.delenv("MX_REFIT_STAGE_RECORD", raising=False)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+    harness, keepalive = _build(_RecordingTransport())
+    harness._plan.segments = []
+
+    assert harness._plan.exact_descriptor_count, "precondition: a bounded plan"
+    with pytest.raises(RuntimeError, match="failed, not fast"):
+        harness.update_weights(step=1)
+
+    assert harness._install_order == []
+    assert keepalive is not None
