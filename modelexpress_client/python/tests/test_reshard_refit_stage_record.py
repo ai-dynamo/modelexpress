@@ -228,13 +228,18 @@ def test_an_exact_phase_that_moved_nothing_is_not_timed(monkeypatch, caplog):
     monkeypatch.delenv("MX_RESHARD_MAX_GBPS", raising=False)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
     harness, keepalive = _build(_RecordingTransport())
+    # A bounded plan, which is the only way a real plan reaches zero segments:
+    # plan_transfer counts every copy into exact_descriptor_count and then moves the
+    # ones it had to bound into full_pulls, so the count stays nonzero with nothing
+    # left to issue. Zeroing it here would describe a plan plan_transfer cannot
+    # produce, and would hide a guard that reads the count instead of the segments.
     harness._plan.segments = []
-    harness._plan.exact_descriptor_count = 0
 
     with caplog.at_level(logging.WARNING):
         harness.update_weights(step=1)
 
     record = _record(caplog)
+    assert harness._plan.exact_descriptor_count, "precondition: a bounded plan"
     assert "wire_exact_s" not in record
     assert "wire_full_s" in record
     assert all(t.data_ptr() for t in keepalive)
