@@ -69,14 +69,28 @@ def tensor_digest(tensor) -> str:
     while the reduction itself stays one cheap kernel over the full tensor.
 
     The tensor is made contiguous first, since a strided view has no meaningful byte
-    order to digest. Returns a hex string so it can ride in JSON alongside the shard
-    table.
+    order to digest, and is rebased to a word-aligned start. Returns a hex string so it
+    can ride in JSON alongside the shard table.
     """
     import torch
 
     flat = tensor.detach().reshape(-1)
     if not flat.is_contiguous():
         flat = flat.contiguous()
+    elif (flat.storage_offset() * flat.element_size()) % 4:
+        # What a publisher actually passes. ``narrow`` returns a view that is
+        # contiguous *and* offset, so the branch above never fires, and
+        # ``.contiguous()`` would return self anyway - only a copy rebases the start.
+        # Without this the int32 view below raises on any shard whose byte offset is
+        # not a multiple of 4, which is every odd bf16 split: the gate/up narrow at an
+        # odd half, the QKV narrow at an odd row.
+        #
+        # Rebasing rather than skipping the leading bytes to reach an aligned
+        # boundary, which would be cheaper and wrong: the digest has to be a function
+        # of the shard's contents alone. A publisher digesting at offset 2818 and a
+        # receiver digesting the same bytes at offset 0 must agree, and they only do
+        # if neither one's result depends on where the bytes happen to sit.
+        flat = flat.clone()
     raw = flat.view(torch.uint8)
     n = int(raw.numel())
 
