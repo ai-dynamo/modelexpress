@@ -171,7 +171,7 @@ ModelExpress/
 │       │       ├── adapter.py          # SglangAdapter and context builder
 │       │       └── loader.py           # MxModelLoader for remote_instance backend
 │       ├── tensor_utils.py             # Tensor collection, checksums, storage views
-│       ├── transfer_safety.py          # MLA feature gate, TransferFingerprint
+│       ├── transfer_safety.py          # Model feature detection for the P2P gate
 │       ├── rank_utils.py               # Rank detection utilities
 │       ├── vllm_worker.py              # Compatibility worker for older manual registration
 │       ├── types.py                    # TensorDescriptor, WorkerMetadata dataclasses
