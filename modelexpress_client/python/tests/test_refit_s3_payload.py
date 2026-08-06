@@ -4,15 +4,21 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 
 import pytest
 import torch
+import zstandard
 from safetensors.torch import save_file
 
 from modelexpress.refit import S3Config
 from modelexpress.refit.s3 import ImmutableS3Conflict, S3Uploader
-from modelexpress.refit.source.canonical import load_hf_snapshot
+from modelexpress.refit.source.canonical import (
+    decode_bucket,
+    encode_compressed_bucket,
+    load_hf_snapshot,
+)
 
 
 class FakeS3:
@@ -90,3 +96,38 @@ def test_launch_schema_orders_names_after_canonical_prefix_normalization(tmp_pat
 
     assert sorted(snapshot) == ["0.weight", "a.weight"]
     assert sorted(metadata) == ["0.weight", "a.weight"]
+
+
+def test_pack_source_rank_compressed_delta_into_canonical_bucket(tmp_path):
+    checkpoint = tmp_path / "model.safetensors"
+    launch = torch.arange(4, dtype=torch.float32)
+    save_file({"model.weight": launch}, checkpoint)
+    snapshot, metadata, format_digest, base_digest = load_hf_snapshot(checkpoint)
+    target = launch + 1
+    old = snapshot["model.weight"].tobytes()
+    new = target.contiguous().view(torch.uint8).numpy().tobytes()
+    delta = bytes(left ^ right for left, right in zip(old, new, strict=True))
+    metadata["model.weight"]["target_digest"] = (
+        f"sha256:{hashlib.sha256(new).hexdigest()}"
+    )
+
+    encoded, decoded_size, names = encode_compressed_bucket(
+        model_id="model",
+        base_version="0",
+        target_version="1",
+        base_digest=base_digest,
+        format_digest=format_digest,
+        ordinal=3,
+        names=["model.weight"],
+        compressed_deltas={
+            "model.weight": zstandard.ZstdCompressor(level=1).compress(delta)
+        },
+        metadata=metadata,
+    )
+
+    restored, restored_metadata, _format, _digest = load_hf_snapshot(checkpoint)
+    header = decode_bucket(encoded, restored, restored_metadata)
+    assert header["ordinal"] == 3
+    assert decoded_size == len(delta)
+    assert names == ("model.weight",)
+    assert restored["model.weight"].tobytes() == new

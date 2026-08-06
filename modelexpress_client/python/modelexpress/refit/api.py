@@ -53,6 +53,7 @@ class ReceiverStatus:
     receiver_id: str
     model_id: ModelId
     installed_version: VersionId | None = None
+    target_digest: str | None = None
     state: ReceiverRevisionState | None = None
     detail: str = ""
 

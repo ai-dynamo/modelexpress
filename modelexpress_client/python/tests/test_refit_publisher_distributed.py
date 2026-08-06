@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import io
+import json
 import multiprocessing
 from datetime import timedelta
 
+import numpy as np
 import pytest
 import torch
 from safetensors.torch import save_file
@@ -18,6 +20,7 @@ from modelexpress.refit import (
     RevisionState,
     S3Config,
 )
+from modelexpress.refit.source.canonical import load_hf_snapshot
 
 
 class Catalog:
@@ -52,17 +55,22 @@ class S3:
         self.objects[key] = (bytes(kwargs["Body"]), kwargs["ChecksumCRC32C"])
         return {"VersionId": f"version-{self.puts}"}
 
-    def head_object(self, **kwargs):
-        data, checksum = self.objects[(kwargs["Bucket"], kwargs["Key"])]
-        return {
-            "ContentLength": len(data),
-            "ChecksumCRC32C": checksum,
-            "VersionId": f"version-{self.puts}",
-        }
-
     def get_object(self, **kwargs):
         data, _checksum = self.objects[(kwargs["Bucket"], kwargs["Key"])]
         return {"Body": io.BytesIO(data), "VersionId": f"version-{self.puts}"}
+
+
+def _contains_model_bytes(value):
+    if isinstance(value, (bytes, bytearray, memoryview, np.ndarray, torch.Tensor)):
+        return True
+    if isinstance(value, dict):
+        return any(
+            _contains_model_bytes(key) or _contains_model_bytes(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_model_bytes(item) for item in value)
+    return False
 
 
 def _run(rank, world_size, init_file, checkpoint, queue):
@@ -71,53 +79,72 @@ def _run(rank, world_size, init_file, checkpoint, queue):
         init_method=f"file://{init_file}",
         rank=rank,
         world_size=world_size,
-        timeout=timedelta(seconds=20),
+        timeout=timedelta(seconds=30),
     )
-    torch.distributed.broadcast_object_list = lambda *_args, **_kwargs: (
-        _ for _ in ()
-    ).throw(AssertionError("publisher must not broadcast objects"))
+    gather_object = torch.distributed.all_gather_object
+
+    def gather_metadata(output, value, group=None):
+        if _contains_model_bytes(value):
+            raise AssertionError("model bytes must not cross all_gather_object")
+        return gather_object(output, value, group=group)
+
+    torch.distributed.all_gather_object = gather_metadata
     catalog = Catalog() if rank == 0 else None
-    s3 = S3() if rank == 0 else None
+    s3 = S3()
     publisher = Publisher(
         launch_checkpoint=checkpoint,
-        bucket_bytes=64,
+        bucket_bytes=16,
         catalog=catalog,
         s3_client=s3,
         sleep=lambda _seconds: None,
     )
     publisher.initialize(PublisherConfig("model", "mx:8001", S3Config("bucket")))
     publisher.publish_version("0")
+    publisher.wait_for_commit("0")
 
-    target = {
-        "model.a.weight": torch.arange(4, dtype=torch.float32).reshape(2, 2) + 1,
-        "model.b.weight": torch.ones((2, 2), dtype=torch.float32) + 1,
+    launch, _metadata, _format, _digest = load_hf_snapshot(checkpoint)
+    local_names = (
+        ("duplicate", "model.a.weight")
+        if rank == 0
+        else ("duplicate", "model.b.weight")
+    )
+    baseline = {
+        name: torch.from_numpy(launch[name].copy()).view(torch.float32).reshape(2, 2)
+        for name in local_names
     }
 
-    def gather(encode_bucket):
-        encode_bucket(list(target.items()), None)
+    def gather(weights):
+        def run(consume):
+            consume(list(weights.items()), None)
 
-    publisher.publish_version("1", base_version="0", gather_hf_buckets=gather)
-    queue.put(
-        (
-            rank,
-            publisher.current_version,
-            catalog.published if catalog is not None else [],
-            s3.puts if s3 is not None else 0,
+        return run
+
+    publisher.capture_baseline(gather(baseline), lambda name: launch[name])
+    target = {name: tensor + 1 for name, tensor in baseline.items()}
+    publisher.publish_version("1", base_version="0", gather_hf_buckets=gather(target))
+    publisher.wait_for_commit("1")
+
+    root = None
+    if rank == 0:
+        manifest = catalog.records[("model", "1")].manifest
+        root = json.loads(
+            s3.objects[(manifest.payload.bucket, manifest.payload.key)][0]
         )
-    )
+    queue.put((rank, s3.puts, root))
     torch.distributed.destroy_process_group()
 
 
 @pytest.mark.skipif(
     not torch.distributed.is_available(), reason="torch.distributed is unavailable"
 )
-def test_two_rank_publisher_uses_miles_buckets_without_object_broadcast(tmp_path):
+def test_two_source_ranks_upload_disjoint_s3_buckets_and_one_root(tmp_path):
     checkpoint = tmp_path / "hf"
     checkpoint.mkdir()
     save_file(
         {
+            "duplicate": torch.ones((2, 2), dtype=torch.float32),
             "model.a.weight": torch.arange(4, dtype=torch.float32).reshape(2, 2),
-            "model.b.weight": torch.ones((2, 2), dtype=torch.float32),
+            "model.b.weight": torch.ones((2, 2), dtype=torch.float32) * 2,
         },
         checkpoint / "model.safetensors",
     )
@@ -134,9 +161,19 @@ def test_two_rank_publisher_uses_miles_buckets_without_object_broadcast(tmp_path
     for process in processes:
         process.start()
     for process in processes:
-        process.join(30)
+        process.join(60)
         assert process.exitcode == 0
 
-    results = sorted(queue.get(timeout=5) for _ in processes)
-    assert results[0][1:] == ("1", ["0", "1"], 2)
-    assert results[1][1:] == ("1", [], 0)
+    results = {
+        rank: (puts, root) for rank, puts, root in [queue.get() for _ in processes]
+    }
+    assert results[0][0] == 3
+    assert results[1][0] == 1
+    root = results[0][1]
+    assert [bucket["ordinal"] for bucket in root["buckets"]] == [0, 1, 2]
+    assert [tensor["name"] for tensor in root["tensors"]] == [
+        "duplicate",
+        "model.a.weight",
+        "model.b.weight",
+    ]
+    assert sum("duplicate" in bucket["tensors"] for bucket in root["buckets"]) == 1

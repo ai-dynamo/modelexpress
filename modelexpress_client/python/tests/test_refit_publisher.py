@@ -17,11 +17,7 @@ from modelexpress.refit import (
     RevisionState,
     S3Config,
 )
-from modelexpress.refit.source.canonical import (
-    CanonicalDeltaEncoder,
-    decode_bucket,
-    load_hf_snapshot,
-)
+from modelexpress.refit.source.canonical import decode_bucket, load_hf_snapshot
 
 
 class FakeCatalog:
@@ -98,6 +94,8 @@ def make_publisher(tmp_path, catalog, s3):
         sleep=lambda _seconds: None,
     )
     publisher.initialize(PublisherConfig("model", "mx:8001", S3Config("bucket", "run")))
+    snapshot, _metadata, _format, _digest = load_hf_snapshot(hf_path)
+    publisher.capture_baseline(gather(_weights), lambda name: snapshot[name])
     return publisher
 
 
@@ -136,9 +134,13 @@ def test_exact_base_update_uses_miles_hf_buckets_and_uploads_delta(tmp_path):
         sleep=lambda _seconds: None,
     )
     publisher.initialize(PublisherConfig("model", "mx:8001", S3Config("bucket", "run")))
+    snapshot, _metadata, _format, _digest = load_hf_snapshot(hf_path)
+    publisher.capture_baseline(gather(launch), lambda name: snapshot[name])
     publisher.publish_version("0")
+    publisher.wait_for_commit("0")
 
     publisher.publish_version("1", base_version="0", gather_hf_buckets=gather(target))
+    publisher.wait_for_commit("1")
 
     assert publisher.current_version == "1"
     manifest = catalog.published[-1]
@@ -154,25 +156,6 @@ def test_exact_base_update_uses_miles_hf_buckets_and_uploads_delta(tmp_path):
             snapshot[name].tobytes()
             == tensor.contiguous().view(torch.uint8).numpy().tobytes()
         )
-
-
-def test_encoder_is_a_plain_snapshot_diff(tmp_path):
-    hf_path, launch = checkpoint(tmp_path)
-    snapshot, metadata, format_digest, base_digest = load_hf_snapshot(hf_path)
-    encoder = CanonicalDeltaEncoder(
-        "model", "0", "1", snapshot, metadata, format_digest, base_digest, 64
-    )
-
-    encoded = []
-    for name in reversed(sorted(launch)):
-        item = encoder.encode_bucket(((name, launch[name] + 1),))
-        if item is not None:
-            encoded.append(item)
-    target_digest, coverage = encoder.finish()
-
-    assert [item[0] for item in encoded] == [0, 1]
-    assert [item["name"] for item in coverage] == sorted(launch)
-    assert target_digest.startswith("sha256:")
 
 
 def test_wrong_base_is_rejected_before_gather(tmp_path):
@@ -212,7 +195,10 @@ def test_s3_failure_prevents_catalog_publication(tmp_path):
         sleep=lambda _seconds: None,
     )
     publisher.initialize(PublisherConfig("model", "mx:8001", S3Config("bucket", "run")))
+    snapshot, _metadata, _format, _digest = load_hf_snapshot(hf_path)
+    publisher.capture_baseline(gather(launch), lambda name: snapshot[name])
     publisher.publish_version("0")
+    publisher.wait_for_commit("0")
     s3.fail = True
 
     with pytest.raises(Exception, match="upload failed"):

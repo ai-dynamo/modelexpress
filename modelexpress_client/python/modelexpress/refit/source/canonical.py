@@ -8,13 +8,13 @@ from __future__ import annotations
 import hashlib
 import json
 import struct
+from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
 import torch
 import zstandard
 
-CanonicalBucket = list[tuple[str, torch.Tensor]] | tuple[tuple[str, torch.Tensor], ...]
 _BUCKET_MAGIC = b"MXCDV0\0"
 _SCHEMA = "mx.canonical.delta.v0"
 
@@ -64,23 +64,73 @@ def load_hf_snapshot(
                     "target_digest": f"sha256:{hashlib.sha256(data).hexdigest()}",
                 }
 
-    ordered = [metadata[name] for name in sorted(metadata)]
-    format_digest = _digest(
+    return snapshot, metadata, format_digest(metadata), snapshot_digest(metadata)
+
+
+def format_digest(metadata: dict[str, dict]) -> str:
+    return _digest(
         [
             {
-                "name": item["name"],
-                "shape": item["shape"],
-                "dtype": item["dtype"],
-                "byte_size": item["byte_size"],
+                "name": metadata[name]["name"],
+                "shape": metadata[name]["shape"],
+                "dtype": metadata[name]["dtype"],
+                "byte_size": metadata[name]["byte_size"],
             }
-            for item in ordered
+            for name in sorted(metadata)
         ]
     )
-    return snapshot, metadata, format_digest, snapshot_digest(metadata)
 
 
 def snapshot_digest(metadata: dict[str, dict]) -> str:
     return _digest([metadata[name] for name in sorted(metadata)])
+
+
+def encode_compressed_bucket(
+    *,
+    model_id: str,
+    base_version: str,
+    target_version: str,
+    base_digest: str,
+    format_digest: str,
+    ordinal: int,
+    names: list[str],
+    compressed_deltas: Mapping[str, bytes | np.ndarray],
+    metadata: dict[str, dict],
+) -> tuple[bytes, int, tuple[str, ...]]:
+    decoded = bytearray()
+    entries = []
+    decompressor = zstandard.ZstdDecompressor()
+    for name in names:
+        item = metadata[name]
+        delta = decompressor.decompress(
+            bytes(compressed_deltas[name]), max_output_size=item["byte_size"]
+        )
+        if len(delta) != item["byte_size"]:
+            raise ValueError(f"{name} delta byte size differs from canonical metadata")
+        entries.append({**item, "offset": len(decoded)})
+        decoded.extend(delta)
+
+    header = canonical_json(
+        {
+            "base_digest": base_digest,
+            "base_version": base_version,
+            "compression": "zstd",
+            "decoded_size": len(decoded),
+            "delta": "xor",
+            "entries": entries,
+            "format_digest": format_digest,
+            "model_id": model_id,
+            "ordinal": ordinal,
+            "schema": f"{_SCHEMA}.bucket",
+            "target_version": target_version,
+        }
+    )
+    compressed = zstandard.ZstdCompressor(level=3).compress(bytes(decoded))
+    return (
+        _BUCKET_MAGIC + struct.pack(">I", len(header)) + header + compressed,
+        len(decoded),
+        tuple(names),
+    )
 
 
 def decode_bucket(
@@ -109,97 +159,3 @@ def decode_bucket(
         snapshot[name] = target
         metadata[name]["target_digest"] = digest
     return header
-
-
-class CanonicalDeltaEncoder:
-    """Diff gathered HF tensors against a mutable byte snapshot."""
-
-    def __init__(
-        self,
-        model_id: str,
-        base_version: str,
-        target_version: str,
-        snapshot: dict[str, np.ndarray],
-        metadata: dict[str, dict],
-        format_digest: str,
-        base_digest: str,
-        bucket_bytes: int,
-    ) -> None:
-        self.model_id = model_id
-        self.base_version = base_version
-        self.target_version = target_version
-        self.snapshot = snapshot
-        self.metadata = metadata
-        self.format_digest = format_digest
-        self.base_digest = base_digest
-        self.bucket_bytes = bucket_bytes
-        self.ordinal = 0
-        self.coverage = {
-            name: {**item, "state": "clean"} for name, item in metadata.items()
-        }
-
-    def encode_bucket(
-        self, bucket: CanonicalBucket
-    ) -> tuple[int, bytes, int, tuple[str, ...]] | None:
-        entries = []
-        decoded = bytearray()
-        ordinal = self.ordinal
-
-        for name, tensor in bucket:
-            name = name.removeprefix("module.")
-            old = self.snapshot[name]
-            data = _tensor_bytes(tensor)
-            new = np.frombuffer(data, dtype=np.uint8).copy()
-            if len(new) != len(old):
-                raise ValueError(f"{name} changed byte size")
-
-            delta = np.bitwise_xor(new, old)
-            digest = f"sha256:{hashlib.sha256(data).hexdigest()}"
-            self.snapshot[name] = new
-            self.metadata[name]["target_digest"] = digest
-            coverage = {**self.metadata[name], "state": "clean"}
-
-            if np.any(delta):
-                offset = len(decoded)
-                decoded.extend(delta.tobytes())
-                entries.append(
-                    {
-                        **self.metadata[name],
-                        "offset": offset,
-                        "target_digest": digest,
-                    }
-                )
-                coverage["state"] = "dirty"
-                coverage["bucket_ordinal"] = ordinal
-            self.coverage[name] = coverage
-
-        if not entries:
-            return None
-
-        header = canonical_json(
-            {
-                "base_digest": self.base_digest,
-                "base_version": self.base_version,
-                "compression": "zstd",
-                "decoded_size": len(decoded),
-                "delta": "xor",
-                "entries": entries,
-                "format_digest": self.format_digest,
-                "model_id": self.model_id,
-                "ordinal": ordinal,
-                "schema": f"{_SCHEMA}.bucket",
-                "target_version": self.target_version,
-            }
-        )
-        compressed = zstandard.ZstdCompressor(level=3).compress(bytes(decoded))
-        self.ordinal += 1
-        return (
-            ordinal,
-            _BUCKET_MAGIC + struct.pack(">I", len(header)) + header + compressed,
-            len(decoded),
-            tuple(entry["name"] for entry in entries),
-        )
-
-    def finish(self) -> tuple[str, list[dict]]:
-        coverage = [self.coverage[name] for name in sorted(self.coverage)]
-        return snapshot_digest(self.metadata), coverage
