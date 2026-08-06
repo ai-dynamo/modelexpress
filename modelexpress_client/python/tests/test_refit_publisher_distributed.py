@@ -73,6 +73,86 @@ def _contains_model_bytes(value):
     return False
 
 
+def _run_with_non_source_rank(rank, world_size, init_file, checkpoint, queue):
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    catalog = Catalog() if rank == 0 else None
+    s3 = S3()
+    publisher = Publisher(
+        launch_checkpoint=checkpoint,
+        bucket_bytes=16,
+        catalog=catalog,
+        s3_client=s3,
+        sleep=lambda _seconds: None,
+    )
+    publisher.initialize(PublisherConfig("model", "mx:8001", S3Config("bucket")))
+    publisher.publish_version("0")
+    publisher.wait_for_commit("0")
+
+    launch, _metadata, _format, _digest = load_hf_snapshot(checkpoint)
+    # Only rank 0 is a source rank, as with Miles at TP>1 or DP>1: every other rank
+    # joins the collectives but is handed no tensors at all.
+    local_names = sorted(launch) if rank == 0 else ()
+    baseline = {
+        name: torch.from_numpy(launch[name].copy()).view(torch.float32).reshape(2, 2)
+        for name in local_names
+    }
+
+    def gather(weights):
+        def run(consume):
+            consume(list(weights.items()), None)
+
+        return run
+
+    publisher.capture_baseline(gather(baseline), lambda name: launch[name])
+    target = {name: tensor + 1 for name, tensor in baseline.items()}
+    publisher.publish_version("1", base_version="0", gather_hf_buckets=gather(target))
+    publisher.wait_for_commit("1")
+    queue.put((rank, s3.puts, publisher.current_version))
+    torch.distributed.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not torch.distributed.is_available(), reason="torch.distributed is unavailable"
+)
+def test_non_source_ranks_publish_without_holding_any_tensor(tmp_path):
+    checkpoint = tmp_path / "hf"
+    checkpoint.mkdir()
+    save_file(
+        {
+            "model.a.weight": torch.arange(4, dtype=torch.float32).reshape(2, 2),
+            "model.b.weight": torch.ones((2, 2), dtype=torch.float32) * 2,
+        },
+        checkpoint / "model.safetensors",
+    )
+    context = multiprocessing.get_context("spawn")
+    queue = context.Queue()
+    init_file = tmp_path / "gloo"
+    processes = [
+        context.Process(
+            target=_run_with_non_source_rank,
+            args=(rank, 2, str(init_file), str(checkpoint), queue),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(60)
+        assert process.exitcode == 0
+
+    results = {rank: (puts, version) for rank, puts, version in [queue.get() for _ in processes]}
+    # The non-source rank uploads nothing yet still advances to the committed revision.
+    assert results[1][0] == 0
+    assert results[0][1] == "1"
+    assert results[1][1] == "1"
+
+
 def _run(rank, world_size, init_file, checkpoint, queue):
     torch.distributed.init_process_group(
         "gloo",

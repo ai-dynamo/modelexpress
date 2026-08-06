@@ -101,6 +101,7 @@ class Publisher:
         self.uploader = None
         self.snapshot = {}
         self.metadata = {}
+        self.captured = False
 
     def initialize(self, config: PublisherConfig) -> None:
         self.config = config
@@ -157,7 +158,7 @@ class Publisher:
                 f"base {base_version!r} does not match current version "
                 f"{self.current_version!r}"
             )
-        if gather_hf_buckets is None or not self.snapshot:
+        if gather_hf_buckets is None or not self.captured:
             raise RuntimeError("Miles source-rank baseline is not captured")
 
         if self.rank == 0:
@@ -215,6 +216,7 @@ class Publisher:
             raise RuntimeError(
                 "Miles source-rank baseline differs from launch revision"
             )
+        self.captured = True
 
     def wait_for_commit(self, version: str, completion=None) -> None:
         if self.pending_version != version:
