@@ -236,6 +236,9 @@ type ModelDownloadRequest struct {
 	ModelName     string                 `protobuf:"bytes,1,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
 	Provider      ModelProvider          `protobuf:"varint,2,opt,name=provider,proto3,enum=model_express.model.ModelProvider" json:"provider,omitempty"`
 	IgnoreWeights bool                   `protobuf:"varint,3,opt,name=ignore_weights,json=ignoreWeights,proto3" json:"ignore_weights,omitempty"`
+	// Optional branch, tag, or commit SHA. When unset the provider's default
+	// revision is used. Providers without a revision concept reject a set value.
+	Revision      *string `protobuf:"bytes,4,opt,name=revision,proto3,oneof" json:"revision,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -291,16 +294,26 @@ func (x *ModelDownloadRequest) GetIgnoreWeights() bool {
 	return false
 }
 
+func (x *ModelDownloadRequest) GetRevision() string {
+	if x != nil && x.Revision != nil {
+		return *x.Revision
+	}
+	return ""
+}
+
 // Streaming status update for model download progress
 type ModelStatusUpdate struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	ModelName string                 `protobuf:"bytes,1,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
 	Status    ModelStatus            `protobuf:"varint,2,opt,name=status,proto3,enum=model_express.model.ModelStatus" json:"status,omitempty"`
 	// Optional message for additional context (e.g., progress info, error details)
-	Message       *string       `protobuf:"bytes,3,opt,name=message,proto3,oneof" json:"message,omitempty"`
-	Provider      ModelProvider `protobuf:"varint,4,opt,name=provider,proto3,enum=model_express.model.ModelProvider" json:"provider,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Message  *string       `protobuf:"bytes,3,opt,name=message,proto3,oneof" json:"message,omitempty"`
+	Provider ModelProvider `protobuf:"varint,4,opt,name=provider,proto3,enum=model_express.model.ModelProvider" json:"provider,omitempty"`
+	// Immutable commit SHA the request resolved to. Unset for providers that do
+	// not expose revisions.
+	ResolvedRevision *string `protobuf:"bytes,5,opt,name=resolved_revision,json=resolvedRevision,proto3,oneof" json:"resolved_revision,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *ModelStatusUpdate) Reset() {
@@ -361,6 +374,13 @@ func (x *ModelStatusUpdate) GetProvider() ModelProvider {
 	return ModelProvider_HUGGING_FACE
 }
 
+func (x *ModelStatusUpdate) GetResolvedRevision() string {
+	if x != nil && x.ResolvedRevision != nil {
+		return *x.ResolvedRevision
+	}
+	return ""
+}
+
 // Request for streaming model files
 type ModelFilesRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -375,6 +395,9 @@ type ModelFilesRequest struct {
 	// When true, weight files are skipped and only non-weight files
 	// (config, tokenizer, etc.) are streamed. Mirrors ModelDownloadRequest.
 	IgnoreWeights bool `protobuf:"varint,5,opt,name=ignore_weights,json=ignoreWeights,proto3" json:"ignore_weights,omitempty"`
+	// Optional branch, tag, or commit SHA identifying the cached snapshot to
+	// serve. When unset the most recent local snapshot is used.
+	Revision      *string `protobuf:"bytes,6,opt,name=revision,proto3,oneof" json:"revision,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -442,6 +465,13 @@ func (x *ModelFilesRequest) GetIgnoreWeights() bool {
 		return x.IgnoreWeights
 	}
 	return false
+}
+
+func (x *ModelFilesRequest) GetRevision() string {
+	if x != nil && x.Revision != nil {
+		return *x.Revision
+	}
+	return ""
 }
 
 // Selects files within a model directory
@@ -722,20 +752,24 @@ const file_model_proto_rawDesc = "" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x1d\n" +
 	"\amessage\x18\x02 \x01(\tH\x00R\amessage\x88\x01\x01B\n" +
 	"\n" +
-	"\b_message\"\x9c\x01\n" +
+	"\b_message\"\xca\x01\n" +
 	"\x14ModelDownloadRequest\x12\x1d\n" +
 	"\n" +
 	"model_name\x18\x01 \x01(\tR\tmodelName\x12>\n" +
 	"\bprovider\x18\x02 \x01(\x0e2\".model_express.model.ModelProviderR\bprovider\x12%\n" +
-	"\x0eignore_weights\x18\x03 \x01(\bR\rignoreWeights\"\xd7\x01\n" +
+	"\x0eignore_weights\x18\x03 \x01(\bR\rignoreWeights\x12\x1f\n" +
+	"\brevision\x18\x04 \x01(\tH\x00R\brevision\x88\x01\x01B\v\n" +
+	"\t_revision\"\x9f\x02\n" +
 	"\x11ModelStatusUpdate\x12\x1d\n" +
 	"\n" +
 	"model_name\x18\x01 \x01(\tR\tmodelName\x128\n" +
 	"\x06status\x18\x02 \x01(\x0e2 .model_express.model.ModelStatusR\x06status\x12\x1d\n" +
 	"\amessage\x18\x03 \x01(\tH\x00R\amessage\x88\x01\x01\x12>\n" +
-	"\bprovider\x18\x04 \x01(\x0e2\".model_express.model.ModelProviderR\bproviderB\n" +
+	"\bprovider\x18\x04 \x01(\x0e2\".model_express.model.ModelProviderR\bprovider\x120\n" +
+	"\x11resolved_revision\x18\x05 \x01(\tH\x01R\x10resolvedRevision\x88\x01\x01B\n" +
 	"\n" +
-	"\b_message\"\x85\x02\n" +
+	"\b_messageB\x14\n" +
+	"\x12_resolved_revision\"\xb3\x02\n" +
 	"\x11ModelFilesRequest\x12\x1d\n" +
 	"\n" +
 	"model_name\x18\x01 \x01(\tR\tmodelName\x12>\n" +
@@ -743,7 +777,9 @@ const file_model_proto_rawDesc = "" +
 	"\n" +
 	"chunk_size\x18\x03 \x01(\rR\tchunkSize\x12K\n" +
 	"\rfile_selector\x18\x04 \x01(\v2&.model_express.model.ModelFileSelectorR\ffileSelector\x12%\n" +
-	"\x0eignore_weights\x18\x05 \x01(\bR\rignoreWeights\")\n" +
+	"\x0eignore_weights\x18\x05 \x01(\bR\rignoreWeights\x12\x1f\n" +
+	"\brevision\x18\x06 \x01(\tH\x00R\brevision\x88\x01\x01B\v\n" +
+	"\t_revision\")\n" +
 	"\x11ModelFileSelector\x12\x14\n" +
 	"\x05paths\x18\x01 \x03(\tR\x05paths\"\xf7\x01\n" +
 	"\tFileChunk\x12#\n" +
@@ -838,7 +874,9 @@ func file_model_proto_init() {
 		return
 	}
 	file_model_proto_msgTypes[1].OneofWrappers = []any{}
+	file_model_proto_msgTypes[2].OneofWrappers = []any{}
 	file_model_proto_msgTypes[3].OneofWrappers = []any{}
+	file_model_proto_msgTypes[4].OneofWrappers = []any{}
 	file_model_proto_msgTypes[6].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{

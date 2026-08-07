@@ -89,6 +89,14 @@ modelexpress-cli model download google-t5/t5-small \
   --provider hugging-face \
   --strategy server-only
 
+# Pin a branch, tag, or commit SHA (Hugging Face only). The commit SHA the request
+# resolved to is printed on success, so a frontend and its workers can be held to
+# one revision. A revision that does not exist fails; it never falls back to the
+# default revision.
+modelexpress-cli model download google-t5/t5-small --revision refs/pr/1
+modelexpress-cli model download google-t5/t5-small \
+  --revision df1b051c49625cf57a3d0d8d3863ed4d13564fe4
+
 # Download from Google Cloud Storage
 modelexpress-cli model download gs://my-bucket/models/qwen/rev-1 \
   --provider gcs
