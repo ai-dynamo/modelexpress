@@ -50,6 +50,12 @@ service WeightSyncService {
 
   // Invalidate the M2N plan for a model (call when trainer reshards).
   rpc InvalidateM2nPlan(InvalidateM2nPlanRequest) returns (InvalidateM2nPlanResponse);
+
+  // Source NCCL rank 0 publishes communicator bootstrap data for one attempt.
+  rpc PublishNcclBootstrap(PublishNcclBootstrapRequest) returns (PublishNcclBootstrapResponse);
+
+  // Participants fetch communicator bootstrap data by attempt_id.
+  rpc GetNcclBootstrap(GetNcclBootstrapRequest) returns (GetNcclBootstrapResponse);
 }
 
 // ---------------------------------------------------------------------------
@@ -197,4 +203,38 @@ message InvalidateM2nPlanRequest {
 
 message InvalidateM2nPlanResponse {
   bool ok = 1;
+}
+
+// ---------------------------------------------------------------------------
+// NCCL communicator bootstrap
+// ---------------------------------------------------------------------------
+
+message NcclBootstrapRecord {
+  // Logical PP communicator group. Metadata only; attempt_id is the storage key.
+  string cohort_id = 1;
+  // Never-reused UUIDv4 for one concrete communicator construction.
+  string attempt_id = 2;
+  bytes nccl_unique_id = 3;
+  uint32 source_world_size = 4;
+  uint32 destination_world_size = 5;
+  uint32 world_size = 6;
+  // SHA-256 of the coordinator's ordered participants, roles, and NCCL ranks.
+  bytes roster_digest = 7;
+}
+
+message PublishNcclBootstrapRequest {
+  NcclBootstrapRecord record = 1;
+}
+
+message PublishNcclBootstrapResponse {
+  bool ok = 1;
+}
+
+message GetNcclBootstrapRequest {
+  string attempt_id = 1;
+}
+
+message GetNcclBootstrapResponse {
+  bool found = 1;
+  NcclBootstrapRecord record = 2;
 }

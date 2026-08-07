@@ -36,4 +36,25 @@ for file in "${OUT_DIR}/p2p_pb2.py" "${OUT_DIR}/p2p_pb2_grpc.py"; do
     mv "${tmp_file}" "${file}"
 done
 
+echo "Generating protobuf files from ${PROTO_DIR}/weight_sync.proto..."
+python -m grpc_tools.protoc \
+    "-I${PROTO_DIR}" \
+    "--python_out=${OUT_DIR}" \
+    "--grpc_python_out=${OUT_DIR}" \
+    "${PROTO_DIR}/weight_sync.proto"
+
+echo "Fixing imports in weight_sync_pb2_grpc.py..."
+tmp_file="$(mktemp)"
+sed 's/^import weight_sync_pb2 as/from . import weight_sync_pb2 as/' \
+    "${OUT_DIR}/weight_sync_pb2_grpc.py" > "${tmp_file}"
+mv "${tmp_file}" "${OUT_DIR}/weight_sync_pb2_grpc.py"
+
+for file in "${OUT_DIR}/weight_sync_pb2.py" "${OUT_DIR}/weight_sync_pb2_grpc.py"; do
+    echo "Adding SPDX header to ${file}..."
+    tmp_file=$(mktemp)
+    echo "${SPDX_HEADER}" > "${tmp_file}"
+    cat "${file}" >> "${tmp_file}"
+    mv "${tmp_file}" "${file}"
+done
+
 echo "Done."
