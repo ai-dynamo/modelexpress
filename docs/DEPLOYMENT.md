@@ -595,7 +595,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles. |
 | `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before source workers publish weight metadata or prepare and publish cache artifact bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim. See [Multi-node readiness](#multi-node-readiness). |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication before giving up. |
-| `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Partitions the torch compile cache artifact source pool by compile configuration. Workers that share a value discover each other's caches; workers with different values do not. Unset removes only compile-configuration partitioning, so workers whose other `SourceIdentity` fields match share one pool regardless of their compile settings. See [Pairing workers by compile configuration](#pairing-workers-by-compile-configuration). |
+| `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Adds compile configuration as a partitioning dimension for the torch compile cache artifact source pool. Workers that share a value discover each other's caches; workers with different values do not. Unset removes **only this dimension** — the pool is still partitioned by every other `SourceIdentity` field (model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch), so workers matching on all of those share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](#pairing-workers-by-compile-configuration). |
 | `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact HF commit SHA / checkpoint version so `mx_source_id` is content-addressed. Required for decentralized backends where no central coordinator tracks versions. |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend. `{rank}` is substituted with the worker's own rank. If the resolved pattern has no `:port`, the client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` (multi-GPU-per-pod shape); if it has an explicit port, that port is used verbatim (1-GPU-per-pod shape). |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` backend: max retries on `FAILED_PRECONDITION` (revision mismatch during rolling updates). Each retry opens a fresh gRPC channel so kube-proxy re-picks a backend. |
@@ -710,12 +710,21 @@ settings, so a worker started with a different `--max-num-batched-tokens` or
 ModelExpress cannot reproduce that hash at load time — part of it depends on
 files traced by Dynamo, which are only known after compilation. Artifact
 discovery therefore keys on `MX_ARTIFACT_COMPILE_CONFIG_DIGEST`, and **that
-variable is unset by default**. With it unset, workers whose other
-`SourceIdentity` fields match belong to one source pool that is not partitioned
-by compile configuration, so a worker can be handed a cache built under a
+variable is unset by default**.
+
+The source pool is still partitioned by every other `SourceIdentity` field, so
+workers differing in model, parallelism sizes, dtype, quantization, revision,
+vLLM/torch/CUDA/Triton version, or GPU architecture never see each other's
+caches. What an unset digest removes is **only the compile-configuration
+dimension**: workers matching on all of the above land in one pool even when
+their compile settings differ, so one can be handed a cache built under a
 different compile configuration. The bytes transfer and install successfully;
 vLLM then ignores them and recompiles. The result is wasted transfer, not
 incorrect output.
+
+That single missing dimension is exactly the one that separates prefill from
+decode in a disaggregated deployment — the two roles otherwise agree on every
+field above.
 
 Set the variable to a distinct value per compile configuration whenever a
 deployment runs more than one — most commonly prefill and decode workers in a

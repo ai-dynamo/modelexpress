@@ -39,6 +39,7 @@ target's data-parallel size (e.g. 2 for the DP=2 job) so the range widens to
 
 import json
 import re
+import time
 import urllib.request
 
 import pytest
@@ -104,17 +105,27 @@ def _all_pod_logs(namespace: str, job_name: str, container: str) -> str:
     `.items[*]` has exactly one element and the regex/assertions in the
     callers operate on one concatenated string either way.
     """
+    return "\n".join(_pod_logs_by_pod(namespace, job_name, container).values())
+
+
+def _pod_logs_by_pod(namespace: str, job_name: str, container: str) -> dict[str, str]:
+    """Same fetch as `_all_pod_logs`, keyed by pod name instead of concatenated.
+
+    Assertions about "every pod did X" cannot be expressed on the concatenated
+    string: one matching line anywhere satisfies a substring check no matter how
+    many pods are missing it.
+    """
     pod_list = kubectl(
         "get", "pods",
         "-l", f"job-name={job_name}",
         "-o", "jsonpath={.items[*].metadata.name}",
         namespace=namespace,
     ).stdout.split()
-    chunks = []
+    out: dict[str, str] = {}
     for pod in pod_list:
         r = kubectl("logs", pod, "-c", container, "--tail=-1", namespace=namespace)
-        chunks.append(r.stdout)
-    return "\n".join(chunks)
+        out[pod] = r.stdout
+    return out
 
 
 def _ready_artifact_source_types(namespace: str) -> set[str]:
@@ -265,6 +276,63 @@ def test_per_rank_source_agents(
     )
 
 
+EFFECTIVENESS_TIMEOUT_SECS = 180
+EFFECTIVENESS_POLL_SECS = 10
+
+# Either outcome ends the wait: the hit line means the cache was reused, the
+# warning means it was not. Both are emitted from the same call site, so seeing
+# one proves the publisher thread ran and the snapshot is no longer premature.
+_EFFECTIVENESS_MARKERS = (
+    "which ModelExpress installed",
+    "was not reused and the engine recompiled",
+)
+
+
+_COMPILE_INSTALL_MARKER = "vLLM artifact install complete: name=torch_compile_cache"
+
+
+def _pods_pending_effectiveness(per_pod: dict[str, str]) -> set[str]:
+    """Pods that installed a torch.compile cache but have not logged the check.
+
+    The granularity is per pod, not per worker rank: `mark_publish_scheduled` is
+    documented as pod-scoped, so in a TP>1 pod exactly one rank schedules the
+    publisher and therefore exactly one rank runs the check. Requiring a line per
+    rank would fail every multi-rank deployment by construction.
+    """
+    return {
+        pod
+        for pod, logs in per_pod.items()
+        if _COMPILE_INSTALL_MARKER in logs
+        and not any(marker in logs for marker in _EFFECTIVENESS_MARKERS)
+    }
+
+
+def _await_effectiveness_check(namespace: str) -> dict[str, str]:
+    """Re-read target logs until every installing pod logged the check.
+
+    Returns the freshest per-pod logs either way; the caller still asserts on
+    content, so a timeout surfaces as a named-pod assertion failure rather than a
+    bare TimeoutError with no context.
+    """
+    per_pod = _pod_logs_by_pod(namespace, "mx-target", "mx-target")
+    pending = _pods_pending_effectiveness(per_pod)
+    if not pending:
+        return per_pod
+    deadline = time.monotonic() + EFFECTIVENESS_TIMEOUT_SECS
+    while time.monotonic() < deadline:
+        time.sleep(EFFECTIVENESS_POLL_SECS)
+        per_pod = _pod_logs_by_pod(namespace, "mx-target", "mx-target")
+        pending = _pods_pending_effectiveness(per_pod)
+        if not pending:
+            print("[mx-target] every installing pod logged the effectiveness check")
+            return per_pod
+    print(
+        f"[mx-target] {len(pending)} pod(s) still missing the effectiveness check "
+        f"after {EFFECTIVENESS_TIMEOUT_SECS}s: {sorted(pending)}"
+    )
+    return per_pod
+
+
 def test_artifact_transfer(
     namespace: str,
     require_artifact_transfer: bool,
@@ -284,7 +352,13 @@ def test_artifact_transfer(
         f"got {sorted(source_types)}"
     )
 
-    logs = _all_pod_logs(namespace, "mx-target", "mx-target")
+    # The effectiveness check runs on each target's own publisher thread, gated on
+    # /health plus a cache-settle interval. The composite action only waits for the
+    # *source* to publish before starting targets, so at this point a target's
+    # publisher may not have fired yet. Poll rather than asserting on one snapshot.
+    per_pod = _await_effectiveness_check(namespace)
+    logs = "\n".join(per_pod.values())
+
     install_lines = [line for line in logs.splitlines() if "artifact install complete" in line]
     print("[mx-target] artifact install lines:\n" + "\n".join(install_lines))
     assert install_lines, "Target did not log artifact installation"
@@ -308,12 +382,15 @@ def test_artifact_transfer(
         "partition the artifact source pool with "
         "MX_ARTIFACT_COMPILE_CONFIG_DIGEST.\n" + "\n".join(unused_lines)
     )
-    if "vLLM artifact install complete: name=torch_compile_cache" in logs:
-        assert "which ModelExpress installed" in logs, (
-            "Target installed a torch.compile cache but never logged the "
-            "effectiveness check; the engine may not have reached the publish "
-            "path, or the check regressed"
-        )
+
+    # Per pod, not across the concatenation: one matching line anywhere would
+    # otherwise satisfy the check no matter how many pods skipped it.
+    pending = _pods_pending_effectiveness(per_pod)
+    assert not pending, (
+        f"{len(pending)} target pod(s) installed a torch.compile cache but never "
+        f"logged the effectiveness check: {sorted(pending)}. The engine may not "
+        "have reached the publish path, or the check regressed."
+    )
 
     # Every target in this fleet runs the same configuration, so each artifact
     # type must resolve to one identity. Divergence means identity construction

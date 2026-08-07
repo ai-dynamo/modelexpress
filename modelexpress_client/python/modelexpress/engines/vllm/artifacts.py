@@ -37,9 +37,15 @@ _CACHE_SETTLE_SECS = _artifact_lifecycle.CACHE_SETTLE_SECS
 _published_sources: dict[tuple[int, int], PublishedArtifactSource] = {}
 _scheduled_publishers: dict[tuple[int, int], PublisherThread] = {}
 # torch.compile cache directories created by an install, keyed by device id.
-# Compared against the directory vLLM actually selects once the engine is up;
-# see _warn_if_compile_cache_unused.
+# Values are POSIX-style paths relative to the torch.compile cache root, at every
+# depth. Compared against the directory vLLM actually selects once the engine is
+# up; see _warn_if_compile_cache_unused.
 _installed_compile_cache_dirs: dict[int, frozenset[str]] = {}
+
+# Directory walk depth. vLLM's deepest layout is
+# torch_aot_compile/<hash>/rank_<r>_<dp>/<prefix>, so four levels below the root
+# covers every published shape without walking an unbounded tree.
+_CACHE_SCAN_DEPTH = 4
 
 
 def install_vllm_cache_artifacts(ctx: LoadContext) -> None:
@@ -47,7 +53,7 @@ def install_vllm_cache_artifacts(ctx: LoadContext) -> None:
     # Snapshot only when transfer is on; the default path should not pay for a
     # directory scan it will never consult.
     track = _artifact_transfer_enabled()
-    before = _torch_compile_cache_dir_names() if track else frozenset()
+    before = _torch_compile_cache_dirs() if track else frozenset()
     _artifact_lifecycle.install_artifacts(
         ctx,
         lambda: _vllm_artifact_transfers(ctx),
@@ -56,19 +62,72 @@ def install_vllm_cache_artifacts(ctx: LoadContext) -> None:
     )
     if not track:
         return
-    installed = _torch_compile_cache_dir_names() - before
     device_id = getattr(ctx, "device_id", None)
-    if installed and device_id is not None:
+    if device_id is None:
+        return
+    installed = _torch_compile_cache_dirs() - before
+    if installed:
         _installed_compile_cache_dirs[device_id] = installed
+    else:
+        # A later load that installs nothing must not be judged against the
+        # previous load's directories. Weight refit and resume_serving both
+        # re-enter this path, so leaving a stale entry would compare the engine's
+        # current cache_dir against a set it never had a chance to match.
+        _installed_compile_cache_dirs.pop(device_id, None)
 
 
-def _torch_compile_cache_dir_names() -> frozenset[str]:
-    """Immediate child directory names under the torch.compile cache root."""
+def _torch_compile_cache_dirs() -> frozenset[str]:
+    """Directories under the torch.compile cache root, as relative POSIX paths.
+
+    Recording every depth rather than only immediate children is what makes the
+    AOT layout distinguishable: ``torch_aot_compile`` is a shared container, so a
+    name-level snapshot cannot tell ``torch_aot_compile/<installed-hash>`` from
+    ``torch_aot_compile/<other-hash>``.
+    """
     try:
         root = _torch_compile_cache_root()
-        return frozenset(entry.name for entry in root.iterdir() if entry.is_dir())
-    except OSError:
+    except Exception:  # noqa: BLE001 - env lookup must not break loading
         return frozenset()
+    out: set[str] = set()
+
+    def walk(directory: Path, prefix: str, depth: int) -> None:
+        if depth > _CACHE_SCAN_DEPTH:
+            return
+        try:
+            entries = list(directory.iterdir())
+        except OSError:
+            return
+        for entry in entries:
+            if not entry.is_dir():
+                continue
+            rel = f"{prefix}/{entry.name}" if prefix else entry.name
+            out.add(rel)
+            walk(entry, rel, depth + 1)
+
+    walk(root, "", 1)
+    return frozenset(out)
+
+
+def _selected_dir_was_installed(cache_dir: str, installed: frozenset[str]) -> bool:
+    """Whether vLLM's chosen directory is one this pod installed.
+
+    Matching is on the exact relative path, never on an ancestor. Ancestor
+    matching is what made the AOT layout report a false hit: an install creates
+    the shared ``torch_aot_compile`` container alongside its hash directory, so
+    any ancestor test would accept ``torch_aot_compile/<some-other-hash>``.
+
+    The tradeoff runs the safe way. If vLLM creates a subdirectory the install
+    did not (a rank directory for a rank the source never published, say), this
+    returns False and the caller warns about a cache that was in fact partly
+    reused. A spurious warning gets investigated; a spurious "reused
+    successfully" hides exactly the waste this check exists to surface.
+    """
+    try:
+        root = _torch_compile_cache_root()
+        rel = Path(cache_dir).resolve().relative_to(root.resolve()).as_posix()
+    except Exception:  # noqa: BLE001 - unresolvable path is simply not a hit
+        return False
+    return rel in installed
 
 
 def _warn_if_compile_cache_unused(ctx: LoadContext) -> None:
@@ -99,11 +158,7 @@ def _warn_if_compile_cache_unused(ctx: LoadContext) -> None:
             ctx.global_rank,
         )
         return
-    selected = Path(cache_dir)
-    if any(part in installed for part in selected.parts):
-        # Matched on a path segment rather than on the basename: vLLM has
-        # appended a rank suffix under the hash directory in some releases, and
-        # the AOT path nests one level deeper still.
+    if _selected_dir_was_installed(cache_dir, installed):
         logger.info(
             "[Worker %s] vLLM selected torch.compile cache directory %s, "
             "which ModelExpress installed",

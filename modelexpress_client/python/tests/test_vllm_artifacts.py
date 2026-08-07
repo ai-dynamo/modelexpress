@@ -748,171 +748,189 @@ def test_vllm_health_url_uses_ctx_head_addr(monkeypatch):
         "http://mx-vllm-0.mx-vllm.test-ns:9090/health"
     )
 
-
 @pytest.fixture
-def clean_compile_cache_state():
-    """Isolate the module-level install bookkeeping between tests."""
-    artifacts._installed_compile_cache_dirs.clear()
-    yield artifacts._installed_compile_cache_dirs
-    artifacts._installed_compile_cache_dirs.clear()
+def compile_cache_root(tmp_path, monkeypatch):
+    """A real torch.compile cache root, wired into the module under test.
 
-
-def _compile_check_ctx(cache_dir: str | None):
-    compilation_config = SimpleNamespace(cache_dir=cache_dir)
-    return SimpleNamespace(
-        global_rank=0,
-        device_id=0,
-        adapter=SimpleNamespace(
-            vllm_config=SimpleNamespace(compilation_config=compilation_config)
-        ),
-    )
-
-
-def test_install_records_compile_cache_dirs_created_by_transfer(
-    tmp_path,
-    monkeypatch,
-    clean_compile_cache_state,
-):
-    cache_root = tmp_path / "torch_compile_cache"
-    cache_root.mkdir()
-    (cache_root / "preexisting").mkdir()
+    These tests drive the snapshot through the filesystem rather than assigning
+    to `_installed_compile_cache_dirs` directly. Hand-seeding that dict is what
+    let an AOT false-positive ship: the seeded value (a bare hash) was one the
+    real scanner could never produce for a nested layout.
+    """
+    root = tmp_path / "torch_compile_cache"
+    root.mkdir()
+    monkeypatch.setattr(artifacts, "_torch_compile_cache_root", lambda: root)
     monkeypatch.setenv("MX_ARTIFACT_TRANSFER", "1")
-    monkeypatch.setattr(artifacts, "_torch_compile_cache_root", lambda: cache_root)
-    ctx = SimpleNamespace(global_rank=0, device_id=3)
+    artifacts._installed_compile_cache_dirs.clear()
+    yield root
+    artifacts._installed_compile_cache_dirs.clear()
 
+
+def _install_creating(root, *rel_dirs, device_id=0):
+    """Run install_vllm_cache_artifacts with a stub that creates `rel_dirs`."""
     def fake_install(*args, **kwargs):
-        (cache_root / "installed-abc").mkdir()
+        for rel in rel_dirs:
+            (root / rel).mkdir(parents=True, exist_ok=True)
 
+    ctx = SimpleNamespace(global_rank=0, device_id=device_id)
     with patch.object(
         artifacts._artifact_lifecycle, "install_artifacts", side_effect=fake_install
     ):
         artifacts.install_vllm_cache_artifacts(ctx)
 
-    assert clean_compile_cache_state == {3: frozenset({"installed-abc"})}
 
-
-def test_install_records_nothing_when_no_cache_dir_appears(
-    tmp_path,
-    monkeypatch,
-    clean_compile_cache_state,
-):
-    cache_root = tmp_path / "torch_compile_cache"
-    cache_root.mkdir()
-    (cache_root / "preexisting").mkdir()
-    monkeypatch.setenv("MX_ARTIFACT_TRANSFER", "1")
-    monkeypatch.setattr(artifacts, "_torch_compile_cache_root", lambda: cache_root)
-
-    with patch.object(artifacts._artifact_lifecycle, "install_artifacts"):
-        artifacts.install_vllm_cache_artifacts(SimpleNamespace(global_rank=0, device_id=0))
-
-    assert clean_compile_cache_state == {}
-
-
-def test_install_tolerates_missing_compile_cache_root(
-    tmp_path,
-    monkeypatch,
-    clean_compile_cache_state,
-):
-    monkeypatch.setenv("MX_ARTIFACT_TRANSFER", "1")
-    monkeypatch.setattr(
-        artifacts, "_torch_compile_cache_root", lambda: tmp_path / "absent"
+def _check_ctx(cache_dir, device_id=0):
+    return SimpleNamespace(
+        global_rank=0,
+        device_id=device_id,
+        adapter=SimpleNamespace(
+            vllm_config=SimpleNamespace(
+                compilation_config=SimpleNamespace(cache_dir=str(cache_dir))
+            )
+        ),
     )
 
-    with patch.object(artifacts._artifact_lifecycle, "install_artifacts"):
-        artifacts.install_vllm_cache_artifacts(SimpleNamespace(global_rank=0, device_id=0))
 
-    assert clean_compile_cache_state == {}
+def _levels(caplog, level):
+    return [r for r in caplog.records if r.levelno >= level]
 
 
-def test_compile_cache_check_warns_when_vllm_selected_another_directory(
-    caplog,
-    clean_compile_cache_state,
-):
-    clean_compile_cache_state[0] = frozenset({"a531dd9a8f"})
+def test_install_records_every_depth_of_a_nested_tree(compile_cache_root):
+    (compile_cache_root / "preexisting").mkdir()
 
-    with caplog.at_level(
-        logging.WARNING, logger="modelexpress.engines.vllm.artifacts"
-    ):
-        artifacts._warn_if_compile_cache_unused(
-            _compile_check_ctx("/root/.cache/vllm/torch_compile_cache/0249c1b5c6/rank_0_0")
-        )
+    _install_creating(compile_cache_root, "torch_aot_compile/aaaa111122/rank_0_0")
 
-    assert "a531dd9a8f" in caplog.text
-    assert "0249c1b5c6" in caplog.text
-    assert "recompiled" in caplog.text
+    assert artifacts._installed_compile_cache_dirs[0] == frozenset({
+        "torch_aot_compile",
+        "torch_aot_compile/aaaa111122",
+        "torch_aot_compile/aaaa111122/rank_0_0",
+    })
+
+
+def test_aot_sibling_hash_is_not_reported_as_reused(compile_cache_root, caplog):
+    """The regression this whole rewrite exists for.
+
+    An install creates the shared `torch_aot_compile` container next to its own
+    hash. If matching accepted any ancestor, a *different* hash under the same
+    container would be reported as successfully reused.
+    """
+    _install_creating(compile_cache_root, "torch_aot_compile/aaaa111122/rank_0_0")
+    other = compile_cache_root / "torch_aot_compile" / "bbbb333344" / "rank_0_0"
+    other.mkdir(parents=True)
+
+    with caplog.at_level(logging.INFO, logger="modelexpress.engines.vllm.artifacts"):
+        artifacts._warn_if_compile_cache_unused(_check_ctx(other))
+
+    assert "which ModelExpress installed" not in caplog.text
+    assert _levels(caplog, logging.WARNING), "应当警告，而不是静默或误报命中"
     assert "MX_ARTIFACT_COMPILE_CONFIG_DIGEST" in caplog.text
 
 
-@pytest.mark.parametrize(
-    "cache_dir",
-    [
-        # Current layout: cache_dir is the hash directory itself.
-        "/root/.cache/vllm/torch_compile_cache/a531dd9a8f",
-        # Releases that append a rank suffix to cache_dir rather than only to
-        # local_cache_dir.
-        "/root/.cache/vllm/torch_compile_cache/a531dd9a8f/rank_0_0",
-        # AOT path, which nests the hash one level deeper.
-        "/root/.cache/vllm/torch_compile_cache/torch_aot_compile/a531dd9a8f/rank_0_0",
-    ],
-)
-def test_compile_cache_check_reports_hit_across_vllm_directory_layouts(
-    cache_dir,
-    caplog,
-    clean_compile_cache_state,
-):
-    clean_compile_cache_state[0] = frozenset({"a531dd9a8f"})
+def test_aot_installed_hash_is_reported_as_reused(compile_cache_root, caplog):
+    _install_creating(compile_cache_root, "torch_aot_compile/aaaa111122/rank_0_0")
+    selected = compile_cache_root / "torch_aot_compile" / "aaaa111122" / "rank_0_0"
 
     with caplog.at_level(logging.INFO, logger="modelexpress.engines.vllm.artifacts"):
-        artifacts._warn_if_compile_cache_unused(_compile_check_ctx(cache_dir))
+        artifacts._warn_if_compile_cache_unused(_check_ctx(selected))
 
     assert "which ModelExpress installed" in caplog.text
-    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not _levels(caplog, logging.WARNING)
 
 
-def test_compile_cache_check_is_quiet_without_an_install(
-    caplog,
-    clean_compile_cache_state,
-):
+@pytest.mark.parametrize("rel", ["a531dd9a8f", "a531dd9a8f/rank_0_0"])
+def test_jit_layouts_are_reported_as_reused(compile_cache_root, caplog, rel):
+    _install_creating(compile_cache_root, "a531dd9a8f/rank_0_0")
+
     with caplog.at_level(logging.INFO, logger="modelexpress.engines.vllm.artifacts"):
-        artifacts._warn_if_compile_cache_unused(_compile_check_ctx("/cache/0249c1b5c6"))
+        artifacts._warn_if_compile_cache_unused(_check_ctx(compile_cache_root / rel))
+
+    assert "which ModelExpress installed" in caplog.text
+    assert not _levels(caplog, logging.WARNING)
+
+
+def test_jit_sibling_hash_warns(compile_cache_root, caplog):
+    _install_creating(compile_cache_root, "a531dd9a8f/rank_0_0")
+    other = compile_cache_root / "0249c1b5c6" / "rank_0_0"
+    other.mkdir(parents=True)
+
+    with caplog.at_level(logging.WARNING, logger="modelexpress.engines.vllm.artifacts"):
+        artifacts._warn_if_compile_cache_unused(_check_ctx(other))
+
+    assert "a531dd9a8f" in caplog.text and "0249c1b5c6" in caplog.text
+    assert "recompiled" in caplog.text
+
+
+def test_a_later_install_that_creates_nothing_clears_the_entry(compile_cache_root):
+    """Weight refit and resume_serving re-enter the load path."""
+    _install_creating(compile_cache_root, "a531dd9a8f/rank_0_0")
+    assert 0 in artifacts._installed_compile_cache_dirs
+
+    _install_creating(compile_cache_root)          # 第二次什么都没装
+
+    assert 0 not in artifacts._installed_compile_cache_dirs, (
+        "过期记录会让第二次加载被拿去和第一次的目录比对"
+    )
+
+
+def test_stale_entry_does_not_leak_across_devices(compile_cache_root):
+    _install_creating(compile_cache_root, "a531dd9a8f/rank_0_0", device_id=0)
+    _install_creating(compile_cache_root, device_id=1)
+
+    assert 0 in artifacts._installed_compile_cache_dirs
+    assert 1 not in artifacts._installed_compile_cache_dirs
+
+
+def test_install_is_skipped_entirely_when_transfer_is_off(compile_cache_root, monkeypatch):
+    monkeypatch.setenv("MX_ARTIFACT_TRANSFER", "0")
+
+    _install_creating(compile_cache_root, "a531dd9a8f")
+
+    assert artifacts._installed_compile_cache_dirs == {}
+
+
+def test_install_tolerates_a_missing_cache_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("MX_ARTIFACT_TRANSFER", "1")
+    monkeypatch.setattr(artifacts, "_torch_compile_cache_root", lambda: tmp_path / "absent")
+    artifacts._installed_compile_cache_dirs.clear()
+
+    with patch.object(artifacts._artifact_lifecycle, "install_artifacts"):
+        artifacts.install_vllm_cache_artifacts(SimpleNamespace(global_rank=0, device_id=0))
+
+    assert artifacts._installed_compile_cache_dirs == {}
+
+
+def test_check_is_quiet_without_an_install(compile_cache_root, caplog):
+    with caplog.at_level(logging.INFO, logger="modelexpress.engines.vllm.artifacts"):
+        artifacts._warn_if_compile_cache_unused(_check_ctx(compile_cache_root / "x"))
 
     assert caplog.records == []
 
 
-def test_compile_cache_check_is_quiet_without_a_selected_directory(
-    caplog,
-    clean_compile_cache_state,
-):
-    """enforce_eager and compilation-off runs never populate cache_dir."""
-    clean_compile_cache_state[0] = frozenset({"a531dd9a8f"})
+def test_check_is_quiet_when_enforce_eager_left_cache_dir_empty(compile_cache_root, caplog):
+    _install_creating(compile_cache_root, "a531dd9a8f/rank_0_0")
 
     with caplog.at_level(logging.INFO, logger="modelexpress.engines.vllm.artifacts"):
-        artifacts._warn_if_compile_cache_unused(_compile_check_ctx(""))
+        artifacts._warn_if_compile_cache_unused(_check_ctx(""))
 
-    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not _levels(caplog, logging.WARNING)
 
 
-def test_publish_runs_compile_cache_check_only_for_compile_artifacts(
-    clean_compile_cache_state,
-):
-    identity = p2p_pb2.SourceIdentity(
-        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE
-    )
+def test_publish_runs_the_check_only_for_compile_artifacts(compile_cache_root):
+    identity = p2p_pb2.SourceIdentity(mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE)
     transfer = SimpleNamespace(
-        name="triton_cache",
-        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
+        name="triton_cache", mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE
     )
     ctx = SimpleNamespace(global_rank=0, accelerator_backend=SimpleNamespace(name="cuda"))
 
-    with patch.object(
-        artifacts._artifact_lifecycle, "publish_artifact"
-    ), patch.object(artifacts, "_warn_if_compile_cache_unused") as check:
+    with patch.object(artifacts._artifact_lifecycle, "publish_artifact"), patch.object(
+        artifacts, "_warn_if_compile_cache_unused"
+    ) as check:
         artifacts._publish_vllm_cache_artifact(ctx, transfer, identity)
 
     check.assert_not_called()
 
 
-def test_publish_survives_a_failing_compile_cache_check(clean_compile_cache_state):
+def test_publish_survives_a_failing_check(compile_cache_root):
     """The check runs on the publisher thread; it must never block publication."""
     identity = p2p_pb2.SourceIdentity(
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE
@@ -927,8 +945,7 @@ def test_publish_survives_a_failing_compile_cache_check(clean_compile_cache_stat
     with patch.object(
         artifacts._artifact_lifecycle, "publish_artifact", return_value=published
     ), patch.object(
-        artifacts,
-        "_warn_if_compile_cache_unused",
+        artifacts, "_warn_if_compile_cache_unused",
         side_effect=AttributeError("adapter went away"),
     ) as check:
         assert artifacts._publish_vllm_cache_artifact(ctx, transfer, identity) is published
