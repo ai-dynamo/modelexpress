@@ -8,7 +8,6 @@ from __future__ import annotations
 import hashlib
 import json
 import struct
-from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
@@ -107,7 +106,7 @@ def snapshot_digest(metadata: dict[str, dict]) -> str:
     return _digest([metadata[name] for name in sorted(metadata)])
 
 
-def encode_compressed_bucket(
+def encode_bucket(
     *,
     model_id: str,
     base_version: str,
@@ -115,22 +114,20 @@ def encode_compressed_bucket(
     base_digest: str,
     format_digest: str,
     ordinal: int,
-    names: list[str],
-    compressed_deltas: Mapping[str, bytes | np.ndarray],
+    tensors: list[tuple[str, bytes | np.ndarray]],
     metadata: dict[str, dict],
 ) -> tuple[bytes, int, tuple[str, ...]]:
     decoded = bytearray()
     entries = []
-    decompressor = zstandard.ZstdDecompressor()
-    for name in names:
+    names = []
+    for name, delta in tensors:
         item = metadata[name]
-        delta = decompressor.decompress(
-            bytes(compressed_deltas[name]), max_output_size=item["byte_size"]
-        )
-        if len(delta) != item["byte_size"]:
+        raw = bytes(delta)
+        if len(raw) != item["byte_size"]:
             raise ValueError(f"{name} delta byte size differs from canonical metadata")
         entries.append({**item, "offset": len(decoded)})
-        decoded.extend(delta)
+        decoded.extend(raw)
+        names.append(name)
 
     header = canonical_json(
         {

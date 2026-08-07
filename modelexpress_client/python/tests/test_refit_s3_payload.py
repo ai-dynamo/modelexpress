@@ -10,14 +10,13 @@ import json
 
 import pytest
 import torch
-import zstandard
 from safetensors.torch import save_file
 
 from modelexpress.refit import S3Config
 from modelexpress.refit.s3 import ImmutableS3Conflict, S3Uploader
 from modelexpress.refit.source.canonical import (
     decode_bucket,
-    encode_compressed_bucket,
+    encode_bucket,
     load_hf_snapshot,
 )
 
@@ -123,7 +122,7 @@ def test_tied_output_head_is_dropped_from_the_canonical_set(tmp_path, tied, expe
     assert sorted(metadata) == expected
 
 
-def test_pack_source_rank_compressed_delta_into_canonical_bucket(tmp_path):
+def test_pack_source_rank_raw_deltas_into_canonical_bucket(tmp_path):
     checkpoint = tmp_path / "model.safetensors"
     launch = torch.arange(4, dtype=torch.float32)
     save_file({"model.weight": launch}, checkpoint)
@@ -136,17 +135,14 @@ def test_pack_source_rank_compressed_delta_into_canonical_bucket(tmp_path):
         f"sha256:{hashlib.sha256(new).hexdigest()}"
     )
 
-    encoded, decoded_size, names = encode_compressed_bucket(
+    encoded, decoded_size, names = encode_bucket(
         model_id="model",
         base_version="0",
         target_version="1",
         base_digest=base_digest,
         format_digest=format_digest,
         ordinal=3,
-        names=["model.weight"],
-        compressed_deltas={
-            "model.weight": zstandard.ZstdCompressor(level=1).compress(delta)
-        },
+        tensors=[("model.weight", delta)],
         metadata=metadata,
     )
 

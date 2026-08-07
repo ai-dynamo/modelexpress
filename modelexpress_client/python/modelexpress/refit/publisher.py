@@ -16,7 +16,6 @@ from urllib.parse import quote
 
 import numpy as np
 import torch
-import zstandard
 
 from .api import PublisherConfig
 from .catalog import GrpcRevisionCatalog
@@ -24,7 +23,7 @@ from .manifest import RevisionManifest, RevisionState
 from .s3 import S3Uploader
 from .source.canonical import (
     canonical_json,
-    encode_compressed_bucket,
+    encode_bucket,
     format_digest,
     load_hf_snapshot,
     snapshot_digest,
@@ -196,13 +195,13 @@ class Publisher:
 
         encode_started = time.monotonic()
         try:
-            deltas, checksums, changed_bytes = self._encode_delta(gather_hf_buckets)
+            raw_deltas, checksums, changed_bytes = self._encode_delta(gather_hf_buckets)
             error = None
         except Exception as exc:
             error = exc
         self._agree_error(error)
         encode_seconds = time.monotonic() - encode_started
-        self._drop_duplicate_names(deltas, checksums, changed_bytes)
+        self._drop_duplicate_names(raw_deltas, checksums, changed_bytes)
         metadata, owners = self._collect_metadata()
         error = (
             RuntimeError("canonical format changed during publication")
@@ -215,7 +214,7 @@ class Publisher:
         wire_bytes, setup_seconds, pool_seconds, finalize_seconds = self._publish_root(
             version,
             base_version,
-            deltas,
+            raw_deltas,
             metadata,
             owners,
             target_digest,
@@ -311,7 +310,7 @@ class Publisher:
             close()
 
     def _encode_delta(self, gather_hf_buckets):
-        deltas = {}
+        raw_deltas = {}
         checksums = {}
         changed_bytes = {}
         max_bytes = max(
@@ -346,17 +345,16 @@ class Publisher:
             if not changed:
                 return name, current, None, None, 0
             digest = f"sha256:{hashlib.sha256(memoryview(current)).hexdigest()}"
-            compressed = zstandard.ZstdCompressor(level=1).compress(delta)
-            return name, current, compressed, digest, changed
+            return name, current, delta, digest, changed
 
         inflight = deque()
         pool = ThreadPoolExecutor(max_workers=NUM_WORKERS)
 
         def collect(future):
-            name, current, compressed, digest, changed = future.result()
+            name, current, raw_delta, digest, changed = future.result()
             self.snapshot[name] = current
             if changed:
-                deltas[name] = compressed
+                raw_deltas[name] = raw_delta
                 checksums[name] = digest
                 changed_bytes[name] = changed
                 self.metadata[name]["target_digest"] = digest
@@ -385,22 +383,22 @@ class Publisher:
                 collect(inflight.popleft())
         finally:
             pool.shutdown()
-        return deltas, checksums, changed_bytes
+        return raw_deltas, checksums, changed_bytes
 
-    def _drop_duplicate_names(self, deltas, checksums, changed_bytes) -> None:
+    def _drop_duplicate_names(self, raw_deltas, checksums, changed_bytes) -> None:
         contributions = self._gather((self.rank, checksums))
         error = None
         try:
             for rank, other in sorted(contributions):
                 if rank >= self.rank:
                     break
-                for name in deltas.keys() & other.keys():
+                for name in raw_deltas.keys() & other.keys():
                     if other[name] != checksums[name]:
                         raise RuntimeError(
                             f"{name!r} published by rank {rank} and rank {self.rank} "
                             "with different bytes"
                         )
-                    del deltas[name]
+                    del raw_deltas[name]
                     del checksums[name]
                     del changed_bytes[name]
         except Exception as exc:
@@ -434,7 +432,7 @@ class Publisher:
         self,
         version,
         base_version,
-        deltas,
+        raw_deltas,
         metadata,
         owners,
         target_digest,
@@ -444,7 +442,7 @@ class Publisher:
             name: item for name, item in metadata.items() if owners[name] == self.rank
         }
         groups = _bucket_groups(
-            sorted(name for name in deltas if owners[name] == self.rank),
+            sorted(name for name in raw_deltas if owners[name] == self.rank),
             local_metadata,
             self.bucket_bytes,
         )
@@ -460,18 +458,23 @@ class Publisher:
         self._agree_error(error)
         setup_seconds = time.monotonic() - setup_started
 
+        tasks = [
+            (ordinal, [(name, raw_deltas[name]) for name in names])
+            for ordinal, names in enumerate(groups)
+        ]
+        raw_deltas.clear()
+
         def upload(item):
-            local_ordinal, names = item
+            local_ordinal, tensors = item
             ordinal = offset + local_ordinal
-            data, decoded_size, tensor_names = encode_compressed_bucket(
+            data, decoded_size, tensor_names = encode_bucket(
                 model_id=self.config.model_id,
                 base_version=base_version,
                 target_version=version,
                 base_digest=self.target_digest,
                 format_digest=self.format_digest,
                 ordinal=ordinal,
-                names=names,
-                compressed_deltas=deltas,
+                tensors=tensors,
                 metadata=local_metadata,
             )
             stored = uploader.put(
@@ -489,7 +492,7 @@ class Publisher:
                     "ordinal": ordinal,
                     "tensors": list(tensor_names),
                 },
-                names,
+                tensor_names,
             )
 
         pool_started = time.monotonic()
@@ -501,7 +504,7 @@ class Publisher:
                 with ThreadPoolExecutor(
                     max_workers=min(UPLOAD_WORKERS, len(groups))
                 ) as pool:
-                    uploaded = pool.map(upload, enumerate(groups))
+                    uploaded = pool.map(upload, tasks)
                     for descriptor, names in uploaded:
                         descriptors.append(descriptor)
                         for name in names:
