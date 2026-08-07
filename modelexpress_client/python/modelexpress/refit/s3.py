@@ -10,6 +10,7 @@ from typing import Any
 
 import google_crc32c
 
+from .. import envs
 from .api import S3Config
 from .manifest import S3Object
 
@@ -37,11 +38,15 @@ class S3Uploader:
         self.owns_client = client is None
         if client is None:
             import boto3
+            from botocore.config import Config as BotoConfig
 
             client = boto3.client(
                 "s3",
                 endpoint_url=config.endpoint_url,
                 region_name=config.region_name,
+                config=BotoConfig(
+                    max_pool_connections=max(1, envs.MX_REFIT_S3_MAX_POOL_CONNECTIONS)
+                ),
             )
         self.client = client
 

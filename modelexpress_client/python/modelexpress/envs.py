@@ -59,6 +59,8 @@ if TYPE_CHECKING:
     MX_MODEL_URI: Optional[str]
     MX_P2P_METADATA: str
     MX_RESHARD_FUSED_WIRE: bool
+    MX_REFIT_S3_UPLOAD_WORKERS: int
+    MX_REFIT_S3_MAX_POOL_CONNECTIONS: int
     # Kubernetes service backend
     MX_K8S_SERVICE_PATTERN: str
     MX_K8S_SOURCE_RETRIES: str
@@ -191,6 +193,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_MODEL_URI": lambda: os.environ.get("MX_MODEL_URI"),
     "MX_P2P_METADATA": lambda: os.environ.get("MX_P2P_METADATA", "1"),
     "MX_RESHARD_FUSED_WIRE": lambda: _env_bool("MX_RESHARD_FUSED_WIRE", True),
+    "MX_REFIT_S3_UPLOAD_WORKERS": lambda: _env_int("MX_REFIT_S3_UPLOAD_WORKERS", 4),
+    "MX_REFIT_S3_MAX_POOL_CONNECTIONS": lambda: _env_int(
+        "MX_REFIT_S3_MAX_POOL_CONNECTIONS", 10
+    ),
     # ── Kubernetes service backend ─────────────────────────────────────────
     "MX_K8S_SERVICE_PATTERN": lambda: os.environ.get("MX_K8S_SERVICE_PATTERN", "mx-sources"),
     "MX_K8S_SOURCE_RETRIES": lambda: os.environ.get("MX_K8S_SOURCE_RETRIES", ""),

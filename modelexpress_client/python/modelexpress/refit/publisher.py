@@ -17,6 +17,7 @@ from urllib.parse import quote
 import numpy as np
 import torch
 
+from .. import envs
 from .api import PublisherConfig
 from .catalog import GrpcRevisionCatalog
 from .manifest import RevisionManifest, RevisionState
@@ -31,7 +32,6 @@ from .source.canonical import (
 
 
 NUM_WORKERS = min(32, os.cpu_count() or 8)
-UPLOAD_WORKERS = 4
 
 
 def _key(model_id: str, version: str, filename: str) -> str:
@@ -503,7 +503,9 @@ class Publisher:
         try:
             if groups:
                 with ThreadPoolExecutor(
-                    max_workers=min(UPLOAD_WORKERS, len(groups))
+                    max_workers=min(
+                        max(1, envs.MX_REFIT_S3_UPLOAD_WORKERS), len(groups)
+                    )
                 ) as pool:
                     uploaded = pool.map(upload, tasks)
                     for descriptor, names in uploaded:

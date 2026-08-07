@@ -74,6 +74,23 @@ def test_s3_uploader_uses_one_conditional_put_and_returns_object():
     assert client.get_calls == 0
 
 
+def test_s3_uploader_configures_http_pool_from_env(monkeypatch):
+    import boto3
+
+    created = {}
+
+    def client(_service, **kwargs):
+        created.update(kwargs)
+        return FakeS3()
+
+    monkeypatch.setenv("MX_REFIT_S3_MAX_POOL_CONNECTIONS", "16")
+    monkeypatch.setattr(boto3, "client", client)
+
+    S3Uploader(S3Config(bucket="bucket"))
+
+    assert created["config"].max_pool_connections == 16
+
+
 def test_s3_uploader_allows_identical_retry_but_rejects_immutable_conflict():
     client = FakeS3()
     uploader = S3Uploader(S3Config(bucket="bucket"), client=client)

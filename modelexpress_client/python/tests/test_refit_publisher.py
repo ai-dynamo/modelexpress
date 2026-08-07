@@ -18,6 +18,7 @@ from modelexpress.refit import (
     RevisionState,
     S3Config,
 )
+from modelexpress.refit import publisher as publisher_module
 from modelexpress.refit.source.canonical import decode_bucket, load_hf_snapshot
 
 
@@ -121,7 +122,18 @@ def test_launch_zero_publishes_metadata_without_weights(tmp_path):
     assert s3.puts == []
 
 
-def test_exact_base_update_uses_miles_hf_buckets_and_uploads_delta(tmp_path):
+def test_exact_base_update_uses_miles_hf_buckets_and_uploads_delta(
+    tmp_path, monkeypatch
+):
+    workers = []
+    executor = publisher_module.ThreadPoolExecutor
+
+    def thread_pool(*args, **kwargs):
+        workers.append(kwargs["max_workers"])
+        return executor(*args, **kwargs)
+
+    monkeypatch.setenv("MX_REFIT_S3_UPLOAD_WORKERS", "1")
+    monkeypatch.setattr(publisher_module, "ThreadPoolExecutor", thread_pool)
     catalog = FakeCatalog()
     s3 = FakeS3()
     hf_path, launch = checkpoint(tmp_path)
@@ -144,6 +156,7 @@ def test_exact_base_update_uses_miles_hf_buckets_and_uploads_delta(tmp_path):
     publisher.wait_for_commit("1")
 
     metrics = publisher.pop_metrics()
+    assert 1 in workers
     old_bytes = launch["model.b.weight"].contiguous().view(torch.uint8).numpy()
     new_bytes = target["model.b.weight"].contiguous().view(torch.uint8).numpy()
     changed = int(torch.from_numpy(old_bytes != new_bytes).sum())
