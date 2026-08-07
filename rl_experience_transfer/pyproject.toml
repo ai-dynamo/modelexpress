@@ -1,0 +1,74 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[build-system]
+requires = ["setuptools>=77.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rl-experience-transfer"
+version = "0.1.0"
+description = "Transport-independent reinforcement-learning experience transfer"
+readme = "README.rst"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24,<2.3",
+]
+
+[project.optional-dependencies]
+nemo-rl = []
+prime-rl = []
+nixl = [
+    "nixl==0.7.1 ; sys_platform == 'linux'",
+    "nixl-cu12==1.0.1 ; sys_platform == 'linux'",
+    "torch>=2.9,<2.10",
+]
+slime = []
+miles = []
+all = [
+    "nixl==0.7.1 ; sys_platform == 'linux'",
+    "nixl-cu12==1.0.1 ; sys_platform == 'linux'",
+    "torch>=2.9,<2.10",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers"
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "unit: deterministic isolated tests",
+    "integration: multi-component tests",
+    "e2e: end-to-end workflow tests",
+    "nixl: requires real NIXL bindings",
+    "nemo_rl: requires NeMo RL",
+    "prime_rl: requires PRIME-RL",
+    "slime: requires slime",
+    "miles: requires MILES",
+    "requires_gpu: requires a supported GPU",
+    "requires_xpu: requires an Intel XPU",
+    "multi_process: launches multiple processes",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["src", "tests"]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.0",
+    "pytest>=8",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.1",
+]
