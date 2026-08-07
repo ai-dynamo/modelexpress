@@ -8,6 +8,8 @@
 
 #![allow(clippy::expect_used)]
 
+mod common;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -19,21 +21,9 @@ use modelexpress_client::Client;
 use modelexpress_common::Error;
 use modelexpress_common::client_config::ClientConfig;
 use modelexpress_common::config::ConnectionConfig;
-use modelexpress_common::grpc::health::health_service_server::HealthServiceServer;
-use modelexpress_server::auth::{AuthLayer, AuthState};
-use modelexpress_server::config::{AuthMode, SecurityConfig, ServiceAccountRef};
-use modelexpress_server::services::HealthServiceImpl;
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
-use tonic::transport::Server;
-use tower::{BoxError, Layer};
+use tower::BoxError;
 
-type ServerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
-
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("local addr").port()
-}
+use common::{free_port, sa_token, security_config, start_auth_server, stop_and_join};
 
 fn fake_kube_client_for_review(review: TokenReview) -> (KubeClient, Arc<AtomicUsize>) {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -53,28 +43,6 @@ fn fake_kube_client_for_review(review: TokenReview) -> (KubeClient, Arc<AtomicUs
     (KubeClient::new(service, "default"), calls)
 }
 
-fn start_auth_server(
-    port: u16,
-    kube_client: KubeClient,
-    security_config: SecurityConfig,
-) -> (oneshot::Sender<()>, JoinHandle<ServerResult>) {
-    let (tx, rx) = oneshot::channel::<()>();
-    let shutdown = async move {
-        let _ = rx.await;
-    };
-    let handle = tokio::spawn(async move {
-        let addr = format!("127.0.0.1:{port}").parse()?;
-        let state = Arc::new(AuthState::new(kube_client, &security_config));
-        let auth_layer = AuthLayer::new(state);
-        Server::builder()
-            .add_service(auth_layer.layer(HealthServiceServer::new(HealthServiceImpl)))
-            .serve_with_shutdown(addr, shutdown)
-            .await
-            .map_err(Into::into)
-    });
-    (tx, handle)
-}
-
 async fn connect_client(port: u16) -> Client {
     let config = ClientConfig {
         connection: ConnectionConfig::new(format!("http://127.0.0.1:{port}")),
@@ -87,15 +55,6 @@ async fn connect_client(port: u16) -> Client {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("server on port {port} never became reachable");
-}
-
-async fn stop_and_join(shutdown: oneshot::Sender<()>, handle: JoinHandle<ServerResult>) {
-    let _ = shutdown.send(());
-    tokio::time::timeout(Duration::from_secs(10), handle)
-        .await
-        .expect("server task did not exit in time")
-        .expect("server task panicked")
-        .expect("server returned an error");
 }
 
 fn token_review_for(username: &str) -> TokenReview {
@@ -123,18 +82,6 @@ fn unauthenticated_review() -> TokenReview {
     }
 }
 
-fn security_config() -> SecurityConfig {
-    SecurityConfig {
-        mode: Some(AuthMode::Enforce),
-        token_audiences: vec!["modelexpress".to_string()],
-        allowed_service_accounts: vec![ServiceAccountRef {
-            namespace: "vllm".to_string(),
-            service_account: "worker".to_string(),
-        }],
-        cache_ttl_secs: 60,
-    }
-}
-
 fn grpc_code(error: &Error) -> Option<tonic::Code> {
     match error {
         Error::Grpc(status) => Some(status.code()),
@@ -146,7 +93,11 @@ fn grpc_code(error: &Error) -> Option<tonic::Code> {
 async fn token_auth_end_to_end() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let token_path = temp_dir.path().join("token");
-    std::fs::write(&token_path, "worker-token\n").expect("write token");
+    std::fs::write(
+        &token_path,
+        format!("{}\n", sa_token("vllm", "worker", "e2e")),
+    )
+    .expect("write token");
     unsafe {
         std::env::set_var(
             modelexpress_common::envs::MX_AUTH_TOKEN_PATH,
@@ -158,7 +109,8 @@ async fn token_auth_end_to_end() {
     let port = free_port();
     let (kube_client, calls) =
         fake_kube_client_for_review(token_review_for("system:serviceaccount:vllm:worker"));
-    let (shutdown, handle) = start_auth_server(port, kube_client, security_config());
+    let (shutdown, handle) =
+        start_auth_server(port, kube_client, security_config(&[("vllm", "worker")]));
     let mut client = connect_client(port).await;
     client.health_check().await.expect("first health_check");
     client.health_check().await.expect("second health_check");
@@ -169,7 +121,8 @@ async fn token_auth_end_to_end() {
     let port = free_port();
     let (kube_client, _calls) =
         fake_kube_client_for_review(token_review_for("system:serviceaccount:other:intruder"));
-    let (shutdown, handle) = start_auth_server(port, kube_client, security_config());
+    let (shutdown, handle) =
+        start_auth_server(port, kube_client, security_config(&[("vllm", "worker")]));
     let mut client = connect_client(port).await;
     let error = client
         .health_check()
@@ -185,7 +138,8 @@ async fn token_auth_end_to_end() {
     // Token the reviewer rejects: UNAUTHENTICATED.
     let port = free_port();
     let (kube_client, _calls) = fake_kube_client_for_review(unauthenticated_review());
-    let (shutdown, handle) = start_auth_server(port, kube_client, security_config());
+    let (shutdown, handle) =
+        start_auth_server(port, kube_client, security_config(&[("vllm", "worker")]));
     let mut client = connect_client(port).await;
     let error = client
         .health_check()
