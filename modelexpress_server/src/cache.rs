@@ -364,13 +364,21 @@ impl CacheEvictionService {
         // Several entries can share one snapshot on disk — a metadata-only download and
         // a full-weight one of the same revision, for instance. Only remove the files
         // once the last entry referencing them goes away.
+        //
+        // An entry with no revision covers every snapshot of its model, so it shares
+        // files with all of them. That is how a record written before revisions existed
+        // behaves: evicting it must not delete the snapshot a revision-scoped entry is
+        // still using.
         let siblings = self.registry.get_models_by_last_used(None).await?;
         let snapshot_still_referenced = siblings.iter().any(|sibling| {
             if sibling.model_name == entry_key {
                 return false;
             }
             let other = EntryKey::parse(&sibling.model_name);
-            other.model_name == key.model_name && other.revision == key.revision
+            other.model_name == key.model_name
+                && (other.revision == key.revision
+                    || other.revision.is_none()
+                    || key.revision.is_none())
         });
 
         // Delete files from disk first. If this fails, we keep the registry record
@@ -725,5 +733,76 @@ mod tests {
         assert_eq!(stats.downloaded_models, 1);
         assert_eq!(stats.downloading_models, 1);
         assert_eq!(stats.error_models, 1);
+    }
+
+    fn downloaded_record(model_name: &str) -> ModelRecord {
+        let now = Utc::now();
+        ModelRecord {
+            model_name: model_name.to_string(),
+            provider: ModelProvider::HuggingFace,
+            status: ModelStatus::DOWNLOADED,
+            created_at: now,
+            last_used_at: now,
+            message: None,
+        }
+    }
+
+    /// Evict `entry_key` with `siblings` also in the registry, and report whether the
+    /// snapshot survived on disk.
+    async fn evict_and_report_files_kept(entry_key: &str, siblings: Vec<&'static str>) -> bool {
+        let evicted = entry_key.to_string();
+        let mut mock = MockRegistryBackend::new();
+        mock.expect_get_model_record()
+            .once()
+            .returning(move |name| Ok(Some(downloaded_record(name))));
+        mock.expect_get_models_by_last_used()
+            .once()
+            .returning(move |_| {
+                let mut records = vec![downloaded_record(&evicted)];
+                records.extend(siblings.iter().map(|name| downloaded_record(name)));
+                Ok(records)
+            });
+        mock.expect_delete_model().once().returning(|_| Ok(()));
+
+        let (service, cache_dir) = service_with_mock(mock, CacheEvictionConfig::default());
+        let snapshot = cache_dir
+            .path()
+            .join("models--test--model/snapshots/abc123");
+        std::fs::create_dir_all(&snapshot).expect("Failed to create snapshot");
+        std::fs::write(snapshot.join("config.json"), b"{}").expect("Failed to write config");
+
+        service.evict_model(entry_key).await.expect("evict");
+        snapshot.exists()
+    }
+
+    #[tokio::test]
+    async fn test_evict_removes_the_snapshot_when_nothing_else_references_it() {
+        assert!(!evict_and_report_files_kept("test/model@rev:abc123", vec![]).await);
+    }
+
+    #[tokio::test]
+    async fn test_evict_keeps_files_shared_with_the_metadata_only_entry() {
+        assert!(
+            evict_and_report_files_kept(
+                "test/model@rev:abc123",
+                vec!["test/model@rev:abc123#metadata"]
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_evict_keeps_files_a_revision_scoped_entry_still_uses() {
+        // A pre-revision record covers every snapshot of its model, so evicting it must
+        // not delete the snapshot a revision-scoped entry points at.
+        assert!(evict_and_report_files_kept("test/model", vec!["test/model@rev:abc123"]).await);
+    }
+
+    #[tokio::test]
+    async fn test_evict_ignores_other_revisions_of_the_same_model() {
+        assert!(
+            !evict_and_report_files_kept("test/model@rev:abc123", vec!["test/model@rev:def456"])
+                .await
+        );
     }
 }
