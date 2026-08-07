@@ -323,6 +323,9 @@ struct WorkerRecordJson {
     /// Runtime accelerator family for compatibility filtering.
     #[serde(default)]
     pub accelerator: String,
+    /// Source-published RDMA NIC utilization in [0, 1].
+    #[serde(default)]
+    pub source_load: f32,
     /// Small discovery summary for file-backed artifact sources.
     #[serde(default)]
     pub artifact_source: Option<ArtifactSourceMetadataJson>,
@@ -337,6 +340,8 @@ struct WorkerSummaryJson {
     updated_at: i64,
     #[serde(default)]
     accelerator: String,
+    #[serde(default)]
+    source_load: f32,
 }
 
 /// Serializable artifact source summary.
@@ -378,6 +383,7 @@ impl WorkerRecordJson {
             agent_name: record.agent_name,
             worker_grpc_endpoint: record.worker_grpc_endpoint,
             accelerator: record.accelerator,
+            source_load: record.source_load,
             artifact_source: record.artifact_source.map(ArtifactSourceMetadataJson::from),
         }
     }
@@ -399,6 +405,7 @@ impl From<WorkerRecordJson> for WorkerRecord {
             agent_name: json.agent_name,
             worker_grpc_endpoint: json.worker_grpc_endpoint,
             accelerator: json.accelerator,
+            source_load: json.source_load,
             artifact_source: json.artifact_source.map(ArtifactSourceMetadataRecord::from),
         }
     }
@@ -518,6 +525,7 @@ impl MetadataBackend for RedisBackend {
             status: worker_record.status,
             updated_at: worker_record.updated_at,
             accelerator: worker_record.accelerator.clone(),
+            source_load: worker_record.source_load,
         })?;
 
         let mut pipe = redis::pipe();
@@ -642,11 +650,11 @@ impl MetadataBackend for RedisBackend {
                     continue;
                 }
 
-                let (status, updated_at, accelerator) = fields
+                let (status, updated_at, accelerator, source_load) = fields
                     .get(&worker_rank.to_string())
                     .and_then(|v| serde_json::from_str::<WorkerRecordJson>(v).ok())
-                    .map(|j| (j.status, j.updated_at, j.accelerator))
-                    .unwrap_or((0, 0, String::new()));
+                    .map(|j| (j.status, j.updated_at, j.accelerator, j.source_load))
+                    .unwrap_or((0, 0, String::new(), 0.0));
 
                 result.push(super::SourceInstanceInfo {
                     source_id: sid.clone(),
@@ -656,6 +664,7 @@ impl MetadataBackend for RedisBackend {
                     status,
                     updated_at,
                     accelerator,
+                    source_load,
                     training_step,
                     layout_signature: layout_signature.clone(),
                 });
@@ -756,6 +765,7 @@ impl MetadataBackend for RedisBackend {
                             status: summary.status,
                             updated_at: summary.updated_at,
                             accelerator: summary.accelerator,
+                            source_load: summary.source_load,
                             training_step,
                             layout_signature: layout_signature.clone(),
                         });
@@ -798,11 +808,18 @@ impl MetadataBackend for RedisBackend {
                 }) {
                     continue;
                 }
-                let (status, updated_at, accelerator) = fields
+                let (status, updated_at, accelerator, source_load) = fields
                     .get(&worker_rank.to_string())
                     .and_then(|value| serde_json::from_str::<WorkerRecordJson>(value).ok())
-                    .map(|record| (record.status, record.updated_at, record.accelerator))
-                    .unwrap_or((0, 0, String::new()));
+                    .map(|record| {
+                        (
+                            record.status,
+                            record.updated_at,
+                            record.accelerator,
+                            record.source_load,
+                        )
+                    })
+                    .unwrap_or((0, 0, String::new(), 0.0));
                 if min_updated_at.is_some_and(|minimum| updated_at < minimum) {
                     continue;
                 }
@@ -814,6 +831,7 @@ impl MetadataBackend for RedisBackend {
                     status,
                     updated_at,
                     accelerator,
+                    source_load,
                     training_step,
                     layout_signature,
                 });
@@ -893,6 +911,7 @@ impl MetadataBackend for RedisBackend {
         worker_rank: u32,
         status: SourceStatus,
         updated_at: i64,
+        source_load: f32,
     ) -> MetadataResult<()> {
         let mut conn = self.get_conn().await?;
         let key = format!("{}{}:{}", keys::SOURCE_PREFIX, source_id, worker_id);
@@ -909,6 +928,7 @@ impl MetadataBackend for RedisBackend {
         let mut record: WorkerRecordJson = serde_json::from_str(&json_str)?;
         record.status = status as i32;
         record.updated_at = updated_at;
+        record.source_load = source_load;
 
         let updated = serde_json::to_string(&record)?;
         let source_key = format!("{}{}", keys::SOURCE_PREFIX, source_id);
@@ -922,6 +942,7 @@ impl MetadataBackend for RedisBackend {
                 worker_rank: representative_rank,
                 status: status as i32,
                 updated_at,
+                source_load: record.source_load,
                 accelerator: record.accelerator,
             })?;
             pipe.hset(&source_key, worker_id, summary);
@@ -1012,6 +1033,7 @@ mod tests {
             agent_name: String::new(),
             worker_grpc_endpoint: String::new(),
             accelerator: "cuda".to_string(),
+            source_load: 0.625,
             artifact_source: Some(ArtifactSourceMetadataRecord {
                 artifact_id: "artifact123".to_string(),
                 total_size: 1_099_511_627_776,
@@ -1032,6 +1054,8 @@ mod tests {
         assert_eq!(back.updated_at, record.updated_at);
         assert_eq!(back.tensors.len(), 1);
         assert_eq!(back.accelerator, record.accelerator);
+        assert_eq!(back.source_load, record.source_load);
+        assert_eq!(back.source_load, 0.625);
         assert_eq!(back.artifact_source, record.artifact_source);
         assert!(
             json.contains(r#""total_size":"#),
@@ -1057,10 +1081,12 @@ mod tests {
             status: SourceStatus::Ready as i32,
             updated_at: 1_700_000_000_000,
             accelerator: "cuda".to_string(),
+            source_load: 0.5,
         };
         let json = serde_json::to_string(&summary).expect("serialize");
         let parsed: WorkerSummaryJson = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.accelerator, "cuda");
+        assert_eq!(parsed.source_load, 0.5);
     }
 
     #[test]

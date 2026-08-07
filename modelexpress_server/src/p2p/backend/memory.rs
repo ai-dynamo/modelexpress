@@ -128,9 +128,9 @@ impl MetadataBackend for InMemoryMetadataBackend {
                     .ranks
                     .get(&entry.index_rank)
                     .or_else(|| entry.ranks.values().next());
-                let (status, updated_at, accelerator) = reported.map_or_else(
-                    || (0, 0, String::new()),
-                    |r| (r.status, r.updated_at, r.accelerator.clone()),
+                let (status, updated_at, accelerator, source_load) = reported.map_or_else(
+                    || (0, 0, String::new(), 0.0),
+                    |r| (r.status, r.updated_at, r.accelerator.clone(), r.source_load),
                 );
                 result.push(SourceInstanceInfo {
                     source_id: sid.clone(),
@@ -140,6 +140,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
                     status,
                     updated_at,
                     accelerator,
+                    source_load,
                     training_step: super::parse_training_step(&source.extra_parameters),
                     layout_signature: super::parse_layout_signature(&source.extra_parameters),
                 });
@@ -180,6 +181,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
         worker_rank: u32,
         status: SourceStatus,
         updated_at: i64,
+        source_load: f32,
     ) -> MetadataResult<()> {
         let mut sources = self.lock();
         let record = sources
@@ -190,6 +192,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
             Some(record) => {
                 record.status = status as i32;
                 record.updated_at = updated_at;
+                record.source_load = source_load;
                 Ok(())
             }
             None => Err(format!(
@@ -378,7 +381,7 @@ mod tests {
             .await
             .expect("publish");
         backend
-            .update_status(&source_id, "w1", 0, SourceStatus::Ready, 123)
+            .update_status(&source_id, "w1", 0, SourceStatus::Ready, 123, 0.0)
             .await
             .expect("patch existing rank");
 
@@ -392,14 +395,14 @@ mod tests {
 
         assert!(
             backend
-                .update_status(&source_id, "w1", 99, SourceStatus::Ready, 1)
+                .update_status(&source_id, "w1", 99, SourceStatus::Ready, 1, 0.0)
                 .await
                 .is_err(),
             "unknown rank errors"
         );
         assert!(
             backend
-                .update_status(&source_id, "ghost", 0, SourceStatus::Ready, 1)
+                .update_status(&source_id, "ghost", 0, SourceStatus::Ready, 1, 0.0)
                 .await
                 .is_err(),
             "unknown worker errors"
