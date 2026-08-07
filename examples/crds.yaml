@@ -88,6 +88,11 @@ spec:
                     accelerator:
                       type: string
                       description: Runtime accelerator family for compatibility filtering
+                    topology:
+                      type: object
+                      additionalProperties:
+                        type: string
+                      description: Datacenter topology domain values keyed by Grove ClusterTopology domain (region/zone/datacenter/block/rack/host/numa)
                     artifactSource:
                       type: object
                       description: Small discovery summary for file-backed artifact sources
