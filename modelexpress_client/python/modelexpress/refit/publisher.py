@@ -212,7 +212,7 @@ class Publisher:
         self._agree_error(error)
         target_digest = snapshot_digest(metadata)
         publish_started = time.monotonic()
-        wire_bytes = self._publish_root(
+        wire_bytes, setup_seconds, pool_seconds, finalize_seconds = self._publish_root(
             version,
             base_version,
             deltas,
@@ -225,17 +225,23 @@ class Publisher:
             (
                 encode_seconds,
                 publish_seconds,
+                setup_seconds,
+                pool_seconds,
+                finalize_seconds,
                 sum(changed_bytes.values()),
                 wire_bytes,
             )
         )
         total_bytes = sum(item["byte_size"] for item in metadata.values())
         self._metrics = {
-            "perf/update_weights_density": sum(item[2] for item in phase_metrics)
+            "perf/update_weights_density": sum(item[5] for item in phase_metrics)
             / max(total_bytes, 1),
-            "perf/update_weights_wire_bytes": sum(item[3] for item in phase_metrics),
+            "perf/update_weights_wire_bytes": sum(item[6] for item in phase_metrics),
             "perf/mx_encode_delta": max(item[0] for item in phase_metrics),
             "perf/mx_publish_time": max(item[1] for item in phase_metrics),
+            "perf/mx_publish_setup": max(item[2] for item in phase_metrics),
+            "perf/mx_publish_pool": max(item[3] for item in phase_metrics),
+            "perf/mx_publish_finalize": max(item[4] for item in phase_metrics),
         }
         self.pending_version = version
         self.pending_digest = target_digest
@@ -432,7 +438,8 @@ class Publisher:
         metadata,
         owners,
         target_digest,
-    ) -> int:
+    ) -> tuple[int, float, float, float]:
+        setup_started = time.monotonic()
         local_metadata = {
             name: item for name, item in metadata.items() if owners[name] == self.rank
         }
@@ -451,6 +458,7 @@ class Publisher:
         except Exception as exc:
             error = exc
         self._agree_error(error)
+        setup_seconds = time.monotonic() - setup_started
 
         def upload(item):
             local_ordinal, names = item
@@ -484,6 +492,7 @@ class Publisher:
                 names,
             )
 
+        pool_started = time.monotonic()
         descriptors = []
         dirty_ordinals = {}
         error = None
@@ -500,6 +509,8 @@ class Publisher:
         except Exception as exc:
             error = exc
         self._agree_error(error)
+        pool_seconds = time.monotonic() - pool_started
+        finalize_started = time.monotonic()
 
         coverage = []
         for name, item in local_metadata.items():
@@ -553,7 +564,8 @@ class Publisher:
             except Exception as exc:
                 error = exc
         self._agree_error(error)
-        return wire_bytes
+        finalize_seconds = time.monotonic() - finalize_started
+        return wire_bytes, setup_seconds, pool_seconds, finalize_seconds
 
     def _uploader(self):
         if self.uploader is None:

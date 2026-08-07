@@ -151,7 +151,15 @@ def test_exact_base_update_uses_miles_hf_buckets_and_uploads_delta(tmp_path):
     assert metrics["perf/update_weights_density"] == changed / total
     assert metrics["perf/update_weights_wire_bytes"] > 0
     assert metrics["perf/mx_encode_delta"] >= 0
-    assert metrics["perf/mx_publish_time"] >= 0
+    assert metrics["perf/mx_publish_setup"] >= 0
+    assert metrics["perf/mx_publish_pool"] >= 0
+    assert metrics["perf/mx_publish_finalize"] >= 0
+    assert metrics["perf/mx_publish_time"] == pytest.approx(
+        metrics["perf/mx_publish_setup"]
+        + metrics["perf/mx_publish_pool"]
+        + metrics["perf/mx_publish_finalize"],
+        abs=1e-4,
+    )
     assert publisher.pop_metrics() == {}
     assert publisher.current_version == "1"
     manifest = catalog.published[-1]
