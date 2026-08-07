@@ -11,14 +11,13 @@ pub use token::CallerIdentity;
 
 use std::collections::HashMap;
 use std::fmt;
-use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
 use http::HeaderMap;
 use kube::client::Client;
 use moka::future::Cache;
 use secrecy::ExposeSecret;
-use secrecy::zeroize::Zeroizing;
+use sha2::{Digest, Sha256};
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::time::timeout;
 use tracing::warn;
@@ -48,36 +47,12 @@ impl Denial {
     }
 }
 
-#[derive(Clone)]
-struct TokenCacheKey(Zeroizing<String>);
-
-impl TokenCacheKey {
-    fn new(token: &str) -> Self {
-        Self(Zeroizing::new(token.to_string()))
-    }
-
-    fn as_str(&self) -> &str {
-        self.0.as_str()
-    }
-}
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct TokenCacheKey([u8; 32]);
 
 impl fmt::Debug for TokenCacheKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("TokenCacheKey([REDACTED])")
-    }
-}
-
-impl PartialEq for TokenCacheKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_str() == other.as_str()
-    }
-}
-
-impl Eq for TokenCacheKey {}
-
-impl Hash for TokenCacheKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.as_str().hash(state);
     }
 }
 
@@ -125,6 +100,10 @@ impl AuthState {
         }
     }
 
+    fn cache_key(token: &str) -> TokenCacheKey {
+        TokenCacheKey(Sha256::digest(token.as_bytes()).into())
+    }
+
     async fn acquire(semaphore: &Semaphore) -> Result<SemaphorePermit<'_>, TokenError> {
         match timeout(Self::PERMIT_WAIT, semaphore.acquire()).await {
             Ok(Ok(permit)) => Ok(permit),
@@ -134,7 +113,7 @@ impl AuthState {
 
     pub(crate) async fn verify(&self, headers: &HeaderMap) -> Result<CallerIdentity, Denial> {
         let token = extract_bearer(headers).ok_or(Denial::Unauthenticated)?;
-        let key = TokenCacheKey::new(token.expose_secret());
+        let key = Self::cache_key(token.expose_secret());
 
         if self.negative_cache.get(&key).await.is_some() {
             return Err(Denial::Unauthenticated);
