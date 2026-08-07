@@ -5,7 +5,7 @@ use crate::{
     cache::{ModelInfo, ProviderCache, directory_size},
     constants, envs,
     models::ModelProvider,
-    providers::ModelProviderTrait,
+    providers::{ModelDownloadOutcome, ModelProviderTrait},
 };
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -20,6 +20,9 @@ use tracing::{debug, info, warn};
 
 const HF_FALLBACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const HF_FALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Revision used when a caller does not pin one. Matches hf-hub's own default branch.
+const DEFAULT_HF_REVISION: &str = "main";
 
 /// Check if offline mode is enabled via `HF_HUB_OFFLINE`.
 /// See [`crate::envs::hf_offline`] for the accepted truthy values.
@@ -65,6 +68,31 @@ impl HuggingFaceProviderCache {
 
     fn snapshots_dir(cache_root: &Path, model_name: &str) -> PathBuf {
         Self::repo_root(cache_root, model_name).join("snapshots")
+    }
+
+    fn refs_dir(cache_root: &Path, model_name: &str) -> PathBuf {
+        Self::repo_root(cache_root, model_name).join("refs")
+    }
+
+    /// Read the commit a cached `refs/<revision>` entry points at.
+    ///
+    /// Returns `None` when the ref does not exist, so callers can fall back to
+    /// treating the requested revision as a commit SHA.
+    fn read_ref(cache_root: &Path, model_name: &str, revision: &str) -> Option<String> {
+        let ref_path = Self::refs_dir(cache_root, model_name).join(revision);
+        let commit = fs::read_to_string(ref_path).ok()?;
+        let commit = commit.trim();
+        if commit.is_empty() {
+            None
+        } else {
+            Some(commit.to_string())
+        }
+    }
+
+    /// Map a requested revision to the commit that identifies its snapshot directory,
+    /// using only local cache state.
+    fn local_commit_for_revision(cache_root: &Path, model_name: &str, revision: &str) -> String {
+        Self::read_ref(cache_root, model_name, revision).unwrap_or_else(|| revision.to_string())
     }
 
     fn folder_name_to_model_id(folder_name: &str) -> String {
@@ -294,27 +322,107 @@ impl HuggingFaceProvider {
                 ));
             }
         }
-        Cache::new(cache_dir.to_path_buf())
-            .model(model_name.to_string())
-            .create_ref(commit_hash)
-            .with_context(|| {
-                format!("Failed to create Hugging Face cache ref for '{model_name}'")
-            })?;
-
         Ok(pointer_path)
     }
-}
 
-#[async_trait::async_trait]
-impl ModelProviderTrait for HuggingFaceProvider {
-    /// Attempt to download a model from Hugging Face.
-    /// Returns the directory it is in.
-    async fn download_model(
+    /// Point `refs/<revision>` at `commit_hash` so the snapshot stays resolvable by the
+    /// name the caller asked for (a branch, a tag, or the default revision).
+    fn create_revision_ref(
+        cache_dir: &Path,
+        model_name: &str,
+        revision: &str,
+        commit_hash: &str,
+    ) -> Result<()> {
+        Cache::new(cache_dir.to_path_buf())
+            .repo(Repo::with_revision(
+                model_name.to_string(),
+                RepoType::Model,
+                revision.to_string(),
+            ))
+            .create_ref(commit_hash)
+            .with_context(|| {
+                format!("Failed to create Hugging Face cache ref for '{model_name}@{revision}'")
+            })
+    }
+
+    /// Fetch repository metadata for a revision.
+    ///
+    /// A missing branch, tag, or commit surfaces as an error here; we never retry
+    /// against the default revision, so a typo can't silently download the wrong model.
+    async fn repo_info_at_revision(
+        model_name: &str,
+        revision: &str,
+        cache_dir: Option<&Path>,
+    ) -> Result<hf_hub::api::RepoInfo> {
+        let mut builder = ApiBuilder::from_env().with_token(envs::hf_token());
+        if let Some(cache_dir) = cache_dir {
+            builder = builder.with_cache_dir(cache_dir.to_path_buf());
+        }
+        let api = builder.build()?;
+        api.repo(Repo::with_revision(
+            model_name.to_string(),
+            RepoType::Model,
+            revision.to_string(),
+        ))
+        .info()
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to fetch model '{model_name}' at revision '{revision}' from HuggingFace. \
+                 Is this a valid HuggingFace ID and revision? Error: {e}"
+            )
+        })
+    }
+
+    /// Resolve a requested revision against the local cache only.
+    ///
+    /// Used in offline mode and by the file-serving paths, which must not reach out to
+    /// the Hub for a model that is already downloaded.
+    fn resolve_revision_offline(
+        cache_dir: &Path,
+        model_name: &str,
+        revision: Option<&str>,
+    ) -> Result<String> {
+        match revision {
+            Some(revision) => {
+                let commit = HuggingFaceProviderCache::local_commit_for_revision(
+                    cache_dir, model_name, revision,
+                );
+                let snapshot =
+                    HuggingFaceProviderCache::snapshots_dir(cache_dir, model_name).join(&commit);
+                if snapshot.is_dir() {
+                    Ok(commit)
+                } else {
+                    anyhow::bail!(
+                        "Revision '{revision}' of model '{model_name}' is not present in the cache"
+                    )
+                }
+            }
+            None => {
+                let latest =
+                    HuggingFaceProviderCache::latest_local_snapshot_path(cache_dir, model_name)?;
+                latest
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(String::from)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Cached snapshot path for '{model_name}' has no revision component"
+                        )
+                    })
+            }
+        }
+    }
+
+    /// Download every eligible file of `model_name` at `revision`, resolving the request
+    /// to an immutable commit first and fetching every file from that commit.
+    async fn download_at_revision(
         &self,
         model_name: &str,
         cache_dir: Option<PathBuf>,
         ignore_weights: bool,
-    ) -> Result<PathBuf> {
+        revision: Option<&str>,
+    ) -> Result<ModelDownloadOutcome> {
         let cache_dir = get_cache_dir(cache_dir);
         std::fs::create_dir_all(&cache_dir).map_err(|e| {
             anyhow::anyhow!("Failed to create cache directory {:?}: {}", cache_dir, e)
@@ -322,7 +430,13 @@ impl ModelProviderTrait for HuggingFaceProvider {
 
         if is_offline_mode() {
             info!("HF_HUB_OFFLINE is set, using cached model for '{model_name}'");
-            return self.get_model_path(model_name, cache_dir).await;
+            let resolved = Self::resolve_revision_offline(&cache_dir, model_name, revision)?;
+            let path =
+                HuggingFaceProviderCache::snapshots_dir(&cache_dir, model_name).join(&resolved);
+            return Ok(ModelDownloadOutcome {
+                path,
+                resolved_revision: Some(resolved),
+            });
         }
 
         let token = envs::hf_token();
@@ -341,24 +455,36 @@ impl ModelProviderTrait for HuggingFaceProvider {
             .with_cache_dir(cache_dir.clone())
             .build()?;
         let model_name = model_name.to_string();
+        let requested_revision = revision.unwrap_or(DEFAULT_HF_REVISION).to_string();
 
-        let repo = api.model(model_name.clone());
-
-        let info = repo.info().await.map_err(
-            |e| anyhow::anyhow!("Failed to fetch model '{model_name}' from HuggingFace. Is this a valid HuggingFace ID? Error: {e}"),
-        )?;
+        let info = api
+            .repo(Repo::with_revision(
+                model_name.clone(),
+                RepoType::Model,
+                requested_revision.clone(),
+            ))
+            .info()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to fetch model '{model_name}' at revision '{requested_revision}' from \
+                     HuggingFace. Is this a valid HuggingFace ID and revision? Error: {e}"
+                )
+            })?;
         debug!("Got model info: {info:?}");
 
         if info.siblings.is_empty() {
             anyhow::bail!("Model '{model_name}' exists but contains no downloadable files.");
         }
 
+        // Every file is fetched from the resolved commit rather than from the requested
+        // branch or tag, so a revision that moves mid-download cannot mix commits into
+        // one snapshot.
         let pinned_repo = api.repo(Repo::with_revision(
             model_name.clone(),
             RepoType::Model,
             info.sha.clone(),
         ));
-        let mut p = PathBuf::new();
         let mut files_downloaded = false;
 
         for sib in info.siblings {
@@ -376,8 +502,8 @@ impl ModelProviderTrait for HuggingFaceProvider {
                 continue;
             }
 
-            let path = match repo.get(&sib.rfilename).await {
-                Ok(path) => path,
+            match pinned_repo.get(&sib.rfilename).await {
+                Ok(_) => {}
                 Err(e) if HuggingFaceProvider::is_missing_content_range_error(&e) => {
                     // hf-hub requires Content-Range for its size probe. Some HF mirrors return a
                     // complete 200 OK body instead, so retry this file without Range headers.
@@ -401,7 +527,7 @@ impl ModelProviderTrait for HuggingFaceProvider {
                             model_name = model_name,
                             e = e
                         )
-                    })?
+                    })?;
                 }
                 Err(e) => {
                     // HTTP 416 (Range Not Satisfiable) occurs for empty files (0 bytes)
@@ -422,9 +548,8 @@ impl ModelProviderTrait for HuggingFaceProvider {
                         e = e
                     ));
                 }
-            };
+            }
 
-            p = path;
             files_downloaded = true;
         }
 
@@ -435,12 +560,75 @@ impl ModelProviderTrait for HuggingFaceProvider {
             ));
         }
 
-        info!("Downloaded model files for {model_name}");
+        HuggingFaceProvider::create_revision_ref(
+            &cache_dir,
+            &model_name,
+            &requested_revision,
+            &info.sha,
+        )?;
 
-        match p.parent() {
-            Some(p) => Ok(p.to_path_buf()),
-            None => Err(anyhow::anyhow!("Invalid HF cache path: {}", p.display())),
+        info!(
+            "Downloaded model files for {model_name} at revision {}",
+            info.sha
+        );
+
+        Ok(ModelDownloadOutcome {
+            path: HuggingFaceProviderCache::snapshots_dir(&cache_dir, &model_name).join(&info.sha),
+            resolved_revision: Some(info.sha),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelProviderTrait for HuggingFaceProvider {
+    /// Attempt to download a model from Hugging Face at its default revision.
+    /// Returns the directory it is in.
+    async fn download_model(
+        &self,
+        model_name: &str,
+        cache_dir: Option<PathBuf>,
+        ignore_weights: bool,
+    ) -> Result<PathBuf> {
+        self.download_at_revision(model_name, cache_dir, ignore_weights, None)
+            .await
+            .map(|outcome| outcome.path)
+    }
+
+    async fn download_model_revision(
+        &self,
+        model_name: &str,
+        cache_dir: Option<PathBuf>,
+        ignore_weights: bool,
+        revision: Option<&str>,
+    ) -> Result<ModelDownloadOutcome> {
+        self.download_at_revision(model_name, cache_dir, ignore_weights, revision)
+            .await
+    }
+
+    /// Resolve a branch, tag, or commit SHA to the immutable commit SHA it names.
+    ///
+    /// Offline, this only consults the local cache; a revision that is not cached is an
+    /// error rather than a fall back to whatever snapshot happens to be newest.
+    async fn resolve_revision(
+        &self,
+        model_name: &str,
+        cache_dir: Option<PathBuf>,
+        revision: Option<&str>,
+    ) -> Result<Option<String>> {
+        let cache_dir = get_cache_dir(cache_dir);
+
+        if is_offline_mode() {
+            return Self::resolve_revision_offline(&cache_dir, model_name, revision).map(Some);
         }
+
+        let info = Self::repo_info_at_revision(
+            model_name,
+            revision.unwrap_or(DEFAULT_HF_REVISION),
+            Some(&cache_dir),
+        )
+        .await?;
+
+        Ok(Some(info.sha))
     }
 
     /// Attempt to delete a model from Hugging Face cache
@@ -543,6 +731,63 @@ impl ModelProviderTrait for HuggingFaceProvider {
         Ok(())
     }
 
+    /// Delete a single cached revision, leaving the model's other revisions intact.
+    ///
+    /// Once the last snapshot is gone the whole repository directory is removed, which
+    /// also reclaims the blobs the snapshots pointed at.
+    async fn delete_model_revision(
+        &self,
+        model_name: &str,
+        cache_dir: PathBuf,
+        revision: Option<&str>,
+    ) -> Result<()> {
+        let Some(revision) = revision else {
+            return self.delete_model(model_name, cache_dir).await;
+        };
+
+        let commit =
+            HuggingFaceProviderCache::local_commit_for_revision(&cache_dir, model_name, revision);
+        let snapshot =
+            HuggingFaceProviderCache::snapshots_dir(&cache_dir, model_name).join(&commit);
+
+        if snapshot.exists() {
+            fs::remove_dir_all(&snapshot)
+                .with_context(|| format!("Failed to remove snapshot {}", snapshot.display()))?;
+            info!("Deleted snapshot {} for model '{model_name}'", commit);
+        } else {
+            info!("Snapshot {commit} for model '{model_name}' is not cached");
+        }
+
+        // Drop refs that named the removed snapshot so a later lookup cannot resolve a
+        // branch or tag to a directory that no longer exists.
+        let refs_dir = HuggingFaceProviderCache::refs_dir(&cache_dir, model_name);
+        if let Ok(entries) = fs::read_dir(&refs_dir) {
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.is_file()
+                    && fs::read_to_string(&path).is_ok_and(|target| target.trim() == commit)
+                    && let Err(e) = fs::remove_file(&path)
+                {
+                    warn!("Failed to remove stale ref {}: {e}", path.display());
+                }
+            }
+        }
+
+        let snapshots_dir = HuggingFaceProviderCache::snapshots_dir(&cache_dir, model_name);
+        let no_snapshots_left = fs::read_dir(&snapshots_dir)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false);
+        if no_snapshots_left {
+            let repo_root = HuggingFaceProviderCache::repo_root(&cache_dir, model_name);
+            fs::remove_dir_all(&repo_root).with_context(|| {
+                format!("Failed to remove empty repository {}", repo_root.display())
+            })?;
+            info!("Removed empty repository directory for model '{model_name}'");
+        }
+
+        Ok(())
+    }
+
     /// Get the full path to the latest model snapshot if it exists.
     /// Returns the path if found, or an error if not found.
     async fn get_model_path(&self, model_name: &str, cache_dir: PathBuf) -> Result<PathBuf> {
@@ -575,6 +820,24 @@ impl ModelProviderTrait for HuggingFaceProvider {
         );
 
         Ok(latest_local_snapshot)
+    }
+
+    /// Resolve a cached snapshot directory without contacting the Hub.
+    ///
+    /// The file-serving paths use this: the model is already downloaded, so a requested
+    /// revision either has a snapshot on disk or the request is not serviceable.
+    async fn get_model_path_revision(
+        &self,
+        model_name: &str,
+        cache_dir: PathBuf,
+        revision: Option<&str>,
+    ) -> Result<PathBuf> {
+        let Some(revision) = revision else {
+            return self.get_model_path(model_name, cache_dir).await;
+        };
+
+        let commit = Self::resolve_revision_offline(&cache_dir, model_name, Some(revision))?;
+        Ok(HuggingFaceProviderCache::snapshots_dir(&cache_dir, model_name).join(commit))
     }
 
     fn provider_name(&self) -> &'static str {
@@ -725,18 +988,14 @@ mod tests {
             .mount(&server)
             .await;
 
+        // Downloads are pinned to the resolved commit, so both hf-hub's range probe and
+        // the full-body fallback hit the commit-pinned URL. A request against the branch
+        // would mean a file could come from a commit other than the one we report.
         Mock::given(method("GET"))
             .and(path_regex(r"^/test/model/resolve/main/LICENSE$"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("etag", "\"license-etag\"")
-                    .insert_header("x-repo-commit", "def5678")
-                    .insert_header("accept-ranges", "bytes")
-                    .insert_header("content-length", file_contents.len().to_string())
-                    .set_body_bytes(file_contents.to_vec()),
-            )
-            .expect(1)
-            .named("hf-hub range probe without content-range")
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .named("branch-resolved download must not happen")
             .mount(&server)
             .await;
 
@@ -750,8 +1009,8 @@ mod tests {
                     .insert_header("content-length", file_contents.len().to_string())
                     .set_body_bytes(file_contents.to_vec()),
             )
-            .expect(1)
-            .named("commit-pinned full-body fallback")
+            .expect(2)
+            .named("commit-pinned range probe, then full-body fallback")
             .mount(&server)
             .await;
 
@@ -1078,6 +1337,299 @@ mod tests {
                 .expect_err("Expected error")
                 .to_string()
                 .contains("not found in cache")
+        );
+    }
+
+    /// Stub the revision-metadata endpoint hf-hub queries for `revision`, reporting
+    /// `sha` as the commit that revision currently points at.
+    async fn mock_revision_info(server: &MockServer, revision: &str, sha: &str) {
+        Mock::given(method("GET"))
+            .and(path_regex(format!(
+                r"^/api/models/test/model/revision/{revision}$"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "test/model",
+                "sha": sha,
+                "siblings": [{"rfilename": "config.json"}]
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// Stub `config.json` under one specific revision path.
+    async fn mock_revision_file(server: &MockServer, revision: &str, sha: &str) {
+        Mock::given(method("GET"))
+            .and(path_regex(format!(
+                r"^/test/model/resolve/{revision}/config\.json$"
+            )))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("etag", format!("\"{sha}\""))
+                    .insert_header("x-repo-commit", sha)
+                    .insert_header("accept-ranges", "bytes")
+                    .insert_header("content-length", "64")
+                    .insert_header("content-range", "bytes 0-63/64")
+                    .set_body_bytes(vec![0u8; 64]),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_download_at_explicit_commit_produces_that_snapshot() {
+        let env_lock = acquire_env_mutex();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let server = MockServer::start().await;
+
+        mock_revision_info(&server, "abc9999", "abc9999").await;
+        mock_revision_file(&server, "abc9999", "abc9999").await;
+
+        let _hf_endpoint_guard =
+            EnvVarGuard::set(&env_lock, crate::envs::HF_ENDPOINT, &server.uri());
+
+        let outcome = HuggingFaceProvider
+            .download_model_revision(
+                "test/model",
+                Some(temp_dir.path().to_path_buf()),
+                false,
+                Some("abc9999"),
+            )
+            .await
+            .expect("Pinned download should succeed");
+
+        assert_eq!(outcome.resolved_revision.as_deref(), Some("abc9999"));
+        assert_eq!(
+            outcome.path,
+            temp_dir
+                .path()
+                .join("models--test--model/snapshots/abc9999")
+        );
+        assert!(outcome.path.join("config.json").exists());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_download_at_tag_fetches_every_file_from_the_resolved_commit() {
+        let env_lock = acquire_env_mutex();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let server = MockServer::start().await;
+
+        mock_revision_info(&server, "v1.0", "def5678").await;
+        mock_revision_file(&server, "def5678", "def5678").await;
+
+        // A tag can move between the metadata lookup and the file fetch, so downloading
+        // through the tag would risk mixing commits into one snapshot.
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/test/model/resolve/v1\.0/config\.json$"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .named("tag-resolved download must not happen")
+            .mount(&server)
+            .await;
+
+        let _hf_endpoint_guard =
+            EnvVarGuard::set(&env_lock, crate::envs::HF_ENDPOINT, &server.uri());
+
+        let outcome = HuggingFaceProvider
+            .download_model_revision(
+                "test/model",
+                Some(temp_dir.path().to_path_buf()),
+                false,
+                Some("v1.0"),
+            )
+            .await
+            .expect("Tag download should succeed");
+
+        assert_eq!(outcome.resolved_revision.as_deref(), Some("def5678"));
+        assert!(outcome.path.ends_with("snapshots/def5678"));
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("models--test--model/refs/v1.0"))
+                .expect("Expected the tag ref to point at the resolved commit"),
+            "def5678"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_unpinned_download_reports_the_default_revision_commit() {
+        let env_lock = acquire_env_mutex();
+        let mock_server = MockHFServer::new(&env_lock).await;
+
+        let outcome = HuggingFaceProvider
+            .download_model_revision(
+                "test/model",
+                Some(mock_server.cache_path.clone()),
+                false,
+                None,
+            )
+            .await
+            .expect("Unpinned download should succeed");
+
+        assert_eq!(outcome.resolved_revision.as_deref(), Some("def5678"));
+        assert!(outcome.path.ends_with("snapshots/def5678"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_missing_revision_fails_without_falling_back_to_the_default() {
+        let env_lock = acquire_env_mutex();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/models/test/model/revision/no-such-tag$"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        // The default revision resolves fine. Falling back to it would quietly hand the
+        // caller a different model than the one they pinned.
+        mock_revision_info(&server, "main", "def5678").await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/test/model/resolve/[^/]+/config\.json$"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .named("no file may be downloaded for a missing revision")
+            .mount(&server)
+            .await;
+
+        let _hf_endpoint_guard =
+            EnvVarGuard::set(&env_lock, crate::envs::HF_ENDPOINT, &server.uri());
+
+        let error = HuggingFaceProvider
+            .download_model_revision(
+                "test/model",
+                Some(temp_dir.path().to_path_buf()),
+                false,
+                Some("no-such-tag"),
+            )
+            .await
+            .expect_err("A missing revision must fail");
+
+        assert!(
+            error.to_string().contains("no-such-tag"),
+            "Error should name the requested revision, got: {error}"
+        );
+        assert!(
+            !temp_dir
+                .path()
+                .join("models--test--model/snapshots/def5678")
+                .exists(),
+            "The default revision must not have been downloaded"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_resolve_revision_offline_uses_refs_then_snapshot_directories() {
+        let env_lock = acquire_env_mutex();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let repo_root = temp_dir.path().join("models--test--model");
+        std::fs::create_dir_all(repo_root.join("snapshots/abc1234"))
+            .expect("Failed to create snapshot");
+        std::fs::create_dir_all(repo_root.join("refs")).expect("Failed to create refs");
+        std::fs::write(repo_root.join("refs/main"), "abc1234").expect("Failed to write ref");
+
+        let _offline_guard = EnvVarGuard::set(&env_lock, crate::envs::HF_HUB_OFFLINE, "1");
+        let cache_dir = Some(temp_dir.path().to_path_buf());
+        let provider = HuggingFaceProvider;
+
+        for revision in [None, Some("main"), Some("abc1234")] {
+            let resolved = provider
+                .resolve_revision("test/model", cache_dir.clone(), revision)
+                .await
+                .unwrap_or_else(|e| panic!("Expected {revision:?} to resolve offline: {e}"));
+            assert_eq!(resolved.as_deref(), Some("abc1234"));
+        }
+
+        assert!(
+            provider
+                .resolve_revision("test/model", cache_dir, Some("not-cached"))
+                .await
+                .is_err(),
+            "An uncached revision must not resolve to the newest local snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_model_revision_keeps_the_other_snapshots() {
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let repo_root = temp_dir.path().join("models--test--model");
+        for commit in ["abc1234", "def5678"] {
+            std::fs::create_dir_all(repo_root.join("snapshots").join(commit))
+                .expect("Failed to create snapshot");
+            std::fs::write(
+                repo_root.join("snapshots").join(commit).join("config.json"),
+                b"{}",
+            )
+            .expect("Failed to write config");
+        }
+        std::fs::create_dir_all(repo_root.join("refs")).expect("Failed to create refs");
+        std::fs::write(repo_root.join("refs/main"), "abc1234").expect("Failed to write ref");
+
+        let provider = HuggingFaceProvider;
+        provider
+            .delete_model_revision("test/model", temp_dir.path().to_path_buf(), Some("main"))
+            .await
+            .expect("Deleting one revision should succeed");
+
+        assert!(!repo_root.join("snapshots/abc1234").exists());
+        assert!(!repo_root.join("refs/main").exists());
+        assert!(repo_root.join("snapshots/def5678/config.json").exists());
+
+        provider
+            .delete_model_revision("test/model", temp_dir.path().to_path_buf(), Some("def5678"))
+            .await
+            .expect("Deleting the last revision should succeed");
+
+        assert!(
+            !repo_root.exists(),
+            "The repository directory should be removed once its last snapshot is gone"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_get_model_path_revision_never_reaches_the_hub() {
+        let env_lock = acquire_env_mutex();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let server = MockServer::start().await;
+
+        // Any request at all fails the test: serving an already-downloaded snapshot must
+        // not depend on the Hub being reachable.
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/.*$"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .named("resolving a cached snapshot must not call the Hub")
+            .mount(&server)
+            .await;
+
+        let repo_root = temp_dir.path().join("models--test--model");
+        std::fs::create_dir_all(repo_root.join("snapshots/abc1234"))
+            .expect("Failed to create snapshot");
+
+        let _hf_endpoint_guard =
+            EnvVarGuard::set(&env_lock, crate::envs::HF_ENDPOINT, &server.uri());
+
+        let provider = HuggingFaceProvider;
+        let path = provider
+            .get_model_path_revision("test/model", temp_dir.path().to_path_buf(), Some("abc1234"))
+            .await
+            .expect("A cached revision should resolve");
+        assert_eq!(path, repo_root.join("snapshots/abc1234"));
+
+        assert!(
+            provider
+                .get_model_path_revision(
+                    "test/model",
+                    temp_dir.path().to_path_buf(),
+                    Some("missing")
+                )
+                .await
+                .is_err(),
+            "An uncached revision must not resolve"
         );
     }
 }

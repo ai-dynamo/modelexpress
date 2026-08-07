@@ -98,6 +98,7 @@ ModelExpress/
 │       ├── registry/
 │       │   ├── state.rs                # RegistryManager wrapper
 │       │   ├── backend.rs              # RegistryBackend trait + ModelRecord
+│       │   ├── entry_key.rs            # EntryKey: model + revision + weight mode
 │       │   ├── k8s_types.rs            # ModelCacheEntry CRD type
 │       │   └── backend/
 │       │       ├── redis.rs            # Redis registry backend
@@ -314,11 +315,25 @@ Four proto files define four services, all compiled via `tonic-build` in `modele
 | `EnsureModelDownloaded` | `ModelDownloadRequest` | stream `ModelStatusUpdate` | Trigger download, stream progress |
 | `StreamModelFiles` | `ModelFilesRequest` | stream `FileChunk` | Stream model file contents (1MB chunks) |
 | `ListModelFiles` | `ModelFilesRequest` | `ModelFileList` | List files with sizes |
-| `DeleteModel` | `DeleteModelRequest` | `DeleteModelResponse` | Remove a model record from the registry (used by `model clear`) |
+| `DeleteModel` | `DeleteModelRequest` | `DeleteModelResponse` | Remove a model's records from the registry (used by `model clear`) |
 
 Key message types: `ModelProvider` (HuggingFace, NGC, GCS), `ModelStatus` (Downloading, Downloaded, Error), `ModelStatusUpdate`, `FileChunk`.
 
 `EnsureModelDownloaded` verifies that a `DOWNLOADED` registry record still has its files on disk before honoring it as a cache hit. If the files are missing (for example after a `model clear` that only removed local storage), the stale record is deleted and the download is re-claimed so the model is actually re-fetched rather than returning a false success.
+
+#### Pinned revisions
+
+`ModelDownloadRequest` and `ModelFilesRequest` carry an optional `revision` (a branch, tag, or commit SHA); `ModelStatusUpdate` reports the `resolved_revision` the request landed on. Providers without a revision concept (NGC, GCS) reject a set `revision` and report none.
+
+The server resolves the revision to an immutable commit **before** claiming the download lease, then pins every Hub file request to that commit, so a tag that moves mid-download cannot mix commits into one snapshot. A requested revision that does not exist fails the request; it never falls back to the default revision. An unpinned request still resolves the default revision to a commit SHA and reports it, so callers always learn the exact commit they got. If the Hub is unreachable while resolving an *unpinned* request, the server falls back to the snapshot already in its cache, which keeps cache hits working during a Hub outage.
+
+`StreamModelFiles` and `ListModelFiles` resolve a requested revision against the local cache only — the model is already downloaded, so serving it must not depend on Hub reachability.
+
+#### Registry entry keys
+
+Registry backends key every record, lease, and claim on one string. That key is a [`EntryKey`](../modelexpress_server/src/registry/entry_key.rs) encoding of `model_name` + resolved revision + weight mode, formatted as `model@rev:<sha>` with a `#metadata` suffix for `ignore_weights` downloads. This is what keeps two revisions of one model from sharing a lease (and coalescing onto each other's download), and what keeps a metadata-only download from satisfying a later full-weight request with a weightless snapshot. An unpinned, full-weight entry encodes to the bare model name, so records written before revisions existed keep parsing.
+
+Cache eviction parses the key back to delete the right snapshot, and skips the filesystem delete while another entry — typically the metadata-only twin of the same commit — still references it.
 
 ### p2p.proto - P2pService
 
@@ -470,6 +485,8 @@ The `Client` struct in `modelexpress_client/src/lib.rs` wraps gRPC connections:
 | `delete_model(name, cache_dir)` | Delete cached model |
 | `validate_model(name, cache_dir)` | Validate cached model integrity |
 
+Each download entry point has a `_revision` variant — `request_model_revision`, `request_model_on_server_revision`, `request_model_with_smart_fallback_revision` — that takes an optional branch, tag, or commit SHA and returns a `ModelDownloadResult { path, resolved_revision }`. The non-`_revision` methods keep their existing signatures and delegate with no revision pinned.
+
 ### Download Strategies
 
 | Strategy | Behavior |
@@ -486,7 +503,7 @@ The `Cli` struct in `args.rs` embeds `ClientArgs` via `#[command(flatten)]`. Com
 |---------|---------|
 | `health` | Check server health |
 | `ping` | Ping server |
-| `model download <name>` | Download a model |
+| `model download <name>` | Download a model. `--revision <branch\|tag\|sha>` pins a revision; the resolved commit SHA is reported back |
 | `model list-files <name>` | List model files |
 | `model clear <name>` | Delete cached model |
 | `model validate <name>` | Validate model integrity |
@@ -516,6 +533,14 @@ pub trait ModelProviderTrait: Send + Sync {
     async fn download_model(&self, name: &str, cache_path: Option<PathBuf>, ignore_weights: bool) -> Result<PathBuf>;
     async fn delete_model(&self, name: &str, cache_dir: PathBuf) -> Result<()>;
     async fn get_model_path(&self, name: &str, cache_dir: PathBuf) -> Result<PathBuf>;
+
+    // Revision-aware variants. The defaults reject a pinned revision and delegate to the
+    // methods above, so only providers that expose revisions need to implement them.
+    async fn download_model_revision(&self, name: &str, cache_path: Option<PathBuf>, ignore_weights: bool, revision: Option<&str>) -> Result<ModelDownloadOutcome>;
+    async fn resolve_revision(&self, name: &str, cache_dir: Option<PathBuf>, revision: Option<&str>) -> Result<Option<String>>;
+    async fn delete_model_revision(&self, name: &str, cache_dir: PathBuf, revision: Option<&str>) -> Result<()>;
+    async fn get_model_path_revision(&self, name: &str, cache_dir: PathBuf, revision: Option<&str>) -> Result<PathBuf>;
+
     fn provider_name(&self) -> &'static str;
     fn is_ignored(filename: &str) -> bool;
     fn is_image(path: &Path) -> bool;
@@ -523,8 +548,10 @@ pub trait ModelProviderTrait: Send + Sync {
 }
 ```
 
+`ModelDownloadOutcome` carries the snapshot `path` plus the `resolved_revision` the request landed on (`None` for providers with no revision concept).
+
 Three implementations:
-- `HuggingFaceProvider` - uses the `hf-hub` crate with high-CPU download mode.
+- `HuggingFaceProvider` - uses the `hf-hub` crate with high-CPU download mode. Implements the revision-aware methods: it resolves a branch, tag, or SHA through `/api/models/<repo>/revision/<rev>`, downloads every file from the resolved commit, and writes `refs/<requested-revision>` so the snapshot stays resolvable by the name the caller used. `delete_model_revision` removes a single snapshot, and drops the whole repository directory once its last snapshot is gone.
 - `NgcProvider` - downloads from NVIDIA NGC via the files-manifest endpoint `…/v2/org/{org}[/team/{team}]/{type}/{name}/{version}/files` (no `versions/` segment), which returns self-authenticating presigned URLs paired with relative paths for every file, for both V1 and V2 storage and both org and team scopes (so nested paths and downloads need no per-file URL construction or Authorization forwarding). Falls back to `checksums.blake3` manifest enumeration against the versioned `…/versions/{version}/files` endpoint (Bearer-authenticated `/files/{path}` downloads) when the listing returns 400/401, as some UAM-gated orgs (e.g. the `nim` catalog) do. Resolves the NGC API key from `NGC_API_KEY`, `NGC_CLI_API_KEY`, or `~/.ngc/config`.
 - `GcsProvider` - downloads objects under a full `gs://<bucket>/<object-prefix>` URL using Google Application Default Credentials. It writes a `.mx/manifest.json` cache manifest, verifies downloaded files with GCS CRC32C checksums, skips dotfiles, README, and images, and stores models under `<cache>/gcs/<bucket>/<object-prefix>`. See [`GCS_PROVIDER.md`](GCS_PROVIDER.md) for the detailed design.
 

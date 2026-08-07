@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::registry::backend::ModelRecord;
+use crate::registry::entry_key::EntryKey;
 use crate::registry::state::RegistryManager;
 use modelexpress_common::config::DurationConfig;
 use modelexpress_common::download::get_provider;
@@ -343,28 +344,55 @@ impl CacheEvictionService {
         Ok(result)
     }
 
-    /// Evict a single model (remove from filesystem, then from database)
+    /// Evict a single entry (remove from filesystem, then from the registry).
+    ///
+    /// `entry_key` is a registry key, so it has to be parsed back into the model name
+    /// and revision the provider needs in order to delete the right snapshot.
     async fn evict_model(
         &self,
-        model_name: &str,
+        entry_key: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Look up the model record to determine the provider
         let record = self
             .registry
-            .get_model_record(model_name)
+            .get_model_record(entry_key)
             .await?
-            .ok_or_else(|| format!("model '{model_name}' not found in registry"))?;
+            .ok_or_else(|| format!("model '{entry_key}' not found in registry"))?;
+
+        let key = EntryKey::parse(entry_key);
+
+        // Several entries can share one snapshot on disk — a metadata-only download and
+        // a full-weight one of the same revision, for instance. Only remove the files
+        // once the last entry referencing them goes away.
+        let siblings = self.registry.get_models_by_last_used(None).await?;
+        let snapshot_still_referenced = siblings.iter().any(|sibling| {
+            if sibling.model_name == entry_key {
+                return false;
+            }
+            let other = EntryKey::parse(&sibling.model_name);
+            other.model_name == key.model_name && other.revision == key.revision
+        });
 
         // Delete files from disk first. If this fails, we keep the registry record
         // so the next eviction cycle can retry.
-        let provider = get_provider(record.provider);
-        provider
-            .delete_model(model_name, self.cache_directory.clone())
-            .await
-            .map_err(|e| format!("failed to delete model files for '{model_name}': {e}"))?;
+        if snapshot_still_referenced {
+            debug!(
+                "Keeping files for '{entry_key}': another registry entry still references \
+                 the same snapshot"
+            );
+        } else {
+            get_provider(record.provider)
+                .delete_model_revision(
+                    &key.model_name,
+                    self.cache_directory.clone(),
+                    key.revision.as_deref(),
+                )
+                .await
+                .map_err(|e| format!("failed to delete model files for '{entry_key}': {e}"))?;
+        }
 
         // Only remove from registry after successful filesystem deletion
-        self.registry.delete_model(model_name).await?;
+        self.registry.delete_model(entry_key).await?;
 
         Ok(())
     }
