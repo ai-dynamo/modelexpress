@@ -15,6 +15,7 @@ use modelexpress_common::{
         },
     },
     models::{ModelStatus, Status},
+    providers::ModelDownloadOutcome,
 };
 use std::collections::HashMap;
 use std::path::{Component, PathBuf};
@@ -49,6 +50,16 @@ type AuthChannel = InterceptedService<Channel, AuthInterceptor>;
 pub struct ModelDownloadResult {
     pub path: Option<PathBuf>,
     pub resolved_revision: Option<String>,
+}
+
+impl From<ModelDownloadOutcome> for ModelDownloadResult {
+    /// A direct provider download always knows where it put the files.
+    fn from(outcome: ModelDownloadOutcome) -> Self {
+        Self {
+            path: Some(outcome.path),
+            resolved_revision: outcome.resolved_revision,
+        }
+    }
 }
 
 /// The main client for interacting with the `modelexpress_server` via gRPC
@@ -922,10 +933,7 @@ impl Client {
                     revision,
                 )
                 .await
-                .map(|outcome| ModelDownloadResult {
-                    path: Some(outcome.path),
-                    resolved_revision: outcome.resolved_revision,
-                })
+                .map(ModelDownloadResult::from)
                 .map_err(|e| {
                     modelexpress_common::Error::Generic(format!("Direct download failed: {e}"))
                         .into()

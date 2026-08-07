@@ -33,6 +33,10 @@ use tracing::{debug, error, info, warn};
 
 static START_TIME: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
 
+/// Ceiling on resolving a revision with the provider. This is a metadata lookup, not a
+/// download, so it should complete quickly or not at all.
+const REVISION_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Get the configured cache directory for model downloads
 fn get_server_cache_dir() -> Option<std::path::PathBuf> {
     // Try to get cache configuration
@@ -112,12 +116,13 @@ async fn resolve_target_revision(
         )));
     }
 
-    let error = match provider_impl
-        .resolve_revision(model_name, cache_dir.clone(), requested)
-        .await
-    {
-        Ok(resolved) => return Ok(resolved),
-        Err(e) => e,
+    // Resolution runs before the download lease is claimed, so an unresponsive provider
+    // would otherwise hold the RPC open indefinitely without any download in progress.
+    let resolve = provider_impl.resolve_revision(model_name, cache_dir.clone(), requested);
+    let error = match tokio::time::timeout(REVISION_RESOLVE_TIMEOUT, resolve).await {
+        Ok(Ok(resolved)) => return Ok(resolved),
+        Ok(Err(e)) => e,
+        Err(_) => anyhow::anyhow!("timed out after {}s", REVISION_RESOLVE_TIMEOUT.as_secs()),
     };
 
     if requested.is_some() {
@@ -1263,12 +1268,17 @@ mod tests {
     }
 
     /// Claim, touch, and report a cache hit for `target`, asserting the registry was
-    /// keyed on `expected_key` rather than on the bare model name.
-    async fn assert_claims_on_key(target: DownloadTarget, expected_key: &'static str) {
+    /// keyed on the target's entry key rather than on the bare model name.
+    async fn assert_claims_on_entry_key(target: DownloadTarget) {
+        let expected_key = target.entry_key();
+        assert_ne!(
+            expected_key, target.model_name,
+            "This target must not reduce to the bare model name, or the test proves nothing"
+        );
         let mut mock = crate::registry::backend::MockRegistryBackend::new();
         mock.expect_try_claim_for_download()
             .with(
-                mockall::predicate::eq(expected_key),
+                mockall::predicate::eq(expected_key.clone()),
                 mockall::predicate::eq(ModelProvider::HuggingFace),
                 mockall::predicate::always(),
                 mockall::predicate::always(),
@@ -1313,13 +1323,10 @@ mod tests {
         std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");
         std::fs::write(model_dir.join("config.json"), b"{}").expect("Failed to write config");
 
-        assert_claims_on_key(
-            DownloadTarget {
-                revision: Some("abc123".to_string()),
-                ..test_target("test/model")
-            },
-            "test/model@rev:abc123",
-        )
+        assert_claims_on_entry_key(DownloadTarget {
+            revision: Some("abc123".to_string()),
+            ..test_target("test/model")
+        })
         .await;
     }
 
@@ -1340,13 +1347,10 @@ mod tests {
 
         // A metadata-only entry must not be the same registry record as a full-weight
         // one, or a weightless snapshot would satisfy a request that needs weights.
-        assert_claims_on_key(
-            DownloadTarget {
-                ignore_weights: true,
-                ..test_target("test/model")
-            },
-            "test/model#metadata",
-        )
+        assert_claims_on_entry_key(DownloadTarget {
+            ignore_weights: true,
+            ..test_target("test/model")
+        })
         .await;
     }
 

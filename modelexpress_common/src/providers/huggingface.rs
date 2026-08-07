@@ -345,6 +345,52 @@ impl HuggingFaceProvider {
             })
     }
 
+    /// Delete blobs that no surviving snapshot references.
+    ///
+    /// Snapshot entries are symlinks into the repository's `blobs/` directory, so
+    /// deleting a snapshot removes the links but leaves the bytes behind. Without this,
+    /// evicting one revision of a multi-revision model reclaims essentially no disk.
+    ///
+    /// Best effort: a blob we cannot classify is kept. Leaking disk is recoverable,
+    /// deleting a blob another snapshot still points at is not.
+    fn reclaim_unreferenced_blobs(cache_dir: &Path, model_name: &str) {
+        let blobs_dir = HuggingFaceProviderCache::repo_root(cache_dir, model_name).join("blobs");
+        let Ok(blobs) = fs::read_dir(&blobs_dir) else {
+            return;
+        };
+
+        let mut referenced = HashSet::new();
+        let snapshots_dir = HuggingFaceProviderCache::snapshots_dir(cache_dir, model_name);
+        let Ok(snapshots) = fs::read_dir(&snapshots_dir) else {
+            // No snapshot directory to walk means we cannot prove a blob is unused.
+            return;
+        };
+        for snapshot in snapshots.filter_map(Result::ok) {
+            let Ok(entries) = fs::read_dir(snapshot.path()) else {
+                // An unreadable snapshot may reference anything, so keep every blob.
+                return;
+            };
+            for entry in entries.filter_map(Result::ok) {
+                if let Ok(target) = fs::canonicalize(entry.path()) {
+                    referenced.insert(target);
+                }
+            }
+        }
+
+        for blob in blobs.filter_map(Result::ok) {
+            let path = blob.path();
+            let is_unreferenced = fs::canonicalize(&path)
+                .map(|canonical| !referenced.contains(&canonical))
+                .unwrap_or(false);
+            if is_unreferenced {
+                match fs::remove_file(&path) {
+                    Ok(()) => debug!("Reclaimed unreferenced blob {}", path.display()),
+                    Err(e) => warn!("Failed to reclaim blob {}: {e}", path.display()),
+                }
+            }
+        }
+    }
+
     /// Fetch repository metadata for a revision.
     ///
     /// A missing branch, tag, or commit surfaces as an error here; we never retry
@@ -742,7 +788,12 @@ impl ModelProviderTrait for HuggingFaceProvider {
         revision: Option<&str>,
     ) -> Result<()> {
         let Some(revision) = revision else {
-            return self.delete_model(model_name, cache_dir).await;
+            // Remove the repository directory outright rather than going through
+            // `delete_model`, which enumerates the repo's files from the Hub and so
+            // frees nothing when the Hub is unreachable. Cache eviction has to reclaim
+            // disk without depending on the network, and dropping the directory also
+            // takes the blobs and refs that a file-by-file delete leaves behind.
+            return HuggingFaceProviderCache.clear_model(&cache_dir, model_name);
         };
 
         let commit =
@@ -783,6 +834,10 @@ impl ModelProviderTrait for HuggingFaceProvider {
                 format!("Failed to remove empty repository {}", repo_root.display())
             })?;
             info!("Removed empty repository directory for model '{model_name}'");
+        } else {
+            // Snapshot entries are symlinks into `blobs/`, so removing a snapshot frees
+            // almost none of its bytes. Reclaim the blobs no surviving snapshot points at.
+            HuggingFaceProvider::reclaim_unreferenced_blobs(&cache_dir, model_name);
         }
 
         Ok(())
@@ -873,6 +928,8 @@ mod tests {
     use super::*;
     use crate::test_support::{EnvVarGuard, acquire_env_mutex};
     use serde_json::json;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use std::sync::MutexGuard;
     use tempfile::TempDir;
     use tokio::time::Duration;
@@ -1608,6 +1665,67 @@ mod tests {
         assert!(
             !repo_root.exists(),
             "The repository directory should be removed once its last snapshot is gone"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_delete_model_revision_reclaims_only_unreferenced_blobs() {
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let repo_root = temp_dir.path().join("models--test--model");
+        let blobs = repo_root.join("blobs");
+        std::fs::create_dir_all(&blobs).expect("Failed to create blobs");
+
+        // `shared` is linked from both snapshots, `only-old` from just the one we delete.
+        for blob in ["shared", "only-old"] {
+            std::fs::write(blobs.join(blob), vec![0u8; 32]).expect("Failed to write blob");
+        }
+        for (commit, blob_names) in [
+            ("abc1234", vec!["shared", "only-old"]),
+            ("def5678", vec!["shared"]),
+        ] {
+            let snapshot = repo_root.join("snapshots").join(commit);
+            std::fs::create_dir_all(&snapshot).expect("Failed to create snapshot");
+            for blob in blob_names {
+                symlink(blobs.join(blob), snapshot.join(blob)).expect("Failed to link blob");
+            }
+        }
+
+        HuggingFaceProvider
+            .delete_model_revision("test/model", temp_dir.path().to_path_buf(), Some("abc1234"))
+            .await
+            .expect("Deleting one revision should succeed");
+
+        assert!(
+            blobs.join("shared").exists(),
+            "A blob the surviving snapshot links to must be kept"
+        );
+        assert!(
+            !blobs.join("only-old").exists(),
+            "A blob no snapshot links to any more must be reclaimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_model_revision_without_a_revision_is_local_only() {
+        // Eviction has to reclaim disk without the Hub being reachable, so the
+        // delete-everything path must not enumerate files from the API.
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let repo_root = temp_dir.path().join("models--test--model");
+        let snapshot = repo_root.join("snapshots/abc1234");
+        std::fs::create_dir_all(&snapshot).expect("Failed to create snapshot");
+        std::fs::write(snapshot.join("config.json"), b"{}").expect("Failed to write config");
+        std::fs::create_dir_all(repo_root.join("blobs")).expect("Failed to create blobs");
+        std::fs::write(repo_root.join("blobs/blob1"), vec![0u8; 32]).expect("Failed to write blob");
+
+        HuggingFaceProvider
+            .delete_model_revision("test/model", temp_dir.path().to_path_buf(), None)
+            .await
+            .expect("Deleting the whole model should succeed");
+
+        assert!(
+            !repo_root.exists(),
+            "The repository directory should be gone"
         );
     }
 

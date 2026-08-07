@@ -17,13 +17,26 @@
 //!
 //! An unpinned, full-weight entry encodes to the bare model name, so providers without
 //! a revision concept keep the keys they have always used.
+//!
+//! # Encoding
+//!
+//! Anything else encodes as `mx1:<revision>:<flags>:<model_name>`. The model name goes
+//! last because it is the only field with no character restrictions — a GCS object path
+//! accepts almost any byte, so a name like `gs://bucket/models/foo:m:bar` must not be
+//! able to impersonate the other fields. Putting it last means nothing after it needs
+//! parsing, and the round trip is exact for any name.
+//!
+//! The revision field does have to avoid `:`, which holds because it is always a commit
+//! identifier: Git forbids `:` in ref names, and resolved revisions are commit SHAs.
 
 use std::fmt::{Display, Formatter};
 
-/// Separates the model name from its resolved revision.
-const REVISION_SEPARATOR: &str = "@rev:";
-/// Marks an entry whose download skipped weight files.
-const METADATA_SUFFIX: &str = "#metadata";
+/// Marks a key that carries a revision or weight mode. Versioned so the format can
+/// change without misreading old keys.
+const STRUCTURED_PREFIX: &str = "mx1:";
+/// Weight-mode field values.
+const METADATA_FLAG: &str = "m";
+const FULL_WEIGHT_FLAG: &str = "-";
 
 /// The components a registry key is built from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,21 +62,36 @@ impl EntryKey {
         }
     }
 
+    /// Whether the key needs the structured form.
+    ///
+    /// A model name that happens to start with the prefix is encoded structurally even
+    /// when it carries no revision, so it can never be mistaken for a key we wrote.
+    fn needs_structured_form(&self) -> bool {
+        self.revision.is_some()
+            || self.metadata_only
+            || self.model_name.starts_with(STRUCTURED_PREFIX)
+    }
+
     /// Recover the components of an encoded key.
     ///
-    /// A key that carries neither marker parses back to an unpinned, full-weight entry,
-    /// which is how records written before revisions existed are read.
+    /// A key without the prefix parses back to an unpinned, full-weight entry, which is
+    /// how records written before revisions existed are read.
     pub fn parse(key: &str) -> Self {
-        let (body, metadata_only) = match key.strip_suffix(METADATA_SUFFIX) {
-            Some(body) => (body, true),
-            None => (key, false),
+        let Some(fields) = key.strip_prefix(STRUCTURED_PREFIX) else {
+            return Self::new(key, None, false);
         };
 
-        match body.rsplit_once(REVISION_SEPARATOR) {
-            Some((model_name, revision)) if !model_name.is_empty() && !revision.is_empty() => {
-                Self::new(model_name, Some(revision.to_string()), metadata_only)
-            }
-            _ => Self::new(body, None, metadata_only),
+        // `splitn(3)` leaves the model name — the only field that may contain `:` —
+        // untouched in the final part.
+        let mut parts = fields.splitn(3, ':');
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some(revision), Some(flags), Some(model_name)) => Self::new(
+                model_name,
+                (!revision.is_empty()).then(|| revision.to_string()),
+                flags == METADATA_FLAG,
+            ),
+            // Not a key this module produced; treat it as a plain model name.
+            _ => Self::new(key, None, false),
         }
     }
 
@@ -76,14 +104,21 @@ impl EntryKey {
 
 impl Display for EntryKey {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.model_name)?;
-        if let Some(revision) = &self.revision {
-            write!(f, "{REVISION_SEPARATOR}{revision}")?;
+        if !self.needs_structured_form() {
+            return f.write_str(&self.model_name);
         }
-        if self.metadata_only {
-            f.write_str(METADATA_SUFFIX)?;
-        }
-        Ok(())
+
+        let flags = if self.metadata_only {
+            METADATA_FLAG
+        } else {
+            FULL_WEIGHT_FLAG
+        };
+        write!(
+            f,
+            "{STRUCTURED_PREFIX}{}:{flags}:{}",
+            self.revision.as_deref().unwrap_or(""),
+            self.model_name
+        )
     }
 }
 
@@ -112,6 +147,44 @@ mod tests {
         roundtrip(EntryKey::new("org/model", None, true));
         roundtrip(EntryKey::new("org/model", Some("abc123".to_string()), true));
         roundtrip(EntryKey::new("gs://bucket/org/model/rev-1", None, false));
+    }
+
+    /// A GCS object path accepts almost any byte, so a model name is free to contain
+    /// whatever the encoding uses as structure. Misreading one would evict a different
+    /// model's files, so every shape has to round-trip exactly.
+    #[test]
+    fn a_model_name_cannot_impersonate_the_encoding() {
+        for name in [
+            "gs://bucket/models/foo:m:bar",
+            "gs://bucket/models/foo#metadata",
+            "gs://bucket/models/foo@rev:abc123",
+            "mx1:abc123:m:gs://bucket/models/foo",
+            "mx1:",
+            ":::",
+        ] {
+            roundtrip(EntryKey::new(name, None, false));
+            roundtrip(EntryKey::new(name, None, true));
+            roundtrip(EntryKey::new(name, Some("abc123".to_string()), false));
+        }
+    }
+
+    #[test]
+    fn a_name_that_looks_like_a_key_stays_distinct_from_the_key_it_mimics() {
+        // The literal name and the entry whose encoding it copies must not collide.
+        let mimic = EntryKey::new("mx1:abc123:m:org/model", None, false);
+        let real = EntryKey::new("org/model", Some("abc123".to_string()), true);
+        assert_ne!(mimic.to_string(), real.to_string());
+        assert_eq!(EntryKey::parse(&mimic.to_string()), mimic);
+        assert_eq!(EntryKey::parse(&real.to_string()), real);
+    }
+
+    #[test]
+    fn a_model_name_with_a_colon_keeps_its_revision_and_weight_mode() {
+        let key = EntryKey::new("ngc/org/model:1.0", Some("abc123".to_string()), true);
+        let parsed = EntryKey::parse(&key.to_string());
+        assert_eq!(parsed.model_name, "ngc/org/model:1.0");
+        assert_eq!(parsed.revision.as_deref(), Some("abc123"));
+        assert!(parsed.metadata_only);
     }
 
     #[test]

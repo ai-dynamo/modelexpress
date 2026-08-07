@@ -282,10 +282,7 @@ async fn download_model(
                 revision,
             )
             .await
-            .map(|outcome| ModelDownloadResult {
-                path: Some(outcome.path),
-                resolved_revision: outcome.resolved_revision,
-            })
+            .map(ModelDownloadResult::from)
             .map_err(|e| {
                 modelexpress_common::Error::Generic(format!("Direct download failed: {e}")).into()
             })
