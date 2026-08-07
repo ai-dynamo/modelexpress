@@ -55,8 +55,298 @@ graph TD
 | Server | Rust | `modelexpress_server/` | gRPC server: model downloads, cache eviction, P2P coordination |
 | Rust Client | Rust | `modelexpress_client/src/` | Client library and CLI tool |
 | Python Client | Python | `modelexpress_client/python/` | Inference engine loaders, NIXL transfer manager, gRPC client |
+| RL Experience Transfer | Python | `rl_experience_transfer/` | Versioned RL experience schema, delivery APIs, framework adapters, and pluggable transports |
 | Common | Rust | `modelexpress_common/` | Protobuf definitions, shared types, provider trait, config |
 | Workspace Tests | Rust | `workspace-tests/` | Integration tests and Criterion benchmarks |
+
+## RL Experience Transfer Incubator
+
+`rl_experience_transfer/` is an isolated Python package for moving reinforcement-learning
+experience from rollout workers to training workers. It transfers prompts, tokens, trajectories,
+rewards, log probabilities, advantages, and related metadata. It does **not** transfer model
+weights and does not depend on the ModelExpress weight-transfer server.
+
+```mermaid
+graph TD
+    A[NeMo RL / PRIME-RL / slime / MILES adapter] --> B[Canonical ExperienceBatch]
+    B --> C[Consumer contract + schema migration]
+    C --> D[Safe JSON metadata + tensor catalog]
+    D --> E[Producer / Consumer delivery API]
+    E --> J[Durable deduplication + dead letters]
+    E --> K[Conservative transport fallback]
+    E --> L[Transport protocol]
+    L --> F[In-memory]
+    L --> G[Filesystem]
+    L --> H[NIXL data plane]
+    H --> I[Filesystem control plane]
+```
+
+The package is intentionally small and separately installable. The dependency direction is from
+framework adapters to the canonical model to transport protocols; adapters never import NIXL, and
+transport implementations never import an RL framework.
+
+### Package layout
+
+| Location | Responsibility |
+|----------|----------------|
+| `src/rlxfer/model.py` | Schema v1.0 dataclasses and contextual validation |
+| `src/rlxfer/serialization.py` | Allowlisted JSON metadata, raw tensor buffers, checksums |
+| `src/rlxfer/contracts.py` | Consumer preflight contracts and explicit schema migrations |
+| `src/rlxfer/api.py` | Producer, consumer, delivery settlement, duplicate suppression |
+| `src/rlxfer/state.py` | Bounded in-memory and durable SQLite consumer state |
+| `src/rlxfer/tracing.py` | Validated W3C trace-context propagation |
+| `src/rlxfer/transport.py` | Capabilities, transfer plans, protocol, instance-scoped registry |
+| `src/rlxfer/transports/` | Memory, filesystem, optional NIXL, and fallback routing |
+| `src/rlxfer/adapters/` | Guarded NeMo RL, PRIME-RL, slime, and MILES conversions |
+| `tests/` | Unit, integration, multiprocess, failure, and real-NIXL tests |
+| `examples/` | Basic, reliable delivery, filesystem, NIXL, and native adapter matrix runs |
+
+### Public API
+
+Application code selects a transport through dependency injection; no NIXL type escapes the
+transport package.
+
+```python
+from rlxfer import ExperienceConsumer, ExperienceProducer, TransportConfig, create_transport
+from rlxfer.adapters import create_adapter
+
+producer = ExperienceProducer(
+    create_transport(TransportConfig("memory")),
+    create_adapter("nemo_rl"),
+)
+receipt = producer.publish(framework_rollout)
+
+consumer = ExperienceConsumer(producer.transport, create_adapter("nemo_rl"))
+delivery = consumer.receive(timeout=1.0)
+training_batch = delivery.to_framework()
+delivery.ack()
+assert receipt.wait(1.0).state.value == "acked"
+```
+
+`publish_trajectory`, `publish_batch`, bounded timeouts, cancellation, negative acknowledgement
+with retry, permanent rejection, synchronous and async wrappers, health checks, idempotency keys,
+and `TransferPlan` capability checks use the same interface for every transport. See
+`examples/basic.py`, `examples/filesystem_process.py`, and
+`examples/reliable_transfer.py` for runnable examples from minimal to production-oriented.
+
+An optional `ConsumerContract` rejects incompatible schema versions, missing dotted field paths,
+semantic mismatches, and unacceptable policy lag before publication. Older batches are converted
+only through migrations explicitly registered in an instance-scoped `SchemaMigrationRegistry`;
+migrations must produce the declared version and preserve the experience ID. Numeric policy lag is
+bounded with `max_policy_lag` and is accepted only when policy and model identities match. The same
+contract can be applied again at the consumer as defense in depth.
+
+### Canonical schema and compatibility
+
+Schema version `1.0` includes `Transition`, `Trajectory`, `Episode`, `ExperienceBatch`,
+`TensorPayload`, `ExperienceMetadata`, `PolicyVersion`, `SampleIdentity`, and
+`TransferDescriptor`. Tensor metadata retains kind, dtype, shape, stride, layout, original device,
+wire device, and byte count. Variable-length trajectories remain separate rather than being
+silently padded. Nested mappings and sequences may contain NumPy arrays or guarded PyTorch
+tensors.
+
+Lossless framework state is retained in namespaced extensions such as
+`extensions["nemo_rl"]`; it is not forced into a lowest-common-denominator record. Compatibility
+reports compare algorithm, tokenizer, model, policy version, reward definition, sequence format,
+padding, chat template, truncation, and reference-policy requirements before a consumer uses the
+batch. Schema errors include the field, expected and actual values, producer and consumer versions,
+and experience ID. `examples/cross_framework.py` demonstrates an actionable early rejection.
+
+`with_trace_context` carries a validated W3C `traceparent` and optional `tracestate` in the
+`w3c.trace_context` extension without changing schema 1.0. Adapters and transports preserve this
+extension through canonical serialization; applications can recover it with `trace_context_from`.
+
+Metadata uses deterministic UTF-8 JSON with an allowlist of schema dataclasses. Pickle and other
+executable deserializers are not used. Tensor bytes are transferred separately; the catalog and
+optional SHA-256 checks validate names, sizes, shapes, dtypes, and values before reconstruction.
+Small tensors can be inlined, while external buffers can remain on CPU, pinned memory, or a
+supported accelerator. Configurable limits bound metadata, nesting, object counts, tensor counts,
+individual buffers, and aggregate bytes before staging or allocation. Wire tensors are contiguous;
+stride values are normalized to element units for both NumPy and PyTorch.
+
+`AuthenticatedExperienceSerializer` is an opt-in HMAC-SHA256 wrapper that authenticates the
+canonical metadata and every tensor buffer before reconstruction. Key IDs support rotation, keys
+must be supplied out of band, and a plain serializer rejects an authenticated envelope instead of
+silently ignoring its signature. Authentication necessarily reads every buffer and may therefore
+trade away a direct-buffer fast path.
+
+### Transport behavior
+
+| Transport | Data movement | Delivery guarantee | Persistence | Tested locally |
+|-----------|---------------|--------------------|-------------|----------------|
+| Memory | copied process-local buffers | At least once until process exit | No | Retry, duplicate, cancellation, timeout, backpressure |
+| Filesystem | private, fsynced atomic directories and raw buffers | At least once with idempotent consumption | Yes | Spawned multiprocess, lease/index recovery, concurrent bounds, byte exact |
+| NIXL UCX | registered CPU/CUDA scatter-gather pull | At least once while producer remains alive | Control only | Real multiprocess CPU, CUDA, multi-GPU, duplicate publish, failure cleanup |
+| Fallback | ordered composition of other transports | At least once | Intersection of children | Routed receipts/tokens, safe-error fallback, health aggregation |
+
+Capability negotiation exposes zero-copy, CPU and accelerator buffers, remote operation,
+scatter/gather, async operation, acknowledgement, persistence, maximum size, and registration
+requirements. A `TransferPlan` fails before publishing if its required capabilities are absent.
+The filesystem control plane and tensor data plane are distinct in the NIXL backend.
+The NIXL capability deliberately reports public `zero_copy=False`: NIXL writes directly into
+registered destination buffers, but canonical reconstruction currently makes an owning tensor
+copy before delivery.
+
+`FallbackTransport` advertises the conservative intersection of its children's capabilities and
+routes receipts and settlement tokens back to the backend that accepted them. By default it falls
+back only for failures known to occur before acceptance: backpressure, capability mismatch, or a
+closed backend. Applications may opt into broader exception classes, but retrying an ambiguous
+post-acceptance error can duplicate a delivery across backends.
+
+Consumers use bounded in-memory duplicate state by default. `SqliteDeliveryState` persists
+consumed idempotency keys across process restarts and records content-free dead letters containing
+only IDs, attempts, timestamps, and rejection reasons. A key is durably marked after application
+processing and before transport acknowledgement, so a failed acknowledgement can be safely
+retried. This closes a common restart gap but does not claim globally exactly-once processing.
+
+NIXL lifecycle:
+
+1. The producer stages only unsupported devices, synchronizes accelerator work, registers source
+   buffers, and publishes safe JSON descriptors plus opaque endpoint metadata.
+2. The consumer validates the serializer and NIXL catalogs before allocation, registers owned
+   destinations, adds the remote endpoint, and issues a NIXL `READ` scatter/gather transfer.
+3. Completion means the requested bytes arrived; it is not delivery acknowledgement. The consumer
+   synchronizes the destination device, deregisters it, then exposes storage through the delivery.
+4. `ack`, terminal `nack`, `reject`, or cancellation lets the producer deregister and reuse source
+   buffers. Producer buffers must remain alive and immutable until terminal settlement.
+5. Timeout or failure releases transfer handles, removes remote metadata, deregisters destinations,
+   and either retries through the control plane or records a terminal receipt. Graceful close
+   cancels pending work and does not release registrations still owned by an inflight transfer.
+
+NIXL supplies byte movement and completion. The library supplies catalog validation,
+acknowledgement, retries, duplicate handling, and cleanup. Exactly-once delivery is not claimed.
+
+### Extending the package
+
+A transport plugin implements `ExperienceTransport`, exposes a factory accepting an options
+mapping, and can register without changing core code:
+
+```python
+from rlxfer import TransportRegistry
+
+registry = TransportRegistry()
+registry.register("custom", CustomTransport.from_options)
+transport = registry.create(TransportConfig("custom", {"endpoint": "local"}))
+```
+
+Optional packages can publish the same factory through the `rlxfer.transports` Python entry-point
+group and call `registry.discover()`. A framework integration independently implements
+`from_framework`, `to_framework`, and `validate_compatible`, then registers its constructor with
+`AdapterRegistry`. Version-specific native imports stay inside that adapter, and all optional
+imports must fail with an installation hint.
+
+Metrics use a vendor-neutral hook. The built-in counters and observations include produced and
+consumed batches and trajectories, metadata and tensor bytes, serialization, registration,
+staging, transfer and acknowledgement latency, retries, duplicates, schema rejections, failures,
+and cleanup failures. Structured logs redact prompt, response, content, and text fields.
+
+### Installation and validation
+
+The core supports Python 3.10 and 3.12 without an RL framework:
+
+```bash
+cd rl_experience_transfer
+uv sync --locked --dev
+uv run --locked pytest -m "not nixl and not requires_gpu and not requires_xpu"
+uv run --locked ruff check src tests examples
+uv run --locked mypy
+```
+
+`.[nixl]` and `.[all]` install the tested optional data plane: NIXL 0.7.1,
+`nixl-cu12` 1.0.1, and PyTorch 2.9.x on Linux. Framework-named extras are
+declared as stable placeholders, but intentionally do not resolve framework dependencies: none of
+the four audited framework source revisions has one portable dependency solution. NeMo RL needs its
+own CUDA/PyTorch index, PRIME-RL has revision-specific submodules, and slime/MILES use source and
+container stacks that are substantially larger than the adapter. Install the actual distributions
+(`nemo-rl`, `prime-rl`, `slime`, or `miles`) in project-supported isolated environments, then
+install this package editable. Do not install a framework stack into the global environment.
+
+Real NIXL commands on the audited machine (the lockfile supplies the exact environment):
+
+```bash
+uv run --locked --extra nixl pytest tests/test_nixl.py -m nixl -q
+uv run --locked --extra nixl python examples/benchmark_nixl.py --device cpu
+uv run --locked --extra nixl python examples/benchmark_nixl.py --device cuda:0
+```
+
+Framework adapter integration is available through
+`python examples/framework_roundtrip.py {nemo_rl,prime_rl,slime,miles}`. This command reconstructs
+a real native record when the framework imports, transfers it through the filesystem backend, and
+executes a small real PyTorch optimizer update. It is explicitly an adapter integration test, not a
+substitute for a complete framework rollout/trainer run.
+
+`python examples/framework_matrix.py` exercises the declared 4-by-4 producer/consumer contract.
+The four self-roundtrips and the two explicitly contracted slime/MILES cross-conversions must
+reconstruct native training inputs; the other ten pairings must fail closed with actionable adapter
+errors and terminal rejected receipts. CI runs the same matrix as pytest integration cases against
+the four pinned source revisions.
+
+`python examples/framework_pipeline.py all --format markdown` adds runtime wiring at the
+framework-owned rollout and training boundaries. The wiring publishes native output through
+`ExperienceProducer`, reconstructs it through `ExperienceConsumer`, invokes the pinned upstream
+loss code, performs a finite CPU optimizer update, and acknowledges only after that update:
+
+| Framework | Rollout-side source component | Training-side source component | CPU-only substitute |
+|-----------|-------------------------------|--------------------------------|---------------------|
+| NeMo RL | `RolloutManager.generate_and_push` | `ClippedPGLossFn` | Deterministic generation and environment |
+| PRIME-RL | `TrainingBatchSender.send` | `compute_loss` | Synthetic native `TrainingBatch` |
+| slime | `call_rollout_fn` | `compute_policy_loss` | Test-time rollout plugin |
+| MILES | `call_rollout_fn` | `compute_policy_loss` | Test-time rollout plugin |
+
+Each claimed component is inspected at runtime and must resolve inside its pinned upstream checkout.
+Narrow import shims bypass eager GPU launcher and optional telemetry imports, but do not replace the
+listed orchestration, plugin dispatch, native records, or loss functions. The deterministic fixtures
+stand in for external model servers, environments, and distributed accelerator engines, so this is
+source-owned component integration rather than a complete distributed framework run.
+
+### Audited compatibility
+
+| Framework | Verified source | Python / PyTorch | Hardware | Transport | Coverage | Result | Artifact / limitation |
+|-----------|-----------------|------------------|----------|-----------|----------|--------|-----------------------|
+| NeMo RL | 0.5.0rc0, `6c708930` | 3.12.6 / 2.9.0+cu129 | RTX 6000 Ada | Filesystem | Real Qwen2.5-0.5B GRPO, two rollouts and updates | PASSED | `artifacts/nemo_rl/result.json`; latest main has newer external requirements |
+| PRIME-RL | 0.5.0, `2873bf2` | 3.12.6 / 2.11.0+cu128 | RTX 6000 Ada | NIXL UCX | Real GPT-2 rollout, PRIME loss/backward/update, subsequent rollout | PASSED | `artifacts/prime_real_nixl_e2e_result.json` |
+| slime | 0.3.1, `a6272da` | 3.12.3 / 2.11.0+cu129 | RTX 6000 Ada | Filesystem | Real Qwen2.5-0.5B SGLang/Megatron GRPO, two updates | PASSED | `artifacts/slime/full_e2e_result.json` |
+| MILES | 0.2.1, `319716c` | 3.12.3 / 2.11.0+cu129 | RTX 6000 Ada | Filesystem | Real Qwen2.5-0.5B SGLang/Megatron GRPO, two updates | PASSED | `artifacts/miles/full_e2e_result.json`; unfused attention used for local driver compatibility |
+
+Every passing framework row used actual framework code, a real generated rollout, canonical
+serialization, a real transport, a finite backward pass, an optimizer step with a verified
+parameter change, a subsequent batch, acknowledgement, and clean shutdown. No mocked framework or
+NIXL result is reported as a real run. Exact isolated-environment setup and commands are recorded
+beside each artifact; generated checkpoints, environments, caches, and logs remain ignored.
+
+| NIXL benchmark | Tensor / total bytes | Registration | NIXL transfer | End to end | Result |
+|----------------|----------------------|--------------|---------------|------------|--------|
+| UCX CPU | 49,152 / 51,324 | 1.871 ms | 0.127 ms | 69.902 ms | PASSED, byte exact, acked |
+| UCX CUDA | 49,152 / 51,342 | 0.395 ms | 6.201 ms | 86.931 ms | PASSED, byte exact, acked |
+
+These are single local measurements, not generalized throughput claims. The JSON records are
+`artifacts/nixl_cpu.json` and `artifacts/nixl_cuda.json`.
+
+The machine audit found two RTX 6000 Ada GPUs, driver 535.309.01, and no Intel XPU. Real NIXL
+0.7.1 with the `nixl-cu12` 1.0.1 wheel used UCX for CPU and CUDA transfers. Loopback/shared-memory
+and PCIe were available; InfiniBand was not. CPU, same-device CUDA, and cross-GPU paths passed.
+Measured JSON results are stored under
+`rl_experience_transfer/artifacts/` and remain uncommitted.
+
+Repository CI runs the dependency-light core on Python 3.10 and 3.12 with locked dependencies,
+including a 12-case public-API lifecycle matrix across memory/filesystem transports,
+JSON/authenticated serialization, and ack/retry/reject outcomes. It also runs every lightweight
+example, Ruff lint and formatting, strict mypy, wheel construction, and an isolated installed-wheel
+smoke test. A separate CPU job checks out the pinned NeMo RL, PRIME-RL, slime, and MILES sources and
+exercises all 16 producer/consumer pairings through actual native record types, filesystem transfer,
+native reconstruction or expected safe rejection, finite optimizer updates on the six supported
+paths, and terminal receipts. Dependency-light import shims bypass unrelated framework launch
+stacks. Four additional pipeline cases execute the source-owned boundaries listed above, verify
+their source provenance, perform framework loss backward/updates, and render a result table in the
+GitHub Actions job summary. Full model-server, distributed-trainer, and NIXL GPU runs remain
+reproducible local gates because standard runners do not provide their pinned CUDA/container stacks.
+
+Troubleshooting starts with `transport.health()` and capability output. For NIXL, verify the Python
+binding, backend plugin, memory type, driver, and device before enabling direct buffers; use CPU
+staging when the backend does not advertise that accelerator. A stale filesystem inflight directory
+is recovered after its lease. A schema rejection should be fixed at the named producer field rather
+than bypassed. Framework import failures belong in isolated framework environments so they cannot
+replace the core package's NumPy or PyTorch versions.
 
 ## Repository Structure
 
