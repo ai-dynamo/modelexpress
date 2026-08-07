@@ -101,7 +101,19 @@ async fn resolve_target_revision(
     cache_dir: Option<PathBuf>,
     requested: Option<&str>,
 ) -> Result<Option<String>, Status> {
-    let error = match download::resolve_revision(model_name, provider, cache_dir.clone(), requested)
+    let provider_impl = download::get_provider(provider);
+
+    // Pinning a revision on a provider that has none is a malformed request, not a
+    // revision that happens to be missing.
+    if requested.is_some() && !provider_impl.supports_revisions() {
+        return Err(Status::invalid_argument(format!(
+            "Provider '{}' does not support pinned revisions",
+            provider_impl.provider_name()
+        )));
+    }
+
+    let error = match provider_impl
+        .resolve_revision(model_name, cache_dir.clone(), requested)
         .await
     {
         Ok(resolved) => return Ok(resolved),
@@ -119,7 +131,7 @@ async fn resolve_target_revision(
          falling back to the cached snapshot"
     );
 
-    match download::get_provider(provider)
+    match provider_impl
         .get_model_path_revision(model_name, cache_dir.unwrap_or_default(), None)
         .await
         .ok()
@@ -1863,6 +1875,31 @@ mod tests {
             (Some("newer222".to_string()), b"new".to_vec()),
             "Without a revision the newest snapshot is served, so the pinned request above \
              really did select a different one"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ensure_model_downloaded_rejects_a_revision_on_a_provider_without_revisions() {
+        let service = test_model_service();
+        let request = Request::new(ModelDownloadRequest {
+            model_name: "gs://test-bucket/org/model/rev-1".to_string(),
+            provider: modelexpress_common::grpc::model::ModelProvider::Gcs as i32,
+            ignore_weights: false,
+            revision: Some("v1.0".to_string()),
+        });
+
+        let status = service
+            .ensure_model_downloaded(request)
+            .await
+            .map(|_| ())
+            .expect_err("A provider without revisions must reject a pinned revision");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status
+                .message()
+                .contains("does not support pinned revisions"),
+            "Unexpected message: {}",
+            status.message()
         );
     }
 

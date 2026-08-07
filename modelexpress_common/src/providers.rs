@@ -61,6 +61,14 @@ pub trait ModelProviderTrait: Send + Sync {
         })
     }
 
+    /// Whether this provider has a revision concept at all.
+    ///
+    /// Lets callers reject a pinned revision as a bad request up front, rather than
+    /// discovering it as a resolution failure that reads like a missing revision.
+    fn supports_revisions(&self) -> bool {
+        false
+    }
+
     /// Resolve a requested branch, tag, or revision identifier to an immutable one.
     ///
     /// A `None` request means "the provider's default revision". Providers with a

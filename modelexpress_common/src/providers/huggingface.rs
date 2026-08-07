@@ -840,6 +840,10 @@ impl ModelProviderTrait for HuggingFaceProvider {
         Ok(HuggingFaceProviderCache::snapshots_dir(&cache_dir, model_name).join(commit))
     }
 
+    fn supports_revisions(&self) -> bool {
+        true
+    }
+
     fn provider_name(&self) -> &'static str {
         "Hugging Face"
     }
