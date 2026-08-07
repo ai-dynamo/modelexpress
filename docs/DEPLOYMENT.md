@@ -232,7 +232,9 @@ Other properties to be aware of:
   apiserver) return `UNAVAILABLE` and are not cached. The gRPC port should not be
   reachable from untrusted networks.
 - Cache-miss verification is bounded: when the concurrency limit on `TokenReview` calls
-  is saturated the server sheds load with `UNAVAILABLE` rather than queueing.
+  is saturated the server sheds load with `UNAVAILABLE` rather than queueing. The auth
+  path logs an `auth interval summary` line each minute with review, rejection, shed,
+  and backend-error counts.
 
 ### Modes
 

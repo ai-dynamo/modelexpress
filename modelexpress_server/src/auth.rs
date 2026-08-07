@@ -11,6 +11,8 @@ pub use token::CallerIdentity;
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use http::HeaderMap;
@@ -19,8 +21,8 @@ use moka::future::Cache;
 use secrecy::ExposeSecret;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Semaphore, SemaphorePermit};
-use tokio::time::timeout;
-use tracing::warn;
+use tokio::time::{MissedTickBehavior, interval, timeout};
+use tracing::{info, warn};
 
 use crate::config::{SecurityConfig, ServiceAccountRef};
 use token::{TokenError, claimed_service_account, extract_bearer, review_token};
@@ -47,6 +49,25 @@ impl Denial {
     }
 }
 
+#[derive(Default)]
+struct AuthCounters {
+    reviews: AtomicU64,
+    rejected: AtomicU64,
+    shed: AtomicU64,
+    backend_errors: AtomicU64,
+}
+
+impl AuthCounters {
+    fn take(&self) -> [u64; 4] {
+        [
+            self.reviews.swap(0, Ordering::Relaxed),
+            self.rejected.swap(0, Ordering::Relaxed),
+            self.shed.swap(0, Ordering::Relaxed),
+            self.backend_errors.swap(0, Ordering::Relaxed),
+        ]
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct TokenCacheKey([u8; 32]);
 
@@ -63,6 +84,7 @@ pub struct AuthState {
     token_cache: Cache<TokenCacheKey, CallerIdentity>,
     negative_cache: Cache<TokenCacheKey, ()>,
     review_permits: Semaphore,
+    counters: AuthCounters,
 }
 
 impl AuthState {
@@ -71,6 +93,7 @@ impl AuthState {
     const MAX_CONCURRENT_REVIEWS: usize = 8;
     const MAX_CONCURRENT_REVIEWS_PER_CALLER: usize = 4;
     const PERMIT_WAIT: Duration = Duration::from_millis(250);
+    const SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
 
     #[must_use]
     pub fn new(client: Client, config: &SecurityConfig) -> Self {
@@ -97,7 +120,36 @@ impl AuthState {
                 .max_capacity(Self::NEGATIVE_CACHE_MAX_ENTRIES)
                 .build(),
             review_permits: Semaphore::new(Self::MAX_CONCURRENT_REVIEWS),
+            counters: AuthCounters::default(),
         }
+    }
+
+    pub fn spawn_summary_reporter(state: &Arc<Self>) {
+        let state = Arc::downgrade(state);
+        tokio::spawn(async move {
+            let mut ticks = interval(Self::SUMMARY_INTERVAL);
+            ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            ticks.tick().await;
+            loop {
+                ticks.tick().await;
+                let Some(state) = state.upgrade() else {
+                    return;
+                };
+                state.log_summary();
+            }
+        });
+    }
+
+    fn log_summary(&self) {
+        let counts = self.counters.take();
+        if counts.iter().all(|count| *count == 0) {
+            return;
+        }
+        let [reviews, rejected, shed, backend_errors] = counts;
+        info!(
+            window_secs = Self::SUMMARY_INTERVAL.as_secs(),
+            reviews, rejected, shed, backend_errors, "auth interval summary"
+        );
     }
 
     fn cache_key(token: &str) -> TokenCacheKey {
@@ -127,6 +179,7 @@ impl AuthState {
                     .ok_or(TokenError::Prefiltered)?;
                 let _caller_permit = Self::acquire(caller_permits).await?;
                 let _review_permit = Self::acquire(&self.review_permits).await?;
+                self.counters.reviews.fetch_add(1, Ordering::Relaxed);
                 review_token(&self.client, token.expose_secret(), &self.audiences).await
             })
             .await
@@ -134,10 +187,13 @@ impl AuthState {
             Ok(identity) => identity,
             Err(error) => {
                 if error.is_token_rejection() {
+                    self.counters.rejected.fetch_add(1, Ordering::Relaxed);
                     self.negative_cache.insert(key, ()).await;
                     return Err(Denial::Unauthenticated);
                 }
-                if !matches!(*error, TokenError::Saturated) {
+                if matches!(*error, TokenError::Saturated) {
+                    self.counters.shed.fetch_add(1, Ordering::Relaxed);
+                } else if self.counters.backend_errors.fetch_add(1, Ordering::Relaxed) == 0 {
                     warn!(error = %error, "TokenReview backend error");
                 }
                 return Err(Denial::Unavailable);
@@ -466,5 +522,23 @@ mod tests {
             Err(Denial::Unauthenticated)
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn counters_track_reviews_and_rejections() {
+        let (client, _calls) = fake_kube_client(vec![unauthenticated_review("expired")]);
+        let config = security_config(vec![allowed_ref("vllm", "worker")]);
+        let state = AuthState::new(client, &config);
+
+        let _ = state.verify(&bearer_headers("not-a-jwt")).await;
+        let _ = state
+            .verify(&bearer_headers(&sa_token("vllm", "worker", "expired")))
+            .await;
+
+        let [reviews, rejected, shed, backend_errors] = state.counters.take();
+        assert_eq!(reviews, 1);
+        assert_eq!(rejected, 2);
+        assert_eq!(shed, 0);
+        assert_eq!(backend_errors, 0);
     }
 }
