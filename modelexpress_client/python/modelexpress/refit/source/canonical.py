@@ -114,27 +114,25 @@ def encode_bucket(
     base_digest: str,
     format_digest: str,
     ordinal: int,
-    tensors: list[tuple[str, bytes | np.ndarray]],
+    tensors: list[tuple[str, np.ndarray]],
     metadata: dict[str, dict],
-) -> tuple[bytes, int, tuple[str, ...]]:
-    decoded = bytearray()
+) -> tuple[bytes, int]:
     entries = []
-    names = []
+    offset = 0
+    compressor = zstandard.ZstdCompressor(level=3).compressobj()
+    chunks = []
     for name, delta in tensors:
-        item = metadata[name]
-        raw = bytes(delta)
-        if len(raw) != item["byte_size"]:
-            raise ValueError(f"{name} delta byte size differs from canonical metadata")
-        entries.append({**item, "offset": len(decoded)})
-        decoded.extend(raw)
-        names.append(name)
+        entries.append({**metadata[name], "offset": offset})
+        offset += delta.nbytes
+        chunks.append(compressor.compress(memoryview(delta)))
+    chunks.append(compressor.flush())
 
     header = canonical_json(
         {
             "base_digest": base_digest,
             "base_version": base_version,
             "compression": "zstd",
-            "decoded_size": len(decoded),
+            "decoded_size": offset,
             "delta": "xor",
             "entries": entries,
             "format_digest": format_digest,
@@ -144,12 +142,8 @@ def encode_bucket(
             "target_version": target_version,
         }
     )
-    compressed = zstandard.ZstdCompressor(level=3).compress(bytes(decoded))
-    return (
-        _BUCKET_MAGIC + struct.pack(">I", len(header)) + header + compressed,
-        len(decoded),
-        tuple(names),
-    )
+    compressed = b"".join(chunks)
+    return _BUCKET_MAGIC + struct.pack(">I", len(header)) + header + compressed, offset
 
 
 def bucket_parts(data: bytes) -> tuple[dict, memoryview]:

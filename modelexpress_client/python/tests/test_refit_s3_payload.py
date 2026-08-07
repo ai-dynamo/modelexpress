@@ -8,12 +8,14 @@ import hashlib
 import io
 import json
 
+import numpy as np
 import pytest
 import torch
 from safetensors.torch import save_file
 
 from modelexpress.refit import S3Config
 from modelexpress.refit.s3 import ImmutableS3Conflict, S3Uploader
+from modelexpress.refit.source import canonical
 from modelexpress.refit.source.canonical import (
     decode_bucket,
     encode_bucket,
@@ -130,12 +132,15 @@ def test_pack_source_rank_raw_deltas_into_canonical_bucket(tmp_path):
     target = launch + 1
     old = snapshot["model.weight"].tobytes()
     new = target.contiguous().view(torch.uint8).numpy().tobytes()
-    delta = bytes(left ^ right for left, right in zip(old, new, strict=True))
+    delta = np.frombuffer(
+        bytes(left ^ right for left, right in zip(old, new, strict=True)),
+        dtype=np.uint8,
+    )
     metadata["model.weight"]["target_digest"] = (
         f"sha256:{hashlib.sha256(new).hexdigest()}"
     )
 
-    encoded, decoded_size, names = encode_bucket(
+    encoded, decoded_size = encode_bucket(
         model_id="model",
         base_version="0",
         target_version="1",
@@ -150,5 +155,59 @@ def test_pack_source_rank_raw_deltas_into_canonical_bucket(tmp_path):
     header = decode_bucket(encoded, restored, restored_metadata)
     assert header["ordinal"] == 3
     assert decoded_size == len(delta)
-    assert names == ("model.weight",)
     assert restored["model.weight"].tobytes() == new
+
+
+def test_bucket_streams_numpy_deltas_without_decoded_copy(monkeypatch):
+    seen = []
+
+    class Compressor:
+        def compressobj(self):
+            return self
+
+        def compress(self, data):
+            seen.append(data)
+            return b"frame"
+
+        def flush(self):
+            return b"end"
+
+    monkeypatch.setattr(
+        canonical.zstandard, "ZstdCompressor", lambda level: Compressor()
+    )
+    first = np.arange(4, dtype=np.uint8)
+    second = np.arange(3, dtype=np.uint8)
+    metadata = {
+        "first": {
+            "name": "first",
+            "shape": [4],
+            "dtype": "uint8",
+            "byte_size": first.nbytes,
+            "target_digest": "sha256:first",
+        },
+        "second": {
+            "name": "second",
+            "shape": [3],
+            "dtype": "uint8",
+            "byte_size": second.nbytes,
+            "target_digest": "sha256:second",
+        },
+    }
+
+    encoded, decoded_size = encode_bucket(
+        model_id="model",
+        base_version="0",
+        target_version="1",
+        base_digest="sha256:base",
+        format_digest="sha256:format",
+        ordinal=0,
+        tensors=[("first", first), ("second", second)],
+        metadata=metadata,
+    )
+
+    header, compressed = canonical.bucket_parts(encoded)
+    assert all(isinstance(data, memoryview) for data in seen)
+    assert [data.obj for data in seen] == [first, second]
+    assert decoded_size == first.nbytes + second.nbytes
+    assert [entry["offset"] for entry in header["entries"]] == [0, first.nbytes]
+    assert bytes(compressed) == b"frameframeend"

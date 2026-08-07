@@ -467,7 +467,8 @@ class Publisher:
         def upload(item):
             local_ordinal, tensors = item
             ordinal = offset + local_ordinal
-            data, decoded_size, tensor_names = encode_bucket(
+            tensor_names = tuple(name for name, _delta in tensors)
+            data, decoded_size = encode_bucket(
                 model_id=self.config.model_id,
                 base_version=base_version,
                 target_version=version,
