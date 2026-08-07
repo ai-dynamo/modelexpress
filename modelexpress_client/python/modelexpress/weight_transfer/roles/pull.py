@@ -104,7 +104,7 @@ class PullRole(WeightSyncRole):
         """Execute one PULL using the pre-built plan."""
         if self._executor is None:
             raise RuntimeError("PullRole not initialized; call initialize() first")
-        self._executor.execute(self._descriptors, operation="READ")
+        self._executor.execute(self._descriptors)
 
     def sync_and_post_process(self, model: Any) -> None:
         """PULL then run the engine's post_pull_hook (e.g. FP8 repack)."""

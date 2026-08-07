@@ -995,12 +995,16 @@ class NixlTransferManager:
         self,
         posted: list,
         timeout_seconds: float | None = None,
+        label: str = "NIXL reshard READ batch",
     ) -> tuple[int, int, float]:
         """Wait for posted READ batches to complete, then release every handle.
 
         Accepts ``None`` entries so callers can pass ``post_read_batch`` results
         straight through. Releases all handles even when one transfer fails, and
         synchronizes the device once for the whole set rather than per batch.
+
+        ``label`` prefixes the timeout and failure messages; callers outside the
+        reshard path should pass their own so the error names the right caller.
 
         Returns ``(total_bytes, num_reads, duration)`` aggregated over the set.
         """
@@ -1012,7 +1016,7 @@ class NixlTransferManager:
             self._wait_for_xfers(
                 [p.handle for p in batches],
                 timeout_seconds,
-                "NIXL reshard READ batch",
+                label,
             )
         finally:
             for batch in batches:

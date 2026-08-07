@@ -800,8 +800,7 @@ agent.release_xfer_handle(handle)
 
 ModelExpress includes a `WeightSyncService` gRPC service that coordinates live
 weight synchronization from a sharded trainer to inference workers.  The Python
-client exposes `PullRole` (inference worker pulls from trainer) and `PushRole`
-(trainer pushes to inference workers).
+client exposes `PullRole` (inference worker pulls from trainer).
 
 ### Protocol Overview
 
@@ -874,10 +873,10 @@ trainer to issue a single coordinated NIXL M2N WRITE to all workers.
 `M2nDescriptor.to_rdma_descriptor()` converts to a plain `RdmaDescriptor` for
 use with the existing `NixlExecutor` on the worker's PULL path.
 
-`M2nExecutor` groups descriptors by `src_agent_index` and fires one NIXL READ
-handle per trainer rank (all in parallel, same as `NixlExecutor`).  When NIXL
-exposes a native many-to-many transfer API, the inner loop can be replaced with
-a single `make_prepped_m2n_xfer` call for true collective semantics.
+M2N descriptors execute on the worker's PULL path via `NixlExecutor`; there is
+no separate M2N execution path.  When NIXL exposes a native many-to-many
+transfer API, that per-rank loop can be replaced with a single
+`make_prepped_m2n_xfer` call for true collective semantics.
 
 ### Invalidation
 

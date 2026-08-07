@@ -3,16 +3,20 @@
 
 """Execute pre-built RDMA plans via NIXL.
 
-NixlExecutor wraps a NixlTransferManager and executes a list of
-RdmaDescriptors as one batched NIXL READ or WRITE, grouped by remote agent.
-Shared by PullRole (READ) and PushRole (WRITE).
+NixlExecutor adapts a list of RdmaDescriptors onto NixlTransferManager's batched
+READ API: descriptors are grouped by remote agent, each group is posted with
+post_read_batch, and the whole set is awaited once. The manager owns handle
+lifetime, polling and the device synchronize, so this file holds no NIXL calls
+of its own.
+
+Used by PullRole.
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 
 from ..protocol.types import RdmaDescriptor
 
@@ -21,11 +25,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("modelexpress.weight_transfer.transport")
 
-NixlOperation = Literal["READ", "WRITE"]
+# RdmaDescriptor has no remote-device field, so the trainer side is assumed to
+# sit on device 0. Lifting this means adding the field to the descriptor and
+# threading it through every planner that builds one.
+REMOTE_DEVICE_ID = 0
 
 
 class NixlExecutor:
-    """Execute a grouped list of RdmaDescriptors via NIXL."""
+    """Execute a grouped list of RdmaDescriptors via NIXL READ."""
 
     def __init__(
         self,
@@ -34,26 +41,25 @@ class NixlExecutor:
         device_id: int,
         timeout: float = 300.0,
     ) -> None:
+        # post_read_batch builds local descriptors from the manager's own device
+        # id, so a divergence here would silently land weights on the wrong
+        # device. Today TrainerPullStrategy passes the same ctx.device_id to
+        # both and nothing else enforces it.
+        if device_id != nixl_manager._device_id:
+            raise ValueError(
+                f"NixlExecutor device_id {device_id} does not match the "
+                f"NixlTransferManager's {nixl_manager._device_id}; local RDMA "
+                "descriptors are built from the manager's device id"
+            )
         self._manager = nixl_manager
         self._remote_agents = remote_agents
         self._device_id = device_id
         self._timeout = timeout
 
-    def execute(
-        self,
-        descriptors: list[RdmaDescriptor],
-        operation: NixlOperation = "READ",
-    ) -> tuple[int, float]:
-        """Issue NIXL transfers for all descriptors and wait for completion."""
+    def execute(self, descriptors: list[RdmaDescriptor]) -> tuple[int, float]:
+        """Issue NIXL READs for all descriptors and wait for completion."""
         if not descriptors:
             return 0, 0.0
-
-        agent = self._manager._agent
-        if agent is None:
-            raise RuntimeError("NIXL agent not initialized")
-
-        backends = self._manager._backends
-        mem_type = self._manager._accelerator_backend.nixl_mem_type
 
         by_agent: dict[str, list[RdmaDescriptor]] = {}
         for desc in descriptors:
@@ -67,74 +73,38 @@ class NixlExecutor:
             by_agent.setdefault(remote_name, []).append(desc)
 
         start = time.perf_counter()
-        total_bytes = 0
-        handles = []
-
+        posted: list = []
         try:
             for remote_name, descs in by_agent.items():
-                if operation == "READ":
-                    src_list = [(d.src_addr, d.nbytes, 0) for d in descs]
-                    dst_list = [(d.dst_addr, d.nbytes, self._device_id) for d in descs]
-                else:
-                    src_list = [(d.src_addr, d.nbytes, self._device_id) for d in descs]
-                    dst_list = [(d.dst_addr, d.nbytes, 0) for d in descs]
-
-                indices = list(range(len(descs)))
-                src_prepped = agent.prep_xfer_dlist(
-                    agent_name=remote_name if operation == "READ" else "",
-                    xfer_list=src_list,
-                    mem_type=mem_type,
-                    backends=backends,
+                posted.append(
+                    self._manager.post_read_batch(
+                        remote_agent_name=remote_name,
+                        ranges=[
+                            (d.src_addr, d.dst_addr, d.nbytes, REMOTE_DEVICE_ID)
+                            for d in descs
+                        ],
+                    )
                 )
-                dst_prepped = agent.prep_xfer_dlist(
-                    agent_name="" if operation == "READ" else remote_name,
-                    xfer_list=dst_list,
-                    mem_type=mem_type,
-                    backends=backends,
+        except Exception:
+            # Earlier batches are already in flight and own handles nobody else
+            # will release. Drain them, but never let a drain failure mask the
+            # post failure that got us here.
+            try:
+                self._manager.await_read_batches(
+                    posted, self._timeout, label="NIXL weight-sync READ batch"
                 )
-                handle = agent.make_prepped_xfer(
-                    operation=operation,
-                    local_xfer_side=dst_prepped if operation == "READ" else src_prepped,
-                    local_indices=indices,
-                    remote_xfer_side=src_prepped if operation == "READ" else dst_prepped,
-                    remote_indices=indices,
-                    backends=backends,
-                )
-                # Track the handle before starting it: a throw from transfer()
-                # would otherwise strand an allocated handle with no owner.
-                handles.append(handle)
-                agent.transfer(handle)
-                total_bytes += sum(d.nbytes for d in descs)
+            except Exception as exc:  # noqa: BLE001 - cleanup must not mask the cause
+                logger.warning("Drain after a failed READ post: %r", exc)
+            raise
 
-            wait_start = time.monotonic()
-            for handle in handles:
-                while True:
-                    if time.monotonic() - wait_start >= self._timeout:
-                        raise TimeoutError(
-                            f"NIXL {operation} timed out after {self._timeout}s"
-                        )
-                    status = agent.check_xfer_state(handle)
-                    if status in ("DONE", "SUCCESS"):
-                        break
-                    if status in ("ERR", "ERROR", "FAIL"):
-                        raise RuntimeError(f"NIXL {operation} failed with status {status}")
-                    time.sleep(0.001)
-        finally:
-            # release_xfer_handle aborts any still-outstanding transfer, and may
-            # itself raise; release every handle regardless.
-            for handle in handles:
-                try:
-                    agent.release_xfer_handle(handle)
-                except Exception as e:
-                    logger.warning("Failed to release NIXL %s handle: %s", operation, e)
-
-        self._manager._accelerator_backend.synchronize(self._device_id)
+        total_bytes, _num_reads, _duration = self._manager.await_read_batches(
+            posted, self._timeout, label="NIXL weight-sync READ batch"
+        )
 
         elapsed = time.perf_counter() - start
         gbps = (total_bytes * 8) / (elapsed * 1e9) if elapsed > 0 else 0.0
         logger.info(
-            "%s complete: %.2f GB in %.3fs (%.1f Gbps)",
-            operation,
+            "READ complete: %.2f GB in %.3fs (%.1f Gbps)",
             total_bytes / 1e9,
             elapsed,
             gbps,
