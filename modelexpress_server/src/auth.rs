@@ -9,7 +9,7 @@ mod token;
 pub use layer::AuthLayer;
 pub use token::CallerIdentity;
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
@@ -19,10 +19,12 @@ use kube::client::Client;
 use moka::future::Cache;
 use secrecy::ExposeSecret;
 use secrecy::zeroize::Zeroizing;
+use tokio::sync::{Semaphore, SemaphorePermit};
+use tokio::time::timeout;
 use tracing::warn;
 
 use crate::config::{SecurityConfig, ServiceAccountRef};
-use token::{extract_bearer, review_token};
+use token::{TokenError, claimed_service_account, extract_bearer, review_token};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Denial {
@@ -82,13 +84,18 @@ impl Hash for TokenCacheKey {
 pub struct AuthState {
     client: Client,
     audiences: Vec<String>,
-    allowlist: HashSet<ServiceAccountRef>,
+    allowlist: HashMap<ServiceAccountRef, Semaphore>,
     token_cache: Cache<TokenCacheKey, CallerIdentity>,
     negative_cache: Cache<TokenCacheKey, ()>,
+    review_permits: Semaphore,
 }
 
 impl AuthState {
     const TOKEN_CACHE_MAX_ENTRIES: u64 = 10_000;
+    const NEGATIVE_CACHE_MAX_ENTRIES: u64 = 1_000;
+    const MAX_CONCURRENT_REVIEWS: usize = 8;
+    const MAX_CONCURRENT_REVIEWS_PER_CALLER: usize = 4;
+    const PERMIT_WAIT: Duration = Duration::from_millis(250);
 
     #[must_use]
     pub fn new(client: Client, config: &SecurityConfig) -> Self {
@@ -96,15 +103,32 @@ impl AuthState {
         Self {
             client,
             audiences: config.token_audiences.clone(),
-            allowlist: config.allowed_service_accounts.iter().cloned().collect(),
+            allowlist: config
+                .allowed_service_accounts
+                .iter()
+                .map(|caller| {
+                    (
+                        caller.clone(),
+                        Semaphore::new(Self::MAX_CONCURRENT_REVIEWS_PER_CALLER),
+                    )
+                })
+                .collect(),
             token_cache: Cache::builder()
                 .time_to_live(ttl)
                 .max_capacity(Self::TOKEN_CACHE_MAX_ENTRIES)
                 .build(),
             negative_cache: Cache::builder()
                 .time_to_live(ttl)
-                .max_capacity(Self::TOKEN_CACHE_MAX_ENTRIES)
+                .max_capacity(Self::NEGATIVE_CACHE_MAX_ENTRIES)
                 .build(),
+            review_permits: Semaphore::new(Self::MAX_CONCURRENT_REVIEWS),
+        }
+    }
+
+    async fn acquire(semaphore: &Semaphore) -> Result<SemaphorePermit<'_>, TokenError> {
+        match timeout(Self::PERMIT_WAIT, semaphore.acquire()).await {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_)) | Err(_) => Err(TokenError::Saturated),
         }
     }
 
@@ -116,13 +140,15 @@ impl AuthState {
             return Err(Denial::Unauthenticated);
         }
 
-        let client = self.client.clone();
-        let audiences = self.audiences.clone();
-        let key_for_review = key.clone();
         let identity = match self
             .token_cache
-            .try_get_with(key.clone(), async move {
-                review_token(&client, key_for_review.as_str(), &audiences).await
+            .try_get_with(key.clone(), async {
+                let caller_permits = claimed_service_account(token.expose_secret())
+                    .and_then(|claimed| self.allowlist.get(&claimed))
+                    .ok_or(TokenError::Prefiltered)?;
+                let _caller_permit = Self::acquire(caller_permits).await?;
+                let _review_permit = Self::acquire(&self.review_permits).await?;
+                review_token(&self.client, token.expose_secret(), &self.audiences).await
             })
             .await
         {
@@ -132,7 +158,9 @@ impl AuthState {
                     self.negative_cache.insert(key, ()).await;
                     return Err(Denial::Unauthenticated);
                 }
-                warn!(error = %error, "TokenReview backend error");
+                if !matches!(*error, TokenError::Saturated) {
+                    warn!(error = %error, "TokenReview backend error");
+                }
                 return Err(Denial::Unavailable);
             }
         };
@@ -141,7 +169,7 @@ impl AuthState {
             namespace: identity.namespace.clone(),
             service_account: identity.service_account.clone(),
         };
-        if !self.allowlist.contains(&caller) {
+        if !self.allowlist.contains_key(&caller) {
             return Err(Denial::PermissionDenied(format!(
                 "service account {}:{} is not in the allowlist",
                 identity.namespace, identity.service_account
@@ -183,6 +211,23 @@ pub(crate) mod test_util {
             allowed_service_accounts: allowed,
             cache_ttl_secs: 60,
         }
+    }
+
+    pub(crate) fn sa_token(namespace: &str, service_account: &str, nonce: &str) -> String {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let payload = serde_json::json!({
+            "sub": format!("system:serviceaccount:{namespace}:{service_account}"),
+            "jti": nonce,
+        });
+        let payload = serde_json::to_vec(&payload).expect("serialize claims");
+        format!(
+            "{}.{}.{}",
+            URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256"}"#),
+            URL_SAFE_NO_PAD.encode(payload),
+            URL_SAFE_NO_PAD.encode(b"not-a-real-signature"),
+        )
     }
 
     pub(crate) fn bearer_headers(token: &str) -> HeaderMap {
@@ -295,7 +340,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use test_util::{
-        allowed_ref, bearer_headers, fake_kube_client, security_config, token_review_for,
+        allowed_ref, bearer_headers, fake_kube_client, sa_token, security_config, token_review_for,
         unauthenticated_review,
     };
 
@@ -324,7 +369,7 @@ mod tests {
             fake_kube_client(vec![token_review_for("system:serviceaccount:vllm:worker")]);
         let config = security_config(vec![allowed_ref("vllm", "worker")]);
         let state = AuthState::new(client, &config);
-        let headers = bearer_headers("good-token");
+        let headers = bearer_headers(&sa_token("vllm", "worker", "good"));
 
         let first = state.verify(&headers).await.expect("first token review");
         let second = state.verify(&headers).await.expect("cached token review");
@@ -341,7 +386,7 @@ mod tests {
             fake_kube_client(vec![token_review_for("system:serviceaccount:other:worker")]);
         let config = security_config(vec![allowed_ref("vllm", "worker")]);
         let state = AuthState::new(client, &config);
-        let headers = bearer_headers("other-token");
+        let headers = bearer_headers(&sa_token("vllm", "worker", "spoofed-sub"));
 
         let error = state
             .verify(&headers)
@@ -358,7 +403,7 @@ mod tests {
         let (client, calls) = fake_kube_client(vec![unauthenticated_review("expired")]);
         let config = security_config(vec![allowed_ref("vllm", "worker")]);
         let state = AuthState::new(client, &config);
-        let headers = bearer_headers("expired-token");
+        let headers = bearer_headers(&sa_token("vllm", "worker", "expired"));
 
         assert!(matches!(
             state.verify(&headers).await,
@@ -381,7 +426,7 @@ mod tests {
         ]);
         let config = security_config(vec![allowed_ref("vllm", "worker")]);
         let state = AuthState::new(client, &config);
-        let headers = bearer_headers("token");
+        let headers = bearer_headers(&sa_token("vllm", "worker", "api-error"));
 
         assert!(matches!(
             state.verify(&headers).await,
@@ -392,5 +437,55 @@ mod tests {
             Err(Denial::Unavailable)
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_prefiltered_tokens_without_calling_the_apiserver() {
+        let oversized = "a".repeat(token::MAX_TOKEN_BYTES + 1);
+        let cases = [
+            ("not a jwt at all", "opaque-token"),
+            ("two segments", "header.payload"),
+            ("empty signature", "header.payload."),
+            ("undecodable payload", "aaaa.!!!!.cccc"),
+            ("payload without sub", "aaaa.e30.cccc"),
+            (
+                "sub is not a service account",
+                "aaaa.eyJzdWIiOiJhbGljZSJ9.cccc",
+            ),
+            ("over the length cap", oversized.as_str()),
+        ];
+
+        for (case, token) in cases {
+            let (client, calls) = fake_kube_client(vec![]);
+            let config = security_config(vec![allowed_ref("vllm", "worker")]);
+            let state = AuthState::new(client, &config);
+
+            assert!(
+                matches!(
+                    state.verify(&bearer_headers(token)).await,
+                    Err(Denial::Unauthenticated)
+                ),
+                "{case} should be rejected"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "{case} reached the apiserver"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_rejects_unallowlisted_claim_without_calling_the_apiserver() {
+        let (client, calls) = fake_kube_client(vec![]);
+        let config = security_config(vec![allowed_ref("vllm", "worker")]);
+        let state = AuthState::new(client, &config);
+        let headers = bearer_headers(&sa_token("other", "intruder", "nonce"));
+
+        assert!(matches!(
+            state.verify(&headers).await,
+            Err(Denial::Unauthenticated)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }

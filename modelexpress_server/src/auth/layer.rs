@@ -12,7 +12,7 @@ use http::{Request, Response};
 use tonic::body::Body;
 use tonic::server::NamedService;
 use tower::{Layer, Service};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::auth::AuthState;
 
@@ -82,7 +82,7 @@ where
                     inner.call(req).await
                 }
                 Err(denial) => {
-                    warn!(reason = %denial, path = %req.uri().path(), "auth denied");
+                    debug!(reason = %denial, path = %req.uri().path(), "auth denied");
                     Ok(denial.into_status().into_http::<Body>())
                 }
             }
@@ -104,7 +104,7 @@ mod tests {
 
     use crate::auth::CallerIdentity;
     use crate::auth::test_util::{
-        allowed_ref, fake_kube_client, security_config, token_review_for,
+        allowed_ref, fake_kube_client, sa_token, security_config, token_review_for,
     };
 
     struct Dummy;
@@ -153,9 +153,13 @@ mod tests {
         let caller = inner.caller.clone();
         let calls = inner.calls.clone();
         let mut service = AuthLayer::new(state).layer(inner);
+        let token = sa_token("vllm", "worker", "layer");
         let request = Request::builder()
             .uri("/model_express.ModelService/ListModelFiles")
-            .header(AUTHORIZATION, HeaderValue::from_static("Bearer good-token"))
+            .header(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer header"),
+            )
             .body(Body::empty())
             .expect("request");
 
