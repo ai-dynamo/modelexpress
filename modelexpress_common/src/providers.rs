@@ -87,6 +87,23 @@ pub trait ModelProviderTrait: Send + Sync {
         Ok(None)
     }
 
+    /// Record locally that the caller's `requested_revision` — or the provider's default
+    /// revision when `None` — names `commit`.
+    ///
+    /// A snapshot installed by streaming from the ModelExpress server never went through
+    /// this provider's downloader, so the cache bookkeeping the provider's own tooling
+    /// expects is missing. Providers with a revision concept implement this to complete
+    /// the install; the default is a no-op.
+    async fn record_local_revision(
+        &self,
+        _model_name: &str,
+        _cache_dir: &std::path::Path,
+        _requested_revision: Option<&str>,
+        _commit: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Delete a model from the provider's cache
     /// Returns Ok(()) if the model was successfully deleted or didn't exist
     async fn delete_model(&self, model_name: &str, cache_dir: PathBuf) -> Result<()>;

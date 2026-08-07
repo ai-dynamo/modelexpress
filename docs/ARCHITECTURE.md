@@ -329,6 +329,8 @@ The server resolves the revision to an immutable commit **before** claiming the 
 
 `StreamModelFiles` and `ListModelFiles` resolve a requested revision against the local cache only — the model is already downloaded, so serving it must not depend on Hub reachability.
 
+When a no-shared-storage client installs a snapshot over the file stream, it also writes the provider's local revision bookkeeping (`ModelProviderTrait::record_local_revision`; for Hugging Face, `refs/<requested-revision>`). Without it the files would be on disk but `huggingface_hub` could not resolve them by branch or tag under `HF_HUB_OFFLINE=1`.
+
 #### Registry entry keys
 
 Registry backends key every record, lease, and claim on one string. That key is a [`EntryKey`](../modelexpress_server/src/registry/entry_key.rs) encoding of `model_name` + resolved revision + weight mode, formatted as `model@rev:<sha>` with a `#metadata` suffix for `ignore_weights` downloads. This is what keeps two revisions of one model from sharing a lease (and coalescing onto each other's download), and what keeps a metadata-only download from satisfying a later full-weight request with a weightless snapshot. An unpinned, full-weight entry encodes to the bare model name, so records written before revisions existed keep parsing.
@@ -540,6 +542,8 @@ pub trait ModelProviderTrait: Send + Sync {
     async fn resolve_revision(&self, name: &str, cache_dir: Option<PathBuf>, revision: Option<&str>) -> Result<Option<String>>;
     async fn delete_model_revision(&self, name: &str, cache_dir: PathBuf, revision: Option<&str>) -> Result<()>;
     async fn get_model_path_revision(&self, name: &str, cache_dir: PathBuf, revision: Option<&str>) -> Result<PathBuf>;
+    async fn record_local_revision(&self, name: &str, cache_dir: &Path, requested: Option<&str>, commit: &str) -> Result<()>;
+    fn supports_revisions(&self) -> bool;
 
     fn provider_name(&self) -> &'static str;
     fn is_ignored(filename: &str) -> bool;

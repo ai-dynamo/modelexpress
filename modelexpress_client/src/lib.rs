@@ -800,15 +800,17 @@ impl Client {
                 "Shared storage disabled, streaming files from server for model {}",
                 model_name
             );
-            Some(
-                self.stream_model_files_from_server(
+            let dir = self
+                .stream_model_files_from_server(
                     &model_name,
                     provider,
                     ignore_weights,
                     resolved_revision.as_deref(),
                 )
-                .await?,
-            )
+                .await?;
+            self.finish_streamed_install(&model_name, provider, revision, &resolved_revision)
+                .await;
+            Some(dir)
         } else {
             self.local_snapshot_path(&model_name, provider, resolved_revision.as_deref())
         };
@@ -817,6 +819,38 @@ impl Client {
             path,
             resolved_revision,
         })
+    }
+
+    /// Complete the provider-specific cache bookkeeping for a snapshot that arrived over
+    /// the file stream instead of through the provider's own downloader — for Hugging
+    /// Face, the `refs/<revision>` entry that makes the snapshot resolvable by branch or
+    /// tag name offline.
+    ///
+    /// Failing here does not fail the request: every file is already on disk and
+    /// resolvable by commit SHA, which is what the caller was handed.
+    async fn finish_streamed_install(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        requested_revision: Option<&str>,
+        resolved_revision: &Option<String>,
+    ) {
+        let (Some(cache_config), Some(commit)) = (self.cache_config.as_ref(), resolved_revision)
+        else {
+            return;
+        };
+
+        if let Err(e) = download::get_provider(provider)
+            .record_local_revision(
+                model_name,
+                &cache_config.local_path,
+                requested_revision,
+                commit,
+            )
+            .await
+        {
+            debug!("Could not record the revision of {model_name} locally: {e}");
+        }
     }
 
     /// Best-effort local path of a downloaded snapshot. `None` when the cache layout
@@ -1785,6 +1819,15 @@ mod tests {
         assert_eq!(
             std::fs::read(expected_dir.join("config.json")).expect("Expected streamed file"),
             b"{}"
+        );
+
+        // The installed snapshot has to be a valid Hugging Face cache entry: without the
+        // ref, huggingface_hub cannot resolve the tag offline even though the files are
+        // all there.
+        assert_eq!(
+            std::fs::read_to_string(cache_dir.path().join("models--test--model/refs/v1.0"))
+                .expect("Expected the requested revision to be recorded"),
+            PINNED_TEST_COMMIT
         );
     }
 

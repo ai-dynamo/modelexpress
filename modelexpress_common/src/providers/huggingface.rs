@@ -844,6 +844,24 @@ impl ModelProviderTrait for HuggingFaceProvider {
         true
     }
 
+    /// Write `refs/<revision>` for a snapshot that was installed by streaming rather
+    /// than downloaded through hf-hub, so `huggingface_hub` can resolve the snapshot by
+    /// branch or tag name — including with `HF_HUB_OFFLINE=1`.
+    async fn record_local_revision(
+        &self,
+        model_name: &str,
+        cache_dir: &Path,
+        requested_revision: Option<&str>,
+        commit: &str,
+    ) -> Result<()> {
+        Self::create_revision_ref(
+            cache_dir,
+            model_name,
+            requested_revision.unwrap_or(DEFAULT_HF_REVISION),
+            commit,
+        )
+    }
+
     fn provider_name(&self) -> &'static str {
         "Hugging Face"
     }
