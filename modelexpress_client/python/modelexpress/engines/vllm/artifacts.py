@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import tempfile
 from importlib.metadata import version as pkg_version
@@ -50,30 +51,83 @@ _CACHE_SCAN_DEPTH = 4
 
 def install_vllm_cache_artifacts(ctx: LoadContext) -> None:
     """Best-effort install of compatible vLLM cache artifacts before load."""
-    # Snapshot only when transfer is on; the default path should not pay for a
-    # directory scan it will never consult.
-    track = _artifact_transfer_enabled()
-    before = _torch_compile_cache_dirs() if track else frozenset()
+    device_id = getattr(ctx, "device_id", None)
+    if device_id is not None:
+        _installed_compile_cache_dirs.pop(device_id, None)
+    before = (
+        _torch_compile_cache_dirs()
+        if _artifact_transfer_enabled()
+        else frozenset()
+    )
+    transfers: list[tuple[P2PArtifactTransfer, p2p_pb2.SourceIdentity]] = []
+
+    def transfers_factory() -> list[
+        tuple[P2PArtifactTransfer, p2p_pb2.SourceIdentity]
+    ]:
+        if not transfers:
+            transfers.extend(_vllm_artifact_transfers(ctx))
+        return transfers
+
     _artifact_lifecycle.install_artifacts(
         ctx,
-        lambda: _vllm_artifact_transfers(ctx),
+        transfers_factory,
         engine_label="vLLM",
+        on_install_completed=lambda transfer, identity: (
+            _record_vllm_cache_install(transfer, identity, before)
+        ),
         log=logger,
     )
-    if not track:
-        return
-    device_id = getattr(ctx, "device_id", None)
     if device_id is None:
         return
+    for transfer, identity in transfers:
+        if transfer.mx_source_type != p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE:
+            continue
+        installed = _read_compile_cache_install_receipt(transfer, identity)
+        if installed:
+            _installed_compile_cache_dirs[device_id] = installed
+        return
+
+
+def _record_vllm_cache_install(
+    transfer: P2PArtifactTransfer,
+    identity: p2p_pb2.SourceIdentity,
+    before: frozenset[str],
+) -> None:
+    """Persist the completed torch.compile installation receipt for this pod."""
+    if transfer.mx_source_type != p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE:
+        return
+
     installed = _torch_compile_cache_dirs() - before
-    if installed:
-        _installed_compile_cache_dirs[device_id] = installed
-    else:
-        # A later load that installs nothing must not be judged against the
-        # previous load's directories. Weight refit and resume_serving both
-        # re-enter this path, so leaving a stale entry would compare the engine's
-        # current cache_dir against a set it never had a chance to match.
-        _installed_compile_cache_dirs.pop(device_id, None)
+    receipt_path = _compile_cache_install_receipt_path(transfer, identity)
+    _artifact_lifecycle.write_marker(receipt_path, json.dumps(sorted(installed)))
+
+
+def _compile_cache_install_receipt_path(
+    transfer: P2PArtifactTransfer,
+    identity: p2p_pb2.SourceIdentity,
+) -> Path:
+    return _artifact_lifecycle.artifact_marker_path(
+        transfer, identity, "install-receipt"
+    )
+
+
+def _read_compile_cache_install_receipt(
+    transfer: P2PArtifactTransfer,
+    identity: p2p_pb2.SourceIdentity,
+) -> frozenset[str]:
+    try:
+        value = json.loads(
+            _compile_cache_install_receipt_path(transfer, identity).read_text(
+                encoding="utf-8"
+            )
+        )
+        if not isinstance(value, list) or not all(
+            isinstance(path, str) for path in value
+        ):
+            return frozenset()
+        return frozenset(value)
+    except (OSError, json.JSONDecodeError):
+        return frozenset()
 
 
 def _torch_compile_cache_dirs() -> frozenset[str]:
@@ -117,10 +171,8 @@ def _selected_dir_was_installed(cache_dir: str, installed: frozenset[str]) -> bo
     any ancestor test would accept ``torch_aot_compile/<some-other-hash>``.
 
     The tradeoff runs the safe way. If vLLM creates a subdirectory the install
-    did not (a rank directory for a rank the source never published, say), this
-    returns False and the caller warns about a cache that was in fact partly
-    reused. A spurious warning gets investigated; a spurious "reused
-    successfully" hides exactly the waste this check exists to surface.
+    did not, this returns False and the caller warns about a cache that may have
+    been partly reused. A spurious warning is safer than a spurious success.
     """
     try:
         root = _torch_compile_cache_root()
@@ -147,8 +199,9 @@ def _warn_if_compile_cache_unused(ctx: LoadContext) -> None:
         return
     adapter = getattr(ctx, "adapter", None)
     vllm_config = getattr(adapter, "vllm_config", None)
-    cache_dir = getattr(
-        getattr(vllm_config, "compilation_config", None), "cache_dir", ""
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    cache_dir = getattr(compilation_config, "local_cache_dir", "") or getattr(
+        compilation_config, "cache_dir", ""
     )
     if not cache_dir:
         # enforce_eager or compilation disabled: nothing selected a cache dir.

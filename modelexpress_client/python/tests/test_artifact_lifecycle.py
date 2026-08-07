@@ -12,12 +12,13 @@ it.
 
 import logging
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from modelexpress import p2p_pb2
 from modelexpress.metadata import artifact_lifecycle
+from modelexpress.metadata.artifact_transfer import ArtifactCacheRoot
 from modelexpress.metadata.source_id import compute_mx_source_id
 
 LOGGER_NAME = "modelexpress.metadata.artifact_lifecycle"
@@ -121,3 +122,42 @@ def test_identities_differing_only_in_digest_get_different_source_ids():
     assert compute_mx_source_id(_identity()) != compute_mx_source_id(
         _identity("vllmcfg1-aaaa")
     )
+
+
+def test_install_artifact_once_calls_completion_hook(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        artifact_lifecycle.tempfile, "gettempdir", lambda: str(tmp_path)
+    )
+    target_root = tmp_path / "cache"
+    header = p2p_pb2.GetArtifactManifestHeaderResponse(artifact_id="artifact-id")
+    transfer = SimpleNamespace(
+        name="torch_compile_cache",
+        roots=(
+            ArtifactCacheRoot(
+                name="primary",
+                source_root=target_root,
+                target_root=target_root,
+            ),
+        ),
+        discover_and_transfer=MagicMock(return_value=header),
+        install=MagicMock(),
+    )
+    ctx = SimpleNamespace(
+        mx_client=object(),
+        nixl_manager=object(),
+        node_rank=0,
+        accelerator_backend=SimpleNamespace(name="cuda"),
+    )
+    on_install_completed = MagicMock()
+
+    result = artifact_lifecycle.install_artifact_once(
+        ctx,
+        transfer,
+        _identity(),
+        engine_label="vLLM",
+        on_install_completed=on_install_completed,
+    )
+
+    assert result is header
+    transfer.install.assert_called_once_with(header)
+    on_install_completed.assert_called_once_with(transfer, _identity())

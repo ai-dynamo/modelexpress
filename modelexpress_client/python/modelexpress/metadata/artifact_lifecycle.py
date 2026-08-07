@@ -44,6 +44,7 @@ READY_POLL_SECS = 5
 CACHE_SETTLE_SECS = 5
 
 ArtifactEntry = tuple[P2PArtifactTransfer, p2p_pb2.SourceIdentity]
+InstallCompleted = Callable[[P2PArtifactTransfer, p2p_pb2.SourceIdentity], None]
 
 
 def install_artifacts(
@@ -51,6 +52,7 @@ def install_artifacts(
     transfers_factory: Callable[[], list[ArtifactEntry]],
     *,
     engine_label: str,
+    on_install_completed: InstallCompleted | None = None,
     log: logging.Logger = logger,
 ) -> None:
     """Best-effort install of compatible artifacts before model loading."""
@@ -85,6 +87,7 @@ def install_artifacts(
                 transfer,
                 identity,
                 engine_label=engine_label,
+                on_install_completed=on_install_completed,
             )
             elapsed = time.perf_counter() - start
             if header is None:
@@ -209,6 +212,7 @@ def install_artifact_once(
     identity: p2p_pb2.SourceIdentity,
     *,
     engine_label: str,
+    on_install_completed: InstallCompleted | None = None,
 ) -> p2p_pb2.GetArtifactManifestHeaderResponse | None:
     """Install one artifact at most once per pod."""
     marker_path = artifact_marker_path(transfer, identity, "install-attempted")
@@ -229,6 +233,8 @@ def install_artifact_once(
             accelerator=ctx.accelerator_backend.name,
         )
         transfer.install(header)
+        if on_install_completed is not None:
+            on_install_completed(transfer, identity)
         write_marker(marker_path, header.artifact_id)
         return header
 

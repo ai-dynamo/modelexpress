@@ -760,6 +760,9 @@ def compile_cache_root(tmp_path, monkeypatch):
     root = tmp_path / "torch_compile_cache"
     root.mkdir()
     monkeypatch.setattr(artifacts, "_torch_compile_cache_root", lambda: root)
+    monkeypatch.setattr(
+        artifact_lifecycle.tempfile, "gettempdir", lambda: str(tmp_path)
+    )
     monkeypatch.setenv("MX_ARTIFACT_TRANSFER", "1")
     artifacts._installed_compile_cache_dirs.clear()
     yield root
@@ -768,24 +771,60 @@ def compile_cache_root(tmp_path, monkeypatch):
 
 def _install_creating(root, *rel_dirs, device_id=0):
     """Run install_vllm_cache_artifacts with a stub that creates `rel_dirs`."""
-    def fake_install(*args, **kwargs):
+    identity = p2p_pb2.SourceIdentity(
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
+        model_name="test/model",
+    )
+    transfer = SimpleNamespace(
+        name="torch_compile_cache",
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
+        roots=(
+            ArtifactCacheRoot(name="primary", source_root=root, target_root=root),
+        ),
+    )
+
+    def install(header):
         for rel in rel_dirs:
             (root / rel).mkdir(parents=True, exist_ok=True)
 
+    transfer.install = install
+    entries = [(transfer, identity)]
+
+    def fake_install_artifacts(
+        ctx, transfers_factory, *, on_install_completed, **kwargs
+    ):
+        if not artifacts._artifact_transfer_enabled():
+            return
+        assert transfers_factory() == entries
+        artifacts._compile_cache_install_receipt_path(
+            transfer, identity
+        ).parent.mkdir(parents=True, exist_ok=True)
+        transfer.install(
+            p2p_pb2.GetArtifactManifestHeaderResponse(artifact_id="artifact-id")
+        )
+        on_install_completed(transfer, identity)
+
     ctx = SimpleNamespace(global_rank=0, device_id=device_id)
     with patch.object(
-        artifacts._artifact_lifecycle, "install_artifacts", side_effect=fake_install
+        artifacts, "_vllm_artifact_transfers", return_value=entries
+    ), patch.object(
+        artifacts._artifact_lifecycle,
+        "install_artifacts",
+        side_effect=fake_install_artifacts,
     ):
         artifacts.install_vllm_cache_artifacts(ctx)
 
 
-def _check_ctx(cache_dir, device_id=0):
+def _check_ctx(cache_dir, device_id=0, *, local_cache_dir=""):
     return SimpleNamespace(
         global_rank=0,
         device_id=device_id,
         adapter=SimpleNamespace(
             vllm_config=SimpleNamespace(
-                compilation_config=SimpleNamespace(cache_dir=str(cache_dir))
+                compilation_config=SimpleNamespace(
+                    cache_dir=str(cache_dir),
+                    local_cache_dir=str(local_cache_dir),
+                )
             )
         ),
     )
@@ -804,6 +843,50 @@ def test_install_records_every_depth_of_a_nested_tree(compile_cache_root):
         "torch_aot_compile",
         "torch_aot_compile/aaaa111122",
         "torch_aot_compile/aaaa111122/rank_0_0",
+    })
+
+
+def test_later_process_reads_the_shared_install_receipt(compile_cache_root):
+    identity = p2p_pb2.SourceIdentity(
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
+        model_name="test/model",
+    )
+    transfer = SimpleNamespace(
+        name="torch_compile_cache",
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
+        roots=(
+            ArtifactCacheRoot(
+                name="primary",
+                source_root=compile_cache_root,
+                target_root=compile_cache_root,
+            ),
+        ),
+    )
+    receipt = artifacts._compile_cache_install_receipt_path(transfer, identity)
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    artifact_lifecycle.write_marker(
+        receipt,
+        '["torch_aot_compile/aaaa111122"]',
+    )
+
+    def fake_install_artifacts(ctx, transfers_factory, **kwargs):
+        assert transfers_factory() == [(transfer, identity)]
+
+    with patch.object(
+        artifacts,
+        "_vllm_artifact_transfers",
+        return_value=[(transfer, identity)],
+    ), patch.object(
+        artifacts._artifact_lifecycle,
+        "install_artifacts",
+        side_effect=fake_install_artifacts,
+    ):
+        artifacts.install_vllm_cache_artifacts(
+            SimpleNamespace(global_rank=1, device_id=1)
+        )
+
+    assert artifacts._installed_compile_cache_dirs[1] == frozenset({
+        "torch_aot_compile/aaaa111122"
     })
 
 
@@ -832,6 +915,19 @@ def test_aot_installed_hash_is_reported_as_reused(compile_cache_root, caplog):
 
     with caplog.at_level(logging.INFO, logger="modelexpress.engines.vllm.artifacts"):
         artifacts._warn_if_compile_cache_unused(_check_ctx(selected))
+
+    assert "which ModelExpress installed" in caplog.text
+    assert not _levels(caplog, logging.WARNING)
+
+
+def test_aot_uses_vllm_local_cache_dir(compile_cache_root, caplog):
+    _install_creating(compile_cache_root, "torch_aot_compile/aaaa111122/rank_0_0")
+    selected = compile_cache_root / "torch_aot_compile" / "aaaa111122"
+
+    with caplog.at_level(logging.INFO, logger="modelexpress.engines.vllm.artifacts"):
+        artifacts._warn_if_compile_cache_unused(
+            _check_ctx("", local_cache_dir=selected)
+        )
 
     assert "which ModelExpress installed" in caplog.text
     assert not _levels(caplog, logging.WARNING)
