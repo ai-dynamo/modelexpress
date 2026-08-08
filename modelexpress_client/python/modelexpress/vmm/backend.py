@@ -81,6 +81,8 @@ class CudaVmmBackend:
     def __init__(self, device: int = 0) -> None:
         self._cu = _import_cuda()
         self._device = device
+        # None = not yet probed; True/False = FABRIC export usable on this host.
+        self._fabric_supported = None
         self._ensure_context()
         self._granularity = self._compute_granularity()
         logger.debug(
@@ -124,8 +126,44 @@ class CudaVmmBackend:
             raise ValueError(
                 f"size {size} is not a multiple of granularity {self._granularity}"
             )
-        prop = self._allocation_prop()
-        handle = self._call("cuMemCreate", self._cu.cuMemCreate(size, prop, 0))
+        # Probe FABRIC once; hosts that reject it fall back to a plain alloc.
+        handle = None
+        if self._fabric_supported is not False:
+            fabric = self._fabric_handle_type()
+            if fabric is not None:
+                try:
+                    handle = self._call(
+                        "cuMemCreate",
+                        self._cu.cuMemCreate(
+                            size, self._allocation_prop(fabric), 0
+                        ),
+                    )
+                    if self._fabric_supported is None:
+                        self._fabric_supported = True
+                        logger.info(
+                            "VMM arena: FABRIC-exportable allocations enabled"
+                        )
+                except CudaBackendError as exc:
+                    # Only a platform-level refusal means FABRIC is unavailable;
+                    # anything else (OOM, bad device) must not disable it.
+                    if (
+                        self._fabric_supported is None
+                        and exc.result_code in self._fabric_unsupported_codes()
+                    ):
+                        self._fabric_supported = False
+                        logger.warning(
+                            "VMM arena: FABRIC handle type unsupported (%s); "
+                            "falling back to non-exportable allocations -- "
+                            "MNNVL cuda_ipc peer-to-peer will NOT be available",
+                            exc,
+                        )
+                    else:
+                        raise
+        if handle is None:
+            prop = self._allocation_prop()
+            handle = self._call(
+                "cuMemCreate", self._cu.cuMemCreate(size, prop, 0)
+            )
         try:
             self._call("cuMemMap", self._cu.cuMemMap(va, size, 0, handle, 0))
             try:
@@ -242,7 +280,7 @@ class CudaVmmBackend:
                 "creating CudaVmmBackend"
             )
 
-    def _allocation_prop(self):
+    def _allocation_prop(self, handle_type=None):
         prop = self._cu.CUmemAllocationProp()
         prop.type = self._cu.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
         prop.location.type = (
@@ -252,7 +290,31 @@ class CudaVmmBackend:
         # GPUDirect RDMA capable so NIXL/UCX can register the resulting
         # range with the HCA without bouncing through host memory.
         prop.allocFlags.gpuDirectRDMACapable = 1
+        # Without this the allocation has no exportable handle types, so
+        # cuMemExportToShareableHandle(FABRIC) fails and MNNVL P2P is impossible.
+        if handle_type is not None:
+            prop.requestedHandleTypes = handle_type
         return prop
+
+    def _fabric_handle_type(self):
+        """CU_MEM_HANDLE_TYPE_FABRIC, or None if unavailable in this build."""
+        try:
+            return self._cu.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+        except AttributeError:
+            logger.warning(
+                "cuda-python bindings expose no CU_MEM_HANDLE_TYPE_FABRIC; "
+                "arena memory will not be MNNVL-exportable (need >= 12.4)"
+            )
+            return None
+
+    def _fabric_unsupported_codes(self):
+        """CUresults that mean the platform cannot do FABRIC handles."""
+        codes = []
+        for name in ("CUDA_ERROR_NOT_SUPPORTED", "CUDA_ERROR_NOT_PERMITTED"):
+            code = getattr(self._cu.CUresult, name, None)
+            if code is not None:
+                codes.append(code)
+        return tuple(codes)
 
     def _access_desc(self):
         access = self._cu.CUmemAccessDesc()
