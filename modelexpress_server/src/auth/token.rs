@@ -3,15 +3,22 @@
 
 //! Bearer-token extraction and Kubernetes `TokenReview` verification.
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use http::HeaderMap;
 use http::header::AUTHORIZATION;
 use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec, UserInfo};
 use kube::api::{Api, PostParams};
 use kube::client::Client;
 use secrecy::SecretString;
+use serde::Deserialize;
+
+use crate::config::ServiceAccountRef;
 
 const EXTRA_POD_NAME: &str = "authentication.kubernetes.io/pod-name";
 const EXTRA_POD_UID: &str = "authentication.kubernetes.io/pod-uid";
+
+pub(crate) const MAX_TOKEN_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct CallerIdentity {
@@ -38,15 +45,48 @@ pub(crate) enum TokenError {
         requested: Vec<String>,
         actual: Option<Vec<String>>,
     },
+    #[error("TokenReview concurrency exhausted")]
+    Saturated,
+    #[error("token is not a claimed allowlisted service account")]
+    Prefiltered,
 }
 
 impl TokenError {
     pub(crate) fn is_token_rejection(&self) -> bool {
         matches!(
             self,
-            Self::NotAuthenticated(_) | Self::NotServiceAccount | Self::AudienceMismatch { .. }
+            Self::NotAuthenticated(_)
+                | Self::NotServiceAccount
+                | Self::AudienceMismatch { .. }
+                | Self::Prefiltered
         )
     }
+}
+
+#[derive(Deserialize)]
+struct UnverifiedClaims {
+    sub: String,
+}
+
+pub(crate) fn claimed_service_account(token: &str) -> Option<ServiceAccountRef> {
+    if token.len() > MAX_TOKEN_BYTES {
+        return None;
+    }
+    let mut segments = token.split('.');
+    let header = segments.next()?;
+    let payload = segments.next()?;
+    let signature = segments.next()?;
+    if segments.next().is_some() || header.is_empty() || payload.is_empty() || signature.is_empty()
+    {
+        return None;
+    }
+    let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims: UnverifiedClaims = serde_json::from_slice(&decoded).ok()?;
+    let (namespace, service_account) = parse_sa_username(&claims.sub)?;
+    Some(ServiceAccountRef {
+        namespace,
+        service_account,
+    })
 }
 
 pub(crate) fn extract_bearer(headers: &HeaderMap) -> Option<SecretString> {
@@ -136,10 +176,39 @@ pub(crate) async fn review_token(
 mod tests {
     use super::*;
     use crate::auth::test_util::{
-        fake_kube_client, review_without_user, token_review_for, unauthenticated_review,
+        fake_kube_client, review_without_user, sa_token, token_review_for, unauthenticated_review,
     };
     use secrecy::ExposeSecret;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn claimed_service_account_reads_the_sub_claim() {
+        let claimed = claimed_service_account(&sa_token("vllm", "worker", "nonce"))
+            .expect("sub claim parsed");
+        assert_eq!(claimed.namespace, "vllm");
+        assert_eq!(claimed.service_account, "worker");
+    }
+
+    #[test]
+    fn claimed_service_account_ignores_unrelated_claims() {
+        use base64::Engine;
+
+        let payload = serde_json::json!({
+            "aud": ["modelexpress"],
+            "exp": 1_900_000_000u64,
+            "kubernetes.io": {"namespace": "vllm", "pod": {"name": "worker-0"}},
+            "sub": "system:serviceaccount:vllm:worker",
+        });
+        let token = format!(
+            "{}.{}.{}",
+            URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","kid":"abc"}"#),
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("serialize claims")),
+            URL_SAFE_NO_PAD.encode(b"signature"),
+        );
+
+        let claimed = claimed_service_account(&token).expect("sub claim parsed");
+        assert_eq!(claimed.service_account, "worker");
+    }
 
     #[test]
     fn extracts_bearer_token_case_insensitively() {
