@@ -18,11 +18,11 @@ SPDX-License-Identifier: Apache-2.0
 </p>
 
 > [!IMPORTANT]
-> The refit package is experimental. It contains framework-neutral resharding primitives, a NIXL transport, normalized timing, and vLLM receiver/install code. It does not yet provide a turnkey integration for an RL framework, and several safety gates listed in [Implementation status](#implementation-status) remain open.
+> The refit package is experimental. Phase 2.1 contains a minimal exact-base CANONICAL publisher that consumes HF buckets gathered by Miles. It does not yet provide the CANONICAL receiver or complete RL-framework integration.
 
 ## Executive summary
 
-Reinforcement Learning (RL) post-training repeatedly moves a new model version from distributed trainer ranks to rollout workers. ModelExpress (MX) extends its peer-to-peer loading model to this **refit** path: trainer ranks publish the shards they already own, and each rollout rank pulls the ranges needed for its own Tensor Parallelism (TP), Pipeline Parallelism (PP), and Expert Parallelism (EP) layout. The MX server coordinates discovery but never carries weight bytes; NVIDIA Interconnect eXchange Library (NIXL) reads move data directly between registered Graphics Processing Unit (GPU) buffers. The current code establishes this shared design and a vLLM receiver, while framework orchestration, trainer publication adapters, version-atomic discovery, and broader engine coverage remain integration work.
+Reinforcement Learning (RL) post-training repeatedly moves a new model version from distributed trainer ranks to rollout workers. ModelExpress (MX) extends its peer-to-peer loading model to this **refit** path: trainer ranks publish the shards they already own, and each rollout rank pulls the ranges needed for its own Tensor Parallelism (TP), Pipeline Parallelism (PP), and Expert Parallelism (EP) layout. The MX server coordinates discovery but never carries weight bytes; NVIDIA Interconnect eXchange Library (NIXL) reads move data directly between registered Graphics Processing Unit (GPU) buffers. The current code establishes this shared design and a vLLM receiver. It also provides a separate exact-base CANONICAL publication path for bounded FSDP and Megatron-Bridge Hugging Face conversion; framework orchestration, CANONICAL receiver execution, and broader engine coverage remain integration work.
 
 ## Overview
 
@@ -97,7 +97,7 @@ The MX server is a directory. It stores source identity and rendezvous metadata,
 | Inference adapter | Interpret names/fusions, install parameters, refresh quantized or derived state |
 | Inference engine | Own live parameters, caches, compiled graphs, and final readiness |
 
-Fully Sharded Data Parallel (FSDP), DTensor, and Megatron integrations belong in trainer adapters; they are not hard-coded into the planner. The current rendezvous format carries shard geometry in a JSON side table because the public protobuf does not yet have typed multidimensional ownership fields.
+Fully Sharded Data Parallel (FSDP), DTensor, and Megatron gathering remain trainer-framework responsibilities. The Phase 2.1 CANONICAL publisher consumes the bounded HF buckets that Miles already produces.
 
 ### Transport and installation are separate
 
@@ -133,9 +133,33 @@ class RuntimeReceiver(ReshardReceiver):
         ...
 ```
 
-The framework constructs one receiver per rollout rank and calls `update_weights(step)` when its version barrier permits the update. A trainer-side adapter must build [`PublishedTensor`](reshard/rendezvous.py) records, wrap them with NIXL endpoint metadata, and publish one READY record per trainer rank.
+The framework constructs one receiver per rollout rank and calls `update_weights(step)` when its version barrier permits the update. For the NIXL reshard path, a trainer-side adapter must build [`PublishedTensor`](reshard/rendezvous.py) records, wrap them with NIXL endpoint metadata, and publish one READY record per trainer rank.
 
 This is an adapter contract, not a complete quick start. The repository does not currently include the RL framework lifecycle hooks or a general trainer publisher that derives ownership from arbitrary training backends.
+
+### Exact-base CANONICAL publication
+
+[`Publisher`](publisher.py) implements the single Miles V0 path. During
+`initialize()` every trainer rank attests the existing HF launch checkpoint as
+version `0`; rank 0 alone creates the catalog and S3 clients. A nonzero
+`publish_version(target, base_version=N)` first proves that catalog revision
+`N` is `COMMITTED` and exactly matches the one retained local base.
+
+For nonzero versions, Miles supplies the same bounded canonical HF buckets used by
+its existing disk-delta path. [`source/canonical.py`](source/canonical.py) keeps
+one plain byte snapshot, computes tensor-byte XOR deltas, updates the snapshot,
+and zstd-compresses dirty buckets. The publisher uploads those bytes and the
+root through [`s3.py`](s3.py).
+
+V0 publication blocks by exact `GetRevision` while Miles installs the rollout
+cohort and calls `CommitRevision`. `deregister()` closes rank-zero catalog and
+S3 resources.
+
+> [!NOTE]
+> This implementation stops at CANONICAL publication. SGLang reconstruction and
+> installation and Miles commit orchestration are implemented in later phases.
+> Rank-local, direct-memory, recovery, and independent asynchronous publication
+> are outside this V0 path.
 
 ### Stable-plan assumption
 
@@ -167,6 +191,11 @@ A trainer restart, reshard, scale event, or buffer replacement requires rediscov
 | vLLM mapped direct install | Implemented as a separate opt-in installer | [`engines/vllm/refit/installer.py`](../engines/vllm/refit/installer.py) |
 | Normalized refit timing schema | Implemented | [`timing.py`](timing.py), [`test_refit_timing.py`](../../tests/test_refit_timing.py) |
 | Descriptor bound for strided slices | Implemented for gap-free dim-0 partitions | [`transfer_plan.py`](reshard/transfer_plan.py), [`test_reshard_refit_transfer.py`](../../tests/test_reshard_refit_transfer.py) |
+| Concrete CANONICAL publisher lifecycle | Implemented for BLOCK publication and external Miles commit | [`publisher.py`](publisher.py), [`test_refit_publisher.py`](../../tests/test_refit_publisher.py) |
+| Miles HF bucket input | Implemented by calling the gather callback supplied by Miles | [`publisher.py`](publisher.py), [`test_refit_publisher.py`](../../tests/test_refit_publisher.py) |
+| Exact-base canonical delta encoding | Implemented with one plain byte snapshot and fixed XOR+zstd | [`source/canonical.py`](source/canonical.py), [`test_refit_publisher.py`](../../tests/test_refit_publisher.py) |
+| Verified immutable payload publication | Implemented directly in the publisher through the S3 uploader | [`publisher.py`](publisher.py), [`s3.py`](s3.py), [`test_refit_s3_payload.py`](../../tests/test_refit_s3_payload.py) |
+| CANONICAL root index | Implemented directly in the publisher as the manifest's S3 payload | [`publisher.py`](publisher.py), [`test_refit_publisher.py`](../../tests/test_refit_publisher.py) |
 
 “Implemented” means the code and focused tests are present. It does not by itself mean a framework/model/topology combination has passed distributed end-to-end validation.
 
@@ -175,16 +204,17 @@ A trainer restart, reshard, scale event, or buffer replacement requires rediscov
 | Gap | Current behavior |
 |---|---|
 | Full-pull fallback for unsupported operations | The planner identifies unsupported tensors, but `ReshardReceiver` fails closed because its full-pull/install fallback is not implemented. This is distinct from the descriptor bound above, which pulls whole source shards for *supported* but descriptor-heavy slices. |
-| Complete coverage gate | The planner does not yet prove that published overlaps cover every requested element before transfer. |
-| Version-atomic multi-rank manifest | Discovery waits for a rank count but does not commit and pin one atomic version across all trainer records. |
+| Complete coverage gate in the NIXL reshard receiver | The reshard planner does not yet prove that published overlaps cover every requested element before transfer. The CANONICAL publisher separately proves complete ordered HF schema coverage before publishing. |
+| Version-atomic NIXL reshard discovery | The NIXL rendezvous waits for a rank count but does not commit and pin one atomic version across all trainer records. The CANONICAL publisher instead publishes one immutable rank-0 root reference. |
 | Topology-change handling | The cached plan is not invalidated after trainer restart, reshard, scaling, or address change. |
 | Partial/subset wire filtering | MDL accepts subset batches, but the reshard receiver currently executes its full cached plan on each update. |
 | Expert-aware wire filtering | Expert destination mapping exists in MDL; the reshard planner has no receiver-owned expert selector. |
-| Parameter digest verification | The package has reference equality tests but no distributed source-to-destination digest gate in the live receiver. |
+| Parameter digest verification in a live receiver | CANONICAL publication emits verified physical checksums and semantic target digests, but no Phase 3 receiver consumes and verifies them at an engine mutation boundary yet. |
 | Inference-to-inference fan-out | Rollout workers do not republish installed refit buffers through this package. |
 | General engine support | The shared core is engine-neutral, but only a vLLM receiver adapter is present. |
-| General trainer support | Framework-specific FSDP, DTensor, and Megatron publisher adapters are not present here. |
+| General trainer support | Miles owns trainer gathering and HF conversion for the V0 publisher path. |
 | Transport-neutral receiver | A transport protocol exists for planning tests, but `ReshardReceiver` setup and handshake are currently NIXL-bound. |
+| CANONICAL receiver and recovery execution | Phase 2.1 publishes CANONICAL revisions only. Runtime reconstruction/installation and RecoveryStore execution are not implemented here. |
 
 ## Timing and configuration
 
@@ -225,6 +255,10 @@ Run the framework-neutral refit tests from `modelexpress_client/python`:
 
 ```bash
 pytest \
+  tests/test_refit_canonical_codec.py \
+  tests/test_refit_canonical_sources.py \
+  tests/test_refit_canonical_transport.py \
+  tests/test_refit_publisher.py \
   tests/test_reshard_refit_geometry.py \
   tests/test_reshard_refit_slice_plan.py \
   tests/test_reshard_refit_transfer.py \
@@ -259,7 +293,7 @@ Performance claims must identify the exact implementation path. Reference transp
 
 ## Open questions
 
-- **Version commit:** Which component publishes the atomic manifest that pins all trainer ranks to one version?
+- **CANONICAL consumption:** How should a Phase 3 receiver select, reconstruct, verify, and install the immutable root published for one version?
 - **Plan invalidation:** What stable topology and address digest should trigger rediscovery?
 - **Partial refit:** Should the selector be expressed as layers, parameter names, expert IDs, or a framework-supplied predicate?
 - **Source lifetime:** How does the orchestrator acknowledge completion before trainers release old buffers?
@@ -270,10 +304,10 @@ Performance claims must identify the exact implementation path. Reference transp
 
 ### Near term
 
-- Add complete coverage and version-consistency gates.
+- Add complete coverage and version-consistency gates to the NIXL reshard receiver path.
 - Implement the full-pull fallback for unsupported loader operations; the descriptor-heavy case is already bounded.
 - Rebuild plans when source topology or registered addresses change.
-- Add a public trainer publisher contract with typed shard geometry.
+- Integrate the concrete CANONICAL publisher into supported RL-framework lifecycles without introducing a generic engine adapter.
 
 ### Mid term
 
@@ -292,6 +326,9 @@ Performance claims must identify the exact implementation path. Reference transp
 
 | Path | Role |
 |---|---|
+| [`publisher.py`](publisher.py) | BLOCK-only exact-base CANONICAL publication lifecycle |
+| [`source/canonical.py`](source/canonical.py) | Launch snapshot and XOR+zstd encoding of Miles-gathered HF buckets |
+| [`s3.py`](s3.py) | Direct immutable S3 publication with conditional writes and CRC32C |
 | [`timing.py`](timing.py) | Normalized timing stages and context propagation |
 | [`reshard/geometry.py`](reshard/geometry.py) | Record the engine loader's source views and destination writes |
 | [`reshard/slice_plan.py`](reshard/slice_plan.py) | Resolve views, intersect shard boxes, emit contiguous runs |

@@ -128,8 +128,13 @@ ModelExpress/
 │       ├── nixl_transfer.py            # NixlTransferManager
 │       ├── refit/                      # Engine-agnostic live-refit primitives
 │       │   ├── __init__.py             # Public refit exports
+│       │   ├── catalog.py              # Revision catalog client and immutable publication mapping
+│       │   ├── publisher.py            # Concrete exact-base CANONICAL publisher lifecycle
 │       │   ├── timing.py               # Structured refit stage timing
-│       │   └── reshard/                # Geometry capture, planning, rendezvous and transport
+│       │   ├── codec/                  # Versioned XOR delta, compression, and CRC32C codecs
+│       │   ├── source/                 # Bounded FSDP and Megatron-Bridge HF canonical capture
+│       │   ├── transport/              # Verified immutable filesystem and S3 object transports
+│       │   └── reshard/                # Geometry capture, planning, rendezvous and NIXL transport
 │       ├── refit_timing.py             # Compatibility shim for refit.timing
 │       ├── source_selection.py         # P2P source-ordering policies (random, rendezvous_hash)
 │       ├── metrics.py                   # Opt-in Prometheus metrics collector (source-selection group today)
@@ -544,7 +549,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `client.py` | `MxClient` - gRPC client wrapping `PublishMetadata`, `ListSources`, `GetMetadata`, and `UpdateStatus` RPCs |
 | `accelerators/` | `AcceleratorBackend` boundary for accelerator-specific torch device control and fast-path capability gates, split into `base.py` (protocol), `cuda.py` (`CudaAcceleratorBackend`), and `xpu.py` (`XpuAcceleratorBackend`). CUDA and XPU are implemented backends; XPU keeps CUDA-only fast paths (pool registration, VMM arena, GDS) disabled and falls back to generic per-tensor NIXL registration. Further backends can be added behind the same interface |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
-| `refit/` | Engine-agnostic live-refit primitives. `RefitTimingRecorder` provides normalized stage timing; `reshard/` provides loader-observed geometry capture, slice/transfer planning, rendezvous, and transport abstractions |
+| `refit/` | Engine-agnostic live-refit primitives. The concrete `Publisher` owns exact-base CANONICAL publication; `source/` provides bounded FSDP and Megatron-Bridge HF capture, `codec/` provides deterministic delta framing, and `transport/` provides verified immutable filesystem/S3 objects. `RefitTimingRecorder` provides normalized stage timing, while `reshard/` provides loader-observed geometry capture, slice/transfer planning, rendezvous, and NIXL transport abstractions |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
 | `adapter.py` | `EngineAdapter` lifecycle hooks and strategy retry errors |
@@ -617,11 +622,34 @@ MDL does not discover sources, plan resharding, transfer bytes, or translate
 trainer tensors. Those stages provide the translated tensor stream and use
 `MdlLoader.load_weights()` as the final installation callback.
 
-The package boundary is intentional: timing and future install-plan contracts
-belong in engine-agnostic `modelexpress.refit`, while vLLM loader observation,
-placement, PWAL interaction, and direct installation belong in
-`modelexpress.engines.vllm.refit`. RL-framework orchestration and trainer
-adapters are separate integrations rather than part of this vLLM installer.
+The package boundary is intentional: timing, typed lifecycle protocols, and the
+revision-catalog client belong in engine-agnostic `modelexpress.refit`, while
+vLLM loader observation, placement, PWAL interaction, and direct installation
+belong in `modelexpress.engines.vllm.refit`. RL-framework orchestration remains
+a separate integration rather than part of this vLLM installer.
+
+### Minimal Revision Catalog
+
+The revision service is a metadata-only catalog with exactly three operations:
+`PublishRevision`, `GetRevision`, and `CommitRevision`. Records are immutable by
+`(model_id, target_version)`. Publication stores a complete record directly as
+`READY`; a byte-identical retry is idempotent and conflicting metadata is
+rejected. Commit is an idempotent `READY` to `COMMITTED` transition.
+
+A revision manifest contains model and version identity, exact-base lineage,
+logical base/format/target digests, and one optional S3 root-index reference.
+Launch version `0` has no base or payload. Every later revision requires both
+exact-base fields and an S3 payload. The server stores this metadata in an
+isolated Redis namespace but never accesses S3, receives S3 credentials,
+transfers model bytes, or tracks receiver and rank state.
+
+`modelexpress.refit.catalog.GrpcRevisionCatalog` exposes only typed publish,
+exact-get, and commit methods. `modelexpress.refit.manifest` owns the matching
+minimal DTOs and protobuf conversion. Publication mode remains client behavior,
+not a server field. The concrete CANONICAL publisher, capture sources, object
+transport, reconstruction, and serving-engine receiver are not part of this
+minimal catalog snapshot; those components must use the three-RPC contract when
+introduced.
 
 ### No-gather Refit Resharding
 
