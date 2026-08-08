@@ -12,8 +12,9 @@ spec:
   type: {{ .Values.service.type | default "ClusterIP" }}
   ports:
     - port: {{ .Values.service.port | default 8001 }}
-      targetPort: http
+      targetPort: grpc
       protocol: TCP
-      name: http
+      name: grpc
+      appProtocol: grpc
   selector:
     {{- include "modelexpress.selectorLabels" . | nindent 4 }}
