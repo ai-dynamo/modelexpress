@@ -16,6 +16,11 @@ use std::time::Duration;
 use modelexpress_client::Client;
 use modelexpress_common::client_config::ClientConfig;
 use modelexpress_common::config::ConnectionConfig;
+use modelexpress_common::grpc::revision::revision_catalog_service_client::RevisionCatalogServiceClient;
+use modelexpress_common::grpc::revision::{
+    CommitRevisionRequest, GetRevisionRequest, PublishRevisionRequest, RevisionManifest,
+    RevisionState, S3Object,
+};
 use modelexpress_server::backend_config::BackendConfig;
 use modelexpress_server::config::ServerConfig;
 use modelexpress_server::run_server;
@@ -89,4 +94,89 @@ async fn server_boots_and_serves_a_client() {
 #[tokio::test]
 async fn another_server_boots_and_serves_a_client() {
     assert_boots_and_serves().await;
+}
+
+#[tokio::test]
+async fn revision_catalog_runs_through_the_real_server_router() {
+    let port = free_port();
+    let (shutdown, handle) = start_server(port);
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let mut client = loop {
+        match RevisionCatalogServiceClient::connect(endpoint.clone()).await {
+            Ok(client) => break client,
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    };
+    let manifest = RevisionManifest {
+        model_id: "model".to_string(),
+        target_version: "1".to_string(),
+        base_version: Some("0".to_string()),
+        base_digest: Some("sha256:target-0".to_string()),
+        target_digest: "sha256:target-1".to_string(),
+        format_digest: "sha256:format".to_string(),
+        payload: Some(S3Object {
+            bucket: "bucket".to_string(),
+            key: "model/1/root.json".to_string(),
+            object_version: Some("object-v1".to_string()),
+            checksum: "crc32c:deadbeef".to_string(),
+        }),
+    };
+    let published = client
+        .publish_revision(PublishRevisionRequest {
+            manifest: Some(manifest.clone()),
+        })
+        .await
+        .expect("publish over network")
+        .into_inner();
+    assert_eq!(published.state, RevisionState::Ready as i32);
+
+    let repeated_publish = client
+        .publish_revision(PublishRevisionRequest {
+            manifest: Some(manifest.clone()),
+        })
+        .await
+        .expect("idempotent publish over network")
+        .into_inner();
+    assert_eq!(repeated_publish, published);
+
+    let mut conflicting_manifest = manifest;
+    conflicting_manifest.target_digest = "sha256:different-target".to_string();
+    let conflict = client
+        .publish_revision(PublishRevisionRequest {
+            manifest: Some(conflicting_manifest),
+        })
+        .await
+        .expect_err("conflicting publish must fail");
+    assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+
+    let committed = client
+        .commit_revision(CommitRevisionRequest {
+            model_id: "model".to_string(),
+            target_version: "1".to_string(),
+        })
+        .await
+        .expect("commit over network")
+        .into_inner();
+    assert_eq!(committed.state, RevisionState::Committed as i32);
+
+    let repeated_commit = client
+        .commit_revision(CommitRevisionRequest {
+            model_id: "model".to_string(),
+            target_version: "1".to_string(),
+        })
+        .await
+        .expect("idempotent commit over network")
+        .into_inner();
+    assert_eq!(repeated_commit, committed);
+
+    let fetched = client
+        .get_revision(GetRevisionRequest {
+            model_id: "model".to_string(),
+            target_version: "1".to_string(),
+        })
+        .await
+        .expect("get over network")
+        .into_inner();
+    assert_eq!(fetched, committed);
+    stop_and_join(shutdown, handle).await;
 }

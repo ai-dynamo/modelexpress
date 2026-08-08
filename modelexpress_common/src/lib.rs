@@ -12,6 +12,7 @@ pub mod download;
 pub mod envs;
 pub mod models;
 pub mod providers;
+pub mod revision;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod test_support;
@@ -33,6 +34,9 @@ pub mod grpc {
     }
     pub mod p2p {
         tonic::include_proto!("model_express.p2p");
+    }
+    pub mod revision {
+        tonic::include_proto!("model_express.revision");
     }
 }
 

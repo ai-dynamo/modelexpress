@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Reusable server entrypoint. `main` is a thin shell over [`run_server`] so the
-//! whole startup path (registry, P2P state, health, reaper, graceful shutdown) can
-//! be embedded by a downstream binary that provides its own configuration or services.
+//! whole startup path (registry, revision catalog, P2P state, health, reaper, graceful
+//! shutdown) can be embedded by a downstream binary with its own configuration or services.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -11,6 +11,7 @@ use std::sync::Arc;
 use modelexpress_common::grpc::{
     api::api_service_server::ApiServiceServer, health::health_service_server::HealthServiceServer,
     model::model_service_server::ModelServiceServer, p2p::p2p_service_server::P2pServiceServer,
+    revision::revision_catalog_service_server::RevisionCatalogServiceServer,
 };
 use tonic::transport::Server;
 use tower::Layer;
@@ -22,6 +23,9 @@ use crate::cache::CacheEvictionService;
 use crate::config::{AuthMode, ServerConfig};
 use crate::p2p::{service::P2pServiceImpl, state::P2pStateManager};
 use crate::registry::state::RegistryManager;
+use crate::revision::backend::create_revision_catalog_backend;
+use crate::revision::service::RevisionCatalogServiceImpl;
+use crate::revision::state::RevisionCatalogState;
 use crate::services::{ApiServiceImpl, HealthServiceImpl, ModelDownloadTracker, ModelServiceImpl};
 
 /// Maximum gRPC message size (100MB) for large models like DeepSeek-V3.
@@ -30,8 +34,8 @@ const MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 
 /// Run the ModelExpress gRPC server to completion.
 ///
-/// Connects the registry and P2P metadata backends (failing fast if either is
-/// unreachable), starts the cache-eviction and reaper background tasks, serves all
+/// Connects the registry, revision catalog, and P2P metadata backends, failing fast if any
+/// is unreachable. It starts the cache-eviction and reaper background tasks, serves all
 /// gRPC services, and tears everything down once `shutdown` resolves. Logging is the
 /// caller's responsibility: install a subscriber before calling this.
 ///
@@ -113,6 +117,18 @@ pub async fn run_server(
         .set_serving::<P2pServiceServer<P2pServiceImpl>>()
         .await;
 
+    let revision_backend = create_revision_catalog_backend(backend.clone())
+        .await
+        .map_err(|error| {
+            error!("Failed to connect to revision catalog backend: {error}");
+            error
+        })?;
+    let revision_state = Arc::new(RevisionCatalogState::with_backend(revision_backend));
+    let revision_service = RevisionCatalogServiceImpl::new(revision_state);
+    health_reporter
+        .set_serving::<RevisionCatalogServiceServer<RevisionCatalogServiceImpl>>()
+        .await;
+
     // Initialize P2P state manager — fails fast if backend is misconfigured or unreachable
     let p2p_state = Arc::new(P2pStateManager::with_config(backend));
 
@@ -182,6 +198,9 @@ pub async fn run_server(
     let p2p = P2pServiceServer::new(p2p_service)
         .max_decoding_message_size(MAX_MESSAGE_SIZE)
         .max_encoding_message_size(MAX_MESSAGE_SIZE);
+    let revision = RevisionCatalogServiceServer::new(revision_service)
+        .max_decoding_message_size(MAX_MESSAGE_SIZE)
+        .max_encoding_message_size(MAX_MESSAGE_SIZE);
 
     info!("Starting gRPC server on: {addr}");
     let router = Server::builder()
@@ -191,8 +210,13 @@ pub async fn run_server(
         Some(layer) => router
             .add_service(layer.layer(api))
             .add_service(layer.layer(model))
-            .add_service(layer.layer(p2p)),
-        None => router.add_service(api).add_service(model).add_service(p2p),
+            .add_service(layer.layer(p2p))
+            .add_service(layer.layer(revision)),
+        None => router
+            .add_service(api)
+            .add_service(model)
+            .add_service(p2p)
+            .add_service(revision),
     };
     let server_result = router.serve_with_shutdown(addr, shutdown_signal).await;
 

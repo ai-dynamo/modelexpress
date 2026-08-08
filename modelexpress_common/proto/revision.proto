@@ -1,0 +1,60 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package model_express.revision;
+
+// Stores immutable model-weight revision metadata. Payload bytes never pass
+// through this service.
+service RevisionCatalogService {
+  // Atomically publishes one immutable revision as READY.
+  rpc PublishRevision(PublishRevisionRequest) returns (RevisionRecord);
+  // Returns one exact revision by model and target version.
+  rpc GetRevision(GetRevisionRequest) returns (RevisionRecord);
+  // Records orchestrator acceptance after the required rollout cohort verifies.
+  rpc CommitRevision(CommitRevisionRequest) returns (RevisionRecord);
+}
+
+message S3Object {
+  string bucket = 1;
+  string key = 2;
+  optional string object_version = 3;
+  string checksum = 4;
+}
+
+message RevisionManifest {
+  string model_id = 1;
+  string target_version = 2;
+  optional string base_version = 3;
+  optional string base_digest = 4;
+  string target_digest = 5;
+  string format_digest = 6;
+  // Absent only for the metadata-only launch anchor.
+  S3Object payload = 7;
+}
+
+enum RevisionState {
+  REVISION_STATE_UNSPECIFIED = 0;
+  REVISION_STATE_READY = 1;
+  REVISION_STATE_COMMITTED = 2;
+}
+
+message RevisionRecord {
+  RevisionManifest manifest = 1;
+  RevisionState state = 2;
+}
+
+message PublishRevisionRequest {
+  RevisionManifest manifest = 1;
+}
+
+message GetRevisionRequest {
+  string model_id = 1;
+  string target_version = 2;
+}
+
+message CommitRevisionRequest {
+  string model_id = 1;
+  string target_version = 2;
+}
