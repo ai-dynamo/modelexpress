@@ -12,6 +12,7 @@ pub mod download;
 pub mod envs;
 pub mod models;
 pub mod providers;
+pub mod revision;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod test_support;
@@ -36,6 +37,9 @@ pub mod grpc {
     }
     pub mod weight_sync {
         tonic::include_proto!("weight_sync");
+    }
+    pub mod revision {
+        tonic::include_proto!("model_express.revision");
     }
 }
 
