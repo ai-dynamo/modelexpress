@@ -1,0 +1,113 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Target pool that pulls weights via the dht backend, bootstrapped with the
+# self-organizing K8s Leases anchor (OPTION A).
+#
+# Each target pod joins the same Kademlia mesh as the sources (same
+# MX_DHT_BOOTSTRAP_LEASES anchor quorum), resolves the publisher for each of
+# its ranks with a single DHT GET on /mx/{mx_source_id}/rank/{rank}, then
+# opens NIXL to the serving source pod for the actual weight pull.
+# mx_source_id is computed client-side from the SourceIdentity (model, dtype,
+# quantization, TP, revision) and validated on the GetTensorManifest response,
+# so a target only accepts weights from a source whose identity matches its
+# own.
+#
+# Target pods become sources themselves once their weights are loaded (the
+# dht backend forces the WorkerGrpcServer on), but note the one-publisher-
+# per-rank schema: a second pod publishing the same (mx_source_id, rank) is
+# out of scope for this backend. Scale the source by moving to a backend
+# that models a replica pool (k8s-service or central-coordinator) if you
+# need multiple interchangeable publishers per rank.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-dht-target
+  labels:
+    app: mx-dht
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mx-dht
+      role: target
+  template:
+    metadata:
+      labels:
+        app: mx-dht
+        role: target
+    spec:
+      # Grants the workers get/update/patch on coordination.k8s.io Leases so
+      # the anchor quorum can self-elect. See lease-rbac.yaml.
+      serviceAccountName: mx-dht
+      containers:
+        - name: vllm
+          image: nvcr.io/nvidian/dynamo-dev/modelexpress-client:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            capabilities:
+              add:
+                - IPC_LOCK
+          env:
+            - name: MODEL_NAME
+              value: "deepseek-ai/DeepSeek-V3"
+            # Must match the source's pinned revision so the computed
+            # mx_source_id resolves to the source's published key.
+            - name: MX_MODEL_REVISION
+              value: "REPLACE_WITH_COMMIT_SHA"
+            - name: VLLM_PLUGINS
+              value: "modelexpress"
+
+            - name: MX_METADATA_BACKEND
+              value: "dht"
+            - name: MX_DHT_LISTEN
+              value: "0.0.0.0:4001"
+            # Same self-electing anchor quorum as the sources.
+            - name: MX_DHT_BOOTSTRAP_LEASES
+              value: "mx-dht-anchor"
+            # POD_IP is the dialable address an anchor publishes into its Lease.
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+
+            # Cold-start convergence: a freshly published record and a freshly
+            # joined node both take a short while to propagate, so a GET can
+            # legitimately miss a key that exists. Retry with backoff.
+            - name: MX_DHT_GET_RETRIES
+              value: "5"
+            - name: MX_DHT_GET_BACKOFF_SECONDS
+              value: "0.5"
+
+            - name: MX_METADATA_PORT
+              value: "5555"
+            - name: MX_WORKER_GRPC_PORT
+              value: "6555"
+            - name: NIXL_LOG_LEVEL
+              value: "INFO"
+
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token-secret
+                  key: HF_TOKEN
+          args:
+            - --model
+            - $(MODEL_NAME)
+            - --load-format
+            - modelexpress
+            - --tensor-parallel-size
+            - "2"
+          ports:
+            - name: kademlia
+              containerPort: 4001
+            - name: worker-grpc
+              containerPort: 6555
+          resources:
+            limits:
+              nvidia.com/gpu: "2"
+              rdma/shared_ib: "1"
+            requests:
+              nvidia.com/gpu: "2"
+              rdma/shared_ib: "1"

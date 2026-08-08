@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# cargo-audit configuration.
+#
+# RUSTSEC-2026-0118 / RUSTSEC-2026-0119 affect hickory-proto, which enters the
+# dependency graph only through libp2p's optional-dependency closure
+# (libp2p-mdns / libp2p-dns). The mdns feature is disabled, so hickory-proto is
+# never compiled into any ModelExpress binary (verified: `cargo tree -i
+# hickory-proto` reports nothing in the active build graph). cargo audit scans
+# Cargo.lock rather than the active feature graph, so these advisories are
+# unreachable in practice and are ignored here. RUSTSEC-2026-0118 additionally
+# has no fixed upstream release.
+[advisories]
+ignore = ["RUSTSEC-2026-0118", "RUSTSEC-2026-0119"]
