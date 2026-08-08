@@ -25,6 +25,8 @@ def test_defaults_when_unset(monkeypatch):
         "MX_GDS_TIMEOUT",
         "MX_HEARTBEAT_INTERVAL_SECS",
         "MX_RESHARD_FUSED_WIRE",
+        "MX_REFIT_S3_UPLOAD_WORKERS",
+        "MX_REFIT_S3_MAX_POOL_CONNECTIONS",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -43,15 +45,21 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_GDS_TIMEOUT == pytest.approx(120.0)
     assert envs.MX_HEARTBEAT_INTERVAL_SECS == 30
     assert envs.MX_RESHARD_FUSED_WIRE is True
+    assert envs.MX_REFIT_S3_UPLOAD_WORKERS == 4
+    assert envs.MX_REFIT_S3_MAX_POOL_CONNECTIONS == 10
 
 
 def test_int_and_float_parsing(monkeypatch):
     monkeypatch.setenv("MX_METADATA_PORT", "1234")
     monkeypatch.setenv("MX_GDS_TIMEOUT", "1.5")
     monkeypatch.setenv("MX_SOURCE_QUERY_TIMEOUT", "42")
+    monkeypatch.setenv("MX_REFIT_S3_UPLOAD_WORKERS", "16")
+    monkeypatch.setenv("MX_REFIT_S3_MAX_POOL_CONNECTIONS", "16")
     assert envs.MX_METADATA_PORT == 1234
     assert envs.MX_GDS_TIMEOUT == pytest.approx(1.5)
     assert envs.MX_SOURCE_QUERY_TIMEOUT == 42
+    assert envs.MX_REFIT_S3_UPLOAD_WORKERS == 16
+    assert envs.MX_REFIT_S3_MAX_POOL_CONNECTIONS == 16
 
 
 def test_invalid_int_falls_back_to_default(monkeypatch):
