@@ -44,14 +44,20 @@
 #   test lane alerts Slack while the (scan-gated) staging proceeds. Flip the
 #   `needs:` of stage-containers-ngc to include e2e-tests to change that.
 #
-#   Every job runs on the internal (velonix) runner pool — the hosted suite is
-#   passed runs_on=prod-modelexpress-builder-amd-v1; nothing lands on
-#   GitHub-hosted runners.
+#   Every job runs on the internal (velonix) runner pools — nothing lands on
+#   GitHub-hosted runners. Build/stage jobs and the hosted suite use
+#   prod-modelexpress-builder-amd-v1 (dind, maxRunners 64); lightweight
+#   coordination jobs (preflight, approval, Slack, status) use
+#   prod-modelexpress-default-small-v1 (maxRunners 200, no dind).
 #
 # Triggers:
 #   - schedule: daily 09:00 UTC (01:00 PST) — release mode forced on
 #   - workflow_dispatch: release defaults OFF (build+test only); enabling it
-#     requires approval via the `manual-release-approval` environment
+#     requires approval via the `manual-release-approval` environment.
+#     Dispatch is also the branch-testing path: velonix job-admission rules
+#     only admit push events from main/release/pull-request branches, so a
+#     push trigger on a dev branch would hang forever waiting for runners —
+#     workflow_dispatch is admitted from any branch.
 #
 # Required secrets (see workflow bodies for exact usage):
 #   repo scope:   NGC_API_KEY, HF_TOKEN, AZURE_AKS_CI_KUBECONFIG_B64,
@@ -67,15 +73,6 @@ name: ModelExpress Nightly CI
 on:
   schedule:
     - cron: '0 9 * * *'   # 09:00 UTC = 01:00 PST daily
-  # TEMPORARY(test): direct pushes to the development branch run the FULL
-  # nightly including staging (release=true is forced for push in preflight).
-  # The manual-release-approval gate only arms on workflow_dispatch, so a
-  # push stages to nvstaging/Artifactory and triggers GitLab with NO human
-  # gate — acceptable only because pushing requires repo write access and
-  # this is scoped to one dev branch. REMOVE before merging to main.
-  push:
-    branches:
-      - pvijayakrish/mx-nightly-ci
   workflow_dispatch:
     inputs:
       release:
@@ -120,7 +117,7 @@ jobs:
   # ---------------------------------------------------------------------------
   preflight:
     name: Compute nightly metadata
-    runs-on: prod-modelexpress-builder-amd-v1
+    runs-on: prod-modelexpress-default-small-v1
     timeout-minutes: 10
     outputs:
       date: ${{ steps.meta.outputs.date }}
@@ -197,13 +194,6 @@ jobs:
               # The cron is the real nightly: always stage, always test.
               RELEASE=true
               ;;
-            push)
-              # TEMPORARY(test): dev-branch pushes exercise the full staging
-              # path, approval-free (see the push trigger comment). REMOVE
-              # this case together with the push trigger before merge.
-              RELEASE=true
-              echo "::warning::TEMPORARY push-triggered staging is active for ${REF}. This bypasses manual-release-approval and repoints floating nvstaging tags. Remove the push trigger before merging to main."
-              ;;
             workflow_dispatch)
               RELEASE="${DISPATCH_RELEASE}"
               RUN_TESTS="${DISPATCH_RUN_TESTS}"
@@ -214,6 +204,10 @@ jobs:
           # from the temporary development branch. Without this, a dispatch
           # from a release/* or feature branch would silently repoint the
           # shared floating nvstaging tags at older or unrelated code.
+          # The dev branch is TEMPORARY(test): it lets a workflow_dispatch
+          # with release=true exercise the full staging path (behind the
+          # manual-release-approval gate) before merge. Remove it from this
+          # allowlist when the branch merges.
           if [ "${RELEASE}" = "true" ]; then
             case "${REF}" in
               refs/heads/main|refs/heads/pvijayakrish/mx-nightly-ci) ;;
@@ -237,7 +231,7 @@ jobs:
   # ---------------------------------------------------------------------------
   manual-release-approval:
     name: Manual release approval
-    runs-on: prod-modelexpress-builder-amd-v1
+    runs-on: prod-modelexpress-default-small-v1
     needs: [preflight]
     if: ${{ github.event_name == 'workflow_dispatch' && needs.preflight.outputs.release == 'true' }}
     environment: manual-release-approval
@@ -287,7 +281,7 @@ jobs:
   # ---------------------------------------------------------------------------
   notify-slack-start:
     name: Notify Slack — nightly started
-    runs-on: prod-modelexpress-builder-amd-v1
+    runs-on: prod-modelexpress-default-small-v1
     timeout-minutes: 10
     needs: [preflight]
     if: ${{ needs.preflight.outputs.release == 'true' }}
@@ -894,7 +888,7 @@ jobs:
   # ---------------------------------------------------------------------------
   notify-slack-staging:
     name: Notify Slack — staging status
-    runs-on: prod-modelexpress-builder-amd-v1
+    runs-on: prod-modelexpress-default-small-v1
     timeout-minutes: 10
     needs: [preflight, notify-slack-start, stage-containers-ngc, build-wheels, stage-crates, stage-helm-ngc]
     if: >-
@@ -1066,7 +1060,7 @@ jobs:
   # ---------------------------------------------------------------------------
   nightly-status:
     name: Nightly status
-    runs-on: prod-modelexpress-builder-amd-v1
+    runs-on: prod-modelexpress-default-small-v1
     timeout-minutes: 10
     needs:
       - preflight

@@ -1218,7 +1218,10 @@ jobs:
   # ---------------------------------------------------------------------------
   ci-status-check:
     name: CI status check
-    runs-on: prod-modelexpress-builder-amd-v1
+    # The small pool (maxRunners 200, no dind): this jq-only umbrella job is
+    # the branch-protection gate for PR merges, so it must not queue behind
+    # image builds and GPU tests saturating the builder pool.
+    runs-on: prod-modelexpress-default-small-v1
     needs:
       - build-server
       - build-client
