@@ -29,10 +29,13 @@ entire logical source tensor contiguously and can recover any publisher's box wi
 :func:`shard_region`. On the exact-segment path the receiver reads a sub-range straight
 into the live parameter and never materialises the shard, so there is nothing to
 recompute the digest over. That is not a corner case: where trainer and inference
-parallelism differ, most sources take the exact path. Covering it needs a gate at
-destination rather than shard granularity, which is a separate mechanism and not this
-one. This digest still contributes there, as a fingerprint over the contributing
-publishers that separates a trainer-side weight change from a transport fault.
+parallelism differ, most sources take the exact path. For strict qualification, the
+receiver must full-pull and verify the publisher's whole shard, derive the expected
+destination slice from that verified staging buffer, and compare it with the destination
+produced by the ordinary exact-segment read. Both reads must target the same immutable,
+step-stamped source version. A fingerprint over the contributing publishers is useful
+freshness evidence, but it is not a byte-for-byte expectation for a partial read and must
+not be presented as one.
 """
 
 from __future__ import annotations
