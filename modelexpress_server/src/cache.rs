@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::registry::backend::ModelRecord;
+use crate::registry::entry_key::EntryKey;
 use crate::registry::state::RegistryManager;
 use modelexpress_common::config::DurationConfig;
 use modelexpress_common::download::get_provider;
@@ -343,28 +344,67 @@ impl CacheEvictionService {
         Ok(result)
     }
 
-    /// Evict a single model (remove from filesystem, then from database)
+    /// Evict a single entry (remove from filesystem, then from the registry).
+    ///
+    /// `entry_key` is a registry key, so it has to be parsed back into the model name
+    /// and revision the provider needs in order to delete the right snapshot.
     async fn evict_model(
         &self,
-        model_name: &str,
+        entry_key: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Look up the model record to determine the provider
         let record = self
             .registry
-            .get_model_record(model_name)
+            .get_model_record(entry_key)
             .await?
-            .ok_or_else(|| format!("model '{model_name}' not found in registry"))?;
+            .ok_or_else(|| format!("model '{entry_key}' not found in registry"))?;
+
+        let key = EntryKey::parse(entry_key);
+
+        // Entries that outlive this one and belong to the same model. Which files we can
+        // delete depends entirely on what they still reference.
+        let siblings = self.registry.get_models_by_last_used(None).await?;
+        let survivors: Vec<EntryKey> = siblings
+            .iter()
+            .filter(|sibling| sibling.model_name != entry_key)
+            .map(|sibling| EntryKey::parse(&sibling.model_name))
+            .filter(|other| other.model_name == key.model_name)
+            .collect();
+
+        // An entry with no revision covers every snapshot of its model, so it shares
+        // files with all of them. That is how a record written before revisions existed
+        // behaves: evicting it must not delete a snapshot a revision-scoped entry uses,
+        // and a revision-scoped evict must not delete files the legacy entry covers.
+        let snapshot_still_referenced = survivors.iter().any(|other| {
+            other.revision == key.revision || other.revision.is_none() || key.revision.is_none()
+        });
 
         // Delete files from disk first. If this fails, we keep the registry record
         // so the next eviction cycle can retry.
-        let provider = get_provider(record.provider);
-        provider
-            .delete_model(model_name, self.cache_directory.clone())
-            .await
-            .map_err(|e| format!("failed to delete model files for '{model_name}': {e}"))?;
+        let delete_revision = if survivors.is_empty() {
+            // Nothing else references this model. Drop the whole cache entry rather than
+            // just this revision, so snapshots left behind by an earlier shared-file
+            // decision cannot outlive the last record pointing at them.
+            Some(None)
+        } else if snapshot_still_referenced {
+            debug!(
+                "Keeping files for '{entry_key}': another registry entry still references \
+                 the same snapshot"
+            );
+            None
+        } else {
+            Some(key.revision.as_deref())
+        };
+
+        if let Some(revision) = delete_revision {
+            get_provider(record.provider)
+                .delete_model_revision(&key.model_name, self.cache_directory.clone(), revision)
+                .await
+                .map_err(|e| format!("failed to delete model files for '{entry_key}': {e}"))?;
+        }
 
         // Only remove from registry after successful filesystem deletion
-        self.registry.delete_model(model_name).await?;
+        self.registry.delete_model(entry_key).await?;
 
         Ok(())
     }
@@ -697,5 +737,109 @@ mod tests {
         assert_eq!(stats.downloaded_models, 1);
         assert_eq!(stats.downloading_models, 1);
         assert_eq!(stats.error_models, 1);
+    }
+
+    fn downloaded_record(model_name: &str) -> ModelRecord {
+        let now = Utc::now();
+        ModelRecord {
+            model_name: model_name.to_string(),
+            provider: ModelProvider::HuggingFace,
+            status: ModelStatus::DOWNLOADED,
+            created_at: now,
+            last_used_at: now,
+            message: None,
+        }
+    }
+
+    fn key(revision: Option<&str>, metadata_only: bool) -> String {
+        EntryKey::new("test/model", revision.map(String::from), metadata_only).to_string()
+    }
+
+    /// Which snapshots of `test/model` survive evicting `entry_key` while `siblings`
+    /// remain in the registry. Two snapshots exist on disk: `abc123` and `def456`.
+    async fn evict_and_report_surviving_snapshots(
+        entry_key: &str,
+        siblings: Vec<String>,
+    ) -> Vec<String> {
+        let evicted = entry_key.to_string();
+        let mut mock = MockRegistryBackend::new();
+        mock.expect_get_model_record()
+            .once()
+            .returning(move |name| Ok(Some(downloaded_record(name))));
+        mock.expect_get_models_by_last_used()
+            .once()
+            .returning(move |_| {
+                let mut records = vec![downloaded_record(&evicted)];
+                records.extend(siblings.iter().map(|name| downloaded_record(name)));
+                Ok(records)
+            });
+        mock.expect_delete_model().once().returning(|_| Ok(()));
+
+        let (service, cache_dir) = service_with_mock(mock, CacheEvictionConfig::default());
+        let snapshots_dir = cache_dir.path().join("models--test--model/snapshots");
+        for commit in ["abc123", "def456"] {
+            let snapshot = snapshots_dir.join(commit);
+            std::fs::create_dir_all(&snapshot).expect("Failed to create snapshot");
+            std::fs::write(snapshot.join("config.json"), b"{}").expect("Failed to write config");
+        }
+
+        service.evict_model(entry_key).await.expect("evict");
+
+        let mut surviving: Vec<String> = std::fs::read_dir(&snapshots_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        surviving.sort();
+        surviving
+    }
+
+    #[tokio::test]
+    async fn test_evict_removes_only_its_own_snapshot() {
+        assert_eq!(
+            evict_and_report_surviving_snapshots(
+                &key(Some("abc123"), false),
+                vec![key(Some("def456"), false)]
+            )
+            .await,
+            vec!["def456".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_evict_keeps_files_shared_with_the_metadata_only_entry() {
+        assert_eq!(
+            evict_and_report_surviving_snapshots(
+                &key(Some("abc123"), false),
+                vec![key(Some("abc123"), true), key(Some("def456"), false)]
+            )
+            .await,
+            vec!["abc123".to_string(), "def456".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_evict_keeps_files_a_revision_scoped_entry_still_uses() {
+        // A pre-revision record covers every snapshot of its model, so evicting it must
+        // not delete the snapshot a revision-scoped entry points at.
+        assert_eq!(
+            evict_and_report_surviving_snapshots("test/model", vec![key(Some("abc123"), false)])
+                .await,
+            vec!["abc123".to_string(), "def456".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_evict_of_the_last_entry_removes_every_snapshot() {
+        // Otherwise a snapshot kept alive by an earlier shared-file decision would
+        // outlive the last record that pointed at it, and never be reclaimed.
+        assert!(
+            evict_and_report_surviving_snapshots(&key(Some("abc123"), false), vec![])
+                .await
+                .is_empty()
+        );
     }
 }

@@ -217,6 +217,7 @@ impl From<&models::ModelStatusResponse> for grpc::model::ModelStatusUpdate {
             status: grpc::model::ModelStatus::from(response.status) as i32,
             message: None,
             provider: grpc::model::ModelProvider::from(response.provider) as i32,
+            resolved_revision: None,
         }
     }
 }
@@ -351,6 +352,7 @@ mod tests {
             status: grpc::model::ModelStatus::Downloaded as i32,
             message: Some("Test message".to_string()),
             provider: grpc::model::ModelProvider::HuggingFace as i32,
+            resolved_revision: None,
         };
 
         let response: models::ModelStatusResponse = grpc_update.into();
