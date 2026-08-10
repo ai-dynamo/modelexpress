@@ -4,3 +4,11 @@
 # Supply-chain and ownership policy require DevOps review.
 /.github/CODEOWNERS @ai-dynamo/devops
 /deny.toml            @ai-dynamo/devops
+
+# CI definitions reach release credentials (the automated-release environment:
+# NGC publish token, Artifactory token, GitLab trigger token) and the AKS
+# kubeconfig, and they run on self-hosted runners. Changes here are
+# supply-chain changes.
+/.github/workflows/ @ai-dynamo/devops
+/.github/actions/   @ai-dynamo/devops
+/.github/scripts/   @ai-dynamo/devops

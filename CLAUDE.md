@@ -104,6 +104,16 @@ Files to bump:
 - `modelexpress_client/python/tests/test_source_id.py` and
   `test_k8s_service_client.py` — `mx_version` strings in test fixtures.
 
+**CI reads these version literals.** The nightly pipeline
+(`.github/workflows/nightly-ci.yml`, job `preflight`) parses
+`[workspace.package].version` from `Cargo.toml`, `[project].version` from
+`pyproject.toml`, and `version:` from `helm/Chart.yaml` to derive the
+nightly crate/wheel/chart versions. It requires each to be a single
+anchored `version = "<x.y.z>"` / `version: <x.y.z>` line and fails fast
+otherwise, so keep the literal format when bumping. The nightly only
+*reads* them — it stamps its derived versions into a throwaway checkout
+and never commits.
+
 `mx_version` is part of the `SourceIdentity` proto, which is hashed into
 the `mx_source_id`. After bumping the version literals, the pinned
 source-id assertions break. Capture the new hashes by running the

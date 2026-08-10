@@ -366,18 +366,60 @@ docker run --rm -v "$PWD/dist:/out" mx-wheel-builder bash -lc 'cp -r /dist/. /ou
 every push to `main` / `release/**`, building both archs in parallel on
 velonix self-hosted runners and uploading the artifacts to NV Artifactory.
 
-Destination layout under `${ARTIFACTORY_PYPI_REPO_NAME}`:
+Destination layout:
 
-| Event | Subpath |
-|---|---|
-| `push` to `pull-request/<pr_id>` (copy-pr-bot mirror) | `pr/<pr_id>/<commit_sha>/<run_id>/<run_attempt>/<arch>/` |
-| `push` to `main`, `release/**` | `post-merge/<commit_sha>/<run_id>/<run_attempt>/<arch>/` |
+| Event | Repository | Subpath |
+|---|---|---|
+| `push` to `pull-request/<pr_id>` (copy-pr-bot mirror) | `${ARTIFACTORY_PYPI_REPO_NAME}` | `pr/<pr_id>/<commit_sha>/<run_id>/<run_attempt>/<arch>/` |
+| `push` to `main`, `release/**` | `${ARTIFACTORY_PYPI_REPO_NAME}` | `post-merge/<commit_sha>/<run_id>/<run_attempt>/<arch>/` |
+| Nightly (`nightly-ci.yml`) | `sw-dynamo-modelexpress-cargo-local` | `nightly/<date>-<sha7>-<run_id>/<run_attempt>/` |
 
-Each path contains the 6 artifacts from one arch: 4 manylinux wheels
-(cp310-cp313), 1 `py3-none-any` wheel, and 1 sdist. The upload step is
-gated on the `automated-release` GitHub environment, which holds three
-secrets: `ARTIFACTORY_URL`, `ARTIFACTORY_TOKEN` (JFrog identity token),
-and `ARTIFACTORY_PYPI_REPO_NAME`.
+The PR and post-merge paths each contain the 6 artifacts from one arch:
+4 manylinux wheels (cp310-cp313), 1 `py3-none-any` wheel, and 1 sdist.
+The nightly path is shared by both archs and additionally receives the
+packaged Rust crates (`.crate`) — see
+[Nightly pipeline](#nightly-pipeline). The upload step is gated on the
+`automated-release` GitHub environment, which holds `ARTIFACTORY_URL`,
+`ARTIFACTORY_TOKEN` (JFrog identity token), and
+`ARTIFACTORY_PYPI_REPO_NAME`.
+
+### Nightly pipeline
+
+`.github/workflows/nightly-ci.yml` runs daily at 09:00 UTC (01:00 PST)
+against `main`, builds every release artifact from that commit, runs the
+full hosted and K8s/GPU test suites, and stages the artifacts internally.
+It can also be dispatched manually; a manual run only stages after
+approval through the `manual-release-approval` GitHub environment.
+
+Every job runs on the velonix self-hosted runners.
+
+| Artifact | Version | Destination |
+|---|---|---|
+| Server image (amd64 + arm64) | tag `<date>-<sha7>` | `nvcr.io/nvstaging/ai-dynamo/modelexpress-server-nightly` (+ floating `:latest`, and `modelexpress-server:nightly`) |
+| Python wheels + sdist | `<base>.dev<date>` | `sw-dynamo-modelexpress-cargo-local/nightly/<date>-<sha7>-<run_id>/<run_attempt>/` |
+| Rust crates (`.crate`) | `<base>-nightly.<date>.<run>.<attempt>.g<sha7>` | same Artifactory path |
+| Helm chart | `<base>-nightly.<date>.<run>.<attempt>.g<sha7>` | `helm.ngc.nvidia.com/nvstaging/ai-dynamo` |
+
+The packaged nightly chart is stamped to reference the nightly server
+image, so `helm install` of a nightly chart deploys nightly code — it does
+not fall back to the released image in `helm/values.yaml`.
+
+After staging, the workflow triggers the internal GitLab
+release-automation pipeline (security scans) and reports to Slack: a
+thread is opened at start, staging results are replied on it, and any
+failed, cancelled or timed-out job raises an alert through
+`SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL`. The single job to watch is
+`nightly-status`.
+
+Test failures do **not** block staging (matching the Dynamo nightly): a
+red test lane alerts Slack while the scan-gated staging proceeds.
+
+Additional secrets beyond the `ARTIFACTORY_*` set above, all in the
+`automated-release` environment unless noted: `NGC_PUBLISH_USERNAME`,
+`NGC_PUBLISH_TOKEN`, `GITLAB_PIPELINE_URL`, `GITLAB_TRIGGER_TOKEN`, and
+(repository scope) `SLACK_RELEASE_BOT_TOKEN`, `SLACK_RELEASE_CHANNEL_ID`,
+`SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL`. The optional repository variable
+`GITLAB_RELEASE_AUTOMATION_REF` overrides the GitLab ref (default `main`).
 
 ### Custom Client Image (P2P Transfers)
 
