@@ -21,6 +21,18 @@ recomputes and compares is deliberately not here; it needs the fresh-discovery
 refresh to avoid reporting ordinary training updates as corruption, which is its own
 change. Publishing is opt-in via ``MX_RESHARD_PUBLISH_DIGEST`` because the reduction
 costs a pass over every published tensor.
+
+Scope, because it is narrower than "the refit is verified" and the difference matters
+when planning the consumer. A publisher digest covers a whole shard, so a receiver can
+only check it where it holds that whole shard - the full-pull path, which stages the
+entire logical source tensor contiguously and can recover any publisher's box with
+:func:`shard_region`. On the exact-segment path the receiver reads a sub-range straight
+into the live parameter and never materialises the shard, so there is nothing to
+recompute the digest over. That is not a corner case: where trainer and inference
+parallelism differ, most sources take the exact path. Covering it needs a gate at
+destination rather than shard granularity, which is a separate mechanism and not this
+one. This digest still contributes there, as a fingerprint over the contributing
+publishers that separates a trainer-side weight change from a transport fault.
 """
 
 from __future__ import annotations
