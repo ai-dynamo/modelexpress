@@ -143,6 +143,18 @@ class TrainerPullStrategy(LoadStrategy):
         # so prep_xfer_dlist on the local side failed with NIXL_ERR_NOT_FOUND.
         register_tensors(result, ctx)
 
+        # register_tensors is deliberately best-effort: at the other call sites a
+        # failure only costs P2P *serving*, so degrading is right. Here the
+        # registered region is the destination of an inbound READ, so without it
+        # every transfer fails at prep and falls silently through to disk. Turn
+        # that into a strategy failure the fallback chain can act on.
+        if ctx.nixl_manager is None or not ctx.nixl_manager.tensor_descriptors:
+            raise StrategyFailed(
+                "NIXL registration did not complete; trainer pull has no local "
+                "destination to read into",
+                mutated=False,
+            )
+
         planner = (
             ServerPlanner(mx_client=ctx.mx_client)
             if _use_server_planner()
