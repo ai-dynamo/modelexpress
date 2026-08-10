@@ -33,6 +33,7 @@ import torch
 from modelexpress import envs
 from modelexpress.client import MxClient
 from modelexpress.nixl_transfer import NixlTransferManager
+from modelexpress.refit.timing import add_refit_bytes, refit_span
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
 from modelexpress.refit.reshard.rendezvous import gather_sources
 from modelexpress.refit.reshard.transfer_plan import (
@@ -51,6 +52,10 @@ from modelexpress.refit.reshard.types import (
 )
 
 logger = logging.getLogger("modelexpress.refit.reshard.receiver")
+
+
+class ReshardTopologyChanged(RuntimeError):
+    """Cached source membership or registered geometry changed before a read."""
 
 
 def handshake_endpoints_for_plan(
@@ -277,6 +282,7 @@ class ReshardReceiver:
         device: "torch.device",
         listen_port: int,
         timeout: float = 1200.0,
+        mx_client: MxClient | None = None,
     ) -> None:
         """Build this rank's NIXL agent + metadata client.
 
@@ -291,12 +297,9 @@ class ReshardReceiver:
                 must be discovered before planning, since a slice can fan in
                 across ranks).
             device: the torch device receive buffers are allocated on.
-            listen_port: NIXL listen port for this rank's agent. The receiver
-                needs a listen thread (MX's P2P metadata exchange is
-                bidirectional); the caller owns port assignment so it can avoid
-                colliding with a colocated trainer publisher (which listens on
-                ``MX_METADATA_PORT + device_id``).
+            listen_port: NIXL listen port for this rank's receiver agent.
             timeout: rendezvous / per-pull timeout seconds.
+            mx_client: Optional metadata client retained by the startup loader.
         """
         self._device = device
         self._model_name = model_name
@@ -312,10 +315,11 @@ class ReshardReceiver:
             agent_name=agent_name, device_id=local_rank, listen_port=listen_port
         )
         self._manager.initialize()
-        self._mx_client = MxClient(server_url=mx_server)
+        self._mx_client = mx_client or MxClient(server_url=mx_server)
 
         self._plan = None  # built lazily on the first refit
         self._transport: NixlReshardTransport | None = None
+        self._source_signature: tuple | None = None
         self._recv_buffers: dict[
             str, torch.Tensor
         ] = {}  # param_name -> receive buffer at load-time layout
@@ -358,7 +362,7 @@ class ReshardReceiver:
         raise NotImplementedError
 
     # ------------------------------------------------------------------ prepare
-    def _prepare(self, timeout: float) -> None:
+    def _prepare(self, timeout: float, step: int) -> None:
         """One-time: discover trainer shards, capture load geometry, build the pull
         plan, connect the trainers it reads from, and allocate + register buffers."""
         logger.info(
@@ -366,18 +370,28 @@ class ReshardReceiver:
             self._num_trainer_sources,
             timeout,
         )
-        sources, session_to_agent, session_to_device, agent_endpoints = gather_sources(
-            self._mx_client,
-            expected_trainers=self._num_trainer_sources,
-            model_name=self._model_name,
-            role="inference",
-            rank=self._global_rank,
-            timeout=timeout,
-        )
+        with refit_span("control_discovery"):
+            sources, session_to_agent, session_to_device, agent_endpoints = (
+                gather_sources(
+                    self._mx_client,
+                    expected_trainers=self._num_trainer_sources,
+                    model_name=self._model_name,
+                    role="inference",
+                    rank=self._global_rank,
+                    timeout=timeout,
+                    expected_training_step=step,
+                )
+            )
         logger.info(
             "[reshard] _prepare: discovered %d source(s), %d agent(s)",
             len(sources),
             len(agent_endpoints),
+        )
+        self._source_signature = self._topology_signature(
+            sources,
+            session_to_agent,
+            session_to_device,
+            agent_endpoints,
         )
         manifest = [
             (name, src.dtype, tuple(src.global_shape)) for name, src in sources.items()
@@ -386,7 +400,8 @@ class ReshardReceiver:
             "[reshard] _prepare: capturing geometry over %d manifest entries",
             len(manifest),
         )
-        capture, param_layout = self._capture(manifest)
+        with refit_span("source_preparation"):
+            capture, param_layout = self._capture(manifest)
         logger.info(
             "[reshard] _prepare: captured %d copies, %d unsupported",
             len(capture.copies),
@@ -398,7 +413,8 @@ class ReshardReceiver:
         # It is built once and reused every step (see the guard in
         # update_weights), which assumes the trainer set + their shard layout +
         # their buffer addresses are stable for the run.
-        plan = plan_transfer(capture, sources)
+        with refit_span("transfer_planning"):
+            plan = plan_transfer(capture, sources)
         all_params = sorted({c.param_name for c in capture.copies})
         # Before the fail-closed rejection below, not after: an unsupported plan is
         # the case where naming the hole matters most, and raising first would leave
@@ -431,82 +447,87 @@ class ReshardReceiver:
             len(handshake_endpoints),
             len(agent_endpoints),
         )
-        handshake_with_peers(
-            self._manager,
-            handshake_endpoints,
-            envs.MX_RESHARD_HANDSHAKE_TIMEOUT_S,
-        )
-
-        self._transport = NixlReshardTransport(
-            self._manager, session_to_agent, session_to_device, timeout_seconds=timeout
-        )
-        self._plan = plan
-
-        # dtype-mismatched sources (e.g. a bf16-served router for an fp32 dest):
-        # one persistent bf16 STAGING buffer per convert param, registered as an
-        # RDMA target (classic cudaMalloc so the HCA can RDMA into it); each refit
-        # we RDMA into staging then cast staging -> the (load-time) receive buffer.
-        self._staging = {}
-        self._staging_ptr = {}
-        if plan.converts:
-            with classic_cuda_alloc():
-                self._staging = {
-                    c.param_name: torch.empty(
-                        c.dest_shape, dtype=c.src_dtype, device=self._device
-                    )
-                    for c in plan.converts
-                }
-            self._manager.register_tensors(
-                {f"__stage__{n}": t for n, t in self._staging.items()}
+        with refit_span("setup_registration"):
+            handshake_with_peers(
+                self._manager,
+                handshake_endpoints,
+                envs.MX_RESHARD_HANDSHAKE_TIMEOUT_S,
             )
-            self._staging_ptr = {n: t.data_ptr() for n, t in self._staging.items()}
 
-        # Descriptor-heavy strided copies pull each complete source into one
-        # persistent contiguous staging tensor, then replay captured loader views
-        # locally. Each source shard contributes one bounded descriptor.
-        self._full_staging = {}
-        self._full_staging_ptr = {}
-        if plan.full_pulls:
-            with classic_cuda_alloc():
-                self._full_staging = {
-                    full_pull.src_name: torch.empty(
-                        full_pull.global_shape,
-                        dtype=full_pull.dtype,
-                        device=self._device,
-                    )
-                    for full_pull in plan.full_pulls
-                }
-            self._manager.register_tensors(
-                {
-                    f"__full__{name}": tensor
+            self._transport = NixlReshardTransport(
+                self._manager,
+                session_to_agent,
+                session_to_device,
+                timeout_seconds=timeout,
+            )
+            self._plan = plan
+
+            # dtype-mismatched sources (e.g. a bf16-served router for an fp32 dest):
+            # one persistent bf16 STAGING buffer per convert param, registered as an
+            # RDMA target (classic cudaMalloc so the HCA can RDMA into it); each refit
+            # we RDMA into staging then cast staging -> the (load-time) receive buffer.
+            self._staging = {}
+            self._staging_ptr = {}
+            if plan.converts:
+                with classic_cuda_alloc():
+                    self._staging = {
+                        c.param_name: torch.empty(
+                            c.dest_shape, dtype=c.src_dtype, device=self._device
+                        )
+                        for c in plan.converts
+                    }
+                self._manager.register_tensors(
+                    {f"__stage__{n}": t for n, t in self._staging.items()}
+                )
+                self._staging_ptr = {n: t.data_ptr() for n, t in self._staging.items()}
+
+            # Descriptor-heavy strided copies pull each complete source into one
+            # persistent contiguous staging tensor, then replay captured loader views
+            # locally. Each source shard contributes one bounded descriptor.
+            self._full_staging = {}
+            self._full_staging_ptr = {}
+            if plan.full_pulls:
+                with classic_cuda_alloc():
+                    self._full_staging = {
+                        full_pull.src_name: torch.empty(
+                            full_pull.global_shape,
+                            dtype=full_pull.dtype,
+                            device=self._device,
+                        )
+                        for full_pull in plan.full_pulls
+                    }
+                self._manager.register_tensors(
+                    {
+                        f"__full__{name}": tensor
+                        for name, tensor in self._full_staging.items()
+                    }
+                )
+                self._full_staging_ptr = {
+                    name: tensor.data_ptr()
                     for name, tensor in self._full_staging.items()
                 }
-            )
-            self._full_staging_ptr = {
-                name: tensor.data_ptr() for name, tensor in self._full_staging.items()
-            }
 
-        # Receive buffers: one per captured param at its CAPTURED (load-time)
-        # shape/dtype, classic cudaMalloc, registered once. The live params are
-        # NOT RDMA targets; _install() writes the buffers into the live params.
-        # Segment params (captured == served) are the RDMA targets - register them
-        # + point _param_ptr at them. Convert params (router) are captured fp32 ->
-        # their bf16 staging is the RDMA target and the refit casts into the buffer.
-        seg_params = {seg.param_name for seg in plan.segments}
-        self._recv_buffers = {}
-        with classic_cuda_alloc():
-            for name in all_params:
-                shape, dtype = param_layout[name]
-                self._recv_buffers[name] = torch.empty(
-                    tuple(shape), dtype=dtype, device=self._device
+            # Receive buffers: one per captured param at its CAPTURED (load-time)
+            # shape/dtype, classic cudaMalloc, registered once. The live params are
+            # NOT RDMA targets; _install() writes the buffers into the live params.
+            # Segment params (captured == served) are the RDMA targets - register them
+            # + point _param_ptr at them. Convert params (router) are captured fp32 ->
+            # their bf16 staging is the RDMA target and the refit casts into the buffer.
+            seg_params = {seg.param_name for seg in plan.segments}
+            self._recv_buffers = {}
+            with classic_cuda_alloc():
+                for name in all_params:
+                    shape, dtype = param_layout[name]
+                    self._recv_buffers[name] = torch.empty(
+                        tuple(shape), dtype=dtype, device=self._device
+                    )
+            self._param_ptr = {}
+            if seg_params:
+                self._manager.register_tensors(
+                    {f"__recv__{n}": self._recv_buffers[n] for n in seg_params}
                 )
-        self._param_ptr = {}
-        if seg_params:
-            self._manager.register_tensors(
-                {f"__recv__{n}": self._recv_buffers[n] for n in seg_params}
-            )
-            for name in seg_params:
-                self._param_ptr[name] = self._recv_buffers[name].data_ptr()
+                for name in seg_params:
+                    self._param_ptr[name] = self._recv_buffers[name].data_ptr()
 
         logger.info(
             "[reshard] prepared: %d descriptor(s), %d full-pull source(s), "
@@ -610,20 +631,108 @@ class ReshardReceiver:
                 f"partial refit."
             )
 
+    @staticmethod
+    def _topology_signature(
+        sources: dict,
+        session_to_agent: dict,
+        session_to_device: dict,
+        agent_endpoints: dict,
+    ) -> tuple:
+        source_rows = []
+        for name, source in sorted(sources.items()):
+            shards = tuple(
+                sorted(
+                    (
+                        tuple(shard.shard_offset),
+                        tuple(shard.shape),
+                        str(shard.session),
+                        int(shard.addr),
+                        int(shard.elsize),
+                    )
+                    for shard in source.shards
+                )
+            )
+            source_rows.append(
+                (
+                    name,
+                    tuple(source.global_shape),
+                    str(source.dtype),
+                    int(source.elsize),
+                    shards,
+                )
+            )
+        return (
+            tuple(source_rows),
+            tuple(sorted(session_to_agent.items())),
+            tuple(sorted(session_to_device.items())),
+            tuple(sorted(agent_endpoints.items())),
+        )
+
+    def _wait_for_publishers(self, step: int, timeout: float) -> None:
+        """Wait until every trainer publication is stamped with ``step``.
+
+        Cached plans intentionally reuse stable source addresses. The bytes at
+        those addresses still change every update, so reading before all sources
+        expose the requested step can install a mixed model version.
+        """
+        with refit_span("control_discovery"):
+            sources, session_to_agent, session_to_device, agent_endpoints = (
+                gather_sources(
+                    self._mx_client,
+                    expected_trainers=self._num_trainer_sources,
+                    model_name=self._model_name,
+                    role="inference",
+                    rank=self._global_rank,
+                    timeout=timeout,
+                    expected_training_step=step,
+                )
+            )
+        current = self._topology_signature(
+            sources,
+            session_to_agent,
+            session_to_device,
+            agent_endpoints,
+        )
+        if current != self._source_signature:
+            raise ReshardTopologyChanged(
+                "trainer membership, shard geometry, endpoint, or registered "
+                "address changed after the SGLang refit plan was cached; refusing "
+                "to read stale addresses"
+            )
+
+    def close(self) -> None:
+        """Release remote peers, registrations, and topology-scoped GPU buffers."""
+        self._manager.shutdown()
+        # A topology rebuild constructs the replacement receiver before this
+        # object goes out of scope. Drop the old model-sized allocations here so
+        # the new receive/staging set does not temporarily require twice the
+        # model memory.
+        self._transport = None
+        self._plan = None
+        self._source_signature = None
+        self._recv_buffers.clear()
+        self._param_ptr.clear()
+        self._staging.clear()
+        self._staging_ptr.clear()
+        self._full_staging.clear()
+        self._full_staging_ptr.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     # ----------------------------------------------------------- update_weights
     @torch.no_grad()
     def update_weights(self, step: int, *, timeout: float | None = None) -> dict:
         """RDMA-pull the needed slices into the receive buffers, cast the
         dtype-mismatched ones, then install into the live params."""
         timeout = timeout if timeout is not None else self._timeout
-        # TODO(re-plan on topology change): the plan is built once and cached, so
-        # a mid-run change in the trainer set - a trainer restart (new buffer
-        # addresses), a reshard (new shard boundaries / fan-in), or scaling the
-        # trainer count - is NOT picked up; every step re-reads the first
-        # discovery's addresses. Adapt the plan when topology changes (e.g.
-        # re-discover + rebuild if a version/epoch token or address set differs).
+        # The plan is built once and cached. Every warm update re-discovers the
+        # stamped publication and compares its complete source topology against
+        # that cached plan. A trainer restart, reshard, or address change fails
+        # closed here; automatic re-planning remains future work.
         if self._plan is None:
-            self._prepare(timeout)
+            self._prepare(timeout, step)
+        else:
+            self._wait_for_publishers(step, timeout)
         assert self._plan is not None and self._transport is not None
 
         # RDMA the sliced bf16 into the receive buffers (segments) and per-param
@@ -658,26 +767,29 @@ class ReshardReceiver:
             for segment in convert.segments
         ]
 
-        if _fused_wire_enabled():
-            descriptors = exact_descriptors(
-                self._plan, lambda name: self._param_ptr[name]
-            )
-            stats = {
-                "segments": len(descriptors),
-                "bytes": sum(descriptor.nbytes for descriptor in descriptors),
-                "fallback": list(self._plan.fallback),
-            }
-            self._transport.read(descriptors + full_descriptors + convert_descriptors)
-        else:
-            stats = execute_transfer(
-                self._plan,
-                resolve_param_ptr=lambda name: self._param_ptr[name],
-                transport=self._transport,
-            )
-            if full_descriptors:
-                self._transport.read(full_descriptors)
-            if convert_descriptors:
-                self._transport.read(convert_descriptors)
+        with refit_span("wire_transfer"):
+            if _fused_wire_enabled():
+                descriptors = exact_descriptors(
+                    self._plan, lambda name: self._param_ptr[name]
+                )
+                stats = {
+                    "segments": len(descriptors),
+                    "bytes": sum(descriptor.nbytes for descriptor in descriptors),
+                    "fallback": list(self._plan.fallback),
+                }
+                self._transport.read(
+                    descriptors + full_descriptors + convert_descriptors
+                )
+            else:
+                stats = execute_transfer(
+                    self._plan,
+                    resolve_param_ptr=lambda name: self._param_ptr[name],
+                    transport=self._transport,
+                )
+                if full_descriptors:
+                    self._transport.read(full_descriptors)
+                if convert_descriptors:
+                    self._transport.read(convert_descriptors)
 
         stats["segments"] += len(full_descriptors) + len(convert_descriptors)
         stats["bytes"] += sum(
@@ -688,26 +800,29 @@ class ReshardReceiver:
         # Local re-slice of every full-pulled source into its receive buffer, and
         # the dtype cast for every converted param. Both read staging written by
         # the reads above, so both must run after the wire completes.
-        for full_pull in self._plan.full_pulls:
-            full_tensor = self._full_staging[full_pull.src_name]
-            for copy in full_pull.copies:
-                source_view = _replay_ops(full_tensor, copy.op_chain)
-                receive_buffer = self._recv_buffers[copy.param_name]
-                destination = receive_buffer.as_strided(
-                    copy.dest_shape,
-                    copy.dest_stride,
-                    receive_buffer.storage_offset() + copy.dest_offset,
+        with refit_span("transformation"):
+            for full_pull in self._plan.full_pulls:
+                full_tensor = self._full_staging[full_pull.src_name]
+                for copy in full_pull.copies:
+                    source_view = _replay_ops(full_tensor, copy.op_chain)
+                    receive_buffer = self._recv_buffers[copy.param_name]
+                    destination = receive_buffer.as_strided(
+                        copy.dest_shape,
+                        copy.dest_stride,
+                        receive_buffer.storage_offset() + copy.dest_offset,
+                    )
+                    destination.copy_(source_view)
+            # Cast the served bf16 staging into the (fp32) receive buffer - a torch
+            # op, so the RDMA never crosses dtypes. _install writes the buffer.
+            for convert in self._plan.converts:
+                self._recv_buffers[convert.param_name].copy_(
+                    self._staging[convert.param_name]
                 )
-                destination.copy_(source_view)
-        # Cast the served bf16 staging into the (fp32) receive buffer - a torch
-        # op, so the RDMA never crosses dtypes. _install writes the buffer.
-        for convert in self._plan.converts:
-            self._recv_buffers[convert.param_name].copy_(
-                self._staging[convert.param_name]
-            )
 
-        self._install(self._recv_buffers)
-        torch.cuda.synchronize(self._device)
+        with refit_span("installation"):
+            self._install(self._recv_buffers)
+        with refit_span("receive_sync"):
+            torch.cuda.synchronize(self._device)
 
         metrics = {
             "step": step,
@@ -721,6 +836,7 @@ class ReshardReceiver:
             "unbounded_sources": len(self._plan.unbounded_sources),
             "fallback": len(stats["fallback"]),
         }
+        add_refit_bytes(stats["bytes"])
         logger.info(
             "[reshard] refit step=%d bytes=%.1fMB descriptors=%d "
             "(saved=%d, extra_wire=%.1fMB) full_pulls=%d converts=%d "

@@ -171,6 +171,84 @@ python -m sglang.launch_server \
   --modelexpress-config '{"transport": "transfer_engine"}'
 ```
 
+## 4. Experimental Megatron to SGLang live refit
+
+ModelExpress includes an experimental receiver for remote Megatron-to-SGLang
+live refit:
+
+- NIXL receiver-driven pull through the shared `ReshardReceiver` planner;
+- Qwen3, full-model BF16 weights only;
+- loader-driven SGLang destination geometry and in-place installation into
+  existing parameter storage;
+- exact destination-parameter coverage and fail-closed rejection of FP8 or
+  other quantization, LoRA/adapters, partial/delta groups, and hidden tensor
+  registry entries.
+
+This package does **not** add an HTTP route to SGLang. An upstream SGLang
+integration must add a control-plane endpoint that dispatches the following
+worker call on every model worker and does not resume rollout traffic unless
+every required worker returns success:
+
+```python
+from modelexpress.engines.sglang import run_sglang_live_refit
+
+result = run_sglang_live_refit(
+    request_json,
+    device_id=gpu_id,
+    # Dense Miles publishes one replica: TP * PP, excluding ordinary DP copies.
+    num_trainer_sources=trainer_tp_size * trainer_pp_size,
+    listen_port=dedicated_refit_metadata_port,
+)
+return result.to_dict()
+```
+
+The accepted request is intentionally narrow:
+
+```json
+{
+  "target_training_step": 42,
+  "logical_group": "model",
+  "expected_layout_signature": "optional-sha256-from-the-target-workers"
+}
+```
+
+`logical_group` must be `model`. The layout signature is computed and checked
+from the SGLang worker's live parameter names, shapes, dtypes, and strides.
+Unknown request fields are rejected. There are no cohort-generation, partial
+tensor, delta, adapter, or quantization fields.
+
+The response reports `success`, requested and installed training steps, layout
+signature, transfer metrics, normalized `RefitTimingRecorder` output, and
+whether a failed in-place install poisoned the receiver. The endpoint must
+remove a poisoned worker from service and restart it. Installation first
+validates every buffer, but once parameter copies begin SGLang has no
+transactional rollback; a device/copy failure can leave mixed live storage.
+
+### Version and cohort limitation
+
+Each trainer publication carries its `target_training_step`. Before every read,
+the receiver requires exactly the configured trainer count at that step.
+Unstamped, lagging, or duplicate publications fail closed. Warm updates also
+compare membership, shard geometry, endpoints, sessions, and registered
+addresses against the cached plan, so a trainer restart or topology change is
+detected before stale addresses are read.
+
+The current rendezvous still has no atomic multi-rank cohort-generation field.
+The upstream RL/SGLang orchestration must select one trainer cohort and keep it
+alive through the update. A detected topology change closes the stale receiver,
+builds a fresh NIXL agent and plan, and retries once before any serving write.
+
+The startup ModelExpress NIXL loader retains the live model, tensor registry,
+metadata client, and NIXL manager. Live refit reuses the model, registry, and
+client, but intentionally creates a dedicated receiver NIXL agent. The manager's
+`register_tensors` operation replaces its published tensor/descriptors registry,
+so registering refit receive buffers on the startup manager would corrupt its
+source-publication and cleanup state. The endpoint must assign `listen_port` a
+free per-worker port that does not collide with the startup loader, trainer
+publisher, or SGLang services. The receiver caches its first trainer topology
+and address plan. Trainer restart, resharding, or scaling is detected before the
+read; the worker rebuilds the receiver and retries once.
+
 ## See also
 
 - Upstream PR: [sgl-project/sglang#24723](https://github.com/sgl-project/sglang/pull/24723).

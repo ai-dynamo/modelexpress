@@ -38,6 +38,7 @@ def publish_megatron_reshard_view(
     tensors: dict[str, Any],
     specs: list[MegatronPublishedTensorSpec],
     metadata_endpoint: str,
+    publisher_step: int | None = None,
 ) -> str:
     """Publish a reshard shard table over an existing NIXL registration.
 
@@ -122,6 +123,7 @@ def publish_megatron_reshard_view(
         rendezvous=rendezvous,
         published=published,
         metadata_endpoint=metadata_endpoint,
+        publisher_step=publisher_step,
     )
 
 
@@ -131,6 +133,7 @@ def publish_registered_shard_table(
     rendezvous: MxReshardRendezvous,
     published: list[PublishedTensor],
     metadata_endpoint: str,
+    publisher_step: int | None = None,
 ) -> str:
     """Publish a validated alias table over already-registered storage.
 
@@ -163,6 +166,7 @@ def publish_registered_shard_table(
         agent_name,
         metadata_endpoint,
         published,
+        publisher_step=publisher_step,
     )
     return rendezvous.publish(blob)
 

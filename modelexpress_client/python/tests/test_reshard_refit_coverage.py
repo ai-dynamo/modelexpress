@@ -393,6 +393,7 @@ def test_coverage_is_recorded_before_an_unsupported_plan_is_rejected(
         _mx_client=object(),
         _model_name="model",
         _manager=types.SimpleNamespace(fetch_remote_and_wait=lambda *a, **k: None),
+        _topology_signature=lambda *_args: (),
         _log_coverage=lambda *args: ReshardReceiver._log_coverage(stub, *args),
         _capture=lambda _manifest: (
             types.SimpleNamespace(
@@ -406,10 +407,41 @@ def test_coverage_is_recorded_before_an_unsupported_plan_is_rejected(
     caplog.clear()
     with caplog.at_level("WARNING"):
         with pytest.raises(UnsupportedReshard):
-            ReshardReceiver._prepare(stub, timeout=1.0)
+            ReshardReceiver._prepare(stub, timeout=1.0, step=1)
 
     records = [r for r in caplog.records if "MX_REFIT_COVERAGE" in r.getMessage()]
     assert len(records) == 1
     rec = json.loads(records[0].getMessage().split("MX_REFIT_COVERAGE ", 1)[1])
     assert rec["fallback"] == 1
     assert rec["params_never_written"] == 3
+
+
+def test_topology_signature_changes_when_a_publisher_address_changes():
+    shard = types.SimpleNamespace(
+        shard_offset=(0, 0),
+        shape=(4, 4),
+        session="trainer-0",
+        addr=4096,
+        elsize=2,
+    )
+    source = types.SimpleNamespace(
+        global_shape=(4, 4),
+        dtype=torch.bfloat16,
+        elsize=2,
+        shards=[shard],
+    )
+    before = ReshardReceiver._topology_signature(
+        {"weight": source},
+        {"trainer-0": "agent-0"},
+        {"trainer-0": 0},
+        {"agent-0": "host:1234"},
+    )
+    shard.addr = 8192
+    after = ReshardReceiver._topology_signature(
+        {"weight": source},
+        {"trainer-0": "agent-0"},
+        {"trainer-0": 0},
+        {"agent-0": "host:1234"},
+    )
+
+    assert before != after

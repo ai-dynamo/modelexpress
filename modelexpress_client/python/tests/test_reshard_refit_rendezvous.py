@@ -172,12 +172,13 @@ class _DiscoveryClient:
         )
 
 
-def _blob(agent_name, tensors):
+def _blob(agent_name, tensors, publisher_step=None):
     return wrap_rendezvous_blob(
         agent_metadata=b"nixl",
         agent_name=agent_name,
         metadata_endpoint=f"{agent_name}:1234",
         tensors=tensors,
+        publisher_step=publisher_step,
     )
 
 
@@ -212,6 +213,43 @@ def test_quorum_is_met_once_every_rank_publishes_tensors():
         "rank-0",
         "rank-1",
     ]
+
+
+def test_exact_step_discovery_rejects_lagging_and_unstamped_publishers():
+    client = _DiscoveryClient(
+        [
+            _blob("current", _one_tensor(), publisher_step=7),
+            _blob("lagging", _one_tensor(), publisher_step=6),
+            _blob("unknown", _one_tensor()),
+        ]
+    )
+
+    with pytest.raises(TimeoutError) as excinfo:
+        _rendezvous(client).discover_trainers(
+            expected_trainers=3,
+            expected_training_step=7,
+            timeout=0,
+        )
+
+    message = str(excinfo.value)
+    assert "wrong/unknown steps={6: 1, None: 1}" in message
+
+
+def test_exact_step_discovery_requires_unambiguous_membership():
+    client = _DiscoveryClient(
+        [
+            _blob("rank-0", _one_tensor(), publisher_step=8),
+            _blob("rank-1", _one_tensor(), publisher_step=8),
+            _blob("duplicate", _one_tensor(), publisher_step=8),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="ambiguous source membership"):
+        _rendezvous(client).discover_trainers(
+            expected_trainers=2,
+            expected_training_step=8,
+            timeout=0,
+        )
 
 
 def test_empty_publishers_are_excluded_from_the_returned_payloads():

@@ -217,7 +217,11 @@ def merge_shard_tables(tables: list) -> list:
 
 
 def wrap_rendezvous_blob(
-    agent_metadata: bytes, agent_name: str, metadata_endpoint: str, tensors: list
+    agent_metadata: bytes,
+    agent_name: str,
+    metadata_endpoint: str,
+    tensors: list,
+    publisher_step: int | None = None,
 ) -> bytes:
     """Pack ``{agent_meta, agent_name, metadata_endpoint, shard_table}`` into one
     JSON blob. ``metadata_endpoint`` (``host:listen_port`` of the trainer's NIXL
@@ -231,6 +235,8 @@ def wrap_rendezvous_blob(
         "agent_meta_b64": base64.b64encode(agent_metadata).decode("ascii"),
         "tensors": json.loads(encode_shard_table(tensors).decode("utf-8"))["tensors"],
     }
+    if publisher_step is not None:
+        payload["publisher_step"] = int(publisher_step)
     return json.dumps(payload).encode("utf-8")
 
 
@@ -250,6 +256,18 @@ class RendezvousPayload(NamedTuple):
 
 def unwrap_rendezvous_blob(blob: bytes) -> RendezvousPayload:
     """Inverse of ``wrap_rendezvous_blob``."""
+    payload, _publisher_step = unwrap_rendezvous_blob_with_step(blob)
+    return payload
+
+
+def unwrap_rendezvous_blob_with_step(
+    blob: bytes,
+) -> tuple[RendezvousPayload, int | None]:
+    """Unwrap a rendezvous blob and its optional training-step stamp.
+
+    A missing stamp means unknown, not step zero. Callers that require exact
+    version ordering must reject or continue polling unstamped publications.
+    """
     payload = json.loads(blob.decode("utf-8"))
     if payload.get("schema") != _SCHEMA:
         raise ValueError(f"unexpected rendezvous blob schema {payload.get('schema')!r}")
@@ -259,7 +277,12 @@ def unwrap_rendezvous_blob(blob: bytes) -> RendezvousPayload:
     tensors = decode_shard_table(
         json.dumps({"schema": _SCHEMA, "tensors": payload["tensors"]}).encode("utf-8")
     )
-    return RendezvousPayload(agent_metadata, agent_name, metadata_endpoint, tensors)
+    raw_step = payload.get("publisher_step")
+    publisher_step = None if raw_step is None else int(raw_step)
+    return (
+        RendezvousPayload(agent_metadata, agent_name, metadata_endpoint, tensors),
+        publisher_step,
+    )
 
 
 class MxReshardRendezvous:
@@ -354,6 +377,7 @@ class MxReshardRendezvous:
         expected_trainers: int,
         timeout: float = 1200.0,
         poll_interval: float = 1.0,
+        expected_training_step: int | None = None,
     ) -> list:
         """Block until ``expected_trainers`` trainer ranks are visible **with a
         non-empty shard table**, then return them.
@@ -379,7 +403,7 @@ class MxReshardRendezvous:
                 status_filter=p2p_pb2.SOURCE_STATUS_READY,
             )
             instances = list(resp.instances)
-            payloads, empty = [], 0
+            payloads, empty, wrong_step = [], 0, {}
             # Every visible READY source is inspected, whatever the count: with
             # fewer sources than expected the shard-table state is exactly what a
             # timeout here has to report, and reaching the quorum on instances
@@ -388,20 +412,38 @@ class MxReshardRendezvous:
                 meta = self.client.get_metadata(inst.mx_source_id, inst.worker_id)
                 if not meta.found:
                     continue
-                payload = unwrap_rendezvous_blob(meta.worker.nixl_metadata)
+                payload, publisher_step = unwrap_rendezvous_blob_with_step(
+                    meta.worker.nixl_metadata
+                )
                 if not payload.tensors:
                     empty += 1
                     continue
+                if (
+                    expected_training_step is not None
+                    and publisher_step != expected_training_step
+                ):
+                    wrong_step[publisher_step] = wrong_step.get(publisher_step, 0) + 1
+                    continue
                 payloads.append(payload)
-                if len(payloads) >= expected_trainers:
+                if (
+                    expected_training_step is None
+                    and len(payloads) >= expected_trainers
+                ):
                     break
+            if expected_training_step is not None and len(payloads) > expected_trainers:
+                raise RuntimeError(
+                    f"found {len(payloads)} trainer publications at step "
+                    f"{expected_training_step}, expected exactly {expected_trainers}; "
+                    "refusing ambiguous source membership"
+                )
             if len(payloads) >= expected_trainers:
                 break
             if time.monotonic() >= deadline:
                 raise TimeoutError(
                     f"timed out after {timeout}s waiting for {expected_trainers} "
                     f"trainer ranks (saw {len(instances)} READY source(s), "
-                    f"{len(payloads)} with a non-empty shard table, {empty} empty)"
+                    f"{len(payloads)} with a non-empty shard table at the requested "
+                    f"step, {empty} empty, wrong/unknown steps={wrong_step})"
                 )
             time.sleep(poll_interval)
 
@@ -424,6 +466,7 @@ def gather_sources(
     role: str = "inference",
     rank: int = 0,
     timeout: float = 1200.0,
+    expected_training_step: int | None = None,
 ) -> tuple:
     """One-call inference helper: discover all trainer ranks, merge their shard
     tables, and build the planning inputs (per-source ``SourceInfo`` + the
@@ -433,7 +476,11 @@ def gather_sources(
     where ``agent_endpoints`` is ``{agent_name: metadata_endpoint}`` for the
     caller to ``fetch_remote_and_wait`` (P2P) before pulling."""
     rdv = MxReshardRendezvous(client, role=role, rank=rank, model_name=model_name)
-    payloads = rdv.discover_trainers(expected_trainers, timeout=timeout)
+    payloads = rdv.discover_trainers(
+        expected_trainers,
+        timeout=timeout,
+        expected_training_step=expected_training_step,
+    )
     tables = [p.tensors for p in payloads]
     agent_endpoints = {p.agent_name: p.metadata_endpoint for p in payloads}
     merged = merge_shard_tables(tables)

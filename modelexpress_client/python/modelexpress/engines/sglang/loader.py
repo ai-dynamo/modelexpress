@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -37,6 +38,82 @@ if TYPE_CHECKING:
 
 _tensor_registry: dict[int, dict[str, torch.Tensor]] = {}
 _nixl_managers: dict[int, NixlTransferManager] = {}
+_model_registry: dict[int, nn.Module] = {}
+_context_registry: dict[int, LoadContext] = {}
+
+
+@dataclass(frozen=True)
+class SglangLoaderState:
+    """Startup state retained for an in-process SGLang live-refit endpoint."""
+
+    model: nn.Module
+    tensors: dict[str, torch.Tensor]
+    nixl_manager: NixlTransferManager | None
+    context: LoadContext
+
+
+def get_sglang_loader_state(device_id: int) -> SglangLoaderState:
+    """Return the completed startup loader state for one SGLang worker."""
+    try:
+        model = _model_registry[device_id]
+        tensors = _tensor_registry[device_id]
+        context = _context_registry[device_id]
+    except KeyError as exc:
+        raise RuntimeError(
+            "SGLang live refit requires a completed ModelExpress NIXL startup "
+            f"load on device {device_id}"
+        ) from exc
+    return SglangLoaderState(
+        model=model,
+        tensors=tensors,
+        nixl_manager=_nixl_managers.get(device_id),
+        context=context,
+    )
+
+
+def register_sglang_live_refit_state(
+    *,
+    model: nn.Module,
+    model_config,
+    load_config,
+    device_id: int,
+    device: str | torch.device = "cuda",
+) -> SglangLoaderState:
+    """Register an already-loaded SGLang model for ModelExpress live refit.
+
+    Miles normally starts SGLang from its Hugging Face checkpoint, so no
+    ModelExpress startup loader runs. Capture the same live tensor/context
+    state from the existing ModelRunner without reloading or replacing weights.
+    """
+    existing = _model_registry.get(device_id)
+    if existing is model:
+        return get_sglang_loader_state(device_id)
+    if existing is not None:
+        raise RuntimeError(
+            "SGLang live-refit state is already registered for a different "
+            f"model on device {device_id}"
+        )
+
+    from sglang.srt.configs.device_config import DeviceConfig
+
+    target_device = torch.device(device)
+    device_config = DeviceConfig(device=target_device.type, gpu_id=device_id)
+    ctx = build_sglang_load_context(load_config, model_config, device_config)
+    tensors = ctx.adapter.discover_tensors(LoadResult(value=model, model=model))
+    ctx.tensors = tensors
+
+    _tensor_registry[device_id] = tensors
+    _model_registry[device_id] = model
+    _context_registry[device_id] = ctx
+    _nixl_managers.pop(device_id, None)
+    logger.info(
+        "[Worker %s] Registered existing SGLang model for live refit "
+        "(device=%s, tensors=%s)",
+        ctx.global_rank,
+        device_id,
+        len(tensors),
+    )
+    return get_sglang_loader_state(device_id)
 
 
 class MxModelLoader:
@@ -105,6 +182,8 @@ class MxModelLoader:
         model = LoadStrategyChain.run(model, ctx)
 
         _tensor_registry[ctx.device_id] = ctx.tensors
+        _model_registry[ctx.device_id] = model
+        _context_registry[ctx.device_id] = ctx
         if ctx.nixl_manager is not None:
             _nixl_managers[ctx.device_id] = ctx.nixl_manager
         else:

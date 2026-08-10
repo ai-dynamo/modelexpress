@@ -46,7 +46,10 @@ from modelexpress.refit.reshard.transport import (
     Transport,
 )
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
-from modelexpress.refit.reshard.receiver import ReshardReceiver
+from modelexpress.refit.reshard.receiver import (
+    ReshardReceiver,
+    ReshardTopologyChanged,
+)
 from modelexpress.refit.reshard.megatron import (
     MegatronTargetLayout,
     MegatronTargetSpec,
@@ -68,6 +71,7 @@ from modelexpress.refit.reshard.rendezvous import (
     PublishedTensor,
     RendezvousPayload,
     gather_sources,
+    unwrap_rendezvous_blob_with_step,
     wrap_rendezvous_blob,
 )
 
@@ -91,6 +95,7 @@ __all__ = [
     "ReadDescriptor",
     "RecordedCopy",
     "ReshardReceiver",
+    "ReshardTopologyChanged",
     "Shard",
     "SourceInfo",
     "Transport",
@@ -109,5 +114,6 @@ __all__ = [
     "plan_transfer",
     "publish_megatron_reshard_view",
     "publish_registered_shard_table",
+    "unwrap_rendezvous_blob_with_step",
     "wrap_rendezvous_blob",
 ]

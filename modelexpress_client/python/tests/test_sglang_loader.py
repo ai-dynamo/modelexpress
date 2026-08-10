@@ -476,6 +476,11 @@ def test_mx_model_loader_nixl_path_delegates_to_shared_strategy_chain(
     run.assert_called_once()
     assert run.call_args.args[0] is model
     ctx = run.call_args.args[1]
+    retained = loader_mod.get_sglang_loader_state(ctx.device_id)
+    assert retained.model is model
+    assert retained.tensors is ctx.tensors
+    assert retained.context is ctx
+    assert retained.nixl_manager is ctx.nixl_manager
     assert ctx.adapter.__class__ is SglangAdapter
     assert ctx.identity.backend_framework == p2p_pb2.BACKEND_FRAMEWORK_SGLANG
     if health_gated:
