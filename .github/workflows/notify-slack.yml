@@ -36,7 +36,7 @@ on:
         description: Runner label for the notifier job.
         required: false
         type: string
-        default: prod-modelexpress-builder-amd-v1
+        default: prod-modelexpress-default-small-v1
     secrets:
       SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL:
         required: true
