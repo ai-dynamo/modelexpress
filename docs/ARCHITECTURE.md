@@ -95,6 +95,12 @@ ModelExpress/
 │       │   └── backend/
 │       │       ├── redis.rs            # P2P Redis backend
 │       │       └── kubernetes.rs       # P2P Kubernetes CRD backend
+│       ├── refit.rs                     # Refit module exports
+│       ├── refit/
+│       │   ├── service.rs               # Backend-neutral Refit gRPC service
+│       │   ├── backend.rs               # RefitBackend contract and factory
+│       │   └── backend/
+│       │       └── redis.rs             # Redis backend and atomic Lua scripts
 │       ├── registry/
 │       │   ├── state.rs                # RegistryManager wrapper
 │       │   ├── backend.rs              # RegistryBackend trait + ModelRecord
@@ -293,7 +299,7 @@ All cargo dependencies are declared in the root `Cargo.toml`. Sub-crates use wor
 
 ## gRPC Services
 
-Four proto files define four services, all compiled via `tonic-build` in `modelexpress_common/build.rs`:
+Six proto files define the server's gRPC services, all compiled via `tonic-build` in `modelexpress_common/build.rs`:
 
 ### health.proto - HealthService
 
@@ -345,6 +351,59 @@ Per-worker gRPC service started when `MX_P2P_METADATA=1`, or unconditionally whe
 
 See [`metadata.md`](metadata.md) for the full metadata architecture including storage schemas and coordination protocol.
 
+### refit.proto - RefitService (Redis only)
+
+`RefitService` is a new RL-specific control plane. It does not reuse or modify the
+legacy `WeightSyncService`. The initial slice stores worker registrations,
+immutable weight versions, and compact physical shard publications in Redis.
+Weight bytes and full tensor manifests remain on trainer or generator workers.
+
+| RPC | Purpose |
+|-----|---------|
+| `RegisterWorker` | Register or refresh one TTL-bound worker process |
+| `CreateWeightVersion` | Idempotently create one immutable `STAGING` version |
+| `GetWeightVersion` | Read the version and its lifecycle state |
+| `DeleteWeightVersion` | Move a `READY` version to `RELEASING`; existing leases remain valid |
+| `CreateWeightVersionShard` | Publish one worker manifest for a required source slot |
+| `ListWeightVersionShards` | List the version's physical source publications |
+| `DeleteWeightVersionShard` | Evict one source shard after release when no lease protects the version |
+| `RegisterVersionLease` | Acquire protection while a version is `READY`, or renew the same owner's existing protection while it is `READY` or `RELEASING` |
+| `DeleteVersionLease` | Release a generator's protection of the version shards |
+
+The final missing source slot atomically changes the version to `READY`.
+`WeightVersionShard` remains the name of the per-worker manifest publication:
+`shard_id` identifies that physical publication, while `source_slot_id`
+identifies the required, version-scoped source contribution it covers. The
+trainer coordinator chooses the opaque slots—for example,
+`publisher:global-rank:12` for a selected Megatron publisher. Multiple
+publications may advertise the same source slot, including a replacement worker
+or a generator that becomes a peer source. Deployments configured with
+Kubernetes or the test-only memory backend do not expose `RefitService` yet.
+
+`RegisterWorker` is also the heartbeat API. `worker_id` is a fresh process
+incarnation identity, so a restarted worker registers a new ID instead of
+fencing an old registration. The registration expires with its TTL; source
+planning and source discovery will use that liveness when selecting a
+publication.
+
+Cross-key compare-and-set operations live in documented Redis scripts
+under `modelexpress_server/src/refit/backend/redis/scripts/`. Redis executes
+each script atomically. The `refit_service_redis` test drives the public gRPC
+API through two server replicas and covers concurrent version creation,
+concurrent final source-slot publication, idempotent and conflicting replay,
+replacement-source publication, lease-protected release, and safe shard
+eviction. CI runs this test against Redis 7.
+
+A future Kubernetes backend can preserve this gRPC contract, but it cannot
+translate each Redis key into an independent CRD and retain the same atomic
+guarantees. Lease creation and shard deletion race across resources. The
+Kubernetes implementation therefore needs one version-scoped coordination
+object as the serialization boundary, updated with `resourceVersion`
+compare-and-swap; shard and lease objects can remain child records.
+`RefitService` depends on the domain-level `RefitBackend` contract, with Redis
+implemented under `refit/backend/redis.rs`. Kubernetes remains a separate
+end-to-end backend slice implementing the same transaction boundaries.
+
 ## Rust Server
 
 ### Startup Flow
@@ -357,7 +416,7 @@ See [`metadata.md`](metadata.md) for the full metadata architecture including st
 6. Start `CacheEvictionService` background task (reads the same registry)
 7. Connect to the P2P metadata backend (`MX_METADATA_BACKEND`, Redis or Kubernetes CRD)
 8. Start reaper background task for stale source detection and GC
-9. Register 4 gRPC services with tonic (max message size: 100MB)
+9. Register the configured gRPC services with tonic (max message size: 100MB)
 10. Listen on configured address (default `0.0.0.0:8001`)
 11. Graceful shutdown on CTRL+C (signals cache eviction service and reaper)
 

@@ -1,0 +1,165 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package model_express.refit;
+
+// Control-plane metadata for RL weight publication. Weight bytes and full
+// manifests remain on trainer and generator workers.
+service RefitService {
+  // External APIs: called by the RL framework orchestrator.
+  rpc CreateWeightVersion(CreateWeightVersionRequest) returns (WeightVersion);
+  rpc GetWeightVersion(GetWeightVersionRequest) returns (WeightVersion);
+  rpc DeleteWeightVersion(DeleteWeightVersionRequest) returns (WeightVersion);
+
+  // Internal APIs: called by ModelExpress worker clients, not by the RL
+  // framework orchestrator.
+  rpc RegisterWorker(RegisterWorkerRequest) returns (WorkerRegistration);
+  rpc CreateWeightVersionShard(CreateWeightVersionShardRequest) returns (CreateWeightVersionShardResponse);
+  rpc ListWeightVersionShards(ListWeightVersionShardsRequest) returns (ListWeightVersionShardsResponse);
+  rpc DeleteWeightVersionShard(DeleteWeightVersionShardRequest) returns (DeleteWeightVersionShardResponse);
+  // A live lease protects every shard while a generator installs the version.
+  // Re-registering the same lease owner renews its expiry.
+  rpc RegisterVersionLease(RegisterVersionLeaseRequest) returns (VersionLease);
+  rpc DeleteVersionLease(DeleteVersionLeaseRequest) returns (DeleteVersionLeaseResponse);
+}
+
+enum WorkerRole {
+  WORKER_ROLE_UNSPECIFIED = 0;
+  WORKER_ROLE_TRAINER = 1;
+  WORKER_ROLE_GENERATOR = 2;
+}
+
+enum WeightPayloadFormat {
+  WEIGHT_PAYLOAD_FORMAT_UNSPECIFIED = 0;
+  WEIGHT_PAYLOAD_FORMAT_FULL_TENSOR = 1;
+  WEIGHT_PAYLOAD_FORMAT_XOR_DELTA = 2;
+}
+
+enum WeightVersionState {
+  WEIGHT_VERSION_STATE_UNSPECIFIED = 0;
+  WEIGHT_VERSION_STATE_STAGING = 1;
+  WEIGHT_VERSION_STATE_READY = 2;
+  WEIGHT_VERSION_STATE_RELEASING = 3;
+}
+
+message WorkerRegistration {
+  // Fresh identity for this concrete process lifetime. A restarted worker
+  // receives a new worker_id rather than fencing a prior registration.
+  string worker_id = 1;
+  reserved 2, 3;
+  WorkerRole role = 4;
+  string model_name = 5;
+  string endpoint = 6;
+  uint64 expires_at_unix_ms = 7;
+}
+
+message RegisterWorkerRequest {
+  WorkerRegistration worker = 1;
+  uint32 ttl_seconds = 2;
+}
+
+message WeightVersion {
+  // Server-generated 8-character lowercase hexadecimal ID.
+  string version_id = 1;
+  string model_name = 2;
+  optional uint64 sequence = 3;
+  string idempotency_key = 4;
+  WeightPayloadFormat payload_format = 5;
+  string base_version_id = 6;
+  // Required version-scoped source contributions. Physical source workers are
+  // not baked in; the trainer coordinator supplies opaque IDs such as a
+  // selected publisher global rank.
+  repeated string expected_source_slots = 7;
+  string layout_signature = 8;
+  WeightVersionState state = 9;
+  uint64 created_at_unix_ms = 10;
+}
+
+message CreateWeightVersionRequest {
+  string model_name = 1;
+  optional uint64 sequence = 2;
+  string idempotency_key = 3;
+  WeightPayloadFormat payload_format = 4;
+  string base_version_id = 5;
+  repeated string expected_source_slots = 6;
+}
+
+message GetWeightVersionRequest {
+  string version_id = 1;
+}
+
+message DeleteWeightVersionRequest {
+  string version_id = 1;
+}
+
+message WeightVersionShard {
+  string version_id = 1;
+  // Unique physical publication of one worker's complete manifest.
+  string shard_id = 2;
+  // Required version-scoped source contribution covered by this publication.
+  string source_slot_id = 3;
+  string worker_id = 4;
+  reserved 5, 6;
+  uint64 tensor_count = 7;
+  uint64 total_bytes = 8;
+  string manifest_digest = 9;
+  string manifest_endpoint = 10;
+  string transport = 11;
+}
+
+message CreateWeightVersionShardRequest {
+  WeightVersionShard shard = 1;
+}
+
+message CreateWeightVersionShardResponse {
+  WeightVersionShard shard = 1;
+  WeightVersion version = 2;
+}
+
+message ListWeightVersionShardsRequest {
+  string version_id = 1;
+}
+
+message ListWeightVersionShardsResponse {
+  repeated WeightVersionShard shards = 1;
+}
+
+message DeleteWeightVersionShardRequest {
+  string version_id = 1;
+  string shard_id = 2;
+  string worker_id = 3;
+  reserved 4, 5;
+}
+
+message DeleteWeightVersionShardResponse {
+  bool deleted = 1;
+}
+
+message VersionLease {
+  // Server-generated 8-character lowercase hexadecimal ID.
+  string lease_id = 1;
+  string version_id = 2;
+  string worker_id = 3;
+  reserved 4, 5;
+  uint64 expires_at_unix_ms = 6;
+}
+
+message RegisterVersionLeaseRequest {
+  string version_id = 1;
+  string worker_id = 2;
+  reserved 3, 4;
+  uint32 ttl_seconds = 5;
+}
+
+message DeleteVersionLeaseRequest {
+  string version_id = 1;
+  string lease_id = 2;
+  string worker_id = 3;
+  reserved 4, 5;
+}
+
+message DeleteVersionLeaseResponse {
+  bool deleted = 1;
+}

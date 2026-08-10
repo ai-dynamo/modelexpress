@@ -1,0 +1,578 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Redis implementation of the Refit control-plane backend.
+
+use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use async_trait::async_trait;
+use modelexpress_common::grpc::refit::{
+    CreateWeightVersionRequest, DeleteVersionLeaseRequest, DeleteWeightVersionShardRequest,
+    RegisterVersionLeaseRequest, VersionLease, WeightVersion, WeightVersionShard,
+    WeightVersionState, WorkerRegistration,
+};
+use prost::Message;
+use redis::aio::ConnectionManager;
+use redis::{AsyncCommands, Script};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+use super::{RefitBackend, RefitBackendError, RefitResult};
+
+const CREATE_VERSION_LUA: &str = include_str!("redis/scripts/create_weight_version.lua");
+const REGISTER_WORKER_LUA: &str = include_str!("redis/scripts/register_worker.lua");
+const CREATE_SHARD_LUA: &str = include_str!("redis/scripts/create_weight_version_shard.lua");
+const DELETE_VERSION_LUA: &str = include_str!("redis/scripts/delete_weight_version.lua");
+const DELETE_SHARD_LUA: &str = include_str!("redis/scripts/delete_weight_version_shard.lua");
+const REGISTER_LEASE_LUA: &str = include_str!("redis/scripts/register_version_lease.lua");
+const DELETE_LEASE_LUA: &str = include_str!("redis/scripts/delete_version_lease.lua");
+
+fn version_key(version_id: &str) -> String {
+    format!("mx:refit:version:{version_id}")
+}
+
+fn shards_key(version_id: &str) -> String {
+    format!("mx:refit:version:{version_id}:shards")
+}
+
+fn coverage_key(version_id: &str) -> String {
+    format!("mx:refit:version:{version_id}:coverage")
+}
+
+fn expected_source_slots_key(version_id: &str) -> String {
+    format!("mx:refit:version:{version_id}:expected-source-slots")
+}
+
+fn worker_key(worker_id: &str) -> String {
+    format!("mx:refit:worker:{worker_id}")
+}
+
+fn leases_key(version_id: &str) -> String {
+    format!("mx:refit:version:{version_id}:leases")
+}
+
+fn lease_key(version_id: &str, lease_id: &str) -> String {
+    format!("mx:refit:version:{version_id}:lease:{lease_id}")
+}
+
+fn idempotency_key(model_name: &str, request_key: &str) -> String {
+    format!("mx:refit:version-request:{model_name}:{request_key}")
+}
+
+fn lease_id(version_id: &str, worker_id: &str) -> String {
+    let digest = Sha256::digest(format!("{version_id}\0{worker_id}").as_bytes());
+    let mut id = String::with_capacity(8);
+    for byte in &digest[..4] {
+        let _ = write!(id, "{byte:02x}");
+    }
+    id
+}
+
+fn now_unix_ms() -> RefitResult<u64> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| RefitBackendError::Internal(format!("system clock error: {error}")))?
+        .as_millis();
+    u64::try_from(millis)
+        .map_err(|_| RefitBackendError::Internal("system time does not fit in uint64".to_string()))
+}
+
+fn redis_error(error: redis::RedisError) -> RefitBackendError {
+    if error.is_io_error()
+        || error.is_cluster_error()
+        || matches!(
+            error.kind(),
+            redis::ErrorKind::BusyLoadingError
+                | redis::ErrorKind::MasterDown
+                | redis::ErrorKind::ClusterConnectionNotFound
+        )
+    {
+        RefitBackendError::Unavailable(error.to_string())
+    } else {
+        RefitBackendError::Internal(error.to_string())
+    }
+}
+
+fn hash_field<'a>(fields: &'a HashMap<String, String>, name: &str) -> RefitResult<&'a str> {
+    fields.get(name).map(String::as_str).ok_or_else(|| {
+        RefitBackendError::Internal(format!("Refit metadata record is missing {name}"))
+    })
+}
+
+fn parse_hash_field<T>(fields: &HashMap<String, String>, name: &str) -> RefitResult<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    hash_field(fields, name)?.parse().map_err(|error| {
+        RefitBackendError::Internal(format!("invalid {name} in Refit metadata: {error}"))
+    })
+}
+
+fn version_from_hash(fields: HashMap<String, String>) -> RefitResult<WeightVersion> {
+    let sequence =
+        match hash_field(&fields, "sequence")? {
+            "" => None,
+            value => Some(value.parse().map_err(|error| {
+                RefitBackendError::Internal(format!("invalid sequence: {error}"))
+            })?),
+        };
+    Ok(WeightVersion {
+        version_id: hash_field(&fields, "version_id")?.to_string(),
+        model_name: hash_field(&fields, "model_name")?.to_string(),
+        sequence,
+        idempotency_key: hash_field(&fields, "idempotency_key")?.to_string(),
+        payload_format: parse_hash_field(&fields, "payload_format")?,
+        base_version_id: hash_field(&fields, "base_version_id")?.to_string(),
+        expected_source_slots: serde_json::from_str(hash_field(&fields, "expected_source_slots")?)
+            .map_err(|error| {
+                RefitBackendError::Internal(format!("invalid expected_source_slots: {error}"))
+            })?,
+        layout_signature: hash_field(&fields, "layout_signature")?.to_string(),
+        state: parse_hash_field(&fields, "state")?,
+        created_at_unix_ms: parse_hash_field(&fields, "created_at_unix_ms")?,
+    })
+}
+
+fn lease_from_hash(fields: HashMap<String, String>) -> RefitResult<VersionLease> {
+    Ok(VersionLease {
+        lease_id: hash_field(&fields, "lease_id")?.to_string(),
+        version_id: hash_field(&fields, "version_id")?.to_string(),
+        worker_id: hash_field(&fields, "worker_id")?.to_string(),
+        expires_at_unix_ms: parse_hash_field(&fields, "expires_at_unix_ms")?,
+    })
+}
+
+#[derive(Clone)]
+pub struct RedisRefitBackend {
+    redis: ConnectionManager,
+}
+
+impl RedisRefitBackend {
+    pub async fn connect(redis_url: &str) -> RefitResult<Self> {
+        let client = redis::Client::open(redis_url).map_err(redis_error)?;
+        let redis = ConnectionManager::new(client).await.map_err(redis_error)?;
+        Ok(Self { redis })
+    }
+
+    async fn get_lease(&self, version_id: &str, lease_id: &str) -> RefitResult<VersionLease> {
+        let mut redis = self.redis.clone();
+        let fields: HashMap<String, String> = redis
+            .hgetall(lease_key(version_id, lease_id))
+            .await
+            .map_err(redis_error)?;
+        if fields.is_empty() {
+            return Err(RefitBackendError::NotFound(format!(
+                "version lease {lease_id:?} was not found"
+            )));
+        }
+        lease_from_hash(fields)
+    }
+
+    async fn create_version_once(
+        &self,
+        request: &CreateWeightVersionRequest,
+        version_id: &str,
+    ) -> RefitResult<String> {
+        let expected_source_slots =
+            serde_json::to_string(&request.expected_source_slots).map_err(|error| {
+                RefitBackendError::Internal(format!("encode expected_source_slots: {error}"))
+            })?;
+        let script = Script::new(CREATE_VERSION_LUA);
+        let mut invocation = script.prepare_invoke();
+        invocation
+            .key(version_key(version_id))
+            .key(idempotency_key(
+                &request.model_name,
+                &request.idempotency_key,
+            ))
+            .key(expected_source_slots_key(version_id))
+            .arg(version_id)
+            .arg(&request.model_name)
+            .arg(
+                request
+                    .sequence
+                    .map_or_else(String::new, |value| value.to_string()),
+            )
+            .arg(&request.idempotency_key)
+            .arg(request.payload_format)
+            .arg(&request.base_version_id)
+            .arg(expected_source_slots)
+            .arg(request.expected_source_slots.len())
+            .arg(i32::from(WeightVersionState::Staging))
+            .arg(now_unix_ms()?);
+        for source_slot_id in &request.expected_source_slots {
+            invocation.arg(source_slot_id);
+        }
+        let mut redis = self.redis.clone();
+        invocation
+            .invoke_async(&mut redis)
+            .await
+            .map_err(redis_error)
+    }
+}
+
+#[async_trait]
+impl RefitBackend for RedisRefitBackend {
+    async fn register_worker(
+        &self,
+        mut worker: WorkerRegistration,
+        ttl_seconds: u32,
+    ) -> RefitResult<WorkerRegistration> {
+        let mut redis = self.redis.clone();
+        let result: String = Script::new(REGISTER_WORKER_LUA)
+            .key(worker_key(&worker.worker_id))
+            .arg(&worker.worker_id)
+            .arg(worker.role)
+            .arg(&worker.model_name)
+            .arg(&worker.endpoint)
+            .arg(u64::from(ttl_seconds).saturating_mul(1000))
+            .invoke_async(&mut redis)
+            .await
+            .map_err(redis_error)?;
+        if result == "CONFLICT" {
+            return Err(RefitBackendError::AlreadyExists(
+                "worker_id is already registered with different metadata".to_string(),
+            ));
+        }
+        worker.expires_at_unix_ms = result
+            .strip_prefix("OK:")
+            .ok_or_else(|| {
+                RefitBackendError::Internal(format!("unexpected Redis response: {result}"))
+            })?
+            .parse()
+            .map_err(|error| {
+                RefitBackendError::Internal(format!("invalid expiry from Redis: {error}"))
+            })?;
+        Ok(worker)
+    }
+
+    async fn create_weight_version(
+        &self,
+        request: &CreateWeightVersionRequest,
+    ) -> RefitResult<WeightVersion> {
+        for _ in 0..5 {
+            let version_id: String = Uuid::new_v4()
+                .simple()
+                .to_string()
+                .chars()
+                .take(8)
+                .collect();
+            let result = self.create_version_once(request, &version_id).await?;
+            if result == "CREATED" {
+                return self.get_weight_version(&version_id).await;
+            }
+            if let Some(existing_id) = result.strip_prefix("EXISTING:") {
+                let existing = self.get_weight_version(existing_id).await?;
+                if existing.model_name == request.model_name
+                    && existing.sequence == request.sequence
+                    && existing.payload_format == request.payload_format
+                    && existing.base_version_id == request.base_version_id
+                    && existing.expected_source_slots == request.expected_source_slots
+                {
+                    return Ok(existing);
+                }
+                return Err(RefitBackendError::AlreadyExists(
+                    "idempotency_key was already used for a different WeightVersion".to_string(),
+                ));
+            }
+            if result != "COLLISION" {
+                return Err(RefitBackendError::Internal(format!(
+                    "unexpected Redis response: {result}"
+                )));
+            }
+        }
+        Err(RefitBackendError::ResourceExhausted(
+            "could not allocate a unique weight version ID".to_string(),
+        ))
+    }
+
+    async fn get_weight_version(&self, version_id: &str) -> RefitResult<WeightVersion> {
+        let mut redis = self.redis.clone();
+        let fields: HashMap<String, String> = redis
+            .hgetall(version_key(version_id))
+            .await
+            .map_err(redis_error)?;
+        if fields.is_empty() {
+            return Err(RefitBackendError::NotFound(format!(
+                "weight version {version_id:?} was not found"
+            )));
+        }
+        version_from_hash(fields)
+    }
+
+    async fn delete_weight_version(&self, version_id: &str) -> RefitResult<WeightVersion> {
+        let mut redis = self.redis.clone();
+        let result: String = Script::new(DELETE_VERSION_LUA)
+            .key(version_key(version_id))
+            .arg(i32::from(WeightVersionState::Releasing))
+            .arg(i32::from(WeightVersionState::Ready))
+            .invoke_async(&mut redis)
+            .await
+            .map_err(redis_error)?;
+        match result.as_str() {
+            "OK" => self.get_weight_version(version_id).await,
+            "VERSION_NOT_FOUND" => Err(RefitBackendError::NotFound(
+                "weight version was not found".to_string(),
+            )),
+            "VERSION_NOT_READY" => Err(RefitBackendError::FailedPrecondition(
+                "only a READY weight version can be deleted".to_string(),
+            )),
+            _ => Err(RefitBackendError::Internal(format!(
+                "unexpected Redis response: {result}"
+            ))),
+        }
+    }
+
+    async fn create_weight_version_shard(
+        &self,
+        shard: WeightVersionShard,
+    ) -> RefitResult<(WeightVersionShard, WeightVersion)> {
+        let mut version = self.get_weight_version(&shard.version_id).await?;
+        let encoded = shard.encode_to_vec();
+        let mut redis = self.redis.clone();
+        let result: String = Script::new(CREATE_SHARD_LUA)
+            .key(version_key(&shard.version_id))
+            .key(worker_key(&shard.worker_id))
+            .key(shards_key(&shard.version_id))
+            .key(coverage_key(&shard.version_id))
+            .key(expected_source_slots_key(&shard.version_id))
+            .arg(&shard.shard_id)
+            .arg(encoded)
+            .arg(&version.model_name)
+            .arg(&shard.source_slot_id)
+            .arg(i32::from(WeightVersionState::Staging))
+            .arg(i32::from(WeightVersionState::Ready))
+            .invoke_async(&mut redis)
+            .await
+            .map_err(redis_error)?;
+        let state = match result.as_str() {
+            "VERSION_NOT_FOUND" => {
+                return Err(RefitBackendError::NotFound(
+                    "weight version was not found".to_string(),
+                ));
+            }
+            "WORKER_NOT_FOUND" => {
+                return Err(RefitBackendError::FailedPrecondition(
+                    "worker registration is missing or expired".to_string(),
+                ));
+            }
+            "MODEL_MISMATCH" => {
+                return Err(RefitBackendError::FailedPrecondition(
+                    "worker and weight version model_name differ".to_string(),
+                ));
+            }
+            "SOURCE_SLOT_NOT_REQUIRED" => {
+                return Err(RefitBackendError::InvalidArgument(
+                    "source_slot_id is not required by the weight version".to_string(),
+                ));
+            }
+            "VERSION_NOT_WRITABLE" => {
+                return Err(RefitBackendError::FailedPrecondition(
+                    "weight version does not accept shard publication".to_string(),
+                ));
+            }
+            "SHARD_CONFLICT" => {
+                return Err(RefitBackendError::AlreadyExists(
+                    "shard_id was already published with different metadata".to_string(),
+                ));
+            }
+            value => {
+                let Some(state) = value.strip_prefix("OK:") else {
+                    return Err(RefitBackendError::Internal(format!(
+                        "unexpected Redis response: {result}"
+                    )));
+                };
+                state.parse().map_err(|error| {
+                    RefitBackendError::Internal(format!("invalid publication state: {error}"))
+                })?
+            }
+        };
+        WeightVersionState::try_from(state).map_err(|_| {
+            RefitBackendError::Internal(format!("invalid publication state: {state}"))
+        })?;
+        version.state = state;
+        Ok((shard, version))
+    }
+
+    async fn list_weight_version_shards(
+        &self,
+        version_id: &str,
+    ) -> RefitResult<Vec<WeightVersionShard>> {
+        self.get_weight_version(version_id).await?;
+        let mut redis = self.redis.clone();
+        let encoded: Vec<Vec<u8>> = redis
+            .hvals(shards_key(version_id))
+            .await
+            .map_err(redis_error)?;
+        let mut shards = encoded
+            .into_iter()
+            .map(|bytes| {
+                WeightVersionShard::decode(bytes.as_slice()).map_err(|error| {
+                    RefitBackendError::Internal(format!(
+                        "invalid WeightVersionShard in Redis: {error}"
+                    ))
+                })
+            })
+            .collect::<RefitResult<Vec<_>>>()?;
+        shards.sort_by(|left, right| {
+            (&left.source_slot_id, &left.shard_id).cmp(&(&right.source_slot_id, &right.shard_id))
+        });
+        Ok(shards)
+    }
+
+    async fn delete_weight_version_shard(
+        &self,
+        request: &DeleteWeightVersionShardRequest,
+    ) -> RefitResult<bool> {
+        let mut redis = self.redis.clone();
+        let encoded: Option<Vec<u8>> = redis
+            .hget(shards_key(&request.version_id), &request.shard_id)
+            .await
+            .map_err(redis_error)?;
+        let encoded = encoded.ok_or_else(|| {
+            RefitBackendError::NotFound("weight version shard not found".to_string())
+        })?;
+        let shard = WeightVersionShard::decode(encoded.as_slice()).map_err(|error| {
+            RefitBackendError::Internal(format!("invalid WeightVersionShard in Redis: {error}"))
+        })?;
+        if shard.worker_id != request.worker_id {
+            return Err(RefitBackendError::FailedPrecondition(
+                "only the publishing worker can delete its shard".to_string(),
+            ));
+        }
+
+        let result: String = Script::new(DELETE_SHARD_LUA)
+            .key(version_key(&request.version_id))
+            .key(worker_key(&request.worker_id))
+            .key(shards_key(&request.version_id))
+            .key(leases_key(&request.version_id))
+            .arg(&request.shard_id)
+            .arg(encoded)
+            .arg(i32::from(WeightVersionState::Releasing))
+            .invoke_async(&mut redis)
+            .await
+            .map_err(redis_error)?;
+        match result.as_str() {
+            "DELETED" => Ok(true),
+            "VERSION_NOT_FOUND" => Err(RefitBackendError::NotFound(
+                "weight version was not found".to_string(),
+            )),
+            "VERSION_NOT_RELEASING" => Err(RefitBackendError::FailedPrecondition(
+                "weight version must be RELEASING before its shards can be deleted".to_string(),
+            )),
+            "WORKER_NOT_FOUND" => Err(RefitBackendError::FailedPrecondition(
+                "worker registration is missing or expired".to_string(),
+            )),
+            "SHARD_NOT_FOUND" => Err(RefitBackendError::NotFound(
+                "weight version shard not found".to_string(),
+            )),
+            "SHARD_CONFLICT" => Err(RefitBackendError::FailedPrecondition(
+                "weight version shard changed while it was being deleted".to_string(),
+            )),
+            "VERSION_LEASED" => Err(RefitBackendError::FailedPrecondition(
+                "weight version has an active lease".to_string(),
+            )),
+            _ => Err(RefitBackendError::Internal(format!(
+                "unexpected Redis response: {result}"
+            ))),
+        }
+    }
+
+    async fn register_version_lease(
+        &self,
+        request: &RegisterVersionLeaseRequest,
+    ) -> RefitResult<VersionLease> {
+        let lease_id = lease_id(&request.version_id, &request.worker_id);
+        let mut redis = self.redis.clone();
+        let result: String = Script::new(REGISTER_LEASE_LUA)
+            .key(version_key(&request.version_id))
+            .key(worker_key(&request.worker_id))
+            .key(lease_key(&request.version_id, &lease_id))
+            .key(leases_key(&request.version_id))
+            .arg(&lease_id)
+            .arg(&request.version_id)
+            .arg(&request.worker_id)
+            .arg(u64::from(request.ttl_seconds).saturating_mul(1000))
+            .arg(i32::from(WeightVersionState::Ready))
+            .arg(i32::from(WeightVersionState::Releasing))
+            .arg(i32::from(
+                modelexpress_common::grpc::refit::WorkerRole::Generator,
+            ))
+            .invoke_async(&mut redis)
+            .await
+            .map_err(redis_error)?;
+        match result.as_str() {
+            value if value.starts_with("OK:") => {
+                self.get_lease(&request.version_id, &lease_id).await
+            }
+            "VERSION_NOT_FOUND" => Err(RefitBackendError::NotFound(
+                "weight version was not found".to_string(),
+            )),
+            "VERSION_NOT_LEASEABLE" => Err(RefitBackendError::FailedPrecondition(
+                "weight version does not accept this lease registration".to_string(),
+            )),
+            "WORKER_NOT_FOUND" => Err(RefitBackendError::FailedPrecondition(
+                "worker registration is missing or expired".to_string(),
+            )),
+            "WORKER_NOT_GENERATOR" => Err(RefitBackendError::FailedPrecondition(
+                "only a generator worker can hold a version lease".to_string(),
+            )),
+            "MODEL_MISMATCH" => Err(RefitBackendError::FailedPrecondition(
+                "worker and weight version model_name differ".to_string(),
+            )),
+            "LEASE_CONFLICT" => Err(RefitBackendError::AlreadyExists(
+                "version lease ID is already used by a different worker".to_string(),
+            )),
+            _ => Err(RefitBackendError::Internal(format!(
+                "unexpected Redis response: {result}"
+            ))),
+        }
+    }
+
+    async fn delete_version_lease(&self, request: &DeleteVersionLeaseRequest) -> RefitResult<bool> {
+        let mut redis = self.redis.clone();
+        let result: String = Script::new(DELETE_LEASE_LUA)
+            .key(lease_key(&request.version_id, &request.lease_id))
+            .key(leases_key(&request.version_id))
+            .arg(&request.lease_id)
+            .arg(&request.version_id)
+            .arg(&request.worker_id)
+            .invoke_async(&mut redis)
+            .await
+            .map_err(redis_error)?;
+        match result.as_str() {
+            "DELETED" => Ok(true),
+            "NOT_FOUND" => Ok(false),
+            "LEASE_CONFLICT" => Err(RefitBackendError::FailedPrecondition(
+                "version lease is owned by a different worker".to_string(),
+            )),
+            _ => Err(RefitBackendError::Internal(format!(
+                "unexpected Redis response: {result}"
+            ))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redis_errors_distinguish_transient_and_internal_failures() {
+        let transient: redis::RedisError = (redis::ErrorKind::TryAgain, "retry").into();
+        assert!(matches!(
+            redis_error(transient),
+            RefitBackendError::Unavailable(_)
+        ));
+
+        let internal: redis::RedisError =
+            (redis::ErrorKind::ResponseError, "invalid script").into();
+        assert!(matches!(
+            redis_error(internal),
+            RefitBackendError::Internal(_)
+        ));
+    }
+}

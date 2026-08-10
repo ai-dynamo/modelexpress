@@ -6,6 +6,7 @@ pub mod backend_config;
 pub mod cache;
 pub mod config;
 pub mod p2p;
+pub mod refit;
 pub mod registry;
 pub mod server;
 pub mod services;
