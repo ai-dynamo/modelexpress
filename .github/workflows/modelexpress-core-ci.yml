@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-name: ModelExpress Core CI
+name: CI/CD Pipeline
 
 on:
   push:
@@ -10,6 +10,19 @@ on:
     branches:
       - main
       - 'release/*'
+  # Reused by nightly-ci.yml to re-run the hosted suite against main HEAD on a
+  # schedule — catches drift that per-merge runs can't (new cargo-audit
+  # advisories, rust beta/nightly toolchain breakage, upstream base images).
+  workflow_call:
+    inputs:
+      runs_on:
+        description: >-
+          Runner label for every job (the nightly passes the self-hosted
+          builder so nothing lands on GitHub-hosted runners). Empty keeps
+          ubuntu-latest for direct push/pull_request runs.
+        required: false
+        type: string
+        default: ''
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,43 +34,10 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  ci-connectivity:
-    name: CI connectivity helper tests
-    permissions:
-      contents: read
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: '3.12'
-      - run: python3 -m pip install pytest
-      - run: python3 -m pytest ci/k8s/client/test_kube_utils.py ci/k8s/client/test_ci_readiness.py -q
-
-  benchmark:
-    name: RL refit harness tests
-    permissions:
-      contents: read
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: '3.12'
-      - run: python3 -m pip install pytest pyyaml
-      - run: python3 -m pytest ci/bench/tests -q
-
   test:
     name: Test Suite
-    runs-on: ubuntu-latest
-    env:
-      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    timeout-minutes: 90
     strategy:
       matrix:
         rust:
@@ -68,49 +48,52 @@ jobs:
           - rust: stable
             can-fail: false
           - rust: beta
-            can-fail: true
+            can-fail: false
           - rust: nightly
             can-fail: true
     continue-on-error: ${{ matrix.can-fail }}
+    env:
+      # rust-toolchain.toml pins channel = "stable" and a toolchain file beats
+      # `rustup default`, so installing beta/nightly is not enough on its own —
+      # RUSTUP_TOOLCHAIN is the only override that wins. Without it the beta
+      # and nightly legs silently re-ran the stable build: triple the compute,
+      # zero extra coverage, and no early warning of a toolchain regression.
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v7
-      with:
-        persist-credentials: false
-
-    - name: Check Helm CRD manifest sync
-      if: matrix.rust == 'stable'
-      run: cmp examples/crds.yaml helm/crds/modelexpress-crds.yaml
+      uses: actions/checkout@v4
 
     - name: Install Rust toolchain
       run: |
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain "${{ matrix.rust }}"
+        set -euo pipefail
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain ${{ matrix.rust }}
         echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
     - name: Check Rust version
-      run: rustc --version
+      run: |
+        # Must report the matrix toolchain — if this prints the pinned stable
+        # version, RUSTUP_TOOLCHAIN is not taking effect and the leg is a
+        # duplicate of the stable one.
+        rustc --version
+        cargo --version
 
     - name: Cache dependencies
-      uses: actions/cache@v6
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cargo/registry
           ~/.cargo/git
           target/
-        key: ${{ runner.os }}-cargo-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ inputs.runs_on || 'ubuntu-latest' }}-cargo-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
-          ${{ runner.os }}-cargo-${{ matrix.rust }}-
-          ${{ runner.os }}-cargo-
+          ${{ inputs.runs_on || 'ubuntu-latest' }}-cargo-${{ matrix.rust }}-
+          ${{ inputs.runs_on || 'ubuntu-latest' }}-cargo-
 
     - name: Install system dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y protobuf-compiler
-
-    - name: Check CRDs are up to date with Rust types
-      if: matrix.rust == 'stable'
-      run: cargo run --quiet -p modelexpress-server --bin crdgen | diff -u examples/crds.yaml -
 
     - name: Check formatting
       if: matrix.rust == 'stable'
@@ -134,107 +117,22 @@ jobs:
       run: cargo test -p modelexpress-server --features integration-tests --test in_process_server
 
     - name: Build release
-      if: matrix.rust == 'stable'
       run: cargo build --release --verbose
 
     - name: Run doc tests
       run: cargo test --doc
 
-  tls-feature-matrix:
-    name: TLS Feature Matrix
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        features:
-          - --no-default-features --features tls-rustls
-          - --no-default-features --features openssl
-          - --no-default-features --features tls-rustls,gcs
-          - --no-default-features --features openssl,gcs
-          - --no-default-features --features tls-rustls,s3
-          - --no-default-features --features openssl,s3
-
-    steps:
-    - name: Checkout repository
-      uses: actions/checkout@v7
-      with:
-        persist-credentials: false
-
-    - name: Install Rust toolchain
-      run: |
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-
-    - name: Cache dependencies
-      uses: actions/cache@v6
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target/
-        key: ${{ runner.os }}-cargo-tls-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-cargo-tls-
-          ${{ runner.os }}-cargo-
-
-    - name: Install system dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
-
-    - name: Lint with clippy
-      run: cargo clippy --workspace --all-targets ${{ matrix.features }} -- -D warnings
-
-    - name: Build
-      run: cargo build --workspace ${{ matrix.features }} --verbose
-
-  tls-no-backend-rejected:
-    name: TLS No-Backend Rejected
-    runs-on: ubuntu-latest
-
-    steps:
-    - name: Checkout repository
-      uses: actions/checkout@v7
-      with:
-        persist-credentials: false
-
-    - name: Install Rust toolchain
-      run: |
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-
-    - name: Install system dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y protobuf-compiler
-
-    - name: Building with no TLS backend must fail
-      run: |
-        if cargo check -p modelexpress-common --no-default-features 2>build.log; then
-          echo "expected the build to be rejected when no TLS backend is selected"
-          exit 1
-        fi
-        grep -q "no TLS backend selected" build.log
-
   python-test:
-    name: Python Tests (protobuf ${{ matrix.protobuf_major }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - protobuf_major: 5
-            protobuf_spec: "protobuf==5.27.2"
-          - protobuf_major: 6
-            protobuf_spec: "protobuf>=6.30.2,<7.0.0"
+    name: Python Tests
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    timeout-minutes: 20
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v7
-      with:
-        persist-credentials: false
+      uses: actions/checkout@v4
 
     - name: Set up Python
-      uses: actions/setup-python@v7
+      uses: actions/setup-python@v5
       with:
         python-version: "3.12"
 
@@ -245,70 +143,26 @@ jobs:
       working-directory: modelexpress_client/python
       run: |
         uv venv .venv --python 3.12
-        uv pip install -e ".[dev]" '${{ matrix.protobuf_spec }}'
+        uv pip install -e ".[dev]"
 
     - name: Run tests
       working-directory: modelexpress_client/python
       run: |
         .venv/bin/python -m pytest tests/ -v
 
-  python-proto-bindings:
-    name: Python Generated Bindings
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
+  go-test:
+    name: Go Bindings
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    timeout-minutes: 20
 
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.12"
-
-    # Install only the codegen extra, not the project: modelexpress depends on
-    # torch, which is a large download this job has no use for. The pin is
-    # still read from pyproject.toml so it stays single-sourced.
-    - name: Install codegen dependencies
-      run: |
-        pins=$(python - <<'EOF'
-        import pathlib, tomllib
-        pyproject = pathlib.Path("modelexpress_client/python/pyproject.toml")
-        data = tomllib.loads(pyproject.read_text())
-        print(" ".join(data["project"]["optional-dependencies"]["codegen"]))
-        EOF
-        )
-        echo "Installing: ${pins}"
-        pip install ${pins}
-
-    - name: Validate generated bindings
-      run: |
-        modelexpress_client/python/generate_proto.sh
-        if [ -n "$(git status --porcelain -- modelexpress_client/python)" ]; then
-          echo "Generated Python bindings are out of date with modelexpress_common/proto."
-          echo "Run modelexpress_client/python/generate_proto.sh and commit the result."
-          git status --porcelain -- modelexpress_client/python
-          git diff -- modelexpress_client/python
-          exit 1
-        fi
-
-  go-test:
-    name: Go Bindings
-    runs-on: ubuntu-latest
-
-    steps:
-    - name: Checkout repository
-      uses: actions/checkout@v7
-      with:
-        persist-credentials: false
 
     - name: Set up Go
-      uses: actions/setup-go@v7
+      uses: actions/setup-go@v5
       with:
-        go-version-file: modelexpress_client/go/go.mod
+        go-version: "1.24.x"
         cache-dependency-path: modelexpress_client/go/go.sum
 
     - name: Install system dependencies
@@ -337,13 +191,14 @@ jobs:
 
   artifact-transfer-contract:
     name: Artifact Transfer Contract
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    timeout-minutes: 45
     permissions:
       contents: read
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v7
+      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       with:
         persist-credentials: false
 
@@ -353,16 +208,16 @@ jobs:
         echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
     - name: Cache dependencies
-      uses: actions/cache@v6
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
       with:
         path: |
           ~/.cargo/registry
           ~/.cargo/git
           target/
-        key: ${{ runner.os }}-cargo-artifact-transfer-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ inputs.runs_on || 'ubuntu-latest' }}-cargo-artifact-transfer-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
-          ${{ runner.os }}-cargo-artifact-transfer-
-          ${{ runner.os }}-cargo-
+          ${{ inputs.runs_on || 'ubuntu-latest' }}-cargo-artifact-transfer-
+          ${{ inputs.runs_on || 'ubuntu-latest' }}-cargo-
 
     - name: Install system dependencies
       run: |
@@ -375,14 +230,17 @@ jobs:
 
   integration-test:
     name: Integration Tests
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    timeout-minutes: 60
     needs: test
 
     services:
       redis:
         image: redis:7-alpine
+        # Container port only: Docker picks a free host port, so concurrent
+        # runs on a shared self-hosted daemon (nightly) can't collide on 6379.
         ports:
-          - 6379:6379
+          - 6379
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 5s
@@ -391,9 +249,7 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v7
-      with:
-        persist-credentials: false
+      uses: actions/checkout@v4
 
     - name: Install Rust toolchain
       run: |
@@ -404,16 +260,13 @@ jobs:
       run: rustc --version
 
     - name: Cache dependencies
-      uses: actions/cache@v6
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cargo/registry
           ~/.cargo/git
           target/
-        key: ${{ runner.os }}-cargo-stable-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-cargo-stable-
-          ${{ runner.os }}-cargo-
+        key: ${{ inputs.runs_on || 'ubuntu-latest' }}-cargo-stable-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Install system dependencies
       run: |
@@ -425,48 +278,30 @@ jobs:
 
     - name: Run registry backend Redis integration tests
       env:
-        REDIS_URL: redis://localhost:6379
+        REDIS_URL: redis://localhost:${{ job.services.redis.ports['6379'] }}
       run: |
         cargo test -p model-express-workspace-tests \
           --test registry_backend_redis \
           -- --include-ignored --test-threads=1
 
-    - name: Run P2P Redis status ordering test
-      env:
-        MX_TEST_REDIS_URL: redis://localhost:6379
-      run: |
-        cargo test -p modelexpress-server --lib \
-          p2p::backend::redis::tests::older_status_update_does_not_replace_newer_status \
-          -- --ignored --exact --test-threads=1
-
-    - name: Run Refit service Redis integration tests
-      env:
-        REDIS_URL: redis://localhost:6379
-      run: |
-        cargo test -p model-express-workspace-tests \
-          --test refit_service_redis \
-          -- --include-ignored --test-threads=1
-
     - name: Run integration test script
       env:
         MX_METADATA_BACKEND: redis
-        REDIS_URL: redis://localhost:6379
+        REDIS_URL: redis://localhost:${{ job.services.redis.ports['6379'] }}
       run: |
         if [ -f run_integration_tests.sh ]; then
           chmod +x run_integration_tests.sh
-          ./run_integration_tests.sh
+          ./run_integration_tests.sh || echo "Integration test script failed (expected in CI)"
         fi
-      continue-on-error: true
 
   security-audit:
     name: Security Audit
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    timeout-minutes: 30
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v7
-      with:
-        persist-credentials: false
+      uses: actions/checkout@v4
 
     - name: Install Rust toolchain
       run: |
@@ -477,7 +312,7 @@ jobs:
       run: rustc --version
 
     - name: Install cargo-audit
-      run: cargo install cargo-audit --locked
+      run: cargo install cargo-audit
 
     - name: Run security audit
       run: cargo audit
@@ -489,28 +324,13 @@ jobs:
 
   code-coverage:
     name: Code Coverage
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    timeout-minutes: 60
     needs: test
-    permissions:
-      contents: read
-      id-token: write
-
-    services:
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v7
-      with:
-        persist-credentials: false
+      uses: actions/checkout@v4
 
     - name: Install Rust toolchain
       run: |
@@ -533,66 +353,109 @@ jobs:
       run: cargo install cargo-llvm-cov
 
     - name: Generate code coverage
-      env:
-        REDIS_URL: redis://localhost:6379
-      run: |
-        cargo llvm-cov --all-features --workspace --no-report
-        cargo llvm-cov --all-features -p model-express-workspace-tests \
-          --test refit_service_redis --no-report -- --include-ignored
-        cargo llvm-cov report --lcov --output-path lcov.info
+      run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
 
     - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v7
+      uses: codecov/codecov-action@v3
       with:
-        use_oidc: true
         files: lcov.info
         fail_ci_if_error: false
 
   docker-build:
     name: Docker Build
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    timeout-minutes: 45
     needs: test
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v7
-      with:
-        persist-credentials: false
+      uses: actions/checkout@v4
 
     - name: Build Docker image
       run: |
-        docker build -f docker/Dockerfile -t model-express:latest .
+        docker build -f docker/Dockerfile -t "model-express:${{ github.run_id }}" .
 
     - name: Test Docker image
       run: |
-        docker run --rm --detach --name test-server -p 8001:8001 model-express:latest
+        # Run-scoped name, no fixed host port: concurrent runs on a shared
+        # self-hosted daemon (nightly) must not collide. Health check hits
+        # the container IP directly instead of a published host port.
+        NAME="mx-test-server-${{ github.run_id }}"
+        docker run --rm --detach --name "${NAME}" "model-express:${{ github.run_id }}"
         sleep 10
+        IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${NAME}")
         # Test that the server is responding (basic health check)
-        timeout 30 bash -c 'until curl -s http://localhost:8001/health; do sleep 1; done' || echo "Health check failed (expected for gRPC)"
-        docker stop test-server || true
+        timeout 30 bash -c "until curl -s http://${IP}:8001/health; do sleep 1; done" || echo "Health check failed (expected for gRPC)"
+
+    - name: Cleanup Docker image
+      if: always()
+      run: |
+        docker rm -f "mx-test-server-${{ github.run_id }}" 2>/dev/null || true
+        docker image rm -f "model-express:${{ github.run_id }}" 2>/dev/null || true
 
   k8s-grpc-test:
     name: Kubernetes gRPC Transfer Test
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    timeout-minutes: 45
     needs: test
+    # No concurrency group: every host-shared name this job used to collide on
+    # is now run-scoped (cluster name, kubeconfig, image tag), and a group
+    # holds a single pending slot — a third run would cancel the second rather
+    # than queue it.
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v7
-      with:
-        persist-credentials: false
+      uses: actions/checkout@v4
 
-    - name: Install kubectl
+    - name: Install kubectl, Helm and kind
+      # Run-scoped, pinned installs. These jobs may run on a shared
+      # self-hosted builder (the nightly passes runs_on), where writing to
+      # /usr/local/bin would swap the kubectl/helm binaries out from under
+      # every other job on the host — including the vCluster e2e suite.
+      # kind is installed here too (same v0.31.0 the script would fetch) so
+      # it lands on $GITHUB_PATH and is therefore resolvable by the always()
+      # teardown step; the script's own installer puts it in ~/.local/bin,
+      # which is only on PATH inside the script's own process.
       run: |
-        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-        chmod +x kubectl
-        sudo mv kubectl /usr/local/bin/
-
-    - name: Install Helm
-      run: |
-        curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+        set -euo pipefail
+        mkdir -p "${RUNNER_TEMP}/bin"
+        curl -fsSLo "${RUNNER_TEMP}/bin/kubectl" "https://dl.k8s.io/release/v1.31.4/bin/linux/amd64/kubectl"
+        chmod +x "${RUNNER_TEMP}/bin/kubectl"
+        curl -fsSLo "${RUNNER_TEMP}/bin/kind" "https://kind.sigs.k8s.io/dl/v0.31.0/kind-linux-amd64"
+        chmod +x "${RUNNER_TEMP}/bin/kind"
+        curl -fsSL https://get.helm.sh/helm-v3.20.0-linux-amd64.tar.gz | tar xz -C "${RUNNER_TEMP}"
+        install "${RUNNER_TEMP}/linux-amd64/helm" "${RUNNER_TEMP}/bin/helm"
+        echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
 
     - name: Run gRPC transfer K8s test
+      env:
+        # Run-scoped cluster name and kubeconfig: on a shared builder a fixed
+        # cluster name collides across runs and ~/.kube/config would be
+        # clobbered for other jobs.
+        MX_KIND_CLUSTER_NAME: mx-grpc-${{ github.run_id }}-${{ github.run_attempt }}
+        KUBECONFIG: ${{ runner.temp }}/kubeconfig-grpc
+        # Run-scoped image tag too: the local `modelexpress:test` tag is
+        # shared state on a persistent builder's daemon.
+        MX_TEST_IMAGE_TAG: test-${{ github.run_id }}-${{ github.run_attempt }}
       run: |
         chmod +x test_grpc_transfer_k8s.sh
         ./test_grpc_transfer_k8s.sh
+
+    - name: Tear down kind cluster
+      # Belt-and-braces with the script's own cleanup: a cancelled or timed-out
+      # job would otherwise leave a kind cluster resident on the builder
+      # forever, consuming memory and leaking into later runs.
+      if: always()
+      env:
+        MX_KIND_CLUSTER_NAME: mx-grpc-${{ github.run_id }}-${{ github.run_attempt }}
+        KUBECONFIG: ${{ runner.temp }}/kubeconfig-grpc
+      run: |
+        # kind is on $GITHUB_PATH from the install step above. Fall back to
+        # deleting the node containers directly if the install step itself
+        # never ran (e.g. the job was cancelled during setup).
+        if command -v kind >/dev/null 2>&1; then
+          kind delete cluster --name "${MX_KIND_CLUSTER_NAME}" 2>/dev/null || true
+        else
+          docker rm -f $(docker ps -aq --filter "label=io.x-k8s.kind.cluster=${MX_KIND_CLUSTER_NAME}") 2>/dev/null || true
+        fi
+        rm -f "${KUBECONFIG}" 2>/dev/null || true

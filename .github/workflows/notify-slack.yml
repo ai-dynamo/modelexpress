@@ -1,0 +1,136 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Reusable Slack failure notifier (modeled on ai-dynamo/dynamo's
+# notify-slack.yml). Collects the calling run's failed jobs via the Actions
+# API and, if any are reportable, posts an alert to a Slack incoming webhook.
+# Called via `uses: ./.github/workflows/notify-slack.yml`.
+
+name: Notify Slack
+
+on:
+  workflow_call:
+    inputs:
+      pipeline_name:
+        description: "Human-readable pipeline name used in the alert header (e.g. Nightly)."
+        required: true
+        type: string
+      ignored_jobs:
+        description: >-
+          Newline-separated substrings; failed jobs whose names contain any of
+          them are excluded from Slack reporting.
+        required: false
+        type: string
+        default: ''
+      force_alert:
+        description: >-
+          Post the alert even when no job row carries a non-success
+          conclusion. A reusable-workflow call cancelled while pending leaves
+          no rows at all, and a release-mandatory job that was *skipped* is red
+          to the caller's umbrella check but invisible to the jobs API — the
+          caller passes its own verdict here so those states still page.
+        required: false
+        type: boolean
+        default: false
+      runs_on:
+        description: Runner label for the notifier job.
+        required: false
+        type: string
+        default: prod-modelexpress-builder-amd-v1
+    secrets:
+      SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL:
+        required: true
+
+jobs:
+  notify-slack:
+    name: Notify Slack
+    runs-on: ${{ inputs.runs_on }}
+    permissions:
+      contents: read
+      actions: read   # list this run's jobs via the Actions API
+    steps:
+      - name: Get failed jobs
+        id: failed-jobs
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IGNORED_JOBS: ${{ inputs.ignored_jobs }}
+          FORCE_ALERT: ${{ inputs.force_alert }}
+        run: |
+          # Fetch every page of the run's jobs — the API caps per_page at 100,
+          # so a run with >100 jobs would otherwise drop later failures.
+          JOBS_JSON=$(mktemp)
+          JOBS_ACC=$(mktemp)
+          page=1
+          while [ "$page" -le 20 ]; do
+            PAGE_JSON=$(mktemp)
+            curl -sS --fail --retry 3 --retry-all-errors --retry-delay 3 \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs?per_page=100&page=${page}" \
+              >"$PAGE_JSON"
+            jq -c '(.jobs // [])[]' "$PAGE_JSON" >>"$JOBS_ACC"
+            [ "$(jq '(.jobs // []) | length' "$PAGE_JSON")" -lt 100 ] && break
+            page=$((page + 1))
+          done
+          jq -s '{jobs: .}' "$JOBS_ACC" >"$JOBS_JSON"
+
+          IGNORED_JSON=$(printf '%s\n' "$IGNORED_JOBS" | jq -R 'gsub("^\\s+|\\s+$";"")' | jq -s 'map(select(length > 0))')
+
+          # Denylist, not an allowlist of "failure": a job cancelled out of a
+          # concurrency group, one killed by timeout-minutes, or one that
+          # died on the runner all carry a non-failure conclusion and would
+          # otherwise page nobody. `skipped` and `neutral` stay excluded —
+          # skipping is a normal outcome of this workflow's release gating.
+          FAILED_JOBS=$(jq -r --argjson ignored "$IGNORED_JSON" \
+            '(.jobs // [])[]
+             | select(.status == "completed")
+             | select(.conclusion != "success" and .conclusion != "skipped" and .conclusion != "neutral")
+             | select(.name as $n | ($ignored | any(. as $i | $n | contains($i))) | not)
+             | (if .conclusion == "cancelled" then ":warning: cancelled: "
+                elif .conclusion == "timed_out" then ":alarm_clock: timed out: "
+                else ":failed: " end) as $mark
+             | $mark + (.name | split(" / ") | if length > 2 then .[0] + " > " + .[-1] else .[-1] end)
+             | . + "\\n"' "$JOBS_JSON")
+          echo "$FAILED_JOBS"
+          {
+            echo "FAILED_JOBS<<EOF"
+            echo "$FAILED_JOBS"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+          if [ -n "$(echo "$FAILED_JOBS" | tr -d '[:space:]')" ]; then
+            echo "has_failures=true" >> "$GITHUB_OUTPUT"
+          elif [ "${FORCE_ALERT}" = "true" ]; then
+            # The caller's umbrella check is red but no job row explains it
+            # (pending-cancel, or a release-mandatory job that was skipped).
+            {
+              echo "FAILED_JOBS<<EOF"
+              echo ":failed: run is red but no failing job row was reported — check the run summary (cancelled-while-pending, or a required job was skipped)."
+              echo "EOF"
+            } >> "$GITHUB_ENV"
+            echo "has_failures=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_failures=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Notify Slack
+        if: steps.failed-jobs.outputs.has_failures == 'true'
+        uses: slackapi/slack-github-action@91efab103c0de0a537f72a35f6b8cda0ee76bf0a # v2.1.1
+        with:
+          webhook: ${{ secrets.SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            blocks:
+              - type: "section"
+                text:
+                  type: mrkdwn
+                  text: ":alert: *ModelExpress ${{ inputs.pipeline_name }} Pipeline Failure*"
+              - type: "section"
+                text:
+                  type: mrkdwn
+                  text: "<https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|Workflow Summary>"
+              - type: "section"
+                text:
+                  type: mrkdwn
+                  text: "${{ env.FAILED_JOBS }}"
