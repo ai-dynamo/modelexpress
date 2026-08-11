@@ -46,6 +46,13 @@ def patch_hf_snapshot_prefetch() -> bool:
         return False
 
     def patched(*args, **kwargs):
+        """Install the snapshot from the server, then run the original call.
+
+        The original always runs, so the engine keeps the behaviour and the
+        errors it already handles. Prefetch failures are logged and swallowed:
+        this sits on the startup path, and a ModelExpress error here would
+        replace the diagnostic the engine expects with an unfamiliar one.
+        """
         repo_id = kwargs["repo_id"] if "repo_id" in kwargs else (args[0] if args else None)
         repo_type = kwargs.get("repo_type") or "model"
         if isinstance(repo_id, str) and repo_type == "model":

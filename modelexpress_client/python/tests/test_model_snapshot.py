@@ -143,11 +143,12 @@ class TestPublish:
 
     def test_discard_removes_staging(self, cache):
         staging = cache.staging()
+        staging_path = staging.path
         staging.begin_file("config.json")
         staging.write(b"{}")
         staging.discard()
 
-        assert not staging.path.exists() if staging._staging_path else True
+        assert not staging_path.exists()
         assert not (cache.repo_root / "snapshots").exists()
 
     def test_republish_same_commit_reuses_complete_snapshot(self, cache):

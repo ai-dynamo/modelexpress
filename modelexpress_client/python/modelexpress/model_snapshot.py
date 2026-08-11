@@ -288,7 +288,10 @@ class SnapshotStaging(SnapshotSink):
             os.replace(staging_path, snapshot_path)
             _fsync_directory(snapshots_root)
             self._cache.write_main_ref(commit_hash)
-        except Exception:
+        except BaseException:
+            # BaseException, not Exception: a KeyboardInterrupt here would
+            # otherwise strand the moved-aside directory with no owner and no
+            # cleanup path, leaking a partial model's worth of disk.
             if stale_path is not None and not snapshot_path.exists():
                 os.replace(stale_path, snapshot_path)
             raise

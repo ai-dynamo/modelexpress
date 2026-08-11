@@ -800,8 +800,10 @@ HF_HUB_OFFLINE: "1"
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MODEL_EXPRESS_NO_SHARED_STORAGE` | `0` | Fetch repository files from ModelExpress Server. When unset, nothing changes: no extra RPCs and no change to P2P or local loading. |
+| `MODEL_EXPRESS_URL` | unset | ModelExpress Server address. Required together with the switch above; without an address the feature stays off. |
+| `MX_SERVER_ADDRESS` | unset | Alternative spelling of the server address, accepted for parity with the P2P client. Either variable satisfies the requirement. |
 | `MODEL_EXPRESS_CACHE_DIRECTORY` | `HF_HUB_CACHE` | Where the worker installs snapshots. Point it at the same path as `HF_HUB_CACHE` so the engine reads what ModelExpress wrote. |
-| `MODEL_EXPRESS_TRANSFER_CHUNK_SIZE` | `1048576` | gRPC file-stream chunk size in bytes. |
+| `MODEL_EXPRESS_TRANSFER_CHUNK_SIZE` | `1048576` | gRPC file-stream chunk size in bytes. Values outside 1..`MAX_CHUNK_SIZE` fall back to the default rather than failing startup. |
 
 Requirements and limits:
 

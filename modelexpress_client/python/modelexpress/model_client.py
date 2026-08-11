@@ -87,6 +87,15 @@ class ModelCacheClient:
             options = [
                 ("grpc.max_send_message_length", self._max_message_size),
                 ("grpc.max_receive_message_length", self._max_message_size),
+                # No RPC here carries a deadline, because a cold-cache download
+                # is legitimately slow. Keepalive is what separates "slow" from
+                # "dead": without it a silently dropped connection blocks the
+                # engine's startup path forever, so the pod neither becomes
+                # ready nor crash-loops.
+                ("grpc.keepalive_time_ms", 30_000),
+                ("grpc.keepalive_timeout_ms", 10_000),
+                ("grpc.keepalive_permit_without_calls", 1),
+                ("grpc.http2.max_pings_without_data", 0),
             ]
             self._channel = auth.with_auth(
                 grpc.insecure_channel(self.server_url, options=options)

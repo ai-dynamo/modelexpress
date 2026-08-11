@@ -29,6 +29,13 @@ class ServerCacheStrategy(LoadStrategy):
     requires = (EngineAdapter.load_via_native,)
 
     def is_available(self, ctx: LoadContext) -> bool:
+        """Return whether the server can supply weights for this model.
+
+        Needs the no-shared-storage switch, a server address, and a Hugging
+        Face repo id. The repo id may have to be recovered from the resolved
+        cache path, because the engine rewrites the model name in place and
+        loads weights in a process that never ran the prefetch.
+        """
         if not super().is_available(ctx):
             return False
         if not model_prefetch.is_enabled():
@@ -42,6 +49,13 @@ class ServerCacheStrategy(LoadStrategy):
         return True
 
     def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
+        """Stream the weights into the resolved snapshot, then load natively.
+
+        Raises :class:`StrategyFailed` with ``mutated=False`` while the model
+        is still untouched, so the chain can try the next strategy, and with
+        ``mutated=True`` once the engine's own loader has started writing into
+        it and only a reinit can recover.
+        """
         result = _as_load_result(result)
         if ctx.adapter is None:
             raise StrategyFailed(
