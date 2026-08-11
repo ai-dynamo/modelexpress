@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from safetensors.torch import load_file, save_file
 
+from modelexpress.refit import receiver as receiver_module
 from modelexpress.refit.manifest import (
     RevisionManifest,
     RevisionRecord,
@@ -22,6 +23,31 @@ from modelexpress.refit.source.canonical import (
     load_hf_snapshot,
     snapshot_digest,
 )
+
+
+def test_receiver_download_workers_follow_receiver_configuration(monkeypatch):
+    monkeypatch.setenv("MX_REFIT_S3_DOWNLOAD_WORKERS", "7")
+
+    assert receiver_module._download_worker_count(20) == 7
+    assert receiver_module._download_worker_count(3) == 3
+
+
+def test_receiver_s3_client_uses_configured_connection_pool(monkeypatch):
+    calls = []
+
+    def client(*args, **kwargs):
+        calls.append((args, kwargs))
+        return object()
+
+    monkeypatch.setattr("boto3.client", client)
+    monkeypatch.setenv("MX_REFIT_S3_MAX_POOL_CONNECTIONS", "16")
+
+    result = receiver_module._create_s3_client("https://s3.example")
+
+    assert result is not None
+    assert calls[0][0] == ("s3",)
+    assert calls[0][1]["endpoint_url"] == "https://s3.example"
+    assert calls[0][1]["config"].max_pool_connections == 16
 
 
 class Catalog:
@@ -152,6 +178,12 @@ def test_receiver_downloads_and_patches_one_persistent_exact_checkpoint(tmp_path
 
     receiver.start_weight_update("1")
 
+    metrics = receiver.pop_metrics()
+    assert metrics["perf/mx_receive_prepare_time"] >= 0
+    assert metrics["perf/mx_receive_root_download"] >= 0
+    assert metrics["perf/mx_receive_pool"] >= 0
+    assert "perf/mx_receive_wire_bytes" not in metrics
+
     assert receiver.status().installed_version == "0"
     assert receiver.prepared["digest"] == target_digest
     assert receiver.prepared["path"] == local_checkpoint
@@ -166,6 +198,9 @@ def test_receiver_downloads_and_patches_one_persistent_exact_checkpoint(tmp_path
 
     follower.start_weight_update("1")
     assert s3.calls == ["root.json", "bucket-0.mxdb"]
+    follower_metrics = follower.pop_metrics()
+    assert follower_metrics["perf/mx_receive_prepare_time"] >= 0
+    assert "perf/mx_receive_wire_bytes" not in follower_metrics
 
     restarted = build()
     assert restarted.status().installed_version == "0"

@@ -9,7 +9,6 @@ import fcntl
 import hashlib
 import json
 import mmap
-import os
 import shutil
 import struct
 import time
@@ -23,11 +22,11 @@ import google_crc32c
 import numpy as np
 import zstandard
 
+from .. import envs
 from .api import ReceiverRevisionState, ReceiverStatus, WeightUpdateResult
 from .manifest import RevisionState
-from .source.canonical import bucket_parts
+from .source.canonical import bucket_parts, snapshot_digest
 from .source.canonical import format_digest as canonical_format_digest
-from .source.canonical import snapshot_digest
 
 
 @dataclass(frozen=True)
@@ -44,6 +43,23 @@ class ReceiverInstallError(RuntimeError):
     def __init__(self, detail: str, *, mutation_started: bool) -> None:
         super().__init__(detail)
         self.mutation_started = mutation_started
+
+
+def _download_worker_count(bucket_count: int) -> int:
+    return min(max(1, envs.MX_REFIT_S3_DOWNLOAD_WORKERS), bucket_count)
+
+
+def _create_s3_client(endpoint_url: str | None):
+    import boto3
+    from botocore.config import Config as BotoConfig
+
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        config=BotoConfig(
+            max_pool_connections=max(1, envs.MX_REFIT_S3_MAX_POOL_CONNECTIONS)
+        ),
+    )
 
 
 class ModelExpressWeightReceiver:
@@ -66,6 +82,7 @@ class ModelExpressWeightReceiver:
         self.prepared = None
         self.state = None
         self.detail = ""
+        self._metrics: dict[str, float] = {}
 
     @property
     def prepared_identity(self):
@@ -79,9 +96,18 @@ class ModelExpressWeightReceiver:
     def start_weight_update(self, version: str) -> None:
         if self.state is ReceiverRevisionState.POISONED:
             raise RuntimeError("poisoned receiver cannot install another update")
-        self.prepared = self.prepare_target(
-            version, self.installed_version, self.installed_digest
-        )
+        self._metrics = {}
+        self.prepared = None
+        started = time.perf_counter()
+        try:
+            self.prepared = self.prepare_target(
+                version, self.installed_version, self.installed_digest
+            )
+            self._metrics.update(self.prepared.get("metrics", {}))
+        finally:
+            self._metrics["perf/mx_receive_prepare_time"] = (
+                time.perf_counter() - started
+            )
         self.detail = ""
 
     def update_weights(self, layers=None) -> WeightUpdateResult:
@@ -93,9 +119,13 @@ class ModelExpressWeightReceiver:
             raise RuntimeError("poisoned receiver cannot install another update")
 
         target = self.prepared
+        started = time.perf_counter()
         try:
             self.install_target(target)
         except ReceiverInstallError as error:
+            self._metrics = {
+                "perf/mx_receive_install_time": time.perf_counter() - started
+            }
             self.state = (
                 ReceiverRevisionState.POISONED
                 if error.mutation_started
@@ -108,7 +138,14 @@ class ModelExpressWeightReceiver:
         self.installed_digest = target["digest"]
         self.prepared = None
         self.state = ReceiverRevisionState.VERIFIED
+        self._metrics = {
+            "perf/mx_receive_install_time": time.perf_counter() - started
+        }
         return self._result(True)
+
+    def pop_metrics(self) -> dict[str, float]:
+        metrics, self._metrics = self._metrics, {}
+        return metrics
 
     def mark_poisoned(self, detail: str):
         self.state = ReceiverRevisionState.POISONED
@@ -337,9 +374,7 @@ def build_weight_receiver(
 
         catalog = GrpcRevisionCatalog(config.catalog_endpoint)
     if s3_client is None:
-        import boto3
-
-        s3_client = boto3.client("s3", endpoint_url=config.s3_endpoint_url)
+        s3_client = _create_s3_client(config.s3_endpoint_url)
     checkpoint = Path(launch_checkpoint)
 
     deadline = time.monotonic() + config.ready_timeout_seconds
@@ -423,10 +458,17 @@ def build_weight_receiver(
                     "version": version,
                     "digest": manifest.target_digest,
                     "path": local_checkpoint,
+                    "metrics": {
+                        "perf/mx_receive_root_download": 0.0,
+                        "perf/mx_receive_pool": 0.0,
+                    },
                 }
             if state["version"] != base_version or state["digest"] != base_digest:
                 raise ValueError("local checkpoint does not match the exact base")
-            root = json.loads(_download(s3_client, manifest.payload))
+            root_started = time.perf_counter()
+            root_payload = _download(s3_client, manifest.payload)
+            root_download_time = time.perf_counter() - root_started
+            root = json.loads(root_payload)
             if (
                 root["model_id"] != model_id
                 or root["base_version"] != base_version
@@ -486,8 +528,9 @@ def build_weight_receiver(
                 maps[path] = (file_handle, mmap.mmap(file_handle.fileno(), 0))
 
             def apply(bucket):
+                payload = _download(s3_client, _location(bucket["object"]))
                 _apply_bucket(
-                    _download(s3_client, _location(bucket["object"])),
+                    payload,
                     locations,
                     maps,
                     root,
@@ -495,13 +538,16 @@ def build_weight_receiver(
                     coverage,
                 )
 
+            bucket_pool_time = 0.0
             try:
                 buckets = root["buckets"]
                 if buckets:
+                    pool_started = time.perf_counter()
                     with ThreadPoolExecutor(
-                        max_workers=min(32, os.cpu_count() or 8, len(buckets))
+                        max_workers=_download_worker_count(len(buckets))
                     ) as pool:
                         list(pool.map(apply, buckets))
+                    bucket_pool_time = time.perf_counter() - pool_started
             finally:
                 for file_handle, mapped in maps.values():
                     mapped.close()
@@ -519,6 +565,10 @@ def build_weight_receiver(
                 "version": version,
                 "digest": manifest.target_digest,
                 "path": local_checkpoint,
+                "metrics": {
+                    "perf/mx_receive_root_download": root_download_time,
+                    "perf/mx_receive_pool": bucket_pool_time,
+                },
             }
 
     def install(target):
