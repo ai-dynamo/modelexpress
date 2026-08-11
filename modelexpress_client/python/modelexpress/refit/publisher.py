@@ -21,7 +21,7 @@ from .. import envs
 from .api import PublisherConfig
 from .catalog import GrpcRevisionCatalog
 from .manifest import RevisionManifest, RevisionState
-from .s3 import S3Uploader
+from .s3 import S3Client
 from .source.canonical import (
     canonical_json,
     encode_bucket,
@@ -32,6 +32,7 @@ from .source.canonical import (
 
 
 NUM_WORKERS = min(32, os.cpu_count() or 8)
+POLL_INTERVAL_SECONDS = 1.0
 
 
 def _key(model_id: str, version: str, filename: str) -> str:
@@ -89,23 +90,15 @@ def _bucket_groups(names: list[str], metadata: dict[str, dict], limit: int):
 class Publisher:
     def __init__(
         self,
-        *,
         launch_checkpoint: str | Path,
         bucket_bytes: int = 256 * 1024 * 1024,
         group=None,
-        catalog=None,
-        s3_client=None,
-        sleep=time.sleep,
-        poll_interval_seconds: float = 1.0,
     ) -> None:
         self.launch_checkpoint = Path(launch_checkpoint)
         self.bucket_bytes = bucket_bytes
         self.group = group
-        self.catalog = catalog
-        self.s3_client = s3_client
-        self.sleep = sleep
-        self.poll_interval_seconds = poll_interval_seconds
-        self.uploader = None
+        self.catalog = None
+        self.s3 = None
         self.snapshot = {}
         self.metadata = {}
         self.captured = False
@@ -122,13 +115,21 @@ class Publisher:
         )
 
         identity = None
-        if self.rank == 0:
-            _snapshot, _metadata, launch_format, launch_digest = load_hf_snapshot(
-                self.launch_checkpoint
-            )
-            identity = (launch_format, launch_digest)
-            if self.catalog is None:
+        error = None
+        try:
+            if self.rank == 0:
+                _snapshot, _metadata, launch_format, launch_digest = load_hf_snapshot(
+                    self.launch_checkpoint
+                )
+                identity = (launch_format, launch_digest)
                 self.catalog = GrpcRevisionCatalog(config.catalog_endpoint)
+            self.s3 = S3Client(
+                endpoint_url=config.s3.endpoint_url,
+                region_name=config.s3.region_name,
+            )
+        except Exception as exc:
+            error = exc
+        self._agree_error(error)
         identities = self._gather(identity)
         self.format_digest, self.target_digest = next(
             item for item in identities if item is not None
@@ -140,7 +141,6 @@ class Publisher:
     def publish_version(
         self,
         version: str,
-        *,
         base_version: str | None = None,
         gather_hf_buckets=None,
     ) -> None:
@@ -270,9 +270,7 @@ class Publisher:
             format_digest(metadata) != self.format_digest
             or snapshot_digest(metadata) != self.target_digest
         ):
-            raise RuntimeError(
-                "source-rank baseline differs from launch revision"
-            )
+            raise RuntimeError("source-rank baseline differs from launch revision")
         self.captured = True
 
     def wait_for_commit(self, version: str, completion=None) -> None:
@@ -289,7 +287,7 @@ class Publisher:
                 ):
                     if completion is not None and completion.done():
                         completion.result()
-                    self.sleep(self.poll_interval_seconds)
+                    time.sleep(POLL_INTERVAL_SECONDS)
             except Exception as exc:
                 error = exc
         self._agree_error(error)
@@ -303,8 +301,8 @@ class Publisher:
         return metrics
 
     def deregister(self) -> None:
-        if self.uploader is not None:
-            self.uploader.close()
+        if self.s3 is not None:
+            self.s3.close()
         close = getattr(self.catalog, "close", None)
         if close is not None:
             close()
@@ -450,12 +448,6 @@ class Publisher:
         offset = sum(count for rank, count in counts if rank < self.rank)
         total = sum(count for _rank, count in counts)
 
-        error = None
-        try:
-            uploader = self._uploader()
-        except Exception as exc:
-            error = exc
-        self._agree_error(error)
         setup_seconds = time.monotonic() - setup_started
 
         tasks = [
@@ -478,7 +470,7 @@ class Publisher:
                 tensors=tensors,
                 metadata=local_metadata,
             )
-            stored = uploader.put(
+            stored = self._put(
                 _key(
                     self.config.model_id,
                     version,
@@ -553,7 +545,7 @@ class Publisher:
                         "tensors": tensors,
                     }
                 )
-                payload = uploader.put(
+                payload = self._put(
                     _key(self.config.model_id, version, "root.json"), root
                 )
                 self.catalog.publish_revision(
@@ -573,10 +565,9 @@ class Publisher:
         finalize_seconds = time.monotonic() - finalize_started
         return wire_bytes, setup_seconds, pool_seconds, finalize_seconds
 
-    def _uploader(self):
-        if self.uploader is None:
-            self.uploader = S3Uploader(self.config.s3, client=self.s3_client)
-        return self.uploader
+    def _put(self, key: str, data: bytes):
+        key = "/".join(part for part in (self.config.s3.prefix.strip("/"), key) if part)
+        return self.s3.put(bucket=self.config.s3.bucket, key=key, data=data)
 
     def _agree_error(self, error) -> None:
         message = None if error is None else f"{type(error).__name__}: {error}"

@@ -9,22 +9,26 @@ import fcntl
 import hashlib
 import json
 import mmap
+import socket
 import shutil
 import struct
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import quote
 
-import google_crc32c
 import numpy as np
+import torch
 import zstandard
 
 from .. import envs
 from .api import ReceiverRevisionState, ReceiverStatus, WeightUpdateResult
-from .manifest import RevisionState
+from .catalog import GrpcRevisionCatalog
+from .manifest import RevisionState, S3Object
+from .s3 import S3Client
 from .source.canonical import bucket_parts, snapshot_digest
 from .source.canonical import format_digest as canonical_format_digest
 
@@ -40,7 +44,7 @@ class ReceiverConfig:
 
 
 class ReceiverInstallError(RuntimeError):
-    def __init__(self, detail: str, *, mutation_started: bool) -> None:
+    def __init__(self, detail: str, mutation_started: bool) -> None:
         super().__init__(detail)
         self.mutation_started = mutation_started
 
@@ -49,49 +53,112 @@ def _download_worker_count(bucket_count: int) -> int:
     return min(max(1, envs.MX_REFIT_S3_DOWNLOAD_WORKERS), bucket_count)
 
 
-def _create_s3_client(endpoint_url: str | None):
-    import boto3
-    from botocore.config import Config as BotoConfig
-
-    return boto3.client(
-        "s3",
-        endpoint_url=endpoint_url,
-        config=BotoConfig(
-            max_pool_connections=max(1, envs.MX_REFIT_S3_MAX_POOL_CONNECTIONS)
-        ),
-    )
+@dataclass(frozen=True)
+class PreparedRevision:
+    target_version: str
+    target_digest: str
+    path: Path
+    metrics: dict[str, float]
 
 
 class ModelExpressWeightReceiver:
     def __init__(
         self,
-        *,
-        receiver_id,
-        model_id,
-        installed_version,
-        installed_digest,
-        prepare_target,
-        install_target,
+        config: ReceiverConfig,
+        receiver_id: str,
+        model_runner,
     ) -> None:
+        self.config = config
         self.receiver_id = receiver_id
-        self.model_id = model_id
-        self.installed_version = installed_version
-        self.installed_digest = installed_digest
-        self.prepare_target = prepare_target
-        self.install_target = install_target
-        self.prepared = None
+        self.model_id = config.model_id
+        self.model_runner = model_runner
+        checkpoint, _, _ = model_runner.loader._prepare_weights(
+            model_runner.model_config.model_path,
+            model_runner.model_config.revision,
+            False,
+        )
+        self.launch_checkpoint = Path(checkpoint)
+        self.installed_version = config.initial_version
+        self.installed_digest: str
+        self.catalog = None
+        self.s3 = None
+        self.checkpoint: _LocalCheckpoint
+        self.prepared: PreparedRevision | None = None
         self.state = None
         self.detail = ""
         self._metrics: dict[str, float] = {}
 
+    def initialize(self) -> None:
+        self.catalog = GrpcRevisionCatalog(self.config.catalog_endpoint)
+        self.s3 = S3Client(endpoint_url=self.config.s3_endpoint_url)
+        deadline = time.monotonic() + self.config.ready_timeout_seconds
+        while True:
+            try:
+                launch = self.catalog.get_revision(
+                    self.model_id, self.installed_version
+                )
+                break
+            except Exception:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(1)
+        if launch.state not in {RevisionState.READY, RevisionState.COMMITTED}:
+            raise ValueError("installed launch revision is not ready")
+        self.checkpoint = _LocalCheckpoint(
+            self.config, self.catalog, self.s3, self.launch_checkpoint
+        )
+        self.installed_digest = self.checkpoint.initialize(launch)
+        self.state = ReceiverRevisionState.VERIFIED
+
     @property
     def prepared_identity(self):
-        if self.prepared is None:
-            return None
-        return SimpleNamespace(
-            target_version=self.prepared["version"],
-            target_digest=self.prepared["digest"],
-        )
+        return self.prepared
+
+    def install_prepared_checkpoint(self, prepared: PreparedRevision) -> None:
+        try:
+            from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+            from sglang.srt.model_loader.loader import (
+                DefaultModelLoader,
+                get_model_loader,
+            )
+
+            loader = get_model_loader(
+                LoadConfig(
+                    load_format=LoadFormat.SAFETENSORS,
+                    download_dir=self.model_runner.server_args.download_dir,
+                    model_loader_extra_config=(
+                        self.model_runner.server_args.model_loader_extra_config
+                    ),
+                ),
+                self.model_runner.model_config,
+            )
+            if not isinstance(loader, DefaultModelLoader):
+                raise TypeError("ModelExpress requires DefaultModelLoader")
+            source = SimpleNamespace(
+                model_or_path=str(prepared.path),
+                revision=None,
+                prefix="",
+                fall_back_to_pt=False,
+                model_config=self.model_runner.model_config,
+            )
+            weights = loader._get_weights_iterator(source)
+        except Exception as error:
+            raise ReceiverInstallError(str(error), False) from error
+
+        try:
+            from sglang.srt.model_loader.utils import set_default_torch_dtype
+
+            with set_default_torch_dtype(self.model_runner.model_config.dtype):
+                loader.load_weights_and_postprocess(
+                    self.model_runner.model,
+                    weights,
+                    torch.device(self.model_runner.device),
+                )
+            device = torch.get_device_module(self.model_runner.device)
+            if hasattr(device, "synchronize"):
+                device.synchronize()
+        except Exception as error:
+            raise ReceiverInstallError(str(error), True) from error
 
     def start_weight_update(self, version: str) -> None:
         if self.state is ReceiverRevisionState.POISONED:
@@ -100,10 +167,10 @@ class ModelExpressWeightReceiver:
         self.prepared = None
         started = time.perf_counter()
         try:
-            self.prepared = self.prepare_target(
+            self.prepared = self.checkpoint.prepare(
                 version, self.installed_version, self.installed_digest
             )
-            self._metrics.update(self.prepared.get("metrics", {}))
+            self._metrics.update(self.prepared.metrics)
         finally:
             self._metrics["perf/mx_receive_prepare_time"] = (
                 time.perf_counter() - started
@@ -112,16 +179,16 @@ class ModelExpressWeightReceiver:
 
     def update_weights(self, layers=None) -> WeightUpdateResult:
         if layers is not None:
-            raise ValueError("V0 supports complete-model updates only")
+            raise ValueError("ModelExpress supports complete-model updates only")
         if self.prepared is None:
             raise RuntimeError("no prepared ModelExpress update")
         if self.state is ReceiverRevisionState.POISONED:
             raise RuntimeError("poisoned receiver cannot install another update")
-
         target = self.prepared
         started = time.perf_counter()
         try:
-            self.install_target(target)
+            with self.checkpoint.installation(target):
+                self.install_prepared_checkpoint(target)
         except ReceiverInstallError as error:
             self._metrics = {
                 "perf/mx_receive_install_time": time.perf_counter() - started
@@ -133,14 +200,11 @@ class ModelExpressWeightReceiver:
             )
             self.detail = str(error)
             return self._result(False)
-
-        self.installed_version = target["version"]
-        self.installed_digest = target["digest"]
+        self.installed_version = target.target_version
+        self.installed_digest = target.target_digest
         self.prepared = None
         self.state = ReceiverRevisionState.VERIFIED
-        self._metrics = {
-            "perf/mx_receive_install_time": time.perf_counter() - started
-        }
+        self._metrics = {"perf/mx_receive_install_time": time.perf_counter() - started}
         return self._result(True)
 
     def pop_metrics(self) -> dict[str, float]:
@@ -171,32 +235,6 @@ class ModelExpressWeightReceiver:
             target_digest=self.installed_digest,
             detail=self.detail,
         )
-
-
-def _download(s3, location) -> bytes:
-    request = {"Bucket": location.bucket, "Key": location.key}
-    if location.object_version is not None:
-        request["VersionId"] = location.object_version
-    body = s3.get_object(**request)["Body"]
-    try:
-        data = body.read()
-    finally:
-        close = getattr(body, "close", None)
-        if close is not None:
-            close()
-    checksum = f"crc32c:{google_crc32c.value(data):08x}"
-    if checksum != location.checksum:
-        raise ValueError(f"S3 checksum differs for {location.key}")
-    return data
-
-
-def _location(value):
-    return SimpleNamespace(
-        bucket=value["bucket"],
-        key=value["key"],
-        checksum=value["checksum"],
-        object_version=value.get("object_version"),
-    )
 
 
 def _seed_checkpoint(source: Path, target: Path) -> None:
@@ -358,132 +396,128 @@ def _write_state(path: Path, state: dict) -> None:
     temporary.replace(path)
 
 
-def build_weight_receiver(
-    *,
-    config: ReceiverConfig,
-    receiver_id: str,
-    launch_checkpoint: str | Path,
-    install_target,
-    catalog=None,
-    s3_client=None,
-) -> ModelExpressWeightReceiver:
-    model_id = config.model_id
-    initial_version = config.initial_version
-    if catalog is None:
-        from .catalog import GrpcRevisionCatalog
+class _LocalCheckpoint:
+    def __init__(self, config, catalog, s3, launch_checkpoint):
+        self.model_id = config.model_id
+        self.initial_version = config.initial_version
+        self.catalog = catalog
+        self.s3 = s3
+        self.launch_checkpoint = Path(launch_checkpoint)
+        self.cache = Path(config.preparation_cache_dir) / quote(self.model_id, safe="")
+        self.local_checkpoint = self.cache / "checkpoint"
+        self.state_path = self.cache / "state.json"
+        self.lock_path = self.cache / ".lock"
+        self.locations = None
+        self.metadata = None
+        self.format_digest = None
 
-        catalog = GrpcRevisionCatalog(config.catalog_endpoint)
-    if s3_client is None:
-        s3_client = _create_s3_client(config.s3_endpoint_url)
-    checkpoint = Path(launch_checkpoint)
-
-    deadline = time.monotonic() + config.ready_timeout_seconds
-    while True:
-        try:
-            launch = catalog.get_revision(model_id, initial_version)
-            break
-        except Exception:
-            if time.monotonic() >= deadline:
-                raise
-            time.sleep(1)
-    if launch.state not in {RevisionState.READY, RevisionState.COMMITTED}:
-        raise ValueError("installed launch revision is not ready")
-    installed_digest = launch.manifest.target_digest
-    format_digest = launch.manifest.format_digest
-    cache = Path(config.preparation_cache_dir) / quote(model_id, safe="")
-    cache.mkdir(parents=True, exist_ok=True)
-    local_checkpoint = cache / "checkpoint"
-    state_path = cache / "state.json"
-    lock_path = cache / ".lock"
-    with lock_path.open("a+") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        state = json.loads(state_path.read_text()) if state_path.exists() else None
-        seeded = (
-            state is None
-            or state.get("poisoned")
-            or state.get("version") != initial_version
-            or state.get("digest") != installed_digest
-            or not any(local_checkpoint.glob("*.safetensors"))
-        )
-        if not seeded:
-            locations, checkpoint_metadata = _tensor_locations(local_checkpoint)
-            seeded = state.get("files") != _checkpoint_files_state(locations)
-        if seeded:
-            _seed_checkpoint(checkpoint, local_checkpoint)
-            locations, checkpoint_metadata = _tensor_locations(local_checkpoint)
-        if canonical_format_digest(checkpoint_metadata) != format_digest:
-            raise ValueError("local checkpoint format differs from revision 0")
-        if seeded:
-            actual_format, actual_digest = _checkpoint_identity(
-                locations, checkpoint_metadata
+    def initialize(self, launch) -> str:
+        installed_digest = launch.manifest.target_digest
+        self.format_digest = launch.manifest.format_digest
+        self.cache.mkdir(parents=True, exist_ok=True)
+        with self.lock_path.open("a+") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            state = (
+                json.loads(self.state_path.read_text())
+                if self.state_path.exists()
+                else None
             )
-            if actual_format != format_digest or actual_digest != installed_digest:
-                raise ValueError("local checkpoint differs from revision 0")
-            _write_state(
-                state_path,
-                {
-                    "version": initial_version,
-                    "digest": installed_digest,
-                    "format_digest": format_digest,
-                    "files": _checkpoint_files_state(locations),
-                },
+            seeded = (
+                state is None
+                or state.get("poisoned")
+                or state.get("version") != self.initial_version
+                or state.get("digest") != installed_digest
+                or not any(self.local_checkpoint.glob("*.safetensors"))
             )
-        elif state["format_digest"] != format_digest:
-            raise ValueError("existing local checkpoint state is not reusable")
+            if not seeded:
+                self.locations, self.metadata = _tensor_locations(self.local_checkpoint)
+                seeded = state.get("files") != _checkpoint_files_state(self.locations)
+            if seeded:
+                _seed_checkpoint(self.launch_checkpoint, self.local_checkpoint)
+                self.locations, self.metadata = _tensor_locations(self.local_checkpoint)
+            if canonical_format_digest(self.metadata) != self.format_digest:
+                raise ValueError("local checkpoint format differs from revision 0")
+            if seeded:
+                actual_format, actual_digest = _checkpoint_identity(
+                    self.locations, self.metadata
+                )
+                if (
+                    actual_format != self.format_digest
+                    or actual_digest != installed_digest
+                ):
+                    raise ValueError("local checkpoint differs from revision 0")
+                _write_state(
+                    self.state_path,
+                    {
+                        "version": self.initial_version,
+                        "digest": installed_digest,
+                        "format_digest": self.format_digest,
+                        "files": _checkpoint_files_state(self.locations),
+                    },
+                )
+            elif state["format_digest"] != self.format_digest:
+                raise ValueError("existing local checkpoint state is not reusable")
+        return installed_digest
 
-    def prepare(version, base_version, base_digest):
-        record = catalog.get_revision(model_id, version)
+    def prepare(
+        self, version: str, base_version: str, base_digest: str
+    ) -> PreparedRevision:
+        record = self.catalog.get_revision(self.model_id, version)
         if record.state not in {RevisionState.READY, RevisionState.COMMITTED}:
             raise ValueError("revision is not ready")
         manifest = record.manifest
         if (
             manifest.base_version != base_version
             or manifest.base_digest != base_digest
-            or manifest.format_digest != format_digest
+            or manifest.format_digest != self.format_digest
         ):
             raise ValueError("revision does not match the installed exact base")
 
-        with lock_path.open("a+") as handle:
+        with self.lock_path.open("a+") as handle:
             fcntl.flock(handle, fcntl.LOCK_EX)
-            state = json.loads(state_path.read_text())
+            state = json.loads(self.state_path.read_text())
             if state.get("poisoned"):
                 raise ValueError("local checkpoint is poisoned")
-            if state.get("files") != _checkpoint_files_state(locations):
+            if state.get("files") != _checkpoint_files_state(self.locations):
                 raise ValueError("local checkpoint files changed outside ModelExpress")
             if (
                 state["version"] == version
                 and state["digest"] == manifest.target_digest
             ):
-                return {
-                    "version": version,
-                    "digest": manifest.target_digest,
-                    "path": local_checkpoint,
-                    "metrics": {
+                return PreparedRevision(
+                    version,
+                    manifest.target_digest,
+                    self.local_checkpoint,
+                    {
                         "perf/mx_receive_root_download": 0.0,
                         "perf/mx_receive_pool": 0.0,
                     },
-                }
+                )
             if state["version"] != base_version or state["digest"] != base_digest:
                 raise ValueError("local checkpoint does not match the exact base")
+            if manifest.payload is None:
+                raise ValueError("revision has no canonical payload")
             root_started = time.perf_counter()
-            root_payload = _download(s3_client, manifest.payload)
+            root_payload = self.s3.get(manifest.payload)
             root_download_time = time.perf_counter() - root_started
             root = json.loads(root_payload)
             if (
-                root["model_id"] != model_id
+                root["model_id"] != self.model_id
                 or root["base_version"] != base_version
                 or root["target_version"] != version
                 or root["base_digest"] != base_digest
                 or root["target_digest"] != manifest.target_digest
-                or root["format_digest"] != format_digest
+                or root["format_digest"] != self.format_digest
             ):
                 raise ValueError("root does not match the requested revision")
             coverage = {item["name"]: item for item in root["tensors"]}
-            if len(coverage) != len(root["tensors"]) or set(coverage) != set(locations):
+            if len(coverage) != len(root["tensors"]) or set(coverage) != set(
+                self.locations
+            ):
                 raise ValueError(
                     "root tensor coverage differs from the local checkpoint"
                 )
-            for name, item in checkpoint_metadata.items():
+            for name, item in self.metadata.items():
                 target = coverage[name]
                 if any(
                     target[field] != item[field]
@@ -504,7 +538,7 @@ def build_weight_receiver(
                 for name, item in coverage.items()
             }
             if (
-                canonical_format_digest(identity) != format_digest
+                canonical_format_digest(identity) != self.format_digest
                 or snapshot_digest(identity) != manifest.target_digest
             ):
                 raise ValueError("root target identity differs from the revision")
@@ -521,22 +555,23 @@ def build_weight_receiver(
                 or set(bucket_names) != set(dirty_names)
             ):
                 raise ValueError("root buckets do not cover the dirty tensor set")
-            _write_state(state_path, {**state, "poisoned": True})
+            _write_state(self.state_path, {**state, "poisoned": True})
             maps = {}
-            for path in {item[0] for item in locations.values()}:
+            for path in {item[0] for item in self.locations.values()}:
                 file_handle = path.open("r+b")
                 maps[path] = (file_handle, mmap.mmap(file_handle.fileno(), 0))
 
             def apply(bucket):
-                payload = _download(s3_client, _location(bucket["object"]))
-                _apply_bucket(
-                    payload,
-                    locations,
-                    maps,
-                    root,
-                    bucket,
-                    coverage,
+                location = bucket["object"]
+                payload = self.s3.get(
+                    S3Object(
+                        bucket=location["bucket"],
+                        key=location["key"],
+                        checksum=location["checksum"],
+                        object_version=location.get("object_version"),
+                    )
                 )
+                _apply_bucket(payload, self.locations, maps, root, bucket, coverage)
 
             bucket_pool_time = 0.0
             try:
@@ -553,47 +588,56 @@ def build_weight_receiver(
                     mapped.close()
                     file_handle.close()
             _write_state(
-                state_path,
+                self.state_path,
                 {
                     "version": version,
                     "digest": manifest.target_digest,
-                    "format_digest": format_digest,
-                    "files": _checkpoint_files_state(locations),
+                    "format_digest": self.format_digest,
+                    "files": _checkpoint_files_state(self.locations),
                 },
             )
-            return {
-                "version": version,
-                "digest": manifest.target_digest,
-                "path": local_checkpoint,
-                "metrics": {
+            return PreparedRevision(
+                version,
+                manifest.target_digest,
+                self.local_checkpoint,
+                {
                     "perf/mx_receive_root_download": root_download_time,
                     "perf/mx_receive_pool": bucket_pool_time,
                 },
-            }
+            )
 
-    def install(target):
-        with lock_path.open("a+") as handle:
+    @contextmanager
+    def installation(self, prepared: PreparedRevision):
+        with self.lock_path.open("a+") as handle:
             fcntl.flock(handle, fcntl.LOCK_SH)
-            state = json.loads(state_path.read_text())
+            state = json.loads(self.state_path.read_text())
             if (
                 state.get("poisoned")
-                or state["version"] != target["version"]
-                or state["digest"] != target["digest"]
-                or state.get("files") != _checkpoint_files_state(locations)
+                or state["version"] != prepared.target_version
+                or state["digest"] != prepared.target_digest
+                or state.get("files") != _checkpoint_files_state(self.locations)
             ):
                 raise ReceiverInstallError(
                     "prepared checkpoint changed before installation",
-                    mutation_started=False,
+                    False,
                 )
-            return install_target(target)
+            yield
 
+
+def build_weight_receiver(model_runner):
+    args = model_runner.server_args
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     receiver = ModelExpressWeightReceiver(
-        receiver_id=receiver_id,
-        model_id=model_id,
-        installed_version=initial_version,
-        installed_digest=installed_digest,
-        prepare_target=prepare,
-        install_target=install,
+        ReceiverConfig(
+            model_id=args.modelexpress_model_id,
+            catalog_endpoint=args.modelexpress_catalog_endpoint,
+            initial_version=args.modelexpress_initial_version,
+            preparation_cache_dir=args.modelexpress_preparation_cache_dir,
+            ready_timeout_seconds=args.modelexpress_ready_timeout_seconds,
+            s3_endpoint_url=args.modelexpress_delta_s3_endpoint,
+        ),
+        f"{socket.gethostname()}:{rank}",
+        model_runner,
     )
-    receiver.state = ReceiverRevisionState.VERIFIED
+    receiver.initialize()
     return receiver

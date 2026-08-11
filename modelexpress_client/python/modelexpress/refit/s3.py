@@ -1,17 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Direct immutable S3 publication for canonical payload objects."""
+"""Direct immutable S3 transport for canonical payload objects."""
 
 from __future__ import annotations
 
 import base64
-from typing import Any
 
 import google_crc32c
 
 from .. import envs
-from .api import S3Config
 from .manifest import S3Object
 
 
@@ -32,30 +30,29 @@ def _checksum(data: bytes) -> tuple[str, str]:
     return f"crc32c:{value:08x}", encoded
 
 
-class S3Uploader:
-    def __init__(self, config: S3Config, *, client: Any = None) -> None:
-        self.config = config
-        self.owns_client = client is None
-        if client is None:
-            import boto3
-            from botocore.config import Config as BotoConfig
+class S3Client:
+    def __init__(
+        self,
+        endpoint_url: str | None = None,
+        region_name: str | None = None,
+    ) -> None:
+        import boto3
+        from botocore.config import Config as BotoConfig
 
-            client = boto3.client(
-                "s3",
-                endpoint_url=config.endpoint_url,
-                region_name=config.region_name,
-                config=BotoConfig(
-                    max_pool_connections=max(1, envs.MX_REFIT_S3_MAX_POOL_CONNECTIONS)
-                ),
-            )
-        self.client = client
+        self.client = boto3.client(
+            "s3",
+            endpoint_url=endpoint_url,
+            region_name=region_name,
+            config=BotoConfig(
+                max_pool_connections=max(1, envs.MX_REFIT_S3_MAX_POOL_CONNECTIONS)
+            ),
+        )
 
-    def put(self, key: str, data: bytes) -> S3Object:
-        key = "/".join(part for part in (self.config.prefix.strip("/"), key) if part)
+    def put(self, bucket: str, key: str, data: bytes) -> S3Object:
         checksum, encoded_checksum = _checksum(data)
         try:
             response = self.client.put_object(
-                Bucket=self.config.bucket,
+                Bucket=bucket,
                 Key=key,
                 Body=data,
                 ChecksumAlgorithm="CRC32C",
@@ -71,29 +68,49 @@ class S3Uploader:
                 "PreconditionFailed",
             }:
                 raise
-            response = self.client.get_object(Bucket=self.config.bucket, Key=key)
-            body = response["Body"]
-            try:
-                existing = body.read()
-            finally:
-                close = getattr(body, "close", None)
-                if close is not None:
-                    close()
+            existing, version = self._read(bucket=bucket, key=key)
             if existing != data:
                 raise ImmutableS3Conflict(
-                    f"immutable S3 object conflict for {self.config.bucket}/{key}"
+                    f"immutable S3 object conflict for {bucket}/{key}"
                 ) from error
-            version = response.get("VersionId")
 
         return S3Object(
-            bucket=self.config.bucket,
+            bucket=bucket,
             key=key,
             checksum=checksum,
             object_version=version,
         )
 
-    def close(self) -> None:
-        if self.owns_client:
-            close = getattr(self.client, "close", None)
+    def get(self, location: S3Object) -> bytes:
+        data, _version = self._read(
+            bucket=location.bucket,
+            key=location.key,
+            version=location.object_version,
+        )
+        checksum, _encoded = _checksum(data)
+        if checksum != location.checksum:
+            raise ValueError(f"S3 checksum differs for {location.key}")
+        return data
+
+    def _read(
+        self,
+        bucket: str,
+        key: str,
+        version: str | None = None,
+    ) -> tuple[bytes, str | None]:
+        request = {"Bucket": bucket, "Key": key}
+        if version is not None:
+            request["VersionId"] = version
+        response = self.client.get_object(**request)
+        body = response["Body"]
+        try:
+            return body.read(), response.get("VersionId")
+        finally:
+            close = getattr(body, "close", None)
             if close is not None:
                 close()
+
+    def close(self) -> None:
+        close = getattr(self.client, "close", None)
+        if close is not None:
+            close()

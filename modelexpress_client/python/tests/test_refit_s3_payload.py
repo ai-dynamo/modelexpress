@@ -13,8 +13,8 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from modelexpress.refit import S3Config
-from modelexpress.refit.s3 import ImmutableS3Conflict, S3Uploader
+from modelexpress.refit.manifest import S3Object
+from modelexpress.refit.s3 import ImmutableS3Conflict, S3Client
 from modelexpress.refit.source import canonical
 from modelexpress.refit.source.canonical import (
     decode_bucket,
@@ -56,25 +56,32 @@ class FakeS3:
         return {"Body": io.BytesIO(data), "VersionId": version}
 
 
-def test_s3_uploader_uses_one_conditional_put_and_returns_object():
-    client = FakeS3()
-    uploader = S3Uploader(S3Config(bucket="bucket", prefix="run"), client=client)
+def test_s3_client_puts_immutable_object_and_gets_verified_bytes(monkeypatch):
+    raw_client = FakeS3()
+    monkeypatch.setattr("boto3.client", lambda *_args, **_kwargs: raw_client)
+    client = S3Client()
 
-    stored = uploader.put("models/m/revisions/1/root.json", b"root")
+    stored = client.put(
+        bucket="bucket",
+        key="run/models/m/revisions/1/root.json",
+        data=b"root",
+    )
 
     assert stored.bucket == "bucket"
     assert stored.key == "run/models/m/revisions/1/root.json"
     assert stored.object_version == "version-1"
     assert stored.checksum.startswith("crc32c:")
-    request = client.puts[0]
+    request = raw_client.puts[0]
     assert request["IfNoneMatch"] == "*"
     assert request["ChecksumAlgorithm"] == "CRC32C"
     assert base64.b64decode(request["ChecksumCRC32C"])
-    assert client.head_calls == 0
-    assert client.get_calls == 0
+    assert raw_client.head_calls == 0
+    assert raw_client.get_calls == 0
+    assert client.get(stored) == b"root"
+    assert raw_client.get_calls == 1
 
 
-def test_s3_uploader_configures_http_pool_from_env(monkeypatch):
+def test_s3_client_configures_http_pool_from_env(monkeypatch):
     import boto3
 
     created = {}
@@ -86,19 +93,45 @@ def test_s3_uploader_configures_http_pool_from_env(monkeypatch):
     monkeypatch.setenv("MX_REFIT_S3_MAX_POOL_CONNECTIONS", "16")
     monkeypatch.setattr(boto3, "client", client)
 
-    S3Uploader(S3Config(bucket="bucket"))
+    S3Client(endpoint_url="https://s3.example", region_name="us-west-2")
 
+    assert created["endpoint_url"] == "https://s3.example"
+    assert created["region_name"] == "us-west-2"
     assert created["config"].max_pool_connections == 16
 
 
-def test_s3_uploader_allows_identical_retry_but_rejects_immutable_conflict():
-    client = FakeS3()
-    uploader = S3Uploader(S3Config(bucket="bucket"), client=client)
+def test_s3_client_allows_identical_retry_but_rejects_immutable_conflict(
+    monkeypatch,
+):
+    raw_client = FakeS3()
+    monkeypatch.setattr("boto3.client", lambda *_args, **_kwargs: raw_client)
+    client = S3Client()
 
-    first = uploader.put("root.json", b"same")
-    assert uploader.put("root.json", b"same") == first
+    first = client.put(bucket="bucket", key="root.json", data=b"same")
+    assert client.put(bucket="bucket", key="root.json", data=b"same") == first
     with pytest.raises(ImmutableS3Conflict):
-        uploader.put("root.json", b"different")
+        client.put(bucket="bucket", key="root.json", data=b"different")
+
+
+def test_s3_client_rejects_download_checksum_mismatch(monkeypatch):
+    raw_client = FakeS3()
+    raw_client.objects[("bucket", "root.json")] = (
+        b"wrong",
+        "unused",
+        "version-1",
+    )
+    monkeypatch.setattr("boto3.client", lambda *_args, **_kwargs: raw_client)
+    client = S3Client()
+
+    with pytest.raises(ValueError, match="checksum"):
+        client.get(
+            S3Object(
+                bucket="bucket",
+                key="root.json",
+                checksum="crc32c:00000000",
+                object_version="version-1",
+            )
+        )
 
 
 def test_launch_schema_orders_names_after_canonical_prefix_normalization(tmp_path):

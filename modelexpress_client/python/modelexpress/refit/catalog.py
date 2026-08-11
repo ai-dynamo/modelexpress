@@ -32,7 +32,7 @@ class RevisionCatalog(Protocol):
 class GrpcRevisionCatalog:
     """Concrete :class:`RevisionCatalog` over the generated gRPC service."""
 
-    def __init__(self, endpoint: str | None = None, *, stub=None) -> None:
+    def __init__(self, endpoint: str | None = None, stub=None) -> None:
         if (endpoint is None) == (stub is None):
             raise ValueError(
                 "GrpcRevisionCatalog needs exactly one of endpoint or stub"

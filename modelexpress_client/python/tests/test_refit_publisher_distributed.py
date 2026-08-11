@@ -8,6 +8,7 @@ import json
 import multiprocessing
 from datetime import timedelta
 
+import boto3
 import numpy as np
 import pytest
 import torch
@@ -20,6 +21,7 @@ from modelexpress.refit import (
     RevisionState,
     S3Config,
 )
+from modelexpress.refit import publisher as publisher_module
 from modelexpress.refit.source.canonical import load_hf_snapshot
 
 
@@ -83,12 +85,11 @@ def _run_with_non_source_rank(rank, world_size, init_file, checkpoint, queue):
     )
     catalog = Catalog() if rank == 0 else None
     s3 = S3()
+    publisher_module.GrpcRevisionCatalog = lambda _endpoint: catalog
+    boto3.client = lambda *_args, **_kwargs: s3
     publisher = Publisher(
         launch_checkpoint=checkpoint,
         bucket_bytes=16,
-        catalog=catalog,
-        s3_client=s3,
-        sleep=lambda _seconds: None,
     )
     publisher.initialize(PublisherConfig("model", "mx:8001", S3Config("bucket")))
     publisher.publish_version("0")
@@ -174,12 +175,11 @@ def _run(rank, world_size, init_file, checkpoint, queue):
     torch.distributed.all_gather_object = gather_metadata
     catalog = Catalog() if rank == 0 else None
     s3 = S3()
+    publisher_module.GrpcRevisionCatalog = lambda _endpoint: catalog
+    boto3.client = lambda *_args, **_kwargs: s3
     publisher = Publisher(
         launch_checkpoint=checkpoint,
         bucket_bytes=16,
-        catalog=catalog,
-        s3_client=s3,
-        sleep=lambda _seconds: None,
     )
     publisher.initialize(PublisherConfig("model", "mx:8001", S3Config("bucket")))
     publisher.publish_version("0")
@@ -271,3 +271,65 @@ def test_two_source_ranks_upload_disjoint_s3_buckets_and_one_root(tmp_path):
         "model.b.weight",
     ]
     assert sum("duplicate" in bucket["tensors"] for bucket in root["buckets"]) == 1
+
+
+def _run_initialize_failure(rank, world_size, init_file, checkpoint, queue):
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=10),
+    )
+    publisher_module.GrpcRevisionCatalog = lambda _endpoint: object()
+
+    def s3_client(**_kwargs):
+        if rank == 1:
+            raise RuntimeError("s3 setup failed")
+        return object()
+
+    publisher_module.S3Client = s3_client
+    publisher = Publisher(checkpoint)
+    try:
+        publisher.initialize(PublisherConfig("model", "mx:8001", S3Config("bucket")))
+    except Exception as error:
+        queue.put((rank, str(error)))
+    else:
+        queue.put((rank, "unexpected success"))
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not torch.distributed.is_available(), reason="torch.distributed is unavailable"
+)
+def test_initialize_reports_rank_local_s3_constructor_failure_to_every_rank(tmp_path):
+    checkpoint = tmp_path / "hf"
+    checkpoint.mkdir()
+    save_file(
+        {"model.weight": torch.ones((2, 2), dtype=torch.float32)},
+        checkpoint / "model.safetensors",
+    )
+    context = multiprocessing.get_context("spawn")
+    queue = context.Queue()
+    init_file = tmp_path / "gloo-init-failure"
+    processes = [
+        context.Process(
+            target=_run_initialize_failure,
+            args=(rank, 2, str(init_file), str(checkpoint), queue),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(20)
+        assert not process.is_alive()
+        assert process.exitcode == 0
+
+    messages = dict(queue.get(timeout=5) for _ in processes)
+    assert set(messages) == {0, 1}
+    assert all(
+        "distributed publication failed" in message for message in messages.values()
+    )
+    assert all("s3 setup failed" in message for message in messages.values())

@@ -1,45 +1,87 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from modelexpress.refit.api import ReceiverRevisionState
 from modelexpress.refit.receiver import (
     ModelExpressWeightReceiver,
+    PreparedRevision,
+    ReceiverConfig,
     ReceiverInstallError,
 )
 
 
-def prepared(tmp_path: Path, version="1", digest="sha256:target"):
+class Receiver(ModelExpressWeightReceiver):
+    def __init__(self, tmp_path: Path):
+        self.targets = {}
+        loader = SimpleNamespace(
+            _prepare_weights=lambda *_args: (tmp_path / "launch", None, None)
+        )
+        super().__init__(
+            ReceiverConfig(
+                model_id="model",
+                catalog_endpoint="mx:8001",
+                initial_version="0",
+                preparation_cache_dir=tmp_path / "cache",
+            ),
+            "receiver",
+            SimpleNamespace(
+                loader=loader,
+                model_config=SimpleNamespace(
+                    model_path=str(tmp_path / "launch"),
+                    revision=None,
+                ),
+            ),
+        )
+        self.installed_digest = "sha256:base"
+        self.state = ReceiverRevisionState.VERIFIED
+        self.installed = []
+        self.install_error = None
+        receiver = self
+
+        class Checkpoint:
+            def prepare(self, version, _installed_version, _installed_digest):
+                target = receiver.targets[version]
+                if isinstance(target, Exception):
+                    raise target
+                return target
+
+            def installation(self, _prepared):
+                return nullcontext()
+
+        self.checkpoint = Checkpoint()
+
+    def install_prepared_checkpoint(self, prepared):
+        if self.install_error is not None:
+            raise self.install_error
+        self.installed.append(prepared)
+
+
+def prepared(tmp_path: Path, version="1", digest="sha256:target", metrics=None):
     path = tmp_path / version
-    path.mkdir()
-    return {"version": version, "digest": digest, "path": path}
+    path.mkdir(exist_ok=True)
+    return PreparedRevision(version, digest, path, metrics or {})
 
 
-def receiver(tmp_path, *, install_target=lambda _target: None):
+def receiver(tmp_path):
+    value = Receiver(tmp_path)
     target = prepared(tmp_path)
-    return (
-        ModelExpressWeightReceiver(
-            receiver_id="receiver",
-            model_id="model",
-            installed_version="0",
-            installed_digest="sha256:base",
-            prepare_target=lambda *_args: target,
-            install_target=install_target,
-        ),
-        target,
-    )
+    value.targets["1"] = target
+    return value, target
 
 
 def test_prepare_and_install_advance_exact_identity(tmp_path):
-    installed = []
-    value, target = receiver(tmp_path, install_target=installed.append)
+    value, target = receiver(tmp_path)
 
     value.start_weight_update("1")
     result = value.update_weights()
 
-    assert installed == [target]
+    assert value.installed == [target]
     assert result.success
     assert result.installed_version == "1"
     assert result.target_digest == "sha256:target"
@@ -63,21 +105,12 @@ def test_receiver_metrics_are_drained_per_phase(tmp_path):
 
 
 def test_failed_prepare_replaces_stale_metrics(tmp_path):
-    target = prepared(tmp_path)
-
-    def prepare(version, *_args):
-        if version == "2":
-            raise RuntimeError("download failed")
-        return {**target, "metrics": {"perf/stale": 1.0}}
-
-    value = ModelExpressWeightReceiver(
-        receiver_id="receiver",
-        model_id="model",
-        installed_version="0",
-        installed_digest="sha256:base",
-        prepare_target=prepare,
-        install_target=lambda _target: None,
+    value, _target = receiver(tmp_path)
+    value.targets["1"] = prepared(
+        tmp_path,
+        metrics={"perf/stale": 1.0},
     )
+    value.targets["2"] = RuntimeError("download failed")
     value.start_weight_update("1")
 
     with pytest.raises(RuntimeError, match="download failed"):
@@ -91,20 +124,17 @@ def test_failed_prepare_replaces_stale_metrics(tmp_path):
 
 
 def test_prepare_does_not_mutate_live_weights(tmp_path):
-    installed = []
-    value, _target = receiver(tmp_path, install_target=installed.append)
+    value, _target = receiver(tmp_path)
 
     value.start_weight_update("1")
 
-    assert installed == []
+    assert value.installed == []
     assert value.status().installed_version == "0"
 
 
 def test_prewrite_install_failure_is_failed(tmp_path):
-    def fail(_target):
-        raise ReceiverInstallError("setup failed", mutation_started=False)
-
-    value, _target = receiver(tmp_path, install_target=fail)
+    value, _target = receiver(tmp_path)
+    value.install_error = ReceiverInstallError("setup failed", False)
     value.start_weight_update("1")
 
     result = value.update_weights()
@@ -115,10 +145,8 @@ def test_prewrite_install_failure_is_failed(tmp_path):
 
 
 def test_postwrite_install_failure_is_poisoned(tmp_path):
-    def fail(_target):
-        raise ReceiverInstallError("load failed", mutation_started=True)
-
-    value, _target = receiver(tmp_path, install_target=fail)
+    value, _target = receiver(tmp_path)
+    value.install_error = ReceiverInstallError("load failed", True)
     value.start_weight_update("1")
 
     result = value.update_weights()

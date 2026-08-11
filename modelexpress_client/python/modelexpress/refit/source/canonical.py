@@ -107,7 +107,6 @@ def snapshot_digest(metadata: dict[str, dict]) -> str:
 
 
 def encode_bucket(
-    *,
     model_id: str,
     base_version: str,
     target_version: str,

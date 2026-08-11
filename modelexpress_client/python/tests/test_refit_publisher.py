@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import io
+import inspect
 import json
 import threading
 
@@ -86,14 +87,19 @@ def checkpoint(tmp_path):
     return path, tensors
 
 
-def make_publisher(tmp_path, catalog, s3):
+def configure_services(monkeypatch, catalog, s3):
+    monkeypatch.setattr(
+        publisher_module, "GrpcRevisionCatalog", lambda _endpoint: catalog
+    )
+    monkeypatch.setattr("boto3.client", lambda *_args, **_kwargs: s3)
+
+
+def make_publisher(tmp_path, monkeypatch, catalog, s3):
+    configure_services(monkeypatch, catalog, s3)
     hf_path, _weights = checkpoint(tmp_path)
     publisher = Publisher(
         launch_checkpoint=hf_path,
         bucket_bytes=64,
-        catalog=catalog,
-        s3_client=s3,
-        sleep=lambda _seconds: None,
     )
     publisher.initialize(PublisherConfig("model", "mx:8001", S3Config("bucket", "run")))
     snapshot, _metadata, _format, _digest = load_hf_snapshot(hf_path)
@@ -108,10 +114,58 @@ def gather(weights):
     return run
 
 
-def test_launch_zero_publishes_metadata_without_weights(tmp_path):
+def test_initialize_constructs_catalog_and_s3_services(tmp_path, monkeypatch):
+    hf_path, _weights = checkpoint(tmp_path)
+    catalog = FakeCatalog()
+    s3 = object()
+    created = []
+
+    monkeypatch.setattr(
+        publisher_module,
+        "GrpcRevisionCatalog",
+        lambda endpoint: created.append(("catalog", endpoint)) or catalog,
+    )
+    monkeypatch.setattr(
+        publisher_module,
+        "S3Client",
+        lambda **kwargs: created.append(("s3", kwargs)) or s3,
+        raising=False,
+    )
+
+    parameters = inspect.signature(Publisher).parameters
+    assert "catalog" not in parameters
+    assert "s3_client" not in parameters
+    assert "sleep" not in parameters
+    assert "poll_interval_seconds" not in parameters
+
+    publisher = Publisher(launch_checkpoint=hf_path)
+    publisher.initialize(
+        PublisherConfig(
+            "model",
+            "mx:8001",
+            S3Config(
+                "bucket",
+                endpoint_url="https://s3.example",
+                region_name="us-west-2",
+            ),
+        )
+    )
+
+    assert publisher.catalog is catalog
+    assert publisher.s3 is s3
+    assert created == [
+        ("catalog", "mx:8001"),
+        (
+            "s3",
+            {"endpoint_url": "https://s3.example", "region_name": "us-west-2"},
+        ),
+    ]
+
+
+def test_launch_zero_publishes_metadata_without_weights(tmp_path, monkeypatch):
     catalog = FakeCatalog()
     s3 = FakeS3()
-    publisher = make_publisher(tmp_path, catalog, s3)
+    publisher = make_publisher(tmp_path, monkeypatch, catalog, s3)
 
     publisher.publish_version("0")
 
@@ -136,15 +190,13 @@ def test_exact_base_update_uses_miles_hf_buckets_and_uploads_delta(
     monkeypatch.setattr(publisher_module, "ThreadPoolExecutor", thread_pool)
     catalog = FakeCatalog()
     s3 = FakeS3()
+    configure_services(monkeypatch, catalog, s3)
     hf_path, launch = checkpoint(tmp_path)
     target = {name: tensor.clone() for name, tensor in launch.items()}
     target["model.b.weight"] += 7
     publisher = Publisher(
         launch_checkpoint=hf_path,
         bucket_bytes=64,
-        catalog=catalog,
-        s3_client=s3,
-        sleep=lambda _seconds: None,
     )
     publisher.initialize(PublisherConfig("model", "mx:8001", S3Config("bucket", "run")))
     snapshot, _metadata, _format, _digest = load_hf_snapshot(hf_path)
@@ -190,8 +242,8 @@ def test_exact_base_update_uses_miles_hf_buckets_and_uploads_delta(
         )
 
 
-def test_wrong_base_is_rejected_before_gather(tmp_path):
-    publisher = make_publisher(tmp_path, FakeCatalog(), FakeS3())
+def test_wrong_base_is_rejected_before_gather(tmp_path, monkeypatch):
+    publisher = make_publisher(tmp_path, monkeypatch, FakeCatalog(), FakeS3())
     publisher.publish_version("0")
     publisher.wait_for_commit("0")
     called = False
@@ -208,7 +260,7 @@ def test_wrong_base_is_rejected_before_gather(tmp_path):
     assert not called
 
 
-def test_s3_failure_prevents_catalog_publication(tmp_path):
+def test_s3_failure_prevents_catalog_publication(tmp_path, monkeypatch):
     class FailingS3(FakeS3):
         fail = False
 
@@ -219,13 +271,11 @@ def test_s3_failure_prevents_catalog_publication(tmp_path):
 
     catalog = FakeCatalog()
     s3 = FailingS3()
+    configure_services(monkeypatch, catalog, s3)
     hf_path, launch = checkpoint(tmp_path)
     publisher = Publisher(
         launch_checkpoint=hf_path,
         bucket_bytes=64,
-        catalog=catalog,
-        s3_client=s3,
-        sleep=lambda _seconds: None,
     )
     publisher.initialize(PublisherConfig("model", "mx:8001", S3Config("bucket", "run")))
     snapshot, _metadata, _format, _digest = load_hf_snapshot(hf_path)
@@ -250,7 +300,7 @@ def test_s3_failure_prevents_catalog_publication(tmp_path):
         )
 
 
-def test_bucket_uploads_run_in_parallel(tmp_path):
+def test_bucket_uploads_run_in_parallel(tmp_path, monkeypatch):
     class ConcurrentS3(FakeS3):
         def __init__(self):
             super().__init__()
@@ -265,13 +315,11 @@ def test_bucket_uploads_run_in_parallel(tmp_path):
 
     catalog = FakeCatalog()
     s3 = ConcurrentS3()
+    configure_services(monkeypatch, catalog, s3)
     hf_path, launch = checkpoint(tmp_path)
     publisher = Publisher(
         launch_checkpoint=hf_path,
         bucket_bytes=8,
-        catalog=catalog,
-        s3_client=s3,
-        sleep=lambda _seconds: None,
     )
     publisher.initialize(PublisherConfig("model", "mx:8001", S3Config("bucket", "run")))
     snapshot, _metadata, _format, _digest = load_hf_snapshot(hf_path)
