@@ -159,7 +159,7 @@ class TestPublish:
         assert again == snapshot
         assert (snapshot / "extra.json").read_text() == "kept"
 
-    def test_republish_replaces_incomplete_snapshot(self, cache):
+    def test_republish_updates_incomplete_snapshot(self, cache):
         snapshot = _write(cache, {"config.json": b"{}"})
         (snapshot / "config.json").unlink()
 
@@ -167,6 +167,40 @@ class TestPublish:
 
         assert again == snapshot
         assert (snapshot / "config.json").read_bytes() == b"{'v': 2}"
+
+    def test_republish_keeps_files_the_manifest_does_not_mention(self, cache):
+        """Installing metadata must not delete an already-installed weight set.
+
+        The commit hash comes from the server resolving ``main``, so a second
+        install targets the same ``snapshots/<commit>/``. The manifest passed
+        here covers metadata only, so replacing the directory wholesale would
+        drop weights that no expected-file check ever looks at.
+        """
+        snapshot = _write(cache, {"config.json": b"{}"})
+        weights = snapshot / "model.safetensors"
+        weights.write_bytes(b"W" * 64)
+        (snapshot / "shards" / "extra").mkdir(parents=True)
+        (snapshot / "shards" / "extra" / "part.safetensors").write_bytes(b"S" * 16)
+
+        again = _write(cache, {"config.json": b"{}", "chat_template.jinja": b"tpl"})
+
+        assert again == snapshot
+        assert weights.read_bytes() == b"W" * 64
+        assert (snapshot / "shards" / "extra" / "part.safetensors").read_bytes() == b"S" * 16
+        assert (snapshot / "chat_template.jinja").read_bytes() == b"tpl"
+
+    def test_republish_leaves_no_staging_or_stale_directories(self, cache):
+        snapshot = _write(cache, {"config.json": b"{}"})
+        (snapshot / "model.safetensors").write_bytes(b"W")
+
+        _write(cache, {"config.json": b"{}", "chat_template.jinja": b"tpl"})
+
+        leftovers = [
+            entry.name
+            for entry in cache.repo_root.iterdir()
+            if entry.name.startswith((".modelexpress-stale-", ".modelexpress-staging-"))
+        ]
+        assert leftovers == []
 
     def test_second_commit_moves_ref(self, cache):
         _write(cache, {"config.json": b"{}"}, commit=COMMIT)

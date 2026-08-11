@@ -269,6 +269,16 @@ class SnapshotStaging(SnapshotSink):
             self._cache.write_main_ref(commit_hash)
             return snapshot_path
 
+        if snapshot_path.is_dir() and not snapshot_path.is_symlink():
+            # Same commit means same content, so the directory already on disk
+            # holds files this manifest never mentions -- weights, above all.
+            # Merge into it rather than swapping it out, or installing metadata
+            # would delete a weight set nothing here checks for.
+            self._merge_into(snapshot_path)
+            self._cache.write_main_ref(commit_hash)
+            self._staging_path = None
+            return snapshot_path
+
         stale_path: Path | None = None
         if snapshot_path.exists() or snapshot_path.is_symlink():
             stale_path = self._cache.repo_root / f"{_STALE_PREFIX}{uuid.uuid4().hex}"
@@ -290,6 +300,29 @@ class SnapshotStaging(SnapshotSink):
             except OSError:
                 logger.warning("Failed to clean up stale snapshot %s", stale_path)
         return snapshot_path
+
+    def _merge_into(self, snapshot_path: Path) -> None:
+        """Move every staged file into an existing snapshot, one rename at a time.
+
+        Staging and the snapshot share a filesystem, so each rename is atomic:
+        a reader sees either the old file or the new one, never a partial write.
+        """
+        staging_path = self.path
+        touched_dirs: set[Path] = set()
+        for source in sorted(staging_path.rglob("*")):
+            if source.is_dir():
+                continue
+            target = snapshot_path / source.relative_to(staging_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not _is_contained(target.parent, self._cache.cache_root):
+                raise ModelSnapshotError(
+                    f"Staged file resolves outside the cache root: {target}"
+                )
+            os.replace(source, target)
+            touched_dirs.add(target.parent)
+        for directory in touched_dirs:
+            _fsync_directory(directory)
+        shutil.rmtree(staging_path, ignore_errors=True)
 
     def discard(self) -> None:
         """Remove the staging directory if it was never published."""
