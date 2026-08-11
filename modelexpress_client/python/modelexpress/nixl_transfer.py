@@ -280,7 +280,11 @@ class NixlTransferManager:
         self._tensor_descriptors = tensor_descriptors
         return tensor_descriptors
 
-    def register_tensors(self, tensors: dict[str, torch.Tensor]) -> bytes:
+    def register_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        force_per_tensor: bool = False,
+    ) -> bytes:
         """
         Register tensors with NIXL for RDMA access.
 
@@ -318,7 +322,7 @@ class NixlTransferManager:
 
         # Phase 1: Discover CUDA allocation boundaries (if pool reg enabled)
         alloc_discovery_start = time.perf_counter()
-        if _pool_reg_enabled():
+        if _pool_reg_enabled() and not force_per_tensor:
             if self._accelerator_backend.supports_pool_reg():
                 allocations = self._find_cuda_allocations(tensor_descriptors)
             else:
@@ -426,6 +430,30 @@ class NixlTransferManager:
                 self._accelerator_backend.name,
             )
             return self.register_tensors(tensors)
+
+        # NIXL resolves descriptors by containment, so one tensor outside
+        # [base, base+used) fails prep_xfer_dlist for the whole transfer.
+        uncovered = [
+            d
+            for d in tensor_descriptors
+            if d.addr < base or (d.addr + d.size) > (base + used)
+        ]
+        if uncovered:
+            logger.warning(
+                "register_arena: %d of %d tensors lie outside the arena range "
+                "[0x%x, 0x%x); falling back to per-tensor registration. "
+                "First uncovered: %s at 0x%x (%d bytes)",
+                len(uncovered),
+                len(tensor_descriptors),
+                base,
+                base + used,
+                uncovered[0].name,
+                uncovered[0].addr,
+                uncovered[0].size,
+            )
+            # Bypass pool reg: it resolves the same per-handle bounds we just
+            # found insufficient.
+            return self.register_tensors(tensors, force_per_tensor=True)
 
         nixl_reg_start = time.perf_counter()
         self._agent.register_memory(
