@@ -264,6 +264,7 @@ cargo bench
 | [Deployment](docs/DEPLOYMENT.md) | Server/client config, Docker, K8s, P2P |
 | [Architecture](docs/ARCHITECTURE.md) | Components, gRPC, NIXL, FP8 |
 | [Benchmarks](docs/BENCHMARKS.md) | Loading paths, NIXL registration, and artifact-transfer results |
+| [RL weight refit](modelexpress_client/python/modelexpress/refit/README.md) | Receiver-driven trainer-to-rollout resharding design and implementation status |
 | [CLI](docs/CLI.md) | Full CLI reference |
 | [Metadata](docs/metadata.md) | Redis keys, K8s CRD schema |
 | [Helm](helm/README.md) | Kubernetes configuration |
@@ -273,6 +274,7 @@ cargo bench
 ## Known Issues
 
 - **GDS loader does not scale with TP** — Each TP rank reads full checkpoint tensors and vLLM shards them afterward, so GDS/disk reads scale with TP degree. This can reduce or reverse expected GDS speedups versus the default mmap-based disk loader; TP-aware range reads are needed for a full fix. See [GDS Reads Full Checkpoint Tensors Under TP](docs/ARCHITECTURE.md#gds-reads-full-checkpoint-tensors-under-tp).
+- **P2P source wedges after a reader is torn down (UCX/InfiniBand)** — Once a reader that pulled from a source is removed, the source can stop serving new readers: their RDMA reads stall to the transfer timeout and fall back to disk, while the source keeps advertising `Ready` and serving inference normally. Loading stays correct, but P2P is effectively lost for that source until the source worker pod is restarted. The cause is NIXL retaining queue-pair state for a peer it holds no record of, so it is not fixable from ModelExpress; tracked as nvbug 6519532. Lower `MX_TRANSFER_TIMEOUT` to bound the stall.
 
 ---
 
@@ -281,7 +283,7 @@ cargo bench
 ### Priorities Under Development
 
 - **DRAM and NVMe-resident shard streaming**: Stream shards across workers while keeping weights in DRAM and host local high-speed NVMe.
-- **RL post-training refit**: Make updates receiver-driven—trainer ranks publish the shards they own, rollout workers discover and plan against their target layout, then pull, convert, reshard, and load directly over NIXL.
+- **[RL post-training refit](modelexpress_client/python/modelexpress/refit/README.md)**: Make updates receiver-driven—trainer ranks publish the shards they own, rollout workers discover and plan against their target layout, then pull, convert, reshard, and load directly over NIXL.
 - **Earlier weight availability**: Bring weights to prefill earlier; identify prefill workers that can act as strong source nodes.
 - **Multi-tier cache hierarchy**: Promote and demote models across DRAM, NVMe, and PVC tiers based on access patterns.
 - **Distributed sharded cache**: Shard large models across nodes using consistent hashing and parallel shard assembly.

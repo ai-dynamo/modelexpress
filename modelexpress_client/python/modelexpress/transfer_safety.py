@@ -4,33 +4,16 @@
 """
 Transfer safety checks for ModelExpress GPU-to-GPU weight transfer.
 
-Two independent safety mechanisms:
-
-1. Feature detection: surfaces model features (attention, quantization, MoE)
-   in the loader log so unexpected combinations are visible during QA.
-   Currently no feature combination blocks P2P transfer.
-
-2. Transfer fingerprint: captures the runtime environment and tensor
-   manifest structure. Source publishes its fingerprint; target computes
-   its own and rejects the transfer if they don't match.
+Feature detection surfaces model features (attention, quantization, MoE)
+in the loader log so unexpected combinations are visible during QA.
+Currently no feature combination blocks P2P transfer.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
-from dataclasses import dataclass, field
-
-import torch
-
-from . import envs
 
 logger = logging.getLogger("modelexpress.transfer_safety")
-
-# ---------------------------------------------------------------------------
-# Feature detection
-# ---------------------------------------------------------------------------
 
 
 def detect_model_features(model_config) -> dict[str, str]:
@@ -38,12 +21,22 @@ def detect_model_features(model_config) -> dict[str, str]:
 
     Returns a dict of feature name -> value for logging and validation.
     """
-    hf_config = model_config.hf_text_config
+    hf_config = (
+        getattr(model_config, "hf_text_config", None)
+        or getattr(model_config, "pretrained_config", None)
+    )
     features: dict[str, str] = {}
 
     features["model_type"] = getattr(hf_config, "model_type", "unknown")
-    features["dtype"] = str(model_config.dtype).replace("torch.", "")
-    features["quantization"] = model_config.quantization or "none"
+    dtype = getattr(model_config, "dtype", None)
+    if dtype is None:
+        dtype = getattr(model_config, "torch_dtype", None)
+    features["dtype"] = str(dtype).replace("torch.", "")
+    quantization = getattr(model_config, "quantization", None)
+    if quantization is None:
+        quant_config = getattr(model_config, "quant_config", None)
+        quantization = getattr(quant_config, "quant_algo", None)
+    features["quantization"] = str(quantization or "none")
 
     # MLA detection via HF config attribute
     kv_lora_rank = getattr(hf_config, "kv_lora_rank", None)
@@ -73,132 +66,3 @@ def check_transfer_allowed(model_config) -> tuple[bool, str]:
     features = detect_model_features(model_config)
     logger.info(f"[Transfer Safety] P2P transfer allowed. Features: {features}")
     return True, "allowed"
-
-
-# ---------------------------------------------------------------------------
-# Transfer fingerprint
-# ---------------------------------------------------------------------------
-
-def get_vllm_version() -> str:
-    try:
-        import vllm
-        return getattr(vllm, "__version__", "unknown")
-    except ImportError:
-        return "unknown"
-
-
-def get_torch_version() -> str:
-    return torch.__version__
-
-
-def get_cuda_version() -> str:
-    return getattr(torch.version, "cuda", "unknown") or "unknown"
-
-
-def _get_attention_backend() -> str:
-    """Get the selected attention backend name."""
-    try:
-        from vllm.config import get_current_vllm_config
-        config = get_current_vllm_config()
-        if hasattr(config, "model_config") and config.model_config is not None:
-            cache_config = getattr(config, "cache_config", None)
-            if cache_config is not None:
-                return getattr(cache_config, "attention_backend", "unknown") or "unknown"
-    except Exception:
-        pass
-    return envs.VLLM_ATTENTION_BACKEND
-
-
-def get_deep_gemm_version() -> str:
-    try:
-        from importlib.metadata import version
-        return version("deep-gemm")
-    except Exception:
-        return "unknown"
-
-
-def get_gpu_capability() -> str:
-    """Get the GPU compute capability as 'major.minor' (e.g. '9.0', '10.0').
-
-    Different GPU architectures can trigger different post-processing paths
-    (e.g. DeepGemm TMA scale packing differs between SM90 and SM100).
-    Including this in SourceIdentity ensures heterogeneous clusters don't
-    attempt cross-architecture transfers.
-
-    Returns 'unknown' if CUDA is not available.
-    """
-    try:
-        if torch.cuda.is_available():
-            props = torch.cuda.get_device_properties(0)
-            return f"{props.major}.{props.minor}"
-    except Exception:
-        pass
-    return "unknown"
-
-
-@dataclass
-class TransferFingerprint:
-    """Captures runtime environment and tensor manifest structure.
-
-    Published by the source alongside tensor metadata. The target computes
-    its own fingerprint and compares. Mismatches cause transfer rejection.
-    """
-    vllm_version: str = ""
-    torch_version: str = ""
-    cuda_version: str = ""
-    deep_gemm_version: str = ""
-    gpu_capability: str = ""
-    attention_backend: str = ""
-    manifest_hash: str = ""
-    tensor_count: int = 0
-
-    @classmethod
-    def from_environment(cls, tensors: dict[str, torch.Tensor] | None = None) -> TransferFingerprint:
-        """Build a fingerprint from the current runtime environment."""
-        fp = cls(
-            vllm_version=get_vllm_version(),
-            torch_version=get_torch_version(),
-            cuda_version=get_cuda_version(),
-            deep_gemm_version=get_deep_gemm_version(),
-            gpu_capability=get_gpu_capability(),
-            attention_backend=_get_attention_backend(),
-        )
-        if tensors is not None:
-            fp.manifest_hash = _compute_manifest_hash(tensors)
-            fp.tensor_count = len(tensors)
-        return fp
-
-    def to_json(self) -> str:
-        """Serialize to JSON string for inclusion in proto metadata."""
-        return json.dumps({
-            "vllm_version": self.vllm_version,
-            "torch_version": self.torch_version,
-            "cuda_version": self.cuda_version,
-            "deep_gemm_version": self.deep_gemm_version,
-            "gpu_capability": self.gpu_capability,
-            "attention_backend": self.attention_backend,
-            "manifest_hash": self.manifest_hash,
-            "tensor_count": self.tensor_count,
-        }, sort_keys=True)
-
-    @classmethod
-    def from_json(cls, s: str) -> TransferFingerprint:
-        """Deserialize from JSON string."""
-        d = json.loads(s)
-        return cls(**d)
-
-
-
-def _compute_manifest_hash(tensors: dict[str, torch.Tensor]) -> str:
-    """Compute a SHA256 hash of the tensor manifest structure.
-
-    Hashes tensor names, sizes, and dtypes (NOT addresses, which are
-    machine-specific). Two identical models with identical post-processing
-    should produce the same hash regardless of GPU memory layout.
-    """
-    entries = []
-    for name in sorted(tensors.keys()):
-        t = tensors[name]
-        entries.append(f"{name}:{list(t.shape)}:{t.dtype}:{t.numel() * t.element_size()}")
-    manifest_str = "\n".join(entries)
-    return hashlib.sha256(manifest_str.encode()).hexdigest()

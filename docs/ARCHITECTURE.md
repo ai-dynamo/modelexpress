@@ -98,6 +98,7 @@ ModelExpress/
 │       ├── registry/
 │       │   ├── state.rs                # RegistryManager wrapper
 │       │   ├── backend.rs              # RegistryBackend trait + ModelRecord
+│       │   ├── entry_key.rs            # EntryKey: model + revision + weight mode
 │       │   ├── k8s_types.rs            # ModelCacheEntry CRD type
 │       │   └── backend/
 │       │       ├── redis.rs            # Redis registry backend
@@ -171,7 +172,7 @@ ModelExpress/
 │       │       ├── adapter.py          # SglangAdapter and context builder
 │       │       └── loader.py           # MxModelLoader for remote_instance backend
 │       ├── tensor_utils.py             # Tensor collection, checksums, storage views
-│       ├── transfer_safety.py          # MLA feature gate, TransferFingerprint
+│       ├── transfer_safety.py          # Model feature detection for the P2P gate
 │       ├── rank_utils.py               # Rank detection utilities
 │       ├── vllm_worker.py              # Compatibility worker for older manual registration
 │       ├── types.py                    # TensorDescriptor, WorkerMetadata dataclasses
@@ -314,11 +315,29 @@ Four proto files define four services, all compiled via `tonic-build` in `modele
 | `EnsureModelDownloaded` | `ModelDownloadRequest` | stream `ModelStatusUpdate` | Trigger download, stream progress |
 | `StreamModelFiles` | `ModelFilesRequest` | stream `FileChunk` | Stream model file contents (1MB chunks) |
 | `ListModelFiles` | `ModelFilesRequest` | `ModelFileList` | List files with sizes |
-| `DeleteModel` | `DeleteModelRequest` | `DeleteModelResponse` | Remove a model record from the registry (used by `model clear`) |
+| `DeleteModel` | `DeleteModelRequest` | `DeleteModelResponse` | Remove a model's records from the registry (used by `model clear`) |
 
 Key message types: `ModelProvider` (HuggingFace, NGC, GCS), `ModelStatus` (Downloading, Downloaded, Error), `ModelStatusUpdate`, `FileChunk`.
 
 `EnsureModelDownloaded` verifies that a `DOWNLOADED` registry record still has its files on disk before honoring it as a cache hit. If the files are missing (for example after a `model clear` that only removed local storage), the stale record is deleted and the download is re-claimed so the model is actually re-fetched rather than returning a false success.
+
+#### Pinned revisions
+
+`ModelDownloadRequest` and `ModelFilesRequest` carry an optional `revision` (a branch, tag, or commit SHA); `ModelStatusUpdate` reports the `resolved_revision` the request landed on. Providers without a revision concept (NGC, GCS) reject a set `revision` and report none.
+
+The server resolves the revision to an immutable commit **before** claiming the download lease, then pins every Hub file request to that commit, so a tag that moves mid-download cannot mix commits into one snapshot. A requested revision that does not exist fails the request; it never falls back to the default revision. An unpinned request still resolves the default revision to a commit SHA and reports it, so callers always learn the exact commit they got. If the Hub is unreachable while resolving an *unpinned* request, the server falls back to the snapshot already in its cache, which keeps cache hits working during a Hub outage.
+
+`StreamModelFiles` and `ListModelFiles` resolve a requested revision against the local cache only — the model is already downloaded, so serving it must not depend on Hub reachability.
+
+When a no-shared-storage client installs a snapshot over the file stream, it also writes the provider's local revision bookkeeping (`ModelProviderTrait::record_local_revision`; for Hugging Face, `refs/<requested-revision>`). Without it the files would be on disk but `huggingface_hub` could not resolve them by branch or tag under `HF_HUB_OFFLINE=1`.
+
+#### Registry entry keys
+
+Registry backends key every record, lease, and claim on one string. That key is an [`EntryKey`](../modelexpress_server/src/registry/entry_key.rs) encoding of `model_name` + resolved revision + weight mode. This is what keeps two revisions of one model from sharing a lease (and coalescing onto each other's download), and what keeps a metadata-only download from satisfying a later full-weight request with a weightless snapshot.
+
+An unpinned, full-weight entry encodes to the bare model name, so records written before revisions existed keep parsing and providers without a revision concept keep the keys they have always used. Anything else encodes as `mx1:<revision>:<flags>:<model_name>`. The model name goes last because it is the only field with no character restrictions — a GCS object path accepts almost any byte, so a name containing the separator must not be able to impersonate the other fields and aim a delete at the wrong model.
+
+Cache eviction parses the key back to delete the right snapshot. It keeps the files while another entry still references the same commit, treating a revisionless entry as covering every snapshot of its model. When the evicted entry is the last one for its model the whole repository directory goes, so a snapshot kept alive by an earlier shared-file decision cannot outlive the last record pointing at it. Hugging Face snapshot entries are symlinks into `blobs/`, so a per-revision delete also reclaims the blobs no surviving snapshot references — otherwise it would free almost no disk.
 
 ### p2p.proto - P2pService
 
@@ -470,6 +489,8 @@ The `Client` struct in `modelexpress_client/src/lib.rs` wraps gRPC connections:
 | `delete_model(name, cache_dir)` | Delete cached model |
 | `validate_model(name, cache_dir)` | Validate cached model integrity |
 
+Each download entry point has a `_revision` variant — `request_model_revision`, `request_model_on_server_revision`, `request_model_with_smart_fallback_revision` — that takes an optional branch, tag, or commit SHA and returns a `ModelDownloadResult { path, resolved_revision }`. The non-`_revision` methods keep their existing signatures and delegate with no revision pinned.
+
 ### Download Strategies
 
 | Strategy | Behavior |
@@ -486,7 +507,7 @@ The `Cli` struct in `args.rs` embeds `ClientArgs` via `#[command(flatten)]`. Com
 |---------|---------|
 | `health` | Check server health |
 | `ping` | Ping server |
-| `model download <name>` | Download a model |
+| `model download <name>` | Download a model. `--revision <branch\|tag\|sha>` pins a revision; the resolved commit SHA is reported back |
 | `model list-files <name>` | List model files |
 | `model clear <name>` | Delete cached model |
 | `model validate <name>` | Validate model integrity |
@@ -516,6 +537,16 @@ pub trait ModelProviderTrait: Send + Sync {
     async fn download_model(&self, name: &str, cache_path: Option<PathBuf>, ignore_weights: bool) -> Result<PathBuf>;
     async fn delete_model(&self, name: &str, cache_dir: PathBuf) -> Result<()>;
     async fn get_model_path(&self, name: &str, cache_dir: PathBuf) -> Result<PathBuf>;
+
+    // Revision-aware variants. The defaults reject a pinned revision and delegate to the
+    // methods above, so only providers that expose revisions need to implement them.
+    async fn download_model_revision(&self, name: &str, cache_path: Option<PathBuf>, ignore_weights: bool, revision: Option<&str>) -> Result<ModelDownloadOutcome>;
+    async fn resolve_revision(&self, name: &str, cache_dir: Option<PathBuf>, revision: Option<&str>) -> Result<Option<String>>;
+    async fn delete_model_revision(&self, name: &str, cache_dir: PathBuf, revision: Option<&str>) -> Result<()>;
+    async fn get_model_path_revision(&self, name: &str, cache_dir: PathBuf, revision: Option<&str>) -> Result<PathBuf>;
+    async fn record_local_revision(&self, name: &str, cache_dir: &Path, requested: Option<&str>, commit: &str) -> Result<()>;
+    fn supports_revisions(&self) -> bool;
+
     fn provider_name(&self) -> &'static str;
     fn is_ignored(filename: &str) -> bool;
     fn is_image(path: &Path) -> bool;
@@ -523,8 +554,10 @@ pub trait ModelProviderTrait: Send + Sync {
 }
 ```
 
+`ModelDownloadOutcome` carries the snapshot `path` plus the `resolved_revision` the request landed on (`None` for providers with no revision concept).
+
 Three implementations:
-- `HuggingFaceProvider` - uses the `hf-hub` crate with high-CPU download mode.
+- `HuggingFaceProvider` - uses the `hf-hub` crate with high-CPU download mode. Implements the revision-aware methods: it resolves a branch, tag, or SHA through `/api/models/<repo>/revision/<rev>`, downloads every file from the resolved commit, and writes `refs/<requested-revision>` so the snapshot stays resolvable by the name the caller used. `delete_model_revision` removes a single snapshot, and drops the whole repository directory once its last snapshot is gone.
 - `NgcProvider` - downloads from NVIDIA NGC via the files-manifest endpoint `…/v2/org/{org}[/team/{team}]/{type}/{name}/{version}/files` (no `versions/` segment), which returns self-authenticating presigned URLs paired with relative paths for every file, for both V1 and V2 storage and both org and team scopes (so nested paths and downloads need no per-file URL construction or Authorization forwarding). Falls back to `checksums.blake3` manifest enumeration against the versioned `…/versions/{version}/files` endpoint (Bearer-authenticated `/files/{path}` downloads) when the listing returns 400/401, as some UAM-gated orgs (e.g. the `nim` catalog) do. Resolves the NGC API key from `NGC_API_KEY`, `NGC_CLI_API_KEY`, or `~/.ngc/config`.
 - `GcsProvider` - downloads objects under a full `gs://<bucket>/<object-prefix>` URL using Google Application Default Credentials. It writes a `.mx/manifest.json` cache manifest, verifies downloaded files with GCS CRC32C checksums, skips dotfiles, README, and images, and stores models under `<cache>/gcs/<bucket>/<object-prefix>`. See [`GCS_PROVIDER.md`](GCS_PROVIDER.md) for the detailed design.
 
@@ -649,23 +682,10 @@ plan currently assumes a stable source cohort, shard layout, and registration
 addresses; topology-epoch invalidation is a follow-up requirement before
 elastic production use.
 
-Exact strided TP slices can produce one descriptor per row. When a captured
-copy exceeds `MX_RESHARD_MAX_SEGMENTS_PER_COPY` (default 64), the planner pulls
-each gap-free dim-0 source shard once into persistent contiguous staging and
-replays the captured loader views locally. This bounds descriptors by source
-shard count at the cost of extra wire bytes. Plans and update metrics report
-the exact descriptor count, descriptor savings, and extra bytes. If the
-published layout cannot be reconstructed as a complete dim-0 partition, the
-planner keeps the exact known-correct descriptors rather than changing
-correctness behavior.
-
-Each receiver retains one load-time receive buffer per captured destination.
-Parameters whose served dtype differs from the load-time dtype also retain a
-source-dtype conversion staging buffer. These buffers are allocated from
-classic CUDA allocations and registered for the receiver lifetime. PWAL is
-intentional here: the receiver reconstructs load-time tensors, and quantized
-models still require vLLM post-load processing. MDL is appropriate only when
-the incoming tensors already match the validated runtime representation.
+See the [RL weight refit overview](../modelexpress_client/python/modelexpress/refit/README.md)
+for the end-to-end design, integration contract, implementation status, and
+validation requirements, including descriptor bounding for strided slices,
+receive and staging buffer ownership, and when PWAL applies rather than MDL.
 
 ### SGLang Loader
 
@@ -809,6 +829,99 @@ while agent.check_xfer_state(handle) not in ("DONE", "SUCCESS"):
 agent.release_xfer_handle(handle)
 ```
 
+## Trainer-Inference Weight Sync (WeightSyncService)
+
+ModelExpress includes a `WeightSyncService` gRPC service that coordinates live
+weight synchronization from a sharded trainer to inference workers.  The Python
+client exposes `PullRole` (inference worker pulls from trainer) and `PushRole`
+(trainer pushes to inference workers).
+
+### Protocol Overview
+
+```mermaid
+sequenceDiagram
+    participant T as Trainer
+    participant MX as MX Server (WeightSyncService)
+    participant W as Inference Worker
+
+    T->>MX: PublishTrainerTable(model_key, table)
+    W->>MX: BuildPlan(plan_key, model_key, regions)
+    MX-->>W: BuildPlanResponse(plan_id)
+    W->>MX: GetPlan(plan_id)
+    MX-->>W: GetPlanResponse(ready, descriptors)
+    W->>T: NIXL READ (RdmaDescriptors)
+```
+
+### Planner Abstraction
+
+Three planner implementations live in `modelexpress/weight_transfer/planner/`:
+
+| Class | When to use |
+|-------|-------------|
+| `LocalPlanner` | No MX server available; each worker routes independently. Per-worker cache only. |
+| `ServerPlanner` | MX server available. One worker routes; all workers with the same `plan_key` reuse the cached plan. Falls back to `LocalPlanner` on server error. |
+| `M2nPlanner` | All workers register simultaneously. MX routes all workers' regions in one pass and returns a globally-consistent M2N plan. Falls back to `LocalPlanner` on error. |
+
+### Key Data Flow (PULL)
+
+1. **Bake pass**: `PullRole.initialize()` drives the engine's weight loader with
+   `LazyWeight` tensors that record op chains without materializing data.
+2. **Resolve**: `resolve_copies()` replays op chains on meta tensors to produce
+   `ResolvedRegion` objects (element-run pairs, torch-dependent, client-side only).
+3. **Plan**: A planner converts `ResolvedRegion` lists to `RdmaDescriptor` lists
+   (pure integer arithmetic).
+4. **Execute**: `NixlExecutor.execute()` issues one NIXL READ handle per trainer
+   rank and waits for all to complete.
+5. **Post-process**: Engine adapter runs `post_pull_hook()` (e.g. FP8 scale repack).
+
+### M2N Coordinated Plan (M2nPlanner)
+
+`M2nPlanner` replaces the per-worker `ServerPlanner` with a server-side barrier:
+
+```mermaid
+sequenceDiagram
+    participant W0 as Worker 0
+    participant W1 as Worker 1
+    participant MX as MX Server
+
+    W0->>MX: RegisterM2nWorker(model_key, rank=0, total=2, regions, nixl_metadata)
+    MX-->>W0: RegisterM2nWorkerResponse(m2n_plan_id="")  # barrier not met
+    W1->>MX: RegisterM2nWorker(model_key, rank=1, total=2, regions, nixl_metadata)
+    MX-->>W1: RegisterM2nWorkerResponse(m2n_plan_id=uuid)  # barrier fires, plan built
+    W0->>MX: RegisterM2nWorker(poll)
+    MX-->>W0: RegisterM2nWorkerResponse(m2n_plan_id=uuid)
+    W0->>MX: GetM2nPlan(m2n_plan_id, worker_rank=0)
+    MX-->>W0: GetM2nPlanResponse(ready=true, descriptors=[...])
+    W1->>MX: GetM2nPlan(m2n_plan_id, worker_rank=1)
+    MX-->>W1: GetM2nPlanResponse(ready=true, descriptors=[...])
+```
+
+When the barrier fires (all `total_workers` have registered), the server calls
+`route_all_workers()` in Rust — which routes every worker's regions against the
+shared `TrainerTable` in one pass and tags each descriptor with a
+`dst_agent_index` (the target worker's rank).  The result is stored as
+per-worker slices keyed by `(plan_id, worker_rank)`.
+
+`M2nDescriptor` extends `RdmaDescriptor` with `dst_agent_index`, enabling the
+trainer to issue a single coordinated NIXL M2N WRITE to all workers.
+`M2nDescriptor.to_rdma_descriptor()` converts to a plain `RdmaDescriptor` for
+use with the existing `NixlExecutor` on the worker's PULL path.
+
+`M2nExecutor` groups descriptors by `src_agent_index` and fires one NIXL READ
+handle per trainer rank (all in parallel, same as `NixlExecutor`).  When NIXL
+exposes a native many-to-many transfer API, the inner loop can be replaced with
+a single `make_prepped_m2n_xfer` call for true collective semantics.
+
+### Invalidation
+
+When the trainer reshards (topology change between steps):
+
+| Planner | Invalidation method |
+|---------|---------------------|
+| `LocalPlanner` | `invalidate(plan_key)` evicts local cache |
+| `ServerPlanner` | `invalidate(plan_key)` evicts local cache + calls `InvalidatePlan` on server |
+| `M2nPlanner` | `invalidate(plan_key)` evicts local cache + calls `InvalidateM2nPlan(model_key)` on server, which removes all per-worker slices for that model |
+
 ## FP8 Model Handling (DeepSeek-V3)
 
 vLLM's `process_weights_after_loading()` transforms model weights into kernel-friendly formats (FP8 scale repacking, NVFP4 padding/swizzling, MLA dequantized projections) and may create new tensors as bare attributes, buffers, or on quant method objects.
@@ -879,6 +992,7 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles |
 | `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before publishing weight metadata or preparing and publishing cache bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time the artifact publisher waits for readiness and successful publication before giving up |
+| `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Feeds the torch compile cache `SourceIdentity`, adding compile configuration as a partitioning dimension for artifact discovery. Unset leaves the field empty, which drops it from the `mx_source_id` input, so workers whose other identity fields match — model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch — share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](DEPLOYMENT.md#pairing-workers-by-compile-configuration) |
 | `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact checkpoint identifier so `mx_source_id` is content-addressed |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend; `{rank}` is substituted with the worker's own rank. Client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` if the resolved pattern has no explicit port |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` max retries on `FAILED_PRECONDITION` (rolling-update transients). Fresh gRPC channel per attempt so kube-proxy re-picks a backend |

@@ -39,6 +39,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from modelexpress import envs, p2p_pb2
 from modelexpress.client import MxClient
@@ -233,9 +234,22 @@ def wrap_rendezvous_blob(
     return json.dumps(payload).encode("utf-8")
 
 
-def unwrap_rendezvous_blob(blob: bytes) -> tuple:
-    """Inverse of ``wrap_rendezvous_blob``; returns ``(agent_metadata, agent_name,
-    metadata_endpoint, tensors)``."""
+class RendezvousPayload(NamedTuple):
+    """One trainer rank's unwrapped rendezvous blob.
+
+    A plain tuple until now, which read as ``payload[3]`` at the point where the
+    interesting question is asked - whether this rank published any tensors. Being
+    a tuple subclass, it still unpacks and indexes as before.
+    """
+
+    agent_metadata: bytes
+    agent_name: str
+    metadata_endpoint: str
+    tensors: list
+
+
+def unwrap_rendezvous_blob(blob: bytes) -> RendezvousPayload:
+    """Inverse of ``wrap_rendezvous_blob``."""
     payload = json.loads(blob.decode("utf-8"))
     if payload.get("schema") != _SCHEMA:
         raise ValueError(f"unexpected rendezvous blob schema {payload.get('schema')!r}")
@@ -245,7 +259,7 @@ def unwrap_rendezvous_blob(blob: bytes) -> tuple:
     tensors = decode_shard_table(
         json.dumps({"schema": _SCHEMA, "tensors": payload["tensors"]}).encode("utf-8")
     )
-    return agent_metadata, agent_name, metadata_endpoint, tensors
+    return RendezvousPayload(agent_metadata, agent_name, metadata_endpoint, tensors)
 
 
 class MxReshardRendezvous:
@@ -341,9 +355,22 @@ class MxReshardRendezvous:
         timeout: float = 1200.0,
         poll_interval: float = 1.0,
     ) -> list:
-        """Block until ``expected_trainers`` trainer ranks are visible, then
-        fetch + unwrap each. Returns ``list[(agent_metadata, agent_name,
-        metadata_endpoint, tensors)]``, one per trainer rank."""
+        """Block until ``expected_trainers`` trainer ranks are visible **with a
+        non-empty shard table**, then return them.
+
+        Returns ``list[RendezvousPayload]``, one per trainer rank.
+
+        A rank counts toward the quorum only once its published table names at
+        least one tensor. A rank that advertises READY with nothing to read has
+        registered no memory, so satisfying the quorum with it makes the receiver
+        stop waiting for the ranks that do have bytes and then stall in the P2P
+        handshake instead - a timeout attributed to the wrong component.
+
+        Exactly ``expected_trainers`` ranks are returned. A stale source from an
+        earlier run can still be READY, and every extra rank returned here becomes
+        an extra peer to handshake and an extra set of shards competing to describe
+        the same tensor names.
+        """
         trainer_id = self._identity("trainer")
         deadline = time.monotonic() + timeout
         while True:
@@ -352,21 +379,41 @@ class MxReshardRendezvous:
                 status_filter=p2p_pb2.SOURCE_STATUS_READY,
             )
             instances = list(resp.instances)
-            if len(instances) >= expected_trainers:
+            payloads, empty = [], 0
+            # Every visible READY source is inspected, whatever the count: with
+            # fewer sources than expected the shard-table state is exactly what a
+            # timeout here has to report, and reaching the quorum on instances
+            # alone says nothing about whether any of them published bytes.
+            for inst in instances:
+                meta = self.client.get_metadata(inst.mx_source_id, inst.worker_id)
+                if not meta.found:
+                    continue
+                payload = unwrap_rendezvous_blob(meta.worker.nixl_metadata)
+                if not payload.tensors:
+                    empty += 1
+                    continue
+                payloads.append(payload)
+                if len(payloads) >= expected_trainers:
+                    break
+            if len(payloads) >= expected_trainers:
                 break
             if time.monotonic() >= deadline:
                 raise TimeoutError(
-                    f"timed out after {timeout}s waiting for {expected_trainers} trainer ranks "
-                    f"(saw {len(instances)})"
+                    f"timed out after {timeout}s waiting for {expected_trainers} "
+                    f"trainer ranks (saw {len(instances)} READY source(s), "
+                    f"{len(payloads)} with a non-empty shard table, {empty} empty)"
                 )
             time.sleep(poll_interval)
 
-        payloads = []
-        for inst in instances:
-            meta = self.client.get_metadata(inst.mx_source_id, inst.worker_id)
-            if not meta.found:
-                continue
-            payloads.append(unwrap_rendezvous_blob(meta.worker.nixl_metadata))
+        logger.info(
+            "[reshard] discovered %d trainer rank(s)%s: %s",
+            len(payloads),
+            f" ({empty} skipped as empty)" if empty else "",
+            ", ".join(
+                f"{p.agent_name}@{p.metadata_endpoint}[{len(p.tensors)}]"
+                for p in payloads
+            ),
+        )
         return payloads
 
 
@@ -387,8 +434,8 @@ def gather_sources(
     caller to ``fetch_remote_and_wait`` (P2P) before pulling."""
     rdv = MxReshardRendezvous(client, role=role, rank=rank, model_name=model_name)
     payloads = rdv.discover_trainers(expected_trainers, timeout=timeout)
-    tables = [tensors for (_meta, _name, _ep, tensors) in payloads]
-    agent_endpoints = {name: ep for (_meta, name, ep, _tensors) in payloads}
+    tables = [p.tensors for p in payloads]
+    agent_endpoints = {p.agent_name: p.metadata_endpoint for p in payloads}
     merged = merge_shard_tables(tables)
     sources, session_to_agent, session_to_device = build_sources(merged)
     return sources, session_to_agent, session_to_device, agent_endpoints

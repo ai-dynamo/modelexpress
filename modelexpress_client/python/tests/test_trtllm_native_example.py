@@ -27,6 +27,32 @@ def test_example_is_a_normal_scalable_deployment() -> None:
     assert "command:\n            - trtllm-serve" in manifest
     assert "checkpoint_format: MX" in manifest
     assert "server_url: modelexpress-server:8001" in manifest
+    assert "server_query_timeout_s" not in manifest
+    assert "requiredDuringSchedulingIgnoredDuringExecution" in manifest
+    assert "topologyKey: kubernetes.io/hostname" in manifest
+    assert "maxSurge: 0" in manifest
+    assert "maxUnavailable: 1" in manifest
+
+
+def test_example_image_layers_mx_on_a_trtllm_release() -> None:
+    dockerfile = (_TRTLLM_EXAMPLE / "Dockerfile").read_text()
+
+    assert (
+        "ARG TRTLLM_IMAGE=nvcr.io/nvidia/tensorrt-llm/release:" in dockerfile
+    )
+    assert "FROM ${TRTLLM_IMAGE}" in dockerfile
+    assert (
+        "PYTHONPATH=/opt/nvidia/nvda_nixl/lib/python3/dist-packages" in dockerfile
+    )
+    assert "/etc/ld.so.conf.d/nixl.conf" in dockerfile
+    assert "ldconfig" in dockerfile
+    manifest = (_TRTLLM_EXAMPLE / "trtllm-single-node-p2p.yaml").read_text()
+    assert "LD_LIBRARY_PATH" not in manifest
+    assert "COPY modelexpress_client/python /opt/modelexpress/client" in dockerfile
+    assert "python3 -m pip install --no-cache-dir --no-deps ." in dockerfile
+    assert "pip install --no-cache-dir --no-deps nixl" not in dockerfile
+    assert "COPY .trtllm-source" not in dockerfile
+    assert "apply_patches" not in dockerfile
 
 
 def test_legacy_trtllm_examples_and_patch_bundle_are_removed() -> None:
@@ -60,4 +86,5 @@ def test_documentation_points_to_the_native_trtllm_example() -> None:
         assert "PRESHARDED" not in text, path
 
     assert "trtllm-single-node-p2p.yaml" in documentation[-2].read_text()
+    assert "trtllm/Dockerfile" in documentation[-2].read_text()
     assert "checkpoint_format=\"MX\"" in documentation[-1].read_text()

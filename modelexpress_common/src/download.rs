@@ -3,7 +3,8 @@
 
 use crate::models::ModelProvider;
 use crate::providers::{
-    GcsProvider, HuggingFaceProvider, ModelProviderTrait, NgcProvider, S3Provider,
+    GcsProvider, HuggingFaceProvider, ModelDownloadOutcome, ModelProviderTrait, NgcProvider,
+    S3Provider,
 };
 use anyhow::Result;
 use std::path::PathBuf;
@@ -45,6 +46,53 @@ pub async fn download_model(
 
     provider_impl
         .download_model(model_name, cache_dir, ignore_weights)
+        .await
+}
+
+/// Download a model at a specific revision, reporting the revision it resolved to.
+///
+/// A `None` revision downloads the provider's default revision; providers that expose
+/// revisions still report the immutable revision they picked.
+pub async fn download_model_revision(
+    model_name: &str,
+    provider: ModelProvider,
+    cache_dir: Option<PathBuf>,
+    ignore_weights: bool,
+    revision: Option<&str>,
+) -> Result<ModelDownloadOutcome> {
+    let provider_impl = get_provider(provider);
+    match revision {
+        Some(revision) => info!(
+            "Downloading model '{}' at revision '{}' using provider: {}",
+            model_name,
+            revision,
+            provider_impl.provider_name()
+        ),
+        None => info!(
+            "Downloading model '{}' using provider: {}",
+            model_name,
+            provider_impl.provider_name()
+        ),
+    }
+
+    if ignore_weights {
+        warn!("`ignore_weights` is set to true. All the model weight files will be ignored!");
+    }
+
+    provider_impl
+        .download_model_revision(model_name, cache_dir, ignore_weights, revision)
+        .await
+}
+
+/// Resolve a requested revision to the provider's immutable identifier for it.
+pub async fn resolve_revision(
+    model_name: &str,
+    provider: ModelProvider,
+    cache_dir: Option<PathBuf>,
+    revision: Option<&str>,
+) -> Result<Option<String>> {
+    get_provider(provider)
+        .resolve_revision(model_name, cache_dir, revision)
         .await
 }
 

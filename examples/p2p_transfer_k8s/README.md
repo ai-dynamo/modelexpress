@@ -64,8 +64,8 @@ with the upstream ModelExpress delegation hook.
 
 For TensorRT-LLM, the current beta path supports `LlamaForCausalLM` with
 TP=4 and native `checkpoint_format="MX"`. See
-[`client/trtllm/README.md`](client/trtllm/README.md) for the qualified-image
-requirement and deployment instructions.
+[`client/trtllm/README.md`](client/trtllm/README.md) for image build and
+deployment instructions.
 
 For ModelStreamer-only startup examples that stream weights from Azure Blob Storage, S3, or a local PVC, see [`../model_streamer_k8s/`](../model_streamer_k8s/).
 

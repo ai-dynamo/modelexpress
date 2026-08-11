@@ -15,8 +15,11 @@ pip install modelexpress
 # Editable install from source
 pip install -e .
 
-# With dev dependencies (pytest, grpcio-tools)
+# With test dependencies
 pip install -e ".[dev]"
+
+# Additionally install the pinned protobuf code generator when changing p2p.proto
+pip install -e ".[codegen]"
 ```
 
 NIXL is expected to be supplied by the runtime environment (TRT-LLM,
@@ -27,6 +30,7 @@ or `pip install nixl-cu13` separately, matching your host CUDA toolkit.
 ### Requirements
 
 - Python >= 3.10
+- protobuf >= 5.27.2 and < 7
 - NVIDIA GPUs with RDMA/InfiniBand support
 - [NIXL](https://github.com/ai-dynamo/nixl) (NVIDIA Interconnect eXchange Library)
 - A running [ModelExpress server](https://github.com/ai-dynamo/modelexpress/tree/main/modelexpress_server) (Rust gRPC service backed by Redis)
@@ -79,7 +83,6 @@ llm = LLM(
     checkpoint_format="MX",
     mx_config={
         "server_url": "modelexpress-server:8001",
-        "server_query_timeout_s": 600,
     },
     tensor_parallel_size=4,
     backend="pytorch",
@@ -151,6 +154,12 @@ register_modelexpress_loaders()
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication |
 | `MX_HEARTBEAT_INTERVAL_SECS` | `30` | Seconds between READY status heartbeats for published sources, including reshard rendezvous sources; keep below the server heartbeat timeout |
 | `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Maximum exact descriptors for one no-gather refit copy before a compatible dim-0-sharded source is pulled once into contiguous staging and sliced locally |
+| `MX_RESHARD_FUSED_WIRE` | `1` | Issue a refit's exact-segment, full-pull, and convert reads as one transport batch instead of draining each phase in turn. Set to `0` to restore the phased reads for an A/B comparison |
+| `MX_RESHARD_REQUIRE_FULL_COVERAGE` | `0` | Fail a refit that installs less than `MX_RESHARD_COVERAGE_FLOOR` of the engine's parameter bytes. Off by default because partial and subset refit are intended; set to `1` for benchmark runs, where an incomplete refit produces timings that are the wrong magnitude |
+| `MX_RESHARD_COVERAGE_FLOOR` | `0.995` | Fraction of engine parameter bytes a gated refit must install. Not `1.0`: a few engine parameters, such as rotary `inv_freq`, are legitimately not refit material. Values outside `[0.0, 1.0]` are rejected |
+| `MX_RESHARD_HANDSHAKE_TIMEOUT_S` | `900` | Budget for the whole P2P metadata handshake, across every trainer peer and every retry. Bounds the handshake independently of the refit timeout, so one unreachable publisher cannot consume the entire refit |
+| `MX_RESHARD_HANDSHAKE_ATTEMPT_S` | `20` | Ceiling on a single peer dial. A reachable peer answers in well under a second, so a short attempt frees the budget to try a different peer rather than block on one |
+| `MX_RESHARD_HANDSHAKE_BACKOFF_S` | `2` | Pause after a full pass over the pending peers makes no progress, so a transient stall is waited out rather than hammered |
 
 ### UCX/NIXL Tuning
 
@@ -166,10 +175,11 @@ register_modelexpress_loaders()
 |--------|-------------|
 | `modelexpress.client` | `MxClient` -- gRPC client for the ModelExpress server |
 | `modelexpress.metadata` | Metadata clients, source identity, publishing, and worker manifest serving |
+| [`modelexpress.refit`](modelexpress/refit/README.md) | Experimental RL weight-refit timing, receiver-driven resharding, and engine adapter contracts |
 | `modelexpress.engines.vllm.loader` | `MxModelLoader` -- vLLM integration |
 | `modelexpress.refit.reshard` | Engine-agnostic loader-geometry capture and bounded no-gather transfer planning |
 | `modelexpress.engines.sglang.loader` | `MxModelLoader` -- SGLang `remote_instance` integration |
-| `modelexpress.trtllm_live_transfer` | Weight-loading helpers consumed by TensorRT-LLM's native MX checkpoint loader |
+| `modelexpress.engines.trtllm.loader` | `MxModelLoader` -- TensorRT-LLM shared-strategy integration |
 | `modelexpress.vllm_loader` | Compatibility shim for the vLLM loader |
 | `modelexpress.nixl_transfer` | `NixlTransferManager` -- NIXL agent lifecycle and RDMA transfers |
 | `modelexpress.types` | `TensorDescriptor`, `WorkerMetadata` -- core data types |

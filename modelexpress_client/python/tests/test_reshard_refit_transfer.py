@@ -23,6 +23,7 @@ from modelexpress.refit.reshard.receiver import _replay_ops
 from modelexpress.refit.reshard.slice_plan import Shard
 from modelexpress.refit.reshard.transfer_plan import (
     SourceInfo,
+    exact_descriptors,
     execute_transfer,
     plan_transfer,
 )
@@ -340,6 +341,44 @@ def test_execute_transfer_surfaces_fallback_for_the_receiver_to_reject():
     )
     assert stats["fallback"] == plan.fallback
     assert "bad" in stats["fallback"]
+    assert all(t.data_ptr() for t in srcs.values())
+
+
+def test_exact_descriptors_match_what_execute_transfer_reads():
+    """The fused wire builds the exact-phase descriptors itself rather than
+    letting execute_transfer read them, so the two must stay in agreement."""
+    srcs = _full_sources()
+    with torch.device("meta"):
+        meta_model = ToyModel()
+    capture = capture_geometry(meta_model, _manifest())
+
+    sources = {}
+    for name, tensor in srcs.items():
+        shard = Shard(
+            (0,) * tensor.dim(), tuple(tensor.shape), name, tensor.data_ptr(), EL
+        )
+        sources[name] = SourceInfo(tuple(tensor.shape), torch.float32, EL, [shard])
+    plan = plan_transfer(capture, sources)
+
+    model = ToyModel()
+    params = dict(model.named_parameters())
+
+    def resolve(name):
+        return params[name].data_ptr()
+
+    built = exact_descriptors(plan, resolve)
+
+    recorded = []
+
+    class _Recorder:
+        def read(self, descriptors):
+            recorded.extend(descriptors)
+
+    stats = execute_transfer(plan, resolve_param_ptr=resolve, transport=_Recorder())
+
+    assert built == recorded
+    assert stats["segments"] == len(built)
+    assert stats["bytes"] == sum(descriptor.nbytes for descriptor in built)
     assert all(t.data_ptr() for t in srcs.values())
 
 

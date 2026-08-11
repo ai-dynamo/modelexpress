@@ -94,27 +94,35 @@ class TransferPlan:
     exact_descriptor_count: int = 0
     exact_bytes: int = 0
 
+    def _all_segments(self):
+        """Every planned segment, wherever it lands.
+
+        Segments live in three places - read straight into live params, into
+        dtype-conversion staging, and into full-pull staging - and any question
+        about the plan as a whole has to ask all three.
+        """
+        yield from self.segments
+        for convert in self.converts:
+            yield from convert.segments
+        for full_pull in self.full_pulls:
+            yield from full_pull.segments
+
     def bytes_planned(self) -> int:
-        return (
-            sum(segment.nbytes for segment in self.segments)
-            + sum(
-                segment.nbytes
-                for convert in self.converts
-                for segment in convert.segments
-            )
-            + sum(
-                segment.nbytes
-                for full_pull in self.full_pulls
-                for segment in full_pull.segments
-            )
-        )
+        return sum(segment.nbytes for segment in self._all_segments())
 
     def descriptor_count(self) -> int:
-        return (
-            len(self.segments)
-            + sum(len(convert.segments) for convert in self.converts)
-            + sum(len(full_pull.segments) for full_pull in self.full_pulls)
-        )
+        return sum(1 for _ in self._all_segments())
+
+    def sessions(self) -> set:
+        """The transport sessions this plan actually reads from.
+
+        A receiver needs every trainer's shard table to build the plan, because it
+        cannot know which trainers hold the bytes it is missing until the slice
+        arithmetic is done. It does not need to *read* from all of them: with
+        enough ranks on both sides, each receiver ends up pulling from a fraction
+        of the trainers. This is that fraction.
+        """
+        return {segment.session for segment in self._all_segments()}
 
     def descriptor_savings(self) -> int:
         return max(0, self.exact_descriptor_count - self.descriptor_count())
@@ -291,6 +299,27 @@ def plan_transfer(
     return plan
 
 
+def exact_descriptors(
+    plan: TransferPlan,
+    resolve_param_ptr: Callable[[str], int],
+) -> list[ReadDescriptor]:
+    """Absolute-address ``ReadDescriptor``s for the exact-segment phase.
+
+    Split out from :func:`execute_transfer` so a caller that issues the exact,
+    full-pull and convert phases as one batch can build the descriptors without
+    also performing the read.
+    """
+    return [
+        ReadDescriptor(
+            session=seg.session,
+            src_addr=seg.src_addr,
+            dst_addr=resolve_param_ptr(seg.param_name) + seg.dst_byte,
+            nbytes=seg.nbytes,
+        )
+        for seg in plan.segments
+    ]
+
+
 def execute_transfer(
     plan: TransferPlan,
     resolve_param_ptr: Callable[[str], int],
@@ -302,15 +331,7 @@ def execute_transfer(
 
     Returns a small stats dict; ``fallback`` is passed through so the receiver
     can reject an unsupported plan."""
-    descriptors = [
-        ReadDescriptor(
-            session=seg.session,
-            src_addr=seg.src_addr,
-            dst_addr=resolve_param_ptr(seg.param_name) + seg.dst_byte,
-            nbytes=seg.nbytes,
-        )
-        for seg in plan.segments
-    ]
+    descriptors = exact_descriptors(plan, resolve_param_ptr)
     transport.read(descriptors)
     return {
         "segments": len(descriptors),

@@ -145,6 +145,20 @@ def _nic_pci_bdf(nic_name: str) -> str | None:
     return os.path.basename(target.rstrip("/"))
 
 
+def _nic_has_accessible_verbs_device(nic_name: str) -> bool:
+    """Return whether the NIC has a verbs device exposed in this container."""
+    verbs_dir = f"/sys/class/infiniband/{nic_name}/device/infiniband_verbs"
+    try:
+        verbs = os.listdir(verbs_dir)
+    except OSError:
+        return False
+    return any(
+        name.startswith("uverbs")
+        and os.path.exists(f"/dev/infiniband/{name}")
+        for name in verbs
+    )
+
+
 def _list_compute_ib_nics(
     min_rate_gbps: float | None = None,
 ) -> list[tuple[str, int, float, list[str]]]:
@@ -162,6 +176,9 @@ def _list_compute_ib_nics(
     Filters out:
       - bonded interfaces (e.g. mlx5_bond_0): UCX cannot resolve them
         in containers and the AH lookup segfaults.
+      - NICs whose verbs device is not exposed in the container. Kubernetes
+        RDMA device plugins commonly expose one ``uverbs`` device while the
+        host's complete InfiniBand sysfs remains visible.
       - NICs without a /ports/1 directory.
       - NICs whose port-1 rate is below the effective threshold.
         If min_rate_gbps is None (default), the threshold is set to
@@ -195,6 +212,8 @@ def _list_compute_ib_nics(
     candidates: list[tuple[str, float, str]] = []
     for name in names:
         if "bond" in name:
+            continue
+        if not _nic_has_accessible_verbs_device(name):
             continue
         port_dir = f"{base}/{name}/ports/1"
         if not os.path.isdir(port_dir):

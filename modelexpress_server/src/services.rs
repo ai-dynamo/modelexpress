@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::registry::backend::ClaimOutcome;
+use crate::registry::entry_key::EntryKey;
 use crate::registry::state::RegistryManager;
 use modelexpress_common::{
     cache::{CacheConfig, resolve_model_path},
@@ -17,6 +18,7 @@ use modelexpress_common::{
         },
     },
     models::{ModelProvider, ModelStatus},
+    providers::is_weight_file,
 };
 use std::{
     collections::HashMap,
@@ -30,6 +32,10 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, warn};
 
 static START_TIME: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
+
+/// Ceiling on resolving a revision with the provider. This is a metadata lookup, not a
+/// download, so it should complete quickly or not at all.
+const REVISION_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Get the configured cache directory for model downloads
 fn get_server_cache_dir() -> Option<std::path::PathBuf> {
@@ -51,14 +57,99 @@ async fn model_files_present(
     cache_dir: Option<std::path::PathBuf>,
     model_name: &str,
     provider: ModelProvider,
+    revision: Option<&str>,
 ) -> bool {
     let Some(cache_dir) = cache_dir else {
         return true;
     };
     download::get_provider(provider)
-        .get_model_path(model_name, cache_dir)
+        .get_model_path_revision(model_name, cache_dir, revision)
         .await
         .is_ok()
+}
+
+/// A model download request reduced to the identity the registry and the provider need.
+///
+/// `revision` is always the *resolved*, immutable revision (a commit SHA for Hugging
+/// Face), never the branch or tag the caller typed, so cache and lease identity cannot
+/// drift when a tag moves.
+#[derive(Debug, Clone)]
+pub struct DownloadTarget {
+    pub model_name: String,
+    pub provider: ModelProvider,
+    pub revision: Option<String>,
+    pub ignore_weights: bool,
+}
+
+impl DownloadTarget {
+    /// The single string every registry backend keys this download on.
+    fn entry_key(&self) -> String {
+        EntryKey::new(
+            self.model_name.clone(),
+            self.revision.clone(),
+            self.ignore_weights,
+        )
+        .to_string()
+    }
+}
+
+/// Resolve a requested revision to the immutable revision the download will use.
+///
+/// A revision the caller pinned explicitly must resolve or the request fails: silently
+/// serving the default revision instead would hand back a different model than asked
+/// for. For an unpinned request we fall back to whatever snapshot is already cached,
+/// so a Hub outage still serves models the server has downloaded before.
+async fn resolve_target_revision(
+    model_name: &str,
+    provider: ModelProvider,
+    cache_dir: Option<PathBuf>,
+    requested: Option<&str>,
+) -> Result<Option<String>, Status> {
+    let provider_impl = download::get_provider(provider);
+
+    // Pinning a revision on a provider that has none is a malformed request, not a
+    // revision that happens to be missing.
+    if requested.is_some() && !provider_impl.supports_revisions() {
+        return Err(Status::invalid_argument(format!(
+            "Provider '{}' does not support pinned revisions",
+            provider_impl.provider_name()
+        )));
+    }
+
+    // Resolution runs before the download lease is claimed, so an unresponsive provider
+    // would otherwise hold the RPC open indefinitely without any download in progress.
+    let resolve = provider_impl.resolve_revision(model_name, cache_dir.clone(), requested);
+    let error = match tokio::time::timeout(REVISION_RESOLVE_TIMEOUT, resolve).await {
+        Ok(Ok(resolved)) => return Ok(resolved),
+        Ok(Err(e)) => e,
+        Err(_) => anyhow::anyhow!("timed out after {}s", REVISION_RESOLVE_TIMEOUT.as_secs()),
+    };
+
+    if requested.is_some() {
+        return Err(Status::not_found(format!(
+            "Failed to resolve revision for model '{model_name}': {error:#}"
+        )));
+    }
+
+    warn!(
+        "Failed to resolve the default revision for '{model_name}': {error:#}; \
+         falling back to the cached snapshot"
+    );
+
+    match provider_impl
+        .get_model_path_revision(model_name, cache_dir.unwrap_or_default(), None)
+        .await
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(String::from)
+        }) {
+        Some(cached) => Ok(Some(cached)),
+        None => Err(Status::not_found(format!(
+            "Failed to resolve revision for model '{model_name}': {error:#}"
+        ))),
+    }
 }
 
 /// Health service implementation
@@ -141,6 +232,7 @@ fn collect_model_files(
     base_path: &Path,
     current_path: &Path,
     file_selector: Option<&ModelFileSelector>,
+    ignore_weights: bool,
 ) -> Vec<(PathBuf, u64)> {
     let mut files = Vec::new();
 
@@ -171,6 +263,10 @@ fn collect_model_files(
                                 path,
                                 relative
                             );
+                        } else if ignore_weights
+                            && is_weight_file(relative.to_string_lossy().as_ref())
+                        {
+                            // Weight file skipped because ignore_weights is set.
                         } else if file_selector.is_none_or(|selector| {
                             selector
                                 .paths
@@ -182,7 +278,12 @@ fn collect_model_files(
                     }
                 }
             } else if path.is_dir() {
-                files.extend(collect_model_files(base_path, &path, file_selector));
+                files.extend(collect_model_files(
+                    base_path,
+                    &path,
+                    file_selector,
+                    ignore_weights,
+                ));
             }
         }
     }
@@ -236,6 +337,23 @@ impl ModelService for ModelServiceImpl {
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let ignore_weights = model_request.ignore_weights;
 
+        // Resolve before claiming: the registry keys the download lease on the resolved
+        // revision, so two revisions of one model never coalesce onto a single claim.
+        let revision = resolve_target_revision(
+            &model_name,
+            provider,
+            get_server_cache_dir(),
+            model_request.revision.as_deref(),
+        )
+        .await?;
+
+        let target = DownloadTarget {
+            model_name: model_name.clone(),
+            provider,
+            revision: revision.clone(),
+            ignore_weights,
+        };
+
         // Spawn a task to handle the streaming download updates
         let tracker = self.tracker.clone();
         tokio::spawn(async move {
@@ -245,9 +363,7 @@ impl ModelService for ModelServiceImpl {
             // duplicate that update or, worse, emit `status=ERROR` on a model we're
             // about to retry and trip the client-lib's terminal-error bailout before
             // the retry completion broadcast arrives.
-            let final_status = tracker
-                .ensure_model_downloaded(&model_name, provider, &tx, ignore_weights)
-                .await;
+            let final_status = tracker.ensure_model_downloaded(&target, &tx).await;
 
             // Send final status update
             let final_update = ModelStatusUpdate {
@@ -261,6 +377,7 @@ impl ModelService for ModelServiceImpl {
                     ModelStatus::DOWNLOADING => Some("Download still in progress".to_string()),
                 },
                 provider: grpc_provider as i32,
+                resolved_revision: revision,
             };
 
             let _ = tx.send(Ok(final_update)).await;
@@ -301,9 +418,14 @@ impl ModelService for ModelServiceImpl {
         let cache_dir = get_server_cache_dir()
             .ok_or_else(|| Status::internal("Server cache directory not configured"))?;
 
-        // Get the model path using the provider from the request
+        // Get the model path using the provider from the request. A requested revision
+        // selects that exact snapshot instead of whichever one is newest on disk.
         let model_path = provider_impl
-            .get_model_path(&model_name, cache_dir.clone())
+            .get_model_path_revision(
+                &model_name,
+                cache_dir.clone(),
+                files_request.revision.as_deref(),
+            )
             .await
             .map_err(|e| Status::not_found(format!("Model not found: {e}")))?;
 
@@ -346,6 +468,7 @@ impl ModelService for ModelServiceImpl {
             &model_path,
             &model_path,
             files_request.file_selector.as_ref(),
+            files_request.ignore_weights,
         );
         ensure_selected_files_exist(&files, files_request.file_selector.as_ref())
             .map_err(Status::not_found)?;
@@ -485,7 +608,7 @@ impl ModelService for ModelServiceImpl {
 
         // Get the model path using the provider from the request
         let model_path = provider_impl
-            .get_model_path(&model_name, cache_dir)
+            .get_model_path_revision(&model_name, cache_dir, files_request.revision.as_deref())
             .await
             .map_err(|e| Status::not_found(format!("Model not found: {e}")))?;
 
@@ -494,6 +617,7 @@ impl ModelService for ModelServiceImpl {
             &model_path,
             &model_path,
             files_request.file_selector.as_ref(),
+            files_request.ignore_weights,
         );
         ensure_selected_files_exist(&files, files_request.file_selector.as_ref())
             .map_err(Status::not_found)?;
@@ -531,13 +655,18 @@ impl ModelService for ModelServiceImpl {
         let model_name = download::canonical_model_name(&delete_request.model_name, provider)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
+        // A model can hold several entries at once (one per revision, and separate ones
+        // for metadata-only downloads). `model clear` means "forget this model", so drop
+        // all of them rather than only the unpinned full-weight entry.
         let tracker = self.tracker.clone();
-        tracker.delete_status(&model_name).await;
-        info!("Deleted registry record for model '{model_name}'");
+        let removed = tracker.delete_model_entries(&model_name).await;
+        info!("Deleted {removed} registry record(s) for model '{model_name}'");
 
         Ok(Response::new(DeleteModelResponse {
             success: true,
-            message: Some(format!("Model '{model_name}' removed from registry")),
+            message: Some(format!(
+                "Model '{model_name}' removed from registry ({removed} record(s))"
+            )),
         }))
     }
 }
@@ -545,6 +674,30 @@ impl ModelService for ModelServiceImpl {
 /// Type alias for the complex waiting channels type
 type WaitingChannels =
     Arc<Mutex<HashMap<String, Vec<tokio::sync::mpsc::Sender<Result<ModelStatusUpdate, Status>>>>>>;
+
+/// What a status update is routed by and what it reports.
+///
+/// Waiters are registered under the registry entry key, which carries the revision and
+/// weight mode, while the update itself reports the plain model name the caller asked
+/// for plus the revision it resolved to.
+struct UpdateIdentity<'a> {
+    entry_key: &'a str,
+    model_name: &'a str,
+    provider: ModelProvider,
+    resolved_revision: Option<&'a str>,
+}
+
+impl UpdateIdentity<'_> {
+    fn status_update(&self, status: ModelStatus, message: Option<String>) -> ModelStatusUpdate {
+        ModelStatusUpdate {
+            model_name: self.model_name.to_string(),
+            status: modelexpress_common::grpc::model::ModelStatus::from(status) as i32,
+            message,
+            provider: GrpcModelProvider::from(self.provider) as i32,
+            resolved_revision: self.resolved_revision.map(String::from),
+        }
+    }
+}
 
 /// Tracks the status of model downloads through the distributed registry backend.
 #[derive(Clone)]
@@ -604,14 +757,22 @@ impl ModelDownloadTracker {
             error!("Failed to update model status in registry: {e}");
             return;
         }
-        self.notify_waiters(model_name, status, provider, message);
+        self.notify_waiters(
+            UpdateIdentity {
+                entry_key: &model_name,
+                model_name: &model_name,
+                provider,
+                resolved_revision: None,
+            },
+            status,
+            message,
+        );
     }
 
     fn notify_waiters(
         &self,
-        model_name: String,
+        identity: UpdateIdentity<'_>,
         status: ModelStatus,
-        provider: ModelProvider,
         message: Option<String>,
     ) {
         let mut waiting = match self.waiting_channels.lock() {
@@ -621,18 +782,13 @@ impl ModelDownloadTracker {
                 poisoned.into_inner()
             }
         };
-        if let Some(channels) = waiting.get(&model_name) {
-            let update = ModelStatusUpdate {
-                model_name: model_name.clone(),
-                status: modelexpress_common::grpc::model::ModelStatus::from(status) as i32,
-                message,
-                provider: GrpcModelProvider::from(provider) as i32,
-            };
+        if let Some(channels) = waiting.get(identity.entry_key) {
+            let update = identity.status_update(status, message);
             for channel in channels {
                 let _ = channel.try_send(Ok(update.clone()));
             }
             if status == ModelStatus::DOWNLOADED || status == ModelStatus::ERROR {
-                waiting.remove(&model_name);
+                waiting.remove(identity.entry_key);
             }
         }
     }
@@ -679,21 +835,50 @@ impl ModelDownloadTracker {
         waiting.remove(model_name);
     }
 
+    /// Deletes every registry entry belonging to `model_name`, whatever revision or
+    /// weight mode each entry covers. Returns how many records were removed.
+    pub async fn delete_model_entries(&self, model_name: &str) -> usize {
+        let records = match self.registry.get_models_by_last_used(None).await {
+            Ok(records) => records,
+            Err(e) => {
+                error!("Failed to list registry records for '{model_name}': {e}");
+                // Fall back to the unpinned full-weight key so the common case still
+                // clears rather than failing outright.
+                self.delete_status(model_name).await;
+                return 0;
+            }
+        };
+
+        let mut removed: usize = 0;
+        for record in records {
+            if EntryKey::parse(&record.model_name).belongs_to(model_name) {
+                self.delete_status(&record.model_name).await;
+                removed = removed.saturating_add(1);
+            }
+        }
+        removed
+    }
+
     /// Spawn a background task that actually downloads the model, updating the tracker on
     /// success or failure. Extracted here so the claim and retry paths share the code.
-    fn spawn_download_task(
-        &self,
-        model_name: String,
-        provider: ModelProvider,
-        ignore_weights: bool,
-        retry: bool,
-        claim_id: String,
-    ) {
+    fn spawn_download_task(&self, target: DownloadTarget, retry: bool, claim_id: String) {
         let tracker = self.clone();
         tokio::spawn(async move {
+            let entry_key = target.entry_key();
+            let DownloadTarget {
+                model_name,
+                provider,
+                revision,
+                ignore_weights,
+            } = target;
             let cache_dir = get_server_cache_dir();
-            let download =
-                download::download_model(&model_name, provider, cache_dir, ignore_weights);
+            let download = download::download_model_revision(
+                &model_name,
+                provider,
+                cache_dir,
+                ignore_weights,
+                revision.as_deref(),
+            );
             tokio::pin!(download);
             let start = tokio::time::Instant::now()
                 .checked_add(DOWNLOAD_HEARTBEAT_INTERVAL)
@@ -706,7 +891,7 @@ impl ModelDownloadTracker {
                         match tracker
                             .registry
                             .refresh_download_claim(
-                                &model_name,
+                                &entry_key,
                                 provider,
                                 &claim_id,
                                 DOWNLOAD_LEASE_DURATION,
@@ -750,11 +935,20 @@ impl ModelDownloadTracker {
 
             match tracker
                 .registry
-                .finish_download_claim(&model_name, provider, &claim_id, status, message.clone())
+                .finish_download_claim(&entry_key, provider, &claim_id, status, message.clone())
                 .await
             {
                 Ok(true) => {
-                    tracker.notify_waiters(model_name.clone(), status, provider, message);
+                    tracker.notify_waiters(
+                        UpdateIdentity {
+                            entry_key: &entry_key,
+                            model_name: &model_name,
+                            provider,
+                            resolved_revision: revision.as_deref(),
+                        },
+                        status,
+                        message,
+                    );
                 }
                 Ok(false) => {
                     warn!("Ignoring completion for {model_name}: lease ownership was lost");
@@ -767,13 +961,26 @@ impl ModelDownloadTracker {
     }
 
     /// Initiates a download for a model and streams status updates.
+    ///
+    /// All registry operations key on the target's entry key rather than its model name,
+    /// so a second revision (or a full-weight request behind a metadata-only one) claims
+    /// its own lease instead of coalescing onto an unrelated download.
     pub async fn ensure_model_downloaded(
         &self,
-        model_name: &str,
-        provider: ModelProvider,
+        target: &DownloadTarget,
         tx: &tokio::sync::mpsc::Sender<Result<ModelStatusUpdate, Status>>,
-        ignore_weights: bool,
     ) -> ModelStatus {
+        let entry_key = target.entry_key();
+        let entry_key = entry_key.as_str();
+        let model_name = target.model_name.as_str();
+        let provider = target.provider;
+        let identity = UpdateIdentity {
+            entry_key,
+            model_name,
+            provider,
+            resolved_revision: target.revision.as_deref(),
+        };
+
         // Atomically try to claim this model for download. The `ClaimOutcome` tells us
         // whether THIS replica won the claim or is observing someone else's claim —
         // status alone (`DOWNLOADING`) can't distinguish those cases across replicas.
@@ -789,39 +996,41 @@ impl ModelDownloadTracker {
             attempt = attempt.saturating_add(1);
             match self
                 .registry
-                .try_claim_for_download(model_name, provider, &claim_id, DOWNLOAD_LEASE_DURATION)
+                .try_claim_for_download(entry_key, provider, &claim_id, DOWNLOAD_LEASE_DURATION)
                 .await
             {
                 Ok(ClaimOutcome::Claimed) => break (ModelStatus::DOWNLOADING, true),
                 Ok(ClaimOutcome::AlreadyExists(existing)) => {
                     if existing == ModelStatus::DOWNLOADED
                         && attempt < MAX_CLAIM_ATTEMPTS
-                        && !model_files_present(get_server_cache_dir(), model_name, provider).await
+                        && !model_files_present(
+                            get_server_cache_dir(),
+                            model_name,
+                            provider,
+                            target.revision.as_deref(),
+                        )
+                        .await
                     {
                         error!(
                             "Registry reports model '{model_name}' as DOWNLOADED but its files \
                              are missing from the cache; clearing the stale record and \
                              re-downloading"
                         );
-                        self.delete_status(model_name).await;
+                        self.delete_status(entry_key).await;
                         continue;
                     }
                     if existing == ModelStatus::DOWNLOADED {
                         // Returning an existing downloaded model is a cache hit for LRU purposes.
-                        self.touch_and_log(model_name).await;
+                        self.touch_and_log(entry_key).await;
                     }
                     break (existing, false);
                 }
                 Err(e) => {
                     error!("Failed to claim model for download: {e}");
-                    let error_update = ModelStatusUpdate {
-                        model_name: model_name.to_string(),
-                        status: modelexpress_common::grpc::model::ModelStatus::from(
-                            ModelStatus::ERROR,
-                        ) as i32,
-                        message: Some("Registry error occurred".to_string()),
-                        provider: GrpcModelProvider::from(provider) as i32,
-                    };
+                    let error_update = identity.status_update(
+                        ModelStatus::ERROR,
+                        Some("Registry error occurred".to_string()),
+                    );
                     let _ = tx.send(Ok(error_update)).await;
                     return ModelStatus::ERROR;
                 }
@@ -836,21 +1045,17 @@ impl ModelDownloadTracker {
         let (effective_status, is_retry_owner) = if status == ModelStatus::ERROR {
             let won = match self
                 .registry
-                .try_reset_error_for_retry(model_name, provider, &claim_id, DOWNLOAD_LEASE_DURATION)
+                .try_reset_error_for_retry(entry_key, provider, &claim_id, DOWNLOAD_LEASE_DURATION)
                 .await
             {
                 Ok(won) => won,
                 Err(e) => {
                     error!("Failed to CAS status for retry: {e}");
                     let _ = tx
-                        .send(Ok(ModelStatusUpdate {
-                            model_name: model_name.to_string(),
-                            status: modelexpress_common::grpc::model::ModelStatus::from(
-                                ModelStatus::ERROR,
-                            ) as i32,
-                            message: Some("Registry error occurred during retry".to_string()),
-                            provider: GrpcModelProvider::from(provider) as i32,
-                        }))
+                        .send(Ok(identity.status_update(
+                            ModelStatus::ERROR,
+                            Some("Registry error occurred during retry".to_string()),
+                        )))
                         .await;
                     return ModelStatus::ERROR;
                 }
@@ -860,36 +1065,28 @@ impl ModelDownloadTracker {
             (status, false)
         };
 
-        let update = ModelStatusUpdate {
-            model_name: model_name.to_string(),
-            status: modelexpress_common::grpc::model::ModelStatus::from(effective_status) as i32,
-            message: match (status, effective_status) {
+        let update = identity.status_update(
+            effective_status,
+            match (status, effective_status) {
                 (_, ModelStatus::DOWNLOADED) => Some("Model already downloaded".to_string()),
                 (ModelStatus::ERROR, _) => Some("Previous download failed, retrying".to_string()),
                 (_, ModelStatus::DOWNLOADING) => Some("Model download in progress".to_string()),
                 // effective can never be ERROR: ERROR observations are CAS'd above.
                 (_, ModelStatus::ERROR) => Some("Download error".to_string()),
             },
-            provider: GrpcModelProvider::from(provider) as i32,
-        };
+        );
         let _ = tx.send(Ok(update)).await;
 
         if effective_status == ModelStatus::DOWNLOADING {
             // Every caller is a waiter — whether we own the download or not, we still
             // need a channel so the completion broadcast reaches this stream.
-            self.add_waiting_channel(model_name, tx.clone());
+            self.add_waiting_channel(entry_key, tx.clone());
 
             // Spawn the download only on the replica that won the claim (fresh
             // download) or won the ERROR-retry CAS. Everyone else waits.
             if is_owner || is_retry_owner {
                 let retry = status == ModelStatus::ERROR;
-                self.spawn_download_task(
-                    model_name.to_string(),
-                    provider,
-                    ignore_weights,
-                    retry,
-                    claim_id,
-                );
+                self.spawn_download_task(target.clone(), retry, claim_id);
                 claim_id = uuid::Uuid::new_v4().to_string();
             }
 
@@ -897,22 +1094,11 @@ impl ModelDownloadTracker {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 match self
                     .registry
-                    .try_claim_for_download(
-                        model_name,
-                        provider,
-                        &claim_id,
-                        DOWNLOAD_LEASE_DURATION,
-                    )
+                    .try_claim_for_download(entry_key, provider, &claim_id, DOWNLOAD_LEASE_DURATION)
                     .await
                 {
                     Ok(ClaimOutcome::Claimed) => {
-                        self.spawn_download_task(
-                            model_name.to_string(),
-                            provider,
-                            ignore_weights,
-                            false,
-                            claim_id,
-                        );
+                        self.spawn_download_task(target.clone(), false, claim_id);
                         claim_id = uuid::Uuid::new_v4().to_string();
                     }
                     Ok(ClaimOutcome::AlreadyExists(current_status))
@@ -1011,6 +1197,16 @@ mod tests {
         ModelDownloadTracker::new(registry)
     }
 
+    /// Unpinned, full-weight target: its entry key is the bare model name.
+    fn test_target(model_name: &str) -> DownloadTarget {
+        DownloadTarget {
+            model_name: model_name.to_string(),
+            provider: ModelProvider::HuggingFace,
+            revision: None,
+            ignore_weights: false,
+        }
+    }
+
     #[tokio::test]
     async fn test_tracker_get_status_missing_returns_none() {
         let mut mock = crate::registry::backend::MockRegistryBackend::new();
@@ -1065,10 +1261,97 @@ mod tests {
 
         assert_eq!(
             tracker
-                .ensure_model_downloaded("test/model", ModelProvider::HuggingFace, &tx, false,)
+                .ensure_model_downloaded(&test_target("test/model"), &tx)
                 .await,
             ModelStatus::DOWNLOADED
         );
+    }
+
+    /// Claim, touch, and report a cache hit for `target`, asserting the registry was
+    /// keyed on the target's entry key rather than on the bare model name.
+    async fn assert_claims_on_entry_key(target: DownloadTarget) {
+        let expected_key = target.entry_key();
+        assert_ne!(
+            expected_key, target.model_name,
+            "This target must not reduce to the bare model name, or the test proves nothing"
+        );
+        let mut mock = crate::registry::backend::MockRegistryBackend::new();
+        mock.expect_try_claim_for_download()
+            .with(
+                mockall::predicate::eq(expected_key.clone()),
+                mockall::predicate::eq(ModelProvider::HuggingFace),
+                mockall::predicate::always(),
+                mockall::predicate::always(),
+            )
+            .once()
+            .returning(|_, _, _, _| Ok(ClaimOutcome::AlreadyExists(ModelStatus::DOWNLOADED)));
+        mock.expect_touch_model()
+            .with(mockall::predicate::eq(expected_key))
+            .once()
+            .returning(|_| Ok(()));
+
+        let tracker = tracker_with_mock(mock);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+
+        assert_eq!(
+            tracker.ensure_model_downloaded(&target, &tx).await,
+            ModelStatus::DOWNLOADED
+        );
+
+        // Clients see the model name they asked for, not the internal registry key.
+        let update = rx
+            .recv()
+            .await
+            .expect("Expected a status update")
+            .expect("Expected an ok status update");
+        assert_eq!(update.model_name, target.model_name);
+        assert_eq!(update.resolved_revision, target.revision);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_tracker_scopes_the_lease_to_the_resolved_revision() {
+        let env_lock = acquire_env_mutex();
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let _cache_dir_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            temp_dir.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+        let model_dir = temp_dir.path().join("models--test--model/snapshots/abc123");
+        std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");
+        std::fs::write(model_dir.join("config.json"), b"{}").expect("Failed to write config");
+
+        assert_claims_on_entry_key(DownloadTarget {
+            revision: Some("abc123".to_string()),
+            ..test_target("test/model")
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_tracker_separates_metadata_only_from_full_weight_downloads() {
+        let env_lock = acquire_env_mutex();
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let _cache_dir_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            temp_dir.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+        let model_dir = temp_dir.path().join("models--test--model/snapshots/abc123");
+        std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");
+        std::fs::write(model_dir.join("config.json"), b"{}").expect("Failed to write config");
+
+        // A metadata-only entry must not be the same registry record as a full-weight
+        // one, or a weightless snapshot would satisfy a request that needs weights.
+        assert_claims_on_entry_key(DownloadTarget {
+            ignore_weights: true,
+            ..test_target("test/model")
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -1237,7 +1520,7 @@ mod tests {
     #[test]
     fn test_collect_model_files_empty_dir() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let files = collect_model_files(temp_dir.path(), temp_dir.path(), None);
+        let files = collect_model_files(temp_dir.path(), temp_dir.path(), None, false);
         assert!(files.is_empty());
     }
 
@@ -1252,7 +1535,7 @@ mod tests {
         let file2_path = temp_dir.path().join("model.bin");
         std::fs::write(&file2_path, vec![0u8; 100]).expect("Failed to write file2");
 
-        let files = collect_model_files(temp_dir.path(), temp_dir.path(), None);
+        let files = collect_model_files(temp_dir.path(), temp_dir.path(), None, false);
 
         assert_eq!(files.len(), 2);
 
@@ -1270,6 +1553,51 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_model_files_ignore_weights() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+
+        // Mix of non-weight and weight files, including a nested weight shard.
+        std::fs::write(temp_dir.path().join("config.json"), "{}").expect("write config");
+        std::fs::write(temp_dir.path().join("tokenizer.json"), "{}").expect("write tokenizer");
+        std::fs::write(temp_dir.path().join("model.safetensors"), vec![0u8; 10])
+            .expect("write safetensors");
+        std::fs::write(temp_dir.path().join("pytorch_model.bin"), vec![0u8; 10])
+            .expect("write bin");
+        let subdir = temp_dir.path().join("subdir");
+        std::fs::create_dir(&subdir).expect("create subdir");
+        std::fs::write(
+            subdir.join("model-00001-of-00002.safetensors"),
+            vec![0u8; 10],
+        )
+        .expect("write nested shard");
+
+        // ignore_weights = false streams everything.
+        let all = collect_model_files(temp_dir.path(), temp_dir.path(), None, false);
+        assert_eq!(all.len(), 5);
+
+        // ignore_weights = true keeps only the non-weight files (config + tokenizer),
+        // dropping weight shards at any depth.
+        let no_weights = collect_model_files(temp_dir.path(), temp_dir.path(), None, true);
+        let names: Vec<String> = no_weights
+            .iter()
+            .map(|(p, _)| p.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            no_weights.len(),
+            2,
+            "expected only non-weight files: {names:?}"
+        );
+        assert!(names.contains(&"config.json".to_string()));
+        assert!(names.contains(&"tokenizer.json".to_string()));
+        assert!(
+            names
+                .iter()
+                .all(|n| !n.ends_with(".safetensors") && !n.ends_with(".bin")),
+            "weight files must be excluded: {names:?}"
+        );
+    }
+
+    #[test]
     fn test_collect_model_files_nested() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
 
@@ -1283,7 +1611,7 @@ mod tests {
         let file2_path = subdir.join("nested_file.txt");
         std::fs::write(&file2_path, "nested content").expect("Failed to write file2");
 
-        let files = collect_model_files(temp_dir.path(), temp_dir.path(), None);
+        let files = collect_model_files(temp_dir.path(), temp_dir.path(), None, false);
 
         assert_eq!(files.len(), 2);
 
@@ -1310,7 +1638,7 @@ mod tests {
         let selector = ModelFileSelector {
             paths: vec!["config.json".to_string(), "subdir/nested.txt".to_string()],
         };
-        let files = collect_model_files(temp_dir.path(), temp_dir.path(), Some(&selector));
+        let files = collect_model_files(temp_dir.path(), temp_dir.path(), Some(&selector), false);
 
         let mut paths: Vec<_> = files
             .iter()
@@ -1330,7 +1658,13 @@ mod tests {
 
         let empty_selector = ModelFileSelector { paths: vec![] };
         assert!(
-            collect_model_files(temp_dir.path(), temp_dir.path(), Some(&empty_selector)).is_empty()
+            collect_model_files(
+                temp_dir.path(),
+                temp_dir.path(),
+                Some(&empty_selector),
+                false
+            )
+            .is_empty()
         );
 
         let nonmatching_selector = ModelFileSelector {
@@ -1340,7 +1674,8 @@ mod tests {
             collect_model_files(
                 temp_dir.path(),
                 temp_dir.path(),
-                Some(&nonmatching_selector)
+                Some(&nonmatching_selector),
+                false
             )
             .is_empty()
         );
@@ -1374,6 +1709,8 @@ mod tests {
             file_selector: Some(ModelFileSelector {
                 paths: vec!["config.json".to_string(), "subdir/nested.txt".to_string()],
             }),
+            ignore_weights: false,
+            revision: None,
         });
 
         let response = service
@@ -1411,7 +1748,8 @@ mod tests {
             !model_files_present(
                 Some(cache_dir.clone()),
                 "test/model",
-                ModelProvider::HuggingFace
+                ModelProvider::HuggingFace,
+                None
             )
             .await
         );
@@ -1421,7 +1759,13 @@ mod tests {
         std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");
         std::fs::write(model_dir.join("config.json"), b"{}").expect("Failed to write config");
         assert!(
-            model_files_present(Some(cache_dir), "test/model", ModelProvider::HuggingFace).await
+            model_files_present(
+                Some(cache_dir),
+                "test/model",
+                ModelProvider::HuggingFace,
+                None
+            )
+            .await
         );
     }
 
@@ -1429,7 +1773,7 @@ mod tests {
     async fn test_model_files_present_assumes_present_without_cache_dir() {
         // With no configured cache directory we cannot verify, so we must not force a
         // re-download loop: assume the files are present.
-        assert!(model_files_present(None, "test/model", ModelProvider::HuggingFace).await);
+        assert!(model_files_present(None, "test/model", ModelProvider::HuggingFace, None).await);
     }
 
     #[tokio::test]
@@ -1458,6 +1802,8 @@ mod tests {
             file_selector: Some(ModelFileSelector {
                 paths: vec!["config.json".to_string()],
             }),
+            ignore_weights: false,
+            revision: None,
         });
 
         let response = service
@@ -1474,6 +1820,125 @@ mod tests {
         assert_eq!(chunks[0].relative_path, "config.json");
         assert_eq!(chunks[0].commit_hash.as_deref(), Some("abc123"));
         assert!(chunks[0].is_last_file);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_stream_model_files_serves_the_requested_revision() {
+        let env_lock = acquire_env_mutex();
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let _cache_dir_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            temp_dir.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+
+        // Two revisions cached side by side. Without a requested revision the newest
+        // snapshot wins, so asking for the older one proves the request is honored.
+        let write_snapshot = |commit: &str, body: &[u8]| {
+            let model_dir = temp_dir
+                .path()
+                .join("models--test--model/snapshots")
+                .join(commit);
+            std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");
+            std::fs::write(model_dir.join("config.json"), body).expect("Failed to write config");
+        };
+        write_snapshot("older111", b"old");
+        // Snapshot ordering is by directory timestamp, so the two have to be distinct.
+        tokio::time::sleep(tokio::time::Duration::from_millis(1100)).await;
+        write_snapshot("newer222", b"new");
+
+        let stream_revision = async |revision: Option<&str>| {
+            let request = Request::new(ModelFilesRequest {
+                model_name: "test/model".to_string(),
+                provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
+                chunk_size: 1024,
+                file_selector: None,
+                ignore_weights: false,
+                revision: revision.map(String::from),
+            });
+            let chunks: Vec<_> = test_model_service()
+                .stream_model_files(request)
+                .await
+                .expect("Expected stream response")
+                .into_inner()
+                .map(|chunk| chunk.expect("Expected chunk"))
+                .collect()
+                .await;
+            assert_eq!(chunks.len(), 1);
+            (chunks[0].commit_hash.clone(), chunks[0].data.clone())
+        };
+
+        assert_eq!(
+            stream_revision(Some("older111")).await,
+            (Some("older111".to_string()), b"old".to_vec())
+        );
+        assert_eq!(
+            stream_revision(None).await,
+            (Some("newer222".to_string()), b"new".to_vec()),
+            "Without a revision the newest snapshot is served, so the pinned request above \
+             really did select a different one"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ensure_model_downloaded_rejects_a_revision_on_a_provider_without_revisions() {
+        let service = test_model_service();
+        let request = Request::new(ModelDownloadRequest {
+            model_name: "gs://test-bucket/org/model/rev-1".to_string(),
+            provider: modelexpress_common::grpc::model::ModelProvider::Gcs as i32,
+            ignore_weights: false,
+            revision: Some("v1.0".to_string()),
+        });
+
+        let status = service
+            .ensure_model_downloaded(request)
+            .await
+            .map(|_| ())
+            .expect_err("A provider without revisions must reject a pinned revision");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            status
+                .message()
+                .contains("does not support pinned revisions"),
+            "Unexpected message: {}",
+            status.message()
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_stream_model_files_rejects_an_uncached_revision() {
+        let env_lock = acquire_env_mutex();
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let _cache_dir_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            temp_dir.path().to_str().expect("Expected temp dir path"),
+        );
+        let _offline_guard = EnvVarGuard::set(&env_lock, "HF_HUB_OFFLINE", "1");
+
+        let model_dir = temp_dir.path().join("models--test--model/snapshots/abc123");
+        std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");
+        std::fs::write(model_dir.join("config.json"), b"{}").expect("Failed to write config");
+
+        let service = test_model_service();
+        let request = Request::new(ModelFilesRequest {
+            model_name: "test/model".to_string(),
+            provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
+            chunk_size: 1024,
+            file_selector: None,
+            ignore_weights: false,
+            revision: Some("not-cached".to_string()),
+        });
+
+        let status = service
+            .stream_model_files(request)
+            .await
+            .map(|_| ())
+            .expect_err("An uncached revision must not fall back to another snapshot");
+        assert_eq!(status.code(), tonic::Code::NotFound);
     }
 
     #[tokio::test]
@@ -1501,6 +1966,8 @@ mod tests {
             file_selector: Some(ModelFileSelector {
                 paths: vec!["config.json".to_string(), "missing.json".to_string()],
             }),
+            ignore_weights: false,
+            revision: None,
         });
 
         let result = service.stream_model_files(request).await;
@@ -1521,6 +1988,8 @@ mod tests {
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
             chunk_size: 0,
             file_selector: None,
+            ignore_weights: false,
+            revision: None,
         });
 
         let result = service.list_model_files(request).await;
@@ -1538,6 +2007,8 @@ mod tests {
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
             chunk_size: 1024,
             file_selector: None,
+            ignore_weights: false,
+            revision: None,
         });
 
         let result = service.stream_model_files(request).await;
@@ -1554,6 +2025,7 @@ mod tests {
             model_name: "test/model".to_string(),
             provider: 99,
             ignore_weights: false,
+            revision: None,
         });
 
         let result = service.ensure_model_downloaded(request).await;
@@ -1572,6 +2044,8 @@ mod tests {
             provider: 99,
             chunk_size: 0,
             file_selector: None,
+            ignore_weights: false,
+            revision: None,
         });
 
         let result = service.list_model_files(request).await;
@@ -1590,6 +2064,8 @@ mod tests {
             provider: 99,
             chunk_size: 1024,
             file_selector: None,
+            ignore_weights: false,
+            revision: None,
         });
 
         let result = service.stream_model_files(request).await;
@@ -1622,6 +2098,8 @@ mod tests {
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
             chunk_size: 1024,
             file_selector: None,
+            ignore_weights: false,
+            revision: None,
         });
 
         let response = service
@@ -1663,6 +2141,8 @@ mod tests {
             provider: modelexpress_common::grpc::model::ModelProvider::HuggingFace as i32,
             chunk_size: 1024,
             file_selector: None,
+            ignore_weights: false,
+            revision: None,
         });
 
         let response = service
