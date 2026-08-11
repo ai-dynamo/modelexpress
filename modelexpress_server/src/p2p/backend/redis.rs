@@ -9,7 +9,10 @@
 //!                                            per source); each other field is an worker_id
 //!                                            with an empty-string value (presence marker).
 //!   `mx:source:{source_id}:{worker_id}` — Redis Hash; field = worker_rank (string),
-//!                                            value = JSON-serialized WorkerRecordJson.
+//!                                            value = JSON-serialized WorkerRecordJson;
+//!                                            field `status:{worker_rank}` = JSON-serialized
+//!                                            WorkerSummaryJson holding the rank's mutable
+//!                                            state, so heartbeats don't rewrite the record.
 //!
 //! Global listing uses SCAN with pattern `mx:source:????????????????` (16-char source IDs)
 //! to enumerate source index keys without a separate secondary index.
@@ -35,6 +38,8 @@ mod keys {
     pub const SOURCE_SCAN_PATTERN: &str = "mx:source:????????????????";
     /// Reserved hash field in the source index key that stores SourceAttributesJson.
     pub const ATTRIBUTES_FIELD: &str = "__attributes__";
+    /// Prefix of the per-rank mutable-state field (`status:{rank}`) rewritten by heartbeats.
+    pub const STATUS_FIELD_PREFIX: &str = "status:";
 }
 
 const REMOVE_WORKER_LUA: &str = r#"
@@ -168,13 +173,38 @@ fn representative_summary_rank_to_update(summary: Option<&str>, updated_rank: u3
     (summary.is_none() || representative_rank == updated_rank).then_some(representative_rank)
 }
 
-fn worker_records_match_status<'a>(
-    records: impl IntoIterator<Item = &'a str>,
+fn status_field(worker_rank: u32) -> String {
+    format!("{}{}", keys::STATUS_FIELD_PREFIX, worker_rank)
+}
+
+/// Live (status, updated_at) of a rank: `status:{rank}` if at least as fresh, else the record.
+fn overlay_status(
+    fields: &std::collections::HashMap<String, String>,
+    worker_rank: u32,
+    record_status: i32,
+    record_updated_at: i64,
+) -> (i32, i64) {
+    fields
+        .get(&status_field(worker_rank))
+        .and_then(|value| serde_json::from_str::<WorkerSummaryJson>(value).ok())
+        .filter(|summary| summary.updated_at >= record_updated_at)
+        .map(|summary| (summary.status, summary.updated_at))
+        .unwrap_or((record_status, record_updated_at))
+}
+
+fn worker_records_match_status(
+    fields: &std::collections::HashMap<String, String>,
     required_status: SourceStatus,
 ) -> bool {
-    records.into_iter().any(|value| {
-        serde_json::from_str::<WorkerRecordJson>(value)
-            .is_ok_and(|record| record.status == required_status as i32)
+    fields.iter().any(|(field, value)| {
+        if field.starts_with(keys::STATUS_FIELD_PREFIX) {
+            return false;
+        }
+        serde_json::from_str::<WorkerRecordJson>(value).is_ok_and(|record| {
+            let (status, _) =
+                overlay_status(fields, record.worker_rank, record.status, record.updated_at);
+            status == required_status as i32
+        })
     })
 }
 
@@ -522,6 +552,11 @@ impl MetadataBackend for RedisBackend {
 
         let mut pipe = redis::pipe();
         pipe.hset(&worker_key, worker_record.worker_rank.to_string(), &value);
+        pipe.hset(
+            &worker_key,
+            status_field(worker_record.worker_rank),
+            &summary,
+        );
         pipe.hset(&source_key, keys::ATTRIBUTES_FIELD, &attr_json);
         pipe.hset(&source_key, worker_id, summary);
         pipe.exec_async(&mut conn).await?;
@@ -561,9 +596,21 @@ impl MetadataBackend for RedisBackend {
         let (model_name, identity) = source_identity_from_attributes(attr_json.as_deref());
 
         let mut workers: Vec<WorkerRecord> = Vec::with_capacity(fields.len());
-        for value in fields.values() {
+        for (field, value) in &fields {
+            if field.starts_with(keys::STATUS_FIELD_PREFIX) {
+                continue;
+            }
             let json: WorkerRecordJson = serde_json::from_str(value)?;
-            workers.push(WorkerRecord::from(json));
+            let mut worker = WorkerRecord::from(json);
+            let (status, updated_at) = overlay_status(
+                &fields,
+                worker.worker_rank,
+                worker.status,
+                worker.updated_at,
+            );
+            worker.status = status;
+            worker.updated_at = updated_at;
+            workers.push(worker);
         }
         workers.sort_by_key(|w| w.worker_rank);
 
@@ -634,10 +681,7 @@ impl MetadataBackend for RedisBackend {
                 }
 
                 if let Some(required_status) = status_filter
-                    && !worker_records_match_status(
-                        fields.values().map(String::as_str),
-                        required_status,
-                    )
+                    && !worker_records_match_status(&fields, required_status)
                 {
                     continue;
                 }
@@ -645,7 +689,11 @@ impl MetadataBackend for RedisBackend {
                 let (status, updated_at, accelerator) = fields
                     .get(&worker_rank.to_string())
                     .and_then(|v| serde_json::from_str::<WorkerRecordJson>(v).ok())
-                    .map(|j| (j.status, j.updated_at, j.accelerator))
+                    .map(|j| {
+                        let (status, updated_at) =
+                            overlay_status(&fields, worker_rank, j.status, j.updated_at);
+                        (status, updated_at, j.accelerator)
+                    })
                     .unwrap_or((0, 0, String::new()));
 
                 result.push(super::SourceInstanceInfo {
@@ -793,15 +841,19 @@ impl MetadataBackend for RedisBackend {
                 if fields.is_empty() {
                     continue;
                 }
-                if status_filter.is_some_and(|required| {
-                    !worker_records_match_status(fields.values().map(String::as_str), required)
-                }) {
+                if status_filter
+                    .is_some_and(|required| !worker_records_match_status(&fields, required))
+                {
                     continue;
                 }
                 let (status, updated_at, accelerator) = fields
                     .get(&worker_rank.to_string())
                     .and_then(|value| serde_json::from_str::<WorkerRecordJson>(value).ok())
-                    .map(|record| (record.status, record.updated_at, record.accelerator))
+                    .map(|record| {
+                        let (status, updated_at) =
+                            overlay_status(&fields, worker_rank, record.status, record.updated_at);
+                        (status, updated_at, record.accelerator)
+                    })
                     .unwrap_or((0, 0, String::new()));
                 if min_updated_at.is_some_and(|minimum| updated_at < minimum) {
                     continue;
@@ -896,25 +948,36 @@ impl MetadataBackend for RedisBackend {
     ) -> MetadataResult<()> {
         let mut conn = self.get_conn().await?;
         let key = format!("{}{}:{}", keys::SOURCE_PREFIX, source_id, worker_id);
-        let field = worker_rank.to_string();
 
-        let value: Option<String> = conn.hget(&key, &field).await?;
-        let json_str = value.ok_or_else(|| {
-            format!(
-                "update_status: rank {} not found in source '{}' worker '{}'",
-                worker_rank, source_id, worker_id
-            )
+        // Heartbeats rewrite only the small `status:{rank}` field, never the record.
+        let status_json: Option<String> = conn.hget(&key, status_field(worker_rank)).await?;
+        let accelerator = if let Some(summary) = status_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<WorkerSummaryJson>(value).ok())
+        {
+            summary.accelerator
+        } else {
+            // Record predating the status field: seed the accelerator from it once.
+            let value: Option<String> = conn.hget(&key, worker_rank.to_string()).await?;
+            let json_str = value.ok_or_else(|| {
+                format!(
+                    "update_status: rank {} not found in source '{}' worker '{}'",
+                    worker_rank, source_id, worker_id
+                )
+            })?;
+            serde_json::from_str::<WorkerRecordJson>(&json_str)?.accelerator
+        };
+
+        let status_summary = serde_json::to_string(&WorkerSummaryJson {
+            worker_rank,
+            status: status as i32,
+            updated_at,
+            accelerator: accelerator.clone(),
         })?;
-
-        let mut record: WorkerRecordJson = serde_json::from_str(&json_str)?;
-        record.status = status as i32;
-        record.updated_at = updated_at;
-
-        let updated = serde_json::to_string(&record)?;
         let source_key = format!("{}{}", keys::SOURCE_PREFIX, source_id);
         let existing_summary: Option<String> = conn.hget(&source_key, worker_id).await?;
         let mut pipe = redis::pipe();
-        pipe.hset(&key, &field, &updated);
+        pipe.hset(&key, status_field(worker_rank), &status_summary);
         if let Some(representative_rank) =
             representative_summary_rank_to_update(existing_summary.as_deref(), worker_rank)
         {
@@ -922,7 +985,7 @@ impl MetadataBackend for RedisBackend {
                 worker_rank: representative_rank,
                 status: status as i32,
                 updated_at,
-                accelerator: record.accelerator,
+                accelerator,
             })?;
             pipe.hset(&source_key, worker_id, summary);
         }
@@ -1096,14 +1159,48 @@ mod tests {
     fn test_status_filter_matches_any_rank_record() {
         let initializing = r#"{"worker_rank":0,"nixl_metadata":[],"tensors":[],"status":1}"#;
         let ready = r#"{"worker_rank":1,"nixl_metadata":[],"tensors":[],"status":2}"#;
-        assert!(worker_records_match_status(
-            [initializing, ready],
-            SourceStatus::Ready
-        ));
+        let both: std::collections::HashMap<String, String> = [
+            ("0".to_string(), initializing.to_string()),
+            ("1".to_string(), ready.to_string()),
+        ]
+        .into();
+        let only_initializing: std::collections::HashMap<String, String> =
+            [("0".to_string(), initializing.to_string())].into();
+        assert!(worker_records_match_status(&both, SourceStatus::Ready));
         assert!(!worker_records_match_status(
-            [initializing],
+            &only_initializing,
             SourceStatus::Ready
         ));
+    }
+
+    #[test]
+    fn test_status_overlay_prefers_fresher_status_field() {
+        let record =
+            r#"{"worker_rank":0,"nixl_metadata":[],"tensors":[],"status":1,"updated_at":100}"#;
+        let fresh_status = r#"{"worker_rank":0,"status":2,"updated_at":200}"#;
+        let stale_status = r#"{"worker_rank":0,"status":3,"updated_at":50}"#;
+
+        let with_fresh: std::collections::HashMap<String, String> = [
+            ("0".to_string(), record.to_string()),
+            ("status:0".to_string(), fresh_status.to_string()),
+        ]
+        .into();
+        assert_eq!(overlay_status(&with_fresh, 0, 1, 100), (2, 200));
+        assert!(worker_records_match_status(
+            &with_fresh,
+            SourceStatus::Ready
+        ));
+
+        let with_stale: std::collections::HashMap<String, String> = [
+            ("0".to_string(), record.to_string()),
+            ("status:0".to_string(), stale_status.to_string()),
+        ]
+        .into();
+        assert_eq!(overlay_status(&with_stale, 0, 1, 100), (1, 100));
+
+        let without_status: std::collections::HashMap<String, String> =
+            [("0".to_string(), record.to_string())].into();
+        assert_eq!(overlay_status(&without_status, 0, 1, 100), (1, 100));
     }
 
     // ── SourceAttributesJson ────────────────────────────────────────────────
