@@ -3,7 +3,7 @@
 
 """Execute a globally-coordinated M2N plan via NIXL.
 
-M2nExecutor accepts M2nDescriptors produced by M2nPlanner and executes the
+M2nExecutor accepts M2nDescriptors and executes the
 receive side for this inference worker.  Descriptors are grouped by
 src_agent_index (trainer rank) and issued as parallel NIXL READ handles.
 

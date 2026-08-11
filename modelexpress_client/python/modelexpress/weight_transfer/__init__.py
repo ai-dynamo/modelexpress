@@ -12,7 +12,7 @@ engine/      LazyWeight bake pass and WeightLoaderAdapter ABC.
              Requires torch.  One adapter per inference engine.
 
 planner/     Op-chain resolver (torch) and region router (pure math).
-             LocalPlanner routes on the client; ServerPlanner offloads to MX.
+             LocalPlanner routes on the client.
 
 transport/   NixlExecutor: execute pre-built RdmaDescriptor lists via NIXL.
 
@@ -24,10 +24,10 @@ adapters/    Model-specific naming bridges (MoEAdapter, etc.).
 Quick start (PULL mode)::
 
     from modelexpress.weight_transfer import PullRole, MoEAdapter
-    from modelexpress.weight_transfer.planner import ServerPlanner
+    from modelexpress.weight_transfer.planner import LocalPlanner
 
     adapter = MyVllmAdapter(num_experts=64)
-    planner = ServerPlanner(mx_client)
+    planner = LocalPlanner()
     role = PullRole(adapter, nixl_manager, device_id=0, planner=planner)
 
     table = fetch_trainer_table(mx_client, model_name)

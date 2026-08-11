@@ -102,7 +102,6 @@ if TYPE_CHECKING:
     MX_TRAINER_TABLE_KEY: Optional[str]
     MX_TRAINER_SYNC_TIMEOUT: int
     MX_REDIS_URL: str
-    MX_WEIGHT_SYNC_SERVER: Optional[str]
     # P2P source selection
     MX_P2P_SOURCE_SELECTOR: Optional[str]
     # Opt-in metrics collector
@@ -304,7 +303,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_TRAINER_TABLE_KEY": lambda: os.environ.get("MX_TRAINER_TABLE_KEY"),
     "MX_TRAINER_SYNC_TIMEOUT": lambda: _env_int("MX_TRAINER_SYNC_TIMEOUT", 300),
     "MX_REDIS_URL": lambda: os.environ.get("MX_REDIS_URL", "redis://localhost:6379"),
-    "MX_WEIGHT_SYNC_SERVER": lambda: os.environ.get("MX_WEIGHT_SYNC_SERVER"),
     # ── P2P source selection ───────────────────────────────────────────────
     # Raw (None when unset); source_selection applies its DEFAULT_SELECTOR fallback.
     "MX_P2P_SOURCE_SELECTOR": lambda: os.environ.get("MX_P2P_SOURCE_SELECTOR"),

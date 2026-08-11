@@ -4,9 +4,8 @@
 """TrainerPullStrategy: load weight updates by pulling from a running trainer.
 
 This strategy wraps PullRole from weight_transfer.roles.pull and plugs it
-into the ModelExpress LoadStrategyChain.  It selects between LocalPlanner
-(no server) and ServerPlanner (server-side routing + plan caching) based
-on whether MX_WEIGHT_SYNC_SERVER is set.
+into the ModelExpress LoadStrategyChain.  Region routing runs client-side
+via LocalPlanner.
 
 Environment variables
 ---------------------
@@ -14,13 +13,9 @@ MX_TRAINER_TABLE_KEY     Redis / MX metadata key for the TrainerTable.
                          Default: "mx:trainer_table:{model_name}"
 MX_TRAINER_SYNC_TIMEOUT  Seconds to wait for trainer table or pull ACK.
                          Default: 300
-MX_WEIGHT_SYNC_SERVER    If set, use ServerPlanner (routes regions on the
-                         MX server in Rust, caches plan for all workers).
-                         If unset, use LocalPlanner (client-side routing).
 
-Either MX_WEIGHT_SYNC_SERVER or MX_TRAINER_TABLE_KEY must be set for this
-strategy to be eligible: with neither, the deployment has no trainer to pull
-from.
+MX_TRAINER_TABLE_KEY must be set for this strategy to be eligible: without
+it, the deployment has no trainer to pull from.
 """
 
 from __future__ import annotations
@@ -36,7 +31,6 @@ from .. import envs
 from ..weight_transfer.protocol.serialization import decode_trainer_table
 from ..weight_transfer.roles.pull import PullRole
 from ..weight_transfer.planner.local import LocalPlanner
-from ..weight_transfer.planner.server import ServerPlanner
 
 if TYPE_CHECKING:
     from ..weight_transfer.protocol.types import TrainerTable
@@ -51,22 +45,14 @@ _DISABLED_VALUES = {"", "0", "false", "no", "off"}
 _REDIS_TIMEOUT = 5.0
 
 
-def _use_server_planner() -> bool:
-    return (envs.MX_WEIGHT_SYNC_SERVER or "").strip().lower() not in _DISABLED_VALUES
-
-
 def _trainer_sync_configured() -> bool:
     """Return whether this deployment is set up to pull from a trainer.
 
-    Either variable on its own is a complete configuration: MX_WEIGHT_SYNC_SERVER
-    selects the server-side planner, MX_TRAINER_TABLE_KEY names the table a
-    client-side (LocalPlanner) deployment pulls from. With neither set there is
-    no trainer to wait for, so the strategy must decline rather than spend the
-    whole MX_TRAINER_SYNC_TIMEOUT budget polling for a table that never appears
-    and starving the strategies behind it.
+    MX_TRAINER_TABLE_KEY names the table this deployment pulls from. With it
+    unset there is no trainer to wait for, so the strategy must decline rather
+    than spend the whole MX_TRAINER_SYNC_TIMEOUT budget polling for a table
+    that never appears and starving the strategies behind it.
     """
-    if _use_server_planner():
-        return True
     return bool((envs.MX_TRAINER_TABLE_KEY or "").strip())
 
 
@@ -101,8 +87,7 @@ class TrainerPullStrategy(LoadStrategy):
             return False
         if not _trainer_sync_configured():
             logger.info(
-                "[Worker %d] Neither MX_WEIGHT_SYNC_SERVER nor MX_TRAINER_TABLE_KEY "
-                "is set, skipping trainer pull",
+                "[Worker %d] MX_TRAINER_TABLE_KEY is not set, skipping trainer pull",
                 ctx.global_rank,
             )
             return False
@@ -131,11 +116,7 @@ class TrainerPullStrategy(LoadStrategy):
                 accelerator_backend=ctx.accelerator_backend,
             )
 
-        planner = (
-            ServerPlanner(mx_client=ctx.mx_client)
-            if _use_server_planner()
-            else LocalPlanner()
-        )
+        planner = LocalPlanner()
 
         # Build the engine adapter from the existing ctx adapter
         wt_adapter = _CtxEngineAdapter(ctx)
@@ -231,17 +212,6 @@ class TrainerPullStrategy(LoadStrategy):
         raise TimeoutError(f"TrainerTable not found at {key!r} after {timeout}s")
 
     def _read_raw(self, ctx: LoadContext, key: str) -> bytes | None:
-        # Try the MX WeightSyncService first (GetTrainerTable RPC)
-        try:
-            resp = ctx.mx_client.get_trainer_table(model_key=key)
-            if resp and resp.found:
-                return resp.table_payload
-        except AttributeError:
-            pass
-        except Exception as e:
-            logger.debug("[Worker %d] GetTrainerTable RPC failed: %s", ctx.global_rank, e)
-
-        # Redis fallback
         redis_url = envs.MX_REDIS_URL
         try:
             import redis as redis_lib
