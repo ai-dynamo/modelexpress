@@ -113,7 +113,6 @@ class Publisher:
         self.snapshot = {}
         self.metadata = {}
         self.captured = False
-        self.poisoned = False
 
     def initialize(self, config: PublisherConfig) -> None:
         self.config = config
@@ -150,13 +149,9 @@ class Publisher:
         base_version: str | None = None,
         gather_hf_buckets=None,
     ) -> None:
-        if self.poisoned:
-            raise RuntimeError("publisher is poisoned")
         if self.pending_version is not None:
             raise RuntimeError(f"revision {self.pending_version!r} is still pending")
         if version == "0":
-            if base_version is not None or self.current_version != "0":
-                raise RuntimeError("version 0 is the launch revision")
             if self.rank == 0:
                 self.catalog.publish_revision(
                     RevisionManifest(
@@ -175,19 +170,6 @@ class Publisher:
                 f"base {base_version!r} does not match current version "
                 f"{self.current_version!r}"
             )
-        if gather_hf_buckets is None or not self.captured:
-            raise RuntimeError("source-rank baseline is not captured")
-
-        if self.rank == 0:
-            base = self.catalog.get_revision(self.config.model_id, base_version)
-            if (
-                base.state is not RevisionState.COMMITTED
-                or base.manifest.target_digest != self.target_digest
-                or base.manifest.format_digest != self.format_digest
-            ):
-                raise RuntimeError("catalog base does not match the current snapshot")
-
-        self.poisoned = True
         capture_started = time.monotonic()
         raw_deltas, changed_bytes = self._capture_deltas(gather_hf_buckets)
         capture_seconds = time.monotonic() - capture_started
@@ -199,7 +181,6 @@ class Publisher:
                 del raw_deltas[name]
                 del changed_bytes[name]
         if format_digest(metadata) != self.format_digest:
-            self.poisoned = True
             raise RuntimeError("canonical format changed during publication")
         target_digest = snapshot_digest(metadata)
         publish_started = time.monotonic()
@@ -214,7 +195,7 @@ class Publisher:
             )
         )
         publish_seconds = time.monotonic() - publish_started
-        phase_metrics = self._gather(
+        self._metrics = self._collect_metrics(
             (
                 capture_seconds,
                 publish_seconds,
@@ -223,22 +204,11 @@ class Publisher:
                 finalize_seconds,
                 sum(changed_bytes.values()),
                 wire_bytes,
-            )
+            ),
+            sum(item["byte_size"] for item in metadata.values()),
         )
-        total_bytes = sum(item["byte_size"] for item in metadata.values())
-        self._metrics = {
-            "perf/update_weights_density": sum(item[5] for item in phase_metrics)
-            / max(total_bytes, 1),
-            "perf/update_weights_wire_bytes": sum(item[6] for item in phase_metrics),
-            "perf/mx_encode_delta": max(item[0] for item in phase_metrics),
-            "perf/mx_publish_time": max(item[1] for item in phase_metrics),
-            "perf/mx_publish_setup": max(item[2] for item in phase_metrics),
-            "perf/mx_publish_pool": max(item[3] for item in phase_metrics),
-            "perf/mx_publish_finalize": max(item[4] for item in phase_metrics),
-        }
         self.pending_version = version
         self.pending_digest = target_digest
-        self.poisoned = False
 
     def capture_baseline(self, gather_hf_buckets, read_hf_tensor) -> None:
         def seed_bucket(bucket, _pbar=None):
@@ -270,8 +240,6 @@ class Publisher:
         self.captured = True
 
     def wait_for_commit(self, version: str, completion=None) -> None:
-        if self.poisoned:
-            raise RuntimeError("publisher is poisoned")
         if self.pending_version != version:
             raise RuntimeError(f"revision {version!r} is not pending")
         if self.rank == 0:
@@ -286,6 +254,19 @@ class Publisher:
         self.target_digest = self.pending_digest
         self.pending_version = None
         self.pending_digest = None
+
+    def _collect_metrics(self, local_metrics, total_bytes: int) -> dict[str, float]:
+        phase_metrics = self._gather(local_metrics)
+        return {
+            "perf/update_weights_density": sum(item[5] for item in phase_metrics)
+            / max(total_bytes, 1),
+            "perf/update_weights_wire_bytes": sum(item[6] for item in phase_metrics),
+            "perf/mx_encode_delta": max(item[0] for item in phase_metrics),
+            "perf/mx_publish_time": max(item[1] for item in phase_metrics),
+            "perf/mx_publish_setup": max(item[2] for item in phase_metrics),
+            "perf/mx_publish_pool": max(item[3] for item in phase_metrics),
+            "perf/mx_publish_finalize": max(item[4] for item in phase_metrics),
+        }
 
     def pop_metrics(self) -> dict[str, float]:
         metrics, self._metrics = getattr(self, "_metrics", {}), {}

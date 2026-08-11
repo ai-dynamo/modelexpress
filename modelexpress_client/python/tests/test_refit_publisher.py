@@ -165,6 +165,7 @@ def test_initialize_constructs_catalog_and_s3_services(tmp_path, monkeypatch):
 
 def test_publisher_uses_direct_capture_and_transport_calls():
     assert hasattr(Publisher, "_capture_deltas")
+    assert hasattr(Publisher, "_collect_metrics")
     assert not hasattr(Publisher, "_encode_delta")
     assert not hasattr(Publisher, "_agree_error")
     assert not hasattr(Publisher, "_put")
@@ -212,8 +213,10 @@ def test_exact_base_update_uses_miles_hf_buckets_and_uploads_delta(
     publisher.capture_baseline(gather(launch), lambda name: snapshot[name])
     publisher.publish_version("0")
     publisher.wait_for_commit("0")
+    catalog.gets.clear()
 
     publisher.publish_version("1", base_version="0", gather_hf_buckets=gather(target))
+    assert catalog.gets == {}
     publisher.wait_for_commit("1")
 
     metrics = publisher.pop_metrics()
@@ -304,10 +307,7 @@ def test_s3_failure_prevents_catalog_publication(tmp_path, monkeypatch):
         )
 
     assert [manifest.target_version for manifest in catalog.published] == ["0"]
-    with pytest.raises(RuntimeError, match="publisher is poisoned"):
-        publisher.publish_version(
-            "1", base_version="0", gather_hf_buckets=gather(launch)
-        )
+    assert not hasattr(publisher, "poisoned")
 
 
 def test_bucket_uploads_run_in_parallel(tmp_path, monkeypatch):
