@@ -20,19 +20,14 @@ from modelexpress.refit.manifest import (
     RevisionState,
     S3Object,
 )
+from modelexpress.refit.delta import encode_bucket
 from modelexpress.refit.receiver import ModelExpressWeightReceiver, ReceiverConfig
-from modelexpress.refit.source.canonical import (
-    encode_bucket,
-    load_hf_snapshot,
-    snapshot_digest,
-)
+from modelexpress.refit.source.canonical import load_hf_snapshot, snapshot_digest
 
 
-def test_receiver_download_workers_follow_receiver_configuration(monkeypatch):
-    monkeypatch.setenv("MX_REFIT_S3_DOWNLOAD_WORKERS", "7")
-
-    assert receiver_module._download_worker_count(20) == 7
-    assert receiver_module._download_worker_count(3) == 3
+def test_receiver_uses_direct_worker_policy_and_result_construction():
+    assert not hasattr(receiver_module, "_download_worker_count")
+    assert not hasattr(ModelExpressWeightReceiver, "_result")
 
 
 def test_receiver_has_no_callback_or_forwarding_helpers():
@@ -137,7 +132,7 @@ def test_receiver_downloads_and_patches_one_persistent_exact_checkpoint(
     target_digest = snapshot_digest(metadata)
     coverage = [{**metadata[name], "state": "dirty", "bucket_ordinal": ordinal}]
     bucket_location = location("bucket-0.mxdb", bucket, include_size=True)
-    root = json.dumps(
+    index = json.dumps(
         {
             "model_id": "model",
             "base_version": "0",
@@ -173,7 +168,7 @@ def test_receiver_downloads_and_patches_one_persistent_exact_checkpoint(
             base_digest=base_digest,
             target_digest=target_digest,
             format_digest=format_digest,
-            payload=S3Object(**location("root.json", root)),
+            payload=S3Object(**location("delta-index.json", index)),
         ),
         RevisionState.READY,
     )
@@ -185,7 +180,7 @@ def test_receiver_downloads_and_patches_one_persistent_exact_checkpoint(
         ready_timeout_seconds=1,
     )
     catalog = Catalog({"0": launch, "1": target_record}, misses=1)
-    s3 = S3({"root.json": root, "bucket-0.mxdb": bucket})
+    s3 = S3({"delta-index.json": index, "bucket-0.mxdb": bucket})
     monkeypatch.setattr(
         receiver_module,
         "GrpcRevisionCatalog",
@@ -222,7 +217,7 @@ def test_receiver_downloads_and_patches_one_persistent_exact_checkpoint(
 
     metrics = receiver.pop_metrics()
     assert metrics["perf/mx_receive_prepare_time"] >= 0
-    assert metrics["perf/mx_receive_root_download"] >= 0
+    assert metrics["perf/mx_receive_delta_index_download"] >= 0
     assert metrics["perf/mx_receive_pool"] >= 0
     assert "perf/mx_receive_wire_bytes" not in metrics
 
@@ -236,10 +231,10 @@ def test_receiver_downloads_and_patches_one_persistent_exact_checkpoint(
         load_file(checkpoint / "model.safetensors")["model.weight"],
         torch.tensor([1.0, 2.0]),
     )
-    assert s3.calls == ["root.json", "bucket-0.mxdb"]
+    assert s3.calls == ["delta-index.json", "bucket-0.mxdb"]
 
     follower.start_weight_update("1")
-    assert s3.calls == ["root.json", "bucket-0.mxdb"]
+    assert s3.calls == ["delta-index.json", "bucket-0.mxdb"]
     follower_metrics = follower.pop_metrics()
     assert follower_metrics["perf/mx_receive_prepare_time"] >= 0
     assert "perf/mx_receive_wire_bytes" not in follower_metrics

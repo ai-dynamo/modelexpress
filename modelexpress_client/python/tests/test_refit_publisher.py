@@ -20,7 +20,8 @@ from modelexpress.refit import (
     S3Config,
 )
 from modelexpress.refit import publisher as publisher_module
-from modelexpress.refit.source.canonical import decode_bucket, load_hf_snapshot
+from modelexpress.refit.delta import decode_bucket
+from modelexpress.refit.source.canonical import load_hf_snapshot
 
 
 class FakeCatalog:
@@ -162,6 +163,14 @@ def test_initialize_constructs_catalog_and_s3_services(tmp_path, monkeypatch):
     ]
 
 
+def test_publisher_uses_direct_capture_and_transport_calls():
+    assert hasattr(Publisher, "_capture_deltas")
+    assert not hasattr(Publisher, "_encode_delta")
+    assert not hasattr(Publisher, "_agree_error")
+    assert not hasattr(Publisher, "_put")
+    assert not hasattr(Publisher, "_barrier")
+
+
 def test_launch_zero_publishes_metadata_without_weights(tmp_path, monkeypatch):
     catalog = FakeCatalog()
     s3 = FakeS3()
@@ -228,10 +237,11 @@ def test_exact_base_update_uses_miles_hf_buckets_and_uploads_delta(
     assert publisher.pop_metrics() == {}
     assert publisher.current_version == "1"
     manifest = catalog.published[-1]
-    root = json.loads(s3.objects[(manifest.payload.bucket, manifest.payload.key)][0])
-    assert root["base_version"] == "0"
-    assert root["target_version"] == "1"
-    [bucket] = root["buckets"]
+    assert manifest.payload.key.endswith("/delta-index.json")
+    index = json.loads(s3.objects[(manifest.payload.bucket, manifest.payload.key)][0])
+    assert index["base_version"] == "0"
+    assert index["target_version"] == "1"
+    [bucket] = index["buckets"]
     encoded = s3.objects[(bucket["object"]["bucket"], bucket["object"]["key"])][0]
     snapshot, metadata, _format_digest, _base_digest = load_hf_snapshot(hf_path)
     decode_bucket(encoded, snapshot, metadata)

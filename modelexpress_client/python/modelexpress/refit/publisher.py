@@ -20,11 +20,11 @@ import torch
 from .. import envs
 from .api import PublisherConfig
 from .catalog import GrpcRevisionCatalog
+from .delta import compute_delta, encode_bucket
 from .manifest import RevisionManifest, RevisionState
 from .s3 import S3Client
 from .source.canonical import (
     canonical_json,
-    encode_bucket,
     format_digest,
     load_hf_snapshot,
     snapshot_digest,
@@ -87,6 +87,17 @@ def _bucket_groups(names: list[str], metadata: dict[str, dict], limit: int):
     return groups
 
 
+def _compute_staged_delta(name, data, size, pinned, base, free_buffers):
+    if pinned:
+        current = np.empty(size, dtype=np.uint8)
+        np.copyto(current, data.numpy()[:size])
+        free_buffers.put(data)
+    else:
+        current = data
+    raw_delta, target_digest, changed_bytes = compute_delta(current, base)
+    return name, current, raw_delta, target_digest, changed_bytes
+
+
 class Publisher:
     def __init__(
         self,
@@ -115,21 +126,16 @@ class Publisher:
         )
 
         identity = None
-        error = None
-        try:
-            if self.rank == 0:
-                _snapshot, _metadata, launch_format, launch_digest = load_hf_snapshot(
-                    self.launch_checkpoint
-                )
-                identity = (launch_format, launch_digest)
-                self.catalog = GrpcRevisionCatalog(config.catalog_endpoint)
-            self.s3 = S3Client(
-                endpoint_url=config.s3.endpoint_url,
-                region_name=config.s3.region_name,
+        if self.rank == 0:
+            _snapshot, _metadata, launch_format, launch_digest = load_hf_snapshot(
+                self.launch_checkpoint
             )
-        except Exception as exc:
-            error = exc
-        self._agree_error(error)
+            identity = (launch_format, launch_digest)
+            self.catalog = GrpcRevisionCatalog(config.catalog_endpoint)
+        self.s3 = S3Client(
+            endpoint_url=config.s3.endpoint_url,
+            region_name=config.s3.region_name,
+        )
         identities = self._gather(identity)
         self.format_digest, self.target_digest = next(
             item for item in identities if item is not None
@@ -151,20 +157,15 @@ class Publisher:
         if version == "0":
             if base_version is not None or self.current_version != "0":
                 raise RuntimeError("version 0 is the launch revision")
-            error = None
             if self.rank == 0:
-                try:
-                    self.catalog.publish_revision(
-                        RevisionManifest(
-                            model_id=self.config.model_id,
-                            target_version="0",
-                            target_digest=self.target_digest,
-                            format_digest=self.format_digest,
-                        )
+                self.catalog.publish_revision(
+                    RevisionManifest(
+                        model_id=self.config.model_id,
+                        target_version="0",
+                        target_digest=self.target_digest,
+                        format_digest=self.format_digest,
                     )
-                except Exception as exc:
-                    error = exc
-            self._agree_error(error)
+                )
             self.pending_version = "0"
             self.pending_digest = self.target_digest
             return
@@ -177,52 +178,45 @@ class Publisher:
         if gather_hf_buckets is None or not self.captured:
             raise RuntimeError("source-rank baseline is not captured")
 
-        error = None
         if self.rank == 0:
-            try:
-                base = self.catalog.get_revision(self.config.model_id, base_version)
-                if (
-                    base.state is not RevisionState.COMMITTED
-                    or base.manifest.target_digest != self.target_digest
-                    or base.manifest.format_digest != self.format_digest
-                ):
-                    raise RuntimeError(
-                        "catalog base does not match the current snapshot"
-                    )
-            except Exception as exc:
-                error = exc
-        self._agree_error(error)
+            base = self.catalog.get_revision(self.config.model_id, base_version)
+            if (
+                base.state is not RevisionState.COMMITTED
+                or base.manifest.target_digest != self.target_digest
+                or base.manifest.format_digest != self.format_digest
+            ):
+                raise RuntimeError("catalog base does not match the current snapshot")
 
-        encode_started = time.monotonic()
-        try:
-            raw_deltas, checksums, changed_bytes = self._encode_delta(gather_hf_buckets)
-            error = None
-        except Exception as exc:
-            error = exc
-        self._agree_error(error)
-        encode_seconds = time.monotonic() - encode_started
-        self._drop_duplicate_names(raw_deltas, checksums, changed_bytes)
-        metadata, owners = self._collect_metadata()
-        error = (
-            RuntimeError("canonical format changed during publication")
-            if format_digest(metadata) != self.format_digest
-            else None
+        self.poisoned = True
+        capture_started = time.monotonic()
+        raw_deltas, changed_bytes = self._capture_deltas(gather_hf_buckets)
+        capture_seconds = time.monotonic() - capture_started
+        metadata, owners = _merge_metadata(
+            self._gather((self.rank, self._local_metadata()))
         )
-        self._agree_error(error)
+        for name in list(raw_deltas):
+            if owners[name] != self.rank:
+                del raw_deltas[name]
+                del changed_bytes[name]
+        if format_digest(metadata) != self.format_digest:
+            self.poisoned = True
+            raise RuntimeError("canonical format changed during publication")
         target_digest = snapshot_digest(metadata)
         publish_started = time.monotonic()
-        wire_bytes, setup_seconds, pool_seconds, finalize_seconds = self._publish_root(
-            version,
-            base_version,
-            raw_deltas,
-            metadata,
-            owners,
-            target_digest,
+        wire_bytes, setup_seconds, pool_seconds, finalize_seconds = (
+            self._publish_delta_index(
+                version,
+                base_version,
+                raw_deltas,
+                metadata,
+                owners,
+                target_digest,
+            )
         )
         publish_seconds = time.monotonic() - publish_started
         phase_metrics = self._gather(
             (
-                encode_seconds,
+                capture_seconds,
                 publish_seconds,
                 setup_seconds,
                 pool_seconds,
@@ -244,7 +238,7 @@ class Publisher:
         }
         self.pending_version = version
         self.pending_digest = target_digest
-        self._barrier()
+        self.poisoned = False
 
     def capture_baseline(self, gather_hf_buckets, read_hf_tensor) -> None:
         def seed_bucket(bucket, _pbar=None):
@@ -265,7 +259,9 @@ class Publisher:
                 self.snapshot[name] = np.asarray(value, dtype=np.uint8).copy()
 
         gather_hf_buckets(seed_bucket)
-        metadata, _owners = self._collect_metadata()
+        metadata, _owners = _merge_metadata(
+            self._gather((self.rank, self._local_metadata()))
+        )
         if (
             format_digest(metadata) != self.format_digest
             or snapshot_digest(metadata) != self.target_digest
@@ -278,19 +274,14 @@ class Publisher:
             raise RuntimeError("publisher is poisoned")
         if self.pending_version != version:
             raise RuntimeError(f"revision {version!r} is not pending")
-        error = None
         if self.rank == 0:
-            try:
-                while (
-                    self.catalog.get_revision(self.config.model_id, version).state
-                    is not RevisionState.COMMITTED
-                ):
-                    if completion is not None and completion.done():
-                        completion.result()
-                    time.sleep(POLL_INTERVAL_SECONDS)
-            except Exception as exc:
-                error = exc
-        self._agree_error(error)
+            while (
+                self.catalog.get_revision(self.config.model_id, version).state
+                is not RevisionState.COMMITTED
+            ):
+                if completion is not None and completion.done():
+                    completion.result()
+                time.sleep(POLL_INTERVAL_SECONDS)
         self.current_version = version
         self.target_digest = self.pending_digest
         self.pending_version = None
@@ -301,15 +292,13 @@ class Publisher:
         return metrics
 
     def deregister(self) -> None:
-        if self.s3 is not None:
-            self.s3.close()
-        close = getattr(self.catalog, "close", None)
-        if close is not None:
-            close()
+        for resource in (self.s3, self.catalog):
+            close = getattr(resource, "close", None)
+            if close is not None:
+                close()
 
-    def _encode_delta(self, gather_hf_buckets):
+    def _capture_deltas(self, gather_hf_buckets):
         raw_deltas = {}
-        checksums = {}
         changed_bytes = {}
         max_bytes = max(
             (int(value.nbytes) for value in self.snapshot.values()), default=0
@@ -328,36 +317,10 @@ class Publisher:
             free_buffers = queue.Queue()
             use_pinned = False
 
-        def encode(name, data, size, pinned):
-            if pinned:
-                current = np.empty(size, dtype=np.uint8)
-                np.copyto(current, data.numpy()[:size])
-                free_buffers.put(data)
-            else:
-                current = data
-            old = self.snapshot[name]
-            if len(current) != len(old):
-                raise RuntimeError(f"{name} changed byte size")
-            delta = np.bitwise_xor(current, old)
-            changed = int(np.count_nonzero(delta))
-            if not changed:
-                return name, current, None, None, 0
-            digest = f"sha256:{hashlib.sha256(memoryview(current)).hexdigest()}"
-            return name, current, delta, digest, changed
-
         inflight = deque()
         pool = ThreadPoolExecutor(max_workers=NUM_WORKERS)
 
-        def collect(future):
-            name, current, raw_delta, digest, changed = future.result()
-            self.snapshot[name] = current
-            if changed:
-                raw_deltas[name] = raw_delta
-                checksums[name] = digest
-                changed_bytes[name] = changed
-                self.metadata[name]["target_digest"] = digest
-
-        def encode_bucket(bucket, _pbar=None):
+        def capture_bucket(bucket, _pbar=None):
             for name, tensor in bucket:
                 name = name.removeprefix("module.")
                 self._record_metadata(name, tensor)
@@ -371,37 +334,39 @@ class Publisher:
                 else:
                     data = flat.cpu().numpy()
                     pinned = False
-                inflight.append(pool.submit(encode, name, data, size, pinned))
+                inflight.append(
+                    pool.submit(
+                        _compute_staged_delta,
+                        name,
+                        data,
+                        size,
+                        pinned,
+                        self.snapshot[name],
+                        free_buffers,
+                    )
+                )
                 if len(inflight) >= 2 * NUM_WORKERS:
-                    collect(inflight.popleft())
+                    name, current, raw_delta, digest, changed = (
+                        inflight.popleft().result()
+                    )
+                    self.snapshot[name] = current
+                    if changed:
+                        raw_deltas[name] = raw_delta
+                        changed_bytes[name] = changed
+                        self.metadata[name]["target_digest"] = digest
 
         try:
-            gather_hf_buckets(encode_bucket)
+            gather_hf_buckets(capture_bucket)
             while inflight:
-                collect(inflight.popleft())
+                name, current, raw_delta, digest, changed = inflight.popleft().result()
+                self.snapshot[name] = current
+                if changed:
+                    raw_deltas[name] = raw_delta
+                    changed_bytes[name] = changed
+                    self.metadata[name]["target_digest"] = digest
         finally:
             pool.shutdown()
-        return raw_deltas, checksums, changed_bytes
-
-    def _drop_duplicate_names(self, raw_deltas, checksums, changed_bytes) -> None:
-        contributions = self._gather((self.rank, checksums))
-        error = None
-        try:
-            for rank, other in sorted(contributions):
-                if rank >= self.rank:
-                    break
-                for name in raw_deltas.keys() & other.keys():
-                    if other[name] != checksums[name]:
-                        raise RuntimeError(
-                            f"{name!r} published by rank {rank} and rank {self.rank} "
-                            "with different bytes"
-                        )
-                    del raw_deltas[name]
-                    del checksums[name]
-                    del changed_bytes[name]
-        except Exception as exc:
-            error = exc
-        self._agree_error(error)
+        return raw_deltas, changed_bytes
 
     def _record_metadata(self, name, tensor) -> None:
         digest = self.metadata.get(name, {}).get("target_digest")
@@ -414,7 +379,7 @@ class Publisher:
         if digest is not None:
             self.metadata[name]["target_digest"] = digest
 
-    def _collect_metadata(self):
+    def _local_metadata(self):
         local = {}
         for name, item in self.metadata.items():
             if name not in self.snapshot:
@@ -424,9 +389,9 @@ class Publisher:
                     f"sha256:{hashlib.sha256(self.snapshot[name].tobytes()).hexdigest()}"
                 )
             local[name] = dict(item)
-        return _merge_metadata(self._gather((self.rank, local)))
+        return local
 
-    def _publish_root(
+    def _publish_delta_index(
         self,
         version,
         base_version,
@@ -470,13 +435,18 @@ class Publisher:
                 tensors=tensors,
                 metadata=local_metadata,
             )
-            stored = self._put(
-                _key(
-                    self.config.model_id,
-                    version,
-                    f"bucket-{ordinal:08d}-of-{total:08d}.mxcd",
-                ),
-                data,
+            key = _key(
+                self.config.model_id,
+                version,
+                f"bucket-{ordinal:08d}-of-{total:08d}.mxcd",
+            )
+            key = "/".join(
+                part for part in (self.config.s3.prefix.strip("/"), key) if part
+            )
+            stored = self.s3.put(
+                bucket=self.config.s3.bucket,
+                key=key,
+                data=data,
             )
             return (
                 {
@@ -491,22 +461,15 @@ class Publisher:
         pool_started = time.monotonic()
         descriptors = []
         dirty_ordinals = {}
-        error = None
-        try:
-            if groups:
-                with ThreadPoolExecutor(
-                    max_workers=min(
-                        max(1, envs.MX_REFIT_S3_UPLOAD_WORKERS), len(groups)
-                    )
-                ) as pool:
-                    uploaded = pool.map(upload, tasks)
-                    for descriptor, names in uploaded:
-                        descriptors.append(descriptor)
-                        for name in names:
-                            dirty_ordinals[name] = descriptor["ordinal"]
-        except Exception as exc:
-            error = exc
-        self._agree_error(error)
+        if groups:
+            with ThreadPoolExecutor(
+                max_workers=min(max(1, envs.MX_REFIT_S3_UPLOAD_WORKERS), len(groups))
+            ) as pool:
+                uploaded = pool.map(upload, tasks)
+                for descriptor, names in uploaded:
+                    descriptors.append(descriptor)
+                    for name in names:
+                        dirty_ordinals[name] = descriptor["ordinal"]
         pool_seconds = time.monotonic() - pool_started
         finalize_started = time.monotonic()
 
@@ -517,65 +480,54 @@ class Publisher:
                 value["state"] = "dirty"
                 value["bucket_ordinal"] = dirty_ordinals[name]
             coverage.append(value)
-        all_descriptors = self._gather((self.rank, descriptors))
-        all_coverage = self._gather((self.rank, coverage))
         wire_bytes = sum(item["object"]["size"] for item in descriptors)
-        error = None
+        contributions = self._gather((self.rank, descriptors, coverage))
+
         if self.rank == 0:
-            try:
-                buckets = sorted(
-                    (item for _rank, values in all_descriptors for item in values),
-                    key=lambda item: item["ordinal"],
+            buckets = sorted(
+                (item for _rank, values, _coverage in contributions for item in values),
+                key=lambda item: item["ordinal"],
+            )
+            tensors = sorted(
+                (item for _rank, _values, values in contributions for item in values),
+                key=lambda item: item["name"],
+            )
+            index_payload = canonical_json(
+                {
+                    "base_digest": self.target_digest,
+                    "base_version": base_version,
+                    "buckets": buckets,
+                    "encoding": {"compression": "zstd", "delta": "xor"},
+                    "format_digest": self.format_digest,
+                    "model_id": self.config.model_id,
+                    "schema": "mx.canonical.delta.v0",
+                    "target_digest": target_digest,
+                    "target_version": version,
+                    "tensors": tensors,
+                }
+            )
+            key = _key(self.config.model_id, version, "delta-index.json")
+            key = "/".join(
+                part for part in (self.config.s3.prefix.strip("/"), key) if part
+            )
+            payload = self.s3.put(
+                bucket=self.config.s3.bucket,
+                key=key,
+                data=index_payload,
+            )
+            self.catalog.publish_revision(
+                RevisionManifest(
+                    model_id=self.config.model_id,
+                    target_version=version,
+                    base_version=base_version,
+                    base_digest=self.target_digest,
+                    target_digest=target_digest,
+                    format_digest=self.format_digest,
+                    payload=payload,
                 )
-                tensors = sorted(
-                    (item for _rank, values in all_coverage for item in values),
-                    key=lambda item: item["name"],
-                )
-                root = canonical_json(
-                    {
-                        "base_digest": self.target_digest,
-                        "base_version": base_version,
-                        "buckets": buckets,
-                        "encoding": {"compression": "zstd", "delta": "xor"},
-                        "format_digest": self.format_digest,
-                        "model_id": self.config.model_id,
-                        "schema": "mx.canonical.delta.v0",
-                        "target_digest": target_digest,
-                        "target_version": version,
-                        "tensors": tensors,
-                    }
-                )
-                payload = self._put(
-                    _key(self.config.model_id, version, "root.json"), root
-                )
-                self.catalog.publish_revision(
-                    RevisionManifest(
-                        model_id=self.config.model_id,
-                        target_version=version,
-                        base_version=base_version,
-                        base_digest=self.target_digest,
-                        target_digest=target_digest,
-                        format_digest=self.format_digest,
-                        payload=payload,
-                    )
-                )
-            except Exception as exc:
-                error = exc
-        self._agree_error(error)
+            )
         finalize_seconds = time.monotonic() - finalize_started
         return wire_bytes, setup_seconds, pool_seconds, finalize_seconds
-
-    def _put(self, key: str, data: bytes):
-        key = "/".join(part for part in (self.config.s3.prefix.strip("/"), key) if part)
-        return self.s3.put(bucket=self.config.s3.bucket, key=key, data=data)
-
-    def _agree_error(self, error) -> None:
-        message = None if error is None else f"{type(error).__name__}: {error}"
-        errors = self._gather(message)
-        failures = [item for item in errors if item is not None]
-        if failures:
-            self.poisoned = True
-            raise RuntimeError("distributed publication failed: " + "; ".join(failures))
 
     def _gather(self, value):
         if not self.distributed:
@@ -583,7 +535,3 @@ class Publisher:
         values = [None] * self.world
         torch.distributed.all_gather_object(values, value, group=self.group)
         return values
-
-    def _barrier(self) -> None:
-        if self.distributed:
-            torch.distributed.barrier(group=self.group)

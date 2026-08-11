@@ -14,13 +14,10 @@ import torch
 from safetensors.torch import save_file
 
 from modelexpress.refit.manifest import S3Object
+from modelexpress.refit import delta
+from modelexpress.refit.delta import decode_bucket, encode_bucket
 from modelexpress.refit.s3 import ImmutableS3Conflict, S3Client
-from modelexpress.refit.source import canonical
-from modelexpress.refit.source.canonical import (
-    decode_bucket,
-    encode_bucket,
-    load_hf_snapshot,
-)
+from modelexpress.refit.source.canonical import load_hf_snapshot
 
 
 class FakeS3:
@@ -63,12 +60,12 @@ def test_s3_client_puts_immutable_object_and_gets_verified_bytes(monkeypatch):
 
     stored = client.put(
         bucket="bucket",
-        key="run/models/m/revisions/1/root.json",
-        data=b"root",
+        key="run/models/m/revisions/1/delta-index.json",
+        data=b"index",
     )
 
     assert stored.bucket == "bucket"
-    assert stored.key == "run/models/m/revisions/1/root.json"
+    assert stored.key == "run/models/m/revisions/1/delta-index.json"
     assert stored.object_version == "version-1"
     assert stored.checksum.startswith("crc32c:")
     request = raw_client.puts[0]
@@ -77,7 +74,7 @@ def test_s3_client_puts_immutable_object_and_gets_verified_bytes(monkeypatch):
     assert base64.b64decode(request["ChecksumCRC32C"])
     assert raw_client.head_calls == 0
     assert raw_client.get_calls == 0
-    assert client.get(stored) == b"root"
+    assert client.get(stored) == b"index"
     assert raw_client.get_calls == 1
 
 
@@ -107,15 +104,15 @@ def test_s3_client_allows_identical_retry_but_rejects_immutable_conflict(
     monkeypatch.setattr("boto3.client", lambda *_args, **_kwargs: raw_client)
     client = S3Client()
 
-    first = client.put(bucket="bucket", key="root.json", data=b"same")
-    assert client.put(bucket="bucket", key="root.json", data=b"same") == first
+    first = client.put(bucket="bucket", key="delta-index.json", data=b"same")
+    assert client.put(bucket="bucket", key="delta-index.json", data=b"same") == first
     with pytest.raises(ImmutableS3Conflict):
-        client.put(bucket="bucket", key="root.json", data=b"different")
+        client.put(bucket="bucket", key="delta-index.json", data=b"different")
 
 
 def test_s3_client_rejects_download_checksum_mismatch(monkeypatch):
     raw_client = FakeS3()
-    raw_client.objects[("bucket", "root.json")] = (
+    raw_client.objects[("bucket", "delta-index.json")] = (
         b"wrong",
         "unused",
         "version-1",
@@ -127,7 +124,7 @@ def test_s3_client_rejects_download_checksum_mismatch(monkeypatch):
         client.get(
             S3Object(
                 bucket="bucket",
-                key="root.json",
+                key="delta-index.json",
                 checksum="crc32c:00000000",
                 object_version="version-1",
             )
@@ -208,6 +205,17 @@ def test_pack_source_rank_raw_deltas_into_canonical_bucket(tmp_path):
     assert restored["model.weight"].tobytes() == new
 
 
+def test_compute_delta_returns_xor_changed_bytes_and_target_digest():
+    base = np.array([0, 1, 2, 3], dtype=np.uint8)
+    current = np.array([0, 4, 2, 8], dtype=np.uint8)
+
+    raw_delta, target_digest, changed_bytes = delta.compute_delta(current, base)
+
+    assert raw_delta.tolist() == [0, 5, 0, 11]
+    assert changed_bytes == 2
+    assert target_digest == f"sha256:{hashlib.sha256(current).hexdigest()}"
+
+
 def test_bucket_streams_numpy_deltas_without_decoded_copy(monkeypatch):
     seen = []
 
@@ -222,9 +230,7 @@ def test_bucket_streams_numpy_deltas_without_decoded_copy(monkeypatch):
         def flush(self):
             return b"end"
 
-    monkeypatch.setattr(
-        canonical.zstandard, "ZstdCompressor", lambda level: Compressor()
-    )
+    monkeypatch.setattr(delta.zstandard, "ZstdCompressor", lambda level: Compressor())
     first = np.arange(4, dtype=np.uint8)
     second = np.arange(3, dtype=np.uint8)
     metadata = {
@@ -255,7 +261,7 @@ def test_bucket_streams_numpy_deltas_without_decoded_copy(monkeypatch):
         metadata=metadata,
     )
 
-    header, compressed = canonical.bucket_parts(encoded)
+    header, compressed = delta.bucket_parts(encoded)
     assert all(isinstance(data, memoryview) for data in seen)
     assert [data.obj for data in seen] == [first, second]
     assert decoded_size == first.nbytes + second.nbytes

@@ -27,9 +27,10 @@ import zstandard
 from .. import envs
 from .api import ReceiverRevisionState, ReceiverStatus, WeightUpdateResult
 from .catalog import GrpcRevisionCatalog
+from .delta import bucket_parts
 from .manifest import RevisionState, S3Object
 from .s3 import S3Client
-from .source.canonical import bucket_parts, snapshot_digest
+from .source.canonical import snapshot_digest
 from .source.canonical import format_digest as canonical_format_digest
 
 
@@ -47,10 +48,6 @@ class ReceiverInstallError(RuntimeError):
     def __init__(self, detail: str, mutation_started: bool) -> None:
         super().__init__(detail)
         self.mutation_started = mutation_started
-
-
-def _download_worker_count(bucket_count: int) -> int:
-    return min(max(1, envs.MX_REFIT_S3_DOWNLOAD_WORKERS), bucket_count)
 
 
 @dataclass(frozen=True)
@@ -199,13 +196,27 @@ class ModelExpressWeightReceiver:
                 else ReceiverRevisionState.FAILED
             )
             self.detail = str(error)
-            return self._result(False)
+            return WeightUpdateResult(
+                success=False,
+                receiver_id=self.receiver_id,
+                installed_version=self.installed_version,
+                state=self.state,
+                target_digest=self.installed_digest,
+                detail=self.detail,
+            )
         self.installed_version = target.target_version
         self.installed_digest = target.target_digest
         self.prepared = None
         self.state = ReceiverRevisionState.VERIFIED
         self._metrics = {"perf/mx_receive_install_time": time.perf_counter() - started}
-        return self._result(True)
+        return WeightUpdateResult(
+            success=True,
+            receiver_id=self.receiver_id,
+            installed_version=self.installed_version,
+            state=self.state,
+            target_digest=self.installed_digest,
+            detail=self.detail,
+        )
 
     def pop_metrics(self) -> dict[str, float]:
         metrics, self._metrics = self._metrics, {}
@@ -214,7 +225,14 @@ class ModelExpressWeightReceiver:
     def mark_poisoned(self, detail: str):
         self.state = ReceiverRevisionState.POISONED
         self.detail = detail
-        return self._result(False)
+        return WeightUpdateResult(
+            success=False,
+            receiver_id=self.receiver_id,
+            installed_version=self.installed_version,
+            state=self.state,
+            target_digest=self.installed_digest,
+            detail=self.detail,
+        )
 
     def status(self) -> ReceiverStatus:
         return ReceiverStatus(
@@ -223,16 +241,6 @@ class ModelExpressWeightReceiver:
             installed_version=self.installed_version,
             target_digest=self.installed_digest,
             state=self.state,
-            detail=self.detail,
-        )
-
-    def _result(self, success: bool) -> WeightUpdateResult:
-        return WeightUpdateResult(
-            success=success,
-            receiver_id=self.receiver_id,
-            installed_version=self.installed_version,
-            state=self.state,
-            target_digest=self.installed_digest,
             detail=self.detail,
         )
 
@@ -324,21 +332,21 @@ def _checkpoint_files_state(locations):
     }
 
 
-def _apply_bucket(data, locations, maps, root, descriptor, coverage) -> None:
+def _apply_bucket(data, locations, maps, index, descriptor, coverage) -> None:
     header, compressed = bucket_parts(data)
     if (
-        header["model_id"] != root["model_id"]
-        or header["base_version"] != root["base_version"]
-        or header["target_version"] != root["target_version"]
-        or header["base_digest"] != root["base_digest"]
-        or header["format_digest"] != root["format_digest"]
+        header["model_id"] != index["model_id"]
+        or header["base_version"] != index["base_version"]
+        or header["target_version"] != index["target_version"]
+        or header["base_digest"] != index["base_digest"]
+        or header["format_digest"] != index["format_digest"]
         or header["ordinal"] != descriptor["ordinal"]
         or header["decoded_size"] != descriptor["decoded_size"]
         or header["compression"] != "zstd"
         or header["delta"] != "xor"
         or [item["name"] for item in header["entries"]] != descriptor["tensors"]
     ):
-        raise ValueError("canonical bucket does not match its root descriptor")
+        raise ValueError("canonical bucket does not match its delta-index descriptor")
     reader = zstandard.ZstdDecompressor().stream_reader(compressed)
     decoded_position = 0
     for entry in header["entries"]:
@@ -489,7 +497,7 @@ class _LocalCheckpoint:
                     manifest.target_digest,
                     self.local_checkpoint,
                     {
-                        "perf/mx_receive_root_download": 0.0,
+                        "perf/mx_receive_delta_index_download": 0.0,
                         "perf/mx_receive_pool": 0.0,
                     },
                 )
@@ -497,25 +505,25 @@ class _LocalCheckpoint:
                 raise ValueError("local checkpoint does not match the exact base")
             if manifest.payload is None:
                 raise ValueError("revision has no canonical payload")
-            root_started = time.perf_counter()
-            root_payload = self.s3.get(manifest.payload)
-            root_download_time = time.perf_counter() - root_started
-            root = json.loads(root_payload)
+            index_started = time.perf_counter()
+            index_payload = self.s3.get(manifest.payload)
+            index_download_time = time.perf_counter() - index_started
+            index = json.loads(index_payload)
             if (
-                root["model_id"] != self.model_id
-                or root["base_version"] != base_version
-                or root["target_version"] != version
-                or root["base_digest"] != base_digest
-                or root["target_digest"] != manifest.target_digest
-                or root["format_digest"] != self.format_digest
+                index["model_id"] != self.model_id
+                or index["base_version"] != base_version
+                or index["target_version"] != version
+                or index["base_digest"] != base_digest
+                or index["target_digest"] != manifest.target_digest
+                or index["format_digest"] != self.format_digest
             ):
-                raise ValueError("root does not match the requested revision")
-            coverage = {item["name"]: item for item in root["tensors"]}
-            if len(coverage) != len(root["tensors"]) or set(coverage) != set(
+                raise ValueError("delta index does not match the requested revision")
+            coverage = {item["name"]: item for item in index["tensors"]}
+            if len(coverage) != len(index["tensors"]) or set(coverage) != set(
                 self.locations
             ):
                 raise ValueError(
-                    "root tensor coverage differs from the local checkpoint"
+                    "delta-index tensor coverage differs from the local checkpoint"
                 )
             for name, item in self.metadata.items():
                 target = coverage[name]
@@ -523,7 +531,7 @@ class _LocalCheckpoint:
                     target[field] != item[field]
                     for field in ("shape", "dtype", "byte_size")
                 ):
-                    raise ValueError(f"root metadata differs for {name}")
+                    raise ValueError(f"delta-index metadata differs for {name}")
             identity = {
                 name: {
                     field: item[field]
@@ -541,10 +549,12 @@ class _LocalCheckpoint:
                 canonical_format_digest(identity) != self.format_digest
                 or snapshot_digest(identity) != manifest.target_digest
             ):
-                raise ValueError("root target identity differs from the revision")
-            bucket_ordinals = [item["ordinal"] for item in root["buckets"]]
+                raise ValueError(
+                    "delta-index target identity differs from the revision"
+                )
+            bucket_ordinals = [item["ordinal"] for item in index["buckets"]]
             bucket_names = [
-                name for item in root["buckets"] for name in item["tensors"]
+                name for item in index["buckets"] for name in item["tensors"]
             ]
             dirty_names = [
                 name for name, item in coverage.items() if item["state"] == "dirty"
@@ -554,7 +564,9 @@ class _LocalCheckpoint:
                 or len(bucket_names) != len(set(bucket_names))
                 or set(bucket_names) != set(dirty_names)
             ):
-                raise ValueError("root buckets do not cover the dirty tensor set")
+                raise ValueError(
+                    "delta-index buckets do not cover the dirty tensor set"
+                )
             _write_state(self.state_path, {**state, "poisoned": True})
             maps = {}
             for path in {item[0] for item in self.locations.values()}:
@@ -571,15 +583,17 @@ class _LocalCheckpoint:
                         object_version=location.get("object_version"),
                     )
                 )
-                _apply_bucket(payload, self.locations, maps, root, bucket, coverage)
+                _apply_bucket(payload, self.locations, maps, index, bucket, coverage)
 
             bucket_pool_time = 0.0
             try:
-                buckets = root["buckets"]
+                buckets = index["buckets"]
                 if buckets:
                     pool_started = time.perf_counter()
                     with ThreadPoolExecutor(
-                        max_workers=_download_worker_count(len(buckets))
+                        max_workers=min(
+                            max(1, envs.MX_REFIT_S3_DOWNLOAD_WORKERS), len(buckets)
+                        )
                     ) as pool:
                         list(pool.map(apply, buckets))
                     bucket_pool_time = time.perf_counter() - pool_started
@@ -601,7 +615,7 @@ class _LocalCheckpoint:
                 manifest.target_digest,
                 self.local_checkpoint,
                 {
-                    "perf/mx_receive_root_download": root_download_time,
+                    "perf/mx_receive_delta_index_download": index_download_time,
                     "perf/mx_receive_pool": bucket_pool_time,
                 },
             )
