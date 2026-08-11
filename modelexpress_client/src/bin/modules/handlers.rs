@@ -5,7 +5,7 @@ use super::args::{DownloadStrategy, ModelCommands, OutputFormat};
 use super::output::{print_human_readable, print_output};
 use super::payload::read_payload;
 use colored::*;
-use modelexpress_client::{Client, ClientConfig, ModelProvider};
+use modelexpress_client::{Client, ClientConfig, ModelDownloadResult, ModelProvider};
 use modelexpress_common::{
     cache::{CacheConfig, CacheStats, ModelInfo, resolve_model_path},
     download,
@@ -156,12 +156,14 @@ pub async fn handle_model_command(
             model_name,
             provider,
             strategy,
+            revision,
         } => {
             download_model(
                 storage_path_override,
                 model_name,
                 provider,
                 strategy,
+                revision,
                 server_config,
                 format,
             )
@@ -205,6 +207,7 @@ async fn download_model(
     model_name: String,
     provider: ModelProvider,
     strategy: DownloadStrategy,
+    revision: Option<String>,
     config: ClientConfig,
     format: &OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -218,6 +221,9 @@ async fn download_model(
         println!("  {}: {}", "Model".cyan().bold(), model_name);
         println!("  {}: {}", "Provider".cyan().bold(), provider);
         println!("  {}: {:?}", "Strategy".cyan().bold(), strategy);
+        if let Some(revision) = &revision {
+            println!("  {}: {}", "Revision".cyan().bold(), revision);
+        }
         println!();
     }
 
@@ -238,6 +244,7 @@ async fn download_model(
         c
     });
 
+    let revision = revision.as_deref();
     let result = match strategy {
         DownloadStrategy::SmartFallback => {
             debug!("Using smart fallback strategy");
@@ -245,9 +252,14 @@ async fn download_model(
             if let Some(cache_config) = cache_config {
                 config.cache = cache_config;
             }
-            Client::request_model_with_smart_fallback(model_name.clone(), provider, config, false)
-                .await
-                .map(|_| ())
+            Client::request_model_with_smart_fallback_revision(
+                model_name.clone(),
+                provider,
+                config,
+                false,
+                revision,
+            )
+            .await
         }
         DownloadStrategy::ServerOnly => {
             debug!("Using server-only strategy");
@@ -257,20 +269,20 @@ async fn download_model(
                 Client::new(config.clone()).await?
             };
             client
-                .request_model(&model_name, provider, false)
+                .request_model_revision(&model_name, provider, false, revision)
                 .await
-                .map(|_| ())
         }
         DownloadStrategy::Direct => {
             debug!("Using direct download strategy");
-            download::download_model(
+            download::download_model_revision(
                 &model_name,
                 provider,
                 cache_config.map(|config| config.local_path),
                 false,
+                revision,
             )
             .await
-            .map(|_| ())
+            .map(ModelDownloadResult::from)
             .map_err(|e| {
                 modelexpress_common::Error::Generic(format!("Direct download failed: {e}")).into()
             })
@@ -278,13 +290,19 @@ async fn download_model(
     };
 
     match result {
-        Ok(()) => {
+        Ok(outcome) => {
             info!("Model download completed successfully: {}", model_name);
             let success_msg = format!("Model '{model_name}' downloaded successfully");
             match format {
                 OutputFormat::Human => {
                     println!("{}", "✅ SUCCESS".green().bold());
                     println!("  {success_msg}");
+                    if let Some(resolved) = &outcome.resolved_revision {
+                        println!("  {}: {}", "Resolved revision".cyan().bold(), resolved);
+                    }
+                    if let Some(path) = &outcome.path {
+                        println!("  {}: {}", "Path".cyan().bold(), path.display());
+                    }
                 }
                 _ => {
                     let output = serde_json::json!({
@@ -292,7 +310,9 @@ async fn download_model(
                         "message": success_msg,
                         "model_name": model_name,
                         "provider": provider.to_string(),
-                        "strategy": format!("{:?}", strategy)
+                        "strategy": format!("{:?}", strategy),
+                        "resolved_revision": outcome.resolved_revision,
+                        "path": outcome.path.as_ref().map(|path| path.display().to_string())
                     });
                     print_output(&output, format);
                 }
