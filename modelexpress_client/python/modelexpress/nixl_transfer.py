@@ -168,6 +168,11 @@ class NixlTransferManager:
         return self._metadata
 
     @property
+    def listen_port(self) -> int | None:
+        """Get the port serving this agent's NIXL metadata."""
+        return self._listen_port
+
+    @property
     def tensor_descriptors(self) -> list[TensorDescriptor]:
         """Get tensor descriptors for registered tensors."""
         return self._tensor_descriptors
