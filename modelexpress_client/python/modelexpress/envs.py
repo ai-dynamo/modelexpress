@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     MX_P2P_METADATA: str
     MX_RESHARD_FUSED_WIRE: bool
     MX_RESHARD_BATCH_INSTALL: bool
+    MX_RESHARD_SPREAD_SOURCES: bool
     MX_RESHARD_REQUIRE_FULL_COVERAGE: bool
     MX_RESHARD_COVERAGE_FLOOR: float
     MX_RESHARD_HANDSHAKE_TIMEOUT_S: float
@@ -238,6 +239,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Python and launch overhead can rival the RDMA itself. Set to 0 to fall back
     # to the per-view loop. See modelexpress.refit.reshard.receiver.
     "MX_RESHARD_BATCH_INSTALL": lambda: _env_bool("MX_RESHARD_BATCH_INSTALL", True),
+    # Rotate which byte-identical DP/EDP replica serves each shard, per receiver
+    # rank, instead of every receiver reading from the first publisher discovered.
+    # Off by default until the per-session distribution measurement says it is
+    # needed, and because resolving a name collision differently on different
+    # receivers is harder to debug than resolving it wrongly everywhere; see
+    # modelexpress.refit.reshard.rendezvous.merge_shard_tables.
+    "MX_RESHARD_SPREAD_SOURCES": lambda: _env_bool("MX_RESHARD_SPREAD_SOURCES", False),
     # Refit coverage gate. The floor is a fraction of the engine's parameter
     # bytes; ReshardReceiver validates its range at the point of use. What a
     # complete refit scores is engine- and model-specific, so the default is set

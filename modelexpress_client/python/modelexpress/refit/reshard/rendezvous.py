@@ -206,25 +206,64 @@ def build_sources(tensors: list) -> tuple:
     return sources, session_to_agent, session_to_device
 
 
-def merge_shard_tables(tables: list) -> list:
+def merge_shard_tables(tables: list, replica_offset: int = 0) -> list:
     """Merge per-rank ``list[PublishedTensor]`` into one, concatenating shards
     for the same source across ranks (reshard fans in cross-rank). full_shape /
-    dtype / elsize must agree across ranks for a given tensor name."""
+    dtype / elsize must agree across ranks for a given tensor name.
+
+    Replica publishers advertise the same geometric shard through DP/EDP
+    replication, so exactly one representative is retained per exact
+    offset/shape. Retaining all of them is what the merge used to do, and it
+    costs a read per replica: a replicated tensor under DP8 was pulled eight
+    times into the same destination bytes, and each extra owner added a P2P
+    handshake. It also defeats the full-pull optimization, whose dim-0
+    partitioner fails closed on overlapping shards and falls back to the exact
+    plan that carries the duplicates.
+
+    ``replica_offset`` selects *which* representative. The default 0 always
+    takes the first publisher seen, which means every receiver in the fleet
+    reads the same shard from the same rank while the other replicas serve
+    nothing. Passing the receiver's global rank rotates the choice so receivers
+    spread their reads over the available replicas.
+
+    Geometry set and ordering are identical for every ``replica_offset``, so only
+    the owning agent and address of each shard change - the resulting plan has
+    the same shape, segment count and byte count.
+
+    Selecting among candidates assumes they really are replicas. They are
+    byte-identical by construction when they come from DP/EDP replication, but a
+    publisher emitting parallelism-local names makes two *different* tensors
+    collide under one name, and then any choice installs bytes that belong to the
+    other. The digest consumer that rejects that case is not on this branch yet;
+    until it is, a non-zero ``replica_offset`` can have different receivers
+    resolve such a collision differently, which is why spreading is off by
+    default.
+    """
     merged: dict = {}
+    # name -> geometry -> candidate shards, insertion-ordered so the retained
+    # geometry sequence is independent of replica_offset.
+    candidates: dict = {}
     for table in tables:
         for t in table:
             cur = merged.get(t.name)
             if cur is None:
                 merged[t.name] = PublishedTensor(
-                    t.name, t.dtype, t.elsize, t.full_shape, list(t.shards)
+                    t.name, t.dtype, t.elsize, t.full_shape, []
                 )
-                continue
-            if cur.full_shape != t.full_shape or cur.dtype != t.dtype:
+                candidates[t.name] = {}
+            elif cur.full_shape != t.full_shape or cur.dtype != t.dtype:
                 raise ValueError(
                     f"tensor {t.name!r} published with inconsistent shape/dtype across ranks: "
                     f"{cur.full_shape}/{cur.dtype} vs {t.full_shape}/{t.dtype}"
                 )
-            cur.shards.extend(t.shards)
+            per_geometry = candidates[t.name]
+            for shard in t.shards:
+                geometry = (tuple(shard.shard_offset), tuple(shard.shape))
+                per_geometry.setdefault(geometry, []).append(shard)
+
+    for name, tensor in merged.items():
+        for offers in candidates[name].values():
+            tensor.shards.append(offers[replica_offset % len(offers)])
     return list(merged.values())
 
 
@@ -475,10 +514,14 @@ def gather_sources(
     role: str = "inference",
     rank: int = 0,
     timeout: float = 1200.0,
+    replica_offset: int = 0,
 ) -> tuple:
     """One-call inference helper: discover all trainer ranks, merge their shard
     tables, and build the planning inputs (per-source ``SourceInfo`` + the
     shard -> owning-agent/device maps).
+
+    ``replica_offset`` is forwarded to :func:`merge_shard_tables` to choose which
+    duplicate DP/EDP replica serves each shard.
 
     Returns ``(sources, session_to_agent, session_to_device, agent_endpoints)``
     where ``agent_endpoints`` is ``{agent_name: metadata_endpoint}`` for the
@@ -487,6 +530,6 @@ def gather_sources(
     payloads = rdv.discover_trainers(expected_trainers, timeout=timeout)
     tables = [p.tensors for p in payloads]
     agent_endpoints = {p.agent_name: p.metadata_endpoint for p in payloads}
-    merged = merge_shard_tables(tables)
+    merged = merge_shard_tables(tables, replica_offset=replica_offset)
     sources, session_to_agent, session_to_device = build_sources(merged)
     return sources, session_to_agent, session_to_device, agent_endpoints
