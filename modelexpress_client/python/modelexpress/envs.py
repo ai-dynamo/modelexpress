@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     MX_MODEL_URI: Optional[str]
     MX_P2P_METADATA: str
     MX_RESHARD_FUSED_WIRE: bool
+    MX_RESHARD_BATCH_INSTALL: bool
     MX_RESHARD_REQUIRE_FULL_COVERAGE: bool
     MX_RESHARD_COVERAGE_FLOOR: float
     MX_RESHARD_HANDSHAKE_TIMEOUT_S: float
@@ -237,6 +238,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_MODEL_URI": lambda: os.environ.get("MX_MODEL_URI"),
     "MX_P2P_METADATA": lambda: os.environ.get("MX_P2P_METADATA", "1"),
     "MX_RESHARD_FUSED_WIRE": lambda: _env_bool("MX_RESHARD_FUSED_WIRE", True),
+    # Issue the per-view re-slice copies of full-pulled sources as one batched
+    # _foreach_copy_ instead of a copy_() per view. On by default: it is the same
+    # set of copies, and one launch per view means thousands of launches whose
+    # Python and launch overhead can rival the RDMA itself. Set to 0 to fall back
+    # to the per-view loop. See modelexpress.refit.reshard.receiver.
+    "MX_RESHARD_BATCH_INSTALL": lambda: _env_bool("MX_RESHARD_BATCH_INSTALL", True),
     # Refit coverage gate. The floor is a fraction of the engine's parameter
     # bytes; ReshardReceiver validates its range at the point of use. What a
     # complete refit scores is engine- and model-specific, so the default is set

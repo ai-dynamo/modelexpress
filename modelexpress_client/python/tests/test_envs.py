@@ -28,6 +28,7 @@ def test_defaults_when_unset(monkeypatch):
         "MX_GDS_TIMEOUT",
         "MX_HEARTBEAT_INTERVAL_SECS",
         "MX_RESHARD_FUSED_WIRE",
+        "MX_RESHARD_BATCH_INSTALL",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -49,6 +50,7 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_GDS_TIMEOUT == pytest.approx(120.0)
     assert envs.MX_HEARTBEAT_INTERVAL_SECS == 30
     assert envs.MX_RESHARD_FUSED_WIRE is True
+    assert envs.MX_RESHARD_BATCH_INSTALL is True
 
 
 def test_int_and_float_parsing(monkeypatch):
