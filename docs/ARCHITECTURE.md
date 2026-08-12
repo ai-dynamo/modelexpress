@@ -95,9 +95,16 @@ ModelExpress/
 │       │   └── backend/
 │       │       ├── redis.rs            # P2P Redis backend
 │       │       └── kubernetes.rs       # P2P Kubernetes CRD backend
+│       ├── refit.rs                     # Refit module exports
+│       ├── refit/
+│       │   ├── service.rs               # Backend-neutral Refit gRPC service
+│       │   ├── backend.rs               # RefitBackend contract and factory
+│       │   └── backend/
+│       │       └── redis.rs             # Redis backend and atomic Lua scripts
 │       ├── registry/
 │       │   ├── state.rs                # RegistryManager wrapper
 │       │   ├── backend.rs              # RegistryBackend trait + ModelRecord
+│       │   ├── entry_key.rs            # EntryKey: model + revision + weight mode
 │       │   ├── k8s_types.rs            # ModelCacheEntry CRD type
 │       │   └── backend/
 │       │       ├── redis.rs            # Redis registry backend
@@ -171,7 +178,7 @@ ModelExpress/
 │       │       ├── adapter.py          # SglangAdapter and context builder
 │       │       └── loader.py           # MxModelLoader for remote_instance backend
 │       ├── tensor_utils.py             # Tensor collection, checksums, storage views
-│       ├── transfer_safety.py          # MLA feature gate, TransferFingerprint
+│       ├── transfer_safety.py          # Model feature detection for the P2P gate
 │       ├── rank_utils.py               # Rank detection utilities
 │       ├── vllm_worker.py              # Compatibility worker for older manual registration
 │       ├── types.py                    # TensorDescriptor, WorkerMetadata dataclasses
@@ -293,7 +300,7 @@ All cargo dependencies are declared in the root `Cargo.toml`. Sub-crates use wor
 
 ## gRPC Services
 
-Four proto files define four services, all compiled via `tonic-build` in `modelexpress_common/build.rs`:
+Six proto files define the server's gRPC services, all compiled via `tonic-build` in `modelexpress_common/build.rs`:
 
 ### health.proto - HealthService
 
@@ -314,11 +321,29 @@ Four proto files define four services, all compiled via `tonic-build` in `modele
 | `EnsureModelDownloaded` | `ModelDownloadRequest` | stream `ModelStatusUpdate` | Trigger download, stream progress |
 | `StreamModelFiles` | `ModelFilesRequest` | stream `FileChunk` | Stream model file contents (1MB chunks) |
 | `ListModelFiles` | `ModelFilesRequest` | `ModelFileList` | List files with sizes |
-| `DeleteModel` | `DeleteModelRequest` | `DeleteModelResponse` | Remove a model record from the registry (used by `model clear`) |
+| `DeleteModel` | `DeleteModelRequest` | `DeleteModelResponse` | Remove a model's records from the registry (used by `model clear`) |
 
 Key message types: `ModelProvider` (HuggingFace, NGC, GCS), `ModelStatus` (Downloading, Downloaded, Error), `ModelStatusUpdate`, `FileChunk`.
 
 `EnsureModelDownloaded` verifies that a `DOWNLOADED` registry record still has its files on disk before honoring it as a cache hit. If the files are missing (for example after a `model clear` that only removed local storage), the stale record is deleted and the download is re-claimed so the model is actually re-fetched rather than returning a false success.
+
+#### Pinned revisions
+
+`ModelDownloadRequest` and `ModelFilesRequest` carry an optional `revision` (a branch, tag, or commit SHA); `ModelStatusUpdate` reports the `resolved_revision` the request landed on. Providers without a revision concept (NGC, GCS) reject a set `revision` and report none.
+
+The server resolves the revision to an immutable commit **before** claiming the download lease, then pins every Hub file request to that commit, so a tag that moves mid-download cannot mix commits into one snapshot. A requested revision that does not exist fails the request; it never falls back to the default revision. An unpinned request still resolves the default revision to a commit SHA and reports it, so callers always learn the exact commit they got. If the Hub is unreachable while resolving an *unpinned* request, the server falls back to the snapshot already in its cache, which keeps cache hits working during a Hub outage.
+
+`StreamModelFiles` and `ListModelFiles` resolve a requested revision against the local cache only — the model is already downloaded, so serving it must not depend on Hub reachability.
+
+When a no-shared-storage client installs a snapshot over the file stream, it also writes the provider's local revision bookkeeping (`ModelProviderTrait::record_local_revision`; for Hugging Face, `refs/<requested-revision>`). Without it the files would be on disk but `huggingface_hub` could not resolve them by branch or tag under `HF_HUB_OFFLINE=1`.
+
+#### Registry entry keys
+
+Registry backends key every record, lease, and claim on one string. That key is an [`EntryKey`](../modelexpress_server/src/registry/entry_key.rs) encoding of `model_name` + resolved revision + weight mode. This is what keeps two revisions of one model from sharing a lease (and coalescing onto each other's download), and what keeps a metadata-only download from satisfying a later full-weight request with a weightless snapshot.
+
+An unpinned, full-weight entry encodes to the bare model name, so records written before revisions existed keep parsing and providers without a revision concept keep the keys they have always used. Anything else encodes as `mx1:<revision>:<flags>:<model_name>`. The model name goes last because it is the only field with no character restrictions — a GCS object path accepts almost any byte, so a name containing the separator must not be able to impersonate the other fields and aim a delete at the wrong model.
+
+Cache eviction parses the key back to delete the right snapshot. It keeps the files while another entry still references the same commit, treating a revisionless entry as covering every snapshot of its model. When the evicted entry is the last one for its model the whole repository directory goes, so a snapshot kept alive by an earlier shared-file decision cannot outlive the last record pointing at it. Hugging Face snapshot entries are symlinks into `blobs/`, so a per-revision delete also reclaims the blobs no surviving snapshot references — otherwise it would free almost no disk.
 
 ### p2p.proto - P2pService
 
@@ -345,6 +370,63 @@ Per-worker gRPC service started when `MX_P2P_METADATA=1`, or unconditionally whe
 
 See [`metadata.md`](metadata.md) for the full metadata architecture including storage schemas and coordination protocol.
 
+### refit.proto - RefitService (Redis only)
+
+`RefitService` is a new RL-specific control plane. It does not reuse or modify the
+legacy `WeightSyncService`. The initial slice stores worker registrations,
+immutable weight versions, and compact physical shard publications in Redis.
+Weight bytes and full tensor manifests remain on trainer or generator workers.
+
+| RPC | Purpose |
+|-----|---------|
+| `RegisterWorker` | Register or refresh one TTL-bound worker process |
+| `CreateWeightVersion` | Idempotently create one immutable `STAGING` version |
+| `GetWeightVersion` | Read the version and its lifecycle state |
+| `DeleteWeightVersion` | Move a `READY` version to `RELEASING`; existing leases remain valid |
+| `CreateWeightVersionShard` | Publish one worker manifest for a required source slot |
+| `ListWeightVersionShards` | List the version's physical source publications |
+| `DeleteWeightVersionShard` | Evict one source shard after release when no lease protects the version |
+| `RegisterVersionLease` | Acquire protection while a version is `READY`, or renew the same owner's existing protection while it is `READY` or `RELEASING` |
+| `DeleteVersionLease` | Release a generator's protection of the version shards |
+
+The final missing source slot atomically changes the version to `READY`.
+`WeightVersion.uid` is MX's opaque identity. `version_number` is the optional
+framework-provided numeric label used for correlation; MX does not use it as an
+identity or ordering key.
+`WeightVersionShard` remains the name of the per-worker manifest publication.
+Its identity is `(version_id, worker_id, source_slot_id)`: `source_slot_id`
+identifies the required, version-scoped source contribution it covers, and
+`worker_id` identifies the publishing process. The trainer coordinator chooses
+the opaque slots—for example,
+`publisher:global-rank:12` for a selected Megatron publisher. Multiple
+publications may advertise the same source slot, including a replacement worker
+or a generator that becomes a peer source. Deployments configured with
+Kubernetes or the test-only memory backend do not expose `RefitService` yet.
+
+`RegisterWorker` is also the heartbeat API. `worker_id` is a fresh process
+incarnation identity, so a restarted worker registers a new ID instead of
+fencing an old registration. The registration expires with its TTL; source
+planning and source discovery will use that liveness when selecting a
+publication.
+
+Cross-key compare-and-set operations live in documented Redis scripts
+under `modelexpress_server/src/refit/backend/redis/scripts/`. Redis executes
+each script atomically. The `refit_service_redis` test drives the public gRPC
+API through two server replicas and covers concurrent version creation,
+concurrent final source-slot publication, idempotent and conflicting replay,
+replacement-source publication, lease-protected release, and safe shard
+eviction. CI runs this test against Redis 7.
+
+A future Kubernetes backend can preserve this gRPC contract, but it cannot
+translate each Redis key into an independent CRD and retain the same atomic
+guarantees. Lease creation and shard deletion race across resources. The
+Kubernetes implementation therefore needs one version-scoped coordination
+object as the serialization boundary, updated with `resourceVersion`
+compare-and-swap; shard and lease objects can remain child records.
+`RefitService` depends on the domain-level `RefitBackend` contract, with Redis
+implemented under `refit/backend/redis.rs`. Kubernetes remains a separate
+end-to-end backend slice implementing the same transaction boundaries.
+
 ## Rust Server
 
 ### Startup Flow
@@ -357,7 +439,7 @@ See [`metadata.md`](metadata.md) for the full metadata architecture including st
 6. Start `CacheEvictionService` background task (reads the same registry)
 7. Connect to the P2P metadata backend (`MX_METADATA_BACKEND`, Redis or Kubernetes CRD)
 8. Start reaper background task for stale source detection and GC
-9. Register 4 gRPC services with tonic (max message size: 100MB)
+9. Register the configured gRPC services with tonic (max message size: 100MB)
 10. Listen on configured address (default `0.0.0.0:8001`)
 11. Graceful shutdown on CTRL+C (signals cache eviction service and reaper)
 
@@ -470,6 +552,8 @@ The `Client` struct in `modelexpress_client/src/lib.rs` wraps gRPC connections:
 | `delete_model(name, cache_dir)` | Delete cached model |
 | `validate_model(name, cache_dir)` | Validate cached model integrity |
 
+Each download entry point has a `_revision` variant — `request_model_revision`, `request_model_on_server_revision`, `request_model_with_smart_fallback_revision` — that takes an optional branch, tag, or commit SHA and returns a `ModelDownloadResult { path, resolved_revision }`. The non-`_revision` methods keep their existing signatures and delegate with no revision pinned.
+
 ### Download Strategies
 
 | Strategy | Behavior |
@@ -486,7 +570,7 @@ The `Cli` struct in `args.rs` embeds `ClientArgs` via `#[command(flatten)]`. Com
 |---------|---------|
 | `health` | Check server health |
 | `ping` | Ping server |
-| `model download <name>` | Download a model |
+| `model download <name>` | Download a model. `--revision <branch\|tag\|sha>` pins a revision; the resolved commit SHA is reported back |
 | `model list-files <name>` | List model files |
 | `model clear <name>` | Delete cached model |
 | `model validate <name>` | Validate model integrity |
@@ -516,6 +600,16 @@ pub trait ModelProviderTrait: Send + Sync {
     async fn download_model(&self, name: &str, cache_path: Option<PathBuf>, ignore_weights: bool) -> Result<PathBuf>;
     async fn delete_model(&self, name: &str, cache_dir: PathBuf) -> Result<()>;
     async fn get_model_path(&self, name: &str, cache_dir: PathBuf) -> Result<PathBuf>;
+
+    // Revision-aware variants. The defaults reject a pinned revision and delegate to the
+    // methods above, so only providers that expose revisions need to implement them.
+    async fn download_model_revision(&self, name: &str, cache_path: Option<PathBuf>, ignore_weights: bool, revision: Option<&str>) -> Result<ModelDownloadOutcome>;
+    async fn resolve_revision(&self, name: &str, cache_dir: Option<PathBuf>, revision: Option<&str>) -> Result<Option<String>>;
+    async fn delete_model_revision(&self, name: &str, cache_dir: PathBuf, revision: Option<&str>) -> Result<()>;
+    async fn get_model_path_revision(&self, name: &str, cache_dir: PathBuf, revision: Option<&str>) -> Result<PathBuf>;
+    async fn record_local_revision(&self, name: &str, cache_dir: &Path, requested: Option<&str>, commit: &str) -> Result<()>;
+    fn supports_revisions(&self) -> bool;
+
     fn provider_name(&self) -> &'static str;
     fn is_ignored(filename: &str) -> bool;
     fn is_image(path: &Path) -> bool;
@@ -523,8 +617,10 @@ pub trait ModelProviderTrait: Send + Sync {
 }
 ```
 
+`ModelDownloadOutcome` carries the snapshot `path` plus the `resolved_revision` the request landed on (`None` for providers with no revision concept).
+
 Three implementations:
-- `HuggingFaceProvider` - uses the `hf-hub` crate with high-CPU download mode.
+- `HuggingFaceProvider` - uses the `hf-hub` crate with high-CPU download mode. Implements the revision-aware methods: it resolves a branch, tag, or SHA through `/api/models/<repo>/revision/<rev>`, downloads every file from the resolved commit, and writes `refs/<requested-revision>` so the snapshot stays resolvable by the name the caller used. `delete_model_revision` removes a single snapshot, and drops the whole repository directory once its last snapshot is gone.
 - `NgcProvider` - downloads from NVIDIA NGC via the files-manifest endpoint `…/v2/org/{org}[/team/{team}]/{type}/{name}/{version}/files` (no `versions/` segment), which returns self-authenticating presigned URLs paired with relative paths for every file, for both V1 and V2 storage and both org and team scopes (so nested paths and downloads need no per-file URL construction or Authorization forwarding). Falls back to `checksums.blake3` manifest enumeration against the versioned `…/versions/{version}/files` endpoint (Bearer-authenticated `/files/{path}` downloads) when the listing returns 400/401, as some UAM-gated orgs (e.g. the `nim` catalog) do. Resolves the NGC API key from `NGC_API_KEY`, `NGC_CLI_API_KEY`, or `~/.ngc/config`.
 - `GcsProvider` - downloads objects under a full `gs://<bucket>/<object-prefix>` URL using Google Application Default Credentials. It writes a `.mx/manifest.json` cache manifest, verifies downloaded files with GCS CRC32C checksums, skips dotfiles, README, and images, and stores models under `<cache>/gcs/<bucket>/<object-prefix>`. See [`GCS_PROVIDER.md`](GCS_PROVIDER.md) for the detailed design.
 
@@ -945,7 +1041,7 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MX_SERVER_ADDRESS` | `localhost:8001` | gRPC server address (recommended) |
-| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated, pending removal in a future release. Still read by all client paths and takes precedence when both are set; keep setting it during the transition. |
+| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
 | `MX_DISABLE_PATCHES` | `0` | Emergency escape hatch that skips all runtime compatibility patches. Set to `1`, `true`, `yes`, or `on` if a patch is incompatible with the installed engine. |
 | `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""` / `server` / `redis` / `kubernetes` (central server) or `k8s-service` (decentralized via K8s Service routing) |
 | `MX_POOL_REG` | `0` | Discover cudaMalloc allocations via `cuMemGetAddressRange` and register each as a single NIXL block instead of registering tensors individually. Reduces NIXL registration count by 80-99% on typical vLLM models, cutting `ibv_reg_mr` time and metadata blob size; transfer semantics unchanged. Not required for `MX_VMM_ARENA=1`, which registers the arena directly |
@@ -959,6 +1055,7 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles |
 | `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before publishing weight metadata or preparing and publishing cache bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time the artifact publisher waits for readiness and successful publication before giving up |
+| `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Feeds the torch compile cache `SourceIdentity`, adding compile configuration as a partitioning dimension for artifact discovery. Unset leaves the field empty, which drops it from the `mx_source_id` input, so workers whose other identity fields match — model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch — share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](DEPLOYMENT.md#pairing-workers-by-compile-configuration) |
 | `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact checkpoint identifier so `mx_source_id` is content-addressed |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend; `{rank}` is substituted with the worker's own rank. Client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` if the resolved pattern has no explicit port |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` max retries on `FAILED_PRECONDITION` (rolling-update transients). Fresh gRPC channel per attempt so kube-proxy re-picks a backend |

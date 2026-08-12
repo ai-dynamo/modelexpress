@@ -165,8 +165,16 @@ jobs:
         grep -q "no TLS backend selected" build.log
 
   python-test:
-    name: Python Tests
+    name: Python Tests (protobuf ${{ matrix.protobuf_major }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - protobuf_major: 5
+            protobuf_spec: "protobuf==5.27.2"
+          - protobuf_major: 6
+            protobuf_spec: "protobuf>=6.30.2,<7.0.0"
 
     steps:
     - name: Checkout repository
@@ -184,7 +192,7 @@ jobs:
       working-directory: modelexpress_client/python
       run: |
         uv venv .venv --python 3.12
-        uv pip install -e ".[dev]"
+        uv pip install -e ".[dev]" '${{ matrix.protobuf_spec }}'
 
     - name: Run tests
       working-directory: modelexpress_client/python
@@ -318,6 +326,14 @@ jobs:
       run: |
         cargo test -p model-express-workspace-tests \
           --test registry_backend_redis \
+          -- --include-ignored --test-threads=1
+
+    - name: Run Refit service Redis integration tests
+      env:
+        REDIS_URL: redis://localhost:6379
+      run: |
+        cargo test -p model-express-workspace-tests \
+          --test refit_service_redis \
           -- --include-ignored --test-threads=1
 
     - name: Run integration test script

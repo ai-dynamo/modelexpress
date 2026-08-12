@@ -11,6 +11,7 @@ use std::sync::Arc;
 use modelexpress_common::grpc::{
     api::api_service_server::ApiServiceServer, health::health_service_server::HealthServiceServer,
     model::model_service_server::ModelServiceServer, p2p::p2p_service_server::P2pServiceServer,
+    refit::refit_service_server::RefitServiceServer,
     weight_sync::weight_sync_service_server::WeightSyncServiceServer,
 };
 use tonic::transport::Server;
@@ -22,6 +23,7 @@ use crate::backend_config::BackendConfig;
 use crate::cache::CacheEvictionService;
 use crate::config::{AuthMode, ServerConfig};
 use crate::p2p::{service::P2pServiceImpl, state::P2pStateManager};
+use crate::refit::{backend::create_backend as create_refit_backend, service::RefitServiceImpl};
 use crate::registry::state::RegistryManager;
 use crate::services::{ApiServiceImpl, HealthServiceImpl, ModelDownloadTracker, ModelServiceImpl};
 use crate::weight_sync::WeightSyncServiceImpl;
@@ -115,6 +117,31 @@ pub async fn run_server(
         .set_serving::<P2pServiceServer<P2pServiceImpl>>()
         .await;
 
+    let refit_backend = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        create_refit_backend(&backend),
+    )
+    .await
+    {
+        Ok(Ok(refit_backend)) => refit_backend,
+        Ok(Err(error)) => {
+            error!("Failed to connect Refit metadata backend: {error}");
+            return Err(error.to_string().into());
+        }
+        Err(_) => {
+            error!("Timed out connecting to Refit metadata backend");
+            return Err("Refit metadata backend connection timed out".into());
+        }
+    };
+    let refit_service = refit_backend.map(RefitServiceImpl::new);
+    if refit_service.is_some() {
+        health_reporter
+            .set_serving::<RefitServiceServer<RefitServiceImpl>>()
+            .await;
+    } else {
+        info!("Refit service is unavailable: this metadata backend is not implemented yet");
+    }
+
     // Initialize P2P state manager — fails fast if backend is misconfigured or unreachable
     let p2p_state = Arc::new(P2pStateManager::with_config(backend));
 
@@ -188,6 +215,11 @@ pub async fn run_server(
     let weight_sync = WeightSyncServiceServer::new(weight_sync_service)
         .max_decoding_message_size(MAX_MESSAGE_SIZE)
         .max_encoding_message_size(MAX_MESSAGE_SIZE);
+    let refit = refit_service.map(|service| {
+        RefitServiceServer::new(service)
+            .max_decoding_message_size(MAX_MESSAGE_SIZE)
+            .max_encoding_message_size(MAX_MESSAGE_SIZE)
+    });
 
     info!("Starting gRPC server on: {addr}");
     let router = Server::builder()
@@ -198,12 +230,14 @@ pub async fn run_server(
             .add_service(layer.layer(api))
             .add_service(layer.layer(model))
             .add_service(layer.layer(p2p))
-            .add_service(layer.layer(weight_sync)),
+            .add_service(layer.layer(weight_sync))
+            .add_optional_service(refit.map(|service| layer.layer(service))),
         None => router
             .add_service(api)
             .add_service(model)
             .add_service(p2p)
-            .add_service(weight_sync),
+            .add_service(weight_sync)
+            .add_optional_service(refit),
     };
     let server_result = router.serve_with_shutdown(addr, shutdown_signal).await;
 

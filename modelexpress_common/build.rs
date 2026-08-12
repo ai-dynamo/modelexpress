@@ -13,6 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "proto/model.proto",
                 "proto/p2p.proto",
                 "proto/weight_sync.proto",
+                "proto/refit.proto",
             ],
             &["proto"],
         )?;

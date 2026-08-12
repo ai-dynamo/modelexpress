@@ -247,16 +247,14 @@ def test_publisher_seam_reuses_registered_tensor_addresses():
 
     assert source_id == "source-id"
     assert client.worker.status > 0
-    agent_metadata, agent_name, endpoint, published = unwrap_rendezvous_blob(
-        client.worker.nixl_metadata
-    )
-    assert (agent_metadata, agent_name, endpoint) == (
+    payload = unwrap_rendezvous_blob(client.worker.nixl_metadata)
+    assert (payload.agent_metadata, payload.agent_name, payload.metadata_endpoint) == (
         b"agent-metadata",
         "trainer-r3",
         "10.0.0.3:19003",
     )
-    assert published[0].shards[0].addr == tensor.data_ptr()
-    assert published[0].shards[0].shard_offset == (8, 0)
+    assert payload.tensors[0].shards[0].addr == tensor.data_ptr()
+    assert payload.tensors[0].shards[0].shard_offset == (8, 0)
 
 
 def test_publishing_leaves_the_heartbeat_with_its_owner():

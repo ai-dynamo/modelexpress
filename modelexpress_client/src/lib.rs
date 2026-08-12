@@ -15,6 +15,7 @@ use modelexpress_common::{
         },
     },
     models::{ModelStatus, Status},
+    providers::ModelDownloadOutcome,
 };
 use std::collections::HashMap;
 use std::path::{Component, PathBuf};
@@ -38,6 +39,28 @@ use std::sync::Arc;
 use tonic::service::interceptor::InterceptedService;
 
 type AuthChannel = InterceptedService<Channel, AuthInterceptor>;
+
+/// What a completed model request resolved to.
+///
+/// Callers that need the frontend and the workers to agree on one commit use
+/// `resolved_revision`; it is `None` only for providers with no revision concept.
+/// `path` is the local snapshot directory, and is `None` when the client has no cache
+/// configured to resolve it against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelDownloadResult {
+    pub path: Option<PathBuf>,
+    pub resolved_revision: Option<String>,
+}
+
+impl From<ModelDownloadOutcome> for ModelDownloadResult {
+    /// A direct provider download always knows where it put the files.
+    fn from(outcome: ModelDownloadOutcome) -> Self {
+        Self {
+            path: Some(outcome.path),
+            resolved_revision: outcome.resolved_revision,
+        }
+    }
+}
 
 /// The main client for interacting with the `modelexpress_server` via gRPC
 pub struct Client {
@@ -363,11 +386,15 @@ impl Client {
 
     /// Stream model files from the server to the local cache.
     /// This is an internal helper used when shared storage is disabled.
+    ///
+    /// Returns the local snapshot directory the files were installed into.
     async fn stream_model_files_from_server(
         &mut self,
         model_name: &str,
         provider: ModelProvider,
-    ) -> CommonResult<()> {
+        ignore_weights: bool,
+        revision: Option<&str>,
+    ) -> CommonResult<PathBuf> {
         let cache_config = self.cache_config.as_ref().ok_or_else(|| {
             modelexpress_common::Error::Server(
                 "Cache configuration is required for file streaming. Please ensure cache_config is set.".to_string()
@@ -393,6 +420,8 @@ impl Client {
             provider: modelexpress_common::grpc::model::ModelProvider::from(provider) as i32,
             chunk_size,
             file_selector: None,
+            ignore_weights,
+            revision: revision.map(String::from),
         });
 
         let mut stream = self
@@ -630,26 +659,54 @@ impl Client {
             files_received, bytes_received, model_name
         );
 
-        Ok(())
+        model_dir.ok_or_else(|| {
+            modelexpress_common::Error::Server(format!(
+                "Server streamed no model directory for model {model_name}"
+            ))
+            .into()
+        })
     }
 
-    /// Request a model on the server.
+    /// Request a model on the server at its default revision.
     pub async fn request_model_on_server(
         &mut self,
         model_name: impl Into<String>,
         provider: ModelProvider,
         ignore_weights: bool,
     ) -> CommonResult<()> {
+        self.request_model_on_server_revision(model_name, provider, ignore_weights, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Request a model on the server at a specific branch, tag, or commit SHA.
+    ///
+    /// Returns the immutable revision the server resolved the request to, or `None` for
+    /// providers that do not expose revisions.
+    pub async fn request_model_on_server_revision(
+        &mut self,
+        model_name: impl Into<String>,
+        provider: ModelProvider,
+        ignore_weights: bool,
+        revision: Option<&str>,
+    ) -> CommonResult<Option<String>> {
         let model_name = model_name.into();
-        info!(
-            "Requesting model: {} from provider: {:?}",
-            model_name, provider
-        );
+        match revision {
+            Some(revision) => info!(
+                "Requesting model: {} at revision {} from provider: {:?}",
+                model_name, revision, provider
+            ),
+            None => info!(
+                "Requesting model: {} from provider: {:?}",
+                model_name, provider
+            ),
+        }
 
         let grpc_request = tonic::Request::new(ModelDownloadRequest {
             model_name: model_name.clone(),
             provider: modelexpress_common::grpc::model::ModelProvider::from(provider) as i32,
             ignore_weights,
+            revision: revision.map(String::from),
         });
 
         let mut stream = self
@@ -658,12 +715,20 @@ impl Client {
             .await?
             .into_inner();
 
+        // The resolved revision is reported on every update; hold on to the last one
+        // seen so it is still available if the terminal update omits it.
+        let mut resolved_revision: Option<String> = None;
+
         // Process streaming updates until the download is complete
         while let Some(update_result) = stream.message().await? {
             let status: ModelStatus =
                 modelexpress_common::grpc::model::ModelStatus::try_from(update_result.status)
                     .unwrap_or(modelexpress_common::grpc::model::ModelStatus::Error)
                     .into();
+
+            if update_result.resolved_revision.is_some() {
+                resolved_revision = update_result.resolved_revision.clone();
+            }
 
             // Log progress messages if available
             if let Some(message) = &update_result.message {
@@ -676,7 +741,7 @@ impl Client {
             match status {
                 ModelStatus::DOWNLOADED => {
                     info!("Model {} is now available", model_name);
-                    return Ok(());
+                    return Ok(resolved_revision);
                 }
                 ModelStatus::ERROR => {
                     let error_message = update_result
@@ -710,9 +775,27 @@ impl Client {
         provider: ModelProvider,
         ignore_weights: bool,
     ) -> CommonResult<()> {
+        self.request_model_revision(model_name, provider, ignore_weights, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Request a model at a specific branch, tag, or commit SHA, reporting the snapshot
+    /// path and the immutable revision the request resolved to.
+    ///
+    /// When shared_storage is disabled, files are streamed from the server into the
+    /// local cache under that resolved revision.
+    pub async fn request_model_revision(
+        &mut self,
+        model_name: impl Into<String>,
+        provider: ModelProvider,
+        ignore_weights: bool,
+        revision: Option<&str>,
+    ) -> CommonResult<ModelDownloadResult> {
         let model_name = model_name.into();
 
-        self.request_model_on_server(&model_name, provider, ignore_weights)
+        let resolved_revision = self
+            .request_model_on_server_revision(&model_name, provider, ignore_weights, revision)
             .await?;
 
         info!("Model {} downloaded successfully via server", model_name);
@@ -723,16 +806,82 @@ impl Client {
             .as_ref()
             .is_some_and(|c| !c.shared_storage);
 
-        if needs_streaming {
+        let path = if needs_streaming {
             info!(
                 "Shared storage disabled, streaming files from server for model {}",
                 model_name
             );
-            self.stream_model_files_from_server(&model_name, provider)
+            let dir = self
+                .stream_model_files_from_server(
+                    &model_name,
+                    provider,
+                    ignore_weights,
+                    resolved_revision.as_deref(),
+                )
                 .await?;
-        }
+            self.finish_streamed_install(&model_name, provider, revision, &resolved_revision)
+                .await;
+            Some(dir)
+        } else {
+            self.local_snapshot_path(&model_name, provider, resolved_revision.as_deref())
+        };
 
-        Ok(())
+        Ok(ModelDownloadResult {
+            path,
+            resolved_revision,
+        })
+    }
+
+    /// Complete the provider-specific cache bookkeeping for a snapshot that arrived over
+    /// the file stream instead of through the provider's own downloader — for Hugging
+    /// Face, the `refs/<revision>` entry that makes the snapshot resolvable by branch or
+    /// tag name offline.
+    ///
+    /// Failing here does not fail the request: every file is already on disk and
+    /// resolvable by commit SHA, which is what the caller was handed.
+    async fn finish_streamed_install(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        requested_revision: Option<&str>,
+        resolved_revision: &Option<String>,
+    ) {
+        let (Some(cache_config), Some(commit)) = (self.cache_config.as_ref(), resolved_revision)
+        else {
+            return;
+        };
+
+        if let Err(e) = download::get_provider(provider)
+            .record_local_revision(
+                model_name,
+                &cache_config.local_path,
+                requested_revision,
+                commit,
+            )
+            .await
+        {
+            debug!("Could not record the revision of {model_name} locally: {e}");
+        }
+    }
+
+    /// Best-effort local path of a downloaded snapshot. `None` when the cache layout
+    /// cannot be resolved or the directory is not present locally, which is the normal
+    /// case for a shared-storage client whose cache is not configured.
+    fn local_snapshot_path(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        revision: Option<&str>,
+    ) -> Option<PathBuf> {
+        let cache_dir = self
+            .cache_config
+            .as_ref()
+            .map(|config| config.local_path.clone())
+            .or_else(|| CacheConfig::discover().map(|config| config.local_path).ok())?;
+
+        resolve_model_path(&cache_dir, provider, model_name, revision)
+            .ok()
+            .filter(|path| path.exists())
     }
 
     /// Request a model with automatic server fallback, creating client connection only if needed.
@@ -744,25 +893,47 @@ impl Client {
         config: Config,
         ignore_weights: bool,
     ) -> CommonResult<()> {
+        Self::request_model_with_smart_fallback_revision(
+            model_name,
+            provider,
+            config,
+            ignore_weights,
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Revision-aware [`Client::request_model_with_smart_fallback`]. The direct-download
+    /// fallback honours the same revision, so a pinned request cannot silently land on a
+    /// different commit just because the server was unreachable.
+    pub async fn request_model_with_smart_fallback_revision(
+        model_name: impl Into<String>,
+        provider: ModelProvider,
+        config: Config,
+        ignore_weights: bool,
+        revision: Option<&str>,
+    ) -> CommonResult<ModelDownloadResult> {
         let model_name = model_name.into();
 
         match Client::new(config.clone()).await {
             Ok(mut client) => {
                 info!("Server connection established, downloading via server...");
                 client
-                    .request_model(&model_name, provider, ignore_weights)
+                    .request_model_revision(&model_name, provider, ignore_weights, revision)
                     .await
             }
             Err(e) => {
                 info!("Cannot connect to server ({}), downloading directly...", e);
-                download::download_model(
+                download::download_model_revision(
                     &model_name,
                     provider,
                     Some(config.cache.local_path.clone()),
                     ignore_weights,
+                    revision,
                 )
                 .await
-                .map(|_| ())
+                .map(ModelDownloadResult::from)
                 .map_err(|e| {
                     modelexpress_common::Error::Generic(format!("Direct download failed: {e}"))
                         .into()
@@ -949,6 +1120,7 @@ mod tests {
                 status: modelexpress_common::grpc::model::ModelStatus::Downloaded as i32,
                 message: None,
                 provider: modelexpress_common::grpc::model::ModelProvider::Gcs as i32,
+                resolved_revision: None,
             };
             Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(
                 update,
@@ -962,6 +1134,82 @@ mod tests {
             Err(Status::unimplemented(
                 "stream_model_files is not used in this test",
             ))
+        }
+
+        async fn list_model_files(
+            &self,
+            _request: Request<ModelFilesRequest>,
+        ) -> Result<Response<ModelFileList>, Status> {
+            Err(Status::unimplemented(
+                "list_model_files is not used in this test",
+            ))
+        }
+
+        async fn delete_model(
+            &self,
+            _request: Request<DeleteModelRequest>,
+        ) -> Result<Response<DeleteModelResponse>, Status> {
+            Err(Status::unimplemented(
+                "delete_model is not used in this test",
+            ))
+        }
+    }
+
+    /// Resolves any requested revision to a fixed commit and streams one file from it,
+    /// recording the revision the client asked the streaming RPC for.
+    #[derive(Default)]
+    struct PinnedRevisionModelService {
+        streamed_revision: Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    const PINNED_TEST_COMMIT: &str = "abc123def456";
+
+    #[tonic::async_trait]
+    impl ModelService for PinnedRevisionModelService {
+        type EnsureModelDownloadedStream =
+            Pin<Box<dyn Stream<Item = Result<ModelStatusUpdate, Status>> + Send>>;
+        type StreamModelFilesStream = Pin<Box<dyn Stream<Item = Result<FileChunk, Status>> + Send>>;
+
+        async fn ensure_model_downloaded(
+            &self,
+            request: Request<ModelDownloadRequest>,
+        ) -> Result<Response<Self::EnsureModelDownloadedStream>, Status> {
+            let request = request.into_inner();
+            let update = ModelStatusUpdate {
+                model_name: request.model_name,
+                status: modelexpress_common::grpc::model::ModelStatus::Downloaded as i32,
+                message: None,
+                provider: request.provider,
+                resolved_revision: Some(PINNED_TEST_COMMIT.to_string()),
+            };
+            Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(
+                update,
+            )]))))
+        }
+
+        async fn stream_model_files(
+            &self,
+            request: Request<ModelFilesRequest>,
+        ) -> Result<Response<Self::StreamModelFilesStream>, Status> {
+            *self
+                .streamed_revision
+                .lock()
+                .expect("Failed to lock streamed_revision") = request.into_inner().revision;
+
+            let data = b"{}".to_vec();
+            let chunk = FileChunk {
+                relative_path: "config.json".to_string(),
+                data: data.clone(),
+                offset: 0,
+                total_size: data.len() as u64,
+                is_last_chunk: true,
+                is_last_file: true,
+                commit_hash: Some(PINNED_TEST_COMMIT.to_string()),
+            };
+
+            Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(
+                chunk,
+            )]))))
         }
 
         async fn list_model_files(
@@ -999,6 +1247,7 @@ mod tests {
                 status: modelexpress_common::grpc::model::ModelStatus::Downloaded as i32,
                 message: None,
                 provider: request.provider,
+                resolved_revision: request.revision,
             };
             Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(
                 update,
@@ -1345,7 +1594,7 @@ mod tests {
             .expect("Expected test client to connect");
 
         let result = client
-            .stream_model_files_from_server("test/model", ModelProvider::HuggingFace)
+            .stream_model_files_from_server("test/model", ModelProvider::HuggingFace, false, None)
             .await;
 
         server_handle.abort();
@@ -1382,7 +1631,7 @@ mod tests {
             .expect("Expected test client to connect");
 
         let result = client
-            .stream_model_files_from_server("test/model", ModelProvider::HuggingFace)
+            .stream_model_files_from_server("test/model", ModelProvider::HuggingFace, false, None)
             .await;
 
         server_handle.abort();
@@ -1429,7 +1678,7 @@ mod tests {
             .expect("Expected test client to connect");
 
         let result = client
-            .stream_model_files_from_server("test/model", ModelProvider::HuggingFace)
+            .stream_model_files_from_server("test/model", ModelProvider::HuggingFace, false, None)
             .await;
 
         server_handle.abort();
@@ -1476,7 +1725,7 @@ mod tests {
             .expect("Expected test client to connect");
 
         let result = client
-            .stream_model_files_from_server("test/model", ModelProvider::HuggingFace)
+            .stream_model_files_from_server("test/model", ModelProvider::HuggingFace, false, None)
             .await;
 
         server_handle.abort();
@@ -1524,6 +1773,69 @@ mod tests {
                 .expect("Expected marker metadata")
                 .len(),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_model_revision_installs_the_resolved_snapshot() {
+        let cache_dir = TempDir::new().expect("Failed to create temp dir");
+        let service = PinnedRevisionModelService::default();
+        let streamed_revision = service.streamed_revision.clone();
+        let (addr, server_handle) = spawn_model_service(service).await;
+
+        let mut config = ClientConfig::for_testing(format!("http://{addr}"));
+        config.cache.local_path = cache_dir.path().to_path_buf();
+        config.cache.shared_storage = false;
+
+        let mut client = Client::new(config)
+            .await
+            .expect("Expected test client to connect");
+
+        let outcome = client
+            .request_model_revision(
+                "test/model",
+                ModelProvider::HuggingFace,
+                false,
+                Some("v1.0"),
+            )
+            .await
+            .expect("Expected pinned model request to succeed");
+
+        server_handle.abort();
+        let _ = server_handle.await;
+
+        assert_eq!(
+            outcome.resolved_revision.as_deref(),
+            Some(PINNED_TEST_COMMIT)
+        );
+
+        // The file stream is requested by resolved commit, not by the tag the caller
+        // typed, so the snapshot on disk matches the revision that was reported back.
+        assert_eq!(
+            streamed_revision
+                .lock()
+                .expect("Failed to lock streamed_revision")
+                .as_deref(),
+            Some(PINNED_TEST_COMMIT)
+        );
+
+        let expected_dir = cache_dir
+            .path()
+            .join("models--test--model/snapshots")
+            .join(PINNED_TEST_COMMIT);
+        assert_eq!(outcome.path.as_deref(), Some(expected_dir.as_path()));
+        assert_eq!(
+            std::fs::read(expected_dir.join("config.json")).expect("Expected streamed file"),
+            b"{}"
+        );
+
+        // The installed snapshot has to be a valid Hugging Face cache entry: without the
+        // ref, huggingface_hub cannot resolve the tag offline even though the files are
+        // all there.
+        assert_eq!(
+            std::fs::read_to_string(cache_dir.path().join("models--test--model/refs/v1.0"))
+                .expect("Expected the requested revision to be recorded"),
+            PINNED_TEST_COMMIT
         );
     }
 

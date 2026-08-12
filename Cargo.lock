@@ -2467,6 +2467,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-test",
+ "tonic 0.13.1",
+ "tonic-health",
  "tracing",
  "tracing-subscriber",
 ]

@@ -64,6 +64,10 @@ class Shard:
     session: str  # transfer-engine session id
     addr: int  # shard base address (element 0)
     elsize: int  # bytes per element
+    # Position-sensitive digest of the publisher's bytes, or None when it published
+    # none. Carried through planning so a receiver-side check has an expectation to
+    # compare against; nothing in the planner reads it.
+    digest: str | None = None
 
 
 @dataclass

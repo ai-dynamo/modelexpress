@@ -280,7 +280,11 @@ class NixlTransferManager:
         self._tensor_descriptors = tensor_descriptors
         return tensor_descriptors
 
-    def register_tensors(self, tensors: dict[str, torch.Tensor]) -> bytes:
+    def register_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        force_per_tensor: bool = False,
+    ) -> bytes:
         """
         Register tensors with NIXL for RDMA access.
 
@@ -318,7 +322,7 @@ class NixlTransferManager:
 
         # Phase 1: Discover CUDA allocation boundaries (if pool reg enabled)
         alloc_discovery_start = time.perf_counter()
-        if _pool_reg_enabled():
+        if _pool_reg_enabled() and not force_per_tensor:
             if self._accelerator_backend.supports_pool_reg():
                 allocations = self._find_cuda_allocations(tensor_descriptors)
             else:
@@ -427,6 +431,30 @@ class NixlTransferManager:
             )
             return self.register_tensors(tensors)
 
+        # NIXL resolves descriptors by containment, so one tensor outside
+        # [base, base+used) fails prep_xfer_dlist for the whole transfer.
+        uncovered = [
+            d
+            for d in tensor_descriptors
+            if d.addr < base or (d.addr + d.size) > (base + used)
+        ]
+        if uncovered:
+            logger.warning(
+                "register_arena: %d of %d tensors lie outside the arena range "
+                "[0x%x, 0x%x); falling back to per-tensor registration. "
+                "First uncovered: %s at 0x%x (%d bytes)",
+                len(uncovered),
+                len(tensor_descriptors),
+                base,
+                base + used,
+                uncovered[0].name,
+                uncovered[0].addr,
+                uncovered[0].size,
+            )
+            # Bypass pool reg: it resolves the same per-handle bounds we just
+            # found insufficient.
+            return self.register_tensors(tensors, force_per_tensor=True)
+
         nixl_reg_start = time.perf_counter()
         self._agent.register_memory(
             [(base, used, self._device_id, "")],
@@ -505,16 +533,27 @@ class NixlTransferManager:
 
         Sleeps only when a full sweep completed nothing, so the polling slop is
         paid once for the whole set rather than once per handle.
+
+        Records data-plane failures exactly as :meth:`_wait_for_xfer` does, for the
+        same reason: a wedged QP yields neither a completion nor an ERR status, so
+        the timeout is the only evidence anything went wrong, and recording it is
+        what lets ``is_healthy()`` stop advertising this agent.
         """
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
         pending = list(handles)
+        waited_on_something = bool(pending)
         wait_start = time.perf_counter()
         while pending:
             if (
                 timeout_seconds is not None
                 and time.perf_counter() - wait_start >= timeout_seconds
             ):
+                self._data_plane_error = (
+                    f"{label} timed out after {timeout_seconds:.1f}s with "
+                    f"{len(pending)} transfer(s) outstanding and no error status "
+                    f"from NIXL"
+                )
                 raise TimeoutError(
                     f"{label} timed out with {len(pending)} transfer(s) outstanding"
                 )
@@ -524,11 +563,19 @@ class NixlTransferManager:
                 if status in ("DONE", "SUCCESS"):
                     continue
                 if status in ("ERR", "ERROR", "FAIL"):
+                    self._data_plane_error = f"{label} failed with status {status}"
                     raise RuntimeError(f"{label} failed with status {status}")
                 still_pending.append(handle)
             if len(still_pending) == len(pending):
                 time.sleep(0.001)
             pending = still_pending
+        # Only once the whole set has completed, and only if there was a set. Nothing
+        # is proven by waiting on no handles, and clearing per handle would let a
+        # batch that failed on its last one report healthy. Health must not latch
+        # either: a completed batch is proof the data plane works, so a worker
+        # demoted for one transient timeout can return to READY.
+        if waited_on_something:
+            self._data_plane_error = None
 
     def _wait_for_xfer(
         self,

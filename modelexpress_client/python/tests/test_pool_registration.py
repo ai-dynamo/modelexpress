@@ -216,18 +216,55 @@ class TestRawDescriptorMemType:
         )
 
     def test_arena_registration_uses_vram_segment(self):
+        # The arena range must actually cover the tensor, as a real arena does.
+        tensor = torch.zeros(1)
+        base = tensor.data_ptr()
+        used = tensor.numel() * tensor.element_size()
+
+        class FakeArena:
+            def registered_range(self):
+                return base, used
+
+        mgr = self._make_manager()
+        assert mgr.register_arena(FakeArena(), {"w": tensor}) == b"metadata"
+
+        mgr._agent.register_memory.assert_called_once_with(
+            [(base, used, 0, "")],
+            mem_type=NIXL_ACCELERATOR_MEM_TYPE,
+            backends=["UCX"],
+        )
+
+    def test_arena_registration_falls_back_when_tensor_uncovered(self):
+        # A tensor outside [base, base+used) must not be served by the single MR.
         class FakeArena:
             def registered_range(self):
                 return 0x1000, 0x2000
 
+        tensor = torch.zeros(4, dtype=torch.float32)
         mgr = self._make_manager()
-        assert mgr.register_arena(FakeArena(), {"w": torch.zeros(1)}) == b"metadata"
+        assert mgr.register_arena(FakeArena(), {"w": tensor}) == b"metadata"
 
-        mgr._agent.register_memory.assert_called_once_with(
-            [(0x1000, 0x2000, 0, "")],
-            mem_type=NIXL_ACCELERATOR_MEM_TYPE,
-            backends=["UCX"],
-        )
+        args, kwargs = mgr._agent.register_memory.call_args
+        assert args[0][0] is tensor
+        assert kwargs == {"backends": ["UCX"]}
+
+    def test_arena_fallback_bypasses_pool_registration(self, monkeypatch):
+        # Pool reg resolves the same per-handle bounds, so the fallback must
+        # register per tensor even when MX_POOL_REG=1.
+        monkeypatch.setenv("MX_POOL_REG", "1")
+
+        class FakeArena:
+            def registered_range(self):
+                return 0x1000, 0x2000
+
+        tensor = torch.zeros(4, dtype=torch.float32)
+        mgr = self._make_manager()
+        assert mgr.register_arena(FakeArena(), {"w": tensor}) == b"metadata"
+
+        # Per-tensor, not the pool-reg alloc tuples.
+        args, kwargs = mgr._agent.register_memory.call_args
+        assert args[0][0] is tensor
+        assert kwargs == {"backends": ["UCX"]}
 
     def test_receive_transfer_descriptors_use_vram_segment(self, monkeypatch):
         monkeypatch.setattr(torch.cuda, "set_device", lambda *args, **kwargs: None)
