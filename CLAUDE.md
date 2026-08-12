@@ -113,8 +113,13 @@ missed fixture is silent: `backend/memory.rs` sat at `"0.3.0"` through
 several bumps because it was not named here. Bump by search, not by list:
 
 ```bash
-grep -rn '<old_version>' --include='*.rs' --include='*.py' --include='*.toml' .
+grep -rIn --exclude-dir=.git '<old_version>' .
 ```
+
+Search every file type, not just `*.rs`/`*.py`/`*.toml`: the version also
+lives in Markdown, YAML and the Helm chart. Then classify the hits, because
+the public-image tag references below are stale on purpose and must not be
+swept up by the same pass.
 
 `mx_version` is part of the `SourceIdentity` proto, which is hashed into
 the `mx_source_id`. After bumping the version literals, the pinned
@@ -151,8 +156,14 @@ reporting no failures.
 
 ```bash
 cargo check --workspace --tests
+cargo test --workspace
 cd modelexpress_client/python && .venv/bin/python -m pytest tests/
 ```
+
+`cargo check --workspace --tests` compiles the test targets, it does not run
+their assertions, so on its own it cannot tell you a pinned hash is wrong.
+`cargo test --workspace` is the step that actually executes them. Read the
+per-test ok lines rather than the exit code alone.
 
 ### Public-image tag references — separate cadence
 
