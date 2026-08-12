@@ -36,7 +36,7 @@ Every source is identified by a `SourceIdentity` proto containing all fields tha
 | `backend_framework` | `VLLM`, `SGLANG`, `TRT_LLM` | Inference framework |
 | `tensor_parallel_size` | `8` | TP degree |
 | `pipeline_parallel_size` | `2` | PP degree |
-| `expert_parallel_size` | `4` | EP degree (MoE models) |
+| `expert_parallel_size` | `4` | EP world size, `1` when expert parallelism is off (MoE models) |
 | `dtype` | `"bfloat16"` | Weight data type |
 | `quantization` | `"fp8"`, `""` | Quantization method |
 | `extra_parameters` | `{}` | Framework-specific config |

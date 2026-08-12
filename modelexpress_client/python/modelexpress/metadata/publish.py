@@ -41,6 +41,32 @@ def _get_worker_server(device_id: int) -> "WorkerGrpcServer | None":
     return _worker_servers.get(device_id)
 
 
+def _derive_expert_parallel_size(parallel) -> int:
+    """Derive the expert-parallel world size from a vLLM ParallelConfig.
+
+    vLLM has no ``expert_parallel_size`` attribute. ``ParallelConfig`` carries
+    only ``enable_expert_parallel``, and the effective expert-parallel world
+    size is the tensor-parallel size flattened across data parallelism and
+    prefill-context parallelism, per
+    ``vllm.model_executor.layers.fused_moe.config``. The expert-parallel group
+    spans data-parallel replicas, so two deployments differing only in
+    data-parallel degree hold different expert subsets per rank and must not
+    share an ``mx_source_id``.
+
+    ``prefill_context_parallel_size`` is absent on vLLM releases predating
+    prefill-context parallelism, where a default of 1 is correct.
+    ``decode_context_parallel_size`` is deliberately excluded: it does not
+    participate in the expert-parallel group.
+    """
+    if not getattr(parallel, "enable_expert_parallel", False):
+        return 1
+
+    tp_size = getattr(parallel, "tensor_parallel_size", 1) or 1
+    dp_size = getattr(parallel, "data_parallel_size", 1) or 1
+    pcp_size = getattr(parallel, "prefill_context_parallel_size", 1) or 1
+    return max(1, tp_size * dp_size * pcp_size)
+
+
 def build_source_identity(
     vllm_config, model_config,
 ) -> p2p_pb2.SourceIdentity:
@@ -55,7 +81,7 @@ def build_source_identity(
     parallel = vllm_config.parallel_config
     tp_size = getattr(parallel, "tensor_parallel_size", 1)
     pp_size = getattr(parallel, "pipeline_parallel_size", 1)
-    ep_size = getattr(parallel, "expert_parallel_size", 0)
+    ep_size = _derive_expert_parallel_size(parallel)
 
     # torch.dtype.__str__ returns e.g. "torch.bfloat16"; strip the prefix
     dtype = str(model_config.dtype).replace("torch.", "")
