@@ -24,18 +24,21 @@ costs a pass over every published tensor.
 
 Scope, because it is narrower than "the refit is verified" and the difference matters
 when planning the consumer. A publisher digest covers a whole shard, so a receiver can
-only check it where it holds that whole shard - the full-pull path, which stages the
-entire logical source tensor contiguously and can recover any publisher's box with
-:func:`shard_region`. On the exact-segment path the receiver reads a sub-range straight
-into the live parameter and never materialises the shard, so there is nothing to
-recompute the digest over. That is not a corner case: where trainer and inference
-parallelism differ, most sources take the exact path. For strict qualification, the
-receiver must full-pull and verify the publisher's whole shard, derive the expected
-destination slice from that verified staging buffer, and compare it with the destination
-produced by the ordinary exact-segment read. Both reads must target the same immutable,
-step-stamped source version. A fingerprint over the contributing publishers is useful
-freshness evidence, but it is not a byte-for-byte expectation for a partial read and must
-not be presented as one.
+compare it directly only when the ordinary plan gives that receiver every byte of the
+shard. That includes a coarser inference topology which assembles whole trainer shards
+into known destination sub-boxes. A finer inference topology instead reads only part of
+each trainer shard, so its partial destination has no value comparable to the published
+whole-shard digest.
+
+For strict qualification of that partial-read case, the receiver must full-pull and
+verify the publisher's whole shard, derive the expected destination slice from the
+verified staging buffer, and compare it with the destination produced by the ordinary
+exact-segment read. Both reads must target the same immutable, step-stamped source
+version. :func:`shard_region` serves the full-pull reference path; the direct case needs
+the transfer plan's source-to-destination provenance to locate each complete publisher
+shard in the assembled destination. A fingerprint over the contributing publishers is
+useful freshness evidence, but it is not a byte-for-byte expectation for a partial read
+and must not be presented as one.
 """
 
 from __future__ import annotations
