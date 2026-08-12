@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from modelexpress.refit.reshard.rendezvous import PublishedShard, PublishedTensor
+from modelexpress.refit.reshard.verify import published_digest
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,7 @@ def _one_shard(
                 addr=int(tensor.data_ptr()),
                 shard_offset=tuple(offset),
                 shape=local_shape,
+                digest=published_digest(tensor),
             )
         ],
     )
@@ -171,6 +173,9 @@ def _build_qkv_aliases(
                     addr=int(tensor.data_ptr()),
                     shard_offset=(start, 0),
                     shape=tuple(int(dim) for dim in tensor.shape),
+                    # The narrow, not the fused parent: this is the box a receiver
+                    # reads from ``addr``, so it is the box whose bytes must match.
+                    digest=published_digest(tensor),
                 )
             )
     return [

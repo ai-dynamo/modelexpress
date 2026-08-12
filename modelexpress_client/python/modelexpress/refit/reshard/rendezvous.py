@@ -68,13 +68,20 @@ def _mx_version() -> str:
 @dataclass
 class PublishedShard:
     """One published shard of a source tensor: the sub-box it covers and where
-    to READ it from (owning agent / device / base address)."""
+    to READ it from (owning agent / device / base address).
+
+    ``digest`` is a position-sensitive digest over the shard's bytes, from
+    :func:`modelexpress.refit.reshard.verify.tensor_digest`. ``None`` means the
+    publisher did not compute one, which a checker must read as *unchecked* rather
+    than as agreement.
+    """
 
     agent_name: str
     device_id: int
     addr: int
     shard_offset: tuple
     shape: tuple
+    digest: str | None = None
 
 
 @dataclass
@@ -89,6 +96,25 @@ class PublishedTensor:
     shards: list  # list[PublishedShard]
 
 
+def _encode_shard(shard) -> dict:
+    """One shard as JSON.
+
+    ``digest`` is omitted rather than written as null when the publisher has none, so
+    a blob from a publisher that does not digest stays byte-identical to what a client
+    without this field would have produced.
+    """
+    encoded = {
+        "agent_name": shard.agent_name,
+        "device_id": shard.device_id,
+        "addr": shard.addr,
+        "shard_offset": list(shard.shard_offset),
+        "shape": list(shard.shape),
+    }
+    if shard.digest is not None:
+        encoded["digest"] = shard.digest
+    return encoded
+
+
 def encode_shard_table(tensors: list) -> bytes:
     """Serialize published tensors + shards to a JSON blob."""
     payload = {
@@ -99,16 +125,7 @@ def encode_shard_table(tensors: list) -> bytes:
                 "dtype": t.dtype,
                 "elsize": t.elsize,
                 "full_shape": list(t.full_shape),
-                "shards": [
-                    {
-                        "agent_name": s.agent_name,
-                        "device_id": s.device_id,
-                        "addr": s.addr,
-                        "shard_offset": list(s.shard_offset),
-                        "shape": list(s.shape),
-                    }
-                    for s in t.shards
-                ],
+                "shards": [_encode_shard(s) for s in t.shards],
             }
             for t in tensors
         ],
@@ -131,6 +148,7 @@ def decode_shard_table(blob: bytes) -> list:
                 addr=int(s["addr"]),
                 shard_offset=tuple(s["shard_offset"]),
                 shape=tuple(s["shape"]),
+                digest=s.get("digest"),
             )
             for s in t["shards"]
         ]
@@ -174,6 +192,7 @@ def build_sources(tensors: list) -> tuple:
                     session=session,
                     addr=s.addr,
                     elsize=t.elsize,
+                    digest=s.digest,
                 )
             )
             session_to_agent[session] = s.agent_name
@@ -217,13 +236,31 @@ def merge_shard_tables(tables: list) -> list:
 
 
 def wrap_rendezvous_blob(
-    agent_metadata: bytes, agent_name: str, metadata_endpoint: str, tensors: list
+    agent_metadata: bytes,
+    agent_name: str,
+    metadata_endpoint: str,
+    tensors: list,
+    publisher_step: int | None = None,
 ) -> bytes:
     """Pack ``{agent_meta, agent_name, metadata_endpoint, shard_table}`` into one
     JSON blob. ``metadata_endpoint`` (``host:listen_port`` of the trainer's NIXL
     listen thread) is what the receiver's ``fetch_remote_and_wait`` connects to
     for the P2P memory-registration handshake (the central agent-metadata blob
-    alone does not make the registrations resolvable for RDMA reads)."""
+    alone does not make the registrations resolvable for RDMA reads).
+
+    ``publisher_step`` stamps the table with the training step whose weights it
+    describes. A receiver otherwise has no way to tell a current table from one
+    published a step ago, and it needs to: the shard table carries the per-shard
+    digests a receiver verifies against, so a table one step behind makes correctly
+    delivered bytes read as corruption. Inferring freshness instead - asking whether
+    any digest changed since planning - holds only when a table is wholly stale or
+    wholly current, and breaks under partial propagation across many publishers,
+    where it reports one lagging publisher's shard as a hard defect. The stamp turns
+    that inference into an observation.
+
+    The key is omitted rather than written as null when absent, so a blob from an
+    unstamped publisher is byte-identical to one an older client would have produced.
+    """
     payload = {
         "schema": _SCHEMA,
         "agent_name": agent_name,
@@ -231,6 +268,8 @@ def wrap_rendezvous_blob(
         "agent_meta_b64": base64.b64encode(agent_metadata).decode("ascii"),
         "tensors": json.loads(encode_shard_table(tensors).decode("utf-8"))["tensors"],
     }
+    if publisher_step is not None:
+        payload["publisher_step"] = int(publisher_step)
     return json.dumps(payload).encode("utf-8")
 
 
@@ -239,13 +278,21 @@ class RendezvousPayload(NamedTuple):
 
     A plain tuple until now, which read as ``payload[3]`` at the point where the
     interesting question is asked - whether this rank published any tensors. Being
-    a tuple subclass, it still unpacks and indexes as before.
+    a tuple subclass, it still indexes as before.
+
+    ``publisher_step`` is ``None`` for a publisher that does not stamp, and that
+    must be read as "unknown", never as step 0: a publisher read as step 0 looks
+    permanently behind, and a consumer that excuses lagging publishers would then
+    excuse all of its shards, going quiet instead of strict. It carries a default
+    so that reading the stamp is a new field rather than a second unwrap function,
+    which is also why unpacking must now name five values.
     """
 
     agent_metadata: bytes
     agent_name: str
     metadata_endpoint: str
     tensors: list
+    publisher_step: int | None = None
 
 
 def unwrap_rendezvous_blob(blob: bytes) -> RendezvousPayload:
@@ -259,7 +306,11 @@ def unwrap_rendezvous_blob(blob: bytes) -> RendezvousPayload:
     tensors = decode_shard_table(
         json.dumps({"schema": _SCHEMA, "tensors": payload["tensors"]}).encode("utf-8")
     )
-    return RendezvousPayload(agent_metadata, agent_name, metadata_endpoint, tensors)
+    raw_step = payload.get("publisher_step")
+    publisher_step = None if raw_step is None else int(raw_step)
+    return RendezvousPayload(
+        agent_metadata, agent_name, metadata_endpoint, tensors, publisher_step
+    )
 
 
 class MxReshardRendezvous:

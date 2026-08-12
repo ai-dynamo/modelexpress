@@ -28,7 +28,14 @@ from typing import TYPE_CHECKING, Any
 
 from ..adapter import EngineAdapter, StrategyFailed
 from ..nixl_transfer import is_nixl_available
-from .base import LoadContext, LoadResult, LoadStrategy, _as_load_result, _init_nixl_manager
+from .base import (
+    LoadContext,
+    LoadResult,
+    LoadStrategy,
+    _as_load_result,
+    _init_nixl_manager,
+    register_tensors,
+)
 from .. import envs
 from ..weight_transfer.protocol.serialization import decode_trainer_table
 from ..weight_transfer.roles.pull import PullRole
@@ -120,6 +127,23 @@ class TrainerPullStrategy(LoadStrategy):
                 ctx.device_id,
                 "trainer-pull",
                 accelerator_backend=ctx.accelerator_backend,
+            )
+
+        # A NIXL READ needs its local destination inside a registered region.
+        # Every other strategy in the chain registers here; this one never did,
+        # so prep_xfer_dlist on the local side failed with NIXL_ERR_NOT_FOUND.
+        register_tensors(result, ctx)
+
+        # register_tensors is deliberately best-effort: at the other call sites a
+        # failure only costs P2P *serving*, so degrading is right. Here the
+        # registered region is the destination of an inbound READ, so without it
+        # every transfer fails at prep and falls silently through to disk. Turn
+        # that into a strategy failure the fallback chain can act on.
+        if ctx.nixl_manager is None or not ctx.nixl_manager.tensor_descriptors:
+            raise StrategyFailed(
+                "NIXL registration did not complete; trainer pull has no local "
+                "destination to read into",
+                mutated=False,
             )
 
         planner = LocalPlanner()

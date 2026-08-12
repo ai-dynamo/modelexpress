@@ -102,3 +102,64 @@ class TestTrainerPullIsAvailable:
         with patch.dict("os.environ", {"MX_TRAINER_TABLE_KEY": "mx:trainer_table:m"}, clear=True):
             with patch(f"{_MODULE}.is_nixl_available", return_value=True):
                 assert strategy.is_available(ctx) is False
+
+
+class TestTrainerPullRequiresRegistration:
+    """register_tensors is best-effort at every other call site, and that is right
+    there: a failure only costs P2P serving.  On this path the registered region is
+    the destination of an inbound READ, so a silent skip means every transfer fails
+    at prep with NIXL_ERR_NOT_FOUND and falls through to disk looking successful.
+    """
+
+    def _load(self, tensor_descriptors):
+        ctx = _make_load_context()
+        ctx.nixl_manager = MagicMock()
+        ctx.nixl_manager.tensor_descriptors = tensor_descriptors
+        strategy = _make_strategy()
+        result = LoadResult(value=MagicMock(), model=MagicMock())
+
+        with (
+            patch.object(strategy, "_fetch_table", return_value=MagicMock()),
+            patch(f"{_MODULE}.register_tensors"),
+            patch(f"{_MODULE}.PullRole") as pull_role,
+            patch(f"{_MODULE}.LocalPlanner"),
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            return strategy.load(result, ctx), pull_role
+
+    def test_load_fails_when_registration_left_no_descriptors(self):
+        """The whole point: refuse rather than read into unregistered memory."""
+        from modelexpress.adapter import StrategyFailed
+
+        import pytest
+
+        with pytest.raises(StrategyFailed) as excinfo:
+            self._load({})
+
+        assert excinfo.value.mutated is False
+
+    def test_load_fails_when_nixl_manager_is_absent(self):
+        from modelexpress.adapter import StrategyFailed
+
+        import pytest
+
+        ctx = _make_load_context()
+        ctx.nixl_manager = None
+        strategy = _make_strategy()
+        result = LoadResult(value=MagicMock(), model=MagicMock())
+
+        with (
+            patch.object(strategy, "_fetch_table", return_value=MagicMock()),
+            patch(f"{_MODULE}._init_nixl_manager", return_value=None),
+            patch(f"{_MODULE}.register_tensors"),
+            patch(f"{_MODULE}.PullRole"),
+            patch(f"{_MODULE}.LocalPlanner"),
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            with pytest.raises(StrategyFailed):
+                strategy.load(result, ctx)
+
+    def test_load_proceeds_once_descriptors_exist(self):
+        """The guard must not fire on the healthy path."""
+        _result, pull_role = self._load({"weight": object()})
+        assert pull_role.called
