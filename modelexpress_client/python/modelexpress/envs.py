@@ -102,8 +102,6 @@ if TYPE_CHECKING:
     MX_ARTIFACT_READY_TIMEOUT_SECS: int
     MX_ARTIFACT_TRANSFER_CHUNK_SIZE: Optional[str]
     # Trainer weight sync
-    MX_TRAINER_TABLE_KEY: Optional[str]
-    MX_TRAINER_SYNC_TIMEOUT: int
     MX_REDIS_URL: str
     # P2P source selection
     MX_P2P_SOURCE_SELECTOR: Optional[str]
@@ -316,8 +314,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # int parse plus its non-positive/max-bound validation and default param.
     "MX_ARTIFACT_TRANSFER_CHUNK_SIZE": lambda: os.environ.get("MX_ARTIFACT_TRANSFER_CHUNK_SIZE"),
     # ── Trainer pull (live weight sync from a running trainer) ─────────────
-    "MX_TRAINER_TABLE_KEY": lambda: os.environ.get("MX_TRAINER_TABLE_KEY"),
-    "MX_TRAINER_SYNC_TIMEOUT": lambda: _env_int("MX_TRAINER_SYNC_TIMEOUT", 300),
     "MX_REDIS_URL": lambda: os.environ.get("MX_REDIS_URL", "redis://localhost:6379"),
     # ── P2P source selection ───────────────────────────────────────────────
     # Raw (None when unset); source_selection applies its DEFAULT_SELECTOR fallback.

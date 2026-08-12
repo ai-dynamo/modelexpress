@@ -892,60 +892,6 @@ while agent.check_xfer_state(handle) not in ("DONE", "SUCCESS"):
 agent.release_xfer_handle(handle)
 ```
 
-## Trainer-Inference Weight Sync
-
-ModelExpress coordinates live weight synchronization from a sharded trainer to
-inference workers.  The Python client exposes `PullRole` (inference worker pulls
-from trainer) and `PushRole` (trainer pushes to inference workers).  Routing and
-plan caching run entirely client-side; the MX server carries no weight-sync
-state and exposes no weight-sync RPCs.
-
-### Planner Abstraction
-
-Planner implementations live in `modelexpress/weight_transfer/planner/`:
-
-| Class | When to use |
-|-------|-------------|
-| `LocalPlanner` | The default and currently the only planner. Each worker routes independently against the `TrainerTable`, with a per-worker cache. |
-
-The `TrainerTable` is published to and read from the metadata store
-(`MX_TRAINER_TABLE_KEY`, Redis-backed), not through the MX server.
-
-### Key Data Flow (PULL)
-
-1. **Bake pass**: `PullRole.initialize()` drives the engine's weight loader with
-   `LazyWeight` tensors that record op chains without materializing data.
-2. **Resolve**: `resolve_copies()` replays op chains on meta tensors to produce
-   `ResolvedRegion` objects (element-run pairs, torch-dependent, client-side only).
-3. **Plan**: `LocalPlanner` converts `ResolvedRegion` lists to `RdmaDescriptor`
-   lists (pure integer arithmetic).
-4. **Execute**: `NixlExecutor.execute()` issues one NIXL READ handle per trainer
-   rank and waits for all to complete.
-5. **Post-process**: Engine adapter runs `post_pull_hook()` (e.g. FP8 scale repack).
-
-### M2N Descriptors
-
-`M2nDescriptor` extends `RdmaDescriptor` with `dst_agent_index`, identifying the
-target worker for a many-to-many transfer.  `M2nDescriptor.to_rdma_descriptor()`
-converts to a plain `RdmaDescriptor` for use with `NixlExecutor` on the worker's
-PULL path.
-
-`M2nExecutor` groups descriptors by `src_agent_index` and fires one NIXL READ
-handle per trainer rank (all in parallel, same as `NixlExecutor`).  When NIXL
-exposes a native many-to-many transfer API, the inner loop can be replaced with
-a single `make_prepped_m2n_xfer` call for true collective semantics.
-
-The coordination layer that produced globally-consistent M2N plans through the
-server has been removed along with the rest of the weight-sync RPC surface.  The
-descriptor and executor types above remain, so a replacement coordinator can be
-built against them.
-
-### Invalidation
-
-When the trainer reshards (topology change between steps), `LocalPlanner`'s
-`invalidate(plan_key)` evicts the per-worker cache.  There is no server-side
-plan state to invalidate.
-
 ## FP8 Model Handling (DeepSeek-V3)
 
 vLLM's `process_weights_after_loading()` transforms model weights into kernel-friendly formats (FP8 scale repacking, NVFP4 padding/swizzling, MLA dequantized projections) and may create new tensors as bare attributes, buffers, or on quant method objects.
@@ -1021,8 +967,6 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend; `{rank}` is substituted with the worker's own rank. Client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` if the resolved pattern has no explicit port |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` max retries on `FAILED_PRECONDITION` (rolling-update transients). Fresh gRPC channel per attempt so kube-proxy re-picks a backend |
 | `MX_K8S_SOURCE_BACKOFF_SECONDS` | `0.5` | `k8s-service` sleep between retry attempts |
-| `MX_TRAINER_TABLE_KEY` | (required for trainer pull; unset disables it) | Metadata-store key holding the TrainerTable that `TrainerPullStrategy` reads. Backed by the metadata store rather than the MX server. With it unset the strategy declines and the chain falls through to the other loaders |
-| `MX_TRAINER_SYNC_TIMEOUT` | `300` | Seconds `TrainerPullStrategy` waits for the TrainerTable to appear or for a pull to complete |
 | `MX_HEARTBEAT_INTERVAL_SECS` | `30` | Client heartbeat frequency |
 | `MX_HEARTBEAT_TIMEOUT_SECS` | `90` | Server reaper staleness threshold |
 | `MX_REAPER_SCAN_INTERVAL_SECS` | `30` | Server reaper scan frequency |
