@@ -59,13 +59,6 @@ impl RevisionCatalogState {
         ))
     }
 
-    pub async fn connect(&self) -> Result<(), CatalogError> {
-        self.backend
-            .connect()
-            .await
-            .map_err(|error| CatalogError::Backend(error.to_string()))
-    }
-
     pub async fn publish(
         &self,
         manifest: RevisionManifest,
@@ -203,6 +196,21 @@ mod tests {
         assert!(matches!(
             state.commit("model", "missing").await,
             Err(CatalogError::RevisionNotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_an_unrecognized_lifecycle_state() {
+        let backend = Arc::new(super::super::backend::testing::TestRevisionCatalogBackend::new());
+        backend.insert(RevisionRecord {
+            manifest: Some(launch_manifest()),
+            state: 99,
+        });
+        let state = RevisionCatalogState::with_backend(backend);
+
+        assert!(matches!(
+            state.commit("model", "0").await,
+            Err(CatalogError::InvalidLifecycle { state: 99, .. })
         ));
     }
 }

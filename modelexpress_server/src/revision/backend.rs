@@ -52,27 +52,25 @@ pub type DynRevisionCatalogBackend = Arc<dyn RevisionCatalogBackend>;
 
 pub async fn create_revision_catalog_backend(
     config: BackendConfig,
-) -> CatalogResult<DynRevisionCatalogBackend> {
+) -> CatalogResult<Option<DynRevisionCatalogBackend>> {
     match config {
         BackendConfig::Redis { url } => {
             let backend = redis::RedisRevisionCatalogBackend::new(&url);
             backend.connect().await?;
-            Ok(Arc::new(backend))
+            Ok(Some(Arc::new(backend)))
         }
-        BackendConfig::Kubernetes { .. } => {
-            Err("revision catalog currently supports only the Redis backend".into())
-        }
+        BackendConfig::Kubernetes { .. } => Ok(None),
         #[cfg(feature = "memory-backend")]
         BackendConfig::Memory => {
             #[cfg(feature = "integration-tests")]
             {
                 let backend = testing::TestRevisionCatalogBackend::new();
                 backend.connect().await?;
-                Ok(Arc::new(backend))
+                Ok(Some(Arc::new(backend)))
             }
             #[cfg(not(feature = "integration-tests"))]
             {
-                Err("revision catalog currently supports only the Redis backend".into())
+                Err("in-memory revision catalog requires the 'integration-tests' feature".into())
             }
         }
     }
@@ -84,16 +82,13 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn revision_catalog_rejects_kubernetes_until_future_support_lands() {
-        let error = create_revision_catalog_backend(BackendConfig::Kubernetes {
+    async fn revision_catalog_is_disabled_for_kubernetes_metadata() {
+        let backend = create_revision_catalog_backend(BackendConfig::Kubernetes {
             namespace: "test".to_string(),
         })
         .await
-        .err()
-        .expect("Kubernetes revision catalog is not implemented");
-        assert_eq!(
-            error.to_string(),
-            "revision catalog currently supports only the Redis backend"
-        );
+        .expect("Kubernetes metadata must not prevent server startup");
+
+        assert!(backend.is_none());
     }
 }

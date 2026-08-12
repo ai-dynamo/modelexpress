@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Reusable server entrypoint. `main` is a thin shell over [`run_server`] so the
-//! whole startup path (registry, revision catalog, P2P state, health, reaper, graceful
+//! whole startup path (registry, optional revision catalog, P2P state, health, reaper, graceful
 //! shutdown) can be embedded by a downstream binary with its own configuration or services.
 
 use std::future::Future;
@@ -36,8 +36,9 @@ const MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 
 /// Run the ModelExpress gRPC server to completion.
 ///
-/// Connects the registry, revision catalog, and P2P metadata backends, failing fast if any
-/// is unreachable. It starts the cache-eviction and reaper background tasks, serves all
+/// Connects the registry and P2P metadata backends, plus the revision catalog when the
+/// selected backend supports it, failing fast if any configured backend is unreachable.
+/// It starts the cache-eviction and reaper background tasks, serves all
 /// gRPC services, and tears everything down once `shutdown` resolves. Logging is the
 /// caller's responsibility: install a subscriber before calling this.
 ///
@@ -119,17 +120,33 @@ pub async fn run_server(
         .set_serving::<P2pServiceServer<P2pServiceImpl>>()
         .await;
 
-    let revision_backend = create_revision_catalog_backend(backend.clone())
-        .await
-        .map_err(|error| {
+    let revision_backend = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        create_revision_catalog_backend(backend.clone()),
+    )
+    .await
+    {
+        Ok(Ok(revision_backend)) => revision_backend,
+        Ok(Err(error)) => {
             error!("Failed to connect to revision catalog backend: {error}");
-            error
-        })?;
-    let revision_state = Arc::new(RevisionCatalogState::with_backend(revision_backend));
-    let revision_service = RevisionCatalogServiceImpl::new(revision_state);
-    health_reporter
-        .set_serving::<RevisionCatalogServiceServer<RevisionCatalogServiceImpl>>()
-        .await;
+            return Err(error);
+        }
+        Err(_) => {
+            error!("Timed out connecting to revision catalog backend");
+            return Err("revision catalog backend connection timed out".into());
+        }
+    };
+    let revision_service = revision_backend.map(|revision_backend| {
+        let revision_state = Arc::new(RevisionCatalogState::with_backend(revision_backend));
+        RevisionCatalogServiceImpl::new(revision_state)
+    });
+    if revision_service.is_some() {
+        health_reporter
+            .set_serving::<RevisionCatalogServiceServer<RevisionCatalogServiceImpl>>()
+            .await;
+    } else {
+        info!("Revision catalog service disabled for the selected metadata backend");
+    }
 
     // Initialize P2P state manager — fails fast if backend is misconfigured or unreachable
     let p2p_state = Arc::new(P2pStateManager::with_config(backend));
@@ -204,9 +221,11 @@ pub async fn run_server(
     let weight_sync = WeightSyncServiceServer::new(weight_sync_service)
         .max_decoding_message_size(MAX_MESSAGE_SIZE)
         .max_encoding_message_size(MAX_MESSAGE_SIZE);
-    let revision = RevisionCatalogServiceServer::new(revision_service)
-        .max_decoding_message_size(MAX_MESSAGE_SIZE)
-        .max_encoding_message_size(MAX_MESSAGE_SIZE);
+    let revision = revision_service.map(|revision_service| {
+        RevisionCatalogServiceServer::new(revision_service)
+            .max_decoding_message_size(MAX_MESSAGE_SIZE)
+            .max_encoding_message_size(MAX_MESSAGE_SIZE)
+    });
 
     info!("Starting gRPC server on: {addr}");
     let router = Server::builder()
@@ -218,13 +237,13 @@ pub async fn run_server(
             .add_service(layer.layer(model))
             .add_service(layer.layer(p2p))
             .add_service(layer.layer(weight_sync))
-            .add_service(layer.layer(revision)),
+            .add_optional_service(revision.map(|revision| layer.layer(revision))),
         None => router
             .add_service(api)
             .add_service(model)
             .add_service(p2p)
             .add_service(weight_sync)
-            .add_service(revision),
+            .add_optional_service(revision),
     };
     let server_result = router.serve_with_shutdown(addr, shutdown_signal).await;
 

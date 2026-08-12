@@ -101,12 +101,16 @@ async fn revision_catalog_runs_through_the_real_server_router() {
     let port = free_port();
     let (shutdown, handle) = start_server(port);
     let endpoint = format!("http://127.0.0.1:{port}");
-    let mut client = loop {
-        match RevisionCatalogServiceClient::connect(endpoint.clone()).await {
-            Ok(client) => break client,
-            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+    let mut client = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match RevisionCatalogServiceClient::connect(endpoint.clone()).await {
+                Ok(client) => break client,
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
         }
-    };
+    })
+    .await
+    .expect("revision catalog service did not accept connections in time");
     let manifest = RevisionManifest {
         model_id: "model".to_string(),
         target_version: "1".to_string(),

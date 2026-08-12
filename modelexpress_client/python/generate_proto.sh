@@ -33,6 +33,8 @@ for name in "${PROTO_NAMES[@]}"; do
     tmp_file="$(mktemp)"
     sed -E 's/^import ([a-zA-Z0-9_]+_pb2) as/from . import \1 as/' "${grpc_file}" > "${tmp_file}"
     mv "${tmp_file}" "${grpc_file}"
+    sed -i "s/+ f' but the generated code/+ ' but the generated code/" "${grpc_file}"
+    sed -i '/^import warnings$/d' "${grpc_file}"
 
     for file in "${OUT_DIR}/${name}_pb2.py" "${grpc_file}"; do
         echo "Adding SPDX header to ${file}..."

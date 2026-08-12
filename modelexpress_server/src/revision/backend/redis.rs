@@ -22,16 +22,22 @@ if existing_manifest then
     end
     return {0, existing_record}
 end
-redis.call('HSET', KEYS[1], 'manifest', ARGV[1], 'record', ARGV[2])
+redis.call('HSET', KEYS[1], 'manifest', ARGV[1], 'record', ARGV[2], 'state', ARGV[3])
 return {1, ARGV[2]}
 "#;
 
 const COMMIT_LUA: &str = r#"
 local current = redis.call('HGET', KEYS[1], 'record')
-if not current then return 0 end
-if current ~= ARGV[1] then return 2 end
-redis.call('HSET', KEYS[1], 'record', ARGV[2])
-return 1
+if not current then return {0, '', ''} end
+local state = redis.call('HGET', KEYS[1], 'state')
+if not state then
+    state = ARGV[4]
+    redis.call('HSET', KEYS[1], 'state', state)
+end
+if state == ARGV[2] then return {2, current, state} end
+if state ~= ARGV[1] then return {3, current, state or ''} end
+redis.call('HSET', KEYS[1], 'record', ARGV[3], 'state', ARGV[2])
+return {1, ARGV[3], ARGV[2]}
 "#;
 
 fn digest_hex(value: &str) -> String {
@@ -124,6 +130,7 @@ impl RevisionCatalogBackend for RedisRevisionCatalogBackend {
             .key(key)
             .arg(manifest_bytes)
             .arg(record_bytes)
+            .arg(RevisionState::Ready as i32)
             .invoke_async(&mut connection)
             .await?;
         match code {
@@ -168,39 +175,42 @@ impl RevisionCatalogBackend for RedisRevisionCatalogBackend {
         model_id: &str,
         target_version: &str,
     ) -> CatalogResult<CommitOutcome> {
-        let key = revision_key(model_id, target_version);
-        for _ in 0..8 {
-            let Some(current) = self.get_revision(model_id, target_version).await? else {
-                return Ok(CommitOutcome::NotFound);
-            };
-            match RevisionState::try_from(current.state).ok() {
-                Some(RevisionState::Committed) => {
-                    return Ok(CommitOutcome::AlreadyCommitted(current));
-                }
-                Some(RevisionState::Ready) => {}
-                _ => return Ok(CommitOutcome::InvalidState(current)),
+        let Some(current) = self.get_revision(model_id, target_version).await? else {
+            return Ok(CommitOutcome::NotFound);
+        };
+        let current_state = current.state;
+        let mut updated = current;
+        updated.state = RevisionState::Committed as i32;
+        let mut connection = self.connection().await?;
+        let (code, stored, stored_state): (i32, Vec<u8>, String) = redis::Script::new(COMMIT_LUA)
+            .key(revision_key(model_id, target_version))
+            .arg(RevisionState::Ready as i32)
+            .arg(RevisionState::Committed as i32)
+            .arg(updated.encode_to_vec())
+            .arg(current_state)
+            .invoke_async(&mut connection)
+            .await?;
+        match code {
+            1 => Ok(CommitOutcome::Committed(updated)),
+            0 => Ok(CommitOutcome::NotFound),
+            2 => Ok(CommitOutcome::AlreadyCommitted(verify_record_identity(
+                decode_record(&stored)?,
+                model_id,
+                target_version,
+            )?)),
+            3 => {
+                let mut record =
+                    verify_record_identity(decode_record(&stored)?, model_id, target_version)?;
+                record.state = stored_state.parse()?;
+                Ok(CommitOutcome::InvalidState(record))
             }
-            let mut updated = current.clone();
-            updated.state = RevisionState::Committed as i32;
-            let mut connection = self.connection().await?;
-            let result: i32 = redis::Script::new(COMMIT_LUA)
-                .key(&key)
-                .arg(current.encode_to_vec())
-                .arg(updated.encode_to_vec())
-                .invoke_async(&mut connection)
-                .await?;
-            match result {
-                1 => return Ok(CommitOutcome::Committed(updated)),
-                0 => return Ok(CommitOutcome::NotFound),
-                2 => continue,
-                other => return Err(format!("unexpected Redis commit result: {other}").into()),
-            }
+            other => Err(format!("unexpected Redis commit result: {other}").into()),
         }
-        Err("revision commit conflicted repeatedly".into())
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use modelexpress_common::grpc::revision::RevisionManifest;
@@ -225,5 +235,131 @@ mod tests {
         };
         assert!(verify_record_identity(record.clone(), "model", "1").is_ok());
         assert!(verify_record_identity(record, "model", "2").is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Redis at REDIS_URL"]
+    async fn commit_does_not_depend_on_byte_exact_protobuf_reencoding() {
+        let redis_url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let backend = RedisRevisionCatalogBackend::new(&redis_url);
+        backend.connect().await.expect("connect to Redis");
+        let model_id = format!("revision-cas-{}", std::process::id());
+        let target_version = "1";
+        let key = revision_key(&model_id, target_version);
+        let manifest = RevisionManifest {
+            model_id: model_id.clone(),
+            target_version: target_version.to_string(),
+            target_digest: "sha256:target".to_string(),
+            format_digest: "sha256:format".to_string(),
+            ..Default::default()
+        };
+        let record = RevisionRecord {
+            manifest: Some(manifest.clone()),
+            state: RevisionState::Ready as i32,
+        };
+        let mut stored_record = record.encode_to_vec();
+        stored_record.extend_from_slice(&[0x78, 0x01]);
+        let mut connection = backend.connection().await.expect("Redis connection");
+        let _: () = redis::cmd("HSET")
+            .arg(&key)
+            .arg("manifest")
+            .arg(manifest.encode_to_vec())
+            .arg("record")
+            .arg(stored_record)
+            .query_async(&mut connection)
+            .await
+            .expect("seed forward-compatible record");
+
+        let outcome = backend
+            .commit_revision(&model_id, target_version)
+            .await
+            .expect("commit");
+
+        assert!(matches!(outcome, CommitOutcome::Committed(_)));
+        let _: () = redis::cmd("DEL")
+            .arg(key)
+            .query_async(&mut connection)
+            .await
+            .expect("cleanup revision");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Redis at REDIS_URL"]
+    async fn redis_commit_preserves_all_lifecycle_outcomes() {
+        let redis_url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let backend = RedisRevisionCatalogBackend::new(&redis_url);
+        backend.connect().await.expect("connect to Redis");
+        let model_id = format!("revision-lifecycle-{}", std::process::id());
+        let target_version = "1";
+        let key = revision_key(&model_id, target_version);
+        let record = RevisionRecord {
+            manifest: Some(RevisionManifest {
+                model_id: model_id.clone(),
+                target_version: target_version.to_string(),
+                target_digest: "sha256:target".to_string(),
+                format_digest: "sha256:format".to_string(),
+                ..Default::default()
+            }),
+            state: RevisionState::Ready as i32,
+        };
+
+        assert!(matches!(
+            backend
+                .publish_ready(record.clone())
+                .await
+                .expect("publish"),
+            PublishReadyOutcome::Created(_)
+        ));
+        assert!(matches!(
+            backend
+                .publish_ready(record.clone())
+                .await
+                .expect("idempotent publish"),
+            PublishReadyOutcome::Existing(_)
+        ));
+        assert!(matches!(
+            backend
+                .commit_revision(&model_id, target_version)
+                .await
+                .expect("commit"),
+            CommitOutcome::Committed(_)
+        ));
+        assert!(matches!(
+            backend
+                .commit_revision(&model_id, target_version)
+                .await
+                .expect("idempotent commit"),
+            CommitOutcome::AlreadyCommitted(_)
+        ));
+        assert!(matches!(
+            backend
+                .commit_revision(&model_id, "missing")
+                .await
+                .expect("not found"),
+            CommitOutcome::NotFound
+        ));
+
+        let mut connection = backend.connection().await.expect("Redis connection");
+        let _: () = redis::cmd("HSET")
+            .arg(&key)
+            .arg("state")
+            .arg(99)
+            .query_async(&mut connection)
+            .await
+            .expect("seed invalid state");
+        assert!(matches!(
+            backend
+                .commit_revision(&model_id, target_version)
+                .await
+                .expect("invalid state"),
+            CommitOutcome::InvalidState(_)
+        ));
+        let _: () = redis::cmd("DEL")
+            .arg(key)
+            .query_async(&mut connection)
+            .await
+            .expect("cleanup revision");
     }
 }

@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Deterministic test double for catalog state and in-process router tests.
-//! This module is not a selectable revision-catalog backend.
+//! Deterministic test double selected for `BackendConfig::Memory` when the
+//! `integration-tests` feature is enabled.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
@@ -30,6 +30,17 @@ impl TestRevisionCatalogBackend {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, TestCatalog> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    #[cfg(test)]
+    pub fn insert(&self, record: RevisionRecord) {
+        let Some(manifest) = record.manifest.as_ref() else {
+            panic!("test record must include a manifest");
+        };
+        self.lock().revisions.insert(
+            (manifest.model_id.clone(), manifest.target_version.clone()),
+            record,
+        );
     }
 }
 
