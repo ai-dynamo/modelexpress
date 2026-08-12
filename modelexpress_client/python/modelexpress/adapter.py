@@ -154,7 +154,12 @@ class EngineAdapter:
 
     @gated_capability
     def reinit_for_retry(self, result: LoadResult) -> LoadResult:
-        """Replace a possibly-mutated model with a fresh engine model instance."""
+        """Restore a possibly-mutated model to freshly initialized state.
+
+        Adapters may return a different model object, or preserve the root
+        object's identity while replacing its complete internal state when an
+        engine-owned caller retains the original root reference.
+        """
         ...
 
     def get_unique_id(self) -> str:

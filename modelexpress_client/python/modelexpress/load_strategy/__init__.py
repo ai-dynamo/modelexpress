@@ -22,6 +22,7 @@ from .base import (
     LoadResult,
     LoadStrategy,
     SourceTransferError,
+    clear_exception_tracebacks,
     publish_source_if_supported,
     register_tensors,
     publish_metadata,
@@ -99,6 +100,7 @@ class LoadStrategyChain:
                     )
                     strategy.rollback(ctx)
                     if e.mutated:
+                        clear_exception_tracebacks(e)
                         result = LoadStrategyChain._reinit_for_retry(result, ctx, strategy)
                     continue
                 except Exception as e:

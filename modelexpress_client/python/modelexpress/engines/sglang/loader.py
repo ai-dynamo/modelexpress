@@ -14,6 +14,7 @@ import torch.nn as nn
 
 from ... import envs, p2p_pb2
 from ...load_strategy import LoadContext, LoadStrategyChain
+from ...load_strategy.base import clear_exception_tracebacks
 from ...load_strategy.context import LoadResult
 from ...metadata.publisher import PublisherThread
 from ...metadata.payload import tensor_source_metadata, worker_tensor_descriptors
@@ -197,6 +198,9 @@ class MxModelLoader:
                     exc,
                     exc_info=True,
                 )
+                registered_tensors = None
+                tensors = {}
+                clear_exception_tracebacks(exc)
                 result = ctx.adapter.reinit_for_retry(result)
                 result = ctx.adapter.load_via_native(result)
                 tensors = ctx.adapter.discover_tensors(result)

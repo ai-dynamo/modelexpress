@@ -30,6 +30,7 @@ from .base import (
     LoadStrategy,
     SourceTransferError,
     _as_load_result,
+    clear_exception_tracebacks,
     register_tensors,
 )
 from .context import LoadResult
@@ -156,7 +157,6 @@ class RdmaStrategy(LoadStrategy):
 
         attempts = candidates[:MAX_SOURCE_RETRIES]
         policy = configured_policy_label()
-        needs_outer_reinit = False
         for attempt_index, instance in enumerate(attempts):
             mx_source_id = instance.mx_source_id
             worker_id = instance.worker_id
@@ -215,8 +215,6 @@ class RdmaStrategy(LoadStrategy):
                     "transfer_retry" if has_next_candidate else "transfer_fallback",
                 )
                 if not has_next_candidate:
-                    if needs_outer_reinit and not e.mutated:
-                        raise StrategyFailed(str(e), mutated=True) from e
                     raise
 
                 logger.warning(
@@ -233,14 +231,24 @@ class RdmaStrategy(LoadStrategy):
                     ) from cleanup_error
                 if e.mutated:
                     try:
-                        result = ctx.adapter.reinit_for_retry(result)
+                        clear_exception_tracebacks(e)
+                        reinitialized = ctx.adapter.reinit_for_retry(result)
+                        # LoadResult is the stable envelope shared with the
+                        # outer strategy chain. Some adapters return a new
+                        # envelope, so copy its restored state back rather than
+                        # leaving the outer owner with the cleared pre-retry
+                        # object if all later candidates miss.
+                        if reinitialized is not result:
+                            result.value = reinitialized.value
+                            result.model = reinitialized.model
+                            result.publishable = reinitialized.publishable
+                            result.metadata = reinitialized.metadata
                     except Exception as reinit_error:
                         raise StrategyFailed(
                             f"Failed to reinitialize target after source worker "
                             f"{worker_id} failed: {reinit_error}",
                             mutated=True,
                         ) from reinit_error
-                    needs_outer_reinit = True
                 continue
             except BaseException:
                 selection_metrics.observe_transfer_seconds(
@@ -259,11 +267,9 @@ class RdmaStrategy(LoadStrategy):
             f"[Worker {ctx.global_rank}] Tried {tried} of {len(candidates)} source workers "
             f"(max retries={MAX_SOURCE_RETRIES}), falling through"
         )
-        # An internal reinit returns a new result, but the outer strategy chain
-        # still owns the original result that the adapter cleared.
         raise StrategyFailed(
             "No RDMA source succeeded",
-            mutated=needs_outer_reinit,
+            mutated=False,
         )
 
     def _find_source_instances(
