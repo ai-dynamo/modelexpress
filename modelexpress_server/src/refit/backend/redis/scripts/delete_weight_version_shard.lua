@@ -4,7 +4,7 @@
 -- KEYS[2]: source worker registration hash
 -- KEYS[3]: physical shards hash
 -- KEYS[4]: active lease expiry sorted set for the version
--- ARGV: shard_id, encoded shard, releasing_state
+-- ARGV: publication key, encoded shard, releasing_state
 --
 -- Expired leases are removed using Redis time. Any remaining lease protects
 -- every shard of the version, independent of which source was selected.

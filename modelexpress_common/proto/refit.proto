@@ -48,11 +48,10 @@ message WorkerRegistration {
   // Fresh identity for this concrete process lifetime. A restarted worker
   // receives a new worker_id rather than fencing a prior registration.
   string worker_id = 1;
-  reserved 2, 3;
-  WorkerRole role = 4;
-  string model_name = 5;
-  string endpoint = 6;
-  uint64 expires_at_unix_ms = 7;
+  WorkerRole role = 2;
+  string model_name = 3;
+  string endpoint = 4;
+  uint64 expires_at_unix_ms = 5;
 }
 
 message RegisterWorkerRequest {
@@ -67,11 +66,15 @@ message WeightVersion {
   optional uint64 sequence = 3;
   string idempotency_key = 4;
   WeightPayloadFormat payload_format = 5;
-  string base_version_id = 6;
+  // Present only for XOR_DELTA; identifies the base WeightVersion to which the
+  // delta is applied.
+  optional string base_version_id = 6;
   // Required version-scoped source contributions. Physical source workers are
   // not baked in; the trainer coordinator supplies opaque IDs such as a
   // selected publisher global rank.
   repeated string expected_source_slots = 7;
+  // Adapter-defined fingerprint of the model parameter layout, used to detect
+  // incompatible source manifests.
   string layout_signature = 8;
   WeightVersionState state = 9;
   uint64 created_at_unix_ms = 10;
@@ -82,7 +85,8 @@ message CreateWeightVersionRequest {
   optional uint64 sequence = 2;
   string idempotency_key = 3;
   WeightPayloadFormat payload_format = 4;
-  string base_version_id = 5;
+  // Required only for XOR_DELTA; omitted for FULL_TENSOR.
+  optional string base_version_id = 5;
   repeated string expected_source_slots = 6;
 }
 
@@ -96,17 +100,15 @@ message DeleteWeightVersionRequest {
 
 message WeightVersionShard {
   string version_id = 1;
-  // Unique physical publication of one worker's complete manifest.
-  string shard_id = 2;
   // Required version-scoped source contribution covered by this publication.
-  string source_slot_id = 3;
-  string worker_id = 4;
-  reserved 5, 6;
-  uint64 tensor_count = 7;
-  uint64 total_bytes = 8;
-  string manifest_digest = 9;
-  string manifest_endpoint = 10;
-  string transport = 11;
+  string source_slot_id = 2;
+  // Together with version_id and source_slot_id, identifies this publication.
+  string worker_id = 3;
+  uint64 tensor_count = 4;
+  uint64 total_bytes = 5;
+  string manifest_digest = 6;
+  string manifest_endpoint = 7;
+  string transport = 8;
 }
 
 message CreateWeightVersionShardRequest {
@@ -128,9 +130,8 @@ message ListWeightVersionShardsResponse {
 
 message DeleteWeightVersionShardRequest {
   string version_id = 1;
-  string shard_id = 2;
+  string source_slot_id = 2;
   string worker_id = 3;
-  reserved 4, 5;
 }
 
 message DeleteWeightVersionShardResponse {
@@ -142,22 +143,19 @@ message VersionLease {
   string lease_id = 1;
   string version_id = 2;
   string worker_id = 3;
-  reserved 4, 5;
-  uint64 expires_at_unix_ms = 6;
+  uint64 expires_at_unix_ms = 4;
 }
 
 message RegisterVersionLeaseRequest {
   string version_id = 1;
   string worker_id = 2;
-  reserved 3, 4;
-  uint32 ttl_seconds = 5;
+  uint32 ttl_seconds = 3;
 }
 
 message DeleteVersionLeaseRequest {
   string version_id = 1;
   string lease_id = 2;
   string worker_id = 3;
-  reserved 4, 5;
 }
 
 message DeleteVersionLeaseResponse {

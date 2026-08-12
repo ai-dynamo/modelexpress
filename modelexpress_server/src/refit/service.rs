@@ -100,12 +100,12 @@ impl RefitService for RefitServiceImpl {
         let payload_format = WeightPayloadFormat::try_from(request.payload_format)
             .unwrap_or(WeightPayloadFormat::Unspecified);
         match payload_format {
-            WeightPayloadFormat::FullTensor if !request.base_version_id.is_empty() => {
+            WeightPayloadFormat::FullTensor if request.base_version_id.is_some() => {
                 return Err(Status::invalid_argument(
-                    "base_version_id must be empty for FULL_TENSOR",
+                    "base_version_id must be omitted for FULL_TENSOR",
                 ));
             }
-            WeightPayloadFormat::XorDelta if request.base_version_id.is_empty() => {
+            WeightPayloadFormat::XorDelta if request.base_version_id.is_none() => {
                 return Err(Status::invalid_argument(
                     "base_version_id is required for XOR_DELTA",
                 ));
@@ -129,10 +129,12 @@ impl RefitService for RefitServiceImpl {
                 ));
             }
         }
-        if payload_format == WeightPayloadFormat::XorDelta {
+        if let Some(base_version_id) = request.base_version_id.as_deref()
+            && payload_format == WeightPayloadFormat::XorDelta
+        {
             let base = self
                 .backend
-                .get_weight_version(&request.base_version_id)
+                .get_weight_version(base_version_id)
                 .await
                 .map_err(backend_status)?;
             if base.model_name != request.model_name
@@ -185,7 +187,6 @@ impl RefitService for RefitServiceImpl {
             .shard
             .ok_or_else(|| Status::invalid_argument("shard is required"))?;
         required(&shard.version_id, "shard.version_id")?;
-        required(&shard.shard_id, "shard.shard_id")?;
         required(&shard.source_slot_id, "shard.source_slot_id")?;
         required(&shard.worker_id, "shard.worker_id")?;
         required(&shard.manifest_digest, "shard.manifest_digest")?;
@@ -222,7 +223,7 @@ impl RefitService for RefitServiceImpl {
     ) -> Result<Response<DeleteWeightVersionShardResponse>, Status> {
         let request = request.into_inner();
         required(&request.version_id, "version_id")?;
-        required(&request.shard_id, "shard_id")?;
+        required(&request.source_slot_id, "source_slot_id")?;
         required(&request.worker_id, "worker_id")?;
         self.backend
             .delete_weight_version_shard(&request)

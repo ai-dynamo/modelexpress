@@ -102,7 +102,6 @@ fn worker(worker_id: &str, role: WorkerRole, ttl_seconds: u32) -> RegisterWorker
 fn shard(version_id: &str, source_slot_id: &str, worker_id: &str) -> WeightVersionShard {
     WeightVersionShard {
         version_id: version_id.to_string(),
-        shard_id: format!("{worker_id}-{source_slot_id}"),
         source_slot_id: source_slot_id.to_string(),
         worker_id: worker_id.to_string(),
         tensor_count: 10,
@@ -156,7 +155,7 @@ async fn version_becomes_ready_across_server_replicas() {
         sequence: Some(42),
         idempotency_key: unique_id("publish"),
         payload_format: WeightPayloadFormat::FullTensor.into(),
-        base_version_id: String::new(),
+        base_version_id: None,
         expected_source_slots: vec![
             "publisher:global-rank:0".to_string(),
             "publisher:global-rank:1".to_string(),
@@ -232,7 +231,7 @@ async fn version_becomes_ready_across_server_replicas() {
             shard: Some(conflicting_shard),
         })
         .await
-        .expect_err("the same shard_id cannot publish different metadata");
+        .expect_err("the same worker and source slot cannot publish different metadata");
     assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
 
     let ready = client_b
@@ -289,7 +288,7 @@ async fn replacement_worker_can_publish_the_same_source_slot() {
             sequence: None,
             idempotency_key: unique_id("replacement-publish"),
             payload_format: WeightPayloadFormat::FullTensor.into(),
-            base_version_id: String::new(),
+            base_version_id: None,
             expected_source_slots: vec!["publisher:global-rank:0".to_string()],
         })
         .await
@@ -369,7 +368,7 @@ async fn live_lease_protects_releasing_version_shards() {
             sequence: Some(43),
             idempotency_key: unique_id("lease-version"),
             payload_format: WeightPayloadFormat::FullTensor.into(),
-            base_version_id: String::new(),
+            base_version_id: None,
             expected_source_slots: vec!["publisher:global-rank:0".to_string()],
         })
         .await
@@ -427,7 +426,7 @@ async fn live_lease_protects_releasing_version_shards() {
     let protected = client_a
         .delete_weight_version_shard(DeleteWeightVersionShardRequest {
             version_id: version.version_id.clone(),
-            shard_id: published_shard.shard_id.clone(),
+            source_slot_id: published_shard.source_slot_id.clone(),
             worker_id: trainer_id.clone(),
         })
         .await
@@ -445,7 +444,7 @@ async fn live_lease_protects_releasing_version_shards() {
     let deleted = client_a
         .delete_weight_version_shard(DeleteWeightVersionShardRequest {
             version_id: version.version_id.clone(),
-            shard_id: published_shard.shard_id,
+            source_slot_id: published_shard.source_slot_id,
             worker_id: trainer_id.clone(),
         })
         .await
@@ -468,7 +467,7 @@ async fn live_lease_protects_releasing_version_shards() {
             sequence: Some(44),
             idempotency_key: unique_id("expiring-lease-version"),
             payload_format: WeightPayloadFormat::FullTensor.into(),
-            base_version_id: String::new(),
+            base_version_id: None,
             expected_source_slots: vec!["publisher:global-rank:0".to_string()],
         })
         .await
@@ -512,7 +511,7 @@ async fn live_lease_protects_releasing_version_shards() {
     client_a
         .delete_weight_version_shard(DeleteWeightVersionShardRequest {
             version_id: expiring_version.version_id,
-            shard_id: expiring_shard.shard_id,
+            source_slot_id: expiring_shard.source_slot_id,
             worker_id: trainer_id.clone(),
         })
         .await
@@ -548,7 +547,7 @@ async fn register_worker_refreshes_liveness_and_expires_without_renewal() {
             sequence: None,
             idempotency_key: unique_id("heartbeat-version"),
             payload_format: WeightPayloadFormat::FullTensor.into(),
-            base_version_id: String::new(),
+            base_version_id: None,
             expected_source_slots: vec!["publisher:global-rank:0".to_string()],
         })
         .await
@@ -569,7 +568,7 @@ async fn register_worker_refreshes_liveness_and_expires_without_renewal() {
             sequence: None,
             idempotency_key: unique_id("expired-worker-version"),
             payload_format: WeightPayloadFormat::FullTensor.into(),
-            base_version_id: String::new(),
+            base_version_id: None,
             expected_source_slots: vec!["publisher:global-rank:0".to_string()],
         })
         .await

@@ -390,10 +390,11 @@ Weight bytes and full tensor manifests remain on trainer or generator workers.
 | `DeleteVersionLease` | Release a generator's protection of the version shards |
 
 The final missing source slot atomically changes the version to `READY`.
-`WeightVersionShard` remains the name of the per-worker manifest publication:
-`shard_id` identifies that physical publication, while `source_slot_id`
-identifies the required, version-scoped source contribution it covers. The
-trainer coordinator chooses the opaque slots—for example,
+`WeightVersionShard` remains the name of the per-worker manifest publication.
+Its identity is `(version_id, worker_id, source_slot_id)`: `source_slot_id`
+identifies the required, version-scoped source contribution it covers, and
+`worker_id` identifies the publishing process. The trainer coordinator chooses
+the opaque slots—for example,
 `publisher:global-rank:12` for a selected Megatron publisher. Multiple
 publications may advertise the same source slot, including a replacement worker
 or a generator that becomes a peer source. Deployments configured with

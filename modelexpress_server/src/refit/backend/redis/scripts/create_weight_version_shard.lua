@@ -2,10 +2,11 @@
 --
 -- KEYS[1]: version hash
 -- KEYS[2]: publishing worker registration hash
--- KEYS[3]: physical WeightVersionShard publications, keyed by shard_id
+-- KEYS[3]: physical WeightVersionShard publications, keyed by the private
+--          worker_id + source_slot_id identity
 -- KEYS[4]: covered version-scoped source slots set
 -- KEYS[5]: expected version-scoped source slots set
--- ARGV: shard_id, encoded shard, model_name, source_slot_id, staging_state,
+-- ARGV: publication key, encoded shard, model_name, source_slot_id, staging_state,
 --       ready_state
 --
 -- Returns OK:<state> for a new or byte-identical repeated publication. Other

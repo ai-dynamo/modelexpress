@@ -37,6 +37,10 @@ fn shards_key(version_id: &str) -> String {
     format!("mx:refit:version:{version_id}:shards")
 }
 
+fn publication_key(worker_id: &str, source_slot_id: &str) -> String {
+    format!("{}:{worker_id}{source_slot_id}", worker_id.len())
+}
+
 fn coverage_key(version_id: &str) -> String {
     format!("mx:refit:version:{version_id}:coverage")
 }
@@ -125,7 +129,10 @@ fn version_from_hash(fields: HashMap<String, String>) -> RefitResult<WeightVersi
         sequence,
         idempotency_key: hash_field(&fields, "idempotency_key")?.to_string(),
         payload_format: parse_hash_field(&fields, "payload_format")?,
-        base_version_id: hash_field(&fields, "base_version_id")?.to_string(),
+        base_version_id: match hash_field(&fields, "base_version_id")? {
+            "" => None,
+            value => Some(value.to_string()),
+        },
         expected_source_slots: serde_json::from_str(hash_field(&fields, "expected_source_slots")?)
             .map_err(|error| {
                 RefitBackendError::Internal(format!("invalid expected_source_slots: {error}"))
@@ -198,7 +205,7 @@ impl RedisRefitBackend {
             )
             .arg(&request.idempotency_key)
             .arg(request.payload_format)
-            .arg(&request.base_version_id)
+            .arg(request.base_version_id.as_deref().unwrap_or_default())
             .arg(expected_source_slots)
             .arg(request.expected_source_slots.len())
             .arg(i32::from(WeightVersionState::Staging))
@@ -331,6 +338,7 @@ impl RefitBackend for RedisRefitBackend {
         shard: WeightVersionShard,
     ) -> RefitResult<(WeightVersionShard, WeightVersion)> {
         let mut version = self.get_weight_version(&shard.version_id).await?;
+        let publication_key = publication_key(&shard.worker_id, &shard.source_slot_id);
         let encoded = shard.encode_to_vec();
         let mut redis = self.redis.clone();
         let result: String = Script::new(CREATE_SHARD_LUA)
@@ -339,7 +347,7 @@ impl RefitBackend for RedisRefitBackend {
             .key(shards_key(&shard.version_id))
             .key(coverage_key(&shard.version_id))
             .key(expected_source_slots_key(&shard.version_id))
-            .arg(&shard.shard_id)
+            .arg(publication_key)
             .arg(encoded)
             .arg(&version.model_name)
             .arg(&shard.source_slot_id)
@@ -376,7 +384,7 @@ impl RefitBackend for RedisRefitBackend {
             }
             "SHARD_CONFLICT" => {
                 return Err(RefitBackendError::AlreadyExists(
-                    "shard_id was already published with different metadata".to_string(),
+                    "worker and source_slot_id already published different metadata".to_string(),
                 ));
             }
             value => {
@@ -418,7 +426,7 @@ impl RefitBackend for RedisRefitBackend {
             })
             .collect::<RefitResult<Vec<_>>>()?;
         shards.sort_by(|left, right| {
-            (&left.source_slot_id, &left.shard_id).cmp(&(&right.source_slot_id, &right.shard_id))
+            (&left.source_slot_id, &left.worker_id).cmp(&(&right.source_slot_id, &right.worker_id))
         });
         Ok(shards)
     }
@@ -427,9 +435,10 @@ impl RefitBackend for RedisRefitBackend {
         &self,
         request: &DeleteWeightVersionShardRequest,
     ) -> RefitResult<bool> {
+        let publication_key = publication_key(&request.worker_id, &request.source_slot_id);
         let mut redis = self.redis.clone();
         let encoded: Option<Vec<u8>> = redis
-            .hget(shards_key(&request.version_id), &request.shard_id)
+            .hget(shards_key(&request.version_id), &publication_key)
             .await
             .map_err(redis_error)?;
         let encoded = encoded.ok_or_else(|| {
@@ -449,7 +458,7 @@ impl RefitBackend for RedisRefitBackend {
             .key(worker_key(&request.worker_id))
             .key(shards_key(&request.version_id))
             .key(leases_key(&request.version_id))
-            .arg(&request.shard_id)
+            .arg(publication_key)
             .arg(encoded)
             .arg(i32::from(WeightVersionState::Releasing))
             .invoke_async(&mut redis)
