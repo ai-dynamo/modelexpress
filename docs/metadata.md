@@ -538,7 +538,7 @@ The `backend_type` discriminator is persisted in storage for unambiguous deseria
 |----------|---------|-------------|
 | `MX_METADATA_BACKEND` | (required) | `redis` or `kubernetes` |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | gRPC server address (recommended) |
-| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated, pending removal in a future release. Still read by all client paths and takes precedence when both are set; keep setting it during the transition. |
+| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
 | `MX_REDIS_HOST` / `REDIS_HOST` | `localhost` | Redis host |
 | `MX_REDIS_PORT` / `REDIS_PORT` | `6379` | Redis port |
 | `REDIS_URL` | (computed) | Full Redis URL (overrides host/port) |
