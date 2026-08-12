@@ -13,27 +13,36 @@ SPDX_HEADER="# SPDX-FileCopyrightText: Copyright (c) 2025-${YEAR} NVIDIA CORPORA
 # SPDX-License-Identifier: Apache-2.0
 #"
 
+PROTO_NAMES=(p2p revision)
+PROTO_FILES=()
+for name in "${PROTO_NAMES[@]}"; do
+    PROTO_FILES+=("${PROTO_DIR}/${name}.proto")
+done
+
 # Generate protobuf files
-echo "Generating protobuf files from ${PROTO_DIR}/p2p.proto..."
+echo "Generating protobuf files from ${PROTO_NAMES[*]}..."
 python -m grpc_tools.protoc \
     "-I${PROTO_DIR}" \
     "--python_out=${OUT_DIR}" \
     "--grpc_python_out=${OUT_DIR}" \
-    "${PROTO_DIR}/p2p.proto"
+    "${PROTO_FILES[@]}"
 
-# Fix relative import in grpc file
-echo "Fixing imports in p2p_pb2_grpc.py..."
-tmp_file="$(mktemp)"
-sed 's/^import p2p_pb2 as/from . import p2p_pb2 as/' "${OUT_DIR}/p2p_pb2_grpc.py" > "${tmp_file}"
-mv "${tmp_file}" "${OUT_DIR}/p2p_pb2_grpc.py"
+for name in "${PROTO_NAMES[@]}"; do
+    grpc_file="${OUT_DIR}/${name}_pb2_grpc.py"
+    echo "Fixing imports in ${name}_pb2_grpc.py..."
+    tmp_file="$(mktemp)"
+    sed -E 's/^import ([a-zA-Z0-9_]+_pb2) as/from . import \1 as/' "${grpc_file}" > "${tmp_file}"
+    mv "${tmp_file}" "${grpc_file}"
+    sed -i "s/+ f' but the generated code/+ ' but the generated code/" "${grpc_file}"
+    sed -i '/^import warnings$/d' "${grpc_file}"
 
-# Add SPDX header to generated files
-for file in "${OUT_DIR}/p2p_pb2.py" "${OUT_DIR}/p2p_pb2_grpc.py"; do
-    echo "Adding SPDX header to ${file}..."
-    tmp_file=$(mktemp)
-    echo "${SPDX_HEADER}" > "${tmp_file}"
-    cat "${file}" >> "${tmp_file}"
-    mv "${tmp_file}" "${file}"
+    for file in "${OUT_DIR}/${name}_pb2.py" "${grpc_file}"; do
+        echo "Adding SPDX header to ${file}..."
+        tmp_file="$(mktemp)"
+        printf '%s\n' "${SPDX_HEADER}" > "${tmp_file}"
+        cat "${file}" >> "${tmp_file}"
+        mv "${tmp_file}" "${file}"
+    done
 done
 
 echo "Done."
