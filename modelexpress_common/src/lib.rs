@@ -37,6 +37,9 @@ pub mod grpc {
     pub mod weight_sync {
         tonic::include_proto!("weight_sync");
     }
+    pub mod refit {
+        tonic::include_proto!("model_express.refit");
+    }
 }
 
 /// Defines the shared response format between server and client (legacy HTTP)
