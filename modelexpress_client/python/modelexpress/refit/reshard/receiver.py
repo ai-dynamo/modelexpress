@@ -267,6 +267,18 @@ def _fused_wire_enabled() -> bool:
     return envs.MX_RESHARD_FUSED_WIRE
 
 
+def _replica_offset(global_rank: int) -> int:
+    """Which duplicate DP/EDP replica this rank reads each shard from.
+
+    Zero means every receiver reads from the first publisher discovered, so one
+    trainer rank and one NIC serve the whole fleet while the replicas holding the
+    same bytes serve nothing. Rotating by global rank spreads the reads. Read at
+    call time so an A/B can toggle it without re-importing. Off by default; see
+    ``merge_shard_tables`` for why.
+    """
+    return global_rank if envs.MX_RESHARD_SPREAD_SOURCES else 0
+
+
 def _batch_install_enabled() -> bool:
     """Whether to re-slice full-pulled sources with one batched copy.
 
@@ -412,6 +424,7 @@ class ReshardReceiver:
             role="inference",
             rank=self._global_rank,
             timeout=timeout,
+            replica_offset=_replica_offset(self._global_rank),
         )
         self._prepare_stages["prepare_discover_s"] = time.perf_counter() - _t
         logger.info(
