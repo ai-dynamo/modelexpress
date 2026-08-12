@@ -34,6 +34,15 @@ class StrategyFailed(RuntimeError):
         self.mutated = mutated
 
 
+class StrategyRecoveryError(RuntimeError):
+    """Raised when a failed strategy cannot restore a safe model state.
+
+    The strategy chain must stop immediately: trying another loader with a
+    partially cleared or otherwise unrecoverable model would hide the original
+    recovery failure and may publish invalid weights.
+    """
+
+
 def gated_capability(method):
     """Create an optional adapter method that engines must override to support it.
 

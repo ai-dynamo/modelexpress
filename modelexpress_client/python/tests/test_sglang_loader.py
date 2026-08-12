@@ -431,6 +431,45 @@ def test_sglang_retry_initializes_model_with_configured_dtype(monkeypatch):
     assert list(initial_model.parameters())
 
 
+def test_sglang_retry_failure_restores_envelope_and_original_error(monkeypatch):
+    sglang_mod = ModuleType("sglang")
+    srt_mod = ModuleType("sglang.srt")
+    model_loader_mod = ModuleType("sglang.srt.model_loader")
+    loader_mod = ModuleType("sglang.srt.model_loader.loader")
+    model_loader_utils_mod = ModuleType("sglang.srt.model_loader.utils")
+
+    @contextmanager
+    def set_default_torch_dtype(_dtype):
+        yield
+
+    failure = RuntimeError("fresh initialization failed")
+    loader_mod._get_quantization_config = lambda *_: None
+    loader_mod._initialize_model = MagicMock(side_effect=failure)
+    model_loader_utils_mod.set_default_torch_dtype = set_default_torch_dtype
+    monkeypatch.setitem(sys.modules, "sglang", sglang_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt", srt_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.model_loader", model_loader_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.model_loader.loader", loader_mod)
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.model_loader.utils",
+        model_loader_utils_mod,
+    )
+
+    model = nn.Linear(2, 2)
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    result = LoadResult(value=model, model=model, metadata={"attempt": 1})
+
+    with pytest.raises(RuntimeError) as exc:
+        adapter.reinit_for_retry(result)
+
+    assert exc.value is failure
+    assert result.value is model
+    assert result.model is model
+    assert result.metadata == {"attempt": 1}
+    assert model.__dict__ == {}
+
+
 def test_sglang_retry_reuses_root_for_native_fallback(monkeypatch):
     sglang_mod = ModuleType("sglang")
     srt_mod = ModuleType("sglang.srt")

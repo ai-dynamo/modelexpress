@@ -19,7 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from modelexpress import p2p_pb2
-from modelexpress.adapter import StrategyFailed
+from modelexpress.adapter import StrategyFailed, StrategyRecoveryError
 from modelexpress.load_strategy.base import LoadResult, clear_exception_tracebacks
 from modelexpress.load_strategy.rdma_strategy import MAX_SOURCE_RETRIES, RdmaStrategy
 from modelexpress.source_selection import (
@@ -611,8 +611,15 @@ def test_load_transfer_failure_reinitializes_and_tries_next_source():
     strat._load_as_target = MagicMock(
         side_effect=[StrategyFailed("receive failed", mutated=True), "loaded"]
     )
-    original_result = MagicMock(name="original-result")
-    retry_result = MagicMock(name="retry-result")
+    original_model = MagicMock(name="original-model")
+    retry_model = MagicMock(name="retry-model")
+    original_result = LoadResult(value=original_model, model=original_model)
+    retry_result = LoadResult(
+        value=retry_model,
+        model=retry_model,
+        publishable=False,
+        metadata={"retry": True},
+    )
     ctx = MagicMock(global_rank=0)
     ctx.accelerator_backend.name = ""  # unknown target -> accelerator gate accepts
     ctx.adapter.reinit_for_retry.return_value = retry_result
@@ -632,6 +639,8 @@ def test_load_transfer_failure_reinitializes_and_tries_next_source():
     assert ctx.adapter.reinit_for_retry.call_args.args[0] is retry_envelope
     assert retry_envelope.value is retry_result.value
     assert retry_envelope.model is retry_result.model
+    assert retry_envelope.publishable is False
+    assert retry_envelope.metadata == {"retry": True}
 
 
 @pytest.mark.parametrize("vmm_arena", [None, object()])
@@ -717,7 +726,24 @@ def test_load_internal_reinit_then_clean_failure_stays_clean():
     ctx.adapter.reinit_for_retry.assert_called_once()
 
 
-def test_load_reinit_failure_remains_mutated():
+def test_load_last_candidate_mutated_failure_propagates_mutated():
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(1))
+    strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
+    strat._load_as_target = MagicMock(
+        side_effect=StrategyFailed("mutated failure", mutated=True)
+    )
+    ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""
+
+    with pytest.raises(StrategyFailed, match="mutated failure") as exc:
+        strat.load(MagicMock(), ctx)
+
+    assert exc.value.mutated is True
+    ctx.adapter.reinit_for_retry.assert_not_called()
+
+
+def test_load_reinit_failure_is_unrecoverable():
     strat = RdmaStrategy()
     strat._find_source_instances = MagicMock(return_value=_sources(2))
     strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
@@ -728,10 +754,10 @@ def test_load_reinit_failure_remains_mutated():
     ctx.accelerator_backend.name = ""
     ctx.adapter.reinit_for_retry.side_effect = RuntimeError("reinit failed")
 
-    with pytest.raises(StrategyFailed, match="reinit failed") as exc:
+    with pytest.raises(StrategyRecoveryError, match="reinit failed") as exc:
         strat.load(MagicMock(), ctx)
 
-    assert exc.value.mutated is True
+    assert isinstance(exc.value.__cause__, RuntimeError)
 
 
 def test_load_cleanup_failure_aborts_before_reinit():

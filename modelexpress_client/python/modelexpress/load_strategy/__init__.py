@@ -16,7 +16,7 @@ import torch.nn as nn
 
 from modelexpress.tracing import tracer
 
-from ..adapter import StrategyFailed, UnsupportedCapability
+from ..adapter import StrategyFailed, StrategyRecoveryError, UnsupportedCapability
 from .base import (
     LoadContext,
     LoadResult,
@@ -93,6 +93,12 @@ class LoadStrategyChain:
                     publish_source_if_supported(result, ctx)
                     span.set_attribute("weight_loading_strategy", strategy.name)
                     return result.value
+                except StrategyRecoveryError:
+                    # Recovery already failed, so no later strategy can safely
+                    # use the current model. Fail closed and retain the original
+                    # recovery error as the exception cause.
+                    strategy.rollback(ctx)
+                    raise
                 except StrategyFailed as e:
                     logger.warning(
                         f"[Worker {ctx.global_rank}] Strategy {strategy.name} failed, "

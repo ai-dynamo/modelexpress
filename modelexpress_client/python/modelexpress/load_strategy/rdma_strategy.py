@@ -11,7 +11,7 @@ import os
 import time
 
 from .. import envs, p2p_pb2
-from ..adapter import EngineAdapter, StrategyFailed
+from ..adapter import EngineAdapter, StrategyFailed, StrategyRecoveryError
 from ..metadata.payload import (
     accelerators_compatible,
     worker_tensor_count,
@@ -239,15 +239,11 @@ class RdmaStrategy(LoadStrategy):
                         # leaving the outer owner with the cleared pre-retry
                         # object if all later candidates miss.
                         if reinitialized is not result:
-                            result.value = reinitialized.value
-                            result.model = reinitialized.model
-                            result.publishable = reinitialized.publishable
-                            result.metadata = reinitialized.metadata
+                            vars(result).update(vars(reinitialized))
                     except Exception as reinit_error:
-                        raise StrategyFailed(
+                        raise StrategyRecoveryError(
                             f"Failed to reinitialize target after source worker "
                             f"{worker_id} failed: {reinit_error}",
-                            mutated=True,
                         ) from reinit_error
                 continue
             except BaseException:
