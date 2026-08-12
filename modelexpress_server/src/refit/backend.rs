@@ -54,9 +54,9 @@ pub trait RefitBackend: Send + Sync {
         request: &CreateWeightVersionRequest,
     ) -> RefitResult<WeightVersion>;
 
-    async fn get_weight_version(&self, version_id: &str) -> RefitResult<WeightVersion>;
+    async fn get_weight_version(&self, uid: &str) -> RefitResult<WeightVersion>;
 
-    async fn delete_weight_version(&self, version_id: &str) -> RefitResult<WeightVersion>;
+    async fn delete_weight_version(&self, uid: &str) -> RefitResult<WeightVersion>;
 
     async fn create_weight_version_shard(
         &self,

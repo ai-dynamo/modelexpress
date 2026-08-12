@@ -390,6 +390,9 @@ Weight bytes and full tensor manifests remain on trainer or generator workers.
 | `DeleteVersionLease` | Release a generator's protection of the version shards |
 
 The final missing source slot atomically changes the version to `READY`.
+`WeightVersion.uid` is MX's opaque identity. `version_number` is the optional
+framework-provided numeric label used for correlation; MX does not use it as an
+identity or ordering key.
 `WeightVersionShard` remains the name of the per-worker manifest publication.
 Its identity is `(version_id, worker_id, source_slot_id)`: `source_slot_id`
 identifies the required, version-scoped source contribution it covers, and

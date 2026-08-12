@@ -156,10 +156,10 @@ impl RefitService for RefitServiceImpl {
         &self,
         request: Request<GetWeightVersionRequest>,
     ) -> Result<Response<WeightVersion>, Status> {
-        let version_id = request.into_inner().version_id;
-        required(&version_id, "version_id")?;
+        let uid = request.into_inner().uid;
+        required(&uid, "uid")?;
         self.backend
-            .get_weight_version(&version_id)
+            .get_weight_version(&uid)
             .await
             .map(Response::new)
             .map_err(backend_status)
@@ -169,10 +169,10 @@ impl RefitService for RefitServiceImpl {
         &self,
         request: Request<DeleteWeightVersionRequest>,
     ) -> Result<Response<WeightVersion>, Status> {
-        let version_id = request.into_inner().version_id;
-        required(&version_id, "version_id")?;
+        let uid = request.into_inner().uid;
+        required(&uid, "uid")?;
         self.backend
-            .delete_weight_version(&version_id)
+            .delete_weight_version(&uid)
             .await
             .map(Response::new)
             .map_err(backend_status)

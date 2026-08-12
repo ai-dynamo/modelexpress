@@ -3,7 +3,7 @@
 -- KEYS[1]: version hash
 -- KEYS[2]: create-request idempotency key
 -- KEYS[3]: expected source slots set
--- ARGV: version_id, model_name, sequence, idempotency_key, payload_format,
+-- ARGV: uid, model_name, version_number, idempotency_key, payload_format,
 --       base_version_id, expected_source_slots JSON, expected_source_slot_count,
 --       state,
 --       created_at_unix_ms
@@ -26,9 +26,9 @@ if redis.call('EXISTS', KEYS[1]) == 1 then
 end
 
 redis.call('HSET', KEYS[1],
-  'version_id', ARGV[1],
+  'uid', ARGV[1],
   'model_name', ARGV[2],
-  'sequence', ARGV[3],
+  'version_number', ARGV[3],
   'idempotency_key', ARGV[4],
   'payload_format', ARGV[5],
   'base_version_id', ARGV[6],

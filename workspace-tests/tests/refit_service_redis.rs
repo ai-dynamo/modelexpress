@@ -152,7 +152,7 @@ async fn version_becomes_ready_across_server_replicas() {
 
     let create_request = CreateWeightVersionRequest {
         model_name: "test/model".to_string(),
-        sequence: Some(42),
+        version_number: Some(42),
         idempotency_key: unique_id("publish"),
         payload_format: WeightPayloadFormat::FullTensor.into(),
         base_version_id: None,
@@ -168,13 +168,13 @@ async fn version_becomes_ready_across_server_replicas() {
     let repeated = version_b
         .expect("concurrent create through second server")
         .into_inner();
-    assert_eq!(version.version_id.len(), 8);
+    assert_eq!(version.uid.len(), 8);
     assert_eq!(version.state, i32::from(WeightVersionState::Staging));
     assert_eq!(repeated, version);
 
     let observed = client_b
         .get_weight_version(GetWeightVersionRequest {
-            version_id: version.version_id.clone(),
+            uid: version.uid.clone(),
         })
         .await
         .expect("second server reads version")
@@ -183,26 +183,18 @@ async fn version_becomes_ready_across_server_replicas() {
 
     let unexpected_source_slot = client_a
         .create_weight_version_shard(CreateWeightVersionShardRequest {
-            shard: Some(shard(
-                &version.version_id,
-                "publisher:global-rank:9",
-                &worker_a,
-            )),
+            shard: Some(shard(&version.uid, "publisher:global-rank:9", &worker_a)),
         })
         .await
         .expect_err("publication must cover a required source slot");
     assert_eq!(unexpected_source_slot.code(), tonic::Code::InvalidArgument);
 
-    let shard_a = shard(&version.version_id, "publisher:global-rank:0", &worker_a);
+    let shard_a = shard(&version.uid, "publisher:global-rank:0", &worker_a);
     let publish_a = client_a.create_weight_version_shard(CreateWeightVersionShardRequest {
         shard: Some(shard_a.clone()),
     });
     let publish_b = client_b.create_weight_version_shard(CreateWeightVersionShardRequest {
-        shard: Some(shard(
-            &version.version_id,
-            "publisher:global-rank:1",
-            &worker_b,
-        )),
+        shard: Some(shard(&version.uid, "publisher:global-rank:1", &worker_b)),
     });
     let (published_a, published_b) = tokio::join!(publish_a, publish_b);
     let states = [published_a, published_b].map(|result| {
@@ -236,7 +228,7 @@ async fn version_becomes_ready_across_server_replicas() {
 
     let ready = client_b
         .get_weight_version(GetWeightVersionRequest {
-            version_id: version.version_id.clone(),
+            uid: version.uid.clone(),
         })
         .await
         .expect("second server observes READY")
@@ -245,7 +237,7 @@ async fn version_becomes_ready_across_server_replicas() {
 
     let shards = client_a
         .list_weight_version_shards(ListWeightVersionShardsRequest {
-            version_id: version.version_id,
+            version_id: version.uid,
         })
         .await
         .expect("list shards")
@@ -285,7 +277,7 @@ async fn replacement_worker_can_publish_the_same_source_slot() {
     let version = client
         .create_weight_version(CreateWeightVersionRequest {
             model_name: "test/model".to_string(),
-            sequence: None,
+            version_number: None,
             idempotency_key: unique_id("replacement-publish"),
             payload_format: WeightPayloadFormat::FullTensor.into(),
             base_version_id: None,
@@ -298,7 +290,7 @@ async fn replacement_worker_can_publish_the_same_source_slot() {
     client
         .create_weight_version_shard(CreateWeightVersionShardRequest {
             shard: Some(shard(
-                &version.version_id,
+                &version.uid,
                 "publisher:global-rank:0",
                 &original_worker_id,
             )),
@@ -308,7 +300,7 @@ async fn replacement_worker_can_publish_the_same_source_slot() {
     client
         .create_weight_version_shard(CreateWeightVersionShardRequest {
             shard: Some(shard(
-                &version.version_id,
+                &version.uid,
                 "publisher:global-rank:0",
                 &replacement_worker_id,
             )),
@@ -318,7 +310,7 @@ async fn replacement_worker_can_publish_the_same_source_slot() {
 
     let publications = client
         .list_weight_version_shards(ListWeightVersionShardsRequest {
-            version_id: version.version_id,
+            version_id: version.uid,
         })
         .await
         .expect("list publications")
@@ -365,7 +357,7 @@ async fn live_lease_protects_releasing_version_shards() {
     let version = client_a
         .create_weight_version(CreateWeightVersionRequest {
             model_name: "test/model".to_string(),
-            sequence: Some(43),
+            version_number: Some(43),
             idempotency_key: unique_id("lease-version"),
             payload_format: WeightPayloadFormat::FullTensor.into(),
             base_version_id: None,
@@ -374,7 +366,7 @@ async fn live_lease_protects_releasing_version_shards() {
         .await
         .expect("create version")
         .into_inner();
-    let published_shard = shard(&version.version_id, "publisher:global-rank:0", &trainer_id);
+    let published_shard = shard(&version.uid, "publisher:global-rank:0", &trainer_id);
     client_a
         .create_weight_version_shard(CreateWeightVersionShardRequest {
             shard: Some(published_shard.clone()),
@@ -383,7 +375,7 @@ async fn live_lease_protects_releasing_version_shards() {
         .expect("publish complete version");
 
     let register_lease = RegisterVersionLeaseRequest {
-        version_id: version.version_id.clone(),
+        version_id: version.uid.clone(),
         worker_id: generator_id.clone(),
         ttl_seconds: 60,
     };
@@ -401,7 +393,7 @@ async fn live_lease_protects_releasing_version_shards() {
 
     let releasing = client_a
         .delete_weight_version(DeleteWeightVersionRequest {
-            version_id: version.version_id.clone(),
+            uid: version.uid.clone(),
         })
         .await
         .expect("logically release version")
@@ -410,7 +402,7 @@ async fn live_lease_protects_releasing_version_shards() {
 
     let late_lease = client_b
         .register_version_lease(RegisterVersionLeaseRequest {
-            version_id: version.version_id.clone(),
+            version_id: version.uid.clone(),
             worker_id: second_generator_id.clone(),
             ttl_seconds: 60,
         })
@@ -425,7 +417,7 @@ async fn live_lease_protects_releasing_version_shards() {
 
     let protected = client_a
         .delete_weight_version_shard(DeleteWeightVersionShardRequest {
-            version_id: version.version_id.clone(),
+            version_id: version.uid.clone(),
             source_slot_id: published_shard.source_slot_id.clone(),
             worker_id: trainer_id.clone(),
         })
@@ -435,7 +427,7 @@ async fn live_lease_protects_releasing_version_shards() {
 
     client_b
         .delete_version_lease(DeleteVersionLeaseRequest {
-            version_id: version.version_id.clone(),
+            version_id: version.uid.clone(),
             lease_id: lease.lease_id,
             worker_id: generator_id.clone(),
         })
@@ -443,7 +435,7 @@ async fn live_lease_protects_releasing_version_shards() {
         .expect("release consumer lease");
     let deleted = client_a
         .delete_weight_version_shard(DeleteWeightVersionShardRequest {
-            version_id: version.version_id.clone(),
+            version_id: version.uid.clone(),
             source_slot_id: published_shard.source_slot_id,
             worker_id: trainer_id.clone(),
         })
@@ -454,7 +446,7 @@ async fn live_lease_protects_releasing_version_shards() {
 
     let remaining = client_a
         .list_weight_version_shards(ListWeightVersionShardsRequest {
-            version_id: version.version_id,
+            version_id: version.uid,
         })
         .await
         .expect("list shards after eviction")
@@ -464,7 +456,7 @@ async fn live_lease_protects_releasing_version_shards() {
     let expiring_version = client_a
         .create_weight_version(CreateWeightVersionRequest {
             model_name: "test/model".to_string(),
-            sequence: Some(44),
+            version_number: Some(44),
             idempotency_key: unique_id("expiring-lease-version"),
             payload_format: WeightPayloadFormat::FullTensor.into(),
             base_version_id: None,
@@ -474,7 +466,7 @@ async fn live_lease_protects_releasing_version_shards() {
         .expect("create version protected by an expiring lease")
         .into_inner();
     let expiring_shard = shard(
-        &expiring_version.version_id,
+        &expiring_version.uid,
         "publisher:global-rank:0",
         &trainer_id,
     );
@@ -485,7 +477,7 @@ async fn live_lease_protects_releasing_version_shards() {
         .await
         .expect("publish version protected by an expiring lease");
     let expiring_lease = RegisterVersionLeaseRequest {
-        version_id: expiring_version.version_id.clone(),
+        version_id: expiring_version.uid.clone(),
         worker_id: generator_id.clone(),
         ttl_seconds: 1,
     };
@@ -495,7 +487,7 @@ async fn live_lease_protects_releasing_version_shards() {
         .expect("register short consumer lease");
     client_a
         .delete_weight_version(DeleteWeightVersionRequest {
-            version_id: expiring_version.version_id.clone(),
+            uid: expiring_version.uid.clone(),
         })
         .await
         .expect("logically release version with short lease");
@@ -510,7 +502,7 @@ async fn live_lease_protects_releasing_version_shards() {
     );
     client_a
         .delete_weight_version_shard(DeleteWeightVersionShardRequest {
-            version_id: expiring_version.version_id,
+            version_id: expiring_version.uid,
             source_slot_id: expiring_shard.source_slot_id,
             worker_id: trainer_id.clone(),
         })
@@ -544,7 +536,7 @@ async fn register_worker_refreshes_liveness_and_expires_without_renewal() {
     let version = client
         .create_weight_version(CreateWeightVersionRequest {
             model_name: "test/model".to_string(),
-            sequence: None,
+            version_number: None,
             idempotency_key: unique_id("heartbeat-version"),
             payload_format: WeightPayloadFormat::FullTensor.into(),
             base_version_id: None,
@@ -553,7 +545,7 @@ async fn register_worker_refreshes_liveness_and_expires_without_renewal() {
         .await
         .expect("create version")
         .into_inner();
-    let current_shard = shard(&version.version_id, "publisher:global-rank:0", &worker_id);
+    let current_shard = shard(&version.uid, "publisher:global-rank:0", &worker_id);
     client
         .create_weight_version_shard(CreateWeightVersionShardRequest {
             shard: Some(current_shard),
@@ -565,7 +557,7 @@ async fn register_worker_refreshes_liveness_and_expires_without_renewal() {
     let expired_version = client
         .create_weight_version(CreateWeightVersionRequest {
             model_name: "test/model".to_string(),
-            sequence: None,
+            version_number: None,
             idempotency_key: unique_id("expired-worker-version"),
             payload_format: WeightPayloadFormat::FullTensor.into(),
             base_version_id: None,
@@ -577,7 +569,7 @@ async fn register_worker_refreshes_liveness_and_expires_without_renewal() {
     let expired = client
         .create_weight_version_shard(CreateWeightVersionShardRequest {
             shard: Some(shard(
-                &expired_version.version_id,
+                &expired_version.uid,
                 "publisher:global-rank:0",
                 &worker_id,
             )),

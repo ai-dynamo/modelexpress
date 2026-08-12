@@ -116,17 +116,16 @@ where
 }
 
 fn version_from_hash(fields: HashMap<String, String>) -> RefitResult<WeightVersion> {
-    let sequence =
-        match hash_field(&fields, "sequence")? {
-            "" => None,
-            value => Some(value.parse().map_err(|error| {
-                RefitBackendError::Internal(format!("invalid sequence: {error}"))
-            })?),
-        };
+    let version_number = match hash_field(&fields, "version_number")? {
+        "" => None,
+        value => Some(value.parse().map_err(|error| {
+            RefitBackendError::Internal(format!("invalid version_number: {error}"))
+        })?),
+    };
     Ok(WeightVersion {
-        version_id: hash_field(&fields, "version_id")?.to_string(),
+        uid: hash_field(&fields, "uid")?.to_string(),
         model_name: hash_field(&fields, "model_name")?.to_string(),
-        sequence,
+        version_number,
         idempotency_key: hash_field(&fields, "idempotency_key")?.to_string(),
         payload_format: parse_hash_field(&fields, "payload_format")?,
         base_version_id: match hash_field(&fields, "base_version_id")? {
@@ -181,7 +180,7 @@ impl RedisRefitBackend {
     async fn create_version_once(
         &self,
         request: &CreateWeightVersionRequest,
-        version_id: &str,
+        uid: &str,
     ) -> RefitResult<String> {
         let expected_source_slots =
             serde_json::to_string(&request.expected_source_slots).map_err(|error| {
@@ -190,17 +189,17 @@ impl RedisRefitBackend {
         let script = Script::new(CREATE_VERSION_LUA);
         let mut invocation = script.prepare_invoke();
         invocation
-            .key(version_key(version_id))
+            .key(version_key(uid))
             .key(idempotency_key(
                 &request.model_name,
                 &request.idempotency_key,
             ))
-            .key(expected_source_slots_key(version_id))
-            .arg(version_id)
+            .key(expected_source_slots_key(uid))
+            .arg(uid)
             .arg(&request.model_name)
             .arg(
                 request
-                    .sequence
+                    .version_number
                     .map_or_else(String::new, |value| value.to_string()),
             )
             .arg(&request.idempotency_key)
@@ -261,20 +260,20 @@ impl RefitBackend for RedisRefitBackend {
         request: &CreateWeightVersionRequest,
     ) -> RefitResult<WeightVersion> {
         for _ in 0..5 {
-            let version_id: String = Uuid::new_v4()
+            let uid: String = Uuid::new_v4()
                 .simple()
                 .to_string()
                 .chars()
                 .take(8)
                 .collect();
-            let result = self.create_version_once(request, &version_id).await?;
+            let result = self.create_version_once(request, &uid).await?;
             if result == "CREATED" {
-                return self.get_weight_version(&version_id).await;
+                return self.get_weight_version(&uid).await;
             }
-            if let Some(existing_id) = result.strip_prefix("EXISTING:") {
-                let existing = self.get_weight_version(existing_id).await?;
+            if let Some(existing_uid) = result.strip_prefix("EXISTING:") {
+                let existing = self.get_weight_version(existing_uid).await?;
                 if existing.model_name == request.model_name
-                    && existing.sequence == request.sequence
+                    && existing.version_number == request.version_number
                     && existing.payload_format == request.payload_format
                     && existing.base_version_id == request.base_version_id
                     && existing.expected_source_slots == request.expected_source_slots
@@ -296,31 +295,29 @@ impl RefitBackend for RedisRefitBackend {
         ))
     }
 
-    async fn get_weight_version(&self, version_id: &str) -> RefitResult<WeightVersion> {
+    async fn get_weight_version(&self, uid: &str) -> RefitResult<WeightVersion> {
         let mut redis = self.redis.clone();
-        let fields: HashMap<String, String> = redis
-            .hgetall(version_key(version_id))
-            .await
-            .map_err(redis_error)?;
+        let fields: HashMap<String, String> =
+            redis.hgetall(version_key(uid)).await.map_err(redis_error)?;
         if fields.is_empty() {
             return Err(RefitBackendError::NotFound(format!(
-                "weight version {version_id:?} was not found"
+                "weight version UID {uid:?} was not found"
             )));
         }
         version_from_hash(fields)
     }
 
-    async fn delete_weight_version(&self, version_id: &str) -> RefitResult<WeightVersion> {
+    async fn delete_weight_version(&self, uid: &str) -> RefitResult<WeightVersion> {
         let mut redis = self.redis.clone();
         let result: String = Script::new(DELETE_VERSION_LUA)
-            .key(version_key(version_id))
+            .key(version_key(uid))
             .arg(i32::from(WeightVersionState::Releasing))
             .arg(i32::from(WeightVersionState::Ready))
             .invoke_async(&mut redis)
             .await
             .map_err(redis_error)?;
         match result.as_str() {
-            "OK" => self.get_weight_version(version_id).await,
+            "OK" => self.get_weight_version(uid).await,
             "VERSION_NOT_FOUND" => Err(RefitBackendError::NotFound(
                 "weight version was not found".to_string(),
             )),
