@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     MX_RESHARD_HANDSHAKE_BACKOFF_S: float
     MX_REFIT_STAGE_RECORD: bool
     MX_RESHARD_MAX_GBPS: float
+    MX_RESHARD_PUBLISH_DIGEST: bool
     # Kubernetes service backend
     MX_K8S_SERVICE_PATTERN: str
     MX_K8S_SOURCE_RETRIES: str
@@ -268,6 +269,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # disables the check, and is the default because only the operator knows the
     # real per-rank limit for their fabric.
     "MX_RESHARD_MAX_GBPS": lambda: _env_float("MX_RESHARD_MAX_GBPS", 0.0),
+    # Have publishers digest each shard they advertise, so a receiver-side check has
+    # something to compare against. Off by default: it costs a reduction over every
+    # published tensor, which is a large relative cost against a ~1.5 s wire, so it
+    # belongs in a qualification run rather than a throughput measurement. See
+    # modelexpress.refit.reshard.verify.
+    "MX_RESHARD_PUBLISH_DIGEST": lambda: _env_bool("MX_RESHARD_PUBLISH_DIGEST", False),
     # ── Kubernetes service backend ─────────────────────────────────────────
     "MX_K8S_SERVICE_PATTERN": lambda: os.environ.get("MX_K8S_SERVICE_PATTERN", "mx-sources"),
     "MX_K8S_SOURCE_RETRIES": lambda: os.environ.get("MX_K8S_SOURCE_RETRIES", ""),

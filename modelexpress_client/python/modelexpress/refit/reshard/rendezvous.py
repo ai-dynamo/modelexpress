@@ -68,13 +68,20 @@ def _mx_version() -> str:
 @dataclass
 class PublishedShard:
     """One published shard of a source tensor: the sub-box it covers and where
-    to READ it from (owning agent / device / base address)."""
+    to READ it from (owning agent / device / base address).
+
+    ``digest`` is a position-sensitive digest over the shard's bytes, from
+    :func:`modelexpress.refit.reshard.verify.tensor_digest`. ``None`` means the
+    publisher did not compute one, which a checker must read as *unchecked* rather
+    than as agreement.
+    """
 
     agent_name: str
     device_id: int
     addr: int
     shard_offset: tuple
     shape: tuple
+    digest: str | None = None
 
 
 @dataclass
@@ -89,6 +96,25 @@ class PublishedTensor:
     shards: list  # list[PublishedShard]
 
 
+def _encode_shard(shard) -> dict:
+    """One shard as JSON.
+
+    ``digest`` is omitted rather than written as null when the publisher has none, so
+    a blob from a publisher that does not digest stays byte-identical to what a client
+    without this field would have produced.
+    """
+    encoded = {
+        "agent_name": shard.agent_name,
+        "device_id": shard.device_id,
+        "addr": shard.addr,
+        "shard_offset": list(shard.shard_offset),
+        "shape": list(shard.shape),
+    }
+    if shard.digest is not None:
+        encoded["digest"] = shard.digest
+    return encoded
+
+
 def encode_shard_table(tensors: list) -> bytes:
     """Serialize published tensors + shards to a JSON blob."""
     payload = {
@@ -99,16 +125,7 @@ def encode_shard_table(tensors: list) -> bytes:
                 "dtype": t.dtype,
                 "elsize": t.elsize,
                 "full_shape": list(t.full_shape),
-                "shards": [
-                    {
-                        "agent_name": s.agent_name,
-                        "device_id": s.device_id,
-                        "addr": s.addr,
-                        "shard_offset": list(s.shard_offset),
-                        "shape": list(s.shape),
-                    }
-                    for s in t.shards
-                ],
+                "shards": [_encode_shard(s) for s in t.shards],
             }
             for t in tensors
         ],
@@ -131,6 +148,7 @@ def decode_shard_table(blob: bytes) -> list:
                 addr=int(s["addr"]),
                 shard_offset=tuple(s["shard_offset"]),
                 shape=tuple(s["shape"]),
+                digest=s.get("digest"),
             )
             for s in t["shards"]
         ]
@@ -174,6 +192,7 @@ def build_sources(tensors: list) -> tuple:
                     session=session,
                     addr=s.addr,
                     elsize=t.elsize,
+                    digest=s.digest,
                 )
             )
             session_to_agent[session] = s.agent_name
