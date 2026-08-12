@@ -1,0 +1,85 @@
+# Reshard-refit E2E — inference receiver (2 GPU TP2 + 4 RDMA rails).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: reshard-recv
+  labels:
+    kai.scheduler/queue: dynamo
+    mx.nvidia.com/benchmark: reshard-e2e
+  annotations:
+    networking.gke.io/default-interface: eth0
+    networking.gke.io/interfaces: >-
+      [{"interfaceName":"eth0","network":"default"},
+       {"interfaceName":"rdma0","network":"rdma-0"},
+       {"interfaceName":"rdma1","network":"rdma-1"},
+       {"interfaceName":"rdma2","network":"rdma-2"},
+       {"interfaceName":"rdma3","network":"rdma-3"}]
+spec:
+  restartPolicy: Never
+  schedulerName: kai-scheduler
+  imagePullSecrets:
+    - name: nvcr-imagepullsecret
+  nodeSelector:
+    nvidia.com/gpu.product: NVIDIA-GB200
+  tolerations:
+    - operator: Exists
+  containers:
+    - name: recv
+      image: nvcr.io/nvidian/dynamo-dev/model-express-dev:real30b-matrix-v12-fp8fix
+      command: [sleep, infinity]
+      env:
+        - {name: HF_HOME, value: /mnt/rl-workspace/kavink/hf-cache}
+        - {name: HF_HUB_OFFLINE, value: "1"}
+        - {name: MX_POOL_REG, value: "1"}
+        - {name: MX_GPU_MEM_UTIL, value: "0.45"}
+        - {name: UCX_TLS, value: "^tcp"}
+        - {name: NIXL_UCX_TLS, value: "^tcp"}
+        - {name: UCX_NET_DEVICES, value: "mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1,eth0"}
+        - {name: UCX_IB_GID_INDEX, value: "3"}
+        - {name: UCX_CUDA_COPY_DMABUF, value: "yes"}
+        - {name: MX_RDMA_NIC_PIN, value: "off"}
+        - {name: VLLM_ALLOW_INSECURE_SERIALIZATION, value: "1"}
+        - {name: PYTORCH_CUDA_ALLOC_CONF, value: "expandable_segments:True"}
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+      resources:
+        requests:
+          cpu: "32"
+          memory: 400Gi
+          nvidia.com/gpu: "2"
+          networking.gke.io.networks/rdma-0: "1"
+          networking.gke.io.networks/rdma-0.IP: "1"
+          networking.gke.io.networks/rdma-1: "1"
+          networking.gke.io.networks/rdma-1.IP: "1"
+          networking.gke.io.networks/rdma-2: "1"
+          networking.gke.io.networks/rdma-2.IP: "1"
+          networking.gke.io.networks/rdma-3: "1"
+          networking.gke.io.networks/rdma-3.IP: "1"
+        limits:
+          cpu: "48"
+          memory: 560Gi
+          nvidia.com/gpu: "2"
+          networking.gke.io.networks/rdma-0: "1"
+          networking.gke.io.networks/rdma-0.IP: "1"
+          networking.gke.io.networks/rdma-1: "1"
+          networking.gke.io.networks/rdma-1.IP: "1"
+          networking.gke.io.networks/rdma-2: "1"
+          networking.gke.io.networks/rdma-2.IP: "1"
+          networking.gke.io.networks/rdma-3: "1"
+          networking.gke.io.networks/rdma-3.IP: "1"
+      securityContext:
+        capabilities:
+          add: [IPC_LOCK]
+      volumeMounts:
+        - {name: workspace, mountPath: /mnt/rl-workspace}
+        - {name: dshm, mountPath: /dev/shm}
+  volumes:
+    - name: workspace
+      persistentVolumeClaim:
+        claimName: shared-model-cache
+    - name: dshm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 64Gi
