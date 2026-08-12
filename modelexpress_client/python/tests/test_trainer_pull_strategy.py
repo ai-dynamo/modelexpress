@@ -77,16 +77,14 @@ class TestTrainerPullIsAvailable:
         """The CI case: NIXL and RDMA present, no trainer anywhere."""
         self._assert_availability({}, False)
 
-    def test_available_with_weight_sync_server(self):
-        self._assert_availability({"MX_WEIGHT_SYNC_SERVER": "mx-server:8080"}, True)
-
     def test_available_with_trainer_table_key(self):
         """LocalPlanner deployments set no server, only the table key."""
         self._assert_availability({"MX_TRAINER_TABLE_KEY": "mx:trainer_table:m"}, True)
 
-    def test_unavailable_when_weight_sync_server_disabled(self):
-        """A falsy MX_WEIGHT_SYNC_SERVER is not a trainer sync configuration."""
-        self._assert_availability({"MX_WEIGHT_SYNC_SERVER": "0"}, False)
+    def test_unavailable_when_only_a_removed_server_var_is_set(self):
+        """MX_WEIGHT_SYNC_SERVER selected the removed server-side planner. It is
+        no longer a trainer sync configuration, and must not read as one."""
+        self._assert_availability({"MX_WEIGHT_SYNC_SERVER": "mx-server:8080"}, False)
 
     def test_unavailable_when_trainer_table_key_blank(self):
         self._assert_availability({"MX_TRAINER_TABLE_KEY": "   "}, False)
@@ -94,14 +92,14 @@ class TestTrainerPullIsAvailable:
     def test_unavailable_without_nixl_even_when_configured(self):
         ctx = _make_load_context()
         strategy = _make_strategy()
-        with patch.dict("os.environ", {"MX_WEIGHT_SYNC_SERVER": "mx:8080"}, clear=True):
+        with patch.dict("os.environ", {"MX_TRAINER_TABLE_KEY": "mx:trainer_table:m"}, clear=True):
             with patch(f"{_MODULE}.is_nixl_available", return_value=False):
                 assert strategy.is_available(ctx) is False
 
     def test_unavailable_without_mx_client_even_when_configured(self):
         ctx = _make_load_context(mx_client=None)
         strategy = _make_strategy()
-        with patch.dict("os.environ", {"MX_WEIGHT_SYNC_SERVER": "mx:8080"}, clear=True):
+        with patch.dict("os.environ", {"MX_TRAINER_TABLE_KEY": "mx:trainer_table:m"}, clear=True):
             with patch(f"{_MODULE}.is_nixl_available", return_value=True):
                 assert strategy.is_available(ctx) is False
 

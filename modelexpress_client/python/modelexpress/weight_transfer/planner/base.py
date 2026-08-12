@@ -14,7 +14,7 @@ class AbstractPlanner(ABC):
     """Converts resolved element-run regions into NIXL RDMA descriptors.
 
     The routing step (mapping element offsets to trainer shard GPU addresses)
-    can run locally (LocalPlanner) or be offloaded to the MX server (ServerPlanner).
+    runs locally (LocalPlanner).
     """
 
     @abstractmethod

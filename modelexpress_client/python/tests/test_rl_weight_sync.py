@@ -10,7 +10,6 @@ import pytest
 import torch
 
 from modelexpress.weight_transfer.planner.local import LocalPlanner
-from modelexpress.weight_transfer.planner.m2n_planner import M2nPlanner
 from modelexpress.weight_transfer.planner.router import route_regions
 from modelexpress.weight_transfer.protocol.types import (
     M2nDescriptor,
@@ -185,52 +184,3 @@ def _make_m2n_client(plan_id="pid-1"):
     get_resp.descriptors = []
     client.get_m2n_plan.return_value = get_resp
     return client
-
-
-class TestM2nPlannerRLLoop:
-    def test_plan_rebuilt_per_rl_step(self):
-        """After invalidate(), M2nPlanner re-registers with server for each step."""
-        client = _make_m2n_client()
-        planner = M2nPlanner(
-            mx_client=client, model_key="policy",
-            worker_rank=0, total_workers=2, nixl_metadata=b"meta",
-        )
-        planner.build_m2n(_simple_regions(), _simple_table(step=1), "step1")
-        planner.invalidate("step1")
-        planner.build_m2n(_simple_regions(), _simple_table(step=1), "step2")
-        assert client.register_m2n_worker.call_count == 2
-
-    def test_invalidate_notifies_server(self):
-        client = _make_m2n_client()
-        planner = M2nPlanner(
-            mx_client=client, model_key="policy",
-            worker_rank=0, total_workers=1, nixl_metadata=b"",
-        )
-        planner.build_m2n(_simple_regions(), _simple_table(), "pk")
-        planner.invalidate("pk")
-        client.invalidate_m2n_plan.assert_called_once_with(model_key="policy")
-
-    def test_fallback_used_when_server_down_during_rl_step(self):
-        """If MX server fails mid-RL-run, LocalPlanner keeps training unblocked."""
-        client = MagicMock()
-        client.register_m2n_worker.side_effect = ConnectionError("server unavailable")
-        planner = M2nPlanner(
-            mx_client=client, model_key="policy",
-            worker_rank=0, total_workers=2, nixl_metadata=b"",
-        )
-        descs = planner.build(_simple_regions(), _simple_table(), "pk")
-        assert isinstance(descs, list)
-        assert all(isinstance(d, RdmaDescriptor) for d in descs)
-        assert sum(d.nbytes for d in descs) == 16 * 2
-
-    def test_worker_rank_forwarded_to_server(self):
-        for rank in range(4):
-            client = _make_m2n_client(plan_id=f"plan-{rank}")
-            planner = M2nPlanner(
-                mx_client=client, model_key="policy",
-                worker_rank=rank, total_workers=4, nixl_metadata=b"meta",
-            )
-            planner.build_m2n(_simple_regions(), _simple_table(), f"pk-{rank}")
-            kwargs = client.register_m2n_worker.call_args.kwargs
-            assert kwargs["worker_rank"] == rank
-            assert kwargs["total_workers"] == 4

@@ -9,7 +9,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from modelexpress.weight_transfer.planner.local import LocalPlanner
-from modelexpress.weight_transfer.planner.m2n_planner import M2nPlanner
 from modelexpress.weight_transfer.planner.router import route_regions
 from modelexpress.weight_transfer.protocol.serialization import (
     decode_m2n_descriptors,
@@ -250,71 +249,3 @@ class TestM2nWireProtocol:
         assert rdma.src_addr == 0xA
         assert rdma.dst_addr == 0xB
         assert rdma.nbytes == 512
-
-
-class TestM2nPlannerE2EPipeline:
-    def _setup(self, shape=(8, 16), n_tp_shards=1):
-        n = math.prod(shape)
-        if n_tp_shards == 2:
-            cols = shape[1]
-            shards = [
-                _col_shard(0, 0, shape[0], 0, cols // 2),
-                _col_shard(1, 0, shape[0], cols // 2, cols),
-            ]
-        else:
-            shards = [_row_shard(0, 0, shape[0], list(shape))]
-        tt = TrainerTensor("layer", "torch.bfloat16", list(shape), shards)
-        table = _table([tt])
-        region = _region("layer", n)
-        return table, [region], n * 2
-
-    def test_local_planner_full_pipeline(self):
-        table, regions, expected_bytes = self._setup()
-        descs = LocalPlanner().build(regions, table, "pk")
-        assert sum(d.nbytes for d in descs) == expected_bytes
-
-    def test_m2n_planner_build_with_server(self):
-        table, regions, _ = self._setup()
-        client = _mock_m2n_client([M2nDescriptor(0, 0, 0x1000, 0x2000, 64)])
-        planner = M2nPlanner(mx_client=client, model_key="m", worker_rank=0, total_workers=1, nixl_metadata=b"")
-        descs = planner.build(regions, table, "pk")
-        assert all(isinstance(d, RdmaDescriptor) for d in descs)
-        assert len(descs) == 1
-
-    def test_m2n_planner_build_m2n_returns_m2n_type(self):
-        table, regions, _ = self._setup()
-        client = _mock_m2n_client([M2nDescriptor(0, 0, 0xA000, 0xB000, 128)])
-        planner = M2nPlanner(mx_client=client, model_key="m", worker_rank=0, total_workers=1, nixl_metadata=b"")
-        descs = planner.build_m2n(regions, table, "pk")
-        assert all(isinstance(d, M2nDescriptor) for d in descs)
-
-    def test_m2n_planner_tp2_fallback_covers_all_bytes(self):
-        """When the server is down, LocalPlanner fallback correctly routes TP=2 shards."""
-        table, regions, expected_bytes = self._setup(shape=(4, 8), n_tp_shards=2)
-        client = MagicMock()
-        client.register_m2n_worker.side_effect = RuntimeError("no server")
-        planner = M2nPlanner(mx_client=client, model_key="m", worker_rank=0, total_workers=2, nixl_metadata=b"")
-        assert sum(d.nbytes for d in planner.build(regions, table, "pk")) == expected_bytes
-
-    def test_m2n_planner_multi_worker_barrier_releases_all(self):
-        """Server holds barrier until all workers register; all N workers get a plan."""
-        N = 4
-        plan_id = "global-plan"
-        table, regions, _ = self._setup()
-        planners = []
-        clients = []
-        for rank in range(N):
-            client = _mock_m2n_client(
-                [M2nDescriptor(0, rank, 0x1000, 0x2000 + rank * 0x1000, 64)],
-                plan_id=plan_id,
-            )
-            clients.append(client)
-            planners.append(M2nPlanner(
-                mx_client=client, model_key="policy",
-                worker_rank=rank, total_workers=N,
-                nixl_metadata=f"meta{rank}".encode(),
-            ))
-        for rank, planner in enumerate(planners):
-            descs = planner.build_m2n(regions, table, f"pk-{rank}")
-            assert len(descs) == 1
-            assert descs[0].dst_agent_index == rank
