@@ -17,13 +17,14 @@ const PUBLISH_LUA: &str = r#"
 local existing_manifest = redis.call('HGET', KEYS[1], 'manifest')
 if existing_manifest then
     local existing_record = redis.call('HGET', KEYS[1], 'record')
+    local existing_state = redis.call('HGET', KEYS[1], 'state') or ''
     if existing_manifest == ARGV[1] then
-        return {2, existing_record}
+        return {2, existing_record, existing_state}
     end
-    return {0, existing_record}
+    return {0, existing_record, existing_state}
 end
 redis.call('HSET', KEYS[1], 'manifest', ARGV[1], 'record', ARGV[2], 'state', ARGV[3])
-return {1, ARGV[2]}
+return {1, ARGV[2], ARGV[3]}
 "#;
 
 const COMMIT_LUA: &str = r#"
@@ -31,13 +32,13 @@ local current = redis.call('HGET', KEYS[1], 'record')
 if not current then return {0, '', ''} end
 local state = redis.call('HGET', KEYS[1], 'state')
 if not state then
-    state = ARGV[4]
+    state = ARGV[3]
     redis.call('HSET', KEYS[1], 'state', state)
 end
 if state == ARGV[2] then return {2, current, state} end
 if state ~= ARGV[1] then return {3, current, state or ''} end
-redis.call('HSET', KEYS[1], 'record', ARGV[3], 'state', ARGV[2])
-return {1, ARGV[3], ARGV[2]}
+redis.call('HSET', KEYS[1], 'state', ARGV[2])
+return {1, current, ARGV[2]}
 "#;
 
 fn digest_hex(value: &str) -> String {
@@ -68,6 +69,19 @@ fn verify_record_identity(
     } else {
         Err(format!("corrupt revision identity at '{model_id}/{target_version}'").into())
     }
+}
+
+fn decode_stored_record(
+    bytes: &[u8],
+    state: Option<i32>,
+    model_id: &str,
+    target_version: &str,
+) -> CatalogResult<RevisionRecord> {
+    let mut record = verify_record_identity(decode_record(bytes)?, model_id, target_version)?;
+    if let Some(state) = state {
+        record.state = state;
+    }
+    Ok(record)
 }
 
 pub struct RedisRevisionCatalogBackend {
@@ -126,18 +140,24 @@ impl RevisionCatalogBackend for RedisRevisionCatalogBackend {
         let manifest_bytes = submitted_manifest.encode_to_vec();
         let record_bytes = record.encode_to_vec();
         let mut connection = self.connection().await?;
-        let (code, existing): (i32, Vec<u8>) = redis::Script::new(PUBLISH_LUA)
-            .key(key)
-            .arg(manifest_bytes)
-            .arg(record_bytes)
-            .arg(RevisionState::Ready as i32)
-            .invoke_async(&mut connection)
-            .await?;
+        let (code, existing, existing_state): (i32, Vec<u8>, String) =
+            redis::Script::new(PUBLISH_LUA)
+                .key(key)
+                .arg(manifest_bytes)
+                .arg(record_bytes)
+                .arg(RevisionState::Ready as i32)
+                .invoke_async(&mut connection)
+                .await?;
         match code {
             1 => Ok(PublishReadyOutcome::Created(record)),
             2 => {
-                let existing = verify_record_identity(
-                    decode_record(&existing)?,
+                let existing = decode_stored_record(
+                    &existing,
+                    if existing_state.is_empty() {
+                        None
+                    } else {
+                        Some(existing_state.parse()?)
+                    },
                     &submitted_manifest.model_id,
                     &submitted_manifest.target_version,
                 )?;
@@ -157,12 +177,13 @@ impl RevisionCatalogBackend for RedisRevisionCatalogBackend {
         target_version: &str,
     ) -> CatalogResult<Option<RevisionRecord>> {
         let mut connection = self.connection().await?;
-        let bytes: Option<Vec<u8>> = connection
-            .hget(revision_key(model_id, target_version), "record")
+        let (bytes, state): (Option<Vec<u8>>, Option<i32>) = connection
+            .hget(revision_key(model_id, target_version), ("record", "state"))
             .await?;
         match bytes {
-            Some(bytes) => Ok(Some(verify_record_identity(
-                decode_record(&bytes)?,
+            Some(bytes) => Ok(Some(decode_stored_record(
+                &bytes,
+                state,
                 model_id,
                 target_version,
             )?)),
@@ -179,31 +200,35 @@ impl RevisionCatalogBackend for RedisRevisionCatalogBackend {
             return Ok(CommitOutcome::NotFound);
         };
         let current_state = current.state;
-        let mut updated = current;
-        updated.state = RevisionState::Committed as i32;
         let mut connection = self.connection().await?;
         let (code, stored, stored_state): (i32, Vec<u8>, String) = redis::Script::new(COMMIT_LUA)
             .key(revision_key(model_id, target_version))
             .arg(RevisionState::Ready as i32)
             .arg(RevisionState::Committed as i32)
-            .arg(updated.encode_to_vec())
             .arg(current_state)
             .invoke_async(&mut connection)
             .await?;
+        let state = || -> CatalogResult<i32> { Ok(stored_state.parse()?) };
         match code {
-            1 => Ok(CommitOutcome::Committed(updated)),
-            0 => Ok(CommitOutcome::NotFound),
-            2 => Ok(CommitOutcome::AlreadyCommitted(verify_record_identity(
-                decode_record(&stored)?,
+            1 => Ok(CommitOutcome::Committed(decode_stored_record(
+                &stored,
+                Some(state()?),
                 model_id,
                 target_version,
             )?)),
-            3 => {
-                let mut record =
-                    verify_record_identity(decode_record(&stored)?, model_id, target_version)?;
-                record.state = stored_state.parse()?;
-                Ok(CommitOutcome::InvalidState(record))
-            }
+            0 => Ok(CommitOutcome::NotFound),
+            2 => Ok(CommitOutcome::AlreadyCommitted(decode_stored_record(
+                &stored,
+                Some(state()?),
+                model_id,
+                target_version,
+            )?)),
+            3 => Ok(CommitOutcome::InvalidState(decode_stored_record(
+                &stored,
+                Some(state()?),
+                model_id,
+                target_version,
+            )?)),
             other => Err(format!("unexpected Redis commit result: {other}").into()),
         }
     }
@@ -266,7 +291,7 @@ mod tests {
             .arg("manifest")
             .arg(manifest.encode_to_vec())
             .arg("record")
-            .arg(stored_record)
+            .arg(stored_record.clone())
             .query_async(&mut connection)
             .await
             .expect("seed forward-compatible record");
@@ -277,6 +302,19 @@ mod tests {
             .expect("commit");
 
         assert!(matches!(outcome, CommitOutcome::Committed(_)));
+        let record_after_commit: Vec<u8> = redis::cmd("HGET")
+            .arg(&key)
+            .arg("record")
+            .query_async(&mut connection)
+            .await
+            .expect("read immutable record bytes");
+        assert_eq!(record_after_commit, stored_record);
+        let fetched = backend
+            .get_revision(&model_id, target_version)
+            .await
+            .expect("read committed revision")
+            .expect("revision exists");
+        assert_eq!(fetched.state, RevisionState::Committed as i32);
         let _: () = redis::cmd("DEL")
             .arg(key)
             .query_async(&mut connection)
@@ -333,6 +371,14 @@ mod tests {
                 .expect("idempotent commit"),
             CommitOutcome::AlreadyCommitted(_)
         ));
+        let PublishReadyOutcome::Existing(existing) = backend
+            .publish_ready(record.clone())
+            .await
+            .expect("publish replay after commit")
+        else {
+            panic!("published revision should already exist");
+        };
+        assert_eq!(existing.state, RevisionState::Committed as i32);
         assert!(matches!(
             backend
                 .commit_revision(&model_id, "missing")
