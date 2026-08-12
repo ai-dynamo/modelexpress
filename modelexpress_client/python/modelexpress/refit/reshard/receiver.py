@@ -267,6 +267,15 @@ def _fused_wire_enabled() -> bool:
     return envs.MX_RESHARD_FUSED_WIRE
 
 
+def _batch_install_enabled() -> bool:
+    """Whether to re-slice full-pulled sources with one batched copy.
+
+    Read at call time so an A/B can toggle it without re-importing. Set
+    ``MX_RESHARD_BATCH_INSTALL=0`` to fall back to one ``copy_()`` per view.
+    """
+    return envs.MX_RESHARD_BATCH_INSTALL
+
+
 def _replay_ops(tensor: torch.Tensor, op_chain: tuple) -> torch.Tensor:
     """Replay a captured loader view chain on a staged full-source tensor."""
     value = tensor
@@ -794,7 +803,15 @@ class ReshardReceiver:
         # block. Without that, launch-bound stages read as free and whichever
         # stage syncs first absorbs the whole queue.
         if self._plan.full_pulls:
+            # Local re-slice of every full-pulled source. One copy_() per captured
+            # view means thousands of individual kernel launches, whose Python and
+            # launch overhead can rival the RDMA itself; _foreach_copy_ issues the
+            # same copies as a single batched op.
             _t = time.perf_counter()
+            batched = _batch_install_enabled()
+            destinations: list[torch.Tensor] = []
+            source_views: list[torch.Tensor] = []
+            copies_done = 0
             for full_pull in self._plan.full_pulls:
                 full_tensor = self._full_staging[full_pull.src_name]
                 for copy in full_pull.copies:
@@ -805,9 +822,20 @@ class ReshardReceiver:
                         copy.dest_stride,
                         receive_buffer.storage_offset() + copy.dest_offset,
                     )
-                    destination.copy_(source_view)
+                    if batched:
+                        destinations.append(destination)
+                        source_views.append(source_view)
+                    else:
+                        destination.copy_(source_view)
+                        copies_done += 1
+            reslice_copies = len(destinations) if batched else copies_done
+            if batched and destinations:
+                torch._foreach_copy_(destinations, source_views)
             torch.cuda.synchronize(self._device)
             stages["reslice_s"] = time.perf_counter() - _t
+            # Views, not sources: the per-view launch count is what batching
+            # removes, and the source count is already reported separately.
+            stages["reslice_copies"] = float(reslice_copies)
 
         # Cast the served bf16 staging into the (fp32) receive buffer - a torch
         # op, so the RDMA never crosses dtypes. _install writes the buffer.
@@ -881,6 +909,10 @@ class ReshardReceiver:
                 "converts": len(self._plan.converts),
                 "fallback": len(stats["fallback"]),
                 "fused_wire": _fused_wire_enabled(),
+                # The install arm this record was measured under. Without it a
+                # captured record cannot be attributed to a batched or per-view
+                # re-slice, which is the whole point of an A/B.
+                "batch_install": _batch_install_enabled(),
                 **{k: round(v, 6) for k, v in stages.items()},
             }
             # WARNING so a benchmark harness captures it without turning on INFO
