@@ -958,6 +958,8 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend; `{rank}` is substituted with the worker's own rank. Client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` if the resolved pattern has no explicit port |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` max retries on `FAILED_PRECONDITION` (rolling-update transients). Fresh gRPC channel per attempt so kube-proxy re-picks a backend |
 | `MX_K8S_SOURCE_BACKOFF_SECONDS` | `0.5` | `k8s-service` sleep between retry attempts |
+| `MX_TRAINER_TABLE_KEY` | (required for trainer pull; unset disables it) | Metadata-store key holding the TrainerTable that `TrainerPullStrategy` reads. Backed by the metadata store rather than the MX server. With it unset the strategy declines and the chain falls through to the other loaders |
+| `MX_TRAINER_SYNC_TIMEOUT` | `300` | Seconds `TrainerPullStrategy` waits for the TrainerTable to appear or for a pull to complete |
 | `MX_HEARTBEAT_INTERVAL_SECS` | `30` | Client heartbeat frequency |
 | `MX_HEARTBEAT_TIMEOUT_SECS` | `90` | Server reaper staleness threshold |
 | `MX_REAPER_SCAN_INTERVAL_SECS` | `30` | Server reaper scan frequency |

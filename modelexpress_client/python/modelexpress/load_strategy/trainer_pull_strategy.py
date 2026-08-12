@@ -10,12 +10,14 @@ via LocalPlanner.
 Environment variables
 ---------------------
 MX_TRAINER_TABLE_KEY     Redis / MX metadata key for the TrainerTable.
-                         Default: "mx:trainer_table:{model_name}"
+                         Required, no default: is_available() declines the
+                         strategy when it is unset, so the historical
+                         "mx:trainer_table:{model_name}" fallback is not
+                         reachable through the strategy chain.
 MX_TRAINER_SYNC_TIMEOUT  Seconds to wait for trainer table or pull ACK.
                          Default: 300
 
-MX_TRAINER_TABLE_KEY must be set for this strategy to be eligible: without
-it, the deployment has no trainer to pull from.
+Without MX_TRAINER_TABLE_KEY the deployment has no trainer to pull from.
 """
 
 from __future__ import annotations
@@ -57,6 +59,10 @@ def _trainer_sync_configured() -> bool:
 
 
 def _trainer_table_key(model_name: str) -> str:
+    # is_available() already declined the strategy if this is unset, so the
+    # historical derived-name fallback is unreachable from the chain.  Kept as
+    # a defensive default for direct callers rather than silently building a
+    # key the deployment never configured.
     key = envs.MX_TRAINER_TABLE_KEY
     if key:
         return key
