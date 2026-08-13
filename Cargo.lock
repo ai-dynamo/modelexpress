@@ -2401,20 +2401,6 @@ dependencies = [
 
 [[package]]
 name = "mockall"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39a6bfcc6c8c7eed5ee98b9c3e33adc726054389233e201c95dab2d41a3839d2"
-dependencies = [
- "cfg-if",
- "downcast",
- "fragile",
- "mockall_derive 0.13.1",
- "predicates",
- "predicates-tree",
-]
-
-[[package]]
-name = "mockall"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f58d964098a5f9c6b63d0798e5372fd04708193510a7af313c22e9f29b7b620b"
@@ -2422,21 +2408,9 @@ dependencies = [
  "cfg-if",
  "downcast",
  "fragile",
- "mockall_derive 0.14.0",
+ "mockall_derive",
  "predicates",
  "predicates-tree",
-]
-
-[[package]]
-name = "mockall_derive"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25ca3004c2efe9011bd4e461bd8256445052b9615405b4f7ea43fc8ca5c20898"
-dependencies = [
- "cfg-if",
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]
@@ -2466,7 +2440,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "tokio-test",
  "tonic 0.13.1",
  "tonic-health",
  "tracing",
@@ -2482,15 +2455,12 @@ dependencies = [
  "colored",
  "futures",
  "modelexpress-common",
- "prost 0.13.5",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.16",
  "tokio",
- "tokio-test",
  "tonic 0.13.1",
- "tonic-build",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -2513,7 +2483,6 @@ dependencies = [
  "google-cloud-storage",
  "hf-hub",
  "jiff",
- "mockall 0.13.1",
  "prost 0.13.5",
  "reqwest 0.12.23",
  "rustls",
@@ -2524,7 +2493,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.16",
  "tokio",
- "tokio-test",
  "tonic 0.13.1",
  "tonic-build",
  "tracing",
@@ -2542,16 +2510,13 @@ dependencies = [
  "clap",
  "config",
  "futures",
- "hf-hub",
  "http",
- "jiff",
  "k8s-openapi",
  "kube",
- "mockall 0.14.0",
+ "mockall",
  "modelexpress-client",
  "modelexpress-common",
  "moka",
- "once_cell",
  "prost 0.13.5",
  "redis",
  "schemars 0.8.22",
@@ -2564,10 +2529,7 @@ dependencies = [
  "thiserror 2.0.16",
  "tokio",
  "tokio-stream",
- "tokio-test",
- "toml",
  "tonic 0.13.1",
- "tonic-build",
  "tonic-health",
  "tower",
  "tracing",
@@ -4297,19 +4259,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokio-test"
-version = "0.4.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2468baabc3311435b55dd935f702f42cd1b8abb7e754fb7dfb16bd36aa88f9f7"
-dependencies = [
- "async-stream",
- "bytes",
- "futures-core",
- "tokio",
- "tokio-stream",
-]
-
-[[package]]
 name = "tokio-tungstenite"
 version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4341,12 +4290,10 @@ version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75129e1dc5000bfbaa9fee9d1b21f974f9fbad9daec557a521ee6e080825f6e8"
 dependencies = [
- "indexmap 2.11.1",
  "serde",
  "serde_spanned",
  "toml_datetime",
  "toml_parser",
- "toml_writer",
  "winnow",
 ]
 
@@ -4367,12 +4314,6 @@ checksum = "b551886f449aa90d4fe2bdaa9f4a2577ad2dde302c61ecf262d80b116db95c10"
 dependencies = [
  "winnow",
 ]
-
-[[package]]
-name = "toml_writer"
-version = "1.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fcc842091f2def52017664b53082ecbbeb5c7731092bad69d2c63050401dfd64"
 
 [[package]]
 name = "tonic"
