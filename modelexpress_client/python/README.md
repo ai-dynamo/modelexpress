@@ -15,8 +15,11 @@ pip install modelexpress
 # Editable install from source
 pip install -e .
 
-# With dev dependencies (pytest, grpcio-tools)
+# With test dependencies
 pip install -e ".[dev]"
+
+# Additionally install the pinned protobuf code generator when changing p2p.proto
+pip install -e ".[codegen]"
 ```
 
 NIXL is expected to be supplied by the runtime environment (TRT-LLM,
@@ -27,6 +30,7 @@ or `pip install nixl-cu13` separately, matching your host CUDA toolkit.
 ### Requirements
 
 - Python >= 3.10
+- protobuf >= 5.27.2 and < 7
 - NVIDIA GPUs with RDMA/InfiniBand support
 - [NIXL](https://github.com/ai-dynamo/nixl) (NVIDIA Interconnect eXchange Library)
 - A running [ModelExpress server](https://github.com/ai-dynamo/modelexpress/tree/main/modelexpress_server) (Rust gRPC service backed by Redis)
