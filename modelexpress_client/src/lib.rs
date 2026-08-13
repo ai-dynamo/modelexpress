@@ -3,7 +3,7 @@
 
 use modelexpress_common::{
     Result as CommonResult,
-    cache::{CacheConfig, CacheStats, resolve_model_path},
+    cache::{CacheConfig, resolve_model_path},
     client_config::ClientConfig as Config,
     constants, download,
     grpc::{
@@ -231,57 +231,10 @@ impl Client {
         Ok(client)
     }
 
-    /// Get cache configuration
-    pub fn get_cache_config(&self) -> Option<&CacheConfig> {
-        self.cache_config.as_ref()
-    }
-
-    /// Set cache configuration
-    pub fn set_cache_config(&mut self, cache_config: CacheConfig) {
-        self.cache_config = Some(cache_config);
-    }
-
-    /// List cached models
-    pub fn list_cached_models(&self) -> CommonResult<CacheStats> {
-        let cache_config = self.cache_config.as_ref().ok_or_else(|| {
-            modelexpress_common::Error::Server("Cache not configured".to_string())
-        })?;
-
-        cache_config.get_cache_stats().map_err(|e| {
-            modelexpress_common::Error::Server(format!("Failed to get cache stats: {e}")).into()
-        })
-    }
-
-    /// Clear specific model from cache for a given provider.
-    pub fn clear_cached_model(
-        &self,
-        model_name: &str,
-        provider: ModelProvider,
-    ) -> CommonResult<()> {
-        let cache_config = self.cache_config.as_ref().ok_or_else(|| {
-            modelexpress_common::Error::Server("Cache not configured".to_string())
-        })?;
-
-        cache_config.clear_model(model_name, provider).map_err(|e| {
-            modelexpress_common::Error::Server(format!("Failed to clear model: {e}")).into()
-        })
-    }
-
-    /// Clear entire cache
-    pub fn clear_all_cached_models(&self) -> CommonResult<()> {
-        let cache_config = self.cache_config.as_ref().ok_or_else(|| {
-            modelexpress_common::Error::Server("Cache not configured".to_string())
-        })?;
-
-        cache_config.clear_all().map_err(|e| {
-            modelexpress_common::Error::Server(format!("Failed to clear cache: {e}")).into()
-        })
-    }
-
     /// Delete a model's record from the server-side registry. This complements
-    /// `clear_cached_model` (which only removes local files) so a cleared model does
-    /// not leave behind a stale `DOWNLOADED` record that would satisfy a later download
-    /// request without re-fetching the files.
+    /// removing the model's local files, so a cleared model does not leave behind a
+    /// stale `DOWNLOADED` record that would satisfy a later download request without
+    /// re-fetching the files.
     pub async fn delete_model_on_server(
         &mut self,
         model_name: &str,

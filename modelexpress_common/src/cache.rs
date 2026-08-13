@@ -191,13 +191,6 @@ impl CacheConfig {
         ))
     }
 
-    /// Query server for cache information
-    pub fn from_server() -> Result<Self> {
-        // This would typically make an HTTP request to the server
-        // For now, we'll return an error to indicate server is not available
-        Err(anyhow::anyhow!("Server not available for cache discovery"))
-    }
-
     /// Get cache path from command line arguments
     fn get_cache_path_from_args() -> Option<String> {
         let args: Vec<String> = env::args().collect();

@@ -237,14 +237,6 @@ impl ClientConfig {
         }
     }
 
-    /// Apply cache path override if provided
-    pub fn with_cache_path(mut self, cache_path: Option<PathBuf>) -> Self {
-        if let Some(path) = cache_path {
-            self.cache.local_path = path;
-        }
-        self
-    }
-
     /// Set timeout for the connection
     pub fn with_timeout(mut self, timeout_secs: u64) -> Self {
         self.connection.timeout_secs = Some(timeout_secs);
