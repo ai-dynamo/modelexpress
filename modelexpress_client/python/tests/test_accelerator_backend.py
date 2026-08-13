@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -34,6 +34,7 @@ class TestCudaAcceleratorBackend:
         assert backend.supports_pool_reg() is True
         assert backend.supports_vmm() is True
         assert backend.supports_gds() is True
+        assert backend.requires_classic_alloc_pool() is True
 
     def test_cuda_backend_delegates_torch_calls(self, monkeypatch):
         calls = []
@@ -100,6 +101,7 @@ class TestXpuAcceleratorBackend:
         assert backend.supports_pool_reg() is False
         assert backend.supports_vmm() is False
         assert backend.supports_gds() is False
+        assert backend.requires_classic_alloc_pool() is False
 
     def test_xpu_backend_delegates_torch_calls(self, monkeypatch):
         calls = []
@@ -314,6 +316,76 @@ class TestAcceleratorCapabilityGates:
             side_effect=AssertionError("system GDS probe should not run"),
         ):
             assert GdsStrategy().is_available(ctx) is False
+
+    def test_registered_buffer_scope_is_a_noop_without_a_pool_requirement(
+        self,
+        mock_accelerator_backend_cls,
+    ):
+        from modelexpress.refit.reshard import cuda_pool
+        from modelexpress.refit.reshard.alloc_scope import (
+            registered_buffer_alloc_scope,
+        )
+
+        backend = mock_accelerator_backend_cls(classic_alloc_pool=False)
+
+        with patch.object(
+            cuda_pool,
+            "_get_pool",
+            side_effect=AssertionError("classic pool should not be built"),
+        ):
+            scope = registered_buffer_alloc_scope(backend)
+            assert isinstance(scope, type(nullcontext()))
+            with scope:
+                pass
+
+    def test_registered_buffer_scope_uses_the_classic_pool_when_required(
+        self,
+        mock_accelerator_backend_cls,
+    ):
+        from modelexpress.refit.reshard import cuda_pool
+        from modelexpress.refit.reshard.alloc_scope import (
+            registered_buffer_alloc_scope,
+        )
+
+        backend = mock_accelerator_backend_cls(
+            name="cuda",
+            classic_alloc_pool=True,
+        )
+        entered = []
+
+        @contextmanager
+        def fake_use_mem_pool(pool, device=None):
+            entered.append(pool)
+            yield
+
+        with patch.object(cuda_pool, "_get_pool", return_value="pool"):
+            with patch.object(torch.cuda, "use_mem_pool", fake_use_mem_pool):
+                with registered_buffer_alloc_scope(backend):
+                    pass
+
+        assert entered == ["pool"]
+
+    def test_registered_buffer_scope_rejects_an_unimplemented_backend_pool(
+        self,
+        mock_accelerator_backend_cls,
+    ):
+        from modelexpress.refit.reshard import cuda_pool
+        from modelexpress.refit.reshard.alloc_scope import (
+            registered_buffer_alloc_scope,
+        )
+
+        backend = mock_accelerator_backend_cls(
+            name="rocm",
+            classic_alloc_pool=True,
+        )
+
+        with patch.object(
+            cuda_pool,
+            "_get_pool",
+            side_effect=AssertionError("CUDA pool should not be built"),
+        ):
+            with pytest.raises(NotImplementedError, match="rocm"):
+                registered_buffer_alloc_scope(backend)
 
     def test_vmm_runtime_noops_when_backend_does_not_support_arena(
         self,

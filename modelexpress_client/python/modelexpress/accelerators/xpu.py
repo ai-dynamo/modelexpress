@@ -78,3 +78,18 @@ class XpuAcceleratorBackend:
 
     def supports_gds(self) -> bool:
         return False
+
+    def requires_classic_alloc_pool(self) -> bool:
+        # The classic pool works around a CUDA-specific interaction between
+        # expandable-segment allocations and nvidia_peermem pinning. No equivalent
+        # hazard is known or has been observed on XPU, so registered buffers use
+        # the default allocator.
+        #
+        # Not a proof of absence. The CUDA failure mode passes ibv_reg_mr and only
+        # fails at WRITE time, so a successful registration does not rule it out;
+        # ruling it out would take a real RDMA write into an XPU buffer allocated
+        # under whatever expandable-segment equivalent XPU has, if it has one.
+        # torch.xpu does expose MemPool and XPUPluggableAllocator, so an
+        # alternate XPU pool could be implemented here if that test ever says one
+        # is needed.
+        return False
