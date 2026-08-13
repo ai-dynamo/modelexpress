@@ -701,7 +701,7 @@ ModelExpress detects this (`live_allocation_count > 1`) and falls back to
 per-tensor registration, which is correct because each arena allocation is one
 handle, so every tensor lies wholly inside one. The log line names the count:
 
-```
+```text
 register_arena: arena spans 1019 physical allocations; a single MR would publish
 an rkey covering only the first, which cuda_ipc cannot address. Falling back to
 per-tensor registration ...
