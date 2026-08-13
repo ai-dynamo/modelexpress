@@ -95,6 +95,75 @@ jobs:
     - name: Run doc tests
       run: cargo test --doc
 
+  tls-feature-matrix:
+    name: TLS Feature Matrix
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features:
+          - --no-default-features --features tls-rustls
+          - --no-default-features --features openssl
+          - --no-default-features --features tls-rustls,gcs
+          - --no-default-features --features openssl,gcs
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      run: |
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+    - name: Cache dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target/
+        key: ${{ runner.os }}-cargo-tls-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-tls-
+          ${{ runner.os }}-cargo-
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+
+    - name: Lint with clippy
+      run: cargo clippy --workspace --all-targets ${{ matrix.features }} -- -D warnings
+
+    - name: Build
+      run: cargo build --workspace ${{ matrix.features }} --verbose
+
+  tls-no-backend-rejected:
+    name: TLS No-Backend Rejected
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      run: |
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+        echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler
+
+    - name: Building with no TLS backend must fail
+      run: |
+        if cargo check -p modelexpress-common --no-default-features 2>build.log; then
+          echo "expected the build to be rejected when no TLS backend is selected"
+          exit 1
+        fi
+        grep -q "no TLS backend selected" build.log
+
   python-test:
     name: Python Tests (protobuf ${{ matrix.protobuf_major }})
     runs-on: ubuntu-latest
