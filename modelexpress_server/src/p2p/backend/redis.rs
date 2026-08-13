@@ -53,6 +53,53 @@ end
 return remaining
 "#;
 
+const UPDATE_STATUS_IF_FRESH_LUA: &str = r#"
+if redis.call('HEXISTS', KEYS[1], ARGV[1]) == 0 then
+    return -1
+end
+
+local incoming_updated_at = tonumber(ARGV[5])
+local current_json = redis.call('HGET', KEYS[1], ARGV[2])
+if current_json then
+    local ok, current = pcall(cjson.decode, current_json)
+    if ok and type(current) == 'table' then
+        local current_updated_at = tonumber(current['updated_at'])
+        if current_updated_at and current_updated_at > incoming_updated_at then
+            return 0
+        end
+    end
+end
+
+local update_source_summary = false
+local source_json = redis.call('HGET', KEYS[2], ARGV[3])
+if not source_json then
+    update_source_summary = true
+else
+    local representative_rank = tonumber(source_json)
+    if representative_rank then
+        update_source_summary = representative_rank == tonumber(ARGV[1])
+    else
+        local ok, source = pcall(cjson.decode, source_json)
+        if ok and type(source) == 'table' then
+            representative_rank = tonumber(source['worker_rank'])
+            local source_updated_at = tonumber(source['updated_at'])
+            if representative_rank == tonumber(ARGV[1]) then
+                if source_updated_at and source_updated_at > incoming_updated_at then
+                    return 0
+                end
+                update_source_summary = true
+            end
+        end
+    end
+end
+
+redis.call('HSET', KEYS[1], ARGV[2], ARGV[4])
+if update_source_summary then
+    redis.call('HSET', KEYS[2], ARGV[3], ARGV[4])
+end
+return 1
+"#;
+
 /// All fields of a SourceIdentity stored once per source in the index hash.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct SourceAttributesJson {
@@ -156,25 +203,36 @@ fn source_identity_from_attributes(attr_json: Option<&str>) -> (String, Option<S
     (model_name, identity)
 }
 
-fn representative_worker_rank(summary: Option<&str>, fallback: u32) -> u32 {
-    summary
-        .and_then(|value| {
-            value.parse().ok().or_else(|| {
-                serde_json::from_str::<WorkerSummaryJson>(value)
-                    .ok()
-                    .map(|summary| summary.worker_rank)
-            })
-        })
-        .unwrap_or(fallback)
-}
-
-fn representative_summary_rank_to_update(summary: Option<&str>, updated_rank: u32) -> Option<u32> {
-    let representative_rank = representative_worker_rank(summary, updated_rank);
-    (summary.is_none() || representative_rank == updated_rank).then_some(representative_rank)
-}
-
 fn status_field(worker_rank: u32) -> String {
     format!("{}{}", keys::STATUS_FIELD_PREFIX, worker_rank)
+}
+
+async fn update_status_if_fresh(
+    conn: &mut ConnectionManager,
+    worker_key: &str,
+    source_key: &str,
+    worker_id: &str,
+    worker_rank: u32,
+    summary: &str,
+    updated_at: i64,
+) -> MetadataResult<bool> {
+    let result: i32 = redis::Script::new(UPDATE_STATUS_IF_FRESH_LUA)
+        .key(worker_key)
+        .key(source_key)
+        .arg(worker_rank)
+        .arg(status_field(worker_rank))
+        .arg(worker_id)
+        .arg(summary)
+        .arg(updated_at)
+        .invoke_async(conn)
+        .await?;
+
+    match result {
+        -1 => Err(format!("worker rank {worker_rank} not found in '{worker_key}'").into()),
+        0 => Ok(false),
+        1 => Ok(true),
+        value => Err(format!("unexpected status update result: {value}").into()),
+    }
 }
 
 /// Live (status, updated_at) of a rank: `status:{rank}` if at least as fresh, else the record.
@@ -972,29 +1030,31 @@ impl MetadataBackend for RedisBackend {
             worker_rank,
             status: status as i32,
             updated_at,
-            accelerator: accelerator.clone(),
+            accelerator,
         })?;
         let source_key = format!("{}{}", keys::SOURCE_PREFIX, source_id);
-        let existing_summary: Option<String> = conn.hget(&source_key, worker_id).await?;
-        let mut pipe = redis::pipe();
-        pipe.hset(&key, status_field(worker_rank), &status_summary);
-        if let Some(representative_rank) =
-            representative_summary_rank_to_update(existing_summary.as_deref(), worker_rank)
-        {
-            let summary = serde_json::to_string(&WorkerSummaryJson {
-                worker_rank: representative_rank,
-                status: status as i32,
-                updated_at,
-                accelerator,
-            })?;
-            pipe.hset(&source_key, worker_id, summary);
-        }
-        pipe.exec_async(&mut conn).await?;
+        let updated = update_status_if_fresh(
+            &mut conn,
+            &key,
+            &source_key,
+            worker_id,
+            worker_rank,
+            &status_summary,
+            updated_at,
+        )
+        .await?;
 
-        debug!(
-            "Updated status for source '{}' worker '{}' rank {} -> {}",
-            source_id, worker_id, worker_rank, status as i32
-        );
+        if updated {
+            debug!(
+                "Updated status for source '{}' worker '{}' rank {} -> {}",
+                source_id, worker_id, worker_rank, status as i32
+            );
+        } else {
+            debug!(
+                "Ignored older status for source '{}' worker '{}' rank {} at {}",
+                source_id, worker_id, worker_rank, updated_at
+            );
+        }
         Ok(())
     }
 }
@@ -1132,27 +1192,6 @@ mod tests {
             serde_json::from_str(r#"{"worker_rank":0,"status":2,"updated_at":1700000000000}"#)
                 .expect("parse legacy summary");
         assert!(parsed.accelerator.is_empty());
-    }
-
-    #[test]
-    fn test_representative_worker_rank_preserves_summary_rank() {
-        let summary = r#"{"worker_rank":7,"status":2,"updated_at":1700000000000}"#;
-        assert_eq!(representative_worker_rank(Some(summary), 3), 7);
-        assert_eq!(
-            representative_summary_rank_to_update(Some(summary), 3),
-            None
-        );
-        assert_eq!(
-            representative_summary_rank_to_update(Some(summary), 7),
-            Some(7)
-        );
-    }
-
-    #[test]
-    fn test_representative_worker_rank_supports_legacy_rank() {
-        assert_eq!(representative_worker_rank(Some("5"), 3), 5);
-        assert_eq!(representative_summary_rank_to_update(Some("5"), 3), None);
-        assert_eq!(representative_worker_rank(Some("corrupt"), 3), 3);
     }
 
     #[test]
@@ -1316,5 +1355,111 @@ mod tests {
             identity.expect("valid legacy attributes").model_name,
             "legacy-model"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Redis at MX_TEST_REDIS_URL"]
+    async fn older_status_update_does_not_replace_newer_status() {
+        let redis_url = std::env::var("MX_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let backend = RedisBackend::new(&redis_url);
+        backend.connect().await.expect("connect");
+
+        let mut identity = test_identity();
+        identity.model_name = format!("status-order-test/{}", uuid::Uuid::new_v4());
+        let source_id = crate::p2p::source_identity::compute_mx_source_id(&identity);
+        let worker_id = uuid::Uuid::new_v4().to_string();
+
+        backend
+            .publish_metadata(
+                &identity,
+                &worker_id,
+                WorkerMetadata {
+                    worker_rank: 0,
+                    status: SourceStatus::Initializing as i32,
+                    updated_at: 50,
+                    accelerator: "cuda".to_string(),
+                    ..Default::default()
+                },
+                "",
+                "",
+                "",
+            )
+            .await
+            .expect("publish");
+        backend
+            .update_status(&source_id, &worker_id, 0, SourceStatus::Ready, 200)
+            .await
+            .expect("newer update");
+        backend
+            .update_status(&source_id, &worker_id, 0, SourceStatus::Stale, 100)
+            .await
+            .expect("older update");
+
+        let metadata = backend
+            .get_metadata(&source_id, &worker_id)
+            .await
+            .expect("get metadata")
+            .expect("metadata exists");
+        assert_eq!(metadata.workers[0].status, SourceStatus::Ready as i32);
+        assert_eq!(metadata.workers[0].updated_at, 200);
+
+        let workers = backend
+            .list_workers(Some(source_id.clone()), None)
+            .await
+            .expect("list workers");
+        assert_eq!(workers[0].status, SourceStatus::Ready as i32);
+        assert_eq!(workers[0].updated_at, 200);
+        let summaries = backend
+            .list_workers_filtered(Some(source_id.clone()), None, None, None, None, None, None)
+            .await
+            .expect("list worker summaries");
+        assert_eq!(summaries[0].status, SourceStatus::Ready as i32);
+        assert_eq!(summaries[0].updated_at, 200);
+
+        let worker_key = format!("{}{}:{}", keys::SOURCE_PREFIX, source_id, worker_id);
+        let mut conn = backend.get_conn().await.expect("connection");
+        let _: usize = conn
+            .hdel(&worker_key, status_field(0))
+            .await
+            .expect("remove status field");
+        backend
+            .update_status(&source_id, &worker_id, 0, SourceStatus::Stale, 100)
+            .await
+            .expect("older legacy update");
+        let metadata = backend
+            .get_metadata(&source_id, &worker_id)
+            .await
+            .expect("get metadata after older legacy update")
+            .expect("metadata exists after older legacy update");
+        assert_eq!(
+            metadata.workers[0].status,
+            SourceStatus::Initializing as i32
+        );
+        assert_eq!(metadata.workers[0].updated_at, 50);
+
+        backend
+            .update_status(&source_id, &worker_id, 0, SourceStatus::Ready, 300)
+            .await
+            .expect("legacy record update");
+        let metadata = backend
+            .get_metadata(&source_id, &worker_id)
+            .await
+            .expect("get legacy metadata")
+            .expect("legacy metadata exists");
+        assert_eq!(metadata.workers[0].updated_at, 300);
+
+        assert!(
+            backend
+                .update_status(&source_id, &worker_id, 99, SourceStatus::Ready, 400)
+                .await
+                .is_err(),
+            "a heartbeat must not create a missing rank"
+        );
+
+        backend
+            .remove_worker(&source_id, &worker_id)
+            .await
+            .expect("cleanup");
     }
 }
