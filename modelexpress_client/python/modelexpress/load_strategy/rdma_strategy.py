@@ -301,15 +301,8 @@ class RdmaStrategy(LoadStrategy):
             # defense-in-depth (empty refs, stale records, metadata drift).
             target_accelerator = ctx.accelerator_backend.name
             candidates = [
-                inst
-                for inst in rank_matched
-                if accelerators_compatible(
-                    target_accelerator,
-                    inst.accelerator,
-                    mx_source_type=ctx.identity.mx_source_type,
-                    quantization=ctx.identity.quantization,
-                    dtype=ctx.identity.dtype,
-                )
+                inst for inst in rank_matched
+                if accelerators_compatible(target_accelerator, inst.accelerator)
             ]
 
             selector = get_configured_selector()
