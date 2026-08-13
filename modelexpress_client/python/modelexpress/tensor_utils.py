@@ -109,7 +109,7 @@ def _find_hidden_accel_tensors(
         if accelerator_backend.is_accel_tensor(tensor) and tensor.numel() > 0:
             results.append(("t", tensor))
     elif isinstance(obj, (list, tuple)):
-        for i, item in enumerate(obj):
+        for i, item in enumerate(list(obj)):
             for path, tensor in _find_hidden_accel_tensors(
                 item,
                 visited,
@@ -118,7 +118,9 @@ def _find_hidden_accel_tensors(
             ):
                 results.append((f"{i}_{path}", tensor))
     elif isinstance(obj, dict):
-        for k, v in obj.items():
+        # snapshot: traversal can trigger lazy attributes that mutate the
+        # container we are walking (seen on SGLang's K3 object graph)
+        for k, v in list(obj.items()):
             for path, tensor in _find_hidden_accel_tensors(
                 v,
                 visited,
@@ -127,7 +129,7 @@ def _find_hidden_accel_tensors(
             ):
                 results.append((f"{k}_{path}", tensor))
     elif hasattr(obj, "__dict__") and not isinstance(obj, (type, nn.Module)):
-        for attr_name, attr_val in vars(obj).items():
+        for attr_name, attr_val in list(vars(obj).items()):
             if attr_name.startswith("__"):
                 continue
             for path, tensor in _find_hidden_accel_tensors(
