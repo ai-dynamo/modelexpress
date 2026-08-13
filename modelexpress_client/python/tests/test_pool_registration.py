@@ -346,3 +346,60 @@ class TestReceiveFromSourceManifestValidation:
             "1 local-only, 1 source-only" in rec.getMessage()
             for rec in caplog.records
         )
+
+    def test_exact_match_rejects_local_only_name(self, monkeypatch):
+        mgr = self._make_manager(
+            monkeypatch,
+            {
+                "w": torch.zeros(1, dtype=torch.float32),
+                "x": torch.zeros(1, dtype=torch.float32),
+            },
+        )
+        src = TensorDescriptor(
+            name="w", addr=0x1000, size=4, device_id=0, dtype="torch.float32",
+        )
+
+        with pytest.raises(ManifestMismatchError, match="heterogeneous transfer"):
+            mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=[src],
+                remote_agent_name="dummy",
+                require_exact_match=True,
+            )
+
+    def test_exact_match_rejects_source_only_name(self, monkeypatch):
+        mgr = self._make_manager(
+            monkeypatch, {"w": torch.zeros(1, dtype=torch.float32)}
+        )
+        src = [
+            TensorDescriptor(
+                name="w", addr=0x1000, size=4, device_id=0, dtype="torch.float32",
+            ),
+            TensorDescriptor(
+                name="extra", addr=0x2000, size=4, device_id=0, dtype="torch.float32",
+            ),
+        ]
+
+        with pytest.raises(ManifestMismatchError, match="heterogeneous transfer"):
+            mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=src,
+                remote_agent_name="dummy",
+                require_exact_match=True,
+            )
+
+    def test_exact_match_rejects_zero_match(self, monkeypatch):
+        mgr = self._make_manager(
+            monkeypatch, {"x": torch.zeros(1, dtype=torch.float32)}
+        )
+        src = TensorDescriptor(
+            name="w", addr=0x1000, size=4, device_id=0, dtype="torch.float32",
+        )
+
+        with pytest.raises(ManifestMismatchError, match="heterogeneous transfer"):
+            mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=[src],
+                remote_agent_name="dummy",
+                require_exact_match=True,
+            )

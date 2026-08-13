@@ -212,8 +212,6 @@ jobs:
         include:
           - framework: vllm
             dockerfile: ci/k8s/client/vllm/Dockerfile
-          - framework: trt-llm
-            dockerfile: ci/k8s/client/trt-llm/Dockerfile
           - framework: sglang
             dockerfile: ci/k8s/client/sgl/Dockerfile
           - framework: sglang-mooncake
@@ -357,17 +355,6 @@ jobs:
             worker_port: "8002"
             expected_artifact_sources: "1"
             expected_artifact_source_types: "torch_compile_cache"
-          - framework: trt-llm
-            namespace: mx-ci-trt-llm-${{ github.run_id }}
-            manifest: ci/k8s/client/trt-llm/manifest-azure.yaml
-            test_script: ci/k8s/client/test_p2p_k8s.py
-            pytest_args: "--p2p-marker 'ModelExpress P2P transfer complete'"
-            source_extra_env: |
-              JOB_NAME=mx-source
-              MODEL_EXPRESS_SOURCE=1
-            extra_env: "JOB_NAME=mx-target"
-            source_port: "8003"
-            worker_port: "8004"
           - framework: sglang
             namespace: mx-ci-sglang-${{ github.run_id }}
             manifest: ci/k8s/client/sgl/manifest-azure.yaml

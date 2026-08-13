@@ -24,6 +24,7 @@ import torch
 
 from . import envs
 from . import ucx_utils
+from ._nixl import load_nixl_api
 from .accelerators import (
     AcceleratorBackend,
     CudaAcceleratorBackend,
@@ -38,12 +39,11 @@ logger = logging.getLogger("modelexpress.nixl_transfer")
 NIXL_AVAILABLE = False
 NixlAgent = None
 nixl_agent_config = None
-try:
-    from nixl._api import nixl_agent as NixlAgent
-    from nixl._api import nixl_agent_config
+_nixl_api = load_nixl_api()
+if _nixl_api is not None:
+    NixlAgent = _nixl_api.nixl_agent
+    nixl_agent_config = _nixl_api.nixl_agent_config
     NIXL_AVAILABLE = True
-except ImportError:
-    pass
 
 
 SUPPORTED_NIXL_BACKENDS = ("UCX", "LIBFABRIC")
@@ -599,6 +599,7 @@ class NixlTransferManager:
         source_tensors: list[TensorDescriptor],
         timeout_seconds: float | None = None,
         remote_agent_name: str | None = None,
+        require_exact_match: bool = False,
     ) -> tuple[int, int, float]:
         """
         Receive weights from a remote source via NIXL RDMA.
@@ -618,6 +619,10 @@ class NixlTransferManager:
             remote_agent_name: If set, use this pre-loaded agent (P2P mode)
                 instead of calling add_remote_agent with source_metadata
                 (centralized mode)
+            require_exact_match: When True, require the source manifest and the
+                locally registered tensors to name the exact same set and reject
+                a zero-match transfer. Same-family transfers leave this False
+                and tolerate subset transfers.
 
         Returns:
             Tuple of (total_bytes, total_tensors, duration)
@@ -683,6 +688,14 @@ class NixlTransferManager:
         local_only = sorted(set(self._tensors) - src_names)
         source_only = sorted(src_names - set(self._tensors))
         if local_only or source_only:
+            if require_exact_match:
+                raise ManifestMismatchError(
+                    "Tensor name mismatch on heterogeneous transfer: "
+                    f"{len(local_only)} local-only "
+                    f"(first: {local_only[:5]}), "
+                    f"{len(source_only)} source-only "
+                    f"(first: {source_only[:5]})"
+                )
             logger.warning(
                 "Tensor name mismatch between source manifest and local "
                 "registration: %d local-only, %d source-only",
@@ -691,6 +704,10 @@ class NixlTransferManager:
             )
 
         if not remote_descs:
+            if require_exact_match:
+                raise ManifestMismatchError(
+                    "No matching tensors found for heterogeneous transfer"
+                )
             logger.warning("No matching tensors found for transfer")
             return 0, 0, 0.0
 

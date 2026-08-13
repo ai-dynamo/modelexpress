@@ -22,6 +22,7 @@ from typing import Any
 import torch
 
 from . import envs
+from ._nixl import load_nixl_api
 from .accelerators import AcceleratorBackend
 
 logger = logging.getLogger("modelexpress.gds_transfer")
@@ -29,12 +30,11 @@ logger = logging.getLogger("modelexpress.gds_transfer")
 NIXL_AVAILABLE = False
 NixlAgent = None
 NixlAgentConfig = None
-try:
-    from nixl._api import nixl_agent as NixlAgent
-    from nixl._api import nixl_agent_config as NixlAgentConfig
+_nixl_api = load_nixl_api()
+if _nixl_api is not None:
+    NixlAgent = _nixl_api.nixl_agent
+    NixlAgentConfig = _nixl_api.nixl_agent_config
     NIXL_AVAILABLE = True
-except ImportError:
-    pass
 
 
 def is_gds_available() -> bool:

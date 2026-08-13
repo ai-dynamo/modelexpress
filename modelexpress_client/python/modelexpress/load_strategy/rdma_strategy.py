@@ -10,8 +10,21 @@ import math
 import os
 import time
 
-from .. import envs
+from .. import envs, p2p_pb2
 from ..adapter import EngineAdapter, StrategyFailed
+from ..metadata.payload import (
+    accelerators_compatible,
+    worker_tensor_count,
+    worker_tensor_descriptors,
+)
+from ..metrics import metrics as selection_metrics
+from ..nixl_transfer import is_nixl_available
+from ..source_selection import (
+    configured_policy_label,
+    get_configured_selector,
+)
+from ..transfer_safety import check_transfer_allowed
+from ..types import TensorDescriptor
 from .base import (
     LoadContext,
     LoadStrategy,
@@ -20,20 +33,6 @@ from .base import (
     register_tensors,
 )
 from .context import LoadResult
-from ..metadata.payload import (
-    accelerators_compatible,
-    worker_tensor_count,
-    worker_tensor_descriptors,
-)
-from ..nixl_transfer import is_nixl_available
-from ..source_selection import (
-    configured_policy_label,
-    get_configured_selector,
-)
-from ..metrics import metrics as selection_metrics
-from ..transfer_safety import check_transfer_allowed
-from ..types import TensorDescriptor
-from .. import p2p_pb2
 
 logger = logging.getLogger("modelexpress.strategy_rdma")
 
@@ -123,17 +122,19 @@ class RdmaStrategy(LoadStrategy):
         # metadata; skip the central-server precondition for them.
         # Strict `is True` check so MagicMock's auto-attribute doesn't
         # masquerade as the flag in tests.
-        server_addr = envs.MODEL_EXPRESS_URL or envs.MX_SERVER_ADDRESS
+        server_addr = (
+            ctx.mx_server_url or envs.MODEL_EXPRESS_URL or envs.MX_SERVER_ADDRESS
+        )
         requires_p2p = getattr(ctx.mx_client, "REQUIRES_P2P_METADATA", False) is True
         if not server_addr and not requires_p2p:
-            logger.info(f"[Worker {ctx.global_rank}] No MX server configured, skipping RDMA")
+            logger.info(
+                f"[Worker {ctx.global_rank}] No MX server configured, skipping RDMA"
+            )
             return False
 
         allowed, reason = check_transfer_allowed(ctx.model_config)
         if not allowed:
-            logger.info(
-                f"[Worker {ctx.global_rank}] RDMA transfer disabled: {reason}"
-            )
+            logger.info(f"[Worker {ctx.global_rank}] RDMA transfer disabled: {reason}")
             return False
 
         return True
@@ -148,7 +149,9 @@ class RdmaStrategy(LoadStrategy):
         result = _as_load_result(result)
         candidates = self._find_source_instances(ctx)
         if not candidates:
-            logger.info(f"[Worker {ctx.global_rank}] No RDMA source available, skipping")
+            logger.info(
+                f"[Worker {ctx.global_rank}] No RDMA source available, skipping"
+            )
             raise StrategyFailed("No RDMA source available", mutated=False)
 
         attempts = candidates[:MAX_SOURCE_RETRIES]
@@ -165,7 +168,9 @@ class RdmaStrategy(LoadStrategy):
 
             try:
                 source_worker = self._fetch_worker_metadata(
-                    ctx, mx_source_id, worker_id,
+                    ctx,
+                    mx_source_id,
+                    worker_id,
                 )
             except Exception as e:
                 logger.warning(
@@ -192,7 +197,11 @@ class RdmaStrategy(LoadStrategy):
             transfer_start = time.perf_counter()
             try:
                 out = self._load_as_target(
-                    result, ctx, source_worker, mx_source_id, worker_id,
+                    result,
+                    ctx,
+                    source_worker,
+                    mx_source_id,
+                    worker_id,
                 )
             except StrategyFailed as e:
                 has_next_candidate = attempt_index + 1 < len(attempts)
@@ -253,11 +262,13 @@ class RdmaStrategy(LoadStrategy):
         # An internal reinit returns a new result, but the outer strategy chain
         # still owns the original result that the adapter cleared.
         raise StrategyFailed(
-            "No RDMA source succeeded", mutated=needs_outer_reinit,
+            "No RDMA source succeeded",
+            mutated=needs_outer_reinit,
         )
 
     def _find_source_instances(
-        self, ctx: LoadContext,
+        self,
+        ctx: LoadContext,
     ) -> list[p2p_pb2.SourceInstanceRef]:
         """Return READY source instances ranked by the configured selector.
 
@@ -272,11 +283,14 @@ class RdmaStrategy(LoadStrategy):
                 status_filter=p2p_pb2.SOURCE_STATUS_READY,
             )
             if not list_resp.instances:
-                logger.debug(f"[Worker {ctx.global_rank}] No ready source instances found")
+                logger.debug(
+                    f"[Worker {ctx.global_rank}] No ready source instances found"
+                )
                 return []
 
             rank_matched = [
-                inst for inst in list_resp.instances
+                inst
+                for inst in list_resp.instances
                 if inst.worker_rank == ctx.worker_rank
             ]
 
@@ -503,6 +517,16 @@ class RdmaStrategy(LoadStrategy):
                 f"{' (P2P)' if is_p2p else ''}"
             )
 
+            # Cross-family transfers and adapters with vendor-specific hidden
+            # state require identical source and target tensor catalogs.
+            target_accelerator = ctx.accelerator_backend.name
+            source_accelerator = source_worker.accelerator
+            require_exact_match = ctx.adapter.requires_exact_tensor_catalog() or bool(
+                target_accelerator
+                and source_accelerator
+                and target_accelerator != source_accelerator
+            )
+
             transfer_start = time.perf_counter()
             try:
                 bytes_transferred, tensor_count, _ = ctx.nixl_manager.receive_from_source(
@@ -510,6 +534,7 @@ class RdmaStrategy(LoadStrategy):
                     source_tensors=source_tensors,
                     timeout_seconds=_transfer_timeout_seconds(),
                     remote_agent_name=remote_agent_name,
+                    require_exact_match=require_exact_match,
                 )
             except Exception as e:
                 raise SourceTransferError(f"RDMA receive failed: {e}") from e
@@ -534,4 +559,6 @@ class RdmaStrategy(LoadStrategy):
                 ctx.nixl_manager.remove_remote_agent(remote_agent_name)
 
         total_time = time.perf_counter() - receive_start
-        logger.info(f"[Worker {ctx.global_rank}] [TIMING] Total receive time: {total_time:.2f}s")
+        logger.info(
+            f"[Worker {ctx.global_rank}] [TIMING] Total receive time: {total_time:.2f}s"
+        )
