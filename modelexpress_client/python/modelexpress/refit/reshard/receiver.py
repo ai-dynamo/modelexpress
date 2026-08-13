@@ -288,6 +288,15 @@ def _batch_install_enabled() -> bool:
     return envs.MX_RESHARD_BATCH_INSTALL
 
 
+def _cache_descriptors_enabled() -> bool:
+    """Whether to reuse the read descriptor lists across steps.
+
+    Read at call time so an A/B can toggle it without re-importing. Set
+    ``MX_RESHARD_CACHE_DESCRIPTORS=0`` to rebuild them on every step.
+    """
+    return envs.MX_RESHARD_CACHE_DESCRIPTORS
+
+
 def _replay_ops(tensor: torch.Tensor, op_chain: tuple) -> torch.Tensor:
     """Replay a captured loader view chain on a staged full-source tensor."""
     value = tensor
@@ -360,6 +369,10 @@ class ReshardReceiver:
         self._mx_client = MxClient(server_url=mx_server)
 
         self._plan = None  # built lazily on the first refit
+        # Read descriptors for the cached plan, reused across steps. Tied to the
+        # plan's lifetime: whatever rebuilds the plan must drop this too, or the
+        # next refit would RDMA into the previous plan's addresses.
+        self._cached_descriptors: tuple | None = None
         self._transport: NixlReshardTransport | None = None
         self._recv_buffers: dict[
             str, torch.Tensor
@@ -503,6 +516,9 @@ class ReshardReceiver:
             self._manager, session_to_agent, session_to_device, timeout_seconds=timeout
         )
         self._plan = plan
+        # New plan, so any descriptors cached for the old one are stale by
+        # construction: they carry the previous plan's source addresses.
+        self._cached_descriptors = None
 
         # dtype-mismatched sources (e.g. a bf16-served router for an fp32 dest):
         # one persistent bf16 STAGING buffer per convert param, registered as an
@@ -725,33 +741,78 @@ class ReshardReceiver:
         # dtype cast) runs after all reads complete. So the phases carry no
         # ordering dependency and are issued as one batch by default. Phased mode
         # drains each in turn and is kept for the A/B.
-        full_descriptors = [
-            ReadDescriptor(
-                session=segment.session,
-                src_addr=segment.src_addr,
-                dst_addr=(
-                    self._full_staging_ptr[full_pull.src_name] + segment.dst_byte
-                ),
-                nbytes=segment.nbytes,
+        # Descriptor construction is timed and cached. Timed because it is real
+        # per-step work that used to fall outside every stage, so it surfaced only
+        # as unattributed time and pushed the record below the attribution floor a
+        # breakdown has to clear to be worth reporting. Cached because a descriptor
+        # is a (session, src_addr, dst_addr, nbytes) tuple derived from the plan and
+        # the registered buffer addresses: the plan is built once and reused, and
+        # the buffers are registered once, so every step was re-deriving an
+        # identical list of hundreds of thousands of objects in Python.
+        _t = time.perf_counter()
+        cached = _cache_descriptors_enabled()
+        fused = _fused_wire_enabled()
+        # The fused flag is part of the key, not just the payload: the phased arm
+        # does not build the exact descriptors, so a cache filled under one arm
+        # cannot serve the other. An A/B that toggles it mid-process is exactly the
+        # case this is for.
+        reusable = (
+            self._cached_descriptors is not None
+            and self._cached_descriptors[0] == fused
+        )
+        if not cached or not reusable:
+            full_descriptors = [
+                ReadDescriptor(
+                    session=segment.session,
+                    src_addr=segment.src_addr,
+                    dst_addr=(
+                        self._full_staging_ptr[full_pull.src_name] + segment.dst_byte
+                    ),
+                    nbytes=segment.nbytes,
+                )
+                for full_pull in self._plan.full_pulls
+                for segment in full_pull.segments
+            ]
+            convert_descriptors = [
+                ReadDescriptor(
+                    session=segment.session,
+                    src_addr=segment.src_addr,
+                    dst_addr=self._staging_ptr[convert.param_name] + segment.dst_byte,
+                    nbytes=segment.nbytes,
+                )
+                for convert in self._plan.converts
+                for segment in convert.segments
+            ]
+            # Only the fused path issues the exact segments as descriptors; the
+            # phased path hands the plan to execute_transfer instead, so building
+            # them here would be wasted work for that arm.
+            exact = (
+                exact_descriptors(self._plan, lambda name: self._param_ptr[name])
+                if fused
+                else None
             )
-            for full_pull in self._plan.full_pulls
-            for segment in full_pull.segments
-        ]
-        convert_descriptors = [
-            ReadDescriptor(
-                session=segment.session,
-                src_addr=segment.src_addr,
-                dst_addr=self._staging_ptr[convert.param_name] + segment.dst_byte,
-                nbytes=segment.nbytes,
+            # nbytes of the auxiliary descriptors, summed once for the same reason.
+            aux_bytes = sum(
+                descriptor.nbytes
+                for descriptor in (*full_descriptors, *convert_descriptors)
             )
-            for convert in self._plan.converts
-            for segment in convert.segments
-        ]
+            if cached:
+                self._cached_descriptors = (
+                    fused,
+                    full_descriptors,
+                    convert_descriptors,
+                    exact,
+                    aux_bytes,
+                )
+        else:
+            _, full_descriptors, convert_descriptors, exact, aux_bytes = (
+                self._cached_descriptors
+            )
+        stages["descriptor_build_s"] = time.perf_counter() - _t
 
-        if _fused_wire_enabled():
-            descriptors = exact_descriptors(
-                self._plan, lambda name: self._param_ptr[name]
-            )
+        if fused:
+            assert exact is not None
+            descriptors = exact
             stats = {
                 "segments": len(descriptors),
                 "bytes": sum(descriptor.nbytes for descriptor in descriptors),
@@ -796,10 +857,7 @@ class ReshardReceiver:
                 stages["wire_convert_s"] = time.perf_counter() - _t
 
         stats["segments"] += len(full_descriptors) + len(convert_descriptors)
-        stats["bytes"] += sum(
-            descriptor.nbytes
-            for descriptor in (*full_descriptors, *convert_descriptors)
-        )
+        stats["bytes"] += aux_bytes
 
         # Before anything reads the receive buffers, and well before _install
         # commits them to live parameters. An impossible rate means the transport
