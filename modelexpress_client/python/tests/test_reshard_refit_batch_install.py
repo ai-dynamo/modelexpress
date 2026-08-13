@@ -59,6 +59,7 @@ class _Harness(ReshardReceiver):
         self._timeout = 1.0
         self._transport = transport
         self._global_rank = 0
+        self._cached_descriptors = None
 
     def _install(self, recv_buffers) -> None:
         pass

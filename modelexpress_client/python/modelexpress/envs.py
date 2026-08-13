@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     MX_P2P_METADATA: str
     MX_RESHARD_FUSED_WIRE: bool
     MX_RESHARD_BATCH_INSTALL: bool
+    MX_RESHARD_CACHE_DESCRIPTORS: bool
     MX_RESHARD_REQUIRE_FULL_COVERAGE: bool
     MX_RESHARD_COVERAGE_FLOOR: float
     MX_RESHARD_HANDSHAKE_TIMEOUT_S: float
@@ -244,6 +245,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Python and launch overhead can rival the RDMA itself. Set to 0 to fall back
     # to the per-view loop. See modelexpress.refit.reshard.receiver.
     "MX_RESHARD_BATCH_INSTALL": lambda: _env_bool("MX_RESHARD_BATCH_INSTALL", True),
+    # Build the RDMA read descriptor lists once per plan instead of once per step.
+    # The descriptors are a pure function of the cached plan and the registered
+    # buffer addresses, neither of which changes between steps, so rebuilding them
+    # every refit re-derives an identical list of hundreds of thousands of objects
+    # in Python. On by default; set to 0 to rebuild per step for an A/B. The cache
+    # is dropped whenever the plan is rebuilt. See
+    # modelexpress.refit.reshard.receiver.
+    "MX_RESHARD_CACHE_DESCRIPTORS": lambda: _env_bool(
+        "MX_RESHARD_CACHE_DESCRIPTORS", True
+    ),
     # Refit coverage gate. The floor is a fraction of the engine's parameter
     # bytes; ReshardReceiver validates its range at the point of use. What a
     # complete refit scores is engine- and model-specific, so the default is set
