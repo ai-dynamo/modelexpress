@@ -17,6 +17,7 @@ use modelexpress_common::grpc::refit::{
     WorkerRegistration, WorkerRole, refit_service_server::RefitService,
 };
 use tonic::{Request, Response, Status};
+use tracing::{debug, error, info, warn};
 
 use super::backend::{RefitBackend, RefitBackendError};
 
@@ -38,15 +39,39 @@ fn validate_ttl(ttl_seconds: u32) -> Result<(), Status> {
     }
 }
 
+/// Converts a backend error into a `Status`, logging it on the way out.
+///
+/// Every backend failure in this service funnels through here, so severity is
+/// assigned once: operator-actionable faults are logged loudly, caller faults at
+/// debug so a misbehaving client cannot flood the server log.
 fn backend_status(error: RefitBackendError) -> Status {
     match error {
-        RefitBackendError::InvalidArgument(message) => Status::invalid_argument(message),
-        RefitBackendError::NotFound(message) => Status::not_found(message),
-        RefitBackendError::FailedPrecondition(message) => Status::failed_precondition(message),
-        RefitBackendError::AlreadyExists(message) => Status::already_exists(message),
-        RefitBackendError::ResourceExhausted(message) => Status::resource_exhausted(message),
-        RefitBackendError::Internal(message) => Status::internal(message),
+        RefitBackendError::InvalidArgument(message) => {
+            debug!("Refit backend rejected request: {message}");
+            Status::invalid_argument(message)
+        }
+        RefitBackendError::NotFound(message) => {
+            debug!("Refit backend reported not found: {message}");
+            Status::not_found(message)
+        }
+        RefitBackendError::FailedPrecondition(message) => {
+            debug!("Refit backend precondition failed: {message}");
+            Status::failed_precondition(message)
+        }
+        RefitBackendError::AlreadyExists(message) => {
+            debug!("Refit backend reported conflict: {message}");
+            Status::already_exists(message)
+        }
+        RefitBackendError::ResourceExhausted(message) => {
+            warn!("Refit backend exhausted: {message}");
+            Status::resource_exhausted(message)
+        }
+        RefitBackendError::Internal(message) => {
+            error!("Refit backend internal error: {message}");
+            Status::internal(message)
+        }
         RefitBackendError::Unavailable(message) => {
+            error!("Refit metadata backend unavailable: {message}");
             Status::unavailable(format!("Refit metadata backend error: {message}"))
         }
     }
@@ -83,6 +108,10 @@ impl RefitService for RefitServiceImpl {
         }
         validate_ttl(request.ttl_seconds)?;
 
+        info!(
+            "Registering refit worker '{}' for model '{}' (ttl {}s)",
+            worker.worker_id, worker.model_name, request.ttl_seconds
+        );
         self.backend
             .register_worker(worker, request.ttl_seconds)
             .await
@@ -145,6 +174,12 @@ impl RefitService for RefitServiceImpl {
                 ));
             }
         }
+        info!(
+            "Creating weight version for model '{}' ({:?}, {} expected source slots)",
+            request.model_name,
+            payload_format,
+            request.expected_source_slots.len()
+        );
         self.backend
             .create_weight_version(&request)
             .await
@@ -158,6 +193,7 @@ impl RefitService for RefitServiceImpl {
     ) -> Result<Response<WeightVersion>, Status> {
         let uid = request.into_inner().uid;
         required(&uid, "uid")?;
+        debug!("Fetching weight version '{uid}'");
         self.backend
             .get_weight_version(&uid)
             .await
@@ -171,6 +207,7 @@ impl RefitService for RefitServiceImpl {
     ) -> Result<Response<WeightVersion>, Status> {
         let uid = request.into_inner().uid;
         required(&uid, "uid")?;
+        info!("Deleting weight version '{uid}'");
         self.backend
             .delete_weight_version(&uid)
             .await
@@ -193,6 +230,10 @@ impl RefitService for RefitServiceImpl {
         required(&shard.manifest_endpoint, "shard.manifest_endpoint")?;
         required(&shard.transport, "shard.transport")?;
 
+        info!(
+            "Registering shard for version '{}' from worker '{}' (source slot '{}', transport '{}')",
+            shard.version_id, shard.worker_id, shard.source_slot_id, shard.transport
+        );
         let (shard, version) = self
             .backend
             .create_weight_version_shard(shard)
@@ -210,6 +251,7 @@ impl RefitService for RefitServiceImpl {
     ) -> Result<Response<ListWeightVersionShardsResponse>, Status> {
         let version_id = request.into_inner().version_id;
         required(&version_id, "version_id")?;
+        debug!("Listing shards for weight version '{version_id}'");
         self.backend
             .list_weight_version_shards(&version_id)
             .await
@@ -225,6 +267,10 @@ impl RefitService for RefitServiceImpl {
         required(&request.version_id, "version_id")?;
         required(&request.source_slot_id, "source_slot_id")?;
         required(&request.worker_id, "worker_id")?;
+        info!(
+            "Deleting shard for version '{}' from worker '{}' (source slot '{}')",
+            request.version_id, request.worker_id, request.source_slot_id
+        );
         self.backend
             .delete_weight_version_shard(&request)
             .await
@@ -240,6 +286,10 @@ impl RefitService for RefitServiceImpl {
         required(&request.version_id, "version_id")?;
         required(&request.worker_id, "worker_id")?;
         validate_ttl(request.ttl_seconds)?;
+        info!(
+            "Registering lease on version '{}' for worker '{}' (ttl {}s)",
+            request.version_id, request.worker_id, request.ttl_seconds
+        );
         self.backend
             .register_version_lease(&request)
             .await
@@ -255,6 +305,10 @@ impl RefitService for RefitServiceImpl {
         required(&request.version_id, "version_id")?;
         required(&request.lease_id, "lease_id")?;
         required(&request.worker_id, "worker_id")?;
+        info!(
+            "Releasing lease '{}' on version '{}' for worker '{}'",
+            request.lease_id, request.version_id, request.worker_id
+        );
         self.backend
             .delete_version_lease(&request)
             .await
