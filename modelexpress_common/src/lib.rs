@@ -40,9 +40,6 @@ pub mod grpc {
     pub mod p2p {
         tonic::include_proto!("model_express.p2p");
     }
-    pub mod weight_sync {
-        tonic::include_proto!("weight_sync");
-    }
     pub mod refit {
         tonic::include_proto!("model_express.refit");
     }
