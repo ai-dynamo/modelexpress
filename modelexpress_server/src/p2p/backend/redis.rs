@@ -84,10 +84,7 @@ else
             representative_rank = tonumber(source['worker_rank'])
             local source_updated_at = tonumber(source['updated_at'])
             if representative_rank == tonumber(ARGV[1]) then
-                if source_updated_at and source_updated_at > incoming_updated_at then
-                    return 0
-                end
-                update_source_summary = true
+                update_source_summary = not (source_updated_at and source_updated_at > incoming_updated_at)
             end
         end
     end
@@ -1426,17 +1423,20 @@ mod tests {
         backend
             .update_status(&source_id, &worker_id, 0, SourceStatus::Stale, 100)
             .await
-            .expect("older legacy update");
+            .expect("rank-fresh legacy update");
         let metadata = backend
             .get_metadata(&source_id, &worker_id)
             .await
-            .expect("get metadata after older legacy update")
-            .expect("metadata exists after older legacy update");
-        assert_eq!(
-            metadata.workers[0].status,
-            SourceStatus::Initializing as i32
-        );
-        assert_eq!(metadata.workers[0].updated_at, 50);
+            .expect("get metadata after legacy rank update")
+            .expect("metadata exists after legacy rank update");
+        assert_eq!(metadata.workers[0].status, SourceStatus::Stale as i32);
+        assert_eq!(metadata.workers[0].updated_at, 100);
+        let summaries = backend
+            .list_workers_filtered(Some(source_id.clone()), None, None, None, None, None, None)
+            .await
+            .expect("list summaries after legacy rank update");
+        assert_eq!(summaries[0].status, SourceStatus::Ready as i32);
+        assert_eq!(summaries[0].updated_at, 200);
 
         backend
             .update_status(&source_id, &worker_id, 0, SourceStatus::Ready, 300)
