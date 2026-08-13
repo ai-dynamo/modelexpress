@@ -471,15 +471,15 @@ Distributed backend selection lives outside the YAML, in env vars: `MX_METADATA_
 
 ### ModelRegistryBackend (Redis and Kubernetes CRD)
 
-**Redis backend**: single Redis Hash per cached model at `mx:model:{name}` with fields `provider`, `status`, `created_at` (RFC3339), `last_used_at` (RFC3339), and optional `message`. No secondary indexes — LRU ordering and status counts are computed on demand by `SCAN` + pipelined `HGETALL`/`HGET`. Claim, retry, and `set_status` updates use Lua scripts so concurrent readers see either the pre-update record or the complete post-update record, never a partially-written hash.
+**Redis backend**: single Redis Hash per cached model at `mx:model:{provider}:{name}` with fields `provider`, `status`, `created_at` (RFC3339), `last_used_at` (RFC3339), and optional `message`. No secondary indexes — LRU ordering and status counts are computed on demand by `SCAN` + pipelined `HGETALL`/`HGET`. Claim, retry, and `set_status` updates use Lua scripts so concurrent readers see either the pre-update record or the complete post-update record, never a partially-written hash.
 
-**Kubernetes CRD backend**: one `ModelCacheEntry` CR per cached model in the server's namespace. `spec.modelName` + `spec.provider` are immutable; `status.{phase,createdAt,lastUsedAt,message}` are patched via the status subresource. Atomicity on the claim path comes from etcd's name-uniqueness on `create` (409 Conflict on the loser). CR names use the shared `sanitize_model_name` with an `mx-cache-` prefix to stay distinct from the P2P `ModelMetadata` CRs.
+**Kubernetes CRD backend**: one `ModelCacheEntry` CR per cached model in the server's namespace. `spec.modelName` + `spec.provider` are immutable; `status.{phase,createdAt,lastUsedAt,message}` are patched via the status subresource. Atomicity on the claim path comes from etcd's name-uniqueness on `create` (409 Conflict on the loser). CR names are `mx-cache-` followed by `sanitize_registry_name("{provider}/{model_name}")`, which lowercases, maps `/` to `--`, and appends a sha256 suffix over the original name. The P2P `ModelMetadata` CRs use their own `sanitize_model_name`; the two are separate implementations, not a shared helper.
 
 Key operations on the async `RegistryBackend` trait:
 
 | Method | Redis implementation |
 |--------|----------------------|
-| `get_status(name)` | `HGET mx:model:{name} status` |
+| `get_status(name)` | `HGET mx:model:{provider}:{name} status` (falls back to the legacy name-only key so pre-0.5.0 records still resolve) |
 | `set_status(name, provider, status, msg)` | Lua `EVAL` updates status/provider/last_used_at/message atomically and `HSETNX`s `created_at` to preserve the first-write timestamp |
 | `try_claim_for_download(name, provider)` | `HSETNX status DOWNLOADING`; winner populates remaining fields without contention |
 | `touch_model(name)` | `HSET last_used_at {now}` (gated on `EXISTS` so touch is update-only, never create) |
@@ -541,18 +541,25 @@ The `Client` struct in `modelexpress_client/src/lib.rs` wraps gRPC connections:
 
 | Method | Purpose |
 |--------|---------|
-| `new(config)` | Create client with config |
-| `health_check()` | Call HealthService |
-| `ping()` | Call ApiService with "ping" |
-| `download_model(name, provider)` | Trigger download via streaming RPC |
-| `download_model_direct(name, provider, cache_dir)` | Download directly from provider |
-| `ensure_model(name, provider, strategy)` | Smart download with fallback strategy |
-| `stream_model_files(name)` | Stream model files from server |
-| `list_model_files(name)` | List model files on server |
-| `delete_model(name, cache_dir)` | Delete cached model |
-| `validate_model(name, cache_dir)` | Validate cached model integrity |
+| `new(config)` | Create a client with the given configuration |
+| `new_with_cache(config, cache_config)` | Create a client with an explicit cache configuration |
+| `get_cache_config()` | Get the client's cache configuration, if any |
+| `set_cache_config(cache_config)` | Set the client's cache configuration |
+| `list_cached_models()` | List locally cached models as `CacheStats` |
+| `clear_cached_model(name, provider)` | Remove a model's local files for a given provider |
+| `clear_all_cached_models()` | Clear the entire local cache |
+| `delete_model_on_server(name, provider)` | Delete the model's record from the server-side registry, so a cleared model leaves no stale `DOWNLOADED` record |
+| `get_model_path(name, provider)` | Resolve the local cache path for a model through its provider |
+| `health_check()` | Call HealthService and return the server `Status` |
+| `send_request(action, payload)` | Send a generic ApiService request and deserialize the response |
+| `request_model_on_server(name, provider)` | Request a download on the server at the provider's default revision |
+| `request_model_on_server_revision(name, provider, revision)` | Same, pinned to a branch, tag, or commit SHA; returns the resolved revision |
+| `request_model(name, provider)` | Request a model using the server as source of truth, streaming files locally when shared storage is disabled |
+| `request_model_revision(name, provider, revision)` | Same, pinned to a revision; returns the snapshot path and the revision it resolved to |
+| `request_model_with_smart_fallback(name, provider, ...)` | Request via the server, falling back to a direct provider download when the connection cannot be established |
+| `request_model_with_smart_fallback_revision(name, provider, revision, ...)` | Same, with the direct-download fallback honouring the same pinned revision |
 
-Each download entry point has a `_revision` variant — `request_model_revision`, `request_model_on_server_revision`, `request_model_with_smart_fallback_revision` — that takes an optional branch, tag, or commit SHA and returns a `ModelDownloadResult { path, resolved_revision }`. The non-`_revision` methods keep their existing signatures and delegate with no revision pinned.
+The `_revision` variants take an optional branch, tag, or commit SHA and return a `ModelDownloadResult { path, resolved_revision }`. The non-`_revision` methods delegate to them with no revision pinned.
 
 ### Download Strategies
 
@@ -568,12 +575,16 @@ The `Cli` struct in `args.rs` embeds `ClientArgs` via `#[command(flatten)]`. Com
 
 | Command | Purpose |
 |---------|---------|
-| `health` | Check server health |
-| `ping` | Ping server |
-| `model download <name>` | Download a model. `--revision <branch\|tag\|sha>` pins a revision; the resolved commit SHA is reported back |
-| `model list-files <name>` | List model files |
-| `model clear <name>` | Delete cached model |
-| `model validate <name>` | Validate model integrity |
+| `health` | Check server health and status |
+| `model download <name>` | Download a model with various strategies (automatically cached). `--revision <branch\|tag\|sha>` pins a revision; the resolved commit SHA is reported back |
+| `model init` | Initialize model storage configuration |
+| `model list` | List downloaded models |
+| `model status` | Show model storage status and usage |
+| `model clear <name>` | Clear a specific model from storage |
+| `model clear-all` | Clear all models from storage |
+| `model validate [name]` | Validate model integrity |
+| `model stats` | Show model storage statistics |
+| `api send <action>` | Send a custom API request |
 
 Output formats: `--format human` (default), `--format json`, `--format json-pretty`.
 

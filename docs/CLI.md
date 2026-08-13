@@ -398,14 +398,21 @@ modelexpress-cli model status
 
 ### Configuration File Support
 
-The CLI loads a YAML configuration file via `-c, --config <FILE>` (default
-`~/.model-express/config.yaml`). Values are merged in this order of precedence,
-highest first:
+The CLI loads a YAML configuration file via `-c, --config <FILE>`. With no
+`--config`, it searches these paths in order and uses the first that exists:
+`model-express.yaml` and `model-express.yml` in the working directory, then
+`/etc/model-express/config.yaml` and `/etc/model-express/config.yml`. Values are
+merged in this order of precedence, highest first:
 
 1. Command line arguments
 2. Environment variables (`MODEL_EXPRESS_*`)
 3. Configuration file
 4. Built-in defaults
+
+This client configuration is separate from the cache configuration written by
+`modelexpress-cli model init`, which lives at `~/.model-express/config.yaml` and
+holds the local storage path and server endpoint used by the cache-management
+commands.
 
 ```bash
 modelexpress-cli --config /etc/modelexpress/client.yaml health
