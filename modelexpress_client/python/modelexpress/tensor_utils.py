@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import types
 from contextlib import contextmanager
 from typing import cast
 
@@ -128,16 +129,32 @@ def _find_hidden_accel_tensors(
                 depth + 1,
             ):
                 results.append((f"{k}_{path}", tensor))
-    elif hasattr(obj, "__dict__") and not isinstance(obj, (type, nn.Module)):
+    elif hasattr(obj, "__dict__") and not isinstance(
+        obj, (type, nn.Module, types.ModuleType)
+    ):
+        # Module objects are import registries, not tensor containers, and
+        # walking them trips lazy-import machinery (transformers' _LazyModule
+        # raises for classes absent from the installed version). Any attribute
+        # may also be a property that raises, so failures skip that attribute
+        # rather than taking the whole registration down.
         for attr_name, attr_val in list(vars(obj).items()):
             if attr_name.startswith("__"):
                 continue
-            for path, tensor in _find_hidden_accel_tensors(
-                attr_val,
-                visited,
-                accelerator_backend,
-                depth + 1,
-            ):
+            try:
+                nested = _find_hidden_accel_tensors(
+                    attr_val,
+                    visited,
+                    accelerator_backend,
+                    depth + 1,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Skipping attribute %s on %s while scanning for hidden "
+                    "tensors: %s",
+                    attr_name, type(obj).__name__, exc,
+                )
+                continue
+            for path, tensor in nested:
                 results.append((f"{attr_name}_{path}", tensor))
 
     return results
