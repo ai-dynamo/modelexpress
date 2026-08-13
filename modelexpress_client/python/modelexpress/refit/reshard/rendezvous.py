@@ -209,22 +209,48 @@ def build_sources(tensors: list) -> tuple:
 def merge_shard_tables(tables: list) -> list:
     """Merge per-rank ``list[PublishedTensor]`` into one, concatenating shards
     for the same source across ranks (reshard fans in cross-rank). full_shape /
-    dtype / elsize must agree across ranks for a given tensor name."""
+    dtype / elsize must agree across ranks for a given tensor name.
+
+    Replica publishers advertise the same geometric shard through DP/EDP
+    replication, so exactly one representative is retained per exact
+    offset/shape. Retaining all of them is what the merge used to do, and it
+    costs a read per replica: a replicated tensor under DP8 was pulled eight
+    times into the same destination bytes, and each extra owner added a P2P
+    handshake. It also defeats the full-pull optimization, whose dim-0
+    partitioner fails closed on overlapping shards and falls back to the exact
+    plan that carries the duplicates.
+
+    Selecting among candidates assumes they really are replicas. They are
+    byte-identical by construction when they come from DP/EDP replication, but a
+    publisher emitting parallelism-local names makes two *different* tensors
+    collide under one name, and then retaining the first installs bytes that
+    belong to the other. Publishers must therefore use globally unique names for
+    parallelism-local tensors.
+    """
     merged: dict = {}
+    # name -> geometry -> first shard, insertion-ordered so the retained geometry
+    # sequence is deterministic.
+    candidates: dict = {}
     for table in tables:
         for t in table:
             cur = merged.get(t.name)
             if cur is None:
                 merged[t.name] = PublishedTensor(
-                    t.name, t.dtype, t.elsize, t.full_shape, list(t.shards)
+                    t.name, t.dtype, t.elsize, t.full_shape, []
                 )
-                continue
-            if cur.full_shape != t.full_shape or cur.dtype != t.dtype:
+                candidates[t.name] = {}
+            elif cur.full_shape != t.full_shape or cur.dtype != t.dtype:
                 raise ValueError(
                     f"tensor {t.name!r} published with inconsistent shape/dtype across ranks: "
                     f"{cur.full_shape}/{cur.dtype} vs {t.full_shape}/{t.dtype}"
                 )
-            cur.shards.extend(t.shards)
+            per_geometry = candidates[t.name]
+            for shard in t.shards:
+                geometry = (tuple(shard.shard_offset), tuple(shard.shape))
+                per_geometry.setdefault(geometry, shard)
+
+    for name, tensor in merged.items():
+        tensor.shards.extend(candidates[name].values())
     return list(merged.values())
 
 
