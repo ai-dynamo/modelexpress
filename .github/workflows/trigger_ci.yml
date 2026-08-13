@@ -19,15 +19,38 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  trigger:
-    # Fork PRs do not receive repository secrets, so the GitLab mirror workflow
-    # would fail with empty TOKEN/MIRROR_URL/PIPELINE_* values.
+  mirror_repo:
+    name: Mirror Repository to GitLab
+    # Fork PRs do not receive repository secrets, so the mirror/trigger jobs
+    # would fail with empty PROJECT_ACCESS_TOKEN/MIRROR_URL/PIPELINE_* values.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    uses: ai-dynamo/.github/.github/workflows/mirror_and_trigger_ci.yml@main
-    with:
-      ref: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
-    secrets:
-      TOKEN: ${{ secrets.TOKEN }}
-      MIRROR_URL: ${{ secrets.MIRROR_URL }}
-      PIPELINE_TOKEN: ${{ secrets.PIPELINE_TOKEN }}
-      PIPELINE_URL: ${{ secrets.PIPELINE_URL }}
+    environment: GITLAB
+    runs-on: gitlab
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Sync Mirror Repository
+        env:
+          PROJECT_ACCESS_TOKEN: ${{ secrets.PROJECT_ACCESS_TOKEN }}
+          MIRROR_URL: ${{ secrets.MIRROR_URL }}
+        run: ./.github/workflows/mirror_repo.sh "$PROJECT_ACCESS_TOKEN" "$MIRROR_URL"
+
+  trigger_ci:
+    name: Trigger CI Pipeline
+    needs: mirror_repo
+    environment: GITLAB
+    runs-on: gitlab
+    steps:
+      - name: Trigger GitLab pipeline
+        env:
+          REF: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
+          PIPELINE_TOKEN: ${{ secrets.PIPELINE_TOKEN }}
+          PIPELINE_URL: ${{ secrets.PIPELINE_URL }}
+        run: |
+          echo "Triggering GitLab pipeline for ref: $REF"
+
+          curl --fail-with-body \
+            --request POST \
+            --form token="$PIPELINE_TOKEN" \
+            --form ref="$REF" \
+            "$PIPELINE_URL"
