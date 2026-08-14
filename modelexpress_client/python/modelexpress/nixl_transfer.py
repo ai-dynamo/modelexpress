@@ -403,12 +403,19 @@ class NixlTransferManager:
         consumes a dmabuf via `ibv_reg_dmabuf_mr` and produces ONE
         lkey/rkey covering all live tensors.
 
-        Empirically validated on Blackwell + ConnectX over InfiniBand
-        against a CUDA VMM range with multiple cuMemCreate handles and
-        mid-range holes (chunks unmapped + released after the export):
-        registration succeeds, the dmabuf attach pins the currently-
-        mapped physical pages, and the HCA translation table survives
-        subsequent CUDA-side unmaps.
+        The multi-handle case is validated on the dmabuf/IB path only.
+        On Blackwell + ConnectX over InfiniBand, against a CUDA VMM range
+        with multiple cuMemCreate handles and mid-range holes (chunks
+        unmapped + released after the export): registration succeeds, the
+        dmabuf attach pins the currently-mapped physical pages, and the
+        HCA translation table survives subsequent CUDA-side unmaps.
+
+        It does NOT hold on UCX cuda_ipc, where a fabric handle names one
+        cuMemCreate allocation and a single MR would publish an rkey
+        covering only the first chunk. That is why this method falls back
+        to per-tensor registration when the arena spans several
+        allocations, unless MX_ARENA_SINGLE_MR overrides it. Upstream fix:
+        openucx/ucx#11283.
 
         Per-tensor descriptors are still built (tensor name -> addr,
         size, dtype) because the receiver matches by name and computes

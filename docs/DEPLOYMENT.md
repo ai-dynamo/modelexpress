@@ -582,7 +582,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_POOL_REG` | `0` | Allocation-level NIXL registration via `cuMemGetAddressRange`. Registers each unique cudaMalloc block instead of each tensor, typically 80-99% fewer registrations, without changing transfer semantics. `MX_VMM_ARENA=1` uses direct arena registration and does not require pool-reg. |
 | `MX_VMM_ARENA` | `0` | Route weight allocations into a CUDA VMM arena via PyTorch's `CUDAPluggableAllocator`, then register the used arena range as one NIXL MR with dmabuf at end-of-load. Reserves 16.0 TiB of VA by default, with no physical commit until allocations are mapped. Requires the `modelexpress.vmm._alloc_ext` C extension to have built at install time; if it did not, this flag is a no-op with a warning and the loader falls back to the pool-reg path. See [VMM Arena](#vmm-arena-single-mr-registration). |
 | `MX_ARENA_SINGLE_MR` | `0` | Keep single-MR arena registration even when the arena spans several `cuMemCreate` handles. Only safe on transports that can register across handles (dmabuf/IB); cuda_ipc cannot, so the default falls back to per-tensor registration. See [VMM Arena](#vmm-arena-single-mr-registration). |
-| `UCX_CUDA_COPY_REG_WHOLE_ALLOC` | (UCX default) | Set to `off` with `MX_VMM_ARENA=1` until the upstream UCX `cuda_copy_md` length-truncation fix ships. |
+| `UCX_CUDA_COPY_REG_WHOLE_ALLOC` | (UCX default) | Set to `off` with `MX_VMM_ARENA=1` on any UCX predating the `cuda_copy_md` length-truncation fix (openucx/ucx#11461). Scoped to the `cuda_copy` transport; it does not affect `cuda_ipc`. |
 | `MX_NIXL_BACKEND` | `UCX` | NIXL backend for GPU-to-GPU RDMA. `UCX` (default) for InfiniBand / RoCE. `LIBFABRIC` for AWS EFA — see [NIXL Backend Selection](#nixl-backend-selection). |
 | `MX_RDMA_NIC_PIN` | (unset) | Per-rank IB NIC pinning. `auto` runs a topology probe; comma-separated NIC list is an explicit override. Workaround for openucx/ucx#11259. |
 | `MX_RDMA_NIC_PIN_MIN_RATE_GBPS` | (auto, max-rate filter) | Override the auto-detect rate filter with an explicit lower bound (Gb/s). |
@@ -680,12 +680,16 @@ arena registration bypasses the pool-reg path and calls `register_arena`
 directly. The arena produces one MR for the used range regardless of the
 pool-reg setting.
 
-Set `UCX_CUDA_COPY_REG_WHOLE_ALLOC=off` until the upstream UCX
-`cuda_copy_md` length-truncation fix ships. Without it, UCX can truncate
-a multi-handle VMM registration to the first physical handle, and RDMA
-operations that cross into later handles fail. See the reproducer and
-fix notes in this gist:
+Set `UCX_CUDA_COPY_REG_WHOLE_ALLOC=off` on any UCX predating the
+`cuda_copy_md` length-truncation fix (openucx/ucx#11461). Without it, UCX
+can truncate a multi-handle VMM registration to the first physical
+handle, and RDMA operations that cross into later handles fail. See the
+reproducer and fix notes in this gist:
 <https://gist.github.com/nicolasnoble/e0e57eb5a1b902057ae3d1df59c039cf>.
+
+That knob covers the `cuda_copy` transport only. It has no effect on
+`cuda_ipc`, which has its own multi-handle limitation described in
+[Multi-handle arenas](#multi-handle-arenas) below.
 
 #### Multi-handle arenas
 
