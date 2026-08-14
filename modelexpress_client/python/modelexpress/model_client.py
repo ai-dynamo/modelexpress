@@ -121,10 +121,13 @@ class ModelCacheClient:
     ) -> str | None:
         """Block until the server reports the model as downloaded.
 
-        ``ignore_weights`` asks for a metadata-only download. The server keys
-        its registry entry on the weight mode, so a metadata-only claim cannot
-        satisfy a later full-weight request; the weight phase asks again with
-        weights and gets its own download.
+        ``ignore_weights`` asks for a metadata-only download. Servers that
+        key their registry entries on the weight mode keep that claim separate
+        from a later full-weight request, so the weight phase asks again and
+        gets its own download. Servers older than that key on the model name
+        alone: the metadata-only claim registers the model as complete there,
+        no later weight fetch happens, and the weights become unreachable
+        through the cache -- see the server requirement in DEPLOYMENT.md.
 
         Returns the commit the server resolved the request to, or ``None``
         when it named none. A server that already holds an unpinned model
