@@ -12,6 +12,7 @@ native staging buffers that the Megatron translator consumes.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from numbers import Integral
 from typing import Any
 
 from modelexpress.refit.reshard.slice_plan import _row_major_strides
@@ -31,6 +32,10 @@ ROW_ROLES = frozenset({"row", "expert_row"})
 SUPPORTED_ROLES = COLUMN_ROLES | ROW_ROLES | {REPLICATED}
 
 
+def _is_integral(value: object) -> bool:
+    return isinstance(value, Integral) and not isinstance(value, bool)
+
+
 @dataclass(frozen=True)
 class MegatronTargetSpec:
     """One native Megatron tensor requested by an inference TP rank."""
@@ -47,10 +52,10 @@ class MegatronTargetSpec:
         if self.role not in SUPPORTED_ROLES:
             raise ValueError(f"unsupported Megatron role {self.role!r}")
         if not self.global_shape or any(
-            int(extent) <= 0 for extent in self.global_shape
+            not _is_integral(extent) or extent <= 0 for extent in self.global_shape
         ):
             raise ValueError(
-                f"{self.source_name}: global_shape must contain positive extents"
+                f"{self.source_name}: global_shape must contain positive integer extents"
             )
 
 
@@ -60,6 +65,10 @@ class MegatronTargetLayout:
     tp_rank: int
 
     def __post_init__(self) -> None:
+        if not _is_integral(self.tp_size):
+            raise ValueError("tp_size must be an integer")
+        if not _is_integral(self.tp_rank):
+            raise ValueError("tp_rank must be an integer")
         if self.tp_size < 1:
             raise ValueError("tp_size must be at least 1")
         if not 0 <= self.tp_rank < self.tp_size:

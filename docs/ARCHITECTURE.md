@@ -397,9 +397,10 @@ identity or ordering key.
 `WeightVersionShard` remains the name of the per-worker manifest publication.
 Its identity is `(version_id, worker_id, source_slot_id)`: `source_slot_id`
 identifies the required, version-scoped source contribution it covers, and
-`worker_id` identifies the publishing process. The trainer coordinator chooses
-the opaque slots—for example,
-`publisher:global-rank:12` for a selected Megatron publisher. Multiple
+`worker_id` identifies the publishing process. The trainer engine adapter
+derives the slot from its native topology; the Megatron adapter uses
+`publisher:global-rank:12` for global rank 12. The orchestrator uses the same
+adapter-defined convention when declaring the version's expected slots. Multiple
 publications may advertise the same source slot, including a replacement worker
 or a generator that becomes a peer source. Deployments configured with
 Kubernetes or the test-only memory backend do not expose `RefitService` yet.
