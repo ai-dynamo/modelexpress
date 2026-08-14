@@ -4,6 +4,25 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
+/// Install Ring before constructing clients that use a providerless Rustls transport.
+#[cfg(any(feature = "gcs", feature = "tls-rustls"))]
+pub(crate) fn ensure_crypto_provider() -> Result<()> {
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return Ok(());
+    }
+
+    match rustls::crypto::ring::default_provider().install_default() {
+        Ok(()) => Ok(()),
+        Err(_) if rustls::crypto::CryptoProvider::get_default().is_some() => Ok(()),
+        Err(_) => anyhow::bail!("Failed to install rustls ring CryptoProvider"),
+    }
+}
+
+#[cfg(not(any(feature = "gcs", feature = "tls-rustls")))]
+pub(crate) fn ensure_crypto_provider() -> Result<()> {
+    Ok(())
+}
+
 /// Result of a model download.
 ///
 /// `resolved_revision` is the immutable revision the request resolved to (a commit SHA
@@ -208,10 +227,12 @@ pub mod gcs;
 pub mod huggingface;
 pub(crate) mod lock_file;
 pub mod ngc;
+pub mod s3;
 
 pub use gcs::GcsProvider;
 pub use huggingface::HuggingFaceProvider;
 pub use ngc::NgcProvider;
+pub use s3::S3Provider;
 
 #[cfg(not(feature = "gcs"))]
 pub mod gcs {
