@@ -206,6 +206,21 @@ class TestInstallMetadataSnapshot:
         assert first == second
         assert len(stub.stream_requests) == 1
 
+    def test_metadata_phase_asks_for_a_metadata_only_download(self, tmp_path):
+        """A cold server must not fetch the weights before RdmaStrategy runs.
+
+        The server keys its registry entry on the weight mode, so this claim
+        does not satisfy the weight phase's later full-weight request.
+        """
+        stub = FakeStub(
+            files={"config.json": 2},
+            chunks=[whole_file("config.json", b"{}", is_last_file=True, commit_hash=COMMIT)],
+        )
+        make_client(tmp_path, stub).install_metadata_snapshot(MODEL)
+
+        assert [r.ignore_weights for r in stub.download_requests] == [True]
+        assert [r.ignore_weights for r in stub.list_requests] == [True]
+
     def test_rejects_manifest_without_metadata(self, tmp_path):
         stub = FakeStub(files={"model.safetensors": 7})
         with pytest.raises(ModelCacheError, match="no non-weight files"):
@@ -276,6 +291,18 @@ class TestInstallWeightFiles:
         make_client(tmp_path, stub).install_weight_files(MODEL, snapshot)
 
         assert stub.stream_requests == []
+
+    def test_weight_phase_asks_for_the_weights(self, tmp_path):
+        snapshot = self._snapshot(tmp_path)
+        stub = FakeStub(
+            files={"config.json": 2, "model.safetensors": 7},
+            chunks=[
+                whole_file("model.safetensors", b"weights", is_last_file=True, commit_hash=COMMIT)
+            ],
+        )
+        make_client(tmp_path, stub).install_weight_files(MODEL, snapshot)
+
+        assert [r.ignore_weights for r in stub.download_requests] == [False]
 
     def test_wrong_commit_aborts_before_transferring(self, tmp_path):
         """Reject on the first chunk, not after the whole checkpoint arrives.

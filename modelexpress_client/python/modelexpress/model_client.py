@@ -117,16 +117,19 @@ class ModelCacheClient:
         self,
         model_name: str,
         provider: int = model_pb2.HUGGING_FACE,
+        ignore_weights: bool = False,
     ) -> None:
-        """Block until the server reports the complete model as downloaded.
+        """Block until the server reports the model as downloaded.
 
-        Always requests weights: a metadata-only download would register the
-        model as complete on the server and stop any later weight fetch.
+        ``ignore_weights`` asks for a metadata-only download. The server keys
+        its registry entry on the weight mode, so a metadata-only claim cannot
+        satisfy a later full-weight request; the weight phase asks again with
+        weights and gets its own download.
         """
         request = model_pb2.ModelDownloadRequest(
             model_name=model_name,
             provider=provider,
-            ignore_weights=False,
+            ignore_weights=ignore_weights,
         )
         for update in self.stub.EnsureModelDownloaded(request):
             if update.message:
@@ -150,10 +153,15 @@ class ModelCacheClient:
         self,
         model_name: str,
         provider: int = model_pb2.HUGGING_FACE,
+        ignore_weights: bool = False,
     ) -> dict[str, int]:
         """Return the server's file manifest as {relative_path: size}."""
         response = self.stub.ListModelFiles(
-            model_pb2.ModelFilesRequest(model_name=model_name, provider=provider)
+            model_pb2.ModelFilesRequest(
+                model_name=model_name,
+                provider=provider,
+                ignore_weights=ignore_weights,
+            )
         )
         return _manifest_to_dict(response)
 
@@ -166,11 +174,15 @@ class ModelCacheClient:
     ) -> Path:
         """Install every non-weight file as a resolvable Hugging Face snapshot.
 
-        Returns the snapshot directory. Reuses an existing local snapshot when
-        it already holds the same files.
+        Asks the server for a metadata-only download, so a cold server does
+        not fetch the weights before ``RdmaStrategy`` has had its chance at
+        them. Returns the snapshot directory, reusing an existing local
+        snapshot when it already holds the same files.
         """
-        self.ensure_downloaded(model_name, provider)
-        manifest = self.list_files(model_name, provider)
+        self.ensure_downloaded(model_name, provider, ignore_weights=True)
+        manifest = self.list_files(model_name, provider, ignore_weights=True)
+        # Still split: an older server ignores ignore_weights and answers with
+        # the whole repository.
         metadata_paths, _ = split_by_weight(manifest.keys())
         if not metadata_paths:
             raise ModelCacheError(
