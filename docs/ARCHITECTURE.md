@@ -559,7 +559,7 @@ The `Client` struct in `modelexpress_client/src/lib.rs` wraps gRPC connections:
 | `request_model_with_smart_fallback(name, provider, ...)` | Request via the server, falling back to a direct provider download when the connection cannot be established |
 | `request_model_with_smart_fallback_revision(name, provider, revision, ...)` | Same, with the direct-download fallback honouring the same pinned revision |
 
-The `_revision` variants take an optional branch, tag, or commit SHA and return a `ModelDownloadResult { path, resolved_revision }`. The non-`_revision` methods delegate to them with no revision pinned.
+The `_revision` variants all take an optional branch, tag, or commit SHA, but they do not share a return type. `request_model_revision` and `request_model_with_smart_fallback_revision` return a `ModelDownloadResult { path, resolved_revision }`. `request_model_on_server_revision` only asks the server to fetch the model, so it returns the resolved revision on its own as an `Option<String>`. The non-`_revision` methods delegate to them with no revision pinned and discard the result.
 
 ### Download Strategies
 
