@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for build_source_identity on the vLLM publish path.
+"""Tests for build_source_identity on the vLLM engine path.
 
 The expert-parallel coverage here exists because vLLM's ParallelConfig has no
 expert_parallel_size attribute. Reading one with a getattr default silently
@@ -15,7 +15,7 @@ import pytest
 import torch
 
 from modelexpress import p2p_pb2
-from modelexpress.metadata.publish import (
+from modelexpress.engines.vllm.source_identity import (
     _derive_expert_parallel_size,
     build_source_identity,
 )
