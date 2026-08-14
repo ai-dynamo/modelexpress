@@ -504,10 +504,25 @@ class ModelSnapshotCache:
             return False
         return True
 
-    def resolve_snapshot(self, expected_files: Mapping[str, int]) -> Path | None:
-        """Return the snapshot refs/main points at when it holds every file."""
+    def resolve_snapshot(
+        self,
+        expected_files: Mapping[str, int],
+        expected_commit: str | None,
+    ) -> Path | None:
+        """Return the snapshot refs/main points at when it holds every file.
+
+        ``expected_commit`` is the revision the server reported for this
+        request. Reuse fails closed unless it matches: a file manifest carries
+        only paths and sizes, so a revision that changed neither is
+        indistinguishable from the one already on disk, and reusing it would
+        hand the engine stale files without ever opening a stream to notice.
+        ``None`` means the server named no revision, which is not proof of
+        anything and so never justifies reuse.
+        """
+        if expected_commit is None:
+            return None
         commit_hash = self.read_main_ref()
-        if commit_hash is None:
+        if commit_hash is None or commit_hash != expected_commit:
             return None
         snapshot_path = self.snapshot_path(commit_hash)
         if self.has_files(snapshot_path, expected_files):

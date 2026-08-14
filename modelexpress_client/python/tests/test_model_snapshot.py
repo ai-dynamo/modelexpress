@@ -227,20 +227,34 @@ class TestPublish:
 class TestResolveSnapshot:
     def test_returns_snapshot_when_files_present(self, cache):
         snapshot = _write(cache, {"config.json": b"{}"})
-        assert cache.resolve_snapshot({"config.json": 2}) == snapshot
+        assert cache.resolve_snapshot({"config.json": 2}, COMMIT) == snapshot
 
     def test_none_when_file_missing(self, cache):
         _write(cache, {"config.json": b"{}"})
-        assert cache.resolve_snapshot({"config.json": 2, "tokenizer.json": 5}) is None
+        assert cache.resolve_snapshot({"config.json": 2, "tokenizer.json": 5}, COMMIT) is None
 
     def test_none_when_size_differs(self, cache):
         _write(cache, {"config.json": b"{}"})
-        assert cache.resolve_snapshot({"config.json": 99}) is None
+        assert cache.resolve_snapshot({"config.json": 99}, COMMIT) is None
 
     def test_none_without_ref(self, cache):
         _write(cache, {"config.json": b"{}"})
         (cache.repo_root / "refs" / MAIN_REF).unlink()
-        assert cache.resolve_snapshot({"config.json": 2}) is None
+        assert cache.resolve_snapshot({"config.json": 2}, COMMIT) is None
+
+    def test_none_when_server_named_no_revision(self, cache):
+        """No reported revision is not proof the local snapshot is current."""
+        _write(cache, {"config.json": b"{}"})
+        assert cache.resolve_snapshot({"config.json": 2}, None) is None
+
+    def test_none_when_revision_differs(self, cache):
+        """The case a manifest cannot catch: same names and sizes, new commit.
+
+        This is what makes size-only reuse unsafe. Without the commit check
+        the stale snapshot is returned and no stream ever opens to notice.
+        """
+        _write(cache, {"config.json": b"{}"})
+        assert cache.resolve_snapshot({"config.json": 2}, OTHER_COMMIT) is None
 
 
 class TestPatch:

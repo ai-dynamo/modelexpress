@@ -118,13 +118,19 @@ class ModelCacheClient:
         model_name: str,
         provider: int = model_pb2.HUGGING_FACE,
         ignore_weights: bool = False,
-    ) -> None:
+    ) -> str | None:
         """Block until the server reports the model as downloaded.
 
         ``ignore_weights`` asks for a metadata-only download. The server keys
         its registry entry on the weight mode, so a metadata-only claim cannot
         satisfy a later full-weight request; the weight phase asks again with
         weights and gets its own download.
+
+        Returns the commit the server resolved the request to, or ``None``
+        when it named none. A server that already holds an unpinned model
+        answers without naming a revision, so ``None`` is ordinary and means
+        only that the caller learned nothing -- not that the local cache is
+        current.
         """
         request = model_pb2.ModelDownloadRequest(
             model_name=model_name,
@@ -135,7 +141,7 @@ class ModelCacheClient:
             if update.message:
                 logger.info("Model %s: %s", model_name, update.message)
             if update.status == model_pb2.DOWNLOADED:
-                return
+                return _reported_revision(model_name, update)
             if update.status == model_pb2.ERROR:
                 raise ModelCacheError(
                     f"ModelExpress failed to download {model_name}: "
@@ -154,15 +160,22 @@ class ModelCacheClient:
         model_name: str,
         provider: int = model_pb2.HUGGING_FACE,
         ignore_weights: bool = False,
+        revision: str | None = None,
     ) -> dict[str, int]:
-        """Return the server's file manifest as {relative_path: size}."""
-        response = self.stub.ListModelFiles(
-            model_pb2.ModelFilesRequest(
-                model_name=model_name,
-                provider=provider,
-                ignore_weights=ignore_weights,
-            )
+        """Return the server's file manifest as {relative_path: size}.
+
+        ``revision`` pins the manifest to one snapshot, so a server whose
+        default revision moves between this call and the stream cannot answer
+        the two from different commits.
+        """
+        request = model_pb2.ModelFilesRequest(
+            model_name=model_name,
+            provider=provider,
+            ignore_weights=ignore_weights,
         )
+        if revision is not None:
+            request.revision = revision
+        response = self.stub.ListModelFiles(request)
         return _manifest_to_dict(response)
 
     # -- Installation ---------------------------------------------------------
@@ -177,10 +190,13 @@ class ModelCacheClient:
         Asks the server for a metadata-only download, so a cold server does
         not fetch the weights before ``RdmaStrategy`` has had its chance at
         them. Returns the snapshot directory, reusing an existing local
-        snapshot when it already holds the same files.
+        snapshot only when the server named the revision it is holding and
+        that revision is the one already on disk.
         """
-        self.ensure_downloaded(model_name, provider, ignore_weights=True)
-        manifest = self.list_files(model_name, provider, ignore_weights=True)
+        revision = self.ensure_downloaded(model_name, provider, ignore_weights=True)
+        manifest = self.list_files(
+            model_name, provider, ignore_weights=True, revision=revision
+        )
         # Still split: an older server ignores ignore_weights and answers with
         # the whole repository.
         metadata_paths, _ = split_by_weight(manifest.keys())
@@ -192,7 +208,7 @@ class ModelCacheClient:
 
         cache = ModelSnapshotCache(model_name, self.cache_directory)
         with cache.lock():
-            existing = cache.resolve_snapshot(expected)
+            existing = cache.resolve_snapshot(expected, revision)
             if existing is not None:
                 logger.info("Reusing local snapshot for %s at %s", model_name, existing)
                 return existing
@@ -200,7 +216,13 @@ class ModelCacheClient:
             staging = cache.staging()
             try:
                 commit_hash = self._stream_into(
-                    model_name, provider, metadata_paths, expected, staging
+                    model_name,
+                    provider,
+                    metadata_paths,
+                    expected,
+                    staging,
+                    expected_commit=revision,
+                    revision=revision,
                 )
                 snapshot_path = staging.publish(commit_hash, expected)
             except BaseException:
@@ -228,8 +250,13 @@ class ModelCacheClient:
         revisions by directory name, so mixing commits would hand it weights
         from one revision under the name of another.
         """
-        self.ensure_downloaded(model_name, provider)
-        manifest = self.list_files(model_name, provider)
+        revision = self.ensure_downloaded(model_name, provider)
+        if revision is not None and revision != snapshot_path.name:
+            raise ModelCacheError(
+                f"Server resolved {model_name} to commit {revision} but the local "
+                f"snapshot is {snapshot_path.name}; refusing to mix revisions"
+            )
+        manifest = self.list_files(model_name, provider, revision=revision)
         _, weight_paths = split_by_weight(manifest.keys())
         if not weight_paths:
             raise ModelCacheError(
@@ -252,6 +279,7 @@ class ModelCacheClient:
                     expected,
                     patch,
                     expected_commit=snapshot_path.name,
+                    revision=revision,
                 )
                 patch.commit()
             except BaseException:
@@ -277,6 +305,7 @@ class ModelCacheClient:
         expected: Mapping[str, int],
         sink: SnapshotSink,
         expected_commit: str | None = None,
+        revision: str | None = None,
     ) -> str:
         """Stream ``paths`` into ``sink``, validating the protocol as it goes.
 
@@ -284,7 +313,8 @@ class ModelCacheClient:
         ``expected_commit`` is given, the stream is rejected on the very first
         chunk if the commit differs -- the alternative is transferring the
         whole model before noticing, which for a sharded checkpoint means tens
-        of gigabytes thrown away.
+        of gigabytes thrown away. ``revision`` pins the server to one snapshot
+        so the manifest and the stream cannot come from different commits.
         """
         request = model_pb2.ModelFilesRequest(
             model_name=model_name,
@@ -292,6 +322,8 @@ class ModelCacheClient:
             chunk_size=self.chunk_size,
             file_selector=model_pb2.ModelFileSelector(paths=list(paths)),
         )
+        if revision is not None:
+            request.revision = revision
 
         commit_hash: str | None = None
         received: dict[str, int] = {}
@@ -397,6 +429,28 @@ def _manifest_to_dict(manifest: model_pb2.ModelFileList) -> dict[str, int]:
             f"manifest advertises {manifest.total_size} bytes"
         )
     return files
+
+
+def _reported_revision(model_name: str, update: model_pb2.ModelStatusUpdate) -> str | None:
+    """Return the commit an update names, or None when it names none.
+
+    An unusable value degrades to None rather than raising. This runs on the
+    engine's startup path, and the only thing the value buys is the reuse
+    shortcut: dropping it costs one metadata stream, while raising would cost
+    the worker its start. Nothing downstream trusts it unchecked either --
+    the stream reports the commit again and validates it there.
+    """
+    if not update.HasField("resolved_revision"):
+        return None
+    try:
+        return safe_commit_hash(update.resolved_revision)
+    except ModelSnapshotError:
+        logger.warning(
+            "ModelExpress reported an unusable revision %r for %s; ignoring it",
+            update.resolved_revision,
+            model_name,
+        )
+        return None
 
 
 def _require_commit_hash(commit_hash: str) -> str:

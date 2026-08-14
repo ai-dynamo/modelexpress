@@ -186,13 +186,13 @@ def configured_chunk_size() -> int | None:
 def _warn_on_revision_mismatch(repo_id: str, revision: str | None, snapshot_path: Path) -> None:
     """Warn when the server's snapshot is not the revision the engine asked for.
 
-    ``ModelDownloadRequest`` and ``ModelFilesRequest`` both carry an optional
-    ``revision``, but this client leaves it unset, so every request is
-    unpinned and the server answers with the default revision it resolves. A
-    mismatch is not silently unsafe -- Hugging Face addresses pinned revisions
-    by directory name, so the engine simply will not see this snapshot -- but
-    the failure that follows is unhelpful unless the real reason is logged
-    here.
+    The client pins its own follow-up calls to the revision the server
+    reported, but it never asks for a particular one, so the engine's choice
+    does not reach the server and the answer is whatever the default revision
+    resolves to. A mismatch is not silently unsafe -- Hugging Face addresses
+    pinned revisions by directory name, so the engine simply will not see this
+    snapshot -- but the failure that follows is unhelpful unless the real
+    reason is logged here.
     """
     if not revision or revision == "main":
         return

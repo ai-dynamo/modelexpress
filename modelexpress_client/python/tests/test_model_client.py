@@ -49,10 +49,11 @@ def whole_file(relative_path, data, *, is_last_file=False, commit_hash=None):
 class FakeStub:
     """Records requests and replays canned ModelService responses."""
 
-    def __init__(self, *, files=None, chunks=None, updates=None):
+    def __init__(self, *, files=None, chunks=None, updates=None, resolved_revision=None):
         self.files = files or {}
         self.chunks = chunks or []
         self.updates = updates
+        self.resolved_revision = resolved_revision
         self.stream_requests = []
         self.list_requests = []
         self.download_requests = []
@@ -61,11 +62,14 @@ class FakeStub:
         self.download_requests.append(request)
         updates = self.updates
         if updates is None:
-            updates = [
-                model_pb2.ModelStatusUpdate(
-                    model_name=request.model_name, status=model_pb2.DOWNLOADED
-                )
-            ]
+            update = model_pb2.ModelStatusUpdate(
+                model_name=request.model_name, status=model_pb2.DOWNLOADED
+            )
+            # A server that already holds an unpinned model names no revision,
+            # so leaving this unset is the ordinary warm-cache answer.
+            if self.resolved_revision is not None:
+                update.resolved_revision = self.resolved_revision
+            updates = [update]
         return iter(updates)
 
     def ListModelFiles(self, request):
@@ -116,6 +120,22 @@ class TestEnsureDownloaded:
         make_client(tmp_path, stub).ensure_downloaded(MODEL)
 
         assert stub.download_requests[0].ignore_weights is False
+
+    def test_reports_the_resolved_revision(self, tmp_path):
+        stub = FakeStub(resolved_revision=COMMIT)
+        assert make_client(tmp_path, stub).ensure_downloaded(MODEL) == COMMIT
+
+    def test_none_when_the_server_names_no_revision(self, tmp_path):
+        stub = FakeStub()
+        assert make_client(tmp_path, stub).ensure_downloaded(MODEL) is None
+
+    def test_unusable_revision_degrades_to_none(self, tmp_path):
+        """A bad value costs the reuse shortcut, not the worker's start."""
+        update = model_pb2.ModelStatusUpdate(model_name=MODEL, status=model_pb2.DOWNLOADED)
+        update.resolved_revision = "../escape"
+        stub = FakeStub(updates=[update])
+
+        assert make_client(tmp_path, stub).ensure_downloaded(MODEL) is None
 
     def test_raises_on_error_status(self, tmp_path):
         stub = FakeStub(
@@ -194,7 +214,21 @@ class TestInstallMetadataSnapshot:
         cache = ModelSnapshotCache(MODEL, tmp_path)
         assert cache.read_main_ref() == COMMIT
 
-    def test_reuses_existing_snapshot(self, tmp_path):
+    def test_reuses_existing_snapshot_when_the_revision_matches(self, tmp_path):
+        stub = FakeStub(
+            files={"config.json": 2},
+            chunks=[whole_file("config.json", b"{}", is_last_file=True, commit_hash=COMMIT)],
+            resolved_revision=COMMIT,
+        )
+        client = make_client(tmp_path, stub)
+        first = client.install_metadata_snapshot(MODEL)
+        second = client.install_metadata_snapshot(MODEL)
+
+        assert first == second
+        assert len(stub.stream_requests) == 1
+
+    def test_restreams_when_the_server_names_no_revision(self, tmp_path):
+        """Reuse fails closed: a server that names no revision proves nothing."""
         stub = FakeStub(
             files={"config.json": 2},
             chunks=[whole_file("config.json", b"{}", is_last_file=True, commit_hash=COMMIT)],
@@ -204,7 +238,41 @@ class TestInstallMetadataSnapshot:
         second = client.install_metadata_snapshot(MODEL)
 
         assert first == second
-        assert len(stub.stream_requests) == 1
+        assert len(stub.stream_requests) == 2
+
+    def test_does_not_reuse_a_stale_snapshot_behind_an_advanced_main(self, tmp_path):
+        """Same file names and sizes, new commit -- the manifest cannot tell.
+
+        The server's default revision moves while the local snapshot keeps a
+        matching manifest. Reuse must not hand the engine the old files.
+        """
+        stub = FakeStub(
+            files={"config.json": 2},
+            chunks=[whole_file("config.json", b"{}", is_last_file=True, commit_hash=COMMIT)],
+            resolved_revision=COMMIT,
+        )
+        client = make_client(tmp_path, stub)
+        first = client.install_metadata_snapshot(MODEL)
+
+        moved = "d" * 40
+        stub.resolved_revision = moved
+        stub.chunks = [whole_file("config.json", b"{}", is_last_file=True, commit_hash=moved)]
+        second = client.install_metadata_snapshot(MODEL)
+
+        assert first != second
+        assert second.name == moved
+        assert len(stub.stream_requests) == 2
+
+    def test_pins_the_manifest_and_stream_to_the_reported_revision(self, tmp_path):
+        stub = FakeStub(
+            files={"config.json": 2},
+            chunks=[whole_file("config.json", b"{}", is_last_file=True, commit_hash=COMMIT)],
+            resolved_revision=COMMIT,
+        )
+        make_client(tmp_path, stub).install_metadata_snapshot(MODEL)
+
+        assert stub.list_requests[0].revision == COMMIT
+        assert stub.stream_requests[0].revision == COMMIT
 
     def test_metadata_phase_asks_for_a_metadata_only_download(self, tmp_path):
         """A cold server must not fetch the weights before RdmaStrategy runs.
@@ -291,6 +359,23 @@ class TestInstallWeightFiles:
         make_client(tmp_path, stub).install_weight_files(MODEL, snapshot)
 
         assert stub.stream_requests == []
+
+    def test_rejects_an_advanced_revision_before_the_present_weights_shortcut(self, tmp_path):
+        """The mirror of the metadata reuse hole, on the weight path.
+
+        ``has_files`` compares names and sizes only, so weights left by an
+        earlier revision satisfy it. Without the revision check the call
+        returns happily and the engine loads the older checkpoint.
+        """
+        snapshot = self._snapshot(tmp_path)
+        (snapshot / "model.safetensors").write_bytes(b"weights")
+        stub = FakeStub(
+            files={"config.json": 2, "model.safetensors": 7},
+            resolved_revision="d" * 40,
+        )
+
+        with pytest.raises(ModelCacheError, match="refusing to mix revisions"):
+            make_client(tmp_path, stub).install_weight_files(MODEL, snapshot)
 
     def test_weight_phase_asks_for_the_weights(self, tmp_path):
         snapshot = self._snapshot(tmp_path)
