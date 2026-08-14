@@ -4,7 +4,7 @@
 use crate::{
     cache::{ModelInfo, ProviderCache},
     models::ModelProvider,
-    providers::ModelProviderTrait,
+    providers::{ModelProviderTrait, ensure_crypto_provider},
 };
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -128,6 +128,7 @@ impl S3Provider {
     }
 
     fn build_store(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
+        ensure_crypto_provider()?;
         Ok(Arc::new(Self::build_store_builder(bucket).build()?))
     }
 
@@ -399,12 +400,9 @@ mod tests {
         assert_eq!(model.to_string(), "s3://bucket/org/model/rev");
     }
 
-    #[cfg(not(target_os = "macos"))]
     #[test]
     fn test_s3_builder_supports_default_credential_chain() {
-        S3Provider::build_store_builder("bucket")
-            .build()
-            .expect("Expected S3 builder without static credentials");
+        S3Provider::build_store("bucket").expect("Expected S3 store without static credentials");
     }
 
     #[test]

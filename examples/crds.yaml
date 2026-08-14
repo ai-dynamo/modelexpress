@@ -217,6 +217,7 @@ spec:
                   enum:
                     - HuggingFace
                     - Ngc
+                    - Gcs
             status:
               type: object
               properties:
@@ -230,9 +231,11 @@ spec:
                     - Error
                 createdAt:
                   type: string
+                  format: date-time
                   description: RFC3339 timestamp of first write
                 lastUsedAt:
                   type: string
+                  format: date-time
                   description: RFC3339 timestamp of most recent status write or touch
                 message:
                   type: string

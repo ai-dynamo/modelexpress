@@ -4,6 +4,25 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
+/// Install Ring before constructing clients that use a providerless Rustls transport.
+#[cfg(any(feature = "gcs", feature = "tls-rustls"))]
+pub(crate) fn ensure_crypto_provider() -> Result<()> {
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return Ok(());
+    }
+
+    match rustls::crypto::ring::default_provider().install_default() {
+        Ok(()) => Ok(()),
+        Err(_) if rustls::crypto::CryptoProvider::get_default().is_some() => Ok(()),
+        Err(_) => anyhow::bail!("Failed to install rustls ring CryptoProvider"),
+    }
+}
+
+#[cfg(not(any(feature = "gcs", feature = "tls-rustls")))]
+pub(crate) fn ensure_crypto_provider() -> Result<()> {
+    Ok(())
+}
+
 /// Result of a model download.
 ///
 /// `resolved_revision` is the immutable revision the request resolved to (a commit SHA
@@ -203,6 +222,7 @@ pub fn is_weight_file(filename: &str) -> bool {
         || filename.ends_with(".gas")
 }
 
+#[cfg(feature = "gcs")]
 pub mod gcs;
 pub mod huggingface;
 pub(crate) mod lock_file;
@@ -213,6 +233,70 @@ pub use gcs::GcsProvider;
 pub use huggingface::HuggingFaceProvider;
 pub use ngc::NgcProvider;
 pub use s3::S3Provider;
+
+#[cfg(not(feature = "gcs"))]
+pub mod gcs {
+    //! Stub provider compiled when the `gcs` feature is off. `ModelProvider::Gcs`
+    //! is part of the gRPC/serde contract, so the variant always exists and these
+    //! types must too; without the feature every GCS operation just reports that
+    //! it's disabled. No path/cache logic lives here, that belongs to the real
+    //! `gcs.rs` module behind the feature.
+    use super::ModelProviderTrait;
+    use crate::cache::{ModelInfo, ProviderCache};
+    use anyhow::Result;
+    use std::path::{Path, PathBuf};
+
+    const FEATURE_DISABLED: &str = "GCS support is disabled; rebuild with the `gcs` feature";
+
+    pub struct GcsProvider;
+
+    pub struct GcsProviderCache;
+
+    #[async_trait::async_trait]
+    impl ModelProviderTrait for GcsProvider {
+        async fn download_model(
+            &self,
+            _model_name: &str,
+            _cache_dir: Option<PathBuf>,
+            _ignore_weights: bool,
+        ) -> Result<PathBuf> {
+            anyhow::bail!(FEATURE_DISABLED)
+        }
+
+        async fn delete_model(&self, _model_name: &str, _cache_dir: PathBuf) -> Result<()> {
+            anyhow::bail!(FEATURE_DISABLED)
+        }
+
+        async fn get_model_path(&self, _model_name: &str, _cache_dir: PathBuf) -> Result<PathBuf> {
+            anyhow::bail!(FEATURE_DISABLED)
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "GCS"
+        }
+    }
+
+    impl ProviderCache for GcsProviderCache {
+        fn clear_model(&self, _cache_root: &Path, _model_name: &str) -> Result<()> {
+            anyhow::bail!(FEATURE_DISABLED)
+        }
+
+        fn resolve_model_path(
+            &self,
+            _cache_root: &Path,
+            _model_name: &str,
+            _revision: Option<&str>,
+        ) -> Result<PathBuf> {
+            anyhow::bail!(FEATURE_DISABLED)
+        }
+
+        // Returns empty so listing every provider's cache stays infallible in a
+        // build without GCS; there are no GCS models to report.
+        fn list_models(&self, _cache_root: &Path) -> Result<Vec<ModelInfo>> {
+            Ok(Vec::new())
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -283,6 +367,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "gcs")]
     #[test]
     fn test_canonical_model_name_gcs_trims_trailing_slash() {
         let provider = GcsProvider;
@@ -293,5 +378,25 @@ mod tests {
                 .is_ok_and(|model_name| model_name == "gs://test-bucket/org/model/rev-1"),
             "Expected canonical model name, got {canonical:?}"
         );
+    }
+
+    #[cfg(feature = "gcs")]
+    #[test]
+    fn test_gcs_rejects_path_traversal_segments() {
+        let provider = GcsProvider;
+        let escapes = [
+            "gs://bucket/org/../../../etc/passwd",
+            "gs://bucket/org/./model",
+            "gs://bucket/org//model",
+            r"gs://bucket/org\..\etc\passwd",
+            "gs://bucket/C:/windows/system32",
+        ];
+        for model_name in escapes {
+            let result = provider.canonical_model_name(model_name);
+            assert!(
+                result.is_err(),
+                "Expected '{model_name}' to be rejected, got {result:?}"
+            );
+        }
     }
 }

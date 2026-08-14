@@ -306,7 +306,7 @@ docker run -p 8001:8001 model-express
 
 ### Docker Compose
 
-Single-service setup for local development:
+Local development setup. Brings up the server plus a Redis metadata backend:
 
 ```bash
 docker compose -f docker/docker-compose.yml up --build
@@ -572,7 +572,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 |----------|---------|-------------|
 | `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""`/`server`/`redis`/`kubernetes` (central server) or `k8s-service` (decentralized via K8s Service routing). |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Client's gRPC server address (recommended; ignored when client uses `k8s-service` backend) |
-| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated, pending removal in a future release. Still read by all client paths and takes precedence when both are set; keep setting it during the transition. |
+| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
 | `MX_DISABLE_PATCHES` | `0` | Emergency escape hatch that skips all runtime compatibility patches. Set to `1`, `true`, `yes`, or `on` if a patch is incompatible with the installed engine. |
 | `MX_P2P_SOURCE_SELECTOR` | `random` | P2P source-ordering policy for the RDMA load path. `random` (behavior-preserving default; local-RNG shuffle) or `rendezvous_hash` (stateless deterministic spreading via HRW hashing; stable across restarts and minimally disrupted by source-set changes). Unknown values log a warning and fall back to `random`. Ordering only — the `MAX_SOURCE_RETRIES=3` retry budget is unchanged. |
 | `MX_METRICS_ENABLED` | `0` | Opt-in Prometheus metrics collector for the client. `1` enables the collectors (requires the `metrics` extra, `prometheus-client`). The P2P source-selection group (`mx_p2p_*`) ships today; the collector is generic so other client metrics can be added later. Off by default; selection signals are always emitted as structured logs regardless. |
@@ -780,6 +780,41 @@ but do not authenticate the publishing replica or attest the artifact. Enable
 artifact transfer only within a trusted deployment, and network-isolate the MX
 server and worker gRPC endpoints from untrusted clients. ModelExpress does not
 currently sign cache artifacts.
+
+### Server-Backed Model Cache (No Shared Storage)
+
+For workers that cannot reach the Hugging Face Hub themselves, ModelExpress Server can act as the only route to the model. The worker asks the server for repository files; the server downloads the model once on a cold miss and serves every later worker from its own cache.
+
+Weights and everything else are fetched at different times. Config, tokenizer, and index files arrive before the engine starts, because the engine resolves the model path (and fails offline) long before any weight loader runs. Weights stay behind the strategy chain, so a live P2P source is still the first choice and the server is only asked after `RdmaStrategy` finds nothing. Fetching metadata early does not weaken P2P-first — no weight moves on that path.
+
+Enable it on the worker:
+
+```yaml
+MODEL_EXPRESS_URL: http://<model-express-service>:8001
+MODEL_EXPRESS_NO_SHARED_STORAGE: "1"
+MODEL_EXPRESS_CACHE_DIRECTORY: /home/dynamo/.cache/huggingface/hub
+HF_HUB_CACHE: /home/dynamo/.cache/huggingface/hub
+HF_HUB_OFFLINE: "1"
+```
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MODEL_EXPRESS_NO_SHARED_STORAGE` | `0` | Fetch repository files from ModelExpress Server. When unset, nothing changes: no extra RPCs and no change to P2P or local loading. |
+| `MODEL_EXPRESS_URL` | unset | ModelExpress Server address. Required together with the switch above; without an address the feature stays off. |
+| `MX_SERVER_ADDRESS` | unset | Alternative spelling of the server address, accepted for parity with the P2P client. Either variable satisfies the requirement. |
+| `MODEL_EXPRESS_CACHE_DIRECTORY` | `HF_HUB_CACHE` | Where the worker installs snapshots. Point it at the same path as `HF_HUB_CACHE` so the engine reads what ModelExpress wrote. |
+| `MODEL_EXPRESS_TRANSFER_CHUNK_SIZE` | `1048576` | gRPC file-stream chunk size in bytes. Values outside 1..`MAX_CHUNK_SIZE` fall back to the default rather than failing startup. |
+
+Requirements and limits:
+
+- ModelExpress Server needs a writable cache directory, egress to Hugging Face, and `HF_TOKEN` for private repositories. The worker needs none of these.
+- The server must be from a release newer than v0.5.0 — the first generation that keys registry entries on the weight mode. The metadata phase claims a metadata-only download; an older server records that claim against the model name alone, which marks the model complete, so the weight phase finds nothing left to fetch and the worker falls through to a native load that an offline pod cannot perform.
+- Mount the cache path as a volume shared by every container that touches it. Without a volume the snapshot lands in the container's writable layer, invisible to other containers and lost on restart.
+- Requesting a pinned revision is not supported yet: the client never sets `revision` on the first call of a phase, so the server picks its default revision. Every call after that is pinned to the revision the server reported — when it named none, later calls stay unpinned and the stream's own commit-hash validation is the guard, which still refuses a mid-stream change. A worker that asked for a specific revision gets the mismatch logged, and weights whose commit differs from the local snapshot directory are refused rather than mixed in.
+- Reusing a local snapshot requires the server to name its revision. A server that already holds an unpinned model answers without naming one, so the worker restreams the metadata rather than assume the copy on disk is current. Metadata is small — well under a second — and the stream carries the commit, which makes restreaming the cheap way to stay correct.
+- On a cold server the metadata phase waits only for the non-weight files. The weights are downloaded later, and only if P2P found no source. The server keys its registry entry on the weight mode, so the metadata-only request does not mark the model complete.
+- The server dedups the upstream download but not the per-worker stream. Concurrent workers on a cold model all wait on one Hugging Face fetch, then each streams its own copy, so N replicas starting together cost N x model size in server egress. Size the server's network accordingly, or stagger large rollouts.
+- An unreachable server costs about 20 seconds per worker before loading falls through to the next strategy. That is the TCP connect timeout; a shorter deadline would abort legitimate cold-cache downloads, which can take minutes.
 
 ### InstantTensor (Fast Local Safetensors)
 

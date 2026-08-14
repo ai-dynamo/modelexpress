@@ -95,6 +95,12 @@ ModelExpress/
 │       │   └── backend/
 │       │       ├── redis.rs            # P2P Redis backend
 │       │       └── kubernetes.rs       # P2P Kubernetes CRD backend
+│       ├── refit.rs                     # Refit module exports
+│       ├── refit/
+│       │   ├── service.rs               # Backend-neutral Refit gRPC service
+│       │   ├── backend.rs               # RefitBackend contract and factory
+│       │   └── backend/
+│       │       └── redis.rs             # Redis backend and atomic Lua scripts
 │       ├── registry/
 │       │   ├── state.rs                # RegistryManager wrapper
 │       │   ├── backend.rs              # RegistryBackend trait + ModelRecord
@@ -153,6 +159,7 @@ ModelExpress/
 │       │   ├── context.py              # LoadContext and LoadResult
 │       │   ├── base.py                 # LoadStrategy ABC and shared helpers
 │       │   ├── rdma_strategy.py        # RdmaStrategy (P2P GPU transfer via NIXL)
+│       │   ├── server_cache_strategy.py # ServerCacheStrategy (weights from MX Server)
 │       │   ├── instant_tensor_strategy.py # InstantTensorStrategy (fast local safetensors)
 │       │   ├── model_streamer_strategy.py # ModelStreamerStrategy (S3/GCS/Azure/local)
 │       │   ├── gds_strategy.py         # GdsStrategy (GPUDirect Storage)
@@ -294,7 +301,7 @@ All cargo dependencies are declared in the root `Cargo.toml`. Sub-crates use wor
 
 ## gRPC Services
 
-Four proto files define four services, all compiled via `tonic-build` in `modelexpress_common/build.rs`:
+Six proto files define the server's gRPC services, all compiled via `tonic-build` in `modelexpress_common/build.rs`:
 
 ### health.proto - HealthService
 
@@ -364,6 +371,63 @@ Per-worker gRPC service started when `MX_P2P_METADATA=1`, or unconditionally whe
 
 See [`metadata.md`](metadata.md) for the full metadata architecture including storage schemas and coordination protocol.
 
+### refit.proto - RefitService (Redis only)
+
+`RefitService` is a new RL-specific control plane. It does not reuse or modify the
+legacy `WeightSyncService`. The initial slice stores worker registrations,
+immutable weight versions, and compact physical shard publications in Redis.
+Weight bytes and full tensor manifests remain on trainer or generator workers.
+
+| RPC | Purpose |
+|-----|---------|
+| `RegisterWorker` | Register or refresh one TTL-bound worker process |
+| `CreateWeightVersion` | Idempotently create one immutable `STAGING` version |
+| `GetWeightVersion` | Read the version and its lifecycle state |
+| `DeleteWeightVersion` | Move a `READY` version to `RELEASING`; existing leases remain valid |
+| `CreateWeightVersionShard` | Publish one worker manifest for a required source slot |
+| `ListWeightVersionShards` | List the version's physical source publications |
+| `DeleteWeightVersionShard` | Evict one source shard after release when no lease protects the version |
+| `RegisterVersionLease` | Acquire protection while a version is `READY`, or renew the same owner's existing protection while it is `READY` or `RELEASING` |
+| `DeleteVersionLease` | Release a generator's protection of the version shards |
+
+The final missing source slot atomically changes the version to `READY`.
+`WeightVersion.uid` is MX's opaque identity. `version_number` is the optional
+framework-provided numeric label used for correlation; MX does not use it as an
+identity or ordering key.
+`WeightVersionShard` remains the name of the per-worker manifest publication.
+Its identity is `(version_id, worker_id, source_slot_id)`: `source_slot_id`
+identifies the required, version-scoped source contribution it covers, and
+`worker_id` identifies the publishing process. The trainer coordinator chooses
+the opaque slots—for example,
+`publisher:global-rank:12` for a selected Megatron publisher. Multiple
+publications may advertise the same source slot, including a replacement worker
+or a generator that becomes a peer source. Deployments configured with
+Kubernetes or the test-only memory backend do not expose `RefitService` yet.
+
+`RegisterWorker` is also the heartbeat API. `worker_id` is a fresh process
+incarnation identity, so a restarted worker registers a new ID instead of
+fencing an old registration. The registration expires with its TTL; source
+planning and source discovery will use that liveness when selecting a
+publication.
+
+Cross-key compare-and-set operations live in documented Redis scripts
+under `modelexpress_server/src/refit/backend/redis/scripts/`. Redis executes
+each script atomically. The `refit_service_redis` test drives the public gRPC
+API through two server replicas and covers concurrent version creation,
+concurrent final source-slot publication, idempotent and conflicting replay,
+replacement-source publication, lease-protected release, and safe shard
+eviction. CI runs this test against Redis 7.
+
+A future Kubernetes backend can preserve this gRPC contract, but it cannot
+translate each Redis key into an independent CRD and retain the same atomic
+guarantees. Lease creation and shard deletion race across resources. The
+Kubernetes implementation therefore needs one version-scoped coordination
+object as the serialization boundary, updated with `resourceVersion`
+compare-and-swap; shard and lease objects can remain child records.
+`RefitService` depends on the domain-level `RefitBackend` contract, with Redis
+implemented under `refit/backend/redis.rs`. Kubernetes remains a separate
+end-to-end backend slice implementing the same transaction boundaries.
+
 ## Rust Server
 
 ### Startup Flow
@@ -376,7 +440,7 @@ See [`metadata.md`](metadata.md) for the full metadata architecture including st
 6. Start `CacheEvictionService` background task (reads the same registry)
 7. Connect to the P2P metadata backend (`MX_METADATA_BACKEND`, Redis or Kubernetes CRD)
 8. Start reaper background task for stale source detection and GC
-9. Register 4 gRPC services with tonic (max message size: 100MB)
+9. Register the configured gRPC services with tonic (max message size: 100MB)
 10. Listen on configured address (default `0.0.0.0:8001`)
 11. Graceful shutdown on CTRL+C (signals cache eviction service and reaper)
 
@@ -583,7 +647,10 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `adapter.py` | `EngineAdapter` lifecycle hooks and strategy retry errors |
 | `vllm_loader.py` | Compatibility shim for `modelexpress.engines.vllm.loader` |
 | `metadata/` | Metadata publishing, source identity, heartbeat, worker manifest serving, metadata client selection, and engine-agnostic cache-artifact transfer |
-| `load_strategy/` | Engine-neutral loading strategy chain: `RdmaStrategy`, `InstantTensorStrategy` (fast local safetensors), `ModelStreamerStrategy` (S3/GCS/Azure/local), `GdsStrategy`, `DefaultStrategy` |
+| `load_strategy/` | Engine-neutral loading strategy chain: `RdmaStrategy`, `ServerCacheStrategy` (weights streamed from MX Server), `InstantTensorStrategy` (fast local safetensors), `ModelStreamerStrategy` (S3/GCS/Azure/local), `GdsStrategy`, `DefaultStrategy` |
+| `model_client.py` | `ModelCacheClient` - `ModelService` RPCs plus stream validation for server-cached models |
+| `model_snapshot.py` | Hugging Face cache layout: path validation, atomic snapshot publication, `refs/main` |
+| `model_prefetch.py` | Pre-engine metadata prefetch and repo-id resolution for server-backed loading |
 | `engines/vllm/` | `VllmAdapter` and `MxModelLoader` map strategy hooks to vLLM loader APIs; `refit/` contains the vLLM-specific MDL installer and geometry-capture/PWAL receiver |
 | `engines/sglang/` | `SglangAdapter` and `MxModelLoader` - maps strategy hooks to SGLang's `remote_instance` backend |
 | `tensor_utils.py` | Tensor collection, checksums, storage views, `capture_tensor_attrs` |
@@ -711,12 +778,34 @@ Auto-detects the best loading strategy with a prioritized chain. Each strategy i
 | Priority | Strategy | `is_available()` | Behavior |
 |---|---|---|---|
 | p0 | `RdmaStrategy` | NIXL available | `ListSources(READY)`, filter by `worker_rank` and runtime `accelerator`, order the survivors via the configured `SourceSelector` (`MX_P2P_SOURCE_SELECTOR`: `random` default or `rendezvous_hash`), then try candidates (max 3). Filtering before the retry slice prevents incompatible sources from exhausting the retry budget; a post-`GetMetadata` accelerator check remains as defense-in-depth. Before preparing target tensors, P2P sources must serve a manifest for the selected runtime `worker_id`; generation mismatches and transfer failures retry the next candidate, reinitializing the target first when it may have been mutated. |
-| p1 | `InstantTensorStrategy` | `MX_INSTANT_TENSOR` enabled (default) + `instanttensor` installed + CUDA device + adapter implements `build_instanttensor_weight_iter` (and `apply_weight_iter`) | Load the model's own safetensors directly onto CUDA via the `instanttensor` library (distributed loading, pipelined prefetch, direct I/O, GDS when available). Reuses vLLM's built-in `--load-format instanttensor` path, so it needs no `MX_MODEL_URI`; the engine resolves and (if needed) downloads the weight files. Falls through on failure. |
-| p2 | `ModelStreamerStrategy` | `MX_MODEL_URI` set + `runai_model_streamer` installed | Stream safetensors to GPU via CPU staging buffer. `MX_MODEL_URI` accepts remote URIs (`s3://`, `gs://`, `az://`), absolute local paths, or HF model IDs (resolved via `HF_HUB_CACHE`). All storage backends (S3, GCS, Azure) included by default. |
-| p3 | `GdsStrategy` | Active accelerator backend supports GDS and GDS hardware is available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. Reads full checkpoint tensors and slices for TP downstream — see [GDS Reads Full Checkpoint Tensors Under TP](#gds-reads-full-checkpoint-tensors-under-tp). |
-| p4 | `DefaultStrategy` | Engine native fallback loader available | Native loader fallback (for vLLM, `DefaultModelLoader`, CPU-staged, auto-downloads from HF Hub). |
+| p1 | `ServerCacheStrategy` | `MODEL_EXPRESS_NO_SHARED_STORAGE` enabled + server address configured + adapter implements `load_via_native` | Stream the model's weight files from ModelExpress Server into the snapshot the engine already resolved, then hand off to the engine's native loader. The cold-miss path for workers with no route to Hugging Face: the server downloads and caches the model once, and every later worker is served from that cache. Non-weight files arrive earlier, before the engine starts — see [Server-Backed Model Cache](#server-backed-model-cache). Falls through on failure. |
+| p2 | `InstantTensorStrategy` | `MX_INSTANT_TENSOR` enabled (default) + `instanttensor` installed + CUDA device + adapter implements `build_instanttensor_weight_iter` (and `apply_weight_iter`) | Load the model's own safetensors directly onto CUDA via the `instanttensor` library (distributed loading, pipelined prefetch, direct I/O, GDS when available). Reuses vLLM's built-in `--load-format instanttensor` path, so it needs no `MX_MODEL_URI`; the engine resolves and (if needed) downloads the weight files. Falls through on failure. |
+| p3 | `ModelStreamerStrategy` | `MX_MODEL_URI` set + `runai_model_streamer` installed | Stream safetensors to GPU via CPU staging buffer. `MX_MODEL_URI` accepts remote URIs (`s3://`, `gs://`, `az://`), absolute local paths, or HF model IDs (resolved via `HF_HUB_CACHE`). All storage backends (S3, GCS, Azure) included by default. |
+| p4 | `GdsStrategy` | Active accelerator backend supports GDS and GDS hardware is available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. Reads full checkpoint tensors and slices for TP downstream — see [GDS Reads Full Checkpoint Tensors Under TP](#gds-reads-full-checkpoint-tensors-under-tp). |
+| p5 | `DefaultStrategy` | Engine native fallback loader available | Native loader fallback (for vLLM, `DefaultModelLoader`, CPU-staged, auto-downloads from HF Hub). |
 
 See [ModelExpress Benchmarks](BENCHMARKS.md) for measured loading-path, NIXL registration, and artifact-transfer results with explicit timing boundaries.
+
+### Server-Backed Model Cache
+
+Workers without shared storage need repository files at two different moments, and only one of them is late enough for the strategy chain.
+
+An engine resolves the model long before it loads weights: vLLM calls `snapshot_download` while parsing engine args and rewrites `ModelConfig.model` with the resolved local path, and the tokenizer follows immediately after. Under `HF_HUB_OFFLINE=1` with an empty cache, that call fails before any loader exists. P2P cannot cover it either — it transfers GPU tensors and never repository files, so even a worker that will end up loading over RDMA still needs config and tokenizer on local disk first.
+
+So the two halves are fetched separately:
+
+| Phase | What | When | Where |
+|---|---|---|---|
+| Metadata | Everything except weights | Before the engine resolves the model | `model_prefetch.ensure_metadata()`, invoked from a `snapshot_download` patch |
+| Weights | Weight files only | After `RdmaStrategy` finds no source | `ServerCacheStrategy` |
+
+Fetching metadata unconditionally does not weaken P2P-first, because no weight moves on that path — a live source still serves every byte of the weights.
+
+`model_client.py` wraps the `ModelService` RPCs (`EnsureModelDownloaded`, `ListModelFiles`, `StreamModelFiles`) and validates the stream: chunk offsets must be contiguous, sizes must match the manifest, and every listed file must arrive before the final marker. `model_snapshot.py` owns the local layout, writing `refs/main` alongside `snapshots/<commit>/` — without that ref, `snapshot_download(local_files_only=True)` cannot resolve a repo id no matter how complete the snapshot is. Metadata is published by renaming a staging directory; weights are added to the live snapshot one atomic rename at a time, and a failure part-way through rolls back the files it already published rather than leaving a partial weight set the engine would load as complete.
+
+Each phase opens with `EnsureModelDownloaded` and pins everything after it to the revision that call reported, so the manifest and the stream come from one commit and a default revision that moves mid-phase cannot mix two; when the server names no revision, later calls go unpinned and the stream's commit-hash validation is what refuses a mid-phase change. Reuse of a local snapshot is gated on the same value and fails closed without it: a manifest carries only paths and sizes, so a revision that changed neither is indistinguishable from the copy on disk, and reusing it would skip the stream that would have caught the difference. The metadata phase asks with `ignore_weights=true`; the server keys its registry entry on the weight mode, so that claim cannot satisfy the weight phase's later full-weight request, and a cold server does not fetch weights before `RdmaStrategy` has had its chance at them.
+
+Two limits are worth knowing. The client never asks for a particular revision, only for whichever one the server resolves by default, so a worker that pinned a revision of its own gets a logged mismatch rather than the revision it wanted. And a server that already holds an unpinned model reports no revision at all, so the metadata phase restreams instead of reusing what is on disk; the files are small and the stream carries the commit, which makes restreaming the cheap way to stay correct.
 
 Strategies handle the loading path and NIXL tensor registration. `LoadContext.accelerator_backend` centralizes accelerator-specific torch operations and capability gates for fast paths such as pool registration, VMM arena registration, and GDS. Backends that do not support those CUDA-specific paths, such as XPU, leave the gates disabled and use the generic fallback path. XPU transfer deployments still require a UCX/NIXL runtime that can register XPU device memory. Adapter hooks handle engine lifecycle such as vLLM `process_weights_after_loading`, and the chain performs best-effort metadata publication after a successful strategy. New strategies can be added by creating a new file in `load_strategy/` and registering it in `LoadStrategyChain.run()`.
 
@@ -829,99 +918,6 @@ while agent.check_xfer_state(handle) not in ("DONE", "SUCCESS"):
 agent.release_xfer_handle(handle)
 ```
 
-## Trainer-Inference Weight Sync (WeightSyncService)
-
-ModelExpress includes a `WeightSyncService` gRPC service that coordinates live
-weight synchronization from a sharded trainer to inference workers.  The Python
-client exposes `PullRole` (inference worker pulls from trainer) and `PushRole`
-(trainer pushes to inference workers).
-
-### Protocol Overview
-
-```mermaid
-sequenceDiagram
-    participant T as Trainer
-    participant MX as MX Server (WeightSyncService)
-    participant W as Inference Worker
-
-    T->>MX: PublishTrainerTable(model_key, table)
-    W->>MX: BuildPlan(plan_key, model_key, regions)
-    MX-->>W: BuildPlanResponse(plan_id)
-    W->>MX: GetPlan(plan_id)
-    MX-->>W: GetPlanResponse(ready, descriptors)
-    W->>T: NIXL READ (RdmaDescriptors)
-```
-
-### Planner Abstraction
-
-Three planner implementations live in `modelexpress/weight_transfer/planner/`:
-
-| Class | When to use |
-|-------|-------------|
-| `LocalPlanner` | No MX server available; each worker routes independently. Per-worker cache only. |
-| `ServerPlanner` | MX server available. One worker routes; all workers with the same `plan_key` reuse the cached plan. Falls back to `LocalPlanner` on server error. |
-| `M2nPlanner` | All workers register simultaneously. MX routes all workers' regions in one pass and returns a globally-consistent M2N plan. Falls back to `LocalPlanner` on error. |
-
-### Key Data Flow (PULL)
-
-1. **Bake pass**: `PullRole.initialize()` drives the engine's weight loader with
-   `LazyWeight` tensors that record op chains without materializing data.
-2. **Resolve**: `resolve_copies()` replays op chains on meta tensors to produce
-   `ResolvedRegion` objects (element-run pairs, torch-dependent, client-side only).
-3. **Plan**: A planner converts `ResolvedRegion` lists to `RdmaDescriptor` lists
-   (pure integer arithmetic).
-4. **Execute**: `NixlExecutor.execute()` issues one NIXL READ handle per trainer
-   rank and waits for all to complete.
-5. **Post-process**: Engine adapter runs `post_pull_hook()` (e.g. FP8 scale repack).
-
-### M2N Coordinated Plan (M2nPlanner)
-
-`M2nPlanner` replaces the per-worker `ServerPlanner` with a server-side barrier:
-
-```mermaid
-sequenceDiagram
-    participant W0 as Worker 0
-    participant W1 as Worker 1
-    participant MX as MX Server
-
-    W0->>MX: RegisterM2nWorker(model_key, rank=0, total=2, regions, nixl_metadata)
-    MX-->>W0: RegisterM2nWorkerResponse(m2n_plan_id="")  # barrier not met
-    W1->>MX: RegisterM2nWorker(model_key, rank=1, total=2, regions, nixl_metadata)
-    MX-->>W1: RegisterM2nWorkerResponse(m2n_plan_id=uuid)  # barrier fires, plan built
-    W0->>MX: RegisterM2nWorker(poll)
-    MX-->>W0: RegisterM2nWorkerResponse(m2n_plan_id=uuid)
-    W0->>MX: GetM2nPlan(m2n_plan_id, worker_rank=0)
-    MX-->>W0: GetM2nPlanResponse(ready=true, descriptors=[...])
-    W1->>MX: GetM2nPlan(m2n_plan_id, worker_rank=1)
-    MX-->>W1: GetM2nPlanResponse(ready=true, descriptors=[...])
-```
-
-When the barrier fires (all `total_workers` have registered), the server calls
-`route_all_workers()` in Rust — which routes every worker's regions against the
-shared `TrainerTable` in one pass and tags each descriptor with a
-`dst_agent_index` (the target worker's rank).  The result is stored as
-per-worker slices keyed by `(plan_id, worker_rank)`.
-
-`M2nDescriptor` extends `RdmaDescriptor` with `dst_agent_index`, enabling the
-trainer to issue a single coordinated NIXL M2N WRITE to all workers.
-`M2nDescriptor.to_rdma_descriptor()` converts to a plain `RdmaDescriptor` for
-use with the existing `NixlExecutor` on the worker's PULL path.
-
-`M2nExecutor` groups descriptors by `src_agent_index` and fires one NIXL READ
-handle per trainer rank (all in parallel, same as `NixlExecutor`).  When NIXL
-exposes a native many-to-many transfer API, the inner loop can be replaced with
-a single `make_prepped_m2n_xfer` call for true collective semantics.
-
-### Invalidation
-
-When the trainer reshards (topology change between steps):
-
-| Planner | Invalidation method |
-|---------|---------------------|
-| `LocalPlanner` | `invalidate(plan_key)` evicts local cache |
-| `ServerPlanner` | `invalidate(plan_key)` evicts local cache + calls `InvalidatePlan` on server |
-| `M2nPlanner` | `invalidate(plan_key)` evicts local cache + calls `InvalidateM2nPlan(model_key)` on server, which removes all per-worker slices for that model |
-
 ## FP8 Model Handling (DeepSeek-V3)
 
 vLLM's `process_weights_after_loading()` transforms model weights into kernel-friendly formats (FP8 scale repacking, NVFP4 padding/swizzling, MLA dequantized projections) and may create new tensors as bare attributes, buffers, or on quant method objects.
@@ -978,7 +974,7 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MX_SERVER_ADDRESS` | `localhost:8001` | gRPC server address (recommended) |
-| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated, pending removal in a future release. Still read by all client paths and takes precedence when both are set; keep setting it during the transition. |
+| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
 | `MX_DISABLE_PATCHES` | `0` | Emergency escape hatch that skips all runtime compatibility patches. Set to `1`, `true`, `yes`, or `on` if a patch is incompatible with the installed engine. |
 | `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""` / `server` / `redis` / `kubernetes` (central server) or `k8s-service` (decentralized via K8s Service routing) |
 | `MX_POOL_REG` | `0` | Discover cudaMalloc allocations via `cuMemGetAddressRange` and register each as a single NIXL block instead of registering tensors individually. Reduces NIXL registration count by 80-99% on typical vLLM models, cutting `ibv_reg_mr` time and metadata blob size; transfer semantics unchanged. Not required for `MX_VMM_ARENA=1`, which registers the arena directly |
