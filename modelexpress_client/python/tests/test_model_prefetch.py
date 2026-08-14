@@ -222,22 +222,22 @@ class TestRevisionMismatch:
     def test_matching_commit_is_quiet(self, enabled, fake_client, caplog):
         with caplog.at_level(logging.WARNING):
             model_prefetch.ensure_metadata(REPO, COMMIT)
-        assert "cannot request a specific revision" not in caplog.text
+        assert "does not pin a revision" not in caplog.text
 
     def test_main_is_quiet(self, enabled, fake_client, caplog):
         with caplog.at_level(logging.WARNING):
             model_prefetch.ensure_metadata(REPO, "main")
-        assert "cannot request a specific revision" not in caplog.text
+        assert "does not pin a revision" not in caplog.text
 
     def test_pinned_mismatch_explains_itself(self, enabled, fake_client, caplog):
         with caplog.at_level(logging.WARNING):
             model_prefetch.ensure_metadata(REPO, "f" * 40)
-        assert "cannot request a specific revision" in caplog.text
+        assert "does not pin a revision" in caplog.text
 
     def test_branch_name_warns(self, enabled, fake_client, caplog):
         with caplog.at_level(logging.WARNING):
             model_prefetch.ensure_metadata(REPO, "refs/pr/1")
-        assert "cannot request a specific revision" in caplog.text
+        assert "does not pin a revision" in caplog.text
 
 
 class TestRepoIdFor:

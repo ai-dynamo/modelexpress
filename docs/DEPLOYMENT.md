@@ -809,7 +809,7 @@ Requirements and limits:
 
 - ModelExpress Server needs a writable cache directory, egress to Hugging Face, and `HF_TOKEN` for private repositories. The worker needs none of these.
 - Mount the cache path as a volume shared by every container that touches it. Without a volume the snapshot lands in the container's writable layer, invisible to other containers and lost on restart.
-- Pinned revisions are not supported yet: the model RPC carries no revision, so the server answers with whatever its cache holds for `main`. A mismatch is logged, and weights whose commit differs from the local snapshot directory are refused rather than mixed in.
+- Pinned revisions are not supported yet: `ModelDownloadRequest` and `ModelFilesRequest` both carry an optional `revision`, but this client leaves it unset, so every request is unpinned and the server answers with the default revision it resolves. A worker that asked for a specific revision gets the mismatch logged, and weights whose commit differs from the local snapshot directory are refused rather than mixed in.
 - On a cold server the first worker waits for the complete download, weights included, before it receives anything.
 - The server dedups the upstream download but not the per-worker stream. Concurrent workers on a cold model all wait on one Hugging Face fetch, then each streams its own copy, so N replicas starting together cost N x model size in server egress. Size the server's network accordingly, or stagger large rollouts.
 - An unreachable server costs about 20 seconds per worker before loading falls through to the next strategy. That is the TCP connect timeout; a shorter deadline would abort legitimate cold-cache downloads, which can take minutes.
