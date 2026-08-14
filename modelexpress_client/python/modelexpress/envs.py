@@ -97,6 +97,7 @@ if TYPE_CHECKING:
     MX_TRANSFER_LOG_DIR: str
     # VMM arena
     MX_VMM_ARENA: bool
+    MX_ARENA_SINGLE_MR: bool
     # Framework artifact (JIT cache) transfer
     MX_ARTIFACT_TRANSFER: bool
     MX_ARTIFACT_BUNDLE_ROOT: Optional[str]
@@ -309,6 +310,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_TRANSFER_LOG_DIR": lambda: os.environ.get("MX_TRANSFER_LOG_DIR", "/tmp/mx_logs"),
     # ── VMM arena ──────────────────────────────────────────────────────────
     "MX_VMM_ARENA": lambda: os.environ.get("MX_VMM_ARENA") == "1",
+    "MX_ARENA_SINGLE_MR": lambda: os.environ.get("MX_ARENA_SINGLE_MR") == "1",
     # ── Framework artifact (JIT cache) transfer ────────────────────────────
     "MX_ARTIFACT_TRANSFER": lambda: os.environ.get("MX_ARTIFACT_TRANSFER", "").strip().lower()
     in _TRUTHY,

@@ -71,6 +71,16 @@ def _resolve_nixl_backend() -> str:
     return raw
 
 
+def _arena_single_mr_forced() -> bool:
+    """Whether to keep the single-MR arena path on a multi-allocation arena.
+
+    MX_ARENA_SINGLE_MR=1 forces it. Only safe on transports that can span
+    several cuMemCreate handles in one registration (dmabuf/IB); cuda_ipc
+    cannot. Read at call time so tests can toggle the env var.
+    """
+    return envs.MX_ARENA_SINGLE_MR
+
+
 def _pool_reg_enabled() -> bool:
     """Whether allocation-level pool registration is enabled.
 
@@ -393,12 +403,19 @@ class NixlTransferManager:
         consumes a dmabuf via `ibv_reg_dmabuf_mr` and produces ONE
         lkey/rkey covering all live tensors.
 
-        Empirically validated on Blackwell + ConnectX over InfiniBand
-        against a CUDA VMM range with multiple cuMemCreate handles and
-        mid-range holes (chunks unmapped + released after the export):
-        registration succeeds, the dmabuf attach pins the currently-
-        mapped physical pages, and the HCA translation table survives
-        subsequent CUDA-side unmaps.
+        The multi-handle case is validated on the dmabuf/IB path only.
+        On Blackwell + ConnectX over InfiniBand, against a CUDA VMM range
+        with multiple cuMemCreate handles and mid-range holes (chunks
+        unmapped + released after the export): registration succeeds, the
+        dmabuf attach pins the currently-mapped physical pages, and the
+        HCA translation table survives subsequent CUDA-side unmaps.
+
+        It does NOT hold on UCX cuda_ipc, where a fabric handle names one
+        cuMemCreate allocation and a single MR would publish an rkey
+        covering only the first chunk. That is why this method falls back
+        to per-tensor registration when the arena spans several
+        allocations, unless MX_ARENA_SINGLE_MR overrides it. Upstream fix:
+        openucx/ucx#11283.
 
         Per-tensor descriptors are still built (tensor name -> addr,
         size, dtype) because the receiver matches by name and computes
@@ -430,6 +447,35 @@ class NixlTransferManager:
                 self._accelerator_backend.name,
             )
             return self.register_tensors(tensors)
+
+        # A CUDA fabric/IPC handle names exactly one cuMemCreate allocation:
+        # UCX cuda_ipc resolves a region with cuMemRetainAllocationHandle and
+        # cuMemGetAddressRange, which report the FIRST allocation under the
+        # range rather than the whole reserve. Registering a multi-allocation
+        # arena as one MR therefore publishes an rkey covering only its first
+        # chunk, and the peer's cuMemcpyDtoDAsync_v2 reads past what it mapped.
+        # Measured on GB200 MNNVL: Kimi-K3 arena, 1019 chunks, segfault in
+        # uct_cuda_ipc_ep_get_zcopy. Per-tensor registration is correct because
+        # the arena does one cuMemCreate per allocation, so every tensor lies
+        # wholly inside one handle.
+        #
+        # dmabuf/IB registration does span several handles, so deployments that
+        # validated the single-MR path there can keep it with
+        # MX_ARENA_SINGLE_MR=1.
+        live_allocs = arena.live_allocation_count
+        if live_allocs > 1 and not _arena_single_mr_forced():
+            logger.warning(
+                "register_arena: arena spans %d physical allocations; a single "
+                "MR would publish an rkey covering only the first, which "
+                "cuda_ipc cannot address. Falling back to per-tensor "
+                "registration for %d tensors over [0x%x, 0x%x). Set "
+                "MX_ARENA_SINGLE_MR=1 to force single-MR (dmabuf/IB only).",
+                live_allocs,
+                len(tensor_descriptors),
+                base,
+                base + used,
+            )
+            return self.register_tensors(tensors, force_per_tensor=True)
 
         # NIXL resolves descriptors by containment, so one tensor outside
         # [base, base+used) fails prep_xfer_dlist for the whole transfer.
