@@ -60,6 +60,7 @@ _LOCK_FILE = ".modelexpress.lock"
 _STAGING_PREFIX = ".modelexpress-staging-"
 _STALE_PREFIX = ".modelexpress-stale-"
 _TEMP_PREFIX = ".modelexpress-tmp-"
+_BACKUP_PREFIX = ".modelexpress-backup-"
 
 
 class ModelSnapshotError(RuntimeError):
@@ -357,16 +358,53 @@ class SnapshotPatch(SnapshotSink):
         super().__init__(snapshot_path, cache.cache_root)
         self._temp_paths: dict[Path, Path] = {}
         self._published: list[Path] = []
+        self._backups: dict[Path, Path] = {}
+
+    def commit(self) -> None:
+        """Make this patch final, dropping the backups it took.
+
+        Call this only once every file has arrived. Afterwards
+        :meth:`rollback` has nothing to undo, so a caller that commits and
+        then fails cannot delete the files it just published.
+        """
+        touched: set[Path] = set()
+        for backup in self._backups.values():
+            backup.unlink(missing_ok=True)
+            touched.add(backup.parent)
+        self._backups.clear()
+        self._published.clear()
+        for directory in touched:
+            _fsync_directory(directory)
 
     def rollback(self) -> None:
         """Undo this patch, leaving the snapshot as it was before it started.
 
         A half-applied patch is worse than none: the engine would see a subset
-        of the weights and load it as if it were complete.
+        of the weights and load it as if it were complete. A file this patch
+        replaced is restored from its backup rather than left deleted --
+        rolling back a refresh must not cost the snapshot a shard it already
+        had.
         """
         self.close()
+        touched: set[Path] = set()
         while self._published:
-            self._published.pop().unlink(missing_ok=True)
+            target = self._published.pop()
+            target.unlink(missing_ok=True)
+            backup = self._backups.pop(target, None)
+            if backup is not None:
+                os.replace(backup, target)
+            touched.add(target.parent)
+        # A backup with no published file means the rename never landed; the
+        # original is the copy to put back, not the one to drop.
+        for target, backup in self._backups.items():
+            if target.exists():
+                backup.unlink(missing_ok=True)
+            else:
+                os.replace(backup, target)
+            touched.add(target.parent)
+        self._backups.clear()
+        for directory in touched:
+            _fsync_directory(directory)
 
     def _open(self, target: Path):
         temp_path = target.parent / f"{_TEMP_PREFIX}{uuid.uuid4().hex}-{target.name}"
@@ -375,6 +413,12 @@ class SnapshotPatch(SnapshotSink):
 
     def _finalize(self, target: Path) -> None:
         temp_path = self._temp_paths.pop(target)
+        # os.replace overwrites, so an existing file is gone the moment the
+        # rename lands. Move it aside first or rollback has nothing to restore.
+        if target.exists() or target.is_symlink():
+            backup = target.parent / f"{_BACKUP_PREFIX}{uuid.uuid4().hex}-{target.name}"
+            os.replace(target, backup)
+            self._backups[target] = backup
         os.replace(temp_path, target)
         _fsync_directory(target.parent)
         self._published.append(target)

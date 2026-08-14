@@ -272,6 +272,69 @@ class TestPatch:
         with pytest.raises(ModelSnapshotError):
             cache.patch(cache.repo_root / "snapshots" / COMMIT)
 
+    def test_rollback_restores_a_replaced_shard(self, cache):
+        """A refresh that fails part-way must not cost the snapshot a shard.
+
+        Publishing shard A overwrites the copy already on disk. If the patch
+        then fails on shard B, rolling back by deleting what it published
+        would leave the snapshot short of a shard it had before the patch
+        started -- worse than the partial write the rollback exists to avoid.
+        """
+        snapshot = _write(
+            cache,
+            {"shard-1.safetensors": b"old-one", "shard-2.safetensors": b"old-two"},
+        )
+
+        patch = cache.patch(snapshot)
+        patch.begin_file("shard-1.safetensors")
+        patch.write(b"new-one")
+        patch.end_file()
+        patch.rollback()
+
+        assert (snapshot / "shard-1.safetensors").read_bytes() == b"old-one"
+        assert (snapshot / "shard-2.safetensors").read_bytes() == b"old-two"
+        assert sorted(p.name for p in snapshot.iterdir()) == [
+            "shard-1.safetensors",
+            "shard-2.safetensors",
+        ]
+
+    def test_rollback_removes_a_newly_added_file(self, cache):
+        snapshot = _write(cache, {"config.json": b"{}"})
+
+        patch = cache.patch(snapshot)
+        patch.begin_file("model.safetensors")
+        patch.write(b"weights")
+        patch.end_file()
+        patch.rollback()
+
+        assert not (snapshot / "model.safetensors").exists()
+        assert list(snapshot.iterdir()) == [snapshot / "config.json"]
+
+    def test_commit_drops_the_backups(self, cache):
+        snapshot = _write(cache, {"shard-1.safetensors": b"old-one"})
+
+        patch = cache.patch(snapshot)
+        patch.begin_file("shard-1.safetensors")
+        patch.write(b"new-one")
+        patch.end_file()
+        patch.commit()
+        patch.close()
+
+        assert (snapshot / "shard-1.safetensors").read_bytes() == b"new-one"
+        assert list(snapshot.iterdir()) == [snapshot / "shard-1.safetensors"]
+
+    def test_rollback_after_commit_keeps_the_published_files(self, cache):
+        snapshot = _write(cache, {"shard-1.safetensors": b"old-one"})
+
+        patch = cache.patch(snapshot)
+        patch.begin_file("shard-1.safetensors")
+        patch.write(b"new-one")
+        patch.end_file()
+        patch.commit()
+        patch.rollback()
+
+        assert (snapshot / "shard-1.safetensors").read_bytes() == b"new-one"
+
 
 class TestLock:
     def test_released_after_context(self, cache):

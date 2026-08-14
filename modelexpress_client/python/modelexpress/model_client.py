@@ -241,6 +241,7 @@ class ModelCacheClient:
                     patch,
                     expected_commit=snapshot_path.name,
                 )
+                patch.commit()
             except BaseException:
                 patch.rollback()
                 raise
