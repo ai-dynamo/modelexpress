@@ -499,3 +499,27 @@ def test_ranks_publishing_a_consistent_tensor_merge_their_shards():
 def test_a_dtype_label_that_names_nothing_in_torch_is_rejected():
     with pytest.raises(ValueError, match="unsupported dtype label"):
         build_sources([_tensor(dtype="torch.not_a_real_dtype", elsize=2)])
+
+
+def test_ranks_spelling_one_dtype_differently_are_not_a_disagreement():
+    # The publish contract accepts both spellings, so ranks that disagree only
+    # on the prefix agree on the dtype; rejecting them would name a cross-rank
+    # inconsistency that does not exist.
+    merged = merge_shard_tables(
+        [[_tensor(dtype="torch.bfloat16")], [_tensor(dtype="bfloat16")]]
+    )
+    assert len(merged) == 1
+    assert len(merged[0].shards) == 2
+
+
+def test_ranks_publishing_the_same_tensor_with_different_dtype_are_rejected():
+    with pytest.raises(ValueError, match="inconsistent shape/dtype/elsize"):
+        merge_shard_tables(
+            [[_tensor(dtype="torch.bfloat16")], [_tensor(dtype="float16")]]
+        )
+
+
+def test_a_non_string_dtype_label_is_rejected_as_invalid_metadata():
+    # dtype rides through decode untouched, so its type is a publisher's claim.
+    with pytest.raises(ValueError, match="unsupported dtype label"):
+        build_sources([_tensor(dtype=123, elsize=2)])

@@ -175,19 +175,30 @@ def decode_shard_entries(entries: list) -> list:
     return tensors
 
 
-def _torch_dtype(label: str):
-    """Resolve a shard-table dtype label to a ``torch.dtype``.
+def _dtype_key(label) -> str:
+    """Canonical comparison key for a shard-table dtype label.
 
     Publishers emit either ``"torch.bfloat16"`` or ``"bfloat16"``, so the prefix
-    is optional. The label must name a dtype rather than merely some torch
-    attribute. A fixed allowlist of names is deliberately avoided: the publish
-    format is an external contract, and a hardcoded list would reject dtypes a
-    newer torch supports.
+    is optional and the two spellings of one dtype must not read as a
+    disagreement. The label comes straight from decoded JSON, so its type is a
+    publisher's claim rather than a guarantee; a non-string is rejected as
+    invalid metadata instead of failing later on an attribute it does not have.
+    """
+    if not isinstance(label, str):
+        raise ValueError(f"unsupported dtype label {label!r} in shard table")
+    return label.split(".")[-1]
+
+
+def _torch_dtype(label):
+    """Resolve a shard-table dtype label to a ``torch.dtype``.
+
+    The label must name a dtype rather than merely some torch attribute. A fixed
+    allowlist of names is deliberately avoided: the publish format is an external
+    contract, and a hardcoded list would reject dtypes a newer torch supports.
     """
     import torch
 
-    name = label.split(".")[-1]
-    dtype = getattr(torch, name, None)
+    dtype = getattr(torch, _dtype_key(label), None)
     if not isinstance(dtype, torch.dtype):
         raise ValueError(f"unsupported dtype label {label!r} in shard table")
     return dtype
@@ -255,6 +266,11 @@ def merge_shard_tables(tables: list) -> list:
     collide under one name, and then retaining the first installs bytes that
     belong to the other. Publishers must therefore use globally unique names for
     parallelism-local tensors.
+
+    Dtype agreement is decided on the canonicalized label, since the publish
+    contract accepts both the prefixed and unprefixed spellings: ranks that
+    spell one dtype differently agree, and reporting them as inconsistent would
+    name a cross-rank disagreement that does not exist.
     """
     merged: dict = {}
     # name -> geometry -> first shard, insertion-ordered so the retained geometry
@@ -270,7 +286,7 @@ def merge_shard_tables(tables: list) -> list:
                 candidates[t.name] = {}
             elif (
                 cur.full_shape != t.full_shape
-                or cur.dtype != t.dtype
+                or _dtype_key(cur.dtype) != _dtype_key(t.dtype)
                 or cur.elsize != t.elsize
             ):
                 raise ValueError(
