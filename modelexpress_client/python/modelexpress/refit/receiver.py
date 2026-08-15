@@ -9,7 +9,6 @@ import fcntl
 import hashlib
 import json
 import mmap
-import socket
 import shutil
 import struct
 import time
@@ -17,11 +16,9 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 from urllib.parse import quote
 
 import numpy as np
-import torch
 import zstandard
 
 from .. import envs
@@ -59,22 +56,30 @@ class PreparedRevision:
 
 
 class ModelExpressWeightReceiver:
-    def __init__(
-        self,
-        config: ReceiverConfig,
-        receiver_id: str,
-        model_runner,
-    ) -> None:
+    """Canonical S3 delta receiver: catalog, S3, prepare, journal, state machine.
+
+    Engine-agnostic. Everything that depends on a specific inference engine is
+    reached through two hooks a subclass implements, both of which run against
+    the live engine model:
+
+      * :meth:`_launch_checkpoint` - the on-disk checkpoint the engine resolved
+        at launch, which seeds the local checkpoint the deltas are applied to.
+      * :meth:`install_prepared_checkpoint` - load a prepared revision into the
+        live model.
+
+    ``initialize`` / ``start_weight_update`` / ``update_weights`` are the
+    receiver protocol and are the same for every engine. A receiver is a client
+    of whatever drives it, so it does not implement any engine's own weight
+    update lifecycle; on vLLM that lifecycle belongs to
+    :class:`~modelexpress.engines.vllm.refit.delta_engine.MxWeightTransferEngine`,
+    which holds a receiver and calls this protocol.
+    """
+
+    def __init__(self, config: ReceiverConfig, receiver_id: str) -> None:
         self.config = config
         self.receiver_id = receiver_id
         self.model_id = config.model_id
-        self.model_runner = model_runner
-        checkpoint, _, _ = model_runner.loader._prepare_weights(
-            model_runner.model_config.model_path,
-            model_runner.model_config.revision,
-            False,
-        )
-        self.launch_checkpoint = Path(checkpoint)
+        self.launch_checkpoint = Path(self._launch_checkpoint())
         self.installed_version = config.initial_version
         self.installed_digest: str
         self.catalog = None
@@ -84,6 +89,19 @@ class ModelExpressWeightReceiver:
         self.state = None
         self.detail = ""
         self._metrics: dict[str, float] = {}
+
+    def _launch_checkpoint(self) -> Path:
+        """The on-disk checkpoint the engine resolved at launch."""
+        raise NotImplementedError
+
+    def install_prepared_checkpoint(self, prepared: PreparedRevision) -> None:
+        """Load ``prepared.path`` into the live model.
+
+        Raise :class:`ReceiverInstallError` with ``mutation_started=True`` once
+        any weight may have been written, so the caller can tell a receiver that
+        is still serving its previous revision from one that must be replaced.
+        """
+        raise NotImplementedError
 
     def initialize(self) -> None:
         self.catalog = GrpcRevisionCatalog(self.config.catalog_endpoint)
@@ -111,52 +129,6 @@ class ModelExpressWeightReceiver:
     def prepared_identity(self):
         return self.prepared
 
-    def install_prepared_checkpoint(self, prepared: PreparedRevision) -> None:
-        try:
-            from sglang.srt.configs.load_config import LoadConfig, LoadFormat
-            from sglang.srt.model_loader.loader import (
-                DefaultModelLoader,
-                get_model_loader,
-            )
-
-            loader = get_model_loader(
-                LoadConfig(
-                    load_format=LoadFormat.SAFETENSORS,
-                    download_dir=self.model_runner.server_args.download_dir,
-                    model_loader_extra_config=(
-                        self.model_runner.server_args.model_loader_extra_config
-                    ),
-                ),
-                self.model_runner.model_config,
-            )
-            if not isinstance(loader, DefaultModelLoader):
-                raise TypeError("ModelExpress requires DefaultModelLoader")
-            source = SimpleNamespace(
-                model_or_path=str(prepared.path),
-                revision=None,
-                prefix="",
-                fall_back_to_pt=False,
-                model_config=self.model_runner.model_config,
-            )
-            weights = loader._get_weights_iterator(source)
-        except Exception as error:
-            raise ReceiverInstallError(str(error), False) from error
-
-        try:
-            from sglang.srt.model_loader.utils import set_default_torch_dtype
-
-            with set_default_torch_dtype(self.model_runner.model_config.dtype):
-                loader.load_weights_and_postprocess(
-                    self.model_runner.model,
-                    weights,
-                    torch.device(self.model_runner.device),
-                )
-            device = torch.get_device_module(self.model_runner.device)
-            if hasattr(device, "synchronize"):
-                device.synchronize()
-        except Exception as error:
-            raise ReceiverInstallError(str(error), True) from error
-
     def start_weight_update(self, version: str) -> None:
         if self.state is ReceiverRevisionState.POISONED:
             raise RuntimeError("poisoned receiver cannot install another update")
@@ -174,7 +146,9 @@ class ModelExpressWeightReceiver:
             )
         self.detail = ""
 
-    def update_weights(self, layers=None) -> WeightUpdateResult:
+    def update_weights(
+        self, layers=None, defer_verification: bool = False
+    ) -> WeightUpdateResult:
         if layers is not None:
             raise ValueError("ModelExpress supports complete-model updates only")
         if self.prepared is None:
@@ -204,11 +178,30 @@ class ModelExpressWeightReceiver:
                 target_digest=self.installed_digest,
                 detail=self.detail,
             )
+        self.state = ReceiverRevisionState.BYTES_RECEIVED
+        self._metrics = {"perf/mx_receive_install_time": time.perf_counter() - started}
+        if defer_verification:
+            return WeightUpdateResult(
+                success=True,
+                receiver_id=self.receiver_id,
+                installed_version=self.installed_version,
+                state=self.state,
+                target_digest=target.target_digest,
+                detail=self.detail,
+            )
+        return self.mark_verified()
+
+    def mark_verified(self) -> WeightUpdateResult:
+        if (
+            self.state is not ReceiverRevisionState.BYTES_RECEIVED
+            or self.prepared is None
+        ):
+            raise RuntimeError("no installed ModelExpress update to verify")
+        target = self.prepared
         self.installed_version = target.target_version
         self.installed_digest = target.target_digest
         self.prepared = None
         self.state = ReceiverRevisionState.VERIFIED
-        self._metrics = {"perf/mx_receive_install_time": time.perf_counter() - started}
         return WeightUpdateResult(
             success=True,
             receiver_id=self.receiver_id,
@@ -636,22 +629,3 @@ class _LocalCheckpoint:
                     False,
                 )
             yield
-
-
-def build_weight_receiver(model_runner):
-    args = model_runner.server_args
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    receiver = ModelExpressWeightReceiver(
-        ReceiverConfig(
-            model_id=args.modelexpress_model_id,
-            catalog_endpoint=args.modelexpress_catalog_endpoint,
-            initial_version=args.modelexpress_initial_version,
-            preparation_cache_dir=args.modelexpress_preparation_cache_dir,
-            ready_timeout_seconds=args.modelexpress_ready_timeout_seconds,
-            s3_endpoint_url=args.modelexpress_delta_s3_endpoint,
-        ),
-        f"{socket.gethostname()}:{rank}",
-        model_runner,
-    )
-    receiver.initialize()
-    return receiver

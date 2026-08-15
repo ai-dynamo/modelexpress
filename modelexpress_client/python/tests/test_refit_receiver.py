@@ -3,8 +3,6 @@
 
 from contextlib import nullcontext
 from pathlib import Path
-from types import SimpleNamespace
-
 import pytest
 
 from modelexpress.refit.api import ReceiverRevisionState
@@ -19,9 +17,7 @@ from modelexpress.refit.receiver import (
 class Receiver(ModelExpressWeightReceiver):
     def __init__(self, tmp_path: Path):
         self.targets = {}
-        loader = SimpleNamespace(
-            _prepare_weights=lambda *_args: (tmp_path / "launch", None, None)
-        )
+        self.launch_checkpoint = tmp_path / "launch"
         super().__init__(
             ReceiverConfig(
                 model_id="model",
@@ -30,13 +26,6 @@ class Receiver(ModelExpressWeightReceiver):
                 preparation_cache_dir=tmp_path / "cache",
             ),
             "receiver",
-            SimpleNamespace(
-                loader=loader,
-                model_config=SimpleNamespace(
-                    model_path=str(tmp_path / "launch"),
-                    revision=None,
-                ),
-            ),
         )
         self.installed_digest = "sha256:base"
         self.state = ReceiverRevisionState.VERIFIED
@@ -55,6 +44,9 @@ class Receiver(ModelExpressWeightReceiver):
                 return nullcontext()
 
         self.checkpoint = Checkpoint()
+
+    def _launch_checkpoint(self):
+        return self.launch_checkpoint
 
     def install_prepared_checkpoint(self, prepared):
         if self.install_error is not None:
@@ -86,6 +78,27 @@ def test_prepare_and_install_advance_exact_identity(tmp_path):
     assert result.installed_version == "1"
     assert result.target_digest == "sha256:target"
     assert value.status().installed_version == "1"
+
+
+def test_deferred_install_is_verified_only_when_completed(tmp_path):
+    value, target = receiver(tmp_path)
+
+    value.start_weight_update("1")
+    result = value.update_weights(defer_verification=True)
+
+    assert value.installed == [target]
+    assert result.success
+    assert result.state is ReceiverRevisionState.BYTES_RECEIVED
+    assert value.status().state is ReceiverRevisionState.BYTES_RECEIVED
+    assert value.status().installed_version == "0"
+    assert value.prepared_identity is target
+
+    verified = value.mark_verified()
+
+    assert verified.state is ReceiverRevisionState.VERIFIED
+    assert verified.installed_version == "1"
+    assert value.status().installed_version == "1"
+    assert value.prepared_identity is None
 
 
 def test_receiver_metrics_are_drained_per_phase(tmp_path):

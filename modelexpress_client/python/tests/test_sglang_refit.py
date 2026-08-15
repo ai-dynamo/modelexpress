@@ -10,7 +10,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from modelexpress.refit import receiver as refit
+from modelexpress.engines.sglang.refit import receiver as refit
+from modelexpress.refit.factory import RolloutBackend, build_delta_receiver
 
 
 def runner(tmp_path):
@@ -44,7 +45,7 @@ def runner(tmp_path):
 def receiver(tmp_path):
     model_runner = runner(tmp_path)
     return (
-        refit.ModelExpressWeightReceiver(
+        refit.SglangWeightReceiver(
             refit.ReceiverConfig(
                 model_id="model",
                 catalog_endpoint="mx:8001",
@@ -100,7 +101,7 @@ def install_sglang_modules(monkeypatch, loader=None, setup_error=None):
     return loader
 
 
-def test_factory_initializes_receiver(tmp_path, monkeypatch):
+def test_factory_builds_sglang_receiver(tmp_path, monkeypatch):
     captured = {}
 
     class Receiver:
@@ -111,25 +112,28 @@ def test_factory_initializes_receiver(tmp_path, monkeypatch):
                 model_runner=model_runner,
             )
 
-        def initialize(self):
-            captured["initialized"] = True
-
-    monkeypatch.setattr(refit, "ModelExpressWeightReceiver", Receiver)
-    monkeypatch.setattr(refit.socket, "gethostname", lambda: "host")
+    monkeypatch.setattr(refit, "SglangWeightReceiver", Receiver)
     model_runner = runner(tmp_path)
+    config = refit.ReceiverConfig(
+        model_id="model",
+        catalog_endpoint="mx:8001",
+        initial_version="0",
+        preparation_cache_dir=tmp_path / "cache",
+        ready_timeout_seconds=123,
+        s3_endpoint_url="http://minio:9000",
+    )
 
-    result = refit.build_weight_receiver(model_runner)
+    result = build_delta_receiver(
+        RolloutBackend.SGLANG,
+        config=config,
+        receiver_id="host:0",
+        model_runner=model_runner,
+    )
 
     assert isinstance(result, Receiver)
-    assert captured["config"].model_id == "model"
-    assert captured["config"].catalog_endpoint == "mx:8001"
-    assert captured["config"].s3_endpoint_url == "http://minio:9000"
-    assert captured["config"].initial_version == "0"
-    assert captured["config"].preparation_cache_dir == str(tmp_path / "cache")
-    assert captured["config"].ready_timeout_seconds == 123
+    assert captured["config"] is config
     assert captured["receiver_id"] == "host:0"
     assert captured["model_runner"] is model_runner
-    assert captured["initialized"] is True
 
 
 def test_receiver_constructor_prepares_launch_checkpoint(tmp_path):

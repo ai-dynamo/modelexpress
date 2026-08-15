@@ -13,6 +13,7 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
+from modelexpress.engines.sglang.refit.receiver import SglangWeightReceiver
 from modelexpress.refit import receiver as receiver_module
 from modelexpress.refit.manifest import (
     RevisionManifest,
@@ -34,23 +35,29 @@ def test_receiver_has_no_callback_or_forwarding_helpers():
     import inspect
 
     parameters = inspect.signature(ModelExpressWeightReceiver).parameters
-    builder_parameters = inspect.signature(
-        receiver_module.build_weight_receiver
-    ).parameters
-
-    assert "model_runner" in parameters
+    engine_parameters = inspect.signature(SglangWeightReceiver).parameters
+    assert "model_runner" not in parameters
+    assert "model_runner" in engine_parameters
     assert "launch_checkpoint" not in parameters
     assert "catalog" not in parameters
     assert "s3_client" not in parameters
     assert "prepare_target" not in parameters
     assert "install_target" not in parameters
-    assert "catalog" not in builder_parameters
-    assert "s3_client" not in builder_parameters
-    assert "checkpoint" not in builder_parameters
+
     assert not hasattr(ModelExpressWeightReceiver, "_prepare_revision")
     assert not hasattr(ModelExpressWeightReceiver, "_installation")
     assert not hasattr(receiver_module, "_location")
     assert not hasattr(receiver_module, "load_prepared_checkpoint")
+    assert not hasattr(receiver_module, "build_weight_receiver")
+
+
+def test_base_receiver_leaves_both_engine_sites_to_a_subclass():
+    base = object.__new__(ModelExpressWeightReceiver)
+
+    with pytest.raises(NotImplementedError):
+        base._launch_checkpoint()
+    with pytest.raises(NotImplementedError):
+        base.install_prepared_checkpoint(None)
 
 
 class Catalog:
@@ -77,7 +84,7 @@ class S3:
         return data
 
 
-class Receiver(ModelExpressWeightReceiver):
+class Receiver(SglangWeightReceiver):
     install_started: threading.Event | None = None
     install_release: threading.Event | None = None
 

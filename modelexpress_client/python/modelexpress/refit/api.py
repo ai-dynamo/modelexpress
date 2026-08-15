@@ -13,7 +13,7 @@ VersionId = str
 
 
 class ReceiverRevisionState(Enum):
-    """SGLang-local receiver outcomes, never persisted by the MX server."""
+    """Engine-local receiver outcomes, never persisted by the MX server."""
 
     BYTES_RECEIVED = "bytes_received"
     VERIFIED = "verified"
