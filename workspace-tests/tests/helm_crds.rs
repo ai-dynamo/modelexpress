@@ -18,7 +18,7 @@ fn repo_file(path: &str) -> String {
 
 #[test]
 fn helm_and_standalone_crd_manifests_stay_in_sync() {
-    let helm_crds = repo_file("helm/crds/modelexpress.nvidia.com.yaml");
+    let helm_crds = repo_file("helm/crds/modelexpress-crds.yaml");
     let standalone_crds = repo_file("examples/crds.yaml");
 
     assert_eq!(
