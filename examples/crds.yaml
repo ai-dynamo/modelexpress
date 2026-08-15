@@ -3,7 +3,6 @@
 #
 # ModelExpress Kubernetes Custom Resource Definitions.
 #
-# Helm installs these CRDs automatically from helm/crds/ when installing the chart.
 # For standalone Kubernetes deployments, apply this manifest once per cluster:
 #
 #     kubectl apply -f examples/crds.yaml

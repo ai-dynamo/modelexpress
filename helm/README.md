@@ -74,12 +74,6 @@ helm install my-modelexpress ./helm -f values.yaml
 helm install my-modelexpress ./helm --namespace modelexpress --create-namespace
 ```
 
-The chart installs the `ModelMetadata` and `ModelCacheEntry` CRDs from
-`helm/crds/` before rendering the remaining resources. Helm retains CRDs when a
-release is uninstalled and does not upgrade CRDs that already exist. Apply the
-updated `examples/crds.yaml` explicitly when a chart upgrade includes CRD schema
-changes.
-
 ## Configuration
 
 ### ⚠️ Important: Override Production Values
