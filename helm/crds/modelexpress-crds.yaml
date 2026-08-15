@@ -3,7 +3,7 @@
 #
 # ModelExpress Kubernetes Custom Resource Definitions.
 #
-# For standalone Kubernetes deployments, apply this manifest once per cluster:
+# Apply once per cluster before deploying the server with MX_METADATA_BACKEND=kubernetes:
 #
 #     kubectl apply -f examples/crds.yaml
 #
