@@ -13,8 +13,8 @@
 #   * ModelCacheEntry — Model-download lifecycle (one CR per cached model, holds
 #                       phase + created_at / last_used_at timestamps for LRU eviction).
 #
-# Both custom resources are namespaced and managed by the server pod's
-# ServiceAccount (see helm/templates/rbac.yaml for the required RBAC rules).
+# Both are scoped to the server's namespace and owned by the server pod's
+# ServiceAccount (see helm/templates/rbac.yaml for the Role).
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
