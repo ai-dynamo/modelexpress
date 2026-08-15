@@ -687,6 +687,85 @@ for the end-to-end design, integration contract, implementation status, and
 validation requirements, including descriptor bounding for strided slices,
 receive and staging buffer ownership, and when PWAL applies rather than MDL.
 
+### Delta Refit Receivers
+
+The second refit path applies XOR deltas from S3 to a local safetensors
+checkpoint and reloads that checkpoint into the live model. A publisher writes
+zstd-compressed XOR buckets plus a delta index; a revision catalog serves the
+per-revision manifest over gRPC. `refit/receiver.py` splits into **prepare**,
+which verifies the installed base version and digest, downloads and validates the
+index, then XORs each bucket into the mmapped checkpoint while hashing against
+the canonical per-tensor digest, and **install**, which loads the prepared
+checkpoint into the running model. Transitions are journaled in `state.json`
+under an exclusive `flock` and marked poisoned for the duration of the mutation,
+so a crash mid-XOR is never mistaken for a clean checkpoint. The cache is keyed
+only by model ID, so ranks on a node share one checkpoint: the first rank to take
+the lock does the XOR while the others block and then take the
+already-installed early return, which yields one download and XOR per node even
+where ranks are separate processes.
+
+`ModelExpressWeightReceiver` owns that protocol -- `initialize()`,
+`start_weight_update(version)`, `update_weights()`, `pop_metrics()`,
+`mark_poisoned()`, `status()`, and the `ReceiverRevisionState` machine -- and is
+engine-agnostic. Two hooks reach the engine: `_launch_checkpoint()`, the on-disk
+checkpoint the engine resolved at launch, which seeds the local copy, and
+`install_prepared_checkpoint(prepared)`, which loads a prepared revision into the
+live model and reports through `ReceiverInstallError.mutation_started` whether
+any weight was already written. That flag is what separates a worker still
+serving its previous revision (`FAILED`) from one that must be replaced
+(`POISONED`).
+
+| Path | Role |
+|---|---|
+| `refit/receiver.py` | The receiver protocol, local checkpoint, journal, and the two engine hooks |
+| `refit/factory.py` | `RolloutBackend` and `build_delta_receiver`, dispatching on the rollout engine |
+| `engines/sglang/refit/receiver.py` | `SglangWeightReceiver`, instantiated by the factory with SGLang's model runner |
+| `engines/vllm/refit/delta_receiver.py` | `VllmWeightReceiver`, both hooks against a live vLLM model |
+| `engines/vllm/refit/delta_engine.py` | `MxWeightTransferEngine`, vLLM's update lifecycle and reload tensor preservation |
+
+On vLLM the receiver is a client rather than the engine itself.
+`MxWeightTransferEngine` extends vLLM's `WeightTransferEngine` and owns vLLM's
+update window, holding a `VllmWeightReceiver` for the delta protocol. The two
+lifecycles collide name for name while meaning different things -- vLLM's
+`start_weight_update()` opens the layerwise reload window, the receiver's
+`start_weight_update(version)` downloads and XORs a revision -- so composition
+keeps each name right for its own object. Since vLLM's `start_weight_update()`
+takes no arguments, the target revision travels in the `update_info` dict as
+`MxDeltaUpdateInfo`, and the receiver's configuration arrives at
+`init_transfer_engine` as `MxDeltaInitInfo`. The engine registers with vLLM's
+own `WeightTransferEngineFactory` under `modelexpress` through the existing
+`vllm.general_plugins` entry point, so a worker opts in with
+`--weight-transfer-config '{"backend": "modelexpress"}'` and no vLLM patch. It
+declines draft-model updates: a receiver is bound to one catalog model ID and one
+local checkpoint, so a speculative draft would need its own receiver.
+
+Installation happens inside vLLM's reload window because
+`process_weights_after_loading` replaces parameters at new addresses for
+quantized models while captured CUDA graphs hold pointers to the old storage.
+The window preserves the storage of every parameter and buffer. The delta
+engine covers what it does not. Bare-attribute tensors -- plain
+`module.__dict__` tensors registered as neither parameter nor buffer, such as
+Marlin's `workspace` and MLA's `W_UV`/`W_UK_T` -- are snapshotted before the
+window opens and re-attached after it closes, copying fresh content into the
+original storage so graph replay reads the captured address with updated values.
+MLA's absorbed KV matrices are additionally recomputed in place from
+`kv_b_proj`, since preserving their address does not refresh their content. Both
+vLLM refit paths share these helpers, and the same module reports any parameter
+left on the meta device, which is a graph-replay hang.
+
+Preparation currently runs inside `receive_weights`, so the first request for a
+revision stalls the worker for the download and XOR; because prepare and install
+are separately callable on the receiver, an out-of-band caller can stage a
+revision ahead of the window and leave the request install-only. Installation
+loads the whole checkpoint even though the delta index already marks the dirty
+tensor set, which is a known inefficiency: exploiting it means reconciling
+checkpoint-format bytes against already-processed parameter layouts, for which
+`MdlLoader.load_weights()` is the intended vehicle. Timings are reported through
+`RefitTimingRecorder`, with the index fetch as `control_discovery` and the bucket
+pool as `wire_transfer`; transformation is marked combined with the wire because
+download and XOR share one thread pool, and a revision another rank on the node
+already prepared is recorded as warm.
+
 ### SGLang Loader
 
 **MxModelLoader** is instantiated by SGLang's `remote_instance` loader when

@@ -11,6 +11,9 @@ from vllm.model_executor.model_loader import register_model_loader
 
 logger = logging.getLogger(__name__)
 
+MX_WEIGHT_TRANSFER_BACKEND = "modelexpress"
+MX_WEIGHT_TRANSFER_MODULE = "modelexpress.engines.vllm.refit.delta_engine"
+
 
 _PLUGIN_LOAD_FORMATS = ("modelexpress", "mx")
 
@@ -28,3 +31,20 @@ def register_plugin_model_loader() -> None:
             )
             continue
         register_model_loader(load_format)(MxModelLoader)
+
+
+def register_weight_transfer() -> None:
+    """Register the delta backend when vLLM exposes weight transfer."""
+    try:
+        from vllm.distributed.weight_transfer.factory import (
+            WeightTransferEngineFactory,
+        )
+    except ImportError:
+        logger.debug("vLLM has no weight transfer registry; delta refit unavailable")
+        return
+
+    WeightTransferEngineFactory.register_engine(
+        MX_WEIGHT_TRANSFER_BACKEND,
+        MX_WEIGHT_TRANSFER_MODULE,
+        "MxWeightTransferEngine",
+    )

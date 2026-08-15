@@ -13,6 +13,7 @@ from modelexpress.engines.vllm.patches.patch_object_storage_format_check import 
     patch_object_storage_format_check,
 )
 from modelexpress.patches import apply_patches
+from tests.vllm_weight_transfer_fake import install_weight_transfer_fake
 
 
 def test_apply_patches_runs_in_order(monkeypatch):
@@ -66,6 +67,11 @@ def test_vllm_entrypoint_configures_logging_before_patches(monkeypatch):
         "register_plugin_model_loader",
         lambda: calls.append(("loader", None)),
     )
+    monkeypatch.setattr(
+        registration,
+        "register_weight_transfer",
+        lambda: calls.append(("weight_transfer", None)),
+    )
 
     vllm_integration.register_modelexpress_loaders()
 
@@ -73,7 +79,29 @@ def test_vllm_entrypoint_configures_logging_before_patches(monkeypatch):
         ("logging", None),
         ("patches", vllm_integration.VLLM_PATCHES),
         ("loader", None),
+        ("weight_transfer", None),
     ]
+
+
+def test_weight_transfer_registration_stays_lazy(monkeypatch):
+    from modelexpress.engines.vllm import registration
+
+    install_weight_transfer_fake()
+    from vllm.distributed.weight_transfer.factory import WeightTransferEngineFactory
+
+    module = "modelexpress.engines.vllm.refit.delta_engine"
+    sys.modules.pop(module, None)
+    calls = []
+    monkeypatch.setattr(
+        WeightTransferEngineFactory,
+        "register_engine",
+        lambda *args: calls.append(args),
+    )
+
+    registration.register_weight_transfer()
+
+    assert calls == [("modelexpress", module, "MxWeightTransferEngine")]
+    assert module not in sys.modules
 
 
 def test_object_storage_patch_preserves_model_weights(monkeypatch):

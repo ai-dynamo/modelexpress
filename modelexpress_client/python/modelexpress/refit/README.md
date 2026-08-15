@@ -293,6 +293,8 @@ Performance claims must identify the exact implementation path. Reference transp
 | Path | Role |
 |---|---|
 | [`timing.py`](timing.py) | Normalized timing stages and context propagation |
+| [`receiver.py`](receiver.py) | Delta receiver protocol, local checkpoint, journal, and the two engine hooks |
+| [`factory.py`](factory.py) | Delta receiver construction, dispatched on the rollout backend |
 | [`reshard/geometry.py`](reshard/geometry.py) | Record the engine loader's source views and destination writes |
 | [`reshard/slice_plan.py`](reshard/slice_plan.py) | Resolve views, intersect shard boxes, emit contiguous runs |
 | [`reshard/transfer_plan.py`](reshard/transfer_plan.py) | Build and execute receiver-local plans |
@@ -301,6 +303,9 @@ Performance claims must identify the exact implementation path. Reference transp
 | [`reshard/transport/`](reshard/transport/) | Reference and NIXL transport adapters |
 | [`engines/vllm/refit/receiver.py`](../engines/vllm/refit/receiver.py) | vLLM geometry capture and graph-safe layerwise install |
 | [`engines/vllm/refit/installer.py`](../engines/vllm/refit/installer.py) | Optional vLLM mapped direct installer |
+| [`engines/vllm/refit/delta_receiver.py`](../engines/vllm/refit/delta_receiver.py) | vLLM delta receiver hooks: launch checkpoint and checkpoint install |
+| [`engines/vllm/refit/delta_engine.py`](../engines/vllm/refit/delta_engine.py) | vLLM weight transfer lifecycle and reload tensor preservation |
+| [`engines/sglang/refit/receiver.py`](../engines/sglang/refit/receiver.py) | SGLang delta receiver hooks instantiated through the shared factory |
 
 ## Related documentation
 
