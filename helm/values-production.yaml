@@ -58,14 +58,14 @@ persistence:
 
 env:
   MODEL_EXPRESS_SERVER_PORT: "8001"
-  MODEL_EXPRESS_LOGGING_LEVEL: "info"
+  MODEL_EXPRESS_LOG_LEVEL: "info"
   MODEL_EXPRESS_CACHE_DIRECTORY: "/root"
   MX_METADATA_BACKEND: "redis"
   REDIS_URL: "redis://redis:6379"
 
 livenessProbe:
   enabled: true
-  tcpSocket:
+  grpc:
     port: 8001
   initialDelaySeconds: 15
   periodSeconds: 10
@@ -74,7 +74,7 @@ livenessProbe:
 
 readinessProbe:
   enabled: true
-  tcpSocket:
+  grpc:
     port: 8001
   initialDelaySeconds: 15
   periodSeconds: 5

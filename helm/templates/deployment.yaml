@@ -44,7 +44,7 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy | default "IfNotPresent" }}
           {{- end }}
           ports:
-            - name: http
+            - name: grpc
               containerPort: {{ .Values.service.port | default 8001 }}
               protocol: TCP
           env:
@@ -96,26 +96,23 @@ spec:
             {{- toYaml .Values.args | nindent 12 }}
           {{- end }}
           {{- if and .Values.livenessProbe .Values.livenessProbe.enabled }}
+          {{- $liveness := omit .Values.livenessProbe "enabled" }}
+          {{- /* A probe allows exactly one handler. Helm deep-merges values,
+               so an override with tcpSocket/httpGet/exec would otherwise
+               combine with the default grpc handler; drop grpc in that case. */}}
+          {{- if or $liveness.tcpSocket $liveness.httpGet $liveness.exec }}
+          {{- $liveness = omit $liveness "grpc" }}
+          {{- end }}
           livenessProbe:
-            {{- if .Values.livenessProbe.tcpSocket }}
-            tcpSocket:
-              {{- toYaml .Values.livenessProbe.tcpSocket | nindent 14 }}
-            {{- end }}
-            initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds | default 5 }}
-            periodSeconds: {{ .Values.livenessProbe.periodSeconds | default 10 }}
-            timeoutSeconds: {{ .Values.livenessProbe.timeoutSeconds | default 5 }}
-            failureThreshold: {{ .Values.livenessProbe.failureThreshold | default 3 }}
+            {{- toYaml $liveness | nindent 12 }}
           {{- end }}
           {{- if and .Values.readinessProbe .Values.readinessProbe.enabled }}
+          {{- $readiness := omit .Values.readinessProbe "enabled" }}
+          {{- if or $readiness.tcpSocket $readiness.httpGet $readiness.exec }}
+          {{- $readiness = omit $readiness "grpc" }}
+          {{- end }}
           readinessProbe:
-            {{- if .Values.readinessProbe.tcpSocket }}
-            tcpSocket:
-              {{- toYaml .Values.readinessProbe.tcpSocket | nindent 14 }}
-            {{- end }}
-            initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds | default 5 }}
-            periodSeconds: {{ .Values.readinessProbe.periodSeconds | default 10 }}
-            timeoutSeconds: {{ .Values.readinessProbe.timeoutSeconds | default 5 }}
-            failureThreshold: {{ .Values.readinessProbe.failureThreshold | default 3 }}
+            {{- toYaml $readiness | nindent 12 }}
           {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
