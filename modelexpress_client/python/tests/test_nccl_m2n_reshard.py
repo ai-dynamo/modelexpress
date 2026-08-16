@@ -12,22 +12,22 @@ from __future__ import annotations
 
 import torch
 
-from modelexpress.weight_transfer.planner.mesh import (
+from modelexpress.refit.reshard.transport.nccl_m2n.mesh import (
     REPLICATE,
     build_tp_meshes,
-    shard_dim_from_trainer_tensor,
+    shard_dim_from_layout,
     tile_shape,
 )
-from modelexpress.weight_transfer.protocol.types import (
-    TrainerShard,
-    TrainerTensor,
+from modelexpress.refit.reshard.transport.nccl_m2n.layout import (
+    LayoutShard,
+    LayoutTensor,
 )
 
 
-def _row_sharded_tensor(name: str, rows: int, cols: int, n: int) -> TrainerTensor:
+def _row_sharded_tensor(name: str, rows: int, cols: int, n: int) -> LayoutTensor:
     step = rows // n
     shards = [
-        TrainerShard(
+        LayoutShard(
             agent_index=i,
             row_start=i * step,
             row_end=(i + 1) * step,
@@ -37,13 +37,13 @@ def _row_sharded_tensor(name: str, rows: int, cols: int, n: int) -> TrainerTenso
         )
         for i in range(n)
     ]
-    return TrainerTensor(name=name, dtype="torch.bfloat16", shape=[rows, cols], shards=shards)
+    return LayoutTensor(name=name, dtype="torch.bfloat16", shape=[rows, cols], shards=shards)
 
 
-def _col_sharded_tensor(name: str, rows: int, cols: int, n: int) -> TrainerTensor:
+def _col_sharded_tensor(name: str, rows: int, cols: int, n: int) -> LayoutTensor:
     step = cols // n
     shards = [
-        TrainerShard(
+        LayoutShard(
             agent_index=i,
             row_start=0,
             row_end=rows,
@@ -55,32 +55,32 @@ def _col_sharded_tensor(name: str, rows: int, cols: int, n: int) -> TrainerTenso
         )
         for i in range(n)
     ]
-    return TrainerTensor(name=name, dtype="torch.bfloat16", shape=[rows, cols], shards=shards)
+    return LayoutTensor(name=name, dtype="torch.bfloat16", shape=[rows, cols], shards=shards)
 
 
-def _replicated_tensor(name: str, rows: int, cols: int) -> TrainerTensor:
-    shard = TrainerShard(
+def _replicated_tensor(name: str, rows: int, cols: int) -> LayoutTensor:
+    shard = LayoutShard(
         agent_index=0, row_start=0, row_end=rows, device_addr=0, row_bytes=cols * 2, device_id=0
     )
-    return TrainerTensor(name=name, dtype="torch.bfloat16", shape=[rows, cols], shards=[shard])
+    return LayoutTensor(name=name, dtype="torch.bfloat16", shape=[rows, cols], shards=[shard])
 
 
 # ---- shard-dim inference ---------------------------------------------------
 def test_shard_dim_row():
-    assert shard_dim_from_trainer_tensor(_row_sharded_tensor("w", 8, 4, 2)) == 0
+    assert shard_dim_from_layout(_row_sharded_tensor("w", 8, 4, 2)) == 0
 
 
 def test_shard_dim_col():
-    assert shard_dim_from_trainer_tensor(_col_sharded_tensor("w", 4, 8, 2)) == 1
+    assert shard_dim_from_layout(_col_sharded_tensor("w", 4, 8, 2)) == 1
 
 
 def test_shard_dim_replicate():
-    assert shard_dim_from_trainer_tensor(_replicated_tensor("norm", 4, 4)) == REPLICATE
+    assert shard_dim_from_layout(_replicated_tensor("norm", 4, 4)) == REPLICATE
 
 
 def test_shard_dim_both_dims_raises():
     shards = [
-        TrainerShard(
+        LayoutShard(
             agent_index=0,
             row_start=0,
             row_end=4,
@@ -90,7 +90,7 @@ def test_shard_dim_both_dims_raises():
             col_start=0,
             col_end=2,
         ),
-        TrainerShard(
+        LayoutShard(
             agent_index=1,
             row_start=4,
             row_end=8,
@@ -101,11 +101,11 @@ def test_shard_dim_both_dims_raises():
             col_end=4,
         ),
     ]
-    tensor = TrainerTensor(
+    tensor = LayoutTensor(
         name="w2d", dtype="torch.bfloat16", shape=[8, 4], shards=shards
     )
     try:
-        shard_dim_from_trainer_tensor(tensor)
+        shard_dim_from_layout(tensor)
     except ValueError as exc:
         assert "shards both dims" in str(exc)
     else:
@@ -113,7 +113,7 @@ def test_shard_dim_both_dims_raises():
 
 
 def test_shard_dim_partial_single_shard_raises():
-    shard = TrainerShard(
+    shard = LayoutShard(
         agent_index=0,
         row_start=0,
         row_end=2,
@@ -121,11 +121,11 @@ def test_shard_dim_partial_single_shard_raises():
         row_bytes=8,
         device_id=0,
     )
-    tensor = TrainerTensor(
+    tensor = LayoutTensor(
         name="partial", dtype="torch.bfloat16", shape=[4, 4], shards=[shard]
     )
     try:
-        shard_dim_from_trainer_tensor(tensor)
+        shard_dim_from_layout(tensor)
     except ValueError as exc:
         assert "does not cover the full tensor" in str(exc)
     else:

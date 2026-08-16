@@ -16,11 +16,11 @@ import os
 import torch
 import torch.distributed as dist
 
-from modelexpress.weight_transfer.transport.nccl_m2n_executor import (
+from modelexpress.refit.reshard.transport.nccl_m2n.executor import (
     NcclM2nExecutor,
     ReshardParam,
 )
-from modelexpress.weight_transfer.transport.nccl_m2n_runtime import (
+from modelexpress.refit.reshard.transport.nccl_m2n.runtime import (
     _M2nLaneSpec,
     _M2nRuntime,
 )

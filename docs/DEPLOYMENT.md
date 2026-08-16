@@ -306,7 +306,7 @@ docker run -p 8001:8001 model-express
 
 ### Docker Compose
 
-Single-service setup for local development:
+Local development setup. Brings up the server plus a Redis metadata backend:
 
 ```bash
 docker compose -f docker/docker-compose.yml up --build
@@ -572,7 +572,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 |----------|---------|-------------|
 | `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""`/`server`/`redis`/`kubernetes` (central server) or `k8s-service` (decentralized via K8s Service routing). |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Client's gRPC server address (recommended; ignored when client uses `k8s-service` backend) |
-| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated, pending removal in a future release. Still read by all client paths and takes precedence when both are set; keep setting it during the transition. |
+| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
 | `MX_DISABLE_PATCHES` | `0` | Emergency escape hatch that skips all runtime compatibility patches. Set to `1`, `true`, `yes`, or `on` if a patch is incompatible with the installed engine. |
 | `MX_P2P_SOURCE_SELECTOR` | `random` | P2P source-ordering policy for the RDMA load path. `random` (behavior-preserving default; local-RNG shuffle) or `rendezvous_hash` (stateless deterministic spreading via HRW hashing; stable across restarts and minimally disrupted by source-set changes). Unknown values log a warning and fall back to `random`. Ordering only — the `MAX_SOURCE_RETRIES=3` retry budget is unchanged. |
 | `MX_METRICS_ENABLED` | `0` | Opt-in Prometheus metrics collector for the client. `1` enables the collectors (requires the `metrics` extra, `prometheus-client`). The P2P source-selection group (`mx_p2p_*`) ships today; the collector is generic so other client metrics can be added later. Off by default; selection signals are always emitted as structured logs regardless. |
@@ -581,7 +581,8 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_METRICS_SCHEME` | `""` | Optional run/scheme label added to every metric, so multiple runs compare on one dashboard. |
 | `MX_POOL_REG` | `0` | Allocation-level NIXL registration via `cuMemGetAddressRange`. Registers each unique cudaMalloc block instead of each tensor, typically 80-99% fewer registrations, without changing transfer semantics. `MX_VMM_ARENA=1` uses direct arena registration and does not require pool-reg. |
 | `MX_VMM_ARENA` | `0` | Route weight allocations into a CUDA VMM arena via PyTorch's `CUDAPluggableAllocator`, then register the used arena range as one NIXL MR with dmabuf at end-of-load. Reserves 16.0 TiB of VA by default, with no physical commit until allocations are mapped. Requires the `modelexpress.vmm._alloc_ext` C extension to have built at install time; if it did not, this flag is a no-op with a warning and the loader falls back to the pool-reg path. See [VMM Arena](#vmm-arena-single-mr-registration). |
-| `UCX_CUDA_COPY_REG_WHOLE_ALLOC` | (UCX default) | Set to `off` with `MX_VMM_ARENA=1` until the upstream UCX `cuda_copy_md` length-truncation fix ships. |
+| `MX_ARENA_SINGLE_MR` | `0` | Keep single-MR arena registration even when the arena spans several `cuMemCreate` handles. Only safe on transports that can register across handles (dmabuf/IB); cuda_ipc cannot, so the default falls back to per-tensor registration. See [VMM Arena](#vmm-arena-single-mr-registration). |
+| `UCX_CUDA_COPY_REG_WHOLE_ALLOC` | (UCX default) | Set to `off` with `MX_VMM_ARENA=1` on any UCX predating the `cuda_copy_md` length-truncation fix (openucx/ucx#11461). Scoped to the `cuda_copy` transport; it does not affect `cuda_ipc`. |
 | `MX_NIXL_BACKEND` | `UCX` | NIXL backend for GPU-to-GPU RDMA. `UCX` (default) for InfiniBand / RoCE. `LIBFABRIC` for AWS EFA — see [NIXL Backend Selection](#nixl-backend-selection). |
 | `MX_RDMA_NIC_PIN` | (unset) | Per-rank IB NIC pinning. `auto` runs a topology probe; comma-separated NIC list is an explicit override. Workaround for openucx/ucx#11259. |
 | `MX_RDMA_NIC_PIN_MIN_RATE_GBPS` | (auto, max-rate filter) | Override the auto-detect rate filter with an explicit lower bound (Gb/s). |
@@ -595,6 +596,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles. |
 | `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before source workers publish weight metadata or prepare and publish cache artifact bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim. See [Multi-node readiness](#multi-node-readiness). |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication before giving up. |
+| `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Adds compile configuration as a partitioning dimension for the torch compile cache artifact source pool. Workers that share a value discover each other's caches; workers with different values do not. Unset removes **only this dimension** — the pool is still partitioned by every other `SourceIdentity` field (model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch), so workers matching on all of those share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](#pairing-workers-by-compile-configuration). |
 | `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact HF commit SHA / checkpoint version so `mx_source_id` is content-addressed. Required for decentralized backends where no central coordinator tracks versions. |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend. `{rank}` is substituted with the worker's own rank. If the resolved pattern has no `:port`, the client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` (multi-GPU-per-pod shape); if it has an explicit port, that port is used verbatim (1-GPU-per-pod shape). |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` backend: max retries on `FAILED_PRECONDITION` (revision mismatch during rolling updates). Each retry opens a fresh gRPC channel so kube-proxy re-picks a backend. |
@@ -661,7 +663,9 @@ arena address. Frees unmap and release that handle, so replacement tensors
 created during post-processing can return physical memory before the final
 registration step. At end-of-load, ModelExpress registers the used arena
 range once through dmabuf and publishes all tensor descriptors against
-that single MR.
+that single MR — but only when the arena is backed by a single physical
+allocation. An arena that spans several `cuMemCreate` handles falls back to
+per-tensor registration; see [Multi-handle arenas](#multi-handle-arenas) below.
 
 Recommended source-worker setting:
 
@@ -676,12 +680,47 @@ arena registration bypasses the pool-reg path and calls `register_arena`
 directly. The arena produces one MR for the used range regardless of the
 pool-reg setting.
 
-Set `UCX_CUDA_COPY_REG_WHOLE_ALLOC=off` until the upstream UCX
-`cuda_copy_md` length-truncation fix ships. Without it, UCX can truncate
-a multi-handle VMM registration to the first physical handle, and RDMA
-operations that cross into later handles fail. See the reproducer and
-fix notes in this gist:
+Set `UCX_CUDA_COPY_REG_WHOLE_ALLOC=off` on any UCX predating the
+`cuda_copy_md` length-truncation fix (openucx/ucx#11461). Without it, UCX
+can truncate a multi-handle VMM registration to the first physical
+handle, and RDMA operations that cross into later handles fail. See the
+reproducer and fix notes in this gist:
 <https://gist.github.com/nicolasnoble/e0e57eb5a1b902057ae3d1df59c039cf>.
+
+That knob covers the `cuda_copy` transport only. It has no effect on
+`cuda_ipc`, which has its own multi-handle limitation described in
+[Multi-handle arenas](#multi-handle-arenas) below.
+
+#### Multi-handle arenas
+
+A CUDA fabric/IPC handle names exactly one `cuMemCreate` allocation. UCX
+cuda_ipc resolves a registered region with `cuMemRetainAllocationHandle` and
+`cuMemGetAddressRange`, both of which report the allocation holding the base
+pointer rather than the whole reserve. Registering a multi-allocation arena as
+one MR therefore publishes an rkey covering only its first chunk, and the peer
+reads past what it mapped — measured on GB200 MNNVL as a segfault in
+`cuMemcpyDtoDAsync_v2` with an arena spanning 1019 chunks.
+
+ModelExpress detects this (`live_allocation_count > 1`) and falls back to
+per-tensor registration, which is correct because each arena allocation is one
+handle, so every tensor lies wholly inside one. The log line names the count:
+
+```text
+register_arena: arena spans 1019 physical allocations; a single MR would publish
+an rkey covering only the first, which cuda_ipc cannot address. Falling back to
+per-tensor registration ...
+```
+
+`UCX_CUDA_COPY_REG_WHOLE_ALLOC=off` does not cover this case: it applies to
+cuda_copy, while the truncation above is in cuda_ipc, and UCX 1.21 has no
+cuda_ipc equivalent. Upstream fixes are in flight for both sides —
+[openucx/ucx#11283](https://github.com/openucx/ucx/pull/11283) for cuda_ipc and
+[openucx/ucx#11461](https://github.com/openucx/ucx/pull/11461) for the
+cuda_copy/dmabuf length truncation.
+
+Set `MX_ARENA_SINGLE_MR=1` to keep the single-MR path on deployments where it
+was validated, i.e. dmabuf/IB, where `ibv_reg_dmabuf_mr` does span several
+handles.
 
 ### P2P Metadata Exchange
 
@@ -697,6 +736,63 @@ For cache artifact transfer, set `MX_ARTIFACT_TRANSFER=1` on source and target w
 vLLM publishes torch compile (`VLLM_CACHE_ROOT/torch_compile_cache`), Triton (`TRITON_CACHE_DIR`, or `~/.triton/cache`), DeepGEMM (`DG_JIT_CACHE_DIR`, or `VLLM_CACHE_ROOT/deep_gemm`), TileLang (`TILELANG_CACHE_DIR`, or `~/.tilelang/cache`), CuTe DSL (`CUTE_DSL_CACHE_DIR`, or `$TMPDIR/<user>/cutlass_python_cache`), and FlashInfer (`FLASHINFER_WORKSPACE_BASE/.cache/flashinfer`, or `~/.cache/flashinfer`) caches. The FlashInfer artifact also includes vLLM's persistent autotune directory from `VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR`, or `VLLM_CACHE_ROOT/flashinfer_autotune_cache` when unset; ModelExpress does not change either path.
 
 SGLang's NIXL loader publishes torch compile (`TORCHINDUCTOR_CACHE_DIR`, or PyTorch Inductor's runtime `cache_dir()`), Triton (`TRITON_CACHE_DIR`, or `~/.triton/cache`), TVM-FFI (`TVM_FFI_CACHE_DIR`, or `~/.cache/tvm-ffi`), DeepGEMM (`SGLANG_DG_CACHE_DIR`, or `~/.cache/deep_gemm`), TileLang (`TILELANG_CACHE_DIR`, or `~/.tilelang/cache`), CuTe DSL (`CUTE_DSL_CACHE_DIR`, or `$TMPDIR/<user>/cutlass_python_cache`), and FlashInfer (`FLASHINFER_WORKSPACE_BASE/.cache/flashinfer`, or `~/.cache/flashinfer`) caches. The FlashInfer artifact also includes SGLang's persistent autotune directory from `SGLANG_CACHE_DIR/flashinfer/autotune`, or `~/.cache/sglang/flashinfer/autotune` when unset. SGLang runs that autotuner only for eligible FlashInfer MoE or FP4 backends; DeepGEMM + DeepEP does not produce an autotune cache. SGLang TransferEngine transport currently remains weight-only for ModelExpress artifact transfer because cache artifact bytes move through the NIXL artifact path.
+
+#### Pairing workers by compile configuration
+
+A torch compile cache is only reusable by a worker whose compile configuration
+matches the one that produced it. vLLM enforces this itself: it derives its own
+cache directory name from a hash that includes scheduler and compilation
+settings, so a worker started with a different `--max-num-batched-tokens` or
+`--max-model-len` looks in a different directory and recompiles from scratch.
+
+ModelExpress cannot reproduce that hash at load time — part of it depends on
+files traced by Dynamo, which are only known after compilation. Artifact
+discovery therefore keys on `MX_ARTIFACT_COMPILE_CONFIG_DIGEST`, and **that
+variable is unset by default**.
+
+The source pool is still partitioned by every other `SourceIdentity` field, so
+workers differing in model, parallelism sizes, dtype, quantization, revision,
+vLLM/torch/CUDA/Triton version, or GPU architecture never see each other's
+caches. What an unset digest removes is **only the compile-configuration
+dimension**: workers matching on all of the above land in one pool even when
+their compile settings differ, so one can be handed a cache built under a
+different compile configuration. The bytes transfer and install successfully;
+vLLM then ignores them and recompiles. The result is wasted transfer, not
+incorrect output.
+
+That single missing dimension is exactly the one that separates prefill from
+decode in a disaggregated deployment — the two roles otherwise agree on every
+field above.
+
+Set the variable to a distinct value per compile configuration whenever a
+deployment runs more than one — most commonly prefill and decode workers in a
+disaggregated setup, which differ in `max_num_batched_tokens`:
+
+```yaml
+# prefill workers
+- name: MX_ARTIFACT_COMPILE_CONFIG_DIGEST
+  value: "prefill-mnbt8192"
+# decode workers
+- name: MX_ARTIFACT_COMPILE_CONFIG_DIGEST
+  value: "decode-mnbt1024"
+```
+
+The value is opaque to ModelExpress; it only has to be equal across workers that
+should share caches and different across those that should not. Note that this
+partitions the pool but does not by itself make prefill and decode share a
+cache — they cannot, because vLLM's own cache keys already differ.
+
+To check whether a transferred cache was actually used, look for the
+effectiveness line the vLLM loader emits once the engine is up:
+
+```text
+vLLM selected torch.compile cache directory <path>, which ModelExpress installed
+```
+
+A `WARNING` naming a different directory means the installed artifact was inert
+and this worker recompiled — the signal that the pool needs partitioning. You
+can confirm independently by comparing the `Using cache directory:` hash that
+each worker logs.
 
 In multi-node deployments, artifact metadata records the framework `node_rank`, so each target node selects the corresponding source node without making the artifact worker-specific. If artifact transfer is enabled while P2P metadata is disabled, the loader logs a warning and skips artifact transfer. Artifact discovery currently requires a central-coordinator backend (`redis` or `kubernetes`), and Kubernetes deployments must use the matching `ModelMetadata` CRD containing `status.worker.artifactSource.nodeRank`.
 
@@ -722,6 +818,41 @@ but do not authenticate the publishing replica or attest the artifact. Enable
 artifact transfer only within a trusted deployment, and network-isolate the MX
 server and worker gRPC endpoints from untrusted clients. ModelExpress does not
 currently sign cache artifacts.
+
+### Server-Backed Model Cache (No Shared Storage)
+
+For workers that cannot reach the Hugging Face Hub themselves, ModelExpress Server can act as the only route to the model. The worker asks the server for repository files; the server downloads the model once on a cold miss and serves every later worker from its own cache.
+
+Weights and everything else are fetched at different times. Config, tokenizer, and index files arrive before the engine starts, because the engine resolves the model path (and fails offline) long before any weight loader runs. Weights stay behind the strategy chain, so a live P2P source is still the first choice and the server is only asked after `RdmaStrategy` finds nothing. Fetching metadata early does not weaken P2P-first — no weight moves on that path.
+
+Enable it on the worker:
+
+```yaml
+MODEL_EXPRESS_URL: http://<model-express-service>:8001
+MODEL_EXPRESS_NO_SHARED_STORAGE: "1"
+MODEL_EXPRESS_CACHE_DIRECTORY: /home/dynamo/.cache/huggingface/hub
+HF_HUB_CACHE: /home/dynamo/.cache/huggingface/hub
+HF_HUB_OFFLINE: "1"
+```
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MODEL_EXPRESS_NO_SHARED_STORAGE` | `0` | Fetch repository files from ModelExpress Server. When unset, nothing changes: no extra RPCs and no change to P2P or local loading. |
+| `MODEL_EXPRESS_URL` | unset | ModelExpress Server address. Required together with the switch above; without an address the feature stays off. |
+| `MX_SERVER_ADDRESS` | unset | Alternative spelling of the server address, accepted for parity with the P2P client. Either variable satisfies the requirement. |
+| `MODEL_EXPRESS_CACHE_DIRECTORY` | `HF_HUB_CACHE` | Where the worker installs snapshots. Point it at the same path as `HF_HUB_CACHE` so the engine reads what ModelExpress wrote. |
+| `MODEL_EXPRESS_TRANSFER_CHUNK_SIZE` | `1048576` | gRPC file-stream chunk size in bytes. Values outside 1..`MAX_CHUNK_SIZE` fall back to the default rather than failing startup. |
+
+Requirements and limits:
+
+- ModelExpress Server needs a writable cache directory, egress to Hugging Face, and `HF_TOKEN` for private repositories. The worker needs none of these.
+- The server must be from a release newer than v0.5.0 — the first generation that keys registry entries on the weight mode. The metadata phase claims a metadata-only download; an older server records that claim against the model name alone, which marks the model complete, so the weight phase finds nothing left to fetch and the worker falls through to a native load that an offline pod cannot perform.
+- Mount the cache path as a volume shared by every container that touches it. Without a volume the snapshot lands in the container's writable layer, invisible to other containers and lost on restart.
+- Requesting a pinned revision is not supported yet: the client never sets `revision` on the first call of a phase, so the server picks its default revision. Every call after that is pinned to the revision the server reported — when it named none, later calls stay unpinned and the stream's own commit-hash validation is the guard, which still refuses a mid-stream change. A worker that asked for a specific revision gets the mismatch logged, and weights whose commit differs from the local snapshot directory are refused rather than mixed in.
+- Reusing a local snapshot requires the server to name its revision. A server that already holds an unpinned model answers without naming one, so the worker restreams the metadata rather than assume the copy on disk is current. Metadata is small — well under a second — and the stream carries the commit, which makes restreaming the cheap way to stay correct.
+- On a cold server the metadata phase waits only for the non-weight files. The weights are downloaded later, and only if P2P found no source. The server keys its registry entry on the weight mode, so the metadata-only request does not mark the model complete.
+- The server dedups the upstream download but not the per-worker stream. Concurrent workers on a cold model all wait on one Hugging Face fetch, then each streams its own copy, so N replicas starting together cost N x model size in server egress. Size the server's network accordingly, or stagger large rollouts.
+- An unreachable server costs about 20 seconds per worker before loading falls through to the next strategy. That is the TCP connect timeout; a shorter deadline would abort legitimate cold-cache downloads, which can take minutes.
 
 ### InstantTensor (Fast Local Safetensors)
 

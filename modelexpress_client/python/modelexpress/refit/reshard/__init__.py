@@ -55,6 +55,7 @@ from modelexpress.refit.reshard.rendezvous import (
     gather_sources,
     wrap_rendezvous_blob,
 )
+from modelexpress.refit.reshard.verify import shard_region, tensor_digest
 
 __all__ = [
     "InMemoryReferenceTransport",
@@ -85,5 +86,7 @@ __all__ = [
     "paired_runs",
     "plan_pull",
     "plan_transfer",
+    "shard_region",
+    "tensor_digest",
     "wrap_rendezvous_blob",
 ]

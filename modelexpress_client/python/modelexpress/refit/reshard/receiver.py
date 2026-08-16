@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from collections import deque
 
@@ -51,6 +52,29 @@ from modelexpress.refit.reshard.types import (
 )
 
 logger = logging.getLogger("modelexpress.refit.reshard.receiver")
+
+
+def _max_gbps() -> float:
+    """Per-rank fabric ceiling in Gbps; 0 disables the check.
+
+    Read at call time so a harness can set it per run. Off unless configured
+    because only the operator knows the real per-rank limit for their fabric.
+
+    A non-finite ceiling disables the check rather than being compared against.
+    ``float("nan")`` parses happily, and every comparison against NaN is False, so
+    a fat-fingered value would slip past the "is it configured" test and then fail
+    the "is the rate acceptable" test - turning the guard into a refit that always
+    aborts. Infinity is accepted by the comparison but means the same as off.
+    """
+    ceiling = envs.MX_RESHARD_MAX_GBPS
+    if not math.isfinite(ceiling):
+        logger.warning(
+            "MX_RESHARD_MAX_GBPS=%r is not a finite number; the throughput ceiling "
+            "is disabled for this run",
+            ceiling,
+        )
+        return 0.0
+    return ceiling
 
 
 def handshake_endpoints_for_plan(
@@ -274,7 +298,7 @@ class ReshardReceiver:
         local_rank: int,
         global_rank: int,
         num_trainer_sources: int,
-        device: "torch.device",
+        device: torch.device,
         listen_port: int,
         timeout: float = 1200.0,
     ) -> None:
@@ -328,6 +352,10 @@ class ReshardReceiver:
         self._param_ptr: dict[
             str, int
         ] = {}  # segment param_name -> receive-buffer data_ptr
+        # One-time setup costs, measured in _prepare and reported with the first
+        # refit's stage record. Kept separate from the per-step timings so a cold
+        # first step is not read as a slow steady state.
+        self._prepare_stages: dict[str, float] = {}
 
         logger.info(
             "[reshard] receiver init: agent=%s global_rank=%d trainer_sources=%d",
@@ -337,7 +365,7 @@ class ReshardReceiver:
         )
 
     # ------------------------------------------------------------- engine hooks
-    def _capture(self, manifest: list) -> "tuple[CaptureResult, dict]":
+    def _capture(self, manifest: list) -> tuple[CaptureResult, dict]:
         """Record where each published source lands in the engine's load-time
         param layout, without moving data.
 
@@ -366,6 +394,8 @@ class ReshardReceiver:
             self._num_trainer_sources,
             timeout,
         )
+        self._prepare_stages = {}
+        _t = time.perf_counter()
         sources, session_to_agent, session_to_device, agent_endpoints = gather_sources(
             self._mx_client,
             expected_trainers=self._num_trainer_sources,
@@ -374,6 +404,7 @@ class ReshardReceiver:
             rank=self._global_rank,
             timeout=timeout,
         )
+        self._prepare_stages["prepare_discover_s"] = time.perf_counter() - _t
         logger.info(
             "[reshard] _prepare: discovered %d source(s), %d agent(s)",
             len(sources),
@@ -386,7 +417,9 @@ class ReshardReceiver:
             "[reshard] _prepare: capturing geometry over %d manifest entries",
             len(manifest),
         )
+        _t = time.perf_counter()
         capture, param_layout = self._capture(manifest)
+        self._prepare_stages["prepare_capture_s"] = time.perf_counter() - _t
         logger.info(
             "[reshard] _prepare: captured %d copies, %d unsupported",
             len(capture.copies),
@@ -398,7 +431,9 @@ class ReshardReceiver:
         # It is built once and reused every step (see the guard in
         # update_weights), which assumes the trainer set + their shard layout +
         # their buffer addresses are stable for the run.
+        _t = time.perf_counter()
         plan = plan_transfer(capture, sources)
+        self._prepare_stages["prepare_plan_s"] = time.perf_counter() - _t
         all_params = sorted({c.param_name for c in capture.copies})
         # Before the fail-closed rejection below, not after: an unsupported plan is
         # the case where naming the hole matters most, and raising first would leave
@@ -423,6 +458,10 @@ class ReshardReceiver:
         # and by here the plan says which trainers are actually read from, so peers
         # this rank never touches are not dialed. It also means an unsupported plan
         # is rejected above without spending the handshake budget first.
+        # prepare_handshake_s covers the dial, and only the peers the plan reads
+        # from. It is therefore not comparable with the same figure from a run
+        # that dialed every discovered trainer before planning.
+        _t = time.perf_counter()
         handshake_endpoints = handshake_endpoints_for_plan(
             plan, session_to_agent, agent_endpoints
         )
@@ -436,6 +475,7 @@ class ReshardReceiver:
             handshake_endpoints,
             envs.MX_RESHARD_HANDSHAKE_TIMEOUT_S,
         )
+        self._prepare_stages["prepare_handshake_s"] = time.perf_counter() - _t
 
         self._transport = NixlReshardTransport(
             self._manager, session_to_agent, session_to_device, timeout_seconds=timeout
@@ -446,9 +486,18 @@ class ReshardReceiver:
         # one persistent bf16 STAGING buffer per convert param, registered as an
         # RDMA target (classic cudaMalloc so the HCA can RDMA into it); each refit
         # we RDMA into staging then cast staging -> the (load-time) receive buffer.
+        # Allocation and registration happen in three places below (convert
+        # staging, full-pull staging, receive buffers). They are accumulated into
+        # one figure each rather than reported per buffer class, because the
+        # actionable question is how much of a cold start is cudaMalloc versus HCA
+        # registration.
+        alloc_s = 0.0
+        register_s = 0.0
+
         self._staging = {}
         self._staging_ptr = {}
         if plan.converts:
+            _t = time.perf_counter()
             with classic_cuda_alloc():
                 self._staging = {
                     c.param_name: torch.empty(
@@ -456,9 +505,12 @@ class ReshardReceiver:
                     )
                     for c in plan.converts
                 }
+            alloc_s += time.perf_counter() - _t
+            _t = time.perf_counter()
             self._manager.register_tensors(
                 {f"__stage__{n}": t for n, t in self._staging.items()}
             )
+            register_s += time.perf_counter() - _t
             self._staging_ptr = {n: t.data_ptr() for n, t in self._staging.items()}
 
         # Descriptor-heavy strided copies pull each complete source into one
@@ -467,6 +519,7 @@ class ReshardReceiver:
         self._full_staging = {}
         self._full_staging_ptr = {}
         if plan.full_pulls:
+            _t = time.perf_counter()
             with classic_cuda_alloc():
                 self._full_staging = {
                     full_pull.src_name: torch.empty(
@@ -476,12 +529,15 @@ class ReshardReceiver:
                     )
                     for full_pull in plan.full_pulls
                 }
+            alloc_s += time.perf_counter() - _t
+            _t = time.perf_counter()
             self._manager.register_tensors(
                 {
                     f"__full__{name}": tensor
                     for name, tensor in self._full_staging.items()
                 }
             )
+            register_s += time.perf_counter() - _t
             self._full_staging_ptr = {
                 name: tensor.data_ptr() for name, tensor in self._full_staging.items()
             }
@@ -494,19 +550,26 @@ class ReshardReceiver:
         # their bf16 staging is the RDMA target and the refit casts into the buffer.
         seg_params = {seg.param_name for seg in plan.segments}
         self._recv_buffers = {}
+        _t = time.perf_counter()
         with classic_cuda_alloc():
             for name in all_params:
                 shape, dtype = param_layout[name]
                 self._recv_buffers[name] = torch.empty(
                     tuple(shape), dtype=dtype, device=self._device
                 )
+        alloc_s += time.perf_counter() - _t
         self._param_ptr = {}
         if seg_params:
+            _t = time.perf_counter()
             self._manager.register_tensors(
                 {f"__recv__{n}": self._recv_buffers[n] for n in seg_params}
             )
+            register_s += time.perf_counter() - _t
             for name in seg_params:
                 self._param_ptr[name] = self._recv_buffers[name].data_ptr()
+
+        self._prepare_stages["prepare_alloc_s"] = alloc_s
+        self._prepare_stages["prepare_register_s"] = register_s
 
         logger.info(
             "[reshard] prepared: %d descriptor(s), %d full-pull source(s), "
@@ -616,6 +679,7 @@ class ReshardReceiver:
         """RDMA-pull the needed slices into the receive buffers, cast the
         dtype-mismatched ones, then install into the live params."""
         timeout = timeout if timeout is not None else self._timeout
+        stages: dict[str, float] = {}
         # TODO(re-plan on topology change): the plan is built once and cached, so
         # a mid-run change in the trainer set - a trainer restart (new buffer
         # addresses), a reshard (new shard boundaries / fan-in), or scaling the
@@ -624,6 +688,10 @@ class ReshardReceiver:
         # re-discover + rebuild if a version/epoch token or address set differs).
         if self._plan is None:
             self._prepare(timeout)
+            # Attributed to the step that paid for it, so the stage record for a
+            # cold first refit accounts for its own setup instead of leaving it
+            # unattributed.
+            stages.update(self._prepare_stages)
         assert self._plan is not None and self._transport is not None
 
         # RDMA the sliced bf16 into the receive buffers (segments) and per-param
@@ -667,17 +735,43 @@ class ReshardReceiver:
                 "bytes": sum(descriptor.nbytes for descriptor in descriptors),
                 "fallback": list(self._plan.fallback),
             }
+            _t = time.perf_counter()
             self._transport.read(descriptors + full_descriptors + convert_descriptors)
+            stages["wire_fused_s"] = time.perf_counter() - _t
         else:
-            stats = execute_transfer(
-                self._plan,
-                resolve_param_ptr=lambda name: self._param_ptr[name],
-                transport=self._transport,
-            )
+            # A plan can be all converts or all full pulls. Timing an exact phase
+            # that moved nothing records a duration that is not a wire duration: it
+            # inflates accounted_s, and because the phased implied rate divides the
+            # bytes by the summed wire stages, it drags that rate down and makes the
+            # throughput ceiling less likely to catch a run that deserves it.
+            #
+            # Gated on segments, not exact_descriptor_count. The latter is the
+            # pre-bounding baseline that descriptor_savings() subtracts from, and it
+            # counts every copy including the ones that became full pulls or
+            # converts, so a bounded plan can carry a nonzero count with nothing
+            # left to issue. exact_descriptors() reads segments and nothing else.
+            if self._plan.segments:
+                _t = time.perf_counter()
+                stats = execute_transfer(
+                    self._plan,
+                    resolve_param_ptr=lambda name: self._param_ptr[name],
+                    transport=self._transport,
+                )
+                stages["wire_exact_s"] = time.perf_counter() - _t
+            else:
+                stats = {
+                    "segments": 0,
+                    "bytes": 0,
+                    "fallback": list(self._plan.fallback),
+                }
             if full_descriptors:
+                _t = time.perf_counter()
                 self._transport.read(full_descriptors)
+                stages["wire_full_s"] = time.perf_counter() - _t
             if convert_descriptors:
+                _t = time.perf_counter()
                 self._transport.read(convert_descriptors)
+                stages["wire_convert_s"] = time.perf_counter() - _t
 
         stats["segments"] += len(full_descriptors) + len(convert_descriptors)
         stats["bytes"] += sum(
@@ -685,29 +779,51 @@ class ReshardReceiver:
             for descriptor in (*full_descriptors, *convert_descriptors)
         )
 
+        # Before anything reads the receive buffers, and well before _install
+        # commits them to live parameters. An impossible rate means the transport
+        # reported completions it did not earn, so the buffers cannot be trusted;
+        # checking after the install would document the corruption rather than
+        # prevent it. Everything the check needs is known by this point.
+        self._check_throughput_ceiling(step, stats["bytes"], stages)
+
         # Local re-slice of every full-pulled source into its receive buffer, and
         # the dtype cast for every converted param. Both read staging written by
         # the reads above, so both must run after the wire completes.
-        for full_pull in self._plan.full_pulls:
-            full_tensor = self._full_staging[full_pull.src_name]
-            for copy in full_pull.copies:
-                source_view = _replay_ops(full_tensor, copy.op_chain)
-                receive_buffer = self._recv_buffers[copy.param_name]
-                destination = receive_buffer.as_strided(
-                    copy.dest_shape,
-                    copy.dest_stride,
-                    receive_buffer.storage_offset() + copy.dest_offset,
-                )
-                destination.copy_(source_view)
+        # Each GPU-side stage is followed by a synchronize so its duration is the
+        # work itself rather than the point at which a later stage happens to
+        # block. Without that, launch-bound stages read as free and whichever
+        # stage syncs first absorbs the whole queue.
+        if self._plan.full_pulls:
+            _t = time.perf_counter()
+            for full_pull in self._plan.full_pulls:
+                full_tensor = self._full_staging[full_pull.src_name]
+                for copy in full_pull.copies:
+                    source_view = _replay_ops(full_tensor, copy.op_chain)
+                    receive_buffer = self._recv_buffers[copy.param_name]
+                    destination = receive_buffer.as_strided(
+                        copy.dest_shape,
+                        copy.dest_stride,
+                        receive_buffer.storage_offset() + copy.dest_offset,
+                    )
+                    destination.copy_(source_view)
+            torch.cuda.synchronize(self._device)
+            stages["reslice_s"] = time.perf_counter() - _t
+
         # Cast the served bf16 staging into the (fp32) receive buffer - a torch
         # op, so the RDMA never crosses dtypes. _install writes the buffer.
-        for convert in self._plan.converts:
-            self._recv_buffers[convert.param_name].copy_(
-                self._staging[convert.param_name]
-            )
+        if self._plan.converts:
+            _t = time.perf_counter()
+            for convert in self._plan.converts:
+                self._recv_buffers[convert.param_name].copy_(
+                    self._staging[convert.param_name]
+                )
+            torch.cuda.synchronize(self._device)
+            stages["convert_s"] = time.perf_counter() - _t
 
+        _t = time.perf_counter()
         self._install(self._recv_buffers)
         torch.cuda.synchronize(self._device)
+        stages["install_s"] = time.perf_counter() - _t
 
         metrics = {
             "step": step,
@@ -735,4 +851,102 @@ class ReshardReceiver:
             len(self._plan.unbounded_sources),
             len(stats["fallback"]),
         )
+        metrics.update({k: round(v, 6) for k, v in stages.items()})
+        if envs.MX_REFIT_STAGE_RECORD:
+            record = {
+                "schema": "refit-stage-v2",
+                # Every rank emits its own line, so without this a fleet-wide
+                # capture cannot tell them apart - and the number that matters for
+                # a refit is the slowest rank, not the average of an anonymous pile.
+                "rank": self._global_rank,
+                "step": step,
+                "bytes": stats["bytes"],
+                "segments": stats["segments"],
+                # Sum of the measured stages. Compared against the caller's own
+                # end-to-end figure it gives the unattributed remainder, which is
+                # the number that says whether this record can be trusted as a
+                # breakdown. The stages do not overlap, so summing them is valid
+                # here; that stops being true if a stage is ever made concurrent.
+                "accounted_s": round(
+                    sum(v for k, v in stages.items() if k.endswith("_s")), 6
+                ),
+                # Byte economics travel with the timings. These were INFO-only, so
+                # a harness that captured the timings still had to reconstruct the
+                # useful-byte figure after the fact. Wire minus extra is measured.
+                "extra_wire_bytes": self._plan.extra_wire_bytes(),
+                "descriptor_savings": self._plan.descriptor_savings(),
+                "exact_descriptors": self._plan.exact_descriptor_count,
+                "full_pull_sources": len(self._plan.full_pulls),
+                "unbounded_sources": len(self._plan.unbounded_sources),
+                "converts": len(self._plan.converts),
+                "fallback": len(stats["fallback"]),
+                "fused_wire": _fused_wire_enabled(),
+                **{k: round(v, 6) for k, v in stages.items()},
+            }
+            # WARNING so a benchmark harness captures it without turning on INFO
+            # across every dependency.
+            logger.warning("MX_REFIT_STAGE %s", json.dumps(record))
         return metrics
+
+    def _check_throughput_ceiling(
+        self, step: int, wire_bytes: int, stages: dict
+    ) -> None:
+        """Refuse a wire rate the fabric cannot physically produce.
+
+        One run delivered nothing and reported the fastest refit yet measured:
+        40.61 GB in 0.84 s, an implied 387 Gbps, on a pod holding two adapters
+        worth about 191 Gbps. Coverage read 100%, fallback and unsupported were 0,
+        and the addresses and digests were stable. The only signal that dissented
+        was the parameter-equality gate, which timing runs switch off by design,
+        so without this check that run becomes the best row in the matrix.
+
+        An impossible rate is not a fast measurement, it is evidence the transport
+        reported completions it did not earn, so this aborts rather than recording
+        the number with a caveat. The impossible-throughput record below is emitted
+        before the raise so the evidence survives the abort; the ordinary stage
+        record is not reached, which is the point - the run produced no trustworthy
+        timing to file.
+
+        Called before the receive buffers are read or installed. Running it after
+        the install would leave the guard describing weights it had already let
+        through, which is the one outcome it exists to prevent.
+
+        Off unless a ceiling is configured, because only the operator knows the
+        real per-rank limit for their fabric.
+        """
+        ceiling = _max_gbps()
+        if ceiling <= 0 or wire_bytes <= 0:
+            return
+        # Fused mode reports one wire span; phased mode reports up to three, and
+        # they run in turn, so summing them is the phased equivalent.
+        wire_s = stages.get("wire_fused_s")
+        if wire_s is None:
+            wire_s = sum(
+                stages.get(key, 0.0)
+                for key in ("wire_exact_s", "wire_full_s", "wire_convert_s")
+            )
+        if wire_s <= 0:
+            return
+        implied_gbps = wire_bytes * 8 / wire_s / 1e9
+        if implied_gbps <= ceiling:
+            return
+        detail = {
+            "schema": "refit-impossible-throughput-v1",
+            # Which rank saw the impossible rate. One rank's adapters being
+            # misselected is a different diagnosis from the whole pod's.
+            "rank": self._global_rank,
+            "step": step,
+            "wire_bytes": wire_bytes,
+            "wire_s": round(wire_s, 6),
+            "implied_gbps": round(implied_gbps, 1),
+            "ceiling_gbps": ceiling,
+        }
+        logger.warning("MX_REFIT_IMPOSSIBLE_THROUGHPUT %s", json.dumps(detail))
+        raise RuntimeError(
+            f"[reshard] step {step} moved {wire_bytes} bytes in {wire_s:.4f}s, an "
+            f"implied {implied_gbps:.1f} Gbps against a per-rank ceiling of "
+            f"{ceiling:.1f} Gbps. The fabric cannot deliver that, so the transport "
+            f"reported completions without moving the payload - one known cause is "
+            f"the fabric library selecting adapters this container does not own. "
+            f"Treat this refit as failed, not fast."
+        )

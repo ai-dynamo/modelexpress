@@ -12,12 +12,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from modelexpress.weight_transfer.planner.mesh import REPLICATE
-from modelexpress.weight_transfer.transport.nccl_m2n_executor import (
+from modelexpress.refit.reshard.transport.nccl_m2n.mesh import REPLICATE
+from modelexpress.refit.reshard.transport.nccl_m2n.executor import (
     NcclM2nExecutor,
     ReshardParam,
 )
-from modelexpress.weight_transfer.transport.nccl_m2n_runtime import _M2nRuntime
+from modelexpress.refit.reshard.transport.nccl_m2n.runtime import _M2nRuntime
 
 
 class FakeStream:

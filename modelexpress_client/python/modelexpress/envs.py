@@ -42,6 +42,9 @@ if TYPE_CHECKING:
     # ModelExpress server address / logging
     MODEL_EXPRESS_URL: Optional[str]
     MX_SERVER_ADDRESS: Optional[str]
+    MODEL_EXPRESS_CACHE_DIRECTORY: Optional[str]
+    MODEL_EXPRESS_NO_SHARED_STORAGE: bool
+    MODEL_EXPRESS_TRANSFER_CHUNK_SIZE: Optional[str]
     MODEL_EXPRESS_LOG_LEVEL: str
     MODEL_NAME: Optional[str]
     # Auth (client)
@@ -65,6 +68,9 @@ if TYPE_CHECKING:
     MX_RESHARD_HANDSHAKE_TIMEOUT_S: float
     MX_RESHARD_HANDSHAKE_ATTEMPT_S: float
     MX_RESHARD_HANDSHAKE_BACKOFF_S: float
+    MX_REFIT_STAGE_RECORD: bool
+    MX_RESHARD_MAX_GBPS: float
+    MX_RESHARD_PUBLISH_DIGEST: bool
     # Kubernetes service backend
     MX_K8S_SERVICE_PATTERN: str
     MX_K8S_SOURCE_RETRIES: str
@@ -91,6 +97,7 @@ if TYPE_CHECKING:
     MX_TRANSFER_LOG_DIR: str
     # VMM arena
     MX_VMM_ARENA: bool
+    MX_ARENA_SINGLE_MR: bool
     # Framework artifact (JIT cache) transfer
     MX_ARTIFACT_TRANSFER: bool
     MX_ARTIFACT_BUNDLE_ROOT: Optional[str]
@@ -99,10 +106,7 @@ if TYPE_CHECKING:
     MX_ARTIFACT_READY_TIMEOUT_SECS: int
     MX_ARTIFACT_TRANSFER_CHUNK_SIZE: Optional[str]
     # Trainer weight sync
-    MX_TRAINER_TABLE_KEY: Optional[str]
-    MX_TRAINER_SYNC_TIMEOUT: int
     MX_REDIS_URL: str
-    MX_WEIGHT_SYNC_SERVER: Optional[str]
     # P2P source selection
     MX_P2P_SOURCE_SELECTOR: Optional[str]
     # Opt-in metrics collector
@@ -209,6 +213,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Site-varying defaults: return raw (None when unset), callers add defaults.
     "MODEL_EXPRESS_URL": lambda: os.environ.get("MODEL_EXPRESS_URL"),
     "MX_SERVER_ADDRESS": lambda: os.environ.get("MX_SERVER_ADDRESS"),
+    "MODEL_EXPRESS_CACHE_DIRECTORY": lambda: os.environ.get("MODEL_EXPRESS_CACHE_DIRECTORY"),
+    "MODEL_EXPRESS_NO_SHARED_STORAGE": lambda: _env_bool("MODEL_EXPRESS_NO_SHARED_STORAGE", False),
+    "MODEL_EXPRESS_TRANSFER_CHUNK_SIZE": lambda: os.environ.get(
+        "MODEL_EXPRESS_TRANSFER_CHUNK_SIZE"
+    ),
     "MODEL_EXPRESS_LOG_LEVEL": lambda: os.environ.get("MODEL_EXPRESS_LOG_LEVEL", "").upper(),
     "MODEL_NAME": lambda: os.environ.get("MODEL_NAME"),
     # ── Auth (client) ──────────────────────────────────────────────────────
@@ -259,6 +268,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_RESHARD_HANDSHAKE_BACKOFF_S": lambda: _env_positive_float(
         "MX_RESHARD_HANDSHAKE_BACKOFF_S", 2.0
     ),
+    # One JSON stage record per refit. On by default: the timings are already
+    # computed, and at INFO they were never captured by a benchmark run.
+    "MX_REFIT_STAGE_RECORD": lambda: _env_bool("MX_REFIT_STAGE_RECORD", True),
+    # Per-rank fabric ceiling in Gbps used to reject impossible wire rates. Zero
+    # disables the check, and is the default because only the operator knows the
+    # real per-rank limit for their fabric.
+    "MX_RESHARD_MAX_GBPS": lambda: _env_float("MX_RESHARD_MAX_GBPS", 0.0),
+    # Have publishers digest each shard they advertise, so a receiver-side check has
+    # something to compare against. Off by default: it costs a reduction over every
+    # published tensor, which is a large relative cost against a ~1.5 s wire, so it
+    # belongs in a qualification run rather than a throughput measurement. See
+    # modelexpress.refit.reshard.verify.
+    "MX_RESHARD_PUBLISH_DIGEST": lambda: _env_bool("MX_RESHARD_PUBLISH_DIGEST", False),
     # ── Kubernetes service backend ─────────────────────────────────────────
     "MX_K8S_SERVICE_PATTERN": lambda: os.environ.get("MX_K8S_SERVICE_PATTERN", "mx-sources"),
     "MX_K8S_SOURCE_RETRIES": lambda: os.environ.get("MX_K8S_SOURCE_RETRIES", ""),
@@ -288,6 +310,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_TRANSFER_LOG_DIR": lambda: os.environ.get("MX_TRANSFER_LOG_DIR", "/tmp/mx_logs"),
     # ── VMM arena ──────────────────────────────────────────────────────────
     "MX_VMM_ARENA": lambda: os.environ.get("MX_VMM_ARENA") == "1",
+    "MX_ARENA_SINGLE_MR": lambda: os.environ.get("MX_ARENA_SINGLE_MR") == "1",
     # ── Framework artifact (JIT cache) transfer ────────────────────────────
     "MX_ARTIFACT_TRANSFER": lambda: os.environ.get("MX_ARTIFACT_TRANSFER", "").strip().lower()
     in _TRUTHY,
@@ -301,10 +324,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # int parse plus its non-positive/max-bound validation and default param.
     "MX_ARTIFACT_TRANSFER_CHUNK_SIZE": lambda: os.environ.get("MX_ARTIFACT_TRANSFER_CHUNK_SIZE"),
     # ── Trainer pull (live weight sync from a running trainer) ─────────────
-    "MX_TRAINER_TABLE_KEY": lambda: os.environ.get("MX_TRAINER_TABLE_KEY"),
-    "MX_TRAINER_SYNC_TIMEOUT": lambda: _env_int("MX_TRAINER_SYNC_TIMEOUT", 300),
     "MX_REDIS_URL": lambda: os.environ.get("MX_REDIS_URL", "redis://localhost:6379"),
-    "MX_WEIGHT_SYNC_SERVER": lambda: os.environ.get("MX_WEIGHT_SYNC_SERVER"),
     # ── P2P source selection ───────────────────────────────────────────────
     # Raw (None when unset); source_selection applies its DEFAULT_SELECTOR fallback.
     "MX_P2P_SOURCE_SELECTOR": lambda: os.environ.get("MX_P2P_SOURCE_SELECTOR"),

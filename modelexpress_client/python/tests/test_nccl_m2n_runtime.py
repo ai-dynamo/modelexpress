@@ -13,8 +13,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from modelexpress.weight_transfer.planner.mesh import REPLICATE, build_tp_meshes, tile_shape
-from modelexpress.weight_transfer.transport.nccl_m2n_runtime import (
+from modelexpress.refit.reshard.transport.nccl_m2n.mesh import REPLICATE, build_tp_meshes, tile_shape
+from modelexpress.refit.reshard.transport.nccl_m2n.runtime import (
     _M2nCall,
     _M2nLaneBatch,
     _M2nLaneSpec,

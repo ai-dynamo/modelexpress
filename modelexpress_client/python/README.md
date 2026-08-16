@@ -15,8 +15,11 @@ pip install modelexpress
 # Editable install from source
 pip install -e .
 
-# With dev dependencies (pytest, grpcio-tools)
+# With test dependencies
 pip install -e ".[dev]"
+
+# Additionally install the pinned protobuf code generator when changing protobuf APIs
+pip install -e ".[codegen]"
 ```
 
 NIXL is expected to be supplied by the runtime environment (TRT-LLM,
@@ -27,6 +30,7 @@ or `pip install nixl-cu13` separately, matching your host CUDA toolkit.
 ### Requirements
 
 - Python >= 3.10
+- protobuf >= 5.27.2 and < 7
 - NVIDIA GPUs with RDMA/InfiniBand support
 - [NIXL](https://github.com/ai-dynamo/nixl) (NVIDIA Interconnect eXchange Library)
 - A running [ModelExpress server](https://github.com/ai-dynamo/modelexpress/tree/main/modelexpress_server) (Rust gRPC service backed by Redis)
@@ -95,6 +99,70 @@ deployment.
 
 ## Programmatic Usage
 
+### RL trainer publication
+
+An RL framework creates a weight version through the external Refit API. Each
+trainer actor then invokes its rank-local client to stage and publish one shard.
+Worker registration, manifest serving, and internal shard CRUD remain hidden
+behind the client.
+
+```python
+from modelexpress_rl import (
+    ModelExpressTrainerClient,
+    WeightVersionRef,
+    WeightVersionShardManifestService,
+    refit_pb2_grpc,
+)
+
+manifest_service = WeightVersionShardManifestService(endpoint="trainer-0:9000")
+refit_pb2_grpc.add_RefitWorkerServiceServicer_to_server(
+    manifest_service,
+    trainer_worker_grpc_server,
+)
+
+trainer = ModelExpressTrainerClient.initialize(
+    manager=nixl_manager,
+    manifest_publisher=manifest_service,
+)
+
+shard = trainer.stage_shard(
+    version=WeightVersionRef(version.uid),
+    tensors=megatron_tensor_specs,
+)
+shard.publish()
+```
+
+The deployment supplies `MODEL_NAME`, `MX_TRAINER_ENGINE`,
+`MX_TRAINER_STAGING_MODE`, `MX_WEIGHT_PAYLOAD_FORMAT`, `MX_WORKER_HOST`, and the
+normal ModelExpress server configuration. The Megatron adapter derives its
+source slot from the engine's global distributed rank. The NIXL metadata
+endpoint is derived from `MX_WORKER_HOST` and the supplied NIXL manager's listen
+port.
+
+`worker_endpoint` is the trainer-side manifest service address advertised to
+other workers. `server_url` selects the central ModelExpress control-plane
+service and defaults to the normal ModelExpress server configuration.
+
+Initialization fixes the staging mode and payload format. `publish()` hides
+manifest publication and the internal `CreateWeightVersionShard` RPC. The
+current Megatron adapter exposes its already-registered live buffers through
+`IN_PLACE`, so callers must keep those tensors immutable while the version is
+published. Its `source_reuse_ready` fence raises `NotImplementedError` until
+version retirement is wired to the adapter; it must not be interpreted as an
+early reuse signal. The required lifecycle is synchronous: create and publish
+the version, update every generator, retire the version, and only then resume
+training or begin the next optimizer step. The adapter does not claim fully
+asynchronous `COPY_TO_DEVICE` behavior until that staging implementation exists.
+
+Version creation and expected-source-slot declaration remain
+framework-orchestrator responsibilities. Each trainer adapter derives its own
+source slot from the engine's native topology; the orchestrator declares the
+expected slots using the same adapter-defined convention. `initialize()`
+selects the configured trainer engine and constructs its adapter internally;
+Megatron is the first implementation. Megatron-specific APIs live under
+`modelexpress_rl`;
+`modelexpress.refit.reshard` remains the shared, engine-neutral transfer core.
+
 ### MxClient
 
 `MxClient` is a lightweight gRPC client for communicating with the ModelExpress server:
@@ -136,7 +204,7 @@ register_modelexpress_loaders()
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MX_SERVER_ADDRESS` | `localhost:8001` | ModelExpress gRPC server address (recommended) |
-| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated, pending removal in a future release. Still read by all client paths and takes precedence when both are set; keep setting it during the transition. |
+| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
 | `MX_DISABLE_PATCHES` | `0` | Emergency escape hatch that skips all runtime compatibility patches. Set to `1`, `true`, `yes`, or `on` if a patch is incompatible with the installed engine. |
 | `MX_EXPECTED_WORKERS` | Auto-detected from TP size | Number of GPU workers to coordinate |
 | `MX_SYNC_PUBLISH` | `0` | Source: wait for all workers before publishing metadata |
@@ -156,6 +224,9 @@ register_modelexpress_loaders()
 | `MX_RESHARD_HANDSHAKE_TIMEOUT_S` | `900` | Budget for the whole P2P metadata handshake, across every trainer peer and every retry. Bounds the handshake independently of the refit timeout, so one unreachable publisher cannot consume the entire refit |
 | `MX_RESHARD_HANDSHAKE_ATTEMPT_S` | `20` | Ceiling on a single peer dial. A reachable peer answers in well under a second, so a short attempt frees the budget to try a different peer rather than block on one |
 | `MX_RESHARD_HANDSHAKE_BACKOFF_S` | `2` | Pause after a full pass over the pending peers makes no progress, so a transient stall is waited out rather than hammered |
+| `MX_REFIT_STAGE_RECORD` | `1` | Emit one `refit-stage-v2` JSON record per refit, giving a benchmark harness the per-stage timings without parsing logs. Set to `0` to silence it |
+| `MX_RESHARD_MAX_GBPS` | `0` | Per-rank fabric ceiling in Gbps. A measured wire rate above it means the timing is wrong rather than the transfer being fast, so the refit is rejected. `0` disables the check, since only the operator knows the real per-rank limit |
+| `MX_RESHARD_PUBLISH_DIGEST` | `0` | Have each trainer publish a position-sensitive digest of every shard it advertises, so a receiver can later confirm it installed the bytes the publisher held. Off by default: the reduction costs a pass over every published tensor, which is large next to a ~1.5 s wire, so turn it on when qualifying a build rather than when measuring throughput |
 
 ### UCX/NIXL Tuning
 

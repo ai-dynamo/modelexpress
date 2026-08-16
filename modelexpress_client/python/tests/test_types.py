@@ -19,8 +19,8 @@ from modelexpress.types import TensorDescriptor, WorkerMetadata, GetMetadataResp
 class TestProtobufCompatibility:
     """Guard against generated protobuf code drifting from the installed runtime."""
 
-    def test_p2p_pb2_gencode_matches_runtime_major_version(self):
-        """Regenerate p2p_pb2.py if this fails (see pyproject.toml [dev] deps)."""
+    def test_p2p_pb2_gencode_supports_runtime_major_version(self):
+        """Keep protobuf 5 gencode usable on supported 5.x and 6.x runtimes."""
         import modelexpress.p2p_pb2 as pb2
 
         with open(pb2.__file__) as f:
@@ -29,12 +29,9 @@ class TestProtobufCompatibility:
         assert m, "Could not parse gencode version from p2p_pb2.py"
         gencode_major = int(m.group(1))
         runtime_major = int(_pb_version.split(".")[0])
-        assert gencode_major == runtime_major, (
-            f"p2p_pb2.py was generated with protobuf {gencode_major}.x "
-            f"but runtime is {runtime_major}.x - regenerate with: "
-            f"python -m grpc_tools.protoc -I../../modelexpress_common/proto "
-            f"--python_out=modelexpress --grpc_python_out=modelexpress "
-            f"../../modelexpress_common/proto/p2p.proto"
+        assert gencode_major == 5, "checked-in bindings must remain protobuf 5 gencode"
+        assert runtime_major in {5, 6}, (
+            f"unsupported protobuf runtime major: {runtime_major}"
         )
 
     def test_publish_request_is_readable_by_0_4_schema(self):

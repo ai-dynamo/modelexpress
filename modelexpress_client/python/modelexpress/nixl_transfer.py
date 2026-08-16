@@ -71,6 +71,16 @@ def _resolve_nixl_backend() -> str:
     return raw
 
 
+def _arena_single_mr_forced() -> bool:
+    """Whether to keep the single-MR arena path on a multi-allocation arena.
+
+    MX_ARENA_SINGLE_MR=1 forces it. Only safe on transports that can span
+    several cuMemCreate handles in one registration (dmabuf/IB); cuda_ipc
+    cannot. Read at call time so tests can toggle the env var.
+    """
+    return envs.MX_ARENA_SINGLE_MR
+
+
 def _pool_reg_enabled() -> bool:
     """Whether allocation-level pool registration is enabled.
 
@@ -166,6 +176,11 @@ class NixlTransferManager:
     def nixl_metadata(self) -> bytes:
         """Get NIXL metadata for this agent."""
         return self._metadata
+
+    @property
+    def listen_port(self) -> int | None:
+        """Get the port serving this agent's NIXL metadata."""
+        return self._listen_port
 
     @property
     def tensor_descriptors(self) -> list[TensorDescriptor]:
@@ -280,7 +295,11 @@ class NixlTransferManager:
         self._tensor_descriptors = tensor_descriptors
         return tensor_descriptors
 
-    def register_tensors(self, tensors: dict[str, torch.Tensor]) -> bytes:
+    def register_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        force_per_tensor: bool = False,
+    ) -> bytes:
         """
         Register tensors with NIXL for RDMA access.
 
@@ -318,7 +337,7 @@ class NixlTransferManager:
 
         # Phase 1: Discover CUDA allocation boundaries (if pool reg enabled)
         alloc_discovery_start = time.perf_counter()
-        if _pool_reg_enabled():
+        if _pool_reg_enabled() and not force_per_tensor:
             if self._accelerator_backend.supports_pool_reg():
                 allocations = self._find_cuda_allocations(tensor_descriptors)
             else:
@@ -389,12 +408,19 @@ class NixlTransferManager:
         consumes a dmabuf via `ibv_reg_dmabuf_mr` and produces ONE
         lkey/rkey covering all live tensors.
 
-        Empirically validated on Blackwell + ConnectX over InfiniBand
-        against a CUDA VMM range with multiple cuMemCreate handles and
-        mid-range holes (chunks unmapped + released after the export):
-        registration succeeds, the dmabuf attach pins the currently-
-        mapped physical pages, and the HCA translation table survives
-        subsequent CUDA-side unmaps.
+        The multi-handle case is validated on the dmabuf/IB path only.
+        On Blackwell + ConnectX over InfiniBand, against a CUDA VMM range
+        with multiple cuMemCreate handles and mid-range holes (chunks
+        unmapped + released after the export): registration succeeds, the
+        dmabuf attach pins the currently-mapped physical pages, and the
+        HCA translation table survives subsequent CUDA-side unmaps.
+
+        It does NOT hold on UCX cuda_ipc, where a fabric handle names one
+        cuMemCreate allocation and a single MR would publish an rkey
+        covering only the first chunk. That is why this method falls back
+        to per-tensor registration when the arena spans several
+        allocations, unless MX_ARENA_SINGLE_MR overrides it. Upstream fix:
+        openucx/ucx#11283.
 
         Per-tensor descriptors are still built (tensor name -> addr,
         size, dtype) because the receiver matches by name and computes
@@ -426,6 +452,59 @@ class NixlTransferManager:
                 self._accelerator_backend.name,
             )
             return self.register_tensors(tensors)
+
+        # A CUDA fabric/IPC handle names exactly one cuMemCreate allocation:
+        # UCX cuda_ipc resolves a region with cuMemRetainAllocationHandle and
+        # cuMemGetAddressRange, which report the FIRST allocation under the
+        # range rather than the whole reserve. Registering a multi-allocation
+        # arena as one MR therefore publishes an rkey covering only its first
+        # chunk, and the peer's cuMemcpyDtoDAsync_v2 reads past what it mapped.
+        # Measured on GB200 MNNVL: Kimi-K3 arena, 1019 chunks, segfault in
+        # uct_cuda_ipc_ep_get_zcopy. Per-tensor registration is correct because
+        # the arena does one cuMemCreate per allocation, so every tensor lies
+        # wholly inside one handle.
+        #
+        # dmabuf/IB registration does span several handles, so deployments that
+        # validated the single-MR path there can keep it with
+        # MX_ARENA_SINGLE_MR=1.
+        live_allocs = arena.live_allocation_count
+        if live_allocs > 1 and not _arena_single_mr_forced():
+            logger.warning(
+                "register_arena: arena spans %d physical allocations; a single "
+                "MR would publish an rkey covering only the first, which "
+                "cuda_ipc cannot address. Falling back to per-tensor "
+                "registration for %d tensors over [0x%x, 0x%x). Set "
+                "MX_ARENA_SINGLE_MR=1 to force single-MR (dmabuf/IB only).",
+                live_allocs,
+                len(tensor_descriptors),
+                base,
+                base + used,
+            )
+            return self.register_tensors(tensors, force_per_tensor=True)
+
+        # NIXL resolves descriptors by containment, so one tensor outside
+        # [base, base+used) fails prep_xfer_dlist for the whole transfer.
+        uncovered = [
+            d
+            for d in tensor_descriptors
+            if d.addr < base or (d.addr + d.size) > (base + used)
+        ]
+        if uncovered:
+            logger.warning(
+                "register_arena: %d of %d tensors lie outside the arena range "
+                "[0x%x, 0x%x); falling back to per-tensor registration. "
+                "First uncovered: %s at 0x%x (%d bytes)",
+                len(uncovered),
+                len(tensor_descriptors),
+                base,
+                base + used,
+                uncovered[0].name,
+                uncovered[0].addr,
+                uncovered[0].size,
+            )
+            # Bypass pool reg: it resolves the same per-handle bounds we just
+            # found insufficient.
+            return self.register_tensors(tensors, force_per_tensor=True)
 
         nixl_reg_start = time.perf_counter()
         self._agent.register_memory(
@@ -505,16 +584,27 @@ class NixlTransferManager:
 
         Sleeps only when a full sweep completed nothing, so the polling slop is
         paid once for the whole set rather than once per handle.
+
+        Records data-plane failures exactly as :meth:`_wait_for_xfer` does, for the
+        same reason: a wedged QP yields neither a completion nor an ERR status, so
+        the timeout is the only evidence anything went wrong, and recording it is
+        what lets ``is_healthy()`` stop advertising this agent.
         """
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
         pending = list(handles)
+        waited_on_something = bool(pending)
         wait_start = time.perf_counter()
         while pending:
             if (
                 timeout_seconds is not None
                 and time.perf_counter() - wait_start >= timeout_seconds
             ):
+                self._data_plane_error = (
+                    f"{label} timed out after {timeout_seconds:.1f}s with "
+                    f"{len(pending)} transfer(s) outstanding and no error status "
+                    f"from NIXL"
+                )
                 raise TimeoutError(
                     f"{label} timed out with {len(pending)} transfer(s) outstanding"
                 )
@@ -524,11 +614,19 @@ class NixlTransferManager:
                 if status in ("DONE", "SUCCESS"):
                     continue
                 if status in ("ERR", "ERROR", "FAIL"):
+                    self._data_plane_error = f"{label} failed with status {status}"
                     raise RuntimeError(f"{label} failed with status {status}")
                 still_pending.append(handle)
             if len(still_pending) == len(pending):
                 time.sleep(0.001)
             pending = still_pending
+        # Only once the whole set has completed, and only if there was a set. Nothing
+        # is proven by waiting on no handles, and clearing per handle would let a
+        # batch that failed on its last one report healthy. Health must not latch
+        # either: a completed batch is proof the data plane works, so a worker
+        # demoted for one transient timeout can return to READY.
+        if waited_on_something:
+            self._data_plane_error = None
 
     def _wait_for_xfer(
         self,

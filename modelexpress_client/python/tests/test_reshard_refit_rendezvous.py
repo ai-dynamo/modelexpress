@@ -134,10 +134,10 @@ def test_published_rendezvous_stays_ready_and_closes_stale(monkeypatch):
         assert client.heartbeat_seen.wait(timeout=1.0)
         assert client.publish_count == 1
         discovered = rendezvous.discover_trainers(expected_trainers=1)
-        assert [(meta, name, ep) for (meta, name, ep, _t) in discovered] == [
-            (b"nixl", "trainer-agent", "trainer:1234")
-        ]
-        assert [t.name for t in discovered[0][3]] == ["weight"]
+        assert [
+            (p.agent_metadata, p.agent_name, p.metadata_endpoint) for p in discovered
+        ] == [(b"nixl", "trainer-agent", "trainer:1234")]
+        assert [t.name for t in discovered[0].tensors] == ["weight"]
         assert client.status_filter == p2p_pb2.SOURCE_STATUS_READY
     finally:
         rendezvous.close()
@@ -208,10 +208,7 @@ def test_quorum_is_met_once_every_rank_publishes_tensors():
 
     discovered = _rendezvous(client).discover_trainers(expected_trainers=2, timeout=0)
 
-    assert [name for (_meta, name, _ep, _tensors) in discovered] == [
-        "rank-0",
-        "rank-1",
-    ]
+    assert [p.agent_name for p in discovered] == ["rank-0", "rank-1"]
 
 
 def test_empty_publishers_are_excluded_from_the_returned_payloads():
@@ -227,7 +224,7 @@ def test_empty_publishers_are_excluded_from_the_returned_payloads():
 
     discovered = _rendezvous(client).discover_trainers(expected_trainers=2, timeout=0)
 
-    assert "empty-rank" not in [name for (_meta, name, _ep, _t) in discovered]
+    assert "empty-rank" not in [p.agent_name for p in discovered]
     assert len(discovered) == 2
 
 
@@ -248,15 +245,19 @@ def test_only_the_requested_number_of_ranks_is_returned():
 
 
 def test_a_discovered_payload_reads_by_field_and_by_position():
-    """Named access is the point of the change; positional access is what every
-    existing caller does, so both have to keep working."""
+    """Named access is the point of the change. Positions are still stable, which is
+    what lets an optional field like the publisher step be appended without moving
+    anything a caller already reads."""
     client = _DiscoveryClient([_blob("rank-0", _one_tensor())])
 
     (payload,) = _rendezvous(client).discover_trainers(expected_trainers=1, timeout=0)
-    agent_metadata, agent_name, endpoint, tensors = payload
 
-    assert (payload.agent_name, payload.metadata_endpoint) == (agent_name, endpoint)
-    assert (payload.agent_metadata, payload.tensors) == (agent_metadata, tensors)
+    assert payload[:4] == (
+        payload.agent_metadata,
+        payload.agent_name,
+        payload.metadata_endpoint,
+        payload.tensors,
+    )
     assert payload[3] is payload.tensors
 
 

@@ -61,16 +61,16 @@ class LoadStrategyChain:
         Returns the (possibly re-initialized) model on success.
         Raises RuntimeError if no strategy succeeds.
         """
-        from .trainer_pull_strategy import TrainerPullStrategy
         from .rdma_strategy import RdmaStrategy
+        from .server_cache_strategy import ServerCacheStrategy
         from .instant_tensor_strategy import InstantTensorStrategy
         from .model_streamer_strategy import ModelStreamerStrategy
         from .gds_strategy import GdsStrategy
         from .default_strategy import DefaultStrategy
 
         all_strategies: list[LoadStrategy] = [
-            TrainerPullStrategy(),
             RdmaStrategy(),
+            ServerCacheStrategy(),
             InstantTensorStrategy(),
             ModelStreamerStrategy(),
             GdsStrategy(),
