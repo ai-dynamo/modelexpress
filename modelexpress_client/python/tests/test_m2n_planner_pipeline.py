@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""End-to-end tests for NCCL M2N transport pipeline (no NIXL, no GPU)."""
+"""Planner/descriptor pipeline tests for the M2N weight-sync path (mocked, no NCCL/GPU)."""
 
 import math
 from unittest.mock import MagicMock

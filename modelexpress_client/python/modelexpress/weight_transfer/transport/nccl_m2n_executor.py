@@ -71,6 +71,8 @@ class NcclM2nExecutor:
         self._lane = lane
         self._tp_src = int(tp_src)
         self._tp_dst = int(tp_dst)
+        # Lane communicators use ranks [0, tp_src) for trainers and
+        # [tp_src, tp_src + tp_dst) for generators (see build_tp_meshes).
         self._is_src = lane.comm_rank < tp_src
         self._staged: list[Any] = []
         self._staging_signature: tuple[Any, ...] | None = None
@@ -280,13 +282,29 @@ class NcclM2nExecutor:
         self._staging_signature = None
 
 
+def _torch_dtype_from_table(dtype_name: str) -> Any:
+    """Parse a ``TrainerTensor.dtype`` string such as ``torch.bfloat16``."""
+    import torch
+
+    name = dtype_name.replace("torch.", "", 1)
+    dtype = getattr(torch, name, None)
+    if dtype is None or not isinstance(dtype, torch.dtype):
+        raise ValueError(f"unsupported trainer-table dtype {dtype_name!r}")
+    return dtype
+
+
 def build_reshard_params(
     model: Any,
     table: TrainerTable,
     tp_src: int,
     tp_dst: int,
 ) -> list[ReshardParam]:
-    """Build local tensors plus globally shared M2N layout metadata."""
+    """Build local tensors plus globally shared M2N layout metadata.
+
+    Shape and shard layout come from the shared ``TrainerTable``. Local
+    parameters must exist on every cohort rank (collectives require identical
+    call sets) and must match the table dtype.
+    """
     if tp_src <= 0 or tp_dst <= 0:
         raise ValueError(f"tp_src and tp_dst must be positive, got {tp_src}/{tp_dst}")
 
@@ -300,6 +318,12 @@ def build_reshard_params(
                 "every rank in a reshard cohort must contribute the same parameter set, "
                 "since reshard operations are collectives"
             )
+        expected_dtype = _torch_dtype_from_table(tensor.dtype)
+        if param.dtype != expected_dtype:
+            raise ValueError(
+                f"parameter {tensor.name!r} dtype {param.dtype} does not match "
+                f"trainer table dtype {expected_dtype}"
+            )
         params.append(
             ReshardParam(
                 name=tensor.name,
@@ -311,4 +335,21 @@ def build_reshard_params(
     return params
 
 
-__all__ = ["NcclM2nExecutor", "ReshardParam", "build_reshard_params"]
+def run_reshard(
+    model: Any,
+    table: TrainerTable,
+    executor: NcclM2nExecutor,
+    tp_src: int,
+    tp_dst: int,
+) -> tuple[int, float]:
+    """Build the shared param list and execute one M2N reshard update."""
+    params = build_reshard_params(model, table, tp_src, tp_dst)
+    return executor.execute(params)
+
+
+__all__ = [
+    "NcclM2nExecutor",
+    "ReshardParam",
+    "build_reshard_params",
+    "run_reshard",
+]

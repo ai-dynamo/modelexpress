@@ -126,10 +126,9 @@ class PullRole(WeightSyncRole):
         generator rank supplies destination staging; the source is ``None``.
         Delegates layout and batching to ``NcclM2nExecutor``.
         """
-        from ..transport.nccl_m2n_executor import build_reshard_params
+        from ..transport.nccl_m2n_executor import run_reshard
 
-        params = build_reshard_params(model, table, tp_src, tp_dst)
-        return executor.execute(params)
+        return run_reshard(model, table, executor, tp_src, tp_dst)
 
     def refresh(self, model: Any, table: TrainerTable) -> None:
         """Invalidate the plan and re-initialize when the trainer reshards."""

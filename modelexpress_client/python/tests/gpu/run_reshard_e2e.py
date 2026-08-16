@@ -38,7 +38,10 @@ def main() -> int:
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
     tp_src = int(os.environ.get("TP_SRC", "1"))
     tp_dst = int(os.environ.get("TP_DST", "1"))
-    assert tp_src + tp_dst == world
+    if tp_src + tp_dst != world:
+        raise SystemExit(
+            f"tp_src+tp_dst ({tp_src}+{tp_dst}) != world {world}"
+        )
 
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend="gloo", rank=rank, world_size=world)
@@ -49,7 +52,8 @@ def main() -> int:
         runtime.new_unique_id_bytes() if rank == 0 else None
     ]
     dist.broadcast_object_list(bootstrap, src=0)
-    assert bootstrap[0] is not None
+    if bootstrap[0] is None:
+        raise RuntimeError("failed to broadcast NCCL unique id")
     lane = runtime.create_lane(
         _M2nLaneSpec(
             lane_id="weights-0",
@@ -64,6 +68,10 @@ def main() -> int:
     rows, cols = 8, 16
     dtype = torch.float32
     shard_dim = 0
+    if rows % tp_src != 0 or rows % tp_dst != 0:
+        raise SystemExit(
+            f"rows {rows} must be divisible by tp_src={tp_src} and tp_dst={tp_dst}"
+        )
     src_rows = rows // tp_src
     dst_rows = rows // tp_dst
 

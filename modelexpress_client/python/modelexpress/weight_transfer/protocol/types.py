@@ -57,7 +57,7 @@ class TrainerTensor:
     def num_rows(self) -> int:
         return self.shape[0] if self.shape else 0
 
-    def _resolved_col_end(self, shard: TrainerShard) -> int:
+    def resolved_col_end(self, shard: TrainerShard) -> int:
         """Return the effective col_end, resolving -1 to the full column count."""
         if shard.col_end == -1:
             return self.shape[1] if len(self.shape) > 1 else 1
@@ -73,7 +73,7 @@ class TrainerTensor:
     def shard_for_elem(self, row: int, col: int) -> TrainerShard | None:
         """Return the shard that owns element (row, col); handles row-only and 2-D tiles."""
         for s in self.shards:
-            col_end = self._resolved_col_end(s)
+            col_end = self.resolved_col_end(s)
             if s.row_start <= row < s.row_end and s.col_start <= col < col_end:
                 return s
         return None

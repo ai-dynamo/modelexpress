@@ -39,7 +39,8 @@ def main() -> int:
     local_rank = int(os.environ["LOCAL_RANK"])
     trainer_pp = 2
     generator_rank = trainer_pp
-    assert world == trainer_pp + 1, f"expected three ranks, got {world}"
+    if world != trainer_pp + 1:
+        raise SystemExit(f"expected three ranks, got {world}")
 
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend="gloo")

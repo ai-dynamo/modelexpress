@@ -78,6 +78,60 @@ def test_shard_dim_replicate():
     assert shard_dim_from_trainer_tensor(_replicated_tensor("norm", 4, 4)) == REPLICATE
 
 
+def test_shard_dim_both_dims_raises():
+    shards = [
+        TrainerShard(
+            agent_index=0,
+            row_start=0,
+            row_end=4,
+            device_addr=0,
+            row_bytes=4,
+            device_id=0,
+            col_start=0,
+            col_end=2,
+        ),
+        TrainerShard(
+            agent_index=1,
+            row_start=4,
+            row_end=8,
+            device_addr=0,
+            row_bytes=4,
+            device_id=1,
+            col_start=2,
+            col_end=4,
+        ),
+    ]
+    tensor = TrainerTensor(
+        name="w2d", dtype="torch.bfloat16", shape=[8, 4], shards=shards
+    )
+    try:
+        shard_dim_from_trainer_tensor(tensor)
+    except ValueError as exc:
+        assert "shards both dims" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for 2-D tile shards")
+
+
+def test_shard_dim_partial_single_shard_raises():
+    shard = TrainerShard(
+        agent_index=0,
+        row_start=0,
+        row_end=2,
+        device_addr=0,
+        row_bytes=8,
+        device_id=0,
+    )
+    tensor = TrainerTensor(
+        name="partial", dtype="torch.bfloat16", shape=[4, 4], shards=[shard]
+    )
+    try:
+        shard_dim_from_trainer_tensor(tensor)
+    except ValueError as exc:
+        assert "does not cover the full tensor" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for partial single shard")
+
+
 # ---- tile shapes -----------------------------------------------------------
 def test_tile_shape_shard_dim0():
     src, dst = build_tp_meshes(shard_dim=0, tp_src=4, tp_dst=2)
@@ -93,9 +147,11 @@ def test_tile_shape_replicate_returns_full():
 
 # ---- golden reshard parity (gather+reslice) --------------------------------
 def _reference_reshard(global_tensor, shard_dim, tp_src, tp_dst):
-    """Golden: src shards -> gather to full -> reslice to dst shards."""
-    src_shards = list(torch.chunk(global_tensor, tp_src, dim=shard_dim))
-    full = torch.cat(src_shards, dim=shard_dim)
+    """Golden: independent src tiles -> gather to full -> reslice to dst tiles."""
+    src_tiles = [
+        tile.clone() for tile in torch.chunk(global_tensor, tp_src, dim=shard_dim)
+    ]
+    full = torch.cat(src_tiles, dim=shard_dim)
     return list(torch.chunk(full, tp_dst, dim=shard_dim))
 
 
@@ -103,17 +159,20 @@ def test_golden_reshard_dim0_4to2():
     torch.manual_seed(0)
     g = torch.randn(8, 16)
     dst_shards = _reference_reshard(g, shard_dim=0, tp_src=4, tp_dst=2)
+    expected = list(torch.chunk(g, 2, dim=0))
     # dst tile shape from mesh math must match the golden shard shape.
     _, dst_mesh = build_tp_meshes(shard_dim=0, tp_src=4, tp_dst=2)
     assert tuple(dst_shards[0].shape) == tile_shape((8, 16), dst_mesh)
-    # concatenating the dst shards reconstructs the global tensor byte-for-byte.
-    assert torch.equal(torch.cat(dst_shards, dim=0), g)
+    for got, exp in zip(dst_shards, expected, strict=True):
+        assert torch.equal(got, exp)
 
 
 def test_golden_reshard_dim1_2to4():
     torch.manual_seed(1)
     g = torch.randn(16, 8)
     dst_shards = _reference_reshard(g, shard_dim=1, tp_src=2, tp_dst=4)
+    expected = list(torch.chunk(g, 4, dim=1))
     _, dst_mesh = build_tp_meshes(shard_dim=1, tp_src=2, tp_dst=4)
     assert tuple(dst_shards[0].shape) == tile_shape((16, 8), dst_mesh)
-    assert torch.equal(torch.cat(dst_shards, dim=1), g)
+    for got, exp in zip(dst_shards, expected, strict=True):
+        assert torch.equal(got, exp)

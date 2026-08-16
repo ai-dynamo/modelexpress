@@ -92,21 +92,33 @@ def build_tp_meshes(shard_dim: int, tp_src: int, tp_dst: int) -> tuple[Mesh, Mes
 def shard_dim_from_trainer_tensor(tensor: TrainerTensor) -> int:
     """Infer the single sharded tensor dim from a ``TrainerTensor``'s shards.
 
-    Returns ``REPLICATE`` when a single shard covers the full tensor, ``0`` when
-    the shards partition rows (row-parallel-loaded / column-parallel weights),
-    or ``1`` when they partition columns (row-parallel weights, 2-D-col tiles).
-    Raises when the layout shards both dims at once (a later 2-D slice).
+    Returns ``REPLICATE`` when shards are absent or a single shard covers the
+    full tensor, ``0`` when the shards partition rows (row-parallel-loaded /
+    column-parallel weights), or ``1`` when they partition columns
+    (row-parallel weights, 2-D-col tiles). Raises when a lone shard covers only
+    a partial region, or when the layout shards both dims at once (a later
+    2-D slice).
     """
     shards = tensor.shards
-    if not shards or len(shards) == 1:
+    if not shards:
         return REPLICATE
 
     rows = tensor.shape[0] if tensor.shape else 0
     cols = tensor.shape[1] if len(tensor.shape) > 1 else 1
 
+    if len(shards) == 1:
+        shard = shards[0]
+        rows_full = shard.row_start == 0 and shard.row_end == rows
+        cols_full = shard.col_start == 0 and tensor.resolved_col_end(shard) == cols
+        if not (rows_full and cols_full):
+            raise ValueError(
+                f"tensor {tensor.name!r} has one shard that does not cover the full tensor"
+            )
+        return REPLICATE
+
     rows_partitioned = any(s.row_start != 0 or s.row_end != rows for s in shards)
     cols_partitioned = any(
-        s.col_start != 0 or tensor._resolved_col_end(s) != cols for s in shards
+        s.col_start != 0 or tensor.resolved_col_end(s) != cols for s in shards
     )
 
     if rows_partitioned and cols_partitioned:
