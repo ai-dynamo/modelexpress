@@ -510,3 +510,84 @@ def test_mla_absorbed_weights_are_recomputed_in_place(engine):
     assert module.W_UV.data_ptr() == uv_ptr
     assert module.W_UK_T.data_ptr() == uk_ptr
     assert module.W_UV.abs().sum() > 0
+
+
+@pytest.fixture
+def vllm_config_active(monkeypatch):
+    """Patch vllm.config with a tracking set_current_vllm_config; returns the active-config cell.
+
+    vllm.config is a MagicMock in the test environment (no real vLLM installed),
+    so setitem on sys.modules is used instead of setattr to guarantee the lazy
+    `from vllm.config import set_current_vllm_config` inside the production functions
+    picks up the fake rather than the auto-generated MagicMock child.
+    """
+    import contextlib
+
+    active: list = [None]
+
+    @contextlib.contextmanager
+    def fake_set_current(config):
+        active[0] = config
+        try:
+            yield
+        finally:
+            active[0] = None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.config",
+        SimpleNamespace(set_current_vllm_config=fake_set_current),
+    )
+    return active
+
+
+def test_load_weights_runs_inside_vllm_config_context(
+    bare_engine, monkeypatch, vllm_config_active
+):
+    captured: list = []
+
+    def build(load_config):
+        class CapturingLoader(Loader):
+            def load_weights(self, model, model_config):
+                captured.append(vllm_config_active[0])
+                super().load_weights(model, model_config)
+
+        return CapturingLoader(load_config)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.model_loader.default_loader",
+        SimpleNamespace(DefaultModelLoader=build),
+    )
+
+    receiver = VllmWeightReceiver(ReceiverConfig(**INIT_INFO), "host:3", bare_engine)
+    receiver.install_prepared_checkpoint(PREPARED)
+
+    assert len(captured) == 1
+    assert captured[0] is bare_engine.vllm_config
+
+
+def test_reload_calls_run_inside_vllm_config_context(
+    engine, monkeypatch, vllm_config_active
+):
+    captured: dict = {}
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.model_executor.model_loader.reload",
+        SimpleNamespace(
+            initialize_layerwise_reload=lambda _m: captured.__setitem__(
+                "initialize", vllm_config_active[0]
+            ),
+            finalize_layerwise_reload=lambda _m, _c: captured.__setitem__(
+                "finalize", vllm_config_active[0]
+            ),
+        ),
+    )
+
+    engine.start_weight_update()
+    engine.receive_weights(MxDeltaUpdateInfo(version="7"))
+    engine.finish_weight_update()
+
+    assert captured.get("initialize") is engine.vllm_config
+    assert captured.get("finalize") is engine.vllm_config

@@ -114,6 +114,7 @@ class MxWeightTransferEngine(WeightTransferEngine[MxDeltaInitInfo, MxDeltaUpdate
         )
 
     def start_weight_update(self) -> None:
+        from vllm.config import set_current_vllm_config
         from vllm.model_executor.model_loader.reload import initialize_layerwise_reload
 
         receiver = self._require_receiver()
@@ -137,7 +138,8 @@ class MxWeightTransferEngine(WeightTransferEngine[MxDeltaInitInfo, MxDeltaUpdate
             }
             if attrs:
                 self._bare_tensors[module] = attrs
-        initialize_layerwise_reload(self.model)
+        with set_current_vllm_config(self.vllm_config):
+            initialize_layerwise_reload(self.model)
 
     def receive_weights(self, update_info: MxDeltaUpdateInfo) -> None:
         receiver = self._require_receiver()
@@ -161,12 +163,14 @@ class MxWeightTransferEngine(WeightTransferEngine[MxDeltaInitInfo, MxDeltaUpdate
         logger.info("[delta] worker loaded revision %s", update_info.version)
 
     def finish_weight_update(self) -> None:
+        from vllm.config import set_current_vllm_config
         from vllm.model_executor.model_loader.reload import finalize_layerwise_reload
 
         receiver = self._require_receiver()
         started = time.perf_counter()
         try:
-            finalize_layerwise_reload(self.model, self.model_config)
+            with set_current_vllm_config(self.vllm_config):
+                finalize_layerwise_reload(self.model, self.model_config)
             for module, attrs in self._bare_tensors.items():
                 for name, boot_tensor in attrs.items():
                     current = module.__dict__.get(name)

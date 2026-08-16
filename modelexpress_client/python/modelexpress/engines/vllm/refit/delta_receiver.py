@@ -69,6 +69,7 @@ class VllmWeightReceiver(ModelExpressWeightReceiver):
         return Path(folder)
 
     def install_prepared_checkpoint(self, prepared: PreparedRevision) -> None:
+        from vllm.config import set_current_vllm_config
         from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 
         try:
@@ -82,7 +83,8 @@ class VllmWeightReceiver(ModelExpressWeightReceiver):
             raise ReceiverInstallError(str(error), False) from error
 
         try:
-            loader.load_weights(self._engine.model, staged)
+            with set_current_vllm_config(self._engine.vllm_config):
+                loader.load_weights(self._engine.model, staged)
         except Exception as error:
             raise ReceiverInstallError(str(error), True) from error
         logger.info(
