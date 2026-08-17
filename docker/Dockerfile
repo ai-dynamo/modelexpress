@@ -37,11 +37,16 @@ COPY --from=builder /app/target/release/fallback_test .
 # Copy the NOTICES files
 COPY NOTICES .
 
-# Expose the default port
+# Expose the gRPC port and the Prometheus /metrics port. They are separate
+# because tonic serves HTTP/2 only, so a scrape aimed at 8001 can never complete.
 EXPOSE 8001
+EXPOSE 9401
 
 # Set default environment variables (can be overridden)
 ENV MODEL_EXPRESS_SERVER_PORT=8001
+# Read only through the clap --metrics-port override; the layered config loader
+# maps this name to the key path server.metrics.port and drops it. 0 disables.
+ENV MODEL_EXPRESS_SERVER_METRICS_PORT=9401
 ENV MODEL_EXPRESS_LOG_LEVEL=info
 ENV MODEL_EXPRESS_CACHE_DIRECTORY=/app/cache
 ENV HF_HUB_CACHE=/app/cache

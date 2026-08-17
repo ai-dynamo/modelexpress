@@ -17,6 +17,9 @@ FROM nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1
 # unambiguous.
 COPY --chown=dynamo:dynamo modelexpress_client/python /opt/modelexpress/client
 WORKDIR /opt/modelexpress/client
-RUN uv pip install .
+# The [metrics] extra pulls in prometheus-client. Without it the collector
+# catches the ImportError and disables itself, so MX_METRICS_ENABLED=1 and a
+# scrape annotation produce up == 0 with no explanation.
+RUN uv pip install ".[metrics]"
 
 WORKDIR /workspace

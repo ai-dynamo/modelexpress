@@ -235,6 +235,56 @@ def test_find_source_instances_empty_on_list_error():
     assert RdmaStrategy()._find_source_instances(ctx) == []
 
 
+def test_no_peers_published_records_a_zero_funnel(monkeypatch):
+    """The empty path must observe zero, not return before recording anything.
+
+    ``_find_source_instances`` used to return early when the response carried no
+    instances, before any ``observe_candidates`` call. That made
+    ``mx_p2p_candidates{stage="listed"}`` unable to ever observe zero — the one
+    bucket that separates "no peers published" from "peers listed but every one
+    filtered out". On a dashboard the two were the same absence.
+    """
+    m = MagicMock()
+    monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
+    monkeypatch.delenv(ENV_SELECTOR, raising=False)
+
+    ctx = _rdma_ctx([])
+    assert RdmaStrategy()._find_source_instances(ctx) == []
+
+    m.record_list_sources.assert_called_once_with("random", "empty")
+    observed = {call.args[1]: call.args[2] for call in m.observe_candidates.call_args_list}
+    assert observed == {"listed": 0, "rank_matched": 0, "accelerator_matched": 0}
+
+
+def test_list_sources_rpc_failure_is_recorded_not_silent(monkeypatch):
+    """A backend outage used to record nothing at all.
+
+    Both a Redis outage and a healthy cluster with no peers presented as the same
+    absence, so the graph could not tell "the metadata backend is down" from
+    "nobody has published weights yet".
+    """
+    m = MagicMock()
+    monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
+    monkeypatch.delenv(ENV_SELECTOR, raising=False)
+
+    ctx = _rdma_ctx([])
+    ctx.mx_client.list_sources.side_effect = RuntimeError("grpc down")
+    assert RdmaStrategy()._find_source_instances(ctx) == []
+
+    m.record_list_sources.assert_called_once_with("random", "error")
+
+
+def test_successful_listing_records_an_ok_outcome(monkeypatch):
+    m = MagicMock()
+    monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
+    monkeypatch.setenv(ENV_SELECTOR, "rendezvous_hash")
+
+    ctx = _rdma_ctx([_ref("s0aaaaaaaaaaaaaa", "w0", worker_rank=0)])
+    RdmaStrategy()._find_source_instances(ctx)
+
+    m.record_list_sources.assert_called_once_with("rendezvous_hash", "ok")
+
+
 def test_find_source_instances_filters_incompatible_accelerator():
     # A compatible source ranked last must survive incompatible ones ranked
     # first, since filtering happens before the MAX_SOURCE_RETRIES slice.
@@ -787,6 +837,11 @@ def test_load_records_success_metrics(monkeypatch):
     ctx.accelerator_backend.name = ""  # unknown target -> accelerator gate accepts
 
     assert strat.load(MagicMock(), ctx) == "loaded"
+    # The peer id is still passed; the collector drops it unless
+    # MX_METRICS_SOURCE_ID_LABEL=1, because it is a per-process uuid whose label
+    # domain grows with process count rather than with cluster size. That the
+    # label really is absent by default is asserted on the exposition itself in
+    # tests/test_metrics.py.
     m.record_selection.assert_called_once_with("random", cands[0].worker_id)
     m.record_attempt.assert_any_call("random", "success")
     assert m.observe_transfer_seconds.call_args.args[:2] == ("random", "success")

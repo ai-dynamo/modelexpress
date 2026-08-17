@@ -18,8 +18,10 @@ from ...load_strategy.context import LoadResult
 from ...metadata.publisher import PublisherThread
 from ...metadata.payload import tensor_source_metadata, worker_tensor_descriptors
 from ...metadata.publish import _heartbeat_threads
+from ...metrics import enable as enable_metrics
 from ...nixl_transfer import NixlTransferManager
-from ...source_selection import get_configured_selector
+from ...metrics import metrics as selection_metrics
+from ...source_selection import configured_policy_label, get_configured_selector
 from .adapter import build_sglang_load_context
 from .artifacts import (
     _sglang_health_ready,
@@ -60,6 +62,11 @@ class MxModelLoader:
         device_config: DeviceConfig,
     ) -> nn.Module:
         """Load model weights through the shared ModelExpress strategy chain."""
+        # Unconditionally, and ahead of the transport branch: a run that records
+        # nothing must still bring the exporter up, so a scrape can prove it came
+        # up. No-op unless MX_METRICS_ENABLED=1; never raises.
+        enable_metrics()
+
         transport = getattr(self.load_config, "modelexpress_transport", "nixl")
         if transport == "nixl":
             return self._load_model_via_nixl(
@@ -242,6 +249,13 @@ class MxModelLoader:
         return result.model.eval()
 
     def _find_transfer_engine_source(self, ctx: LoadContext):
+        # This path bypasses LoadStrategyChain and RdmaStrategy entirely, so it
+        # needs its own instrumentation: without it a mooncake/transfer_engine
+        # pod exports mx_build_info and nothing else in every state, and a
+        # metadata-backend outage is indistinguishable from a cluster that has
+        # published no peers -- the exact pair the ListSources counter exists to
+        # separate.
+        policy = configured_policy_label()
         try:
             response = ctx.mx_client.list_sources(
                 identity=ctx.identity,
@@ -254,11 +268,21 @@ class MxModelLoader:
                 ctx.global_rank,
                 exc,
             )
+            selection_metrics.record_list_sources(policy, "error")
+            return None
+
+        if not response.instances:
+            selection_metrics.record_list_sources(policy, "empty")
+            for stage in ("listed", "rank_matched"):
+                selection_metrics.observe_candidates(policy, stage, 0)
             return None
 
         candidates = [
             inst for inst in response.instances if inst.worker_rank == ctx.worker_rank
         ]
+        selection_metrics.record_list_sources(policy, "ok")
+        selection_metrics.observe_candidates(policy, "listed", len(response.instances))
+        selection_metrics.observe_candidates(policy, "rank_matched", len(candidates))
         # The nixl transport (and vLLM) order sources in the shared
         # RdmaStrategy; this is SGLang's separate transfer_engine path, which
         # discovers sources itself, so it applies the same selector here.

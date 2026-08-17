@@ -15,12 +15,13 @@ use modelexpress_common::grpc::{
 };
 use tonic::transport::Server;
 use tower::Layer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::auth::{AuthLayer, AuthState};
 use crate::backend_config::BackendConfig;
 use crate::cache::CacheEvictionService;
 use crate::config::{AuthMode, ServerConfig};
+use crate::metrics::{BuildInfo, MetricsRegistry};
 use crate::p2p::{service::P2pServiceImpl, state::P2pStateManager};
 use crate::refit::{backend::create_backend as create_refit_backend, service::RefitServiceImpl};
 use crate::registry::state::RegistryManager;
@@ -29,6 +30,14 @@ use crate::services::{ApiServiceImpl, HealthServiceImpl, ModelDownloadTracker, M
 /// Maximum gRPC message size (100MB) for large models like DeepSeek-V3.
 /// Each worker can have thousands of tensor descriptors with NIXL metadata.
 const MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
+
+/// How long to wait for the metrics listener to drain before abandoning it.
+///
+/// Short on purpose. A scrape is a sub-second GET, so anything still open after
+/// this is a stalled client rather than work worth waiting for — and this is the
+/// last await in [`run_server`], so waiting on it delays nothing else and blocks
+/// everything.
+const METRICS_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Run the ModelExpress gRPC server to completion.
 ///
@@ -53,6 +62,33 @@ pub async fn run_server(
         error!("Invalid server address: {e}");
         e
     })?;
+    let metrics_addr = config.metrics_socket_addr().map_err(|e| {
+        error!("Invalid metrics address: {e}");
+        e
+    })?;
+
+    // Start the Prometheus listener before anything else can fail, so a scrape
+    // proves the exporter came up even on a server that never reaches a healthy
+    // state. It is a separate HTTP/1.1 listener on its own port because tonic
+    // serves HTTP/2 only — a scrape aimed at the gRPC port can never succeed.
+    // Its shutdown is signalled at the very end of this function, after the gRPC
+    // server has drained, so the drain window stays scrapeable.
+    let (metrics_shutdown_tx, metrics_shutdown_rx) = tokio::sync::oneshot::channel();
+    let metrics_handle = metrics_addr.map(|metrics_addr| {
+        let mut metrics_registry = MetricsRegistry::new();
+        let _build_info = BuildInfo::register(&mut metrics_registry, &backend);
+        let metrics_registry = Arc::new(metrics_registry);
+        tokio::spawn(crate::metrics::serve(
+            metrics_addr,
+            metrics_registry,
+            async move {
+                let _ = metrics_shutdown_rx.await;
+            },
+        ))
+    });
+    if metrics_handle.is_none() {
+        info!("Metrics endpoint is disabled");
+    }
 
     // Initialize the model registry manager (Redis or Kubernetes CRDs). Shares the
     // injected backend with the P2P state manager below.
@@ -241,6 +277,30 @@ pub async fn run_server(
     }
     if let Err(e) = reaper_handle.await {
         error!("Reaper join error: {e}");
+    }
+
+    // The metrics listener stops last, once the gRPC server has drained and the
+    // background tasks have joined. Signalling it alongside them would make the
+    // shutdown window unscrapeable during exactly the window these metrics exist
+    // to explain.
+    if let Some(handle) = metrics_handle {
+        // A send failure just means the task already finished — the normal case
+        // when the bind failed, which is a supported degraded state. The join
+        // below is the real synchronization point, so this must not be an error.
+        let _ = metrics_shutdown_tx.send(());
+        // Bounded. The listener is unauthenticated and reachable from the pod
+        // network, and hyper's graceful shutdown holds a connection that wrote a
+        // partial request head open indefinitely. Without a deadline, any client
+        // killed mid-write — a scraper, a probe, a port scan — wedges the last
+        // await in run_server and burns the whole termination grace period.
+        match tokio::time::timeout(METRICS_DRAIN_TIMEOUT, handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => error!("Metrics listener join error: {e}"),
+            Err(_) => warn!(
+                "Metrics listener did not drain within {}s; abandoning it to finish shutdown",
+                METRICS_DRAIN_TIMEOUT.as_secs()
+            ),
+        }
     }
 
     server_result?;

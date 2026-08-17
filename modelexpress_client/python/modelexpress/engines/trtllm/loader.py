@@ -19,6 +19,7 @@ from ...load_strategy import (
     register_tensors,
     unpublish_metadata,
 )
+from ...metrics import enable as enable_metrics
 from .adapter import TrtllmAdapter, build_trtllm_load_context
 
 logger = logging.getLogger("modelexpress.engines.trtllm.loader")
@@ -75,6 +76,11 @@ class MxModelLoader:
 
     def load_model(self, model: torch.nn.Module) -> Any:
         """Load one TRT-LLM shard and return its native weight-loader value."""
+        # Unconditionally, ahead of the strategy chain: a run that records
+        # nothing must still bring the exporter up, so a scrape can prove it came
+        # up. No-op unless MX_METRICS_ENABLED=1; never raises.
+        enable_metrics()
+
         load_start = time.perf_counter()
         logger.info(
             "[Worker %s] TRT-LLM MxModelLoader starting (model=%s, p2p_enabled=%s)",

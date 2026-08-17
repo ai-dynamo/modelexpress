@@ -14,7 +14,21 @@ spec:
       {{- include "modelexpress.selectorLabels" . | nindent 6 }}
   template:
     metadata:
-      {{- with .Values.podAnnotations }}
+      {{- /*
+        Scrape annotations are generated from .Values.metrics rather than written
+        by hand, so the port can never drift back onto the gRPC listener. Values
+        set explicitly in .Values.podAnnotations still win, so an operator can
+        override or suppress any single key.
+      */}}
+      {{- $scrapeAnnotations := dict }}
+      {{- if and .Values.metrics .Values.metrics.enabled .Values.metrics.podAnnotations }}
+      {{- $scrapeAnnotations = dict
+            "prometheus.io/scrape" "true"
+            "prometheus.io/port" (.Values.metrics.port | default 9401 | toString)
+            "prometheus.io/path" "/metrics" }}
+      {{- end }}
+      {{- $podAnnotations := merge (deepCopy (.Values.podAnnotations | default dict)) $scrapeAnnotations }}
+      {{- with $podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -47,12 +61,32 @@ spec:
             - name: http
               containerPort: {{ .Values.service.port | default 8001 }}
               protocol: TCP
+            {{- if and .Values.metrics .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port | default 9401 }}
+              protocol: TCP
+            {{- end }}
           env:
             {{- $hasNsInExtra := false }}
+            {{- $hasMetricsPortInExtra := false }}
             {{- range .Values.extraEnv }}
               {{- if eq .name "MX_METADATA_NAMESPACE" }}
                 {{- $hasNsInExtra = true }}
               {{- end }}
+              {{- if eq .name "MODEL_EXPRESS_SERVER_METRICS_PORT" }}
+                {{- $hasMetricsPortInExtra = true }}
+              {{- end }}
+            {{- end }}
+            {{- /*
+              MODEL_EXPRESS_SERVER_METRICS_PORT is read only through the clap
+              --metrics-port override. The layered config loader would map this
+              name to the key path server.metrics.port, which matches no field
+              and is dropped by serde without a warning. 0 disables the listener.
+              Skipped when set explicitly, so the chart never emits the key twice.
+            */}}
+            {{- if and (not (hasKey .Values.env "MODEL_EXPRESS_SERVER_METRICS_PORT")) (not $hasMetricsPortInExtra) }}
+            - name: MODEL_EXPRESS_SERVER_METRICS_PORT
+              value: {{ if and .Values.metrics .Values.metrics.enabled }}{{ .Values.metrics.port | default 9401 | quote }}{{ else }}"0"{{ end }}
             {{- end }}
             {{- if and (not (hasKey .Values.env "MX_METADATA_NAMESPACE")) (not $hasNsInExtra) }}
             - name: MX_METADATA_NAMESPACE

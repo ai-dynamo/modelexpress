@@ -145,6 +145,14 @@ pub mod constants {
     pub const DEFAULT_GRPC_PORT: NonZeroU16 = NonZeroU16::new(8001).expect("8001 is non-zero");
     pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
+    /// Default port for the server's Prometheus `/metrics` listener.
+    ///
+    /// Deliberately not [`DEFAULT_GRPC_PORT`]: tonic serves HTTP/2 only, so a
+    /// scrape aimed at the gRPC port can never succeed. Chosen clear of the
+    /// ports already in play around a ModelExpress deployment — 8001/8002 (gRPC
+    /// and the client worker service) and 9090 (Dynamo's health endpoint).
+    pub const DEFAULT_METRICS_PORT: NonZeroU16 = NonZeroU16::new(9401).expect("9401 is non-zero");
+
     /// Default setting for shared storage mode (true = client and server share a network drive)
     pub const DEFAULT_SHARED_STORAGE: bool = true;
 
@@ -390,6 +398,13 @@ mod tests {
     #[test]
     fn test_constants() {
         assert_eq!(constants::DEFAULT_GRPC_PORT.get(), 8001);
+        assert_eq!(constants::DEFAULT_METRICS_PORT.get(), 9401);
+        // The scrape target must never be the gRPC listener: tonic is HTTP/2
+        // only and Prometheus scrapes with an HTTP/1.1 GET.
+        assert_ne!(
+            constants::DEFAULT_METRICS_PORT,
+            constants::DEFAULT_GRPC_PORT
+        );
         assert_eq!(constants::DEFAULT_TIMEOUT_SECS, 30);
         assert_eq!(constants::DEFAULT_TRANSFER_CHUNK_SIZE, 32 * 1024);
     }

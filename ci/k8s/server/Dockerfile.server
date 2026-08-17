@@ -26,6 +26,9 @@ RUN apt-get update && \
 
 COPY --from=builder /app/target/release/modelexpress-server .
 
+# The gRPC port and the Prometheus /metrics port are separate: tonic serves
+# HTTP/2 only, so a scrape aimed at the gRPC port can never complete.
 EXPOSE 8000
+EXPOSE 9401
 
-CMD ["./modelexpress-server", "--port", "8000"]
+CMD ["./modelexpress-server", "--port", "8000", "--metrics-port", "9401"]
