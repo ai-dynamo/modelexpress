@@ -12,10 +12,13 @@ any log to say why.
   ``service.port`` and ``MODEL_EXPRESS_SERVER_PORT``. That is the tonic gRPC
   listener. tonic speaks HTTP/2 only; Prometheus issues an HTTP/1.1
   ``GET /metrics``, so the scrape could never complete.
-* **D5** ``prometheus-client`` is an optional extra and no container image
-  installed it. Every image either used ``pip install .`` (core deps only,
-  extras excluded) or ``pip install --no-deps .`` (no dependencies at all), so
-  the collector caught the ``ImportError`` and disabled itself.
+* **D5** ``prometheus-client`` is an optional extra that no container image
+  installed explicitly. Every image either used ``pip install .`` (core deps
+  only, extras excluded) or ``pip install --no-deps .`` (no dependencies at
+  all), so whether the collector worked depended entirely on the engine in the
+  base image happening to pull prometheus_client in as one of *its* dependencies
+  -- unpinned, and one base bump or one ``--no-deps`` rebuild away from the
+  collector silently disabling itself on the ``ImportError`` path.
 
 These are cheap file-level assertions on purpose. The failure mode they guard
 is a one-character edit in a values file or a Dockerfile that no unit test

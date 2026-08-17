@@ -331,7 +331,7 @@ sum by (result) (rate(mx_p2p_list_sources_total[5m]))
 sum by (scheme) (rate(mx_p2p_transfer_seconds_sum[5m]))
   / sum by (scheme) (rate(mx_p2p_transfer_seconds_count[5m]))
 
-# Attach a server-side constant that is NOT on the other families.
+# Attach a constant that is only on build_info (version), not on the family itself.
 mx_p2p_list_sources_total
   * on (instance) group_left(version) mx_build_info{component="client"}
 
@@ -396,7 +396,7 @@ the only symptom is `up == 0` fleet-wide.
 | Symptom | Likely cause |
 | --- | --- |
 | `up == 0` on server pods | Scrape is aimed at the gRPC port. tonic is HTTP/2 only; use `metrics.port`. |
-| `up == 0` on worker pods | `prometheus-client` is missing from the image, or `MX_METRICS_ENABLED` is unset. |
+| `up == 0` on worker pods | `MX_METRICS_ENABLED` is unset, or `prometheus-client` is missing from the image (it is installed explicitly now, but a custom image may not). |
 | 200 with no `mx_*` series | `PROMETHEUS_MULTIPROC_DIR` was set after `prometheus_client` was imported. Check the logs for the "latched its single-process value class" error. |
 | Only one rank's numbers | `PROMETHEUS_MULTIPROC_DIR` is not set, so there is nothing to merge. |
 | A rank vanishes mid-run | Something wiped the directory after ranks started. Only the entrypoint may do that. |
@@ -415,8 +415,12 @@ pytest tests/test_metrics.py tests/test_metrics_deployment.py -v
 # Selection funnel and the ListSources outcome counter.
 pytest tests/test_source_selection.py -v
 
-# Server listener, over real HTTP/1.1.
+# Server registry, build info, and the config wiring.
 cargo test --package modelexpress-server metrics
+
+# The listener itself, scraped over real HTTP/1.1. Gated behind the feature, so
+# the command above does NOT run it.
+cargo test --package modelexpress-server --features integration-tests --test in_process_server
 
 # Before/after numbers.
 python benchmarks/metrics_pipeline.py --ranks 8
