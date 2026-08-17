@@ -10,9 +10,20 @@ default, and the Python client, opt-in. This page covers how to scrape both,
 what the pipeline guarantees, and the two operational choices it leaves to the
 deployment.
 
-This is the foundation phase. It repairs the exposition path and adds the one
-family every later family joins against (`mx_build_info`); the load- and
-transfer-timing tiers and the server subsystem families land on top of it.
+This is the foundation: steps 1–2 of a six-step rollout. It repairs the
+exposition path and adds the one family every later family joins against
+(`mx_build_info`). What lands on top of it:
+
+| Step | Scope |
+| --- | --- |
+| 1. Server exposition ✅ | `/metrics` listener, Helm repoint, `prometheus-client` into the images, `mx_build_info` |
+| 2. Client pipeline ✅ | multiprocess mode, eager `enable()`, pod-scoped push, bounded labels, the selection funnel |
+| 3. Request and backend coverage | one gRPC interceptor with in-handler outcomes, one backend-operation wrapper |
+| 4. Export what is already computed | refit stage timings, cache statistics, registry status counts, NIXL agent health |
+| 5. Load and transfer timing tiers | `mx_load_seconds` down to `mx_transfer_phase_seconds`, plus the strategy-chain bypass paths |
+| 6. Deployment surface | gauges, PodMonitor, dashboards, recording rules, `absent()` alerts |
+
+Steps 3–6 are not in this document yet; it covers what ships today.
 
 ---
 
@@ -80,7 +91,7 @@ configurations span TP=1, TP=2, TP=4 and TP=8, and the published benchmarks use
 TP=8 on an 8×B200 node. The design assumes only that N > 1.
 
 The previous implementation assumed one metrics-producing process per scrape
-target. Under N ranks that failed in four ways, and every one of them produced
+target. Under N ranks that failed in five ways, and every one of them produced
 plausible-looking output rather than an error:
 
 | Symptom | Cause |
@@ -110,7 +121,7 @@ the real `vllm-runtime` client image, TP=8:
 | Events surviving when every rank is SIGKILLed | 0 % | 100 % |
 
 Both "before" figures are ranges rather than single numbers, and that is the
-defect rather than noise in the measurement: on the pull path the survivor was
+issue rather than noise in the measurement: on the pull path the survivor was
 whichever rank won the race to `bind()`, and on the push path whichever rank
 happened to `PUT` last. The pull row is reported as the mean over all N possible
 winners — with comparable per-rank event counts it converges on losing
@@ -123,9 +134,9 @@ python benchmarks/metrics_pipeline.py --ranks 8
 
 ### Verified live
 
-Both rollout-phase exit criteria were checked on the same cluster.
+Both exit criteria from the rollout table above were checked on real hardware.
 
-**Server (phase 0)** — a server pod that has served no traffic, scraped from a
+**Step 1, server** — a server pod that has served no traffic, scraped from a
 *different* pod over its pod IP, the way Prometheus does:
 
 ```
@@ -140,7 +151,7 @@ The same scrape against the gRPC port — which is where the annotation used to
 point — fails as it always did: `curl: (1) Received HTTP/0.9 when not allowed`.
 That is what `up == 0` looked like.
 
-**Client (phase 1)** — eight ranks in one pod behind one port, scraped over HTTP,
+**Step 2, client** — eight ranks in one pod behind one port, scraped over HTTP,
 then SIGKILLed mid-flight:
 
 ```
@@ -408,7 +419,7 @@ the only symptom is `up == 0` fleet-wide.
 ## Verification
 
 ```bash
-# Client pipeline, per defect.
+# Client pipeline, per issue.
 cd modelexpress_client/python
 pytest tests/test_metrics.py tests/test_metrics_deployment.py -v
 
