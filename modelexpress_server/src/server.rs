@@ -21,7 +21,7 @@ use crate::auth::{AuthLayer, AuthState};
 use crate::backend_config::BackendConfig;
 use crate::cache::CacheEvictionService;
 use crate::config::{AuthMode, ServerConfig};
-use crate::metrics::{BuildInfo, MetricsRegistry};
+use crate::metrics;
 use crate::p2p::{service::P2pServiceImpl, state::P2pStateManager};
 use crate::refit::{backend::create_backend as create_refit_backend, service::RefitServiceImpl};
 use crate::registry::state::RegistryManager;
@@ -75,12 +75,11 @@ pub async fn run_server(
     // server has drained, so the drain window stays scrapeable.
     let (metrics_shutdown_tx, metrics_shutdown_rx) = tokio::sync::oneshot::channel();
     let metrics_handle = metrics_addr.map(|metrics_addr| {
-        let mut metrics_registry = MetricsRegistry::new();
-        let _build_info = BuildInfo::register(&mut metrics_registry, &backend);
-        let metrics_registry = Arc::new(metrics_registry);
-        tokio::spawn(crate::metrics::serve(
+        let mut registry = metrics::new_registry();
+        metrics::register_build_info(&mut registry, &backend);
+        tokio::spawn(metrics::serve(
             metrics_addr,
-            metrics_registry,
+            Arc::new(registry),
             async move {
                 let _ = metrics_shutdown_rx.await;
             },

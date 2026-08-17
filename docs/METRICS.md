@@ -100,7 +100,8 @@ are durable at increment time, so no exit hook is in the path at all.
 ### Measured
 
 `modelexpress_client/python/benchmarks/metrics_pipeline.py` reconstructs the old
-mechanism and runs both through the same workload. On a TP=8 pod:
+mechanism and runs both through the same workload. Measured on an **H200 node** (128 vCPU) inside
+the real `vllm-runtime` client image, TP=8:
 
 | Scenario | Before | After |
 | --- | --- | --- |
@@ -119,6 +120,39 @@ winners — with comparable per-rank event counts it converges on losing
 cd modelexpress_client/python
 python benchmarks/metrics_pipeline.py --ranks 8
 ```
+
+### Verified live
+
+Both rollout-phase exit criteria were checked on the same cluster.
+
+**Server (phase 0)** — a server pod that has served no traffic, scraped from a
+*different* pod over its pod IP, the way Prometheus does:
+
+```
+$ curl -i --http1.1 http://<server-pod-ip>:9401/metrics
+HTTP/1.1 200 OK
+content-type: application/openmetrics-text; version=1.0.0; charset=utf-8
+
+mx_build_info{component="server",version="0.5.0",backend="redis",scheme=""} 1
+```
+
+The same scrape against the gRPC port — which is where the annotation used to
+point — fails as it always did: `curl: (1) Received HTTP/0.9 when not allowed`.
+That is what `up == 0` looked like.
+
+**Client (phase 1)** — eight ranks in one pod behind one port, scraped over HTTP,
+then SIGKILLed mid-flight:
+
+```
+[scrape 1] HTTP 200   mx_p2p_source_attempts_total = 360 / 360
+[scrape 1] mx_build_info series=1 value=1.0
+[scrape 2] HTTP 200   mx_p2p_source_attempts_total = 360 / 360   (4 of 8 ranks SIGKILLed)
+```
+
+All eight ranks reach one endpoint; killing half of them loses nothing, because
+mmap writes are durable at increment time; `mx_build_info` merges to a single
+series at 1 rather than to 8, which is what pins the gauge's `multiprocess_mode`;
+and no `pid` label leaks into the exposition.
 
 ---
 
@@ -175,12 +209,13 @@ instead. Measure the curve on your own pod:
 python benchmarks/metrics_pipeline.py --only scrape-cost --max-file-sets 512
 ```
 
-On an idle host with the synthetic family the benchmark uses, cost runs from
-~0.3 ms at one file set to ~21 ms at 256. That is a floor, not a planning
-figure: it scales with series count and with contention for the GIL, and the
-process being measured is the one running the engine scheduler. If you recycle
-workers aggressively — an RL pod cycling ranks per refit — measure before
-assuming headroom against Prometheus's 10 s default scrape timeout.
+On an idle H200 node with the synthetic family the benchmark uses, cost runs from
+~0.1 ms at one file set to ~2.4 ms at 256 — comfortably inside Prometheus's 10 s
+default scrape timeout. Treat that as a floor rather than a planning figure: it
+scales with series count and with contention for the GIL, the process being
+measured is the one running the engine scheduler, and this pod was not running
+one. If you recycle workers aggressively — an RL pod cycling ranks per refit —
+measure on your own pod before assuming headroom.
 
 ### 2. Sharing the directory with the engine's exporter
 

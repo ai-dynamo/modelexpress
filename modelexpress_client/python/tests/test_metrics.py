@@ -700,20 +700,6 @@ def test_latched_single_process_value_class_is_reported(monkeypatch, tmp_path, c
     ), caplog.text
 
 
-def test_exposition_registry_is_merged_under_multiprocess(monkeypatch, tmp_path):
-    """Exposition must go through MultiProcessCollector, not the local registry."""
-    from prometheus_client import REGISTRY
-
-    collector = _fresh_collector(monkeypatch, PROMETHEUS_MULTIPROC_DIR=str(tmp_path))
-    registry = collector._exposition_registry()
-    assert registry is not REGISTRY
-    assert registry is not collector._registry
-    assert any(
-        type(c).__name__ == "MultiProcessCollector"
-        for c in registry._collector_to_names
-    ), registry._collector_to_names
-
-
 # ---------------------------------------------------------------------------
 # D2 + D6 end to end: one endpoint, every rank, including hard-killed ones
 # ---------------------------------------------------------------------------

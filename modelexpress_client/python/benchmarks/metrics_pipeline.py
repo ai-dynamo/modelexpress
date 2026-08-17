@@ -47,7 +47,7 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -697,22 +697,7 @@ def main(argv: list[str] | None = None) -> int:
                 results.append(fn(args.ranks))
 
     if args.json:
-        print(
-            json.dumps(
-                [
-                    {
-                        "scenario": r.scenario,
-                        "question": r.question,
-                        "before": r.before,
-                        "after": r.after,
-                        "detail": r.detail,
-                        "rows": r.rows,
-                    }
-                    for r in results
-                ],
-                indent=2,
-            )
-        )
+        print(json.dumps([asdict(r) for r in results], indent=2))
     else:
         print(_render(results))
     return 0

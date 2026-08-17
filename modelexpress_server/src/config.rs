@@ -936,27 +936,36 @@ mod tests {
         assert!(security.validate_resolved(AuthMode::Enforce).is_ok());
     }
 
-    /// A config file that sets the documented disable value must not take the
-    /// whole file down with it.
+    /// A config file must survive both spellings of the metrics port.
     ///
     /// `load_layered_config` swallows every deserialization error and returns
-    /// `T::default()` with no log line, so any value this field rejects costs
-    /// the operator the gRPC port, the cache directory, the eviction policy and
-    /// the auth settings — silently. That is why `metrics_port` is a `u16` and
-    /// not a `NonZeroU16`: `0` has to survive deserialization and be normalized
-    /// afterwards.
+    /// `T::default()` with no log line, so any value this field rejects costs the
+    /// operator the gRPC port, the cache directory, the eviction policy and the
+    /// auth settings -- silently. That is why `metrics_port` is a `u16` and not a
+    /// `NonZeroU16` (`0` has to deserialize, and is normalized afterwards), and
+    /// why it carries `#[serde(default)]` (no existing model-express.yaml mentions
+    /// it). Both cases assert the *rest* of the file survived, because that is how
+    /// the failure would present.
     #[test]
     #[allow(clippy::expect_used)]
-    fn metrics_port_zero_in_a_config_file_disables_only_metrics() {
-        let temp_dir = tempdir().expect("Failed to create temp dir");
-        let config_file = temp_dir.path().join("zero_metrics_port.yaml");
-        fs::write(
-            &config_file,
-            r#"
+    fn metrics_port_never_costs_the_rest_of_the_config_file() {
+        // (metrics_port line, expected port, expected metrics address)
+        let cases = [
+            ("metrics_port: 0", 0_u16, None),
+            ("", default_metrics_port(), Some(default_metrics_port())),
+        ];
+
+        for (metrics_line, expected_metrics_port, expects_addr) in cases {
+            let temp_dir = tempdir().expect("Failed to create temp dir");
+            let config_file = temp_dir.path().join("metrics_port.yaml");
+            fs::write(
+                &config_file,
+                format!(
+                    r#"
             server:
               host: "127.0.0.1"
               port: 18012
-              metrics_port: 0
+              {metrics_line}
             cache:
               eviction:
                 enabled: false
@@ -973,91 +982,63 @@ mod tests {
               format: Json
               file: null
               structured: true
-        "#,
-        )
-        .expect("Failed to write config file");
+        "#
+                ),
+            )
+            .expect("Failed to write config file");
 
-        let args = ServerArgs {
-            config: Some(config_file),
-            port: None,
-            host: None,
-            metrics_port: None,
-            log_level: None,
-            log_format: None,
-            cache_directory: None,
-            cache_eviction_enabled: None,
-            security: SecurityArgs::default(),
-            validate_config: false,
-        };
-        let config = ServerConfig::load(args).expect("config should load");
+            let args = ServerArgs {
+                config: Some(config_file),
+                port: None,
+                host: None,
+                metrics_port: None,
+                log_level: None,
+                log_format: None,
+                cache_directory: None,
+                cache_eviction_enabled: None,
+                security: SecurityArgs::default(),
+                validate_config: false,
+            };
+            let config = ServerConfig::load(args).expect("config should load");
 
-        // The listener is off ...
-        assert_eq!(config.server.metrics_port, 0);
-        assert_eq!(
-            config
-                .metrics_socket_addr()
-                .expect("metrics address should resolve"),
-            None
-        );
-        // ... and every other setting in the file survived. If this ever regresses
-        // these assertions fail together, because the whole file was dropped.
-        assert_eq!(config.server.port.get(), 18012);
-        assert_eq!(config.server.host, "127.0.0.1");
-        assert!(!config.cache.eviction.enabled);
-        assert_eq!(config.logging.level, LogLevel::Debug);
+            assert_eq!(config.server.metrics_port, expected_metrics_port);
+            assert_eq!(
+                config
+                    .metrics_socket_addr()
+                    .expect("metrics address should resolve")
+                    .map(|addr| addr.port()),
+                expects_addr,
+                "0 must mean disabled and nothing else"
+            );
+            // The rest of the file survived. If this regresses these fail
+            // together, because the whole file was dropped.
+            assert_eq!(config.server.port.get(), 18012, "the file was dropped");
+            assert_eq!(config.server.host, "127.0.0.1");
+            assert!(!config.cache.eviction.enabled);
+            assert_eq!(config.logging.level, LogLevel::Debug);
+        }
     }
 
-    /// The missing-key case: no existing `model-express.yaml` mentions this
-    /// field, and all of them must keep parsing.
+    /// The env var must stay wired through clap.
+    ///
+    /// `load_layered_config` reads env as
+    /// `Environment::with_prefix("MODEL_EXPRESS").separator("_")`, so
+    /// `MODEL_EXPRESS_SERVER_METRICS_PORT` resolves to the key path
+    /// `server.metrics.port`, matches no field, and serde drops it without a
+    /// warning. The clap `#[arg(env = ...)]` override is the only path that
+    /// reaches the field, and `--metrics-port` is what the Helm chart drives.
     #[test]
-    #[allow(clippy::expect_used)]
-    fn a_config_file_without_metrics_port_still_parses() {
-        let temp_dir = tempdir().expect("Failed to create temp dir");
-        let config_file = temp_dir.path().join("no_metrics_port.yaml");
-        fs::write(
-            &config_file,
-            r#"
-            server:
-              host: "127.0.0.1"
-              port: 18013
-            cache:
-              eviction:
-                enabled: false
-                policy:
-                  type: lru
-                  unused_threshold: "3d"
-                  max_models: 10
-                  min_free_space_bytes: 1000000
-                check_interval: "30m"
-              directory: "./cache"
-              max_size_bytes: 5000000
-            logging:
-              level: Debug
-              format: Json
-              file: null
-              structured: true
-        "#,
-        )
-        .expect("Failed to write config file");
+    fn metrics_port_is_reachable_from_the_command_line() {
+        use clap::Parser as _;
 
-        let args = ServerArgs {
-            config: Some(config_file),
-            port: None,
-            host: None,
-            metrics_port: None,
-            log_level: None,
-            log_format: None,
-            cache_directory: None,
-            cache_eviction_enabled: None,
-            security: SecurityArgs::default(),
-            validate_config: false,
-        };
-        let config = ServerConfig::load(args).expect("config should load");
+        let args = ServerArgs::parse_from(["modelexpress-server", "--metrics-port", "9999"]);
+        assert_eq!(args.metrics_port, Some(9999));
 
-        assert_eq!(config.server.port.get(), 18013, "the file was dropped");
+        let off = ServerArgs::parse_from(["modelexpress-server", "--metrics-port", "0"]);
         assert_eq!(
-            config.server.metrics_port,
-            modelexpress_common::constants::DEFAULT_METRICS_PORT.get()
+            off.metrics_port,
+            Some(0),
+            "0 is the documented disable value"
         );
     }
 }

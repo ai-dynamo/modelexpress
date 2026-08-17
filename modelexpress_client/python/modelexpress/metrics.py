@@ -15,89 +15,20 @@ Two properties are load-bearing and must survive any change here:
 * **Structured logs remain the source of truth.** Disabling metrics loses
   comparability, not correctness.
 
-Exposition: one endpoint per pod, not per rank
-----------------------------------------------
+Exposition is one endpoint per **pod**, not per rank. A ModelExpress pod runs one
+worker process per GPU, so this module uses ``prometheus_client`` multiprocess
+mode: each rank mmaps per-PID files into a pod-local directory, and one process
+binds the port and serves the ``MultiProcessCollector`` union of every rank,
+including ranks that have already exited. Losing the bind is the *normal* case
+rather than a failure, and mmap writes are durable at increment time, so no exit
+hook is in the pull path.
 
-A ModelExpress pod runs one worker process per GPU, and the previous
-implementation assumed one metrics-producing process per scrape target. That
-assumption failed in four separate ways, all of which produced plausible-looking
-but wrong output rather than an error:
-
-* every rank called ``start_http_server`` on the same port, so one bound and
-  N-1 logged a warning and gave up — the endpoint served one rank's data while
-  presenting as the pod's, and disappeared entirely if that rank exited first;
-* the Pushgateway grouping key was ``{"instance": hostname}`` and
-  ``push_to_gateway`` is a ``PUT`` that replaces the whole group, so ranks
-  sharing a host erased each other and whichever exited last looked complete;
-* the endpoint and the push hook were both registered inside the lazy
-  ``_ensure()``, reachable only from a recording call, so a run that fell back
-  off P2P produced output byte-identical to ``MX_METRICS_ENABLED=0`` — the run
-  you most need to diagnose;
-* the push ran from an ``atexit`` hook, which does not run on SIGKILL or an
-  OOM-kill, which is exactly the failure the metrics exist to explain.
-
-The fix is ``prometheus_client`` multiprocess mode. Each rank mmaps per-PID
-files into a pod-local directory; one process binds the port and its
-``MultiProcessCollector`` serves the merged union of every rank, including ranks
-that have already exited. Losing the bind is now the *normal* case rather than a
-failure, and mmap writes are durable at increment time, so no exit hook is
-involved and an OOM-killed rank's data survives.
-
-The deployment shape is a memory-backed ``emptyDir`` and two environment
-variables set in the **pod manifest** — see ``docs/METRICS.md``::
-
-    volumes:
-      - name: mx-metrics
-        emptyDir: {medium: Memory, sizeLimit: 64Mi}
-    volumeMounts:
-      - {name: mx-metrics, mountPath: /var/run/mx-metrics}
-    env:
-      - {name: PROMETHEUS_MULTIPROC_DIR, value: /var/run/mx-metrics}
-      - {name: MX_METRICS_ENABLED, value: "1"}
-
-Sharp edges, all of which fail silently rather than raising
------------------------------------------------------------
-
-* ``PROMETHEUS_MULTIPROC_DIR`` must be set in the manifest, never assigned from
-  Python. ``prometheus_client.values.get_value_class()`` latches at module
-  import; an in-process assignment lands after ``import vllm`` and produces zero
-  ``.db`` files with no error. :func:`enable` detects the latched-wrong state and
-  says so loudly instead of exporting an empty endpoint.
-* Never wipe the directory from :func:`enable`. Ranks start staggered, so rank
-  5's wipe unlinks rank 0's already-mmapped files; rank 0 keeps writing to an
-  unlinked inode and vanishes from every later scrape, permanently and silently.
-  Wipe at the container entrypoint only — :func:`reset_multiproc_dir`, also
-  reachable as ``python -m modelexpress.metrics --reset``. That is required
-  anyway, because an ``emptyDir`` survives container restarts within a pod.
-  ``makedirs(exist_ok=True)`` is safe and is done here; it never unlinks.
-* ``mx_build_info`` is a ``Gauge`` set to 1, never an ``Info``. Under
-  multiprocess mode an ``Info`` writes no file, exposes nothing, and raises
-  nothing — it would pass its own health check while being invisible and
-  silently emptying every ``group_left`` join.
-* Gauges need an explicit ``multiprocess_mode``, and ``livesum`` is unsafe here:
-  it depends on ``mark_process_dead``, which only ever runs on a clean exit. In
-  flight quantities belong in ``_started_total`` / ``_finished_total`` counter
-  pairs differenced in PromQL, which self-heals.
-
-Cost and the one open trade-off
--------------------------------
-
-``MultiProcessCollector`` re-reads every mmap file in Python, holding the GIL,
-inside the process driving the engine scheduler. Files for dead PIDs are never
-reclaimed, so a pod that recycles workers accumulates file sets and scrape cost
-grows with them. Reaping the files bounds the cost but makes merged counters
-decrease, which Prometheus reads as a reset. This module does **not** reap: it
-keeps counters monotonic and asks deployments to bound pod lifetime instead. See
-``docs/METRICS.md`` for the measurements behind that choice.
-
-Sharing with the engine's own exporter
---------------------------------------
-
-vLLM sets and manages ``PROMETHEUS_MULTIPROC_DIR`` itself, and the value class
-is process-global, so a genuinely separate directory is not achievable from
-inside the engine process. The deliberate decision is: **share the directory,
-take a distinct port, and never wipe it from code.** ModelExpress families are
-namespaced ``mx_*`` and cannot collide with the engine's own.
+``docs/METRICS.md`` carries the operator-facing half: the deployment shape
+(memory-backed ``emptyDir``, the two pod-manifest environment variables, the
+entrypoint ``--reset``), the four failure modes this replaced, and the
+scrape-cost and shared-directory trade-offs. Every rule that fails *silently*
+when broken is also stated at the code site that depends on it — those comments
+are the point, not decoration.
 """
 
 from __future__ import annotations
@@ -200,7 +131,6 @@ class MetricsCollector:
         # Real value is latched in _build_families, which runs lazily -- this
         # singleton is constructed at import, before any deployment env is read.
         self._source_id_label = False
-        self._http_server = None
         self._retry_thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self.scheme = envs.MX_METRICS_SCHEME
@@ -387,6 +317,9 @@ class MetricsCollector:
             self._try_bind(port)
         if gateway and not self._push_registered:
             self._push_registered = True
+            # Best-effort only: atexit does not run on SIGKILL or an OOM-kill.
+            # That is why the push is an opt-in escape hatch and the pull path
+            # carries no exit hook at all.
             atexit.register(push_metrics_if_enabled)
 
     def _try_bind(self, port: int | None) -> None:
@@ -396,12 +329,7 @@ class MetricsCollector:
         try:
             from prometheus_client import start_http_server
 
-            # Recent prometheus_client returns (server, thread); older versions
-            # return None. Kept so a caller (and tests) can shut the endpoint
-            # down deterministically instead of leaking a thread.
-            self._http_server = start_http_server(
-                port, registry=self._exposition_registry()
-            )
+            start_http_server(port, registry=self._exposition_registry())
         except OSError as e:
             # The errno matters, not just whether a shared directory is set.
             # "Another rank got here first" is EADDRINUSE and nothing else: a
@@ -564,19 +492,13 @@ def _configured_port() -> int | None:
     Every decision that depends on "is a scrape endpoint configured?" must go
     through this, never through the raw ``MX_METRICS_PORT`` string. ``"0"`` and
     junk are both truthy strings but mean *no endpoint*, so a raw-string test
-    reads them as "yes" and then binds nothing.
+    reads them as "yes" and then binds nothing. ``0`` is the documented disable
+    value, matching the server's ``--metrics-port 0``; passing it through would
+    have the OS hand out an ephemeral port that nothing could ever be configured
+    to scrape — an endpoint that exists and is unreachable, which is the failure
+    mode this whole module exists to eliminate.
     """
-    return int_or_none(envs.MX_METRICS_PORT)
-
-
-def int_or_none(value: str | int | None) -> int | None:
-    """Parse a port, returning ``None`` rather than raising on junk.
-
-    ``0`` means disabled, matching the server's ``--metrics-port 0``. Passing it
-    through would have the OS hand out an ephemeral port that nothing could ever
-    be configured to scrape — an endpoint that exists and is unreachable, which
-    is the failure mode this whole module is trying to eliminate.
-    """
+    value = envs.MX_METRICS_PORT
     if value is None:
         return None
     try:
@@ -644,6 +566,9 @@ def _check_multiproc_ready(multiproc_dir: str) -> None:
     is indistinguishable from "this rank did nothing" unless it is called out.
     """
     try:
+        # makedirs only, never unlink: wiping from worker code unlinks an
+        # earlier rank's mmapped files and that rank vanishes from every later
+        # scrape. Entrypoint only -- see reset_multiproc_dir.
         os.makedirs(multiproc_dir, exist_ok=True)
     except OSError as e:
         logger.error(

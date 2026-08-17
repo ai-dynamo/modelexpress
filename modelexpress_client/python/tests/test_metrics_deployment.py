@@ -88,45 +88,36 @@ def _install_lines(content: str) -> list[str]:
 def test_client_images_install_prometheus_client(dockerfile):
     """D5: the collector needs the dependency to exist in the image.
 
-    Two acceptable spellings: the ``[metrics]`` extra where pip resolves
-    dependencies, and an explicit ``prometheus-client`` install where the image
-    deliberately uses ``--no-deps`` to protect the engine's CUDA/NIXL/Torch
-    stack. Asserted against install lines with comments stripped — the comments
-    in these files mention prometheus-client by name, so a whole-file substring
-    search passes even with the install deleted.
+    Two acceptable spellings, and which one is required depends on the image:
+    the ``[metrics]`` extra where pip resolves dependencies, but an *explicit*
+    ``prometheus-client`` install where the image uses ``--no-deps`` to protect
+    the engine's CUDA/NIXL/Torch stack, because ``--no-deps`` excludes extras.
+
+    Asserted against install lines with comments stripped. Every one of these
+    files carries a comment naming prometheus-client, so a whole-file substring
+    search passes even with the real install line deleted.
     """
     installs = _install_lines(_read(dockerfile))
     assert installs, f"{dockerfile} has no recognizable install line"
-    satisfied = [
-        line
-        for line in installs
-        if ".[metrics]" in line or "prometheus-client" in line
-    ]
-    assert satisfied, (
-        f"{dockerfile} installs the ModelExpress client but no install line "
-        f"brings in prometheus-client. MX_METRICS_ENABLED=1 would silently "
-        f"disable itself in this image and the pod would report up == 0.\n"
-        f"install lines seen: {installs}"
-    )
 
-
-@pytest.mark.parametrize("dockerfile", _CLIENT_IMAGE_DOCKERFILES)
-def test_no_deps_images_install_prometheus_client_explicitly(dockerfile):
-    """``--no-deps`` excludes extras, so the extra alone is not enough there."""
-    installs = _install_lines(_read(dockerfile))
     # The client install itself: `... --no-deps .` (a bare dot as the target).
-    no_deps_client = [
-        line
+    installs_client_with_no_deps = any(
+        "--no-deps" in line and re.search(r"\s\.\s*(&&|;|\\)?\s*$", line)
         for line in installs
-        if "--no-deps" in line and re.search(r"\s\.\s*(&&|;|\\)?\s*$", line)
-    ]
-    if not no_deps_client:
-        pytest.skip(f"{dockerfile} does not use --no-deps for the client install")
-    explicit = [line for line in installs if "prometheus-client" in line]
-    assert explicit, (
-        f"{dockerfile} installs the client with --no-deps, which excludes the "
-        f"[metrics] extra; prometheus-client must be installed by its own "
-        f"install line.\ninstall lines seen: {installs}"
+    )
+    if installs_client_with_no_deps:
+        satisfied = [line for line in installs if "prometheus-client" in line]
+        how = "an explicit prometheus-client install line (--no-deps excludes extras)"
+    else:
+        satisfied = [
+            line for line in installs if ".[metrics]" in line or "prometheus-client" in line
+        ]
+        how = "the [metrics] extra or an explicit prometheus-client install"
+
+    assert satisfied, (
+        f"{dockerfile} installs the ModelExpress client but not prometheus-client. "
+        f"It needs {how}. Without it MX_METRICS_ENABLED=1 silently disables itself "
+        f"and the pod reports up == 0.\ninstall lines seen: {installs}"
     )
 
 
@@ -173,30 +164,3 @@ def test_deployment_publishes_the_metrics_port_and_env():
     # The generated annotation must reference the metrics port, never
     # service.port.
     assert 'prometheus.io/port" (.Values.metrics.port' in deployment
-
-
-def test_rust_metrics_port_env_is_wired_through_clap_not_the_config_loader():
-    """The config-loader trap, asserted where it would silently regress.
-
-    ``Environment::with_prefix("MODEL_EXPRESS").separator("_")`` maps
-    ``MODEL_EXPRESS_SERVER_METRICS_PORT`` to the key path ``server.metrics.port``,
-    which matches no field; serde drops it without a warning. Only the clap
-    ``#[arg(env = ...)]`` override actually reaches the field.
-    """
-    config_rs = _read("modelexpress_server/src/config.rs")
-    assert "pub metrics_port: Option<u16>" in config_rs
-    # The attribute form, not the bare identifier: the name also appears in the
-    # comment warning against removing this very attribute, so a substring test
-    # passed even with `#[arg(long, env = ...)]` reduced to `#[arg(long)]`.
-    assert (
-        "env = modelexpress_common::envs::MODEL_EXPRESS_SERVER_METRICS_PORT" in config_rs
-    )
-    # The serde default is mandatory: without it, every existing
-    # model-express.yaml fails to parse and load_layered_config silently falls
-    # back to a full default configuration.
-    assert 'default = "default_metrics_port"' in config_rs
-    # And the stored type must stay a plain u16. NonZeroU16 rejects the
-    # documented `0` during deserialization, which under load_layered_config's
-    # error-swallowing fallback means the entire config file is discarded —
-    # gRPC port, cache directory, eviction policy and auth settings included.
-    assert "pub metrics_port: u16," in config_rs
