@@ -180,3 +180,47 @@ def test_deployment_publishes_the_metrics_port_and_env():
     # The generated annotation must reference the metrics port, never
     # service.port.
     assert 'prometheus.io/port" (.Values.metrics.port' in deployment
+
+
+def test_metrics_port_is_the_single_source_of_truth():
+    """Four things must move together, and none may be skippable.
+
+    ``metrics.port`` drives where the server listens (the env var), where
+    Prometheus scrapes (the annotation), what the pod advertises (the
+    containerPort) and what a Service-based scrape targets. Any change that lets
+    one of them move alone reproduces the original issue one layer up — a server
+    listening on a port nothing scrapes, with no error anywhere.
+
+    This is a regression guard for a real one: an earlier revision *skipped* the
+    generated env var when the user set it directly, leaving the other three on
+    ``metrics.port``. An override of ``9500`` then had the server on 9500 while
+    Kubernetes advertised 9401. The chart now rejects that override instead.
+
+    Rendering all the combinations is stronger and lives in the reviewer notes;
+    this is the part that can run without helm installed.
+    """
+    deployment = _read("helm/templates/deployment.yaml")
+    service = _read("helm/templates/service.yaml")
+
+    # Every consumer derives from the same value.
+    for consumer, text, needle in [
+        ("scrape annotation", deployment, 'prometheus.io/port" (.Values.metrics.port'),
+        ("containerPort", deployment, "containerPort: {{ .Values.metrics.port"),
+        ("env var", deployment, "{{ .Values.metrics.port | default 9401 | quote }}"),
+        ("service port", service, "port: {{ .Values.metrics.port"),
+    ]:
+        assert needle in text, f"the {consumer} no longer derives from .Values.metrics.port"
+
+    # And an env-only override is rejected, not silently honoured. Without this
+    # the env var moves alone and the other three keep pointing elsewhere.
+    assert "fail " in deployment and "MODEL_EXPRESS_SERVER_METRICS_PORT" in deployment, (
+        "the chart must reject MODEL_EXPRESS_SERVER_METRICS_PORT set via .Values.env "
+        "or .Values.extraEnv, because it moves only where the server listens"
+    )
+    emission = deployment.index("- name: MODEL_EXPRESS_SERVER_METRICS_PORT")
+    guard = deployment.rindex("{{- fail ", 0, emission)
+    between = deployment[guard:emission]
+    assert "{{- if" not in between.split("{{- end }}")[-1], (
+        "the env emission is inside a conditional again; it must be unconditional "
+        "so it can never disagree with the annotation and containerPort"
+    )
