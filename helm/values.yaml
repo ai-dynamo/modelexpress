@@ -12,8 +12,7 @@ image:
   pullPolicy: IfNotPresent
   tag: "0.3.0"
 
-imagePullSecrets:
-  - name: nvcr-secret
+imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
@@ -101,8 +100,8 @@ env:
   #
   # When "redis": also set REDIS_URL to your cluster's Redis service (e.g.
   # "redis://redis.default.svc:6379"). The chart does not bundle a Redis sub-chart.
-  # When "kubernetes": apply examples/crds.yaml as a cluster-admin and set
-  # serviceAccount.rbac.enabled=true to grant the server access to the CRDs.
+  # When "kubernetes": set serviceAccount.rbac.enabled=true to grant the server
+  # access to ModelMetadata and ModelCacheEntry resources.
   #
   # MX_METADATA_BACKEND: "redis"
   # REDIS_URL: "redis://redis.default.svc:6379"

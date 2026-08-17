@@ -43,6 +43,10 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
+    - name: Check Helm CRD manifest sync
+      if: matrix.rust == 'stable'
+      run: cmp examples/crds.yaml helm/crds/modelexpress-crds.yaml
+
     - name: Install Rust toolchain
       run: |
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
