@@ -7,7 +7,8 @@ replicaCount: 3
 image:
   repository: nvcr.io/nvidia/ai-dynamo/modelexpress-server
   pullPolicy: Always
-  tag: "0.3.0"
+  # Overrides the image tag whose default is the chart appVersion
+  tag: ""
 
 serviceAccount:
   create: true
