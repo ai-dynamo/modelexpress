@@ -14,6 +14,7 @@ import torch
 
 from modelexpress.accelerators import NIXL_ACCELERATOR_MEM_TYPE
 from modelexpress.nixl_transfer import (
+    _arena_single_mr_forced,
     NixlTransferManager,
     _pool_reg_enabled,
 )
@@ -222,6 +223,8 @@ class TestRawDescriptorMemType:
         used = tensor.numel() * tensor.element_size()
 
         class FakeArena:
+            live_allocation_count = 1
+
             def registered_range(self):
                 return base, used
 
@@ -237,6 +240,8 @@ class TestRawDescriptorMemType:
     def test_arena_registration_falls_back_when_tensor_uncovered(self):
         # A tensor outside [base, base+used) must not be served by the single MR.
         class FakeArena:
+            live_allocation_count = 1
+
             def registered_range(self):
                 return 0x1000, 0x2000
 
@@ -254,6 +259,8 @@ class TestRawDescriptorMemType:
         monkeypatch.setenv("MX_POOL_REG", "1")
 
         class FakeArena:
+            live_allocation_count = 1
+
             def registered_range(self):
                 return 0x1000, 0x2000
 
@@ -520,3 +527,119 @@ class TestWaitForXfer:
         manager = self._manager(["ERROR"])
         with pytest.raises(RuntimeError, match="test transfer failed"):
             manager._wait_for_xfer(object(), None, "test transfer")
+
+
+class TestArenaSingleMrForced:
+    """MX_ARENA_SINGLE_MR keeps the single-MR path on a multi-allocation arena."""
+
+    def test_default_is_off(self, monkeypatch):
+        monkeypatch.delenv("MX_ARENA_SINGLE_MR", raising=False)
+        assert _arena_single_mr_forced() is False
+
+    def test_one_is_on(self, monkeypatch):
+        monkeypatch.setenv("MX_ARENA_SINGLE_MR", "1")
+        assert _arena_single_mr_forced() is True
+
+    def test_read_at_call_time(self, monkeypatch):
+        monkeypatch.setenv("MX_ARENA_SINGLE_MR", "1")
+        assert _arena_single_mr_forced() is True
+        monkeypatch.setenv("MX_ARENA_SINGLE_MR", "0")
+        assert _arena_single_mr_forced() is False
+
+
+class TestMultiAllocationArena:
+    """A single MR cannot describe an arena spanning several cuMemCreate handles.
+
+    UCX cuda_ipc resolves a region with cuMemGetAddressRange, which reports only
+    the allocation holding the base pointer, so the published rkey would cover
+    just the first chunk and the peer would read past what it mapped.
+    """
+
+    @staticmethod
+    def _make_manager() -> NixlTransferManager:
+        mgr = NixlTransferManager(agent_name="test", device_id=0)
+        mgr._agent = MagicMock()
+        mgr._agent.get_agent_metadata.return_value = b"metadata"
+        return mgr
+
+    @staticmethod
+    def _covering_arena(tensor, live_allocs):
+        base = tensor.data_ptr()
+        used = tensor.numel() * tensor.element_size()
+
+        class FakeArena:
+            live_allocation_count = live_allocs
+
+            def registered_range(self):
+                return base, used
+
+        return FakeArena(), base, used
+
+    def test_multi_allocation_arena_registers_per_tensor(self, monkeypatch):
+        monkeypatch.delenv("MX_ARENA_SINGLE_MR", raising=False)
+        tensor = torch.zeros(4, dtype=torch.float32)
+        arena, _, _ = self._covering_arena(tensor, live_allocs=1019)
+
+        mgr = self._make_manager()
+        assert mgr.register_arena(arena, {"w": tensor}) == b"metadata"
+
+        # Per-tensor, not one MR over the arena range.
+        args, kwargs = mgr._agent.register_memory.call_args
+        assert args[0][0] is tensor
+        assert kwargs == {"backends": ["UCX"]}
+
+    def test_single_allocation_arena_keeps_one_mr(self, monkeypatch):
+        monkeypatch.delenv("MX_ARENA_SINGLE_MR", raising=False)
+        tensor = torch.zeros(4, dtype=torch.float32)
+        arena, base, used = self._covering_arena(tensor, live_allocs=1)
+
+        mgr = self._make_manager()
+        assert mgr.register_arena(arena, {"w": tensor}) == b"metadata"
+
+        mgr._agent.register_memory.assert_called_once_with(
+            [(base, used, 0, "")],
+            mem_type=NIXL_ACCELERATOR_MEM_TYPE,
+            backends=["UCX"],
+        )
+
+    def test_env_override_keeps_one_mr_on_multi_allocation(self, monkeypatch):
+        # dmabuf/IB can span several handles in one registration, so deployments
+        # that validated the single-MR path there can keep it.
+        monkeypatch.setenv("MX_ARENA_SINGLE_MR", "1")
+        tensor = torch.zeros(4, dtype=torch.float32)
+        arena, base, used = self._covering_arena(tensor, live_allocs=1019)
+
+        mgr = self._make_manager()
+        assert mgr.register_arena(arena, {"w": tensor}) == b"metadata"
+
+        mgr._agent.register_memory.assert_called_once_with(
+            [(base, used, 0, "")],
+            mem_type=NIXL_ACCELERATOR_MEM_TYPE,
+            backends=["UCX"],
+        )
+
+    def test_multi_allocation_fallback_bypasses_pool_registration(self, monkeypatch):
+        # Pool reg resolves the same per-handle bounds that were insufficient.
+        monkeypatch.delenv("MX_ARENA_SINGLE_MR", raising=False)
+        monkeypatch.setenv("MX_POOL_REG", "1")
+        tensor = torch.zeros(4, dtype=torch.float32)
+        arena, _, _ = self._covering_arena(tensor, live_allocs=1019)
+
+        mgr = self._make_manager()
+        assert mgr.register_arena(arena, {"w": tensor}) == b"metadata"
+
+        args, kwargs = mgr._agent.register_memory.call_args
+        assert args[0][0] is tensor
+        assert kwargs == {"backends": ["UCX"]}
+
+    def test_warning_names_the_allocation_count(self, monkeypatch, caplog):
+        monkeypatch.delenv("MX_ARENA_SINGLE_MR", raising=False)
+        tensor = torch.zeros(4, dtype=torch.float32)
+        arena, _, _ = self._covering_arena(tensor, live_allocs=1019)
+
+        mgr = self._make_manager()
+        with caplog.at_level(logging.WARNING):
+            mgr.register_arena(arena, {"w": tensor})
+
+        assert "1019 physical allocations" in caplog.text
+        assert "MX_ARENA_SINGLE_MR=1" in caplog.text
