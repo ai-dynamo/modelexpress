@@ -11,9 +11,8 @@ or override env.REDIS_URL to point at your own instance.
 {{- end }}
 {{- if eq .Values.env.MX_METADATA_BACKEND "kubernetes" }}
 
-IMPORTANT: The Kubernetes backend requires the ModelExpress CRDs to be installed
-cluster-wide (examples/crds.yaml) and serviceAccount.rbac.enabled=true so the
-server can manage ModelMetadata and ModelCacheEntry resources.
+Set serviceAccount.rbac.enabled=true so the server can manage ModelMetadata and
+ModelCacheEntry resources with the Kubernetes backend.
 {{- end }}
 {{- else }}
 
