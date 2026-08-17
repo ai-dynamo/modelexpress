@@ -86,6 +86,19 @@ def capture_tensor_attrs(accelerator_backend: AcceleratorBackend):
         nn.Module.__setattr__ = original_setattr
 
 
+def _has_own_dict(obj: object) -> bool:
+    """Whether obj carries an instance dict worth walking.
+
+    ``hasattr`` reaches ``__getattr__`` on objects without a real ``__dict__``,
+    and a lazy proxy can raise there, so a raising probe means "not a
+    container" rather than aborting the whole scan.
+    """
+    try:
+        return hasattr(obj, "__dict__")
+    except Exception:
+        return False
+
+
 def _find_hidden_accel_tensors(
     obj: object,
     visited: set[int],
@@ -129,8 +142,8 @@ def _find_hidden_accel_tensors(
                 depth + 1,
             ):
                 results.append((f"{k}_{path}", tensor))
-    elif hasattr(obj, "__dict__") and not isinstance(
-        obj, (type, nn.Module, types.ModuleType)
+    elif not isinstance(obj, (type, nn.Module, types.ModuleType)) and _has_own_dict(
+        obj
     ):
         # Module objects are import registries, not tensor containers, and
         # walking them trips lazy-import machinery (transformers' _LazyModule
