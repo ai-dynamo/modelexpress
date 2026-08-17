@@ -49,6 +49,7 @@ from modelexpress.refit.reshard.types import (
     CaptureResult,
     IncompleteRefit,
     UnsupportedReshard,
+    summarize_unsupported,
 )
 
 logger = logging.getLogger("modelexpress.refit.reshard.receiver")
@@ -466,10 +467,22 @@ class ReshardReceiver:
             # installed, so they would silently keep their initial (base-model)
             # weights for the entire run. Until the full-pull/loader path exists
             # (TODO), fail loudly rather than serve stale weights.
+            #
+            # Carry the capture causes, not just the names. A rejection that
+            # reports only which tensors are missing forces the reader back onto
+            # the cluster to find out which op defeated capture.
+            causes = summarize_unsupported(
+                getattr(capture, "unsupported_reasons", {}) or {}
+            )
+            cause_text = (
+                "; ".join(f"{count} x {cause}" for cause, count in causes)
+                if causes
+                else "cause not recorded at capture"
+            )
             raise UnsupportedReshard(
                 f"[reshard] {len(plan.fallback)} source(s) need the unimplemented "
                 f"full-pull path (unsupported reshard ops); refusing to serve stale "
-                f"weights. Params: {plan.fallback[:10]}"
+                f"weights. Causes: {cause_text}. Params: {plan.fallback[:10]}"
             )
         # P2P memory handshake (mirrors MX's vLLM RDMA path): fetch each trainer's
         # NIXL metadata (incl. its memory registrations) via its listen thread, so
@@ -662,6 +675,14 @@ class ReshardReceiver:
             "copies_captured": len(capture.copies),
             "unsupported": len(unsupported),
             "unsupported_sample": [str(u)[:120] for u in unsupported[:10]],
+            # Grouped causes, so the harvested record explains an incomplete
+            # refit without needing the run's console output alongside it.
+            "unsupported_causes": [
+                {"cause": cause[:200], "sources": count}
+                for cause, count in summarize_unsupported(
+                    getattr(capture, "unsupported_reasons", {}) or {}
+                )
+            ],
             "planned_wire_bytes": plan.bytes_planned(),
             "extra_wire_bytes": plan.extra_wire_bytes(),
             "descriptors": plan.descriptor_count(),

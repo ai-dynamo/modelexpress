@@ -41,6 +41,7 @@ from modelexpress.refit.reshard.types import (
     OpSpec,
     RecordedCopy,
     UnsupportedReshard,
+    summarize_unsupported,
 )
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,13 @@ _SUPPORTED_OPS: dict[Callable, str] = {
     torch.Tensor.flatten: "flatten",
     torch.Tensor.contiguous: "contiguous",
     torch.Tensor.chunk: "chunk",
+    # vLLM's fused-MoE expert loader unifies its fused and per-expert paths by
+    # doing `experts_shard.unbind()`, reached via `unsqueeze(0)` for a per-expert
+    # source. Without this entry every expert weight in a MoE model is classified
+    # unsupported and the refit fails closed at ~5% coverage. Like `chunk` it is a
+    # pure multi-return view, so the existing tuple handling in `_intercept`
+    # applies unchanged.
+    torch.Tensor.unbind: "unbind",
 }
 
 
@@ -213,10 +221,14 @@ def _install_stamps(
 
         def make_stamp(inner, name):
             @functools.wraps(inner)
-            def stamp(p, *a, **kw):
+            def stamp(*a, **kw):
+                # Signature-transparent on purpose. vLLM's fused-MoE loader is
+                # invoked entirely by keyword (`param=`, `loaded_weight=`,
+                # `shard_id=`, `expert_id=`), so a stamp that named its first
+                # parameter positionally raised TypeError for every expert.
                 recorder.current = name
                 try:
-                    return inner(p, *a, **kw)
+                    return inner(*a, **kw)
                 finally:
                     recorder.current = None
 
@@ -260,6 +272,7 @@ def capture_geometry(
     recorder = _BakeRecorder()
     saved = _install_stamps(model, recorder, default_weight_loader)
     unsupported: list[str] = []
+    unsupported_reasons: dict[str, str] = {}
     try:
         # One source at a time: a single unsupported loader is attributed only
         # to that tensor, never the whole bake. Fused params
@@ -269,8 +282,9 @@ def capture_geometry(
             lazy = LazyWeight(name, torch.Size(shape), dtype, "meta", recorder=recorder)
             try:
                 model.load_weights([(name, lazy)])
-            except UnsupportedReshard:
+            except UnsupportedReshard as exc:
                 unsupported.append(name)
+                unsupported_reasons[name] = str(exc)
     finally:
         _restore_stamps(saved)
 
@@ -280,8 +294,16 @@ def capture_geometry(
         len(unsupported),
         recorder.unattributed,
     )
+    # A whole model class can fail for one reason (every fused expert source, say),
+    # so report the distinct causes with counts rather than a list of names. The
+    # names alone say which tensors are missing but never why.
+    for reason, count in summarize_unsupported(unsupported_reasons):
+        logger.warning(
+            "reshard capture: %d source(s) unsupported, cause: %s", count, reason
+        )
     return CaptureResult(
         copies=recorder.copies,
         unsupported=unsupported,
         unattributed=recorder.unattributed,
+        unsupported_reasons=unsupported_reasons,
     )
