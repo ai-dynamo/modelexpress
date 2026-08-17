@@ -18,7 +18,7 @@ pip install -e .
 # With test dependencies
 pip install -e ".[dev]"
 
-# Additionally install the pinned protobuf code generator when changing p2p.proto
+# Additionally install the pinned protobuf code generator when changing protobuf APIs
 pip install -e ".[codegen]"
 ```
 
@@ -98,6 +98,70 @@ for the qualified-image requirement and production-style Kubernetes
 deployment.
 
 ## Programmatic Usage
+
+### RL trainer publication
+
+An RL framework creates a weight version through the external Refit API. Each
+trainer actor then invokes its rank-local client to stage and publish one shard.
+Worker registration, manifest serving, and internal shard CRUD remain hidden
+behind the client.
+
+```python
+from modelexpress_rl import (
+    ModelExpressTrainerClient,
+    WeightVersionRef,
+    WeightVersionShardManifestService,
+    refit_pb2_grpc,
+)
+
+manifest_service = WeightVersionShardManifestService(endpoint="trainer-0:9000")
+refit_pb2_grpc.add_RefitWorkerServiceServicer_to_server(
+    manifest_service,
+    trainer_worker_grpc_server,
+)
+
+trainer = ModelExpressTrainerClient.initialize(
+    manager=nixl_manager,
+    manifest_publisher=manifest_service,
+)
+
+shard = trainer.stage_shard(
+    version=WeightVersionRef(version.uid),
+    tensors=megatron_tensor_specs,
+)
+shard.publish()
+```
+
+The deployment supplies `MODEL_NAME`, `MX_TRAINER_ENGINE`,
+`MX_TRAINER_STAGING_MODE`, `MX_WEIGHT_PAYLOAD_FORMAT`, `MX_WORKER_HOST`, and the
+normal ModelExpress server configuration. The Megatron adapter derives its
+source slot from the engine's global distributed rank. The NIXL metadata
+endpoint is derived from `MX_WORKER_HOST` and the supplied NIXL manager's listen
+port.
+
+`worker_endpoint` is the trainer-side manifest service address advertised to
+other workers. `server_url` selects the central ModelExpress control-plane
+service and defaults to the normal ModelExpress server configuration.
+
+Initialization fixes the staging mode and payload format. `publish()` hides
+manifest publication and the internal `CreateWeightVersionShard` RPC. The
+current Megatron adapter exposes its already-registered live buffers through
+`IN_PLACE`, so callers must keep those tensors immutable while the version is
+published. Its `source_reuse_ready` fence raises `NotImplementedError` until
+version retirement is wired to the adapter; it must not be interpreted as an
+early reuse signal. The required lifecycle is synchronous: create and publish
+the version, update every generator, retire the version, and only then resume
+training or begin the next optimizer step. The adapter does not claim fully
+asynchronous `COPY_TO_DEVICE` behavior until that staging implementation exists.
+
+Version creation and expected-source-slot declaration remain
+framework-orchestrator responsibilities. Each trainer adapter derives its own
+source slot from the engine's native topology; the orchestrator declares the
+expected slots using the same adapter-defined convention. `initialize()`
+selects the configured trainer engine and constructs its adapter internally;
+Megatron is the first implementation. Megatron-specific APIs live under
+`modelexpress_rl`;
+`modelexpress.refit.reshard` remains the shared, engine-neutral transfer core.
 
 ### MxClient
 

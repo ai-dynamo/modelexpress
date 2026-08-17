@@ -84,9 +84,11 @@ from .client import MxClient  # noqa: F401
 from .gds_loader import MxGdsLoader  # noqa: F401
 from .gds_transfer import GdsTransferManager  # noqa: F401
 from .metadata.publisher import PublisherThread  # noqa: F401
+from .model_client import ModelCacheClient  # noqa: F401
 
 __all__ = [
     "GdsTransferManager",
+    "ModelCacheClient",
     "MxClient",
     "MxGdsLoader",
     "PublisherThread",

@@ -12,7 +12,6 @@ use modelexpress_common::grpc::{
     api::api_service_server::ApiServiceServer, health::health_service_server::HealthServiceServer,
     model::model_service_server::ModelServiceServer, p2p::p2p_service_server::P2pServiceServer,
     refit::refit_service_server::RefitServiceServer,
-    weight_sync::weight_sync_service_server::WeightSyncServiceServer,
 };
 use tonic::transport::Server;
 use tower::Layer;
@@ -26,7 +25,6 @@ use crate::p2p::{service::P2pServiceImpl, state::P2pStateManager};
 use crate::refit::{backend::create_backend as create_refit_backend, service::RefitServiceImpl};
 use crate::registry::state::RegistryManager;
 use crate::services::{ApiServiceImpl, HealthServiceImpl, ModelDownloadTracker, ModelServiceImpl};
-use crate::weight_sync::WeightSyncServiceImpl;
 
 /// Maximum gRPC message size (100MB) for large models like DeepSeek-V3.
 /// Each worker can have thousands of tensor descriptors with NIXL metadata.
@@ -158,7 +156,6 @@ pub async fn run_server(
     }
 
     let p2p_service = P2pServiceImpl::new(p2p_state.clone());
-    let weight_sync_service = WeightSyncServiceImpl::new();
 
     // Start reaper for stale source detection
     let (reaper_shutdown_tx, reaper_shutdown_rx) = tokio::sync::oneshot::channel();
@@ -212,9 +209,6 @@ pub async fn run_server(
     let p2p = P2pServiceServer::new(p2p_service)
         .max_decoding_message_size(MAX_MESSAGE_SIZE)
         .max_encoding_message_size(MAX_MESSAGE_SIZE);
-    let weight_sync = WeightSyncServiceServer::new(weight_sync_service)
-        .max_decoding_message_size(MAX_MESSAGE_SIZE)
-        .max_encoding_message_size(MAX_MESSAGE_SIZE);
     let refit = refit_service.map(|service| {
         RefitServiceServer::new(service)
             .max_decoding_message_size(MAX_MESSAGE_SIZE)
@@ -230,13 +224,11 @@ pub async fn run_server(
             .add_service(layer.layer(api))
             .add_service(layer.layer(model))
             .add_service(layer.layer(p2p))
-            .add_service(layer.layer(weight_sync))
             .add_optional_service(refit.map(|service| layer.layer(service))),
         None => router
             .add_service(api)
             .add_service(model)
             .add_service(p2p)
-            .add_service(weight_sync)
             .add_optional_service(refit),
     };
     let server_result = router.serve_with_shutdown(addr, shutdown_signal).await;
