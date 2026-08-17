@@ -72,6 +72,7 @@ The following table lists the configurable parameters of the ModelExpress chart 
 | `serviceAccount.create`                      | Create a service account                       | `true`   |
 | `serviceAccount.annotations`                 | Service account annotations                    | `{}`     |
 | `serviceAccount.name`                        | Service account name                           | `""`     |
+| `serviceAccount.rbac.enabled`                | Create a ClusterRole and ClusterRoleBinding for the Kubernetes metadata backend | `false` |
 | `podAnnotations`                             | Pod annotations                                | `{}`     |
 | `podSecurityContext`                         | Pod security context                           | `{}`     |
 | `securityContext`                            | Container security context                     | `{}`     |
@@ -179,6 +180,21 @@ extraEnv:
       secretKeyRef:
         name: modelexpress-secrets
         key: secret-key
+```
+
+### With Kubernetes Backend RBAC
+
+Enabling `serviceAccount.rbac.enabled` creates a `ClusterRole` and
+`ClusterRoleBinding`, allowing a ModelExpress server deployed in a dedicated
+namespace to access metadata resources in a workload namespace:
+
+```yaml
+serviceAccount:
+  rbac:
+    enabled: true
+
+env:
+  MX_METADATA_BACKEND: kubernetes
 ```
 
 ## Upgrading
