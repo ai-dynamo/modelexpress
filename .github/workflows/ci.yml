@@ -43,6 +43,10 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
+    - name: Check Helm CRD manifest sync
+      if: matrix.rust == 'stable'
+      run: cmp examples/crds.yaml helm/crds/modelexpress-crds.yaml
+
     - name: Install Rust toolchain
       run: |
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
@@ -327,6 +331,14 @@ jobs:
         cargo test -p model-express-workspace-tests \
           --test registry_backend_redis \
           -- --include-ignored --test-threads=1
+
+    - name: Run P2P Redis status ordering test
+      env:
+        MX_TEST_REDIS_URL: redis://localhost:6379
+      run: |
+        cargo test -p modelexpress-server --lib \
+          p2p::backend::redis::tests::older_status_update_does_not_replace_newer_status \
+          -- --ignored --exact --test-threads=1
 
     - name: Run Refit service Redis integration tests
       env:

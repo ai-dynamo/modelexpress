@@ -7,12 +7,13 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from modelexpress.refit.reshard.megatron import (
+from modelexpress.refit.reshard.receiver import ReshardReceiver
+
+from .layout import (
     MegatronTargetLayout,
     MegatronTargetSpec,
     lower_megatron_target,
 )
-from modelexpress.refit.reshard.receiver import ReshardReceiver
 
 
 def _dtype_label(dtype: Any) -> str:

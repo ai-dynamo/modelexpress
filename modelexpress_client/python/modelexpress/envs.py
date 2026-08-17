@@ -42,6 +42,9 @@ if TYPE_CHECKING:
     # ModelExpress server address / logging
     MODEL_EXPRESS_URL: Optional[str]
     MX_SERVER_ADDRESS: Optional[str]
+    MODEL_EXPRESS_CACHE_DIRECTORY: Optional[str]
+    MODEL_EXPRESS_NO_SHARED_STORAGE: bool
+    MODEL_EXPRESS_TRANSFER_CHUNK_SIZE: Optional[str]
     MODEL_EXPRESS_LOG_LEVEL: str
     MODEL_NAME: Optional[str]
     # Auth (client)
@@ -94,6 +97,7 @@ if TYPE_CHECKING:
     MX_TRANSFER_LOG_DIR: str
     # VMM arena
     MX_VMM_ARENA: bool
+    MX_ARENA_SINGLE_MR: bool
     # Framework artifact (JIT cache) transfer
     MX_ARTIFACT_TRANSFER: bool
     MX_ARTIFACT_BUNDLE_ROOT: Optional[str]
@@ -209,6 +213,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Site-varying defaults: return raw (None when unset), callers add defaults.
     "MODEL_EXPRESS_URL": lambda: os.environ.get("MODEL_EXPRESS_URL"),
     "MX_SERVER_ADDRESS": lambda: os.environ.get("MX_SERVER_ADDRESS"),
+    "MODEL_EXPRESS_CACHE_DIRECTORY": lambda: os.environ.get("MODEL_EXPRESS_CACHE_DIRECTORY"),
+    "MODEL_EXPRESS_NO_SHARED_STORAGE": lambda: _env_bool("MODEL_EXPRESS_NO_SHARED_STORAGE", False),
+    "MODEL_EXPRESS_TRANSFER_CHUNK_SIZE": lambda: os.environ.get(
+        "MODEL_EXPRESS_TRANSFER_CHUNK_SIZE"
+    ),
     "MODEL_EXPRESS_LOG_LEVEL": lambda: os.environ.get("MODEL_EXPRESS_LOG_LEVEL", "").upper(),
     "MODEL_NAME": lambda: os.environ.get("MODEL_NAME"),
     # ── Auth (client) ──────────────────────────────────────────────────────
@@ -301,6 +310,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_TRANSFER_LOG_DIR": lambda: os.environ.get("MX_TRANSFER_LOG_DIR", "/tmp/mx_logs"),
     # ── VMM arena ──────────────────────────────────────────────────────────
     "MX_VMM_ARENA": lambda: os.environ.get("MX_VMM_ARENA") == "1",
+    "MX_ARENA_SINGLE_MR": lambda: os.environ.get("MX_ARENA_SINGLE_MR") == "1",
     # ── Framework artifact (JIT cache) transfer ────────────────────────────
     "MX_ARTIFACT_TRANSFER": lambda: os.environ.get("MX_ARTIFACT_TRANSFER", "").strip().lower()
     in _TRUTHY,
