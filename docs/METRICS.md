@@ -10,20 +10,9 @@ default, and the Python client, opt-in. This page covers how to scrape both,
 what the pipeline guarantees, and the two operational choices it leaves to the
 deployment.
 
-This is the foundation: steps 1–2 of a six-step rollout. It repairs the
-exposition path and adds the one family every later family joins against
-(`mx_build_info`). What lands on top of it:
-
-| Step | Scope |
-| --- | --- |
-| 1. Server exposition ✅ | `/metrics` listener, Helm repoint, `prometheus-client` into the images, `mx_build_info` |
-| 2. Client pipeline ✅ | multiprocess mode, eager `enable()`, pod-scoped push, bounded labels, the selection funnel |
-| 3. Request and backend coverage | one gRPC interceptor with in-handler outcomes, one backend-operation wrapper |
-| 4. Export what is already computed | refit stage timings, cache statistics, registry status counts, NIXL agent health |
-| 5. Load and transfer timing tiers | `mx_load_seconds` down to `mx_transfer_phase_seconds`, plus the strategy-chain bypass paths |
-| 6. Deployment surface | gauges, PodMonitor, dashboards, recording rules, `absent()` alerts |
-
-Steps 3–6 are not in this document yet; it covers what ships today.
+This documents what ships today: the exposition path and `mx_build_info`, the
+family that later ones join against. Request/backend coverage, the load and
+transfer timing tiers, and the dashboard surface come later and are not here yet.
 
 ---
 
@@ -83,87 +72,21 @@ binds the port and serves the merged union of all of them.
 
 ---
 
-## Why the client works this way
+## Why one endpoint per pod
 
-A ModelExpress pod runs **one worker process per GPU**. The parallelism is a
-customer variable, not a ModelExpress constant — this repository's own
-configurations span TP=1, TP=2, TP=4 and TP=8, and the published benchmarks use
-TP=8 on an 8×B200 node. The design assumes only that N > 1.
+A ModelExpress pod runs **one worker process per GPU**, and N is a customer
+variable: this repository's own configurations span TP=1 through TP=8. Anything
+that assumes one metrics-producing process per scrape target loses N-1 ranks.
 
-The previous implementation assumed one metrics-producing process per scrape
-target. Under N ranks that failed in five ways, and every one of them produced
-plausible-looking output rather than an error:
+So the client uses `prometheus_client` **multiprocess mode**. Each rank mmaps
+per-PID files into a pod-local directory; one process binds the port and its
+`MultiProcessCollector` serves the union of every rank, including ranks that have
+already exited. Losing the bind is the *normal* case, not a failure, and mmap
+writes are durable at increment time, so no exit hook is in the path — an
+OOM-killed rank's counters still show up.
 
-| Symptom | Cause |
-| --- | --- |
-| The endpoint showed one rank's numbers as if they were the pod's | All N ranks called `start_http_server` on one port; one bound, N-1 caught `EADDRINUSE` and kept recording into a registry nothing reads |
-| The endpoint vanished while the pod stayed healthy | The bind winner exited first |
-| Pushgateway data looked complete but was one rank's | The grouping key was the hostname, and a push is a `PUT` that replaces the whole group |
-| A run that skipped P2P produced output identical to metrics being off | Initialization was reachable only from a recording call |
-| An OOM-killed rank contributed nothing | The flush ran from `atexit` |
-
-The fix is `prometheus_client` **multiprocess mode**. Each rank mmaps per-PID
-files into a pod-local directory; one process binds the port and its
-`MultiProcessCollector` serves the union of every rank, including ranks that
-have already exited. Losing the bind became the *normal* case, and mmap writes
-are durable at increment time, so no exit hook is in the path at all.
-
-### Measured
-
-`modelexpress_client/python/benchmarks/metrics_pipeline.py` reconstructs the old
-mechanism and runs both through the same workload. Measured on an **H200 node** (128 vCPU) inside
-the real `vllm-runtime` client image, TP=8:
-
-| Scenario | Before | After |
-| --- | --- | --- |
-| Events reaching a scrape of the pod's one endpoint | 12.5 % mean (2.8–22.2 %) | 100 % |
-| Events retained after the pod pushes to a gateway | 10–22 %, varying by run | 100 % |
-| Events surviving when every rank is SIGKILLed | 0 % | 100 % |
-
-Both "before" figures are ranges rather than single numbers, and that is the
-issue rather than noise in the measurement: on the pull path the survivor was
-whichever rank won the race to `bind()`, and on the push path whichever rank
-happened to `PUT` last. The pull row is reported as the mean over all N possible
-winners — with comparable per-rank event counts it converges on losing
-(N-1)/N of the pod.
-
-```bash
-cd modelexpress_client/python
-python benchmarks/metrics_pipeline.py --ranks 8
-```
-
-### Verified live
-
-Both exit criteria from the rollout table above were checked on real hardware.
-
-**Step 1, server** — a server pod that has served no traffic, scraped from a
-*different* pod over its pod IP, the way Prometheus does:
-
-```
-$ curl -i --http1.1 http://<server-pod-ip>:9401/metrics
-HTTP/1.1 200 OK
-content-type: application/openmetrics-text; version=1.0.0; charset=utf-8
-
-mx_build_info{component="server",version="0.5.0",backend="redis",scheme=""} 1
-```
-
-The same scrape against the gRPC port — which is where the annotation used to
-point — fails as it always did: `curl: (1) Received HTTP/0.9 when not allowed`.
-That is what `up == 0` looked like.
-
-**Step 2, client** — eight ranks in one pod behind one port, scraped over HTTP,
-then SIGKILLed mid-flight:
-
-```
-[scrape 1] HTTP 200   mx_p2p_source_attempts_total = 360 / 360
-[scrape 1] mx_build_info series=1 value=1.0
-[scrape 2] HTTP 200   mx_p2p_source_attempts_total = 360 / 360   (4 of 8 ranks SIGKILLed)
-```
-
-All eight ranks reach one endpoint; killing half of them loses nothing, because
-mmap writes are durable at increment time; `mx_build_info` merges to a single
-series at 1 rather than to 8, which is what pins the gauge's `multiprocess_mode`;
-and no `pid` label leaks into the exposition.
+`benchmarks/metrics_pipeline.py` reconstructs the previous mechanism and measures
+what it lost, if you want the numbers.
 
 ---
 
@@ -207,26 +130,19 @@ double-counts every series.
 
 `MultiProcessCollector` re-reads every mmap file in Python, holding the GIL,
 inside the process driving the engine scheduler. Files for dead PIDs are never
-reclaimed, so a pod that recycles workers accumulates file sets and scrape cost
-grows with them.
+reclaimed, so a pod that recycles workers accumulates them and scrape cost grows.
 
-Reaping the files bounds the cost but makes merged counters *decrease*, which
+Reaping them bounds the cost but makes merged counters *decrease*, which
 Prometheus reads as a reset and `rate()` then mis-accounts.
 
 **ModelExpress does not reap.** Counters stay monotonic; bound pod lifetime
-instead. Measure the curve on your own pod:
+instead. On an idle H200 node the curve runs ~0.1 ms at one file set to ~2.4 ms at
+256 — inside Prometheus's 10 s timeout, but measured without an engine competing
+for the GIL. If you recycle workers aggressively, measure your own pod:
 
 ```bash
 python benchmarks/metrics_pipeline.py --only scrape-cost --max-file-sets 512
 ```
-
-On an idle H200 node with the synthetic family the benchmark uses, cost runs from
-~0.1 ms at one file set to ~2.4 ms at 256 — comfortably inside Prometheus's 10 s
-default scrape timeout. Treat that as a floor rather than a planning figure: it
-scales with series count and with contention for the GIL, the process being
-measured is the one running the engine scheduler, and this pod was not running
-one. If you recycle workers aggressively — an RL pod cycling ranks per refit —
-measure on your own pod before assuming headroom.
 
 ### 2. Sharing the directory with the engine's exporter
 
@@ -284,52 +200,34 @@ Two changes to the client families are breaking for existing dashboards:
 
 ### Selection skew and the `source_worker_id` label
 
-The question `source_worker_id` answered — *is one source peer being picked
-disproportionately under this policy?* — is the central question when comparing
-selection policies (`random` vs `rendezvous_hash` vs `load_aware`). It is also
-the question whose obvious implementation does not survive a production fleet.
+*Is one source peer being picked disproportionately?* is the central question
+when comparing selection policies, and the obvious way to answer it does not
+survive a production fleet — the id is a per-process uuid, so its label domain
+grows with process count over time.
 
-**On a fleet, leave it off.** A dashboard built as
+**On a fleet, leave it off.** Note that a dashboard built as `sum by
+(source_worker_id) (...)` does not error once the label is gone: PromQL groups
+every sample under `source_worker_id=""`, so N lines become one and the panel
+reads as perfectly balanced. Group by `policy` instead. Pinned matchers return no
+data, and were already unreliable — the id was reminted on every process start.
 
-```promql
-sum by (source_worker_id) (rate(mx_p2p_source_selections_total[5m]))
-```
-
-does not error once the label is gone — PromQL groups every sample under
-`source_worker_id=""`, so N lines become one and the panel reads as perfectly
-balanced. Rewrite it to group by `policy`. Pinned matchers such as
-`{source_worker_id="a1b2c3d4"}` return no data; those were already unreliable,
-because the id was reminted on every process start.
-
-**On a benchmark run, turn it back on.**
-
-```bash
-export MX_METRICS_SOURCE_ID_LABEL=1
-```
-
-The call site always passes the peer id; the collector drops it unless this is
-set, so the cardinality decision lives in one place. The label set is latched
-when the family is built, so flipping the variable mid-process has no effect —
-`prometheus_client` fixes a family's labels at construction, and re-reading per
-call would make every later `.labels()` mismatch and silently drop the metric.
-
-With it on:
+**On a benchmark run, set `MX_METRICS_SOURCE_ID_LABEL=1`**, point it at a
+Prometheus you are willing to throw away, and keep the run short enough that
+process churn does not outgrow it. Then:
 
 ```promql
-# Selection share per peer — the skew a policy comparison is looking for.
 sum by (source_worker_id) (mx_p2p_source_selections_total)
   / ignoring(source_worker_id) group_left sum(mx_p2p_source_selections_total)
 ```
 
-Two constraints on that: point the run at a Prometheus you are willing to throw
-away, and keep the run short enough that process churn does not outgrow it. If
-you need skew on a long-lived fleet instead, the bounded form is a client-side
-gauge — one series per pod per policy regardless of peer count — which is
-follow-on work, not part of this phase.
+The call site always passes the peer id and the collector drops it unless the
+variable is set, so the cardinality decision lives in one place. The label set is
+latched when the family is built, so flipping the variable mid-process does
+nothing — `prometheus_client` fixes a family's labels at construction.
 
-The same data is already in the structured logs regardless of any metric
-setting: `rdma_strategy` emits `source_worker_id=` on every source attempt, so a
-per-peer histogram is derivable from a log capture with metrics off entirely.
+For skew on a long-lived fleet the bounded form is a client-side gauge, which is
+follow-on work. The same data is in the structured logs regardless:
+`rdma_strategy` emits `source_worker_id=` on every source attempt.
 
 ### Useful queries
 
