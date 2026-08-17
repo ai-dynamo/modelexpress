@@ -24,13 +24,26 @@ use tokio::task::JoinHandle;
 
 type ServerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("local addr").port()
+/// Reserve `N` distinct ephemeral ports.
+///
+/// All `N` sockets are held open until every port has been read, then released
+/// together. Calling a one-port helper twice can hand back the same port -- the
+/// first socket is already closed by then, so the OS is free to reuse it -- and
+/// the two listeners would race for it, failing whichever bound second.
+fn free_ports<const N: usize>() -> [u16; N] {
+    let sockets: Vec<std::net::TcpListener> = (0..N)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port"))
+        .collect();
+    let mut ports = [0_u16; N];
+    for (slot, socket) in ports.iter_mut().zip(&sockets) {
+        *slot = socket.local_addr().expect("local addr").port();
+    }
+    ports
 }
 
 fn start_server(port: u16) -> (oneshot::Sender<()>, JoinHandle<ServerResult>) {
-    start_server_with_metrics(port, free_port())
+    let [metrics_port] = free_ports::<1>();
+    start_server_with_metrics(port, metrics_port)
 }
 
 fn start_server_with_metrics(
@@ -79,7 +92,7 @@ async fn stop_and_join(shutdown: oneshot::Sender<()>, handle: JoinHandle<ServerR
 }
 
 async fn assert_boots_and_serves() {
-    let port = free_port();
+    let [port] = free_ports::<1>();
     let (shutdown, handle) = start_server(port);
 
     let mut client = connect_client(port).await;
@@ -112,8 +125,7 @@ async fn another_server_boots_and_serves_a_client() {
 /// permanently — indistinguishable from a crashed pod.
 #[tokio::test]
 async fn server_serves_metrics_over_http1() {
-    let port = free_port();
-    let metrics_port = free_port();
+    let [port, metrics_port] = free_ports::<2>();
     let (shutdown, handle) = start_server_with_metrics(port, metrics_port);
 
     // Wait for the gRPC side, so the metrics assertion is about a server that

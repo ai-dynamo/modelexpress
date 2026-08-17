@@ -78,16 +78,25 @@ spec:
               {{- end }}
             {{- end }}
             {{- /*
-              MODEL_EXPRESS_SERVER_METRICS_PORT is read only through the clap
-              --metrics-port override. The layered config loader would map this
-              name to the key path server.metrics.port, which matches no field
-              and is dropped by serde without a warning. 0 disables the listener.
-              Skipped when set explicitly, so the chart never emits the key twice.
+              metrics.port is the single source of truth. It drives four things
+              that have to agree: this env var, the scrape annotation, the
+              containerPort, and the optional Service port. Setting the env var
+              directly would move only the first of those, so the server would
+              listen on one port while Kubernetes advertised another -- and
+              setting it to "0" would silently disable the listener while the
+              scrape annotation still pointed at it. Rejected rather than
+              silently skipped.
+
+              The env var itself is read only through the clap --metrics-port
+              override: the layered config loader maps this name to the key path
+              server.metrics.port, which matches no field, and serde drops it
+              without a warning.
             */}}
-            {{- if and (not (hasKey .Values.env "MODEL_EXPRESS_SERVER_METRICS_PORT")) (not $hasMetricsPortInExtra) }}
+            {{- if or (hasKey .Values.env "MODEL_EXPRESS_SERVER_METRICS_PORT") $hasMetricsPortInExtra }}
+            {{- fail "Set metrics.port (and metrics.enabled) rather than MODEL_EXPRESS_SERVER_METRICS_PORT directly: the chart derives the scrape annotation, containerPort and Service port from metrics.port, and an env-only override desynchronizes them." }}
+            {{- end }}
             - name: MODEL_EXPRESS_SERVER_METRICS_PORT
               value: {{ if and .Values.metrics .Values.metrics.enabled }}{{ .Values.metrics.port | default 9401 | quote }}{{ else }}"0"{{ end }}
-            {{- end }}
             {{- if and (not (hasKey .Values.env "MX_METADATA_NAMESPACE")) (not $hasNsInExtra) }}
             - name: MX_METADATA_NAMESPACE
               value: {{ .Release.Namespace | quote }}

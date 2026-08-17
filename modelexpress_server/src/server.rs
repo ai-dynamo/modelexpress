@@ -292,13 +292,25 @@ pub async fn run_server(
         // partial request head open indefinitely. Without a deadline, any client
         // killed mid-write — a scraper, a probe, a port scan — wedges the last
         // await in run_server and burns the whole termination grace period.
-        match tokio::time::timeout(METRICS_DRAIN_TIMEOUT, handle).await {
+        //
+        // The handle is borrowed, not moved: `timeout` consuming it would drop it
+        // on expiry, which *detaches* the task rather than stopping it. It would
+        // keep holding the port after `run_server` returned — and `run_server` is
+        // documented as callable more than once in a process, so the next call
+        // would then fail to bind. On expiry we abort and wait for the
+        // cancellation to land.
+        let mut handle = handle;
+        match tokio::time::timeout(METRICS_DRAIN_TIMEOUT, &mut handle).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => error!("Metrics listener join error: {e}"),
-            Err(_) => warn!(
-                "Metrics listener did not drain within {}s; abandoning it to finish shutdown",
-                METRICS_DRAIN_TIMEOUT.as_secs()
-            ),
+            Err(_) => {
+                warn!(
+                    "Metrics listener did not drain within {}s; aborting it to finish shutdown",
+                    METRICS_DRAIN_TIMEOUT.as_secs()
+                );
+                handle.abort();
+                let _ = handle.await;
+            }
         }
     }
 

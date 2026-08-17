@@ -144,13 +144,26 @@ def test_helm_scrape_annotation_is_not_hardcoded_to_the_grpc_port():
             )
 
 
-def test_metrics_port_default_differs_from_the_grpc_port():
-    """The two ports must never converge: one is HTTP/1.1, the other HTTP/2."""
-    values = _read("helm/values.yaml")
+@pytest.mark.parametrize("name", _VALUES_FILES)
+def test_metrics_port_differs_from_the_grpc_port(name):
+    """The two ports must never converge: one is HTTP/1.1, the other HTTP/2.
+
+    Checked in **every** values file that sets both, not just `values.yaml`.
+    `values-production.yaml` overrides `metrics.port`, so a check against the
+    defaults alone would pass while production scraped the gRPC listener — which
+    is exactly the shape of the original defect.
+    """
+    values = _read(f"helm/{name}")
     service_port = re.search(r"^service:\n(?:.*\n)*?\s+port:\s*(\d+)", values, re.M)
     metrics_port = re.search(r"^metrics:\n(?:.*\n)*?\s+port:\s*(\d+)", values, re.M)
-    assert service_port and metrics_port, values
-    assert service_port.group(1) != metrics_port.group(1)
+    if not metrics_port:
+        pytest.skip(f"helm/{name} does not set metrics.port; it inherits values.yaml")
+    assert service_port, f"helm/{name} sets metrics.port but no service.port: {values}"
+    assert service_port.group(1) != metrics_port.group(1), (
+        f"helm/{name} points metrics.port at the gRPC port ({service_port.group(1)}). "
+        f"tonic serves HTTP/2 only, so every scrape of it fails and the target "
+        f"reports up == 0."
+    )
 
 
 def test_deployment_publishes_the_metrics_port_and_env():
