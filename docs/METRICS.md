@@ -304,8 +304,8 @@ to go on.
 | Symptom | Likely cause |
 | --- | --- |
 | `up == 0` on server pods | Scrape is aimed at the gRPC port. tonic is HTTP/2 only; use `metrics.port`. |
-| `up == 0` on worker pods | `MX_METRICS_ENABLED` is unset, or `prometheus-client` is missing from the image (it is installed explicitly now, but a custom image may not). |
-| 200 with no `mx_*` series | `PROMETHEUS_MULTIPROC_DIR` was set after `prometheus_client` was imported. Check the logs for the "latched its single-process value class" error. |
+| `up == 0` on worker pods | `MX_METRICS_ENABLED` is unset, or `prometheus-client` is missing from the image. The engine images ship it; an image built without one needs `modelexpress[metrics]`. |
+| 200 with no `mx_*` series | `PROMETHEUS_MULTIPROC_DIR` was set after `prometheus_client` was imported. Check the logs for the "no .db files were written" error. |
 | Only one rank's numbers | `PROMETHEUS_MULTIPROC_DIR` is not set, so there is nothing to merge. |
 | A rank vanishes mid-run | Something wiped the directory after ranks started. Only the entrypoint may do that. |
 | Scrapes time out | Dead-PID file sets have accumulated. See "Scrape cost" above. |
