@@ -116,6 +116,9 @@ if TYPE_CHECKING:
     MX_METRICS_PORT: Optional[str]
     MX_METRICS_PUSHGATEWAY: Optional[str]
     MX_METRICS_SCHEME: str
+    MX_METRICS_BIND_RETRY_SECS: float
+    MX_METRICS_SOURCE_ID_LABEL: bool
+    PROMETHEUS_MULTIPROC_DIR: Optional[str]
     # Third-party JIT/compile cache locations read for artifact transfer
     TRITON_CACHE_DIR: Optional[str]
     TVM_FFI_CACHE_DIR: Optional[str]
@@ -352,6 +355,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_METRICS_PORT": lambda: os.environ.get("MX_METRICS_PORT"),
     "MX_METRICS_PUSHGATEWAY": lambda: os.environ.get("MX_METRICS_PUSHGATEWAY"),
     "MX_METRICS_SCHEME": lambda: os.environ.get("MX_METRICS_SCHEME", ""),
+    # Interval at which a rank that lost the /metrics bind re-attempts it, so
+    # endpoint ownership migrates when the winning rank exits.
+    "MX_METRICS_BIND_RETRY_SECS": lambda: _env_float("MX_METRICS_BIND_RETRY_SECS", 15.0),
+    # Restore the per-peer source_worker_id label on
+    # mx_p2p_source_selections_total. Benchmark runs only: the id is a
+    # per-process uuid, so its label domain grows with process count over time
+    # rather than with cluster size.
+    "MX_METRICS_SOURCE_ID_LABEL": lambda: os.environ.get("MX_METRICS_SOURCE_ID_LABEL", "0")
+    .strip()
+    .lower()
+    in _TRUTHY,
+    # prometheus_client multiprocess directory. Read-only here: it MUST be set
+    # in the pod manifest, never assigned in Python. get_value_class() latches at
+    # prometheus_client import time, so an in-process assignment lands after the
+    # engine has already imported it and produces zero .db files with no error.
+    "PROMETHEUS_MULTIPROC_DIR": lambda: os.environ.get("PROMETHEUS_MULTIPROC_DIR"),
     # ── Third-party JIT/compile cache locations (raw; caller builds path) ──
     "TRITON_CACHE_DIR": lambda: os.environ.get("TRITON_CACHE_DIR"),
     "TVM_FFI_CACHE_DIR": lambda: os.environ.get("TVM_FFI_CACHE_DIR"),

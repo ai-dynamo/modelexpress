@@ -30,6 +30,7 @@ tls-rustls = ["modelexpress-common/tls-rustls", "kube/rustls-tls"]
 modelexpress-common = { workspace = true, default-features = false }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+axum = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 config = { workspace = true }
@@ -58,6 +59,7 @@ tower = { workspace = true }
 http = { workspace = true }
 moka = { workspace = true }
 secrecy = { workspace = true }
+prometheus-client = { workspace = true }
 
 [dev-dependencies]
 modelexpress-common = { workspace = true, default-features = false, features = ["test-support"] }

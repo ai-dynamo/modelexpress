@@ -19,6 +19,7 @@ from ...load_strategy import (
     register_tensors,
     unpublish_metadata,
 )
+from ...metrics import enable_metrics
 from .adapter import TrtllmAdapter, build_trtllm_load_context
 
 logger = logging.getLogger("modelexpress.engines.trtllm.loader")
@@ -56,6 +57,11 @@ class MxModelLoader:
             p2p_enabled=p2p_enabled,
             mx_server_url=mx_server_url,
         )
+
+        # Off the load path, but still before any strategy decision: a run
+        # that records nothing must leave the exporter up, so a scrape can
+        # prove it came up. No-op unless enabled; never raises.
+        enable_metrics()
 
     @property
     def adapter(self) -> TrtllmAdapter:
