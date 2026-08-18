@@ -23,17 +23,36 @@ MX_VMM_ARENA=1
 That is the only knob. The arena enables itself on supported devices and
 falls back with a warning when the underlying C extension is missing.
 
-### Required deployment flag
+### Deployment flag for the cuda_copy path
 
 UCX's `cuda_copy_md` path probes allocations with `cuMemGetAddressRange`,
 which returns per-handle bounds rather than the full reserve when called
 against a multi-handle VMM range. Without the override, UCX truncates
-transfers to a single physical chunk. Until the upstream fix lands
-(openucx/ucx#11461), set:
+transfers to a single physical chunk. On any UCX predating the upstream
+fix (openucx/ucx#11461), set:
 
 ```bash
 UCX_CUDA_COPY_REG_WHOLE_ALLOC=off
 ```
+
+This knob is scoped to the `cuda_copy` transport and does not affect
+`cuda_ipc`. Multi-allocation arenas have a separate limitation on
+`cuda_ipc`; see Transport support below before enabling the arena on an
+NVLink or MNNVL deployment.
+
+### Transport support
+
+Single-MR arena registration is validated on the dmabuf/IB path, where
+`ibv_reg_dmabuf_mr` genuinely spans several `cuMemCreate` handles.
+
+It does not hold on `cuda_ipc`. A CUDA fabric/IPC handle names exactly
+one `cuMemCreate` allocation, so a single MR over a multi-allocation
+arena publishes an rkey covering only the first chunk and the peer reads
+past what it mapped. ModelExpress detects this and falls back to
+per-tensor registration. `MX_ARENA_SINGLE_MR=1` overrides that fallback
+and is only safe on dmabuf/IB. The upstream fix is openucx/ucx#11283.
+The mechanism and the measured failure are in the Multi-handle arenas
+section of `docs/DEPLOYMENT.md`.
 
 ## Why this exists
 
@@ -148,12 +167,18 @@ Key invariants:
 
 Validated configurations:
 
-- Blackwell B200 + ConnectX over InfiniBand, single-pod and P2P.
+- Blackwell B200 + ConnectX over InfiniBand, single-pod and P2P. This is
+  the only transport on which single-MR registration is validated.
 - vLLM 0.x with `CUDAPluggableAllocator` (PyTorch 2.4+).
 - TP=8 ranks running concurrently against independent arenas.
 
 Known limitations:
 
+- Single-MR registration does not work on the UCX `cuda_ipc` transport
+  when the arena spans more than one `cuMemCreate` handle. The published
+  rkey covers only the first chunk. ModelExpress falls back to per-tensor
+  registration in that case; see Transport support above. Upstream fix:
+  openucx/ucx#11283.
 - VMM arena is x86_64-Linux only (CUDA driver constraint).
 - Bump pointer is monotonic. Long-lived processes that load and unload
   many models within one arena lifetime will fragment the VA but never

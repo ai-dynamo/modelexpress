@@ -40,11 +40,17 @@ impl ModelName {
 
         let mut components = Vec::new();
         for component in normalized_object_prefix.split('/') {
+            let bytes = component.as_bytes();
+            let has_windows_drive_prefix =
+                bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
             if component.is_empty() {
                 anyhow::bail!("GCS model path must not contain empty path segments");
             }
             if component == "." || component == ".." {
                 anyhow::bail!("GCS model path must not contain '.' or '..' segments");
+            }
+            if component.contains('\\') || has_windows_drive_prefix {
+                anyhow::bail!("GCS model path must contain only portable path segments");
             }
             components.push(component);
         }
