@@ -140,6 +140,10 @@ class NixlTransferManager:
         self._metadata: bytes = b""
         self._tensor_descriptors: list[TensorDescriptor] = []
         self._tensors: dict[str, torch.Tensor] = {}
+        # Registration descriptors must be deregistered before destroying the
+        # UCX-backed NIXL agent. Dropping an agent with live GPU registrations
+        # can abort inside ucp_worker_destroy during framework teardown.
+        self._registered_memory: list[Any] = []
         # Remote agents this manager has loaded, so shutdown can disconnect them.
         # Maps agent name -> (ip, port) for agents reached over the P2P socket, or
         # None for agents loaded from a metadata blob.
@@ -360,15 +364,19 @@ class NixlTransferManager:
             alloc_tuples = [
                 (base, size, self._device_id, "") for base, size in allocations
             ]
-            self._agent.register_memory(
-                alloc_tuples,
-                mem_type=self._accelerator_backend.nixl_mem_type,
-                backends=self._backends,
+            self._registered_memory.append(
+                self._agent.register_memory(
+                    alloc_tuples,
+                    mem_type=self._accelerator_backend.nixl_mem_type,
+                    backends=self._backends,
+                )
             )
             reg_count = len(allocations)
         else:
             tensor_list = list(tensors.values())
-            self._agent.register_memory(tensor_list, backends=self._backends)
+            self._registered_memory.append(
+                self._agent.register_memory(tensor_list, backends=self._backends)
+            )
             reg_count = len(tensor_list)
         nixl_reg_time = time.perf_counter() - nixl_reg_start
 
@@ -507,10 +515,12 @@ class NixlTransferManager:
             return self.register_tensors(tensors, force_per_tensor=True)
 
         nixl_reg_start = time.perf_counter()
-        self._agent.register_memory(
-            [(base, used, self._device_id, "")],
-            mem_type=self._accelerator_backend.nixl_mem_type,
-            backends=self._backends,
+        self._registered_memory.append(
+            self._agent.register_memory(
+                [(base, used, self._device_id, "")],
+                mem_type=self._accelerator_backend.nixl_mem_type,
+                backends=self._backends,
+            )
         )
         nixl_reg_time = time.perf_counter() - nixl_reg_start
 
@@ -1221,6 +1231,16 @@ class NixlTransferManager:
             atexit.unregister(self.shutdown)
             self._atexit_registered = False
         disconnected = self.disconnect_remote_agents()
+        if self._agent is not None:
+            for registered in reversed(self._registered_memory):
+                try:
+                    self._agent.deregister_memory(registered)
+                except Exception:
+                    logger.warning(
+                        "Failed to deregister NIXL memory during shutdown",
+                        exc_info=True,
+                    )
+        self._registered_memory = []
         self._agent = None
         self._metadata = b""
         self._tensor_descriptors = []
