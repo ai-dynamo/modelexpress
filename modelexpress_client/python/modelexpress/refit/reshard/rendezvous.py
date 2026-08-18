@@ -139,8 +139,19 @@ def decode_shard_table(blob: bytes) -> list:
     schema = payload.get("schema")
     if schema != _SCHEMA:
         raise ValueError(f"unexpected shard-table schema {schema!r} (want {_SCHEMA!r})")
+    return decode_shard_entries(payload["tensors"])
+
+
+def decode_shard_entries(entries: list) -> list:
+    """Build ``PublishedTensor``s from already-parsed shard-table entries.
+
+    Split out so a caller holding a parsed blob does not have to re-serialize the
+    table just to hand it back to a decoder that immediately re-parses it. On
+    Qwen3-30B-A3B that round-trip cost ~0.47 s per refit across 16 trainer
+    sources, for nothing.
+    """
     tensors = []
-    for t in payload["tensors"]:
+    for t in entries:
         shards = [
             PublishedShard(
                 agent_name=s["agent_name"],
@@ -319,23 +330,46 @@ class RendezvousPayload(NamedTuple):
     metadata_endpoint: str
     tensors: list
     publisher_step: int | None = None
+    tensor_count: int | None = None
+
+    def entry_count(self) -> int:
+        """How many shard-table entries this rank published.
+
+        Distinct from ``len(self.tensors)`` because a payload unwrapped for a
+        quorum check carries the count without paying to build the table. Asking
+        "did this rank publish anything" must stay answerable on both.
+        """
+        return len(self.tensors) if self.tensor_count is None else self.tensor_count
 
 
-def unwrap_rendezvous_blob(blob: bytes) -> RendezvousPayload:
-    """Inverse of ``wrap_rendezvous_blob``."""
+def unwrap_rendezvous_blob(
+    blob: bytes, *, with_tensors: bool = True
+) -> RendezvousPayload:
+    """Inverse of ``wrap_rendezvous_blob``.
+
+    ``with_tensors=False`` decodes everything except the shard table, for callers
+    that only need the version stamp. Building the table dominates this function
+    (~97 ms vs ~9 ms per source on Qwen3-30B-A3B's 4922 entries), and a per-step
+    quorum check re-does it for a table that never changes between steps.
+    ``tensor_count`` is still populated, so an empty publisher stays detectable.
+    """
     payload = json.loads(blob.decode("utf-8"))
     if payload.get("schema") != _SCHEMA:
         raise ValueError(f"unexpected rendezvous blob schema {payload.get('schema')!r}")
     agent_metadata = base64.b64decode(payload["agent_meta_b64"])
     agent_name = payload["agent_name"]
     metadata_endpoint = payload.get("metadata_endpoint", "")
-    tensors = decode_shard_table(
-        json.dumps({"schema": _SCHEMA, "tensors": payload["tensors"]}).encode("utf-8")
-    )
+    entries = payload["tensors"]
+    tensors = decode_shard_entries(entries) if with_tensors else []
     raw_step = payload.get("publisher_step")
     publisher_step = None if raw_step is None else int(raw_step)
     return RendezvousPayload(
-        agent_metadata, agent_name, metadata_endpoint, tensors, publisher_step
+        agent_metadata,
+        agent_name,
+        metadata_endpoint,
+        tensors,
+        publisher_step,
+        len(entries),
     )
 
 
@@ -426,16 +460,54 @@ class MxReshardRendezvous:
             self._publisher = None
         self._mx_source_id = None
 
+    def _fetch_metadata(self, instances: list) -> list:
+        """Fetch each instance's metadata, in order.
+
+        Returns one entry per instance, ``None`` where the fetch raised. A single
+        rank's transport error must not abort the sweep: the poll loop's job is to
+        report how many ranks are actually readable, and one raised exception would
+        instead surface as a discovery failure with no count at all.
+
+        Serial on purpose, which is the opposite of what the shape of the problem
+        suggests. Issuing these round-trips from a thread pool was tried and made
+        it **worse**: the fetch went from 4.02 s to ~6.9 s median on 16 sources.
+        The contention is not in this process. Every receiver rank runs this loop,
+        so 16 ranks x 16 sources put 256 requests and ~358 MB of shard table
+        in flight against one metadata server, and queueing there costs more than
+        the serial round-trips saved. Making this concurrent requires reducing what
+        the server has to serve first - see the note in ``discover_trainers``.
+        """
+        return [self._get_metadata_or_none(inst) for inst in instances]
+
+    def _get_metadata_or_none(self, inst):
+        try:
+            return self.client.get_metadata(inst.mx_source_id, inst.worker_id)
+        except Exception as exc:  # noqa: BLE001 - one bad rank must not end the sweep
+            logger.warning(
+                "[reshard] get_metadata failed for source %s worker %s: %s",
+                inst.mx_source_id,
+                inst.worker_id,
+                exc,
+            )
+            return None
+
     def discover_trainers(
         self,
         expected_trainers: int,
         timeout: float = 1200.0,
         poll_interval: float = 1.0,
+        with_tensors: bool = True,
     ) -> list:
         """Block until ``expected_trainers`` trainer ranks are visible **with a
         non-empty shard table**, then return them.
 
         Returns ``list[RendezvousPayload]``, one per trainer rank.
+
+        ``with_tensors=False`` skips building the shard tables, for a caller that
+        only needs each rank's version stamp. The quorum semantics are unchanged -
+        emptiness is still judged on the published entry count - but a per-step
+        check no longer rebuilds tables that are identical every step. Anything
+        that reads shard geometry must leave this ``True``.
 
         A rank counts toward the quorum only once its published table names at
         least one tensor. A rank that advertises READY with nothing to read has
@@ -450,28 +522,52 @@ class MxReshardRendezvous:
         """
         trainer_id = self._identity("trainer")
         deadline = time.monotonic() + timeout
+        # Cost split, kept because this call dominates a MoE refit: measured at
+        # 51% of a 10.25 s refit on Qwen3-30B-A3B, 2.7x the weight transfer it
+        # precedes. On the cluster the fetch is ~4.0 s of that and the parse ~0.8 s,
+        # which is why the round-trips are issued concurrently below rather than the
+        # codec being tuned. Reported so a regression is visible without a rebuild.
+        fetch_s = 0.0
+        parse_s = 0.0
+        polls = 0
         while True:
+            list_t0 = time.perf_counter()
             resp = self.client.list_sources(
                 trainer_id,
                 status_filter=p2p_pb2.SOURCE_STATUS_READY,
             )
             instances = list(resp.instances)
+            fetch_s += time.perf_counter() - list_t0
             payloads, empty = [], 0
             # Every visible READY source is inspected, whatever the count: with
             # fewer sources than expected the shard-table state is exactly what a
             # timeout here has to report, and reaching the quorum on instances
             # alone says nothing about whether any of them published bytes.
-            for inst in instances:
-                meta = self.client.get_metadata(inst.mx_source_id, inst.worker_id)
-                if not meta.found:
+            #
+            # The fetch is the dominant term (~4.0 s of ~4.8 s here) and it is
+            # server-bound, not client-bound: see ``_fetch_metadata`` for the
+            # measurement that ruled out concurrency. Cutting it further means
+            # sending less, which needs ``publisher_step`` carried in the
+            # ``list_sources`` instance record so the quorum costs one small call
+            # instead of one full shard table per rank. That is a protocol change.
+            fetch_t0 = time.perf_counter()
+            metas = self._fetch_metadata(instances)
+            fetch_s += time.perf_counter() - fetch_t0
+            for meta in metas:
+                if meta is None or not meta.found:
                     continue
-                payload = unwrap_rendezvous_blob(meta.worker.nixl_metadata)
-                if not payload.tensors:
+                parse_t0 = time.perf_counter()
+                payload = unwrap_rendezvous_blob(
+                    meta.worker.nixl_metadata, with_tensors=with_tensors
+                )
+                parse_s += time.perf_counter() - parse_t0
+                if payload.entry_count() == 0:
                     empty += 1
                     continue
                 payloads.append(payload)
                 if len(payloads) >= expected_trainers:
                     break
+            polls += 1
             if len(payloads) >= expected_trainers:
                 break
             if time.monotonic() >= deadline:
@@ -482,6 +578,24 @@ class MxReshardRendezvous:
                 )
             time.sleep(poll_interval)
 
+        print(
+            "MX_DISCOVER_COST "
+            + json.dumps(
+                {
+                    "schema": "mx-discover-cost-v1",
+                    "sources": len(payloads),
+                    # entry_count, not len(tensors): the quorum path does not build
+                    # the tables, and this figure is what shows the cost tracks
+                    # source count rather than bytes moved.
+                    "tensors": sum(p.entry_count() for p in payloads),
+                    "tables_built": with_tensors,
+                    "grpc_fetch_s": round(fetch_s, 6),
+                    "blob_parse_s": round(parse_s, 6),
+                    "polls": polls,
+                }
+            ),
+            flush=True,
+        )
         logger.info(
             "[reshard] discovered %d trainer rank(s)%s: %s",
             len(payloads),
