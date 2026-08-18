@@ -21,9 +21,9 @@ from ...adapter import EngineAdapter
 from ...accelerators import accelerator_backend_for
 from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
-from ...metadata.publish import build_source_identity
 from ...rank_utils import get_global_rank
 from ...tensor_utils import adopt_hidden_tensors, capture_tensor_attrs, collect_module_tensors
+from .source_identity import build_source_identity
 
 logger = logging.getLogger("modelexpress.engines.vllm.adapter")
 

@@ -36,7 +36,7 @@ Every source is identified by a `SourceIdentity` proto containing all fields tha
 | `backend_framework` | `VLLM`, `SGLANG`, `TRT_LLM` | Inference framework |
 | `tensor_parallel_size` | `8` | TP degree |
 | `pipeline_parallel_size` | `2` | PP degree |
-| `expert_parallel_size` | `4` | EP degree (MoE models) |
+| `expert_parallel_size` | `4` | EP world size, `1` when expert parallelism is off (MoE models) |
 | `dtype` | `"bfloat16"` | Weight data type |
 | `quantization` | `"fp8"`, `""` | Quantization method |
 | `extra_parameters` | `{}` | Framework-specific config |
@@ -354,7 +354,9 @@ without a Pod owner reference. This preserves behavior for older clients and
 non-Kubernetes environments; the server-side stale metadata reaper remains the
 cleanup path in those cases.
 
-**Model lifecycle CRD name format**: `mx-cache-{sanitized-model-name}-{hash}`
+**Model lifecycle CRD name format**: `mx-cache-{provider}--{sanitized-model-name}-{hash}`
+
+The name is `mx-cache-` followed by `sanitize("{provider}/{model_name}")`, so each `/` becomes `--` and the sha256 suffix binds the pair `(provider, name)`. For provider `HuggingFace` and model `deepseek-ai/DeepSeek-V3` the CR is named `mx-cache-huggingface--deepseek-ai--deepseek-v3-{hash}`. Pre-0.5.0 deployments carry name-only CRs (`mx-cache-{sanitized-model-name}-{hash}`), which the server still looks up so those records migrate.
 
 `ModelCacheEntry.spec.modelName` preserves the original model name while `status.phase`, `status.createdAt`, `status.lastUsedAt`, and `status.message` track the same lifecycle fields as the Redis `mx:model:*` hash.
 
@@ -439,14 +441,14 @@ status:
 
 ```bash
 kubectl get modelcacheentries -n <namespace>
-kubectl get modelcacheentry mx-cache-deepseek-ai--deepseek-v3-<hash> -n <namespace> -o yaml
+kubectl get modelcacheentry mx-cache-huggingface--deepseek-ai--deepseek-v3-<hash> -n <namespace> -o yaml
 ```
 
 ```yaml
 apiVersion: modelexpress.nvidia.com/v1alpha1
 kind: ModelCacheEntry
 metadata:
-  name: mx-cache-deepseek-ai--deepseek-v3-<hash>
+  name: mx-cache-huggingface--deepseek-ai--deepseek-v3-<hash>
 spec:
   modelName: deepseek-ai/DeepSeek-V3
   provider: HuggingFace

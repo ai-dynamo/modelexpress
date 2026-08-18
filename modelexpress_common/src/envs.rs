@@ -45,10 +45,6 @@ pub const MODEL_EXPRESS_CACHE_DIRECTORY: &str = "MODEL_EXPRESS_CACHE_DIRECTORY";
 pub const MODEL_EXPRESS_LOG_LEVEL: &str = "MODEL_EXPRESS_LOG_LEVEL";
 /// Log output format (client and server).
 pub const MODEL_EXPRESS_LOG_FORMAT: &str = "MODEL_EXPRESS_LOG_FORMAT";
-/// Maximum connection/request retries (`ClientArgs::max_retries`).
-pub const MODEL_EXPRESS_MAX_RETRIES: &str = "MODEL_EXPRESS_MAX_RETRIES";
-/// Delay between retries in seconds (`ClientArgs::retry_delay`).
-pub const MODEL_EXPRESS_RETRY_DELAY: &str = "MODEL_EXPRESS_RETRY_DELAY";
 /// Disable shared-storage mode (`ClientArgs::no_shared_storage`).
 pub const MODEL_EXPRESS_NO_SHARED_STORAGE: &str = "MODEL_EXPRESS_NO_SHARED_STORAGE";
 /// File-transfer chunk size in bytes (`ClientArgs::transfer_chunk_size`).
@@ -107,10 +103,6 @@ pub const REDIS_PORT: &str = "REDIS_PORT";
 pub const MX_METADATA_NAMESPACE: &str = "MX_METADATA_NAMESPACE";
 /// Kubernetes namespace injected via the downward API for in-cluster pods.
 pub const POD_NAMESPACE: &str = "POD_NAMESPACE";
-/// Kubernetes pod name injected via the downward API (used by clients).
-pub const POD_NAME: &str = "POD_NAME";
-/// Kubernetes pod UID injected via the downward API (used by clients).
-pub const POD_UID: &str = "POD_UID";
 
 // ── Reaper (server) ─────────────────────────────────────────────────────────
 /// Interval (seconds) between reaper scans for stale/GC worker sweeps.
@@ -302,8 +294,6 @@ mod tests {
         );
         assert_eq!(MODEL_EXPRESS_LOG_LEVEL, "MODEL_EXPRESS_LOG_LEVEL");
         assert_eq!(MODEL_EXPRESS_LOG_FORMAT, "MODEL_EXPRESS_LOG_FORMAT");
-        assert_eq!(MODEL_EXPRESS_MAX_RETRIES, "MODEL_EXPRESS_MAX_RETRIES");
-        assert_eq!(MODEL_EXPRESS_RETRY_DELAY, "MODEL_EXPRESS_RETRY_DELAY");
         assert_eq!(
             MODEL_EXPRESS_NO_SHARED_STORAGE,
             "MODEL_EXPRESS_NO_SHARED_STORAGE"
@@ -360,8 +350,6 @@ mod tests {
         assert_eq!(HOME, "HOME");
         assert_eq!(USERPROFILE, "USERPROFILE");
         assert_eq!(KUBECONFIG, "KUBECONFIG");
-        assert_eq!(POD_NAME, "POD_NAME");
-        assert_eq!(POD_UID, "POD_UID");
     }
 
     #[test]

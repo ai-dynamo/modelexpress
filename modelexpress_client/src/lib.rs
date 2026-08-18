@@ -3,7 +3,7 @@
 
 use modelexpress_common::{
     Result as CommonResult,
-    cache::{CacheConfig, CacheStats, resolve_model_path},
+    cache::{CacheConfig, resolve_model_path},
     client_config::ClientConfig as Config,
     constants, download,
     grpc::{
@@ -231,57 +231,10 @@ impl Client {
         Ok(client)
     }
 
-    /// Get cache configuration
-    pub fn get_cache_config(&self) -> Option<&CacheConfig> {
-        self.cache_config.as_ref()
-    }
-
-    /// Set cache configuration
-    pub fn set_cache_config(&mut self, cache_config: CacheConfig) {
-        self.cache_config = Some(cache_config);
-    }
-
-    /// List cached models
-    pub fn list_cached_models(&self) -> CommonResult<CacheStats> {
-        let cache_config = self.cache_config.as_ref().ok_or_else(|| {
-            modelexpress_common::Error::Server("Cache not configured".to_string())
-        })?;
-
-        cache_config.get_cache_stats().map_err(|e| {
-            modelexpress_common::Error::Server(format!("Failed to get cache stats: {e}")).into()
-        })
-    }
-
-    /// Clear specific model from cache for a given provider.
-    pub fn clear_cached_model(
-        &self,
-        model_name: &str,
-        provider: ModelProvider,
-    ) -> CommonResult<()> {
-        let cache_config = self.cache_config.as_ref().ok_or_else(|| {
-            modelexpress_common::Error::Server("Cache not configured".to_string())
-        })?;
-
-        cache_config.clear_model(model_name, provider).map_err(|e| {
-            modelexpress_common::Error::Server(format!("Failed to clear model: {e}")).into()
-        })
-    }
-
-    /// Clear entire cache
-    pub fn clear_all_cached_models(&self) -> CommonResult<()> {
-        let cache_config = self.cache_config.as_ref().ok_or_else(|| {
-            modelexpress_common::Error::Server("Cache not configured".to_string())
-        })?;
-
-        cache_config.clear_all().map_err(|e| {
-            modelexpress_common::Error::Server(format!("Failed to clear cache: {e}")).into()
-        })
-    }
-
     /// Delete a model's record from the server-side registry. This complements
-    /// `clear_cached_model` (which only removes local files) so a cleared model does
-    /// not leave behind a stale `DOWNLOADED` record that would satisfy a later download
-    /// request without re-fetching the files.
+    /// removing the model's local files, so a cleared model does not leave behind a
+    /// stale `DOWNLOADED` record that would satisfy a later download request without
+    /// re-fetching the files.
     pub async fn delete_model_on_server(
         &mut self,
         model_name: &str,
@@ -311,6 +264,7 @@ impl Client {
         model_name: &str,
         provider: ModelProvider,
     ) -> anyhow::Result<PathBuf> {
+        let provider = ModelProvider::resolve_provider_for_model_name(model_name, provider);
         let cache_dir = self
             .cache_config
             .as_ref()
@@ -691,6 +645,7 @@ impl Client {
         revision: Option<&str>,
     ) -> CommonResult<Option<String>> {
         let model_name = model_name.into();
+        let provider = ModelProvider::resolve_provider_for_model_name(&model_name, provider);
         match revision {
             Some(revision) => info!(
                 "Requesting model: {} at revision {} from provider: {:?}",
@@ -793,6 +748,7 @@ impl Client {
         revision: Option<&str>,
     ) -> CommonResult<ModelDownloadResult> {
         let model_name = model_name.into();
+        let provider = ModelProvider::resolve_provider_for_model_name(&model_name, provider);
 
         let resolved_revision = self
             .request_model_on_server_revision(&model_name, provider, ignore_weights, revision)
@@ -915,6 +871,7 @@ impl Client {
         revision: Option<&str>,
     ) -> CommonResult<ModelDownloadResult> {
         let model_name = model_name.into();
+        let provider = ModelProvider::resolve_provider_for_model_name(&model_name, provider);
 
         match Client::new(config.clone()).await {
             Ok(mut client) => {
@@ -972,6 +929,7 @@ mod tests {
     struct UnavailableModelService;
     struct RecordingModelService {
         seen_model_name: Arc<Mutex<Option<String>>>,
+        seen_provider: Arc<Mutex<Option<i32>>>,
     }
     struct ZeroByteGcsMarkerStreamModelService;
 
@@ -1115,11 +1073,15 @@ mod tests {
                 .seen_model_name
                 .lock()
                 .expect("Failed to lock seen_model_name") = Some(request.model_name);
+            *self
+                .seen_provider
+                .lock()
+                .expect("Failed to lock seen_provider") = Some(request.provider);
             let update = ModelStatusUpdate {
                 model_name: "gs://envbucket/dev/bake/qwen/rev123".to_string(),
                 status: modelexpress_common::grpc::model::ModelStatus::Downloaded as i32,
                 message: None,
-                provider: modelexpress_common::grpc::model::ModelProvider::Gcs as i32,
+                provider: request.provider,
                 resolved_revision: None,
             };
             Ok(Response::new(Box::pin(futures::stream::iter(vec![Ok(
@@ -1897,8 +1859,10 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn test_request_model_with_smart_fallback_accepts_full_gcs_url() {
         let seen_model_name = Arc::new(Mutex::new(None));
+        let seen_provider = Arc::new(Mutex::new(None));
         let (addr, server_handle) = spawn_model_service(RecordingModelService {
             seen_model_name: Arc::clone(&seen_model_name),
+            seen_provider: Arc::clone(&seen_provider),
         })
         .await;
 
@@ -1923,6 +1887,49 @@ mod tests {
                 .expect("Failed to lock seen_model_name")
                 .clone(),
             "gs://envbucket/dev/bake/qwen/rev123".to_string().into()
+        );
+        assert_eq!(
+            *seen_provider.lock().expect("Failed to lock seen_provider"),
+            Some(modelexpress_common::grpc::model::ModelProvider::Gcs as i32)
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_request_model_with_smart_fallback_infers_s3_provider() {
+        let seen_model_name = Arc::new(Mutex::new(None));
+        let seen_provider = Arc::new(Mutex::new(None));
+        let (addr, server_handle) = spawn_model_service(RecordingModelService {
+            seen_model_name: Arc::clone(&seen_model_name),
+            seen_provider: Arc::clone(&seen_provider),
+        })
+        .await;
+
+        let mut config = ClientConfig::for_testing(format!("http://{addr}"));
+        config.cache.shared_storage = true;
+
+        Client::request_model_with_smart_fallback(
+            "s3://envbucket/dev/bake/qwen/rev123",
+            ModelProvider::HuggingFace,
+            config,
+            true,
+        )
+        .await
+        .expect("Expected smart fallback request to succeed");
+
+        server_handle.abort();
+        let _ = server_handle.await;
+
+        assert_eq!(
+            seen_model_name
+                .lock()
+                .expect("Failed to lock seen_model_name")
+                .clone(),
+            "s3://envbucket/dev/bake/qwen/rev123".to_string().into()
+        );
+        assert_eq!(
+            *seen_provider.lock().expect("Failed to lock seen_provider"),
+            Some(modelexpress_common::grpc::model::ModelProvider::S3 as i32)
         );
     }
 }

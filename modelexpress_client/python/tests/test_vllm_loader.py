@@ -251,9 +251,23 @@ class TestAbstractMethodCompleteness:
     def test_download_model_delegates(self):
         loader = _make_loader()
         cfg = MagicMock()
-        with patch("modelexpress.engines.vllm.loader.DefaultModelLoader") as mock_cls:
-            loader.download_model(cfg)
-            mock_cls.return_value.download_model.assert_called_once_with(cfg)
+        with patch.dict("os.environ", {}, clear=True):
+            with patch("modelexpress.engines.vllm.loader.DefaultModelLoader") as mock_cls:
+                loader.download_model(cfg)
+                mock_cls.return_value.download_model.assert_called_once_with(cfg)
+
+    def test_download_model_defers_without_shared_storage(self):
+        """A full pre-download here would pull weights before P2P gets a turn."""
+        loader = _make_loader()
+        cfg = MagicMock()
+        env = {
+            "MODEL_EXPRESS_NO_SHARED_STORAGE": "1",
+            "MODEL_EXPRESS_URL": "http://mx:8001",
+        }
+        with patch.dict("os.environ", env, clear=True):
+            with patch("modelexpress.engines.vllm.loader.DefaultModelLoader") as mock_cls:
+                loader.download_model(cfg)
+                mock_cls.return_value.download_model.assert_not_called()
 
     def test_load_weights_delegates(self):
         loader = _make_loader()
