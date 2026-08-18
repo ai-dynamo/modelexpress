@@ -74,8 +74,10 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         self._source_slot_id = f"publisher:global-rank:{dist.get_rank()}"
         self._initialized = False
         self._staging_mode: TrainerStagingMode | None = None
-        # Populated once by initialize(); keyed by tensor name.
-        self._expected_names: frozenset[str] = frozenset()
+        # name -> (global_shape, shard_offset, local_shape) fixed at initialize().
+        self._expected_layout: dict[
+            str, tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]
+        ] = {}
         self._arenas: dict[str, torch.Tensor] = {}  # COPY: name -> registered arena
         # name -> the address we registered (the arena for COPY, the live source
         # for IN_PLACE). The served buffer must keep sitting here.
@@ -104,9 +106,12 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
             raise NotImplementedError(
                 f"FSDPTrainerAdapter does not support {staging_mode.value} staging"
             )
-        self._expected_names = frozenset(s.name for s in shards)
-        if len(self._expected_names) != len(shards):
+        names = frozenset(s.name for s in shards)
+        if len(names) != len(shards):
             raise ValueError("FSDP shard names are not unique within this rank")
+        self._expected_layout = {
+            s.name: (s.global_shape, s.shard_offset, s.local_shape) for s in shards
+        }
 
         if staging_mode is TrainerStagingMode.COPY_TO_DEVICE:
             self._allocate_and_register_arenas(shards)
@@ -222,14 +227,23 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         return shards
 
     def _require_same_layout(self, shards: list[LocalTensorShard]) -> None:
+        expected_names = frozenset(self._expected_layout)
         names = frozenset(s.name for s in shards)
-        if names != self._expected_names:
-            missing = sorted(self._expected_names - names)
-            extra = sorted(names - self._expected_names)
+        if names != expected_names:
+            missing = sorted(expected_names - names)
+            extra = sorted(names - expected_names)
             raise ValueError(
                 "FSDP tensor set changed since initialize "
                 f"(missing={missing[:5]} extra={extra[:5]})"
             )
+        for shard in shards:
+            layout = (shard.global_shape, shard.shard_offset, shard.local_shape)
+            if layout != self._expected_layout[shard.name]:
+                raise ValueError(
+                    f"{shard.name}: shard geometry changed since initialize "
+                    f"(was {self._expected_layout[shard.name]}, now {layout}); "
+                    "a trainer must keep a fixed shard layout across steps"
+                )
 
     @staticmethod
     def _register_key(index: int, name: str) -> str:

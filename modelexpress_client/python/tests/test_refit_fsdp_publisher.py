@@ -37,6 +37,16 @@ def test_capture_publishes_full_copies_and_skips_non_float():
     assert by_name["w"].global_shape == (2, 4)
 
 
+def test_capture_gives_a_scalar_tensor_a_rank_zero_offset():
+    state_dict = {"loss_scale": torch.tensor(1.0, dtype=torch.float32)}
+
+    (shard,) = capture_local_shards(state_dict)
+
+    assert shard.global_shape == ()
+    assert shard.shard_offset == ()
+    assert shard.local_shape == ()
+
+
 def test_build_manifest_describes_the_served_buffer():
     tensor = torch.zeros(2, 4, dtype=torch.bfloat16)
     shard = LocalTensorShard(

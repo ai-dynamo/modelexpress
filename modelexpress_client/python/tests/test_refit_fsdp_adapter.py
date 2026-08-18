@@ -94,6 +94,15 @@ def test_stage_rejects_a_changed_tensor_set(dist_ready):
         _stage(adapter, state_dict)
 
 
+def test_stage_rejects_a_changed_shard_geometry(dist_ready):
+    adapter = _adapter()
+    _stage(adapter, {"w": torch.ones(2, 4, dtype=torch.bfloat16)})
+
+    # Same name, different local shape: geometry must stay fixed after initialize.
+    with pytest.raises(ValueError, match="shard geometry changed"):
+        _stage(adapter, {"w": torch.ones(4, 4, dtype=torch.bfloat16)})
+
+
 def test_in_place_requires_wire_dtype_source(dist_ready):
     adapter = _adapter()
     with pytest.raises(NotImplementedError, match="use COPY_TO_DEVICE to cast"):

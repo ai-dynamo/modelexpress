@@ -80,7 +80,7 @@ def capture_local_shards(
         if not value.is_floating_point():
             continue
         full_shape = tuple(value.shape)
-        zero_offset = tuple(0 for _ in full_shape) or (0,)
+        zero_offset = tuple(0 for _ in full_shape)
 
         # TODO(dedup-staging): for the full-copy tensors below (unsharded +
         # replicated), under COPY_TO_DEVICE every rank stages a redundant copy;
