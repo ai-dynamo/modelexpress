@@ -198,7 +198,6 @@ The CLI client also uses layered configuration: CLI args > env vars > config fil
 | `MODEL_EXPRESS_ENDPOINT` | `http://localhost:8001` | Server endpoint |
 | `MODEL_EXPRESS_TIMEOUT` | `30` | Request timeout (seconds) |
 | `MODEL_EXPRESS_CACHE_DIRECTORY` | (auto) | Cache path override |
-| `MODEL_EXPRESS_MAX_RETRIES` | (none) | Max retry attempts |
 | `MODEL_EXPRESS_NO_SHARED_STORAGE` | `false` | Use gRPC streaming instead of shared storage |
 | `MODEL_EXPRESS_TRANSFER_CHUNK_SIZE` | `32768` | Transfer chunk size (bytes) |
 
