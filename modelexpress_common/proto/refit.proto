@@ -25,6 +25,12 @@ service RefitService {
   rpc DeleteVersionLease(DeleteVersionLeaseRequest) returns (DeleteVersionLeaseResponse);
 }
 
+// Internal worker-to-worker API. The generator fetches the small transfer
+// manifest here; tensor bytes remain on the advertised data-plane transport.
+service RefitWorkerService {
+  rpc GetWeightVersionShardManifest(GetWeightVersionShardManifestRequest) returns (GetWeightVersionShardManifestResponse);
+}
+
 enum WorkerRole {
   WORKER_ROLE_UNSPECIFIED = 0;
   WORKER_ROLE_TRAINER = 1;
@@ -127,6 +133,16 @@ message ListWeightVersionShardsRequest {
 
 message ListWeightVersionShardsResponse {
   repeated WeightVersionShard shards = 1;
+}
+
+message GetWeightVersionShardManifestRequest {
+  string version_id = 1;
+  string source_slot_id = 2;
+}
+
+message GetWeightVersionShardManifestResponse {
+  bytes manifest = 1;
+  string manifest_digest = 2;
 }
 
 message DeleteWeightVersionShardRequest {
