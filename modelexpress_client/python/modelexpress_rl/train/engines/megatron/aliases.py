@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -199,10 +200,71 @@ def _qkv_source_interval(item: MegatronTensorSpec) -> tuple[int, int]:
     return lo, hi
 
 
-def _build_global_qkv_aliases(
-    item: MegatronTensorSpec, agent_name: str
-) -> list[PublishedTensor]:
-    """Map one raw TP row interval through Megatron's global QKV interleave."""
+_Q, _K, _V = 0, 1, 2
+
+
+@dataclass(frozen=True)
+class _QkvBand:
+    """One run of fused rows that belongs to a single projection.
+
+    ``destination_start`` is where the run lands in that projection's own
+    tensor, which is not where it sits in the fused tensor.
+    """
+
+    projection: int
+    start: int
+    rows: int
+    destination_start: int
+
+
+@dataclass(frozen=True)
+class _QkvLayout:
+    """Global row layout of a fused QKV tensor, derived from head counts.
+
+    Megatron lays the tensor out as one block per KV group: that group's query
+    rows, then its single K head, then its single V head. Blocks repeat for
+    every KV group, so Q, K and V rows interleave rather than forming three
+    contiguous regions.
+    """
+
+    head_dim: int
+    q_heads: int
+    kv_heads: int
+
+    @property
+    def q_rows_per_group(self) -> int:
+        return (self.q_heads // self.kv_heads) * self.head_dim
+
+    @property
+    def group_rows(self) -> int:
+        return self.q_rows_per_group + 2 * self.head_dim
+
+    @property
+    def total_rows(self) -> int:
+        return self.kv_heads * self.group_rows
+
+    @property
+    def destination_rows(self) -> tuple[int, int, int]:
+        """Row count of the whole q, k and v tensors this layout unpacks into."""
+        kv_rows = self.kv_heads * self.head_dim
+        return self.q_heads * self.head_dim, kv_rows, kv_rows
+
+    def bands(self) -> Iterator[_QkvBand]:
+        """Yield every projection run, in global row order."""
+        for group in range(self.kv_heads):
+            group_start = group * self.group_rows
+            k_start = group_start + self.q_rows_per_group
+            yield _QkvBand(
+                _Q, group_start, self.q_rows_per_group, group * self.q_rows_per_group
+            )
+            yield _QkvBand(_K, k_start, self.head_dim, group * self.head_dim)
+            yield _QkvBand(
+                _V, k_start + self.head_dim, self.head_dim, group * self.head_dim
+            )
+
+
+def _read_qkv_layout(item: MegatronTensorSpec) -> _QkvLayout:
+    """Validate the published global head metadata and derive the row layout."""
     if item.extras.get("qkv_interleave") != "by_head":
         raise ValueError(
             f"{item.name}: global QKV aliasing requires qkv_interleave='by_head'"
@@ -211,51 +273,58 @@ def _build_global_qkv_aliases(
         raise ValueError(
             f"{item.name}: global QKV aliasing requires extras['head_dim']"
         )
-    head_dim = int(item.extras["head_dim"])
-    q_heads = int(item.extras["num_heads"])
-    kv_heads = int(item.extras["num_kv_heads"])
-    if head_dim < 1 or q_heads < 1 or kv_heads < 1 or q_heads % kv_heads:
+    layout = _QkvLayout(
+        head_dim=int(item.extras["head_dim"]),
+        q_heads=int(item.extras["num_heads"]),
+        kv_heads=int(item.extras["num_kv_heads"]),
+    )
+    if (
+        layout.head_dim < 1
+        or layout.q_heads < 1
+        or layout.kv_heads < 1
+        or layout.q_heads % layout.kv_heads
+    ):
         raise ValueError(f"{item.name}: invalid global Q/KV head geometry")
+    return layout
 
+
+def _build_global_qkv_aliases(
+    item: MegatronTensorSpec, agent_name: str
+) -> list[PublishedTensor]:
+    """Map one raw TP row interval through Megatron's global QKV interleave.
+
+    This rank owns a single contiguous interval of fused rows. Intersecting it
+    with each band says which projection those rows belong to and where they
+    land, so a rank that happens to own no K or V rows simply matches no K or V
+    band.
+    """
+    layout = _read_qkv_layout(item)
     hidden = int(item.tensor.shape[1])
     if len(item.global_shape) != 2 or int(item.global_shape[1]) != hidden:
         raise ValueError(f"{item.name}: QKV hidden dimension mismatch")
-    q_heads_per_group = q_heads // kv_heads
-    q_rows_per_group = q_heads_per_group * head_dim
-    group_rows = q_rows_per_group + 2 * head_dim
-    expected_global_rows = kv_heads * group_rows
-    if int(item.global_shape[0]) != expected_global_rows:
+    if int(item.global_shape[0]) != layout.total_rows:
         raise ValueError(f"{item.name}: global QKV rows disagree with head metadata")
 
     source_lo, source_hi = _qkv_source_interval(item)
-    shards: list[list[PublishedShard]] = [[], [], []]
+    shards: tuple[list[PublishedShard], ...] = ([], [], [])
     mapped_rows = 0
-    for group in range(kv_heads):
-        group_lo = group * group_rows
-        parts = (
-            (group_lo, q_rows_per_group, group * q_rows_per_group),
-            (group_lo + q_rows_per_group, head_dim, group * head_dim),
-            (group_lo + q_rows_per_group + head_dim, head_dim, group * head_dim),
-        )
-        for part_index, (part_lo, part_rows, destination_lo) in enumerate(parts):
-            part_hi = part_lo + part_rows
-            overlap_lo = max(source_lo, part_lo)
-            overlap_hi = min(source_hi, part_hi)
-            if overlap_lo >= overlap_hi:
-                continue
-            rows = overlap_hi - overlap_lo
-            tensor = item.tensor.narrow(0, overlap_lo - source_lo, rows)
-            shards[part_index].append(
-                PublishedShard(
-                    agent_name=agent_name,
-                    device_id=int(tensor.device.index or 0),
-                    addr=int(tensor.data_ptr()),
-                    shard_offset=(destination_lo + overlap_lo - part_lo, 0),
-                    shape=tuple(int(dim) for dim in tensor.shape),
-                    digest=published_digest(tensor),
-                )
+    for band in layout.bands():
+        overlap_lo = max(source_lo, band.start)
+        overlap_hi = min(source_hi, band.start + band.rows)
+        if overlap_lo >= overlap_hi:
+            continue
+        tensor = item.tensor.narrow(0, overlap_lo - source_lo, overlap_hi - overlap_lo)
+        shards[band.projection].append(
+            PublishedShard(
+                agent_name=agent_name,
+                device_id=int(tensor.device.index or 0),
+                addr=int(tensor.data_ptr()),
+                shard_offset=(band.destination_start + overlap_lo - band.start, 0),
+                shape=tuple(int(dim) for dim in tensor.shape),
+                digest=published_digest(tensor),
             )
-            mapped_rows += rows
+        )
+        mapped_rows += overlap_hi - overlap_lo
 
     if mapped_rows != int(item.tensor.shape[0]):
         raise ValueError(
@@ -263,27 +332,22 @@ def _build_global_qkv_aliases(
             f"{int(item.tensor.shape[0])} source rows"
         )
 
-    aliases = []
-    for name, rows, tensor_shards in zip(
-        item.hf_names,
-        (q_heads * head_dim, kv_heads * head_dim, kv_heads * head_dim),
-        shards,
-        strict=True,
-    ):
-        # When KV heads are fewer than TP ranks, most publishers legitimately
-        # own no K or V rows. Other ranks contribute those destination intervals
-        # when the per-rank tables are merged.
-        if tensor_shards:
-            aliases.append(
-                PublishedTensor(
-                    name=name,
-                    dtype=str(item.tensor.dtype),
-                    elsize=int(item.tensor.element_size()),
-                    full_shape=(rows, hidden),
-                    shards=tensor_shards,
-                )
-            )
-    return aliases
+    # When KV heads are fewer than TP ranks, most publishers legitimately own no
+    # K or V rows. Other ranks contribute those destination intervals when the
+    # per-rank tables are merged.
+    return [
+        PublishedTensor(
+            name=name,
+            dtype=str(item.tensor.dtype),
+            elsize=int(item.tensor.element_size()),
+            full_shape=(rows, hidden),
+            shards=projection_shards,
+        )
+        for name, rows, projection_shards in zip(
+            item.hf_names, layout.destination_rows, shards, strict=True
+        )
+        if projection_shards
+    ]
 
 
 def _build_legacy_qkv_aliases(
