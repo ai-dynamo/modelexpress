@@ -9,8 +9,9 @@ receiver captures how these trainer-format sources land in the vLLM param layout
 (see ``modelexpress_rl/inference/reshard/fsdp``).
 
 Extraction rules (per state_dict tensor, floating point only):
-- unsharded (not a DTensor): every rank holds + publishes the full tensor; the
-  receiver dedups the identical copies by box
+- unsharded (not a DTensor): every rank holds + publishes the full tensor;
+  the identical copies across ranks are deduped by box upstream of the
+  transfer planner (merge_shard_tables)
 - replicated DTensor: same as unsharded
 - sharded DTensor: this rank serves its per-dim local box (general: FSDP dim 0,
   tensor-parallel dim 1, or 2-D meshes) via compute_local_shape_and_global_offset
@@ -20,6 +21,7 @@ Extraction rules (per state_dict tensor, floating point only):
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import torch
@@ -32,6 +34,8 @@ from modelexpress.refit.reshard.rendezvous import (
     wrap_rendezvous_blob,
 )
 from modelexpress_rl.train.adapter import NixlMetadataProvider
+
+logger = logging.getLogger("modelexpress_rl.train.engines.fsdp.publisher")
 
 # The dtype weights are served on the wire as. The cast only actually happens
 # when the source dtype differs (e.g. an fp32 master): a matching source copies
@@ -70,14 +74,15 @@ def capture_local_shards(
     """Extract each rank's local source shards from an FSDP state_dict.
 
     Every rank publishes what it holds, including the tensors it holds in full
-    (unsharded and replicated). Those redundant full copies are identical across
-    ranks; the receiver dedups them by box (keeping one per distinct box, chosen
-    at random) so the extra copies only spread reads across NICs, they do not
-    corrupt fan-in.
+    (unsharded and replicated). Those redundant full copies are identical
+    across ranks; deduping them to one shard per box is handled upstream of
+    the transfer planner (merge_shard_tables), not here.
     """
     shards: list[LocalTensorShard] = []
+    skipped: list[str] = []
     for name, value in state_dict.items():
         if not value.is_floating_point():
+            skipped.append(name)
             continue
         full_shape = tuple(value.shape)
         zero_offset = tuple(0 for _ in full_shape)
@@ -133,6 +138,12 @@ def capture_local_shards(
                     source_tensor=local,
                 )
             )
+    if skipped:
+        logger.debug(
+            "capture_local_shards: skipped %d non-floating-point entries: %s",
+            len(skipped),
+            sorted(skipped),
+        )
     return shards
 
 
@@ -160,10 +171,13 @@ def build_fsdp_reshard_manifest(
         served = shard.served_tensor
         if not served.is_contiguous():
             raise ValueError(f"{shard.name}: served tensor must be contiguous for RDMA")
+        addr = served.data_ptr()
+        if addr <= 0:
+            raise ValueError(f"{shard.name}: shard has invalid address")
         published_shard = PublishedShard(
             agent_name=agent_name,
             device_id=served.device.index if served.device.type == "cuda" else 0,
-            addr=served.data_ptr(),
+            addr=addr,
             shard_offset=tuple(shard.shard_offset),
             shape=tuple(shard.local_shape),
         )

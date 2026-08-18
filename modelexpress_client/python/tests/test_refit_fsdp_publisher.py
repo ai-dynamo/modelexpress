@@ -104,6 +104,16 @@ def test_build_manifest_rejects_non_contiguous_served_tensor():
         )
 
 
+def test_build_manifest_rejects_an_invalid_address():
+    meta = torch.zeros(2, 4, dtype=torch.bfloat16, device="meta")
+    shard = LocalTensorShard("w", (2, 4), (0, 0), (2, 4), meta)
+
+    with pytest.raises(ValueError, match="invalid address"):
+        build_fsdp_reshard_manifest(
+            manager=_Manager(), shards=[shard], metadata_endpoint="host:1234"
+        )
+
+
 def test_build_manifest_requires_host_port_endpoint():
     shard = LocalTensorShard(
         "w", (2, 4), (0, 0), (2, 4), torch.zeros(2, 4, dtype=torch.bfloat16)
