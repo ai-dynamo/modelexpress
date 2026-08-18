@@ -441,7 +441,7 @@ class TestReadSafetensorsIndexObjectStore:
         # Reverting to a bare, unanchored pattern makes the fake fnmatch miss,
         # so this returns None and the assertion fails, as it should.
         assert _read_safetensors_index("s3://bucket/model") == index
-        assert calls and all(pat[0].startswith("*") for pat in calls)
+        assert calls == [[f"*{_SAFETENSORS_INDEX_NAME}"]]
 
     def test_returns_none_and_warns_when_index_absent(self, monkeypatch, caplog):
         _stub_runai(monkeypatch, {"model-00001-of-00001.safetensors": "weights"})
