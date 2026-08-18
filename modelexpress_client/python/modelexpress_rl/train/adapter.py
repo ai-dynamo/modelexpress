@@ -10,11 +10,20 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    import torch
 
 
 class NixlMetadataProvider(Protocol):
-    """Narrow NIXL manager surface required to publish trainer manifests."""
+    """NIXL manager surface required to publish trainer manifests.
+
+    Exposes the agent metadata every adapter needs plus ``register_tensors``.
+    NIXL can only transfer registered memory, so an adapter registers whatever
+    source buffers it owns (staging arenas, in-place local storage) before
+    building its manifest, so the published ``nixl_metadata`` covers them.
+    """
 
     @property
     def agent_name(self) -> str:
@@ -29,6 +38,10 @@ class NixlMetadataProvider(Protocol):
     @property
     def listen_port(self) -> int | None:
         """Return the local NIXL metadata-listener port, when enabled."""
+        ...
+
+    def register_tensors(self, tensors: dict[str, torch.Tensor]) -> bytes:
+        """Register buffers with NIXL and return the refreshed agent metadata."""
         ...
 
 
