@@ -34,7 +34,7 @@ import torch.nn as nn
 
 from ... import configure_vllm_logging, envs, model_prefetch
 from ...load_strategy import LoadContext, LoadStrategyChain
-from ...metrics import enable as enable_metrics
+from ...metrics import enable_metrics
 from ...nixl_transfer import NixlTransferManager
 from ...vmm.runtime import log_arena_post_load, maybe_enter_vmm_arena
 from .adapter import _is_speculative_draft, build_vllm_load_context
@@ -72,6 +72,11 @@ class MxModelLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         configure_vllm_logging()
+        # Unconditionally, and off the load path: a run that skips P2P and falls
+        # back to a local or HuggingFace path must still bring the exporter up,
+        # or it produces output byte-identical to MX_METRICS_ENABLED=0 -- the run
+        # you most need to diagnose. No-op unless enabled; never raises.
+        enable_metrics()
         self._ctx: LoadContext | None = None
 
     def load_model(
@@ -87,13 +92,6 @@ class MxModelLoader(BaseModelLoader):
         to vLLM's initialize_model().
         """
         load_start = time.perf_counter()
-
-        # Unconditionally, and before the strategy eligibility filter below: a
-        # run that skips P2P and falls back to a local or HuggingFace path must
-        # still bring the exporter up, or it produces output byte-identical to
-        # MX_METRICS_ENABLED=0 -- and that is the run you most need to diagnose.
-        # No-op unless MX_METRICS_ENABLED=1; never raises.
-        enable_metrics()
 
         ctx = build_vllm_load_context(vllm_config, model_config)
         ctx.p2p_enabled = not _is_speculative_draft(vllm_config, model_config)

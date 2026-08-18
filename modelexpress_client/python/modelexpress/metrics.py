@@ -143,7 +143,7 @@ class MetricsCollector:
         """Build the families and start exposition, at most once.
 
         Still reachable from every recorder, so a caller that never invoked
-        :func:`enable` is not silently unrecorded. :func:`enable` is the
+        :func:`enable_metrics` is not silently unrecorded. :func:`enable_metrics` is the
         preferred entry point because it also runs on loads that record nothing.
         """
         with self._lock:
@@ -180,7 +180,7 @@ class MetricsCollector:
         # except OSError handler -- _start_bind_retry's Thread.start(), which can
         # raise RuntimeError under thread or FD exhaustion on a large-TP worker
         # -- is not covered by a sibling except. Without this, a recorder called
-        # before enable() would propagate that into the model load.
+        # before enable_metrics() would propagate that into the model load.
         try:
             self._start_exposition()
         except Exception as e:
@@ -539,11 +539,11 @@ def _make_gauge(registry, name: str, documentation: str, labels: list[str]):
     return Gauge(name, documentation, labels, registry=registry)
 
 
-def enable() -> bool:
+def enable_metrics() -> bool:
     """Initialize the collector and start exposition. Idempotent; never raises.
 
-    Call this **unconditionally** from every engine loader entry point, before
-    the strategy eligibility filter. That is the whole point: initialization used
+    Call this **unconditionally** from every engine loader's constructor. That
+    is the whole point: initialization used
     to be reachable only from a recording call, so a run that skipped P2P and
     fell back to a local or HuggingFace path started no endpoint, pushed nothing,
     and produced output byte-identical to ``MX_METRICS_ENABLED=0``. A scrape must
@@ -559,7 +559,7 @@ def enable() -> bool:
         if multiproc_dir:
             _check_multiproc_dir(multiproc_dir)
         return metrics._ensure()
-    except Exception as e:  # noqa: BLE001 - enable() may never raise into a load
+    except Exception as e:  # noqa: BLE001 - enable_metrics() may never raise into a load
         logger.warning("Failed to enable metrics: %s", e)
         return False
 

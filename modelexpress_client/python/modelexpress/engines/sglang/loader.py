@@ -18,7 +18,7 @@ from ...load_strategy.context import LoadResult
 from ...metadata.publisher import PublisherThread
 from ...metadata.payload import tensor_source_metadata, worker_tensor_descriptors
 from ...metadata.publish import _heartbeat_threads
-from ...metrics import enable as enable_metrics
+from ...metrics import enable_metrics
 from ...nixl_transfer import NixlTransferManager
 from ...metrics import metrics as selection_metrics
 from ...source_selection import configured_policy_label, get_configured_selector
@@ -52,6 +52,10 @@ class MxModelLoader:
 
     def __init__(self, load_config: LoadConfig):
         self.load_config = load_config
+        # Off the load path, but still before any transport or strategy choice:
+        # a run that records nothing must leave the exporter up, so a scrape can
+        # prove it came up. No-op unless enabled; never raises.
+        enable_metrics()
         self._ctx: LoadContext | None = None
 
     def load_model(
@@ -62,11 +66,6 @@ class MxModelLoader:
         device_config: DeviceConfig,
     ) -> nn.Module:
         """Load model weights through the shared ModelExpress strategy chain."""
-        # Unconditionally, and ahead of the transport branch: a run that records
-        # nothing must still bring the exporter up, so a scrape can prove it came
-        # up. No-op unless MX_METRICS_ENABLED=1; never raises.
-        enable_metrics()
-
         transport = getattr(self.load_config, "modelexpress_transport", "nixl")
         if transport == "nixl":
             return self._load_model_via_nixl(

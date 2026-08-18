@@ -182,7 +182,7 @@ def _record_via_modelexpress(rank: int) -> None:
     """The shipped client path, as a forked rank runs it."""
     import modelexpress.metrics as mx
 
-    mx.enable()
+    mx.enable_metrics()
     for _ in range(EVENTS_PER_RANK * (rank + 1)):
         mx.metrics.record_attempt("random", "success")
 

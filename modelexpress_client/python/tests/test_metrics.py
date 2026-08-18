@@ -48,7 +48,7 @@ from modelexpress.metrics import (
     ENV_ENABLED,
     LIST_SOURCES_RESULTS,
     MetricsCollector,
-    enable,
+    enable_metrics,
     push_metrics_if_enabled,
     reset_multiproc_dir,
 )
@@ -159,7 +159,7 @@ def test_push_is_noop_when_disabled(monkeypatch):
 
 def test_enable_is_a_noop_and_never_raises_when_disabled(monkeypatch):
     monkeypatch.delenv(ENV_ENABLED, raising=False)
-    assert enable() is False
+    assert enable_metrics() is False
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +178,7 @@ def test_enable_brings_up_the_exporter_with_zero_recordings(monkeypatch):
     collector = _fresh_collector(monkeypatch, MX_METRICS_PORT=None, MX_METRICS_PUSHGATEWAY=None)
     monkeypatch.setattr("modelexpress.metrics.metrics", collector)
 
-    assert enable() is True
+    assert enable_metrics() is True
 
     assert collector._ready is True
     assert collector._server_started is True
@@ -634,7 +634,7 @@ def test_push_is_not_armed_when_a_scrape_port_is_configured(monkeypatch, squatte
 def test_enable_never_wipes_the_multiproc_directory(monkeypatch, tmp_path):
     """A late-starting rank must not unlink an early rank's mmapped files.
 
-    Ranks start staggered. If rank 5's ``enable()`` wiped the directory, rank 0
+    Ranks start staggered. If rank 5's ``enable_metrics()`` wiped the directory, rank 0
     would keep writing to an unlinked inode and vanish from every subsequent
     scrape — permanently, silently, and only under the staggered start that a
     single-rank test would never reproduce.
@@ -646,9 +646,9 @@ def test_enable_never_wipes_the_multiproc_directory(monkeypatch, tmp_path):
         monkeypatch, PROMETHEUS_MULTIPROC_DIR=str(tmp_path), MX_METRICS_PORT=None
     )
     monkeypatch.setattr("modelexpress.metrics.metrics", collector)
-    assert enable() is True
+    assert enable_metrics() is True
 
-    assert existing.exists(), "enable() must never unlink another rank's files"
+    assert existing.exists(), "enable_metrics() must never unlink another rank's files"
 
 
 def test_reset_multiproc_dir_clears_stale_files(tmp_path):
@@ -727,14 +727,14 @@ _MULTIRANK_SCRIPT = textwrap.dedent(
 
     import modelexpress.metrics as mx
 
-    # prometheus_client is imported lazily inside enable(), so the value class
+    # prometheus_client is imported lazily inside enable_metrics(), so the value class
     # latches per child, after the fork, with the directory already set.
     children = []
     for rank in range(ranks):
         pid = os.fork()
         if pid == 0:
             try:
-                mx.enable()
+                mx.enable_metrics()
                 for _ in range(rank + 1):
                     mx.metrics.record_attempt("random", "success")
             except BaseException:

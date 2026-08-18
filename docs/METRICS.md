@@ -72,7 +72,9 @@ binds the port and serves the merged union of all of them.
 
 A working TP=8 example, with the annotations, the memory-backed `emptyDir`, the
 port and the entrypoint reset all wired up, is
-[`examples/p2p_transfer_k8s/client/vllm/vllm-single-node.yaml`](../examples/p2p_transfer_k8s/client/vllm/vllm-single-node.yaml).
+[`examples/p2p_transfer_k8s/client/vllm/vllm-single-node-metrics.yaml`](../examples/p2p_transfer_k8s/client/vllm/vllm-single-node-metrics.yaml)
+— a metrics-enabled sibling of the stock single-node manifest, so the diff
+between the two is exactly what metrics cost you.
 
 Without the directory nothing breaks — the client falls back to
 one-rank-per-endpoint and says so in a warning — but only one of your ranks is
