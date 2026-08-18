@@ -293,7 +293,7 @@ cargo bench
 - **Multi-tier cache hierarchy**: Promote and demote models across DRAM, NVMe, and PVC tiers based on access patterns.
 - **Distributed sharded cache**: Shard large models across nodes using consistent hashing and parallel shard assembly.
 - **Training checkpoint management**: Cache and reuse CUDA kernel compilations (torch.compile, deepGEMM) and CUDA graphs across restarts.
-- **Metrics and observability**: Cache hit rates, eviction frequency, and P2P RDMA utilization via Prometheus/OpenTelemetry. The server exposes `/metrics` on its own port and the client ships P2P source-selection and transfer-duration metrics behind `MX_METRICS_ENABLED=1` (see [Metrics](docs/METRICS.md)); the subsystem families above are still to come.
+- **Metrics and observability**: The exposition path exists today — the server serves `/metrics` on its own port, and the client collector is opt-in behind `MX_METRICS_ENABLED=1` (see [Metrics](docs/METRICS.md)). Still to build on it: cache hit rates, eviction frequency, and P2P RDMA utilization.
 - **Predictive prefetching**: Pre-warm caches from workload history or scheduling hints.
 - **Dynamic EPLB (Expert Parallelism Load Balancer)**: Rebalance MoE expert placement across GPUs at runtime via P2P transfer of expert weights as load shifts.
 
