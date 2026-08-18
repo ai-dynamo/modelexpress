@@ -89,9 +89,6 @@ already exited. Losing the bind is the *normal* case, not a failure, and mmap
 writes are durable at increment time, so no exit hook is in the path — an
 OOM-killed rank's counters still show up.
 
-`benchmarks/metrics_pipeline.py` reconstructs the previous mechanism and measures
-what it lost, if you want the numbers.
-
 ---
 
 ## The rules that are not style
@@ -140,13 +137,11 @@ Reaping them bounds the cost but makes merged counters *decrease*, which
 Prometheus reads as a reset and `rate()` then mis-accounts.
 
 **ModelExpress does not reap.** Counters stay monotonic; bound pod lifetime
-instead. On an idle H200 node the curve runs ~0.1 ms at one file set to ~2.4 ms at
-256 — inside Prometheus's 10 s timeout, but measured without an engine competing
-for the GIL. If you recycle workers aggressively, measure your own pod:
-
-```bash
-python benchmarks/metrics/metrics_pipeline.py --only scrape-cost --max-file-sets 512
-```
+instead. Measured on an idle H200 node, the curve runs ~0.1 ms at one file set to
+~2.4 ms at 256 — inside Prometheus's 10 s timeout, but taken without an engine
+competing for the GIL, so treat it as a floor. If you recycle workers
+aggressively, watch `scrape_duration_seconds` for the pod in Prometheus itself
+rather than trusting that figure.
 
 ### 2. Sharing the directory with the engine's exporter
 
@@ -334,9 +329,6 @@ cargo test --package modelexpress-server metrics
 # The listener itself, scraped over real HTTP/1.1. Gated behind the feature, so
 # the command above does NOT run it.
 cargo test --package modelexpress-server --features integration-tests --test in_process_server
-
-# Before/after numbers.
-python benchmarks/metrics/metrics_pipeline.py --ranks 8
 ```
 
 `tests/test_metrics.py` runs the merged-endpoint check at both TP=2 and TP=8 by
