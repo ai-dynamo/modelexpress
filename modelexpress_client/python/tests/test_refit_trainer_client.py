@@ -3,23 +3,25 @@
 
 import time
 from concurrent import futures
+from unittest.mock import MagicMock
 
 import grpc
+import modelexpress_rl.train.client as client_module
 import pytest
-
-import modelexpress_rl.client as client_module
 from modelexpress_rl import (
-    CompletionFence,
     ModelExpressTrainerClient,
-    StagedWeightVersionShardData,
-    TrainerEngineAdapter,
     TrainerStagingMode,
     WeightPayloadFormat,
     WeightVersionRef,
-    WeightVersionShardManifest,
-    WeightVersionShardManifestService,
     refit_pb2,
     refit_pb2_grpc,
+)
+from modelexpress_rl.train import (
+    CompletionFence,
+    StagedWeightVersionShardData,
+    TrainerEngineAdapter,
+    WeightVersionShardManifest,
+    WeightVersionShardManifestService,
 )
 
 
@@ -28,6 +30,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         self.registrations = {}
         self.registration_count = 0
         self.shards = []
+        self.deleted_shards = []
 
     def RegisterWorker(self, request, _context):
         self.registration_count += 1
@@ -48,6 +51,10 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
                 state=refit_pb2.WEIGHT_VERSION_STATE_READY,
             ),
         )
+
+    def DeleteWeightVersionShard(self, request, _context):
+        self.deleted_shards.append(request)
+        return refit_pb2.DeleteWeightVersionShardResponse(deleted=True)
 
 
 class _Manager:
@@ -133,6 +140,9 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
         retained_owners = [
             staged.buffer_owner for staged in trainer._published_shards["version-a"]
         ]
+        trainer.release_version(version=WeightVersionRef("version-a"))
+        trainer.release_version(version=WeightVersionRef("version-a"))
+        assert "version-a" not in trainer._published_shards
     finally:
         if "trainer" in locals():
             trainer.close()
@@ -152,6 +162,8 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
     ]
     assert retained_owners == ["model", "model-2"]
     assert len(service.shards) == 2
+    assert len(service.deleted_shards) == 1
+    assert service.deleted_shards[0].source_slot_id == "rank:0"
     assert service.registrations["trainer-0"].role == refit_pb2.WORKER_ROLE_TRAINER
     assert (
         service.registrations["trainer-0"].endpoint
@@ -215,3 +227,39 @@ def test_trainer_initialization_rejects_unknown_configured_engine(monkeypatch):
             manifest_publisher=object(),
             worker_endpoint="trainer:9000",
         )
+
+
+def test_trainer_client_owns_default_transport_resources(monkeypatch):
+    manager = MagicMock(listen_port=19002)
+    resources = MagicMock(
+        manager=manager,
+        manifest_service=MagicMock(),
+        worker_endpoint="trainer:19002",
+    )
+    adapter = _Adapter()
+    monkeypatch.setenv("MX_WORKER_HOST", "trainer")
+    monkeypatch.setattr(
+        client_module._TrainerResources,
+        "initialize",
+        MagicMock(return_value=resources),
+    )
+    monkeypatch.setattr(client_module, "_trainer_adapter", lambda **_kwargs: adapter)
+    monkeypatch.setattr(
+        ModelExpressTrainerClient, "_register_worker", lambda self: None
+    )
+    monkeypatch.setattr(client_module.threading.Thread, "start", lambda self: None)
+    monkeypatch.setattr(client_module.threading.Thread, "join", lambda self: None)
+
+    trainer = ModelExpressTrainerClient.initialize(
+        model_name="test/model",
+        device_id=2,
+        staging_mode=TrainerStagingMode.COPY_TO_DEVICE,
+        server_url="mx:8000",
+    )
+    tensors = {"weight": object()}
+    trainer.register_tensors(tensors)
+
+    assert trainer.source_slot_id == "rank:0"
+    manager.register_tensors.assert_called_once_with(tensors)
+    trainer.close()
+    resources.close.assert_called_once_with()

@@ -13,11 +13,14 @@ from .adapter import (
     WeightVersionShardManifest,
     WeightVersionShardManifestPublisher,
 )
+from .client import ModelExpressTrainerClient, StagedWeightVersionShard
 from .manifest import WeightVersionShardManifestService
 
 __all__ = [
     "CompletionFence",
+    "ModelExpressTrainerClient",
     "NixlMetadataProvider",
+    "StagedWeightVersionShard",
     "StagedWeightVersionShardData",
     "TrainerEngineAdapter",
     "TrainerStagingMode",

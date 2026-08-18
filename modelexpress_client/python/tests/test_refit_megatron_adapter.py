@@ -7,17 +7,18 @@ from types import SimpleNamespace
 
 import grpc
 import pytest
-
 from modelexpress.refit.reshard.rendezvous import unwrap_rendezvous_blob
 from modelexpress_rl import (
     ModelExpressTrainerClient,
-    TrainerEngineAdapter,
     TrainerStagingMode,
     WeightPayloadFormat,
     WeightVersionRef,
-    WeightVersionShardManifestService,
     refit_pb2,
     refit_pb2_grpc,
+)
+from modelexpress_rl.train import (
+    TrainerEngineAdapter,
+    WeightVersionShardManifestService,
 )
 from modelexpress_rl.train.engines.megatron import (
     MegatronTensorSpec,
@@ -83,6 +84,10 @@ def test_megatron_adapter_requires_initialized_distributed_engine(monkeypatch):
 
 
 def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
+    monkeypatch.setattr(
+        "modelexpress_rl.train.engines.megatron.aliases.published_digest",
+        lambda _tensor: "tensor-digest",
+    )
     monkeypatch.setattr(
         "modelexpress_rl.train.engines.megatron.adapter.dist.is_initialized",
         lambda: True,

@@ -110,19 +110,11 @@ behind the client.
 from modelexpress_rl import (
     ModelExpressTrainerClient,
     WeightVersionRef,
-    WeightVersionShardManifestService,
-    refit_pb2_grpc,
 )
 
-manifest_service = WeightVersionShardManifestService(endpoint="trainer-0:9000")
-refit_pb2_grpc.add_RefitWorkerServiceServicer_to_server(
-    manifest_service,
-    trainer_worker_grpc_server,
-)
-
-trainer = ModelExpressTrainerClient.initialize(
-    manager=nixl_manager,
-    manifest_publisher=manifest_service,
+trainer = ModelExpressTrainerClient.initialize()
+trainer.register_tensors(
+    {spec.name: spec.tensor for spec in megatron_tensor_specs}
 )
 
 shard = trainer.stage_shard(
@@ -136,12 +128,16 @@ The deployment supplies `MODEL_NAME`, `MX_TRAINER_ENGINE`,
 `MX_TRAINER_STAGING_MODE`, `MX_WEIGHT_PAYLOAD_FORMAT`, `MX_WORKER_HOST`, and the
 normal ModelExpress server configuration. The Megatron adapter derives its
 source slot from the engine's global distributed rank. The NIXL metadata
-endpoint is derived from `MX_WORKER_HOST` and the supplied NIXL manager's listen
-port.
+endpoint is derived from `MX_WORKER_HOST` and the client-owned NIXL manager's
+listen port. `LOCAL_RANK` selects the device unless `device_id` is passed to
+`initialize()`.
 
-`worker_endpoint` is the trainer-side manifest service address advertised to
-other workers. `server_url` selects the central ModelExpress control-plane
-service and defaults to the normal ModelExpress server configuration.
+The client owns the NIXL manager and trainer-side manifest service. `server_url`
+selects the central ModelExpress control-plane service and defaults to the
+normal ModelExpress server configuration. A Megatron worker may initialize the
+client after selecting its CUDA device but before creating NCCL resources; the
+engine adapter is created lazily when the worker first requests its source slot
+or stages a shard after distributed setup.
 
 Initialization fixes the staging mode and payload format. `publish()` hides
 manifest publication and the internal `CreateWeightVersionShard` RPC. The

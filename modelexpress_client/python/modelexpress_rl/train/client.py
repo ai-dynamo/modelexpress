@@ -5,18 +5,19 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import uuid
-from dataclasses import dataclass
-from typing import Any
+from typing import Any, Self
 
 import grpc
 from modelexpress import auth, envs
 from modelexpress.client import _get_server_url
 
-from . import envs as rl_envs
-from . import refit_pb2, refit_pb2_grpc
-from .train.adapter import (
+from .. import envs as rl_envs
+from .. import refit_pb2, refit_pb2_grpc
+from ..version import WeightVersionRef
+from .adapter import (
     CompletionFence,
     NixlMetadataProvider,
     StagedWeightVersionShardData,
@@ -25,6 +26,7 @@ from .train.adapter import (
     WeightPayloadFormat,
     WeightVersionShardManifestPublisher,
 )
+from .resources import _TrainerResources
 
 
 def _required(value: str, name: str) -> str:
@@ -42,7 +44,7 @@ def _trainer_adapter(
     if engine != "MEGATRON":
         raise ValueError(f"unsupported MX_TRAINER_ENGINE={engine!r}")
 
-    from .train.engines.megatron import MegatronTrainerAdapter
+    from .engines.megatron import MegatronTrainerAdapter
 
     return MegatronTrainerAdapter(
         manager=manager,
@@ -73,16 +75,6 @@ def _payload_format(value: WeightPayloadFormat | None) -> WeightPayloadFormat:
         raise ValueError(
             f"invalid MX_WEIGHT_PAYLOAD_FORMAT={rl_envs.MX_WEIGHT_PAYLOAD_FORMAT!r}"
         ) from error
-
-
-@dataclass(frozen=True)
-class WeightVersionRef:
-    """Opaque reference to one global WeightVersion created by the orchestrator."""
-
-    version_id: str
-
-    def __post_init__(self) -> None:
-        _required(self.version_id, "version.version_id")
 
 
 class StagedWeightVersionShard:
@@ -124,18 +116,25 @@ class ModelExpressTrainerClient:
     def __init__(self) -> None:
         self._channel: grpc.Channel | None = None
         self._stub: refit_pb2_grpc.RefitServiceStub | None = None
-        self._published_shards: dict[
-            str, list[StagedWeightVersionShardData]
-        ] = {}
+        self._published_shards: dict[str, list[StagedWeightVersionShardData]] = {}
         self._registration_stop = threading.Event()
         self._registration_thread: threading.Thread | None = None
+        self._adapter: TrainerEngineAdapter | None = None
+        self._resources: _TrainerResources | None = None
+
+    @property
+    def source_slot_id(self) -> str:
+        """Return the logical source contribution owned by this client."""
+        return self._get_adapter().source_slot_id
 
     @classmethod
     def initialize(
         cls,
         *,
-        manager: NixlMetadataProvider,
-        manifest_publisher: WeightVersionShardManifestPublisher,
+        manager: NixlMetadataProvider | None = None,
+        manifest_publisher: WeightVersionShardManifestPublisher | None = None,
+        device_id: int | None = None,
+        agent_name: str | None = None,
         model_name: str | None = None,
         staging_mode: TrainerStagingMode | None = None,
         payload_format: WeightPayloadFormat | None = None,
@@ -153,16 +152,6 @@ class ModelExpressTrainerClient:
         model_name = _required(model_name or envs.MODEL_NAME or "", "model_name")
         staging_mode = _staging_mode(staging_mode)
         payload_format = _payload_format(payload_format)
-        nixl_metadata_endpoint = _nixl_metadata_endpoint(manager)
-        worker_endpoint = _required(
-            worker_endpoint
-            or (
-                f"{envs.MX_WORKER_HOST}:{envs.MX_WORKER_GRPC_PORT}"
-                if envs.MX_WORKER_HOST
-                else ""
-            ),
-            "worker_endpoint",
-        )
         worker_id = _required(worker_id or uuid.uuid4().hex[:8], "worker_id")
         if staging_mode is TrainerStagingMode.UNSPECIFIED:
             raise ValueError("staging_mode must be specified")
@@ -174,18 +163,42 @@ class ModelExpressTrainerClient:
             raise ValueError("registration_ttl_seconds must be positive")
         if rpc_timeout_seconds <= 0:
             raise ValueError("rpc_timeout_seconds must be positive")
-        adapter = _trainer_adapter(
-            manager=manager,
-            nixl_metadata_endpoint=nixl_metadata_endpoint,
-        )
-        if staging_mode not in adapter.supported_staging_modes:
-            raise ValueError(
-                f"adapter does not support staging mode {staging_mode.value}"
+        if (manager is None) != (manifest_publisher is None):
+            raise ValueError("manager and manifest_publisher must be provided together")
+
+        resources = None
+        adapter = None
+        if manager is None:
+            if device_id is None:
+                local_rank = os.environ.get("LOCAL_RANK")
+                if local_rank is None:
+                    raise ValueError("device_id or LOCAL_RANK is required")
+                device_id = int(local_rank)
+            resources = _TrainerResources.initialize(
+                device_id=device_id,
+                agent_name=agent_name,
             )
-        if payload_format not in adapter.supported_payload_formats:
-            raise ValueError(
-                f"adapter does not support payload format {payload_format.value}"
+            manager = resources.manager
+            manifest_publisher = resources.manifest_service
+            worker_endpoint = resources.worker_endpoint
+        else:
+            worker_endpoint = _required(
+                worker_endpoint
+                or (
+                    f"{envs.MX_WORKER_HOST}:{envs.MX_WORKER_GRPC_PORT}"
+                    if envs.MX_WORKER_HOST
+                    else ""
+                ),
+                "worker_endpoint",
             )
+            adapter = _trainer_adapter(
+                manager=manager,
+                nixl_metadata_endpoint=_nixl_metadata_endpoint(manager),
+            )
+            cls._validate_adapter(adapter, staging_mode, payload_format)
+
+        assert manager is not None
+        assert manifest_publisher is not None
 
         client = cls()
         client.model_name = model_name
@@ -195,17 +208,53 @@ class ModelExpressTrainerClient:
         client.worker_endpoint = worker_endpoint
         client.server_url = _get_server_url(server_url)
         client._adapter = adapter
+        client._manager = manager
+        client._nixl_metadata_endpoint = _nixl_metadata_endpoint(manager)
         client._manifest_publisher = manifest_publisher
+        client._resources = resources
         client._registration_ttl_seconds = registration_ttl_seconds
         client._rpc_timeout_seconds = rpc_timeout_seconds
-        client._register_worker()
-        client._registration_thread = threading.Thread(
-            target=client._renew_worker_registration,
-            name=f"modelexpress-refit-renew-{worker_id}",
-            daemon=True,
-        )
-        client._registration_thread.start()
+        try:
+            client._register_worker()
+            client._registration_thread = threading.Thread(
+                target=client._renew_worker_registration,
+                name=f"modelexpress-refit-renew-{worker_id}",
+                daemon=True,
+            )
+            client._registration_thread.start()
+        except Exception:
+            client.close()
+            raise
         return client
+
+    @staticmethod
+    def _validate_adapter(
+        adapter: TrainerEngineAdapter,
+        staging_mode: TrainerStagingMode,
+        payload_format: WeightPayloadFormat,
+    ) -> None:
+        if staging_mode not in adapter.supported_staging_modes:
+            raise ValueError(
+                f"adapter does not support staging mode {staging_mode.value}"
+            )
+        if payload_format not in adapter.supported_payload_formats:
+            raise ValueError(
+                f"adapter does not support payload format {payload_format.value}"
+            )
+
+    def _get_adapter(self) -> TrainerEngineAdapter:
+        if self._adapter is None:
+            adapter = _trainer_adapter(
+                manager=self._manager,
+                nixl_metadata_endpoint=self._nixl_metadata_endpoint,
+            )
+            self._validate_adapter(adapter, self.staging_mode, self.payload_format)
+            self._adapter = adapter
+        return self._adapter
+
+    def register_tensors(self, tensors: dict[str, Any]) -> None:
+        """Register stable trainer tensors with the selected transport."""
+        self._manager.register_tensors(tensors)
 
     @property
     def _service(self) -> refit_pb2_grpc.RefitServiceStub:
@@ -247,7 +296,7 @@ class ModelExpressTrainerClient:
         """Capture one immutable rank-local shard for ``version``."""
         if not isinstance(version, WeightVersionRef):
             raise TypeError("version must be a WeightVersionRef")
-        staged = self._adapter.stage_shard(
+        staged = self._get_adapter().stage_shard(
             tensors=tensors,
             staging_mode=self.staging_mode,
             payload_format=self.payload_format,
@@ -260,7 +309,7 @@ class ModelExpressTrainerClient:
         version: WeightVersionRef,
         staged: StagedWeightVersionShardData,
     ) -> None:
-        source_slot_id = self._adapter.source_slot_id
+        source_slot_id = self._get_adapter().source_slot_id
         staged.publish_ready.wait()
         manifest_endpoint = self._manifest_publisher.publish_manifest(
             version_id=version.version_id,
@@ -286,6 +335,29 @@ class ModelExpressTrainerClient:
         # operation, not the staged handle's Python object lifetime.
         self._published_shards.setdefault(version.version_id, []).append(staged)
 
+    def release_version(self, *, version: WeightVersionRef) -> None:
+        """Withdraw this worker's shard after the version is retired.
+
+        The framework must call this only after the control plane has moved the
+        version to ``RELEASING``. Once the shard is deleted, ModelExpress no
+        longer advertises this worker's buffers as a transfer source and an
+        in-place trainer may resume mutating them.
+        """
+        if not isinstance(version, WeightVersionRef):
+            raise TypeError("version must be a WeightVersionRef")
+        staged = self._published_shards.get(version.version_id)
+        if staged is None:
+            return
+        self._service.DeleteWeightVersionShard(
+            refit_pb2.DeleteWeightVersionShardRequest(
+                version_id=version.version_id,
+                source_slot_id=self._get_adapter().source_slot_id,
+                worker_id=self.worker_id,
+            ),
+            timeout=self._rpc_timeout_seconds,
+        )
+        del self._published_shards[version.version_id]
+
     def close(self) -> None:
         """Close the underlying gRPC channel."""
         if self._registration_thread is not None:
@@ -297,8 +369,11 @@ class ModelExpressTrainerClient:
             self._channel = None
             self._stub = None
         self._published_shards.clear()
+        if self._resources is not None:
+            self._resources.close()
+            self._resources = None
 
-    def __enter__(self) -> ModelExpressTrainerClient:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
@@ -308,5 +383,4 @@ class ModelExpressTrainerClient:
 __all__ = [
     "ModelExpressTrainerClient",
     "StagedWeightVersionShard",
-    "WeightVersionRef",
 ]

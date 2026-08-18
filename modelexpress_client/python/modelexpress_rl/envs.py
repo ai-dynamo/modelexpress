@@ -15,25 +15,29 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    MX_GENERATOR_ENGINE: str
+    MX_GENERATOR_INSTALLATION_MODE: str
     MX_TRAINER_ENGINE: str
     MX_TRAINER_STAGING_MODE: str
     MX_WEIGHT_PAYLOAD_FORMAT: str
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
-    "MX_TRAINER_ENGINE": lambda: os.environ.get("MX_TRAINER_ENGINE", "MEGATRON")
-    .strip()
-    .upper(),
-    "MX_TRAINER_STAGING_MODE": lambda: os.environ.get(
-        "MX_TRAINER_STAGING_MODE", "IN_PLACE"
-    )
-    .strip()
-    .upper(),
-    "MX_WEIGHT_PAYLOAD_FORMAT": lambda: os.environ.get(
-        "MX_WEIGHT_PAYLOAD_FORMAT", "FULL_TENSOR"
-    )
-    .strip()
-    .upper(),
+    "MX_GENERATOR_ENGINE": lambda: (
+        os.environ.get("MX_GENERATOR_ENGINE", "VLLM").strip().upper()
+    ),
+    "MX_GENERATOR_INSTALLATION_MODE": lambda: (
+        os.environ.get("MX_GENERATOR_INSTALLATION_MODE", "STAGED").strip().upper()
+    ),
+    "MX_TRAINER_ENGINE": lambda: (
+        os.environ.get("MX_TRAINER_ENGINE", "MEGATRON").strip().upper()
+    ),
+    "MX_TRAINER_STAGING_MODE": lambda: (
+        os.environ.get("MX_TRAINER_STAGING_MODE", "IN_PLACE").strip().upper()
+    ),
+    "MX_WEIGHT_PAYLOAD_FORMAT": lambda: (
+        os.environ.get("MX_WEIGHT_PAYLOAD_FORMAT", "FULL_TENSOR").strip().upper()
+    ),
 }
 
 
