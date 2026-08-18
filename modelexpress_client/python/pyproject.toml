@@ -39,6 +39,11 @@ dependencies = [
 dev = [
     "opentelemetry-api>=1.41.1",
     "opentelemetry-sdk>=1.41.1",
+    # tests/test_metrics.py builds the real collectors and forks real ranks, so
+    # the test extra needs what the metrics extra installs. CI installs only
+    # [dev]; without this the metrics tests would error out on import rather
+    # than run.
+    "prometheus-client>=0.20.0",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
 ]

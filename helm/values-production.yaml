@@ -15,15 +15,22 @@ serviceAccount:
   annotations: {}
   automount: true
 
-podAnnotations:
-  prometheus.io/scrape: "true"
-  prometheus.io/port: "8001"
+# Scrape annotations are generated from .Values.metrics (see values.yaml); do not
+# hand-write prometheus.io/port here. It used to be pinned to "8001", the tonic
+# gRPC listener — tonic is HTTP/2 only, so every server pod reported up == 0
+# permanently.
+podAnnotations: {}
 
 podLabels: {}
 
 service:
   type: ClusterIP
   port: 8001
+
+metrics:
+  enabled: true
+  port: 9401
+  podAnnotations: true
 
 ingress:
   enabled: true

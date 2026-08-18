@@ -14,7 +14,21 @@ spec:
       {{- include "modelexpress.selectorLabels" . | nindent 6 }}
   template:
     metadata:
-      {{- with .Values.podAnnotations }}
+      {{- /*
+        Scrape annotations are generated from .Values.metrics rather than written
+        by hand, so the port can never drift back onto the gRPC listener. Values
+        set explicitly in .Values.podAnnotations still win, so an operator can
+        override or suppress any single key.
+      */}}
+      {{- $scrapeAnnotations := dict }}
+      {{- if and .Values.metrics .Values.metrics.enabled .Values.metrics.podAnnotations }}
+      {{- $scrapeAnnotations = dict
+            "prometheus.io/scrape" "true"
+            "prometheus.io/port" (.Values.metrics.port | default 9401 | toString)
+            "prometheus.io/path" "/metrics" }}
+      {{- end }}
+      {{- $podAnnotations := merge (deepCopy (.Values.podAnnotations | default dict)) $scrapeAnnotations }}
+      {{- with $podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -47,13 +61,42 @@ spec:
             - name: http
               containerPort: {{ .Values.service.port | default 8001 }}
               protocol: TCP
+            {{- if and .Values.metrics .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port | default 9401 }}
+              protocol: TCP
+            {{- end }}
           env:
             {{- $hasNsInExtra := false }}
+            {{- $hasMetricsPortInExtra := false }}
             {{- range .Values.extraEnv }}
               {{- if eq .name "MX_METADATA_NAMESPACE" }}
                 {{- $hasNsInExtra = true }}
               {{- end }}
+              {{- if eq .name "MODEL_EXPRESS_SERVER_METRICS_PORT" }}
+                {{- $hasMetricsPortInExtra = true }}
+              {{- end }}
             {{- end }}
+            {{- /*
+              metrics.port is the single source of truth. It drives four things
+              that have to agree: this env var, the scrape annotation, the
+              containerPort, and the optional Service port. Setting the env var
+              directly would move only the first of those, so the server would
+              listen on one port while Kubernetes advertised another -- and
+              setting it to "0" would silently disable the listener while the
+              scrape annotation still pointed at it. Rejected rather than
+              silently skipped.
+
+              The env var itself is read only through the clap --metrics-port
+              override: the layered config loader maps this name to the key path
+              server.metrics.port, which matches no field, and serde drops it
+              without a warning.
+            */}}
+            {{- if or (hasKey .Values.env "MODEL_EXPRESS_SERVER_METRICS_PORT") $hasMetricsPortInExtra }}
+            {{- fail "Set metrics.port (and metrics.enabled) rather than MODEL_EXPRESS_SERVER_METRICS_PORT directly: the chart derives the scrape annotation, containerPort and Service port from metrics.port, and an env-only override desynchronizes them." }}
+            {{- end }}
+            - name: MODEL_EXPRESS_SERVER_METRICS_PORT
+              value: {{ if and .Values.metrics .Values.metrics.enabled }}{{ .Values.metrics.port | default 9401 | quote }}{{ else }}"0"{{ end }}
             {{- if and (not (hasKey .Values.env "MX_METADATA_NAMESPACE")) (not $hasNsInExtra) }}
             - name: MX_METADATA_NAMESPACE
               value: {{ .Release.Namespace | quote }}

@@ -90,6 +90,14 @@ MX_METADATA_BACKEND=redis REDIS_URL=redis://localhost:6379 \
 |--------|----------|---------|---------|-------------|
 | host | `--host` | `MODEL_EXPRESS_SERVER_HOST` | `0.0.0.0` | Bind address |
 | port | `--port`, `-p` | `MODEL_EXPRESS_SERVER_PORT` | `8001` | gRPC port |
+| metrics_port | `--metrics-port` | `MODEL_EXPRESS_SERVER_METRICS_PORT` | `9401` | Prometheus `/metrics` port. `0` disables the listener. Deliberately not the gRPC port: tonic serves HTTP/2 only, so a scrape aimed at `--port` can never complete. See [METRICS.md](METRICS.md). |
+
+> The env var above reaches the server **only** through the `--metrics-port` clap
+> override. The layered config loader reads environment variables as
+> `Environment::with_prefix("MODEL_EXPRESS").separator("_")`, so
+> `MODEL_EXPRESS_SERVER_METRICS_PORT` resolves to the key path
+> `server.metrics.port`, matches no field, and is dropped by serde without a
+> warning. In a config file the field is `server.metrics_port`.
 
 #### Distributed backend selection
 
@@ -580,10 +588,13 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
 | `MX_DISABLE_PATCHES` | `0` | Emergency escape hatch that skips all runtime compatibility patches. Set to `1`, `true`, `yes`, or `on` if a patch is incompatible with the installed engine. |
 | `MX_P2P_SOURCE_SELECTOR` | `random` | P2P source-ordering policy for the RDMA load path. `random` (behavior-preserving default; local-RNG shuffle) or `rendezvous_hash` (stateless deterministic spreading via HRW hashing; stable across restarts and minimally disrupted by source-set changes). Unknown values log a warning and fall back to `random`. Ordering only — the `MAX_SOURCE_RETRIES=3` retry budget is unchanged. |
-| `MX_METRICS_ENABLED` | `0` | Opt-in Prometheus metrics collector for the client. `1` enables the collectors (requires the `metrics` extra, `prometheus-client`). The P2P source-selection group (`mx_p2p_*`) ships today; the collector is generic so other client metrics can be added later. Off by default; selection signals are always emitted as structured logs regardless. |
-| `MX_METRICS_PORT` | (unset) | With metrics enabled, serve a pull `/metrics` endpoint on this port. |
-| `MX_METRICS_PUSHGATEWAY` | (unset) | With metrics enabled, push to this Pushgateway host:port (for short-lived load-only processes). |
-| `MX_METRICS_SCHEME` | `""` | Optional run/scheme label added to every metric, so multiple runs compare on one dashboard. |
+| `MX_METRICS_ENABLED` | `0` | Opt-in Prometheus metrics collector for the client. `1` enables the collectors (requires the `metrics` extra, `prometheus-client`, which the vLLM, SGLang and TensorRT-LLM engine images already provide). Off by default; selection signals are always emitted as structured logs regardless. See [METRICS.md](METRICS.md). |
+| `PROMETHEUS_MULTIPROC_DIR` | (unset) | Pod-local directory shared by every rank, so one endpoint serves the merged union of all of them. **Required on any pod with more than one worker process**, and it must be set in the pod manifest: `prometheus_client` latches its value class at import, so assigning it from Python produces zero data with no error. Wipe it at the container entrypoint with `python -m modelexpress.metrics --reset`, never from worker code. |
+| `MX_METRICS_PORT` | (unset) | With metrics enabled, serve a pull `/metrics` endpoint on this port. One rank per pod wins the bind and serves every rank's data; the rest re-attempt periodically so the endpoint migrates if the winner exits. |
+| `MX_METRICS_PUSHGATEWAY` | (unset) | With metrics enabled, push to this Pushgateway host:port. An escape hatch for pure-batch pods; mutually exclusive with `MX_METRICS_PORT`, enforced in code, because running both double-counts every series. One push per pod, keyed on the pod UID. |
+| `MX_METRICS_BIND_RETRY_SECS` | `15` | How often a rank that lost the `/metrics` bind re-attempts it, so endpoint ownership migrates when the current owner exits. |
+| `MX_METRICS_SOURCE_ID_LABEL` | `0` | Restore the per-peer `source_worker_id` label on `mx_p2p_source_selections_total`, for comparing source-selection policies. **Benchmark runs only:** the id is `uuid4().hex[:8]` minted per process, so its label domain grows with process count over time rather than with cluster size. Point such a run at a throwaway Prometheus. |
+| `MX_METRICS_SCHEME` | `""` | Optional run/scheme label, so multiple runs compare on one dashboard. On the client it is a label on `mx_build_info` **and** on every `mx_p2p_*` family; on the server it is on `mx_build_info` only. |
 | `MX_POOL_REG` | `0` | Allocation-level NIXL registration via `cuMemGetAddressRange`. Registers each unique cudaMalloc block instead of each tensor, typically 80-99% fewer registrations, without changing transfer semantics. `MX_VMM_ARENA=1` uses direct arena registration and does not require pool-reg. |
 | `MX_VMM_ARENA` | `0` | Route weight allocations into a CUDA VMM arena via PyTorch's `CUDAPluggableAllocator`, then register the used arena range as one NIXL MR with dmabuf at end-of-load. Reserves 16.0 TiB of VA by default, with no physical commit until allocations are mapped. Requires the `modelexpress.vmm._alloc_ext` C extension to have built at install time; if it did not, this flag is a no-op with a warning and the loader falls back to the pool-reg path. See [VMM Arena](#vmm-arena-single-mr-registration). |
 | `MX_ARENA_SINGLE_MR` | `0` | Keep single-MR arena registration even when the arena spans several `cuMemCreate` handles. Only safe on transports that can register across handles (dmabuf/IB); cuda_ipc cannot, so the default falls back to per-tensor registration. See [VMM Arena](#vmm-arena-single-mr-registration). |

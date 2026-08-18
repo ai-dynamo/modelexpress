@@ -63,6 +63,25 @@ service:
   type: ClusterIP
   port: 8001
 
+# Prometheus metrics.
+#
+# The server serves /metrics over HTTP/1.1 on its own port, deliberately not on
+# service.port. service.port is the tonic gRPC listener, and tonic speaks HTTP/2
+# only: a scrape aimed at it can never complete, so the target reports up == 0
+# permanently. That is worse than no annotation at all, because a permanently
+# down target is indistinguishable from a crashed pod. Point scrapes here.
+metrics:
+  enabled: true
+  port: 9401
+  # Emit prometheus.io/{scrape,port,path} pod annotations pointing at the port
+  # above. Turn this off if you scrape via a PodMonitor or ServiceMonitor
+  # instead — anything in .Values.podAnnotations still wins over these.
+  podAnnotations: true
+  # Publish the metrics port on the Service as well. Off by default: pod
+  # annotations and PodMonitors both scrape pod IPs directly, and a Service
+  # would load-balance scrapes across replicas.
+  service: false
+
 ingress:
   enabled: false
   className: ""
