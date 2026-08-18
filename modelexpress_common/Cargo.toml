@@ -63,8 +63,6 @@ fd-lock = { workspace = true }
 [dev-dependencies]
 google-cloud-auth = { version = "1.7.0", default-features = false }
 google-cloud-gax = { workspace = true }
-mockall = "0.13"
-tokio-test = "0.4"
 wiremock = "0.6.5"
 
 [build-dependencies]
