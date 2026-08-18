@@ -10,10 +10,10 @@ replicaCount: 1
 image:
   repository: nvcr.io/nvidia/ai-dynamo/modelexpress-server
   pullPolicy: IfNotPresent
-  tag: "0.3.0"
+  # Overrides the image tag whose default is the chart appVersion
+  tag: ""
 
-imagePullSecrets:
-  - name: nvcr-secret
+imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
@@ -23,7 +23,7 @@ serviceAccount:
   name: ""
   automount: false
   rbac:
-    # Enable Role + RoleBinding for the Kubernetes metadata backend.
+    # Enable ClusterRole + ClusterRoleBinding for the Kubernetes metadata backend.
     # Required when MX_METADATA_BACKEND=kubernetes.
     enabled: false
 
@@ -63,6 +63,25 @@ service:
   type: ClusterIP
   port: 8001
 
+# Prometheus metrics.
+#
+# The server serves /metrics over HTTP/1.1 on its own port, deliberately not on
+# service.port. service.port is the tonic gRPC listener, and tonic speaks HTTP/2
+# only: a scrape aimed at it can never complete, so the target reports up == 0
+# permanently. That is worse than no annotation at all, because a permanently
+# down target is indistinguishable from a crashed pod. Point scrapes here.
+metrics:
+  enabled: true
+  port: 9401
+  # Emit prometheus.io/{scrape,port,path} pod annotations pointing at the port
+  # above. Turn this off if you scrape via a PodMonitor or ServiceMonitor
+  # instead — anything in .Values.podAnnotations still wins over these.
+  podAnnotations: true
+  # Publish the metrics port on the Service as well. Off by default: pod
+  # annotations and PodMonitors both scrape pod IPs directly, and a Service
+  # would load-balance scrapes across replicas.
+  service: false
+
 ingress:
   enabled: false
   className: ""
@@ -93,7 +112,7 @@ persistence:
 
 env:
   MODEL_EXPRESS_SERVER_PORT: "8001"
-  MODEL_EXPRESS_LOGGING_LEVEL: "info"
+  MODEL_EXPRESS_LOG_LEVEL: "info"
   MODEL_EXPRESS_CACHE_DIRECTORY: "/root"
   # Distributed backend selection. Required — the server fails to start without it.
   # Set MX_METADATA_BACKEND to "redis" or "kubernetes"; it drives both the P2P metadata
@@ -101,8 +120,8 @@ env:
   #
   # When "redis": also set REDIS_URL to your cluster's Redis service (e.g.
   # "redis://redis.default.svc:6379"). The chart does not bundle a Redis sub-chart.
-  # When "kubernetes": apply examples/crds.yaml as a cluster-admin and set
-  # serviceAccount.rbac.enabled=true to grant the server access to the CRDs.
+  # When "kubernetes": set serviceAccount.rbac.enabled=true to grant the server
+  # access to ModelMetadata and ModelCacheEntry resources.
   #
   # MX_METADATA_BACKEND: "redis"
   # REDIS_URL: "redis://redis.default.svc:6379"

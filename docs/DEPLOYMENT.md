@@ -90,6 +90,14 @@ MX_METADATA_BACKEND=redis REDIS_URL=redis://localhost:6379 \
 |--------|----------|---------|---------|-------------|
 | host | `--host` | `MODEL_EXPRESS_SERVER_HOST` | `0.0.0.0` | Bind address |
 | port | `--port`, `-p` | `MODEL_EXPRESS_SERVER_PORT` | `8001` | gRPC port |
+| metrics_port | `--metrics-port` | `MODEL_EXPRESS_SERVER_METRICS_PORT` | `9401` | Prometheus `/metrics` port. `0` disables the listener. Deliberately not the gRPC port: tonic serves HTTP/2 only, so a scrape aimed at `--port` can never complete. See [METRICS.md](METRICS.md). |
+
+> The env var above reaches the server **only** through the `--metrics-port` clap
+> override. The layered config loader reads environment variables as
+> `Environment::with_prefix("MODEL_EXPRESS").separator("_")`, so
+> `MODEL_EXPRESS_SERVER_METRICS_PORT` resolves to the key path
+> `server.metrics.port`, matches no field, and is dropped by serde without a
+> warning. In a config file the field is `server.metrics_port`.
 
 #### Distributed backend selection
 
@@ -103,7 +111,13 @@ reachable.
 | `REDIS_URL` | e.g. `redis://host:6379` | when Redis | Redis connection (or set `MX_REDIS_HOST` / `MX_REDIS_PORT`) |
 | `POD_NAMESPACE` / `MX_METADATA_NAMESPACE` | e.g. `default` | when Kubernetes | Namespace for the `ModelMetadata` and `ModelCacheEntry` CRDs |
 
-To use the Kubernetes backend, apply `examples/crds.yaml` at cluster install time (installs both the `ModelMetadata` P2P CRD and the `ModelCacheEntry` registry CRD), then either enable `serviceAccount.rbac.enabled=true` on the Helm chart or apply `examples/p2p_transfer_k8s/server/kubernetes_backend/rbac-modelmetadata.yaml`.
+To use the Kubernetes backend, apply `examples/crds.yaml` at cluster install time
+(installs both the `ModelMetadata` P2P CRD and the `ModelCacheEntry` registry CRD),
+then either enable `serviceAccount.rbac.enabled=true` on the Helm chart or apply
+`examples/p2p_transfer_k8s/server/kubernetes_backend/rbac-modelmetadata.yaml`.
+The chart creates a `ClusterRole` and `ClusterRoleBinding`, allowing the server
+to run in a dedicated namespace while accessing metadata resources in another
+namespace.
 
 For automatic cleanup of P2P metadata, expose the client Pod identity through
 the Kubernetes Downward API. The checked-in vLLM, SGLang, and Dynamo manifests
@@ -192,7 +206,6 @@ The CLI client also uses layered configuration: CLI args > env vars > config fil
 | `MODEL_EXPRESS_ENDPOINT` | `http://localhost:8001` | Server endpoint |
 | `MODEL_EXPRESS_TIMEOUT` | `30` | Request timeout (seconds) |
 | `MODEL_EXPRESS_CACHE_DIRECTORY` | (auto) | Cache path override |
-| `MODEL_EXPRESS_MAX_RETRIES` | (none) | Max retry attempts |
 | `MODEL_EXPRESS_NO_SHARED_STORAGE` | `false` | Use gRPC streaming instead of shared storage |
 | `MODEL_EXPRESS_TRANSFER_CHUNK_SIZE` | `32768` | Transfer chunk size (bytes) |
 
@@ -575,10 +588,13 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
 | `MX_DISABLE_PATCHES` | `0` | Emergency escape hatch that skips all runtime compatibility patches. Set to `1`, `true`, `yes`, or `on` if a patch is incompatible with the installed engine. |
 | `MX_P2P_SOURCE_SELECTOR` | `random` | P2P source-ordering policy for the RDMA load path. `random` (behavior-preserving default; local-RNG shuffle) or `rendezvous_hash` (stateless deterministic spreading via HRW hashing; stable across restarts and minimally disrupted by source-set changes). Unknown values log a warning and fall back to `random`. Ordering only — the `MAX_SOURCE_RETRIES=3` retry budget is unchanged. |
-| `MX_METRICS_ENABLED` | `0` | Opt-in Prometheus metrics collector for the client. `1` enables the collectors (requires the `metrics` extra, `prometheus-client`). The P2P source-selection group (`mx_p2p_*`) ships today; the collector is generic so other client metrics can be added later. Off by default; selection signals are always emitted as structured logs regardless. |
-| `MX_METRICS_PORT` | (unset) | With metrics enabled, serve a pull `/metrics` endpoint on this port. |
-| `MX_METRICS_PUSHGATEWAY` | (unset) | With metrics enabled, push to this Pushgateway host:port (for short-lived load-only processes). |
-| `MX_METRICS_SCHEME` | `""` | Optional run/scheme label added to every metric, so multiple runs compare on one dashboard. |
+| `MX_METRICS_ENABLED` | `0` | Opt-in Prometheus metrics collector for the client. `1` enables the collectors (requires the `metrics` extra, `prometheus-client`, which the vLLM, SGLang and TensorRT-LLM engine images already provide). Off by default; selection signals are always emitted as structured logs regardless. See [METRICS.md](METRICS.md). |
+| `PROMETHEUS_MULTIPROC_DIR` | (unset) | Pod-local directory shared by every rank, so one endpoint serves the merged union of all of them. **Required on any pod with more than one worker process**, and it must be set in the pod manifest: `prometheus_client` latches its value class at import, so assigning it from Python produces zero data with no error. Wipe it at the container entrypoint with `python -m modelexpress.metrics --reset`, never from worker code. |
+| `MX_METRICS_PORT` | (unset) | With metrics enabled, serve a pull `/metrics` endpoint on this port. One rank per pod wins the bind and serves every rank's data; the rest re-attempt periodically so the endpoint migrates if the winner exits. |
+| `MX_METRICS_PUSHGATEWAY` | (unset) | With metrics enabled, push to this Pushgateway host:port. An escape hatch for pure-batch pods; mutually exclusive with `MX_METRICS_PORT`, enforced in code, because running both double-counts every series. One push per pod, keyed on the pod UID. |
+| `MX_METRICS_BIND_RETRY_SECS` | `15` | How often a rank that lost the `/metrics` bind re-attempts it, so endpoint ownership migrates when the current owner exits. |
+| `MX_METRICS_SOURCE_ID_LABEL` | `0` | Restore the per-peer `source_worker_id` label on `mx_p2p_source_selections_total`, for comparing source-selection policies. **Benchmark runs only:** the id is `uuid4().hex[:8]` minted per process, so its label domain grows with process count over time rather than with cluster size. Point such a run at a throwaway Prometheus. |
+| `MX_METRICS_SCHEME` | `""` | Optional run/scheme label, so multiple runs compare on one dashboard. On the client it is a label on `mx_build_info` **and** on every `mx_p2p_*` family; on the server it is on `mx_build_info` only. |
 | `MX_POOL_REG` | `0` | Allocation-level NIXL registration via `cuMemGetAddressRange`. Registers each unique cudaMalloc block instead of each tensor, typically 80-99% fewer registrations, without changing transfer semantics. `MX_VMM_ARENA=1` uses direct arena registration and does not require pool-reg. |
 | `MX_VMM_ARENA` | `0` | Route weight allocations into a CUDA VMM arena via PyTorch's `CUDAPluggableAllocator`, then register the used arena range as one NIXL MR with dmabuf at end-of-load. Reserves 16.0 TiB of VA by default, with no physical commit until allocations are mapped. Requires the `modelexpress.vmm._alloc_ext` C extension to have built at install time; if it did not, this flag is a no-op with a warning and the loader falls back to the pool-reg path. See [VMM Arena](#vmm-arena-single-mr-registration). |
 | `MX_ARENA_SINGLE_MR` | `0` | Keep single-MR arena registration even when the arena spans several `cuMemCreate` handles. Only safe on transports that can register across handles (dmabuf/IB); cuda_ipc cannot, so the default falls back to per-tensor registration. See [VMM Arena](#vmm-arena-single-mr-registration). |
@@ -601,7 +617,6 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend. `{rank}` is substituted with the worker's own rank. If the resolved pattern has no `:port`, the client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` (multi-GPU-per-pod shape); if it has an explicit port, that port is used verbatim (1-GPU-per-pod shape). |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` backend: max retries on `FAILED_PRECONDITION` (revision mismatch during rolling updates). Each retry opens a fresh gRPC channel so kube-proxy re-picks a backend. |
 | `MX_K8S_SOURCE_BACKOFF_SECONDS` | `0.5` | `k8s-service` backend: sleep between retry attempts. |
-| `MX_STATUS_TTL_SECS` | `3600` | TTL for Redis metadata keys (seconds) |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL (Redis backend only) |
 | `MX_METADATA_NAMESPACE` | `default` | K8s namespace for CRD backend |
 | `VLLM_RPC_TIMEOUT` | `7200000` | vLLM RPC timeout in ms (2 hours for large models) |
@@ -848,7 +863,7 @@ Requirements and limits:
 - ModelExpress Server needs a writable cache directory, egress to Hugging Face, and `HF_TOKEN` for private repositories. The worker needs none of these.
 - The server must be from a release newer than v0.5.0 — the first generation that keys registry entries on the weight mode. The metadata phase claims a metadata-only download; an older server records that claim against the model name alone, which marks the model complete, so the weight phase finds nothing left to fetch and the worker falls through to a native load that an offline pod cannot perform.
 - Mount the cache path as a volume shared by every container that touches it. Without a volume the snapshot lands in the container's writable layer, invisible to other containers and lost on restart.
-- Requesting a pinned revision is not supported yet: the client never sets `revision` on the first call of a phase, so the server picks its default revision. Every call after that is pinned to the revision the server reported — when it named none, later calls stay unpinned and the stream's own commit-hash validation is the guard, which still refuses a mid-stream change. A worker that asked for a specific revision gets the mismatch logged, and weights whose commit differs from the local snapshot directory are refused rather than mixed in.
+- Requesting a pinned revision is not supported yet: the metadata phase never asks for a particular revision, so the server picks its default. The weight phase does pin — it requests the commit the local snapshot is named after, so a server whose default revision has moved past that snapshot serves the snapshot's own weights instead of failing the phase; when the pinned call fails with a `grpc.RpcError` (resolving a pin needs the Hub, and its failure takes this shape) it degrades to the unpinned request, which is the previous behavior — a download failure the server reports through the status stream is raised, not retried. Every call after the first in a phase is pinned to the revision the server reported — when it named none, later calls stay unpinned and the stream's own commit-hash validation is the guard, which still refuses a mid-stream change. A worker that asked for a specific revision gets the mismatch logged, and weights whose commit differs from the local snapshot directory are refused rather than mixed in.
 - Reusing a local snapshot requires the server to name its revision. A server that already holds an unpinned model answers without naming one, so the worker restreams the metadata rather than assume the copy on disk is current. Metadata is small — well under a second — and the stream carries the commit, which makes restreaming the cheap way to stay correct.
 - On a cold server the metadata phase waits only for the non-weight files. The weights are downloaded later, and only if P2P found no source. The server keys its registry entry on the weight mode, so the metadata-only request does not mark the model complete.
 - The server dedups the upstream download but not the per-worker stream. Concurrent workers on a cold model all wait on one Hugging Face fetch, then each streams its own copy, so N replicas starting together cost N x model size in server egress. Size the server's network accordingly, or stagger large rollouts.

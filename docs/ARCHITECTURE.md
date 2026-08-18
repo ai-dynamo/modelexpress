@@ -473,15 +473,15 @@ Distributed backend selection lives outside the YAML, in env vars: `MX_METADATA_
 
 ### ModelRegistryBackend (Redis and Kubernetes CRD)
 
-**Redis backend**: single Redis Hash per cached model at `mx:model:{name}` with fields `provider`, `status`, `created_at` (RFC3339), `last_used_at` (RFC3339), and optional `message`. No secondary indexes — LRU ordering and status counts are computed on demand by `SCAN` + pipelined `HGETALL`/`HGET`. Claim, retry, and `set_status` updates use Lua scripts so concurrent readers see either the pre-update record or the complete post-update record, never a partially-written hash.
+**Redis backend**: single Redis Hash per cached model at `mx:model:{provider}:{name}` with fields `provider`, `status`, `created_at` (RFC3339), `last_used_at` (RFC3339), and optional `message`. No secondary indexes — LRU ordering and status counts are computed on demand by `SCAN` + pipelined `HGETALL`/`HGET`. Claim, retry, and `set_status` updates use Lua scripts so concurrent readers see either the pre-update record or the complete post-update record, never a partially-written hash.
 
-**Kubernetes CRD backend**: one `ModelCacheEntry` CR per cached model in the server's namespace. `spec.modelName` + `spec.provider` are immutable; `status.{phase,createdAt,lastUsedAt,message}` are patched via the status subresource. Atomicity on the claim path comes from etcd's name-uniqueness on `create` (409 Conflict on the loser). CR names use the shared `sanitize_model_name` with an `mx-cache-` prefix to stay distinct from the P2P `ModelMetadata` CRs.
+**Kubernetes CRD backend**: one `ModelCacheEntry` CR per cached model in the server's namespace. `spec.modelName` + `spec.provider` are immutable; `status.{phase,createdAt,lastUsedAt,message}` are patched via the status subresource. Atomicity on the claim path comes from etcd's name-uniqueness on `create` (409 Conflict on the loser). CR names are `mx-cache-` followed by `sanitize_registry_name("{provider}/{model_name}")`, which lowercases, maps `/` to `--`, and appends a sha256 suffix over the original name. The P2P `ModelMetadata` CRs use their own `sanitize_model_name`; the two are separate implementations, not a shared helper.
 
 Key operations on the async `RegistryBackend` trait:
 
 | Method | Redis implementation |
 |--------|----------------------|
-| `get_status(name)` | `HGET mx:model:{name} status` |
+| `get_status(name)` | `HGET mx:model:{provider}:{name} status` (falls back to the legacy name-only key so pre-0.5.0 records still resolve) |
 | `set_status(name, provider, status, msg)` | Lua `EVAL` updates status/provider/last_used_at/message atomically and `HSETNX`s `created_at` to preserve the first-write timestamp |
 | `try_claim_for_download(name, provider)` | `HSETNX status DOWNLOADING`; winner populates remaining fields without contention |
 | `touch_model(name)` | `HSET last_used_at {now}` (gated on `EXISTS` so touch is update-only, never create) |
@@ -543,18 +543,25 @@ The `Client` struct in `modelexpress_client/src/lib.rs` wraps gRPC connections:
 
 | Method | Purpose |
 |--------|---------|
-| `new(config)` | Create client with config |
-| `health_check()` | Call HealthService |
-| `ping()` | Call ApiService with "ping" |
-| `download_model(name, provider)` | Trigger download via streaming RPC |
-| `download_model_direct(name, provider, cache_dir)` | Download directly from provider |
-| `ensure_model(name, provider, strategy)` | Smart download with fallback strategy |
-| `stream_model_files(name)` | Stream model files from server |
-| `list_model_files(name)` | List model files on server |
-| `delete_model(name, cache_dir)` | Delete cached model |
-| `validate_model(name, cache_dir)` | Validate cached model integrity |
+| `new(config)` | Create a client with the given configuration |
+| `new_with_cache(config, cache_config)` | Create a client with an explicit cache configuration |
+| `get_cache_config()` | Get the client's cache configuration, if any |
+| `set_cache_config(cache_config)` | Set the client's cache configuration |
+| `list_cached_models()` | List locally cached models as `CacheStats` |
+| `clear_cached_model(name, provider)` | Remove a model's local files for a given provider |
+| `clear_all_cached_models()` | Clear the entire local cache |
+| `delete_model_on_server(name, provider)` | Delete the model's record from the server-side registry, so a cleared model leaves no stale `DOWNLOADED` record |
+| `get_model_path(name, provider)` | Resolve the local cache path for a model through its provider |
+| `health_check()` | Call HealthService and return the server `Status` |
+| `send_request(action, payload)` | Send a generic ApiService request and deserialize the response |
+| `request_model_on_server(name, provider)` | Request a download on the server at the provider's default revision |
+| `request_model_on_server_revision(name, provider, revision)` | Same, pinned to a branch, tag, or commit SHA; returns the resolved revision |
+| `request_model(name, provider)` | Request a model using the server as source of truth, streaming files locally when shared storage is disabled |
+| `request_model_revision(name, provider, revision)` | Same, pinned to a revision; returns the snapshot path and the revision it resolved to |
+| `request_model_with_smart_fallback(name, provider, ...)` | Request via the server, falling back to a direct provider download when the connection cannot be established |
+| `request_model_with_smart_fallback_revision(name, provider, revision, ...)` | Same, with the direct-download fallback honouring the same pinned revision |
 
-Each download entry point has a `_revision` variant — `request_model_revision`, `request_model_on_server_revision`, `request_model_with_smart_fallback_revision` — that takes an optional branch, tag, or commit SHA and returns a `ModelDownloadResult { path, resolved_revision }`. The non-`_revision` methods keep their existing signatures and delegate with no revision pinned.
+The `_revision` variants all take an optional branch, tag, or commit SHA, but they do not share a return type. `request_model_revision` and `request_model_with_smart_fallback_revision` return a `ModelDownloadResult { path, resolved_revision }`. `request_model_on_server_revision` only asks the server to fetch the model, so it returns the resolved revision on its own as an `Option<String>`. The non-`_revision` methods delegate to them with no revision pinned and discard the result.
 
 ### Download Strategies
 
@@ -570,12 +577,16 @@ The `Cli` struct in `args.rs` embeds `ClientArgs` via `#[command(flatten)]`. Com
 
 | Command | Purpose |
 |---------|---------|
-| `health` | Check server health |
-| `ping` | Ping server |
-| `model download <name>` | Download a model. `--revision <branch\|tag\|sha>` pins a revision; the resolved commit SHA is reported back |
-| `model list-files <name>` | List model files |
-| `model clear <name>` | Delete cached model |
-| `model validate <name>` | Validate model integrity |
+| `health` | Check server health and status |
+| `model download <name>` | Download a model with various strategies (automatically cached). `--revision <branch\|tag\|sha>` pins a revision; the resolved commit SHA is reported back |
+| `model init` | Initialize model storage configuration |
+| `model list` | List downloaded models |
+| `model status` | Show model storage status and usage |
+| `model clear <name>` | Clear a specific model from storage |
+| `model clear-all` | Clear all models from storage |
+| `model validate [name]` | Validate model integrity |
+| `model stats` | Show model storage statistics |
+| `api send <action>` | Send a custom API request |
 
 Output formats: `--format human` (default), `--format json`, `--format json-pretty`.
 
@@ -835,7 +846,7 @@ Fetching metadata unconditionally does not weaken P2P-first, because no weight m
 
 Each phase opens with `EnsureModelDownloaded` and pins everything after it to the revision that call reported, so the manifest and the stream come from one commit and a default revision that moves mid-phase cannot mix two; when the server names no revision, later calls go unpinned and the stream's commit-hash validation is what refuses a mid-phase change. Reuse of a local snapshot is gated on the same value and fails closed without it: a manifest carries only paths and sizes, so a revision that changed neither is indistinguishable from the copy on disk, and reusing it would skip the stream that would have caught the difference. The metadata phase asks with `ignore_weights=true`; the server keys its registry entry on the weight mode, so that claim cannot satisfy the weight phase's later full-weight request, and a cold server does not fetch weights before `RdmaStrategy` has had its chance at them.
 
-Two limits are worth knowing. The client never asks for a particular revision, only for whichever one the server resolves by default, so a worker that pinned a revision of its own gets a logged mismatch rather than the revision it wanted. And a server that already holds an unpinned model reports no revision at all, so the metadata phase restreams instead of reusing what is on disk; the files are small and the stream carries the commit, which makes restreaming the cheap way to stay correct.
+Two limits are worth knowing. The metadata phase never asks for a particular revision, only for whichever one the server resolves by default, so a worker that pinned a revision of its own gets a logged mismatch rather than the revision it wanted; the weight phase does pin its request — to the commit the snapshot is named after — so its download claim is scoped to that revision, and it degrades to an unpinned request when the pinned call fails with a `grpc.RpcError`, the shape a failed pin resolve takes; a download failure the server reports through the status stream is raised, not retried. And a server that already holds an unpinned model reports no revision at all, so the metadata phase restreams instead of reusing what is on disk; the files are small and the stream carries the commit, which makes restreaming the cheap way to stay correct.
 
 Strategies handle the loading path and NIXL tensor registration. `LoadContext.accelerator_backend` centralizes accelerator-specific torch operations and capability gates for fast paths such as pool registration, VMM arena registration, and GDS. Backends that do not support those CUDA-specific paths, such as XPU, leave the gates disabled and use the generic fallback path. XPU transfer deployments still require a UCX/NIXL runtime that can register XPU device memory. Adapter hooks handle engine lifecycle such as vLLM `process_weights_after_loading`, and the chain performs best-effort metadata publication after a successful strategy. New strategies can be added by creating a new file in `load_strategy/` and registering it in `LoadStrategyChain.run()`.
 

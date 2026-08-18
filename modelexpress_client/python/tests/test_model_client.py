@@ -3,6 +3,7 @@
 
 """Tests for the ModelExpress model-cache client and its stream validation."""
 
+import grpc
 import pytest
 
 from modelexpress import model_pb2
@@ -388,6 +389,56 @@ class TestInstallWeightFiles:
         make_client(tmp_path, stub).install_weight_files(MODEL, snapshot)
 
         assert [r.ignore_weights for r in stub.download_requests] == [False]
+
+    def test_pins_the_download_to_the_snapshot_commit(self, tmp_path):
+        """The weight phase asks for the snapshot's own commit.
+
+        Without the pin, a server whose default revision moved past this
+        snapshot downloads the newer revision and the phase fails on the
+        mismatch check -- even though the server could have fetched the
+        snapshot's commit.
+        """
+        snapshot = self._snapshot(tmp_path)
+        stub = FakeStub(
+            files={"config.json": 2, "model.safetensors": 7},
+            chunks=[
+                whole_file("model.safetensors", b"weights", is_last_file=True, commit_hash=COMMIT)
+            ],
+            resolved_revision=COMMIT,
+        )
+        make_client(tmp_path, stub).install_weight_files(MODEL, snapshot)
+
+        assert stub.download_requests[0].revision == COMMIT
+        assert stub.list_requests[0].revision == COMMIT
+        assert (snapshot / "model.safetensors").read_bytes() == b"weights"
+
+    def test_falls_back_to_an_unpinned_download_when_the_pin_fails(self, tmp_path):
+        """A failed pinned request degrades to the previous behavior.
+
+        Resolving a pin needs the Hub; the server's cache fallback during an
+        outage exists only on the unpinned path. Without the fallback, an
+        outage the unpinned path survives would fail the weight phase.
+        """
+        snapshot = self._snapshot(tmp_path)
+        stub = FakeStub(
+            files={"config.json": 2, "model.safetensors": 7},
+            chunks=[
+                whole_file("model.safetensors", b"weights", is_last_file=True, commit_hash=COMMIT)
+            ],
+        )
+        original = stub.EnsureModelDownloaded
+
+        def failing_when_pinned(request):
+            if request.HasField("revision"):
+                raise grpc.RpcError("revision resolve failed")
+            return original(request)
+
+        stub.EnsureModelDownloaded = failing_when_pinned
+        make_client(tmp_path, stub).install_weight_files(MODEL, snapshot)
+
+        # Only the unpinned retry reaches the recording stub.
+        assert [r.HasField("revision") for r in stub.download_requests] == [False]
+        assert (snapshot / "model.safetensors").read_bytes() == b"weights"
 
     def test_wrong_commit_aborts_before_transferring(self, tmp_path):
         """Reject on the first chunk, not after the whole checkpoint arrives.

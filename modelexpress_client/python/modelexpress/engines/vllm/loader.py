@@ -34,6 +34,7 @@ import torch.nn as nn
 
 from ... import configure_vllm_logging, envs, model_prefetch
 from ...load_strategy import LoadContext, LoadStrategyChain
+from ...metrics import enable_metrics
 from ...nixl_transfer import NixlTransferManager
 from ...vmm.runtime import log_arena_post_load, maybe_enter_vmm_arena
 from .adapter import _is_speculative_draft, build_vllm_load_context
@@ -71,6 +72,11 @@ class MxModelLoader(BaseModelLoader):
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         configure_vllm_logging()
+        # Unconditionally, and off the load path: a run that skips P2P and falls
+        # back to a local or HuggingFace path must still bring the exporter up,
+        # or it produces output byte-identical to MX_METRICS_ENABLED=0 -- the run
+        # you most need to diagnose. No-op unless enabled; never raises.
+        enable_metrics()
         self._ctx: LoadContext | None = None
 
     def load_model(

@@ -6,7 +6,6 @@
 use crate::grpc::p2p::{
     ArtifactManifest as ProtoArtifactManifest, ArtifactManifestChunk as ProtoArtifactManifestChunk,
     ArtifactManifestFile as ProtoArtifactManifestFile, ArtifactSourceMetadata,
-    GetArtifactManifestChunksResponse, GetArtifactManifestHeaderResponse,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use crc32c::{crc32c, crc32c_append};
@@ -20,10 +19,6 @@ use std::{
 
 pub const ARTIFACT_MANIFEST_VERSION: u32 = 1;
 pub const MAX_ARTIFACT_TRANSFER_CHUNK_SIZE: u64 = 4 * 1024 * 1024 * 1024;
-// Number of chunk metadata records per GetArtifactManifestChunks response.
-// This is not the artifact byte chunk size; 1024 keeps metadata responses
-// bounded while avoiding one RPC per transfer chunk.
-const ARTIFACT_CHUNK_METADATA_PAGE_SIZE: u32 = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactManifest {
@@ -171,75 +166,6 @@ impl SealedArtifactManifest {
                 .context("artifact manifest file count exceeds u32")?,
             chunk_count: self.manifest.chunk_count()?,
             node_rank: 0,
-        })
-    }
-
-    pub fn to_header_response(
-        &self,
-        mx_source_id: impl Into<String>,
-        metadata_endpoint: impl Into<String>,
-        agent_name: impl Into<String>,
-        worker_rank: u32,
-    ) -> Result<GetArtifactManifestHeaderResponse> {
-        Ok(GetArtifactManifestHeaderResponse {
-            mx_source_id: mx_source_id.into(),
-            artifact_id: self.artifact_id.clone(),
-            manifest_version: self.manifest.manifest_version,
-            mx_source_type: self.manifest.mx_source_type,
-            total_size: self.manifest.total_size()?,
-            file_count: u32::try_from(self.manifest.files.len())
-                .context("artifact manifest file count exceeds u32")?,
-            chunk_count: self.manifest.chunk_count()?,
-            chunk_size: self.manifest.chunk_size,
-            metadata_endpoint: metadata_endpoint.into(),
-            agent_name: agent_name.into(),
-            worker_rank,
-            files: self
-                .manifest
-                .files
-                .iter()
-                .map(ArtifactManifestFile::to_proto)
-                .collect(),
-        })
-    }
-
-    pub fn to_chunks_response(
-        &self,
-        mx_source_id: impl Into<String>,
-        start_chunk_index: u32,
-        max_chunks: u32,
-    ) -> Result<GetArtifactManifestChunksResponse> {
-        let start = usize::try_from(start_chunk_index)
-            .context("artifact manifest start chunk index exceeds usize")?;
-        if start > self.manifest.chunks.len() {
-            bail!(
-                "artifact manifest start_chunk_index {} exceeds chunk_count {}",
-                start_chunk_index,
-                self.manifest.chunks.len()
-            );
-        }
-        let max_chunks = if max_chunks == 0 {
-            ARTIFACT_CHUNK_METADATA_PAGE_SIZE
-        } else {
-            max_chunks.min(ARTIFACT_CHUNK_METADATA_PAGE_SIZE)
-        };
-        let max =
-            usize::try_from(max_chunks).context("artifact manifest page size exceeds usize")?;
-        let end = start.saturating_add(max).min(self.manifest.chunks.len());
-        let next_page_token = if end < self.manifest.chunks.len() {
-            end.to_string()
-        } else {
-            String::new()
-        };
-        Ok(GetArtifactManifestChunksResponse {
-            mx_source_id: mx_source_id.into(),
-            artifact_id: self.artifact_id.clone(),
-            start_chunk_index,
-            chunks: self.manifest.chunks[start..end]
-                .iter()
-                .map(ArtifactManifestChunk::to_proto)
-                .collect(),
-            next_page_token,
         })
     }
 }
@@ -591,36 +517,6 @@ mod tests {
     }
 
     #[test]
-    fn chunks_response_uses_default_page_size_for_zero_max_chunks() {
-        let sealed = SealedArtifactManifest {
-            artifact_id: "artifact".to_string(),
-            manifest: manifest_with_1025_chunks(),
-        };
-
-        let response = sealed
-            .to_chunks_response("source-123", 0, 0)
-            .expect("chunks response");
-
-        assert_eq!(response.chunks.len(), 1024);
-        assert_eq!(response.next_page_token, "1024");
-    }
-
-    #[test]
-    fn chunks_response_caps_requested_page_size() {
-        let sealed = SealedArtifactManifest {
-            artifact_id: "artifact".to_string(),
-            manifest: manifest_with_1025_chunks(),
-        };
-
-        let response = sealed
-            .to_chunks_response("source-123", 0, 2048)
-            .expect("chunks response");
-
-        assert_eq!(response.chunks.len(), 1024);
-        assert_eq!(response.next_page_token, "1024");
-    }
-
-    #[test]
     fn pinned_artifact_manifest_id_cross_checked_with_python() {
         let manifest = ArtifactManifest {
             manifest_version: ARTIFACT_MANIFEST_VERSION,
@@ -698,29 +594,6 @@ mod tests {
             file_offset,
             length,
             checksum: checksum.to_string(),
-        }
-    }
-
-    fn manifest_with_1025_chunks() -> ArtifactManifest {
-        ArtifactManifest {
-            manifest_version: ARTIFACT_MANIFEST_VERSION,
-            mx_source_type: MxSourceType::TorchCompileCache as i32,
-            chunk_size: 1,
-            files: vec![ArtifactManifestFile {
-                file_index: 0,
-                path: "/tmp/artifact.bin".to_string(),
-                size: 1025,
-                checksum: "file".to_string(),
-            }],
-            chunks: (0..1025)
-                .map(|index| ArtifactManifestChunk {
-                    chunk_index: index,
-                    file_index: 0,
-                    file_offset: u64::from(index),
-                    length: 1,
-                    checksum: format!("chunk-{index}"),
-                })
-                .collect(),
         }
     }
 }

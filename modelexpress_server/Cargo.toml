@@ -30,20 +30,17 @@ tls-rustls = ["modelexpress-common/tls-rustls", "kube/rustls-tls"]
 modelexpress-common = { workspace = true, default-features = false }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+axum = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 config = { workspace = true }
 futures = { workspace = true }
-hf-hub = { workspace = true }
-jiff = { workspace = true }
-once_cell = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
-toml = "0.9"
 tonic = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -62,13 +59,12 @@ tower = { workspace = true }
 http = { workspace = true }
 moka = { workspace = true }
 secrecy = { workspace = true }
+prometheus-client = { workspace = true }
 
 [dev-dependencies]
 modelexpress-common = { workspace = true, default-features = false, features = ["test-support"] }
 mockall = { workspace = true }
 tempfile = "3.20"
-tokio-test = "0.4"
-tonic-build = { workspace = true }
 modelexpress-client.workspace = true
 
 [[test]]
