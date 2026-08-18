@@ -24,7 +24,6 @@ keywords = ["llm", "inference", "nvidia"]
 [workspace.dependencies]
 anyhow = { version = "1.0.98", features = ["backtrace"] }
 async-trait = "0.1"
-axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 config = { version = "0.15", features = ["yaml", "toml", "json"] }
@@ -59,6 +58,7 @@ uuid = { version = "1.17", features = ["v4", "serde"] }
 thiserror = "2.0"
 tower = { version = "0.5.3", features = ["util"] }
 http = "1.4.1"
+http-body-util = "0.1.4"
 moka = { version = "0.12.15", features = ["future"] }
 secrecy = "0.10.3"
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }

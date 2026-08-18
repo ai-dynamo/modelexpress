@@ -198,10 +198,9 @@ pub async fn run_server(
             config.security.allowed_service_accounts.len(),
             config.security.token_audiences.len()
         );
-        Some(AuthLayer::new(Arc::new(AuthState::new(
-            client,
-            &config.security,
-        ))))
+        let state = Arc::new(AuthState::new(client, &config.security));
+        AuthState::spawn_summary_reporter(&state);
+        Some(AuthLayer::new(state))
     };
 
     let api = ApiServiceServer::new(api_service);

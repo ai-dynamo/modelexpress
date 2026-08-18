@@ -91,7 +91,7 @@ jobs:
 
     - name: Run integration tests
       if: matrix.rust == 'stable'
-      run: cargo test -p modelexpress-server --features integration-tests --test in_process_server
+      run: cargo test -p modelexpress-server --features integration-tests --tests
 
     - name: Build release
       run: cargo build --release --verbose

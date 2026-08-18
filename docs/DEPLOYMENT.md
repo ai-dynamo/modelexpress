@@ -235,9 +235,12 @@ Other properties to be aware of:
   keeps flowing even if the token expires or the ServiceAccount is revoked mid-stream;
   revocation takes effect on the next RPC (bounded by the cache TTL below).
 - Definitive rejections are cached per token; backend errors (e.g. an unreachable
-  apiserver) return `UNAVAILABLE` and are not cached. A caller cycling unique invalid
-  tokens sends one `TokenReview` to the Kubernetes API server per token. The gRPC port
-  should not be reachable from untrusted networks.
+  apiserver) return `UNAVAILABLE` and are not cached. The gRPC port should not be
+  reachable from untrusted networks.
+- Cache-miss verification is bounded: when the concurrency limit on `TokenReview` calls
+  is saturated the server sheds load with `UNAVAILABLE` rather than queueing. The auth
+  path logs an `auth interval summary` line each minute with review, rejection, shed,
+  and backend-error counts.
 
 ### Modes
 
