@@ -172,6 +172,120 @@ def _build_qkv_aliases(
 ) -> list[PublishedTensor]:
     if len(item.hf_names) != 3 or item.tensor.ndim != 2:
         raise ValueError(f"{item.name}: QKV aliasing requires 2D q/k/v weights")
+    has_global_q = "num_heads" in item.extras
+    has_global_kv = "num_kv_heads" in item.extras
+    if has_global_q != has_global_kv:
+        raise ValueError(
+            f"{item.name}: global QKV metadata requires both num_heads and num_kv_heads"
+        )
+    if has_global_q:
+        return _build_global_qkv_aliases(item, agent_name)
+    return _build_legacy_qkv_aliases(item, agent_name)
+
+
+def _qkv_source_interval(item: MegatronTensorSpec) -> tuple[int, int]:
+    """Return this rank's raw row interval in the global fused QKV tensor."""
+    local_rows = int(item.tensor.shape[0])
+    global_rows = int(item.global_shape[0])
+    if item.placement_kind != "SHARD":
+        if local_rows != global_rows:
+            raise ValueError(f"{item.name}: replicated QKV shape mismatch")
+        return 0, global_rows
+    if item.shard_axis != 0 or item.local_shard_range is None:
+        raise ValueError(f"{item.name}: QKV shards must carry a row range")
+    lo, hi = (int(value) for value in item.local_shard_range)
+    if not 0 <= lo < hi <= global_rows or hi - lo != local_rows:
+        raise ValueError(f"{item.name}: inconsistent QKV source row interval")
+    return lo, hi
+
+
+def _build_global_qkv_aliases(
+    item: MegatronTensorSpec, agent_name: str
+) -> list[PublishedTensor]:
+    """Map one raw TP row interval through Megatron's global QKV interleave."""
+    if item.extras.get("qkv_interleave") != "by_head":
+        raise ValueError(
+            f"{item.name}: global QKV aliasing requires qkv_interleave='by_head'"
+        )
+    head_dim = int(item.extras["head_dim"])
+    q_heads = int(item.extras["num_heads"])
+    kv_heads = int(item.extras["num_kv_heads"])
+    if head_dim < 1 or q_heads < 1 or kv_heads < 1 or q_heads % kv_heads:
+        raise ValueError(f"{item.name}: invalid global Q/KV head geometry")
+
+    hidden = int(item.tensor.shape[1])
+    if len(item.global_shape) != 2 or int(item.global_shape[1]) != hidden:
+        raise ValueError(f"{item.name}: QKV hidden dimension mismatch")
+    q_heads_per_group = q_heads // kv_heads
+    q_rows_per_group = q_heads_per_group * head_dim
+    group_rows = q_rows_per_group + 2 * head_dim
+    expected_global_rows = kv_heads * group_rows
+    if int(item.global_shape[0]) != expected_global_rows:
+        raise ValueError(f"{item.name}: global QKV rows disagree with head metadata")
+
+    source_lo, source_hi = _qkv_source_interval(item)
+    shards: list[list[PublishedShard]] = [[], [], []]
+    mapped_rows = 0
+    for group in range(kv_heads):
+        group_lo = group * group_rows
+        parts = (
+            (group_lo, q_rows_per_group, group * q_rows_per_group),
+            (group_lo + q_rows_per_group, head_dim, group * head_dim),
+            (group_lo + q_rows_per_group + head_dim, head_dim, group * head_dim),
+        )
+        for part_index, (part_lo, part_rows, destination_lo) in enumerate(parts):
+            part_hi = part_lo + part_rows
+            overlap_lo = max(source_lo, part_lo)
+            overlap_hi = min(source_hi, part_hi)
+            if overlap_lo >= overlap_hi:
+                continue
+            rows = overlap_hi - overlap_lo
+            tensor = item.tensor.narrow(0, overlap_lo - source_lo, rows)
+            shards[part_index].append(
+                PublishedShard(
+                    agent_name=agent_name,
+                    device_id=int(tensor.device.index or 0),
+                    addr=int(tensor.data_ptr()),
+                    shard_offset=(destination_lo + overlap_lo - part_lo, 0),
+                    shape=tuple(int(dim) for dim in tensor.shape),
+                    digest=published_digest(tensor),
+                )
+            )
+            mapped_rows += rows
+
+    if mapped_rows != int(item.tensor.shape[0]):
+        raise ValueError(
+            f"{item.name}: QKV interval mapping covered {mapped_rows} of "
+            f"{int(item.tensor.shape[0])} source rows"
+        )
+
+    aliases = []
+    for name, rows, tensor_shards in zip(
+        item.hf_names,
+        (q_heads * head_dim, kv_heads * head_dim, kv_heads * head_dim),
+        shards,
+        strict=True,
+    ):
+        # When KV heads are fewer than TP ranks, most publishers legitimately
+        # own no K or V rows. Other ranks contribute those destination intervals
+        # when the per-rank tables are merged.
+        if tensor_shards:
+            aliases.append(
+                PublishedTensor(
+                    name=name,
+                    dtype=str(item.tensor.dtype),
+                    elsize=int(item.tensor.element_size()),
+                    full_shape=(rows, hidden),
+                    shards=tensor_shards,
+                )
+            )
+    return aliases
+
+
+def _build_legacy_qkv_aliases(
+    item: MegatronTensorSpec, agent_name: str
+) -> list[PublishedTensor]:
+    """Compatibility path for descriptors whose head counts divide across TP."""
     required = ("head_dim", "num_heads_local", "num_kv_heads_local")
     missing = [key for key in required if key not in item.extras]
     if missing:
