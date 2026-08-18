@@ -56,9 +56,6 @@ pub struct Response<T> {
 /// Common error types that both client and server can use
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("Network error: {0}")]
-    Network(String),
-
     #[error("Server returned error: {0}")]
     Server(String),
 
@@ -373,9 +370,6 @@ mod tests {
 
     #[test]
     fn test_error_types() {
-        let network_error = Error::Network("Connection failed".to_string());
-        assert!(network_error.to_string().contains("Network error"));
-
         let server_error = Error::Server("Internal error".to_string());
         assert!(server_error.to_string().contains("Server returned error"));
 

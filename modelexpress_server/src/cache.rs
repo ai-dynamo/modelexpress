@@ -409,44 +409,6 @@ impl CacheEvictionService {
         Ok(())
     }
 
-    /// Manually trigger eviction for specific models
-    pub async fn manual_evict(
-        &self,
-        model_names: &[String],
-    ) -> Result<EvictionResult, Box<dyn std::error::Error + Send + Sync>> {
-        info!(
-            "Manual eviction requested for models: {models:?}",
-            models = model_names
-        );
-
-        let mut successfully_evicted = Vec::new();
-        for model_name in model_names {
-            match self.evict_model(model_name).await {
-                Ok(()) => {
-                    successfully_evicted.push(model_name.clone());
-                    info!(
-                        "Successfully evicted model: {model_name}",
-                        model_name = model_name
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to evict model '{model_name}': {e}",
-                        model_name = model_name,
-                        e = e
-                    );
-                }
-            }
-        }
-
-        Ok(EvictionResult {
-            evicted_count: successfully_evicted.len() as u32,
-            evicted_models: successfully_evicted,
-            bytes_freed: None,
-            reason: EvictionReason::Manual,
-        })
-    }
-
     /// Get statistics about the current cache state
     pub async fn get_cache_stats(
         &self,

@@ -197,22 +197,6 @@ impl FromStr for LogFormat {
     }
 }
 
-/// Base trait for configuration loading with layered approach
-pub trait ConfigLoader<T> {
-    /// Load configuration from multiple sources in order of precedence:
-    /// 1. Command line arguments (highest priority)
-    /// 2. Environment variables
-    /// 3. Configuration file
-    /// 4. Default values (lowest priority)
-    fn load_layered(
-        config_file: Option<PathBuf>,
-        env_prefix: &str,
-        defaults: T,
-    ) -> Result<T, ConfigError>
-    where
-        T: serde::de::DeserializeOwned + Default;
-}
-
 /// Load configuration file strictly without any fallbacks to defaults.
 /// This function will return an error if the file doesn't exist, has invalid syntax,
 /// or contains invalid values. Use this for validation purposes.
