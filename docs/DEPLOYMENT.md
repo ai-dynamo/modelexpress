@@ -103,7 +103,13 @@ reachable.
 | `REDIS_URL` | e.g. `redis://host:6379` | when Redis | Redis connection (or set `MX_REDIS_HOST` / `MX_REDIS_PORT`) |
 | `POD_NAMESPACE` / `MX_METADATA_NAMESPACE` | e.g. `default` | when Kubernetes | Namespace for the `ModelMetadata` and `ModelCacheEntry` CRDs |
 
-To use the Kubernetes backend, apply `examples/crds.yaml` at cluster install time (installs both the `ModelMetadata` P2P CRD and the `ModelCacheEntry` registry CRD), then either enable `serviceAccount.rbac.enabled=true` on the Helm chart or apply `examples/p2p_transfer_k8s/server/kubernetes_backend/rbac-modelmetadata.yaml`.
+To use the Kubernetes backend, apply `examples/crds.yaml` at cluster install time
+(installs both the `ModelMetadata` P2P CRD and the `ModelCacheEntry` registry CRD),
+then either enable `serviceAccount.rbac.enabled=true` on the Helm chart or apply
+`examples/p2p_transfer_k8s/server/kubernetes_backend/rbac-modelmetadata.yaml`.
+The chart creates a `ClusterRole` and `ClusterRoleBinding`, allowing the server
+to run in a dedicated namespace while accessing metadata resources in another
+namespace.
 
 For automatic cleanup of P2P metadata, expose the client Pod identity through
 the Kubernetes Downward API. The checked-in vLLM, SGLang, and Dynamo manifests
@@ -192,7 +198,6 @@ The CLI client also uses layered configuration: CLI args > env vars > config fil
 | `MODEL_EXPRESS_ENDPOINT` | `http://localhost:8001` | Server endpoint |
 | `MODEL_EXPRESS_TIMEOUT` | `30` | Request timeout (seconds) |
 | `MODEL_EXPRESS_CACHE_DIRECTORY` | (auto) | Cache path override |
-| `MODEL_EXPRESS_MAX_RETRIES` | (none) | Max retry attempts |
 | `MODEL_EXPRESS_NO_SHARED_STORAGE` | `false` | Use gRPC streaming instead of shared storage |
 | `MODEL_EXPRESS_TRANSFER_CHUNK_SIZE` | `32768` | Transfer chunk size (bytes) |
 
@@ -581,7 +586,8 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_METRICS_SCHEME` | `""` | Optional run/scheme label added to every metric, so multiple runs compare on one dashboard. |
 | `MX_POOL_REG` | `0` | Allocation-level NIXL registration via `cuMemGetAddressRange`. Registers each unique cudaMalloc block instead of each tensor, typically 80-99% fewer registrations, without changing transfer semantics. `MX_VMM_ARENA=1` uses direct arena registration and does not require pool-reg. |
 | `MX_VMM_ARENA` | `0` | Route weight allocations into a CUDA VMM arena via PyTorch's `CUDAPluggableAllocator`, then register the used arena range as one NIXL MR with dmabuf at end-of-load. Reserves 16.0 TiB of VA by default, with no physical commit until allocations are mapped. Requires the `modelexpress.vmm._alloc_ext` C extension to have built at install time; if it did not, this flag is a no-op with a warning and the loader falls back to the pool-reg path. See [VMM Arena](#vmm-arena-single-mr-registration). |
-| `UCX_CUDA_COPY_REG_WHOLE_ALLOC` | (UCX default) | Set to `off` with `MX_VMM_ARENA=1` until the upstream UCX `cuda_copy_md` length-truncation fix ships. |
+| `MX_ARENA_SINGLE_MR` | `0` | Keep single-MR arena registration even when the arena spans several `cuMemCreate` handles. Only safe on transports that can register across handles (dmabuf/IB); cuda_ipc cannot, so the default falls back to per-tensor registration. See [VMM Arena](#vmm-arena-single-mr-registration). |
+| `UCX_CUDA_COPY_REG_WHOLE_ALLOC` | (UCX default) | Set to `off` with `MX_VMM_ARENA=1` on any UCX predating the `cuda_copy_md` length-truncation fix (openucx/ucx#11461). Scoped to the `cuda_copy` transport; it does not affect `cuda_ipc`. |
 | `MX_NIXL_BACKEND` | `UCX` | NIXL backend for GPU-to-GPU RDMA. `UCX` (default) for InfiniBand / RoCE. `LIBFABRIC` for AWS EFA — see [NIXL Backend Selection](#nixl-backend-selection). |
 | `MX_RDMA_NIC_PIN` | (unset) | Per-rank IB NIC pinning. `auto` runs a topology probe; comma-separated NIC list is an explicit override. Workaround for openucx/ucx#11259. |
 | `MX_RDMA_NIC_PIN_MIN_RATE_GBPS` | (auto, max-rate filter) | Override the auto-detect rate filter with an explicit lower bound (Gb/s). |
@@ -600,7 +606,6 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend. `{rank}` is substituted with the worker's own rank. If the resolved pattern has no `:port`, the client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` (multi-GPU-per-pod shape); if it has an explicit port, that port is used verbatim (1-GPU-per-pod shape). |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` backend: max retries on `FAILED_PRECONDITION` (revision mismatch during rolling updates). Each retry opens a fresh gRPC channel so kube-proxy re-picks a backend. |
 | `MX_K8S_SOURCE_BACKOFF_SECONDS` | `0.5` | `k8s-service` backend: sleep between retry attempts. |
-| `MX_STATUS_TTL_SECS` | `3600` | TTL for Redis metadata keys (seconds) |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL (Redis backend only) |
 | `MX_METADATA_NAMESPACE` | `default` | K8s namespace for CRD backend |
 | `VLLM_RPC_TIMEOUT` | `7200000` | vLLM RPC timeout in ms (2 hours for large models) |
@@ -662,7 +667,9 @@ arena address. Frees unmap and release that handle, so replacement tensors
 created during post-processing can return physical memory before the final
 registration step. At end-of-load, ModelExpress registers the used arena
 range once through dmabuf and publishes all tensor descriptors against
-that single MR.
+that single MR — but only when the arena is backed by a single physical
+allocation. An arena that spans several `cuMemCreate` handles falls back to
+per-tensor registration; see [Multi-handle arenas](#multi-handle-arenas) below.
 
 Recommended source-worker setting:
 
@@ -677,12 +684,47 @@ arena registration bypasses the pool-reg path and calls `register_arena`
 directly. The arena produces one MR for the used range regardless of the
 pool-reg setting.
 
-Set `UCX_CUDA_COPY_REG_WHOLE_ALLOC=off` until the upstream UCX
-`cuda_copy_md` length-truncation fix ships. Without it, UCX can truncate
-a multi-handle VMM registration to the first physical handle, and RDMA
-operations that cross into later handles fail. See the reproducer and
-fix notes in this gist:
+Set `UCX_CUDA_COPY_REG_WHOLE_ALLOC=off` on any UCX predating the
+`cuda_copy_md` length-truncation fix (openucx/ucx#11461). Without it, UCX
+can truncate a multi-handle VMM registration to the first physical
+handle, and RDMA operations that cross into later handles fail. See the
+reproducer and fix notes in this gist:
 <https://gist.github.com/nicolasnoble/e0e57eb5a1b902057ae3d1df59c039cf>.
+
+That knob covers the `cuda_copy` transport only. It has no effect on
+`cuda_ipc`, which has its own multi-handle limitation described in
+[Multi-handle arenas](#multi-handle-arenas) below.
+
+#### Multi-handle arenas
+
+A CUDA fabric/IPC handle names exactly one `cuMemCreate` allocation. UCX
+cuda_ipc resolves a registered region with `cuMemRetainAllocationHandle` and
+`cuMemGetAddressRange`, both of which report the allocation holding the base
+pointer rather than the whole reserve. Registering a multi-allocation arena as
+one MR therefore publishes an rkey covering only its first chunk, and the peer
+reads past what it mapped — measured on GB200 MNNVL as a segfault in
+`cuMemcpyDtoDAsync_v2` with an arena spanning 1019 chunks.
+
+ModelExpress detects this (`live_allocation_count > 1`) and falls back to
+per-tensor registration, which is correct because each arena allocation is one
+handle, so every tensor lies wholly inside one. The log line names the count:
+
+```text
+register_arena: arena spans 1019 physical allocations; a single MR would publish
+an rkey covering only the first, which cuda_ipc cannot address. Falling back to
+per-tensor registration ...
+```
+
+`UCX_CUDA_COPY_REG_WHOLE_ALLOC=off` does not cover this case: it applies to
+cuda_copy, while the truncation above is in cuda_ipc, and UCX 1.21 has no
+cuda_ipc equivalent. Upstream fixes are in flight for both sides —
+[openucx/ucx#11283](https://github.com/openucx/ucx/pull/11283) for cuda_ipc and
+[openucx/ucx#11461](https://github.com/openucx/ucx/pull/11461) for the
+cuda_copy/dmabuf length truncation.
+
+Set `MX_ARENA_SINGLE_MR=1` to keep the single-MR path on deployments where it
+was validated, i.e. dmabuf/IB, where `ibv_reg_dmabuf_mr` does span several
+handles.
 
 ### P2P Metadata Exchange
 
@@ -780,6 +822,41 @@ but do not authenticate the publishing replica or attest the artifact. Enable
 artifact transfer only within a trusted deployment, and network-isolate the MX
 server and worker gRPC endpoints from untrusted clients. ModelExpress does not
 currently sign cache artifacts.
+
+### Server-Backed Model Cache (No Shared Storage)
+
+For workers that cannot reach the Hugging Face Hub themselves, ModelExpress Server can act as the only route to the model. The worker asks the server for repository files; the server downloads the model once on a cold miss and serves every later worker from its own cache.
+
+Weights and everything else are fetched at different times. Config, tokenizer, and index files arrive before the engine starts, because the engine resolves the model path (and fails offline) long before any weight loader runs. Weights stay behind the strategy chain, so a live P2P source is still the first choice and the server is only asked after `RdmaStrategy` finds nothing. Fetching metadata early does not weaken P2P-first — no weight moves on that path.
+
+Enable it on the worker:
+
+```yaml
+MODEL_EXPRESS_URL: http://<model-express-service>:8001
+MODEL_EXPRESS_NO_SHARED_STORAGE: "1"
+MODEL_EXPRESS_CACHE_DIRECTORY: /home/dynamo/.cache/huggingface/hub
+HF_HUB_CACHE: /home/dynamo/.cache/huggingface/hub
+HF_HUB_OFFLINE: "1"
+```
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MODEL_EXPRESS_NO_SHARED_STORAGE` | `0` | Fetch repository files from ModelExpress Server. When unset, nothing changes: no extra RPCs and no change to P2P or local loading. |
+| `MODEL_EXPRESS_URL` | unset | ModelExpress Server address. Required together with the switch above; without an address the feature stays off. |
+| `MX_SERVER_ADDRESS` | unset | Alternative spelling of the server address, accepted for parity with the P2P client. Either variable satisfies the requirement. |
+| `MODEL_EXPRESS_CACHE_DIRECTORY` | `HF_HUB_CACHE` | Where the worker installs snapshots. Point it at the same path as `HF_HUB_CACHE` so the engine reads what ModelExpress wrote. |
+| `MODEL_EXPRESS_TRANSFER_CHUNK_SIZE` | `1048576` | gRPC file-stream chunk size in bytes. Values outside 1..`MAX_CHUNK_SIZE` fall back to the default rather than failing startup. |
+
+Requirements and limits:
+
+- ModelExpress Server needs a writable cache directory, egress to Hugging Face, and `HF_TOKEN` for private repositories. The worker needs none of these.
+- The server must be from a release newer than v0.5.0 — the first generation that keys registry entries on the weight mode. The metadata phase claims a metadata-only download; an older server records that claim against the model name alone, which marks the model complete, so the weight phase finds nothing left to fetch and the worker falls through to a native load that an offline pod cannot perform.
+- Mount the cache path as a volume shared by every container that touches it. Without a volume the snapshot lands in the container's writable layer, invisible to other containers and lost on restart.
+- Requesting a pinned revision is not supported yet: the client never sets `revision` on the first call of a phase, so the server picks its default revision. Every call after that is pinned to the revision the server reported — when it named none, later calls stay unpinned and the stream's own commit-hash validation is the guard, which still refuses a mid-stream change. A worker that asked for a specific revision gets the mismatch logged, and weights whose commit differs from the local snapshot directory are refused rather than mixed in.
+- Reusing a local snapshot requires the server to name its revision. A server that already holds an unpinned model answers without naming one, so the worker restreams the metadata rather than assume the copy on disk is current. Metadata is small — well under a second — and the stream carries the commit, which makes restreaming the cheap way to stay correct.
+- On a cold server the metadata phase waits only for the non-weight files. The weights are downloaded later, and only if P2P found no source. The server keys its registry entry on the weight mode, so the metadata-only request does not mark the model complete.
+- The server dedups the upstream download but not the per-worker stream. Concurrent workers on a cold model all wait on one Hugging Face fetch, then each streams its own copy, so N replicas starting together cost N x model size in server egress. Size the server's network accordingly, or stagger large rollouts.
+- An unreachable server costs about 20 seconds per worker before loading falls through to the next strategy. That is the TCP connect timeout; a shorter deadline would abort legitimate cold-cache downloads, which can take minutes.
 
 ### InstantTensor (Fast Local Safetensors)
 

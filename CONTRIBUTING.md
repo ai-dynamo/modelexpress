@@ -125,7 +125,6 @@ MX_METADATA_BACKEND=redis REDIS_URL=redis://localhost:6379 cargo run -p modelexp
 | `MODEL_EXPRESS_ENDPOINT` | `http://localhost:8001` | Server endpoint |
 | `MODEL_EXPRESS_TIMEOUT` | `30` | Request timeout in seconds |
 | `MODEL_EXPRESS_CACHE_DIRECTORY` | (see below) | Cache path override |
-| `MODEL_EXPRESS_MAX_RETRIES` | (none) | Max retry attempts |
 | `MODEL_EXPRESS_NO_SHARED_STORAGE` | `false` | Disable shared storage mode |
 
 Cache directory resolution order: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `HF_HUB_CACHE` -> `~/.cache/huggingface/hub`.

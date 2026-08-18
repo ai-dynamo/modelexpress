@@ -216,6 +216,7 @@ spec:
                   enum:
                     - HuggingFace
                     - Ngc
+                    - Gcs
             status:
               type: object
               properties:

@@ -1,6 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(not(any(feature = "tls-rustls", feature = "tls-native")))]
+compile_error!(
+    "no TLS backend selected: enable `tls-rustls` (default) or `tls-native`/`openssl`. \
+     Without one, reqwest builds with no TLS support and every HTTPS request fails at runtime."
+);
+
 use serde::{Deserialize, Serialize};
 use std::error::Error as StdError;
 
@@ -176,6 +182,7 @@ impl From<models::ModelProvider> for grpc::model::ModelProvider {
             models::ModelProvider::HuggingFace => grpc::model::ModelProvider::HuggingFace,
             models::ModelProvider::Ngc => grpc::model::ModelProvider::Ngc,
             models::ModelProvider::Gcs => grpc::model::ModelProvider::Gcs,
+            models::ModelProvider::S3 => grpc::model::ModelProvider::S3,
         }
     }
 }
@@ -186,6 +193,7 @@ impl From<grpc::model::ModelProvider> for models::ModelProvider {
             grpc::model::ModelProvider::HuggingFace => models::ModelProvider::HuggingFace,
             grpc::model::ModelProvider::Ngc => models::ModelProvider::Ngc,
             grpc::model::ModelProvider::Gcs => models::ModelProvider::Gcs,
+            grpc::model::ModelProvider::S3 => models::ModelProvider::S3,
         }
     }
 }
@@ -301,6 +309,7 @@ mod tests {
             models::ModelProvider::HuggingFace,
             models::ModelProvider::Ngc,
             models::ModelProvider::Gcs,
+            models::ModelProvider::S3,
         ] {
             let grpc_provider: grpc::model::ModelProvider = model_provider.into();
             let back_to_model: models::ModelProvider = grpc_provider.into();
