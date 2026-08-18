@@ -286,6 +286,41 @@ def _cache_descriptors_enabled() -> bool:
     return envs.MX_RESHARD_CACHE_DESCRIPTORS
 
 
+def _destinations_are_disjoint(destinations: list[torch.Tensor]) -> bool:
+    """Conservatively check whether destination views occupy separate storage.
+
+    A strided view can contain holes, so its min/max storage span may overlap
+    another view even when their logical elements do not. Treating that case as
+    overlapping only loses batching; it cannot change copy order or bytes.
+    """
+    spans_by_storage: dict[int, list[tuple[int, int]]] = {}
+    for tensor in destinations:
+        if tensor.numel() == 0:
+            continue
+        min_element = int(tensor.storage_offset())
+        max_element = min_element
+        for size, stride in zip(tensor.shape, tensor.stride(), strict=True):
+            extent = (int(size) - 1) * int(stride)
+            min_element += min(0, extent)
+            max_element += max(0, extent)
+        element_size = int(tensor.element_size())
+        spans_by_storage.setdefault(
+            int(tensor.untyped_storage().data_ptr()), []
+        ).append(
+            (
+                min_element * element_size,
+                (max_element + 1) * element_size,
+            )
+        )
+    for spans in spans_by_storage.values():
+        previous_end = -1
+        for start, end in sorted(spans):
+            if start < previous_end:
+                return False
+            previous_end = max(previous_end, end)
+    return True
+
+
 def _replay_ops(tensor: torch.Tensor, op_chain: tuple) -> torch.Tensor:
     """Replay a captured loader view chain on a staged full-source tensor."""
     value = tensor
@@ -909,7 +944,15 @@ class ReshardReceiver:
                         copies_done += 1
             reslice_copies = len(destinations) if batched else copies_done
             if batched and destinations:
-                torch._foreach_copy_(destinations, source_views)
+                if _destinations_are_disjoint(destinations):
+                    torch._foreach_copy_(destinations, source_views)
+                else:
+                    # ``_foreach_copy_`` does not define ordering for overlapping
+                    # destinations. Preserve the captured loader order instead.
+                    for destination, source_view in zip(
+                        destinations, source_views, strict=True
+                    ):
+                        destination.copy_(source_view)
             torch.cuda.synchronize(self._device)
             stages["reslice_s"] = time.perf_counter() - _t
             # Views, not sources: the per-view launch count is what batching

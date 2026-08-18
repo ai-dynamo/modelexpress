@@ -207,6 +207,10 @@ def _build_global_qkv_aliases(
         raise ValueError(
             f"{item.name}: global QKV aliasing requires qkv_interleave='by_head'"
         )
+    if "head_dim" not in item.extras:
+        raise ValueError(
+            f"{item.name}: global QKV aliasing requires extras['head_dim']"
+        )
     head_dim = int(item.extras["head_dim"])
     q_heads = int(item.extras["num_heads"])
     kv_heads = int(item.extras["num_kv_heads"])

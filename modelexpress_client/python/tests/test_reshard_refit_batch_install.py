@@ -43,10 +43,6 @@ class _Copy:
         self.dest_offset = dest_offset
 
 
-class _CountingTransport(InMemoryReferenceTransport):
-    """Real byte moves; the wire is not what these tests vary."""
-
-
 class _Harness(ReshardReceiver):
     """A receiver with the plan and buffers set directly.
 
@@ -54,7 +50,7 @@ class _Harness(ReshardReceiver):
     this bypasses it. Only the state ``update_weights`` touches is populated.
     """
 
-    def __init__(self, transport) -> None:  # noqa: D107 - see class docstring
+    def __init__(self, transport) -> None:
         self._device = torch.device("cpu")
         self._timeout = 1.0
         self._transport = transport
@@ -171,7 +167,7 @@ def _build(transport):
 def _run(monkeypatch, *, batched: bool):
     monkeypatch.setenv("MX_RESHARD_BATCH_INSTALL", "1" if batched else "0")
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
-    transport = _CountingTransport()
+    transport = InMemoryReferenceTransport()
     harness, keepalive = _build(transport)
     metrics = harness.update_weights(step=1)
     return harness, metrics, keepalive
@@ -205,30 +201,46 @@ def test_reconstructs_the_expected_values(monkeypatch):
         assert torch.equal(harness._recv_buffers["rows"], rows), f"batched={batched}"
 
 
-def test_batching_preserves_view_order(monkeypatch):
-    """Two views onto one destination region must land in plan order.
-
-    ``_foreach_copy_`` is not documented to serialize overlapping destinations,
-    so a plan that relies on a later view overwriting an earlier one is the case
-    where batching could diverge. The plan builder does not emit overlapping
-    views, and this pins that: if it ever does, the paths must still agree.
-    """
+def test_disjoint_destinations_use_the_foreach_batch(monkeypatch):
+    """The normal plan is pairwise disjoint and stays on the batched path."""
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+    monkeypatch.setenv("MX_RESHARD_BATCH_INSTALL", "1")
+    calls = []
+    real_foreach = torch._foreach_copy_
 
-    results = {}
-    for batched in (True, False):
-        monkeypatch.setenv("MX_RESHARD_BATCH_INSTALL", "1" if batched else "0")
-        transport = _CountingTransport()
-        harness, keepalive = _build(transport)
-        # Redirect both "rows" views at the same destination block: the second
-        # one wins under the sequential path.
-        for copy in harness._plan.full_pulls[1].copies:
-            copy.dest_offset = 0
-        harness.update_weights(step=1)
-        results[batched] = harness._recv_buffers["rows"].clone()
-        assert all(t.data_ptr() for t in keepalive)  # keep alive
+    def record(destinations, sources):
+        calls.append((destinations, sources))
+        return real_foreach(destinations, sources)
 
-    assert torch.equal(results[True], results[False])
+    monkeypatch.setattr(torch, "_foreach_copy_", record)
+    harness, keepalive = _build(InMemoryReferenceTransport())
+    harness.update_weights(step=1)
+
+    assert len(calls) == 1
+    assert len(calls[0][0]) == 5
+    assert all(t.data_ptr() for t in keepalive)
+
+
+def test_overlapping_destinations_fall_back_to_plan_order(monkeypatch):
+    """Overlapping views use sequential copies because foreach order is undefined."""
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+    monkeypatch.setenv("MX_RESHARD_BATCH_INSTALL", "1")
+    monkeypatch.setattr(
+        torch,
+        "_foreach_copy_",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("overlapping destinations must not be batched")
+        ),
+    )
+    harness, keepalive = _build(InMemoryReferenceTransport())
+    for copy in harness._plan.full_pulls[1].copies:
+        copy.dest_offset = 0
+
+    harness.update_weights(step=1)
+
+    expected = torch.arange(108, 116, dtype=torch.float32).reshape(2, 4)
+    assert torch.equal(harness._recv_buffers["rows"][:2], expected)
+    assert all(t.data_ptr() for t in keepalive)
 
 
 def test_stage_record_reports_the_install_arm(monkeypatch, caplog):
@@ -262,7 +274,7 @@ def test_empty_full_pulls_is_a_no_op(monkeypatch):
 
     for batched in (True, False):
         monkeypatch.setenv("MX_RESHARD_BATCH_INSTALL", "1" if batched else "0")
-        transport = _CountingTransport()
+        transport = InMemoryReferenceTransport()
         harness, keepalive = _build(transport)
         harness._plan.full_pulls = []
 

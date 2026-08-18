@@ -322,7 +322,9 @@ class RendezvousPayload(NamedTuple):
     permanently behind, and a consumer that excuses lagging publishers would then
     excuse all of its shards, going quiet instead of strict. It carries a default
     so that reading the stamp is a new field rather than a second unwrap function,
-    which is also why unpacking must now name five values.
+    which is also why unpacking must now name six values. ``tensor_count`` keeps
+    the published table size available when ``with_tensors=False`` deliberately
+    leaves ``tensors`` empty; ``None`` preserves direct and older callers.
     """
 
     agent_metadata: bytes
@@ -524,9 +526,10 @@ class MxReshardRendezvous:
         deadline = time.monotonic() + timeout
         # Cost split, kept because this call dominates a MoE refit: measured at
         # 51% of a 10.25 s refit on Qwen3-30B-A3B, 2.7x the weight transfer it
-        # precedes. On the cluster the fetch is ~4.0 s of that and the parse ~0.8 s,
-        # which is why the round-trips are issued concurrently below rather than the
-        # codec being tuned. Reported so a regression is visible without a rebuild.
+        # precedes. On the cluster the fetch is ~4.0 s of that and the parse ~0.8 s.
+        # The round-trips stay serial; see ``_fetch_metadata`` for the measurement
+        # that ruled out a thread pool. ``fetch_s`` includes both ``list_sources``
+        # and the metadata sweep.
         fetch_s = 0.0
         parse_s = 0.0
         polls = 0
@@ -578,11 +581,12 @@ class MxReshardRendezvous:
                 )
             time.sleep(poll_interval)
 
-        print(
-            "MX_DISCOVER_COST "
-            + json.dumps(
+        logger.warning(
+            "MX_DISCOVER_COST %s",
+            json.dumps(
                 {
                     "schema": "mx-discover-cost-v1",
+                    "rank": self.rank,
                     "sources": len(payloads),
                     # entry_count, not len(tensors): the quorum path does not build
                     # the tables, and this figure is what shows the cost tracks
@@ -594,7 +598,6 @@ class MxReshardRendezvous:
                     "polls": polls,
                 }
             ),
-            flush=True,
         )
         logger.info(
             "[reshard] discovered %d trainer rank(s)%s: %s",

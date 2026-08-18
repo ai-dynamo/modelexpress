@@ -25,10 +25,16 @@ tests that matter are the ones that would catch a stale cache:
 Run: pytest tests/test_reshard_refit_descriptor_cache.py
 """
 
+from contextlib import nullcontext
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-from tests.test_reshard_refit_fused_wire import _RecordingTransport, _build
+from modelexpress.refit.reshard import receiver as receiver_mod
+from modelexpress.refit.reshard.transfer_plan import TransferPlan
+from modelexpress.refit.reshard.types import CaptureResult
+from tests.test_reshard_refit_fused_wire import _build, _RecordingTransport
 
 
 @pytest.fixture(autouse=True)
@@ -90,15 +96,34 @@ def test_rebuilding_the_plan_drops_the_cache(monkeypatch):
     _refit(harness, 1)
     assert harness._cached_descriptors is not None
 
-    # _prepare is what installs a new plan, and it is also what must invalidate.
-    # Asserting on the state rather than calling _prepare keeps this test off the
-    # network while still pinning the invariant the invalidation exists for.
-    harness._plan = harness._plan
-    harness._cached_descriptors = None
-    metrics, buffers = _refit(harness, 2)
-    assert harness._cached_descriptors is not None
-    assert metrics["bytes_received"] > 0
-    assert buffers and keepalive
+    new_plan = TransferPlan()
+    monkeypatch.setattr(
+        receiver_mod,
+        "gather_sources",
+        lambda *_args, **_kwargs: ({}, {}, {}, {}),
+    )
+    monkeypatch.setattr(receiver_mod, "plan_transfer", lambda *_args: new_plan)
+    monkeypatch.setattr(
+        receiver_mod, "handshake_endpoints_for_plan", lambda *_args: {}
+    )
+    monkeypatch.setattr(receiver_mod, "handshake_with_peers", lambda *_args: None)
+    monkeypatch.setattr(
+        receiver_mod, "NixlReshardTransport", lambda *_args, **_kwargs: object()
+    )
+    monkeypatch.setattr(receiver_mod, "classic_cuda_alloc", nullcontext)
+    harness._num_trainer_sources = 0
+    harness._mx_client = object()
+    harness._model_name = "model"
+    harness._global_rank = 0
+    harness._manager = SimpleNamespace(register_tensors=lambda *_args: None)
+    harness._capture = lambda _manifest: (CaptureResult(), {})
+    harness._log_coverage = lambda *_args: None
+
+    harness._prepare(timeout=1.0)
+
+    assert harness._plan is new_plan
+    assert harness._cached_descriptors is None
+    assert keepalive
 
 
 def test_switching_the_wire_arm_rebuilds_the_cache(monkeypatch):

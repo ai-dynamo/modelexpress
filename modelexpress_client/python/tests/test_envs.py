@@ -29,6 +29,7 @@ def test_defaults_when_unset(monkeypatch):
         "MX_HEARTBEAT_INTERVAL_SECS",
         "MX_RESHARD_FUSED_WIRE",
         "MX_RESHARD_BATCH_INSTALL",
+        "MX_RESHARD_CACHE_DESCRIPTORS",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -51,6 +52,7 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_HEARTBEAT_INTERVAL_SECS == 30
     assert envs.MX_RESHARD_FUSED_WIRE is True
     assert envs.MX_RESHARD_BATCH_INSTALL is True
+    assert envs.MX_RESHARD_CACHE_DESCRIPTORS is True
 
 
 def test_int_and_float_parsing(monkeypatch):

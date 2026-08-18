@@ -312,18 +312,30 @@ def test_quorum_can_skip_shard_tables_without_losing_emptiness():
     assert "1 empty" in message
 
 
-def test_skipping_shard_tables_still_reports_the_entry_count():
+def test_skipping_shard_tables_still_reports_the_entry_count(caplog):
     """``entry_count`` is what keeps emptiness decidable, and it is also the figure
     that showed this cost scales with source count rather than bytes moved."""
+    import json
+    import logging
+
     client = _DiscoveryClient([_blob("rank-0", _one_tensor() * 3)])
 
-    (payload,) = _rendezvous(client).discover_trainers(
-        expected_trainers=1, timeout=0, with_tensors=False
-    )
+    with caplog.at_level(logging.WARNING):
+        (payload,) = _rendezvous(client).discover_trainers(
+            expected_trainers=1, timeout=0, with_tensors=False
+        )
 
     assert payload.tensors == []
     assert payload.entry_count() == 3
     assert payload.agent_name == "rank-0"
+    record = next(
+        json.loads(message.split("MX_DISCOVER_COST ", 1)[1])
+        for message in caplog.messages
+        if "MX_DISCOVER_COST " in message
+    )
+    assert record["rank"] == 0
+    assert record["tensors"] == 3
+    assert record["tables_built"] is False
 
 
 def test_entry_count_falls_back_to_the_table_when_not_recorded():

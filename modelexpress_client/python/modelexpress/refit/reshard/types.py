@@ -35,7 +35,9 @@ class IncompleteRefit(RuntimeError):
     ``RuntimeError``, so a caller that catches only that is unaffected."""
 
 
-def summarize_unsupported(reasons: dict, limit: int = 3) -> list[tuple[str, int]]:
+def summarize_unsupported(
+    reasons: dict, limit: int | None = 3
+) -> list[tuple[str, int]]:
     """Group per-source capture failures by cause, most frequent first.
 
     Every message embeds the offending source's name and op-chain, so thousands

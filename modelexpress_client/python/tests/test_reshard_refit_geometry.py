@@ -134,6 +134,7 @@ def test_unsupported_source_records_the_op_that_defeated_capture():
     assert set(result.unsupported_reasons) == {"bad"}
     reason = result.unsupported_reasons["bad"]
     assert "unsupported op" in reason
+    assert "aten.mul" in reason
     # The offending source and its op-chain stay in the message, which is what
     # makes a single failure actionable without a re-run.
     assert "'bad'" in reason
@@ -156,6 +157,19 @@ def test_summarize_unsupported_groups_one_cause_across_many_sources():
     assert summarize_unsupported(reasons) == [
         ("unsupported op aten.index_copy_", 128),
         ("unsupported op aten.mul", 1),
+    ]
+
+
+def test_summarize_unsupported_accepts_none_for_all_causes():
+    from modelexpress.refit.reshard.types import summarize_unsupported
+
+    reasons = {
+        f"source-{index}": f"cause-{index} on lazy 'source-{index}'"
+        for index in range(4)
+    }
+
+    assert summarize_unsupported(reasons, limit=None) == [
+        (f"cause-{index}", 1) for index in range(4)
     ]
 
 

@@ -350,6 +350,15 @@ def test_cuda_64q_2kv_tp8_noop_and_moving_weight_refits_match_logits():
             8704,
             "requires both",
         ),
+        (
+            {
+                "num_heads": "64",
+                "num_kv_heads": "2",
+                "qkv_interleave": "by_head",
+            },
+            8704,
+            "head_dim",
+        ),
         (_global_extras(64, 2, 128), 8192, "rows disagree"),
         (
             {**_global_extras(64, 2, 128), "qkv_interleave": "unsupported"},
