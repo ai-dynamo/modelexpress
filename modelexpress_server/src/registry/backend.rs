@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use modelexpress_common::models::{ModelProvider, ModelStatus};
 use std::sync::Arc;
 
+pub mod instrumented;
 pub mod kubernetes;
 #[cfg(feature = "memory-backend")]
 pub mod memory;

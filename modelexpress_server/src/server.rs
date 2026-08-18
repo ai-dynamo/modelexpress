@@ -23,7 +23,10 @@ use crate::cache::CacheEvictionService;
 use crate::config::{AuthMode, ServerConfig};
 use crate::metrics;
 use crate::p2p::{service::P2pServiceImpl, state::P2pStateManager};
-use crate::refit::{backend::create_backend as create_refit_backend, service::RefitServiceImpl};
+use crate::refit::{
+    backend::create_backend as create_refit_backend,
+    backend::instrumented::InstrumentedRefitBackend, service::RefitServiceImpl,
+};
 use crate::registry::state::RegistryManager;
 use crate::services::{ApiServiceImpl, HealthServiceImpl, ModelDownloadTracker, ModelServiceImpl};
 
@@ -62,18 +65,21 @@ struct MetricsListener {
 
 impl MetricsListener {
     /// Start the listener. Returns `None` when metrics are disabled.
-    fn spawn(metrics_addr: Option<std::net::SocketAddr>, backend: &BackendConfig) -> Option<Self> {
+    ///
+    /// The registry is built and fully populated by the caller. It has to be:
+    /// `Registry::register` takes `&mut self` and there is no interior
+    /// mutability, so once the registry is behind the `Arc` this task shares, no
+    /// further family can be added. Building it here would make the listener the
+    /// only thing that could ever own a metric.
+    fn spawn(
+        metrics_addr: Option<std::net::SocketAddr>,
+        registry: Arc<prometheus_client::registry::Registry>,
+    ) -> Option<Self> {
         let metrics_addr = metrics_addr?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        let mut registry = metrics::new_registry();
-        metrics::register_build_info(&mut registry, backend);
-        let handle = tokio::spawn(metrics::serve(
-            metrics_addr,
-            Arc::new(registry),
-            async move {
-                let _ = shutdown_rx.await;
-            },
-        ));
+        let handle = tokio::spawn(metrics::serve(metrics_addr, registry, async move {
+            let _ = shutdown_rx.await;
+        }));
         Some(Self {
             handle: Some(handle),
             shutdown_tx: Some(shutdown_tx),
@@ -162,14 +168,26 @@ pub async fn run_server(
     //
     // Held in a guard so every return path stops it: the steps below can fail,
     // and a detached listener would keep the port for the next call.
-    let metrics_listener = MetricsListener::spawn(metrics_addr, &backend);
+    //
+    // The families are registered unconditionally, even when the listener is
+    // disabled. The alternative -- an `Option` at every instrumentation site --
+    // buys four `Arc` allocations and a second, untested code path.
+    let mut metrics_registry = metrics::new_registry();
+    metrics::register_build_info(&mut metrics_registry, &backend);
+    let grpc_metrics = metrics::grpc::GrpcMetrics::register(&mut metrics_registry);
+    let backend_metrics = metrics::backend::BackendMetrics::register(&mut metrics_registry);
+    let metrics_registry = Arc::new(metrics_registry);
+
+    let metrics_listener = MetricsListener::spawn(metrics_addr, Arc::clone(&metrics_registry));
     if metrics_listener.is_none() {
         info!("Metrics endpoint is disabled");
     }
 
     // Initialize the model registry manager (Redis or Kubernetes CRDs). Shares the
     // injected backend with the P2P state manager below.
-    let registry = Arc::new(RegistryManager::with_config(backend.clone()));
+    let registry = Arc::new(
+        RegistryManager::with_config(backend.clone()).with_metrics(backend_metrics.clone()),
+    );
     match tokio::time::timeout(std::time::Duration::from_secs(10), registry.connect()).await {
         Ok(Ok(backend_name)) => info!("Model registry connected (backend: {backend_name})"),
         Ok(Err(e)) => {
@@ -228,9 +246,21 @@ pub async fn run_server(
         .set_serving::<P2pServiceServer<P2pServiceImpl>>()
         .await;
 
+    // Timed inside the timeout, matching the P2P and registry managers: the
+    // factory connects the concrete backend before it can be wrapped, so the
+    // decorator's own `connect` forward is never reached.
+    //
+    // A connect that exceeds the timeout records nothing, here and in the other
+    // two managers -- `tokio::time::timeout` drops the inner future, so the
+    // recording never runs. That path is loud rather than silent: the server logs
+    // and refuses to start, so it does not need a metric to be noticed.
     let refit_backend = match tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        create_refit_backend(&backend),
+        backend_metrics.time(
+            metrics::backend::Store::Refit,
+            "connect",
+            create_refit_backend(&backend),
+        ),
     )
     .await
     {
@@ -244,7 +274,9 @@ pub async fn run_server(
             return Err("Refit metadata backend connection timed out".into());
         }
     };
-    let refit_service = refit_backend.map(RefitServiceImpl::new);
+    let refit_service = refit_backend
+        .map(|inner| InstrumentedRefitBackend::wrap(inner, backend_metrics.clone()))
+        .map(RefitServiceImpl::new);
     if refit_service.is_some() {
         health_reporter
             .set_serving::<RefitServiceServer<RefitServiceImpl>>()
@@ -254,7 +286,8 @@ pub async fn run_server(
     }
 
     // Initialize P2P state manager — fails fast if backend is misconfigured or unreachable
-    let p2p_state = Arc::new(P2pStateManager::with_config(backend));
+    let p2p_state =
+        Arc::new(P2pStateManager::with_config(backend).with_metrics(backend_metrics.clone()));
 
     match tokio::time::timeout(std::time::Duration::from_secs(10), p2p_state.connect()).await {
         Ok(Ok(backend_name)) => info!("P2P state manager connected (backend: {backend_name})"),
@@ -329,7 +362,12 @@ pub async fn run_server(
     });
 
     info!("Starting gRPC server on: {addr}");
+    // One layer for the whole router rather than one per service: it covers the
+    // two health services as well, and a service added later is instrumented
+    // without a second edit. It sits outside `AuthLayer`, so a rejected call is
+    // counted as `outcome="unauthenticated"` instead of vanishing.
     let router = Server::builder()
+        .layer(metrics::grpc::GrpcMetricsLayer::new(grpc_metrics))
         .add_service(health_service_v1)
         .add_service(HealthServiceServer::new(health_service));
     let router = match &auth_layer {
