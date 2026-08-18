@@ -8,11 +8,13 @@ from types import SimpleNamespace
 import pytest
 
 from modelexpress import p2p_pb2
+from modelexpress.refit.reshard import rendezvous as rendezvous_mod
 from modelexpress.refit.reshard.rendezvous import (
     MxReshardRendezvous,
     PublishedShard,
     PublishedTensor,
     _mx_version,
+    build_sources,
     wrap_rendezvous_blob,
 )
 
@@ -274,6 +276,49 @@ def test_a_partial_ready_set_still_reports_its_shard_tables():
     assert "1 READY source(s)" in message
     assert "0 with a non-empty shard table" in message
     assert "1 empty" in message
+
+
+def test_build_sources_dedups_redundant_boxes_by_random_pick(monkeypatch):
+    """Every rank publishes replicated sources, so a box arrives several times.
+    The planner needs one shard per box; build_sources keeps a random one."""
+    tensor = PublishedTensor(
+        name="w",
+        dtype="torch.bfloat16",
+        elsize=2,
+        full_shape=(4, 4),
+        shards=[
+            PublishedShard("a0", 0, 100, (0, 0), (4, 4)),
+            PublishedShard("a1", 1, 200, (0, 0), (4, 4)),
+        ],
+    )
+    monkeypatch.setattr(rendezvous_mod.random, "choice", lambda group: group[0])
+
+    sources, session_to_agent, session_to_device = build_sources([tensor])
+
+    (shard,) = sources["w"].shards
+    assert shard.session == "a0"
+    assert shard.addr == 100
+    assert session_to_agent == {"a0": "a0"}
+    assert session_to_device == {"a0": 0}
+
+
+def test_build_sources_keeps_distinct_boxes():
+    """A genuinely sharded source (disjoint dim-0 boxes) keeps every box."""
+    tensor = PublishedTensor(
+        name="w",
+        dtype="torch.float32",
+        elsize=4,
+        full_shape=(4, 4),
+        shards=[
+            PublishedShard("a0", 0, 100, (0, 0), (2, 4)),
+            PublishedShard("a1", 1, 200, (2, 0), (2, 4)),
+        ],
+    )
+
+    sources, _agent, _device = build_sources([tensor])
+
+    offsets = sorted(tuple(s.shard_offset) for s in sources["w"].shards)
+    assert offsets == [(0, 0), (2, 0)]
 
 
 def test_invalid_heartbeat_period_fails_before_publish(monkeypatch):

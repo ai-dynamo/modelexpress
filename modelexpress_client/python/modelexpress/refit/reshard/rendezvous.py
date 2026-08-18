@@ -36,6 +36,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import random
 import time
 import uuid
 from dataclasses import dataclass
@@ -176,14 +177,25 @@ def build_sources(tensors: list) -> tuple:
     Returns ``(sources, session_to_agent, session_to_device)`` where ``sources``
     is ``{src_name: SourceInfo}`` for ``plan_transfer`` and the two maps drive
     ``NixlReshardTransport``. Each shard's ``session`` is its owning agent name.
+
+    Unsharded/replicated sources are published by every trainer rank, so a source
+    can arrive with several shards covering the SAME box. The planners require a
+    single non-overlapping cover, so keep one shard per distinct box, chosen at
+    random -- the copies are identical, and randomizing spreads a replicated
+    source's reads across the publishing ranks' NICs without assuming any
+    rank/agent ordering.
     """
     sources = {}
     session_to_agent = {}
     session_to_device = {}
     for t in tensors:
         dtype = _torch_dtype(t.dtype)
-        shards = []
+        by_box: dict = {}
         for s in t.shards:
+            by_box.setdefault((tuple(s.shard_offset), tuple(s.shape)), []).append(s)
+        shards = []
+        for group in by_box.values():
+            s = random.choice(group)
             session = s.agent_name
             shards.append(
                 Shard(
