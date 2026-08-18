@@ -188,3 +188,90 @@ async fn scrape(port: u16) -> String {
     }
     String::new()
 }
+
+/// An early failure inside `run_server` must leave the metrics port bindable.
+///
+/// The listener starts before the registry, refit and P2P backends connect, and
+/// any of those can fail. This pins the contract that such a failure leaves the
+/// port free for the next `run_server` in the same process, which is a
+/// documented use.
+///
+/// Scope, measured rather than assumed: the release comes from the guard's
+/// oneshot sender dropping, which fires the graceful shutdown and makes axum drop
+/// the listener socket. This test therefore does *not* fail if only
+/// `MetricsListener::drop`'s abort is removed -- it fails when the release path
+/// itself breaks, e.g. if the sender is moved somewhere that outlives the
+/// function. The abort is defence in depth for the detached task, and is not
+/// what this test covers.
+///
+/// The stalled connection keeps a request in flight across the failure, so a
+/// listener that only stopped accepting would still be holding the socket.
+#[tokio::test]
+async fn an_early_failure_releases_the_metrics_port() {
+    use tokio::io::AsyncWriteExt;
+
+    let [port, metrics_port, dead_port] = free_ports::<3>();
+
+    let mut config = ServerConfig::default();
+    config.server.host = "127.0.0.1".to_string();
+    config.server.port = NonZeroU16::new(port).expect("port is non-zero");
+    config.server.metrics_port = metrics_port;
+    config.cache.eviction.enabled = false;
+
+    // Redis on a port nothing is listening on: the registry connect fails and
+    // run_server returns Err long before its normal shutdown path.
+    let backend = BackendConfig::Redis {
+        url: format!("redis://127.0.0.1:{dead_port}"),
+    };
+
+    let (_tx, rx) = oneshot::channel::<()>();
+    let server = tokio::spawn(run_server(config, backend, async move {
+        let _ = rx.await;
+    }));
+
+    // Hold a connection that has written a partial request head and stalled.
+    // Kept alive for the rest of the test.
+    let mut stalled = None;
+    for _ in 0..200 {
+        match tokio::net::TcpStream::connect(("127.0.0.1", metrics_port)).await {
+            Ok(mut stream) => {
+                let partial =
+                    format!("GET /metrics HTTP/1.1\r\nHost: 127.0.0.1:{metrics_port}\r\n");
+                stream
+                    .write_all(partial.as_bytes())
+                    .await
+                    .expect("write partial request head");
+                stream.flush().await.expect("flush");
+                stalled = Some(stream);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+        }
+    }
+    assert!(stalled.is_some(), "metrics listener never came up");
+
+    let result = tokio::time::timeout(Duration::from_secs(60), server)
+        .await
+        .expect("run_server did not return")
+        .expect("run_server task panicked");
+    assert!(result.is_err(), "expected the backend connect to fail");
+
+    // The port must be free again even though the stalled connection is still
+    // open. Retry briefly: the abort is asynchronous.
+    let mut bound = None;
+    for _ in 0..100 {
+        match std::net::TcpListener::bind(("127.0.0.1", metrics_port)) {
+            Ok(listener) => {
+                bound = Some(listener);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    drop(stalled);
+    assert!(
+        bound.is_some(),
+        "metrics port {metrics_port} is still held after run_server returned early; \
+         the listener was detached rather than stopped"
+    );
+}

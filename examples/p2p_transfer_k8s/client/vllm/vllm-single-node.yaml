@@ -45,7 +45,31 @@ spec:
     metadata:
       labels:
         app: mx-vllm
+      # Opt-in ModelExpress client metrics. One endpoint per pod serves the
+      # merged series from all eight ranks -- see docs/METRICS.md.
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9402"
+        prometheus.io/path: /metrics
     spec:
+      initContainers:
+        # An emptyDir survives container restarts within a pod, so last run's
+        # .db files would otherwise be merged into this run's numbers. Must not
+        # be done from worker code: ranks start staggered, and a late rank's
+        # wipe unlinks an earlier rank's mmapped files, which then vanishes from
+        # every later scrape. Note this runs on pod start, not on an app-only
+        # container restart; put the same command in your image entrypoint if
+        # you need it to cover that too.
+        - name: reset-metrics-dir
+          image: <your-registry>/modelexpress-client:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "-m", "modelexpress.metrics", "--reset"]
+          env:
+            - name: PROMETHEUS_MULTIPROC_DIR
+              value: /var/run/mx-metrics
+          volumeMounts:
+            - name: mx-metrics
+              mountPath: /var/run/mx-metrics
       containers:
         - name: vllm
           # Build a vLLM + ModelExpress client image using
@@ -69,6 +93,19 @@ spec:
             - name: MX_SERVER_ADDRESS
               value: "modelexpress-server:8001"
             # Transfer compatible vLLM JIT caches after the source is healthy.
+            # Client metrics. PROMETHEUS_MULTIPROC_DIR must be set here in the
+            # manifest, never from Python: prometheus_client latches its value
+            # class at import, so an in-process assignment lands after the engine
+            # has already imported it and silently produces no data.
+            - name: MX_METRICS_ENABLED
+              value: "1"
+            - name: PROMETHEUS_MULTIPROC_DIR
+              value: /var/run/mx-metrics
+            # Distinct from vLLM's own metrics port. Every rank calls enable();
+            # whichever wins the bind serves all eight, and the rest re-attempt
+            # so the endpoint migrates if that rank exits.
+            - name: MX_METRICS_PORT
+              value: "9402"
             - name: MX_ARTIFACT_TRANSFER
               value: "1"
             # Per-rank IB NIC pinning. Workaround for openucx/ucx#11259.
@@ -108,6 +145,10 @@ spec:
                 secretKeyRef:
                   name: hf-token-secret
                   key: HF_TOKEN
+          ports:
+            - name: mx-metrics
+              containerPort: 9402
+              protocol: TCP
           args:
             - --model
             - $(MODEL_NAME)
@@ -131,8 +172,15 @@ spec:
               mountPath: /dev/shm
             - name: model-cache
               mountPath: /models
+            - name: mx-metrics
+              mountPath: /var/run/mx-metrics
 
       volumes:
+        # Memory-backed and small: these are per-rank mmap files, not storage.
+        - name: mx-metrics
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
         - name: shm
           emptyDir:
             medium: Memory

@@ -156,6 +156,11 @@ class MetricsCollector:
                 return False
             try:
                 self._build_families()
+                # Now that a metric has been written, whether multiprocess mode
+                # is really active is observable on disk.
+                multiproc_dir = _multiproc_dir()
+                if multiproc_dir:
+                    _warn_if_multiprocess_inactive(multiproc_dir)
                 self._ready = True
                 logger.info(
                     "ModelExpress metrics enabled (scheme=%r, multiprocess=%s)",
@@ -552,18 +557,19 @@ def enable() -> bool:
     try:
         multiproc_dir = _multiproc_dir()
         if multiproc_dir:
-            _check_multiproc_ready(multiproc_dir)
+            _check_multiproc_dir(multiproc_dir)
         return metrics._ensure()
     except Exception as e:  # noqa: BLE001 - enable() may never raise into a load
         logger.warning("Failed to enable metrics: %s", e)
         return False
 
 
-def _check_multiproc_ready(multiproc_dir: str) -> None:
-    """Warn loudly about the two silent failures of multiprocess mode.
+def _check_multiproc_dir(multiproc_dir: str) -> None:
+    """Make sure the multiprocess directory exists and is usable.
 
-    Both produce an endpoint that returns 200 with no ModelExpress series, which
-    is indistinguishable from "this rank did nothing" unless it is called out.
+    Pre-flight only. Whether multiprocess mode is *actually active* cannot be
+    known until a metric has been written; that is
+    :func:`_warn_if_multiprocess_inactive`, called after the families are built.
     """
     try:
         # makedirs only, never unlink: wiping from worker code unlinks an
@@ -577,22 +583,42 @@ def _check_multiproc_ready(multiproc_dir: str) -> None:
             multiproc_dir,
             e,
         )
-        return
-    try:
-        from prometheus_client import values
 
-        if not getattr(values.ValueClass, "_multiprocess", False):
-            logger.error(
-                "PROMETHEUS_MULTIPROC_DIR=%s is set but prometheus_client "
-                "latched its single-process value class at import time, so no "
-                ".db files will be written and the merged endpoint will be "
-                "empty. The variable must be set in the pod manifest, before "
-                "the process starts -- assigning it from Python lands after the "
-                "engine has already imported prometheus_client.",
-                multiproc_dir,
-            )
-    except Exception as e:
-        logger.debug("Could not inspect the prometheus_client value class: %s", e)
+
+def _warn_if_multiprocess_inactive(multiproc_dir: str) -> None:
+    """Detect the latched-single-process case, from what is on disk.
+
+    ``prometheus_client.values.get_value_class()`` latches at module import. If
+    ``PROMETHEUS_MULTIPROC_DIR`` was assigned after the engine imported
+    prometheus_client, metrics are created in single-process mode: no ``.db``
+    files, a merged endpoint that returns 200 with nothing in it, and no error
+    anywhere.
+
+    Checked by looking for the files rather than by reading
+    ``values.ValueClass._multiprocess``. That attribute is private and the
+    dependency has no upper version bound, so a rename upstream would turn this
+    into a false alarm on healthy pods -- and a warning that cries wolf is worse
+    than none, because this is the message that explains an empty endpoint. The
+    files are the thing that actually matters, and they are observable.
+
+    Called after the families are built, since that is the write that creates
+    them.
+    """
+    try:
+        if any(os.scandir(multiproc_dir)):
+            return
+    except OSError:
+        # Already reported by _check_multiproc_dir; nothing to add.
+        return
+    logger.error(
+        "PROMETHEUS_MULTIPROC_DIR=%s is set but no .db files were written, so "
+        "prometheus_client is not in multiprocess mode and the merged endpoint "
+        "will be empty. get_value_class() latches at import, so the variable "
+        "must be set in the pod manifest before the process starts -- assigning "
+        "it from Python lands after the engine has already imported "
+        "prometheus_client.",
+        multiproc_dir,
+    )
 
 
 def push_metrics_if_enabled(job: str = "modelexpress") -> None:

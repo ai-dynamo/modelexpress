@@ -39,6 +39,92 @@ const MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 /// everything.
 const METRICS_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Owns the metrics listener task and stops it on **every** exit path.
+///
+/// [`run_server`] has several fallible steps between starting this listener and
+/// reaching its normal shutdown -- registry connect, refit backend, P2P connect,
+/// auth setup -- and it is documented as callable more than once in a process.
+/// Without a guard, an early `?` return left the task *detached*: still draining,
+/// owned by nobody, for as long as a client held a connection open.
+///
+/// The port itself was already released on that path, and it is worth being
+/// precise about why, because the reason is easy to break. Dropping the guard
+/// drops its oneshot sender, which closes the channel, resolves the shutdown
+/// future and makes axum drop the listener socket. Measured: suppressing the
+/// abort alone still frees the port; only suppressing the abort *and* the
+/// shutdown signal holds it. So the drop-chain does the freeing and this guard
+/// bounds the task -- and makes a chain that used to be implicit explicit, so
+/// moving the sender somewhere longer-lived cannot silently undo it.
+struct MetricsListener {
+    handle: Option<tokio::task::JoinHandle<()>>,
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl MetricsListener {
+    /// Start the listener. Returns `None` when metrics are disabled.
+    fn spawn(metrics_addr: Option<std::net::SocketAddr>, backend: &BackendConfig) -> Option<Self> {
+        let metrics_addr = metrics_addr?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let mut registry = metrics::new_registry();
+        metrics::register_build_info(&mut registry, backend);
+        let handle = tokio::spawn(metrics::serve(
+            metrics_addr,
+            Arc::new(registry),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+        Some(Self {
+            handle: Some(handle),
+            shutdown_tx: Some(shutdown_tx),
+        })
+    }
+
+    /// Signal, drain with a deadline, then abort if it overruns.
+    ///
+    /// Bounded because the listener is unauthenticated and reachable from the pod
+    /// network, and hyper's graceful shutdown holds a connection that wrote a
+    /// partial request head open indefinitely. Without a deadline any client
+    /// killed mid-write -- a scraper, a probe, a port scan -- would wedge the last
+    /// await in `run_server` and burn the whole termination grace period.
+    async fn shutdown(mut self) {
+        // A send failure just means the task already finished -- the normal case
+        // when the bind failed, which is a supported degraded state. The join
+        // below is the real synchronization point, so this must not be an error.
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(());
+        }
+        // `take` leaves `Drop` with nothing to do, so the abort below is the only
+        // one that can run.
+        let Some(mut handle) = self.handle.take() else {
+            return;
+        };
+        match tokio::time::timeout(METRICS_DRAIN_TIMEOUT, &mut handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => error!("Metrics listener join error: {e}"),
+            Err(_) => {
+                warn!(
+                    "Metrics listener did not drain within {}s; aborting it to finish shutdown",
+                    METRICS_DRAIN_TIMEOUT.as_secs()
+                );
+                handle.abort();
+                let _ = handle.await;
+            }
+        }
+    }
+}
+
+impl Drop for MetricsListener {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            // Reached only when `run_server` returned early. There is no async
+            // context to drain in here, so stop the task outright rather than
+            // leaving it detached and draining on its own.
+            handle.abort();
+        }
+    }
+}
+
 /// Run the ModelExpress gRPC server to completion.
 ///
 /// Connects the registry and P2P metadata backends (failing fast if either is
@@ -73,19 +159,11 @@ pub async fn run_server(
     // serves HTTP/2 only — a scrape aimed at the gRPC port can never succeed.
     // Its shutdown is signalled at the very end of this function, after the gRPC
     // server has drained, so the drain window stays scrapeable.
-    let (metrics_shutdown_tx, metrics_shutdown_rx) = tokio::sync::oneshot::channel();
-    let metrics_handle = metrics_addr.map(|metrics_addr| {
-        let mut registry = metrics::new_registry();
-        metrics::register_build_info(&mut registry, &backend);
-        tokio::spawn(metrics::serve(
-            metrics_addr,
-            Arc::new(registry),
-            async move {
-                let _ = metrics_shutdown_rx.await;
-            },
-        ))
-    });
-    if metrics_handle.is_none() {
+    //
+    // Held in a guard so every return path stops it: the steps below can fail,
+    // and a detached listener would keep the port for the next call.
+    let metrics_listener = MetricsListener::spawn(metrics_addr, &backend);
+    if metrics_listener.is_none() {
         info!("Metrics endpoint is disabled");
     }
 
@@ -282,36 +360,8 @@ pub async fn run_server(
     // background tasks have joined. Signalling it alongside them would make the
     // shutdown window unscrapeable during exactly the window these metrics exist
     // to explain.
-    if let Some(handle) = metrics_handle {
-        // A send failure just means the task already finished — the normal case
-        // when the bind failed, which is a supported degraded state. The join
-        // below is the real synchronization point, so this must not be an error.
-        let _ = metrics_shutdown_tx.send(());
-        // Bounded. The listener is unauthenticated and reachable from the pod
-        // network, and hyper's graceful shutdown holds a connection that wrote a
-        // partial request head open indefinitely. Without a deadline, any client
-        // killed mid-write — a scraper, a probe, a port scan — wedges the last
-        // await in run_server and burns the whole termination grace period.
-        //
-        // The handle is borrowed, not moved: `timeout` consuming it would drop it
-        // on expiry, which *detaches* the task rather than stopping it. It would
-        // keep holding the port after `run_server` returned — and `run_server` is
-        // documented as callable more than once in a process, so the next call
-        // would then fail to bind. On expiry we abort and wait for the
-        // cancellation to land.
-        let mut handle = handle;
-        match tokio::time::timeout(METRICS_DRAIN_TIMEOUT, &mut handle).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => error!("Metrics listener join error: {e}"),
-            Err(_) => {
-                warn!(
-                    "Metrics listener did not drain within {}s; aborting it to finish shutdown",
-                    METRICS_DRAIN_TIMEOUT.as_secs()
-                );
-                handle.abort();
-                let _ = handle.await;
-            }
-        }
+    if let Some(metrics_listener) = metrics_listener {
+        metrics_listener.shutdown().await;
     }
 
     server_result?;

@@ -479,7 +479,10 @@ def test_an_unbindable_port_is_reported_as_an_error_not_a_lost_race(
     assert collector._retry_thread is None, "a retry cannot fix EACCES"
     errors = [r for r in caplog.records if r.levelname == "ERROR"]
     assert errors, caplog.text
-    assert "not a lost race" in errors[0].message
+    # Not errors[0]: a multiprocess dir under pytest also (correctly) logs that
+    # multiprocess mode is inactive, since the value class latched
+    # single-process at import.
+    assert any("not a lost race" in r.message for r in errors), caplog.text
     assert not any(
         "held by another rank" in r.message for r in caplog.records
     ), caplog.text
@@ -670,34 +673,43 @@ def test_reset_multiproc_dir_is_a_noop_without_a_directory(monkeypatch):
     reset_multiproc_dir(None)  # must not raise
 
 
-def test_latched_single_process_value_class_is_reported(monkeypatch, tmp_path, caplog):
+def test_inactive_multiprocess_mode_is_reported(tmp_path, caplog):
     """The silent failure that has no other symptom.
 
     ``prometheus_client.values.get_value_class()`` latches at module import. If
     ``PROMETHEUS_MULTIPROC_DIR`` is assigned after the engine has imported
     prometheus_client, no ``.db`` files are written, the merged endpoint returns
-    200 with nothing in it, and nothing raises. In this test the value class is
-    already latched single-process (pytest imported prometheus_client without
-    the variable set), which is exactly the broken state.
+    200 with nothing in it, and nothing raises.
+
+    Detected from the empty directory rather than from
+    ``values.ValueClass._multiprocess``: that attribute is private and the
+    dependency has no upper version bound, so keying on it would make a rename
+    upstream report healthy pods as broken.
     """
-    monkeypatch.setenv(ENV_ENABLED, "1")
-    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
-    monkeypatch.delenv("MX_METRICS_PORT", raising=False)
-
-    from prometheus_client import values
-
-    if getattr(values.ValueClass, "_multiprocess", False):
-        pytest.skip("prometheus_client already latched multiprocess in this process")
-
-    from modelexpress.metrics import _check_multiproc_ready
+    from modelexpress.metrics import _warn_if_multiprocess_inactive
 
     with caplog.at_level("ERROR", logger="modelexpress.metrics"):
-        _check_multiproc_ready(str(tmp_path))
+        _warn_if_multiprocess_inactive(str(tmp_path))
 
     assert any(
-        "latched its single-process value class" in record.message
-        for record in caplog.records
+        "no .db files were written" in record.message for record in caplog.records
     ), caplog.text
+
+
+def test_active_multiprocess_mode_is_silent(tmp_path, caplog):
+    """A directory with files must not produce the warning.
+
+    This is the false-alarm case the private-attribute probe could not avoid: a
+    healthy pod whose prometheus_client renamed its internals.
+    """
+    from modelexpress.metrics import _warn_if_multiprocess_inactive
+
+    (tmp_path / "counter_1234.db").write_bytes(b"pretend this is a rank's mmap")
+
+    with caplog.at_level("ERROR", logger="modelexpress.metrics"):
+        _warn_if_multiprocess_inactive(str(tmp_path))
+
+    assert not caplog.records, caplog.text
 
 
 # ---------------------------------------------------------------------------

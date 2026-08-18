@@ -70,6 +70,14 @@ python -m modelexpress.metrics --reset
 That is it. Every rank calls `enable()` from its engine loader; one of them
 binds the port and serves the merged union of all of them.
 
+A working TP=8 example, with the annotations, the memory-backed `emptyDir`, the
+port and the entrypoint reset all wired up, is
+[`examples/p2p_transfer_k8s/client/vllm/vllm-single-node.yaml`](../examples/p2p_transfer_k8s/client/vllm/vllm-single-node.yaml).
+
+Without the directory nothing breaks — the client falls back to
+one-rank-per-endpoint and says so in a warning — but only one of your ranks is
+then represented, which for TP=8 means losing seven eighths of the pod.
+
 ---
 
 ## Why one endpoint per pod
