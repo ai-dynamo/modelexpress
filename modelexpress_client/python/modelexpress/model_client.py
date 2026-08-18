@@ -118,6 +118,7 @@ class ModelCacheClient:
         model_name: str,
         provider: int = model_pb2.HUGGING_FACE,
         ignore_weights: bool = False,
+        revision: str | None = None,
     ) -> str | None:
         """Block until the server reports the model as downloaded.
 
@@ -128,6 +129,12 @@ class ModelCacheClient:
         alone: the metadata-only claim registers the model as complete there,
         no later weight fetch happens, and the weights become unreachable
         through the cache -- see the server requirement in DEPLOYMENT.md.
+
+        ``revision`` pins the download to one commit. The server resolves a
+        pinned revision before claiming its download lease, so the claim is
+        scoped to that exact commit and the reply names it whether the
+        download was fresh or already present. Servers from before the
+        revision field ignore the pin.
 
         Returns the commit the server resolved the request to, or ``None``
         when it named none. A server that already holds an unpinned model
@@ -140,6 +147,8 @@ class ModelCacheClient:
             provider=provider,
             ignore_weights=ignore_weights,
         )
+        if revision is not None:
+            request.revision = revision
         for update in self.stub.EnsureModelDownloaded(request):
             if update.message:
                 logger.info("Model %s: %s", model_name, update.message)
@@ -248,12 +257,32 @@ class ModelCacheClient:
     ) -> None:
         """Add the model's weight files to an already published snapshot.
 
-        Refuses to write weights the server reports under a different commit
-        than the snapshot is named after: the engine addresses pinned
-        revisions by directory name, so mixing commits would hand it weights
-        from one revision under the name of another.
+        The download is pinned to the commit the snapshot is named after, so
+        a server whose default revision has moved past this snapshot fetches
+        the snapshot's own weights instead of answering from the newer
+        default. Refuses to write weights the server reports under a
+        different commit than the snapshot is named after: the engine
+        addresses pinned revisions by directory name, so mixing commits would
+        hand it weights from one revision under the name of another.
         """
-        revision = self.ensure_downloaded(model_name, provider)
+        try:
+            revision = self.ensure_downloaded(
+                model_name, provider, revision=snapshot_path.name
+            )
+        except grpc.RpcError as exc:
+            # Resolving a pin needs the Hub, and the server's cache fallback
+            # during a Hub outage exists only on the unpinned path -- so a
+            # pinned request would turn an outage the unpinned path survives
+            # into a failure. Degrade to the unpinned request instead; the
+            # revision check below and the stream's first-chunk commit
+            # validation still refuse weights from any other commit.
+            logger.warning(
+                "Pinned download of %s at commit %s failed (%s); retrying unpinned",
+                model_name,
+                snapshot_path.name,
+                exc,
+            )
+            revision = self.ensure_downloaded(model_name, provider)
         if revision is not None and revision != snapshot_path.name:
             raise ModelCacheError(
                 f"Server resolved {model_name} to commit {revision} but the local "
