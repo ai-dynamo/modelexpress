@@ -77,18 +77,16 @@ instead of the standard single-node manifest — it is the same fleet plus the
 four things metrics need, each marked `# metrics:` in the file.
 
 The one part that is not obvious: a TP=8 pod runs eight worker processes, and
-`prometheus_client` needs a shared directory (`PROMETHEUS_MULTIPROC_DIR`, backed
-by an `emptyDir`) for one endpoint to serve all of them. It must be set in the
-manifest rather than in code, because `prometheus_client` fixes its value class
-at import — an in-process assignment lands after the engine has already imported
-it and silently produces no data. Without the directory nothing breaks; the
-client falls back to one endpoint per rank and logs a warning, so only one of the
+`prometheus_client` needs a shared directory (`PROMETHEUS_MULTIPROC_DIR`) for one
+endpoint to serve all of them. Any writable container path works — the ranks
+share the container filesystem — but it has to be set in the manifest rather than
+in code, because `prometheus_client` fixes its value class at import and an
+in-process assignment lands too late to take effect. Without it nothing breaks;
+the client falls back to one endpoint per rank and warns, so only one of the
 eight is represented.
 
-Your image also needs `prometheus-client`. The vLLM, SGLang and TensorRT-LLM base
-images already provide it as an engine dependency; a custom image built without
-it disables the collector on the `ImportError` path. See
-[`docs/METRICS.md`](../../docs/METRICS.md) for the families, the PromQL, and a
+The engine images already ship `prometheus-client`, so no image change is needed.
+See [`docs/METRICS.md`](../../docs/METRICS.md) for the families, the PromQL, and a
 diagnosis table.
 
 ## Environment Variables

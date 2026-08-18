@@ -20,10 +20,4 @@ RUN python3 -m pip uninstall -y modelexpress 2>/dev/null || true && \
     rm -rf "$(python3 -c 'import site; print(site.getsitepackages()[0])')"/modelexpress* && \
     python3 -m pip install --no-cache-dir --no-deps .
 
-# --no-deps above excludes the [metrics] extra, so prometheus-client is
-# installed explicitly; the collector otherwise catches the ImportError and
-# disables itself. It has no dependencies of its own, so --no-deps keeps the
-# engine-provided stack untouched.
-RUN python3 -m pip install --no-cache-dir --no-deps "prometheus-client>=0.20.0"
-
 WORKDIR /sgl-workspace

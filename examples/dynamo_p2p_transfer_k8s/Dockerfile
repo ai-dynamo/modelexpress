@@ -25,10 +25,7 @@ FROM ${DYNAMO_VLLM_RUNTIME_IMAGE}
 # regenerate them with grpcio-tools when p2p.proto changes.
 COPY --chown=dynamo:dynamo modelexpress_client/python /opt/modelexpress/client
 WORKDIR /opt/modelexpress/client
-# The [metrics] extra pulls in prometheus-client. Without it the collector
-# catches the ImportError and disables itself, so MX_METRICS_ENABLED=1 and a
-# scrape annotation produce up == 0 with no explanation.
-RUN uv pip install ".[metrics]"
+RUN uv pip install .
 
 # Back to default workdir
 WORKDIR /workspace

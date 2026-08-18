@@ -42,36 +42,30 @@ To turn the listener off, `--set metrics.enabled=false`, or set
 
 ### Client
 
-Opt-in, and it needs three things in the **pod manifest** — not in code:
+Opt-in, and it needs three environment variables in the **pod manifest** — not
+in code:
 
 ```yaml
-spec:
-  volumes:
-    - name: mx-metrics
-      emptyDir: {medium: Memory, sizeLimit: 64Mi}
-  containers:
-    - name: worker
-      volumeMounts:
-        - {name: mx-metrics, mountPath: /var/run/mx-metrics}
-      env:
-        - {name: MX_METRICS_ENABLED, value: "1"}
-        - {name: PROMETHEUS_MULTIPROC_DIR, value: /var/run/mx-metrics}
-        - {name: MX_METRICS_PORT, value: "9402"}
-      ports:
-        - {name: mx-metrics, containerPort: 9402}
+env:
+  - {name: MX_METRICS_ENABLED, value: "1"}
+  - {name: PROMETHEUS_MULTIPROC_DIR, value: /tmp/mx-metrics}
+  - {name: MX_METRICS_PORT, value: "9402"}
+ports:
+  - {name: mx-metrics, containerPort: 9402}
 ```
 
-and one line at the container entrypoint, before the engine starts:
+That is it. Every rank calls `enable_metrics()` from its engine loader; one of
+them binds the port and serves the merged union of all of them.
 
-```bash
-python -m modelexpress.metrics --reset
-```
+No volume is required. The ranks are processes inside one container, so an
+ordinary container path is already shared between them, and a container restart
+recreates it empty — which is what a stale `.db` file would otherwise survive.
+Mount a memory-backed `emptyDir` at the same path if you want tmpfs and a size
+cap; then clear it at the container entrypoint with
+`python -m modelexpress.metrics --reset`, because an `emptyDir` *does* persist
+across container restarts.
 
-That is it. Every rank calls `enable()` from its engine loader; one of them
-binds the port and serves the merged union of all of them.
-
-A working TP=8 example, with the annotations, the memory-backed `emptyDir`, the
-port and the entrypoint reset all wired up, is
+A worked TP=8 example is
 [`examples/p2p_transfer_k8s/client/vllm/vllm-single-node-metrics.yaml`](../examples/p2p_transfer_k8s/client/vllm/vllm-single-node-metrics.yaml)
 — a metrics-enabled sibling of the stock single-node manifest, so the diff
 between the two is exactly what metrics cost you.
@@ -113,9 +107,9 @@ naming the cause, rather than serving an empty endpoint that returns 200.
 **Never wipe the directory from worker code.** Ranks start staggered, so a late
 rank's wipe unlinks an early rank's already-mmapped files; that rank keeps
 writing to an unlinked inode and disappears from every later scrape. Wipe at the
-container entrypoint only, with `python -m modelexpress.metrics --reset`. That
-step is required, not optional: an `emptyDir` survives container restarts within
-a pod, so last run's files would otherwise be merged into this run's numbers.
+container entrypoint only, with `python -m modelexpress.metrics --reset` — and
+only if you mounted a volume, since an `emptyDir` survives container restarts
+within a pod while a plain container path does not.
 
 **`mx_build_info` is a Gauge set to 1, never an `Info`.** Under multiprocess
 mode an `Info` writes no file, exposes nothing, and raises nothing. It would
@@ -151,7 +145,7 @@ instead. On an idle H200 node the curve runs ~0.1 ms at one file set to ~2.4 ms 
 for the GIL. If you recycle workers aggressively, measure your own pod:
 
 ```bash
-python benchmarks/metrics_pipeline.py --only scrape-cost --max-file-sets 512
+python benchmarks/metrics/metrics_pipeline.py --only scrape-cost --max-file-sets 512
 ```
 
 ### 2. Sharing the directory with the engine's exporter
@@ -302,11 +296,11 @@ The client needs `prometheus-client`, which is the `metrics` extra:
 pip install "modelexpress[metrics]"
 ```
 
-Every client container image in this repository installs it. Images that use
-`pip install --no-deps` (to protect the engine's CUDA/NIXL/Torch stack) install
-it explicitly, because `--no-deps` excludes extras. If you build your own image,
-do the same — the collector catches the `ImportError` and disables itself, so
-the only symptom is `up == 0` fleet-wide.
+In practice the engine images already provide it — vLLM, SGLang and TensorRT-LLM
+all depend on it for their own metrics — so the extra matters only for an image
+built without one of those. If it is missing the collector catches the
+`ImportError` and disables itself, so the symptom is `up == 0` with nothing else
+to go on.
 
 ---
 
@@ -342,7 +336,7 @@ cargo test --package modelexpress-server metrics
 cargo test --package modelexpress-server --features integration-tests --test in_process_server
 
 # Before/after numbers.
-python benchmarks/metrics_pipeline.py --ranks 8
+python benchmarks/metrics/metrics_pipeline.py --ranks 8
 ```
 
 `tests/test_metrics.py` runs the merged-endpoint check at both TP=2 and TP=8 by

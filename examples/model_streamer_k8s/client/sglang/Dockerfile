@@ -12,12 +12,6 @@ RUN pip uninstall -y modelexpress 2>/dev/null || true && \
     rm -rf "$(python3 -c 'import site; print(site.getsitepackages()[0])')"/modelexpress* && \
     pip install --no-cache-dir --no-deps .
 
-# --no-deps above excludes the [metrics] extra, so prometheus-client is
-# installed explicitly; the collector otherwise catches the ImportError and
-# disables itself. It has no dependencies of its own, so --no-deps keeps the
-# engine-provided stack untouched.
-RUN pip install --no-cache-dir --no-deps "prometheus-client>=0.20.0"
-
 RUN python3 -c "from modelexpress.engines.sglang import MxModelLoader" && \
     python3 -c "import runai_model_streamer"
 

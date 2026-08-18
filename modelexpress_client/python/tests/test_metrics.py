@@ -24,10 +24,9 @@ that asserts the *corrected* shape can tell them apart:
 * **D8** ``mx_p2p_candidates{stage="listed"}`` could never observe zero, and a
   ListSources RPC failure recorded nothing at all.
 
-D1 (the Helm annotation pointed at the gRPC port) and D5 (no image installed
-prometheus-client explicitly) are deployment artifacts; they are covered by
-``test_metrics_deployment.py`` and, for the server listener,
-``modelexpress_server/src/metrics/exposition.rs``.
+D1 (the Helm annotation pointed at the gRPC port) is a deployment artifact,
+covered by ``test_metrics_deployment.py`` and by the server integration test in
+``modelexpress_server/tests/in_process_server.rs``.
 """
 
 from __future__ import annotations

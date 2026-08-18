@@ -15,12 +15,12 @@ flush that only runs on a clean exit — driven through the same synthetic
 workload as the "after" column, in the same forked-rank harness. Nothing here is
 extrapolated from a single-process run.
 
-Run it::
+Run it from the repository root::
 
-    python benchmarks/metrics_pipeline.py                # every scenario, TP=8
-    python benchmarks/metrics_pipeline.py --ranks 2      # TP=2
-    python benchmarks/metrics_pipeline.py --only scrape-cost --max-file-sets 512
-    python benchmarks/metrics_pipeline.py --json
+    python benchmarks/metrics/metrics_pipeline.py                  # every scenario, TP=8
+    python benchmarks/metrics/metrics_pipeline.py --ranks 2        # TP=2
+    python benchmarks/metrics/metrics_pipeline.py --only scrape-cost
+    python benchmarks/metrics/metrics_pipeline.py --json
 
 It needs ``prometheus-client`` and nothing else: no GPU, no cluster, and no
 network beyond a loopback stub Pushgateway.
@@ -51,7 +51,8 @@ from dataclasses import asdict, dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# Import the client from the source tree, so this runs without installing it.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "modelexpress_client" / "python"))
 
 #: Events each rank records. Rank ``r`` records ``EVENTS_PER_RANK * (r + 1)`` so
 #: a lost rank shows up in the total instead of being hidden by symmetry.

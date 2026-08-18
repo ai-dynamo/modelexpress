@@ -8,12 +8,9 @@ FROM vllm/vllm-openai:v0.17.1
 # regenerate them with grpcio-tools when p2p.proto changes.
 COPY modelexpress_client/python /opt/modelexpress/client
 WORKDIR /opt/modelexpress/client
-# The [metrics] extra pulls in prometheus-client. Without it the collector
-# catches the ImportError and disables itself, so MX_METRICS_ENABLED=1 and a
-# scrape annotation produce up == 0 with no explanation.
 RUN pip uninstall -y modelexpress 2>/dev/null || true && \
     rm -rf "$(python3 -c 'import site; print(site.getsitepackages()[0])')"/modelexpress* && \
-    pip install ".[metrics]"
+    pip install .
 
 # Back to default workdir
 WORKDIR /workspace

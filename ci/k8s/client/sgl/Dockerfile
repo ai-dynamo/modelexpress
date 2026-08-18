@@ -27,13 +27,6 @@ RUN pip uninstall -y modelexpress 2>/dev/null || true && \
     rm -rf "$(python3 -c 'import site; print(site.getsitepackages()[0])')"/modelexpress* && \
     pip install --no-cache-dir --no-deps .
 
-# --no-deps above excludes the [metrics] extra, so prometheus-client is
-# installed explicitly. Without it the collector catches the ImportError and
-# disables itself, and MX_METRICS_ENABLED=1 produces up == 0 with no
-# explanation. It has no dependencies of its own, so --no-deps keeps the
-# engine-provided CUDA/NIXL/Torch stack untouched.
-RUN pip install --no-cache-dir --no-deps "prometheus-client>=0.20.0"
-
 # Verify the client and the SGLang loader hook imported successfully.
 RUN python3 -c "from modelexpress.client import MxClient; print('MxClient OK')" && \
     python3 -c "from modelexpress.engines.sglang import MxModelLoader; print('SGLang MxModelLoader OK')" && \
