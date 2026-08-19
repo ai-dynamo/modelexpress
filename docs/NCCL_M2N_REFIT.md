@@ -3,24 +3,30 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# NCCL M2N Refit — collective weight transfer, standalone from NIXL
+# NCCL M2N Refit
 
-> **Status: design.** This document specifies the push-style collective refit
-> path. It is a *sibling* of the NIXL pull path in
-> [`modelexpress/refit/reshard/`](../modelexpress_client/python/modelexpress/refit/README.md),
-> not a mode of it. Nothing on this path imports NIXL, and nothing on the NIXL
-> path imports this.
+Design for a collective weight-transfer path for Reinforcement Learning (RL) refit, built on
+the NVIDIA Collective Communications Library (NCCL) and independent of the NVIDIA
+Interconnect eXchange Library (NIXL) pull path. For the existing pull path, see
+[the refit package](../modelexpress_client/python/modelexpress/refit/README.md). For
+architecture and gRPC services, see [`ARCHITECTURE.md`](ARCHITECTURE.md). For configuration,
+see [`DEPLOYMENT.md`](DEPLOYMENT.md).
 
-## 1. What this is
+> [!IMPORTANT]
+> This is a design, not an implementation. No code for this path exists in the repository
+> yet. It is a *sibling* of the NIXL pull path, not a mode of it: nothing on this path
+> imports NIXL, and nothing on the NIXL path imports this.
+
+## What this is
 
 ModelExpress (MX) already has one RL refit data plane: a **receiver-driven NIXL
 pull**. Each generator rank discovers trainer shard ownership through the MX
-control plane and issues one-sided RDMA READs for exactly the byte ranges its own
-layout needs.
+control plane and issues one-sided Remote Direct Memory Access (RDMA) reads for exactly
+the byte ranges its own layout needs.
 
 This document specifies the second, independent data plane: a **sender-driven
 NCCL collective push**, built on `nccl.m2n.reshard`. Trainer ranks and generator
-ranks enter one collective call together and NCCL performs the M-to-N
+ranks enter one collective call together and NCCL performs the many-to-many (M-to-N)
 redistribution between the two parallelism meshes internally.
 
 The two paths answer the same question with opposite mechanics:
@@ -28,12 +34,12 @@ The two paths answer the same question with opposite mechanics:
 | | NIXL pull (existing) | NCCL M2N push (this document) |
 |---|---|---|
 | Initiator | Generator rank | Both sides co-call; the trainer supplies bytes |
-| Wire primitive | One-sided RDMA `READ` | `nccl.m2n.reshard` collective |
+| Wire primitive | One-sided Remote Direct Memory Access (RDMA) `READ` | `nccl.m2n.reshard` collective |
 | Who routes | The MX receiver plans byte runs | NCCL routes from the src/dst meshes |
 | Membership | Each receiver joins independently | Fixed communicator; every member must enter |
 | MX control-plane role | Shard and manifest directory, leases | Rendezvous, admission, fencing, group state |
 | Source lifetime | Buffers must outlive the receivers | Buffers live only across the collective |
-| Partial generator set | Natural — receivers are independent | Requires a per-operation admitted group (§5) |
+| Partial generator set | Natural — receivers are independent | Requires a per-operation admitted group (see [Control plane](#control-plane)) |
 
 Neither supersedes the other. Pull tolerates ragged membership and late joiners;
 push gets NCCL's tuned M-to-N kernels and does not need trainer buffers kept
@@ -48,9 +54,9 @@ registered and pinned between refits.
 - No change to the existing `RefitService` pull RPCs (`WeightVersionShard`,
   `VersionLease`, `RefitWorkerService`). Those are the pull path's vocabulary.
 
-## 2. Requirements and prior art
+## Requirements and prior art
 
-### A. What this path must satisfy
+### What this path must satisfy
 
 The requirements below come from the internal MX RL refit design work. They are
 restated here as the contract this path implements:
@@ -73,7 +79,7 @@ restated here as the contract this path implements:
 6. The TransferPlan abstraction survives, but its NCCL form carries collective
    membership and prepared destination bindings. Layer grouping stays internal.
 
-### B. The shared two-sided client shape
+### The shared two-sided client shape
 
 MX refit clients are `RefitClient.Trainer` and `RefitClient.Generator`, each
 decomposed into a pluggable **Publisher** (trainer) / **Loader** (generator) and
@@ -95,7 +101,7 @@ flowchart LR
   F --> X[cleanup]
 ```
 
-### C. NeMo RL `nccl_reshard_refit`
+### Prior art: NeMo RL `nccl_reshard_refit`
 
 NVIDIA-NeMo/RL PR #2971, merged 2026-07-29. The proven upstream implementation of
 exactly this transfer. We adopt its wire contract so that an MX-brokered
@@ -104,16 +110,16 @@ deployment and a NeMo-RL-native deployment move identical bytes:
 - `nccl.m2n.reshard` from the **nccl4py** package is the default and only wire op
   (`xferdtensor`'s pure-Python and golden paths are debugging aids, not our
   contract).
-- Parameters are keyed by **HuggingFace names** with **global shapes**; per-expert
-  MoE weights are grouped into one `...experts.{gate,up,down}_proj.weight` entry
-  of shape `[E, ...]`.
+- Parameters are keyed by **HuggingFace (HF) names** with **global shapes**; per-expert
+  Mixture-of-Experts (MoE) weights are grouped into one
+  `...experts.{gate,up,down}_proj.weight` entry of shape `[E, ...]`.
 - Source and destination layouts are described as a **rank mesh** plus DTensor
   **`Shard(dim)` / `Replicate()`** placements.
-- Communicators are **per trainer PP stage**: stage `s`'s trainer ranks plus all
-  participating generator ranks. Rank order within a group is **trainer ranks
+- Communicators are **per trainer Pipeline Parallelism (PP) stage**: stage `s`'s trainer
+  ranks plus all participating generator ranks. Rank order within a group is **trainer ranks
   first, generator ranks after**.
-- A **bulk/misc split**: FFN projection weights take the reshard path (97-98% of
-  the bytes on large MoE models); everything else rides a packed broadcast over a
+- A **bulk/misc split**: feed-forward network (FFN) projection weights take the reshard
+  path (97-98% of the bytes on large MoE models); everything else rides a packed broadcast over a
   separate all-participants communicator.
 
 Where NeMo RL and MX differ is precisely the piece MX is asked to own:
@@ -127,7 +133,7 @@ Where NeMo RL and MX differ is precisely the piece MX is asked to own:
 | Readiness | Implicit — everyone calls `init_nccl_communicator` and blocks | Explicit `FORMING -> READY` state the trainer waits on before launching |
 | Group lifetime | One communicator for the whole job | Membership-keyed group, reused across refits, invalidated on epoch change |
 
-## 3. Component architecture
+## Component architecture
 
 ![Component diagram: the RL orchestrator creates a collective transfer in the ModelExpress control plane and invokes trainer and generator actors; each rank-local refit client joins the collective group, receives an MX-assigned rank per lane, and waits for READY before entering the collective, while weight bytes move directly between trainer and generator ranks](images/nccl-m2n-components.png)
 
@@ -145,13 +151,13 @@ Ownership, one line each:
 - **ShardRedistribution Backend (nccl_m2n)** owns the communicators and the wire
   ops. It is the only component that imports `nccl`.
 
-## 4. Rendezvous: what MX replaces
+## Rendezvous: what MX replaces
 
 NeMo RL's `StatelessProcessGroup` is a `TCPStore` whose sole job is to move 128
 bytes of `ncclUniqueId` from rank 0 to everyone else, at an address the Ray driver
 had to allocate and plumb through both actor sets, once per PP stage.
 
-MX already is a well-known, authenticated, TTL-backed coordination service that
+MX already is a well-known, authenticated, time-to-live (TTL)-backed coordination service that
 both sides are connected to. Making it the store removes that port allocation,
 makes membership explicit instead of implied by "whoever shows up", and gives us
 the three things a `TCPStore` structurally cannot: admission, fencing, and a
@@ -160,13 +166,13 @@ collective — can observe.
 
 ![Timing waterfall of group formation: the orchestrator creates the transfer and fans out actor RPCs, every worker joins, the lane leader publishes the NCCL unique id, MX flips the group to READY, and only then do all ranks pay the one-time Communicator.init cost before generators fetch the reshard plan](images/nccl-m2n-group-formation.png)
 
-## 5. Control plane
+## Control plane
 
 New proto file `modelexpress_common/proto/refit_collective.proto`, new service
 `RefitCollectiveService`. Kept in its own file and its own Rust module so the NIXL
 pull path and the NCCL push path never share a type.
 
-### 5.1 Resources
+### Resources
 
 | Resource | Lifetime | Owner |
 |---|---|---|
@@ -177,11 +183,12 @@ pull path and the NCCL push path never share a type.
 Splitting group from operation reconciles two requirements that read as being in
 tension: the group is described as ephemeral and per-operation, yet MX is also
 expected to *reuse* a communicator until membership changes invalidate it. Treating
-them as two objects satisfies both. The *operation* is per-refit and cheap. The *group* — and the communicator it describes — is keyed by membership
-and reused until membership changes. A client caches its `Communicator` under
+them as two objects satisfies both. The *operation* is per-refit and cheap. The *group* —
+and the communicator it describes — is keyed by membership and reused until membership
+changes. A client caches its `Communicator` under
 `(group_id, epoch)` and drops it when the epoch moves.
 
-### 5.2 Lanes
+### Lanes
 
 One `CollectiveGroup` carries several communicators, because the transfer needs
 two different spans:
@@ -197,10 +204,10 @@ path on its own communicators is not cosmetic: the workers must run the misc
 broadcast strictly after the bulk reshard, because concurrent traffic on
 overlapping communicators can deadlock.
 
-### 5.3 Rank assignment
+### Rank assignment
 
 MX assigns `rank_in_lane`. The rule reproduces NeMo RL's convention exactly, so
-the mesh arithmetic in §6 is unchanged:
+the mesh arithmetic below is unchanged:
 
 ```text
 reshard lane s     world_size = trainer_ranks_per_stage + admitted_generator_count
@@ -212,14 +219,15 @@ broadcast lane     world_size = trainer_world_size + admitted_generator_count
   generator index_in_role g ->  rank_in_lane = trainer_world_size + g
 ```
 
-MX needs no knowledge of TP/EP/DP to do this — only the role, the lane, and the
-index within the role. All parallelism semantics stay client-side (§6). That is
+MX needs no knowledge of Tensor Parallelism (TP), Expert Parallelism (EP), or Data
+Parallelism (DP) to do this — only the role, the lane, and the index within the role. All
+parallelism semantics stay client-side. That is
 the whole point of keeping MX a rendezvous rather than a planner on this path.
 
 `rank_in_lane == 0` of each lane is always a trainer, and that participant
 generates and posts the lane's `ncclUniqueId`.
 
-### 5.4 States
+### States
 
 ```mermaid
 stateDiagram-v2
@@ -248,7 +256,7 @@ liveness check the NIXL path gets from lease renewal — here it is checked at
 admission and re-checked at the `READY` transition, because the collective's
 failure mode is a hang rather than a `NOT_FOUND`.
 
-### 5.5 RPCs
+### RPCs
 
 ```protobuf
 service RefitCollectiveService {
@@ -275,13 +283,14 @@ service RefitCollectiveWorkerService {
 polling with backoff, so a stalled peer surfaces as a client-side deadline
 carrying the group's own participant list, rather than as a hung stream.
 
-### 5.6 Why the plan is worker-served
+### Why the plan is worker-served
 
-The reshard plan (§6) is one record per bulk parameter: HF name, global shape,
+The reshard plan (see [The plan](#the-plan-mesh-and-placement-contract)) is one record per
+bulk parameter: HF name, global shape,
 dtype, source mesh and placements, destination mesh and placements, PP stage. For
 a large MoE model that is on the order of hundreds of entries and hundreds of
 kilobytes. The pull path already established the rule: the full sealed manifest
-stays worker-served so that CRD or etcd records stay small, while
+stays worker-served so that Custom Resource Definition (CRD) or etcd records stay small, while
 `manifest_digest` verifies that fetched content matches.
 
 The same rule applies here. MX stores `plan_source = {worker_id, endpoint,
@@ -291,7 +300,7 @@ function of `(model layout, trainer parallelism, admitted generator set)` and no
 of the weights, it is keyed by `(group_id, epoch)` and fetched **once per epoch**,
 never per refit.
 
-## 6. The plan: mesh and placement contract
+## The plan: mesh and placement contract
 
 This is where NeMo RL's contract is adopted wholesale. The plan is torch-free
 data; only the backend touches tensors.
@@ -331,7 +340,7 @@ dense and MoE, excluding `shared_expert`) go to the misc list and ride the
 broadcast lane in a deterministic order. That order is load-bearing: producer and
 consumer walk it in lockstep.
 
-### 6.1 Local realization: Publisher and Loader
+### Local realization: Publisher and Loader
 
 The plan says *what* moves. The Publisher and Loader say *where it lives locally*.
 This is NeMo RL's `LocalParamSpec` contract, adopted verbatim so that an existing
@@ -354,10 +363,11 @@ class LocalParamSpec:
   allocates a receive buffer for the region, `post` copies it back into the fused
   tensor.
 
-`pre`, `post`, and the wire op all enqueue on the same CUDA stream, so staging is
+`pre`, `post`, and the wire op all enqueue on the same Compute Unified Device
+Architecture (CUDA) stream, so staging is
 ordered with the transfer without a host synchronize.
 
-## 7. Lifecycle and sequencing
+## Lifecycle and sequencing
 
 The shared lifecycle's sequencing rules map onto the collective path as follows.
 The rules are the contract; the right-hand column is what this backend does with
@@ -382,7 +392,7 @@ Two invariants the collective imposes on top of that lifecycle:
    is the core requirement of this path, and it is why readiness is
    server-observable state rather than a client-side barrier.
 
-### 7.1 Refit-time waterfall
+### Refit-time waterfall
 
 ![Timing waterfall of one warm refit: two trainer PP stages stack grouped MoE experts and co-call nccl.m2n.reshard with the generator ranks on independent per-stage communicators that overlap on separate CUDA streams, after which the misc packed broadcast is serialized behind every reshard lane, then the loader installs and both sides report](images/nccl-m2n-refit-waterfall.png)
 
@@ -393,7 +403,7 @@ serialized after all bulk lanes: it uses the all-participants communicator, whic
 overlaps every reshard lane, and concurrent traffic on overlapping communicators
 can deadlock.
 
-## 8. Failure semantics
+## Failure semantics
 
 The collective's characteristic failure is a **hang**, not an error return. Every
 guarantee below exists to convert a potential hang into a bounded, attributable
@@ -415,7 +425,7 @@ engine, not an MX-side rollback. A Loader that wants verify-before-activate must
 allocate its own receive buffers in `pre` and commit in `post`/`install()` — which
 is exactly what the fused-parameter path already does.
 
-## 9. Configuration
+## Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -431,7 +441,7 @@ registration* is dominated by `Communicator.init` and is charged **once per
 epoch**, not once per refit — reporting it per refit would make a warm refit look
 an order of magnitude worse than it is.
 
-## 10. Dependencies
+## Dependencies
 
 `nccl4py` (the `nccl` package) provides everything this path needs:
 
@@ -446,7 +456,7 @@ It is an **optional extra** (`modelexpress[nccl-m2n]`). Importing
 actionable message; the torch-free plan and rendezvous modules import and test
 cleanly without NCCL, CUDA, or torch.
 
-## 11. Proposed implementation slices
+## Proposed implementation slices
 
 | Slice | Contents |
 |---|---|
@@ -454,15 +464,15 @@ cleanly without NCCL, CUDA, or torch.
 | 2. Torch-free client core | Plan records, mesh and placement derivation, bulk/misc split, layer groups, rank-assignment mirror, digest |
 | 3. Rendezvous client | Join, poll to READY, publish/fetch `uniqueId`, communicator cache keyed by `(group_id, epoch)` |
 | 4. Backend | `NcclM2nSender` / `NcclM2nReceiver`: reshard lanes, broadcast lane, stream assignment |
-| 5. Two-sided clients | `RefitClientTrainer` / `RefitClientGenerator` lifecycle + Publisher/Loader SPI + reference implementations |
-| 6. Tests | Torch-free unit tests for slices 1-3 and 5; a GPU end-to-end harness for slice 4 |
+| 5. Two-sided clients | `RefitClientTrainer` / `RefitClientGenerator` lifecycle + Publisher/Loader Service Provider Interface (SPI) + reference implementations |
+| 6. Tests | Torch-free unit tests for slices 1-3 and 5; a Graphics Processing Unit (GPU) end-to-end harness for slice 4 |
 
 Megatron publisher and vLLM loader are deliberately **out of this PR**: they are
 the only pieces with genuinely new logic per NeMo RL's own analysis, they need
 real engines to validate, and the SPI above is `LocalParamSpec`-compatible so
 NeMo RL's existing builders port directly.
 
-## 12. Open questions
+## Open questions
 
 - **Group keying.** A group is keyed by `(model_name, trainer topology, admitted
   generator set)`. If the orchestrator refits overlapping generator subsets in
@@ -479,3 +489,10 @@ NeMo RL's existing builders port directly.
 - **Bulk whitelist coverage.** Inherited from NeMo RL: FFN projections only.
   Attention projections are the obvious next increment for dense models, where the
   bulk fraction is 67% rather than 97%.
+
+## Related documentation
+
+- [ModelExpress for RL Weight Refit](../modelexpress_client/python/modelexpress/refit/README.md) — the NIXL pull path this is a sibling of
+- [ModelExpress architecture](ARCHITECTURE.md) — components, gRPC services, server internals
+- [Deployment and NIXL configuration](DEPLOYMENT.md)
+- [NVIDIA-NeMo/RL#2971](https://github.com/NVIDIA-NeMo/RL/pull/2971) — the upstream `nccl_reshard_refit` implementation whose wire contract this adopts
