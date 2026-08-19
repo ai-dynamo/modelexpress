@@ -9,6 +9,9 @@ either -- the plan contract and the rendezvous are deliberately testable
 without a GPU. See ``docs/NCCL_M2N_REFIT.md``.
 """
 
+from .backend import DEFAULT_LAYER_GROUP, NcclM2nReceiver, NcclM2nSender
+from .client import RefitClientGenerator, RefitClientTrainer
+from .comm import CommunicatorCache, LaneCommunicator, LaneKey, NcclUnavailableError
 from .plan import (
     PlanCoverageError,
     build_mesh,
@@ -30,6 +33,7 @@ from .rendezvous import (
     Membership,
     RendezvousError,
 )
+from .spi import Loader, LocalParamSpec, Publisher, RefitCtx, resolve_specs
 from .types import (
     MeshSpec,
     MiscParam,
@@ -42,16 +46,29 @@ from .types import (
 
 __all__ = [
     "CollectiveRendezvous",
+    "CommunicatorCache",
+    "DEFAULT_LAYER_GROUP",
     "EpochChangedError",
     "GroupNotReadyError",
+    "LaneCommunicator",
+    "LaneKey",
     "LaneMembership",
-    "MeshSpec",
+    "Loader",
+    "LocalParamSpec",
     "Membership",
+    "MeshSpec",
     "MiscParam",
+    "NcclM2nReceiver",
+    "NcclM2nSender",
+    "NcclUnavailableError",
     "ParamPlan",
     "Placement",
     "PlacementKind",
     "PlanCoverageError",
+    "Publisher",
+    "RefitClientGenerator",
+    "RefitClientTrainer",
+    "RefitCtx",
     "RendezvousError",
     "ReshardPlan",
     "Role",
@@ -64,5 +81,6 @@ __all__ = [
     "is_bulk_param",
     "is_expert_param",
     "plan_digest",
+    "resolve_specs",
     "validate_coverage",
 ]

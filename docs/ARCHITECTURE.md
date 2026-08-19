@@ -198,6 +198,10 @@ ModelExpress/
 │       │   ├── types.py                # Placement, MeshSpec, ParamPlan, ReshardPlan
 │       │   ├── plan.py                 # Coverage gate, plan digest, default derivation
 │       │   ├── rendezvous.py           # MX-brokered join, readiness, bootstrap, report
+│       │   ├── spi.py                  # Publisher/Loader engine boundary, LocalParamSpec
+│       │   ├── comm.py                 # Communicator cache keyed by (group_id, epoch)
+│       │   ├── backend.py              # NcclM2nSender / NcclM2nReceiver
+│       │   ├── client.py               # RefitClientTrainer / RefitClientGenerator
 │       │   └── envs.py                 # Deadlines and stream count
 │       ├── refit_collective_pb2.py     # Generated protobuf stubs
 │       └── refit_collective_pb2_grpc.py # Generated gRPC stubs
@@ -430,6 +434,15 @@ Lanes are one per disjoint source partition plus one broadcast lane. MX derives
 them and assigns ranks from role, ordinal within role, and partition alone; it
 never interprets tensor, expert, data or pipeline parallelism, which stay
 client-side. `refit_collective/lanes.rs` is the whole of that logic.
+
+The data plane lives in `collective/{backend,client,comm,spi}.py`. `nccl4py` is
+imported lazily, so the plan contract and the rendezvous stay usable and
+testable where it is not installed. Both halves walk the same plan in the same
+order, because a collective requires every participant to issue an identical
+sequence: a rank that skips a parameter its peers issue hangs the communicator
+rather than failing alone. The misc broadcast is one phase per refit in
+`finish_weight_update`, never per layer group, since its communicator spans
+every rank and overlaps every reshard lane.
 
 Groups are reclaimed automatically once every participant's registration has
 lapsed and no operation still references them. There is no group-delete RPC,
