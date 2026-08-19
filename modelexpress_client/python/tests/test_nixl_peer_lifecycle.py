@@ -32,6 +32,7 @@ class FakeAgent:
 
     def __init__(self, fail_remove: bool = False):
         self.removed: list[str] = []
+        self.deregistered: list[object] = []
         self.fail_remove = fail_remove
         self._fetched: set[str] = set()
 
@@ -48,6 +49,9 @@ class FakeAgent:
         if self.fail_remove:
             raise RuntimeError(f"remote metadata for agent '{name}' not found")
         self.removed.append(name)
+
+    def deregister_memory(self, registered):
+        self.deregistered.append(registered)
 
 
 def _manager(agent=None, metadata=b"md", accelerator=None):
@@ -155,6 +159,26 @@ class TestDisconnect:
         mgr.shutdown()
 
         assert seen["agent_alive"] is True
+        assert mgr._agent is None
+
+    def test_registered_memory_is_released_before_agent_is_dropped(self):
+        agent = FakeAgent()
+        mgr = _manager(agent=agent)
+        first, second = object(), object()
+        mgr._registered_memory = [first, second]
+        seen = []
+        real_deregister = agent.deregister_memory
+
+        def spy(registered):
+            seen.append((registered, mgr._agent is agent))
+            real_deregister(registered)
+
+        agent.deregister_memory = spy
+        mgr.shutdown()
+
+        assert seen == [(second, True), (first, True)]
+        assert agent.deregistered == [second, first]
+        assert mgr._registered_memory == []
         assert mgr._agent is None
 
     def test_removing_a_peer_twice_is_harmless(self):

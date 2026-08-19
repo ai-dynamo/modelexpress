@@ -11,24 +11,119 @@ use std::sync::Arc;
 use modelexpress_common::grpc::{
     api::api_service_server::ApiServiceServer, health::health_service_server::HealthServiceServer,
     model::model_service_server::ModelServiceServer, p2p::p2p_service_server::P2pServiceServer,
-    weight_sync::weight_sync_service_server::WeightSyncServiceServer,
+    refit::refit_service_server::RefitServiceServer,
 };
 use tonic::transport::Server;
 use tower::Layer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::auth::{AuthLayer, AuthState};
 use crate::backend_config::BackendConfig;
 use crate::cache::CacheEvictionService;
 use crate::config::{AuthMode, ServerConfig};
+use crate::metrics;
 use crate::p2p::{service::P2pServiceImpl, state::P2pStateManager};
+use crate::refit::{backend::create_backend as create_refit_backend, service::RefitServiceImpl};
 use crate::registry::state::RegistryManager;
 use crate::services::{ApiServiceImpl, HealthServiceImpl, ModelDownloadTracker, ModelServiceImpl};
-use crate::weight_sync::WeightSyncServiceImpl;
 
 /// Maximum gRPC message size (100MB) for large models like DeepSeek-V3.
 /// Each worker can have thousands of tensor descriptors with NIXL metadata.
 const MAX_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
+
+/// How long to wait for the metrics listener to drain before abandoning it.
+///
+/// Short on purpose. A scrape is a sub-second GET, so anything still open after
+/// this is a stalled client rather than work worth waiting for — and this is the
+/// last await in [`run_server`], so waiting on it delays nothing else and blocks
+/// everything.
+const METRICS_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Owns the metrics listener task and stops it on **every** exit path.
+///
+/// [`run_server`] has several fallible steps between starting this listener and
+/// reaching its normal shutdown -- registry connect, refit backend, P2P connect,
+/// auth setup -- and it is documented as callable more than once in a process.
+/// Without a guard, an early `?` return left the task *detached*: still draining,
+/// owned by nobody, for as long as a client held a connection open.
+///
+/// The port itself was already released on that path, and it is worth being
+/// precise about why, because the reason is easy to break. Dropping the guard
+/// drops its oneshot sender, which closes the channel, resolves the shutdown
+/// future and makes axum drop the listener socket. Measured: suppressing the
+/// abort alone still frees the port; only suppressing the abort *and* the
+/// shutdown signal holds it. So the drop-chain does the freeing and this guard
+/// bounds the task -- and makes a chain that used to be implicit explicit, so
+/// moving the sender somewhere longer-lived cannot silently undo it.
+struct MetricsListener {
+    handle: Option<tokio::task::JoinHandle<()>>,
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl MetricsListener {
+    /// Start the listener. Returns `None` when metrics are disabled.
+    fn spawn(metrics_addr: Option<std::net::SocketAddr>, backend: &BackendConfig) -> Option<Self> {
+        let metrics_addr = metrics_addr?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let mut registry = metrics::new_registry();
+        metrics::register_build_info(&mut registry, backend);
+        let handle = tokio::spawn(metrics::serve(
+            metrics_addr,
+            Arc::new(registry),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        ));
+        Some(Self {
+            handle: Some(handle),
+            shutdown_tx: Some(shutdown_tx),
+        })
+    }
+
+    /// Signal, drain with a deadline, then abort if it overruns.
+    ///
+    /// Bounded because the listener is unauthenticated and reachable from the pod
+    /// network, and hyper's graceful shutdown holds a connection that wrote a
+    /// partial request head open indefinitely. Without a deadline any client
+    /// killed mid-write -- a scraper, a probe, a port scan -- would wedge the last
+    /// await in `run_server` and burn the whole termination grace period.
+    async fn shutdown(mut self) {
+        // A send failure just means the task already finished -- the normal case
+        // when the bind failed, which is a supported degraded state. The join
+        // below is the real synchronization point, so this must not be an error.
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(());
+        }
+        // `take` leaves `Drop` with nothing to do, so the abort below is the only
+        // one that can run.
+        let Some(mut handle) = self.handle.take() else {
+            return;
+        };
+        match tokio::time::timeout(METRICS_DRAIN_TIMEOUT, &mut handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => error!("Metrics listener join error: {e}"),
+            Err(_) => {
+                warn!(
+                    "Metrics listener did not drain within {}s; aborting it to finish shutdown",
+                    METRICS_DRAIN_TIMEOUT.as_secs()
+                );
+                handle.abort();
+                let _ = handle.await;
+            }
+        }
+    }
+}
+
+impl Drop for MetricsListener {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            // Reached only when `run_server` returned early. There is no async
+            // context to drain in here, so stop the task outright rather than
+            // leaving it detached and draining on its own.
+            handle.abort();
+        }
+    }
+}
 
 /// Run the ModelExpress gRPC server to completion.
 ///
@@ -53,6 +148,24 @@ pub async fn run_server(
         error!("Invalid server address: {e}");
         e
     })?;
+    let metrics_addr = config.metrics_socket_addr().map_err(|e| {
+        error!("Invalid metrics address: {e}");
+        e
+    })?;
+
+    // Start the Prometheus listener before anything else can fail, so a scrape
+    // proves the exporter came up even on a server that never reaches a healthy
+    // state. It is a separate HTTP/1.1 listener on its own port because tonic
+    // serves HTTP/2 only — a scrape aimed at the gRPC port can never succeed.
+    // Its shutdown is signalled at the very end of this function, after the gRPC
+    // server has drained, so the drain window stays scrapeable.
+    //
+    // Held in a guard so every return path stops it: the steps below can fail,
+    // and a detached listener would keep the port for the next call.
+    let metrics_listener = MetricsListener::spawn(metrics_addr, &backend);
+    if metrics_listener.is_none() {
+        info!("Metrics endpoint is disabled");
+    }
 
     // Initialize the model registry manager (Redis or Kubernetes CRDs). Shares the
     // injected backend with the P2P state manager below.
@@ -115,6 +228,31 @@ pub async fn run_server(
         .set_serving::<P2pServiceServer<P2pServiceImpl>>()
         .await;
 
+    let refit_backend = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        create_refit_backend(&backend),
+    )
+    .await
+    {
+        Ok(Ok(refit_backend)) => refit_backend,
+        Ok(Err(error)) => {
+            error!("Failed to connect Refit metadata backend: {error}");
+            return Err(error.to_string().into());
+        }
+        Err(_) => {
+            error!("Timed out connecting to Refit metadata backend");
+            return Err("Refit metadata backend connection timed out".into());
+        }
+    };
+    let refit_service = refit_backend.map(RefitServiceImpl::new);
+    if refit_service.is_some() {
+        health_reporter
+            .set_serving::<RefitServiceServer<RefitServiceImpl>>()
+            .await;
+    } else {
+        info!("Refit service is unavailable: this metadata backend is not implemented yet");
+    }
+
     // Initialize P2P state manager — fails fast if backend is misconfigured or unreachable
     let p2p_state = Arc::new(P2pStateManager::with_config(backend));
 
@@ -131,7 +269,6 @@ pub async fn run_server(
     }
 
     let p2p_service = P2pServiceImpl::new(p2p_state.clone());
-    let weight_sync_service = WeightSyncServiceImpl::new();
 
     // Start reaper for stale source detection
     let (reaper_shutdown_tx, reaper_shutdown_rx) = tokio::sync::oneshot::channel();
@@ -185,9 +322,11 @@ pub async fn run_server(
     let p2p = P2pServiceServer::new(p2p_service)
         .max_decoding_message_size(MAX_MESSAGE_SIZE)
         .max_encoding_message_size(MAX_MESSAGE_SIZE);
-    let weight_sync = WeightSyncServiceServer::new(weight_sync_service)
-        .max_decoding_message_size(MAX_MESSAGE_SIZE)
-        .max_encoding_message_size(MAX_MESSAGE_SIZE);
+    let refit = refit_service.map(|service| {
+        RefitServiceServer::new(service)
+            .max_decoding_message_size(MAX_MESSAGE_SIZE)
+            .max_encoding_message_size(MAX_MESSAGE_SIZE)
+    });
 
     info!("Starting gRPC server on: {addr}");
     let router = Server::builder()
@@ -198,12 +337,12 @@ pub async fn run_server(
             .add_service(layer.layer(api))
             .add_service(layer.layer(model))
             .add_service(layer.layer(p2p))
-            .add_service(layer.layer(weight_sync)),
+            .add_optional_service(refit.map(|service| layer.layer(service))),
         None => router
             .add_service(api)
             .add_service(model)
             .add_service(p2p)
-            .add_service(weight_sync),
+            .add_optional_service(refit),
     };
     let server_result = router.serve_with_shutdown(addr, shutdown_signal).await;
 
@@ -215,6 +354,14 @@ pub async fn run_server(
     }
     if let Err(e) = reaper_handle.await {
         error!("Reaper join error: {e}");
+    }
+
+    // The metrics listener stops last, once the gRPC server has drained and the
+    // background tasks have joined. Signalling it alongside them would make the
+    // shutdown window unscrapeable during exactly the window these metrics exist
+    // to explain.
+    if let Some(metrics_listener) = metrics_listener {
+        metrics_listener.shutdown().await;
     }
 
     server_result?;

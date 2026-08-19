@@ -1052,3 +1052,60 @@ def test_te_find_source_skips_not_found(monkeypatch):
     assert [
         c.kwargs["worker_id"] for c in ctx.mx_client.get_metadata.call_args_list
     ] == ["w0", "w1"]
+
+
+# ---------------------------------------------------------------------------
+# TransferEngine source discovery -> selection metrics
+#
+# This transport bypasses LoadStrategyChain and RdmaStrategy, so the D8
+# instrumentation added to RdmaStrategy._find_source_instances does not reach
+# it. Without its own recording, a mooncake/transfer_engine pod exports
+# mx_build_info and nothing else in every state, and a metadata-backend outage
+# is indistinguishable from a cluster that has published no peers.
+# ---------------------------------------------------------------------------
+
+
+def _patched_te_metrics(monkeypatch):
+    m = MagicMock()
+    monkeypatch.setattr("modelexpress.engines.sglang.loader.selection_metrics", m)
+    return m
+
+
+def test_te_find_source_records_a_list_sources_error(monkeypatch):
+    m = _patched_te_metrics(monkeypatch)
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+    ctx = _te_ctx([])
+    ctx.mx_client.list_sources.side_effect = RuntimeError("grpc down")
+
+    assert loader._find_transfer_engine_source(ctx) is None
+
+    assert m.record_list_sources.call_args.args[1] == "error"
+
+
+def test_te_find_source_records_a_zero_funnel_when_no_peers(monkeypatch):
+    m = _patched_te_metrics(monkeypatch)
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+
+    assert loader._find_transfer_engine_source(_te_ctx([])) is None
+
+    assert m.record_list_sources.call_args.args[1] == "empty"
+    observed = {
+        call.args[1]: call.args[2] for call in m.observe_candidates.call_args_list
+    }
+    assert observed == {"listed": 0, "rank_matched": 0}
+
+
+def test_te_find_source_records_the_funnel_on_success(monkeypatch):
+    m = _patched_te_metrics(monkeypatch)
+    loader = MxModelLoader(_load_config(modelexpress_transport="transfer_engine"))
+    ctx = _te_ctx(
+        [_te_ref("s0aaaaaaaaaaaaaa", "w0"), _te_ref("s1aaaaaaaaaaaaaa", "w1")]
+    )
+
+    loader._find_transfer_engine_source(ctx)
+
+    assert m.record_list_sources.call_args.args[1] == "ok"
+    observed = {
+        call.args[1]: call.args[2] for call in m.observe_candidates.call_args_list
+    }
+    assert observed["listed"] == 2

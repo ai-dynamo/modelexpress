@@ -45,10 +45,6 @@ pub const MODEL_EXPRESS_CACHE_DIRECTORY: &str = "MODEL_EXPRESS_CACHE_DIRECTORY";
 pub const MODEL_EXPRESS_LOG_LEVEL: &str = "MODEL_EXPRESS_LOG_LEVEL";
 /// Log output format (client and server).
 pub const MODEL_EXPRESS_LOG_FORMAT: &str = "MODEL_EXPRESS_LOG_FORMAT";
-/// Maximum connection/request retries (`ClientArgs::max_retries`).
-pub const MODEL_EXPRESS_MAX_RETRIES: &str = "MODEL_EXPRESS_MAX_RETRIES";
-/// Delay between retries in seconds (`ClientArgs::retry_delay`).
-pub const MODEL_EXPRESS_RETRY_DELAY: &str = "MODEL_EXPRESS_RETRY_DELAY";
 /// Disable shared-storage mode (`ClientArgs::no_shared_storage`).
 pub const MODEL_EXPRESS_NO_SHARED_STORAGE: &str = "MODEL_EXPRESS_NO_SHARED_STORAGE";
 /// File-transfer chunk size in bytes (`ClientArgs::transfer_chunk_size`).
@@ -57,10 +53,30 @@ pub const MODEL_EXPRESS_TRANSFER_CHUNK_SIZE: &str = "MODEL_EXPRESS_TRANSFER_CHUN
 pub const MODEL_EXPRESS_SERVER_PORT: &str = "MODEL_EXPRESS_SERVER_PORT";
 /// Server host/bind address (`ServerArgs::host`).
 pub const MODEL_EXPRESS_SERVER_HOST: &str = "MODEL_EXPRESS_SERVER_HOST";
+/// Prometheus `/metrics` listen port (`ServerArgs::metrics_port`).
+///
+/// Read **only** through the clap `#[arg(env = ...)]` attribute, never through
+/// the layered config loader. [`crate::config::load_layered_config`] builds its
+/// environment source as `Environment::with_prefix("MODEL_EXPRESS").separator("_")`,
+/// so this name resolves to the key path `server.metrics.port` — which no field
+/// matches — and serde drops it without a warning. The clap override is the only
+/// path that reaches `ServerSettings::metrics_port`.
+pub const MODEL_EXPRESS_SERVER_METRICS_PORT: &str = "MODEL_EXPRESS_SERVER_METRICS_PORT";
 /// Toggle the background cache-eviction sweeper (`ServerArgs::cache_eviction_enabled`).
 pub const MODEL_EXPRESS_CACHE_EVICTION_ENABLED: &str = "MODEL_EXPRESS_CACHE_EVICTION_ENABLED";
 /// Server endpoint used by the cache module's default-endpoint helper.
 pub const MODEL_EXPRESS_SERVER_ENDPOINT: &str = "MODEL_EXPRESS_SERVER_ENDPOINT";
+
+// ── Metrics ─────────────────────────────────────────────────────────────────
+/// Benchmark run label carried by `mx_build_info`.
+///
+/// Shared verbatim with the Python client's `MX_METRICS_SCHEME`, so one run
+/// label covers both halves of a deployment. Note the asymmetry: the server
+/// carries it only on `mx_build_info`, while the client also carries it on every
+/// `mx_p2p_*` family. It is process-constant either way, so consolidating the
+/// client onto `mx_build_info` alone is a follow-on taxonomy change, not
+/// something to assume has already happened.
+pub const MX_METRICS_SCHEME: &str = "MX_METRICS_SCHEME";
 
 // ── HuggingFace ─────────────────────────────────────────────────────────────
 /// HuggingFace Hub auth token.
@@ -107,10 +123,6 @@ pub const REDIS_PORT: &str = "REDIS_PORT";
 pub const MX_METADATA_NAMESPACE: &str = "MX_METADATA_NAMESPACE";
 /// Kubernetes namespace injected via the downward API for in-cluster pods.
 pub const POD_NAMESPACE: &str = "POD_NAMESPACE";
-/// Kubernetes pod name injected via the downward API (used by clients).
-pub const POD_NAME: &str = "POD_NAME";
-/// Kubernetes pod UID injected via the downward API (used by clients).
-pub const POD_UID: &str = "POD_UID";
 
 // ── Reaper (server) ─────────────────────────────────────────────────────────
 /// Interval (seconds) between reaper scans for stale/GC worker sweeps.
@@ -179,6 +191,14 @@ pub fn cache_directory() -> Option<PathBuf> {
 pub fn server_endpoint_or_default() -> String {
     env::var(MODEL_EXPRESS_SERVER_ENDPOINT)
         .unwrap_or_else(|_| format!("http://localhost:{}", constants::DEFAULT_GRPC_PORT))
+}
+
+/// Benchmark run label from [`MX_METRICS_SCHEME`]; empty string when unset.
+///
+/// Empty is a valid value, not a missing one: outside a benchmark there is no
+/// scheme, and `mx_build_info` still needs its one series.
+pub fn metrics_scheme() -> String {
+    env::var(MX_METRICS_SCHEME).unwrap_or_default()
 }
 
 /// HuggingFace Hub token from [`HF_TOKEN`].
@@ -302,8 +322,6 @@ mod tests {
         );
         assert_eq!(MODEL_EXPRESS_LOG_LEVEL, "MODEL_EXPRESS_LOG_LEVEL");
         assert_eq!(MODEL_EXPRESS_LOG_FORMAT, "MODEL_EXPRESS_LOG_FORMAT");
-        assert_eq!(MODEL_EXPRESS_MAX_RETRIES, "MODEL_EXPRESS_MAX_RETRIES");
-        assert_eq!(MODEL_EXPRESS_RETRY_DELAY, "MODEL_EXPRESS_RETRY_DELAY");
         assert_eq!(
             MODEL_EXPRESS_NO_SHARED_STORAGE,
             "MODEL_EXPRESS_NO_SHARED_STORAGE"
@@ -315,6 +333,10 @@ mod tests {
         assert_eq!(MODEL_EXPRESS_SERVER_PORT, "MODEL_EXPRESS_SERVER_PORT");
         assert_eq!(MODEL_EXPRESS_SERVER_HOST, "MODEL_EXPRESS_SERVER_HOST");
         assert_eq!(
+            MODEL_EXPRESS_SERVER_METRICS_PORT,
+            "MODEL_EXPRESS_SERVER_METRICS_PORT"
+        );
+        assert_eq!(
             MODEL_EXPRESS_CACHE_EVICTION_ENABLED,
             "MODEL_EXPRESS_CACHE_EVICTION_ENABLED"
         );
@@ -322,6 +344,7 @@ mod tests {
             MODEL_EXPRESS_SERVER_ENDPOINT,
             "MODEL_EXPRESS_SERVER_ENDPOINT"
         );
+        assert_eq!(MX_METRICS_SCHEME, "MX_METRICS_SCHEME");
         assert_eq!(HF_TOKEN, "HF_TOKEN");
         assert_eq!(HF_HUB_CACHE, "HF_HUB_CACHE");
         assert_eq!(HF_HUB_OFFLINE, "HF_HUB_OFFLINE");
@@ -360,8 +383,6 @@ mod tests {
         assert_eq!(HOME, "HOME");
         assert_eq!(USERPROFILE, "USERPROFILE");
         assert_eq!(KUBECONFIG, "KUBECONFIG");
-        assert_eq!(POD_NAME, "POD_NAME");
-        assert_eq!(POD_UID, "POD_UID");
     }
 
     #[test]

@@ -793,17 +793,6 @@ impl ModelDownloadTracker {
         }
     }
 
-    /// Sets the status of a model (no message), notifying waiters.
-    pub async fn set_status(
-        &self,
-        model_name: String,
-        status: ModelStatus,
-        provider: ModelProvider,
-    ) {
-        self.set_status_and_notify(model_name, status, provider, None)
-            .await;
-    }
-
     /// Adds a channel that wants updates on a specific model (server-replica-local).
     pub fn add_waiting_channel(
         &self,
@@ -1409,23 +1398,6 @@ mod tests {
             .expect("waiters lock")
             .contains_key("m");
         assert!(!waiters);
-    }
-
-    #[tokio::test]
-    async fn test_tracker_set_status_delegates_without_message() {
-        let mut mock = crate::registry::backend::MockRegistryBackend::new();
-        mock.expect_set_status()
-            .withf(|_, _, status, msg| *status == ModelStatus::DOWNLOADING && msg.is_none())
-            .once()
-            .returning(|_, _, _, _| Ok(()));
-        let tracker = tracker_with_mock(mock);
-        tracker
-            .set_status(
-                "m".to_string(),
-                ModelStatus::DOWNLOADING,
-                ModelProvider::HuggingFace,
-            )
-            .await;
     }
 
     #[tokio::test]

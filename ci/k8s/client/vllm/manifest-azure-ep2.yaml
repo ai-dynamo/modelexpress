@@ -18,10 +18,14 @@
 #   runs with tp_size=2 and the per-rank agent assertion expects two distinct
 #   source agents (ranks 0 and 1).
 #
-#   The novel coverage is the identity hash: enabling EP sets
-#   parallel_config.expert_parallel_size > 0, which build_source_identity
-#   folds into mx_source_id. This is the first test to exercise rank pairing
-#   with expert_parallel_size > 0 (TEST_PLAN row 5.3). If that field were
+#   The novel coverage is the identity hash. vLLM's ParallelConfig has no
+#   expert_parallel_size attribute, so build_source_identity derives the
+#   expert-parallel world size as tp * dp * pcp when enable_expert_parallel is
+#   set and 1 otherwise, then folds that into mx_source_id. This is the first
+#   test to exercise rank pairing with a derived expert-parallel size above 1
+#   (TEST_PLAN row 5.3). Before MX-440 the published value was a constant 0 for
+#   every vLLM source, so this job passed trivially: both sides published the
+#   same wrong number and the hashes matched. If that field were
 #   encoded inconsistently between source and target, the source_id would not
 #   match, the target would fall back to disk, and the RDMA marker assertion
 #   would fail.
@@ -104,8 +108,9 @@ spec:
             - --tensor-parallel-size
             - "2"
             # Distribute MoE experts expert-parallel across the TP=2 ranks.
-            # Sets parallel_config.expert_parallel_size > 0, which flows into
-            # the ModelExpress source identity (mx_source_id) hash.
+            # Sets parallel_config.enable_expert_parallel, from which
+            # build_source_identity derives an expert-parallel world size of
+            # tp * dp * pcp = 2, folded into the source identity hash.
             - --enable-expert-parallel
             # Keep KV fixed and small so VRAM parity stays sensitive to
             # weight residency instead of vLLM auto-sizing cache around leaks.

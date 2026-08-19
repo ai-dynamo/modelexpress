@@ -193,6 +193,9 @@ class RdmaStrategy(LoadStrategy):
                 f"({worker_tensor_count(source_worker)} tensors)"
             )
 
+            # The peer id is always passed; the collector drops it unless
+            # MX_METRICS_SOURCE_ID_LABEL=1, so the cardinality decision lives in
+            # one place rather than being duplicated at every call site.
             selection_metrics.record_selection(policy, worker_id)
             transfer_start = time.perf_counter()
             try:
@@ -279,6 +282,7 @@ class RdmaStrategy(LoadStrategy):
         ``random``). The retry slice (MAX_SOURCE_RETRIES) is applied by the
         caller in load(), so the selector controls ordering only.
         """
+        policy = configured_policy_label()
         try:
             list_resp = ctx.mx_client.list_sources(
                 identity=ctx.identity,
@@ -288,6 +292,14 @@ class RdmaStrategy(LoadStrategy):
                 logger.debug(
                     f"[Worker {ctx.global_rank}] No ready source instances found"
                 )
+                # Record the empty funnel before returning. Without this,
+                # ``stage="listed"`` could never observe zero -- the one bucket
+                # that distinguishes "no peers published" from "peers listed but
+                # every one filtered out" was unreachable, so the two looked
+                # identical on a dashboard.
+                selection_metrics.record_list_sources(policy, "empty")
+                for stage in ("listed", "rank_matched", "accelerator_matched"):
+                    selection_metrics.observe_candidates(policy, stage, 0)
                 return []
 
             rank_matched = [
@@ -319,6 +331,7 @@ class RdmaStrategy(LoadStrategy):
             ordered = selector.order(candidates, ctx)
             select_seconds = time.perf_counter() - select_start
 
+            selection_metrics.record_list_sources(selector.name, "ok")
             selection_metrics.observe_candidates(
                 selector.name, "listed", len(list_resp.instances)
             )
@@ -348,6 +361,11 @@ class RdmaStrategy(LoadStrategy):
             logger.warning(
                 f"[Worker {ctx.global_rank}] Error listing sources, falling through: {e}"
             )
+            # A ListSources RPC failure used to record nothing at all, so a
+            # complete backend outage was indistinguishable from a cluster with
+            # no peers -- both showed up as an absence. This counter is what
+            # separates them.
+            selection_metrics.record_list_sources(policy, "error")
             return []
 
     def _accelerator_compatible(
