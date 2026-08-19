@@ -129,7 +129,7 @@ Where NeMo RL and MX differ is precisely the piece MX is asked to own:
 
 ## 3. Component architecture
 
-![Component diagram: the RL orchestrator creates a collective transfer in the ModelExpress control plane and invokes trainer and generator actors; each rank-local refit client joins the collective group, receives an MX-assigned rank per lane, and waits for READY before entering the collective, while weight bytes move directly between trainer and generator ranks](images/nccl-m2n-components.svg)
+![Component diagram: the RL orchestrator creates a collective transfer in the ModelExpress control plane and invokes trainer and generator actors; each rank-local refit client joins the collective group, receives an MX-assigned rank per lane, and waits for READY before entering the collective, while weight bytes move directly between trainer and generator ranks](images/nccl-m2n-components.png)
 
 Ownership, one line each:
 
@@ -158,7 +158,7 @@ the three things a `TCPStore` structurally cannot: admission, fencing, and a
 readiness state that a *third* party — the trainer that must launch the
 collective — can observe.
 
-![Timing waterfall of group formation: the orchestrator creates the transfer and fans out actor RPCs, every worker joins, the lane leader publishes the NCCL unique id, MX flips the group to READY, and only then do all ranks pay the one-time Communicator.init cost before generators fetch the reshard plan](images/nccl-m2n-group-formation.svg)
+![Timing waterfall of group formation: the orchestrator creates the transfer and fans out actor RPCs, every worker joins, the lane leader publishes the NCCL unique id, MX flips the group to READY, and only then do all ranks pay the one-time Communicator.init cost before generators fetch the reshard plan](images/nccl-m2n-group-formation.png)
 
 ## 5. Control plane
 
@@ -384,7 +384,7 @@ Two invariants the collective imposes on top of that lifecycle:
 
 ### 7.1 Refit-time waterfall
 
-![Timing waterfall of one warm refit: two trainer PP stages stack grouped MoE experts and co-call nccl.m2n.reshard with the generator ranks on independent per-stage communicators that overlap on separate CUDA streams, after which the misc packed broadcast is serialized behind every reshard lane, then the loader installs and both sides report](images/nccl-m2n-refit-waterfall.svg)
+![Timing waterfall of one warm refit: two trainer PP stages stack grouped MoE experts and co-call nccl.m2n.reshard with the generator ranks on independent per-stage communicators that overlap on separate CUDA streams, after which the misc packed broadcast is serialized behind every reshard lane, then the loader installs and both sides report](images/nccl-m2n-refit-waterfall.png)
 
 Per-PP-stage lanes are independent communicators, so stage 0's and stage 1's
 reshards overlap on separate CUDA streams (`MX_NCCL_REFIT_NUM_STREAMS`, default 2,
