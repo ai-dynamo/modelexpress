@@ -277,6 +277,152 @@ class TestHeartbeatOnExit:
         assert statuses == [2, 3]
 
 
+class TestHeartbeatReRegistration:
+    """Recovery when the server rejects heartbeats (e.g. its store was reset)."""
+
+    def _publisher(self, mx_client, nixl_manager, publish):
+        return PublisherThread(
+            mx_client=mx_client,
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            publish_fn=publish,
+            interval_secs=1,
+        )
+
+    def test_consecutive_rejections_trigger_republish(self, mx_client, nixl_manager):
+        publish = MagicMock(side_effect=["id1", "id2"])
+        publisher = self._publisher(mx_client, nixl_manager, publish)
+        # Publish succeeds, then the server loses the registration: two
+        # rejected heartbeats, then the re-published source heartbeats fine.
+        mx_client.update_status.side_effect = [True, False, False, True]
+
+        publisher._tick()  # publish id1 + READY accepted
+        publisher._tick()  # rejected (1/2)
+        assert publisher.mx_source_id == "id1"
+        publisher._tick()  # rejected (2/2) -> re-registration scheduled
+        assert publisher.mx_source_id is None
+        publisher._tick()  # re-publish id2 + READY accepted
+
+        assert publish.call_count == 2
+        assert publisher.mx_source_id == "id2"
+        ready_ids = [
+            c.kwargs["mx_source_id"]
+            for c in mx_client.update_status.call_args_list
+            if c.kwargs["status"] == 2
+        ]
+        assert ready_ids == ["id1", "id1", "id1", "id2"]
+
+    def test_single_rejection_does_not_republish(self, mx_client, nixl_manager):
+        publish = MagicMock(return_value="id1")
+        publisher = self._publisher(mx_client, nixl_manager, publish)
+        # Rejections never happen twice in a row.
+        mx_client.update_status.side_effect = [True, False, True, False, True]
+
+        for _ in range(5):
+            publisher._tick()
+
+        publish.assert_called_once_with()
+        assert publisher.mx_source_id == "id1"
+
+    def test_accepted_heartbeat_resets_rejection_count(self, mx_client, nixl_manager):
+        publish = MagicMock(return_value="id1")
+        publisher = self._publisher(mx_client, nixl_manager, publish)
+        mx_client.update_status.side_effect = [True, False, True, False, False]
+
+        for _ in range(4):
+            publisher._tick()
+        assert publisher.mx_source_id == "id1"  # count was reset by tick 3
+        publisher._tick()  # second consecutive rejection -> re-register
+
+        assert publisher.mx_source_id is None
+
+    def test_republish_resets_publish_timeout_window(self, mx_client, nixl_manager):
+        publish = MagicMock(side_effect=["id1", "id2"])
+        publisher = self._publisher(mx_client, nixl_manager, publish)
+        mx_client.update_status.side_effect = [True, False, False, True]
+        # Pretend the initial publish already used up its timeout.
+        publisher._tick()
+        publisher._publish_started_at = time.monotonic() - 10_000
+        publisher._publish_given_up = True
+
+        publisher._tick()
+        publisher._tick()  # triggers re-registration
+        assert publisher._publish_started_at is None
+        assert publisher._publish_given_up is False
+        publisher._tick()
+
+        assert publisher.mx_source_id == "id2"
+        assert not publisher._stop_event.is_set()
+
+    def test_rejections_without_publish_fn_warn_once_and_keep_heartbeating(
+        self, mx_client, nixl_manager, caplog
+    ):
+        publisher = PublisherThread(
+            mx_client=mx_client,
+            mx_source_id="abc123",
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            interval_secs=1,
+        )
+        mx_client.update_status.return_value = False
+
+        with caplog.at_level("WARNING", logger="modelexpress.metadata.publisher"):
+            for _ in range(6):
+                publisher._tick()
+
+        # Cannot recover, but keeps trying and stays on the cached id.
+        assert publisher.mx_source_id == "abc123"
+        assert mx_client.update_status.call_count == 6
+        warnings = [
+            r for r in caplog.records if "no publish_fn" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+
+    def test_transport_error_does_not_trigger_republish(self, mx_client, nixl_manager):
+        publish = MagicMock(return_value="id1")
+        publisher = self._publisher(mx_client, nixl_manager, publish)
+        mx_client.update_status.side_effect = [
+            True,
+            RuntimeError("unreachable"),
+            RuntimeError("unreachable"),
+            True,
+        ]
+
+        publisher._tick()
+        for _ in range(2):
+            with pytest.raises(RuntimeError):
+                publisher._tick()
+        publisher._tick()
+
+        # Server was unreachable, not rejecting: keep the cached id.
+        publish.assert_called_once_with()
+        assert publisher.mx_source_id == "id1"
+
+    def test_stop_while_reregistration_pending_does_not_raise(
+        self, mx_client, nixl_manager
+    ):
+        publish = MagicMock(return_value="id1")
+        publisher = self._publisher(mx_client, nixl_manager, publish)
+        mx_client.update_status.side_effect = [True, False, False]
+
+        for _ in range(3):
+            publisher._tick()
+        assert publisher.mx_source_id is None
+
+        mx_client.update_status.side_effect = None
+        mx_client.update_status.reset_mock()
+        publisher.stop()
+
+        # No mx_source_id left, so no STALE update is sent.
+        stale_calls = [
+            c for c in mx_client.update_status.call_args_list
+            if c.kwargs.get("status") == 3
+        ]
+        assert stale_calls == []
+
+
 class TestHeartbeatDaemon:
     def test_thread_is_daemon(self, heartbeat):
         heartbeat.start()
