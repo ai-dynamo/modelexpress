@@ -21,6 +21,15 @@ class GeneratorInstallationMode(str, Enum):
     DIRECT = "DIRECT"
 
 
+class GeneratorEngineContext(ABC):
+    """Typed rank-local inputs used to construct one engine adapter."""
+
+    @property
+    @abstractmethod
+    def engine_name(self) -> str:
+        """Return the configured engine name for factory dispatch."""
+
+
 @dataclass(frozen=True)
 class GeneratorSource:
     """One verified, version-scoped source selected for a logical slot."""
@@ -104,6 +113,7 @@ class GeneratorEngineAdapter(ABC):
 
 
 __all__ = [
+    "GeneratorEngineContext",
     "GeneratorEngineAdapter",
     "GeneratorInstallationMode",
     "GeneratorSource",

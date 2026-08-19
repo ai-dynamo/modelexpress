@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from modelexpress.refit.reshard.geometry import capture_geometry
+from modelexpress.refit.reshard.types import IncompleteRefit
 
 if TYPE_CHECKING:
     from torch.nn import Module
@@ -57,8 +58,13 @@ class _VllmInstaller:
         The unquantized meta twin has the same structural fusion and load-time
         parameter layout without allocating tensor storage.
         """
-        from vllm.model_executor.model_loader.utils import initialize_model
-        from vllm.utils.torch_utils import set_default_torch_dtype
+        try:
+            from vllm.model_executor.model_loader.utils import initialize_model
+            from vllm.utils.torch_utils import set_default_torch_dtype
+        except (ImportError, AttributeError) as error:
+            raise RuntimeError(
+                "ModelExpress refit requires vLLM's layerwise reload APIs"
+            ) from error
 
         # Strip quantization so capture observes pre-PWAL load-time parameters,
         # not fp8/Marlin kernel storage.
@@ -86,7 +92,14 @@ class _VllmInstaller:
         dict[str, tuple[tuple[int, ...], torch.dtype]],
     ]:
         """Record how published tensors map into vLLM's load-time parameters."""
-        from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+        try:
+            from vllm.model_executor.model_loader.weight_utils import (
+                default_weight_loader,
+            )
+        except (ImportError, AttributeError) as error:
+            raise RuntimeError(
+                "ModelExpress refit requires vLLM's weight-loader APIs"
+            ) from error
 
         # The explicit default loader stamps norm and other parameters without a
         # custom weight_loader, so their copies are attributed rather than lost.
@@ -110,7 +123,7 @@ class _VllmInstaller:
     def install(self, tensors: dict[str, torch.Tensor]) -> None:
         """Install verified load-layout tensors without changing graph addresses."""
         self._process_and_commit(tensors)
-        _update_mla_absorbed_weights(self._model)
+        _update_mla_absorbed_weights(self._model, quantized=self._is_quantized)
         torch.cuda.synchronize(self._device)
 
     @torch.no_grad()
@@ -123,26 +136,22 @@ class _VllmInstaller:
         result back into the original kernel storage used by CUDA graphs.
         """
         from torch import nn
-        from vllm.config import set_current_vllm_config
-        from vllm.model_executor.layers.quantization.base_config import (
-            QuantizeMethodBase,
-        )
-        from vllm.model_executor.model_loader.reload.layerwise import (
-            LAYERWISE_INFO,
-            _copy_and_restore_kernel_tensors,
-            finalize_layerwise_reload,
-            initialize_layerwise_reload,
-        )
 
-        # Resolve captured parameter names through the live module hierarchy;
-        # PWAL is a layer operation rather than a whole-model operation.
-        groups: dict[Module, list[tuple[str, str]]] = {}
-        names = set(tensors)
-        for module_name, module in self._model.named_modules():
-            for leaf, _parameter in module.named_parameters(recurse=False):
-                full_name = f"{module_name}.{leaf}" if module_name else leaf
-                if full_name in names:
-                    groups.setdefault(module, []).append((full_name, leaf))
+        try:
+            from vllm.config import set_current_vllm_config
+            from vllm.model_executor.layers.quantization.base_config import (
+                QuantizeMethodBase,
+            )
+            from vllm.model_executor.model_loader.reload.layerwise import (
+                LAYERWISE_INFO,
+                _copy_and_restore_kernel_tensors,
+                finalize_layerwise_reload,
+                initialize_layerwise_reload,
+            )
+        except (ImportError, AttributeError) as error:
+            raise RuntimeError(
+                "ModelExpress refit requires vLLM's layerwise reload APIs"
+            ) from error
 
         # vLLM also keeps graph-bound tensors as plain object attributes rather
         # than registered parameters or buffers. Layerwise reload does not save
@@ -162,6 +171,25 @@ class _VllmInstaller:
 
         with torch.device(self._device), set_current_vllm_config(self._vllm_config):
             initialize_layerwise_reload(self._model)
+
+            # Quantized models expose kernel-packed parameters before layerwise
+            # reload and load-time parameters after it. Resolve the captured
+            # names only after vLLM has restored that load-time hierarchy.
+            groups: dict[Module, list[tuple[str, str]]] = {}
+            matched: set[str] = set()
+            for module_name, module in self._model.named_modules():
+                for leaf, _parameter in module.named_parameters(recurse=False):
+                    full_name = f"{module_name}.{leaf}" if module_name else leaf
+                    if full_name in tensors:
+                        groups.setdefault(module, []).append((full_name, leaf))
+                        matched.add(full_name)
+            unmatched = sorted(set(tensors) - matched)
+            if unmatched:
+                raise IncompleteRefit(
+                    "vLLM layerwise reload did not expose every staged parameter; "
+                    f"unmatched={unmatched[:10]}"
+                )
+
             for layer, parameters in groups.items():
                 info = LAYERWISE_INFO.get(layer)
                 for full_name, leaf in parameters:
@@ -206,21 +234,21 @@ class _VllmInstaller:
                     setattr(module, name, graph_tensor)
 
         # A parameter left on meta has no backing storage. CUDA-graph replay would
-        # read an invalid address, so retain an explicit diagnostic here.
+        # read an invalid address, so reject the update and let the framework
+        # restart the engine.
         meta_parameters = [
             name
             for name, parameter in self._model.named_parameters()
             if parameter.device.type == "meta"
         ]
         if meta_parameters:
-            logger.error(
-                "vLLM refit left %d parameters on the meta device: %s",
-                len(meta_parameters),
-                meta_parameters[:10],
+            raise IncompleteRefit(
+                "vLLM refit left parameters on the meta device; "
+                f"count={len(meta_parameters)}, names={meta_parameters[:10]}"
             )
 
 
-def _update_mla_absorbed_weights(model: Module) -> None:
+def _update_mla_absorbed_weights(model: Module, *, quantized: bool) -> None:
     """Refresh MLA tensors derived from ``kv_b_proj`` in graph-bound storage.
 
     ``W_UV`` and ``W_UK_T`` are cached bare attributes rather than parameters or
@@ -236,6 +264,10 @@ def _update_mla_absorbed_weights(model: Module) -> None:
             module, "kv_b_proj"
         ):
             continue
+        if quantized:
+            raise IncompleteRefit(
+                "MLA derived-weight refresh from a quantized kv_b_proj is unsupported"
+            )
         output_dtype = (
             module.W_UV.dtype if hasattr(module, "W_UV") else module.W_UK_T.dtype
         )

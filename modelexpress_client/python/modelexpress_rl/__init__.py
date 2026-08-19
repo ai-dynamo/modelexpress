@@ -7,6 +7,8 @@ from .control import ModelExpressControlClient, WeightVersion, WeightVersionStat
 from .inference import (
     GeneratorInstallationMode,
     ModelExpressGeneratorClient,
+    ModelExpressGeneratorConfig,
+    VllmGeneratorContext,
 )
 from .train import (
     ModelExpressTrainerClient,
@@ -22,8 +24,10 @@ __all__ = [  # noqa: RUF022 - grouped by public API role, not alphabetically.
     "ModelExpressTrainerClient",
     # Configuration fixed when a worker client is initialized.
     "GeneratorInstallationMode",
+    "ModelExpressGeneratorConfig",
     "TrainerStagingMode",
     "WeightPayloadFormat",
+    "VllmGeneratorContext",
     # Version values shared across the control, trainer, and generator clients.
     "WeightVersion",
     "WeightVersionRef",

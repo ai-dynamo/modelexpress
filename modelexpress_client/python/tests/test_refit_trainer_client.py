@@ -263,3 +263,38 @@ def test_trainer_client_owns_default_transport_resources(monkeypatch):
     manager.register_tensors.assert_called_once_with(tensors)
     trainer.close()
     resources.close.assert_called_once_with()
+
+
+def test_trainer_initialization_cleans_up_when_renewal_thread_cannot_start(
+    monkeypatch,
+):
+    manager = MagicMock(listen_port=19002)
+    resources = MagicMock(
+        manager=manager,
+        manifest_service=MagicMock(),
+        worker_endpoint="trainer:19002",
+    )
+    monkeypatch.setenv("MX_WORKER_HOST", "trainer")
+    monkeypatch.setattr(
+        client_module._TrainerResources,
+        "initialize",
+        MagicMock(return_value=resources),
+    )
+    monkeypatch.setattr(
+        ModelExpressTrainerClient, "_register_worker", lambda self: None
+    )
+    monkeypatch.setattr(
+        client_module.threading.Thread,
+        "start",
+        lambda _self: (_ for _ in ()).throw(RuntimeError("thread start failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="thread start failed"):
+        ModelExpressTrainerClient.initialize(
+            model_name="test/model",
+            device_id=2,
+            staging_mode=TrainerStagingMode.COPY_TO_DEVICE,
+            server_url="mx:8000",
+        )
+
+    resources.close.assert_called_once_with()

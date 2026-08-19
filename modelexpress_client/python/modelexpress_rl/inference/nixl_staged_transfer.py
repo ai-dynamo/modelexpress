@@ -63,6 +63,7 @@ class _PreparedNixlTransfer:
     sources: dict
     descriptors: tuple[ReadDescriptor, ...]
     transport: NixlReshardTransport
+    generation: int
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,7 @@ class _StagedNixlWeights:
 
     tensors: dict[str, torch.Tensor]
     metrics: dict[str, Any]
+    generation: int
 
 
 def _resolve_sources(manifests: list[bytes]) -> _ResolvedSources:
@@ -289,6 +291,7 @@ class _NixlStagedTransfer:
         self._convert_registered = False
         self._full_registered = False
         self._active: _PreparedNixlTransfer | None = None
+        self._generation = 0
         self._closed = False
 
     def prepare(
@@ -328,12 +331,14 @@ class _NixlStagedTransfer:
             for copy in capture.copies
             if copy.src_name in resolved.sources
         }
+        self._generation += 1
         prepared = _PreparedNixlTransfer(
             plan=plan,
             capture=capture,
             sources=used_sources,
             descriptors=descriptors,
             transport=transport,
+            generation=self._generation,
         )
         self._active = prepared
         return prepared
@@ -505,6 +510,7 @@ class _NixlStagedTransfer:
                 "full_pull_sources": len(prepared.plan.full_pulls),
                 "converts": len(prepared.plan.converts),
             },
+            generation=prepared.generation,
         )
 
     def _verification_tensor(self, prepared: _PreparedNixlTransfer, name: str):

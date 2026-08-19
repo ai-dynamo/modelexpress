@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 import threading
 import uuid
-from typing import Any, Self
+from typing import Any
 
 import grpc
 from modelexpress import auth, envs
@@ -221,7 +221,11 @@ class ModelExpressTrainerClient:
                 name=f"modelexpress-refit-renew-{worker_id}",
                 daemon=True,
             )
-            client._registration_thread.start()
+            try:
+                client._registration_thread.start()
+            except Exception:
+                client._registration_thread = None
+                raise
         except Exception:
             client.close()
             raise
@@ -373,7 +377,7 @@ class ModelExpressTrainerClient:
             self._resources.close()
             self._resources = None
 
-    def __enter__(self) -> Self:
+    def __enter__(self) -> ModelExpressTrainerClient:
         return self
 
     def __exit__(self, _exc_type, _exc_value, _traceback) -> None:

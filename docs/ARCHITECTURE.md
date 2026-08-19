@@ -425,6 +425,13 @@ and leases, but it does not discover engine tensor layouts or transfer weights.
 opaque description of the exact published source buffers; the generator uses
 it to compile and validate its receiver-local transfer plan.
 
+The initial worker manifest channel uses plaintext gRPC and does not authenticate
+the publishing worker. Manifest digests detect corruption but do not establish
+source identity. Deploy RL refit only on a trusted, network-isolated cluster and
+prevent untrusted clients from reaching MX server and worker gRPC endpoints.
+Transport authentication and TLS require a separate protocol and deployment
+design; they are not provided by this implementation.
+
 The generator adapter deliberately composes two private implementations rather
 than inheriting from the legacy reshard receiver:
 
@@ -737,6 +744,7 @@ RL framework integrations live in the separate `modelexpress_rl` package:
 | `train/client.py` | Rank-local trainer lifecycle, registration, staging, and shard publication |
 | `inference/client.py` | Rank-local generator lifecycle, leases, exact-version source discovery, plan validation, staging, and apply |
 | `inference/nixl_staged_transfer.py` | Private engine-neutral exact-manifest NIXL planning, transfer, reusable buffers, and verification |
+| `inference/engines/vllm/context.py` | Public typed vLLM objects passed to `ModelExpressGeneratorClient.initialize()` |
 | `inference/engines/vllm/adapter.py` | Generator adapter that composes staged transfer with the private vLLM installer |
 | `inference/engines/vllm/installer.py` | Private vLLM load-layout capture and graph-safe installation |
 

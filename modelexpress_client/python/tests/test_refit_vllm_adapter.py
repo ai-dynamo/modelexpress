@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
+import pytest
+from dataclasses import replace
 
 import modelexpress_rl.inference.engines.vllm.adapter as vllm_adapter_module
 from modelexpress_rl import (
@@ -16,11 +18,15 @@ def test_vllm_adapter_composes_transfer_and_installer_lifecycles(
     monkeypatch,
 ):
     events = []
-    native_plan = object()
+    native_plan = type("NativePlan", (), {"generation": 1})()
     transferred = type(
         "Transferred",
         (),
-        {"tensors": {"weight": object()}, "metrics": {"bytes_received": 128}},
+        {
+            "tensors": {"weight": object()},
+            "metrics": {"bytes_received": 128},
+            "generation": 1,
+        },
     )()
 
     class _Installer:
@@ -91,8 +97,19 @@ def test_vllm_adapter_composes_transfer_and_installer_lifecycles(
     plan = adapter.create_transfer_plan(inputs)
     assert adapter.validate_transfer_plan(plan, inputs)
     staged = adapter.stage_weight(plan)
+    with pytest.raises(RuntimeError, match="release staged weight"):
+        adapter.create_transfer_plan(inputs)
     assert adapter.apply_weight(staged) == {"bytes_received": 128}
     adapter.release_staged_weight(staged)
+
+    with pytest.raises(ValueError, match="does not support XOR_DELTA"):
+        adapter.create_transfer_plan(
+            replace(inputs, payload_format=WeightPayloadFormat.XOR_DELTA)
+        )
+    with pytest.raises(ValueError, match="supports NIXL sources only"):
+        adapter.create_transfer_plan(
+            replace(inputs, sources=(replace(inputs.sources[0], transport="NCCL"),))
+        )
     adapter.close()
 
     assert events == [

@@ -10,6 +10,8 @@ import pytest
 from modelexpress_rl import (
     GeneratorInstallationMode,
     ModelExpressGeneratorClient,
+    ModelExpressGeneratorConfig,
+    VllmGeneratorContext,
     WeightPayloadFormat,
     WeightVersionRef,
     refit_pb2,
@@ -24,6 +26,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         self.active_leases = set()
         self.lease_registrations = 0
         self.lease_deletions = 0
+        self.fail_lease_deletion = False
         self.version = refit_pb2.WeightVersion(
             uid="version-a",
             model_name="test/model",
@@ -79,7 +82,9 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
             expires_at_unix_ms=1234,
         )
 
-    def DeleteVersionLease(self, request, _context):
+    def DeleteVersionLease(self, request, context):
+        if self.fail_lease_deletion:
+            context.abort(grpc.StatusCode.UNAVAILABLE, "lease backend unavailable")
         deleted = request.lease_id in self.active_leases
         self.active_leases.discard(request.lease_id)
         self.lease_deletions += 1
@@ -154,18 +159,25 @@ def _start_server(*, state=None, manifest_digest=None):
 def _initialize(monkeypatch, endpoint, adapter):
     monkeypatch.setattr(
         generator_client_module,
-        "_generator_adapter",
+        "_create_generator_adapter",
         lambda **_kwargs: adapter,
     )
     return ModelExpressGeneratorClient.initialize(
-        model_name="test/model",
-        installation_mode=GeneratorInstallationMode.STAGED,
-        payload_format=WeightPayloadFormat.FULL_TENSOR,
-        worker_endpoint=endpoint,
-        worker_id="generator-0",
-        server_url=endpoint,
-        registration_ttl_seconds=60,
-        lease_ttl_seconds=60,
+        ModelExpressGeneratorConfig(
+            engine_context=VllmGeneratorContext(
+                model=object(),
+                vllm_config=object(),
+                model_config=object(),
+            ),
+            model_name="test/model",
+            installation_mode=GeneratorInstallationMode.STAGED,
+            payload_format=WeightPayloadFormat.FULL_TENSOR,
+            worker_endpoint=endpoint,
+            worker_id="generator-0",
+            server_url=endpoint,
+            registration_ttl_seconds=60,
+            lease_ttl_seconds=60,
+        )
     )
 
 
@@ -188,18 +200,22 @@ def test_generator_stages_applies_releases_and_reuses_valid_plan(monkeypatch):
 
         second = generator.stage_weight(version=WeightVersionRef("version-a"))
         second.release()
+
+        service.shards[0].worker_id = "replacement-trainer-0"
+        replacement = generator.stage_weight(version=WeightVersionRef("version-a"))
+        replacement.release()
     finally:
         generator.close()
         server.stop(grace=None).wait()
 
     assert service.registrations["generator-0"].role == refit_pb2.WORKER_ROLE_GENERATOR
-    assert service.lease_registrations == 2
-    assert service.lease_deletions == 2
-    assert len(adapter.create_calls) == 1
+    assert service.lease_registrations == 3
+    assert service.lease_deletions == 3
+    assert len(adapter.create_calls) == 2
     assert len(adapter.validate_calls) == 1
-    assert len(adapter.stage_calls) == 2
+    assert len(adapter.stage_calls) == 3
     assert len(adapter.apply_calls) == 1
-    assert len(adapter.release_calls) == 2
+    assert len(adapter.release_calls) == 3
     assert adapter.close_calls == 1
     assert [source.source_slot_id for source in adapter.create_calls[0].sources] == [
         "rank:0",
@@ -213,7 +229,7 @@ def test_generator_releases_lease_when_manifest_is_invalid(monkeypatch):
     generator = _initialize(monkeypatch, endpoint, adapter)
 
     try:
-        with pytest.raises(RuntimeError, match="no usable source.*digest mismatch"):
+        with pytest.raises(RuntimeError, match=r"no usable source.*digest mismatch"):
             generator.stage_weight(version=WeightVersionRef("version-a"))
     finally:
         generator.close()
@@ -243,6 +259,37 @@ def test_generator_retries_complete_staged_transfer_under_one_lease(monkeypatch)
     assert service.lease_deletions == 1
     assert len(adapter.stage_calls) == 2
     assert len(adapter.create_calls) == 2
+
+
+def test_generator_preserves_transfer_error_when_lease_cleanup_also_fails(
+    monkeypatch,
+):
+    server, endpoint, service = _start_server()
+    service.fail_lease_deletion = True
+    adapter = _Adapter(service)
+    adapter.stage_failures = 3
+    generator = _initialize(monkeypatch, endpoint, adapter)
+
+    try:
+        with pytest.raises(RuntimeError, match="transfer failed"):
+            generator.stage_weight(version=WeightVersionRef("version-a"))
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+
+def test_generator_reports_lease_cleanup_failure_after_success(monkeypatch):
+    server, endpoint, service = _start_server()
+    service.fail_lease_deletion = True
+    adapter = _Adapter(service)
+    generator = _initialize(monkeypatch, endpoint, adapter)
+
+    try:
+        with pytest.raises(grpc.RpcError, match="lease backend unavailable"):
+            generator.stage_weight(version=WeightVersionRef("version-a"))
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
 
 
 def test_generator_rejects_non_ready_version_before_leasing(monkeypatch):
@@ -281,7 +328,7 @@ def test_generator_closes_adapter_when_registration_fails(monkeypatch):
     adapter = _Adapter(service)
     monkeypatch.setattr(
         generator_client_module,
-        "_generator_adapter",
+        "_create_generator_adapter",
         lambda **_kwargs: adapter,
     )
     monkeypatch.setattr(
@@ -292,12 +339,19 @@ def test_generator_closes_adapter_when_registration_fails(monkeypatch):
 
     with pytest.raises(RuntimeError, match="registration failed"):
         ModelExpressGeneratorClient.initialize(
-            model_name="test/model",
-            installation_mode=GeneratorInstallationMode.STAGED,
-            payload_format=WeightPayloadFormat.FULL_TENSOR,
-            worker_endpoint="generator:9000",
-            worker_id="generator-0",
-            server_url="mx-server:9000",
+            ModelExpressGeneratorConfig(
+                engine_context=VllmGeneratorContext(
+                    model=object(),
+                    vllm_config=object(),
+                    model_config=object(),
+                ),
+                model_name="test/model",
+                installation_mode=GeneratorInstallationMode.STAGED,
+                payload_format=WeightPayloadFormat.FULL_TENSOR,
+                worker_endpoint="generator:9000",
+                worker_id="generator-0",
+                server_url="mx-server:9000",
+            )
         )
 
     assert adapter.close_calls == 1

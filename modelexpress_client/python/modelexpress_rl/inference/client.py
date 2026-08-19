@@ -6,10 +6,12 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import threading
 import uuid
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any, Self
+from dataclasses import dataclass
+from typing import Any
 
 import grpc
 
@@ -21,15 +23,15 @@ from modelexpress_rl.version import WeightVersionRef
 
 from .. import refit_pb2, refit_pb2_grpc
 from .adapter import (
+    GeneratorEngineContext,
     GeneratorEngineAdapter,
     GeneratorInstallationMode,
     GeneratorSource,
     GeneratorTransferInputs,
 )
+from .engines import _create_generator_adapter
 
-if TYPE_CHECKING:
-    from torch.nn import Module
-    from vllm.config import ModelConfig, VllmConfig
+logger = logging.getLogger("modelexpress_rl.inference.client")
 
 
 def _required(value: str, name: str) -> str:
@@ -61,31 +63,21 @@ def _payload_format(value: WeightPayloadFormat | None) -> WeightPayloadFormat:
         ) from error
 
 
-def _generator_adapter(
-    *,
-    model: Module | None,
-    vllm_config: VllmConfig | None,
-    model_config: ModelConfig | None,
-    worker_id: str,
-) -> GeneratorEngineAdapter:
-    engine = rl_envs.MX_GENERATOR_ENGINE
-    if engine != "VLLM":
-        raise ValueError(f"unsupported MX_GENERATOR_ENGINE={engine!r}")
-    if model is None:
-        raise ValueError("model is required for the vLLM generator adapter")
-    if vllm_config is None:
-        raise ValueError("vllm_config is required for the vLLM generator adapter")
-    if model_config is None:
-        raise ValueError("model_config is required for the vLLM generator adapter")
+@dataclass(frozen=True)
+class ModelExpressGeneratorConfig:
+    """Immutable configuration for one rank-local generator client."""
 
-    from .engines.vllm import VllmGeneratorAdapter
-
-    return VllmGeneratorAdapter(
-        model=model,
-        vllm_config=vllm_config,
-        model_config=model_config,
-        worker_id=worker_id,
-    )
+    engine_context: GeneratorEngineContext
+    model_name: str | None = None
+    installation_mode: GeneratorInstallationMode | None = None
+    payload_format: WeightPayloadFormat | None = None
+    worker_endpoint: str | None = None
+    worker_id: str | None = None
+    server_url: str | None = None
+    registration_ttl_seconds: int | None = None
+    lease_ttl_seconds: int | None = None
+    max_transfer_attempts: int = 3
+    rpc_timeout_seconds: float = 30.0
 
 
 class StagedWeightHandle:
@@ -132,32 +124,20 @@ class ModelExpressGeneratorClient:
     @classmethod
     def initialize(
         cls,
-        *,
-        model: Module | None = None,
-        vllm_config: VllmConfig | None = None,
-        model_config: ModelConfig | None = None,
-        model_name: str | None = None,
-        installation_mode: GeneratorInstallationMode | None = None,
-        payload_format: WeightPayloadFormat | None = None,
-        worker_endpoint: str | None = None,
-        worker_id: str | None = None,
-        server_url: str | None = None,
-        registration_ttl_seconds: int | None = None,
-        lease_ttl_seconds: int | None = None,
-        max_transfer_attempts: int = 3,
-        rpc_timeout_seconds: float = 30.0,
-    ) -> Self:
+        config: ModelExpressGeneratorConfig,
+    ) -> ModelExpressGeneratorClient:
         """Initialize one generator rank with immutable operating settings.
 
-        ``model``, ``vllm_config``, and ``model_config`` are the live vLLM rank
-        objects. The client selects and constructs the configured engine adapter;
-        callers do not construct ModelExpress adapter or receiver implementations.
+        ``config.engine_context`` contains the engine's live rank-local objects.
+        Callers do not construct ModelExpress adapter or receiver implementations.
         """
-        model_name = _required(model_name or envs.MODEL_NAME or "", "model_name")
-        installation_mode = _installation_mode(installation_mode)
-        payload_format = _payload_format(payload_format)
+        if not isinstance(config, ModelExpressGeneratorConfig):
+            raise TypeError("config must be a ModelExpressGeneratorConfig")
+        model_name = _required(config.model_name or envs.MODEL_NAME or "", "model_name")
+        installation_mode = _installation_mode(config.installation_mode)
+        payload_format = _payload_format(config.payload_format)
         worker_endpoint = _required(
-            worker_endpoint
+            config.worker_endpoint
             or (
                 f"{envs.MX_WORKER_HOST}:{envs.MX_WORKER_GRPC_PORT}"
                 if envs.MX_WORKER_HOST
@@ -165,29 +145,30 @@ class ModelExpressGeneratorClient:
             ),
             "worker_endpoint",
         )
-        worker_id = _required(worker_id or uuid.uuid4().hex[:8], "worker_id")
-        server_url = _get_server_url(server_url)
+        worker_id = _required(config.worker_id or uuid.uuid4().hex[:8], "worker_id")
+        server_url = _get_server_url(config.server_url)
         if installation_mode is GeneratorInstallationMode.UNSPECIFIED:
             raise ValueError("installation_mode must be specified")
         if payload_format is WeightPayloadFormat.UNSPECIFIED:
             raise ValueError("payload_format must be specified")
+        registration_ttl_seconds = config.registration_ttl_seconds
         if registration_ttl_seconds is None:
             registration_ttl_seconds = envs.MX_HEARTBEAT_INTERVAL_SECS * 3
+        lease_ttl_seconds = config.lease_ttl_seconds
         if lease_ttl_seconds is None:
             lease_ttl_seconds = registration_ttl_seconds
         if registration_ttl_seconds <= 0:
             raise ValueError("registration_ttl_seconds must be positive")
         if lease_ttl_seconds <= 0:
             raise ValueError("lease_ttl_seconds must be positive")
-        if max_transfer_attempts <= 0:
+        if config.max_transfer_attempts <= 0:
             raise ValueError("max_transfer_attempts must be positive")
-        if rpc_timeout_seconds <= 0:
+        if config.rpc_timeout_seconds <= 0:
             raise ValueError("rpc_timeout_seconds must be positive")
 
-        adapter = _generator_adapter(
-            model=model,
-            vllm_config=vllm_config,
-            model_config=model_config,
+        adapter = _create_generator_adapter(
+            engine=rl_envs.MX_GENERATOR_ENGINE,
+            engine_context=config.engine_context,
             worker_id=worker_id,
         )
         try:
@@ -213,8 +194,8 @@ class ModelExpressGeneratorClient:
         client.server_url = server_url
         client._registration_ttl_seconds = registration_ttl_seconds
         client._lease_ttl_seconds = lease_ttl_seconds
-        client._max_transfer_attempts = max_transfer_attempts
-        client._rpc_timeout_seconds = rpc_timeout_seconds
+        client._max_transfer_attempts = config.max_transfer_attempts
+        client._rpc_timeout_seconds = config.rpc_timeout_seconds
         client._adapter = adapter
         try:
             client._register_worker()
@@ -232,6 +213,71 @@ class ModelExpressGeneratorClient:
             client.close()
             raise
         return client
+
+    def stage_weight(self, *, version: WeightVersionRef) -> StagedWeightHandle:
+        """Synchronously transfer and verify a STAGED full-weight version."""
+        if self.installation_mode is not GeneratorInstallationMode.STAGED:
+            raise RuntimeError("stage_weight is available only in STAGED mode")
+        if not isinstance(version, WeightVersionRef):
+            raise TypeError("version must be a WeightVersionRef")
+        with self._operation_lock:
+            if self._active_handle is not None:
+                if self._active_handle.version_id == version.version_id:
+                    return self._active_handle
+                raise RuntimeError("another generator update is still active")
+            ready = self._get_ready_version(version.version_id)
+            staged = self._stage_with_lease(ready)
+            self._active_handle = StagedWeightHandle(
+                client=self,
+                version_id=version.version_id,
+                staged=staged,
+            )
+            return self._active_handle
+
+    def apply_weight(self, staged: StagedWeightHandle) -> Any:
+        """Install a verified local staged version at the caller's safe point."""
+        if not isinstance(staged, StagedWeightHandle) or staged._client is not self:
+            raise ValueError("staged handle does not belong to this client")
+        with self._operation_lock:
+            if staged._released:
+                raise RuntimeError("staged weight has already been released")
+            if staged._applied:
+                return staged._apply_result
+            staged._apply_result = self._adapter.apply_weight(staged._staged)
+            staged._applied = True
+            self._serving_version_id = staged.version_id
+            return staged._apply_result
+
+    def update_weight(self, *, version: WeightVersionRef) -> Any:
+        """Update live destinations in DIRECT mode."""
+        del version
+        raise NotImplementedError("DIRECT installation is not implemented")
+
+    def close(self) -> None:
+        """Stop renewal and release control-plane and adapter resources."""
+        if self._closed:
+            return
+        with self._operation_lock:
+            if self._active_handle is not None:
+                self._release_staged(self._active_handle)
+        if self._registration_thread is not None:
+            self._registration_stop.set()
+            self._registration_thread.join()
+            self._registration_thread = None
+        if self._channel is not None:
+            self._channel.close()
+            self._channel = None
+            self._stub = None
+        if self._adapter is not None:
+            self._adapter.close()
+            self._adapter = None
+        self._closed = True
+
+    def __enter__(self) -> ModelExpressGeneratorClient:
+        return self
+
+    def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
+        self.close()
 
     @property
     def _service(self) -> refit_pb2_grpc.RefitServiceStub:
@@ -260,7 +306,11 @@ class ModelExpressGeneratorClient:
         while not self._registration_stop.wait(interval_seconds):
             try:
                 self._register_worker()
-            except grpc.RpcError:
+            except grpc.RpcError as error:
+                logger.warning("worker registration renewal failed: %s", error)
+                continue
+            except Exception:
+                logger.exception("unexpected worker registration renewal failure")
                 continue
 
     def _get_ready_version(self, version_id: str) -> refit_pb2.WeightVersion:
@@ -383,7 +433,18 @@ class ModelExpressGeneratorClient:
             while not stop.wait(interval_seconds):
                 try:
                     self._register_lease(version.uid)
-                except grpc.RpcError:
+                except grpc.RpcError as error:
+                    logger.warning(
+                        "version %s lease renewal failed: %s",
+                        version.uid,
+                        error,
+                    )
+                    continue
+                except Exception:
+                    logger.exception(
+                        "unexpected version %s lease renewal failure",
+                        version.uid,
+                    )
                     continue
 
         renewal = threading.Thread(
@@ -392,6 +453,7 @@ class ModelExpressGeneratorClient:
             daemon=True,
         )
         renewal.start()
+        primary_error: BaseException | None = None
         try:
             last_error: grpc.RpcError | RuntimeError | None = None
             for _attempt in range(self._max_transfer_attempts):
@@ -406,51 +468,30 @@ class ModelExpressGeneratorClient:
                     self._cached_fingerprint = None
             assert last_error is not None
             raise last_error
+        except BaseException as error:
+            primary_error = error
+            raise
         finally:
             stop.set()
             renewal.join()
-            self._service.DeleteVersionLease(
-                refit_pb2.DeleteVersionLeaseRequest(
-                    version_id=version.uid,
-                    lease_id=lease.lease_id,
-                    worker_id=self.worker_id,
-                ),
-                timeout=self._rpc_timeout_seconds,
-            )
-
-    def stage_weight(self, *, version: WeightVersionRef) -> StagedWeightHandle:
-        """Synchronously transfer and verify a STAGED full-weight version."""
-        if self.installation_mode is not GeneratorInstallationMode.STAGED:
-            raise RuntimeError("stage_weight is available only in STAGED mode")
-        if not isinstance(version, WeightVersionRef):
-            raise TypeError("version must be a WeightVersionRef")
-        with self._operation_lock:
-            if self._active_handle is not None:
-                if self._active_handle.version_id == version.version_id:
-                    return self._active_handle
-                raise RuntimeError("another generator update is still active")
-            ready = self._get_ready_version(version.version_id)
-            staged = self._stage_with_lease(ready)
-            self._active_handle = StagedWeightHandle(
-                client=self,
-                version_id=version.version_id,
-                staged=staged,
-            )
-            return self._active_handle
-
-    def apply_weight(self, staged: StagedWeightHandle) -> Any:
-        """Install a verified local staged version at the caller's safe point."""
-        if not isinstance(staged, StagedWeightHandle) or staged._client is not self:
-            raise ValueError("staged handle does not belong to this client")
-        with self._operation_lock:
-            if staged._released:
-                raise RuntimeError("staged weight has already been released")
-            if staged._applied:
-                return staged._apply_result
-            staged._apply_result = self._adapter.apply_weight(staged._staged)
-            staged._applied = True
-            self._serving_version_id = staged.version_id
-            return staged._apply_result
+            try:
+                self._service.DeleteVersionLease(
+                    refit_pb2.DeleteVersionLeaseRequest(
+                        version_id=version.uid,
+                        lease_id=lease.lease_id,
+                        worker_id=self.worker_id,
+                    ),
+                    timeout=self._rpc_timeout_seconds,
+                )
+            except grpc.RpcError:
+                if primary_error is None:
+                    raise
+                logger.warning(
+                    "failed to release lease %s while handling %s",
+                    lease.lease_id,
+                    type(primary_error).__name__,
+                    exc_info=True,
+                )
 
     def _release_staged(self, staged: StagedWeightHandle) -> None:
         if staged._client is not self:
@@ -463,36 +504,9 @@ class ModelExpressGeneratorClient:
             if self._active_handle is staged:
                 self._active_handle = None
 
-    def update_weight(self, *, version: WeightVersionRef) -> Any:
-        """Update live destinations in DIRECT mode."""
-        del version
-        raise NotImplementedError("DIRECT installation is not implemented")
 
-    def close(self) -> None:
-        """Stop renewal and release control-plane and adapter resources."""
-        if self._closed:
-            return
-        with self._operation_lock:
-            if self._active_handle is not None:
-                self._release_staged(self._active_handle)
-        if self._registration_thread is not None:
-            self._registration_stop.set()
-            self._registration_thread.join()
-            self._registration_thread = None
-        if self._channel is not None:
-            self._channel.close()
-            self._channel = None
-            self._stub = None
-        if self._adapter is not None:
-            self._adapter.close()
-            self._adapter = None
-        self._closed = True
-
-    def __enter__(self) -> Self:
-        return self
-
-    def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
-        self.close()
-
-
-__all__ = ["ModelExpressGeneratorClient", "StagedWeightHandle"]
+__all__ = [
+    "ModelExpressGeneratorClient",
+    "ModelExpressGeneratorConfig",
+    "StagedWeightHandle",
+]

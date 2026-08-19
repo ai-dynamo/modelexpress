@@ -4,18 +4,27 @@
 """Inference-side ModelExpress RL integrations."""
 
 from .adapter import (
+    GeneratorEngineContext,
     GeneratorEngineAdapter,
     GeneratorInstallationMode,
     GeneratorSource,
     GeneratorTransferInputs,
 )
-from .client import ModelExpressGeneratorClient, StagedWeightHandle
+from .client import (
+    ModelExpressGeneratorClient,
+    ModelExpressGeneratorConfig,
+    StagedWeightHandle,
+)
+from .engines.vllm import VllmGeneratorContext
 
 __all__ = [
+    "GeneratorEngineContext",
     "GeneratorEngineAdapter",
     "GeneratorInstallationMode",
     "GeneratorSource",
     "GeneratorTransferInputs",
     "ModelExpressGeneratorClient",
+    "ModelExpressGeneratorConfig",
     "StagedWeightHandle",
+    "VllmGeneratorContext",
 ]

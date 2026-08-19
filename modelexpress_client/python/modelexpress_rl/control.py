@@ -7,8 +7,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Self
-
 import grpc
 from modelexpress import auth
 from modelexpress.client import _get_server_url
@@ -97,7 +95,7 @@ class ModelExpressControlClient:
         *,
         server_url: str | None = None,
         rpc_timeout_seconds: float = 30.0,
-    ) -> Self:
+    ) -> ModelExpressControlClient:
         """Connect to the MX control plane without exposing protobuf details."""
         if rpc_timeout_seconds <= 0:
             raise ValueError("rpc_timeout_seconds must be positive")
@@ -176,7 +174,7 @@ class ModelExpressControlClient:
             self._channel = None
             self._stub = None
 
-    def __enter__(self) -> Self:
+    def __enter__(self) -> ModelExpressControlClient:
         return self
 
     def __exit__(self, _exc_type, _exc_value, _traceback) -> None:

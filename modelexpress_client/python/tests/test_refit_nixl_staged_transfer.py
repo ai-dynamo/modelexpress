@@ -12,7 +12,7 @@ from modelexpress.refit.reshard.rendezvous import (
     PublishedTensor,
     wrap_rendezvous_blob,
 )
-from modelexpress.refit.reshard.slice_plan import Shard
+from modelexpress.refit.reshard.slice_plan import PullSegment, Shard
 from modelexpress.refit.reshard.transfer_plan import SourceInfo, TransferPlan
 from modelexpress.refit.reshard.types import (
     CaptureResult,
@@ -24,7 +24,10 @@ from modelexpress_rl.inference.nixl_staged_transfer import (
     _NixlStagedTransfer,
     _plan_staged_transfer,
     _PreparedNixlTransfer,
+    _required_endpoints,
+    _ResolvedSources,
     _resolve_sources,
+    _handshake,
 )
 
 
@@ -81,6 +84,50 @@ def test_exact_manifests_resolve_without_legacy_source_discovery():
         "trainer-0": "trainer-0:19000",
         "trainer-1": "trainer-1:19001",
     }
+
+
+def test_required_endpoints_rejects_incomplete_source_metadata():
+    plan = TransferPlan(segments=[PullSegment("session-a", 1, "weight", 0, 4)])
+    resolved = _ResolvedSources(
+        sources={},
+        session_to_agent={"session-a": "agent-a"},
+        session_to_device={},
+        agent_endpoints={"agent-a": "trainer:19000"},
+    )
+    assert _required_endpoints(plan, resolved) == {"agent-a": "trainer:19000"}
+
+    with pytest.raises(RuntimeError, match="unknown source sessions"):
+        _required_endpoints(
+            plan,
+            _ResolvedSources({}, {}, {}, {}),
+        )
+    with pytest.raises(RuntimeError, match="without metadata endpoints"):
+        _required_endpoints(
+            plan,
+            _ResolvedSources({}, {"session-a": "agent-a"}, {}, {}),
+        )
+
+
+def test_handshake_retries_and_reports_deadline(monkeypatch):
+    calls = []
+    sleeps = []
+
+    class _Manager:
+        def fetch_remote_and_wait(self, agent, host, port, *, timeout_seconds):
+            calls.append((agent, host, port, timeout_seconds))
+            if len(calls) == 1:
+                raise RuntimeError("not ready")
+
+    monkeypatch.setattr(transfer_module.envs, "MX_RESHARD_HANDSHAKE_TIMEOUT_S", 10)
+    monkeypatch.setattr(transfer_module.time, "sleep", sleeps.append)
+    _handshake(_Manager(), {"agent-a": "trainer:19000"})
+
+    assert len(calls) == 2
+    assert sleeps
+
+    monkeypatch.setattr(transfer_module.envs, "MX_RESHARD_HANDSHAKE_TIMEOUT_S", 0)
+    with pytest.raises(RuntimeError, match="did not complete before the deadline"):
+        _handshake(_Manager(), {"agent-a": "trainer:19000"})
 
 
 def test_transformed_source_is_fully_reconstructed_for_verification():
@@ -146,6 +193,7 @@ def _prepared(tensor: torch.Tensor, digest: str | None) -> _PreparedNixlTransfer
         sources={"weight": source},
         descriptors=(),
         transport=object(),
+        generation=1,
     )
 
 

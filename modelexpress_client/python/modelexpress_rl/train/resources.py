@@ -9,7 +9,7 @@ import os
 import socket
 import uuid
 from concurrent import futures
-from typing import Any, Self
+from typing import Any
 
 import grpc
 from modelexpress import envs
@@ -47,7 +47,7 @@ class _TrainerResources:
         *,
         device_id: int,
         agent_name: str | None = None,
-    ) -> Self:
+    ) -> _TrainerResources:
         """Start NIXL and the worker-local manifest service."""
         from modelexpress.nixl_transfer import NixlTransferManager
 

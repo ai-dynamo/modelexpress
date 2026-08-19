@@ -33,11 +33,13 @@ if TYPE_CHECKING:
 class _VllmTransferPlan:
     transfer: _PreparedNixlTransfer
     fingerprint: tuple
+    generation: int
 
 
 @dataclass(frozen=True)
 class _VllmStagedWeight:
     transfer: _StagedNixlWeights
+    generation: int
 
 
 class VllmGeneratorAdapter(GeneratorEngineAdapter):
@@ -80,6 +82,10 @@ class VllmGeneratorAdapter(GeneratorEngineAdapter):
     def create_transfer_plan(
         self, inputs: GeneratorTransferInputs
     ) -> _VllmTransferPlan:
+        if self._active_staged is not None:
+            raise RuntimeError(
+                "release staged weight before replacing its transfer plan"
+            )
         if inputs.payload_format not in self.supported_payload_formats:
             raise ValueError(
                 f"VllmGeneratorAdapter does not support "
@@ -96,6 +102,7 @@ class VllmGeneratorAdapter(GeneratorEngineAdapter):
         plan = _VllmTransferPlan(
             transfer=transfer,
             fingerprint=inputs.physical_fingerprint,
+            generation=transfer.generation,
         )
         self._active_plan = plan
         return plan
@@ -115,20 +122,31 @@ class VllmGeneratorAdapter(GeneratorEngineAdapter):
         if plan is not self._active_plan or not isinstance(plan, _VllmTransferPlan):
             raise RuntimeError("vLLM transfer plan is no longer active")
         transferred = self._transfer.stage(plan.transfer)
-        staged = _VllmStagedWeight(transfer=transferred)
+        staged = _VllmStagedWeight(
+            transfer=transferred,
+            generation=transferred.generation,
+        )
         self._active_staged = staged
         return staged
 
     def apply_weight(self, staged: object) -> dict[str, Any]:
-        if staged is not self._active_staged or not isinstance(
-            staged, _VllmStagedWeight
+        if (
+            staged is not self._active_staged
+            or not isinstance(staged, _VllmStagedWeight)
+            or self._active_plan is None
+            or staged.generation != self._active_plan.generation
         ):
             raise RuntimeError("vLLM staged weight is no longer active")
         self._installer.install(staged.transfer.tensors)
         return staged.transfer.metrics
 
     def release_staged_weight(self, staged: object) -> None:
-        if staged is not self._active_staged:
+        if (
+            staged is not self._active_staged
+            or not isinstance(staged, _VllmStagedWeight)
+            or self._active_plan is None
+            or staged.generation != self._active_plan.generation
+        ):
             raise RuntimeError("vLLM staged weight is no longer active")
         # Registered buffers are reusable plan workspace; releasing a version
         # invalidates only this staged handle.
