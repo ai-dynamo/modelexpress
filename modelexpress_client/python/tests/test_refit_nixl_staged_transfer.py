@@ -118,14 +118,16 @@ def test_handshake_retries_and_reports_deadline(monkeypatch):
             if len(calls) == 1:
                 raise RuntimeError("not ready")
 
-    monkeypatch.setattr(transfer_module.envs, "MX_RESHARD_HANDSHAKE_TIMEOUT_S", 10)
+    monkeypatch.setenv("MX_RESHARD_HANDSHAKE_TIMEOUT_S", "10")
     monkeypatch.setattr(transfer_module.time, "sleep", sleeps.append)
     _handshake(_Manager(), {"agent-a": "trainer:19000"})
 
     assert len(calls) == 2
     assert sleeps
 
-    monkeypatch.setattr(transfer_module.envs, "MX_RESHARD_HANDSHAKE_TIMEOUT_S", 0)
+    monkeypatch.setenv("MX_RESHARD_HANDSHAKE_TIMEOUT_S", "1")
+    monotonic = iter((0.0, 2.0))
+    monkeypatch.setattr(transfer_module.time, "monotonic", monotonic.__next__)
     with pytest.raises(RuntimeError, match="did not complete before the deadline"):
         _handshake(_Manager(), {"agent-a": "trainer:19000"})
 
