@@ -51,7 +51,10 @@ class VllmGeneratorAdapter(GeneratorEngineAdapter):
         vllm_config: VllmConfig,
         model_config: ModelConfig,
         worker_id: str,
+        metadata_port_offset: int = 0,
     ) -> None:
+        if metadata_port_offset < 0:
+            raise ValueError("metadata_port_offset must be non-negative")
         engine = VllmAdapter(vllm_config, model_config)
         device_id = engine.get_device_id()
         device = engine.get_target_device()
@@ -65,7 +68,7 @@ class VllmGeneratorAdapter(GeneratorEngineAdapter):
             agent_name=f"mx-refit-{worker_id}",
             device_id=device_id,
             device=device,
-            listen_port=envs.MX_METADATA_PORT + device_id,
+            listen_port=envs.MX_METADATA_PORT + metadata_port_offset + device_id,
         )
         self._active_plan: _VllmTransferPlan | None = None
         self._active_staged: _VllmStagedWeight | None = None

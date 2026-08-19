@@ -68,6 +68,7 @@ def test_vllm_adapter_composes_transfer_and_installer_lifecycles(
         vllm_config="vllm-config",
         model_config="model-config",
         worker_id="generator-0",
+        metadata_port_offset=100,
     )
     inputs = GeneratorTransferInputs(
         version_id="version-a",
@@ -122,7 +123,7 @@ def test_vllm_adapter_composes_transfer_and_installer_lifecycles(
                 "agent_name": "mx-refit-generator-0",
                 "device_id": 2,
                 "device": torch.device("cuda:2"),
-                "listen_port": vllm_adapter_module.envs.MX_METADATA_PORT + 2,
+                "listen_port": vllm_adapter_module.envs.MX_METADATA_PORT + 102,
             },
         ),
         (

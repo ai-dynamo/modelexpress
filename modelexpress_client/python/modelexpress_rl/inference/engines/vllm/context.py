@@ -21,6 +21,8 @@ class VllmGeneratorContext(GeneratorEngineContext):
 
     model: Module
     vllm_config: VllmConfig
+    # Reserve a distinct listener range for each engine sharing one host.
+    metadata_port_offset: int = 0
 
 
 __all__ = ["VllmGeneratorContext"]
