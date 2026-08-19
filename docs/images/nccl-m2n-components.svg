@@ -102,7 +102,7 @@ SPDX-License-Identifier: Apache-2.0
   <rect x="694" y="524" width="420" height="116" rx="10" fill="#ffffff" stroke="#2E7D32" stroke-width="2"/>
   <text x="904" y="549" text-anchor="middle" class="nt">CollectiveTransfer — one per refit</text>
   <text x="904" y="571" text-anchor="middle" class="nx">operation_id · version_id · (group_id, epoch)</text>
-  <text x="904" y="590" text-anchor="middle" class="nx">admitted trainer + generator slots  &lt;- RQ5</text>
+  <text x="904" y="590" text-anchor="middle" class="nx">admitted trainer + generator slots (a subset)</text>
   <text x="904" y="609" text-anchor="middle" class="nx">PENDING -&gt; RUNNING -&gt; COMPLETE | FAILED</text>
   <rect x="694" y="666" width="420" height="90" rx="10" fill="#f0fdf4" stroke="#76B900" stroke-width="2"/>
   <text x="904" y="691" text-anchor="middle" class="nt">READY requires all three</text>

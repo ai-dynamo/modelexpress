@@ -42,20 +42,18 @@ registered and pinned between refits.
 ### Non-goals
 
 - No NIXL fallback, no runtime transport ranking, no "try NCCL then NIXL". One
-  deployment configures one backend, per RQ1 of the layering doc.
-- No public layer or tensor selection API beyond the `layer_group_id` the
-  layering doc already specifies (RQ6).
+  deployment configures one backend.
+- No public layer or tensor selection API beyond the `layer_group_id` the shared
+  client contract already specifies.
 - No change to the existing `RefitService` pull RPCs (`WeightVersionShard`,
   `VersionLease`, `RefitWorkerService`). Those are the pull path's vocabulary.
 
-## 2. Design inputs
+## 2. Requirements and prior art
 
-Two documents govern this work, plus one upstream implementation we deliberately
-mirror.
+### A. What this path must satisfy
 
-### A. MX RL Refit API Design (V2), §8.1 "NCCL M2N collective extension"
-
-The binding constraints:
+The requirements below come from the internal MX RL refit design work. They are
+restated here as the contract this path implements:
 
 1. NCCL M2N is a *push-style collective*. Source trainer ranks initiate the data
    movement, **but only after the destination generator ranks have joined and
@@ -69,19 +67,19 @@ The binding constraints:
    the selected generator replicas and the trainer replica with the same version
    and operation reference. **The trainer-side clients launch the collective only
    when MX reports the group READY.**
-5. This requires an **additive collective-operation API** — the
-   generator-initiated pull call is not sufficient, because "a trainer cannot
-   safely push to unknown or unprepared generators."
+5. This requires an **additive collective-operation API**. The generator-initiated
+   pull call is not sufficient, because a trainer cannot safely push into
+   destinations it has no way to know are prepared.
 6. The TransferPlan abstraction survives, but its NCCL form carries collective
    membership and prepared destination bindings. Layer grouping stays internal.
 
-### B. MX Refit Two-sided API layering (v04)
+### B. The shared two-sided client shape
 
-The client shape: `RefitClient.Trainer` and `RefitClient.Generator`, each
+MX refit clients are `RefitClient.Trainer` and `RefitClient.Generator`, each
 decomposed into a pluggable **Publisher** (trainer) / **Loader** (generator) and
 a **ShardRedistribution Backend** with a `Sender` and a `Receiver` half. The
-lifecycle and its sequencing rules are fixed, and `NCCL M2N backend` is listed
-explicitly under **Push mode options**, opposite the existing NIXL pull backend.
+lifecycle and its sequencing rules are fixed and shared with the pull path; a
+push-mode backend slots in opposite the existing NIXL pull backend.
 
 ```mermaid
 flowchart LR
@@ -118,13 +116,13 @@ deployment and a NeMo-RL-native deployment move identical bytes:
   the bytes on large MoE models); everything else rides a packed broadcast over a
   separate all-participants communicator.
 
-Where NeMo RL and MX differ is precisely the piece §8.1 asks MX to own:
+Where NeMo RL and MX differ is precisely the piece MX is asked to own:
 
 | Concern | NeMo RL today | MX (this design) |
 |---|---|---|
 | Rendezvous | `StatelessProcessGroup` over a raw `TCPStore`, at an IP/port the Ray driver allocates per PP stage | MX control plane brokers the NCCL `uniqueId` |
 | Rank assignment | Computed in the driver, hardcoded "train first, gen after" | MX assigns and returns `rank_in_lane`; same ordering rule, now enforced server-side |
-| Membership | Always *all* generator ranks | Per-operation admitted set — satisfies layering RQ5 |
+| Membership | Always *all* generator ranks | Per-operation admitted set, so a selected subset of generators can refit |
 | Fencing | None; a restarted worker silently rejoins | The `worker_id` generation is admitted or rejected; a membership change bumps the group epoch |
 | Readiness | Implicit — everyone calls `init_nccl_communicator` and blocks | Explicit `FORMING -> READY` state the trainer waits on before launching |
 | Group lifetime | One communicator for the whole job | Membership-keyed group, reused across refits, invalidated on epoch change |
@@ -135,8 +133,8 @@ Where NeMo RL and MX differ is precisely the piece §8.1 asks MX to own:
 
 Ownership, one line each:
 
-- **RL framework** picks the version, picks *which* generator replicas refit
-  (RQ5), and invokes both sides' actors with the same `(version, operation_ref)`.
+- **RL framework** picks the version, picks *which* generator replicas refit, and
+  invokes both sides' actors with the same `(version, operation_ref)`.
 - **MX control plane** owns group identity, admission, rank assignment, the NCCL
   `uniqueId`, worker-generation fencing, and the `FORMING -> READY` state the
   trainer gates on.
@@ -176,10 +174,10 @@ pull path and the NCCL push path never share a type.
 | `CollectiveLane` | One per group per communicator (per trainer PP stage, plus one broadcast lane) | MX |
 | `CollectiveTransfer` | One per refit operation; references `(group_id, epoch)` and a `version_id` | MX |
 
-Splitting group from operation is what reconciles §8.1's "ephemeral group per
-operation" with V1 §3.4's "creates **or reuses** the NCCL communicator ...
-membership changes invalidate the communicator". The *operation* is per-refit and
-cheap. The *group* — and the communicator it describes — is keyed by membership
+Splitting group from operation reconciles two requirements that read as being in
+tension: the group is described as ephemeral and per-operation, yet MX is also
+expected to *reuse* a communicator until membership changes invalidate it. Treating
+them as two objects satisfies both. The *operation* is per-refit and cheap. The *group* — and the communicator it describes — is keyed by membership
 and reused until membership changes. A client caches its `Communicator` under
 `(group_id, epoch)` and drops it when the epoch moves.
 
@@ -282,9 +280,9 @@ carrying the group's own participant list, rather than as a hung stream.
 The reshard plan (§6) is one record per bulk parameter: HF name, global shape,
 dtype, source mesh and placements, destination mesh and placements, PP stage. For
 a large MoE model that is on the order of hundreds of entries and hundreds of
-kilobytes. The pull path already established the rule, in §4.2 of the V2 design:
-the full sealed manifest stays worker-served so that CRD or etcd records stay
-small, while `manifest_digest` verifies that fetched content matches.
+kilobytes. The pull path already established the rule: the full sealed manifest
+stays worker-served so that CRD or etcd records stay small, while
+`manifest_digest` verifies that fetched content matches.
 
 The same rule applies here. MX stores `plan_source = {worker_id, endpoint,
 digest}` on the group; generators fetch the plan from the trainer coordinator over
@@ -361,10 +359,11 @@ ordered with the transfer without a host synchronize.
 
 ## 7. Lifecycle and sequencing
 
-The layering doc's sequencing rules map onto the collective path as follows. The
-rules are the contract; the right-hand column is what this backend does with them.
+The shared lifecycle's sequencing rules map onto the collective path as follows.
+The rules are the contract; the right-hand column is what this backend does with
+them.
 
-| Call | Layering-doc rule | NCCL M2N backend |
+| Call | Sequencing rule | NCCL M2N backend |
 |---|---|---|
 | `initialize` | Once per worker; before `setup_layer_groups`; unordered across workers | Publisher/Loader `capture()`; register with MX; `Sender/Receiver.initialize()` records local shard geometry |
 | `setup_layer_groups` | Once per worker; groups must be disjoint and cover the model | Map each `layer_group_id` to its bulk `ParamPlan` subset and misc subset |
@@ -374,14 +373,14 @@ rules are the contract; the right-hand column is what this backend does with the
 | `finish_weight_update(version)` | After all `*_weight_update` calls for this refit | `Loader.finish()`; stream sync; `ReportCollectiveTransfer` |
 | `cleanup` | Terminal | Release buffers, destroy communicators, deregister |
 
-Two invariants the collective imposes on top of the layering doc:
+Two invariants the collective imposes on top of that lifecycle:
 
 1. **Every participant must issue the same sequence of wire ops.** The plan's
    parameter order is the single source of truth for both sides; a rank that skips
    a parameter its peers issue hangs the communicator, not just itself.
 2. **The trainer must not enter the collective before the group is READY.** This
-   is §8.1's core requirement, and it is why readiness is server-observable state
-   rather than a client-side barrier.
+   is the core requirement of this path, and it is why readiness is
+   server-observable state rather than a client-side barrier.
 
 ### 7.1 Refit-time waterfall
 
@@ -406,10 +405,10 @@ failure.
 | A participant joined then died before the collective | Its `WorkerRegistration` TTL expires; re-checked at the `READY` transition | Group returns to `FORMING`, epoch bumps; nobody entered the collective |
 | A worker restarts and rejoins | New `worker_id` for the same slot | Admitted as a *different generation*; epoch bumps; cached communicators dropped |
 | A participant dies mid-collective | NCCL error or timeout on the surviving ranks | `ReportCollectiveTransfer(FAILED)`; operation `FAILED`; the epoch bumps so the next `compute_plan` rebuilds. Communicators are not reusable after an aborted collective |
-| Membership changes between refits | Epoch mismatch on `start_weight_update` | `FAILED_PRECONDITION`; the caller re-runs `compute_plan` — the layering doc's stated trigger |
+| Membership changes between refits | Epoch mismatch on `start_weight_update` | `FAILED_PRECONDITION`; the caller re-runs `compute_plan` — the stated trigger for replanning |
 | Plan digest mismatch | Generator verifies the fetched plan against `plan_source.digest` | Fail closed before any wire op |
 
-Installation failure follows the V2 design's `DIRECT` semantics: a collective push
+Installation failure follows `DIRECT` installation semantics: a collective push
 writes into destinations the Loader prepared, so a partial failure may have already
 changed live parameters. Recovery is the RL framework restarting the generator
 engine, not an MX-side rollback. A Loader that wants verify-before-activate must
@@ -467,7 +466,7 @@ NeMo RL's existing builders port directly.
 
 - **Group keying.** A group is keyed by `(model_name, trainer topology, admitted
   generator set)`. If the orchestrator refits overlapping generator subsets in
-  alternation — RQ5's motivating case, where idle instances update first — each
+  alternation — the motivating case, where idle instances update first — each
   distinct subset is its own group and pays its own `Communicator.init`. A superset
   group with per-operation participation masks would amortize that, but NCCL
   requires every communicator member to enter every collective.
@@ -476,7 +475,7 @@ NeMo RL's existing builders port directly.
 - **Layer-group granularity vs. lane count.** `layer_group_id` and `pp_stage` are
   independent partitions of the parameter set; their product determines wire-op
   count. There is a point where finer layer groups cost more in launch overhead
-  than they save in trainer memory (RQ6's motivation).
+  than they save in trainer memory, which is what motivates layer grouping at all.
 - **Bulk whitelist coverage.** Inherited from NeMo RL: FFN projections only.
   Attention projections are the obvious next increment for dense models, where the
   bulk fraction is 67% rather than 97%.
