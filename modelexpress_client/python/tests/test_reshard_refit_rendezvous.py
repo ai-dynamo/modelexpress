@@ -205,7 +205,20 @@ def test_built_sources_own_immutable_geometry():
         shard.addr = 0
 
 
-def _tensor(dtype="torch.bfloat16", elsize=2, name="weight"):
+def _tensor(
+    dtype="torch.bfloat16",
+    elsize=2,
+    name="weight",
+    shard_offset=(0, 0),
+    shape=(4, 4),
+):
+    """One published tensor with a single shard.
+
+    ``shard_offset``/``shape`` are parameterized because the merge retains one
+    representative per distinct geometry: two ranks publishing the SAME box are
+    replicas and collapse to one shard, so a test about cross-rank fan-in has to
+    hand the two ranks different boxes.
+    """
     return PublishedTensor(
         name=name,
         dtype=dtype,
@@ -216,8 +229,8 @@ def _tensor(dtype="torch.bfloat16", elsize=2, name="weight"):
                 agent_name="trainer-agent",
                 device_id=0,
                 addr=4096,
-                shard_offset=(0, 0),
-                shape=(4, 4),
+                shard_offset=shard_offset,
+                shape=shape,
             )
         ],
     )
@@ -254,7 +267,12 @@ def test_ranks_publishing_the_same_tensor_with_different_elsize_are_rejected():
 
 
 def test_ranks_publishing_a_consistent_tensor_merge_their_shards():
-    merged = merge_shard_tables([[_tensor()], [_tensor()]])
+    merged = merge_shard_tables(
+        [
+            [_tensor(shard_offset=(0, 0), shape=(2, 4))],
+            [_tensor(shard_offset=(2, 0), shape=(2, 4))],
+        ]
+    )
     assert len(merged) == 1
     assert len(merged[0].shards) == 2
 
@@ -269,7 +287,10 @@ def test_ranks_spelling_one_dtype_differently_are_not_a_disagreement():
     # on the prefix agree on the dtype; rejecting them would name a cross-rank
     # inconsistency that does not exist.
     merged = merge_shard_tables(
-        [[_tensor(dtype="torch.bfloat16")], [_tensor(dtype="bfloat16")]]
+        [
+            [_tensor(dtype="torch.bfloat16", shard_offset=(0, 0), shape=(2, 4))],
+            [_tensor(dtype="bfloat16", shard_offset=(2, 0), shape=(2, 4))],
+        ]
     )
     assert len(merged) == 1
     assert len(merged[0].shards) == 2
