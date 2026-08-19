@@ -304,7 +304,6 @@ Performance claims must identify the exact implementation path. Reference transp
 
 ## Related documentation
 
-- [NCCL M2N refit design](../../../../docs/NCCL_M2N_REFIT.md) — design for a sibling collective (push) transfer path
 - [ModelExpress overview](../../../../README.md)
 - [Python client](../../README.md)
 - [ModelExpress architecture](../../../../docs/ARCHITECTURE.md)
