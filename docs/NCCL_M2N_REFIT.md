@@ -237,15 +237,10 @@ can deadlock — the workers must drain all reshard lanes before the misc broadc
 MX assigns `rank_in_lane`. Trainers occupy the low ranks of a lane and generators follow, so
 each lane looks like a small self-contained world:
 
-```text
-reshard lane p     world_size = trainer_ranks_in_partition + admitted_generator_count
-  trainer  index_in_role r  ->  rank_in_lane = r % trainer_ranks_in_partition
-  generator index_in_role g ->  rank_in_lane = trainer_ranks_in_partition + g
-
-broadcast lane     world_size = trainer_world_size + admitted_generator_count
-  trainer  index_in_role r  ->  rank_in_lane = r
-  generator index_in_role g ->  rank_in_lane = trainer_world_size + g
-```
+| Lane | `world_size` | Trainer at `index_in_role` `r` | Generator at `index_in_role` `g` |
+|---|---|---|---|
+| Reshard lane `p` | `trainer_ranks_in_partition + admitted_generators` | `r % trainer_ranks_in_partition` | `trainer_ranks_in_partition + g` |
+| Broadcast lane | `trainer_world_size + admitted_generators` | `r` | `trainer_world_size + g` |
 
 MX needs no knowledge of Tensor Parallelism (TP), Expert Parallelism (EP), or Data
 Parallelism (DP) to do this — only the role, the lane, and the index within the role. All
@@ -264,8 +259,9 @@ stateDiagram-v2
     [*] --> FORMING
     FORMING --> READY: all expected slots joined,<br/>every lane bootstrapped,<br/>every registration live
     READY --> FORMING: membership change (epoch += 1)
-    READY --> RELEASING: DeleteCollectiveGroup
-    FORMING --> RELEASING: DeleteCollectiveGroup
+    READY --> RELEASING: last participant registration expires
+    FORMING --> RELEASING: last participant registration expires
+    RELEASING --> [*]: reclaimed once no operation references it
   }
   state "CollectiveTransfer" as T {
     [*] --> PENDING
@@ -277,18 +273,33 @@ stateDiagram-v2
   }
 ```
 
-`READY` requires **all three** of: every expected slot has an admitted
-participant; every lane has a posted `nccl_unique_id`; every admitted
-participant's `WorkerRegistration` is unexpired. The third condition is the
-liveness check the NIXL path gets from lease renewal — here it is checked at
-admission and re-checked at the `READY` transition, because the collective's
-failure mode is a hang rather than a `NOT_FOUND`.
+`READY` requires **all four** of: every expected slot has an admitted participant; every lane
+has a posted `nccl_unique_id` **stamped with the current epoch**; every admitted participant's
+`WorkerRegistration` is unexpired; and every participant reported the same `plan_digest`.
+
+The liveness condition is what the NIXL path gets from lease renewal. Here it is checked at
+admission and re-checked at the `READY` transition, because the collective's failure mode is a
+hang rather than a `NOT_FOUND`.
+
+The epoch stamp on the bootstrap identifier is load-bearing. A group outlives any single
+membership, so a bootstrap identifier left over from a previous epoch would describe a
+communicator with the wrong world size. Every rank would then initialize against it and block
+forever. So `PublishGroupBootstrap` names its `(group_id, epoch, lane_id)`, an epoch bump
+atomically clears every lane's identifier, and a publication whose epoch is not current is
+rejected with `FAILED_PRECONDITION` rather than overwriting the live one.
+
+**Reclamation is automatic.** There is no group-delete RPC, symmetrically with workers never
+creating a group: a group whose participants have all let their registrations lapse moves to
+`RELEASING`, and is reclaimed once no `CollectiveTransfer` still references it. An orchestrator
+that wants a group gone stops invoking its workers.
 
 ### RPCs
 
 ```protobuf
 service RefitCollectiveService {
-  // Orchestrator-facing.
+  // Orchestrator-facing. CreateCollectiveTransferRequest carries an
+  // idempotency_key, as CreateWeightVersion does on the pull path, so a
+  // retried create returns the same operation instead of a second one.
   rpc CreateCollectiveTransfer(CreateCollectiveTransferRequest) returns (CollectiveTransfer);
   rpc GetCollectiveTransfer(GetCollectiveTransferRequest) returns (CollectiveTransfer);
   rpc DeleteCollectiveTransfer(DeleteCollectiveTransferRequest) returns (CollectiveTransfer);
@@ -296,7 +307,10 @@ service RefitCollectiveService {
   // Worker-client-facing. Workers join; they never create a group.
   rpc JoinCollectiveGroup(JoinCollectiveGroupRequest) returns (CollectiveGroupMembership);
   rpc GetCollectiveGroup(GetCollectiveGroupRequest) returns (CollectiveGroup);
+  // Names (group_id, epoch, lane_id); a stale epoch is rejected, not applied.
   rpc PublishGroupBootstrap(PublishGroupBootstrapRequest) returns (CollectiveGroup);
+  // Fenced on (operation_id, group_id, epoch, worker_id). A report from a
+  // restarted worker or a superseded epoch is rejected, not recorded.
   rpc ReportCollectiveTransfer(ReportCollectiveTransferRequest) returns (CollectiveTransfer);
 }
 
@@ -310,6 +324,13 @@ service RefitCollectiveWorkerService {
 `AwaitGroupReady` is deliberately *not* an RPC. Waiting is `GetCollectiveGroup`
 polling with backoff, so a stalled peer surfaces as a client-side deadline
 carrying the group's own participant list, rather than as a hung stream.
+
+Both mutating RPCs are fenced rather than last-write-wins. `CreateCollectiveTransfer` is
+idempotent on its key, so an orchestrator retry after a timeout cannot open a second operation
+against the same group. `ReportCollectiveTransfer` is checked against the operation, the group
+epoch, and the reporting worker's admitted generation, so a report that arrives after a worker
+restart or an epoch bump is rejected instead of completing an operation the reporter is no
+longer part of.
 
 ### Why the plan is worker-served
 
@@ -374,6 +395,38 @@ generator count.
 Parameters the Publisher does not mark bulk-eligible go to the misc list and ride the
 broadcast lane in a deterministic order. That order is load-bearing: producer and consumer
 walk it in lockstep.
+
+### Coverage is a validated property, not a convention
+
+The bulk plan and the ordered misc list are two contracts, and nothing about writing them
+separately guarantees they agree. So the Publisher must prove, before publishing, that their
+union names **every canonical parameter exactly once**:
+
+- a parameter in neither list never moves, and the destination silently keeps serving its
+  previous value — a partially-updated model that reports success;
+- a parameter in both lists is applied twice, once through each path, with the later write
+  deciding.
+
+Both fail silently, which is why this is a gate rather than a guideline. The validated
+coverage result is folded into the `plan_digest` below, so a generator that verifies the
+digest has also verified coverage, and neither side can start a wire operation against a plan
+that does not partition the model.
+
+### The plan digest is part of the group's identity
+
+The plan is fetched once per `(group_id, epoch)`, and the Publisher now decides everything in
+it. That combination has a hole: membership can stay constant while the plan changes — a
+different bulk classification, a renamed parameter, a dtype change — and a group keyed only on
+membership would not notice. Generators would keep the plan they cached at the last epoch and
+receive bytes laid out for a model that no longer exists.
+
+So `plan_digest` is part of the group's identity, not a property hanging off it. It is a
+canonical digest over every `ParamPlan` field, the misc order, and the coverage proof. Each
+participant reports its digest when it joins; MX admits the group to `READY` only when every
+participant reports the same one, and a changed digest bumps the epoch exactly as a membership
+change does. The cached plan and the cached communicator are then invalidated together, which
+is the only safe pairing — a communicator that matches the membership but a plan that does not
+match the model is precisely the case that moves wrong bytes without erroring.
 
 ### Defaults, so the common case stays cheap
 
@@ -445,8 +498,8 @@ them.
 | `setup_layer_groups` | Once per worker; groups must be disjoint and cover the model | Map each `layer_group_id` to its bulk `ParamPlan` subset and misc subset |
 | `compute_plan` | After all workers finish `initialize`+`setup_layer_groups`; re-run on membership change | **Join the group, wait for READY, create the communicators, fetch and verify the plan.** Membership change = new epoch = new communicators |
 | `start_weight_update(version, worker_ids)` | Once per refit; all `compute_plan` done; no overlapping refits | `Publisher.start_new_round(version)`; the backend binds the operation and the admitted destination subset |
-| `publish_weights` / `update_weights(version, layer_group_id)` | Multiple per refit; concurrency across affected workers is desirable | The co-called `nccl.m2n.reshard` sequence for that group's bulk params, then its misc broadcast |
-| `finish_weight_update(version)` | After all `*_weight_update` calls for this refit | `Loader.finish()`; stream sync; `ReportCollectiveTransfer` |
+| `publish_weights` / `update_weights(version, layer_group_id)` | Multiple per refit; concurrency across affected workers is desirable | The co-called `nccl.m2n.reshard` sequence for that group's bulk params. Bulk only — see below |
+| `finish_weight_update(version)` | After all `*_weight_update` calls for this refit | Drain every reshard lane, then the **single** misc broadcast for the whole refit; `Loader.finish()`; stream sync; `ReportCollectiveTransfer` |
 | `cleanup` | Terminal | Release buffers, destroy communicators, deregister |
 
 Two invariants the collective imposes on top of that lifecycle:
@@ -457,6 +510,16 @@ Two invariants the collective imposes on top of that lifecycle:
 2. **The trainer must not enter the collective before the group is READY.** This
    is the core requirement of this path, and it is why readiness is
    server-observable state rather than a client-side barrier.
+3. **The misc broadcast is one phase per refit, not one per layer group.** It belongs to
+   `finish_weight_update`, after every reshard lane has drained.
+
+That third one falls out of the deadlock rule rather than being an independent choice. The
+broadcast communicator spans every rank, so it overlaps every reshard lane. If each
+`publish_weights` call ended with its own broadcast, then with more than one layer group a
+rank would enter the broadcast for group 0 while its peers were still resharding group 1 —
+two overlapping communicators with operations in flight in different orders, which is exactly
+the case that hangs. One broadcast, after everything, is the only ordering that holds for any
+number of layer groups.
 
 ### Refit-time waterfall
 
@@ -480,9 +543,18 @@ failure.
 | A participant never joins | `READY` never reached; client-side deadline on `GetCollectiveGroup` | Operation `ABORTED`; the error names the missing slots |
 | A participant joined then died before the collective | Its `WorkerRegistration` TTL expires; re-checked at the `READY` transition | Group returns to `FORMING`, epoch bumps; nobody entered the collective |
 | A worker restarts and rejoins | New `worker_id` for the same slot | Admitted as a *different generation*; epoch bumps; cached communicators dropped |
-| A participant dies mid-collective | NCCL error or timeout on the surviving ranks | `ReportCollectiveTransfer(FAILED)`; operation `FAILED`; the epoch bumps so the next `compute_plan` rebuilds. Communicators are not reusable after an aborted collective |
+| A participant dies mid-collective | NCCL error, or `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` on the surviving ranks | Abort the lane's communicator, `ReportCollectiveTransfer(FAILED)`, operation `FAILED`, epoch bumps so the next `compute_plan` rebuilds |
+| `Communicator.init` never returns | `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S` | Abort the lane, fail `compute_plan` naming the lane and its participants. No operation ever starts |
+| A collective stalls with every rank alive | `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | Abort every lane of the group, not just the stalled one: a partially-aborted group would leave peers blocked in the lanes that did not time out |
 | Membership changes between refits | Epoch mismatch on `start_weight_update` | `FAILED_PRECONDITION`; the caller re-runs `compute_plan` — the stated trigger for replanning |
 | Plan digest mismatch | Generator verifies the fetched plan against `plan_source.digest` | Fail closed before any wire op |
+
+**An aborted communicator is never reused.** Abort is what makes a deadline mean anything —
+without it the call is still blocked, it merely has an error attached. So an abort marks the
+whole group's communicators dead, bumps the epoch, and forces the next `compute_plan` through
+a fresh bootstrap. That is deliberately the most expensive recovery available: rebuilding is
+seconds, whereas silently reusing a communicator whose peers disagree about what already
+completed is unbounded.
 
 Installation failure follows `DIRECT` installation semantics: a collective push
 writes into destinations the Loader prepared, so a partial failure may have already
@@ -499,7 +571,16 @@ is exactly what the fused-parameter path already does.
 | `MX_NCCL_REFIT_NUM_STREAMS` | `2` | CUDA streams for overlapping reshard lanes |
 | `MX_NCCL_REFIT_GROUP_TIMEOUT_S` | `600` | Deadline for `FORMING -> READY` |
 | `MX_NCCL_REFIT_POLL_INTERVAL_S` | `0.25` | `GetCollectiveGroup` poll backoff floor |
+| `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S` | `300` | Deadline for `Communicator.init` on one lane |
+| `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600` | Deadline covering one refit's reshards, broadcast, and final stream sync |
 | `MX_NCCL_REFIT_MISC_CHUNK_BYTES` | `268435456` | Packed misc-broadcast chunk size |
+
+Every one of those is a deadline, not a hint. Group formation being bounded is not enough on
+its own: `READY` only means the group *formed*, and each of `Communicator.init`, each
+`nccl.m2n.reshard`, the packed broadcast, and the closing stream synchronization can block
+indefinitely on its own. A path whose whole failure story is "turn hangs into attributable
+failures" has to bound the operations after `READY` too, or the story stops being true at the
+point it matters most.
 
 Timing is reported through the existing `RefitTimingRecorder` stage vocabulary so
 NIXL-pull and NCCL-push refits are directly comparable. For this path, *setup and
@@ -541,7 +622,7 @@ NeMo RL's existing builders port directly.
 ## Open questions
 
 - **Group keying.** A group is keyed by `(model_name, trainer topology, admitted
-  generator set)`. If the orchestrator refits overlapping generator subsets in
+  generator set, plan_digest)`. If the orchestrator refits overlapping generator subsets in
   alternation — the motivating case, where idle instances update first — each
   distinct subset is its own group and pays its own `Communicator.init`. A superset
   group with per-operation participation masks would amortize that, but NCCL
