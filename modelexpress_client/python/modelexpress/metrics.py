@@ -235,9 +235,10 @@ class MetricsCollector:
             selection_labels.append("source_worker_id")
             logger.warning(
                 "MX_METRICS_SOURCE_ID_LABEL=1: mx_p2p_source_selections_total "
-                "carries source_worker_id, whose domain grows with process "
-                "count over time rather than with cluster size. Benchmark runs "
-                "only -- never a long-lived production Prometheus."
+                "and mx_p2p_source_load carry source_worker_id, whose domain "
+                "grows with process count over time rather than with cluster "
+                "size. Benchmark runs only -- never a long-lived production "
+                "Prometheus."
             )
         self.selections = Counter(
             "mx_p2p_source_selections_total",
@@ -280,6 +281,15 @@ class MetricsCollector:
             "strict-mode refusal, which raises instead of returning.",
             ["scheme", "result"],
             registry=registry,
+        )
+        # Same label, same cardinality argument as selections above: the peer id
+        # is per-process, so it rides the same opt-in switch rather than being
+        # the one mx_p2p_* family that grows unbounded by default.
+        self.source_load = _make_gauge(
+            registry,
+            "mx_p2p_source_load",
+            "Source-published load in [0,1] observed on candidates at selection.",
+            ["scheme", "source_worker_id"] if self._source_id_label else ["scheme"],
         )
         self.candidates = Histogram(
             "mx_p2p_candidates",
@@ -536,6 +546,22 @@ class MetricsCollector:
         if self._ensure():
             try:
                 self.selection_seconds.labels(policy, self.scheme).observe(seconds)
+            except Exception:
+                pass
+
+    def set_source_load(self, source_worker_id: str, value: float) -> None:
+        """Record a candidate's published load.
+
+        ``source_worker_id`` is ignored unless ``MX_METRICS_SOURCE_ID_LABEL=1``,
+        mirroring ``record_selection`` so the call site stays unconditional and
+        the cardinality decision lives in one place.
+        """
+        if self._ensure():
+            try:
+                if self._source_id_label:
+                    self.source_load.labels(self.scheme, source_worker_id).set(value)
+                else:
+                    self.source_load.labels(self.scheme).set(value)
             except Exception:
                 pass
 

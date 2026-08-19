@@ -232,19 +232,23 @@ async fn update_status_if_fresh(
     }
 }
 
-/// Live (status, updated_at) of a rank: `status:{rank}` if at least as fresh, else the record.
+/// Live (status, updated_at, source_load) of a rank: `status:{rank}` if at least as
+/// fresh, else the record. `source_load` is overlaid alongside status because it is
+/// refreshed by every heartbeat, and heartbeats deliberately no longer rewrite the
+/// record -- reading it off the record would pin it to its registration-time value.
 fn overlay_status(
     fields: &std::collections::HashMap<String, String>,
     worker_rank: u32,
     record_status: i32,
     record_updated_at: i64,
-) -> (i32, i64) {
+    record_source_load: f32,
+) -> (i32, i64, f32) {
     fields
         .get(&status_field(worker_rank))
         .and_then(|value| serde_json::from_str::<WorkerSummaryJson>(value).ok())
         .filter(|summary| summary.updated_at >= record_updated_at)
-        .map(|summary| (summary.status, summary.updated_at))
-        .unwrap_or((record_status, record_updated_at))
+        .map(|summary| (summary.status, summary.updated_at, summary.source_load))
+        .unwrap_or((record_status, record_updated_at, record_source_load))
 }
 
 fn worker_records_match_status(
@@ -256,8 +260,13 @@ fn worker_records_match_status(
             return false;
         }
         serde_json::from_str::<WorkerRecordJson>(value).is_ok_and(|record| {
-            let (status, _) =
-                overlay_status(fields, record.worker_rank, record.status, record.updated_at);
+            let (status, _, _) = overlay_status(
+                fields,
+                record.worker_rank,
+                record.status,
+                record.updated_at,
+                record.source_load,
+            );
             status == required_status as i32
         })
     })
@@ -408,6 +417,9 @@ struct WorkerRecordJson {
     /// Runtime accelerator family for compatibility filtering.
     #[serde(default)]
     pub accelerator: String,
+    /// Source-published RDMA NIC utilization in [0, 1].
+    #[serde(default)]
+    pub source_load: f32,
     /// Small discovery summary for file-backed artifact sources.
     #[serde(default)]
     pub artifact_source: Option<ArtifactSourceMetadataJson>,
@@ -422,6 +434,8 @@ struct WorkerSummaryJson {
     updated_at: i64,
     #[serde(default)]
     accelerator: String,
+    #[serde(default)]
+    source_load: f32,
 }
 
 /// Serializable artifact source summary.
@@ -463,6 +477,7 @@ impl WorkerRecordJson {
             agent_name: record.agent_name,
             worker_grpc_endpoint: record.worker_grpc_endpoint,
             accelerator: record.accelerator,
+            source_load: record.source_load,
             artifact_source: record.artifact_source.map(ArtifactSourceMetadataJson::from),
         }
     }
@@ -484,6 +499,7 @@ impl From<WorkerRecordJson> for WorkerRecord {
             agent_name: json.agent_name,
             worker_grpc_endpoint: json.worker_grpc_endpoint,
             accelerator: json.accelerator,
+            source_load: json.source_load,
             artifact_source: json.artifact_source.map(ArtifactSourceMetadataRecord::from),
         }
     }
@@ -603,6 +619,7 @@ impl MetadataBackend for RedisBackend {
             status: worker_record.status,
             updated_at: worker_record.updated_at,
             accelerator: worker_record.accelerator.clone(),
+            source_load: worker_record.source_load,
         })?;
 
         let mut pipe = redis::pipe();
@@ -657,14 +674,16 @@ impl MetadataBackend for RedisBackend {
             }
             let json: WorkerRecordJson = serde_json::from_str(value)?;
             let mut worker = WorkerRecord::from(json);
-            let (status, updated_at) = overlay_status(
+            let (status, updated_at, source_load) = overlay_status(
                 &fields,
                 worker.worker_rank,
                 worker.status,
                 worker.updated_at,
+                worker.source_load,
             );
             worker.status = status;
             worker.updated_at = updated_at;
+            worker.source_load = source_load;
             workers.push(worker);
         }
         workers.sort_by_key(|w| w.worker_rank);
@@ -741,15 +760,20 @@ impl MetadataBackend for RedisBackend {
                     continue;
                 }
 
-                let (status, updated_at, accelerator) = fields
+                let (status, updated_at, accelerator, source_load) = fields
                     .get(&worker_rank.to_string())
                     .and_then(|v| serde_json::from_str::<WorkerRecordJson>(v).ok())
                     .map(|j| {
-                        let (status, updated_at) =
-                            overlay_status(&fields, worker_rank, j.status, j.updated_at);
-                        (status, updated_at, j.accelerator)
+                        let (status, updated_at, source_load) = overlay_status(
+                            &fields,
+                            worker_rank,
+                            j.status,
+                            j.updated_at,
+                            j.source_load,
+                        );
+                        (status, updated_at, j.accelerator, source_load)
                     })
-                    .unwrap_or((0, 0, String::new()));
+                    .unwrap_or((0, 0, String::new(), 0.0));
 
                 result.push(super::SourceInstanceInfo {
                     source_id: sid.clone(),
@@ -759,6 +783,7 @@ impl MetadataBackend for RedisBackend {
                     status,
                     updated_at,
                     accelerator,
+                    source_load,
                     training_step,
                     layout_signature: layout_signature.clone(),
                 });
@@ -859,6 +884,7 @@ impl MetadataBackend for RedisBackend {
                             status: summary.status,
                             updated_at: summary.updated_at,
                             accelerator: summary.accelerator,
+                            source_load: summary.source_load,
                             training_step,
                             layout_signature: layout_signature.clone(),
                         });
@@ -901,15 +927,20 @@ impl MetadataBackend for RedisBackend {
                 {
                     continue;
                 }
-                let (status, updated_at, accelerator) = fields
+                let (status, updated_at, accelerator, source_load) = fields
                     .get(&worker_rank.to_string())
                     .and_then(|value| serde_json::from_str::<WorkerRecordJson>(value).ok())
                     .map(|record| {
-                        let (status, updated_at) =
-                            overlay_status(&fields, worker_rank, record.status, record.updated_at);
-                        (status, updated_at, record.accelerator)
+                        let (status, updated_at, source_load) = overlay_status(
+                            &fields,
+                            worker_rank,
+                            record.status,
+                            record.updated_at,
+                            record.source_load,
+                        );
+                        (status, updated_at, record.accelerator, source_load)
                     })
-                    .unwrap_or((0, 0, String::new()));
+                    .unwrap_or((0, 0, String::new(), 0.0));
                 if min_updated_at.is_some_and(|minimum| updated_at < minimum) {
                     continue;
                 }
@@ -921,6 +952,7 @@ impl MetadataBackend for RedisBackend {
                     status,
                     updated_at,
                     accelerator,
+                    source_load,
                     training_step,
                     layout_signature,
                 });
@@ -1000,6 +1032,7 @@ impl MetadataBackend for RedisBackend {
         worker_rank: u32,
         status: SourceStatus,
         updated_at: i64,
+        source_load: f32,
     ) -> MetadataResult<()> {
         let mut conn = self.get_conn().await?;
         let key = format!("{}{}:{}", keys::SOURCE_PREFIX, source_id, worker_id);
@@ -1028,6 +1061,7 @@ impl MetadataBackend for RedisBackend {
             status: status as i32,
             updated_at,
             accelerator,
+            source_load,
         })?;
         let source_key = format!("{}{}", keys::SOURCE_PREFIX, source_id);
         let updated = update_status_if_fresh(
@@ -1132,6 +1166,7 @@ mod tests {
             agent_name: String::new(),
             worker_grpc_endpoint: String::new(),
             accelerator: "cuda".to_string(),
+            source_load: 0.625,
             artifact_source: Some(ArtifactSourceMetadataRecord {
                 artifact_id: "artifact123".to_string(),
                 total_size: 1_099_511_627_776,
@@ -1152,6 +1187,8 @@ mod tests {
         assert_eq!(back.updated_at, record.updated_at);
         assert_eq!(back.tensors.len(), 1);
         assert_eq!(back.accelerator, record.accelerator);
+        assert_eq!(back.source_load, record.source_load);
+        assert_eq!(back.source_load, 0.625);
         assert_eq!(back.artifact_source, record.artifact_source);
         assert!(
             json.contains(r#""total_size":"#),
@@ -1177,10 +1214,12 @@ mod tests {
             status: SourceStatus::Ready as i32,
             updated_at: 1_700_000_000_000,
             accelerator: "cuda".to_string(),
+            source_load: 0.5,
         };
         let json = serde_json::to_string(&summary).expect("serialize");
         let parsed: WorkerSummaryJson = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.accelerator, "cuda");
+        assert_eq!(parsed.source_load, 0.5);
     }
 
     #[test]
@@ -1221,7 +1260,7 @@ mod tests {
             ("status:0".to_string(), fresh_status.to_string()),
         ]
         .into();
-        assert_eq!(overlay_status(&with_fresh, 0, 1, 100), (2, 200));
+        assert_eq!(overlay_status(&with_fresh, 0, 1, 100, 0.0), (2, 200, 0.0));
         assert!(worker_records_match_status(
             &with_fresh,
             SourceStatus::Ready
@@ -1232,11 +1271,55 @@ mod tests {
             ("status:0".to_string(), stale_status.to_string()),
         ]
         .into();
-        assert_eq!(overlay_status(&with_stale, 0, 1, 100), (1, 100));
+        assert_eq!(overlay_status(&with_stale, 0, 1, 100, 0.0), (1, 100, 0.0));
 
         let without_status: std::collections::HashMap<String, String> =
             [("0".to_string(), record.to_string())].into();
-        assert_eq!(overlay_status(&without_status, 0, 1, 100), (1, 100));
+        assert_eq!(
+            overlay_status(&without_status, 0, 1, 100, 0.0),
+            (1, 100, 0.0)
+        );
+    }
+
+    #[test]
+    fn test_status_overlay_surfaces_live_source_load() {
+        // Heartbeats rewrite only `status:{rank}`, never the worker record, so a
+        // reader that took source_load from the record would see the value frozen
+        // at registration time and load_aware would silently behave like
+        // rendezvous_hash. The overlay must surface the fresh value instead.
+        let record = serde_json::json!({
+            "worker_rank": 0, "nixl_metadata": [], "tensors": [],
+            "status": 2, "updated_at": 100, "source_load": 0.0
+        });
+        let fresh_status = serde_json::json!({
+            "worker_rank": 0, "status": 2, "updated_at": 200,
+            "accelerator": "cuda", "source_load": 0.75
+        });
+        let fields: std::collections::HashMap<String, String> = [
+            ("0".to_string(), record.to_string()),
+            ("status:0".to_string(), fresh_status.to_string()),
+        ]
+        .into();
+        assert_eq!(
+            overlay_status(&fields, 0, 2, 100, 0.0),
+            (2, 200, 0.75),
+            "the heartbeat's source_load must win over the record's stale value"
+        );
+
+        // A stale status field must not drag the record backwards.
+        let stale_status = serde_json::json!({
+            "worker_rank": 0, "status": 2, "updated_at": 50,
+            "accelerator": "cuda", "source_load": 0.9
+        });
+        let stale_fields: std::collections::HashMap<String, String> = [
+            ("0".to_string(), record.to_string()),
+            ("status:0".to_string(), stale_status.to_string()),
+        ]
+        .into();
+        assert_eq!(
+            overlay_status(&stale_fields, 0, 2, 100, 0.25),
+            (2, 100, 0.25)
+        );
     }
 
     // ── SourceAttributesJson ────────────────────────────────────────────────
@@ -1385,11 +1468,11 @@ mod tests {
             .await
             .expect("publish");
         backend
-            .update_status(&source_id, &worker_id, 0, SourceStatus::Ready, 200)
+            .update_status(&source_id, &worker_id, 0, SourceStatus::Ready, 200, 0.0)
             .await
             .expect("newer update");
         backend
-            .update_status(&source_id, &worker_id, 0, SourceStatus::Stale, 100)
+            .update_status(&source_id, &worker_id, 0, SourceStatus::Stale, 100, 0.0)
             .await
             .expect("older update");
 
@@ -1421,7 +1504,7 @@ mod tests {
             .await
             .expect("remove status field");
         backend
-            .update_status(&source_id, &worker_id, 0, SourceStatus::Stale, 100)
+            .update_status(&source_id, &worker_id, 0, SourceStatus::Stale, 100, 0.0)
             .await
             .expect("rank-fresh legacy update");
         let metadata = backend
@@ -1439,7 +1522,7 @@ mod tests {
         assert_eq!(summaries[0].updated_at, 200);
 
         backend
-            .update_status(&source_id, &worker_id, 0, SourceStatus::Ready, 300)
+            .update_status(&source_id, &worker_id, 0, SourceStatus::Ready, 300, 0.0)
             .await
             .expect("legacy record update");
         let metadata = backend
@@ -1451,7 +1534,7 @@ mod tests {
 
         assert!(
             backend
-                .update_status(&source_id, &worker_id, 99, SourceStatus::Ready, 400)
+                .update_status(&source_id, &worker_id, 99, SourceStatus::Ready, 400, 0.0)
                 .await
                 .is_err(),
             "a heartbeat must not create a missing rank"
