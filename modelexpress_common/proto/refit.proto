@@ -56,6 +56,8 @@ message WorkerRegistration {
   string worker_id = 1;
   WorkerRole role = 2;
   string model_name = 3;
+  // Optional legacy worker endpoint. Version shards advertise the
+  // authoritative manifest_endpoint used by generators.
   string endpoint = 4;
   uint64 expires_at_unix_ms = 5;
 }

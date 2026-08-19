@@ -425,6 +425,12 @@ and leases, but it does not discover engine tensor layouts or transfer weights.
 opaque description of the exact published source buffers; the generator uses
 it to compile and validate its receiver-local transfer plan.
 
+The synchronous generator client returns a staged handle only after transfer
+and verification finish. That handle owns the version lease through graph-safe
+installation; applying the weights or releasing an unapplied handle ends the
+lease. There is no separate asynchronous wait or unimplemented direct-install
+API.
+
 The initial worker manifest channel uses plaintext gRPC and does not authenticate
 the publishing worker. Manifest digests detect corruption but do not establish
 source identity. Deploy RL refit only on a trusted, network-isolated cluster and
@@ -741,7 +747,10 @@ RL framework integrations live in the separate `modelexpress_rl` package:
 | Module | Purpose |
 |--------|---------|
 | `control.py` | Public orchestrator client for creating, reading, and retiring immutable weight versions |
-| `train/client.py` | Rank-local trainer lifecycle, registration, staging, and shard publication |
+| `train/client.py` | Public rank-local trainer lifecycle; owns transport resources and bound tensor state, selects the configured engine lazily after distributed setup, and publishes shards |
+| `train/engines/megatron/selection.py` | Megatron-Bridge mapping and tensor-selection translation into MX publication specs |
+| `train/engines/megatron/adapter.py` | Stable in-place Megatron tensor registration and manifest construction |
+| `train/engines/fsdp/adapter.py` | FSDP/DTensor source capture with in-place or device-copy staging |
 | `inference/client.py` | Rank-local generator lifecycle, leases, exact-version source discovery, plan validation, staging, and apply |
 | `inference/nixl_staged_transfer.py` | Private engine-neutral exact-manifest NIXL planning, transfer, reusable buffers, and verification |
 | `inference/engines/vllm/context.py` | Public typed vLLM objects passed to `ModelExpressGeneratorClient.initialize()` |

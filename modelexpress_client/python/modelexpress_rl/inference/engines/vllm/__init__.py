@@ -21,7 +21,7 @@ def _create_vllm_adapter(
 
     model = engine_context.model
     vllm_config = engine_context.vllm_config
-    model_config = engine_context.model_config
+    model_config = vllm_config.model_config
     if not isinstance(model, Module):
         raise TypeError("vLLM engine context model must be a torch Module")
     if not isinstance(vllm_config, VllmConfig):

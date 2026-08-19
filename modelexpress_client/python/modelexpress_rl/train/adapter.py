@@ -105,7 +105,6 @@ class StagedWeightVersionShardData:
 
     manifest: WeightVersionShardManifest
     publish_ready: CompletionFence
-    source_reuse_ready: CompletionFence
     buffer_owner: object | None = None
 
 

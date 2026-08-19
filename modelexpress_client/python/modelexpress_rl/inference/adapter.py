@@ -7,27 +7,13 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from enum import Enum
 from typing import Any
 
 from modelexpress_rl.train import WeightPayloadFormat
 
 
-class GeneratorInstallationMode(str, Enum):
-    """How transferred weights become the engine's serving weights."""
-
-    UNSPECIFIED = "UNSPECIFIED"
-    STAGED = "STAGED"
-    DIRECT = "DIRECT"
-
-
 class GeneratorEngineContext(ABC):
     """Typed rank-local inputs used to construct one engine adapter."""
-
-    @property
-    @abstractmethod
-    def engine_name(self) -> str:
-        """Return the configured engine name for factory dispatch."""
 
 
 @dataclass(frozen=True)
@@ -75,11 +61,6 @@ class GeneratorEngineAdapter(ABC):
 
     @property
     @abstractmethod
-    def supported_installation_modes(self) -> frozenset[GeneratorInstallationMode]:
-        """Return installation modes implemented by this adapter."""
-
-    @property
-    @abstractmethod
     def supported_payload_formats(self) -> frozenset[WeightPayloadFormat]:
         """Return payload formats implemented by this adapter."""
 
@@ -115,7 +96,6 @@ class GeneratorEngineAdapter(ABC):
 __all__ = [
     "GeneratorEngineContext",
     "GeneratorEngineAdapter",
-    "GeneratorInstallationMode",
     "GeneratorSource",
     "GeneratorTransferInputs",
 ]

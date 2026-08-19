@@ -12,6 +12,7 @@ from .publisher import (
     publish_megatron_reshard_view,
     publish_registered_shard_table,
 )
+from .selection import build_megatron_tensor_specs, model_express_role_for_mapping
 
 __all__ = [
     "MegatronAliasInput",
@@ -20,7 +21,9 @@ __all__ = [
     "MegatronTensorSpec",
     "MegatronTrainerAdapter",
     "build_hf_aliases",
+    "build_megatron_tensor_specs",
     "build_megatron_reshard_manifest",
+    "model_express_role_for_mapping",
     "publish_megatron_reshard_view",
     "publish_registered_shard_table",
 ]

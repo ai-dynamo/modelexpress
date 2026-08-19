@@ -56,7 +56,7 @@ def test_source_slot_id_is_rank_stamped(dist_ready):
     assert _adapter().source_slot_id == "publisher:global-rank:0"
 
 
-def test_in_place_stage_registers_once_and_blocks_source_reuse(dist_ready):
+def test_in_place_stage_registers_once(dist_ready):
     manager = _Manager()
     adapter = _adapter(manager)
     state_dict = {"w": torch.ones(2, 4, dtype=torch.bfloat16)}
@@ -67,8 +67,6 @@ def test_in_place_stage_registers_once_and_blocks_source_reuse(dist_ready):
     assert staged.manifest.total_bytes == 2 * 4 * 2  # bf16 elsize
     assert staged.manifest.transport == "NIXL"
     staged.publish_ready.wait()  # IN_PLACE performs no copy: no-op
-    with pytest.raises(NotImplementedError, match="retire the published"):
-        staged.source_reuse_ready.wait()
 
     # Re-staging the same weights must not re-register (setup is one-time).
     _stage(adapter, state_dict)

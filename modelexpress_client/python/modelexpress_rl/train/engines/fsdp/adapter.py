@@ -46,13 +46,6 @@ from .publisher import (
 )
 
 
-def _source_reuse_unsupported() -> None:
-    raise NotImplementedError(
-        "FSDP publishing requires the RL framework to retire the published "
-        "version before resuming training; version-retirement signaling is not wired"
-    )
-
-
 class FSDPTrainerAdapter(TrainerEngineAdapter):
     """Expose FSDP/DTensor state-dict shards through the trainer contract.
 
@@ -89,7 +82,9 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
 
     @property
     def supported_staging_modes(self) -> frozenset[TrainerStagingMode]:
-        return frozenset({TrainerStagingMode.COPY_TO_DEVICE, TrainerStagingMode.IN_PLACE})
+        return frozenset(
+            {TrainerStagingMode.COPY_TO_DEVICE, TrainerStagingMode.IN_PLACE}
+        )
 
     @property
     def supported_payload_formats(self) -> frozenset[WeightPayloadFormat]:
@@ -135,7 +130,10 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
                 for s in shards
             }
         self._manager.register_tensors(
-            {self._register_key(i, s.name): self._arenas[s.name] for i, s in enumerate(shards)}
+            {
+                self._register_key(i, s.name): self._arenas[s.name]
+                for i, s in enumerate(shards)
+            }
         )
         self._registered_addrs = {
             name: arena.data_ptr() for name, arena in self._arenas.items()
@@ -146,7 +144,10 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         for shard in shards:
             self._require_in_place_servable(shard)
         self._manager.register_tensors(
-            {self._register_key(i, s.name): s.source_tensor for i, s in enumerate(shards)}
+            {
+                self._register_key(i, s.name): s.source_tensor
+                for i, s in enumerate(shards)
+            }
         )
         self._registered_addrs = {s.name: s.source_tensor.data_ptr() for s in shards}
 
@@ -280,10 +281,6 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
                 transport="NIXL",
             ),
             publish_ready=publish_ready,
-            # Mirror Megatron: the framework must retire the version before
-            # resuming training. Retirement is not wired to this fence, so fail
-            # rather than claim the source is safe to mutate.
-            source_reuse_ready=CompletionFence(_source_reuse_unsupported),
             # Keep the served buffers alive while the version can be selected.
             buffer_owner=tuple(s.served_tensor for s in shards),
         )

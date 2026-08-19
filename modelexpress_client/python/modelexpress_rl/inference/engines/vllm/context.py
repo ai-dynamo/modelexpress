@@ -12,7 +12,7 @@ from ...adapter import GeneratorEngineContext
 
 if TYPE_CHECKING:
     from torch.nn import Module
-    from vllm.config import ModelConfig, VllmConfig
+    from vllm.config import VllmConfig
 
 
 @dataclass(frozen=True)
@@ -21,11 +21,6 @@ class VllmGeneratorContext(GeneratorEngineContext):
 
     model: Module
     vllm_config: VllmConfig
-    model_config: ModelConfig
-
-    @property
-    def engine_name(self) -> str:
-        return "VLLM"
 
 
 __all__ = ["VllmGeneratorContext"]

@@ -6,20 +6,20 @@ from concurrent import futures
 from types import SimpleNamespace
 
 import grpc
+import modelexpress_rl.train.client as client_module
 import pytest
 from modelexpress.refit.reshard.rendezvous import unwrap_rendezvous_blob
 from modelexpress_rl import (
     ModelExpressTrainerClient,
+    ModelExpressTrainerConfig,
     TrainerStagingMode,
     WeightPayloadFormat,
     WeightVersionRef,
     refit_pb2,
     refit_pb2_grpc,
 )
-from modelexpress_rl.train import (
-    TrainerEngineAdapter,
-    WeightVersionShardManifestService,
-)
+from modelexpress_rl.train.adapter import TrainerEngineAdapter
+from modelexpress_rl.train.manifest import WeightVersionShardManifestService
 from modelexpress_rl.train.engines.megatron import (
     MegatronTensorSpec,
     MegatronTrainerAdapter,
@@ -45,6 +45,13 @@ class _Manager:
     agent_name = "trainer-r3"
     nixl_metadata = b"agent-metadata"
     listen_port = 19003
+
+    def __init__(self):
+        self.registered = []
+
+    def register_tensors(self, tensors):
+        self.registered.append(dict(tensors))
+        return self.nixl_metadata
 
 
 class _RefitService(refit_pb2_grpc.RefitServiceServicer):
@@ -105,6 +112,17 @@ def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
     manifest_service = WeightVersionShardManifestService(endpoint=f"127.0.0.1:{port}")
     refit_pb2_grpc.add_RefitWorkerServiceServicer_to_server(manifest_service, server)
     server.start()
+    resources = SimpleNamespace(
+        manager=_Manager(),
+        manifest_service=manifest_service,
+        worker_endpoint="trainer-3:9000",
+        close=lambda: None,
+    )
+    monkeypatch.setattr(
+        client_module._TrainerResources,
+        "initialize",
+        lambda **_kwargs: resources,
+    )
     adapter = MegatronTrainerAdapter(
         manager=_Manager(),
         nixl_metadata_endpoint="10.0.0.3:19003",
@@ -137,22 +155,20 @@ def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
 
     try:
         refit_client = ModelExpressTrainerClient.initialize(
-            server_url=f"127.0.0.1:{port}",
-            manager=_Manager(),
-            model_name="model",
-            staging_mode=TrainerStagingMode.IN_PLACE,
-            payload_format=WeightPayloadFormat.FULL_TENSOR,
-            manifest_publisher=manifest_service,
-            worker_endpoint="trainer-3:9000",
-            worker_id="worker-3",
-            registration_ttl_seconds=60,
+            ModelExpressTrainerConfig(
+                device_id=3,
+                server_url=f"127.0.0.1:{port}",
+                model_name="model",
+                staging_mode=TrainerStagingMode.IN_PLACE,
+                payload_format=WeightPayloadFormat.FULL_TENSOR,
+                worker_id="worker-3",
+                registration_ttl_seconds=60,
+            )
         )
         staged = refit_client.stage_shard(
             version=WeightVersionRef("version-a"),
             tensors=tensors,
         )
-        with pytest.raises(NotImplementedError, match="version-retirement"):
-            staged.source_reuse_ready.wait()
         staged.publish()
         worker_stub = refit_pb2_grpc.RefitWorkerServiceStub(
             grpc.insecure_channel(refit_service.shard.manifest_endpoint)
@@ -175,6 +191,7 @@ def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
         "publish-version-shard",
     ]
     assert refit_service.registration_ttl == 60
+    assert len(resources.manager.registered) == 1
     assert refit_service.shard.version_id == "version-a"
     assert refit_service.shard.source_slot_id == "publisher:global-rank:3"
     assert refit_service.shard.worker_id == "worker-3"

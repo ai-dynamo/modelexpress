@@ -109,19 +109,13 @@ behind the client.
 ```python
 from modelexpress_rl import (
     ModelExpressTrainerClient,
+    ModelExpressTrainerConfig,
     WeightVersionRef,
 )
 
-trainer = ModelExpressTrainerClient.initialize()
-trainer.register_tensors(
-    {spec.name: spec.tensor for spec in megatron_tensor_specs}
-)
-
-shard = trainer.stage_shard(
-    version=WeightVersionRef(version.uid),
-    tensors=megatron_tensor_specs,
-)
-shard.publish()
+trainer = ModelExpressTrainerClient.initialize(ModelExpressTrainerConfig())
+trainer.bind_tensors(megatron_tensor_specs)
+trainer.publish_version(version=WeightVersionRef(version.uid))
 ```
 
 The deployment supplies `MODEL_NAME`, `MX_TRAINER_ENGINE`,
@@ -141,21 +135,18 @@ or stages a shard after distributed setup.
 
 Initialization fixes the staging mode and payload format. `publish()` hides
 manifest publication and the internal `CreateWeightVersionShard` RPC. The
-current Megatron adapter exposes its already-registered live buffers through
+current Megatron adapter registers and exposes its live buffers through
 `IN_PLACE`, so callers must keep those tensors immutable while the version is
-published. Its `source_reuse_ready` fence raises `NotImplementedError` until
-version retirement is wired to the adapter; it must not be interpreted as an
-early reuse signal. The required lifecycle is synchronous: create and publish
-the version, update every generator, retire the version, and only then resume
-training or begin the next optimizer step. The adapter does not claim fully
-asynchronous `COPY_TO_DEVICE` behavior until that staging implementation exists.
+published. The required lifecycle is synchronous: create and publish the
+version, update every generator, retire and release the version, and only then
+resume training or begin the next optimizer step.
 
 Version creation and expected-source-slot declaration remain
 framework-orchestrator responsibilities. Each trainer adapter derives its own
 source slot from the engine's native topology; the orchestrator declares the
 expected slots using the same adapter-defined convention. `initialize()`
-selects the configured trainer engine and constructs its adapter internally;
-Megatron is the first implementation. Megatron-specific APIs live under
+selects the configured trainer engine and constructs its adapter internally.
+Megatron and FSDP implementations are available. Megatron-specific APIs live under
 `modelexpress_rl`;
 `modelexpress.refit.reshard` remains the shared, engine-neutral transfer core.
 

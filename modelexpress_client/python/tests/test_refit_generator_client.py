@@ -8,7 +8,6 @@ import grpc
 import modelexpress_rl.inference.client as generator_client_module
 import pytest
 from modelexpress_rl import (
-    GeneratorInstallationMode,
     ModelExpressGeneratorClient,
     ModelExpressGeneratorConfig,
     VllmGeneratorContext,
@@ -17,7 +16,7 @@ from modelexpress_rl import (
     refit_pb2,
     refit_pb2_grpc,
 )
-from modelexpress_rl.inference import GeneratorEngineAdapter
+from modelexpress_rl.inference.adapter import GeneratorEngineAdapter
 
 
 class _RefitService(refit_pb2_grpc.RefitServiceServicer):
@@ -100,7 +99,6 @@ class _WorkerService(refit_pb2_grpc.RefitWorkerServiceServicer):
 
 
 class _Adapter(GeneratorEngineAdapter):
-    supported_installation_modes = frozenset({GeneratorInstallationMode.STAGED})
     supported_payload_formats = frozenset({WeightPayloadFormat.FULL_TENSOR})
 
     def __init__(self, service):
@@ -112,6 +110,7 @@ class _Adapter(GeneratorEngineAdapter):
         self.release_calls = []
         self.close_calls = 0
         self.stage_failures = 0
+        self.apply_failure = False
 
     def create_transfer_plan(self, inputs):
         self.create_calls.append(inputs)
@@ -130,8 +129,10 @@ class _Adapter(GeneratorEngineAdapter):
         return {"plan": plan}
 
     def apply_weight(self, staged):
-        assert not self.service.active_leases
+        assert self.service.active_leases
         self.apply_calls.append(staged)
+        if self.apply_failure:
+            raise RuntimeError("apply failed")
         return "installed"
 
     def release_staged_weight(self, staged):
@@ -167,12 +168,9 @@ def _initialize(monkeypatch, endpoint, adapter):
             engine_context=VllmGeneratorContext(
                 model=object(),
                 vllm_config=object(),
-                model_config=object(),
             ),
             model_name="test/model",
-            installation_mode=GeneratorInstallationMode.STAGED,
             payload_format=WeightPayloadFormat.FULL_TENSOR,
-            worker_endpoint=endpoint,
             worker_id="generator-0",
             server_url=endpoint,
             registration_ttl_seconds=60,
@@ -189,14 +187,14 @@ def test_generator_stages_applies_releases_and_reuses_valid_plan(monkeypatch):
     try:
         first = generator.stage_weight(version=WeightVersionRef("version-a"))
         duplicate = generator.stage_weight(version=WeightVersionRef("version-a"))
-        first.wait()
-
         assert duplicate is first
+        assert service.active_leases
+        assert generator.apply_weight(first) == "installed"
+        assert generator.apply_weight(first) == "installed"
         assert not service.active_leases
-        assert generator.apply_weight(first) == "installed"
-        assert generator.apply_weight(first) == "installed"
         first.release()
         first.release()
+        assert not service.active_leases
 
         second = generator.stage_weight(version=WeightVersionRef("version-a"))
         second.release()
@@ -285,9 +283,27 @@ def test_generator_reports_lease_cleanup_failure_after_success(monkeypatch):
     generator = _initialize(monkeypatch, endpoint, adapter)
 
     try:
+        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
         with pytest.raises(grpc.RpcError, match="lease backend unavailable"):
-            generator.stage_weight(version=WeightVersionRef("version-a"))
+            staged.release()
     finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+
+def test_generator_preserves_apply_error_when_lease_cleanup_also_fails(monkeypatch):
+    server, endpoint, service = _start_server()
+    service.fail_lease_deletion = True
+    adapter = _Adapter(service)
+    adapter.apply_failure = True
+    generator = _initialize(monkeypatch, endpoint, adapter)
+
+    try:
+        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+        with pytest.raises(RuntimeError, match="apply failed"):
+            generator.apply_weight(staged)
+    finally:
+        service.fail_lease_deletion = False
         generator.close()
         server.stop(grace=None).wait()
 
@@ -310,19 +326,6 @@ def test_generator_rejects_non_ready_version_before_leasing(monkeypatch):
     assert service.lease_deletions == 0
 
 
-def test_generator_rejects_direct_until_implemented(monkeypatch):
-    server, endpoint, service = _start_server()
-    adapter = _Adapter(service)
-    generator = _initialize(monkeypatch, endpoint, adapter)
-
-    try:
-        with pytest.raises(NotImplementedError, match="DIRECT installation"):
-            generator.update_weight(version=WeightVersionRef("version-a"))
-    finally:
-        generator.close()
-        server.stop(grace=None).wait()
-
-
 def test_generator_closes_adapter_when_registration_fails(monkeypatch):
     service = _RefitService(endpoint="unused")
     adapter = _Adapter(service)
@@ -343,12 +346,9 @@ def test_generator_closes_adapter_when_registration_fails(monkeypatch):
                 engine_context=VllmGeneratorContext(
                     model=object(),
                     vllm_config=object(),
-                    model_config=object(),
                 ),
                 model_name="test/model",
-                installation_mode=GeneratorInstallationMode.STAGED,
                 payload_format=WeightPayloadFormat.FULL_TENSOR,
-                worker_endpoint="generator:9000",
                 worker_id="generator-0",
                 server_url="mx-server:9000",
             )

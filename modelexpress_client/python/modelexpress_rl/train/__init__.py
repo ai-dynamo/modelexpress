@@ -3,29 +3,17 @@
 
 """Trainer-side ModelExpress RL integrations."""
 
-from .adapter import (
-    CompletionFence,
-    NixlMetadataProvider,
-    StagedWeightVersionShardData,
-    TrainerEngineAdapter,
-    TrainerStagingMode,
-    WeightPayloadFormat,
-    WeightVersionShardManifest,
-    WeightVersionShardManifestPublisher,
+from .adapter import TrainerStagingMode, WeightPayloadFormat
+from .client import (
+    ModelExpressTrainerClient,
+    ModelExpressTrainerConfig,
+    StagedWeightVersionShard,
 )
-from .client import ModelExpressTrainerClient, StagedWeightVersionShard
-from .manifest import WeightVersionShardManifestService
 
 __all__ = [
-    "CompletionFence",
     "ModelExpressTrainerClient",
-    "NixlMetadataProvider",
+    "ModelExpressTrainerConfig",
     "StagedWeightVersionShard",
-    "StagedWeightVersionShardData",
-    "TrainerEngineAdapter",
     "TrainerStagingMode",
     "WeightPayloadFormat",
-    "WeightVersionShardManifest",
-    "WeightVersionShardManifestPublisher",
-    "WeightVersionShardManifestService",
 ]

@@ -6,11 +6,8 @@ import pytest
 from dataclasses import replace
 
 import modelexpress_rl.inference.engines.vllm.adapter as vllm_adapter_module
-from modelexpress_rl import (
-    GeneratorInstallationMode,
-    WeightPayloadFormat,
-)
-from modelexpress_rl.inference import GeneratorSource, GeneratorTransferInputs
+from modelexpress_rl import WeightPayloadFormat
+from modelexpress_rl.inference.adapter import GeneratorSource, GeneratorTransferInputs
 from modelexpress_rl.inference.engines.vllm import VllmGeneratorAdapter
 
 
@@ -88,9 +85,6 @@ def test_vllm_adapter_composes_transfer_and_installer_lifecycles(
         ),
     )
 
-    assert adapter.supported_installation_modes == frozenset(
-        {GeneratorInstallationMode.STAGED}
-    )
     assert adapter.supported_payload_formats == frozenset(
         {WeightPayloadFormat.FULL_TENSOR}
     )

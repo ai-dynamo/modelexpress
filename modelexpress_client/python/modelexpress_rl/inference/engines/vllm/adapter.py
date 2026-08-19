@@ -12,7 +12,6 @@ from modelexpress import envs
 from modelexpress.engines.vllm.adapter import VllmAdapter
 from modelexpress_rl.inference.adapter import (
     GeneratorEngineAdapter,
-    GeneratorInstallationMode,
     GeneratorTransferInputs,
 )
 from modelexpress_rl.inference.nixl_staged_transfer import (
@@ -70,10 +69,6 @@ class VllmGeneratorAdapter(GeneratorEngineAdapter):
         )
         self._active_plan: _VllmTransferPlan | None = None
         self._active_staged: _VllmStagedWeight | None = None
-
-    @property
-    def supported_installation_modes(self) -> frozenset[GeneratorInstallationMode]:
-        return frozenset({GeneratorInstallationMode.STAGED})
 
     @property
     def supported_payload_formats(self) -> frozenset[WeightPayloadFormat]:
