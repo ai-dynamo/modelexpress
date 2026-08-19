@@ -192,6 +192,15 @@ ModelExpress/
 │       ├── types.py                    # TensorDescriptor, WorkerMetadata dataclasses
 │       ├── p2p_pb2.py                  # Generated protobuf stubs
 │       └── p2p_pb2_grpc.py             # Generated gRPC stubs
+│   └── modelexpress_rl/                # RL weight-refit client surface
+│       ├── client.py                   # Trainer lifecycle for the NIXL pull path
+│       ├── collective/                 # NCCL M2N collective path (torch-free core)
+│       │   ├── types.py                # Placement, MeshSpec, ParamPlan, ReshardPlan
+│       │   ├── plan.py                 # Coverage gate, plan digest, default derivation
+│       │   ├── rendezvous.py           # MX-brokered join, readiness, bootstrap, report
+│       │   └── envs.py                 # Deadlines and stream count
+│       ├── refit_collective_pb2.py     # Generated protobuf stubs
+│       └── refit_collective_pb2_grpc.py # Generated gRPC stubs
 │
 ├── modelexpress_common/
 │   ├── Cargo.toml
@@ -408,6 +417,14 @@ those invalidates a cached communicator, a cached plan, or both, and clients
 drop them together. Bumping clears every lane's bootstrap identifier in the same
 transaction, because an identifier from a previous epoch names a communicator
 whose world size no longer matches the membership.
+
+The client-side control plane lives in `modelexpress_rl/collective/` and is
+deliberately torch-free, NCCL-free and CUDA-free, so the plan contract and the
+rendezvous are testable without a GPU. Two guarantees there are gates rather
+than conventions, because both failures are silent at refit time: `plan.py`
+proves that the bulk and misc lists together name every parameter exactly once,
+and folds that result into a plan digest every participant must agree on before
+the group becomes READY.
 
 Lanes are one per disjoint source partition plus one broadcast lane. MX derives
 them and assigns ranks from role, ordinal within role, and partition alone; it
