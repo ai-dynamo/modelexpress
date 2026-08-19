@@ -7,12 +7,14 @@ Streamed files carry paths relative to the server's snapshot directory. This
 module turns them into a cache an engine can resolve while offline::
 
     <cache_root>/models--<org>--<name>/
-        refs/main            commit hash of the published snapshot
+        refs/<revision>      commit hash the engine's revision resolves to
         snapshots/<commit>/  the files themselves
 
-``refs/main`` is what lets ``snapshot_download(local_files_only=True)`` resolve
-a repo id. Without it the engine raises ``LocalEntryNotFoundError`` even when
-every file is already on disk.
+A ref is what lets ``snapshot_download(local_files_only=True)`` resolve a
+revision that is not itself a commit hash -- a branch, a tag, or no revision
+at all, which resolves through ``refs/main``. Without it the engine raises
+``LocalEntryNotFoundError`` even when every file is already on disk. A request
+pinned to a commit hash needs no ref: it resolves by snapshot directory name.
 
 There are two write paths because their atomicity requirements differ:
 
@@ -253,8 +255,18 @@ class SnapshotStaging(SnapshotSink):
             raise ModelSnapshotError("Staging directory has already been consumed")
         return self._staging_path
 
-    def publish(self, commit_hash: str, expected_files: Mapping[str, int]) -> Path:
-        """Move the staged files into ``snapshots/<commit>`` and update refs/main."""
+    def publish(
+        self,
+        commit_hash: str,
+        expected_files: Mapping[str, int],
+        requested_revision: str | None = None,
+    ) -> Path:
+        """Move the staged files into ``snapshots/<commit>`` and record its ref.
+
+        ``requested_revision`` is what the engine asked for, which decides
+        which ref the snapshot becomes reachable under. See
+        :meth:`ModelSnapshotCache.write_revision_ref`.
+        """
         staging_path = self.path
         commit_hash = safe_commit_hash(commit_hash)
         snapshots_root = self._cache.repo_root / "snapshots"
@@ -267,7 +279,7 @@ class SnapshotStaging(SnapshotSink):
             )
             shutil.rmtree(staging_path, ignore_errors=True)
             self._staging_path = None
-            self._cache.write_main_ref(commit_hash)
+            self._cache.write_revision_ref(commit_hash, requested_revision)
             return snapshot_path
 
         if snapshot_path.is_dir() and not snapshot_path.is_symlink():
@@ -276,7 +288,7 @@ class SnapshotStaging(SnapshotSink):
             # Merge into it rather than swapping it out, or installing metadata
             # would delete a weight set nothing here checks for.
             self._merge_into(snapshot_path)
-            self._cache.write_main_ref(commit_hash)
+            self._cache.write_revision_ref(commit_hash, requested_revision)
             self._staging_path = None
             return snapshot_path
 
@@ -288,7 +300,7 @@ class SnapshotStaging(SnapshotSink):
         try:
             os.replace(staging_path, snapshot_path)
             _fsync_directory(snapshots_root)
-            self._cache.write_main_ref(commit_hash)
+            self._cache.write_revision_ref(commit_hash, requested_revision)
         except BaseException:
             # BaseException, not Exception: a KeyboardInterrupt here would
             # otherwise strand the moved-aside directory with no owner and no
@@ -471,19 +483,49 @@ class ModelSnapshotCache:
 
     def write_main_ref(self, commit_hash: str) -> None:
         """Point refs/main at ``commit_hash``, replacing any previous value."""
+        self.write_ref(MAIN_REF, commit_hash)
+
+    def write_ref(self, ref_name: str, commit_hash: str) -> None:
+        """Point ``refs/<ref_name>`` at ``commit_hash``.
+
+        A ref name may contain slashes -- ``refs/pr/1`` is a legal revision --
+        so the parent directories are created here. The name comes from the
+        engine's own configuration, so it is validated against the same rules
+        as a streamed file path before it becomes part of one.
+        """
         commit_hash = safe_commit_hash(commit_hash)
         refs_root = self.repo_root / "refs"
-        _ensure_directory(refs_root, self.cache_root)
-        temp_ref = refs_root / f"{_TEMP_PREFIX}{uuid.uuid4().hex}"
+        ref_path = refs_root / safe_relative_path(ref_name)
+        _ensure_directory(ref_path.parent, self.cache_root)
+        temp_ref = ref_path.parent / f"{_TEMP_PREFIX}{uuid.uuid4().hex}"
         try:
             with temp_ref.open("x", encoding="utf-8") as ref_file:
                 ref_file.write(commit_hash)
                 ref_file.flush()
                 os.fsync(ref_file.fileno())
-            os.replace(temp_ref, refs_root / MAIN_REF)
-            _fsync_directory(refs_root)
+            os.replace(temp_ref, ref_path)
+            _fsync_directory(ref_path.parent)
         finally:
             temp_ref.unlink(missing_ok=True)
+
+    def write_revision_ref(self, commit_hash: str, requested_revision: str | None) -> None:
+        """Record the alias the engine will look the snapshot up by.
+
+        Mirrors what ``huggingface_hub`` caches for itself: a ref is written
+        only when the requested revision is not already the commit hash, since
+        a full commit hash resolves straight to ``snapshots/<commit>/``.
+
+        A pinned request must not touch ``refs/main``. Pointing the default
+        revision at a pin would make every later unpinned resolution -- in this
+        worker or the next one to share the cache -- read a revision nobody
+        asked for.
+        """
+        if requested_revision is None:
+            self.write_main_ref(commit_hash)
+            return
+        if requested_revision == commit_hash:
+            return
+        self.write_ref(requested_revision, commit_hash)
 
     def has_files(self, snapshot_path: Path, expected_files: Mapping[str, int]) -> bool:
         """Return whether every expected file is present at its expected size."""
@@ -503,6 +545,22 @@ class ModelSnapshotCache:
         except (OSError, ModelSnapshotError):
             return False
         return True
+
+    def resolve_pinned_snapshot(
+        self,
+        expected_files: Mapping[str, int],
+        commit_hash: str,
+    ) -> Path | None:
+        """Return ``snapshots/<commit>`` when it already holds every file.
+
+        A pinned request addresses one snapshot directly, so ``refs/main`` --
+        which tracks the default revision, a different thing entirely -- has no
+        say in whether this one can be reused.
+        """
+        snapshot_path = self.snapshot_path(commit_hash)
+        if self.has_files(snapshot_path, expected_files):
+            return snapshot_path
+        return None
 
     def resolve_snapshot(
         self,
