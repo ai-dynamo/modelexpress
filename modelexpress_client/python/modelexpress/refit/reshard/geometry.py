@@ -273,11 +273,17 @@ def build_lazy_weights(
 
 
 def _shared_recorder(weights: dict) -> "_BakeRecorder":
-    recorders = {
-        id(w._recorder): w._recorder
-        for w in weights.values()
-        if isinstance(w, LazyWeight) and w._recorder is not None
-    }
+    # Every value must be a recording LazyWeight: an ordinary tensor would be sent
+    # to load_weights and its copies dropped (the copy_ sink only fires for a
+    # LazyWeight), silently under-capturing the model.
+    recorders: dict = {}
+    for name, w in weights.items():
+        if not isinstance(w, LazyWeight) or w._recorder is None:
+            raise ValueError(
+                f"capture_weights requires LazyWeights from build_lazy_weights; "
+                f"{name!r} is a {type(w).__name__}"
+            )
+        recorders[id(w._recorder)] = w._recorder
     if len(recorders) != 1:
         raise ValueError(
             "capture_weights expects LazyWeights that share one recorder "

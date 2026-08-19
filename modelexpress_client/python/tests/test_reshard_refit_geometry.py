@@ -252,8 +252,6 @@ def test_default_loader_param_needs_default_weight_loader():
     assert got.unattributed == 0
 
 
-# ------------------------------------------------- pre-built (capture_weights)
-
 def test_capture_weights_records_the_converted_source_name():
     """Pre-built weights whose keys were renamed (native -> loader name): the
     recorded copy names the ORIGINAL source (the lazy's _name), not the key."""
@@ -281,8 +279,6 @@ def test_capture_weights_requires_a_shared_recorder():
     with pytest.raises(ValueError, match="share one recorder"):
         capture_weights(model, {"col": a["col"], "norm": b["norm"]})
 
-
-# ----------------------------------------------- native -> HF source conversion
 
 _CONVERT_MANIFEST = [
     ("model.router.gate.weight", torch.bfloat16, (2, 4)),
@@ -338,8 +334,6 @@ def test_convert_source_weights_rejects_a_dtype_cast():
     with pytest.raises(UnsupportedReshard):
         convert_source_weights(convert, _CONVERT_MANIFEST)
 
-
-# --------------------------------------------- MoE convert -> capture -> reconstruct
 
 _E, _I, _H = 3, 2, 4  # experts, intermediate, hidden
 

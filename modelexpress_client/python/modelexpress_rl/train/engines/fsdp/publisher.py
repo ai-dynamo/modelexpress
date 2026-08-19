@@ -6,7 +6,7 @@ Extracts the rank-local shards from an FSDP ``state_dict`` and emits MX's
 engine-neutral manifest (``PublishedTensor`` / ``PublishedShard`` +
 ``wrap_rendezvous_blob``). HF-name conversion is deliberately NOT done here: the
 receiver maps these native trainer-format sources into the HF/vLLM param layout
-(see ``VllmReshardReceiver``'s ``convert_native_to_hf`` in
+(see the ``convert_native_to_hf=`` argument to ``VllmReshardReceiver`` in
 ``modelexpress/engines/vllm/refit/receiver.py``).
 
 Extraction rules (per state_dict tensor, floating point only):
