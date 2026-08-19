@@ -412,21 +412,28 @@ coverage result is folded into the `plan_digest` below, so a generator that veri
 digest has also verified coverage, and neither side can start a wire operation against a plan
 that does not partition the model.
 
-### The plan digest is part of the group's identity
+### A changed plan digest bumps the epoch
 
-The plan is fetched once per `(group_id, epoch)`, and the Publisher now decides everything in
-it. That combination has a hole: membership can stay constant while the plan changes — a
-different bulk classification, a renamed parameter, a dtype change — and a group keyed only on
+The plan is fetched once per `(group_id, epoch)`, and the Publisher decides everything in it.
+That combination has a hole: membership can stay constant while the plan changes — a different
+bulk classification, a renamed parameter, a dtype change — and a group that tracked only
 membership would not notice. Generators would keep the plan they cached at the last epoch and
 receive bytes laid out for a model that no longer exists.
 
-So `plan_digest` is part of the group's identity, not a property hanging off it. It is a
-canonical digest over every `ParamPlan` field, the misc order, and the coverage proof. Each
-participant reports its digest when it joins; MX admits the group to `READY` only when every
-participant reports the same one, and a changed digest bumps the epoch exactly as a membership
-change does. The cached plan and the cached communicator are then invalidated together, which
-is the only safe pairing — a communicator that matches the membership but a plan that does not
-match the model is precisely the case that moves wrong bytes without erroring.
+So the group carries a `plan_digest`: a canonical digest over every `ParamPlan` field, the
+misc order, and the coverage proof. Each participant reports its digest when it joins. MX
+admits the group to `READY` only when every participant reports the same one, and **a changed
+digest bumps the epoch exactly as a membership change does.** The cached plan and the cached
+communicator are then invalidated together, which is the only safe pairing — a communicator
+that matches the membership but a plan that does not match the model is precisely the case
+that moves wrong bytes without erroring.
+
+The digest deliberately stays *off* the group's identity. Folding it into `group_id` would
+close the same hole, but every plan change would then strand the previous group as an orphan
+that nothing rejoins, to be cleaned up only when its participants' registrations lapse. The
+epoch already exists to express "same participants, invalidated caches", and a plan change is
+exactly that. Group identity therefore stays `(model_name, trainer topology, admitted
+generator set)`, and the digest rides on the group as versioned state.
 
 ### Defaults, so the common case stays cheap
 
@@ -622,7 +629,7 @@ NeMo RL's existing builders port directly.
 ## Open questions
 
 - **Group keying.** A group is keyed by `(model_name, trainer topology, admitted
-  generator set, plan_digest)`. If the orchestrator refits overlapping generator subsets in
+  generator set)`. If the orchestrator refits overlapping generator subsets in
   alternation — the motivating case, where idle instances update first — each
   distinct subset is its own group and pays its own `Communicator.init`. A superset
   group with per-operation participation masks would amortize that, but NCCL
