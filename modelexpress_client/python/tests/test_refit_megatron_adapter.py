@@ -85,7 +85,7 @@ def test_megatron_adapter_requires_initialized_distributed_engine(monkeypatch):
 
 def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
     monkeypatch.setattr(
-        "modelexpress_rl.train.engines.megatron.aliases.published_digest",
+        "modelexpress_rl.train.engines.megatron.aliases.tensor_digest",
         lambda _tensor: "tensor-digest",
     )
     monkeypatch.setattr(
@@ -191,3 +191,4 @@ def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
     assert payload.metadata_endpoint == "10.0.0.3:19003"
     assert payload.tensors[0].shards[0].addr == 0x1234
     assert payload.tensors[0].shards[0].shard_offset == (8, 0)
+    assert payload.tensors[0].shards[0].digest == "tensor-digest"
