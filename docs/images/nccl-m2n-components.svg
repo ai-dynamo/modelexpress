@@ -117,13 +117,12 @@ SPDX-License-Identifier: Apache-2.0
   <path class="edge" d="M1116,398 L1392,398" stroke="#2E7D32" marker-end="url(#agr)"/>
   <path class="edge" d="M416,434 L692,434" stroke="#2E7D32" marker-end="url(#agr)"/>
   <text x="554" y="427" text-anchor="middle" class="mono" fill="#2E7D32">PublishGroupBootstrap</text>
-  <path class="edge" d="M1392,434 L1116,434" stroke="#2E7D32" marker-end="url(#agr)"/>
   <path class="edge" d="M692,470 L416,470" stroke="#2E7D32" marker-end="url(#agr)" stroke-dasharray="5 4"/>
   <text x="554" y="463" text-anchor="middle" class="mono" fill="#2E7D32">GetCollectiveGroup poll</text>
   <path class="edge" d="M1116,470 L1392,470" stroke="#2E7D32" marker-end="url(#agr)" stroke-dasharray="5 4"/>
   <text x="1254" y="355" text-anchor="middle" class="mono" fill="#2E7D32">JoinCollectiveGroup</text>
   <text x="1254" y="391" text-anchor="middle" class="mono" fill="#2E7D32">-&gt; rank_in_lane, epoch</text>
-  <text x="1254" y="427" text-anchor="middle" class="mono" fill="#2E7D32">(lane leader only)</text>
+  <text x="1254" y="427" text-anchor="middle" class="mono" fill="#94a3b8">(trainer lane leader only)</text>
   <text x="1254" y="463" text-anchor="middle" class="mono" fill="#2E7D32">GetCollectiveGroup poll</text>
   <path class="edge" d="M416,570 L692,570" stroke="#2E7D32" marker-end="url(#agr)"/>
   <text x="554" y="563" text-anchor="middle" class="mono" fill="#2E7D32">ReportCollectiveTransfer</text>
