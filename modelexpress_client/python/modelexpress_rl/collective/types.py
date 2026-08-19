@@ -72,6 +72,10 @@ class Placement:
         return Replicate() if self.kind is PlacementKind.REPLICATE else Shard(self.dim)
 
 
+#: ``ncclMesh_t`` is a two-dimensional descriptor; a 1-D grid widens to (N, 1).
+MESH_MAX_NDIM = 2
+
+
 @dataclass(frozen=True)
 class MeshSpec:
     """A rank grid, as a shape plus the rank the grid starts at.
@@ -87,6 +91,15 @@ class MeshSpec:
     def __post_init__(self) -> None:
         if not self.shape or any(extent <= 0 for extent in self.shape):
             raise ValueError("mesh shape must be non-empty and positive")
+        if len(self.shape) > MESH_MAX_NDIM:
+            # ncclMesh_t carries exactly two dims, and a 1-D grid is widened to
+            # (N, 1). A deeper mesh cannot be expressed, and rejecting it here
+            # names the constraint instead of failing inside the collective.
+            raise ValueError(
+                f"a mesh may have at most {MESH_MAX_NDIM} dimensions; got "
+                f"{len(self.shape)} ({self.shape}). Collapse the parallelism "
+                "axes so at most two of them are larger than one."
+            )
         if self.rank_offset < 0:
             raise ValueError("rank_offset must not be negative")
 

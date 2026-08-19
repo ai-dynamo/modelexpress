@@ -23,7 +23,7 @@ import hashlib
 import re
 from collections import Counter
 
-from .types import MeshSpec, MiscParam, ParamPlan, Placement, ReshardPlan
+from .types import MESH_MAX_NDIM, MeshSpec, MiscParam, ParamPlan, Placement, ReshardPlan
 
 # FFN projection weights. Column-parallel projections shard the output dim,
 # the row-parallel one shards the input dim.
@@ -183,6 +183,13 @@ def build_mesh(
         return MeshSpec(shape=(rank_count,), rank_offset=rank_offset), {}
 
     reversed_active = list(reversed(active))
+    if len(reversed_active) > MESH_MAX_NDIM:
+        raise ValueError(
+            f"{len(reversed_active)} parallelism axes are larger than one "
+            f"({', '.join(name for name, _ in active)}), but a mesh may carry at "
+            f"most {MESH_MAX_NDIM}. Declare the mesh explicitly, or collapse the "
+            "axes so at most two are larger than one."
+        )
     shape = tuple(size for _, size in reversed_active)
     axis_of = {name: index for index, (name, _) in enumerate(reversed_active)}
     return MeshSpec(shape=shape, rank_offset=rank_offset), axis_of

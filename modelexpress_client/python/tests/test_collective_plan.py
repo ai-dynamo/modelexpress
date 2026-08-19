@@ -56,6 +56,16 @@ class TestMeshSpec:
     def test_ranks_are_lane_local_and_start_at_the_offset(self):
         assert MeshSpec(shape=(2, 3), rank_offset=4).ranks() == [4, 5, 6, 7, 8, 9]
 
+    def test_a_mesh_deeper_than_two_dimensions_is_rejected(self):
+        # ncclMesh_t carries exactly two dims and widens a 1-D grid to (N, 1).
+        # A deeper mesh cannot be expressed, and accepting it here would defer
+        # the failure into the collective.
+        with pytest.raises(ValueError, match="at most 2 dimensions"):
+            MeshSpec(shape=(2, 2, 2))
+
+    def test_two_dimensions_are_still_allowed(self):
+        assert MeshSpec(shape=(2, 3)).nested() == [[0, 1, 2], [3, 4, 5]]
+
     def test_degenerate_shapes_are_rejected(self):
         with pytest.raises(ValueError):
             MeshSpec(shape=())
@@ -273,6 +283,15 @@ class TestDefaultMesh:
         mesh, axis_of = build_mesh(rank_count=4, dp_size=4)
         assert mesh.shape == (4,)
         assert axis_of == {"dp": 0}
+
+    def test_more_than_two_active_axes_is_rejected_with_the_axis_names(self):
+        with pytest.raises(ValueError, match="tp, ep, dp"):
+            build_mesh(rank_count=8, tp_size=2, ep_size=2, dp_size=2)
+
+    def test_two_active_axes_are_fine(self):
+        mesh, axis_of = build_mesh(rank_count=8, tp_size=2, dp_size=4)
+        assert mesh.shape == (4, 2)
+        assert set(axis_of) == {"tp", "dp"}
 
     def test_a_parallelism_product_that_misses_ranks_is_rejected(self):
         with pytest.raises(ValueError, match="does not account for"):
