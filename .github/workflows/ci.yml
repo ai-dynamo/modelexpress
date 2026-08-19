@@ -41,7 +41,7 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
 
     - name: Check Helm CRD manifest sync
       if: matrix.rust == 'stable'
@@ -49,14 +49,14 @@ jobs:
 
     - name: Install Rust toolchain
       run: |
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain ${{ matrix.rust }}
         echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
     - name: Check Rust version
       run: rustc --version
 
     - name: Cache dependencies
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: |
           ~/.cargo/registry
@@ -94,6 +94,7 @@ jobs:
       run: cargo test -p modelexpress-server --features integration-tests --test in_process_server
 
     - name: Build release
+      if: matrix.rust == 'stable'
       run: cargo build --release --verbose
 
     - name: Run doc tests
@@ -112,7 +113,7 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
 
     - name: Install Rust toolchain
       run: |
@@ -120,7 +121,7 @@ jobs:
         echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
     - name: Cache dependencies
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: |
           ~/.cargo/registry
@@ -148,7 +149,7 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
 
     - name: Install Rust toolchain
       run: |
@@ -182,10 +183,10 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v7
       with:
         python-version: "3.12"
 
@@ -209,10 +210,10 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
 
     - name: Set up Go
-      uses: actions/setup-go@v5
+      uses: actions/setup-go@v7
       with:
         go-version: "1.24.x"
         cache-dependency-path: modelexpress_client/go/go.sum
@@ -249,7 +250,7 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      uses: actions/checkout@v7
       with:
         persist-credentials: false
 
@@ -259,7 +260,7 @@ jobs:
         echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
     - name: Cache dependencies
-      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache@v6
       with:
         path: |
           ~/.cargo/registry
@@ -297,7 +298,7 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
 
     - name: Install Rust toolchain
       run: |
@@ -308,13 +309,16 @@ jobs:
       run: rustc --version
 
     - name: Cache dependencies
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: |
           ~/.cargo/registry
           ~/.cargo/git
           target/
         key: ${{ runner.os }}-cargo-stable-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-stable-
+          ${{ runner.os }}-cargo-
 
     - name: Install system dependencies
       run: |
@@ -355,8 +359,9 @@ jobs:
       run: |
         if [ -f run_integration_tests.sh ]; then
           chmod +x run_integration_tests.sh
-          ./run_integration_tests.sh || echo "Integration test script failed (expected in CI)"
+          ./run_integration_tests.sh
         fi
+      continue-on-error: true
 
   security-audit:
     name: Security Audit
@@ -364,7 +369,7 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
 
     - name: Install Rust toolchain
       run: |
@@ -392,7 +397,7 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
 
     - name: Install Rust toolchain
       run: |
@@ -418,7 +423,7 @@ jobs:
       run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
 
     - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v3
+      uses: codecov/codecov-action@v7
       with:
         files: lcov.info
         fail_ci_if_error: false
@@ -430,7 +435,7 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
 
     - name: Build Docker image
       run: |
@@ -451,7 +456,7 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
 
     - name: Install kubectl
       run: |
