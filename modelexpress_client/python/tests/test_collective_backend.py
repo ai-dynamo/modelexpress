@@ -42,16 +42,16 @@ class Recorder:
 def recorder(monkeypatch):
     rec = Recorder()
 
-    def reshard(src, src_mesh, src_pl, dst, dst_mesh, dst_pl, comm, stream):
+    def reshard(src, dst, comm, **kwargs):
         rec.ops.append(
             SimpleNamespace(
                 kind="reshard",
                 src=src,
                 dst=dst,
-                src_mesh=tuple(src_mesh),
-                dst_mesh=tuple(dst_mesh),
                 comm=comm,
-                stream=stream,
+                kwargs=kwargs,
+                src_mesh=kwargs["src_mesh"],
+                dst_mesh=kwargs["dst_mesh"],
             )
         )
 
@@ -78,7 +78,7 @@ class FakeComm:
         self.aborted = True
 
 
-def lane(rec, name, *, rank=0, world=4, stream="s0"):
+def lane(rec, name, *, rank=0, world=4, stream=None):
     return LaneCommunicator(FakeComm(rec, name), rank=rank, world_size=world, stream=stream)
 
 
@@ -179,8 +179,62 @@ class TestOpOrdering:
         sender, _ = build(recorder, plan=plan, half_cls=NcclM2nSender)
         sender.start_weight_update("v")
         sender.publish_weights(0)
-        assert recorder.ops[0].src_mesh == (0, 1)
-        assert recorder.ops[0].dst_mesh == (2, 3)
+        assert recorder.ops[0].src_mesh == [0, 1]
+        assert recorder.ops[0].dst_mesh == [2, 3]
+
+    def test_the_call_shape_matches_the_nemo_rl_contract(self, recorder):
+        """Pins the binding against NeMo RL's xferdtensor call site.
+
+        Every one of these was wrong in the first draft, and each would have
+        failed at the first real transfer rather than at import: tensors and
+        communicator are positional, meshes and placements are keyword,
+        placements are DTensor objects rather than strings, and stream is
+        omitted entirely when there is none.
+        """
+        from torch.distributed.tensor.placement_types import Shard
+
+        plan = ReshardPlan(bulk=[entry("a")])
+        sender, _ = build(recorder, plan=plan, half_cls=NcclM2nSender)
+        sender.start_weight_update("v")
+        sender.publish_weights(0)
+
+        op = recorder.ops[0]
+        assert set(op.kwargs) == {"src_mesh", "src_placements", "dst_mesh", "dst_placements"}
+        assert isinstance(op.kwargs["src_placements"][0], Shard)
+        assert op.kwargs["src_placements"][0].dim == 0
+
+    def test_a_multi_axis_mesh_is_nested_not_flattened(self, recorder):
+        """A flat list would describe a different topology entirely."""
+        nested = ParamPlan(
+            name="a",
+            global_shape=(8, 4),
+            dtype="bfloat16",
+            partition_id=0,
+            src_mesh=MeshSpec(shape=(2, 2), rank_offset=0),
+            src_placements=(Placement.replicate(), Placement.shard(0)),
+            dst_mesh=MeshSpec(shape=(2,), rank_offset=4),
+            dst_placements=(Placement.shard(0),),
+        )
+        sender, _ = build(recorder, plan=ReshardPlan(bulk=[nested]), half_cls=NcclM2nSender)
+        sender.start_weight_update("v")
+        sender.publish_weights(0)
+        assert recorder.ops[0].src_mesh == [[0, 1], [2, 3]]
+
+    def test_a_stream_is_passed_as_a_raw_handle_when_present(self, recorder):
+        plan = ReshardPlan(bulk=[entry("a")])
+        cache = CommunicatorCache()
+        cache._lanes[LaneKey("g", 1, 0)] = LaneCommunicator(
+            FakeComm(recorder, "lane0"),
+            rank=0,
+            world_size=4,
+            stream=SimpleNamespace(cuda_stream=99),
+        )
+        cache._lanes[LaneKey("g", 1, 1)] = lane(recorder, "lane1")
+        specs = {"a": LocalParamSpec(base="buf::a")}
+        half = NcclM2nSender(plan=plan, specs=specs, group_id="g", epoch=1, cache=cache)
+        half.start_weight_update("v")
+        half.publish_weights(0)
+        assert recorder.ops[0].kwargs["stream"] == 99
 
 
 class TestLaneRouting:

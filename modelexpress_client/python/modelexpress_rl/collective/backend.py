@@ -41,21 +41,35 @@ def _reshard(
     from the two meshes. Both sides still pass *both* meshes, because each has
     to know the shape of the other end to route into it.
 
-    The call is isolated here so the binding is in one place if the nccl4py
-    signature moves.
+    The argument shape is pinned to the one NeMo RL's ``xferdtensor`` uses, so
+    an MX-brokered deployment and a NeMo-RL-native one issue the identical
+    call: tensors and communicator positional, meshes and placements by
+    keyword, meshes nested to their shape, placements as real DTensor objects,
+    and ``stream`` passed as a raw handle only when there is one.
     """
     from nccl.m2n import reshard  # noqa: PLC0415 - lazy: only this path needs nccl4py
 
-    reshard(
-        src,
-        list(entry.src_mesh.ranks()),
-        [p.canonical() for p in entry.src_placements],
-        dst,
-        list(entry.dst_mesh.ranks()),
-        [p.canonical() for p in entry.dst_placements],
-        comm.handle,
-        comm.stream,
-    )
+    kwargs: dict[str, Any] = {
+        "src_mesh": entry.src_mesh.nested(),
+        "src_placements": [p.to_dtensor() for p in entry.src_placements],
+        "dst_mesh": entry.dst_mesh.nested(),
+        "dst_placements": [p.to_dtensor() for p in entry.dst_placements],
+    }
+    stream = comm.stream
+    if stream is not None:
+        kwargs["stream"] = _stream_handle(stream)
+
+    reshard(src, dst, comm.handle, **kwargs)
+
+
+def _stream_handle(stream: Any) -> int:
+    """Raw CUDA stream handle for the reshard op.
+
+    A ``torch.cuda.Stream`` carries it on ``cuda_stream``; anything already
+    integral is passed through so a caller can supply a handle directly.
+    """
+    handle = getattr(stream, "cuda_stream", stream)
+    return int(handle)
 
 
 class _CollectiveHalf:

@@ -110,7 +110,7 @@ class FakeRendezvous:
 def fake_nccl(monkeypatch):
     ops = []
 
-    def reshard(src, src_mesh, src_pl, dst, dst_mesh, dst_pl, comm, stream):
+    def reshard(src, dst, comm, **kwargs):
         ops.append("reshard")
 
     class Comm:

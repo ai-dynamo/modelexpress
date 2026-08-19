@@ -58,6 +58,19 @@ class Placement:
         """Stable text form, used by the plan digest."""
         return "R" if self.kind is PlacementKind.REPLICATE else f"S{self.dim}"
 
+    def to_dtensor(self):
+        """Convert to the torch DTensor placement the reshard op expects.
+
+        torch is imported here rather than at module scope so the plan
+        contract stays importable, and testable, without it.
+        """
+        from torch.distributed.tensor.placement_types import (  # noqa: PLC0415
+            Replicate,
+            Shard,
+        )
+
+        return Replicate() if self.kind is PlacementKind.REPLICATE else Shard(self.dim)
+
 
 @dataclass(frozen=True)
 class MeshSpec:
@@ -85,8 +98,27 @@ class MeshSpec:
         return total
 
     def ranks(self) -> list[int]:
-        """The grid in row-major order, which is the order NCCL reads it in."""
+        """The grid flattened in row-major order."""
         return [self.rank_offset + i for i in range(self.size)]
+
+    def nested(self) -> list:
+        """The grid nested to ``shape``, which is the form the reshard op takes.
+
+        NeMo RL passes ``mesh.mesh.tolist()`` of a tensor already reshaped to
+        the mesh shape, so a flat list would silently describe a different
+        topology for any mesh with more than one axis.
+        """
+        flat = self.ranks()
+
+        def build(dims: tuple[int, ...], offset: int):
+            if len(dims) == 1:
+                return flat[offset : offset + dims[0]]
+            stride = 1
+            for extent in dims[1:]:
+                stride *= extent
+            return [build(dims[1:], offset + i * stride) for i in range(dims[0])]
+
+        return build(self.shape, 0)
 
     def canonical(self) -> str:
         return f"{'x'.join(str(e) for e in self.shape)}@{self.rank_offset}"
