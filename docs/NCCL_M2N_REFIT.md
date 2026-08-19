@@ -110,17 +110,31 @@ deployment and a NeMo-RL-native deployment move identical bytes:
 - `nccl.m2n.reshard` from the **nccl4py** package is the default and only wire op
   (`xferdtensor`'s pure-Python and golden paths are debugging aids, not our
   contract).
-- Parameters are keyed by **HuggingFace (HF) names** with **global shapes**; per-expert
-  Mixture-of-Experts (MoE) weights are grouped into one
-  `...experts.{gate,up,down}_proj.weight` entry of shape `[E, ...]`.
-- Source and destination layouts are described as a **rank mesh** plus DTensor
+Adopted as **mechanism**, and framework-neutral:
+
+- `nccl.m2n.reshard` from the **nccl4py** package as the wire op.
+- Parameters keyed by a **canonical name** carrying a **global shape**, with per-expert
+  Mixture-of-Experts (MoE) weights grouped into one entry of shape `[E, ...]`.
+- Source and destination layouts described as a **rank mesh** plus DTensor
   **`Shard(dim)` / `Replicate()`** placements.
-- Communicators are **per trainer Pipeline Parallelism (PP) stage**: stage `s`'s trainer
-  ranks plus all participating generator ranks. Rank order within a group is **trainer ranks
-  first, generator ranks after**.
-- A **bulk/misc split**: feed-forward network (FFN) projection weights take the reshard
-  path (97-98% of the bytes on large MoE models); everything else rides a packed broadcast over a
-  separate all-participants communicator.
+- One communicator per **disjoint source partition**, spanning that partition's trainer
+  ranks plus all participating generator ranks, with **trainer ranks first**.
+- A **bulk/misc split**: parameters whose layout the reshard can express take the collective
+  path; the rest ride a packed broadcast on a separate all-participants communicator.
+
+Adopted as **default policy**, and overridable per deployment:
+
+- HuggingFace (HF) names as the canonical namespace. It is what vLLM, SGLang, and TRT-LLM
+  already consume, so it is the useful default — but it is a Publisher choice, not a
+  property of this path.
+- Pipeline Parallelism (PP) stage as the source partition. It is the common case, not the
+  only one.
+- Feed-forward network (FFN) projection weights as the bulk set. That is a profiling result
+  about MoE models (97-98% of refit bytes there, ~67% on a dense model), not a property of
+  the transport.
+
+The line between those two lists is the whole of this path's portability, so
+[The plan](#the-plan-mesh-and-placement-contract) states where each is decided.
 
 Where NeMo RL and MX differ is precisely the piece MX is asked to own:
 
@@ -177,7 +191,7 @@ pull path and the NCCL push path never share a type.
 | Resource | Lifetime | Owner |
 |---|---|---|
 | `CollectiveGroup` | Membership-keyed; reused across refits; `epoch` bumps on membership change | MX |
-| `CollectiveLane` | One per group per communicator (per trainer PP stage, plus one broadcast lane) | MX |
+| `CollectiveLane` | One per group per communicator (one per source partition, plus one broadcast lane) | MX |
 | `CollectiveTransfer` | One per refit operation; references `(group_id, epoch)` and a `version_id` | MX |
 
 Splitting group from operation reconciles two requirements that read as being in
@@ -195,24 +209,38 @@ two different spans:
 
 | Lane kind | Count | Span | Carries |
 |---|---|---|---|
-| `LANE_KIND_RESHARD` | `trainer_pp_size` | PP stage `s`'s trainer ranks + all admitted generator ranks | `nccl.m2n.reshard` bulk params |
+| `LANE_KIND_RESHARD` | one per source partition | that partition's trainer ranks + all admitted generator ranks | `nccl.m2n.reshard` bulk params |
 | `LANE_KIND_BROADCAST` | 1 | All admitted trainer + generator ranks | Packed misc-param broadcast |
 
-This is NeMo RL's `pp_comm_group` / `model_update_group` split, promoted from two
-ad-hoc `StatelessProcessGroup`s into one MX-brokered resource. Keeping the bulk
-path on its own communicators is not cosmetic: the workers must run the misc
-broadcast strictly after the bulk reshard, because concurrent traffic on
-overlapping communicators can deadlock.
+A **source partition** is a set of trainer ranks that jointly own a disjoint slice of the
+parameters. The Publisher declares which partition each parameter belongs to; MX only counts
+them. Pipeline Parallelism (PP) stages are the common instance — stage `s` owns a disjoint
+set of layers — but nothing here requires the partition to *be* PP, and a single-partition
+trainer is just the degenerate case of one reshard lane.
+
+Why partition at all, rather than one communicator over everyone: **a collective requires
+every member to enter every operation.** With one global communicator, a trainer rank that
+owns none of a parameter would still have to enter that parameter's `reshard` as a no-op
+participant. Every parameter becomes a fleet-wide barrier and the partitions serialize behind
+each other. Separate lanes make them independent, so they overlap on separate Compute Unified
+Device Architecture (CUDA) streams.
+
+Generator ranks sit in *every* reshard lane, because a generator holds all layers and so needs
+bytes from whichever partition owns each one.
+
+Keeping the bulk path on its own communicators is not cosmetic. The broadcast lane spans every
+rank, so it overlaps every reshard lane, and concurrent traffic on overlapping communicators
+can deadlock — the workers must drain all reshard lanes before the misc broadcast.
 
 ### Rank assignment
 
-MX assigns `rank_in_lane`. The rule reproduces NeMo RL's convention exactly, so
-the mesh arithmetic below is unchanged:
+MX assigns `rank_in_lane`. Trainers occupy the low ranks of a lane and generators follow, so
+each lane looks like a small self-contained world:
 
 ```text
-reshard lane s     world_size = trainer_ranks_per_stage + admitted_generator_count
-  trainer  index_in_role r  ->  rank_in_lane = r % trainer_ranks_per_stage
-  generator index_in_role g ->  rank_in_lane = trainer_ranks_per_stage + g
+reshard lane p     world_size = trainer_ranks_in_partition + admitted_generator_count
+  trainer  index_in_role r  ->  rank_in_lane = r % trainer_ranks_in_partition
+  generator index_in_role g ->  rank_in_lane = trainer_ranks_in_partition + g
 
 broadcast lane     world_size = trainer_world_size + admitted_generator_count
   trainer  index_in_role r  ->  rank_in_lane = r
@@ -287,7 +315,7 @@ carrying the group's own participant list, rather than as a hung stream.
 
 The reshard plan (see [The plan](#the-plan-mesh-and-placement-contract)) is one record per
 bulk parameter: HF name, global shape,
-dtype, source mesh and placements, destination mesh and placements, PP stage. For
+dtype, source mesh and placements, destination mesh and placements, partition. For
 a large MoE model that is on the order of hundreds of entries and hundreds of
 kilobytes. The pull path already established the rule: the full sealed manifest
 stays worker-served so that Custom Resource Definition (CRD) or etcd records stay small, while
@@ -302,49 +330,74 @@ never per refit.
 
 ## The plan: mesh and placement contract
 
-This is where NeMo RL's contract is adopted wholesale. The plan is torch-free
-data; only the backend touches tensors.
+The plan is torch-free data; only the backend touches tensors. It is **declared by the
+Publisher**, not inferred by the shared core. That inversion is what keeps this path
+portable, so it is worth being explicit about which component decides what.
 
-For each **bulk** parameter:
+### Mechanism versus policy
+
+| Decision | Owner | Why there |
+|---|---|---|
+| Rank assignment, lane membership, readiness, fencing | MX | Needs only role, lane, index — no parallelism semantics |
+| Executing the collective, stream assignment, buffer lifetime | Backend | Transport concerns |
+| Canonical name, global shape, dtype, mesh, placements, partition, bulk-eligibility | **Publisher** | Only the training framework knows how its own ranks are laid out |
+| Where each canonical name lives locally, and any staging | **Loader** | Only the inference engine knows its own storage |
+
+The shared core never inspects a parameter name to decide how it is sharded, and never
+assumes a device-mesh ordering. Both were the two most framework-specific things in the prior
+art, and both are silent-failure modes: a wrong mesh order does not raise, it moves the wrong
+bytes.
+
+### The declared plan
+
+For each **bulk** parameter the Publisher declares:
 
 ```text
 ParamPlan {
-  name                 # HF name, e.g. model.layers.3.mlp.experts.gate_proj.weight
-  global_shape         # full, unsharded
+  name              # canonical name, HF by default
+  global_shape      # full, unsharded
   dtype
-  pp_stage             # selects the reshard lane
-  src_mesh             # rank grid over this stage's trainer ranks
-  src_placements       # [Shard(d) | Replicate()] per mesh dim
-  dst_mesh             # rank grid over the admitted generator ranks
+  partition_id      # which source partition owns it -> selects the reshard lane
+  src_mesh          # rank grid over this partition's trainer ranks
+  src_placements    # [Shard(d) | Replicate()] per mesh dim
+  dst_mesh          # rank grid over the admitted generator ranks
   dst_placements
-  grouped_expert_proj  # optional: gate_proj | up_proj | down_proj
+  group_key         # optional: marks entries fused/stacked from several local tensors
 }
 ```
 
-Mesh construction follows NeMo RL's `build_mesh_info`: dims are emitted in the
-order `(tp, ep, dp, pp)`, size-1 dims are dropped, and the survivors are reversed
-into a row-major rank tensor, so the first surviving dim becomes the innermost
-(fastest-varying) axis. Non-expert parameters live on a TP mesh (`ep_size=1`);
-expert parameters live on an EP mesh (`tp_size=1`). Placements follow
-`get_placements`: 1-D parameters replicate; expert parameters `Shard(0)` on the EP
-axis; non-expert FFN weights `Shard(0)` for `gate_proj`/`up_proj`
-(column-parallel) and `Shard(1)` for `down_proj` (row-parallel).
+MX contributes exactly one thing to this: the **rank offsets**, because the destination set
+is the *admitted* generator subset rather than "all generators". `dst_mesh` is built at
+`rank_offset = trainer_ranks_in_partition` within each reshard lane, over the admitted
+generator count.
 
-The **only** thing MX changes is the rank offsets, and only because the
-destination rank set is now the *admitted* generator set rather than "all
-generators": `dst_mesh` is built with `rank_offset = trainer_ranks_per_stage`
-inside each reshard lane, over `len(admitted_generators)` ranks.
+Parameters the Publisher does not mark bulk-eligible go to the misc list and ride the
+broadcast lane in a deterministic order. That order is load-bearing: producer and consumer
+walk it in lockstep.
 
-Parameters not on the bulk whitelist (`is_bulk_param`: FFN projection weights,
-dense and MoE, excluding `shared_expert`) go to the misc list and ride the
-broadcast lane in a deterministic order. That order is load-bearing: producer and
-consumer walk it in lockstep.
+### Defaults, so the common case stays cheap
+
+Declaring a mesh per parameter would be tedious for a conventional Megatron-style trainer, so
+the shared core ships an opt-in default derivation the Publisher may call instead of writing
+its own:
+
+- **Mesh** — emit dims in the order `(tp, ep, dp, pp)`, drop size-1 dims, reverse the
+  survivors into a row-major rank tensor, so the first surviving dim is the innermost
+  (fastest-varying) axis. Non-expert parameters get a TP mesh (`ep_size=1`); expert
+  parameters get an EP mesh (`tp_size=1`).
+- **Placements** — 1-D parameters replicate; expert parameters `Shard(0)` on the EP axis;
+  column-parallel projections `Shard(0)` and row-parallel projections `Shard(1)`.
+- **Bulk set** — FFN projection weights, dense and MoE, excluding shared experts.
+
+These reproduce the prior art's behaviour exactly, so a Megatron-to-vLLM deployment gets it
+for free. A trainer that lays its ranks out differently — a Fully Sharded Data Parallel
+(FSDP) or DTensor-native trainer, say — declares its own and never touches these.
 
 ### Local realization: Publisher and Loader
 
-The plan says *what* moves. The Publisher and Loader say *where it lives locally*.
-This is NeMo RL's `LocalParamSpec` contract, adopted verbatim so that an existing
-Megatron or vLLM `build_hf_to_local_param_map` drops in unchanged:
+The plan says *what* moves. A second, smaller contract says *where it lives locally*. It is
+deliberately identical in shape to the prior art's, so an existing Megatron or vLLM
+name-to-local-tensor map drops in unchanged:
 
 ```python
 @dataclass
@@ -364,8 +417,21 @@ class LocalParamSpec:
   tensor.
 
 `pre`, `post`, and the wire op all enqueue on the same Compute Unified Device
-Architecture (CUDA) stream, so staging is
-ordered with the transfer without a host synchronize.
+Architecture (CUDA) stream, so staging is ordered with the transfer without a host
+synchronize.
+
+### Current limitations, and where they live
+
+These are properties of the **first Publisher and Loader**, not of the path. They are listed
+here so an integrator can see what they would have to lift, rather than discovering it as a
+silent constraint:
+
+| Limitation | Lives in | Why it is not structural |
+|---|---|---|
+| Generator-side pipeline parallelism must be 1 | Loader | Reshard lanes assume a generator holds every layer, so it can receive from every source partition. Generator-side PP needs destination partitions too — symmetric with the source side, not a new concept |
+| Generator expert parallelism is 1 or equal to its tensor parallelism | Loader | The Loader maps experts onto its own ranks; a different mapping is a different `dst_mesh`, which the Publisher already declares |
+| Source and destination dtype must match | Backend | The collective moves bytes. A converting path needs staging on the receive side, which the `pre`/`post` hooks can already express |
+| Expert tensor parallelism on the trainer is 1 | Default derivation only | A Publisher declaring its own meshes is unaffected |
 
 ## Lifecycle and sequencing
 
@@ -430,7 +496,7 @@ is exactly what the fused-parameter path already does.
 | Variable | Default | Purpose |
 |---|---|---|
 | `MX_REFIT_TRANSPORT` | `nixl` | `nccl_m2n` selects this path. One deployment, one backend |
-| `MX_NCCL_REFIT_NUM_STREAMS` | `2` | CUDA streams for overlapping per-PP-stage reshard lanes |
+| `MX_NCCL_REFIT_NUM_STREAMS` | `2` | CUDA streams for overlapping reshard lanes |
 | `MX_NCCL_REFIT_GROUP_TIMEOUT_S` | `600` | Deadline for `FORMING -> READY` |
 | `MX_NCCL_REFIT_POLL_INTERVAL_S` | `0.25` | `GetCollectiveGroup` poll backoff floor |
 | `MX_NCCL_REFIT_MISC_CHUNK_BYTES` | `268435456` | Packed misc-broadcast chunk size |
@@ -482,13 +548,18 @@ NeMo RL's existing builders port directly.
   requires every communicator member to enter every collective.
 - **Misc-path ownership.** The packed broadcast currently sits inside the NCCL
   backend. If a second push backend appears it should move up into the client.
-- **Layer-group granularity vs. lane count.** `layer_group_id` and `pp_stage` are
+- **Layer-group granularity vs. lane count.** `layer_group_id` and `partition_id` are
   independent partitions of the parameter set; their product determines wire-op
   count. There is a point where finer layer groups cost more in launch overhead
   than they save in trainer memory, which is what motivates layer grouping at all.
-- **Bulk whitelist coverage.** Inherited from NeMo RL: FFN projections only.
-  Attention projections are the obvious next increment for dense models, where the
-  bulk fraction is 67% rather than 97%.
+- **Default bulk set coverage.** The shipped default covers FFN projections only. Attention
+  projections are the obvious next increment for dense models, where the bulk fraction is
+  ~67% rather than ~97%. A Publisher can already widen this today by declaring
+  bulk-eligibility itself; the open question is what the *default* should be.
+- **Cost of declaring versus deriving.** Pushing mesh and placement declaration into the
+  Publisher removes the silent-wrong-bytes failure mode, but it moves real work onto every
+  new trainer integration. If the default derivation turns out to fit every trainer we
+  actually target, the extra surface is not paying for itself.
 
 ## Related documentation
 
