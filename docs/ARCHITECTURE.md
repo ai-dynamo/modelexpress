@@ -101,6 +101,13 @@ ModelExpress/
 │       │   ├── backend.rs               # RefitBackend contract and factory
 │       │   └── backend/
 │       │       └── redis.rs             # Redis backend and atomic Lua scripts
+│       ├── refit_collective.rs          # Collective refit module exports
+│       ├── refit_collective/
+│       │   ├── lanes.rs                 # Lane layout and rank assignment
+│       │   ├── service.rs               # Backend-neutral collective gRPC service
+│       │   ├── backend.rs               # CollectiveBackend contract and factory
+│       │   └── backend/
+│       │       └── redis.rs             # Redis backend and atomic Lua scripts
 │       ├── registry/
 │       │   ├── state.rs                # RegistryManager wrapper
 │       │   ├── backend.rs              # RegistryBackend trait + ModelRecord
@@ -370,6 +377,46 @@ Key message types: `SourceIdentity` (all fields affecting tensor layout compatib
 Per-worker gRPC service started when `MX_P2P_METADATA=1`, or unconditionally when using a decentralized metadata backend (the backend's client sets `REQUIRES_P2P_METADATA = True` and the env var is ignored). Targets call this instead of fetching tensor descriptors or artifact manifest metadata from the central server. `GetTensorManifestResponse` carries the source worker's runtime `accelerator` value so decentralized targets can apply the same compatibility filter as central metadata mode. Artifact byte transfer still uses NIXL; `PrepareArtifactChunk` only exposes a source-side registered DRAM range for one sealed artifact chunk. `GetTensorManifest` validates both `mx_source_id` and the selected runtime `worker_id` to catch stale discovery records whose endpoint has been reused by a new process. The `worker_id` handshake fields are optional for rolling-upgrade compatibility; generation validation takes effect when the source supports them.
 
 See [`metadata.md`](metadata.md) for the full metadata architecture including storage schemas and coordination protocol.
+
+### refit_collective.proto - RefitCollectiveService (Redis only)
+
+Rendezvous and admission for the NCCL M2N collective refit path, which is a
+sibling of the NIXL pull path rather than a mode of it. The two share no types:
+this service reuses only `RegisterWorker` and the `WeightVersion` lifecycle from
+`refit.proto`. Design: [`NCCL_M2N_REFIT.md`](NCCL_M2N_REFIT.md).
+
+Where the pull path hands a generator a shard table to read one-sidedly, here
+both sides enter one collective together, so MX brokers the NCCL bootstrap
+instead. Weight bytes never reach the service, and neither does the reshard
+plan: MX stores only its digest and the endpoint that serves it.
+
+| RPC | Purpose |
+|-----|---------|
+| `CreateCollectiveTransfer` | Idempotently open one refit operation against a group |
+| `GetCollectiveTransfer` | Read an operation and its lifecycle state |
+| `DeleteCollectiveTransfer` | Drop a terminal operation and release its idempotency key |
+| `JoinCollectiveGroup` | Admit one worker, returning its MX-assigned rank in every lane it joins |
+| `GetCollectiveGroup` | Poll group state, lane bootstrap, and participants |
+| `PublishGroupBootstrap` | Record one lane's `ncclUniqueId`, stamped with the epoch it was generated for |
+| `ReportCollectiveTransfer` | Record one participant's terminal result, fenced on operation, epoch and worker generation |
+
+A group is keyed by its declared membership, so every participant of one
+operation resolves the same group without a separate create call, and is reused
+across refits until its `epoch` moves. The epoch bumps on a membership change, a
+new worker generation for an existing slot, or a changed plan digest; each of
+those invalidates a cached communicator, a cached plan, or both, and clients
+drop them together. Bumping clears every lane's bootstrap identifier in the same
+transaction, because an identifier from a previous epoch names a communicator
+whose world size no longer matches the membership.
+
+Lanes are one per disjoint source partition plus one broadcast lane. MX derives
+them and assigns ranks from role, ordinal within role, and partition alone; it
+never interprets tensor, expert, data or pipeline parallelism, which stay
+client-side. `refit_collective/lanes.rs` is the whole of that logic.
+
+Groups are reclaimed automatically once every participant's registration has
+lapsed and no operation still references them. There is no group-delete RPC,
+symmetrically with workers never creating one.
 
 ### refit.proto - RefitService (Redis only)
 
