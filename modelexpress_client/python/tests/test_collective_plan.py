@@ -339,3 +339,26 @@ class TestGeneratorRankOffset:
             generator_rank_offset(5, 2)
         with pytest.raises(ValueError, match="must be positive"):
             generator_rank_offset(4, 0)
+
+
+class TestPackageIsolation:
+    def test_importing_the_collective_path_does_not_pull_in_nixl(self):
+        """The two refit paths must stay installable independently.
+
+        A generator that only speaks the collective path should not need a NIXL
+        agent present to import it. Eager re-exports in the package __init__
+        broke this silently, since the failure only appears at deployment.
+        """
+        import subprocess
+        import sys
+
+        probe = (
+            "import sys; import modelexpress_rl.collective; "
+            "leaked=[m for m in sys.modules "
+            "if m=='modelexpress' or m.startswith('modelexpress.')]; "
+            "print(leaked)"
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", probe], capture_output=True, text=True, check=True
+        )
+        assert out.stdout.strip() == "[]", f"collective import pulled in {out.stdout}"
