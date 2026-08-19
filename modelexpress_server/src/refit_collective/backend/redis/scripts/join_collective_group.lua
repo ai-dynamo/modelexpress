@@ -53,7 +53,11 @@ if not epoch then
 else
   local existing = redis.call('HGET', KEYS[2], ARGV[5])
   local incoming = ARGV[6] .. '|' .. ARGV[7] .. '|' .. ARGV[8] .. '|' .. ARGV[9]
-  if existing ~= incoming then
+  -- Only a *replacement* invalidates anything. Admitting an expected slot for
+  -- the first time cannot invalidate a communicator or a plan, because none
+  -- exists yet -- and bumping there would churn the epoch once per participant
+  -- during formation, leaving every worker but the last holding a stale one.
+  if existing and existing ~= incoming then
     changed = true
   end
   if redis.call('HGET', KEYS[1], 'plan_digest') ~= ARGV[10] then
