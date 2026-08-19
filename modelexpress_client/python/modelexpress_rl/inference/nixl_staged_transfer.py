@@ -269,7 +269,6 @@ class _NixlStagedTransfer:
         agent_name: str,
         device_id: int,
         device: torch.device,
-        listen_port: int,
         timeout_seconds: float = 1200.0,
     ) -> None:
         self._device = device
@@ -277,7 +276,6 @@ class _NixlStagedTransfer:
         self._manager = NixlTransferManager(
             agent_name=agent_name,
             device_id=device_id,
-            listen_port=listen_port,
         )
         try:
             self._manager.initialize()

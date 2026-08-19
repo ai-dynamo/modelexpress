@@ -243,7 +243,6 @@ def test_transfer_manager_is_closed_after_failed_init_and_only_once(monkeypatch)
             agent_name="generator",
             device_id=0,
             device=torch.device("cpu"),
-            listen_port=19000,
         )
     assert calls == ["initialize", "shutdown"]
 

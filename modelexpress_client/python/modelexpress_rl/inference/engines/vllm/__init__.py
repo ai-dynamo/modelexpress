@@ -33,7 +33,6 @@ def _create_vllm_adapter(
         vllm_config=vllm_config,
         model_config=model_config,
         worker_id=worker_id,
-        metadata_port_offset=engine_context.metadata_port_offset,
     )
 
 
