@@ -11,6 +11,7 @@ lets the planning rules be checked without a GPU.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -117,6 +118,8 @@ class ParamPlan:
             raise ValueError("a param plan needs a name")
         if not self.global_shape or any(extent <= 0 for extent in self.global_shape):
             raise ValueError(f"{self.name}: global_shape must be non-empty and positive")
+        if not self.dtype:
+            raise ValueError(f"{self.name}: dtype must not be empty")
         if self.partition_id < 0:
             raise ValueError(f"{self.name}: partition_id must not be negative")
         _check_placements(self.name, "src", self.src_mesh, self.src_placements, self.global_shape)
@@ -124,18 +127,24 @@ class ParamPlan:
 
     def canonical(self) -> str:
         """Stable text form, used by the plan digest."""
-        return "|".join(
-            (
+        # Encode fields structurally instead of joining unescaped user strings.
+        # Otherwise, for example, a delimiter in a name can be indistinguishable
+        # from the boundary before a shape or dtype and two different plans can
+        # hash to the same value.
+        return json.dumps(
+            [
                 self.name,
-                ",".join(str(e) for e in self.global_shape),
+                self.global_shape,
                 self.dtype,
-                str(self.partition_id),
+                self.partition_id,
                 self.src_mesh.canonical(),
-                "".join(p.canonical() for p in self.src_placements),
+                [p.canonical() for p in self.src_placements],
                 self.dst_mesh.canonical(),
-                "".join(p.canonical() for p in self.dst_placements),
-                self.group_key or "",
-            )
+                [p.canonical() for p in self.dst_placements],
+                self.group_key,
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
         )
 
 
@@ -184,22 +193,54 @@ class MiscParam:
     global_shape: tuple[int, ...]
     dtype: str
 
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("a misc param needs a name")
+        if not self.global_shape or any(extent <= 0 for extent in self.global_shape):
+            raise ValueError(f"{self.name}: global_shape must be non-empty and positive")
+        if not self.dtype:
+            raise ValueError(f"{self.name}: dtype must not be empty")
+
     def canonical(self) -> str:
-        return f"{self.name}|{','.join(str(e) for e in self.global_shape)}|{self.dtype}"
+        return json.dumps(
+            [self.name, self.global_shape, self.dtype],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
 
 
 @dataclass
 class ReshardPlan:
     """The full declared plan: bulk parameters plus the ordered misc list.
 
-    The misc order is load-bearing. Producer and consumer walk it in lockstep
-    during the packed broadcast, so a plan whose order differs between the two
-    sides mismatches the payload without either side detecting it.
+    Both orders are load-bearing. Producer and consumer walk bulk entries as
+    collective calls and misc entries as packed broadcasts, so a plan whose
+    order differs between the two sides mismatches the wire sequence.
     """
 
     bulk: list[ParamPlan] = field(default_factory=list)
     misc: list[MiscParam] = field(default_factory=list)
     source_partition_count: int = 1
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        """Reject geometry that cannot map onto the declared reshard lanes."""
+        if self.source_partition_count <= 0:
+            raise ValueError("source_partition_count must be positive")
+        invalid = sorted(
+            {
+                entry.partition_id
+                for entry in self.bulk
+                if entry.partition_id >= self.source_partition_count
+            }
+        )
+        if invalid:
+            raise ValueError(
+                "bulk parameter partition_id must be less than "
+                f"source_partition_count {self.source_partition_count}; got {invalid}"
+            )
 
     def parameter_names(self) -> list[str]:
         return [p.name for p in self.bulk] + [p.name for p in self.misc]

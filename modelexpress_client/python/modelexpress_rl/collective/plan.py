@@ -56,6 +56,7 @@ def validate_coverage(plan: ReshardPlan, expected: list[str]) -> None:
     - a duplicated parameter is applied twice, once through each path, with the
       later write deciding.
     """
+    plan.validate()
     declared = plan.parameter_names()
     counts = Counter(declared)
 
@@ -64,6 +65,15 @@ def validate_coverage(plan: ReshardPlan, expected: list[str]) -> None:
         raise PlanCoverageError(
             f"the plan names {len(duplicates)} parameter(s) more than once: "
             f"{', '.join(duplicates[:5])}"
+        )
+
+    expected_counts = Counter(expected)
+    expected_duplicates = sorted(name for name, count in expected_counts.items() if count > 1)
+    if expected_duplicates:
+        raise PlanCoverageError(
+            "the model parameter list names "
+            f"{len(expected_duplicates)} parameter(s) more than once: "
+            f"{', '.join(expected_duplicates[:5])}"
         )
 
     expected_set = set(expected)
@@ -90,17 +100,20 @@ def plan_digest(plan: ReshardPlan) -> str:
     MX admits the group only when they all agree, and a change bumps the group
     epoch, which drops the cached plan and the cached communicator together.
 
-    The bulk set is hashed order-independently, because two Publishers may
-    enumerate parameters differently and still describe the same transfer. The
-    misc list is hashed *in order*, because its order is the payload layout.
+    Both lists are hashed in order. The backend walks bulk entries as collective
+    operations and misc entries as broadcast payloads, so either ordering is
+    part of the wire contract. Treating bulk as a set would let two participants
+    reach READY and then enter different NCCL operations at the same sequence
+    number.
     """
+    plan.validate()
     hasher = hashlib.sha256()
-    hasher.update(b"mx-nccl-m2n-plan-v1\0")
+    hasher.update(b"mx-nccl-m2n-plan-v2\0")
     hasher.update(f"{plan.source_partition_count}\0".encode())
 
     hasher.update(b"bulk\0")
-    for canonical in sorted(entry.canonical() for entry in plan.bulk):
-        hasher.update(canonical.encode())
+    for entry in plan.bulk:
+        hasher.update(entry.canonical().encode())
         hasher.update(b"\0")
 
     hasher.update(b"misc\0")
@@ -171,6 +184,8 @@ def build_mesh(
     """
     if rank_count <= 0:
         raise ValueError("rank_count must be positive")
+    if any(size <= 0 for size in (tp_size, ep_size, dp_size, pp_size)):
+        raise ValueError("parallelism sizes must be positive")
     declared = tp_size * ep_size * dp_size * pp_size
     if declared != rank_count:
         raise ValueError(
@@ -250,6 +265,8 @@ def generator_rank_offset(trainer_count: int, source_partition_count: int) -> in
     mirrors the server's assignment rule; the two must agree or every rank
     builds a mesh that disagrees with the rank it was actually given.
     """
+    if trainer_count <= 0:
+        raise ValueError("trainer_count must be positive")
     if source_partition_count <= 0:
         raise ValueError("source_partition_count must be positive")
     if trainer_count % source_partition_count != 0:
