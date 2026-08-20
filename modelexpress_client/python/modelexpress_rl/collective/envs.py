@@ -17,8 +17,6 @@ import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from modelexpress import envs as mx_envs
-
 if TYPE_CHECKING:
     MX_NCCL_REFIT_NUM_STREAMS: int
     MX_NCCL_REFIT_GROUP_TIMEOUT_S: float
@@ -64,7 +62,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "MX_NCCL_REFIT_REGISTRATION_TTL_S": lambda: _int(
         "MX_NCCL_REFIT_REGISTRATION_TTL_S",
-        mx_envs.MX_HEARTBEAT_INTERVAL_SECS * 3,
+        _int("MX_HEARTBEAT_INTERVAL_SECS", 30) * 3,
     ),
 }
 
