@@ -539,6 +539,31 @@ serialized after all bulk lanes: it uses the all-participants communicator, whic
 overlaps every reshard lane, and concurrent traffic on overlapping communicators
 can deadlock.
 
+## Two integration depths
+
+A framework can adopt this path at either of two levels, and which one fits
+depends on what it already has.
+
+**Full two-sided client.** `RefitClient.Trainer` / `.Generator` own the
+lifecycle, the layer groups, the plan, and the wire ops. A framework with no
+existing reshard path takes this one: it supplies a Publisher and a Loader and
+gets everything else.
+
+**Bootstrap only.** A framework that *already* performs an equivalent reshard
+needs far less. The transfer consumes exactly one thing from its process group
+-- the NCCL communicator -- so MX can supply a group object carrying an
+MX-brokered `ncclUniqueId` and let the framework's existing refit loop run
+untouched.
+
+The second is the better deal wherever it applies, and not only because it is
+less code. The framework's two transports then share every line below the
+bootstrap, so they cannot drift apart, and a measured comparison between them
+isolates the rendezvous rather than confounding it with two separate
+implementations of the same transfer. NeMo RL integrates this way.
+
+Both depths use the same control plane; they differ only in how much of the
+client the framework delegates.
+
 ## Failure semantics
 
 The collective's characteristic failure is a **hang**, not an error return. Every
