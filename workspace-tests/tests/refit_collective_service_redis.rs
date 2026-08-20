@@ -494,6 +494,124 @@ async fn admission_bootstrap_epoch_and_transfer_fences_hold() {
 
 #[tokio::test]
 #[ignore = "requires a live Redis at REDIS_URL"]
+async fn full_cohort_replacement_converges_on_one_new_epoch() {
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let port = free_port();
+    let (stop_server, server) = start_server(port, &redis_url);
+    let (mut refit, mut collective) = connect(port).await;
+
+    let model = unique_id("cohort-restart");
+    let group_spec = spec(&model, &["t0", "t1"], &["g0"]);
+    let old_t0 = unique_id("old-t0");
+    let old_t1 = unique_id("old-t1");
+    let old_g0 = unique_id("old-g0");
+    register(&mut refit, &model, &old_t0, WorkerRole::Trainer, 60).await;
+    register(&mut refit, &model, &old_t1, WorkerRole::Trainer, 60).await;
+    register(&mut refit, &model, &old_g0, WorkerRole::Generator, 60).await;
+
+    let initial = join(
+        &mut collective,
+        join_request(&group_spec, "t0", &old_t0, CollectiveRole::Trainer, 0),
+    )
+    .await;
+    join(
+        &mut collective,
+        join_request(&group_spec, "t1", &old_t1, CollectiveRole::Trainer, 1),
+    )
+    .await;
+    join(
+        &mut collective,
+        join_request(&group_spec, "g0", &old_g0, CollectiveRole::Generator, 0),
+    )
+    .await;
+    publish(&mut collective, &initial.group_id, 1, 0, &old_t0, 10).await;
+    let initial_ready = publish(&mut collective, &initial.group_id, 1, 1, &old_t0, 11).await;
+    assert_eq!(initial_ready.state, i32::from(CollectiveGroupState::Ready));
+
+    let new_t0 = unique_id("new-t0");
+    let new_t1 = unique_id("new-t1");
+    let new_g0 = unique_id("new-g0");
+    register(&mut refit, &model, &new_t0, WorkerRole::Trainer, 60).await;
+    register(&mut refit, &model, &new_t1, WorkerRole::Trainer, 60).await;
+    register(&mut refit, &model, &new_g0, WorkerRole::Generator, 60).await;
+
+    let replacement_t0 = join(
+        &mut collective,
+        join_request(&group_spec, "t0", &new_t0, CollectiveRole::Trainer, 0),
+    )
+    .await;
+    let replacement_t1 = join(
+        &mut collective,
+        join_request(&group_spec, "t1", &new_t1, CollectiveRole::Trainer, 1),
+    )
+    .await;
+    let replacement_g0 = join(
+        &mut collective,
+        join_request(&group_spec, "g0", &new_g0, CollectiveRole::Generator, 0),
+    )
+    .await;
+    assert_eq!(replacement_t0.epoch, 2);
+    assert_eq!(replacement_t1.epoch, 2);
+    assert_eq!(replacement_g0.epoch, 2);
+
+    publish(&mut collective, &initial.group_id, 2, 0, &new_t0, 12).await;
+    let replacement_ready = publish(&mut collective, &initial.group_id, 2, 1, &new_t0, 13).await;
+    assert_eq!(replacement_ready.epoch, 2);
+    assert_eq!(
+        replacement_ready.state,
+        i32::from(CollectiveGroupState::Ready)
+    );
+    let broadcast = replacement_ready
+        .lanes
+        .last()
+        .expect("broadcast lane contains the full cohort");
+    let workers: Vec<&str> = broadcast
+        .participants
+        .iter()
+        .map(|participant| participant.worker_id.as_str())
+        .collect();
+    assert_eq!(
+        workers,
+        vec![new_t0.as_str(), new_t1.as_str(), new_g0.as_str()]
+    );
+
+    let newer_t0 = unique_id("newer-t0");
+    let newer_t1 = unique_id("newer-t1");
+    register(&mut refit, &model, &newer_t0, WorkerRole::Trainer, 60).await;
+    register(&mut refit, &model, &newer_t1, WorkerRole::Trainer, 60).await;
+    let third_epoch = join(
+        &mut collective,
+        join_request(&group_spec, "t0", &newer_t0, CollectiveRole::Trainer, 0),
+    )
+    .await;
+    assert_eq!(third_epoch.epoch, 3);
+    publish(&mut collective, &initial.group_id, 3, 0, &newer_t0, 14).await;
+    let fourth_epoch = join(
+        &mut collective,
+        join_request(&group_spec, "t1", &newer_t1, CollectiveRole::Trainer, 1),
+    )
+    .await;
+    assert_eq!(fourth_epoch.epoch, 4);
+    let invalidated = collective
+        .get_collective_group(GetCollectiveGroupRequest {
+            group_id: initial.group_id,
+        })
+        .await
+        .expect("read epoch after published lane was invalidated")
+        .into_inner();
+    assert!(
+        invalidated
+            .lanes
+            .iter()
+            .all(|lane| lane.nccl_unique_id.is_empty())
+    );
+
+    stop(stop_server, server).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis at REDIS_URL"]
 async fn expired_registration_revokes_ready_membership() {
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());

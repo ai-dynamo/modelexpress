@@ -73,6 +73,7 @@ end
 
 local epoch = tonumber(redis.call('HGET', KEYS[1], 'epoch'))
 local changed = false
+local membership_change_requires_bump = false
 
 if not epoch then
   epoch = 1
@@ -99,8 +100,24 @@ if not epoch then
     'plan_source_digest', '',
     'created_at_unix_ms', ARGV[16])
 else
-  -- Expired registrations are no longer admitted. Removing them here and
-  -- advancing the epoch fences any communicator they helped form.
+  -- The first membership change from READY invalidates the old communicator
+  -- and opens a clean FORMING epoch. Further replacements in that same clean
+  -- epoch only acknowledge it; otherwise a full-cohort restart would bump once
+  -- per slot and no worker could share an epoch. Once any lane has published a
+  -- current-epoch bootstrap, another membership change must invalidate it.
+  membership_change_requires_bump = redis.call('HGET', KEYS[1], 'state') == 'READY'
+  if not membership_change_requires_bump then
+    for i = 1, lane_count do
+      local bootstrap_epoch = redis.call('HGET', KEYS[4 + i], 'bootstrap_epoch')
+      if bootstrap_epoch and tonumber(bootstrap_epoch) == epoch then
+        membership_change_requires_bump = true
+        break
+      end
+    end
+  end
+
+  -- Expired registrations are no longer admitted. Removing them advances the
+  -- epoch whenever this membership could already have communicator state.
   local records = redis.call('HGETALL', KEYS[2])
   for i = 1, #records, 2 do
     local slot_id = records[i]
@@ -108,7 +125,9 @@ else
     if not worker_id or not registration_matches(worker_id, role, ARGV[2]) then
       redis.call('HDEL', KEYS[2], slot_id)
       redis.call('HDEL', KEYS[3], slot_id)
-      changed = true
+      if membership_change_requires_bump then
+        changed = true
+      end
     end
   end
 
@@ -125,7 +144,15 @@ else
       return 'CONFLICTING_ASSIGNMENT'
     end
     if worker_id ~= ARGV[6] then
-      changed = true
+      if redis.call('HGET', KEYS[1], 'plan_source_worker_id') == worker_id then
+        redis.call('HSET', KEYS[1],
+          'plan_source_worker_id', '',
+          'plan_source_endpoint', '',
+          'plan_source_digest', '')
+      end
+      if membership_change_requires_bump then
+        changed = true
+      end
     end
   end
 
