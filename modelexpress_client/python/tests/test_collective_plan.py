@@ -9,6 +9,7 @@ duplicated parameters, and a digest that fails to notice a plan change.
 """
 
 import pytest
+from modelexpress_rl.collective import envs
 from modelexpress_rl.collective import (
     MeshSpec,
     MiscParam,
@@ -133,6 +134,28 @@ class TestParamPlanValidation:
     def test_a_valid_plan_is_accepted(self):
         assert param().name == "w"
 
+    def test_an_empty_dtype_is_rejected(self):
+        with pytest.raises(ValueError, match="dtype"):
+            param(dtype="")
+
+
+class TestReshardPlanValidation:
+    def test_invalid_misc_records_are_rejected(self):
+        with pytest.raises(ValueError, match="name"):
+            MiscParam("", (4,), "bfloat16")
+        with pytest.raises(ValueError, match="global_shape"):
+            MiscParam("m", (), "bfloat16")
+        with pytest.raises(ValueError, match="global_shape"):
+            MiscParam("m", (4, 0), "bfloat16")
+        with pytest.raises(ValueError, match="dtype"):
+            MiscParam("m", (4,), "")
+
+    def test_source_partitions_must_exist(self):
+        with pytest.raises(ValueError, match="source_partition_count must be positive"):
+            ReshardPlan(source_partition_count=0)
+        with pytest.raises(ValueError, match="partition_id must be less than"):
+            ReshardPlan(bulk=[param(partition=1)], source_partition_count=1)
+
 
 class TestCoverage:
     def test_a_plan_that_partitions_the_model_passes(self):
@@ -164,14 +187,18 @@ class TestCoverage:
         with pytest.raises(PlanCoverageError, match="does not have"):
             validate_coverage(plan, ["a"])
 
+    def test_duplicate_expected_names_are_rejected(self):
+        with pytest.raises(PlanCoverageError, match="model parameter list"):
+            validate_coverage(ReshardPlan(bulk=[param("a")]), ["a", "a"])
+
 
 class TestDigest:
-    def test_the_digest_is_stable_across_bulk_ordering(self):
-        # Two Publishers may enumerate parameters differently and still
-        # describe the same transfer.
+    def test_the_digest_depends_on_bulk_operation_order(self):
+        # Both sides execute this list in order. If different orders shared a
+        # digest, they could reach READY and enter different NCCL collectives.
         a = ReshardPlan(bulk=[param("a"), param("b")])
         b = ReshardPlan(bulk=[param("b"), param("a")])
-        assert plan_digest(a) == plan_digest(b)
+        assert plan_digest(a) != plan_digest(b)
 
     def test_the_digest_depends_on_misc_ordering(self):
         # The misc order is the broadcast payload layout, so two orders are
@@ -185,7 +212,6 @@ class TestDigest:
         [
             pytest.param(lambda p: ReshardPlan(bulk=[param("a", dtype="float16")]), id="dtype"),
             pytest.param(lambda p: ReshardPlan(bulk=[param("a", shape=(16, 4))]), id="shape"),
-            pytest.param(lambda p: ReshardPlan(bulk=[param("a", partition=1)]), id="partition"),
             pytest.param(lambda p: ReshardPlan(bulk=[param("a", group_key="k")]), id="group_key"),
             pytest.param(lambda p: ReshardPlan(bulk=[param("z")]), id="name"),
             pytest.param(
@@ -197,6 +223,17 @@ class TestDigest:
     def test_any_meaningful_change_moves_the_digest(self, mutate):
         base = ReshardPlan(bulk=[param("a")])
         assert plan_digest(mutate(base)) != plan_digest(base)
+
+    def test_a_changed_partition_moves_the_digest(self):
+        base = ReshardPlan(bulk=[param("a", partition=0)], source_partition_count=2)
+        moved = ReshardPlan(bulk=[param("a", partition=1)], source_partition_count=2)
+        assert plan_digest(moved) != plan_digest(base)
+
+    def test_structurally_distinct_records_cannot_alias_through_delimiters(self):
+        # These produced the same string under the old unescaped ``|`` format.
+        left = ReshardPlan(misc=[MiscParam("x|1", (2,), "f")])
+        right = ReshardPlan(misc=[MiscParam("x", (1,), "2|f")])
+        assert plan_digest(left) != plan_digest(right)
 
     def test_a_changed_placement_moves_the_digest(self):
         base = ReshardPlan(bulk=[param("a")])
@@ -297,12 +334,31 @@ class TestDefaultMesh:
         with pytest.raises(ValueError, match="does not account for"):
             build_mesh(rank_count=8, tp_size=3)
 
+    @pytest.mark.parametrize("sizes", [(-2, -2, 1, 1), (1, 1, 0, 4)])
+    def test_non_positive_parallelism_sizes_are_rejected(self, sizes):
+        with pytest.raises(ValueError, match="parallelism sizes must be positive"):
+            build_mesh(
+                rank_count=4,
+                tp_size=sizes[0],
+                ep_size=sizes[1],
+                dp_size=sizes[2],
+                pp_size=sizes[3],
+            )
+
     def test_expert_params_shard_the_expert_dim_on_the_ep_axis(self):
         _, axis_of = build_mesh(rank_count=8, ep_size=8)
         placements = default_placements(
             "model.layers.0.mlp.experts.gate_proj.weight", axis_of, ndim=3
         )
         assert placements[axis_of["ep"]].canonical() == "S0"
+
+    def test_expert_params_apply_both_ep_and_tp_placements(self):
+        _, axis_of = build_mesh(rank_count=8, tp_size=2, ep_size=4)
+        placements = default_placements(
+            "model.layers.0.mlp.experts.gate_proj.weight", axis_of, ndim=3
+        )
+        assert placements[axis_of["ep"]].canonical() == "S0"
+        assert placements[axis_of["tp"]].canonical() == "S1"
 
     def test_one_dimensional_params_replicate(self):
         _, axis_of = build_mesh(rank_count=8, tp_size=8)
@@ -339,6 +395,8 @@ class TestGeneratorRankOffset:
             generator_rank_offset(5, 2)
         with pytest.raises(ValueError, match="must be positive"):
             generator_rank_offset(4, 0)
+        with pytest.raises(ValueError, match="trainer_count must be positive"):
+            generator_rank_offset(0, 1)
 
 
 class TestPackageIsolation:
@@ -362,3 +420,16 @@ class TestPackageIsolation:
             [sys.executable, "-c", probe], capture_output=True, text=True, check=True
         )
         assert out.stdout.strip() == "[]", f"collective import pulled in {out.stdout}"
+
+
+class TestEnvironment:
+    @pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+    def test_non_finite_deadlines_are_rejected(self, monkeypatch, value):
+        monkeypatch.setenv("MX_NCCL_REFIT_GROUP_TIMEOUT_S", value)
+        with pytest.raises(ValueError, match="must be positive"):
+            _ = envs.MX_NCCL_REFIT_GROUP_TIMEOUT_S
+
+    def test_registration_ttl_defaults_to_three_heartbeats(self, monkeypatch):
+        monkeypatch.delenv("MX_NCCL_REFIT_REGISTRATION_TTL_S", raising=False)
+        monkeypatch.setenv("MX_HEARTBEAT_INTERVAL_SECS", "7")
+        assert envs.MX_NCCL_REFIT_REGISTRATION_TTL_S == 21

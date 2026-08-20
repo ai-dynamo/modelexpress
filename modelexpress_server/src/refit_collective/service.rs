@@ -31,6 +31,19 @@ fn required(value: &str, field: &str) -> Result<(), Status> {
     }
 }
 
+fn delimiter_free(value: &str, field: &str, delimiters: &[char]) -> Result<(), Status> {
+    if let Some(delimiter) = delimiters
+        .iter()
+        .find(|delimiter| value.contains(**delimiter))
+    {
+        return Err(Status::invalid_argument(format!(
+            "{field} must not contain the reserved delimiter {:?}",
+            delimiter
+        )));
+    }
+    Ok(())
+}
+
 fn backend_status(error: CollectiveBackendError) -> Status {
     match error {
         CollectiveBackendError::InvalidArgument(message) => Status::invalid_argument(message),
@@ -49,6 +62,7 @@ fn backend_status(error: CollectiveBackendError) -> Status {
 fn validate_spec(spec: Option<&CollectiveGroupSpec>) -> Result<&CollectiveGroupSpec, Status> {
     let spec = spec.ok_or_else(|| Status::invalid_argument("spec is required"))?;
     required(&spec.model_name, "spec.model_name")?;
+    delimiter_free(&spec.model_name, "spec.model_name", &['\0'])?;
     if spec.expected_trainer_slots.is_empty() {
         return Err(Status::invalid_argument(
             "spec.expected_trainer_slots must not be empty",
@@ -75,6 +89,27 @@ fn validate_spec(spec: Option<&CollectiveGroupSpec>) -> Result<&CollectiveGroupS
     if has_duplicates(&spec.expected_generator_slots) {
         return Err(Status::invalid_argument(
             "spec.expected_generator_slots must not contain duplicates",
+        ));
+    }
+    for (field, slots) in [
+        ("spec.expected_trainer_slots", &spec.expected_trainer_slots),
+        (
+            "spec.expected_generator_slots",
+            &spec.expected_generator_slots,
+        ),
+    ] {
+        for slot in slots {
+            required(slot, field)?;
+            delimiter_free(slot, field, &['\0', '\n', '\r', '|'])?;
+        }
+    }
+    if spec
+        .expected_trainer_slots
+        .iter()
+        .any(|slot| spec.expected_generator_slots.contains(slot))
+    {
+        return Err(Status::invalid_argument(
+            "trainer and generator slot namespaces must not overlap",
         ));
     }
     Ok(spec)
@@ -150,6 +185,8 @@ impl RefitCollectiveService for RefitCollectiveServiceImpl {
         required(&request.slot_id, "slot_id")?;
         required(&request.worker_id, "worker_id")?;
         required(&request.plan_digest, "plan_digest")?;
+        delimiter_free(&request.slot_id, "slot_id", &['\0', '\n', '\r', '|'])?;
+        delimiter_free(&request.worker_id, "worker_id", &['\0', '|'])?;
 
         let role = CollectiveRole::try_from(request.role).unwrap_or(CollectiveRole::Unspecified);
         if role == CollectiveRole::Unspecified {
@@ -165,6 +202,16 @@ impl RefitCollectiveService for RefitCollectiveServiceImpl {
             if source.digest != request.plan_digest {
                 return Err(Status::invalid_argument(
                     "plan_source.digest must match plan_digest",
+                ));
+            }
+            if source.worker_id != request.worker_id {
+                return Err(Status::invalid_argument(
+                    "plan_source.worker_id must match worker_id",
+                ));
+            }
+            if role != CollectiveRole::Trainer || request.index_in_role != 0 {
+                return Err(Status::invalid_argument(
+                    "only trainer index_in_role 0 may advertise plan_source",
                 ));
             }
         }
@@ -228,8 +275,10 @@ impl RefitCollectiveService for RefitCollectiveServiceImpl {
                 "epoch must be the epoch the operation was admitted against",
             ));
         }
-        if !request.succeeded {
-            required(&request.message, "message is required for a failed report")?;
+        if !request.succeeded && request.message.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "message is required for a failed report",
+            ));
         }
 
         self.backend
@@ -316,12 +365,23 @@ mod tests {
     }
 
     #[test]
-    fn slots_may_repeat_across_roles() {
-        // Trainer and generator namespaces are independent; a slot named the
-        // same on both sides is two different participants.
+    fn slots_must_not_repeat_across_roles() {
+        // Redis admission is keyed by slot_id, so sharing a name across roles
+        // would overwrite one participant and leave the group permanently short.
         let mut s = spec();
         s.expected_trainer_slots = vec!["r0".to_string()];
         s.expected_generator_slots = vec!["r0".to_string()];
-        assert!(validate_spec(Some(&s)).is_ok());
+        assert!(validate_spec(Some(&s)).is_err());
+    }
+
+    #[test]
+    fn slots_reject_the_redis_record_delimiters() {
+        let mut s = spec();
+        s.expected_trainer_slots = vec!["trainer\n0".to_string()];
+        assert!(validate_spec(Some(&s)).is_err());
+
+        let mut s = spec();
+        s.expected_generator_slots = vec!["generator|0".to_string()];
+        assert!(validate_spec(Some(&s)).is_err());
     }
 }

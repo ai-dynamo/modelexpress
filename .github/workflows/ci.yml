@@ -348,6 +348,14 @@ jobs:
           --test refit_service_redis \
           -- --include-ignored --test-threads=1
 
+    - name: Run collective Refit Redis integration tests
+      env:
+        REDIS_URL: redis://localhost:6379
+      run: |
+        cargo test -p model-express-workspace-tests \
+          --test refit_collective_service_redis \
+          -- --include-ignored --test-threads=1
+
     - name: Run integration test script
       env:
         MX_METADATA_BACKEND: redis

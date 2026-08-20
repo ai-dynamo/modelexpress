@@ -12,9 +12,12 @@ failures" has to bound what happens after READY too.
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
+
+from modelexpress import envs as mx_envs
 
 if TYPE_CHECKING:
     MX_NCCL_REFIT_NUM_STREAMS: int
@@ -23,6 +26,7 @@ if TYPE_CHECKING:
     MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S: float
     MX_NCCL_REFIT_TRANSFER_TIMEOUT_S: float
     MX_NCCL_REFIT_MISC_CHUNK_BYTES: int
+    MX_NCCL_REFIT_REGISTRATION_TTL_S: int
 
 
 def _int(name: str, default: int) -> int:
@@ -40,7 +44,7 @@ def _float(name: str, default: float) -> float:
         value = float(os.environ.get(name, default))
     except ValueError as error:
         raise ValueError(f"invalid {name}: {os.environ.get(name)!r}") from error
-    if value <= 0:
+    if not math.isfinite(value) or value <= 0:
         raise ValueError(f"{name} must be positive, got {value}")
     return value
 
@@ -57,6 +61,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "MX_NCCL_REFIT_MISC_CHUNK_BYTES": lambda: _int(
         "MX_NCCL_REFIT_MISC_CHUNK_BYTES", 268435456
+    ),
+    "MX_NCCL_REFIT_REGISTRATION_TTL_S": lambda: _int(
+        "MX_NCCL_REFIT_REGISTRATION_TTL_S",
+        mx_envs.MX_HEARTBEAT_INTERVAL_SECS * 3,
     ),
 }
 

@@ -46,11 +46,12 @@ pub trait CollectiveBackend: Send + Sync {
     /// Admit one worker to the group implied by its declared membership,
     /// creating the group on first contact.
     ///
-    /// Bumps the group's epoch when the admitted set changes, when a worker
-    /// presents a new generation for a slot already held, or when the reported
-    /// plan digest differs from the group's. Every one of those invalidates
-    /// the cached communicator, the cached plan, or both, and the epoch is what
-    /// tells a client to drop them.
+    /// Requires a live matching `WorkerRegistration`. Bumps the group's epoch
+    /// when an admitted registration expires, when a worker presents a new
+    /// generation for a slot already held, or when the reported plan digest
+    /// differs from the group's. Every one of those invalidates the cached
+    /// communicator, the cached plan, or both, and the epoch tells a client to
+    /// drop them. First admission while a group is still forming does not bump.
     async fn join_group(
         &self,
         request: &JoinCollectiveGroupRequest,

@@ -27,6 +27,8 @@ const JOIN_GROUP_LUA: &str = include_str!("redis/scripts/join_collective_group.l
 const PUBLISH_BOOTSTRAP_LUA: &str = include_str!("redis/scripts/publish_group_bootstrap.lua");
 const CREATE_TRANSFER_LUA: &str = include_str!("redis/scripts/create_collective_transfer.lua");
 const REPORT_TRANSFER_LUA: &str = include_str!("redis/scripts/report_collective_transfer.lua");
+const REFRESH_GROUP_LUA: &str = include_str!("redis/scripts/refresh_collective_group.lua");
+const DELETE_TRANSFER_LUA: &str = include_str!("redis/scripts/delete_collective_transfer.lua");
 
 fn group_key(group_id: &str) -> String {
     format!("mx:refitc:group:{group_id}")
@@ -53,7 +55,14 @@ fn reported_key(operation_id: &str) -> String {
 }
 
 fn operation_idempotency_key(model_name: &str, request_key: &str) -> String {
-    format!("mx:refitc:op-request:{model_name}:{request_key}")
+    format!(
+        "mx:refitc:op-request:{}:{model_name}{request_key}",
+        model_name.len()
+    )
+}
+
+fn worker_key(worker_id: &str) -> String {
+    format!("mx:refit:worker:{worker_id}")
 }
 
 /// Derive a stable group identity from the declared membership.
@@ -187,7 +196,7 @@ fn split_slots(text: &str) -> Vec<String> {
     text.split('\n').map(str::to_string).collect()
 }
 
-/// Parse one `worker_id|role|index_in_role|source_partition` participant record.
+/// Parse one `worker_id|role|index_in_role|source_partition|joined_epoch` record.
 fn participant_from_record(
     slot_id: &str,
     record: &str,
@@ -212,6 +221,14 @@ fn participant_from_record(
             CollectiveBackendError::Internal(format!("invalid participant partition: {error}"))
         })?),
     };
+    let _: u64 = parts.next().unwrap_or_default().parse().map_err(|error| {
+        CollectiveBackendError::Internal(format!("invalid participant epoch: {error}"))
+    })?;
+    if parts.next().is_some() {
+        return Err(CollectiveBackendError::Internal(
+            "participant record has extra fields".to_string(),
+        ));
+    }
 
     Ok((
         CollectiveParticipant {
@@ -247,7 +264,7 @@ impl RedisCollectiveBackend {
             .map_err(|error| CollectiveBackendError::InvalidArgument(error.to_string()))
     }
 
-    async fn read_group(&self, group_id: &str) -> CollectiveResult<CollectiveGroup> {
+    async fn read_group_once(&self, group_id: &str) -> CollectiveResult<CollectiveGroup> {
         let mut connection = self.connection.clone();
         let fields: HashMap<String, String> = connection
             .hgetall(group_key(group_id))
@@ -305,10 +322,13 @@ impl RedisCollectiveBackend {
                 let (mut participant, partition) = participant_from_record(slot_id, record)?;
                 let role = CollectiveRole::try_from(participant.role)
                     .unwrap_or(CollectiveRole::Unspecified);
-                let Ok(assignments) = layout.assign(role, participant.index_in_role, partition)
-                else {
-                    continue;
-                };
+                let assignments = layout
+                    .assign(role, participant.index_in_role, partition)
+                    .map_err(|error| {
+                        CollectiveBackendError::Internal(format!(
+                            "stored participant {slot_id} has an invalid lane assignment: {error}"
+                        ))
+                    })?;
                 if let Some(assignment) = assignments.iter().find(|a| a.lane_id == lane_id) {
                     participant.rank_in_lane = assignment.rank_in_lane;
                     participants.push(participant);
@@ -349,6 +369,70 @@ impl RedisCollectiveBackend {
             expected_generator_slots: generator_slots,
             created_at_unix_ms: parse_field(&fields, "created_at_unix_ms")?,
         })
+    }
+
+    async fn refresh_group_state(&self, group_id: &str) -> CollectiveResult<()> {
+        let mut connection = self.connection.clone();
+        let partitions: Option<u32> = connection
+            .hget(group_key(group_id), "source_partition_count")
+            .await
+            .map_err(redis_error)?;
+        let Some(partitions) = partitions else {
+            return Err(CollectiveBackendError::NotFound(format!(
+                "collective group {group_id} was not found"
+            )));
+        };
+        let lane_count = partitions.checked_add(1).ok_or_else(|| {
+            CollectiveBackendError::Internal("collective lane count overflowed".to_string())
+        })?;
+
+        let refresh_script = Script::new(REFRESH_GROUP_LUA);
+        let mut script = refresh_script.prepare_invoke();
+        script.key(group_key(group_id));
+        script.key(participants_key(group_id));
+        script.key(digests_key(group_id));
+        for lane_id in 0..lane_count {
+            script.key(lane_key(group_id, lane_id));
+        }
+        let outcome: String = script
+            .invoke_async(&mut connection)
+            .await
+            .map_err(redis_error)?;
+        if outcome == "NOTFOUND" {
+            return Err(CollectiveBackendError::NotFound(format!(
+                "collective group {group_id} was not found"
+            )));
+        }
+        if !outcome.starts_with("OK:") {
+            return Err(CollectiveBackendError::Internal(format!(
+                "unexpected group refresh outcome {outcome}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn read_group(&self, group_id: &str) -> CollectiveResult<CollectiveGroup> {
+        // A group spans several Redis hashes. Retry if a concurrent join or
+        // bootstrap changes the root record while those hashes are being read,
+        // so callers never receive READY paired with another epoch's lanes.
+        for _ in 0..5 {
+            self.refresh_group_state(group_id).await?;
+            let group = self.read_group_once(group_id).await?;
+            let mut connection = self.connection.clone();
+            let fields: HashMap<String, String> = connection
+                .hgetall(group_key(group_id))
+                .await
+                .map_err(redis_error)?;
+            if !fields.is_empty()
+                && parse_field::<u64>(&fields, "epoch")? == group.epoch
+                && i32::from(group_state_from_str(field(&fields, "state")?)) == group.state
+            {
+                return Ok(group);
+            }
+        }
+        Err(CollectiveBackendError::Unavailable(format!(
+            "collective group {group_id} changed while it was being read"
+        )))
     }
 
     async fn read_transfer(&self, operation_id: &str) -> CollectiveResult<CollectiveTransfer> {
@@ -402,6 +486,7 @@ impl CollectiveBackend for RedisCollectiveBackend {
             group_key(&group_id),
             participants_key(&group_id),
             digests_key(&group_id),
+            worker_key(&request.worker_id),
         ];
         for lane_id in 0..layout.lane_count() {
             keys.push(lane_key(&group_id, lane_id));
@@ -450,6 +535,50 @@ impl CollectiveBackend for RedisCollectiveBackend {
             .await
             .map_err(redis_error)?;
 
+        match outcome.as_str() {
+            "UNEXPECTED_SLOT" => {
+                return Err(CollectiveBackendError::InvalidArgument(format!(
+                    "slot {} is not expected for role {role_text}",
+                    request.slot_id
+                )));
+            }
+            "UNREGISTERED" => {
+                return Err(CollectiveBackendError::FailedPrecondition(format!(
+                    "worker {} has no live matching registration",
+                    request.worker_id
+                )));
+            }
+            "INVALID_PLAN_SOURCE" => {
+                return Err(CollectiveBackendError::InvalidArgument(
+                    "plan_source must be the registered trainer coordinator endpoint".to_string(),
+                ));
+            }
+            "CONFLICTING_ASSIGNMENT" => {
+                return Err(CollectiveBackendError::AlreadyExists(format!(
+                    "slot {} is already bound to a different role, ordinal, or partition",
+                    request.slot_id
+                )));
+            }
+            "DUPLICATE_RANK" => {
+                return Err(CollectiveBackendError::AlreadyExists(format!(
+                    "another slot already owns {role_text} index {}",
+                    request.index_in_role
+                )));
+            }
+            "DUPLICATE_WORKER" => {
+                return Err(CollectiveBackendError::AlreadyExists(format!(
+                    "worker {} is already admitted under another slot",
+                    request.worker_id
+                )));
+            }
+            "CORRUPT_PARTICIPANT" => {
+                return Err(CollectiveBackendError::Internal(
+                    "collective group contains a malformed participant record".to_string(),
+                ));
+            }
+            _ => {}
+        }
+
         let mut parts = outcome.split(':');
         if parts.next() != Some("OK") {
             return Err(CollectiveBackendError::Internal(format!(
@@ -497,6 +626,27 @@ impl CollectiveBackend for RedisCollectiveBackend {
                 request.lane_id
             )));
         }
+        let lane = group
+            .lanes
+            .iter()
+            .find(|lane| lane.lane_id == request.lane_id)
+            .ok_or_else(|| {
+                CollectiveBackendError::Internal(format!(
+                    "collective group {} is missing lane {}",
+                    request.group_id, request.lane_id
+                ))
+            })?;
+        let leader_slot = lane
+            .participants
+            .iter()
+            .find(|participant| participant.rank_in_lane == 0)
+            .map(|participant| participant.slot_id.as_str())
+            .ok_or_else(|| {
+                CollectiveBackendError::FailedPrecondition(format!(
+                    "lane {} has no admitted rank-0 participant",
+                    request.lane_id
+                ))
+            })?;
 
         let publish_script = Script::new(PUBLISH_BOOTSTRAP_LUA);
         let mut script = publish_script.prepare_invoke();
@@ -512,6 +662,7 @@ impl CollectiveBackend for RedisCollectiveBackend {
             .arg(request.epoch)
             .arg(&request.worker_id)
             .arg(hex_encode(&request.nccl_unique_id))
+            .arg(leader_slot)
             .invoke_async(&mut self.connection.clone())
             .await
             .map_err(redis_error)?;
@@ -528,6 +679,23 @@ impl CollectiveBackend for RedisCollectiveBackend {
                 request.epoch
             )));
         }
+        if outcome == "NOTLEADER" {
+            return Err(CollectiveBackendError::FailedPrecondition(format!(
+                "worker {} is not the live rank-0 participant for lane {}",
+                request.worker_id, request.lane_id
+            )));
+        }
+        if outcome == "CONFLICT" {
+            return Err(CollectiveBackendError::AlreadyExists(format!(
+                "lane {} already has a different bootstrap for epoch {}",
+                request.lane_id, request.epoch
+            )));
+        }
+        if !outcome.starts_with("OK:") {
+            return Err(CollectiveBackendError::Internal(format!(
+                "unexpected bootstrap outcome {outcome}"
+            )));
+        }
 
         self.read_group(&request.group_id).await
     }
@@ -542,6 +710,11 @@ impl CollectiveBackend for RedisCollectiveBackend {
         Self::layout_for(spec)?;
         let group_id = group_id_for(spec);
         let operation_id = Uuid::new_v4().simple().to_string();
+
+        match self.refresh_group_state(&group_id).await {
+            Ok(()) | Err(CollectiveBackendError::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
 
         let outcome: String = Script::new(CREATE_TRANSFER_LUA)
             .key(operation_key(&operation_id))
@@ -570,7 +743,21 @@ impl CollectiveBackend for RedisCollectiveBackend {
                 "no collective group has formed for this membership yet".to_string(),
             )),
             other => match other.strip_prefix("EXISTING:") {
-                Some(existing) => self.read_transfer(existing).await,
+                Some(existing) => {
+                    let transfer = self.read_transfer(existing).await?;
+                    if transfer.group_id == group_id
+                        && transfer.version_id == request.version_id
+                        && transfer.model_name == spec.model_name
+                        && transfer.idempotency_key == request.idempotency_key
+                    {
+                        Ok(transfer)
+                    } else {
+                        Err(CollectiveBackendError::AlreadyExists(
+                            "idempotency_key was already used for a different collective transfer"
+                                .to_string(),
+                        ))
+                    }
+                }
                 None => Err(CollectiveBackendError::Internal(format!(
                     "unexpected create outcome {other}"
                 ))),
@@ -584,30 +771,57 @@ impl CollectiveBackend for RedisCollectiveBackend {
 
     async fn delete_transfer(&self, operation_id: &str) -> CollectiveResult<CollectiveTransfer> {
         let transfer = self.read_transfer(operation_id).await?;
-        let mut connection = self.connection.clone();
-        let _: () = connection
-            .del(&[operation_key(operation_id), reported_key(operation_id)])
-            .await
-            .map_err(redis_error)?;
-        let _: () = connection
-            .del(operation_idempotency_key(
+        if !matches!(
+            CollectiveTransferState::try_from(transfer.state),
+            Ok(CollectiveTransferState::Complete)
+                | Ok(CollectiveTransferState::Failed)
+                | Ok(CollectiveTransferState::Aborted)
+        ) {
+            return Err(CollectiveBackendError::FailedPrecondition(format!(
+                "collective transfer {operation_id} is not terminal"
+            )));
+        }
+
+        let outcome: String = Script::new(DELETE_TRANSFER_LUA)
+            .key(operation_key(operation_id))
+            .key(reported_key(operation_id))
+            .key(operation_idempotency_key(
                 &transfer.model_name,
                 &transfer.idempotency_key,
             ))
+            .arg(operation_id)
+            .invoke_async(&mut self.connection.clone())
             .await
             .map_err(redis_error)?;
-        Ok(transfer)
+        match outcome.as_str() {
+            "DELETED" => Ok(transfer),
+            "NOTFOUND" => Err(CollectiveBackendError::NotFound(format!(
+                "collective transfer {operation_id} was not found"
+            ))),
+            "NOTTERMINAL" => Err(CollectiveBackendError::FailedPrecondition(format!(
+                "collective transfer {operation_id} is not terminal"
+            ))),
+            other => Err(CollectiveBackendError::Internal(format!(
+                "unexpected delete outcome {other}"
+            ))),
+        }
     }
 
     async fn report_transfer(
         &self,
         request: &ReportCollectiveTransferRequest,
     ) -> CollectiveResult<CollectiveTransfer> {
-        let outcome: String = Script::new(REPORT_TRANSFER_LUA)
-            .key(operation_key(&request.operation_id))
-            .key(reported_key(&request.operation_id))
-            .key(group_key(&request.group_id))
-            .key(participants_key(&request.group_id))
+        let group = self.read_group(&request.group_id).await?;
+        let report_script = Script::new(REPORT_TRANSFER_LUA);
+        let mut script = report_script.prepare_invoke();
+        script.key(operation_key(&request.operation_id));
+        script.key(reported_key(&request.operation_id));
+        script.key(group_key(&request.group_id));
+        script.key(participants_key(&request.group_id));
+        for lane in &group.lanes {
+            script.key(lane_key(&request.group_id, lane.lane_id));
+        }
+        let outcome: String = script
             .arg(&request.operation_id)
             .arg(&request.group_id)
             .arg(request.epoch)
@@ -630,14 +844,30 @@ impl CollectiveBackend for RedisCollectiveBackend {
                 "worker {} is not an admitted generation of this group",
                 request.worker_id
             ))),
+            "NOTREADY" => Err(CollectiveBackendError::FailedPrecondition(format!(
+                "collective group {} is not READY for reports",
+                request.group_id
+            ))),
             other => {
+                if let Some(operation_epoch) = other.strip_prefix("OPSTALE:") {
+                    return Err(CollectiveBackendError::FailedPrecondition(format!(
+                        "report for epoch {} does not match the operation epoch {operation_epoch}",
+                        request.epoch
+                    )));
+                }
                 if let Some(current) = other.strip_prefix("STALE:") {
                     return Err(CollectiveBackendError::FailedPrecondition(format!(
                         "report for epoch {} was rejected; the group is at epoch {current}",
                         request.epoch
                     )));
                 }
-                self.read_transfer(&request.operation_id).await
+                if other.starts_with("OK:") {
+                    self.read_transfer(&request.operation_id).await
+                } else {
+                    Err(CollectiveBackendError::Internal(format!(
+                        "unexpected report outcome {other}"
+                    )))
+                }
             }
         }
     }
@@ -714,16 +944,17 @@ mod tests {
     #[test]
     fn participant_records_round_trip() {
         let (trainer, partition) =
-            participant_from_record("t0", "w1|TRAINER|3|1").expect("trainer record");
+            participant_from_record("t0", "w1|TRAINER|3|1|7").expect("trainer record");
         assert_eq!(trainer.worker_id, "w1");
         assert_eq!(trainer.index_in_role, 3);
         assert_eq!(partition, Some(1));
 
         let (generator, partition) =
-            participant_from_record("g0", "w2|GENERATOR|0|").expect("generator record");
+            participant_from_record("g0", "w2|GENERATOR|0||7").expect("generator record");
         assert_eq!(generator.worker_id, "w2");
         assert_eq!(partition, None);
 
-        assert!(participant_from_record("x", "w|BOGUS|0|").is_err());
+        assert!(participant_from_record("x", "w|BOGUS|0||7").is_err());
+        assert!(participant_from_record("x", "w|TRAINER|0|0").is_err());
     }
 }
