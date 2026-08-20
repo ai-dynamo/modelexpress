@@ -101,6 +101,20 @@ class SglangAdapter(EngineAdapter):
             result = self._post_load_weights(result)
             return self._process_weights_after_loading(result)
 
+    def after_rdma_receive(self, result: LoadResult) -> LoadResult:
+        model = result.model
+        if model is None or type(model).__module__ != "sglang.srt.models.kimi_k3":
+            return result
+        for name, proj in model.named_modules():
+            cache = getattr(proj, "_attn_res_cw_cache", None)
+            if not cache:
+                continue
+            norm = model.get_submodule(name.removesuffix("_proj") + "_norm")
+            combined = (norm.weight.float() * proj.weight.squeeze().float()).contiguous()
+            for dtype, cached in cache.items():
+                cached.copy_(combined.to(dtype))
+        return result
+
     def apply_weight_iter(
         self,
         result: LoadResult,
