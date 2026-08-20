@@ -275,8 +275,10 @@ impl RefitCollectiveService for RefitCollectiveServiceImpl {
                 "epoch must be the epoch the operation was admitted against",
             ));
         }
-        if !request.succeeded {
-            required(&request.message, "message is required for a failed report")?;
+        if !request.succeeded && request.message.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "message is required for a failed report",
+            ));
         }
 
         self.backend
