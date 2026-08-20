@@ -101,6 +101,16 @@ class ModelExpressTrainerConfig:
     # Deadline applied independently to each control-plane RPC.
     rpc_timeout_seconds: float = 30.0
 
+    def __post_init__(self) -> None:
+        """Validate explicit settings before client initialization."""
+        if self.payload_format is WeightPayloadFormat.UNSPECIFIED:
+            raise ValueError("payload_format must be specified")
+        if self.registration_ttl_seconds is not None:
+            rl_envs.require_positive_int(
+                self.registration_ttl_seconds, "registration_ttl_seconds"
+            )
+        rl_envs.require_positive_float(self.rpc_timeout_seconds, "rpc_timeout_seconds")
+
 
 class StagedWeightVersionShard:
     """One immutable rank-local shard staged for a global weight version."""
@@ -184,10 +194,9 @@ class ModelExpressTrainerClient:
         registration_ttl_seconds = config.registration_ttl_seconds
         if registration_ttl_seconds is None:
             registration_ttl_seconds = envs.MX_HEARTBEAT_INTERVAL_SECS * 3
-        if registration_ttl_seconds <= 0:
-            raise ValueError("registration_ttl_seconds must be positive")
-        if config.rpc_timeout_seconds <= 0:
-            raise ValueError("rpc_timeout_seconds must be positive")
+        registration_ttl_seconds = rl_envs.require_positive_int(
+            registration_ttl_seconds, "registration_ttl_seconds"
+        )
         device_id = config.device_id
         if device_id is None:
             local_rank = os.environ.get("LOCAL_RANK")
@@ -276,7 +285,6 @@ class ModelExpressTrainerClient:
                     worker_id=self.worker_id,
                     role=refit_pb2.WORKER_ROLE_TRAINER,
                     model_name=self.model_name,
-                    endpoint=self.worker_endpoint,
                 ),
                 ttl_seconds=self._registration_ttl_seconds,
             ),

@@ -17,7 +17,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-
 from modelexpress.nixl_transfer import NixlTransferManager
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
 from modelexpress.refit.reshard.rendezvous import (
@@ -54,23 +53,27 @@ class _ResolvedSources:
 
 @dataclass(frozen=True)
 class _PreparedNixlTransfer:
-    """One immutable physical plan over reusable registered destinations."""
+    """One immutable physical plan over reusable registered destinations.
+
+    ``plan_revision`` is process-local and changes whenever ``prepare`` rebuilds
+    the plan. It is not a control-plane weight-version number.
+    """
 
     plan: TransferPlan
     capture: CaptureResult
     sources: dict
     descriptors: tuple[ReadDescriptor, ...]
     transport: NixlReshardTransport
-    generation: int
+    plan_revision: int
 
 
 @dataclass(frozen=True)
 class _StagedNixlWeights:
-    """Verified load-layout tensors produced by one completed transfer."""
+    """Verified tensors tagged with the local plan revision that produced them."""
 
     tensors: dict[str, torch.Tensor]
     metrics: dict[str, Any]
-    generation: int
+    plan_revision: int
 
 
 def _resolve_sources(manifests: list[bytes]) -> _ResolvedSources:
@@ -259,7 +262,7 @@ class _NixlStagedTransfer:
         self._full_registered = False
         self._active: _PreparedNixlTransfer | None = None
         self._loaded_agent_metadata: dict[str, bytes] = {}
-        self._generation = 0
+        self._plan_revision = 0
         self._closed = False
 
     def prepare(
@@ -316,14 +319,14 @@ class _NixlStagedTransfer:
             for copy in capture.copies
             if copy.src_name in resolved.sources
         }
-        self._generation += 1
+        self._plan_revision += 1
         prepared = _PreparedNixlTransfer(
             plan=plan,
             capture=capture,
             sources=used_sources,
             descriptors=descriptors,
             transport=transport,
-            generation=self._generation,
+            plan_revision=self._plan_revision,
         )
         self._active = prepared
         return prepared
@@ -495,7 +498,7 @@ class _NixlStagedTransfer:
                 "full_pull_sources": len(prepared.plan.full_pulls),
                 "converts": len(prepared.plan.converts),
             },
-            generation=prepared.generation,
+            plan_revision=prepared.plan_revision,
         )
 
     def _verification_tensor(self, prepared: _PreparedNixlTransfer, name: str):

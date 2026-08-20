@@ -3,10 +3,9 @@
 
 from contextlib import nullcontext
 
+import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 import pytest
 import torch
-
-import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 from modelexpress.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
@@ -21,13 +20,13 @@ from modelexpress.refit.reshard.types import (
 )
 from modelexpress.refit.reshard.verify import tensor_digest
 from modelexpress_rl.inference.nixl_staged_transfer import (
+    _load_agent_metadata,
     _NixlStagedTransfer,
     _plan_staged_transfer,
     _PreparedNixlTransfer,
     _required_agent_metadata,
-    _ResolvedSources,
     _resolve_sources,
-    _load_agent_metadata,
+    _ResolvedSources,
 )
 
 
@@ -186,7 +185,7 @@ def _prepared(tensor: torch.Tensor, digest: str | None) -> _PreparedNixlTransfer
         sources={"weight": source},
         descriptors=(),
         transport=object(),
-        generation=1,
+        plan_revision=1,
     )
 
 

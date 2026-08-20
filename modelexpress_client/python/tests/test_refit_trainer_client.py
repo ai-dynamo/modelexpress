@@ -105,6 +105,27 @@ def _patch_resources(monkeypatch, *, manager, manifest_service, worker_endpoint)
     return resources
 
 
+@pytest.mark.parametrize(
+    ("setting", "value", "message"),
+    [
+        ("registration_ttl_seconds", 0, "registration_ttl_seconds must be positive"),
+        (
+            "rpc_timeout_seconds",
+            float("nan"),
+            "rpc_timeout_seconds must be finite and positive",
+        ),
+    ],
+)
+def test_trainer_config_rejects_invalid_numeric_settings(setting, value, message):
+    with pytest.raises(ValueError, match=message):
+        ModelExpressTrainerConfig(**{setting: value})
+
+
+def test_trainer_config_rejects_unspecified_payload_format():
+    with pytest.raises(ValueError, match="payload_format must be specified"):
+        ModelExpressTrainerConfig(payload_format=WeightPayloadFormat.UNSPECIFIED)
+
+
 def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
     service = _RefitService()
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
@@ -191,10 +212,7 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
     assert len(service.deleted_shards) == 1
     assert service.deleted_shards[0].source_slot_id == "rank:0"
     assert service.registrations["trainer-0"].role == refit_pb2.WORKER_ROLE_TRAINER
-    assert (
-        service.registrations["trainer-0"].endpoint
-        == service.shards[0].manifest_endpoint
-    )
+    assert "endpoint" not in refit_pb2.WorkerRegistration.DESCRIPTOR.fields_by_name
     assert service.shards[0].version_id == "version-a"
     assert service.shards[0].source_slot_id == "rank:0"
     assert service.shards[0].worker_id == "trainer-0"

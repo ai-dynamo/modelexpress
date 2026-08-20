@@ -99,6 +99,7 @@ impl DownloadTarget {
 /// serving the default revision instead would hand back a different model than asked
 /// for. For an unpinned request we fall back to whatever snapshot is already cached,
 /// so a Hub outage still serves models the server has downloaded before.
+#[allow(clippy::result_large_err)] // tonic::Status grew past Clippy's Rust 1.98 threshold.
 async fn resolve_target_revision(
     model_name: &str,
     provider: ModelProvider,

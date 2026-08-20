@@ -179,6 +179,41 @@ def _initialize(monkeypatch, endpoint, adapter):
     )
 
 
+@pytest.mark.parametrize(
+    ("setting", "value", "message"),
+    [
+        ("registration_ttl_seconds", 0, "registration_ttl_seconds must be positive"),
+        ("lease_ttl_seconds", -1, "lease_ttl_seconds must be positive"),
+        ("max_transfer_attempts", 0, "max_transfer_attempts must be positive"),
+        (
+            "rpc_timeout_seconds",
+            float("inf"),
+            "rpc_timeout_seconds must be finite and positive",
+        ),
+    ],
+)
+def test_generator_config_rejects_invalid_numeric_settings(setting, value, message):
+    with pytest.raises(ValueError, match=message):
+        ModelExpressGeneratorConfig(
+            engine_context=VllmGeneratorContext(
+                model=object(),
+                vllm_config=object(),
+            ),
+            **{setting: value},
+        )
+
+
+def test_generator_config_rejects_unspecified_payload_format():
+    with pytest.raises(ValueError, match="payload_format must be specified"):
+        ModelExpressGeneratorConfig(
+            engine_context=VllmGeneratorContext(
+                model=object(),
+                vllm_config=object(),
+            ),
+            payload_format=WeightPayloadFormat.UNSPECIFIED,
+        )
+
+
 def test_generator_stages_applies_releases_and_reuses_valid_plan(monkeypatch):
     server, endpoint, service = _start_server()
     adapter = _Adapter(service)

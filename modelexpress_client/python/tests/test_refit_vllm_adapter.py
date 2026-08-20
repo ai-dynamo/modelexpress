@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import torch
-import pytest
 from dataclasses import replace
 
 import modelexpress_rl.inference.engines.vllm.adapter as vllm_adapter_module
+import pytest
+import torch
 from modelexpress_rl import WeightPayloadFormat
 from modelexpress_rl.inference.adapter import GeneratorSource, GeneratorTransferInputs
 from modelexpress_rl.inference.engines.vllm import VllmGeneratorAdapter
@@ -15,14 +15,14 @@ def test_vllm_adapter_composes_transfer_and_installer_lifecycles(
     monkeypatch,
 ):
     events = []
-    native_plan = type("NativePlan", (), {"generation": 1})()
+    native_plan = type("NativePlan", (), {"plan_revision": 1})()
     transferred = type(
         "Transferred",
         (),
         {
             "tensors": {"weight": object()},
             "metrics": {"bytes_received": 128},
-            "generation": 1,
+            "plan_revision": 1,
         },
     )()
 
@@ -89,8 +89,13 @@ def test_vllm_adapter_composes_transfer_and_installer_lifecycles(
         {WeightPayloadFormat.FULL_TENSOR}
     )
     plan = adapter.create_transfer_plan(inputs)
+    assert plan is native_plan
     assert adapter.validate_transfer_plan(plan, inputs)
+    assert not adapter.validate_transfer_plan(
+        plan, replace(inputs, layout_signature="layout-b")
+    )
     staged = adapter.stage_weight(plan)
+    assert staged is transferred
     with pytest.raises(RuntimeError, match="release staged weight"):
         adapter.create_transfer_plan(inputs)
     assert adapter.apply_weight(staged) == {"bytes_received": 128}

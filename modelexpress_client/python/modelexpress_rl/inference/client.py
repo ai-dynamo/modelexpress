@@ -71,6 +71,23 @@ class ModelExpressGeneratorConfig:
     # Deadline applied independently to each control-plane or manifest RPC.
     rpc_timeout_seconds: float = 30.0
 
+    def __post_init__(self) -> None:
+        """Validate explicit settings before client initialization."""
+        if self.payload_format is WeightPayloadFormat.UNSPECIFIED:
+            raise ValueError("payload_format must be specified")
+        if self.registration_ttl_seconds is not None:
+            rl_envs.require_positive_int(
+                self.registration_ttl_seconds, "registration_ttl_seconds"
+            )
+        if self.lease_ttl_seconds is not None:
+            rl_envs.require_positive_int(
+                self.lease_ttl_seconds, "lease_ttl_seconds"
+            )
+        rl_envs.require_positive_int(
+            self.max_transfer_attempts, "max_transfer_attempts"
+        )
+        rl_envs.require_positive_float(self.rpc_timeout_seconds, "rpc_timeout_seconds")
+
 
 class StagedWeightHandle:
     """Local verified staging buffers for one exact WeightVersion."""
@@ -167,14 +184,9 @@ class ModelExpressGeneratorClient:
         lease_ttl_seconds = config.lease_ttl_seconds
         if lease_ttl_seconds is None:
             lease_ttl_seconds = registration_ttl_seconds
-        if registration_ttl_seconds <= 0:
-            raise ValueError("registration_ttl_seconds must be positive")
-        if lease_ttl_seconds <= 0:
-            raise ValueError("lease_ttl_seconds must be positive")
-        if config.max_transfer_attempts <= 0:
-            raise ValueError("max_transfer_attempts must be positive")
-        if config.rpc_timeout_seconds <= 0:
-            raise ValueError("rpc_timeout_seconds must be positive")
+        registration_ttl_seconds = rl_envs.require_positive_int(
+            registration_ttl_seconds, "registration_ttl_seconds"
+        )
 
         adapter = _create_generator_adapter(
             engine_context=config.engine_context,
