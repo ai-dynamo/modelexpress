@@ -409,14 +409,23 @@ drop them together. Bumping clears every lane's bootstrap identifier in the same
 transaction, because an identifier from a previous epoch names a communicator
 whose world size no longer matches the membership.
 
+Before `JoinCollectiveGroup`, each worker must call `RefitService.RegisterWorker`
+with the same `worker_id`, model, and role, then renew that immutable registration
+through communicator setup, transfer, and terminal reporting (the client must
+renew no less frequently than once per third of the registration TTL). Join and
+bootstrap transitions validate the registration atomically. `GetCollectiveGroup`
+also removes expired generations, advances the epoch, and clears lane bootstrap
+identifiers before returning state, so `READY` cannot survive a dead rank.
+
 Lanes are one per disjoint source partition plus one broadcast lane. MX derives
 them and assigns ranks from role, ordinal within role, and partition alone; it
 never interprets tensor, expert, data or pipeline parallelism, which stay
 client-side. `refit_collective/lanes.rs` is the whole of that logic.
 
-Groups are reclaimed automatically once every participant's registration has
-lapsed and no operation still references them. There is no group-delete RPC,
-symmetrically with workers never creating one.
+There is no group-delete RPC, symmetrically with workers never creating one.
+Expired generations are fenced now; reclaiming the resulting empty group hashes
+after their last operation is deleted still requires a backend reaper/index and
+is not implemented in this slice.
 
 ### refit.proto - RefitService (Redis only)
 

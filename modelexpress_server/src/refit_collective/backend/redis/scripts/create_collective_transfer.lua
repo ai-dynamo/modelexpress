@@ -18,7 +18,12 @@
 
 local existing = redis.call('GET', KEYS[2])
 if existing then
-  return 'EXISTING:' .. existing
+  if redis.call('EXISTS', 'mx:refitc:op:' .. existing) == 1 then
+    return 'EXISTING:' .. existing
+  end
+  -- Recover an orphaned reservation left by partial/manual metadata cleanup.
+  -- Normal deletion removes the operation and reservation atomically.
+  redis.call('DEL', KEYS[2])
 end
 
 if redis.call('EXISTS', KEYS[1]) == 1 then
