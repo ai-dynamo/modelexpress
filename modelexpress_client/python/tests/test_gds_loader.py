@@ -5,6 +5,7 @@
 
 import json
 import struct
+from types import SimpleNamespace
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
@@ -259,6 +260,31 @@ class TestGdsStrategyIntegration:
         assert result.model is model
         mock_gds.load_iter.assert_called_once()
         model.load_weights.assert_called_once()
+        mock_gds.shutdown.assert_called_once()
+
+    @patch("modelexpress.gds_transfer.is_gds_available", return_value=True)
+    @patch("modelexpress.gds_loader.MxGdsLoader")
+    def test_gds_uses_sglang_model_path(self, mock_gds_cls, _mock_avail):
+        from modelexpress.load_strategy.gds_strategy import GdsStrategy
+
+        mock_gds = MagicMock()
+        mock_gds.load_iter.return_value = iter([("w", torch.zeros(1))])
+        mock_gds_cls.return_value = mock_gds
+
+        ctx = self._make_context()
+        ctx.model_config = SimpleNamespace(
+            model_path="test-sglang-model",
+            revision="test-revision",
+        )
+        ctx.load_config.use_tqdm_on_load = False
+
+        GdsStrategy().load(MagicMock(), ctx)
+
+        mock_gds.load_iter.assert_called_once_with(
+            "test-sglang-model",
+            use_tqdm=False,
+            revision="test-revision",
+        )
         mock_gds.shutdown.assert_called_once()
 
     @patch("modelexpress.gds_transfer.is_gds_available", return_value=True)
