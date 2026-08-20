@@ -45,9 +45,9 @@ from .types import (
 )
 
 __all__ = [
+    "DEFAULT_LAYER_GROUP",
     "CollectiveRendezvous",
     "CommunicatorCache",
-    "DEFAULT_LAYER_GROUP",
     "EpochChangedError",
     "GroupNotReadyError",
     "LaneCommunicator",

@@ -69,6 +69,8 @@ class EpochChangedError(RendezvousError):
 
     The caller must rebuild: a communicator created against the old epoch, or a
     plan fetched for it, no longer describes this group.
+
+    ``actual`` is ``-1`` when the current epoch could not be read back.
     """
 
     def __init__(self, group_id: str, expected: int, actual: int) -> None:
@@ -498,8 +500,31 @@ class CollectiveRendezvous:
             )
         except grpc.RpcError as error:
             if error.code() is grpc.StatusCode.FAILED_PRECONDITION:
-                raise EpochChangedError(group_id, epoch, -1) from error
+                # FAILED_PRECONDITION covers more than a stale epoch here: MX
+                # also rejects a publisher that is not the lane's live rank 0.
+                # Read the epoch back so a rejection that is not an epoch move
+                # keeps the server's own explanation instead of being relabelled
+                # -- and so the one that is names the epoch it moved to.
+                current = self._current_epoch(group_id)
+                if current != epoch:
+                    raise EpochChangedError(group_id, epoch, current) from error
             raise
+
+    def _current_epoch(self, group_id: str) -> int:
+        """The group's epoch now, or ``-1`` when it cannot be read.
+
+        MX reports the epoch that rejected a publication in the status detail
+        rather than in a typed field, so it is read back from the group. A
+        failure here must not replace the rejection the caller needs to see, so
+        it degrades to ``-1``, which no live group ever carries.
+        """
+        try:
+            return self._stub.GetCollectiveGroup(
+                pb.GetCollectiveGroupRequest(group_id=group_id),
+                timeout=self._rpc_timeout_s,
+            ).epoch
+        except grpc.RpcError:
+            return -1
 
     def await_ready(
         self,

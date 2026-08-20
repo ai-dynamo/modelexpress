@@ -425,6 +425,17 @@ class TestAwaitReady:
         assert rz._missing_slots(g) == ["generator slot rank0"]
 
 
+class _RejectingPublishStub(FakeStub):
+    """A stub whose PublishGroupBootstrap always fails the precondition."""
+
+    def PublishGroupBootstrap(self, request, timeout=None):  # noqa: N802
+        class FailedPrecondition(grpc.RpcError):
+            def code(self):
+                return grpc.StatusCode.FAILED_PRECONDITION
+
+        raise FailedPrecondition()
+
+
 class TestPublishBootstrap:
     def test_a_correctly_sized_identifier_is_published_with_its_epoch(self):
         stub = FakeStub()
@@ -437,6 +448,34 @@ class TestPublishBootstrap:
         )
         assert stub.published[0].epoch == 2
         assert len(stub.published[0].nccl_unique_id) == rz.NCCL_UNIQUE_ID_BYTES
+
+    def test_a_stale_epoch_rejection_names_the_epoch_it_moved_to(self):
+        # "moved from epoch 2 to -1" tells the caller nothing, so the epoch is
+        # read back from the group MX rejected the publication against.
+        stub = _RejectingPublishStub(groups=[group(epoch=5)])
+        with pytest.raises(EpochChangedError) as caught:
+            make_rendezvous(stub).publish_bootstrap(
+                group_id="g1",
+                epoch=2,
+                lane_id=0,
+                worker_id="w0",
+                nccl_unique_id=b"\x01" * rz.NCCL_UNIQUE_ID_BYTES,
+            )
+        assert caught.value.actual == 5
+
+    def test_a_rejection_that_is_not_an_epoch_move_keeps_the_server_error(self):
+        # MX also rejects a publisher that is not the lane's live rank 0. That
+        # is not a stale epoch, and telling the caller to rebuild would hide the
+        # reason it was actually turned away.
+        stub = _RejectingPublishStub(groups=[group(epoch=2)])
+        with pytest.raises(grpc.RpcError):
+            make_rendezvous(stub).publish_bootstrap(
+                group_id="g1",
+                epoch=2,
+                lane_id=0,
+                worker_id="w0",
+                nccl_unique_id=b"\x01" * rz.NCCL_UNIQUE_ID_BYTES,
+            )
 
     @pytest.mark.parametrize("size", [0, 1, 127, 129])
     def test_a_wrong_sized_identifier_is_rejected_before_the_rpc(self, size):

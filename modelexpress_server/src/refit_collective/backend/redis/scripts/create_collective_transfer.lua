@@ -10,7 +10,7 @@
 --   CREATED
 --   EXISTING:<operation_id>   another invocation already owns the key
 --   COLLISION                 the generated operation ID already exists
---   NOGROUP                   the group has not formed yet
+--   NOGROUP                   no group exists for this membership
 --
 -- The idempotency reservation is what makes an orchestrator retry safe: a
 -- create that timed out client-side but committed server-side returns the
