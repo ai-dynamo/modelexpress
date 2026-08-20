@@ -28,7 +28,10 @@
 //!   Redis `SCAN` or a similar keyspace walk belongs in a refresh task that
 //!   writes a plain gauge; the scrape only encodes what is already in memory.
 
+pub mod backend;
+pub mod buckets;
 pub mod exposition;
+pub mod grpc;
 
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::encoding::text::encode;

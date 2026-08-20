@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::metrics::grpc::RpcOutcome;
 use crate::registry::backend::ClaimOutcome;
 use crate::registry::entry_key::EntryKey;
 use crate::registry::state::RegistryManager;
@@ -183,6 +184,17 @@ impl HealthService for HealthServiceImpl {
 #[derive(Debug, Default)]
 pub struct ApiServiceImpl;
 
+/// Return `body` with the handler's own verdict attached.
+///
+/// See [`crate::metrics::grpc`]. Mirrors the helper in `p2p/service.rs`; kept
+/// local to each module so a handler's outcome is stated next to the handler.
+#[allow(clippy::result_large_err)] // Returns the handlers' own tonic::Status result type.
+fn tagged<T>(body: T, outcome: RpcOutcome) -> Result<Response<T>, Status> {
+    let mut response = Response::new(body);
+    response.extensions_mut().insert(outcome);
+    Ok(response)
+}
+
 #[tonic::async_trait]
 impl ApiService for ApiServiceImpl {
     async fn send_request(
@@ -199,18 +211,27 @@ impl ApiService for ApiServiceImpl {
             let data_bytes = serde_json::to_vec(&response_data)
                 .map_err(|e| Status::internal(format!("Serialization error: {e}")))?;
 
-            Ok(Response::new(ApiResponse {
-                success: true,
-                data: Some(data_bytes),
-                error: None,
-            }))
+            tagged(
+                ApiResponse {
+                    success: true,
+                    data: Some(data_bytes),
+                    error: None,
+                },
+                RpcOutcome::Ok,
+            )
         } else {
             error!("Unknown action: {}", api_request.action);
-            Ok(Response::new(ApiResponse {
-                success: false,
-                data: None,
-                error: Some(format!("Unknown action: {}", api_request.action)),
-            }))
+            // In band, like the P2P handlers: `Ok` on the wire with
+            // `success: false` in the body, so the outcome has to be stated
+            // rather than inferred from the status code.
+            tagged(
+                ApiResponse {
+                    success: false,
+                    data: None,
+                    error: Some(format!("Unknown action: {}", api_request.action)),
+                },
+                RpcOutcome::InvalidArgument,
+            )
         }
     }
 }

@@ -14,6 +14,7 @@ use modelexpress_common::grpc::refit::{
 
 use crate::backend_config::BackendConfig;
 
+pub mod instrumented;
 pub mod redis;
 
 pub type RefitResult<T> = Result<T, RefitBackendError>;

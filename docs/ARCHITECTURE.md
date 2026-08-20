@@ -85,6 +85,12 @@ ModelExpress/
 │       ├── backend_config.rs           # Shared BackendConfig (Redis / K8s) + env parsing
 │       ├── cache.rs                    # CacheEvictionService, LRU policy
 │       ├── services.rs                 # Health, API, Model gRPC services + ModelDownloadTracker
+│       ├── metrics.rs                   # Prometheus registry, mx_build_info, encoding
+│       ├── metrics/
+│       │   ├── exposition.rs            # HTTP/1.1 /metrics listener (separate port)
+│       │   ├── buckets.rs               # Shared histogram bucket boundaries
+│       │   ├── grpc.rs                  # Per-RPC tower layer; in-handler outcomes
+│       │   └── backend.rs               # Backend op counters and latency
 │       ├── p2p/
 │       │   ├── state.rs                # P2pStateManager wrapper
 │       │   ├── service.rs              # P2P gRPC service implementation
@@ -94,13 +100,15 @@ ModelExpress/
 │       │   ├── backend.rs              # MetadataBackend trait + types
 │       │   └── backend/
 │       │       ├── redis.rs            # P2P Redis backend
-│       │       └── kubernetes.rs       # P2P Kubernetes CRD backend
+│       │       ├── kubernetes.rs       # P2P Kubernetes CRD backend
+│       │       └── instrumented.rs     # Metrics decorator over MetadataBackend
 │       ├── refit.rs                     # Refit module exports
 │       ├── refit/
 │       │   ├── service.rs               # Backend-neutral Refit gRPC service
 │       │   ├── backend.rs               # RefitBackend contract and factory
 │       │   └── backend/
-│       │       └── redis.rs             # Redis backend and atomic Lua scripts
+│       │       ├── redis.rs             # Redis backend and atomic Lua scripts
+│       │       └── instrumented.rs      # Metrics decorator over RefitBackend
 │       ├── registry/
 │       │   ├── state.rs                # RegistryManager wrapper
 │       │   ├── backend.rs              # RegistryBackend trait + ModelRecord
@@ -108,7 +116,8 @@ ModelExpress/
 │       │   ├── k8s_types.rs            # ModelCacheEntry CRD type
 │       │   └── backend/
 │       │       ├── redis.rs            # Redis registry backend
-│       │       └── kubernetes.rs       # K8s ModelCacheEntry registry backend
+│       │       ├── kubernetes.rs       # K8s ModelCacheEntry registry backend
+│       │       └── instrumented.rs     # Metrics decorator over RegistryBackend
 │       └── bin/
 │           └── config_gen.rs           # Config file generator/migrator
 │

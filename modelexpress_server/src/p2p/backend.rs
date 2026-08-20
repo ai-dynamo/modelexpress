@@ -18,6 +18,7 @@ use modelexpress_common::grpc::p2p::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub mod instrumented;
 pub mod kubernetes;
 #[cfg(feature = "memory-backend")]
 pub mod memory;
