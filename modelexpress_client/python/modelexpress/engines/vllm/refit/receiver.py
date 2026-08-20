@@ -7,10 +7,12 @@ Implements the two engine hooks of
 :class:`~modelexpress.refit.reshard.receiver.ReshardReceiver`
 for vLLM:
 
-  * :meth:`_capture` - build a fresh UNQUANTIZED meta twin of the model and drive
-    its ``load_weights`` with the record-only geometry capture, so we record where
-    each source lands in the bf16 load-time layout (the live params are post-quant
-    for a quantized model, so we can't capture on them).
+  * :meth:`_capture` - capture load geometry on the live model: revert its params
+    to their bf16 load-time skeletons via ``initialize_layerwise_reload`` (the
+    pre-quant layout we slice into), drive ``load_weights`` with the record-only
+    geometry capture, then restore the graph-bound tensors (without finalizing).
+    Recording on the real model keeps Expert-Parallel's expert map populated with
+    real values, which the FusedMoE loader reads while placing expert weights.
   * :meth:`_install` - install the RDMA'd receive buffers into the live params via
     vLLM's layerwise reload: ``initialize_layerwise_reload`` reverts the live
     params to bf16 load-time skeletons + snapshots the CUDA-graph-bound kernel
@@ -31,7 +33,9 @@ from typing import Any
 import torch
 from torch.nn import Module
 
-from modelexpress.refit.reshard.geometry import capture_geometry
+from collections.abc import Callable
+
+from modelexpress.refit.reshard.geometry import capture_weights, convert_source_weights
 from modelexpress.refit.reshard.receiver import ReshardReceiver
 from modelexpress.refit.reshard.types import CaptureResult
 
@@ -39,83 +43,81 @@ logger = logging.getLogger("modelexpress.engines.vllm.refit.receiver")
 
 
 class VllmReshardReceiver(ReshardReceiver):
-    """Slice-resharding weight receiver for a vLLM model."""
+    """Slice-resharding weight receiver for a vLLM model.
+
+    ``convert_native_to_hf`` handles a trainer that publishes weights under its own
+    native (non-HF) layout: it is that trainer's native -> HF mapping
+    (``dict[str, Tensor] -> dict[str, Tensor]``), run on lazy placeholders during
+    capture so only structure is traced (see :func:`convert_source_weights`). Leave
+    it ``None`` (the default) when the trainer already publishes HF-canonical names.
+    """
 
     def __init__(
-        self, *, model: Module, vllm_config: Any, model_config: Any, **base_kwargs: Any
+        self,
+        *,
+        model: Module,
+        vllm_config: Any,
+        model_config: Any,
+        convert_native_to_hf: Callable[[dict], dict] | None = None,
+        **base_kwargs: Any,
     ) -> None:
         self._model = model
         self._vllm_config = vllm_config
         self._model_config = model_config
+        self._convert_native_to_hf = convert_native_to_hf
         super().__init__(device=base_kwargs.pop("device"), **base_kwargs)
 
     @property
     def _is_quantized(self) -> bool:
         """True when the live model was quantized (fp8, etc.) - its live params are
-        then post-PWAL (Marlin-packed / kernel layout), not the bf16 load-time
-        layout, so capture runs on a meta twin and quantized layers re-quantize
-        via PWAL on install."""
+        then post-PWAL (Marlin-packed / kernel layout). Capture reverts them to the
+        bf16 load-time skeletons via layerwise reload, and install re-quantizes via
+        PWAL."""
         return getattr(self._vllm_config, "quant_config", None) is not None
 
     # ---------------------------------------------------------------- capture
-    def _build_meta_twin(self) -> Module:
-        """Build a fresh twin of the model on ``meta`` to capture the bf16
-        load-time slice geometry.
-
-        Stripped of quantization: vLLM's fp8 ``create_weights`` makes params
-        directly as ``float8_e4m3fn``, so a same-config twin would have fp8 params
-        and every source would be a dtype mismatch (no bf16 layout to slice into).
-        An unquantized twin has bf16 params with the same structural fusion =
-        the load-time layout; the live fp8 model is re-quantized separately on
-        install. ``meta`` -> zero storage, discarded after capture."""
-        import copy as _copy
-
-        from vllm.model_executor.model_loader.utils import initialize_model
-        from vllm.utils.torch_utils import set_default_torch_dtype
-
-        # Strip quantization so the twin builds Unquantized (bf16) params.
-        twin_config = _copy.copy(self._vllm_config)
-        twin_mc = _copy.copy(self._vllm_config.model_config)
-        twin_mc.quantization = None
-        twin_config.model_config = twin_mc
-        twin_config.quant_config = None
-        # Attention.__init__ rejects a duplicate layer prefix in
-        # compilation_config.static_forward_context - the live model already
-        # populated it, so the twin needs its OWN empty registry.
-        twin_cc = _copy.copy(self._vllm_config.compilation_config)
-        twin_cc.static_forward_context = {}
-        twin_config.compilation_config = twin_cc
-
-        # Without set_default_torch_dtype the layers create params at torch's
-        # default (fp32), not the model's bf16 (vLLM's loader wraps init the same).
-        with set_default_torch_dtype(self._model_config.dtype), torch.device("meta"):
-            twin = initialize_model(twin_config)
-        logger.info(
-            "[reshard] built unquantized meta-twin for bf16 load-time geometry capture"
-        )
-        return twin
-
     def _capture(self, manifest: list) -> "tuple[CaptureResult, dict]":
+        from vllm.config import set_current_vllm_config
+        from vllm.model_executor.model_loader.reload.layerwise import (
+            LAYERWISE_INFO,
+            _get_original_loader,
+            _place_kernel_tensors,
+            initialize_layerwise_reload,
+        )
         from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-        # Always capture on a fresh meta twin (uniform for bf16 + quantized): its
-        # load_weights is pre-PWAL (bf16 load-time), which for a quantized model is
-        # the layout we slice into, and for bf16 is identical to the live params.
-        # Pass default_weight_loader so params WITHOUT a custom weight_loader
-        # (norms) are stamped and their copies attributed rather than dropped.
-        twin = self._build_meta_twin()
-        capture = capture_geometry(
-            twin, manifest, default_weight_loader=default_weight_loader
-        )
+        # Capture on the LIVE model, params reverted to bf16 load-time skeletons via
+        # layerwise reload (see module docstring). No weight data moves; restored below.
+        model = self._model
+        with torch.device(self._device), set_current_vllm_config(self._vllm_config):
+            initialize_layerwise_reload(model)
+            try:
+                # Trace the ORIGINAL loaders, not the reload shims they were wrapped in.
+                for _, param in model.named_parameters():
+                    param.weight_loader = _get_original_loader(param)
+                capture = capture_weights(
+                    model,
+                    convert_source_weights(self._convert_native_to_hf, manifest),
+                    default_weight_loader=default_weight_loader,
+                )
+                param_layout = {
+                    n: (tuple(p.shape), p.dtype) for n, p in model.named_parameters()
+                }
+            finally:
+                # Restore graph-bound kernel tensors; do NOT finalize (would corrupt
+                # the live params by committing a reload of the empty skeletons).
+                for layer in model.modules():
+                    info = LAYERWISE_INFO.get(layer)
+                    if info is not None:
+                        if info.kernel_tensors is not None:
+                            _place_kernel_tensors(layer, info)
+                        info.reset()
         logger.info(
             "[reshard] captured %d copies, %d unsupported (quantized=%s)",
             len(capture.copies),
             len(capture.unsupported),
             self._is_quantized,
         )
-        param_layout = {
-            n: (tuple(p.shape), p.dtype) for n, p in twin.named_parameters()
-        }
         return capture, param_layout
 
     # ---------------------------------------------------------------- install
