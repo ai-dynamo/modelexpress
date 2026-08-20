@@ -216,9 +216,12 @@ def default_placements(name: str, axis_of: dict[str, int], ndim: int) -> tuple[P
         return tuple(placements)
 
     if is_expert_param(name):
+        # A grouped expert tensor carries the expert dimension in front. EP
+        # shards that leading dimension, while TP still shards the shifted
+        # projection dimension when both axes are present.
         if "ep" in axis_of:
             placements[axis_of["ep"]] = Placement.shard(0)
-        elif "tp" in axis_of:
+        if "tp" in axis_of:
             shard_dim = default_shard_dim(name)
             if shard_dim is not None:
                 placements[axis_of["tp"]] = Placement.shard(shard_dim + 1)

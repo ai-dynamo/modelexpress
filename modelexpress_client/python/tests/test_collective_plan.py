@@ -333,6 +333,14 @@ class TestDefaultMesh:
         )
         assert placements[axis_of["ep"]].canonical() == "S0"
 
+    def test_expert_params_apply_both_ep_and_tp_placements(self):
+        _, axis_of = build_mesh(rank_count=8, tp_size=2, ep_size=4)
+        placements = default_placements(
+            "model.layers.0.mlp.experts.gate_proj.weight", axis_of, ndim=3
+        )
+        assert placements[axis_of["ep"]].canonical() == "S0"
+        assert placements[axis_of["tp"]].canonical() == "S1"
+
     def test_one_dimensional_params_replicate(self):
         _, axis_of = build_mesh(rank_count=8, tp_size=8)
         placements = default_placements("model.layers.0.input_layernorm.weight", axis_of, ndim=1)
