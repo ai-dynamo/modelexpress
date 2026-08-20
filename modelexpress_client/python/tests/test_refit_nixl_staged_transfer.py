@@ -24,10 +24,10 @@ from modelexpress_rl.inference.nixl_staged_transfer import (
     _NixlStagedTransfer,
     _plan_staged_transfer,
     _PreparedNixlTransfer,
-    _required_endpoints,
+    _required_agent_metadata,
     _ResolvedSources,
     _resolve_sources,
-    _handshake,
+    _load_agent_metadata,
 )
 
 
@@ -80,56 +80,47 @@ def test_exact_manifests_resolve_without_legacy_source_discovery():
         "trainer-0": "trainer-0",
         "trainer-1": "trainer-1",
     }
-    assert resolved.agent_endpoints == {
-        "trainer-0": "trainer-0:19000",
-        "trainer-1": "trainer-1:19001",
+    assert resolved.agent_metadata == {
+        "trainer-0": b"nixl-metadata",
+        "trainer-1": b"nixl-metadata",
     }
 
 
-def test_required_endpoints_rejects_incomplete_source_metadata():
+def test_required_agent_metadata_rejects_incomplete_source_metadata():
     plan = TransferPlan(segments=[PullSegment("session-a", 1, "weight", 0, 4)])
     resolved = _ResolvedSources(
         sources={},
         session_to_agent={"session-a": "agent-a"},
         session_to_device={},
-        agent_endpoints={"agent-a": "trainer:19000"},
+        agent_metadata={"agent-a": b"metadata"},
     )
-    assert _required_endpoints(plan, resolved) == {"agent-a": "trainer:19000"}
+    assert _required_agent_metadata(plan, resolved) == {"agent-a": b"metadata"}
 
     with pytest.raises(RuntimeError, match="unknown source sessions"):
-        _required_endpoints(
+        _required_agent_metadata(
             plan,
             _ResolvedSources({}, {}, {}, {}),
         )
-    with pytest.raises(RuntimeError, match="without metadata endpoints"):
-        _required_endpoints(
+    with pytest.raises(RuntimeError, match="without NIXL metadata"):
+        _required_agent_metadata(
             plan,
             _ResolvedSources({}, {"session-a": "agent-a"}, {}, {}),
         )
 
 
-def test_handshake_retries_and_reports_deadline(monkeypatch):
+def test_load_agent_metadata_validates_embedded_agent_identity():
     calls = []
-    sleeps = []
 
     class _Manager:
-        def fetch_remote_and_wait(self, agent, host, port, *, timeout_seconds):
-            calls.append((agent, host, port, timeout_seconds))
-            if len(calls) == 1:
-                raise RuntimeError("not ready")
+        def add_remote_agent(self, metadata):
+            calls.append(metadata)
+            return b"agent-a"
 
-    monkeypatch.setenv("MX_RESHARD_HANDSHAKE_TIMEOUT_S", "10")
-    monkeypatch.setattr(transfer_module.time, "sleep", sleeps.append)
-    _handshake(_Manager(), {"agent-a": "trainer:19000"})
+    _load_agent_metadata(_Manager(), {"agent-a": b"metadata"})
+    assert calls == [b"metadata"]
 
-    assert len(calls) == 2
-    assert sleeps
-
-    monkeypatch.setenv("MX_RESHARD_HANDSHAKE_TIMEOUT_S", "1")
-    monotonic = iter((0.0, 2.0))
-    monkeypatch.setattr(transfer_module.time, "monotonic", monotonic.__next__)
-    with pytest.raises(RuntimeError, match="did not complete before the deadline"):
-        _handshake(_Manager(), {"agent-a": "trainer:19000"})
+    with pytest.raises(RuntimeError, match="does not match its manifest"):
+        _load_agent_metadata(_Manager(), {"agent-b": b"metadata"})
 
 
 def test_transformed_source_is_fully_reconstructed_for_verification():

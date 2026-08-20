@@ -12,14 +12,12 @@ how an inference engine captures its load layout or installs received weights.
 from __future__ import annotations
 
 import time
-from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 
-from modelexpress import envs
 from modelexpress.nixl_transfer import NixlTransferManager
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
 from modelexpress.refit.reshard.rendezvous import (
@@ -51,7 +49,7 @@ class _ResolvedSources:
     sources: dict
     session_to_agent: dict
     session_to_device: dict
-    agent_endpoints: dict
+    agent_metadata: dict[str, bytes]
 
 
 @dataclass(frozen=True)
@@ -88,13 +86,15 @@ def _resolve_sources(manifests: list[bytes]) -> _ResolvedSources:
         sources=sources,
         session_to_agent=session_to_agent,
         session_to_device=session_to_device,
-        agent_endpoints={
-            payload.agent_name: payload.metadata_endpoint for payload in payloads
+        agent_metadata={
+            payload.agent_name: payload.agent_metadata for payload in payloads
         },
     )
 
 
-def _required_endpoints(plan: TransferPlan, resolved: _ResolvedSources) -> dict:
+def _required_agent_metadata(
+    plan: TransferPlan, resolved: _ResolvedSources
+) -> dict[str, bytes]:
     sessions = plan.sessions()
     missing_sessions = sorted(sessions - set(resolved.session_to_agent))
     if missing_sessions:
@@ -102,63 +102,32 @@ def _required_endpoints(plan: TransferPlan, resolved: _ResolvedSources) -> dict:
             f"transfer plan references unknown source sessions: {missing_sessions[:10]}"
         )
     needed = {resolved.session_to_agent[session] for session in sessions}
-    missing = sorted(needed - set(resolved.agent_endpoints))
+    missing = sorted(needed - set(resolved.agent_metadata))
     if missing:
         raise RuntimeError(
-            "transfer plan references source agents without metadata endpoints: "
+            "transfer plan references source agents without NIXL metadata: "
             f"{missing[:10]}"
         )
     return {
-        agent: endpoint
-        for agent, endpoint in resolved.agent_endpoints.items()
+        agent: metadata
+        for agent, metadata in resolved.agent_metadata.items()
         if agent in needed
     }
 
 
-def _handshake(manager: NixlTransferManager, endpoints: dict) -> None:
-    """Load every required peer registration within one bounded retry budget."""
-    pending = deque(endpoints.items())
-    attempts = {agent: 0 for agent in endpoints}
-    last_error: dict[str, Exception] = {}
-    deadline = time.monotonic() + envs.MX_RESHARD_HANDSHAKE_TIMEOUT_S
-    stalled = 0
-    while pending:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            outstanding = ", ".join(
-                f"{agent}@{endpoint} ({attempts[agent]} attempt(s), "
-                f"last={last_error.get(agent)!r})"
-                for agent, endpoint in pending
-            )
+def _load_agent_metadata(
+    manager: NixlTransferManager, metadata_by_agent: dict[str, bytes]
+) -> None:
+    """Load the exact source registrations carried by the version manifests."""
+    for expected_agent, metadata in metadata_by_agent.items():
+        loaded_agent = manager.add_remote_agent(metadata)
+        if isinstance(loaded_agent, bytes):
+            loaded_agent = loaded_agent.decode("utf-8")
+        if loaded_agent != expected_agent:
             raise RuntimeError(
-                "NIXL peer handshake did not complete before the deadline: "
-                f"{outstanding}"
+                "NIXL metadata agent does not match its manifest: "
+                f"expected {expected_agent!r}, got {loaded_agent!r}"
             )
-
-        agent, endpoint = pending.popleft()
-        attempts[agent] += 1
-        try:
-            host, port = endpoint.rsplit(":", 1)
-            manager.fetch_remote_and_wait(
-                agent,
-                host,
-                int(port),
-                timeout_seconds=min(envs.MX_RESHARD_HANDSHAKE_ATTEMPT_S, remaining),
-            )
-        except Exception as error:  # noqa: BLE001 - every dial error is retryable
-            last_error[agent] = error
-            pending.append((agent, endpoint))
-            stalled += 1
-            if stalled >= len(pending):
-                time.sleep(
-                    min(
-                        envs.MX_RESHARD_HANDSHAKE_BACKOFF_S,
-                        max(0.0, deadline - time.monotonic()),
-                    )
-                )
-                stalled = 0
-            continue
-        stalled = 0
 
 
 def _replay_ops(tensor: torch.Tensor, op_chain: tuple) -> torch.Tensor:
@@ -289,6 +258,7 @@ class _NixlStagedTransfer:
         self._convert_registered = False
         self._full_registered = False
         self._active: _PreparedNixlTransfer | None = None
+        self._loaded_agent_metadata: dict[str, bytes] = {}
         self._generation = 0
         self._closed = False
 
@@ -315,7 +285,24 @@ class _NixlStagedTransfer:
         capture, parameter_layout = capture_layout(manifest)
         plan = _plan_staged_transfer(capture, resolved.sources)
         self._validate_complete(capture, parameter_layout, plan)
-        _handshake(self._manager, _required_endpoints(plan, resolved))
+        required_metadata = _required_agent_metadata(plan, resolved)
+        changed = {
+            agent: metadata
+            for agent, metadata in required_metadata.items()
+            if self._loaded_agent_metadata.get(agent) != metadata
+        }
+        conflicting = sorted(
+            agent
+            for agent in changed
+            if agent in self._loaded_agent_metadata
+        )
+        if conflicting:
+            raise RuntimeError(
+                "NIXL metadata changed for an already connected source agent: "
+                f"{conflicting[:10]}"
+            )
+        _load_agent_metadata(self._manager, changed)
+        self._loaded_agent_metadata.update(changed)
         transport = NixlReshardTransport(
             self._manager,
             resolved.session_to_agent,
