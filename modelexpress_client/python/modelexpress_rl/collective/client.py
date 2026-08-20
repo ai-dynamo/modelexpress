@@ -19,17 +19,45 @@ The sequencing is the contract, and two of its rules are load-bearing here:
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from typing import Any
 
 from . import envs
-from .backend import DEFAULT_LAYER_GROUP, NcclM2nReceiver, NcclM2nSender
-from .comm import CommunicatorCache, LaneKey, new_unique_id
+from .backend import (
+    DEFAULT_LAYER_GROUP,
+    NcclM2nReceiver,
+    NcclM2nSender,
+    require_nccl_m2n,
+)
+from .comm import CommunicatorCache, LaneCommunicator, LaneKey, new_unique_id
 from .plan import plan_digest, validate_coverage
 from .rendezvous import CollectiveRendezvous, Membership
-from .spi import Loader, Publisher
+from .spi import Loader, Publisher, resolve_specs
 from .types import ReshardPlan, Role
 
 logger = logging.getLogger("modelexpress_rl.collective.client")
+
+
+def _bootstrap_barrier(lane: LaneCommunicator, device: Any) -> None:
+    """Full-group barrier used between overlapping communicator initializations."""
+    import torch
+
+    device_context = torch.cuda.device(device) if device is not None else nullcontext()
+    with device_context:
+        barrier = torch.zeros(
+            1, dtype=torch.uint8, device=device if device is not None else "cuda"
+        )
+        stream = lane.stream
+        stream_arg = (
+            None if stream is None else int(getattr(stream, "cuda_stream", stream))
+        )
+        lane.handle.broadcast(
+            sendbuf=barrier,
+            recvbuf=barrier,
+            root=0,
+            stream=stream_arg,
+        )
+        lane.synchronize()
 
 
 class _RefitClientBase:
@@ -59,11 +87,15 @@ class _RefitClientBase:
         self._streams = list(streams) if streams else [None]
 
         self._cache = CommunicatorCache()
+        self._publisher: Publisher | None = None
+        self._loader: Loader | None = None
+        self._expected_parameters: list[str] | None = None
         self._plan: ReshardPlan | None = None
         self._digest: str | None = None
         self._membership: Membership | None = None
         self._half: NcclM2nSender | NcclM2nReceiver | None = None
         self._groupings: list[list[str]] | None = None
+        self._round_started = False
 
     @property
     def membership(self) -> Membership:
@@ -79,8 +111,20 @@ class _RefitClientBase:
 
     def _capture(self, engine: Publisher | Loader, expected: list[str] | None) -> None:
         plan = engine.capture()
-        if expected is not None:
-            validate_coverage(plan, expected)
+        if plan.source_partition_count != self._source_partition_count:
+            raise ValueError(
+                "captured plan source_partition_count does not match the group spec: "
+                f"{plan.source_partition_count} != {self._source_partition_count}"
+            )
+        if expected is None:
+            parameter_names = getattr(engine, "parameter_names", None)
+            if not callable(parameter_names):
+                raise ValueError(
+                    "expected_parameters is required unless the Publisher/Loader "
+                    "implements parameter_names(); plan coverage cannot be optional"
+                )
+            expected = list(parameter_names())
+        validate_coverage(plan, list(expected))
         self._plan = plan
         self._digest = plan_digest(plan)
 
@@ -99,9 +143,12 @@ class _RefitClientBase:
         """
         return self._streams[lane_id % len(self._streams)]
 
-    def _join_and_bootstrap(self, role: Role, source_partition: int | None) -> Membership:
+    def _join_and_bootstrap(
+        self, role: Role, source_partition: int | None
+    ) -> Membership:
         if self._digest is None:
             raise RuntimeError("initialize must run before compute_plan")
+        require_nccl_m2n()
 
         membership = self._rendezvous.join(
             model_name=self._model_name,
@@ -115,11 +162,34 @@ class _RefitClientBase:
             plan_digest=self._digest,
             source_partition=source_partition,
         )
-        # A membership or plan change invalidates both the cached communicator
-        # and the cached plan, and the epoch is the single signal for both.
+        expected_reshard = (
+            {source_partition}
+            if role is Role.TRAINER and source_partition is not None
+            else set(range(self._source_partition_count))
+        )
+        actual_reshard = {lane.lane_id for lane in membership.reshard_lanes}
+        if actual_reshard != expected_reshard:
+            raise RuntimeError(
+                "MX returned unexpected reshard-lane membership: "
+                f"expected {sorted(expected_reshard)}, got {sorted(actual_reshard)}"
+            )
+        if membership.broadcast_lane.lane_id != self._source_partition_count:
+            raise RuntimeError(
+                "MX returned an unexpected broadcast lane id: "
+                f"expected {self._source_partition_count}, got "
+                f"{membership.broadcast_lane.lane_id}"
+            )
+
+        previous = self._membership
+        if previous is not None and previous.group_id != membership.group_id:
+            self._cache.abort_group(previous.group_id)
+        # An epoch move invalidates every cached communicator. The plan was
+        # freshly captured before this join and is guarded by its digest.
         dropped = self._cache.invalidate_epoch(membership.group_id, membership.epoch)
         if dropped:
-            logger.info("epoch moved to %s; dropped %s stale lane(s)", membership.epoch, dropped)
+            logger.info(
+                "epoch moved to %s; dropped %s stale lane(s)", membership.epoch, dropped
+            )
 
         if membership.is_bootstrap_leader:
             for lane in membership.reshard_lanes:
@@ -145,23 +215,60 @@ class _RefitClientBase:
             group_id=membership.group_id, epoch=membership.epoch
         )
 
-        for lane in group.lanes:
-            try:
-                mine = membership.lane(lane.lane_id)
-            except KeyError:
-                continue
-            self._cache.create(
-                LaneKey(
-                    group_id=membership.group_id,
-                    epoch=membership.epoch,
-                    lane_id=lane.lane_id,
-                ),
-                rank=mine.rank_in_lane,
-                world_size=mine.world_size,
-                unique_id=bytes(lane.nccl_unique_id),
-                device=self._device,
-                stream=self._stream_for(lane.lane_id),
+        by_lane_id = {lane.lane_id: lane for lane in group.lanes}
+        all_lane_ids = set(range(self._source_partition_count)) | {
+            membership.broadcast_lane.lane_id
+        }
+        missing = sorted(all_lane_ids - set(by_lane_id))
+        if missing:
+            raise RuntimeError(
+                f"READY group omitted lane(s) assigned to this worker: {missing}"
             )
+
+        # All ranks create the broadcast communicator first. It then provides a
+        # full-group barrier after every reshard-lane init. Without those
+        # barriers, a PP-stage trainer can enter lane N+1 while generators are
+        # still initializing lane N; overlapping communicator creation can hang.
+        lane_order = [membership.broadcast_lane.lane_id] + list(
+            range(self._source_partition_count)
+        )
+        try:
+            for lane_id in lane_order:
+                lane_record = by_lane_id[lane_id]
+                try:
+                    mine = membership.lane(lane_id)
+                except KeyError:
+                    mine = None
+                if mine is not None:
+                    self._cache.create(
+                        LaneKey(
+                            group_id=membership.group_id,
+                            epoch=membership.epoch,
+                            lane_id=lane_id,
+                        ),
+                        rank=mine.rank_in_lane,
+                        world_size=mine.world_size,
+                        unique_id=bytes(lane_record.nccl_unique_id),
+                        device=self._device,
+                        stream=self._stream_for(lane_id),
+                    )
+
+                broadcast = self._cache.get(
+                    LaneKey(
+                        group_id=membership.group_id,
+                        epoch=membership.epoch,
+                        lane_id=membership.broadcast_lane.lane_id,
+                    )
+                )
+                if broadcast is None:
+                    raise RuntimeError(
+                        "broadcast communicator was not initialized first"
+                    )
+                _bootstrap_barrier(broadcast, self._device)
+        except BaseException:
+            self._cache.abort_group(membership.group_id)
+            self._membership = None
+            raise
 
         self._membership = membership
         return membership
@@ -171,6 +278,7 @@ class _RefitClientBase:
             self._cache.abort_group(self._membership.group_id)
         self._membership = None
         self._half = None
+        self._round_started = False
 
 
 class RefitClientTrainer(_RefitClientBase):
@@ -183,45 +291,89 @@ class RefitClientTrainer(_RefitClientBase):
         source_partition: int,
         expected_parameters: list[str] | None = None,
     ) -> None:
+        if not 0 <= source_partition < self._source_partition_count:
+            raise ValueError(
+                f"source_partition must be in [0, {self._source_partition_count}), "
+                f"got {source_partition}"
+            )
         self._publisher = publisher
         self._source_partition = source_partition
-        self._capture(publisher, expected_parameters)
+        self._expected_parameters = (
+            list(expected_parameters) if expected_parameters is not None else None
+        )
+        self._capture(publisher, self._expected_parameters)
 
     def compute_plan(self) -> Membership:
+        if self._publisher is None:
+            raise RuntimeError("initialize must run before compute_plan")
+        self._capture(self._publisher, self._expected_parameters)
+        specs = self._publisher.local_params()
+        required = [
+            entry.name
+            for entry in self.plan.bulk
+            if entry.partition_id == self._source_partition
+        ] + [entry.name for entry in self.plan.misc]
+        # Resolve storage before joining. READY must not include a worker that
+        # will discover only afterward that it cannot issue the agreed ops.
+        resolve_specs(self.plan, specs, required)
         membership = self._join_and_bootstrap(Role.TRAINER, self._source_partition)
-        self._half = NcclM2nSender(
-            plan=self.plan,
-            specs=self._publisher.local_params(),
-            group_id=membership.group_id,
-            epoch=membership.epoch,
-            cache=self._cache,
-        )
-        self._half.setup_layer_groups(self._groupings)
+        try:
+            self._half = NcclM2nSender(
+                plan=self.plan,
+                specs=specs,
+                group_id=membership.group_id,
+                epoch=membership.epoch,
+                cache=self._cache,
+                source_partition=self._source_partition,
+            )
+            self._half.setup_layer_groups(self._groupings)
+        except BaseException:
+            self._cache.abort_group(membership.group_id)
+            self._membership = None
+            self._half = None
+            raise
         return membership
 
     def start_weight_update(self, version: str) -> None:
         if self._half is None:
             raise RuntimeError("compute_plan must run before start_weight_update")
+        if self._publisher is None:
+            raise RuntimeError("initialize must run before start_weight_update")
         self._publisher.start_new_round(version)
         self._half.start_weight_update(version)
+        self._round_started = True
 
-    def publish_weights(self, version: str, layer_group_id: int = DEFAULT_LAYER_GROUP) -> None:
+    def publish_weights(
+        self, version: str, layer_group_id: int = DEFAULT_LAYER_GROUP
+    ) -> None:
         if self._half is None:
+            raise RuntimeError("compute_plan must run before publish_weights")
+        if not self._round_started:
             raise RuntimeError("start_weight_update must run before publish_weights")
         self._half.publish_weights(layer_group_id)
 
-    def finish_weight_update(self, version: str, operation_id: str | None = None) -> None:
+    def finish_weight_update(
+        self, version: str, operation_id: str | None = None
+    ) -> None:
         if self._half is None:
-            raise RuntimeError("start_weight_update must run before finish_weight_update")
+            raise RuntimeError("compute_plan must run before finish_weight_update")
+        if not self._round_started:
+            raise RuntimeError(
+                "start_weight_update must run before finish_weight_update"
+            )
         try:
             self._half.finish_weight_update(self.membership.broadcast_lane.lane_id)
         except Exception as error:
             self._report(operation_id, succeeded=False, message=repr(error))
             self._half.abort()
             raise
+        finally:
+            self._round_started = False
         self._report(operation_id, succeeded=True)
 
-    def _report(self, operation_id: str | None, *, succeeded: bool, message: str = "") -> None:
+    def _report(
+        self, operation_id: str | None, *, succeeded: bool, message: str = ""
+    ) -> None:
         if operation_id is None:
             return
         self._rendezvous.report(
@@ -234,7 +386,9 @@ class RefitClientTrainer(_RefitClientBase):
         )
 
     def cleanup(self) -> None:
-        self._publisher.cleanup()
+        if self._publisher is not None:
+            self._publisher.cleanup()
+        self._publisher = None
         super().cleanup()
 
 
@@ -248,35 +402,66 @@ class RefitClientGenerator(_RefitClientBase):
         expected_parameters: list[str] | None = None,
     ) -> None:
         self._loader = loader
-        self._capture(loader, expected_parameters)
+        self._expected_parameters = (
+            list(expected_parameters) if expected_parameters is not None else None
+        )
+        self._capture(loader, self._expected_parameters)
 
     def compute_plan(self) -> Membership:
+        if self._loader is None:
+            raise RuntimeError("initialize must run before compute_plan")
+        self._capture(self._loader, self._expected_parameters)
+        specs = self._loader.local_params()
+        resolve_specs(self.plan, specs)
         membership = self._join_and_bootstrap(Role.GENERATOR, None)
-        self._half = NcclM2nReceiver(
-            plan=self.plan,
-            specs=self._loader.local_params(),
-            group_id=membership.group_id,
-            epoch=membership.epoch,
-            cache=self._cache,
-        )
-        self._half.setup_layer_groups(self._groupings)
+        try:
+            self._half = NcclM2nReceiver(
+                plan=self.plan,
+                specs=specs,
+                group_id=membership.group_id,
+                epoch=membership.epoch,
+                cache=self._cache,
+            )
+            self._half.setup_layer_groups(self._groupings)
+        except BaseException:
+            self._cache.abort_group(membership.group_id)
+            self._membership = None
+            self._half = None
+            raise
         return membership
 
     def start_weight_update(self, version: str) -> None:
         if self._half is None:
             raise RuntimeError("compute_plan must run before start_weight_update")
+        if self._loader is None:
+            raise RuntimeError("initialize must run before start_weight_update")
         self._loader.start_new_round(version)
         self._half.start_weight_update(version)
+        self._round_started = True
 
-    def update_weights(self, version: str, layer_group_id: int = DEFAULT_LAYER_GROUP) -> None:
+    def update_weights(
+        self, version: str, layer_group_id: int = DEFAULT_LAYER_GROUP
+    ) -> None:
         if self._half is None:
+            raise RuntimeError("compute_plan must run before update_weights")
+        if not self._round_started:
             raise RuntimeError("start_weight_update must run before update_weights")
+        if self._loader is None:
+            raise RuntimeError("initialize must run before update_weights")
         self._half.update_weights(layer_group_id)
         self._loader.install(layer_group_id)
 
-    def finish_weight_update(self, version: str, operation_id: str | None = None) -> None:
+    def finish_weight_update(
+        self, version: str, operation_id: str | None = None
+    ) -> None:
         if self._half is None:
-            raise RuntimeError("start_weight_update must run before finish_weight_update")
+            raise RuntimeError("compute_plan must run before finish_weight_update")
+        if not self._round_started:
+            raise RuntimeError(
+                "start_weight_update must run before finish_weight_update"
+            )
+        if self._loader is None:
+            raise RuntimeError("initialize must run before finish_weight_update")
         try:
             self._half.finish_weight_update(self.membership.broadcast_lane.lane_id)
             self._loader.finish()
@@ -284,9 +469,13 @@ class RefitClientGenerator(_RefitClientBase):
             self._report(operation_id, succeeded=False, message=repr(error))
             self._half.abort()
             raise
+        finally:
+            self._round_started = False
         self._report(operation_id, succeeded=True)
 
-    def _report(self, operation_id: str | None, *, succeeded: bool, message: str = "") -> None:
+    def _report(
+        self, operation_id: str | None, *, succeeded: bool, message: str = ""
+    ) -> None:
         if operation_id is None:
             return
         self._rendezvous.report(
@@ -299,7 +488,9 @@ class RefitClientGenerator(_RefitClientBase):
         )
 
     def cleanup(self) -> None:
-        self._loader.cleanup()
+        if self._loader is not None:
+            self._loader.cleanup()
+        self._loader = None
         super().cleanup()
 
 

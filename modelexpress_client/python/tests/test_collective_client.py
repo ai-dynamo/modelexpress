@@ -10,11 +10,15 @@ blocked on peers that will never arrive.
 """
 
 import sys
+from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 
 import pytest
 
+import modelexpress_rl.collective.client as collective_client
 from modelexpress_rl.collective import (
+    CommunicatorCache,
+    LaneKey,
     LocalParamSpec,
     MeshSpec,
     MiscParam,
@@ -24,6 +28,7 @@ from modelexpress_rl.collective import (
     RefitClientTrainer,
     ReshardPlan,
 )
+from modelexpress_rl.collective.comm import new_unique_id
 from modelexpress_rl.collective.rendezvous import LaneMembership, Membership
 
 
@@ -53,8 +58,13 @@ class FakeEngine:
     def capture(self):
         return self._plan
 
+    def parameter_names(self):
+        return self._plan.parameter_names()
+
     def local_params(self):
-        return {n: LocalParamSpec(base=f"buf::{n}") for n in self._plan.parameter_names()}
+        return {
+            n: LocalParamSpec(base=f"buf::{n}") for n in self._plan.parameter_names()
+        }
 
     def start_new_round(self, version):
         self.calls.append(("start", version))
@@ -106,6 +116,29 @@ class FakeRendezvous:
         return SimpleNamespace(operation_id=kwargs["operation_id"])
 
 
+class FakeRendezvousPP2(FakeRendezvous):
+    def join(self, **kwargs):
+        self.joins += 1
+        source_partition = kwargs["source_partition"]
+        assert source_partition == 1
+        return Membership(
+            group_id="g",
+            epoch=1,
+            lanes=(
+                LaneMembership(1, "RESHARD", 0, 4),
+                LaneMembership(2, "BROADCAST", 2, 6),
+            ),
+            is_bootstrap_leader=True,
+        )
+
+    def await_ready(self, *, group_id, epoch, **kwargs):
+        lanes = [
+            SimpleNamespace(lane_id=i, nccl_unique_id=bytes([i]) * 128)
+            for i in range(3)
+        ]
+        return SimpleNamespace(group_id=group_id, epoch=epoch, lanes=lanes)
+
+
 @pytest.fixture
 def fake_nccl(monkeypatch):
     ops = []
@@ -120,21 +153,47 @@ def fake_nccl(monkeypatch):
         def abort(self):
             ops.append("abort")
 
+        def get_async_error(self):
+            return Result.Success
+
+        def get_last_error(self):
+            return ""
+
+    class NCCLConfig:
+        def __init__(self, *, blocking=None):
+            self.blocking = blocking
+
+    class Result:
+        Success = 0
+        InProgress = 7
+
     m2n = ModuleType("nccl.m2n")
     m2n.reshard = reshard
     communicator = ModuleType("nccl.core.communicator")
+    communicator.NCCLConfig = NCCLConfig
     communicator.Communicator = SimpleNamespace(init=lambda **kw: Comm())
     utils = ModuleType("nccl.core.utils")
     utils.get_unique_id = lambda: SimpleNamespace(as_bytes=b"\x07" * 128)
     utils.UniqueId = SimpleNamespace(from_bytes=lambda raw: raw)
+    bindings = ModuleType("nccl.bindings.nccl")
+    bindings.Result = Result
     for name, mod in [
         ("nccl", ModuleType("nccl")),
+        ("nccl.bindings", ModuleType("nccl.bindings")),
+        ("nccl.bindings.nccl", bindings),
         ("nccl.core", ModuleType("nccl.core")),
         ("nccl.core.communicator", communicator),
         ("nccl.core.utils", utils),
         ("nccl.m2n", m2n),
     ]:
         monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.setattr(
+        collective_client, "_bootstrap_barrier", lambda lane, device: None
+    )
+    monkeypatch.setattr(
+        "modelexpress_rl.collective.comm.LaneCommunicator.synchronize",
+        lambda self: None,
+    )
     return ops
 
 
@@ -163,10 +222,8 @@ class TestSequencing:
     def test_publish_before_start_is_refused(self, fake_nccl):
         client = trainer(FakeRendezvous(), FakeEngine())
         client.compute_plan()
-        # The half exists after compute_plan, so this checks the rounds are
-        # still bracketed rather than that the object is missing.
-        client.start_weight_update("v1")
-        client.publish_weights("v1")
+        with pytest.raises(RuntimeError, match="start_weight_update must run"):
+            client.publish_weights("v1")
 
     def test_membership_is_unavailable_before_compute_plan(self):
         client = trainer(FakeRendezvous(), FakeEngine())
@@ -188,6 +245,153 @@ class TestBootstrap:
         trainer(rz, FakeEngine()).compute_plan()
         assert rz.published == []
 
+    def test_every_worker_barriers_between_global_pp_lane_initializations(
+        self, fake_nccl, monkeypatch
+    ):
+        plan = ReshardPlan(
+            bulk=[entry("a", partition=0), entry("b", partition=1)],
+            misc=[MiscParam("m", (4,), "bfloat16")],
+            source_partition_count=2,
+        )
+        engine = FakeEngine(plan)
+        client = RefitClientTrainer(
+            rendezvous=FakeRendezvousPP2(),
+            model_name="m",
+            trainer_slots=["t0", "t1", "t2", "t3"],
+            generator_slots=["g0", "g1"],
+            source_partition_count=2,
+            slot_id="t2",
+            worker_id="w2",
+            index_in_role=2,
+        )
+        client.initialize(engine, source_partition=1)
+
+        events = []
+        original_create = client._cache.create
+
+        def create(key, **kwargs):
+            events.append(("create", key.lane_id))
+            return original_create(key, **kwargs)
+
+        monkeypatch.setattr(client._cache, "create", create)
+        monkeypatch.setattr(
+            collective_client,
+            "_bootstrap_barrier",
+            lambda lane, device: events.append(("barrier", lane.rank)),
+        )
+
+        client.compute_plan()
+
+        # This stage-1 trainer is not in lane 0, but it still waits at lane 0's
+        # full-group barrier before it is allowed to initialize lane 1.
+        assert events == [
+            ("create", 2),
+            ("barrier", 2),
+            ("barrier", 2),
+            ("create", 1),
+            ("barrier", 2),
+        ]
+
+
+class TestCommunicatorBootstrap:
+    def test_init_is_nonblocking_bounded_and_device_scoped(
+        self, fake_nccl, monkeypatch
+    ):
+        import torch
+
+        seen = {}
+        communicator = sys.modules["nccl.core.communicator"]
+        original_init = communicator.Communicator.init
+
+        def init(**kwargs):
+            seen["config"] = kwargs["config"]
+            return original_init(**kwargs)
+
+        @contextmanager
+        def device_context(device):
+            seen["device"] = device
+            yield
+
+        communicator.Communicator.init = init
+        monkeypatch.setattr(torch.cuda, "device", device_context)
+        cache = CommunicatorCache()
+        cache.create(
+            LaneKey("g", 1, 0),
+            rank=0,
+            world_size=2,
+            unique_id=b"x" * 128,
+            device=3,
+            stream=None,
+            timeout_s=0.1,
+        )
+
+        assert seen["config"].blocking is False
+        assert seen["device"] == 3
+
+    def test_a_stalled_nonblocking_init_is_aborted_at_the_deadline(
+        self, fake_nccl, monkeypatch
+    ):
+        bindings = sys.modules["nccl.bindings.nccl"]
+        communicator = sys.modules["nccl.core.communicator"]
+
+        class Stuck:
+            def __init__(self):
+                self.aborted = False
+
+            def get_async_error(self):
+                return bindings.Result.InProgress
+
+            def abort(self):
+                self.aborted = True
+
+        stuck = Stuck()
+        communicator.Communicator.init = lambda **kwargs: stuck
+        cache = CommunicatorCache()
+        with pytest.raises(TimeoutError, match="did not complete"):
+            cache.create(
+                LaneKey("g", 1, 0),
+                rank=0,
+                world_size=2,
+                unique_id=b"x" * 128,
+                device=None,
+                stream=None,
+                timeout_s=0.001,
+            )
+        assert stuck.aborted
+
+    def test_forced_nccl_comm_id_is_rejected_before_minting(
+        self, fake_nccl, monkeypatch
+    ):
+        monkeypatch.setenv("NCCL_COMM_ID", "mxray-gen:1234")
+        with pytest.raises(RuntimeError, match="incompatible with MX-brokered"):
+            new_unique_id()
+        with pytest.raises(RuntimeError, match="incompatible with MX-brokered"):
+            CommunicatorCache().create(
+                LaneKey("g", 1, 0),
+                rank=1,
+                world_size=2,
+                unique_id=b"x" * 128,
+                device=None,
+                stream=None,
+                timeout_s=0.1,
+            )
+
+    def test_blocking_override_cannot_silently_disable_the_timeout(
+        self, fake_nccl, monkeypatch
+    ):
+        monkeypatch.setenv("NCCL_COMM_BLOCKING", "1")
+        cache = CommunicatorCache()
+        with pytest.raises(RuntimeError, match="defeat.*TIMEOUT"):
+            cache.create(
+                LaneKey("g", 1, 0),
+                rank=0,
+                world_size=2,
+                unique_id=b"x" * 128,
+                device=None,
+                stream=None,
+                timeout_s=0.1,
+            )
+
 
 class TestEpochInvalidation:
     def test_a_second_compute_plan_at_a_new_epoch_rebuilds_the_lanes(self, fake_nccl):
@@ -199,6 +403,55 @@ class TestEpochInvalidation:
         # Stale lanes are dropped and rebuilt, not accumulated alongside.
         assert len(client._cache) == first
         assert client.membership.epoch == 2
+
+
+class TestPlanGates:
+    def test_coverage_evidence_is_mandatory(self):
+        class NoInventory:
+            def capture(self):
+                return PLAN
+
+        client = RefitClientTrainer(
+            rendezvous=FakeRendezvous(),
+            model_name="m",
+            trainer_slots=["t0", "t1"],
+            generator_slots=["g0", "g1"],
+            source_partition_count=1,
+            slot_id="t0",
+            worker_id="w0",
+            index_in_role=0,
+        )
+        with pytest.raises(ValueError, match="coverage cannot be optional"):
+            client.initialize(NoInventory(), source_partition=0)
+
+    def test_plan_partition_count_must_match_the_join_spec(self):
+        plan = ReshardPlan(
+            bulk=[entry("a")],
+            source_partition_count=2,
+        )
+        client = RefitClientTrainer(
+            rendezvous=FakeRendezvous(),
+            model_name="m",
+            trainer_slots=["t0", "t1"],
+            generator_slots=["g0", "g1"],
+            source_partition_count=1,
+            slot_id="t0",
+            worker_id="w0",
+            index_in_role=0,
+        )
+        with pytest.raises(ValueError, match="does not match the group spec"):
+            client.initialize(FakeEngine(plan), source_partition=0)
+
+    def test_missing_local_storage_fails_before_the_worker_joins(self, fake_nccl):
+        class MissingLocal(FakeEngine):
+            def local_params(self):
+                return {"a": LocalParamSpec(base="buf::a")}
+
+        rz = FakeRendezvous()
+        client = trainer(rz, MissingLocal())
+        with pytest.raises(KeyError, match="no local storage"):
+            client.compute_plan()
+        assert rz.joins == 0
 
 
 class TestRefitRound:
@@ -296,3 +549,16 @@ class TestCleanup:
         client.cleanup()
         assert ("cleanup",) in engine.calls
         assert len(client._cache) == 0
+
+    def test_cleanup_is_safe_before_initialize(self):
+        client = RefitClientTrainer(
+            rendezvous=FakeRendezvous(),
+            model_name="m",
+            trainer_slots=["t0"],
+            generator_slots=["g0"],
+            source_partition_count=1,
+            slot_id="t0",
+            worker_id="w0",
+            index_in_role=0,
+        )
+        client.cleanup()

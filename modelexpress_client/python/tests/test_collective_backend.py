@@ -63,6 +63,22 @@ def recorder(monkeypatch):
     return rec
 
 
+class FakeStream:
+    def __init__(self, rec, name):
+        self._rec = rec
+        self._name = name
+        self.cuda_stream = hash(name) & 0xFFFF
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def synchronize(self):
+        self._rec.ops.append(SimpleNamespace(kind="sync", stream=self._name))
+
+
 class FakeComm:
     def __init__(self, rec, name):
         self._rec = rec
@@ -78,11 +94,18 @@ class FakeComm:
         self.aborted = True
 
 
-def lane(rec, name, *, rank=0, world=4, stream=None):
-    return LaneCommunicator(FakeComm(rec, name), rank=rank, world_size=world, stream=stream)
+_DEFAULT_STREAM = object()
 
 
-def entry(name, partition=0):
+def lane(rec, name, *, rank=0, world=4, stream=_DEFAULT_STREAM):
+    if stream is _DEFAULT_STREAM:
+        stream = FakeStream(rec, f"stream::{name}")
+    return LaneCommunicator(
+        FakeComm(rec, name), rank=rank, world_size=world, stream=stream
+    )
+
+
+def entry(name, partition=0, group_key=None):
     return ParamPlan(
         name=name,
         global_shape=(8, 4),
@@ -92,15 +115,38 @@ def entry(name, partition=0):
         src_placements=(Placement.shard(0),),
         dst_mesh=MeshSpec(shape=(2,), rank_offset=2),
         dst_placements=(Placement.shard(0),),
+        group_key=group_key,
     )
 
 
-def build(rec, *, plan, half_cls, partitions=1):
+def build(
+    rec,
+    *,
+    plan,
+    half_cls,
+    partitions=1,
+    source_partition=None,
+    with_streams=True,
+):
     cache = CommunicatorCache()
     for lane_id in range(partitions + 1):
-        cache._lanes[LaneKey("g", 1, lane_id)] = lane(rec, f"lane{lane_id}")
-    specs = {name: LocalParamSpec(base=f"buf::{name}") for name in plan.parameter_names()}
-    half = half_cls(plan=plan, specs=specs, group_id="g", epoch=1, cache=cache)
+        stream = _DEFAULT_STREAM if with_streams else None
+        cache._lanes[LaneKey("g", 1, lane_id)] = lane(
+            rec, f"lane{lane_id}", stream=stream
+        )
+    specs = {
+        name: LocalParamSpec(base=f"buf::{name}") for name in plan.parameter_names()
+    }
+    kwargs = {
+        "plan": plan,
+        "specs": specs,
+        "group_id": "g",
+        "epoch": 1,
+        "cache": cache,
+    }
+    if half_cls is NcclM2nSender:
+        kwargs["source_partition"] = source_partition
+    half = half_cls(**kwargs)
     return half, cache
 
 
@@ -110,7 +156,7 @@ class TestOpOrdering:
         # publish_weights call means entering the all-ranks communicator while
         # another group is still resharding, which deadlocks.
         plan = ReshardPlan(
-            bulk=[entry("a"), entry("b")],
+            bulk=[entry("a", group_key="g0"), entry("b", group_key="g1")],
             misc=[MiscParam("m", (4,), "bfloat16")],
         )
         half, _ = build(recorder, plan=plan, half_cls=NcclM2nSender)
@@ -122,7 +168,13 @@ class TestOpOrdering:
         assert [op.kind for op in recorder.ops] == ["reshard", "reshard"]
 
         half.finish_weight_update(broadcast_lane_id=1)
-        assert [op.kind for op in recorder.ops] == ["reshard", "reshard", "broadcast"]
+        assert [op.kind for op in recorder.ops] == [
+            "reshard",
+            "reshard",
+            "sync",
+            "broadcast",
+            "sync",
+        ]
 
     def test_the_broadcast_runs_once_per_refit_not_once_per_call(self, recorder):
         plan = ReshardPlan(bulk=[entry("a")], misc=[MiscParam("m", (4,), "f")])
@@ -155,6 +207,14 @@ class TestOpOrdering:
         received = [op.kind for op in recorder.ops]
 
         assert sent == received
+        assert sent == [
+            "reshard",
+            "reshard",
+            "sync",
+            "broadcast",
+            "broadcast",
+            "sync",
+        ]
 
     def test_each_half_supplies_only_its_own_end(self, recorder):
         # Co-called: the trainer passes dst=None, the generator src=None, and
@@ -176,7 +236,16 @@ class TestOpOrdering:
 
     def test_both_meshes_travel_with_every_transfer(self, recorder):
         plan = ReshardPlan(bulk=[entry("a")])
-        sender, _ = build(recorder, plan=plan, half_cls=NcclM2nSender)
+        cache = CommunicatorCache()
+        cache._lanes[LaneKey("g", 1, 0)] = lane(recorder, "lane0", stream=None)
+        cache._lanes[LaneKey("g", 1, 1)] = lane(recorder, "lane1", stream=None)
+        sender = NcclM2nSender(
+            plan=plan,
+            specs={"a": LocalParamSpec(base="buf::a")},
+            group_id="g",
+            epoch=1,
+            cache=cache,
+        )
         sender.start_weight_update("v")
         sender.publish_weights(0)
         assert recorder.ops[0].src_mesh == [0, 1]
@@ -194,12 +263,22 @@ class TestOpOrdering:
         from torch.distributed.tensor.placement_types import Shard
 
         plan = ReshardPlan(bulk=[entry("a")])
-        sender, _ = build(recorder, plan=plan, half_cls=NcclM2nSender)
+        sender, _ = build(
+            recorder,
+            plan=plan,
+            half_cls=NcclM2nSender,
+            with_streams=False,
+        )
         sender.start_weight_update("v")
         sender.publish_weights(0)
 
         op = recorder.ops[0]
-        assert set(op.kwargs) == {"src_mesh", "src_placements", "dst_mesh", "dst_placements"}
+        assert set(op.kwargs) == {
+            "src_mesh",
+            "src_placements",
+            "dst_mesh",
+            "dst_placements",
+        }
         assert isinstance(op.kwargs["src_placements"][0], Shard)
         assert op.kwargs["src_placements"][0].dim == 0
 
@@ -215,7 +294,9 @@ class TestOpOrdering:
             dst_mesh=MeshSpec(shape=(2,), rank_offset=4),
             dst_placements=(Placement.shard(0),),
         )
-        sender, _ = build(recorder, plan=ReshardPlan(bulk=[nested]), half_cls=NcclM2nSender)
+        sender, _ = build(
+            recorder, plan=ReshardPlan(bulk=[nested]), half_cls=NcclM2nSender
+        )
         sender.start_weight_update("v")
         sender.publish_weights(0)
         assert recorder.ops[0].src_mesh == [[0, 1], [2, 3]]
@@ -239,14 +320,51 @@ class TestOpOrdering:
 
 class TestLaneRouting:
     def test_a_parameter_goes_to_its_partition_s_lane(self, recorder):
-        plan = ReshardPlan(bulk=[entry("a", partition=0), entry("b", partition=1)])
+        plan = ReshardPlan(
+            bulk=[entry("a", partition=0), entry("b", partition=1)],
+            source_partition_count=2,
+        )
         half, _ = build(recorder, plan=plan, half_cls=NcclM2nSender, partitions=2)
         half.start_weight_update("v")
         half.publish_weights(0)
         assert [op.comm._name for op in recorder.ops] == ["lane0", "lane1"]
 
+    def test_a_pp_trainer_requires_and_uses_only_its_admitted_partition(self, recorder):
+        plan = ReshardPlan(
+            bulk=[entry("stage0", partition=0), entry("stage1", partition=1)],
+            misc=[MiscParam("m", (4,), "f")],
+            source_partition_count=2,
+        )
+        cache = CommunicatorCache()
+        cache._lanes[LaneKey("g", 1, 1)] = lane(recorder, "lane1")
+        cache._lanes[LaneKey("g", 1, 2)] = lane(recorder, "broadcast")
+        half = NcclM2nSender(
+            plan=plan,
+            specs={
+                "stage1": LocalParamSpec(base="buf::stage1"),
+                "m": LocalParamSpec(base="buf::m"),
+            },
+            group_id="g",
+            epoch=1,
+            cache=cache,
+            source_partition=1,
+        )
+
+        half.start_weight_update("v")
+        half.publish_weights(0)
+
+        assert [op.src for op in recorder.ops if op.kind == "reshard"] == [
+            "buf::stage1"
+        ]
+        assert [op.comm._name for op in recorder.ops if op.kind == "reshard"] == [
+            "lane1"
+        ]
+
     def test_a_missing_communicator_is_a_clear_error_not_a_hang(self, recorder):
-        plan = ReshardPlan(bulk=[entry("a", partition=3)])
+        plan = ReshardPlan(
+            bulk=[entry("a", partition=3)],
+            source_partition_count=4,
+        )
         half, _ = build(recorder, plan=plan, half_cls=NcclM2nSender, partitions=1)
         half.start_weight_update("v")
         with pytest.raises(RuntimeError, match="no communicator"):
@@ -282,6 +400,15 @@ class TestHooks:
         with pytest.raises(ValueError, match="base tensor or a pre hook"):
             LocalParamSpec().enter()
 
+    def test_staging_context_is_retained_until_the_lane_is_drained(self, recorder):
+        plan = ReshardPlan(bulk=[entry("a")])
+        half, _ = build(recorder, plan=plan, half_cls=NcclM2nSender)
+        half.start_weight_update("v")
+        half.publish_weights(0)
+        assert len(half._pending_contexts) == 1
+        half.finish_weight_update(broadcast_lane_id=1)
+        assert half._pending_contexts == []
+
 
 class TestLayerGroups:
     def test_uncovered_bulk_parameters_are_rejected(self, recorder):
@@ -291,16 +418,41 @@ class TestLayerGroups:
             half.setup_layer_groups([["a"]])
 
     def test_a_parameter_in_two_groups_is_rejected(self, recorder):
-        plan = ReshardPlan(bulk=[entry("a")])
+        plan = ReshardPlan(
+            bulk=[entry("a", group_key="g0"), entry("b", group_key="g1")]
+        )
         half, _ = build(recorder, plan=plan, half_cls=NcclM2nSender)
         with pytest.raises(ValueError, match="more than one layer group"):
-            half.setup_layer_groups([["a"], ["a"]])
+            half.setup_layer_groups([["a"], ["a", "b"]])
 
     def test_an_unknown_parameter_is_rejected(self, recorder):
-        plan = ReshardPlan(bulk=[entry("a")])
+        plan = ReshardPlan(
+            bulk=[entry("a", group_key="g0"), entry("b", group_key="g1")]
+        )
         half, _ = build(recorder, plan=plan, half_cls=NcclM2nSender)
         with pytest.raises(KeyError, match="not a bulk parameter"):
             half.setup_layer_groups([["a"], ["ghost"]])
+
+    def test_group_key_does_not_define_layer_groups(self, recorder):
+        plan = ReshardPlan(bulk=[entry("a", group_key="same-fused-buffer"), entry("b")])
+        half, _ = build(recorder, plan=plan, half_cls=NcclM2nSender)
+        assert half.layer_group_ids == [0]
+        assert [entry.name for entry in half.entries(0)] == ["a", "b"]
+
+        half.setup_layer_groups([["a"], ["b"]])
+        assert [entry.name for entry in half.entries(0)] == ["a"]
+        assert [entry.name for entry in half.entries(1)] == ["b"]
+
+    def test_names_within_a_declared_group_execute_in_canonical_order(self, recorder):
+        plan = ReshardPlan(bulk=[entry("z", group_key="g"), entry("a", group_key="g")])
+        half, _ = build(recorder, plan=plan, half_cls=NcclM2nSender)
+        half.setup_layer_groups([["z", "a"]])
+        half.start_weight_update("v")
+        half.publish_weights(0)
+        assert [op.src for op in recorder.ops if op.kind == "reshard"] == [
+            "buf::a",
+            "buf::z",
+        ]
 
     def test_the_default_is_one_group_holding_everything(self, recorder):
         plan = ReshardPlan(bulk=[entry("a"), entry("b")])
@@ -327,14 +479,16 @@ class TestCommunicatorCache:
 
     def test_an_epoch_move_drops_the_stale_lanes(self, recorder):
         cache = CommunicatorCache()
-        cache._lanes[LaneKey("g", 1, 0)] = lane(recorder, "old")
-        cache._lanes[LaneKey("g", 1, 1)] = lane(recorder, "old")
+        old_lanes = [lane(recorder, "old0"), lane(recorder, "old1")]
+        cache._lanes[LaneKey("g", 1, 0)] = old_lanes[0]
+        cache._lanes[LaneKey("g", 1, 1)] = old_lanes[1]
         cache._lanes[LaneKey("other", 1, 0)] = lane(recorder, "untouched")
 
         dropped = cache.invalidate_epoch("g", 2)
 
         assert dropped == 2
         assert cache.get(LaneKey("g", 1, 0)) is None
+        assert all(entry_lane.aborted for entry_lane in old_lanes)
         # A different group's lanes are not collateral damage.
         assert cache.get(LaneKey("other", 1, 0)) is not None
 

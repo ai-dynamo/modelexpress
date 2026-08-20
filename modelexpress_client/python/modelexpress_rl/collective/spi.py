@@ -14,13 +14,11 @@ name-to-local-tensor map ports across with its hooks intact.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    import torch
-
     from .types import ReshardPlan
 
 
@@ -61,7 +59,9 @@ class LocalParamSpec:
         if self.pre is not None:
             return self.pre(self.base)
         if self.base is None:
-            raise ValueError("a LocalParamSpec needs either a base tensor or a pre hook")
+            raise ValueError(
+                "a LocalParamSpec needs either a base tensor or a pre hook"
+            )
         return RefitCtx(buf=self.base)
 
     def leave(self, ctx: RefitCtx) -> None:
@@ -84,6 +84,10 @@ class Publisher(Protocol):
         """Declare the plan: names, shapes, dtypes, meshes, placements, partitions."""
         ...
 
+    def parameter_names(self) -> list[str]:
+        """Return the complete canonical parameter set the plan must cover."""
+        ...
+
     def local_params(self) -> dict[str, LocalParamSpec]:
         """Map each declared name onto this rank's local storage."""
         ...
@@ -101,6 +105,10 @@ class Loader(Protocol):
 
     def capture(self) -> ReshardPlan:
         """Declare the same plan the Publisher does, from this side's view."""
+        ...
+
+    def parameter_names(self) -> list[str]:
+        """Return the complete canonical parameter set the plan must cover."""
         ...
 
     def local_params(self) -> dict[str, LocalParamSpec]:
@@ -123,6 +131,7 @@ class Loader(Protocol):
 def resolve_specs(
     plan: ReshardPlan,
     specs: dict[str, LocalParamSpec],
+    required_names: Iterable[str] | None = None,
 ) -> None:
     """Check that every declared parameter has local storage on this worker.
 
@@ -131,7 +140,8 @@ def resolve_specs(
     this rank would skip an op its peers issue -- which hangs the communicator
     rather than raising on the rank that is actually misconfigured.
     """
-    missing = [name for name in plan.parameter_names() if name not in specs]
+    names = plan.parameter_names() if required_names is None else list(required_names)
+    missing = [name for name in names if name not in specs]
     if missing:
         raise KeyError(
             f"{len(missing)} declared parameter(s) have no local storage on this worker: "
