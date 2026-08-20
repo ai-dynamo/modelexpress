@@ -16,7 +16,7 @@ SPDX_HEADER="# SPDX-FileCopyrightText: Copyright (c) 2025-${YEAR} NVIDIA CORPORA
 
 # Generate protobuf files. Keep the inference and RL surfaces in separate
 # Python modules even though they are built from the same proto directory.
-for package_proto in "${OUT_DIR}:p2p" "${OUT_DIR}:model" "${RL_OUT_DIR}:refit"; do
+for package_proto in "${OUT_DIR}:p2p" "${OUT_DIR}:model" "${RL_OUT_DIR}:refit" "${RL_OUT_DIR}:refit_collective"; do
     package_dir="${package_proto%%:*}"
     proto="${package_proto##*:}"
     echo "Generating protobuf files from ${PROTO_DIR}/${proto}.proto..."
