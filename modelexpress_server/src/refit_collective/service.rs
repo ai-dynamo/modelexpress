@@ -276,7 +276,7 @@ impl RefitCollectiveService for RefitCollectiveServiceImpl {
             ));
         }
         if !request.succeeded {
-            required(&request.message, "message is required for a failed report")?;
+            required(&request.message, "message")?;
         }
 
         self.backend
