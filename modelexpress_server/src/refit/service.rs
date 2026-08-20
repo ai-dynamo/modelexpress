@@ -75,7 +75,6 @@ impl RefitService for RefitServiceImpl {
             .ok_or_else(|| Status::invalid_argument("worker is required"))?;
         required(&worker.worker_id, "worker.worker_id")?;
         required(&worker.model_name, "worker.model_name")?;
-        required(&worker.endpoint, "worker.endpoint")?;
         if WorkerRole::try_from(worker.role).unwrap_or(WorkerRole::Unspecified)
             == WorkerRole::Unspecified
         {

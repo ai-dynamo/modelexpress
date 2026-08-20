@@ -105,7 +105,6 @@ class StagedWeightVersionShardData:
 
     manifest: WeightVersionShardManifest
     publish_ready: CompletionFence
-    source_reuse_ready: CompletionFence
     buffer_owner: object | None = None
 
 
@@ -121,6 +120,10 @@ class TrainerEngineAdapter(ABC):
     @abstractmethod
     def source_slot_id(self) -> str:
         """Return this rank's required logical contribution identifier."""
+
+    @abstractmethod
+    def bind_tensors(self, tensors: Any) -> str:
+        """Bind stable engine tensors and return their logical source slot."""
 
     @property
     @abstractmethod
