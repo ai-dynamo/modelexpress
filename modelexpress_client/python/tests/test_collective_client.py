@@ -225,6 +225,17 @@ class TestSequencing:
         with pytest.raises(RuntimeError, match="start_weight_update must run"):
             client.publish_weights("v1")
 
+    def test_a_call_naming_another_version_is_refused(self, fake_nccl):
+        # version was accepted and ignored, so publishing "v2" into the round
+        # "v1" opened moved v1's tensors under v2's label on every rank.
+        client = trainer(FakeRendezvous(), FakeEngine())
+        client.compute_plan()
+        client.start_weight_update("v1")
+        with pytest.raises(ValueError, match="round in flight is 'v1'"):
+            client.publish_weights("v2")
+        with pytest.raises(ValueError, match="round in flight is 'v1'"):
+            client.finish_weight_update("v2")
+
     def test_membership_is_unavailable_before_compute_plan(self):
         client = trainer(FakeRendezvous(), FakeEngine())
         with pytest.raises(RuntimeError, match="compute_plan has not run"):

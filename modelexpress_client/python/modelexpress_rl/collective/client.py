@@ -96,6 +96,7 @@ class _RefitClientBase:
         self._half: NcclM2nSender | NcclM2nReceiver | None = None
         self._groupings: list[list[str]] | None = None
         self._round_started = False
+        self._version: str | None = None
 
     @property
     def membership(self) -> Membership:
@@ -108,6 +109,26 @@ class _RefitClientBase:
         if self._plan is None:
             raise RuntimeError("initialize has not run on this worker yet")
         return self._plan
+
+    def _require_round(
+        self, version: str, method: str
+    ) -> NcclM2nSender | NcclM2nReceiver:
+        """Reject a call that does not belong to the round now in flight.
+
+        ``version`` was accepted and ignored, so a call naming a version other
+        than the one ``start_weight_update`` opened moved that round's tensors
+        under the label of a different one -- silently, and on every rank.
+        """
+        if self._half is None:
+            raise RuntimeError(f"compute_plan must run before {method}")
+        if not self._round_started:
+            raise RuntimeError(f"start_weight_update must run before {method}")
+        if version != self._version:
+            raise ValueError(
+                f"{method} names version {version!r}, but the round in flight is "
+                f"{self._version!r}"
+            )
+        return self._half
 
     def _capture(self, engine: Publisher | Loader, expected: list[str] | None) -> None:
         plan = engine.capture()
@@ -279,6 +300,7 @@ class _RefitClientBase:
         self._membership = None
         self._half = None
         self._round_started = False
+        self._version = None
 
 
 class RefitClientTrainer(_RefitClientBase):
@@ -342,33 +364,27 @@ class RefitClientTrainer(_RefitClientBase):
         self._publisher.start_new_round(version)
         self._half.start_weight_update(version)
         self._round_started = True
+        self._version = version
 
     def publish_weights(
         self, version: str, layer_group_id: int = DEFAULT_LAYER_GROUP
     ) -> None:
-        if self._half is None:
-            raise RuntimeError("compute_plan must run before publish_weights")
-        if not self._round_started:
-            raise RuntimeError("start_weight_update must run before publish_weights")
-        self._half.publish_weights(layer_group_id)
+        half = self._require_round(version, "publish_weights")
+        half.publish_weights(layer_group_id)
 
     def finish_weight_update(
         self, version: str, operation_id: str | None = None
     ) -> None:
-        if self._half is None:
-            raise RuntimeError("compute_plan must run before finish_weight_update")
-        if not self._round_started:
-            raise RuntimeError(
-                "start_weight_update must run before finish_weight_update"
-            )
+        half = self._require_round(version, "finish_weight_update")
         try:
-            self._half.finish_weight_update(self.membership.broadcast_lane.lane_id)
+            half.finish_weight_update(self.membership.broadcast_lane.lane_id)
         except Exception as error:
             self._report(operation_id, succeeded=False, message=repr(error))
-            self._half.abort()
+            half.abort()
             raise
         finally:
             self._round_started = False
+            self._version = None
         self._report(operation_id, succeeded=True)
 
     def _report(
@@ -438,39 +454,33 @@ class RefitClientGenerator(_RefitClientBase):
         self._loader.start_new_round(version)
         self._half.start_weight_update(version)
         self._round_started = True
+        self._version = version
 
     def update_weights(
         self, version: str, layer_group_id: int = DEFAULT_LAYER_GROUP
     ) -> None:
-        if self._half is None:
-            raise RuntimeError("compute_plan must run before update_weights")
-        if not self._round_started:
-            raise RuntimeError("start_weight_update must run before update_weights")
+        half = self._require_round(version, "update_weights")
         if self._loader is None:
             raise RuntimeError("initialize must run before update_weights")
-        self._half.update_weights(layer_group_id)
+        half.update_weights(layer_group_id)
         self._loader.install(layer_group_id)
 
     def finish_weight_update(
         self, version: str, operation_id: str | None = None
     ) -> None:
-        if self._half is None:
-            raise RuntimeError("compute_plan must run before finish_weight_update")
-        if not self._round_started:
-            raise RuntimeError(
-                "start_weight_update must run before finish_weight_update"
-            )
+        half = self._require_round(version, "finish_weight_update")
         if self._loader is None:
             raise RuntimeError("initialize must run before finish_weight_update")
         try:
-            self._half.finish_weight_update(self.membership.broadcast_lane.lane_id)
+            half.finish_weight_update(self.membership.broadcast_lane.lane_id)
             self._loader.finish()
         except Exception as error:
             self._report(operation_id, succeeded=False, message=repr(error))
-            self._half.abort()
+            half.abort()
             raise
         finally:
             self._round_started = False
+            self._version = None
         self._report(operation_id, succeeded=True)
 
     def _report(
