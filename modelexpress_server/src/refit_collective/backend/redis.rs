@@ -149,7 +149,9 @@ fn hex_decode(text: &str) -> CollectiveResult<Vec<u8>> {
         ));
     }
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let digits = std::str::from_utf8(pair).map_err(|error| {
                 CollectiveBackendError::Internal(format!("invalid bootstrap identifier: {error}"))
