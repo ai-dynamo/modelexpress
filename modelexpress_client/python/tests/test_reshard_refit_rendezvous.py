@@ -291,3 +291,152 @@ def test_invalid_heartbeat_period_fails_before_publish(monkeypatch):
 
     with pytest.raises(ValueError, match="must be positive"):
         rendezvous.publish(b"registered")
+
+
+def test_quorum_can_skip_shard_tables_without_losing_emptiness():
+    """The per-step quorum check needs each rank's version stamp, not its shard
+    table, and rebuilding the table dominated the call. Skipping it must not make
+    a rank that published nothing look like a valid member of the quorum, which is
+    the one thing the emptiness rule exists to prevent."""
+    client = _DiscoveryClient(
+        [_blob("empty-rank", []), _blob("real-rank", _one_tensor())]
+    )
+
+    with pytest.raises(TimeoutError) as excinfo:
+        _rendezvous(client).discover_trainers(
+            expected_trainers=2, timeout=0, with_tensors=False
+        )
+
+    message = str(excinfo.value)
+    assert "1 with a non-empty shard table" in message
+    assert "1 empty" in message
+
+
+def test_skipping_shard_tables_still_reports_the_entry_count(caplog):
+    """``entry_count`` is what keeps emptiness decidable, and it is also the figure
+    that showed this cost scales with source count rather than bytes moved."""
+    import json
+    import logging
+
+    client = _DiscoveryClient([_blob("rank-0", _one_tensor() * 3)])
+
+    with caplog.at_level(logging.WARNING):
+        (payload,) = _rendezvous(client).discover_trainers(
+            expected_trainers=1, timeout=0, with_tensors=False
+        )
+
+    assert payload.tensors == []
+    assert payload.entry_count() == 3
+    assert payload.agent_name == "rank-0"
+    record = next(
+        json.loads(message.split("MX_DISCOVER_COST ", 1)[1])
+        for message in caplog.messages
+        if "MX_DISCOVER_COST " in message
+    )
+    assert record["rank"] == 0
+    assert record["tensors"] == 3
+    assert record["tables_built"] is False
+
+
+def test_entry_count_falls_back_to_the_table_when_not_recorded():
+    """Payloads built directly, as tests and older callers do, record no count."""
+    from modelexpress.refit.reshard.rendezvous import RendezvousPayload
+
+    payload = RendezvousPayload(b"", "a", "", _one_tensor())
+    assert payload.tensor_count is None
+    assert payload.entry_count() == 1
+
+
+def test_decoding_parsed_entries_matches_decoding_the_blob():
+    """The shard table used to be re-serialized only to be parsed again. Removing
+    that round-trip must not change a single decoded field."""
+    import json
+
+    from modelexpress.refit.reshard.rendezvous import (
+        _SCHEMA,
+        decode_shard_entries,
+        decode_shard_table,
+        encode_shard_table,
+    )
+
+    blob = encode_shard_table(_one_tensor())
+    entries = json.loads(blob.decode("utf-8"))["tensors"]
+
+    assert decode_shard_entries(entries) == decode_shard_table(blob)
+    assert decode_shard_table(blob) == _one_tensor()
+    assert json.loads(blob.decode("utf-8"))["schema"] == _SCHEMA
+
+
+def test_metadata_fetches_stay_serial():
+    """Concurrency here was measured to be slower, not faster: from a thread pool
+    the fetch went 4.02 s -> ~6.9 s median on 16 sources, because every receiver
+    rank runs this loop and the single metadata server, not this process, is the
+    contended resource. Pinned with a barrier that a concurrent implementation
+    would satisfy and a serial one cannot, so the decision cannot be quietly
+    reversed without this failing."""
+    from threading import Barrier, BrokenBarrierError
+
+    ranks = 4
+    barrier = Barrier(ranks, timeout=0.5)
+    overlapped = []
+
+    class Barriered(_DiscoveryClient):
+        def get_metadata(self, source_id, worker_id):
+            try:
+                barrier.wait()
+                overlapped.append(source_id)
+            except BrokenBarrierError:
+                pass
+            return super().get_metadata(source_id, worker_id)
+
+    client = Barriered([_blob(f"rank-{i}", _one_tensor()) for i in range(ranks)])
+
+    discovered = _rendezvous(client).discover_trainers(
+        expected_trainers=ranks, timeout=0
+    )
+
+    assert len(discovered) == ranks
+    assert overlapped == [], "fetches overlapped; this path is deliberately serial"
+
+
+def test_quorum_membership_does_not_depend_on_completion_order():
+    """Concurrency must not make which ranks satisfy the quorum depend on who
+    answers first. With more READY sources than needed, the same prefix has to win
+    every time, or two receivers can disagree about the source set they read."""
+    import time as _time
+
+    class Reordering(_DiscoveryClient):
+        def get_metadata(self, source_id, worker_id):
+            # Earlier ranks answer last, inverting completion order.
+            index = int(source_id.rsplit("-", 1)[1])
+            _time.sleep(0.02 * (4 - index))
+            return super().get_metadata(source_id, worker_id)
+
+    client = Reordering([_blob(f"rank-{i}", _one_tensor()) for i in range(4)])
+
+    discovered = _rendezvous(client).discover_trainers(expected_trainers=2, timeout=0)
+
+    assert [p.agent_name for p in discovered] == ["rank-0", "rank-1"]
+
+
+def test_one_unreadable_rank_does_not_abort_the_sweep():
+    """The poll loop's value is reporting how many ranks are readable. A single
+    rank's transport error must therefore be counted, not raised: otherwise a
+    transient failure on one rank surfaces as a discovery crash with no count."""
+
+    class OneBadRank(_DiscoveryClient):
+        def get_metadata(self, source_id, worker_id):
+            if source_id.endswith("-1"):
+                raise RuntimeError("transport blip on rank 1")
+            return super().get_metadata(source_id, worker_id)
+
+    client = OneBadRank([_blob(f"rank-{i}", _one_tensor()) for i in range(3)])
+
+    with pytest.raises(TimeoutError) as excinfo:
+        _rendezvous(client).discover_trainers(expected_trainers=3, timeout=0)
+    assert "3 READY source(s)" in str(excinfo.value)
+    assert "2 with a non-empty shard table" in str(excinfo.value)
+
+    # The readable ranks are still returned when the quorum only needs them.
+    discovered = _rendezvous(client).discover_trainers(expected_trainers=2, timeout=0)
+    assert [p.agent_name for p in discovered] == ["rank-0", "rank-2"]
