@@ -2,6 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Redis implementation of the collective control-plane backend.
+//!
+//! One group's root hash, participants, digests and lane hashes are mutated
+//! together by a single Lua script, and none of the key helpers below carries a
+//! hash tag. That makes the whole keyspace single-slot: this backend targets
+//! standalone or replicated Redis, not Redis Cluster, where those keys would
+//! land on different slots and every script would fail CROSSSLOT.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -292,8 +298,48 @@ impl RedisCollectiveBackend {
             .await
             .map_err(redis_error)?;
 
-        let mut lanes: Vec<CollectiveLane> = Vec::with_capacity(layout.lane_count() as usize);
+        // Place every participant in one pass. Rebuilding the assignment per
+        // lane instead would parse and re-assign the whole membership
+        // `lane_count` times, and `publish_bootstrap` reads a group twice.
+        let mut lane_participants: Vec<Vec<CollectiveParticipant>> =
+            vec![Vec::new(); layout.lane_count() as usize];
+        for (slot_id, record) in &records {
+            let (participant, partition) = participant_from_record(slot_id, record)?;
+            let role =
+                CollectiveRole::try_from(participant.role).unwrap_or(CollectiveRole::Unspecified);
+            let assignments = layout
+                .assign(role, participant.index_in_role, partition)
+                .map_err(|error| {
+                    CollectiveBackendError::Internal(format!(
+                        "stored participant {slot_id} has an invalid lane assignment: {error}"
+                    ))
+                })?;
+            for assignment in assignments {
+                if let Some(lane) = lane_participants.get_mut(assignment.lane_id as usize) {
+                    let mut placed = participant.clone();
+                    placed.rank_in_lane = assignment.rank_in_lane;
+                    lane.push(placed);
+                }
+            }
+        }
+        for participants in &mut lane_participants {
+            participants.sort_by_key(|p| p.rank_in_lane);
+        }
+
+        let mut lane_pipe = redis::pipe();
         for lane_id in 0..layout.lane_count() {
+            lane_pipe.hgetall(lane_key(group_id, lane_id));
+        }
+        let lane_hashes: Vec<HashMap<String, String>> = lane_pipe
+            .query_async(&mut connection)
+            .await
+            .map_err(redis_error)?;
+
+        let mut lanes: Vec<CollectiveLane> = Vec::with_capacity(layout.lane_count() as usize);
+        for (lane_id, participants) in lane_participants.into_iter().enumerate() {
+            let lane_id = u32::try_from(lane_id).map_err(|_| {
+                CollectiveBackendError::Internal("collective lane count overflowed".to_string())
+            })?;
             let kind = if lane_id == layout.broadcast_lane_id() {
                 LaneKind::Broadcast
             } else {
@@ -304,10 +350,8 @@ impl RedisCollectiveBackend {
             } else {
                 layout.reshard_world_size()
             };
-            let lane_fields: HashMap<String, String> = connection
-                .hgetall(lane_key(group_id, lane_id))
-                .await
-                .map_err(redis_error)?;
+            let empty = HashMap::new();
+            let lane_fields = lane_hashes.get(lane_id as usize).unwrap_or(&empty);
             let nccl_unique_id = match lane_fields.get("nccl_unique_id") {
                 Some(text) => hex_decode(text)?,
                 None => Vec::new(),
@@ -316,25 +360,6 @@ impl RedisCollectiveBackend {
                 .get("bootstrap_epoch")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0);
-
-            let mut participants: Vec<CollectiveParticipant> = Vec::new();
-            for (slot_id, record) in &records {
-                let (mut participant, partition) = participant_from_record(slot_id, record)?;
-                let role = CollectiveRole::try_from(participant.role)
-                    .unwrap_or(CollectiveRole::Unspecified);
-                let assignments = layout
-                    .assign(role, participant.index_in_role, partition)
-                    .map_err(|error| {
-                        CollectiveBackendError::Internal(format!(
-                            "stored participant {slot_id} has an invalid lane assignment: {error}"
-                        ))
-                    })?;
-                if let Some(assignment) = assignments.iter().find(|a| a.lane_id == lane_id) {
-                    participant.rank_in_lane = assignment.rank_in_lane;
-                    participants.push(participant);
-                }
-            }
-            participants.sort_by_key(|p| p.rank_in_lane);
 
             lanes.push(CollectiveLane {
                 lane_id,
