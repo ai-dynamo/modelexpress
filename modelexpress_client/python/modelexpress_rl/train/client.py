@@ -157,8 +157,9 @@ class ModelExpressTrainerClient:
             raise ValueError("tensors must not be None")
         if self._bound_tensors is not None:
             raise RuntimeError("trainer tensors are already bound")
+        source_slot_id = self._get_adapter().bind_tensors(tensors)
         self._bound_tensors = tensors
-        return self.source_slot_id
+        return source_slot_id
 
     @classmethod
     def initialize(

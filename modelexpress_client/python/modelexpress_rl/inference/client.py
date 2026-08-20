@@ -371,6 +371,8 @@ class ModelExpressGeneratorClient:
     def _discover_sources(
         self,
         version: refit_pb2.WeightVersion,
+        *,
+        candidate_offset: int = 0,
     ) -> GeneratorTransferInputs:
         response = self._service.ListWeightVersionShards(
             refit_pb2.ListWeightVersionShardsRequest(version_id=version.uid),
@@ -383,9 +385,13 @@ class ModelExpressGeneratorClient:
         selected = []
         for source_slot_id in version.expected_source_slots:
             failures = []
-            for shard in sorted(
+            ordered = sorted(
                 candidates[source_slot_id], key=lambda item: item.worker_id
-            ):
+            )
+            if ordered:
+                offset = candidate_offset % len(ordered)
+                ordered = ordered[offset:] + ordered[:offset]
+            for shard in ordered:
                 try:
                     manifest = self._fetch_manifest(shard)
                 except (grpc.RpcError, RuntimeError) as error:
@@ -494,9 +500,12 @@ class ModelExpressGeneratorClient:
         lease = self._start_version_lease(version.uid)
         try:
             last_error: grpc.RpcError | RuntimeError | None = None
-            for _attempt in range(self._max_transfer_attempts):
+            for attempt in range(self._max_transfer_attempts):
                 try:
-                    inputs = self._discover_sources(version)
+                    inputs = self._discover_sources(
+                        version,
+                        candidate_offset=attempt,
+                    )
                     staged = self._adapter.stage_weight(self._transfer_plan(inputs))
                     return staged, lease
                 except (grpc.RpcError, RuntimeError) as error:

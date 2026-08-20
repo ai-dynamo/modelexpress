@@ -70,6 +70,11 @@ class _Adapter(TrainerEngineAdapter):
     def __init__(self):
         self.calls = []
 
+    def bind_tensors(self, tensors):
+        if tensors is None:
+            raise ValueError("tensors must not be None")
+        return self.source_slot_id
+
     def stage_shard(self, *, tensors, staging_mode, payload_format):
         self.calls.append((tensors, staging_mode, payload_format))
 

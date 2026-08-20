@@ -121,6 +121,10 @@ class TrainerEngineAdapter(ABC):
     def source_slot_id(self) -> str:
         """Return this rank's required logical contribution identifier."""
 
+    @abstractmethod
+    def bind_tensors(self, tensors: Any) -> str:
+        """Bind stable engine tensors and return their logical source slot."""
+
     @property
     @abstractmethod
     def supported_staging_modes(self) -> frozenset[TrainerStagingMode]:

@@ -80,6 +80,11 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
     def source_slot_id(self) -> str:
         return self._source_slot_id
 
+    def bind_tensors(self, tensors: Any) -> str:
+        """Validate the local state dict and bind it to this global-rank slot."""
+        self._capture(tensors)
+        return self.source_slot_id
+
     @property
     def supported_staging_modes(self) -> frozenset[TrainerStagingMode]:
         return frozenset(

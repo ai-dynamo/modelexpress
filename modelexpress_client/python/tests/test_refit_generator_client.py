@@ -259,6 +259,28 @@ def test_generator_retries_complete_staged_transfer_under_one_lease(monkeypatch)
     assert len(adapter.create_calls) == 2
 
 
+def test_generator_retries_with_redundant_worker_for_same_slot(monkeypatch):
+    server, endpoint, service = _start_server()
+    replica = refit_pb2.WeightVersionShard()
+    replica.CopyFrom(service.shards[0])
+    replica.worker_id = "trainer-replica"
+    service.shards.append(replica)
+    adapter = _Adapter(service)
+    adapter.stage_failures = 1
+    generator = _initialize(monkeypatch, endpoint, adapter)
+
+    try:
+        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+        staged.release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert [
+        call.sources[0].worker_id for call in adapter.create_calls
+    ] == ["trainer-0", "trainer-replica"]
+
+
 def test_generator_preserves_transfer_error_when_lease_cleanup_also_fails(
     monkeypatch,
 ):

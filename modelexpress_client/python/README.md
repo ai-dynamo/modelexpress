@@ -121,10 +121,11 @@ trainer.publish_version(version=WeightVersionRef(version.uid))
 The deployment supplies `MODEL_NAME`, `MX_TRAINER_ENGINE`,
 `MX_TRAINER_STAGING_MODE`, `MX_WEIGHT_PAYLOAD_FORMAT`, `MX_WORKER_HOST`, and the
 normal ModelExpress server configuration. The Megatron adapter derives its
-source slot from the engine's global distributed rank. The NIXL metadata
-endpoint is derived from `MX_WORKER_HOST` and the client-owned NIXL manager's
-listen port. `LOCAL_RANK` selects the device unless `device_id` is passed to
-`initialize()`.
+source slot from logical tensor names and shard geometry. DP replicas of the same
+partition therefore publish redundant workers for one slot, while distinct TP
+partitions remain separate required slots. The NIXL metadata endpoint is derived
+from `MX_WORKER_HOST` and the client-owned NIXL manager's listen port. `LOCAL_RANK`
+selects the device unless `device_id` is passed to `initialize()`.
 
 The client owns the NIXL manager and trainer-side manifest service. `server_url`
 selects the central ModelExpress control-plane service and defaults to the

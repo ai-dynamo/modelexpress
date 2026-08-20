@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from typing import Any
 
@@ -37,13 +39,43 @@ class MegatronTrainerAdapter(TrainerEngineAdapter):
             raise RuntimeError("Megatron distributed process group is not initialized")
         self._manager = manager
         self._nixl_metadata_endpoint = nixl_metadata_endpoint
-        self._source_slot_id = f"publisher:global-rank:{dist.get_rank()}"
+        self._source_slot_id: str | None = None
         self._registered_addrs: dict[str, int] | None = None
 
     @property
     def source_slot_id(self) -> str:
         """Return the logical trainer contribution represented by this rank."""
+        if self._source_slot_id is None:
+            raise RuntimeError("bind_tensors() must be called before source_slot_id")
         return self._source_slot_id
+
+    def bind_tensors(self, tensors: Any) -> str:
+        """Bind one logical model partition independently of its DP replica."""
+        if not isinstance(tensors, list) or not all(
+            isinstance(item, MegatronTensorSpec) for item in tensors
+        ):
+            raise TypeError("tensors must be a list of MegatronTensorSpec")
+        layout = [
+            {
+                "name": item.name,
+                "role": item.role,
+                "hf_names": item.hf_names,
+                "global_shape": item.global_shape,
+                "placement_kind": item.placement_kind,
+                "shard_axis": item.shard_axis,
+                "local_shard_range": item.local_shard_range,
+                "extras": item.extras,
+            }
+            for item in sorted(tensors, key=lambda item: item.name)
+        ]
+        digest = hashlib.sha256(
+            json.dumps(layout, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        source_slot_id = f"megatron:partition:{digest}"
+        if self._source_slot_id is not None and self._source_slot_id != source_slot_id:
+            raise RuntimeError("Megatron logical tensor partition changed after binding")
+        self._source_slot_id = source_slot_id
+        return source_slot_id
 
     @property
     def supported_staging_modes(self) -> frozenset[TrainerStagingMode]:

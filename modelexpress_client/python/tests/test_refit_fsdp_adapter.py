@@ -56,6 +56,16 @@ def test_source_slot_id_is_rank_stamped(dist_ready):
     assert _adapter().source_slot_id == "publisher:global-rank:0"
 
 
+def test_bind_tensors_validates_state_dict_and_returns_rank_slot(dist_ready):
+    adapter = _adapter()
+
+    assert adapter.bind_tensors({"w": torch.ones(2, 4)}) == (
+        "publisher:global-rank:0"
+    )
+    with pytest.raises(TypeError, match="state_dict"):
+        adapter.bind_tensors([torch.ones(2, 4)])
+
+
 def test_in_place_stage_registers_once(dist_ready):
     manager = _Manager()
     adapter = _adapter(manager)

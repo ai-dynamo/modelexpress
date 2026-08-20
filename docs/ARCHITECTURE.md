@@ -470,10 +470,11 @@ Its identity is `(version_id, worker_id, source_slot_id)`: `source_slot_id`
 identifies the required, version-scoped source contribution it covers, and
 `worker_id` identifies the publishing process. The trainer engine adapter
 derives the slot from its native topology; the Megatron adapter uses
-`publisher:global-rank:12` for global rank 12. The orchestrator uses the same
-adapter-defined convention when declaring the version's expected slots. Multiple
-publications may advertise the same source slot, including a replacement worker
-or a generator that becomes a peer source. Deployments configured with
+the logical tensor names and shard geometry, excluding physical process and DP
+replica identity. The orchestrator deduplicates those adapter-defined slots when
+declaring the version's expected contributions. Multiple DP workers may therefore
+advertise the same source slot; generators rotate through those publications on
+transfer retry. Deployments configured with
 Kubernetes or the test-only memory backend do not expose `RefitService` yet.
 
 `RegisterWorker` is also the heartbeat API. `worker_id` is a fresh process
