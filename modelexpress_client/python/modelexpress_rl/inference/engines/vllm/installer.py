@@ -120,6 +120,14 @@ class _VllmInstaller:
             for name, parameter in twin.named_parameters()
         }
 
+    def parameter_layout(self) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+        """Return the canonical load-time layout used by peer staging buffers."""
+        twin = self._build_meta_twin()
+        return {
+            name: (tuple(parameter.shape), parameter.dtype)
+            for name, parameter in twin.named_parameters()
+        }
+
     def install(self, tensors: dict[str, torch.Tensor]) -> None:
         """Install verified load-layout tensors without changing graph addresses."""
         self._process_and_commit(tensors)

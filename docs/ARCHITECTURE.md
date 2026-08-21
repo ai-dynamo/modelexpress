@@ -462,6 +462,17 @@ engine-specific parameter and CUDA-graph handling out of the transfer layer.
 | `DeleteVersionLease` | Release a generator's protection of the version shards |
 
 The final missing source slot atomically changes the version to `READY`.
+
+Peer generators reuse the existing inference P2P metadata service rather than
+creating a second Refit peer registry. A generator serving an exact version
+publishes its normal `SourceIdentity` with `revision=WeightVersion.uid`; another
+generator queries `P2pService.ListSources` with the same engine-compatible
+identity and selects a READY source for its worker rank before falling back to
+trainer shard publications. Applied generators publish their verified canonical
+staging buffers—not engine-specific packed kernel tensors—under that identity.
+An identical-rank peer pulls those buffers directly with NIXL, then uses the
+same graph-safe engine installer as a trainer update.
+
 `WeightVersion.uid` is MX's opaque identity. `version_number` is the optional
 framework-provided numeric label used for correlation; MX does not use it as an
 identity or ordering key.
