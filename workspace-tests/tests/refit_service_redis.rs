@@ -19,8 +19,8 @@ use modelexpress_common::grpc::refit::{
     CreateWeightVersionRequest, CreateWeightVersionShardRequest, DeleteVersionLeaseRequest,
     DeleteWeightVersionRequest, DeleteWeightVersionShardRequest, GetWeightVersionRequest,
     ListWeightVersionShardsRequest, NixlTransport, RegisterVersionLeaseRequest,
-    RegisterWorkerRequest, WeightPayloadFormat, WeightVersionShard, WeightVersionState,
-    WorkerRegistration, WorkerRole, refit_service_client::RefitServiceClient,
+    RegisterWorkerRequest, S3Transport, WeightPayloadFormat, WeightVersionShard,
+    WeightVersionState, WorkerRegistration, WorkerRole, refit_service_client::RefitServiceClient,
     weight_version_shard::Transport,
 };
 use modelexpress_server::backend_config::BackendConfig;
@@ -109,6 +109,23 @@ fn shard(version_id: &str, source_slot_id: &str, worker_id: &str) -> WeightVersi
         manifest_digest: format!("digest-{source_slot_id}"),
         transport: Some(Transport::Nixl(NixlTransport {
             manifest_endpoint: format!("{worker_id}:9000"),
+        })),
+    }
+}
+
+fn s3_shard(version_id: &str, worker_id: &str) -> WeightVersionShard {
+    WeightVersionShard {
+        version_id: version_id.to_string(),
+        source_slot_id: "canonical.delta.root".to_string(),
+        worker_id: worker_id.to_string(),
+        tensor_count: 10,
+        total_bytes: 1024,
+        manifest_digest: "sha256:delta-index".to_string(),
+        transport: Some(Transport::S3(S3Transport {
+            bucket: "weights".to_string(),
+            key: format!("test/model/{version_id}/delta-index.json"),
+            object_version: None,
+            checksum: "crc32c:00000000".to_string(),
         })),
     }
 }
@@ -254,6 +271,96 @@ async fn version_becomes_ready_across_server_replicas() {
 
     stop(stop_a, server_a).await;
     stop(stop_b, server_b).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis at REDIS_URL"]
+async fn s3_root_becomes_ready_and_survives_publisher_expiry() {
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let port = free_port();
+    let (shutdown, server) = start_server(port, &redis_url);
+    let mut client = connect(port).await;
+    let worker_id = unique_id("s3-worker");
+
+    client
+        .register_worker(worker(&worker_id, WorkerRole::Trainer, 1))
+        .await
+        .expect("register S3 publisher");
+    let version = client
+        .create_weight_version(CreateWeightVersionRequest {
+            model_name: "test/model".to_string(),
+            version_number: Some(42),
+            idempotency_key: unique_id("s3-version"),
+            payload_format: WeightPayloadFormat::FullTensor.into(),
+            base_version_id: None,
+            expected_source_slots: vec!["canonical.delta.root".to_string()],
+        })
+        .await
+        .expect("create S3 version")
+        .into_inner();
+    let root_shard = s3_shard(&version.uid, &worker_id);
+    let published = client
+        .create_weight_version_shard(CreateWeightVersionShardRequest {
+            shard: Some(root_shard.clone()),
+        })
+        .await
+        .expect("publish canonical delta root")
+        .into_inner();
+    assert_eq!(
+        published.version.expect("published version").state,
+        i32::from(WeightVersionState::Ready)
+    );
+    client
+        .create_weight_version_shard(CreateWeightVersionShardRequest {
+            shard: Some(root_shard.clone()),
+        })
+        .await
+        .expect("repeated S3 root publication is idempotent");
+    let mut conflicting_root = root_shard;
+    conflicting_root.total_bytes += 1;
+    let conflict = client
+        .create_weight_version_shard(CreateWeightVersionShardRequest {
+            shard: Some(conflicting_root),
+        })
+        .await
+        .expect_err("conflicting S3 root publication is rejected");
+    assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+
+    tokio::time::sleep(Duration::from_millis(1_250)).await;
+    let expired_version = client
+        .create_weight_version(CreateWeightVersionRequest {
+            model_name: "test/model".to_string(),
+            version_number: Some(43),
+            idempotency_key: unique_id("expired-s3-version"),
+            payload_format: WeightPayloadFormat::FullTensor.into(),
+            base_version_id: None,
+            expected_source_slots: vec!["canonical.delta.root".to_string()],
+        })
+        .await
+        .expect("create version after publisher expiry")
+        .into_inner();
+    let expired = client
+        .create_weight_version_shard(CreateWeightVersionShardRequest {
+            shard: Some(s3_shard(&expired_version.uid, &worker_id)),
+        })
+        .await
+        .expect_err("expired worker cannot publish another S3 root");
+    assert_eq!(expired.code(), tonic::Code::FailedPrecondition);
+
+    let shards = client
+        .list_weight_version_shards(ListWeightVersionShardsRequest {
+            version_id: version.uid,
+        })
+        .await
+        .expect("list accepted S3 root after publisher expiry")
+        .into_inner()
+        .shards;
+    assert_eq!(shards.len(), 1);
+    assert_eq!(shards[0].source_slot_id, "canonical.delta.root");
+    assert!(matches!(shards[0].transport, Some(Transport::S3(_))));
+
+    stop(shutdown, server).await;
 }
 
 #[tokio::test]

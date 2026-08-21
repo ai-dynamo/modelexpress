@@ -45,9 +45,11 @@ fn validate_transport(transport: Option<&Transport>) -> Result<(), Status> {
             &source.manifest_endpoint,
             "shard.transport.nixl.manifest_endpoint",
         ),
-        Some(other) => Err(Status::unimplemented(format!(
-            "transport {other:?} is not supported by this server"
-        ))),
+        Some(Transport::S3(source)) => {
+            required(&source.bucket, "shard.transport.s3.bucket")?;
+            required(&source.key, "shard.transport.s3.key")?;
+            required(&source.checksum, "shard.transport.s3.checksum")
+        }
         None => Err(Status::invalid_argument("shard.transport is required")),
     }
 }
@@ -290,26 +292,53 @@ mod tests {
     }
 
     #[test]
-    fn typed_nixl_transport_is_accepted() {
-        let transport = Transport::Nixl(NixlTransport {
+    fn typed_nixl_and_s3_transports_are_accepted() {
+        let nixl = Transport::Nixl(NixlTransport {
             manifest_endpoint: "trainer:9000".to_string(),
         });
-
-        assert!(validate_transport(Some(&transport)).is_ok());
-    }
-
-    #[test]
-    fn unsupported_and_missing_transports_are_rejected() {
-        let unsupported = Transport::S3(S3Transport {
+        let s3 = Transport::S3(S3Transport {
             bucket: "weights".to_string(),
-            key: "version".to_string(),
+            key: "model/version/delta-index.json".to_string(),
             object_version: None,
             checksum: "crc32c:00000000".to_string(),
         });
 
+        assert!(validate_transport(Some(&nixl)).is_ok());
+        assert!(validate_transport(Some(&s3)).is_ok());
+    }
+
+    #[test]
+    fn malformed_and_missing_transports_are_rejected() {
+        for source in [
+            S3Transport {
+                bucket: String::new(),
+                key: "delta-index.json".to_string(),
+                checksum: "crc32c:00000000".to_string(),
+                ..Default::default()
+            },
+            S3Transport {
+                bucket: "weights".to_string(),
+                key: String::new(),
+                checksum: "crc32c:00000000".to_string(),
+                ..Default::default()
+            },
+            S3Transport {
+                bucket: "weights".to_string(),
+                key: "delta-index.json".to_string(),
+                checksum: String::new(),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                error_code(validate_transport(Some(&Transport::S3(source)))),
+                Code::InvalidArgument
+            );
+        }
         assert_eq!(
-            error_code(validate_transport(Some(&unsupported))),
-            Code::Unimplemented
+            error_code(validate_transport(Some(&Transport::Nixl(
+                NixlTransport::default(),
+            )))),
+            Code::InvalidArgument
         );
         assert_eq!(error_code(validate_transport(None)), Code::InvalidArgument);
     }
