@@ -13,6 +13,8 @@ from modelexpress.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
     _mx_version,
+    build_sources,
+    merge_shard_tables,
     wrap_rendezvous_blob,
 )
 
@@ -440,3 +442,107 @@ def test_one_unreadable_rank_does_not_abort_the_sweep():
     # The readable ranks are still returned when the quorum only needs them.
     discovered = _rendezvous(client).discover_trainers(expected_trainers=2, timeout=0)
     assert [p.agent_name for p in discovered] == ["rank-0", "rank-2"]
+
+
+def _tensor(
+    dtype="torch.bfloat16",
+    elsize=2,
+    name="weight",
+    shard_offset=(0, 0),
+    shape=(4, 4),
+):
+    """One published tensor with a single shard.
+
+    ``shard_offset``/``shape`` are parameterized because the merge retains one
+    representative per distinct geometry: two ranks publishing the SAME box are
+    replicas and collapse to one shard, so a test about cross-rank fan-in has to
+    hand the two ranks different boxes.
+    """
+    return PublishedTensor(
+        name=name,
+        dtype=dtype,
+        elsize=elsize,
+        full_shape=(4, 4),
+        shards=[
+            PublishedShard(
+                agent_name="trainer-agent",
+                device_id=0,
+                addr=4096,
+                shard_offset=shard_offset,
+                shape=shape,
+            )
+        ],
+    )
+
+
+def test_a_published_elsize_that_disagrees_with_its_dtype_is_rejected():
+    # elsize drives raw address arithmetic in the slice plan, so a wrong value
+    # reads the wrong bytes rather than failing.
+    with pytest.raises(ValueError, match="disagrees with dtype"):
+        build_sources([_tensor(dtype="torch.bfloat16", elsize=4)])
+
+
+def test_a_published_elsize_matching_its_dtype_is_accepted():
+    sources, _, _ = build_sources([_tensor(dtype="torch.bfloat16", elsize=2)])
+    assert sources["weight"].elsize == 2
+
+
+def test_a_stripped_dtype_label_resolves_the_same_as_a_prefixed_one():
+    stripped, _, _ = build_sources([_tensor(dtype="bfloat16", elsize=2)])
+    prefixed, _, _ = build_sources([_tensor(dtype="torch.bfloat16", elsize=2)])
+    assert stripped["weight"].dtype == prefixed["weight"].dtype
+
+
+def test_a_dtype_label_naming_a_non_dtype_torch_attribute_is_rejected():
+    # getattr(torch, "load") resolves to a function; without an allowlist it
+    # would be accepted as a dtype.
+    with pytest.raises(ValueError, match="unsupported dtype label"):
+        build_sources([_tensor(dtype="torch.load", elsize=2)])
+
+
+def test_ranks_publishing_the_same_tensor_with_different_elsize_are_rejected():
+    with pytest.raises(ValueError, match="inconsistent shape/dtype/elsize"):
+        merge_shard_tables([[_tensor(elsize=2)], [_tensor(elsize=4)]])
+
+
+def test_ranks_publishing_a_consistent_tensor_merge_their_shards():
+    merged = merge_shard_tables(
+        [
+            [_tensor(shard_offset=(0, 0), shape=(2, 4))],
+            [_tensor(shard_offset=(2, 0), shape=(2, 4))],
+        ]
+    )
+    assert len(merged) == 1
+    assert len(merged[0].shards) == 2
+
+
+def test_a_dtype_label_that_names_nothing_in_torch_is_rejected():
+    with pytest.raises(ValueError, match="unsupported dtype label"):
+        build_sources([_tensor(dtype="torch.not_a_real_dtype", elsize=2)])
+
+
+def test_ranks_spelling_one_dtype_differently_are_not_a_disagreement():
+    # The publish contract accepts both spellings, so ranks that disagree only
+    # on the prefix agree on the dtype; rejecting them would name a cross-rank
+    # inconsistency that does not exist.
+    merged = merge_shard_tables(
+        [
+            [_tensor(dtype="torch.bfloat16", shard_offset=(0, 0), shape=(2, 4))],
+            [_tensor(dtype="bfloat16", shard_offset=(2, 0), shape=(2, 4))],
+        ]
+    )
+    assert len(merged) == 1
+    assert len(merged[0].shards) == 2
+
+
+def test_ranks_publishing_the_same_tensor_with_different_dtype_are_rejected():
+    with pytest.raises(ValueError, match="inconsistent shape/dtype/elsize"):
+        merge_shard_tables(
+            [[_tensor(dtype="torch.bfloat16")], [_tensor(dtype="float16")]]
+        )
+
+
+def test_a_non_string_dtype_label_is_rejected_as_invalid_metadata():
+    # dtype rides through decode untouched, so its type is a publisher's claim.
+    with pytest.raises(ValueError, match="unsupported dtype label"):
+        build_sources([_tensor(dtype=123, elsize=2)])
