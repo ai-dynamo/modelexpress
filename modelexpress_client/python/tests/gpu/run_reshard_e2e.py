@@ -5,8 +5,8 @@
 
 Launch one process per rank. Ranks ``[0, tp_src)`` are trainers; remaining
 ranks are generators. A Gloo process group broadcasts only NCCL bootstrap
-bytes. The transfer itself uses a runtime-owned NCCL4Py communicator, one
-explicit CUDA stream, and public ``nccl.m2n.reshard``.
+bytes. Transfer uses an MX-owned NCCL4Py communicator and CUDA stream plus
+official ``DistTensor``, ``m2n.group()``, and ``Handle.reshard()`` APIs.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from modelexpress.refit.reshard.transport.nccl_m2n.executor import (
     ReshardParam,
 )
 from modelexpress.refit.reshard.transport.nccl_m2n.runtime import (
-    _M2nLaneSpec,
+    _M2nPPGroupSpec,
     _M2nRuntime,
 )
 
@@ -39,9 +39,7 @@ def main() -> int:
     tp_src = int(os.environ.get("TP_SRC", "1"))
     tp_dst = int(os.environ.get("TP_DST", "1"))
     if tp_src + tp_dst != world:
-        raise SystemExit(
-            f"tp_src+tp_dst ({tp_src}+{tp_dst}) != world {world}"
-        )
+        raise SystemExit(f"tp_src+tp_dst ({tp_src}+{tp_dst}) != world {world}")
 
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend="gloo", rank=rank, world_size=world)
@@ -54,15 +52,18 @@ def main() -> int:
     dist.broadcast_object_list(bootstrap, src=0)
     if bootstrap[0] is None:
         raise RuntimeError("failed to broadcast NCCL unique id")
-    lane = runtime.create_lane(
-        _M2nLaneSpec(
-            lane_id="weights-0",
-            key=(0, 0),
-            unique_id=bootstrap[0],
-            nranks=world,
-            comm_rank=rank,
-            device_id=local_rank,
-        ),
+    (pp_group,) = runtime.create_pp_groups(
+        [
+            _M2nPPGroupSpec(
+                group_id="weights-0",
+                key=(0, 0),
+                unique_id=bootstrap[0],
+                source_size=tp_src,
+                destination_size=tp_dst,
+                comm_rank=rank,
+                device_id=local_rank,
+            )
+        ]
     )
 
     rows, cols = 8, 16
@@ -80,29 +81,31 @@ def main() -> int:
     for offset in offsets:
         if is_src:
             global_tensor = torch.arange(rows * cols, dtype=dtype).reshape(rows, cols)
-            tile = global_tensor[
-                rank * src_rows : (rank + 1) * src_rows
-            ].contiguous().cuda() + offset
+            tile = (
+                global_tensor[rank * src_rows : (rank + 1) * src_rows]
+                .contiguous()
+                .cuda()
+                + offset
+            )
         else:
             tile = torch.zeros(dst_rows, cols, dtype=dtype, device="cuda")
         tiles.append(tile)
 
-    executor = NcclM2nExecutor(
-        runtime,
-        lane,
-        tp_src=tp_src,
-        tp_dst=tp_dst,
-    )
+    del pp_group
+    executor = NcclM2nExecutor(runtime)
     executor.execute(
-        [
-            ReshardParam(
-                name=f"w{index}",
-                global_shape=(rows, cols),
-                shard_dim=shard_dim,
-                local_tensor=tile,
-            )
-            for index, tile in enumerate(tiles)
-        ]
+        {
+            (0, 0): [
+                ReshardParam(
+                    name=f"w{index}",
+                    global_shape=(rows, cols),
+                    shard_dim=shard_dim,
+                    local_tensor=tile,
+                    local_shard_index=(rank if is_src else rank - tp_src),
+                )
+                for index, tile in enumerate(tiles)
+            ]
+        }
     )
 
     rc = 0
@@ -110,14 +113,17 @@ def main() -> int:
         dst_index = rank - tp_src
         results = []
         for index, (tile, offset) in enumerate(zip(tiles, offsets, strict=True)):
-            expected = _reference_dst_tile(
-                rows,
-                cols,
-                dtype,
-                shard_dim,
-                tp_dst,
-                dst_index,
-            ) + offset
+            expected = (
+                _reference_dst_tile(
+                    rows,
+                    cols,
+                    dtype,
+                    shard_dim,
+                    tp_dst,
+                    dst_index,
+                )
+                + offset
+            )
             got = tile.cpu()
             ok = torch.equal(got, expected)
             results.append(ok)
