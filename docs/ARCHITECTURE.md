@@ -375,10 +375,10 @@ See [`metadata.md`](metadata.md) for the full metadata architecture including st
 `RefitService` is a new RL-specific control plane. It does not reuse or modify the
 legacy `WeightSyncService`. The initial slice stores worker registrations,
 immutable weight versions, and compact physical shard publications in Redis.
-Each shard has a typed transport `oneof`; the current runtime accepts NIXL
-sources, while the protocol also defines S3 object locations for the durable
-transport implementation. On the current NIXL path, weight bytes and full tensor
-manifests remain on trainer workers.
+Each shard has a typed transport `oneof`; the runtime accepts NIXL sources and
+canonical S3 delta roots. On the NIXL path, weight bytes and full tensor
+manifests remain on trainer workers. On the S3 path, rank zero advertises one
+`canonical.delta.root` after every trainer rank has uploaded its owned buckets.
 
 #### RL refit client architecture
 
@@ -401,7 +401,10 @@ flowchart LR
         TA["Trainer engine adapter"]
         B["Registered source buffers"]
         M["RefitWorkerService<br/>manifest endpoint"]
+        C["Canonical HF gather<br/>XOR staging"]
     end
+
+    D["S3<br/>safetensors shards + index"]
 
     subgraph Generator["Generator rank"]
         GA["Generator engine adapter"]
@@ -413,6 +416,7 @@ flowchart LR
     O -->|"Framework-native RPC"| T
     O -->|"Framework-native RPC"| G
     T --> TA --> B
+    T --> C --> D
     T -->|"Register worker; publish shard metadata"| S
     T --> M
     G -->|"Register worker; discover shards; lease version"| S
@@ -427,6 +431,9 @@ and leases, but it does not discover engine tensor layouts or transfer weights.
 For a `NixlTransport`, `RefitWorkerService` is the trainer-local manifest endpoint.
 The manifest is an opaque description of the exact published source buffers;
 the generator uses it to compile and validate its receiver-local transfer plan.
+For an `S3Transport`, the advertised object is the global
+`model.safetensors.index.json`;
+the server validates only its typed location and does not contact S3.
 
 The synchronous generator client returns a staged handle only after transfer
 and verification finish. That handle owns the version lease through graph-safe
