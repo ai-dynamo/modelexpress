@@ -4,7 +4,8 @@
 """Mesh mapping for the nccl_m2n reshard transport.
 
 Pure-math (no torch) helpers that translate shared shard layouts into the 2-D
-mesh and placement metadata consumed by public ``nccl.m2n.reshard``.
+mesh and placement metadata used by official ``nccl.m2n.DistTensor``
+descriptors passed to ``Handle.reshard``.
 
 First slice: TP-only, same-dim reshards (one axis SHARD, the other REPLICATE).
 Cross-dim (transpose) and 2-D TP x FSDP tiles are later slices.

@@ -24,9 +24,9 @@ ModelExpress-owned PP transfer resources.
    communicator is valid, then releases streams and destroys communicators in
    canonical PP-group order.
 
-Preparation may be concurrent. M2N submission is single-dispatcher and
-canonically ordered. Sequential host submission does not prevent GPU overlap:
-each PP group uses a different CUDA stream.
+Callers may prepare update inputs concurrently. Each executor serializes
+validation, staging, descriptor construction, and M2N submission. PP-group GPU
+work uses distinct streams and may overlap after grouped submission.
 
 ## Caller contract
 
@@ -38,6 +38,10 @@ returns.
 Every rank in one PP communicator must supply identical parameter count and
 order. M2N calls are collectives.
 
+Each `execute()` call must include every locally owned PP group exactly once.
+Use an empty parameter sequence when one group has no parameters for that
+update. Partial PP-group maps are rejected before M2N submission.
+
 PP communicator membership is ordered: source ranks occupy
 `[0, source_size)` and destination ranks follow. Within each side, communicator
 rank must equal logical tensor shard index. MX validates NeMo
@@ -48,8 +52,13 @@ rank must equal logical tensor shard index. MX validates NeMo
 - MX owns PP communicators and streams. Caller-owned resources are deferred.
 - Direct caller-supplied `DistTensor` descriptors are deferred.
 - Dynamic PP membership requires a new runtime and communicator set.
+- Any update failure leaves the executor unusable. Once grouped M2N submission
+  begins, a transfer or commit failure also poisons the entire runtime and every
+  PP group. Recovery requires rebuilding the runtime and executor.
 - Whole-version staging protects one destination process. Serving must remain
   quiesced until the complete destination cohort reports success.
+- Megatron shard ranges must be uniform, aligned, and evenly divide the global
+  extent. Non-uniform or unaligned `local_shard_range` values are rejected.
 - Cross-rank parameter-plan agreement is not implemented here. Different
   skipped parameters can still cause collective-order divergence.
 - Source-only storage overlap across different M2N buckets is intentionally
