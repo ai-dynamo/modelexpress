@@ -27,19 +27,19 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0brefit.proto\x12\x13model_express.refit\"\x86\x01\n\x12WorkerRegistration\x12\x11\n\tworker_id\x18\x01 \x01(\t\x12-\n\x04role\x18\x02 \x01(\x0e\x32\x1f.model_express.refit.WorkerRole\x12\x12\n\nmodel_name\x18\x03 \x01(\t\x12\x1a\n\x12\x65xpires_at_unix_ms\x18\x04 \x01(\x04\"e\n\x15RegisterWorkerRequest\x12\x37\n\x06worker\x18\x01 \x01(\x0b\x32\'.model_express.refit.WorkerRegistration\x12\x13\n\x0bttl_seconds\x18\x02 \x01(\r\"\xfa\x02\n\rWeightVersion\x12\x0b\n\x03uid\x18\x01 \x01(\t\x12\x12\n\nmodel_name\x18\x02 \x01(\t\x12\x1b\n\x0eversion_number\x18\x03 \x01(\x04H\x00\x88\x01\x01\x12\x17\n\x0fidempotency_key\x18\x04 \x01(\t\x12@\n\x0epayload_format\x18\x05 \x01(\x0e\x32(.model_express.refit.WeightPayloadFormat\x12\x1c\n\x0f\x62\x61se_version_id\x18\x06 \x01(\tH\x01\x88\x01\x01\x12\x1d\n\x15\x65xpected_source_slots\x18\x07 \x03(\t\x12\x18\n\x10layout_signature\x18\x08 \x01(\t\x12\x36\n\x05state\x18\t \x01(\x0e\x32\'.model_express.refit.WeightVersionState\x12\x1a\n\x12\x63reated_at_unix_ms\x18\n \x01(\x04\x42\x11\n\x0f_version_numberB\x12\n\x10_base_version_id\"\x8c\x02\n\x1a\x43reateWeightVersionRequest\x12\x12\n\nmodel_name\x18\x01 \x01(\t\x12\x1b\n\x0eversion_number\x18\x02 \x01(\x04H\x00\x88\x01\x01\x12\x17\n\x0fidempotency_key\x18\x03 \x01(\t\x12@\n\x0epayload_format\x18\x04 \x01(\x0e\x32(.model_express.refit.WeightPayloadFormat\x12\x1c\n\x0f\x62\x61se_version_id\x18\x05 \x01(\tH\x01\x88\x01\x01\x12\x1d\n\x15\x65xpected_source_slots\x18\x06 \x03(\tB\x11\n\x0f_version_numberB\x12\n\x10_base_version_id\"&\n\x17GetWeightVersionRequest\x12\x0b\n\x03uid\x18\x01 \x01(\t\")\n\x1a\x44\x65leteWeightVersionRequest\x12\x0b\n\x03uid\x18\x01 \x01(\t\"\xc5\x01\n\x12WeightVersionShard\x12\x12\n\nversion_id\x18\x01 \x01(\t\x12\x16\n\x0esource_slot_id\x18\x02 \x01(\t\x12\x11\n\tworker_id\x18\x03 \x01(\t\x12\x14\n\x0ctensor_count\x18\x04 \x01(\x04\x12\x13\n\x0btotal_bytes\x18\x05 \x01(\x04\x12\x17\n\x0fmanifest_digest\x18\x06 \x01(\t\x12\x19\n\x11manifest_endpoint\x18\x07 \x01(\t\x12\x11\n\ttransport\x18\x08 \x01(\t\"Y\n\x1f\x43reateWeightVersionShardRequest\x12\x36\n\x05shard\x18\x01 \x01(\x0b\x32\'.model_express.refit.WeightVersionShard\"\x8f\x01\n CreateWeightVersionShardResponse\x12\x36\n\x05shard\x18\x01 \x01(\x0b\x32\'.model_express.refit.WeightVersionShard\x12\x33\n\x07version\x18\x02 \x01(\x0b\x32\".model_express.refit.WeightVersion\"4\n\x1eListWeightVersionShardsRequest\x12\x12\n\nversion_id\x18\x01 \x01(\t\"Z\n\x1fListWeightVersionShardsResponse\x12\x37\n\x06shards\x18\x01 \x03(\x0b\x32\'.model_express.refit.WeightVersionShard\"R\n$GetWeightVersionShardManifestRequest\x12\x12\n\nversion_id\x18\x01 \x01(\t\x12\x16\n\x0esource_slot_id\x18\x02 \x01(\t\"R\n%GetWeightVersionShardManifestResponse\x12\x10\n\x08manifest\x18\x01 \x01(\x0c\x12\x17\n\x0fmanifest_digest\x18\x02 \x01(\t\"`\n\x1f\x44\x65leteWeightVersionShardRequest\x12\x12\n\nversion_id\x18\x01 \x01(\t\x12\x16\n\x0esource_slot_id\x18\x02 \x01(\t\x12\x11\n\tworker_id\x18\x03 \x01(\t\"3\n DeleteWeightVersionShardResponse\x12\x0f\n\x07\x64\x65leted\x18\x01 \x01(\x08\"c\n\x0cVersionLease\x12\x10\n\x08lease_id\x18\x01 \x01(\t\x12\x12\n\nversion_id\x18\x02 \x01(\t\x12\x11\n\tworker_id\x18\x03 \x01(\t\x12\x1a\n\x12\x65xpires_at_unix_ms\x18\x04 \x01(\x04\"Y\n\x1bRegisterVersionLeaseRequest\x12\x12\n\nversion_id\x18\x01 \x01(\t\x12\x11\n\tworker_id\x18\x02 \x01(\t\x12\x13\n\x0bttl_seconds\x18\x03 \x01(\r\"T\n\x19\x44\x65leteVersionLeaseRequest\x12\x12\n\nversion_id\x18\x01 \x01(\t\x12\x10\n\x08lease_id\x18\x02 \x01(\t\x12\x11\n\tworker_id\x18\x03 \x01(\t\"-\n\x1a\x44\x65leteVersionLeaseResponse\x12\x0f\n\x07\x64\x65leted\x18\x01 \x01(\x08*]\n\nWorkerRole\x12\x1b\n\x17WORKER_ROLE_UNSPECIFIED\x10\x00\x12\x17\n\x13WORKER_ROLE_TRAINER\x10\x01\x12\x19\n\x15WORKER_ROLE_GENERATOR\x10\x02*\x88\x01\n\x13WeightPayloadFormat\x12%\n!WEIGHT_PAYLOAD_FORMAT_UNSPECIFIED\x10\x00\x12%\n!WEIGHT_PAYLOAD_FORMAT_FULL_TENSOR\x10\x01\x12#\n\x1fWEIGHT_PAYLOAD_FORMAT_XOR_DELTA\x10\x02*\xa0\x01\n\x12WeightVersionState\x12$\n WEIGHT_VERSION_STATE_UNSPECIFIED\x10\x00\x12 \n\x1cWEIGHT_VERSION_STATE_STAGING\x10\x01\x12\x1e\n\x1aWEIGHT_VERSION_STATE_READY\x10\x02\x12\"\n\x1eWEIGHT_VERSION_STATE_RELEASING\x10\x03\x32\xb2\x08\n\x0cRefitService\x12j\n\x13\x43reateWeightVersion\x12/.model_express.refit.CreateWeightVersionRequest\x1a\".model_express.refit.WeightVersion\x12\x64\n\x10GetWeightVersion\x12,.model_express.refit.GetWeightVersionRequest\x1a\".model_express.refit.WeightVersion\x12j\n\x13\x44\x65leteWeightVersion\x12/.model_express.refit.DeleteWeightVersionRequest\x1a\".model_express.refit.WeightVersion\x12\x65\n\x0eRegisterWorker\x12*.model_express.refit.RegisterWorkerRequest\x1a\'.model_express.refit.WorkerRegistration\x12\x87\x01\n\x18\x43reateWeightVersionShard\x12\x34.model_express.refit.CreateWeightVersionShardRequest\x1a\x35.model_express.refit.CreateWeightVersionShardResponse\x12\x84\x01\n\x17ListWeightVersionShards\x12\x33.model_express.refit.ListWeightVersionShardsRequest\x1a\x34.model_express.refit.ListWeightVersionShardsResponse\x12\x87\x01\n\x18\x44\x65leteWeightVersionShard\x12\x34.model_express.refit.DeleteWeightVersionShardRequest\x1a\x35.model_express.refit.DeleteWeightVersionShardResponse\x12k\n\x14RegisterVersionLease\x12\x30.model_express.refit.RegisterVersionLeaseRequest\x1a!.model_express.refit.VersionLease\x12u\n\x12\x44\x65leteVersionLease\x12..model_express.refit.DeleteVersionLeaseRequest\x1a/.model_express.refit.DeleteVersionLeaseResponse2\xad\x01\n\x12RefitWorkerService\x12\x96\x01\n\x1dGetWeightVersionShardManifest\x12\x39.model_express.refit.GetWeightVersionShardManifestRequest\x1a:.model_express.refit.GetWeightVersionShardManifestResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0brefit.proto\x12\x13model_express.refit\"\x86\x01\n\x12WorkerRegistration\x12\x11\n\tworker_id\x18\x01 \x01(\t\x12-\n\x04role\x18\x02 \x01(\x0e\x32\x1f.model_express.refit.WorkerRole\x12\x12\n\nmodel_name\x18\x03 \x01(\t\x12\x1a\n\x12\x65xpires_at_unix_ms\x18\x04 \x01(\x04\"e\n\x15RegisterWorkerRequest\x12\x37\n\x06worker\x18\x01 \x01(\x0b\x32\'.model_express.refit.WorkerRegistration\x12\x13\n\x0bttl_seconds\x18\x02 \x01(\r\"\xfa\x02\n\rWeightVersion\x12\x0b\n\x03uid\x18\x01 \x01(\t\x12\x12\n\nmodel_name\x18\x02 \x01(\t\x12\x1b\n\x0eversion_number\x18\x03 \x01(\x04H\x00\x88\x01\x01\x12\x17\n\x0fidempotency_key\x18\x04 \x01(\t\x12@\n\x0epayload_format\x18\x05 \x01(\x0e\x32(.model_express.refit.WeightPayloadFormat\x12\x1c\n\x0f\x62\x61se_version_id\x18\x06 \x01(\tH\x01\x88\x01\x01\x12\x1d\n\x15\x65xpected_source_slots\x18\x07 \x03(\t\x12\x18\n\x10layout_signature\x18\x08 \x01(\t\x12\x36\n\x05state\x18\t \x01(\x0e\x32\'.model_express.refit.WeightVersionState\x12\x1a\n\x12\x63reated_at_unix_ms\x18\n \x01(\x04\x42\x11\n\x0f_version_numberB\x12\n\x10_base_version_id\"\x8c\x02\n\x1a\x43reateWeightVersionRequest\x12\x12\n\nmodel_name\x18\x01 \x01(\t\x12\x1b\n\x0eversion_number\x18\x02 \x01(\x04H\x00\x88\x01\x01\x12\x17\n\x0fidempotency_key\x18\x03 \x01(\t\x12@\n\x0epayload_format\x18\x04 \x01(\x0e\x32(.model_express.refit.WeightPayloadFormat\x12\x1c\n\x0f\x62\x61se_version_id\x18\x05 \x01(\tH\x01\x88\x01\x01\x12\x1d\n\x15\x65xpected_source_slots\x18\x06 \x03(\tB\x11\n\x0f_version_numberB\x12\n\x10_base_version_id\"&\n\x17GetWeightVersionRequest\x12\x0b\n\x03uid\x18\x01 \x01(\t\")\n\x1a\x44\x65leteWeightVersionRequest\x12\x0b\n\x03uid\x18\x01 \x01(\t\"\x88\x02\n\x12WeightVersionShard\x12\x12\n\nversion_id\x18\x01 \x01(\t\x12\x16\n\x0esource_slot_id\x18\x02 \x01(\t\x12\x11\n\tworker_id\x18\x03 \x01(\t\x12\x14\n\x0ctensor_count\x18\x04 \x01(\x04\x12\x13\n\x0btotal_bytes\x18\x05 \x01(\x04\x12\x17\n\x0fmanifest_digest\x18\x06 \x01(\t\x12\x32\n\x04nixl\x18\x07 \x01(\x0b\x32\".model_express.refit.NixlTransportH\x00\x12.\n\x02s3\x18\x08 \x01(\x0b\x32 .model_express.refit.S3TransportH\x00\x42\x0b\n\ttransport\"*\n\rNixlTransport\x12\x19\n\x11manifest_endpoint\x18\x01 \x01(\t\"l\n\x0bS3Transport\x12\x0e\n\x06\x62ucket\x18\x01 \x01(\t\x12\x0b\n\x03key\x18\x02 \x01(\t\x12\x1b\n\x0eobject_version\x18\x03 \x01(\tH\x00\x88\x01\x01\x12\x10\n\x08\x63hecksum\x18\x04 \x01(\tB\x11\n\x0f_object_version\"Y\n\x1f\x43reateWeightVersionShardRequest\x12\x36\n\x05shard\x18\x01 \x01(\x0b\x32\'.model_express.refit.WeightVersionShard\"\x8f\x01\n CreateWeightVersionShardResponse\x12\x36\n\x05shard\x18\x01 \x01(\x0b\x32\'.model_express.refit.WeightVersionShard\x12\x33\n\x07version\x18\x02 \x01(\x0b\x32\".model_express.refit.WeightVersion\"4\n\x1eListWeightVersionShardsRequest\x12\x12\n\nversion_id\x18\x01 \x01(\t\"Z\n\x1fListWeightVersionShardsResponse\x12\x37\n\x06shards\x18\x01 \x03(\x0b\x32\'.model_express.refit.WeightVersionShard\"R\n$GetWeightVersionShardManifestRequest\x12\x12\n\nversion_id\x18\x01 \x01(\t\x12\x16\n\x0esource_slot_id\x18\x02 \x01(\t\"R\n%GetWeightVersionShardManifestResponse\x12\x10\n\x08manifest\x18\x01 \x01(\x0c\x12\x17\n\x0fmanifest_digest\x18\x02 \x01(\t\"`\n\x1f\x44\x65leteWeightVersionShardRequest\x12\x12\n\nversion_id\x18\x01 \x01(\t\x12\x16\n\x0esource_slot_id\x18\x02 \x01(\t\x12\x11\n\tworker_id\x18\x03 \x01(\t\"3\n DeleteWeightVersionShardResponse\x12\x0f\n\x07\x64\x65leted\x18\x01 \x01(\x08\"c\n\x0cVersionLease\x12\x10\n\x08lease_id\x18\x01 \x01(\t\x12\x12\n\nversion_id\x18\x02 \x01(\t\x12\x11\n\tworker_id\x18\x03 \x01(\t\x12\x1a\n\x12\x65xpires_at_unix_ms\x18\x04 \x01(\x04\"Y\n\x1bRegisterVersionLeaseRequest\x12\x12\n\nversion_id\x18\x01 \x01(\t\x12\x11\n\tworker_id\x18\x02 \x01(\t\x12\x13\n\x0bttl_seconds\x18\x03 \x01(\r\"T\n\x19\x44\x65leteVersionLeaseRequest\x12\x12\n\nversion_id\x18\x01 \x01(\t\x12\x10\n\x08lease_id\x18\x02 \x01(\t\x12\x11\n\tworker_id\x18\x03 \x01(\t\"-\n\x1a\x44\x65leteVersionLeaseResponse\x12\x0f\n\x07\x64\x65leted\x18\x01 \x01(\x08*]\n\nWorkerRole\x12\x1b\n\x17WORKER_ROLE_UNSPECIFIED\x10\x00\x12\x17\n\x13WORKER_ROLE_TRAINER\x10\x01\x12\x19\n\x15WORKER_ROLE_GENERATOR\x10\x02*\x88\x01\n\x13WeightPayloadFormat\x12%\n!WEIGHT_PAYLOAD_FORMAT_UNSPECIFIED\x10\x00\x12%\n!WEIGHT_PAYLOAD_FORMAT_FULL_TENSOR\x10\x01\x12#\n\x1fWEIGHT_PAYLOAD_FORMAT_XOR_DELTA\x10\x02*\xa0\x01\n\x12WeightVersionState\x12$\n WEIGHT_VERSION_STATE_UNSPECIFIED\x10\x00\x12 \n\x1cWEIGHT_VERSION_STATE_STAGING\x10\x01\x12\x1e\n\x1aWEIGHT_VERSION_STATE_READY\x10\x02\x12\"\n\x1eWEIGHT_VERSION_STATE_RELEASING\x10\x03\x32\xb2\x08\n\x0cRefitService\x12j\n\x13\x43reateWeightVersion\x12/.model_express.refit.CreateWeightVersionRequest\x1a\".model_express.refit.WeightVersion\x12\x64\n\x10GetWeightVersion\x12,.model_express.refit.GetWeightVersionRequest\x1a\".model_express.refit.WeightVersion\x12j\n\x13\x44\x65leteWeightVersion\x12/.model_express.refit.DeleteWeightVersionRequest\x1a\".model_express.refit.WeightVersion\x12\x65\n\x0eRegisterWorker\x12*.model_express.refit.RegisterWorkerRequest\x1a\'.model_express.refit.WorkerRegistration\x12\x87\x01\n\x18\x43reateWeightVersionShard\x12\x34.model_express.refit.CreateWeightVersionShardRequest\x1a\x35.model_express.refit.CreateWeightVersionShardResponse\x12\x84\x01\n\x17ListWeightVersionShards\x12\x33.model_express.refit.ListWeightVersionShardsRequest\x1a\x34.model_express.refit.ListWeightVersionShardsResponse\x12\x87\x01\n\x18\x44\x65leteWeightVersionShard\x12\x34.model_express.refit.DeleteWeightVersionShardRequest\x1a\x35.model_express.refit.DeleteWeightVersionShardResponse\x12k\n\x14RegisterVersionLease\x12\x30.model_express.refit.RegisterVersionLeaseRequest\x1a!.model_express.refit.VersionLease\x12u\n\x12\x44\x65leteVersionLease\x12..model_express.refit.DeleteVersionLeaseRequest\x1a/.model_express.refit.DeleteVersionLeaseResponse2\xad\x01\n\x12RefitWorkerService\x12\x96\x01\n\x1dGetWeightVersionShardManifest\x12\x39.model_express.refit.GetWeightVersionShardManifestRequest\x1a:.model_express.refit.GetWeightVersionShardManifestResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'refit_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_WORKERROLE']._serialized_start=2238
-  _globals['_WORKERROLE']._serialized_end=2331
-  _globals['_WEIGHTPAYLOADFORMAT']._serialized_start=2334
-  _globals['_WEIGHTPAYLOADFORMAT']._serialized_end=2470
-  _globals['_WEIGHTVERSIONSTATE']._serialized_start=2473
-  _globals['_WEIGHTVERSIONSTATE']._serialized_end=2633
+  _globals['_WORKERROLE']._serialized_start=2459
+  _globals['_WORKERROLE']._serialized_end=2552
+  _globals['_WEIGHTPAYLOADFORMAT']._serialized_start=2555
+  _globals['_WEIGHTPAYLOADFORMAT']._serialized_end=2691
+  _globals['_WEIGHTVERSIONSTATE']._serialized_start=2694
+  _globals['_WEIGHTVERSIONSTATE']._serialized_end=2854
   _globals['_WORKERREGISTRATION']._serialized_start=37
   _globals['_WORKERREGISTRATION']._serialized_end=171
   _globals['_REGISTERWORKERREQUEST']._serialized_start=173
@@ -53,33 +53,37 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_DELETEWEIGHTVERSIONREQUEST']._serialized_start=968
   _globals['_DELETEWEIGHTVERSIONREQUEST']._serialized_end=1009
   _globals['_WEIGHTVERSIONSHARD']._serialized_start=1012
-  _globals['_WEIGHTVERSIONSHARD']._serialized_end=1209
-  _globals['_CREATEWEIGHTVERSIONSHARDREQUEST']._serialized_start=1211
-  _globals['_CREATEWEIGHTVERSIONSHARDREQUEST']._serialized_end=1300
-  _globals['_CREATEWEIGHTVERSIONSHARDRESPONSE']._serialized_start=1303
-  _globals['_CREATEWEIGHTVERSIONSHARDRESPONSE']._serialized_end=1446
-  _globals['_LISTWEIGHTVERSIONSHARDSREQUEST']._serialized_start=1448
-  _globals['_LISTWEIGHTVERSIONSHARDSREQUEST']._serialized_end=1500
-  _globals['_LISTWEIGHTVERSIONSHARDSRESPONSE']._serialized_start=1502
-  _globals['_LISTWEIGHTVERSIONSHARDSRESPONSE']._serialized_end=1592
-  _globals['_GETWEIGHTVERSIONSHARDMANIFESTREQUEST']._serialized_start=1594
-  _globals['_GETWEIGHTVERSIONSHARDMANIFESTREQUEST']._serialized_end=1676
-  _globals['_GETWEIGHTVERSIONSHARDMANIFESTRESPONSE']._serialized_start=1678
-  _globals['_GETWEIGHTVERSIONSHARDMANIFESTRESPONSE']._serialized_end=1760
-  _globals['_DELETEWEIGHTVERSIONSHARDREQUEST']._serialized_start=1762
-  _globals['_DELETEWEIGHTVERSIONSHARDREQUEST']._serialized_end=1858
-  _globals['_DELETEWEIGHTVERSIONSHARDRESPONSE']._serialized_start=1860
-  _globals['_DELETEWEIGHTVERSIONSHARDRESPONSE']._serialized_end=1911
-  _globals['_VERSIONLEASE']._serialized_start=1913
-  _globals['_VERSIONLEASE']._serialized_end=2012
-  _globals['_REGISTERVERSIONLEASEREQUEST']._serialized_start=2014
-  _globals['_REGISTERVERSIONLEASEREQUEST']._serialized_end=2103
-  _globals['_DELETEVERSIONLEASEREQUEST']._serialized_start=2105
-  _globals['_DELETEVERSIONLEASEREQUEST']._serialized_end=2189
-  _globals['_DELETEVERSIONLEASERESPONSE']._serialized_start=2191
-  _globals['_DELETEVERSIONLEASERESPONSE']._serialized_end=2236
-  _globals['_REFITSERVICE']._serialized_start=2636
-  _globals['_REFITSERVICE']._serialized_end=3710
-  _globals['_REFITWORKERSERVICE']._serialized_start=3713
-  _globals['_REFITWORKERSERVICE']._serialized_end=3886
+  _globals['_WEIGHTVERSIONSHARD']._serialized_end=1276
+  _globals['_NIXLTRANSPORT']._serialized_start=1278
+  _globals['_NIXLTRANSPORT']._serialized_end=1320
+  _globals['_S3TRANSPORT']._serialized_start=1322
+  _globals['_S3TRANSPORT']._serialized_end=1430
+  _globals['_CREATEWEIGHTVERSIONSHARDREQUEST']._serialized_start=1432
+  _globals['_CREATEWEIGHTVERSIONSHARDREQUEST']._serialized_end=1521
+  _globals['_CREATEWEIGHTVERSIONSHARDRESPONSE']._serialized_start=1524
+  _globals['_CREATEWEIGHTVERSIONSHARDRESPONSE']._serialized_end=1667
+  _globals['_LISTWEIGHTVERSIONSHARDSREQUEST']._serialized_start=1669
+  _globals['_LISTWEIGHTVERSIONSHARDSREQUEST']._serialized_end=1721
+  _globals['_LISTWEIGHTVERSIONSHARDSRESPONSE']._serialized_start=1723
+  _globals['_LISTWEIGHTVERSIONSHARDSRESPONSE']._serialized_end=1813
+  _globals['_GETWEIGHTVERSIONSHARDMANIFESTREQUEST']._serialized_start=1815
+  _globals['_GETWEIGHTVERSIONSHARDMANIFESTREQUEST']._serialized_end=1897
+  _globals['_GETWEIGHTVERSIONSHARDMANIFESTRESPONSE']._serialized_start=1899
+  _globals['_GETWEIGHTVERSIONSHARDMANIFESTRESPONSE']._serialized_end=1981
+  _globals['_DELETEWEIGHTVERSIONSHARDREQUEST']._serialized_start=1983
+  _globals['_DELETEWEIGHTVERSIONSHARDREQUEST']._serialized_end=2079
+  _globals['_DELETEWEIGHTVERSIONSHARDRESPONSE']._serialized_start=2081
+  _globals['_DELETEWEIGHTVERSIONSHARDRESPONSE']._serialized_end=2132
+  _globals['_VERSIONLEASE']._serialized_start=2134
+  _globals['_VERSIONLEASE']._serialized_end=2233
+  _globals['_REGISTERVERSIONLEASEREQUEST']._serialized_start=2235
+  _globals['_REGISTERVERSIONLEASEREQUEST']._serialized_end=2324
+  _globals['_DELETEVERSIONLEASEREQUEST']._serialized_start=2326
+  _globals['_DELETEVERSIONLEASEREQUEST']._serialized_end=2410
+  _globals['_DELETEVERSIONLEASERESPONSE']._serialized_start=2412
+  _globals['_DELETEVERSIONLEASERESPONSE']._serialized_end=2457
+  _globals['_REFITSERVICE']._serialized_start=2857
+  _globals['_REFITSERVICE']._serialized_end=3931
+  _globals['_REFITWORKERSERVICE']._serialized_start=3934
+  _globals['_REFITWORKERSERVICE']._serialized_end=4107
 # @@protoc_insertion_point(module_scope)

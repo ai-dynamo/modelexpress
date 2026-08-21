@@ -359,8 +359,12 @@ class ModelExpressGeneratorClient:
             WeightPayloadFormat.XOR_DELTA: refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA,
         }[self.payload_format]
 
-    def _fetch_manifest(self, shard) -> bytes:
-        with grpc.insecure_channel(shard.manifest_endpoint) as channel:
+    def _fetch_manifest(self, shard) -> tuple[bytes, refit_pb2.NixlTransport]:
+        transport = shard.WhichOneof("transport")
+        if transport != "nixl":
+            raise RuntimeError(f"unsupported shard transport {transport!r}")
+        source = shard.nixl
+        with grpc.insecure_channel(source.manifest_endpoint) as channel:
             response = refit_pb2_grpc.RefitWorkerServiceStub(
                 channel
             ).GetWeightVersionShardManifest(
@@ -378,7 +382,7 @@ class ModelExpressGeneratorClient:
             raise RuntimeError(
                 f"manifest digest mismatch for source slot {shard.source_slot_id!r}"
             )
-        return response.manifest
+        return response.manifest, source
 
     def _discover_sources(
         self,
@@ -405,7 +409,7 @@ class ModelExpressGeneratorClient:
                 ordered = ordered[offset:] + ordered[:offset]
             for shard in ordered:
                 try:
-                    manifest = self._fetch_manifest(shard)
+                    manifest, nixl = self._fetch_manifest(shard)
                 except (grpc.RpcError, RuntimeError) as error:
                     failures.append(str(error))
                     continue
@@ -413,9 +417,9 @@ class ModelExpressGeneratorClient:
                     GeneratorSource(
                         source_slot_id=source_slot_id,
                         worker_id=shard.worker_id,
-                        manifest_endpoint=shard.manifest_endpoint,
+                        manifest_endpoint=nixl.manifest_endpoint,
                         manifest_digest=shard.manifest_digest,
-                        transport=shard.transport,
+                        transport="NIXL",
                         manifest=manifest,
                     )
                 )

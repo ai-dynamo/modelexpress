@@ -332,6 +332,10 @@ class ModelExpressTrainerClient:
     ) -> None:
         source_slot_id = self._get_adapter().source_slot_id
         staged.publish_ready.wait()
+        if staged.manifest.transport.upper() != "NIXL":
+            raise ValueError(
+                f"unsupported shard transport {staged.manifest.transport!r}"
+            )
         manifest_endpoint = self._manifest_publisher.publish_manifest(
             version_id=version.version_id,
             source_slot_id=source_slot_id,
@@ -344,8 +348,9 @@ class ModelExpressTrainerClient:
             tensor_count=staged.manifest.tensor_count,
             total_bytes=staged.manifest.total_bytes,
             manifest_digest=staged.manifest.digest,
-            manifest_endpoint=_required(manifest_endpoint, "manifest_endpoint"),
-            transport=staged.manifest.transport,
+            nixl=refit_pb2.NixlTransport(
+                manifest_endpoint=_required(manifest_endpoint, "manifest_endpoint"),
+            ),
         )
         self._service.CreateWeightVersionShard(
             refit_pb2.CreateWeightVersionShardRequest(shard=shard),

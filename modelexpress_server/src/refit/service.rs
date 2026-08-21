@@ -15,6 +15,7 @@ use modelexpress_common::grpc::refit::{
     ListWeightVersionShardsRequest, ListWeightVersionShardsResponse, RegisterVersionLeaseRequest,
     RegisterWorkerRequest, VersionLease, WeightPayloadFormat, WeightVersion, WeightVersionState,
     WorkerRegistration, WorkerRole, refit_service_server::RefitService,
+    weight_version_shard::Transport,
 };
 use tonic::{Request, Response, Status};
 
@@ -35,6 +36,19 @@ fn validate_ttl(ttl_seconds: u32) -> Result<(), Status> {
         ))
     } else {
         Ok(())
+    }
+}
+
+fn validate_transport(transport: Option<&Transport>) -> Result<(), Status> {
+    match transport {
+        Some(Transport::Nixl(source)) => required(
+            &source.manifest_endpoint,
+            "shard.transport.nixl.manifest_endpoint",
+        ),
+        Some(other) => Err(Status::unimplemented(format!(
+            "transport {other:?} is not supported by this server"
+        ))),
+        None => Err(Status::invalid_argument("shard.transport is required")),
     }
 }
 
@@ -189,8 +203,7 @@ impl RefitService for RefitServiceImpl {
         required(&shard.source_slot_id, "shard.source_slot_id")?;
         required(&shard.worker_id, "shard.worker_id")?;
         required(&shard.manifest_digest, "shard.manifest_digest")?;
-        required(&shard.manifest_endpoint, "shard.manifest_endpoint")?;
-        required(&shard.transport, "shard.transport")?;
+        validate_transport(shard.transport.as_ref())?;
 
         let (shard, version) = self
             .backend
@@ -259,5 +272,45 @@ impl RefitService for RefitServiceImpl {
             .await
             .map(|deleted| Response::new(DeleteVersionLeaseResponse { deleted }))
             .map_err(backend_status)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use modelexpress_common::grpc::refit::{NixlTransport, S3Transport};
+    use tonic::Code;
+
+    use super::*;
+
+    fn error_code(result: Result<(), Status>) -> Code {
+        match result {
+            Ok(()) => panic!("transport validation unexpectedly succeeded"),
+            Err(status) => status.code(),
+        }
+    }
+
+    #[test]
+    fn typed_nixl_transport_is_accepted() {
+        let transport = Transport::Nixl(NixlTransport {
+            manifest_endpoint: "trainer:9000".to_string(),
+        });
+
+        assert!(validate_transport(Some(&transport)).is_ok());
+    }
+
+    #[test]
+    fn unsupported_and_missing_transports_are_rejected() {
+        let unsupported = Transport::S3(S3Transport {
+            bucket: "weights".to_string(),
+            key: "version".to_string(),
+            object_version: None,
+            checksum: "crc32c:00000000".to_string(),
+        });
+
+        assert_eq!(
+            error_code(validate_transport(Some(&unsupported))),
+            Code::Unimplemented
+        );
+        assert_eq!(error_code(validate_transport(None)), Code::InvalidArgument);
     }
 }

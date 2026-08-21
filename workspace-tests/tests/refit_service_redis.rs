@@ -18,9 +18,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use modelexpress_common::grpc::refit::{
     CreateWeightVersionRequest, CreateWeightVersionShardRequest, DeleteVersionLeaseRequest,
     DeleteWeightVersionRequest, DeleteWeightVersionShardRequest, GetWeightVersionRequest,
-    ListWeightVersionShardsRequest, RegisterVersionLeaseRequest, RegisterWorkerRequest,
-    WeightPayloadFormat, WeightVersionShard, WeightVersionState, WorkerRegistration, WorkerRole,
-    refit_service_client::RefitServiceClient,
+    ListWeightVersionShardsRequest, NixlTransport, RegisterVersionLeaseRequest,
+    RegisterWorkerRequest, WeightPayloadFormat, WeightVersionShard, WeightVersionState,
+    WorkerRegistration, WorkerRole, refit_service_client::RefitServiceClient,
+    weight_version_shard::Transport,
 };
 use modelexpress_server::backend_config::BackendConfig;
 use modelexpress_server::config::ServerConfig;
@@ -106,8 +107,9 @@ fn shard(version_id: &str, source_slot_id: &str, worker_id: &str) -> WeightVersi
         tensor_count: 10,
         total_bytes: 1024,
         manifest_digest: format!("digest-{source_slot_id}"),
-        manifest_endpoint: format!("{worker_id}:9000"),
-        transport: "NIXL".to_string(),
+        transport: Some(Transport::Nixl(NixlTransport {
+            manifest_endpoint: format!("{worker_id}:9000"),
+        })),
     }
 }
 

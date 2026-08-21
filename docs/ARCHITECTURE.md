@@ -375,7 +375,10 @@ See [`metadata.md`](metadata.md) for the full metadata architecture including st
 `RefitService` is a new RL-specific control plane. It does not reuse or modify the
 legacy `WeightSyncService`. The initial slice stores worker registrations,
 immutable weight versions, and compact physical shard publications in Redis.
-Weight bytes and full tensor manifests remain on trainer or generator workers.
+Each shard has a typed transport `oneof`; the current runtime accepts NIXL
+sources, while the protocol also defines S3 object locations for the durable
+transport implementation. On the current NIXL path, weight bytes and full tensor
+manifests remain on trainer workers.
 
 #### RL refit client architecture
 
@@ -421,9 +424,9 @@ flowchart LR
 `RefitService` is the central metadata service defined by `refit.proto`. It
 coordinates immutable versions, worker registrations, shard advertisements,
 and leases, but it does not discover engine tensor layouts or transfer weights.
-`RefitWorkerService` is the trainer-local manifest endpoint. The manifest is an
-opaque description of the exact published source buffers; the generator uses
-it to compile and validate its receiver-local transfer plan.
+For a `NixlTransport`, `RefitWorkerService` is the trainer-local manifest endpoint.
+The manifest is an opaque description of the exact published source buffers;
+the generator uses it to compile and validate its receiver-local transfer plan.
 
 The synchronous generator client returns a staged handle only after transfer
 and verification finish. That handle owns the version lease through graph-safe
@@ -474,7 +477,9 @@ the logical tensor names and shard geometry, excluding physical process and DP
 replica identity. The orchestrator deduplicates those adapter-defined slots when
 declaring the version's expected contributions. Multiple DP workers may therefore
 advertise the same source slot; generators rotate through those publications on
-transfer retry. Deployments configured with
+transfer retry. Its `transport` `oneof` carries transport-specific addressing
+instead of the former untyped `manifest_endpoint` and `transport` strings.
+Deployments configured with
 Kubernetes or the test-only memory backend do not expose `RefitService` yet.
 
 `RegisterWorker` is also the heartbeat API. `worker_id` is a fresh process

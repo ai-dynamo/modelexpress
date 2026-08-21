@@ -30,7 +30,7 @@ if _version_not_supported:
 
 class RefitServiceStub(object):
     """Control-plane metadata for RL weight publication. Weight bytes and full
-    manifests remain on trainer and generator workers.
+    manifests travel through the transport advertised by each source shard.
     """
 
     def __init__(self, channel):
@@ -88,7 +88,7 @@ class RefitServiceStub(object):
 
 class RefitServiceServicer(object):
     """Control-plane metadata for RL weight publication. Weight bytes and full
-    manifests remain on trainer and generator workers.
+    manifests travel through the transport advertised by each source shard.
     """
 
     def CreateWeightVersion(self, request, context):
@@ -208,7 +208,7 @@ def add_RefitServiceServicer_to_server(servicer, server):
  # This class is part of an EXPERIMENTAL API.
 class RefitService(object):
     """Control-plane metadata for RL weight publication. Weight bytes and full
-    manifests remain on trainer and generator workers.
+    manifests travel through the transport advertised by each source shard.
     """
 
     @staticmethod

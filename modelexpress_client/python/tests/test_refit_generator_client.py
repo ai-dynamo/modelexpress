@@ -43,8 +43,9 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
                 tensor_count=2,
                 total_bytes=128,
                 manifest_digest=digest,
-                manifest_endpoint=endpoint,
-                transport="NIXL",
+                nixl=refit_pb2.NixlTransport(
+                    manifest_endpoint=endpoint,
+                ),
             )
             for rank, slot in enumerate(self.version.expected_source_slots)
         ]

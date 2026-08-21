@@ -6,7 +6,7 @@ syntax = "proto3";
 package model_express.refit;
 
 // Control-plane metadata for RL weight publication. Weight bytes and full
-// manifests remain on trainer and generator workers.
+// manifests travel through the transport advertised by each source shard.
 service RefitService {
   // External APIs: called by the RL framework orchestrator.
   rpc CreateWeightVersion(CreateWeightVersionRequest) returns (WeightVersion);
@@ -79,8 +79,8 @@ message WeightVersion {
   // not baked in; the trainer coordinator supplies opaque IDs such as a
   // selected publisher global rank.
   repeated string expected_source_slots = 7;
-  // Adapter-defined fingerprint of the model parameter layout, used to detect
-  // incompatible source manifests.
+  // Reserved placeholder for a future server-assigned layout fingerprint.
+  // Content identity currently travels in the payload.
   string layout_signature = 8;
   WeightVersionState state = 9;
   uint64 created_at_unix_ms = 10;
@@ -113,8 +113,22 @@ message WeightVersionShard {
   uint64 tensor_count = 4;
   uint64 total_bytes = 5;
   string manifest_digest = 6;
-  string manifest_endpoint = 7;
-  string transport = 8;
+
+  oneof transport {
+    NixlTransport nixl = 7;
+    S3Transport s3 = 8;
+  }
+}
+
+message NixlTransport {
+  string manifest_endpoint = 1;
+}
+
+message S3Transport {
+  string bucket = 1;
+  string key = 2;
+  optional string object_version = 3;
+  string checksum = 4;
 }
 
 message CreateWeightVersionShardRequest {
