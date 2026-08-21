@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 
 from modelexpress import p2p_pb2
-from modelexpress.adapter import EngineAdapter, StrategyFailed
+from modelexpress.adapter import EngineAdapter, StrategyFailed, StrategyRecoveryError
 from modelexpress.load_strategy.context import LoadResult
 from modelexpress.nixl_transfer import NixlTransferManager
 
@@ -909,6 +909,53 @@ class TestLoadStrategyChainRunErrorHandling:
 
         assert call_order == ["failed", "rollback", "fallback"]
         ctx.adapter.reinit_for_retry.assert_not_called()
+
+    def test_strategy_recovery_error_aborts_without_fallback(self):
+        from modelexpress.load_strategy import LoadStrategyChain
+
+        call_order = []
+
+        def failed_recovery(self_or_result, *_args, **_kwargs):
+            call_order.append("failed")
+            raise StrategyRecoveryError("model recovery failed")
+
+        def rollback(self_or_ctx, *_args, **_kwargs):
+            call_order.append("rollback")
+
+        def fallback_load(self_or_result, *_args, **_kwargs):
+            call_order.append("fallback")
+            return self_or_result
+
+        ctx = _make_load_context()
+        with patch(
+            "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.is_available",
+            return_value=False,
+        ), patch(
+            "modelexpress.load_strategy.model_streamer_strategy."
+            "ModelStreamerStrategy.is_available",
+            return_value=True,
+        ), patch(
+            "modelexpress.load_strategy.model_streamer_strategy."
+            "ModelStreamerStrategy.load",
+            failed_recovery,
+        ), patch(
+            "modelexpress.load_strategy.model_streamer_strategy."
+            "ModelStreamerStrategy.rollback",
+            rollback,
+        ), patch(
+            "modelexpress.load_strategy.gds_strategy.GdsStrategy.is_available",
+            return_value=False,
+        ), patch(
+            "modelexpress.load_strategy.default_strategy.DefaultStrategy.is_available",
+            return_value=True,
+        ), patch(
+            "modelexpress.load_strategy.default_strategy.DefaultStrategy.load",
+            fallback_load,
+        ):
+            with pytest.raises(StrategyRecoveryError, match="model recovery failed"):
+                LoadStrategyChain.run(MagicMock(), ctx)
+
+        assert call_order == ["failed", "rollback"]
 
     def test_strategy_failed_runs_rollback_and_reinit_when_mutated(self):
         from modelexpress.load_strategy import LoadStrategyChain

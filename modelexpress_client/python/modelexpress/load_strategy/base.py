@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import traceback
 import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, ClassVar
@@ -23,6 +24,30 @@ if TYPE_CHECKING:
     from ..nixl_transfer import NixlTransferManager
 
 logger = logging.getLogger("modelexpress.load_strategy")
+
+
+def clear_exception_tracebacks(exc: BaseException) -> None:
+    """Drop completed failure frames before releasing a mutated model.
+
+    Transfer failures commonly retain target tensors through traceback frame
+    locals (for example ``local_tensor`` in the NIXL matching loop). Clearing
+    only ``LoadResult`` and ``LoadContext`` therefore does not guarantee that
+    CUDA allocations become unreachable before retry initialization.
+    """
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+        if current.__traceback__ is not None:
+            traceback.clear_frames(current.__traceback__)
+            current.__traceback__ = None
 
 
 class SourceTransferError(Exception):
