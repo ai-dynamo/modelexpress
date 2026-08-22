@@ -424,6 +424,93 @@ def test_moe_convert_capture_plan_reconstructs_end_to_end():
         assert torch.equal(w13_out[e, 1], w3[e])  # up_proj -> half 1
 
 
+def test_capture_weights_composes_a_select_prefix_with_the_loader_op():
+    """A select in the conversion prefix survives into the recorded op-chain,
+    ahead of the loader's own ops."""
+    f32 = torch.float32
+    with torch.device("meta"):
+        model = ToyModel()
+    lazies = build_lazy_weights([("native.stack", f32, [2, 4])])
+    converted = {"norm": lazies["native.stack"].select(0, 1)}  # unstack row 1 -> [4]
+
+    (copy,) = capture_weights(model, converted).copies
+
+    assert copy.src_name == "native.stack"
+    assert copy.op_chain == (("select", (0, 1), ()),)  # prefix; copy_ is the sink
+    assert copy.dest_shape == (4,)
+
+
+def test_convert_source_weights_traces_expert_unstack():
+    def convert(sd):
+        stacked = sd["model.experts.w13"]
+        return {
+            f"model.experts.{e}.gate_proj.weight": stacked.select(0, e)
+            for e in range(stacked.shape[0])
+        }
+
+    weights = convert_source_weights(convert, _CONVERT_MANIFEST)
+
+    expert = weights["model.experts.2.gate_proj.weight"]
+    assert expert._name == "model.experts.w13"
+    assert expert._ops == (("select", (0, 2), ()),)
+    assert tuple(expert.shape) == (2, 4)
+
+
+def test_stacked_moe_convert_capture_plan_reconstructs_end_to_end():
+    """Stacked-source variant of the MoE e2e: the trainer publishes experts
+    stacked and the conversion unstacks them with select. Each per-expert slab is
+    a zero-copy sub-range that lands in the right fused destination slot."""
+    f32 = torch.float32
+    router = torch.arange(_E * _H, dtype=f32).reshape(_E, _H)
+    w1 = (torch.arange(_E * _I * _H, dtype=f32) + 100).reshape(_E, _I, _H)  # stacked gate
+    w3 = (torch.arange(_E * _I * _H, dtype=f32) + 200).reshape(_E, _I, _H)  # stacked up
+    src_buf = {
+        "router.gate": router.reshape(-1),
+        "experts.w1": w1.reshape(-1),
+        "experts.w3": w3.reshape(-1),
+    }
+    src_shape = {
+        "router.gate": (_E, _H),
+        "experts.w1": (_E, _I, _H),
+        "experts.w3": (_E, _I, _H),
+    }
+    manifest = [(n, f32, s) for n, s in src_shape.items()]
+
+    def convert(sd):
+        out = {"gate.weight": sd["router.gate"]}
+        for e in range(_E):
+            out[f"experts.{e}.gate_proj.weight"] = sd["experts.w1"].select(0, e)
+            out[f"experts.{e}.up_proj.weight"] = sd["experts.w3"].select(0, e)
+        return out
+
+    with torch.device("meta"):
+        model = ToyMoEModel()
+    hf = convert_source_weights(convert, manifest)
+    copies = capture_weights(model, hf).copies
+
+    dst = {
+        "gate": torch.zeros(_E, _H).reshape(-1),
+        "w13": torch.zeros(_E, 2, _I, _H).reshape(-1),
+    }
+    for copy in copies:
+        shape = src_shape[copy.src_name]
+        shard = Shard(
+            shard_offset=(0,) * len(shape), shape=shape, session="s", addr=0, elsize=4
+        )
+        segs = plan_pull(copy, global_shape=shape, src_dtype=f32, elsize=4, shards=[shard])
+        source, dest = src_buf[copy.src_name], dst[copy.param_name]
+        for seg in segs:
+            s0, d0, n = seg.src_addr // 4, seg.dst_byte // 4, seg.nbytes // 4
+            dest[d0 : d0 + n] = source[s0 : s0 + n]
+
+    gate_out = dst["gate"].reshape(_E, _H)
+    w13_out = dst["w13"].reshape(_E, 2, _I, _H)
+    assert torch.equal(gate_out, router)
+    for e in range(_E):
+        assert torch.equal(w13_out[e, 0], w1[e])
+        assert torch.equal(w13_out[e, 1], w3[e])
+
+
 if __name__ == "__main__":
     test_capture_op_chains_and_dest_offsets()
     test_unsupported_op_falls_back_per_source()

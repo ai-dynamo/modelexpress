@@ -64,6 +64,10 @@ __all__ = [
 # ``__torch_dispatch__`` and raises UnsupportedReshard.
 _SUPPORTED_OPS: dict[Callable, str] = {
     torch.Tensor.narrow: "narrow",
+    # select/split unstack a stacked source (e.g. a trainer that publishes its
+    # experts stacked -> per-expert HF weights). select is rank-reducing; split is
+    # a multi-return view like chunk. slice_plan resolves both to a source box.
+    torch.Tensor.select: "select",
     torch.Tensor.view: "view",
     torch.Tensor.reshape: "reshape",
     torch.Tensor.__getitem__: "__getitem__",
@@ -75,6 +79,7 @@ _SUPPORTED_OPS: dict[Callable, str] = {
     torch.Tensor.flatten: "flatten",
     torch.Tensor.contiguous: "contiguous",
     torch.Tensor.chunk: "chunk",
+    torch.Tensor.split: "split",
     # vLLM's fused-MoE expert loader unifies its fused and per-expert paths by
     # doing `experts_shard.unbind()`, reached via `unsqueeze(0)` for a per-expert
     # source. Without this entry every expert weight in a MoE model is classified
