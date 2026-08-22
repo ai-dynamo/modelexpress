@@ -10,13 +10,15 @@ import pytest
 from modelexpress_rl import (
     ModelExpressGeneratorClient,
     ModelExpressGeneratorConfig,
+    S3GeneratorConfig,
     VllmGeneratorContext,
     WeightPayloadFormat,
     WeightVersionRef,
     refit_pb2,
     refit_pb2_grpc,
 )
-from modelexpress_rl.inference.adapter import GeneratorEngineAdapter
+from modelexpress_rl.inference.adapter import GeneratorEngineAdapter, S3GeneratorSource
+from modelexpress_rl.inference.receiver import PoisonedCheckpointError
 
 
 class _RefitService(refit_pb2_grpc.RefitServiceServicer):
@@ -33,6 +35,12 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
             expected_source_slots=["rank:0", "rank:1"],
             layout_signature="layout-a",
             state=state or refit_pb2.WEIGHT_VERSION_STATE_READY,
+        )
+        self.base = refit_pb2.WeightVersion(
+            uid="base-a",
+            model_name="test/model",
+            payload_format=refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_TENSOR,
+            state=refit_pb2.WEIGHT_VERSION_STATE_READY,
         )
         digest = manifest_digest or hashlib.sha256(b"manifest").hexdigest()
         self.shards = [
@@ -57,6 +65,8 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         return worker
 
     def GetWeightVersion(self, request, context):
+        if request.uid == self.base.uid:
+            return self.base
         if request.uid != self.version.uid:
             context.abort(grpc.StatusCode.NOT_FOUND, "version not found")
         return self.version
@@ -100,34 +110,29 @@ class _WorkerService(refit_pb2_grpc.RefitWorkerServiceServicer):
 
 
 class _Adapter(GeneratorEngineAdapter):
-    supported_payload_formats = frozenset({WeightPayloadFormat.FULL_TENSOR})
+    supported_payload_formats = frozenset(
+        {WeightPayloadFormat.FULL_TENSOR, WeightPayloadFormat.XOR_DELTA}
+    )
 
     def __init__(self, service):
         self.service = service
-        self.create_calls = []
-        self.validate_calls = []
         self.stage_calls = []
         self.apply_calls = []
         self.release_calls = []
         self.close_calls = 0
         self.stage_failures = 0
+        self.poisoned_failure = False
         self.apply_failure = False
 
-    def create_transfer_plan(self, inputs):
-        self.create_calls.append(inputs)
-        return {"sources": inputs.sources}
-
-    def validate_transfer_plan(self, plan, inputs):
-        self.validate_calls.append((plan, inputs))
-        return True
-
-    def stage_weight(self, plan):
+    def stage_weight(self, inputs):
         assert self.service.active_leases
-        self.stage_calls.append(plan)
+        self.stage_calls.append(inputs)
+        if self.poisoned_failure:
+            raise PoisonedCheckpointError("checkpoint is poisoned")
         if self.stage_failures:
             self.stage_failures -= 1
             raise RuntimeError("transfer failed")
-        return {"plan": plan}
+        return {"inputs": inputs}
 
     def apply_weight(self, staged):
         assert self.service.active_leases
@@ -158,7 +163,12 @@ def _start_server(*, state=None, manifest_digest=None):
     return server, endpoint, service
 
 
-def _initialize(monkeypatch, endpoint, adapter):
+def _initialize(
+    monkeypatch,
+    endpoint,
+    adapter,
+    payload_format=WeightPayloadFormat.FULL_TENSOR,
+):
     monkeypatch.setattr(
         generator_client_module,
         "_create_generator_adapter",
@@ -171,11 +181,20 @@ def _initialize(monkeypatch, endpoint, adapter):
                 vllm_config=object(),
             ),
             model_name="test/model",
-            payload_format=WeightPayloadFormat.FULL_TENSOR,
+            payload_format=payload_format,
             worker_id="generator-0",
             server_url=endpoint,
             registration_ttl_seconds=60,
             lease_ttl_seconds=60,
+            s3=(
+                S3GeneratorConfig(
+                    initial_base_version_id="base-a",
+                    launch_checkpoint="unused-launch",
+                    preparation_cache_dir="unused-cache",
+                )
+                if payload_format is WeightPayloadFormat.XOR_DELTA
+                else None
+            ),
         )
     )
 
@@ -215,7 +234,7 @@ def test_generator_config_rejects_unspecified_payload_format():
         )
 
 
-def test_generator_stages_applies_releases_and_reuses_valid_plan(monkeypatch):
+def test_generator_stages_applies_and_releases(monkeypatch):
     server, endpoint, service = _start_server()
     adapter = _Adapter(service)
     generator = _initialize(monkeypatch, endpoint, adapter)
@@ -245,13 +264,11 @@ def test_generator_stages_applies_releases_and_reuses_valid_plan(monkeypatch):
     assert service.registrations["generator-0"].role == refit_pb2.WORKER_ROLE_GENERATOR
     assert service.lease_registrations == 3
     assert service.lease_deletions == 3
-    assert len(adapter.create_calls) == 2
-    assert len(adapter.validate_calls) == 1
     assert len(adapter.stage_calls) == 3
     assert len(adapter.apply_calls) == 1
     assert len(adapter.release_calls) == 3
     assert adapter.close_calls == 1
-    assert [source.source_slot_id for source in adapter.create_calls[0].sources] == [
+    assert [source.source_slot_id for source in adapter.stage_calls[0].sources] == [
         "rank:0",
         "rank:1",
     ]
@@ -272,8 +289,127 @@ def test_generator_releases_lease_when_manifest_is_invalid(monkeypatch):
     assert not service.active_leases
     assert service.lease_registrations == 1
     assert service.lease_deletions == 1
-    assert adapter.create_calls == []
     assert adapter.stage_calls == []
+
+
+def test_generator_dispatches_canonical_s3_without_fetching_a_worker_manifest(
+    monkeypatch,
+):
+    server, endpoint, service = _start_server()
+    service.version.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA
+    service.version.base_version_id = "base-a"
+    service.version.expected_source_slots[:] = ["canonical.delta.root"]
+    service.shards[:] = [
+        refit_pb2.WeightVersionShard(
+            version_id="version-a",
+            source_slot_id="canonical.delta.root",
+            worker_id="trainer-0",
+            manifest_digest="a" * 64,
+            s3=refit_pb2.S3Transport(
+                bucket="weights",
+                key="model.safetensors.index.json",
+                object_version="object-a",
+                checksum="crc32c:12345678",
+            ),
+        )
+    ]
+    adapter = _Adapter(service)
+    generator = _initialize(
+        monkeypatch,
+        endpoint,
+        adapter,
+        WeightPayloadFormat.XOR_DELTA,
+    )
+
+    try:
+        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+        source = adapter.stage_calls[0].sources[0]
+        assert isinstance(source.transport, S3GeneratorSource)
+        assert source.transport.location.bucket == "weights"
+        assert source.transport.location.object_version == "object-a"
+        assert generator.apply_weight(staged) == "installed"
+        staged.release()
+        repeated = generator.stage_weight(version=WeightVersionRef("version-a"))
+        repeated.release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+
+def test_generator_rejects_missing_s3_transport_before_adapter_mutation(monkeypatch):
+    server, endpoint, service = _start_server()
+    service.version.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA
+    service.version.base_version_id = "base-a"
+    service.version.expected_source_slots[:] = ["canonical.delta.root"]
+    service.shards[:] = [
+        refit_pb2.WeightVersionShard(
+            version_id="version-a",
+            source_slot_id="canonical.delta.root",
+            worker_id="trainer-0",
+            manifest_digest="a" * 64,
+        )
+    ]
+    adapter = _Adapter(service)
+    generator = _initialize(
+        monkeypatch,
+        endpoint,
+        adapter,
+        WeightPayloadFormat.XOR_DELTA,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="unsupported shard transport"):
+            generator.stage_weight(version=WeightVersionRef("version-a"))
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert adapter.stage_calls == []
+    assert service.lease_deletions == 1
+
+
+def test_generator_rejects_wrong_delta_base_before_leasing(monkeypatch):
+    server, endpoint, service = _start_server()
+    service.version.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA
+    service.version.base_version_id = "other-base"
+    service.version.expected_source_slots[:] = ["canonical.delta.root"]
+    adapter = _Adapter(service)
+    generator = _initialize(
+        monkeypatch,
+        endpoint,
+        adapter,
+        WeightPayloadFormat.XOR_DELTA,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="does not match serving version"):
+            generator.stage_weight(version=WeightVersionRef("version-a"))
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert service.lease_registrations == 0
+    assert adapter.stage_calls == []
+
+
+def test_generator_validates_the_initial_s3_base_before_registration(monkeypatch):
+    server, endpoint, service = _start_server()
+    service.base.state = refit_pb2.WEIGHT_VERSION_STATE_STAGING
+    adapter = _Adapter(service)
+
+    try:
+        with pytest.raises(RuntimeError, match="initial base.*not READY"):
+            _initialize(
+                monkeypatch,
+                endpoint,
+                adapter,
+                WeightPayloadFormat.XOR_DELTA,
+            )
+    finally:
+        server.stop(grace=None).wait()
+
+    assert service.registrations == {}
+    assert adapter.close_calls == 1
 
 
 def test_generator_retries_complete_staged_transfer_under_one_lease(monkeypatch):
@@ -292,7 +428,23 @@ def test_generator_retries_complete_staged_transfer_under_one_lease(monkeypatch)
     assert service.lease_registrations == 1
     assert service.lease_deletions == 1
     assert len(adapter.stage_calls) == 2
-    assert len(adapter.create_calls) == 2
+
+
+def test_generator_does_not_retry_a_poisoned_checkpoint(monkeypatch):
+    server, endpoint, service = _start_server()
+    adapter = _Adapter(service)
+    adapter.poisoned_failure = True
+    generator = _initialize(monkeypatch, endpoint, adapter)
+
+    try:
+        with pytest.raises(PoisonedCheckpointError, match="checkpoint is poisoned"):
+            generator.stage_weight(version=WeightVersionRef("version-a"))
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert len(adapter.stage_calls) == 1
+    assert service.lease_deletions == 1
 
 
 def test_generator_retries_with_redundant_worker_for_same_slot(monkeypatch):
@@ -312,9 +464,10 @@ def test_generator_retries_with_redundant_worker_for_same_slot(monkeypatch):
         generator.close()
         server.stop(grace=None).wait()
 
-    assert [
-        call.sources[0].worker_id for call in adapter.create_calls
-    ] == ["trainer-0", "trainer-replica"]
+    assert [call.sources[0].worker_id for call in adapter.stage_calls] == [
+        "trainer-0",
+        "trainer-replica",
+    ]
 
 
 def test_generator_preserves_transfer_error_when_lease_cleanup_also_fails(

@@ -12,6 +12,7 @@ from modelexpress.engines.vllm.adapter import VllmAdapter
 from modelexpress_rl.inference.adapter import (
     GeneratorEngineAdapter,
     GeneratorTransferInputs,
+    NixlGeneratorSource,
 )
 from modelexpress_rl.inference.nixl_staged_transfer import (
     _NixlStagedTransfer,
@@ -25,6 +26,7 @@ from .installer import _VllmInstaller
 if TYPE_CHECKING:
     from torch.nn import Module
     from vllm.config import ModelConfig, VllmConfig
+
 
 class VllmGeneratorAdapter(GeneratorEngineAdapter):
     """Compose exact-version NIXL staging with graph-safe vLLM installation."""
@@ -59,9 +61,7 @@ class VllmGeneratorAdapter(GeneratorEngineAdapter):
     def supported_payload_formats(self) -> frozenset[WeightPayloadFormat]:
         return frozenset({WeightPayloadFormat.FULL_TENSOR})
 
-    def create_transfer_plan(
-        self, inputs: GeneratorTransferInputs
-    ) -> _PreparedNixlTransfer:
+    def stage_weight(self, inputs: GeneratorTransferInputs) -> _StagedNixlWeights:
         if self._active_staged is not None:
             raise RuntimeError(
                 "release staged weight before replacing its transfer plan"
@@ -71,32 +71,30 @@ class VllmGeneratorAdapter(GeneratorEngineAdapter):
                 f"VllmGeneratorAdapter does not support "
                 f"{inputs.payload_format.value} payloads"
             )
-        if any(source.transport.upper() != "NIXL" for source in inputs.sources):
+        if any(
+            not isinstance(source.transport, NixlGeneratorSource)
+            for source in inputs.sources
+        ):
             raise ValueError(
                 "VllmGeneratorAdapter currently supports NIXL sources only"
             )
-        plan = self._transfer.prepare(
-            manifests=[source.manifest for source in inputs.sources],
-            capture_layout=self._installer.capture,
-        )
-        self._active_plan = plan
-        self._active_fingerprint = inputs.physical_fingerprint
-        return plan
-
-    def validate_transfer_plan(
-        self,
-        plan: object,
-        inputs: GeneratorTransferInputs,
-    ) -> bool:
-        return (
-            plan is self._active_plan
-            and self._active_fingerprint == inputs.physical_fingerprint
-        )
-
-    def stage_weight(self, plan: object) -> _StagedNixlWeights:
-        if plan is not self._active_plan:
-            raise RuntimeError("vLLM transfer plan is no longer active")
-        staged = self._transfer.stage(cast(_PreparedNixlTransfer, plan))
+        if (
+            self._active_plan is None
+            or self._active_fingerprint != inputs.physical_fingerprint
+        ):
+            self._active_plan = self._transfer.prepare(
+                manifests=[source.transport.manifest for source in inputs.sources],
+                capture_layout=self._installer.capture,
+            )
+            self._active_fingerprint = inputs.physical_fingerprint
+        try:
+            staged = self._transfer.stage(
+                cast(_PreparedNixlTransfer, self._active_plan)
+            )
+        except Exception:
+            self._active_plan = None
+            self._active_fingerprint = None
+            raise
         self._active_staged = staged
         return staged
 

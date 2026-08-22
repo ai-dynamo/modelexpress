@@ -93,7 +93,28 @@ def _read_header(path: Path) -> tuple[int, dict]:
         if len(header_size_data) != 8:
             raise ValueError(f"invalid safetensors header in {path}")
         (header_size,) = struct.unpack("<Q", header_size_data)
-        return header_size, json.loads(handle.read(header_size))
+        header, _ = read_safetensors_header(
+            header_size_data + handle.read(header_size),
+            str(path),
+        )
+        return header_size, header
+
+
+def read_safetensors_header(data: bytes, source: str) -> tuple[dict, int]:
+    """Parse a safetensors header and return it with the data-region offset."""
+    if len(data) < 8:
+        raise ValueError(f"invalid safetensors header in {source}")
+    (header_size,) = struct.unpack("<Q", data[:8])
+    data_start = 8 + header_size
+    if data_start > len(data):
+        raise ValueError(f"invalid safetensors header in {source}")
+    try:
+        header = json.loads(data[8:data_start])
+    except (UnicodeDecodeError, ValueError) as error:
+        raise ValueError(f"invalid safetensors header in {source}") from error
+    if not isinstance(header, dict):
+        raise ValueError(f"invalid safetensors header in {source}")
+    return header, data_start
 
 
 def _index_tensors(
@@ -134,10 +155,7 @@ def make_tensor_reader(
     checkpoint: str | Path,
 ) -> tuple[Callable[[str], np.ndarray], dict[str, dict]]:
     """Index safetensors once and return direct byte reads by tensor name."""
-    root = Path(checkpoint)
-    paths = _checkpoint_paths(root)
-    tied = _tied_names(root if root.is_dir() else root.parent)
-    locations, metadata = _index_tensors(paths, tied)
+    locations, metadata = index_checkpoint_tensors(checkpoint)
 
     def read(name: str) -> np.ndarray:
         path, offset, size = locations[name.removeprefix("module.")]
@@ -151,9 +169,21 @@ def make_tensor_reader(
     return read, metadata
 
 
+def index_checkpoint_tensors(
+    checkpoint: str | Path,
+) -> tuple[dict[str, tuple[Path, int, int]], dict[str, dict]]:
+    """Return safetensors byte locations and metadata for a checkpoint."""
+    root = Path(checkpoint)
+    paths = _checkpoint_paths(root)
+    tied = _tied_names(root if root.is_dir() else root.parent)
+    return _index_tensors(paths, tied)
+
+
 __all__ = [
     "adler32_checksum",
     "compress_delta",
     "compute_delta",
+    "index_checkpoint_tensors",
     "make_tensor_reader",
+    "read_safetensors_header",
 ]

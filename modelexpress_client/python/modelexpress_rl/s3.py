@@ -39,7 +39,7 @@ def _checksum(data: bytes) -> tuple[str, str]:
 
 
 class S3Client:
-    """Small immutable PUT client used by the trainer publisher."""
+    """Small immutable S3 client for canonical refit artifacts."""
 
     def __init__(
         self,
@@ -78,7 +78,7 @@ class S3Client:
                 "PreconditionFailed",
             }:
                 raise
-            existing, object_version = self._read(bucket=bucket, key=key)
+            existing, object_version, _ = self._read(bucket=bucket, key=key)
             if existing != data:
                 raise ImmutableS3Conflict(
                     f"immutable S3 object conflict for {bucket}/{key}"
@@ -90,11 +90,59 @@ class S3Client:
             object_version=object_version,
         )
 
-    def _read(self, *, bucket: str, key: str) -> tuple[bytes, str | None]:
-        response = self._client.get_object(Bucket=bucket, Key=key)
+    def get(self, location: S3Object) -> bytes:
+        """Read one advertised object and verify its CRC32C checksum."""
+        data, _, response_checksum = self._read(
+            bucket=location.bucket,
+            key=location.key,
+            object_version=location.object_version,
+            checksum_mode=True,
+        )
+        checksum, encoded_checksum = _checksum(data)
+        if checksum != location.checksum:
+            raise ValueError(
+                f"S3 checksum mismatch for {location.bucket}/{location.key}"
+            )
+        if response_checksum is not None and response_checksum != encoded_checksum:
+            raise ValueError(
+                f"S3 response checksum mismatch for {location.bucket}/{location.key}"
+            )
+        return data
+
+    def get_key(self, *, bucket: str, key: str) -> bytes:
+        """Read an immutable index-referenced object."""
+        data, _, response_checksum = self._read(
+            bucket=bucket,
+            key=key,
+            checksum_mode=True,
+        )
+        if response_checksum is not None:
+            _, encoded_checksum = _checksum(data)
+            if response_checksum != encoded_checksum:
+                raise ValueError(f"S3 response checksum mismatch for {bucket}/{key}")
+        return data
+
+    def _read(
+        self,
+        *,
+        bucket: str,
+        key: str,
+        object_version: str | None = None,
+        checksum_mode: bool = False,
+    ) -> tuple[bytes, str | None, str | None]:
+        request = {"Bucket": bucket, "Key": key}
+        if object_version is not None:
+            request["VersionId"] = object_version
+        if checksum_mode:
+            request["ChecksumMode"] = "ENABLED"
+        response = self._client.get_object(**request)
         body = response["Body"]
         try:
-            return body.read(), response.get("VersionId")
+            return (
+                body.read(),
+                response.get("VersionId"),
+                response.get("ChecksumCRC32C"),
+            )
         finally:
             close = getattr(body, "close", None)
             if close is not None:

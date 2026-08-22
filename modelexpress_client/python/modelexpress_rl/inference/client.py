@@ -18,8 +18,9 @@ import grpc
 from modelexpress import auth, envs
 from modelexpress.client import _get_server_url
 from modelexpress_rl import envs as rl_envs
+from modelexpress_rl.s3 import S3Object
 from modelexpress_rl.train import WeightPayloadFormat
-from modelexpress_rl.version import WeightVersionRef
+from modelexpress_rl.version import CANONICAL_DELTA_SOURCE_SLOT, WeightVersionRef
 
 from .. import refit_pb2, refit_pb2_grpc
 from .adapter import (
@@ -27,8 +28,11 @@ from .adapter import (
     GeneratorEngineAdapter,
     GeneratorSource,
     GeneratorTransferInputs,
+    NixlGeneratorSource,
+    S3GeneratorSource,
 )
 from .engines import _create_generator_adapter
+from .receiver import S3GeneratorConfig
 
 logger = logging.getLogger("modelexpress_rl.inference.client")
 
@@ -70,6 +74,8 @@ class ModelExpressGeneratorConfig:
     max_transfer_attempts: int = 3
     # Deadline applied independently to each control-plane or manifest RPC.
     rpc_timeout_seconds: float = 30.0
+    # Canonical S3 checkpoint settings. Omit for the existing NIXL path.
+    s3: S3GeneratorConfig | None = None
 
     def __post_init__(self) -> None:
         """Validate explicit settings before client initialization."""
@@ -80,9 +86,7 @@ class ModelExpressGeneratorConfig:
                 self.registration_ttl_seconds, "registration_ttl_seconds"
             )
         if self.lease_ttl_seconds is not None:
-            rl_envs.require_positive_int(
-                self.lease_ttl_seconds, "lease_ttl_seconds"
-            )
+            rl_envs.require_positive_int(self.lease_ttl_seconds, "lease_ttl_seconds")
         rl_envs.require_positive_int(
             self.max_transfer_attempts, "max_transfer_attempts"
         )
@@ -111,6 +115,16 @@ class StagedWeightHandle:
     def release(self) -> None:
         """Release local staging buffers; repeated calls are idempotent."""
         self._client._release_staged(self)
+
+    @property
+    def metrics(self) -> dict[str, float]:
+        """Return preparation metrics exposed by the selected adapter."""
+        return dict(getattr(self._staged, "metrics", {}))
+
+    @property
+    def applied(self) -> bool:
+        """Return whether engine installation completed."""
+        return self._applied
 
 
 class _VersionLease:
@@ -154,8 +168,6 @@ class ModelExpressGeneratorClient:
         self._registration_thread: threading.Thread | None = None
         self._operation_lock = threading.RLock()
         self._active_handle: StagedWeightHandle | None = None
-        self._cached_plan: Any = None
-        self._cached_fingerprint: tuple | None = None
         self._serving_version_id: str | None = None
         self._adapter: GeneratorEngineAdapter | None = None
         self._closed = False
@@ -191,6 +203,8 @@ class ModelExpressGeneratorClient:
         adapter = _create_generator_adapter(
             engine_context=config.engine_context,
             worker_id=worker_id,
+            model_name=model_name,
+            s3=config.s3,
         )
         try:
             if payload_format not in adapter.supported_payload_formats:
@@ -211,7 +225,11 @@ class ModelExpressGeneratorClient:
         client._max_transfer_attempts = config.max_transfer_attempts
         client._rpc_timeout_seconds = config.rpc_timeout_seconds
         client._adapter = adapter
+        if config.s3 is not None:
+            client._serving_version_id = config.s3.initial_base_version_id
         try:
+            if client._serving_version_id is not None:
+                client._validate_initial_base(client._serving_version_id)
             client._register_worker()
             client._registration_thread = threading.Thread(
                 target=client._renew_worker_registration,
@@ -350,7 +368,28 @@ class ModelExpressGeneratorClient:
             raise RuntimeError(
                 "weight version payload_format does not match the generator"
             )
+        if self.payload_format is WeightPayloadFormat.XOR_DELTA:
+            if not version.HasField("base_version_id"):
+                raise RuntimeError("XOR_DELTA version is missing base_version_id")
+            if (
+                version.uid != self._serving_version_id
+                and version.base_version_id != self._serving_version_id
+            ):
+                raise RuntimeError(
+                    f"weight version base {version.base_version_id!r} does not match "
+                    f"serving version {self._serving_version_id!r}"
+                )
         return version
+
+    def _validate_initial_base(self, version_id: str) -> None:
+        version = self._service.GetWeightVersion(
+            refit_pb2.GetWeightVersionRequest(uid=version_id),
+            timeout=self._rpc_timeout_seconds,
+        )
+        if version.state != refit_pb2.WEIGHT_VERSION_STATE_READY:
+            raise RuntimeError(f"initial base {version_id!r} is not READY")
+        if version.model_name != self.model_name:
+            raise RuntimeError("initial base model_name does not match the generator")
 
     @property
     def _proto_payload_format(self) -> int:
@@ -359,30 +398,60 @@ class ModelExpressGeneratorClient:
             WeightPayloadFormat.XOR_DELTA: refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA,
         }[self.payload_format]
 
-    def _fetch_manifest(self, shard) -> tuple[bytes, refit_pb2.NixlTransport]:
+    def _resolve_source(self, shard) -> GeneratorSource:
         transport = shard.WhichOneof("transport")
-        if transport != "nixl":
+        if transport == "nixl":
+            source = shard.nixl
+            if not source.manifest_endpoint:
+                raise RuntimeError("NIXL source is missing its manifest endpoint")
+            with grpc.insecure_channel(source.manifest_endpoint) as channel:
+                response = refit_pb2_grpc.RefitWorkerServiceStub(
+                    channel
+                ).GetWeightVersionShardManifest(
+                    refit_pb2.GetWeightVersionShardManifestRequest(
+                        version_id=shard.version_id,
+                        source_slot_id=shard.source_slot_id,
+                    ),
+                    timeout=self._rpc_timeout_seconds,
+                )
+            digest = hashlib.sha256(response.manifest).hexdigest()
+            if (
+                response.manifest_digest != shard.manifest_digest
+                or digest != shard.manifest_digest
+            ):
+                raise RuntimeError(
+                    f"manifest digest mismatch for source slot {shard.source_slot_id!r}"
+                )
+            resolved = NixlGeneratorSource(
+                manifest_endpoint=source.manifest_endpoint,
+                manifest=response.manifest,
+            )
+        elif transport == "s3":
+            source = shard.s3
+            if not source.bucket or not source.key or not source.checksum:
+                raise RuntimeError("S3 source is missing its object location")
+            resolved = S3GeneratorSource(
+                location=S3Object(
+                    bucket=source.bucket,
+                    key=source.key,
+                    checksum=source.checksum,
+                    object_version=(
+                        source.object_version
+                        if source.HasField("object_version")
+                        else None
+                    ),
+                )
+            )
+        else:
             raise RuntimeError(f"unsupported shard transport {transport!r}")
-        source = shard.nixl
-        with grpc.insecure_channel(source.manifest_endpoint) as channel:
-            response = refit_pb2_grpc.RefitWorkerServiceStub(
-                channel
-            ).GetWeightVersionShardManifest(
-                refit_pb2.GetWeightVersionShardManifestRequest(
-                    version_id=shard.version_id,
-                    source_slot_id=shard.source_slot_id,
-                ),
-                timeout=self._rpc_timeout_seconds,
-            )
-        digest = hashlib.sha256(response.manifest).hexdigest()
-        if (
-            response.manifest_digest != shard.manifest_digest
-            or digest != shard.manifest_digest
-        ):
-            raise RuntimeError(
-                f"manifest digest mismatch for source slot {shard.source_slot_id!r}"
-            )
-        return response.manifest, source
+        if not shard.manifest_digest:
+            raise RuntimeError("source is missing its manifest digest")
+        return GeneratorSource(
+            source_slot_id=shard.source_slot_id,
+            worker_id=shard.worker_id,
+            manifest_digest=shard.manifest_digest,
+            transport=resolved,
+        )
 
     def _discover_sources(
         self,
@@ -390,6 +459,13 @@ class ModelExpressGeneratorClient:
         *,
         candidate_offset: int = 0,
     ) -> GeneratorTransferInputs:
+        if self.payload_format is WeightPayloadFormat.XOR_DELTA:
+            if not version.HasField("base_version_id"):
+                raise RuntimeError("XOR_DELTA version is missing base_version_id")
+            if tuple(version.expected_source_slots) != (CANONICAL_DELTA_SOURCE_SLOT,):
+                raise RuntimeError(
+                    "canonical S3 version must expect only canonical.delta.root"
+                )
         response = self._service.ListWeightVersionShards(
             refit_pb2.ListWeightVersionShardsRequest(version_id=version.uid),
             timeout=self._rpc_timeout_seconds,
@@ -409,20 +485,18 @@ class ModelExpressGeneratorClient:
                 ordered = ordered[offset:] + ordered[:offset]
             for shard in ordered:
                 try:
-                    manifest, nixl = self._fetch_manifest(shard)
+                    source = self._resolve_source(shard)
+                    if (
+                        self.payload_format is WeightPayloadFormat.XOR_DELTA
+                        and not isinstance(source.transport, S3GeneratorSource)
+                    ):
+                        raise RuntimeError(
+                            "canonical.delta.root must use the S3 transport"
+                        )
                 except (grpc.RpcError, RuntimeError) as error:
                     failures.append(str(error))
                     continue
-                selected.append(
-                    GeneratorSource(
-                        source_slot_id=source_slot_id,
-                        worker_id=shard.worker_id,
-                        manifest_endpoint=nixl.manifest_endpoint,
-                        manifest_digest=shard.manifest_digest,
-                        transport="NIXL",
-                        manifest=manifest,
-                    )
-                )
+                selected.append(source)
                 break
             else:
                 detail = f": {failures[-1]}" if failures else ""
@@ -432,21 +506,13 @@ class ModelExpressGeneratorClient:
 
         return GeneratorTransferInputs(
             version_id=version.uid,
+            base_version_id=(
+                version.base_version_id if version.HasField("base_version_id") else None
+            ),
             layout_signature=version.layout_signature,
             payload_format=self.payload_format,
             sources=tuple(selected),
         )
-
-    def _transfer_plan(self, inputs: GeneratorTransferInputs) -> Any:
-        reusable = (
-            self._cached_plan is not None
-            and self._cached_fingerprint == inputs.physical_fingerprint
-            and self._adapter.validate_transfer_plan(self._cached_plan, inputs)
-        )
-        if not reusable:
-            self._cached_plan = self._adapter.create_transfer_plan(inputs)
-            self._cached_fingerprint = inputs.physical_fingerprint
-        return self._cached_plan
 
     def _register_lease(self, version_id: str):
         return self._service.RegisterVersionLease(
@@ -522,14 +588,10 @@ class ModelExpressGeneratorClient:
                         version,
                         candidate_offset=attempt,
                     )
-                    staged = self._adapter.stage_weight(self._transfer_plan(inputs))
+                    staged = self._adapter.stage_weight(inputs)
                     return staged, lease
                 except (grpc.RpcError, RuntimeError) as error:
                     last_error = error
-                    # A failed transfer may have invalidated transport state even
-                    # when the source metadata fingerprint is unchanged.
-                    self._cached_plan = None
-                    self._cached_fingerprint = None
             assert last_error is not None
             raise last_error
         except BaseException as primary_error:

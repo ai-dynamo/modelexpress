@@ -32,7 +32,7 @@ from modelexpress_rl.utils import (
 
 from .. import envs as rl_envs
 from .. import refit_pb2, refit_pb2_grpc
-from ..version import WeightVersionRef
+from ..version import CANONICAL_DELTA_SOURCE_SLOT, WeightVersionRef
 from .adapter import (
     NixlMetadataProvider,
     StagedWeightVersionShardData,
@@ -41,9 +41,6 @@ from .adapter import (
     WeightPayloadFormat,
 )
 from .resources import _TrainerResources
-
-
-CANONICAL_DELTA_SOURCE_SLOT = "canonical.delta.root"
 
 
 def _required(value: str, name: str) -> str:

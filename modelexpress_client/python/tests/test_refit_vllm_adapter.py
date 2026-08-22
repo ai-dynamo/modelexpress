@@ -7,7 +7,11 @@ import modelexpress_rl.inference.engines.vllm.adapter as vllm_adapter_module
 import pytest
 import torch
 from modelexpress_rl import WeightPayloadFormat
-from modelexpress_rl.inference.adapter import GeneratorSource, GeneratorTransferInputs
+from modelexpress_rl.inference.adapter import (
+    GeneratorSource,
+    GeneratorTransferInputs,
+    NixlGeneratorSource,
+)
 from modelexpress_rl.inference.engines.vllm import VllmGeneratorAdapter
 
 
@@ -71,16 +75,18 @@ def test_vllm_adapter_composes_transfer_and_installer_lifecycles(
     )
     inputs = GeneratorTransferInputs(
         version_id="version-a",
+        base_version_id=None,
         layout_signature="layout-a",
         payload_format=WeightPayloadFormat.FULL_TENSOR,
         sources=(
             GeneratorSource(
                 source_slot_id="rank:0",
                 worker_id="trainer-0",
-                manifest_endpoint="trainer-0:9000",
                 manifest_digest="digest",
-                transport="NIXL",
-                manifest=b"manifest",
+                transport=NixlGeneratorSource(
+                    manifest_endpoint="trainer-0:9000",
+                    manifest=b"manifest",
+                ),
             ),
         ),
     )
@@ -88,25 +94,24 @@ def test_vllm_adapter_composes_transfer_and_installer_lifecycles(
     assert adapter.supported_payload_formats == frozenset(
         {WeightPayloadFormat.FULL_TENSOR}
     )
-    plan = adapter.create_transfer_plan(inputs)
-    assert plan is native_plan
-    assert adapter.validate_transfer_plan(plan, inputs)
-    assert not adapter.validate_transfer_plan(
-        plan, replace(inputs, layout_signature="layout-b")
-    )
-    staged = adapter.stage_weight(plan)
+    staged = adapter.stage_weight(inputs)
     assert staged is transferred
     with pytest.raises(RuntimeError, match="release staged weight"):
-        adapter.create_transfer_plan(inputs)
+        adapter.stage_weight(inputs)
     assert adapter.apply_weight(staged) == {"bytes_received": 128}
     adapter.release_staged_weight(staged)
 
+    adapter.release_staged_weight(adapter.stage_weight(inputs))
+    adapter.release_staged_weight(
+        adapter.stage_weight(replace(inputs, layout_signature="layout-b"))
+    )
+
     with pytest.raises(ValueError, match="does not support XOR_DELTA"):
-        adapter.create_transfer_plan(
+        adapter.stage_weight(
             replace(inputs, payload_format=WeightPayloadFormat.XOR_DELTA)
         )
     with pytest.raises(ValueError, match="supports NIXL sources only"):
-        adapter.create_transfer_plan(
+        adapter.stage_weight(
             replace(inputs, sources=(replace(inputs.sources[0], transport="NCCL"),))
         )
     adapter.close()
@@ -138,5 +143,14 @@ def test_vllm_adapter_composes_transfer_and_installer_lifecycles(
         ),
         ("stage", native_plan),
         ("install", transferred.tensors),
+        ("stage", native_plan),
+        (
+            "prepare",
+            {
+                "manifests": [b"manifest"],
+                "capture_layout": adapter._installer.capture,
+            },
+        ),
+        ("stage", native_plan),
         ("close",),
     ]
