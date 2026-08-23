@@ -10,9 +10,12 @@ import json
 import os
 import threading
 import uuid
+from collections import deque
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 from urllib.parse import quote
 
@@ -117,10 +120,13 @@ class _StagedDelta:
     base_version_id: str
     target_version_id: str
     candidate_snapshot: dict[str, np.ndarray]
-    raw_deltas: dict[str, np.ndarray]
+    encoded_deltas: dict[str, np.ndarray]
+    checksums: dict[str, str]
     changed_bytes: int
     total_bytes: int
     wire_bytes: int = 0
+    stage_delta_time: float = 0.0
+    publish_s3_time: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -408,44 +414,22 @@ class ModelExpressTrainerClient:
                 # A later renewal retries after transient control-plane failure.
                 continue
 
-    def _stage_delta(
+    def _process_delta_bucket(
         self,
-        *,
-        target_version_id: str,
-        base_version_id: str,
-        hf_tensor_iter: Iterable[tuple[str, torch.Tensor]],
-    ) -> _StagedDelta:
-        if base_version_id != self._current_base_version_id:
-            raise RuntimeError(
-                f"target base {base_version_id!r} does not match retained base "
-                f"{self._current_base_version_id!r}"
-        )
-        candidate: dict[str, np.ndarray] = {}
-        raw_deltas: dict[str, np.ndarray] = {}
+        bucket: list[tuple[str, np.ndarray]],
+    ) -> tuple[
+        dict[str, np.ndarray],
+        dict[str, np.ndarray],
+        dict[str, str],
+        int,
+        int,
+    ]:
+        candidate = {}
+        encoded = {}
+        checksums = {}
         changed_bytes = 0
         total_bytes = 0
-
-        for source_name, tensor in hf_tensor_iter:
-            if not isinstance(tensor, torch.Tensor):
-                raise TypeError(
-                    f"canonical tensor {source_name!r} must be a torch.Tensor"
-                )
-            name = source_name.removeprefix("module.")
-            current = (
-                tensor.detach()
-                .cpu()
-                .contiguous()
-                .reshape(-1)
-                .view(torch.uint8)
-                .numpy()
-                .copy()
-            )
-            if name in candidate:
-                if not np.array_equal(current, candidate[name]):
-                    raise RuntimeError(
-                        f"duplicate canonical tensor {name!r} differs"
-                    )
-                continue
+        for name, current in bucket:
             base = self._snapshot.get(name)
             if base is None:
                 assert self._read_launch_tensor is not None
@@ -461,14 +445,100 @@ class ModelExpressTrainerClient:
             changed_bytes += changed
             total_bytes += int(current.nbytes)
             if delta is not None:
-                raw_deltas[name] = delta
+                encoded[name] = compress_delta(delta)
+                checksums[name] = adler32_checksum(current)
+
+        return candidate, encoded, checksums, changed_bytes, total_bytes
+
+    def _stage_delta(
+        self,
+        *,
+        target_version_id: str,
+        base_version_id: str,
+        hf_tensor_iter: Iterable[tuple[str, torch.Tensor]],
+    ) -> _StagedDelta:
+        started = perf_counter()
+        if base_version_id != self._current_base_version_id:
+            raise RuntimeError(
+                f"target base {base_version_id!r} does not match retained base "
+                f"{self._current_base_version_id!r}"
+            )
+        candidate: dict[str, np.ndarray] = {}
+        encoded_deltas: dict[str, np.ndarray] = {}
+        checksums: dict[str, str] = {}
+        changed_bytes = 0
+        total_bytes = 0
+        seen_names = set()
+        inflight = deque()
+        bucket_limit = rl_envs.MX_REFIT_DELTA_BUCKET_BYTES
+        workers = rl_envs.MX_REFIT_DELTA_WORKERS
+        max_inflight = 2 * workers
+
+        def collect_one() -> None:
+            nonlocal changed_bytes, total_bytes
+            current, encoded, bucket_checksums, changed, total = (
+                inflight.popleft().result()
+            )
+            candidate.update(current)
+            encoded_deltas.update(encoded)
+            checksums.update(bucket_checksums)
+            changed_bytes += changed
+            total_bytes += total
+
+        with ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="modelexpress-delta",
+        ) as pool:
+            bucket = []
+            bucket_bytes = 0
+            for source_name, tensor in hf_tensor_iter:
+                if not isinstance(tensor, torch.Tensor):
+                    raise TypeError(
+                        f"canonical tensor {source_name!r} must be a torch.Tensor"
+                    )
+                name = source_name.removeprefix("module.")
+                if name in seen_names:
+                    raise RuntimeError(f"duplicate canonical tensor {name!r}")
+                seen_names.add(name)
+                tensor_bytes = tensor.numel() * tensor.element_size()
+                if (
+                    bucket
+                    and bucket_bytes + tensor_bytes > bucket_limit
+                ):
+                    inflight.append(pool.submit(self._process_delta_bucket, bucket))
+                    bucket = []
+                    bucket_bytes = 0
+                current = (
+                    tensor.detach()
+                    .cpu()
+                    .contiguous()
+                    .reshape(-1)
+                    .view(torch.uint8)
+                    .numpy()
+                    .copy()
+                )
+                bucket.append((name, current))
+                bucket_bytes += int(current.nbytes)
+                if bucket_bytes >= bucket_limit:
+                    inflight.append(pool.submit(self._process_delta_bucket, bucket))
+                    bucket = []
+                    bucket_bytes = 0
+                if len(inflight) >= max_inflight:
+                    collect_one()
+            if bucket:
+                inflight.append(pool.submit(self._process_delta_bucket, bucket))
+            while inflight:
+                collect_one()
+
         return _StagedDelta(
             base_version_id=base_version_id,
             target_version_id=target_version_id,
             candidate_snapshot=candidate,
-            raw_deltas=raw_deltas,
+            encoded_deltas=encoded_deltas,
+            checksums=checksums,
             changed_bytes=changed_bytes,
             total_bytes=total_bytes,
+            stage_delta_time=perf_counter() - started,
         )
 
     def _publish_delta_to_s3(self, staged: _StagedDelta) -> _S3Root | None:
@@ -480,7 +550,7 @@ class ModelExpressTrainerClient:
         counts: list[Any] = [None] * self._world_size
         dist.all_gather_object(
             counts,
-            (self._rank, int(bool(staged.raw_deltas))),
+            (self._rank, int(bool(staged.encoded_deltas))),
             group=self._process_group,
         )
         counts.sort()
@@ -489,17 +559,9 @@ class ModelExpressTrainerClient:
 
         local_map: dict[str, str] = {}
         shard_size = 0
-        if staged.raw_deltas:
+        if staged.encoded_deltas:
+            shard = safetensors.numpy.save(staged.encoded_deltas, metadata=staged.checksums)
             filename = f"model-{offset:05d}-of-{total:05d}.safetensors"
-            encoded = {
-                name: compress_delta(staged.raw_deltas[name])
-                for name in sorted(staged.raw_deltas)
-            }
-            checksums = {
-                name: adler32_checksum(staged.candidate_snapshot[name])
-                for name in encoded
-            }
-            shard = safetensors.numpy.save(encoded, metadata=checksums)
             self._s3.put(
                 bucket=self._s3_config.bucket,
                 key=_s3_key(
@@ -512,7 +574,7 @@ class ModelExpressTrainerClient:
             )
             shard_size = len(shard)
             staged.wire_bytes = shard_size
-            local_map = {name: filename for name in staged.raw_deltas}
+            local_map = dict.fromkeys(staged.encoded_deltas, filename)
 
         contributions = [None] * self._world_size if self._rank == 0 else None
         dist.gather_object(
@@ -637,7 +699,9 @@ class ModelExpressTrainerClient:
         if isinstance(staged, _StagedDelta):
             if self._s3 is None:
                 raise RuntimeError("S3 transport is not initialized")
+            started = perf_counter()
             root = self._publish_delta_to_s3(staged)
+            staged.publish_s3_time = perf_counter() - started
 
             def advertise() -> None:
                 assert root is not None
@@ -667,7 +731,8 @@ class ModelExpressTrainerClient:
             self._snapshot = staged.candidate_snapshot
             self._current_base_version_id = staged.target_version_id
             self._metric_delta = staged
-            staged.raw_deltas.clear()
+            staged.encoded_deltas.clear()
+            staged.checksums.clear()
             self._published_shards.setdefault(version.version_id, []).append(staged)
             return
 
@@ -783,10 +848,22 @@ class ModelExpressTrainerClient:
             dtype=torch.int64,
         )
         dist.all_reduce(counts, group=self._process_group)
+        timings = torch.tensor(
+            [staged.stage_delta_time, staged.publish_s3_time],
+            dtype=torch.float64,
+        )
+        dist.all_reduce(
+            timings,
+            op=dist.ReduceOp.MAX,
+            group=self._process_group,
+        )
         changed_bytes, total_bytes, wire_bytes = counts.tolist()
+        stage_delta_time, publish_s3_time = timings.tolist()
         self._metrics = {
             "perf/update_weights_density": changed_bytes / max(total_bytes, 1),
             "perf/update_weights_wire_bytes": wire_bytes,
+            "perf/mx_stage_delta_time": stage_delta_time,
+            "perf/mx_publish_s3_time": publish_s3_time,
         }
         self._metric_delta = None
 

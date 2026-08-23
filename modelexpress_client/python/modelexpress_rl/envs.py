@@ -16,6 +16,8 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    MX_REFIT_DELTA_BUCKET_BYTES: int
+    MX_REFIT_DELTA_WORKERS: int
     MX_TRAINER_ENGINE: str
     MX_TRAINER_STAGING_MODE: str
     MX_WEIGHT_PAYLOAD_FORMAT: str
@@ -30,6 +32,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "MX_WEIGHT_PAYLOAD_FORMAT": lambda: (
         os.environ.get("MX_WEIGHT_PAYLOAD_FORMAT", "FULL_TENSOR").strip().upper()
+    ),
+    "MX_REFIT_DELTA_BUCKET_BYTES": lambda: require_positive_int(
+        int(os.environ.get("MX_REFIT_DELTA_BUCKET_BYTES", 512 * 1024**2)),
+        "MX_REFIT_DELTA_BUCKET_BYTES",
+    ),
+    "MX_REFIT_DELTA_WORKERS": lambda: require_positive_int(
+        int(
+            os.environ.get(
+                "MX_REFIT_DELTA_WORKERS",
+                min(32, os.cpu_count() or 8),
+            )
+        ),
+        "MX_REFIT_DELTA_WORKERS",
     ),
 }
 

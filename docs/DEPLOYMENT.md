@@ -838,6 +838,10 @@ RL refit has the same trusted-network requirement. Its trainer-local
 `RefitWorkerService` serves exact-version manifests over plaintext gRPC; the
 manifest digest detects corruption but does not authenticate the trainer.
 
+Canonical S3/XOR trainers use `MX_REFIT_DELTA_BUCKET_BYTES` (512 MiB by
+default) and `MX_REFIT_DELTA_WORKERS` (default `min(32, CPU count)`) to control
+delta-processing bucket size and concurrency.
+
 ### Server-Backed Model Cache (No Shared Storage)
 
 For workers that cannot reach the Hugging Face Hub themselves, ModelExpress Server can act as the only route to the model. The worker asks the server for repository files; the server downloads the model once on a cold miss and serves every later worker from its own cache.

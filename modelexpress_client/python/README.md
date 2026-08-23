@@ -127,6 +127,10 @@ partitions remain separate required slots. The NIXL metadata endpoint is derived
 from `MX_WORKER_HOST` and the client-owned NIXL manager's listen port. `LOCAL_RANK`
 selects the device unless `device_id` is passed to `initialize()`.
 
+Canonical S3/XOR staging uses `MX_REFIT_DELTA_BUCKET_BYTES` (default 512 MiB)
+to bound decoded tensor bytes per delta-processing task. CPU workers are
+configured by `MX_REFIT_DELTA_WORKERS` (default `min(32, CPU count)`).
+
 The client owns the NIXL manager and trainer-side manifest service. `server_url`
 selects the central ModelExpress control-plane service and defaults to the
 normal ModelExpress server configuration. A Megatron worker may initialize the
