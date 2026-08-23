@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::metrics::grpc::RpcOutcome;
-use crate::metrics::registry::{DownloadMetrics, StatusLabel};
+use crate::metrics::registry::{DownloadMetrics, RegistryMetrics, StatusLabel};
 use crate::registry::backend::ClaimOutcome;
 use crate::registry::entry_key::EntryKey;
 use crate::registry::state::RegistryManager;
@@ -755,17 +755,23 @@ pub struct ModelDownloadTracker {
     /// Maps model names to list of channels waiting for updates on this server replica.
     waiting_channels: WaitingChannels,
     download_metrics: DownloadMetrics,
+    registry_metrics: RegistryMetrics,
 }
 
 const DOWNLOAD_LEASE_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
 const DOWNLOAD_HEARTBEAT_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(10);
 
 impl ModelDownloadTracker {
-    pub fn new(registry: Arc<RegistryManager>, download_metrics: DownloadMetrics) -> Self {
+    pub fn new(
+        registry: Arc<RegistryManager>,
+        download_metrics: DownloadMetrics,
+        registry_metrics: RegistryMetrics,
+    ) -> Self {
         Self {
             registry,
             waiting_channels: Arc::new(Mutex::new(HashMap::new())),
             download_metrics,
+            registry_metrics,
         }
     }
 
@@ -912,6 +918,17 @@ impl ModelDownloadTracker {
         let mut removed: usize = 0;
         for record in records {
             if EntryKey::parse(&record.model_name).belongs_to(model_name) {
+                // Deleting a record mid-download is a real exit from DOWNLOADING,
+                // and the only one the claim lifecycle cannot see: once the key
+                // is gone, finish_download_claim finds nothing to fence and
+                // returns false, so it records no departure. Without this the
+                // arrival booked by the claim is never matched and the flow
+                // accounting stays permanently ahead. The status is already in
+                // hand here, so this costs no extra read.
+                if record.status == ModelStatus::DOWNLOADING {
+                    self.registry_metrics
+                        .record_transition(StatusLabel::Downloading, StatusLabel::Absent);
+                }
                 self.delete_status(&record.model_name).await;
                 removed = removed.saturating_add(1);
             }
@@ -1296,6 +1313,7 @@ mod tests {
         ModelDownloadTracker::new(
             registry,
             DownloadMetrics::register(&mut crate::metrics::new_registry()),
+            RegistryMetrics::register(&mut crate::metrics::new_registry()),
         )
     }
 
@@ -1602,6 +1620,7 @@ mod tests {
         ModelServiceImpl::new(Arc::new(ModelDownloadTracker::new(
             registry,
             DownloadMetrics::register(&mut crate::metrics::new_registry()),
+            RegistryMetrics::register(&mut crate::metrics::new_registry()),
         )))
     }
 

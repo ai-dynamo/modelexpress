@@ -40,10 +40,18 @@
 //! difference can go negative. That is a property of differencing counters, not
 //! something a label change fixes -- hence the gauge.
 //!
-//! Within a process the difference does balance, and that depends on a takeover
-//! recording `downloading -> downloading`: an arrival and a departure that cancel,
-//! because ownership changed while the entry never left `DOWNLOADING`. Recording
-//! it as `absent -> downloading` would add an arrival that never leaves.
+//! Within a process the difference does balance, and that rests on every exit
+//! from `DOWNLOADING` being recorded. There are three, and the third is easy to
+//! miss:
+//!
+//! - a finish, `downloading -> {downloaded, error}`;
+//! - a takeover, `downloading -> downloading` -- an arrival and a departure that
+//!   cancel, because ownership changed while the entry never left `DOWNLOADING`.
+//!   Recording it as `absent -> downloading` would add an arrival that never
+//!   leaves;
+//! - a **delete while downloading**, `downloading -> absent`. Once the record is
+//!   gone `finish_download_claim` finds nothing to fence and returns false, so it
+//!   records no departure; the deleting side has to book it.
 
 use modelexpress_common::models::ModelStatus;
 use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue, LabelValueEncoder};
@@ -379,6 +387,27 @@ mod tests {
         metrics.record_transition(StatusLabel::Downloading, StatusLabel::Downloaded);
         let encoded = encode_text(&registry).unwrap_or_else(|_| String::from("<encode failed>"));
         assert_eq!(in_flight(&encoded), 0, "the download finished");
+    }
+
+    /// Deleting a record mid-download is the third exit from `DOWNLOADING`, and
+    /// the one the claim lifecycle cannot observe for itself.
+    #[test]
+    fn a_delete_during_download_is_a_departure() {
+        let mut registry = new_registry();
+        let metrics = RegistryMetrics::register(&mut registry);
+
+        metrics.record_claim(ClaimResult::Claimed);
+        let encoded = encode_text(&registry).unwrap_or_else(|_| String::from("<encode failed>"));
+        assert_eq!(in_flight(&encoded), 1);
+
+        // `model clear` on a model that is still downloading.
+        metrics.record_transition(StatusLabel::Downloading, StatusLabel::Absent);
+        let encoded = encode_text(&registry).unwrap_or_else(|_| String::from("<encode failed>"));
+        assert_eq!(
+            in_flight(&encoded),
+            0,
+            "a deleted download must not stay counted as in flight: {encoded}"
+        );
     }
 
     /// A waiter observing an existing claim is not a transition at all.

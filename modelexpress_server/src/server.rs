@@ -190,7 +190,7 @@ pub async fn run_server(
     // injected backend with the P2P state manager below.
     let registry = Arc::new(
         RegistryManager::with_config(backend.clone())
-            .with_metrics(backend_metrics.clone(), registry_metrics),
+            .with_metrics(backend_metrics.clone(), registry_metrics.clone()),
     );
     match tokio::time::timeout(std::time::Duration::from_secs(10), registry.connect()).await {
         Ok(Ok(backend_name)) => info!("Model registry connected (backend: {backend_name})"),
@@ -208,6 +208,7 @@ pub async fn run_server(
     let tracker = Arc::new(ModelDownloadTracker::new(
         registry.clone(),
         download_metrics,
+        registry_metrics.clone(),
     ));
 
     // Create cache eviction service
