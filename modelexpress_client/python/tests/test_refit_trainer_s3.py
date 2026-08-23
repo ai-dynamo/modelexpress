@@ -25,7 +25,6 @@ from modelexpress_rl import (
 )
 from modelexpress_rl.s3 import S3Object
 from modelexpress_rl.train import client as trainer_client_module
-from modelexpress_rl.train.client import _merge_metadata
 
 
 class _MemoryS3:
@@ -136,6 +135,21 @@ def _trainer(
     monkeypatch.setattr(
         trainer_client_module, "S3Client", lambda **_kwargs: storage
     )
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda _group=None: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda _group=None: 1)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda output, value, group=None: output.__setitem__(0, value),
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "gather_object",
+        lambda value, output, dst=0, group=None: (
+            output.__setitem__(0, value) if output is not None else None
+        ),
+    )
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda value, group=None: None)
     trainer = ModelExpressTrainerClient.initialize(
         ModelExpressTrainerConfig(
             model_name="test/model",
@@ -181,14 +195,11 @@ def test_s3_stage_is_local_then_publish_advertises_one_canonical_root(
     trainer, storage = _trainer(monkeypatch, tmp_path, server_url)
     current = torch.tensor([1.0, 3.0])
 
-    def gather(consume):
-        consume([("weight", current)])
-
     try:
         assert trainer.source_slot_id == "canonical.delta.root"
         staged = trainer.stage_shard(
             version=WeightVersionRef("target-a"),
-            tensors=gather,
+            hf_tensor_iter=iter([("weight", current)]),
         )
         assert storage.objects == {}
 
@@ -249,13 +260,10 @@ def test_s3_publish_failure_keeps_handle_retryable(monkeypatch, tmp_path, refit_
     service, server_url = refit_server
     trainer, storage = _trainer(monkeypatch, tmp_path, server_url)
 
-    def gather(consume):
-        consume([("weight", torch.tensor([4.0, 5.0]))])
-
     try:
         staged = trainer.stage_shard(
             version=WeightVersionRef("target-a"),
-            tensors=gather,
+            hf_tensor_iter=iter([("weight", torch.tensor([4.0, 5.0]))]),
         )
         storage.fail_next = True
         with pytest.raises(RuntimeError, match="injected upload failure"):
@@ -271,20 +279,88 @@ def test_s3_publish_failure_keeps_handle_retryable(monkeypatch, tmp_path, refit_
     assert len(service.shards) == 1
 
 
+def test_s3_collects_byte_metrics_after_publication(
+    monkeypatch, tmp_path, refit_server
+):
+    _service, server_url = refit_server
+    trainer, storage = _trainer(monkeypatch, tmp_path, server_url)
+    current = torch.tensor([1.0, 3.0])
+    gather_calls = 0
+    all_gather = torch.distributed.all_gather_object
+
+    def track_gather(output, value, group=None):
+        nonlocal gather_calls
+        gather_calls += 1
+        return all_gather(output, value, group=group)
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", track_gather)
+    try:
+        staged = trainer.stage_shard(
+            version=WeightVersionRef("target-a"),
+            hf_tensor_iter=iter([("weight", current)]),
+        )
+        expected_delta = torch.bitwise_xor(
+            torch.tensor([1.0, 2.0]).view(torch.uint8),
+            current.view(torch.uint8),
+        )
+        assert gather_calls == 0
+        assert staged._staged.changed_bytes == int(torch.count_nonzero(expected_delta))
+        assert staged._staged.total_bytes == current.numel() * current.element_size()
+        assert staged._staged.wire_bytes == 0
+
+        staged.publish()
+        assert gather_calls == 1
+        shard = next(
+            data
+            for (_bucket, key), data in storage.objects.items()
+            if key.endswith(".safetensors")
+        )
+        assert staged._staged.wire_bytes == len(shard)
+
+        reductions = []
+        process_group = object()
+        trainer._process_group = process_group
+
+        def all_reduce(counts, group=None):
+            reductions.append((counts.tolist(), group))
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+        trainer.collect_metrics()
+        trainer.collect_metrics()
+        assert reductions == [
+            (
+                [
+                    int(torch.count_nonzero(expected_delta)),
+                    expected_delta.numel(),
+                    len(shard),
+                ],
+                process_group,
+            )
+        ]
+        assert trainer.pop_metrics() == {
+            "perf/update_weights_density": int(torch.count_nonzero(expected_delta))
+            / expected_delta.numel(),
+            "perf/update_weights_wire_bytes": len(shard),
+        }
+        assert trainer.pop_metrics() == {}
+    finally:
+        trainer.close()
+
+
 def test_s3_clean_update_still_publishes_root_index(
     monkeypatch, tmp_path, refit_server
 ):
     service, server_url = refit_server
     trainer, storage = _trainer(monkeypatch, tmp_path, server_url)
 
-    def gather(consume):
-        consume([("weight", torch.tensor([1.0, 2.0]))])
-
     try:
-        trainer.stage_shard(
+        staged = trainer.stage_shard(
             version=WeightVersionRef("target-a"),
-            tensors=gather,
-        ).publish()
+            hf_tensor_iter=iter([("weight", torch.tensor([1.0, 2.0]))]),
+        )
+        staged.publish()
+        trainer.collect_metrics()
+        metrics = trainer.pop_metrics()
     finally:
         trainer.close()
 
@@ -292,36 +368,10 @@ def test_s3_clean_update_still_publishes_root_index(
     shard = service.shards[0]
     index = json.loads(storage.objects[("weights", shard.s3.key)])
     assert index["weight_map"] == {}
-
-
-def test_s3_rejects_incomplete_launch_checkpoint_coverage(
-    monkeypatch, tmp_path, refit_server
-):
-    service, server_url = refit_server
-    trainer, storage = _trainer(
-        monkeypatch,
-        tmp_path,
-        server_url,
-        {
-            "weight": torch.tensor([1.0, 2.0]),
-            "other": torch.tensor([3.0]),
-        },
-    )
-
-    def gather(consume):
-        consume([("weight", torch.tensor([1.0, 3.0]))])
-
-    try:
-        with pytest.raises(RuntimeError, match="launch checkpoint format"):
-            trainer.stage_shard(
-                version=WeightVersionRef("target-a"),
-                tensors=gather,
-            )
-    finally:
-        trainer.close()
-
-    assert storage.objects == {}
-    assert service.shards == []
+    assert metrics == {
+        "perf/update_weights_density": 0.0,
+        "perf/update_weights_wire_bytes": 0,
+    }
 
 
 def test_s3_chains_from_published_base_and_releases_previous(
@@ -330,16 +380,10 @@ def test_s3_chains_from_published_base_and_releases_previous(
     service, server_url = refit_server
     trainer, storage = _trainer(monkeypatch, tmp_path, server_url)
 
-    def gather_first(consume):
-        consume([("weight", torch.tensor([1.0, 3.0]))])
-
-    def gather_second(consume):
-        consume([("weight", torch.tensor([2.0, 4.0]))])
-
     try:
         first = trainer.stage_shard(
             version=WeightVersionRef("target-a"),
-            tensors=gather_first,
+            hf_tensor_iter=iter([("weight", torch.tensor([1.0, 3.0]))]),
         )
         first.publish()
         assert first._staged.raw_deltas == {}
@@ -354,7 +398,7 @@ def test_s3_chains_from_published_base_and_releases_previous(
         )
         second = trainer.stage_shard(
             version=WeightVersionRef("target-b"),
-            tensors=gather_second,
+            hf_tensor_iter=iter([("weight", torch.tensor([2.0, 4.0]))]),
         )
         second.publish()
         assert second._staged.raw_deltas == {}
@@ -385,16 +429,10 @@ def test_s3_release_retry_accepts_not_found_after_lost_delete_response(
     service, server_url = refit_server
     trainer, _storage = _trainer(monkeypatch, tmp_path, server_url)
 
-    def gather_first(consume):
-        consume([("weight", torch.tensor([1.0, 3.0]))])
-
-    def gather_second(consume):
-        consume([("weight", torch.tensor([2.0, 4.0]))])
-
     try:
         trainer.stage_shard(
             version=WeightVersionRef("target-a"),
-            tensors=gather_first,
+            hf_tensor_iter=iter([("weight", torch.tensor([1.0, 3.0]))]),
         ).publish()
         service.target = refit_pb2.WeightVersion(
             uid="target-b",
@@ -406,7 +444,7 @@ def test_s3_release_retry_accepts_not_found_after_lost_delete_response(
         )
         trainer.stage_shard(
             version=WeightVersionRef("target-b"),
-            tensors=gather_second,
+            hf_tensor_iter=iter([("weight", torch.tensor([2.0, 4.0]))]),
         ).publish()
 
         service.fail_delete_response_once = True
@@ -424,46 +462,22 @@ def test_s3_release_retry_accepts_not_found_after_lost_delete_response(
     assert len(service.deleted_shards) == 1
 
 
-def test_s3_defers_consumer_error_until_gather_returns(
+def test_s3_propagates_tensor_processing_error(
     monkeypatch, tmp_path, refit_server
 ):
     _service, server_url = refit_server
     trainer, storage = _trainer(monkeypatch, tmp_path, server_url)
-    callback_continued = False
-
-    def gather(consume):
-        nonlocal callback_continued
-        consume([("missing", torch.tensor([1.0]))])
-        callback_continued = True
 
     try:
         with pytest.raises(KeyError, match="missing"):
             trainer.stage_shard(
                 version=WeightVersionRef("target-a"),
-                tensors=gather,
+                hf_tensor_iter=iter([("missing", torch.tensor([1.0]))]),
             )
     finally:
         trainer.close()
 
-    assert callback_continued
     assert storage.objects == {}
-
-
-def test_merge_metadata_deduplicates_equal_lowest_rank():
-    item = {"weight": {"dtype": "float32", "byte_size": 8}}
-    metadata, owners = _merge_metadata([(3, item), (1, item)])
-    assert metadata == item
-    assert owners == {"weight": 1}
-
-
-def test_merge_metadata_rejects_unequal_duplicates():
-    with pytest.raises(RuntimeError, match="differs between source ranks"):
-        _merge_metadata(
-            [
-                (0, {"weight": {"dtype": "float32", "byte_size": 8}}),
-                (1, {"weight": {"dtype": "float32", "byte_size": 16}}),
-            ]
-        )
 
 
 def test_s3_config_requires_storage_delta_pair(tmp_path):

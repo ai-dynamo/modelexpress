@@ -378,7 +378,10 @@ immutable weight versions, and compact physical shard publications in Redis.
 Each shard has a typed transport `oneof`; the runtime accepts NIXL sources and
 canonical S3 delta roots. On the NIXL path, weight bytes and full tensor
 manifests remain on trainer workers. On the S3 path, rank zero advertises one
-`canonical.delta.root` after every trainer rank has uploaded its owned buckets.
+`canonical.delta.root` after every trainer rank has uploaded its owned delta
+shard. Frameworks own tensor gathering and Hugging Face conversion, then pass a
+lazy canonical tensor stream to the trainer client, which owns delta processing
+and S3 shard construction.
 
 #### RL refit client architecture
 
