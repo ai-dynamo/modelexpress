@@ -60,7 +60,7 @@ impl EncodeLabelValue for Store {
 
 /// Whether the operation succeeded.
 ///
-/// Two values only. The error *kind* is deliberately not a label: the three
+/// The error *kind* is deliberately not a label: the three
 /// backends have three unrelated error types, two of them boxed
 /// `dyn Error`, so any faithful mapping would be an unbounded string.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]

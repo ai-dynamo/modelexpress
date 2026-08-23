@@ -208,17 +208,29 @@ means a previous downloader died and the bytes are being pulled again, which for
 a large model is hundreds of gigabytes of repeated transfer.
 `mx_download_lease_refresh_total{result="lost"}` is its leading indicator.
 
-Downloads currently in flight are a derivation rather than a gauge:
+Downloads currently in flight:
 
 ```promql
-sum(mx_registry_status_transitions_total{to="downloading"})
-  - sum(mx_registry_status_transitions_total{from="downloading"})
+mx_registry_entries{status="downloading"}
 ```
 
-It balances because a takeover is recorded as arriving *from* `downloading`
-rather than from `absent`, and because a fenced `finish_download_claim` records
-no departure. A persistent non-zero value with no matching download activity is a
-model wedged in `DOWNLOADING`.
+Use the gauge, not a difference over the transition counters. The gauge is
+recomputed from the registry itself, so it is correct across a restart and across
+replicas; the counters are process-local while `DOWNLOADING` persists in the
+store, so after a restart a download that began in the previous process
+contributes a departure with no matching arrival and a raw difference can go
+negative.
+
+The transition counters answer flow rather than level -- how often downloads
+start, and how often they end in error:
+
+```promql
+sum(rate(mx_registry_status_transitions_total{to="downloading"}[5m]))
+sum(rate(mx_registry_status_transitions_total{to="error"}[5m]))
+```
+
+A `mx_registry_entries{status="downloading"}` that stays non-zero with no
+`to="downloading"` rate underneath it is a model wedged in `DOWNLOADING`.
 
 ### Refreshed gauges, not scrape-time collection
 

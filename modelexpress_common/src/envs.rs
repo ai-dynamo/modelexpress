@@ -295,11 +295,15 @@ pub fn reaper_scan_interval_secs() -> u64 {
 
 /// Registry-statistics refresh interval in seconds
 /// ([`MX_REGISTRY_STATS_INTERVAL_SECS`], default 60).
+///
+/// Clamped to at least 1: `tokio::time::interval` panics on a zero period, so a
+/// deployment that set this to 0 would take the refresh task down at startup.
 pub fn registry_stats_interval_secs() -> u64 {
     env_u64(
         MX_REGISTRY_STATS_INTERVAL_SECS,
         DEFAULT_REGISTRY_STATS_INTERVAL_SECS,
     )
+    .max(1)
 }
 
 /// Heartbeat staleness timeout in seconds ([`MX_HEARTBEAT_TIMEOUT_SECS`], default 90).

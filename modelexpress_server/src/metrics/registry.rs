@@ -22,12 +22,28 @@
 //!
 //! # Reading the wedged-model signal
 //!
-//! `sum(mx_registry_status_transitions_total{to="downloading"})` minus
-//! `sum(mx_registry_status_transitions_total{from="downloading"})` is the number
-//! of downloads currently in flight. It only holds because a takeover is counted
-//! as its own result rather than as a fresh claim -- a takeover that looked like
-//! a new entry would add an arrival with no matching departure, and the
-//! derivation would drift upward forever.
+//! The authoritative count of downloads in flight is the refreshed gauge
+//! `mx_registry_entries{status="downloading"}`, not a derivation over these
+//! counters. The gauge is recomputed from the registry itself, so it is correct
+//! across a restart and across replicas.
+//!
+//! Differencing the transition counters gives the same number *within one process
+//! lifetime* and is useful for seeing flow rather than level:
+//!
+//! ```promql
+//! sum(rate(mx_registry_status_transitions_total{to="downloading"}[5m]))
+//! ```
+//!
+//! It is not a restart-safe level. `DOWNLOADING` persists in Redis while these
+//! counters are process-local, so after a restart a download that began in the
+//! previous process contributes a departure with no matching arrival and a raw
+//! difference can go negative. That is a property of differencing counters, not
+//! something a label change fixes -- hence the gauge.
+//!
+//! Within a process the difference does balance, and that depends on a takeover
+//! recording `downloading -> downloading`: an arrival and a departure that cancel,
+//! because ownership changed while the entry never left `DOWNLOADING`. Recording
+//! it as `absent -> downloading` would add an arrival that never leaves.
 
 use modelexpress_common::models::ModelStatus;
 use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue, LabelValueEncoder};
@@ -312,42 +328,74 @@ mod tests {
         assert!(!encoded.contains("_total_total"), "{encoded}");
     }
 
-    /// The in-flight derivation is arrivals minus departures, so a takeover must
-    /// arrive from `downloading` rather than from `absent`. If it arrived from
-    /// `absent` the count would gain an entry that never leaves.
+    /// Sum the `to="downloading"` and `from="downloading"` series the way the
+    /// documented query does, so the assertion is the derivation itself rather
+    /// than the individual series.
+    fn in_flight(encoded: &str) -> i64 {
+        let mut arrivals: i64 = 0;
+        let mut departures: i64 = 0;
+        for line in encoded.lines() {
+            let Some((labels, value)) = line
+                .strip_prefix("mx_registry_status_transitions_total{")
+                .and_then(|rest| rest.split_once("} "))
+            else {
+                continue;
+            };
+            let count: i64 = value.trim().parse().unwrap_or_default();
+            if labels.contains(r#"to="downloading""#) {
+                arrivals = arrivals.saturating_add(count);
+            }
+            if labels.contains(r#"from="downloading""#) {
+                departures = departures.saturating_add(count);
+            }
+        }
+        arrivals.saturating_sub(departures)
+    }
+
+    /// One download, taken over mid-flight, then finished.
+    ///
+    /// A takeover records `downloading -> downloading`: an arrival and a departure
+    /// that cancel, because ownership changed while the entry never left
+    /// `DOWNLOADING`. Recording it as `absent -> downloading` instead would add an
+    /// arrival that never leaves and the level would drift up by one per takeover.
     #[test]
-    fn the_in_flight_derivation_balances() {
+    fn a_takeover_does_not_change_the_in_flight_level() {
         let mut registry = new_registry();
         let metrics = RegistryMetrics::register(&mut registry);
 
-        // One fresh download that finishes, and one that is taken over and then
-        // finishes: two arrivals into downloading, two departures.
         metrics.record_claim(ClaimResult::Claimed);
-        metrics.record_transition(StatusLabel::Downloading, StatusLabel::Downloaded);
+        let encoded = encode_text(&registry).unwrap_or_else(|_| String::from("<encode failed>"));
+        assert_eq!(in_flight(&encoded), 1, "one download in flight");
+
+        // Ownership moves; the download itself is still the same one.
         metrics.record_claim(ClaimResult::Takeover);
+        let encoded = encode_text(&registry).unwrap_or_else(|_| String::from("<encode failed>"));
+        assert_eq!(
+            in_flight(&encoded),
+            1,
+            "a takeover is not a second download"
+        );
+
         metrics.record_transition(StatusLabel::Downloading, StatusLabel::Downloaded);
+        let encoded = encode_text(&registry).unwrap_or_else(|_| String::from("<encode failed>"));
+        assert_eq!(in_flight(&encoded), 0, "the download finished");
+    }
+
+    /// A waiter observing an existing claim is not a transition at all.
+    #[test]
+    fn an_already_exists_claim_records_no_transition() {
+        let mut registry = new_registry();
+        let metrics = RegistryMetrics::register(&mut registry);
+
+        metrics.record_claim(ClaimResult::Claimed);
+        metrics.record_claim(ClaimResult::AlreadyExists);
+        metrics.record_claim(ClaimResult::Error);
 
         let encoded = encode_text(&registry).unwrap_or_else(|_| String::from("<encode failed>"));
-
-        // Arrivals: absent->downloading once, downloading->downloading once.
-        assert!(
-            encoded.contains(
-                r#"mx_registry_status_transitions_total{from="absent",to="downloading"} 1"#
-            ),
-            "{encoded}"
-        );
-        assert!(
-            encoded.contains(
-                r#"mx_registry_status_transitions_total{from="downloading",to="downloading"} 1"#
-            ),
-            "a takeover must arrive from downloading, not absent: {encoded}"
-        );
-        // Departures: two.
-        assert!(
-            encoded.contains(
-                r#"mx_registry_status_transitions_total{from="downloading",to="downloaded"} 2"#
-            ),
-            "{encoded}"
+        assert_eq!(
+            in_flight(&encoded),
+            1,
+            "waiters and errors must not move the level: {encoded}"
         );
     }
 
