@@ -173,6 +173,14 @@ of the deployment export it, distinguished by `component`.
 | `mx_backend_ops_total` | Counter | `store`, `op`, `result` |
 | `mx_backend_op_seconds` | Histogram | `store`, `op`, `result` |
 | `mx_backend_ops_in_flight` | Gauge | `store`, `op` |
+| `mx_registry_status_transitions_total` | Counter | `from`, `to` |
+| `mx_download_claims_total` | Counter | `result` |
+| `mx_download_lease_refresh_total` | Counter | `result` |
+| `mx_download_seconds` | Histogram | `outcome` |
+| `mx_cache_evictions_total` | Counter | `reason` |
+| `mx_registry_entries` | Gauge | `status` |
+| `mx_state_entries` | Gauge | `map` |
+| `mx_task_last_success_timestamp_seconds` | Gauge | `task` |
 
 `method` is a closed set of the 21 routed RPCs plus `other`; an unrecognised path
 cannot mint a series.
@@ -192,6 +200,48 @@ are plain gauges rather than the `_started_total`/`_finished_total` counter pair
 the client side uses, because that pattern exists to survive a SIGKILLed rank
 under multiprocess mode -- the server is one process with an in-process registry,
 so there is nothing to wedge.
+
+### The download lifecycle
+
+`mx_download_claims_total{result="takeover"}` is the one to watch: a takeover
+means a previous downloader died and the bytes are being pulled again, which for
+a large model is hundreds of gigabytes of repeated transfer.
+`mx_download_lease_refresh_total{result="lost"}` is its leading indicator.
+
+Downloads currently in flight are a derivation rather than a gauge:
+
+```promql
+sum(mx_registry_status_transitions_total{to="downloading"})
+  - sum(mx_registry_status_transitions_total{from="downloading"})
+```
+
+It balances because a takeover is recorded as arriving *from* `downloading`
+rather than from `absent`, and because a fenced `finish_download_claim` records
+no departure. A persistent non-zero value with no matching download activity is a
+model wedged in `DOWNLOADING`.
+
+### Refreshed gauges, not scrape-time collection
+
+`mx_registry_entries` and `mx_state_entries` are written by a background task on
+`MX_REGISTRY_STATS_INTERVAL_SECS` (default 60), not computed during a scrape.
+Counting registry entries walks the keyspace -- a `SCAN` plus a pipelined per-key
+fetch on Redis, an unpaginated list of every `ModelCacheEntry` on Kubernetes -- so
+collecting at scrape time would put that on the metadata store every fifteen
+seconds.
+
+The task is independent of cache eviction on purpose: that service ticks hourly
+and is skipped entirely when eviction is disabled, which would leave these gauges
+permanently absent rather than merely stale.
+
+When a refresh fails the gauges hold their previous values and the heartbeat is
+not stamped, so staleness is the signal:
+
+```promql
+time() - mx_task_last_success_timestamp_seconds{task="registry_stats_refresh"} > 300
+```
+
+`mx_registry_entries` counts *entries*, not models: one logical model holds
+several at once, one per revision plus separate ones for metadata-only downloads.
 
 **The two streaming RPCs are deliberately absent.** `EnsureModelDownloaded` and
 `StreamModelFiles` return their response head as soon as the stream is set up and

@@ -237,6 +237,7 @@ pub async fn run_server(
     // Create service implementations
     let health_service = HealthServiceImpl;
     let api_service = ApiServiceImpl;
+    let stats_tracker = tracker.clone();
     let model_service = ModelServiceImpl::new(tracker);
 
     // Create standard gRPC health service (grpc.health.v1.Health)
@@ -317,6 +318,23 @@ pub async fn run_server(
         crate::p2p::reaper::run_reaper(reaper_state, reaper_shutdown_rx).await;
     });
 
+    // Registry statistics refresh. Independent of the cache-eviction service on
+    // purpose: that one ticks hourly and is skipped entirely when eviction is
+    // disabled, which would leave these gauges permanently absent rather than
+    // merely stale.
+    let (stats_shutdown_tx, stats_shutdown_rx) = tokio::sync::oneshot::channel();
+    let stats_registry = registry.clone();
+    let stats_metrics = cache_metrics.clone();
+    let stats_handle = tokio::spawn(async move {
+        crate::registry::stats_refresh::run_stats_refresh(
+            stats_registry,
+            stats_metrics,
+            std::sync::Arc::new(move || stats_tracker.waiting_count()),
+            stats_shutdown_rx,
+        )
+        .await;
+    });
+
     // Fan the caller's shutdown trigger out to the background tasks, then let
     // serve_with_shutdown observe the same trigger to stop accepting connections.
     let shutdown_signal = async move {
@@ -330,6 +348,11 @@ pub async fn run_server(
         // Signal reaper to shutdown
         if reaper_shutdown_tx.send(()).is_err() {
             error!("Failed to send shutdown signal to reaper");
+        }
+
+        // Signal registry stats refresh to shutdown
+        if stats_shutdown_tx.send(()).is_err() {
+            error!("Failed to send shutdown signal to registry stats refresh");
         }
     };
 
@@ -396,6 +419,9 @@ pub async fn run_server(
         && let Err(e) = handle.await
     {
         error!("Cache eviction service join error: {e}");
+    }
+    if let Err(e) = stats_handle.await {
+        error!("Registry stats refresh join error: {e}");
     }
     if let Err(e) = reaper_handle.await {
         error!("Reaper join error: {e}");

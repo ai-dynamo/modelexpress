@@ -90,7 +90,9 @@ ModelExpress/
 │       │   ├── exposition.rs            # HTTP/1.1 /metrics listener (separate port)
 │       │   ├── buckets.rs               # Shared histogram bucket boundaries
 │       │   ├── grpc.rs                  # Per-RPC tower layer; in-handler outcomes
-│       │   └── backend.rs               # Backend op counters and latency
+│       │   ├── backend.rs               # Backend op counters and latency
+│       │   ├── registry.rs              # Download claim, lease and status transitions
+│       │   └── cache.rs                 # Eviction reasons and refreshed gauges
 │       ├── p2p/
 │       │   ├── state.rs                # P2pStateManager wrapper
 │       │   ├── service.rs              # P2P gRPC service implementation
@@ -111,6 +113,7 @@ ModelExpress/
 │       │       └── instrumented.rs      # Metrics decorator over RefitBackend
 │       ├── registry/
 │       │   ├── state.rs                # RegistryManager wrapper
+│       │   ├── stats_refresh.rs        # Background gauge refresh (own interval)
 │       │   ├── backend.rs              # RegistryBackend trait + ModelRecord
 │       │   ├── entry_key.rs            # EntryKey: model + revision + weight mode
 │       │   ├── k8s_types.rs            # ModelCacheEntry CRD type
@@ -1104,6 +1107,7 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_HEARTBEAT_INTERVAL_SECS` | `30` | Client heartbeat frequency |
 | `MX_HEARTBEAT_TIMEOUT_SECS` | `90` | Server reaper staleness threshold |
 | `MX_REAPER_SCAN_INTERVAL_SECS` | `30` | Server reaper scan frequency |
+| `MX_REGISTRY_STATS_INTERVAL_SECS` | `60` | Registry-statistics refresh frequency. Writes `mx_registry_entries` and `mx_state_entries`; each pass walks the keyspace, so it is deliberately coarser than a scrape and runs independently of cache eviction |
 | `MX_GC_TIMEOUT_SECS` | `3600` | Time before stale entries are deleted |
 | `VLLM_RPC_TIMEOUT` | `7200000` | vLLM RPC timeout in ms |
 

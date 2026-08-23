@@ -769,6 +769,19 @@ impl ModelDownloadTracker {
         }
     }
 
+    /// Number of models with callers currently waiting on a download.
+    ///
+    /// This map is never evicted wholesale, so its size is the early warning for
+    /// the leak that would eventually OOM the server. A poisoned lock reports the
+    /// recovered length rather than failing: a metric read must not be able to
+    /// take down the download path.
+    pub fn waiting_count(&self) -> usize {
+        match self.waiting_channels.lock() {
+            Ok(waiting) => waiting.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
+        }
+    }
+
     async fn touch_and_log(&self, model_name: &str) {
         if let Err(e) = self.registry.touch_model(model_name).await {
             error!("Failed to touch model {model_name}: {e}");
