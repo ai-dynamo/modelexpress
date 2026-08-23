@@ -176,6 +176,8 @@ pub async fn run_server(
     metrics::register_build_info(&mut metrics_registry, &backend);
     let grpc_metrics = metrics::grpc::GrpcMetrics::register(&mut metrics_registry);
     let backend_metrics = metrics::backend::BackendMetrics::register(&mut metrics_registry);
+    let registry_metrics = metrics::registry::RegistryMetrics::register(&mut metrics_registry);
+    let download_metrics = metrics::registry::DownloadMetrics::register(&mut metrics_registry);
     let metrics_registry = Arc::new(metrics_registry);
 
     let metrics_listener = MetricsListener::spawn(metrics_addr, Arc::clone(&metrics_registry));
@@ -186,7 +188,8 @@ pub async fn run_server(
     // Initialize the model registry manager (Redis or Kubernetes CRDs). Shares the
     // injected backend with the P2P state manager below.
     let registry = Arc::new(
-        RegistryManager::with_config(backend.clone()).with_metrics(backend_metrics.clone()),
+        RegistryManager::with_config(backend.clone())
+            .with_metrics(backend_metrics.clone(), registry_metrics),
     );
     match tokio::time::timeout(std::time::Duration::from_secs(10), registry.connect()).await {
         Ok(Ok(backend_name)) => info!("Model registry connected (backend: {backend_name})"),
@@ -201,7 +204,10 @@ pub async fn run_server(
     }
 
     // Initialize the download tracker, injected with the registry.
-    let tracker = Arc::new(ModelDownloadTracker::new(registry.clone()));
+    let tracker = Arc::new(ModelDownloadTracker::new(
+        registry.clone(),
+        download_metrics,
+    ));
 
     // Create cache eviction service
     let cache_service = CacheEvictionService::new(

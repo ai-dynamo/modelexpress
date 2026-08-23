@@ -32,6 +32,7 @@ pub mod backend;
 pub mod buckets;
 pub mod exposition;
 pub mod grpc;
+pub mod registry;
 
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::encoding::text::encode;

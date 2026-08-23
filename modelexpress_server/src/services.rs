@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::metrics::grpc::RpcOutcome;
+use crate::metrics::registry::{DownloadMetrics, StatusLabel};
 use crate::registry::backend::ClaimOutcome;
 use crate::registry::entry_key::EntryKey;
 use crate::registry::state::RegistryManager;
@@ -753,16 +754,18 @@ pub struct ModelDownloadTracker {
     registry: Arc<RegistryManager>,
     /// Maps model names to list of channels waiting for updates on this server replica.
     waiting_channels: WaitingChannels,
+    download_metrics: DownloadMetrics,
 }
 
 const DOWNLOAD_LEASE_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
 const DOWNLOAD_HEARTBEAT_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(10);
 
 impl ModelDownloadTracker {
-    pub fn new(registry: Arc<RegistryManager>) -> Self {
+    pub fn new(registry: Arc<RegistryManager>, download_metrics: DownloadMetrics) -> Self {
         Self {
             registry,
             waiting_channels: Arc::new(Mutex::new(HashMap::new())),
+            download_metrics,
         }
     }
 
@@ -911,6 +914,7 @@ impl ModelDownloadTracker {
     fn spawn_download_task(&self, target: DownloadTarget, retry: bool, claim_id: String) {
         let tracker = self.clone();
         tokio::spawn(async move {
+            let started = std::time::Instant::now();
             let entry_key = target.entry_key();
             let DownloadTarget {
                 model_name,
@@ -979,6 +983,14 @@ impl ModelDownloadTracker {
                     (ModelStatus::ERROR, Some(msg))
                 }
             };
+
+            // Timed from the top of the task, so this is the whole download
+            // rather than the registry write below it. Observed before the fence
+            // check: the bytes were fetched regardless of whether this replica
+            // still owns the right to publish the result.
+            tracker
+                .download_metrics
+                .observe(StatusLabel::from(status), started.elapsed().as_secs_f64());
 
             match tracker
                 .registry
@@ -1268,7 +1280,10 @@ mod tests {
         mock: crate::registry::backend::MockRegistryBackend,
     ) -> ModelDownloadTracker {
         let registry = Arc::new(RegistryManager::with_backend(Arc::new(mock)));
-        ModelDownloadTracker::new(registry)
+        ModelDownloadTracker::new(
+            registry,
+            DownloadMetrics::register(&mut crate::metrics::new_registry()),
+        )
     }
 
     /// Unpinned, full-weight target: its entry key is the bare model name.
@@ -1571,7 +1586,10 @@ mod tests {
         let registry = Arc::new(RegistryManager::with_backend(Arc::new(
             crate::registry::backend::MockRegistryBackend::new(),
         )));
-        ModelServiceImpl::new(Arc::new(ModelDownloadTracker::new(registry)))
+        ModelServiceImpl::new(Arc::new(ModelDownloadTracker::new(
+            registry,
+            DownloadMetrics::register(&mut crate::metrics::new_registry()),
+        )))
     }
 
     #[test]

@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 
 use crate::metrics::backend::{BackendMetrics, Store};
+use crate::metrics::registry::{ClaimResult, LeaseResult, RegistryMetrics, StatusLabel};
 use crate::registry::backend::{ClaimOutcome, ModelRecord, RegistryBackend, RegistryResult};
 use modelexpress_common::models::{ModelProvider, ModelStatus};
 
@@ -26,6 +27,7 @@ use modelexpress_common::models::{ModelProvider, ModelStatus};
 pub struct InstrumentedRegistryBackend {
     inner: Arc<dyn RegistryBackend>,
     metrics: BackendMetrics,
+    lifecycle: RegistryMetrics,
 }
 
 impl InstrumentedRegistryBackend {
@@ -34,8 +36,13 @@ impl InstrumentedRegistryBackend {
     pub fn wrap(
         inner: Arc<dyn RegistryBackend>,
         metrics: BackendMetrics,
+        lifecycle: RegistryMetrics,
     ) -> Arc<dyn RegistryBackend> {
-        Arc::new(Self { inner, metrics })
+        Arc::new(Self {
+            inner,
+            metrics,
+            lifecycle,
+        })
     }
 }
 
@@ -133,14 +140,22 @@ impl RegistryBackend for InstrumentedRegistryBackend {
         claim_id: &str,
         lease_duration: std::time::Duration,
     ) -> RegistryResult<ClaimOutcome> {
-        self.metrics
+        let outcome = self
+            .metrics
             .time(
                 Store::Registry,
                 "try_claim_for_download",
                 self.inner
                     .try_claim_for_download(model_name, provider, claim_id, lease_duration),
             )
-            .await
+            .await;
+        self.lifecycle.record_claim(match &outcome {
+            Ok(ClaimOutcome::Claimed) => ClaimResult::Claimed,
+            Ok(ClaimOutcome::TookOver) => ClaimResult::Takeover,
+            Ok(ClaimOutcome::AlreadyExists(_)) => ClaimResult::AlreadyExists,
+            Err(_) => ClaimResult::Error,
+        });
+        outcome
     }
 
     async fn try_reset_error_for_retry(
@@ -150,7 +165,8 @@ impl RegistryBackend for InstrumentedRegistryBackend {
         claim_id: &str,
         lease_duration: std::time::Duration,
     ) -> RegistryResult<bool> {
-        self.metrics
+        let reset = self
+            .metrics
             .time(
                 Store::Registry,
                 "try_reset_error_for_retry",
@@ -161,7 +177,14 @@ impl RegistryBackend for InstrumentedRegistryBackend {
                     lease_duration,
                 ),
             )
-            .await
+            .await;
+        // Only the winner sees `true`, so this counts retries actually started
+        // rather than replicas that observed the error.
+        if matches!(reset, Ok(true)) {
+            self.lifecycle
+                .record_transition(StatusLabel::Error, StatusLabel::Downloading);
+        }
+        reset
     }
 
     async fn refresh_download_claim(
@@ -171,14 +194,21 @@ impl RegistryBackend for InstrumentedRegistryBackend {
         claim_id: &str,
         lease_duration: std::time::Duration,
     ) -> RegistryResult<bool> {
-        self.metrics
+        let renewed = self
+            .metrics
             .time(
                 Store::Registry,
                 "refresh_download_claim",
                 self.inner
                     .refresh_download_claim(model_name, provider, claim_id, lease_duration),
             )
-            .await
+            .await;
+        self.lifecycle.record_lease_refresh(match &renewed {
+            Ok(true) => LeaseResult::Renewed,
+            Ok(false) => LeaseResult::Lost,
+            Err(_) => LeaseResult::Error,
+        });
+        renewed
     }
 
     async fn finish_download_claim(
@@ -189,14 +219,23 @@ impl RegistryBackend for InstrumentedRegistryBackend {
         status: ModelStatus,
         message: Option<String>,
     ) -> RegistryResult<bool> {
-        self.metrics
+        let finished = self
+            .metrics
             .time(
                 Store::Registry,
                 "finish_download_claim",
                 self.inner
                     .finish_download_claim(model_name, provider, claim_id, status, message),
             )
-            .await
+            .await;
+        // `false` means a stale owner was fenced after its lease was taken over:
+        // the entry did not leave `downloading` on this call, and counting it
+        // would make the in-flight derivation go negative.
+        if matches!(finished, Ok(true)) {
+            self.lifecycle
+                .record_transition(StatusLabel::Downloading, status.into());
+        }
+        finished
     }
 }
 
@@ -215,7 +254,11 @@ mod tests {
 
         let mut registry = new_registry();
         let metrics = BackendMetrics::register(&mut registry);
-        let backend = InstrumentedRegistryBackend::wrap(Arc::new(mock), metrics);
+        let backend = InstrumentedRegistryBackend::wrap(
+            Arc::new(mock),
+            metrics,
+            RegistryMetrics::register(&mut new_registry()),
+        );
 
         let status = backend.get_status("google-t5/t5-small").await;
         assert_eq!(status.ok().flatten(), Some(ModelStatus::DOWNLOADED));
@@ -238,7 +281,11 @@ mod tests {
 
         let mut registry = new_registry();
         let metrics = BackendMetrics::register(&mut registry);
-        let backend = InstrumentedRegistryBackend::wrap(Arc::new(mock), metrics);
+        let backend = InstrumentedRegistryBackend::wrap(
+            Arc::new(mock),
+            metrics,
+            RegistryMetrics::register(&mut new_registry()),
+        );
 
         assert!(backend.connect().await.is_err());
 
@@ -288,7 +335,11 @@ mod tests {
 
         let mut registry = new_registry();
         let metrics = BackendMetrics::register(&mut registry);
-        let backend = InstrumentedRegistryBackend::wrap(Arc::new(mock), metrics);
+        let backend = InstrumentedRegistryBackend::wrap(
+            Arc::new(mock),
+            metrics,
+            RegistryMetrics::register(&mut new_registry()),
+        );
 
         let model = "google-t5/t5-small";
         let _ = backend.connect().await;
