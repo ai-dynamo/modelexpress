@@ -1046,7 +1046,11 @@ impl ModelDownloadTracker {
                 .try_claim_for_download(entry_key, provider, &claim_id, DOWNLOAD_LEASE_DURATION)
                 .await
             {
-                Ok(ClaimOutcome::Claimed) => break (ModelStatus::DOWNLOADING, true),
+                // Both outcomes mean this replica owns the download; they differ
+                // only in cost, which the metrics layer records separately.
+                Ok(ClaimOutcome::Claimed | ClaimOutcome::TookOver) => {
+                    break (ModelStatus::DOWNLOADING, true);
+                }
                 Ok(ClaimOutcome::AlreadyExists(existing)) => {
                     if existing == ModelStatus::DOWNLOADED
                         && attempt < MAX_CLAIM_ATTEMPTS
@@ -1144,7 +1148,10 @@ impl ModelDownloadTracker {
                     .try_claim_for_download(entry_key, provider, &claim_id, DOWNLOAD_LEASE_DURATION)
                     .await
                 {
-                    Ok(ClaimOutcome::Claimed) => {
+                    // A taken-over lease must be re-driven exactly like a fresh
+                    // claim. Letting it fall through instead would leave the entry
+                    // wedged in DOWNLOADING with no owner running.
+                    Ok(ClaimOutcome::Claimed | ClaimOutcome::TookOver) => {
                         self.spawn_download_task(target.clone(), false, claim_id);
                         claim_id = uuid::Uuid::new_v4().to_string();
                     }

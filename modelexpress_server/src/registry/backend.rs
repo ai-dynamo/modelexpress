@@ -37,9 +37,19 @@ pub struct ModelRecord {
 /// `AlreadyExists` must wait on the owner instead of spawning a duplicate download.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ClaimOutcome {
-    /// This call atomically created the registry record or took over an expired lease.
-    /// The caller is the download owner.
+    /// This call atomically created the registry record. The caller is the download
+    /// owner and this is the first download of this entry.
     Claimed,
+    /// This call took over an expired lease: a previous owner claimed the entry and
+    /// died without finishing. The caller is the download owner, exactly as for
+    /// [`ClaimOutcome::Claimed`], and every caller that only cares about ownership
+    /// should match the two together.
+    ///
+    /// They are distinguished because the cost is not comparable. A `Claimed` is the
+    /// first fetch of a model; a `TookOver` means the bytes are being pulled again
+    /// because the previous downloader died, which for a large model is hundreds of
+    /// gigabytes of repeated transfer. Collapsing them makes that invisible.
+    TookOver,
     /// The record already existed when we tried to claim. The caller is a waiter, not
     /// the owner; the enclosed status is the snapshot observed during the attempt.
     AlreadyExists(ModelStatus),
