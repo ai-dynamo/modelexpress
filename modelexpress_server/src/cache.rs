@@ -80,7 +80,7 @@ pub struct EvictionResult {
 }
 
 /// Reason for cache eviction
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EvictionReason {
     /// Models exceeded unused time threshold
     TimeThreshold,
@@ -92,6 +92,19 @@ pub enum EvictionReason {
     Manual,
 }
 
+/// One model selected for eviction, with the rule that picked it.
+///
+/// The reason travels with the model rather than with the cycle: a single pass
+/// can evict some models for age and others for the count limit, and a
+/// cycle-level reason has to pick one and misreport the rest.
+#[derive(Debug, Clone)]
+pub struct EvictionCandidate {
+    /// Registry key of the model to evict.
+    pub model_name: String,
+    /// Which rule selected it.
+    pub reason: EvictionReason,
+}
+
 /// Trait for implementing different eviction policies
 #[async_trait::async_trait]
 pub trait EvictionPolicyTrait {
@@ -100,7 +113,7 @@ pub trait EvictionPolicyTrait {
         &self,
         models: &[ModelRecord],
         config: &CacheEvictionConfig,
-    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>>;
+    ) -> Result<Vec<EvictionCandidate>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// LRU (Least Recently Used) eviction policy implementation
@@ -133,7 +146,7 @@ impl EvictionPolicyTrait for LruEvictionPolicy {
         &self,
         models: &[ModelRecord],
         config: &CacheEvictionConfig,
-    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Vec<EvictionCandidate>, Box<dyn std::error::Error + Send + Sync>> {
         let EvictionPolicyType::Lru(lru_config) = &config.policy;
 
         let mut candidates_for_eviction = Vec::new();
@@ -157,7 +170,10 @@ impl EvictionPolicyTrait for LruEvictionPolicy {
                     model_name = model.model_name,
                     last_used_at = model.last_used_at
                 );
-                candidates_for_eviction.push(model.model_name.clone());
+                candidates_for_eviction.push(EvictionCandidate {
+                    model_name: model.model_name.clone(),
+                    reason: EvictionReason::TimeThreshold,
+                });
             }
         }
 
@@ -178,8 +194,14 @@ impl EvictionPolicyTrait for LruEvictionPolicy {
                 sorted_models.sort_by_key(|model| model.last_used_at);
 
                 for model in sorted_models.iter().take(models_to_remove_by_count) {
-                    if !candidates_for_eviction.contains(&model.model_name) {
-                        candidates_for_eviction.push(model.model_name.clone());
+                    if !candidates_for_eviction
+                        .iter()
+                        .any(|candidate| candidate.model_name == model.model_name)
+                    {
+                        candidates_for_eviction.push(EvictionCandidate {
+                            model_name: model.model_name.clone(),
+                            reason: EvictionReason::CountLimit,
+                        });
                     }
                 }
             }
@@ -209,6 +231,7 @@ pub struct CacheEvictionService {
     registry: Arc<RegistryManager>,
     config: CacheEvictionConfig,
     cache_directory: PathBuf,
+    metrics: crate::metrics::cache::CacheMetrics,
 }
 
 impl CacheEvictionService {
@@ -217,8 +240,10 @@ impl CacheEvictionService {
         registry: Arc<RegistryManager>,
         config: CacheEvictionConfig,
         cache_directory: PathBuf,
+        metrics: crate::metrics::cache::CacheMetrics,
     ) -> Self {
         Self {
+            metrics,
             registry,
             config,
             cache_directory,
@@ -306,10 +331,15 @@ impl CacheEvictionService {
 
         // Remove models from the database and filesystem
         let mut successfully_evicted = Vec::new();
-        for model_name in &models_to_evict {
+        for candidate in &models_to_evict {
+            let model_name = &candidate.model_name;
             match self.evict_model(model_name).await {
                 Ok(()) => {
                     successfully_evicted.push(model_name.clone());
+                    // Counted per model, with the rule that actually selected it:
+                    // one cycle can evict some models for age and others for the
+                    // count limit.
+                    self.metrics.record_eviction(candidate.reason);
                     info!(
                         "Successfully evicted model: {model_name}",
                         model_name = model_name
@@ -329,7 +359,11 @@ impl CacheEvictionService {
             evicted_count: successfully_evicted.len() as u32,
             evicted_models: successfully_evicted,
             bytes_freed: None, // Could be implemented with actual file size tracking
-            reason: EvictionReason::TimeThreshold,
+            // A summary of a cycle that may have evicted for more than one
+            // reason; the per-reason breakdown is in mx_cache_evictions_total.
+            reason: models_to_evict
+                .first()
+                .map_or(EvictionReason::TimeThreshold, |candidate| candidate.reason),
         };
 
         if result.evicted_count > 0 {
@@ -467,7 +501,12 @@ mod tests {
     ) -> (CacheEvictionService, TempDir) {
         let registry = Arc::new(RegistryManager::with_backend(Arc::new(mock)));
         let cache_dir = TempDir::new().expect("Failed to create cache directory");
-        let service = CacheEvictionService::new(registry, config, cache_dir.path().to_path_buf());
+        let service = CacheEvictionService::new(
+            registry,
+            config,
+            cache_dir.path().to_path_buf(),
+            crate::metrics::cache::CacheMetrics::register(&mut crate::metrics::new_registry()),
+        );
         (service, cache_dir)
     }
 
@@ -612,7 +651,8 @@ mod tests {
 
         // Should only evict the old downloaded model, not the downloading one
         assert_eq!(evicted.len(), 1);
-        assert_eq!(evicted[0], "old-model");
+        assert_eq!(evicted[0].model_name, "old-model");
+        assert_eq!(evicted[0].reason, EvictionReason::TimeThreshold);
     }
 
     #[tokio::test]
@@ -664,7 +704,11 @@ mod tests {
 
         // Should evict the oldest model to stay within the limit of 2
         assert_eq!(evicted.len(), 1);
-        assert_eq!(evicted[0], "model1");
+        assert_eq!(evicted[0].model_name, "model1");
+        // Selected by the count limit, not by age. This assertion is the whole
+        // point of carrying the reason per candidate: before, this path was
+        // reported as a time-threshold eviction.
+        assert_eq!(evicted[0].reason, EvictionReason::CountLimit);
     }
 
     #[tokio::test]

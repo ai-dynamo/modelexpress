@@ -178,6 +178,7 @@ pub async fn run_server(
     let backend_metrics = metrics::backend::BackendMetrics::register(&mut metrics_registry);
     let registry_metrics = metrics::registry::RegistryMetrics::register(&mut metrics_registry);
     let download_metrics = metrics::registry::DownloadMetrics::register(&mut metrics_registry);
+    let cache_metrics = metrics::cache::CacheMetrics::register(&mut metrics_registry);
     let metrics_registry = Arc::new(metrics_registry);
 
     let metrics_listener = MetricsListener::spawn(metrics_addr, Arc::clone(&metrics_registry));
@@ -214,6 +215,7 @@ pub async fn run_server(
         registry.clone(),
         config.cache.eviction.clone(),
         config.cache.directory.clone(),
+        cache_metrics.clone(),
     );
 
     // Create shutdown channels
