@@ -24,6 +24,8 @@ jobs:
   test:
     name: Test Suite
     runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
     strategy:
       matrix:
         rust:
