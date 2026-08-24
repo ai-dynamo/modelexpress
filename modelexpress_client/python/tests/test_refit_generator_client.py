@@ -18,7 +18,6 @@ from modelexpress_rl import (
     refit_pb2_grpc,
 )
 from modelexpress_rl.inference.adapter import GeneratorEngineAdapter, S3GeneratorSource
-from modelexpress_rl.inference.receiver import PoisonedCheckpointError
 
 
 class _RefitService(refit_pb2_grpc.RefitServiceServicer):
@@ -121,14 +120,11 @@ class _Adapter(GeneratorEngineAdapter):
         self.release_calls = []
         self.close_calls = 0
         self.stage_failures = 0
-        self.poisoned_failure = False
         self.apply_failure = False
 
     def stage_weight(self, inputs):
         assert self.service.active_leases
         self.stage_calls.append(inputs)
-        if self.poisoned_failure:
-            raise PoisonedCheckpointError("checkpoint is poisoned")
         if self.stage_failures:
             self.stage_failures -= 1
             raise RuntimeError("transfer failed")
@@ -428,23 +424,6 @@ def test_generator_retries_complete_staged_transfer_under_one_lease(monkeypatch)
     assert service.lease_registrations == 1
     assert service.lease_deletions == 1
     assert len(adapter.stage_calls) == 2
-
-
-def test_generator_does_not_retry_a_poisoned_checkpoint(monkeypatch):
-    server, endpoint, service = _start_server()
-    adapter = _Adapter(service)
-    adapter.poisoned_failure = True
-    generator = _initialize(monkeypatch, endpoint, adapter)
-
-    try:
-        with pytest.raises(PoisonedCheckpointError, match="checkpoint is poisoned"):
-            generator.stage_weight(version=WeightVersionRef("version-a"))
-    finally:
-        generator.close()
-        server.stop(grace=None).wait()
-
-    assert len(adapter.stage_calls) == 1
-    assert service.lease_deletions == 1
 
 
 def test_generator_retries_with_redundant_worker_for_same_slot(monkeypatch):

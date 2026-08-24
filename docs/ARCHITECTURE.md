@@ -379,9 +379,13 @@ Each shard has a typed transport `oneof`; the runtime accepts NIXL sources and
 canonical S3 delta roots. On the NIXL path, weight bytes and full tensor
 manifests remain on trainer workers. On the S3 path, rank zero advertises one
 `canonical.delta.root` after every trainer rank has uploaded its owned delta
-shard. Frameworks own tensor gathering and Hugging Face conversion, then pass a
-lazy canonical tensor stream to the trainer client, which owns delta processing
-and S3 shard construction.
+shard. Frameworks own tensor gathering, Hugging Face conversion, and
+bucketization, then pass a lazy canonical bucket stream to the trainer client,
+which owns delta processing and S3 shard construction.
+During framework initialization, the same bucket stream seeds only that rank's
+owned launch-checkpoint tensors through direct, concurrent
+`prepare_delta_base()` bucket reads. The first real delta stage uses the
+prepared snapshot without checkpoint I/O.
 
 #### RL refit client architecture
 
@@ -456,8 +460,8 @@ than inheriting from the legacy reshard receiver:
 
 - `nixl_staged_transfer.py` owns exact-manifest decoding, transfer planning,
   reusable registered buffers, NIXL reads, transforms, and digest verification.
-- `inference/receiver.py` owns canonical S3 root validation, safetensors XOR
-  reconstruction, and the locked host-local checkpoint journal.
+- `inference/receiver.py` owns canonical S3 downloads, safetensors XOR
+  reconstruction, and locked host-local checkpoint state.
 - `inference/engines/vllm/installer.py` owns vLLM load-layout capture and
   graph-safe installation through vLLM's layerwise reload and post-load path.
 - `inference/engines/sglang/adapter.py` reloads a prepared canonical checkpoint
@@ -772,7 +776,7 @@ RL framework integrations live in the separate `modelexpress_rl` package:
 | `train/engines/megatron/adapter.py` | Stable in-place Megatron tensor registration and manifest construction |
 | `train/engines/fsdp/adapter.py` | FSDP/DTensor source capture with in-place or device-copy staging |
 | `inference/client.py` | Rank-local generator lifecycle, leases, exact-version source discovery, staging, and apply |
-| `inference/receiver.py` | Canonical S3 index/shard decoding, exact-base checkpoint mutation, and crash-safe local journal |
+| `inference/receiver.py` | Canonical S3 index/shard decoding and exact-base checkpoint mutation under a local lock |
 | `inference/nixl_staged_transfer.py` | Private engine-neutral exact-manifest NIXL planning, transfer, reusable buffers, and verification |
 | `inference/engines/sglang/` | SGLang context and native checkpoint reload adapter |
 | `inference/engines/vllm/context.py` | Public typed vLLM objects passed to `ModelExpressGeneratorClient.initialize()` |

@@ -127,9 +127,15 @@ partitions remain separate required slots. The NIXL metadata endpoint is derived
 from `MX_WORKER_HOST` and the client-owned NIXL manager's listen port. `LOCAL_RANK`
 selects the device unless `device_id` is passed to `initialize()`.
 
-Canonical S3/XOR staging uses `MX_REFIT_DELTA_BUCKET_BYTES` (default 512 MiB)
-to bound decoded tensor bytes per delta-processing task. CPU workers are
-configured by `MX_REFIT_DELTA_WORKERS` (default `min(32, CPU count)`).
+Canonical S3/XOR staging consumes Hugging Face tensor buckets produced by the
+training framework. Framework-native bucket settings remain the default;
+explicit `MX_REFIT_DELTA_BUCKET_BYTES` overrides them, and frameworks without a
+native setting use its 512 MiB default. CPU workers are configured by
+`MX_REFIT_DELTA_WORKERS` (default `min(32, CPU count)`).
+Before training begins, the framework calls `prepare_delta_base()` with one
+bucket stream. ModelExpress submits each framework bucket directly for
+concurrent rank-local launch-checkpoint reads. Real delta staging therefore
+performs no launch-checkpoint reads.
 
 The client owns the NIXL manager and trainer-side manifest service. `server_url`
 selects the central ModelExpress control-plane service and defaults to the

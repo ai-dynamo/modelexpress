@@ -36,10 +36,7 @@ def test_values_are_normalized_and_read_live(monkeypatch):
 
 @pytest.mark.parametrize(
     "name",
-    [
-        "MX_REFIT_DELTA_BUCKET_BYTES",
-        "MX_REFIT_DELTA_WORKERS",
-    ],
+    ["MX_REFIT_DELTA_BUCKET_BYTES", "MX_REFIT_DELTA_WORKERS"],
 )
 def test_positive_integer_settings_reject_zero(monkeypatch, name):
     monkeypatch.setenv(name, "0")

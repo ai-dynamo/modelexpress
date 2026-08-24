@@ -62,7 +62,7 @@ class SGLangGeneratorAdapter(CanonicalS3GeneratorAdapter):
                 )
             )
         except Exception as error:
-            raise ReceiverInstallError(str(error), mutation_started=False) from error
+            raise ReceiverInstallError(str(error)) from error
 
         try:
             from sglang.srt.model_loader.utils import set_default_torch_dtype
@@ -77,7 +77,7 @@ class SGLangGeneratorAdapter(CanonicalS3GeneratorAdapter):
             if hasattr(device, "synchronize"):
                 device.synchronize()
         except Exception as error:
-            raise ReceiverInstallError(str(error), mutation_started=True) from error
+            raise ReceiverInstallError(str(error)) from error
 
 
 def _create_sglang_adapter(

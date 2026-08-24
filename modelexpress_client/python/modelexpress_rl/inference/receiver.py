@@ -12,6 +12,7 @@ import mmap
 import shutil
 import time
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -21,6 +22,7 @@ from urllib.parse import quote
 import numpy as np
 import zstandard
 
+from modelexpress_rl import envs as rl_envs
 from modelexpress_rl.s3 import S3Client, S3Object
 from modelexpress_rl.train import WeightPayloadFormat
 from modelexpress_rl.utils import index_checkpoint_tensors, read_safetensors_header
@@ -53,15 +55,7 @@ class S3GeneratorConfig:
 
 
 class ReceiverInstallError(RuntimeError):
-    """An engine reload failed before or after live mutation began."""
-
-    def __init__(self, detail: str, *, mutation_started: bool) -> None:
-        super().__init__(detail)
-        self.mutation_started = mutation_started
-
-
-class PoisonedCheckpointError(Exception):
-    """The private checkpoint requires recovery before another delta."""
+    """An engine reload failed."""
 
 
 @dataclass(frozen=True)
@@ -109,12 +103,6 @@ def _write_state(path: Path, state: dict) -> None:
     temporary.replace(path)
 
 
-def _validate_filename(filename: str) -> None:
-    path = PurePosixPath(filename)
-    if not filename or path.name != filename or filename in {".", ".."}:
-        raise ValueError(f"invalid delta shard filename {filename!r}")
-
-
 def _source_identity(version: _S3Version) -> dict[str, str | None]:
     return {
         "bucket": version.root.bucket,
@@ -126,7 +114,7 @@ def _source_identity(version: _S3Version) -> dict[str, str | None]:
 
 
 class _LocalCheckpoint:
-    """One crash-safe, host-local checkpoint updated under an exact-base lock."""
+    """One host-local checkpoint updated under an exact-base lock."""
 
     def __init__(
         self,
@@ -151,7 +139,6 @@ class _LocalCheckpoint:
             state = self._state()
             reusable = (
                 state is not None
-                and not state.get("poisoned")
                 and state.get("version") == self.initial_version
                 and any(self.local_checkpoint.glob("*.safetensors"))
             )
@@ -181,21 +168,18 @@ class _LocalCheckpoint:
     @property
     def current_version(self) -> str:
         state = self._state()
-        if state is None or state.get("poisoned"):
-            raise PoisonedCheckpointError("local checkpoint is poisoned")
+        if state is None:
+            raise RuntimeError("local checkpoint state is missing")
         return str(state["version"])
 
     def prepare(self, version: _S3Version) -> PreparedCheckpoint:
         with self.lock_path.open("a+") as handle:
             fcntl.flock(handle, fcntl.LOCK_EX)
             state = self._state()
-            if state is None or state.get("poisoned"):
-                raise PoisonedCheckpointError("local checkpoint is poisoned")
+            if state is None:
+                raise RuntimeError("local checkpoint state is missing")
             if state.get("files") != _checkpoint_files_state(self.locations):
-                _write_state(self.state_path, {**state, "poisoned": True})
-                raise PoisonedCheckpointError(
-                    "local checkpoint files changed outside ModelExpress"
-                )
+                raise RuntimeError("local checkpoint files changed outside ModelExpress")
             if state["version"] == version.version_id:
                 if state.get("source") != _source_identity(version):
                     raise ValueError(
@@ -206,6 +190,7 @@ class _LocalCheckpoint:
                     path=self.local_checkpoint,
                     metrics={
                         "perf/mx_receive_delta_index_download": 0.0,
+                        "perf/mx_receive_delta_download": 0.0,
                         "perf/mx_receive_delta_apply": 0.0,
                     },
                 )
@@ -220,20 +205,19 @@ class _LocalCheckpoint:
                 index_data = self.s3.get(version.root)
             except Exception as error:
                 raise RuntimeError("canonical root download failed") from error
+
             index_download_time = time.perf_counter() - started
             if hashlib.sha256(index_data).hexdigest() != version.manifest_digest:
                 raise ValueError("canonical root manifest digest mismatch")
-            index = self._validate_index(index_data, version)
-            shards = self._download_shards(index, version.root)
 
-            _write_state(self.state_path, {**state, "poisoned": True})
+            weight_map = json.loads(index_data)["weight_map"]
+
+            download_started = time.perf_counter()
+            shards = self._download_deltas(weight_map, version.root)
+            download_time = time.perf_counter() - download_started
+
             apply_started = time.perf_counter()
-            try:
-                self._apply_shards(shards)
-            except Exception as error:
-                raise PoisonedCheckpointError(
-                    f"canonical delta left the local checkpoint poisoned: {error}"
-                ) from error
+            self._apply_shards(shards)
             _write_state(
                 self.state_path,
                 {
@@ -247,176 +231,127 @@ class _LocalCheckpoint:
                 path=self.local_checkpoint,
                 metrics={
                     "perf/mx_receive_delta_index_download": index_download_time,
+                    "perf/mx_receive_delta_download": download_time,
                     "perf/mx_receive_delta_apply": time.perf_counter() - apply_started,
                 },
             )
 
-    def _validate_index(self, data: bytes, version: _S3Version) -> dict:
-        try:
-            index = json.loads(data)
-        except (UnicodeDecodeError, ValueError) as error:
-            raise ValueError("canonical root is not valid JSON") from error
-        if not isinstance(index, dict):
-            raise ValueError("canonical root must be a JSON object")
-        metadata = index.get("metadata")
-        weight_map = index.get("weight_map")
-        expected = {
-            "version": version.version_id,
-            "base_version": version.base_version_id,
-            "delta_encoding": "xor",
-            "compression_format": "zstd",
-            "checksum_format": "adler32",
-        }
-        if metadata != expected:
-            raise ValueError(
-                "canonical root metadata does not match the requested version"
-            )
-        if not isinstance(weight_map, dict) or any(
-            not isinstance(name, str) or not isinstance(filename, str)
-            for name, filename in weight_map.items()
-        ):
-            raise ValueError("canonical root weight_map must map strings to strings")
-        unknown = set(weight_map) - set(self.locations)
-        if unknown:
-            raise ValueError(f"canonical root contains unknown tensor {min(unknown)!r}")
-        for filename in set(weight_map.values()):
-            _validate_filename(filename)
-        return index
-
-    def _download_shards(
+    def _download_deltas(
         self,
-        index: dict,
+        weight_map: dict[str, str],
         root: S3Object,
-    ) -> dict[str, list[tuple[str, bytes, str]]]:
-        weight_map: dict[str, str] = index["weight_map"]
+    ) -> dict[str, tuple[bytes, list[str]]]:
         if not weight_map:
             return {}
-        by_file: dict[str, set[str]] = {}
+        by_file: dict[str, list[str]] = {}
         for name, filename in weight_map.items():
-            by_file.setdefault(filename, set()).add(name)
+            by_file.setdefault(filename, []).append(name)
         parent = PurePosixPath(root.key).parent
         shards = {}
-        for filename, names in sorted(by_file.items()):
-            try:
-                data = self.s3.get_key(
+        with ThreadPoolExecutor(
+            max_workers=min(32, len(by_file)),
+            thread_name_prefix="modelexpress-s3-download",
+        ) as pool:
+            downloads = {
+                filename: pool.submit(
+                    self.s3.get_key,
                     bucket=root.bucket,
                     key=str(parent / filename),
                 )
-            except Exception as error:
-                raise RuntimeError(
-                    f"canonical shard download failed for {filename!r}"
-                ) from error
-            shards[filename] = self._decode_shard(data, filename, names)
+                for filename in by_file
+            }
+            for filename, names in by_file.items():
+                try:
+                    data = downloads[filename].result()
+                except Exception as error:
+                    raise RuntimeError(
+                        f"canonical delta download failed for {filename!r}"
+                    ) from error
+                shards[filename] = (data, names)
         return shards
 
     def _apply_shards(
         self,
-        shards: dict[str, list[tuple[str, bytes, str]]],
+        shards: dict[str, tuple[bytes, list[str]]],
     ) -> None:
         if not shards:
             return
 
+        items = []
+        for filename, (data, names) in shards.items():
+            header, data_start = read_safetensors_header(data, repr(filename))
+            checksums = header["__metadata__"]
+            view = memoryview(data)
+            for name in names:
+                begin, end = header[name]["data_offsets"]
+                items.append(
+                    (
+                        name,
+                        view[data_start + begin : data_start + end],
+                        checksums[name],
+                    )
+                )
+        if not items:
+            return
+
         maps: dict[Path, tuple[Any, mmap.mmap]] = {}
         try:
-            for path in {location[0] for location in self.locations.values()}:
+            for path in {self.locations[name][0] for name, _data, _checksum in items}:
                 file_handle = path.open("r+b")
                 maps[path] = (file_handle, mmap.mmap(file_handle.fileno(), 0))
-            for entries in shards.values():
-                for name, compressed, expected_checksum in entries:
-                    path, file_offset, size = self.locations[name]
-                    delta = zstandard.ZstdDecompressor().decompress(
-                        compressed,
-                        max_output_size=size,
-                    )
-                    if len(delta) != size:
-                        raise ValueError(
-                            f"canonical delta byte size differs for {name!r}"
-                        )
-                    target = np.frombuffer(
-                        maps[path][1],
-                        dtype=np.uint8,
-                        count=size,
-                        offset=file_offset,
-                    )
+
+            def apply_one(item) -> None:
+                name, compressed, expected_checksum = item
+                path, file_offset, size = self.locations[name]
+                target = np.frombuffer(
+                    maps[path][1],
+                    dtype=np.uint8,
+                    count=size,
+                    offset=file_offset,
+                )
+                checksum = 1
+                position = 0
+                extra = b""
+                try:
+                    reader = zstandard.ZstdDecompressor().stream_reader(compressed)
                     try:
-                        np.bitwise_xor(
-                            target,
-                            np.frombuffer(delta, dtype=np.uint8),
-                            out=target,
-                        )
-                        actual_checksum = f"{zlib.adler32(target):08x}"
+                        while position < size:
+                            block = reader.read(min(2 << 20, size - position))
+                            if not block:
+                                break
+                            delta = np.frombuffer(block, dtype=np.uint8)
+                            end = position + delta.size
+                            region = target[position:end]
+                            try:
+                                np.bitwise_xor(region, delta, out=region)
+                                checksum = zlib.adler32(region, checksum)
+                            finally:
+                                del region
+                            position = end
+                        if position == size:
+                            extra = reader.read(1)
                     finally:
-                        del target
-                    if actual_checksum != expected_checksum:
-                        raise ValueError(
-                            f"canonical target checksum differs for {name!r}"
-                        )
-            for _, mapped in maps.values():
-                mapped.flush()
+                        reader.close()
+                finally:
+                    del target
+                if position != size or extra:
+                    raise ValueError(
+                        f"canonical delta byte size differs for {name!r}"
+                    )
+                if f"{checksum:08x}" != expected_checksum:
+                    raise ValueError(
+                        f"canonical target checksum differs for {name!r}"
+                    )
+
+            with ThreadPoolExecutor(
+                max_workers=min(rl_envs.MX_REFIT_DELTA_WORKERS, len(items)),
+                thread_name_prefix="modelexpress-delta-apply",
+            ) as pool:
+                list(pool.map(apply_one, items))
         finally:
             for file_handle, mapped in maps.values():
                 mapped.close()
                 file_handle.close()
-
-    def _decode_shard(
-        self,
-        data: bytes,
-        filename: str,
-        expected_names: set[str],
-    ) -> list[tuple[str, bytes, str]]:
-        header, data_start = read_safetensors_header(data, repr(filename))
-        checksums = header.pop("__metadata__", None)
-        if (
-            not isinstance(checksums, dict)
-            or set(header) != expected_names
-            or set(checksums) != expected_names
-        ):
-            raise ValueError(f"safetensors entries do not match {filename!r}")
-        ordered = sorted(header.items(), key=lambda item: item[1]["data_offsets"][0])
-        position = 0
-        decoded = []
-        for name, info in ordered:
-            if not isinstance(info, dict):
-                raise ValueError(f"invalid safetensors entry for {name!r}")
-            offsets = info.get("data_offsets")
-            if (
-                info.get("dtype") != "U8"
-                or not isinstance(offsets, list)
-                or len(offsets) != 2
-                or offsets[0] != position
-                or not isinstance(offsets[1], int)
-                or offsets[1] < offsets[0]
-            ):
-                raise ValueError(f"invalid canonical delta entry for {name!r}")
-            begin, end = offsets
-            shape = info.get("shape")
-            if shape != [end - begin] or data_start + end > len(data):
-                raise ValueError(f"invalid canonical delta size for {name!r}")
-            expected_checksum = checksums.get(name)
-            if not isinstance(expected_checksum, str) or len(expected_checksum) != 8:
-                raise ValueError(f"invalid canonical checksum for {name!r}")
-            try:
-                int(expected_checksum, 16)
-            except ValueError as error:
-                raise ValueError(f"invalid canonical checksum for {name!r}") from error
-            compressed = data[data_start + begin : data_start + end]
-            if not compressed.startswith(b"\x28\xb5\x2f\xfd"):
-                raise ValueError(f"canonical delta is not zstd for {name!r}")
-            expected_size = self.locations[name][2]
-            reader = zstandard.ZstdDecompressor().stream_reader(compressed)
-            decoded_size = 0
-            try:
-                while block := reader.read(2 << 20):
-                    decoded_size += len(block)
-            finally:
-                reader.close()
-            if decoded_size != expected_size:
-                raise ValueError(f"canonical delta byte size differs for {name!r}")
-            decoded.append((name, compressed, expected_checksum))
-            position = end
-        if data_start + position != len(data):
-            raise ValueError(f"safetensors data has unused bytes in {filename!r}")
-        return decoded
 
     @contextmanager
     def installation(self, prepared: PreparedCheckpoint):
@@ -425,13 +360,11 @@ class _LocalCheckpoint:
             state = self._state()
             if (
                 state is None
-                or state.get("poisoned")
                 or state.get("version") != prepared.target_version
                 or state.get("files") != _checkpoint_files_state(self.locations)
             ):
                 raise ReceiverInstallError(
-                    "prepared checkpoint changed before installation",
-                    mutation_started=False,
+                    "prepared checkpoint changed before installation"
                 )
             yield
 
@@ -456,17 +389,12 @@ class CanonicalS3GeneratorAdapter(GeneratorEngineAdapter):
         )
         self._checkpoint.initialize()
         self._active_staged: PreparedCheckpoint | None = None
-        self._poisoned = False
 
     @property
     def supported_payload_formats(self) -> frozenset[WeightPayloadFormat]:
         return frozenset({WeightPayloadFormat.XOR_DELTA})
 
     def stage_weight(self, inputs: GeneratorTransferInputs) -> PreparedCheckpoint:
-        if self._poisoned:
-            raise PoisonedCheckpointError(
-                "poisoned generator cannot install another update"
-            )
         if self._active_staged is not None:
             raise RuntimeError("release staged weight before staging another version")
         if inputs.payload_format is not WeightPayloadFormat.XOR_DELTA:
@@ -494,9 +422,6 @@ class CanonicalS3GeneratorAdapter(GeneratorEngineAdapter):
         started = time.perf_counter()
         try:
             staged = self._checkpoint.prepare(version)
-        except PoisonedCheckpointError:
-            self._poisoned = True
-            raise
         except ValueError as error:
             raise RuntimeError(str(error)) from error
         staged.metrics["perf/mx_receive_prepare_time"] = time.perf_counter() - started
@@ -504,15 +429,11 @@ class CanonicalS3GeneratorAdapter(GeneratorEngineAdapter):
         return staged
 
     def apply_weight(self, staged: object) -> dict[str, float]:
-        if self._poisoned or staged is not self._active_staged:
+        if staged is not self._active_staged:
             raise RuntimeError("canonical S3 staged weight is no longer active")
         started = time.perf_counter()
-        try:
-            with self._checkpoint.installation(self._active_staged):
-                self.install_prepared_checkpoint(self._active_staged)
-        except ReceiverInstallError as error:
-            self._poisoned = error.mutation_started
-            raise
+        with self._checkpoint.installation(self._active_staged):
+            self.install_prepared_checkpoint(self._active_staged)
         return {"perf/mx_receive_install_time": time.perf_counter() - started}
 
     def install_prepared_checkpoint(self, prepared: PreparedCheckpoint) -> None:
@@ -532,7 +453,6 @@ class CanonicalS3GeneratorAdapter(GeneratorEngineAdapter):
 __all__ = [
     "CANONICAL_DELTA_SOURCE_SLOT",
     "CanonicalS3GeneratorAdapter",
-    "PoisonedCheckpointError",
     "PreparedCheckpoint",
     "ReceiverInstallError",
     "S3GeneratorConfig",

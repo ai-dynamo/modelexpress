@@ -838,9 +838,11 @@ RL refit has the same trusted-network requirement. Its trainer-local
 `RefitWorkerService` serves exact-version manifests over plaintext gRPC; the
 manifest digest detects corruption but does not authenticate the trainer.
 
-Canonical S3/XOR trainers use `MX_REFIT_DELTA_BUCKET_BYTES` (512 MiB by
-default) and `MX_REFIT_DELTA_WORKERS` (default `min(32, CPU count)`) to control
-delta-processing bucket size and concurrency.
+Canonical S3/XOR trainers consume Hugging Face tensor buckets produced by the
+training framework. Framework-native bucket settings remain the default;
+explicit `MX_REFIT_DELTA_BUCKET_BYTES` overrides them, and frameworks without a
+native setting use its 512 MiB default. `MX_REFIT_DELTA_WORKERS` (default
+`min(32, CPU count)`) controls delta-processing concurrency.
 
 ### Server-Backed Model Cache (No Shared Storage)
 

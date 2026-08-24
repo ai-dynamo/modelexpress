@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import threading
 import uuid
@@ -45,6 +46,8 @@ from .adapter import (
     WeightPayloadFormat,
 )
 from .resources import _TrainerResources
+
+logger = logging.getLogger(__name__)
 
 
 def _required(value: str, name: str) -> str:
@@ -127,6 +130,7 @@ class _StagedDelta:
     wire_bytes: int = 0
     stage_delta_time: float = 0.0
     publish_s3_time: float = 0.0
+    advertise_time: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -244,12 +248,41 @@ class ModelExpressTrainerClient:
             return CANONICAL_DELTA_SOURCE_SLOT
         return self._get_adapter().source_slot_id
 
+    def prepare_delta_base(
+        self,
+        *,
+        hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]],
+    ) -> None:
+        """Prepare this rank's launch snapshot before the first delta."""
+        started = perf_counter()
+        assert self._read_launch_tensor is not None
+        reader = self._read_launch_tensor
+
+        def read_bucket(
+            bucket: list[tuple[str, torch.Tensor]],
+        ) -> dict[str, np.ndarray]:
+            return {
+                name: np.asarray(reader(name), dtype=np.uint8) for name, _ in bucket
+            }
+
+        snapshot = {}
+        with ThreadPoolExecutor(
+            max_workers=rl_envs.MX_REFIT_DELTA_WORKERS,
+            thread_name_prefix="modelexpress-delta-base",
+        ) as pool:
+            futures = [pool.submit(read_bucket, bucket) for bucket in hf_tensor_iter]
+            for future in futures:
+                snapshot.update(future.result())
+        self._snapshot = snapshot
+        logger.info(
+            "ModelExpress prepare_delta_base: rank=%d tensors=%d duration=%.3fs",
+            self._rank,
+            len(snapshot),
+            perf_counter() - started,
+        )
+
     def bind_tensors(self, tensors: Any) -> str:
         """Bind the stable engine tensors used by subsequent publications."""
-        if self._closed:
-            raise RuntimeError("trainer client is closed")
-        if self._s3 is not None:
-            raise RuntimeError("S3 publication uses a per-version tensor stream")
         if tensors is None:
             raise ValueError("tensors must not be None")
         if self._bound_tensors is not None:
@@ -325,7 +358,9 @@ class ModelExpressTrainerClient:
             client._process_group = config.process_group
             client._rank = dist.get_rank(config.process_group)
             client._world_size = dist.get_world_size(config.process_group)
-            client._read_launch_tensor, _ = make_tensor_reader(config.s3.launch_checkpoint)
+            client._read_launch_tensor, _ = make_tensor_reader(
+                config.s3.launch_checkpoint
+            )
             client._s3 = S3Client(
                 endpoint_url=config.s3.endpoint_url,
                 region_name=config.s3.region_name,
@@ -416,7 +451,7 @@ class ModelExpressTrainerClient:
 
     def _process_delta_bucket(
         self,
-        bucket: list[tuple[str, np.ndarray]],
+        bucket: list[tuple[str, torch.Tensor]],
     ) -> tuple[
         dict[str, np.ndarray],
         dict[str, np.ndarray],
@@ -429,17 +464,19 @@ class ModelExpressTrainerClient:
         checksums = {}
         changed_bytes = 0
         total_bytes = 0
-        for name, current in bucket:
-            base = self._snapshot.get(name)
-            if base is None:
-                assert self._read_launch_tensor is not None
-                base = np.asarray(
-                    self._read_launch_tensor(name), dtype=np.uint8
-                ).copy()
+        for name, tensor in bucket:
+            current = (
+                tensor.detach()
+                .cpu()
+                .contiguous()
+                .reshape(-1)
+                .view(torch.uint8)
+                .numpy()
+                .copy()
+            )
+            base = self._snapshot[name]
             if base.nbytes != current.nbytes:
-                raise RuntimeError(
-                    f"canonical tensor {name!r} changed byte size"
-                )
+                raise RuntimeError(f"canonical tensor {name!r} changed byte size")
             delta, changed = compute_delta(current, base)
             candidate[name] = current
             changed_bytes += changed
@@ -455,7 +492,7 @@ class ModelExpressTrainerClient:
         *,
         target_version_id: str,
         base_version_id: str,
-        hf_tensor_iter: Iterable[tuple[str, torch.Tensor]],
+        hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]],
     ) -> _StagedDelta:
         started = perf_counter()
         if base_version_id != self._current_base_version_id:
@@ -468,9 +505,7 @@ class ModelExpressTrainerClient:
         checksums: dict[str, str] = {}
         changed_bytes = 0
         total_bytes = 0
-        seen_names = set()
         inflight = deque()
-        bucket_limit = rl_envs.MX_REFIT_DELTA_BUCKET_BYTES
         workers = rl_envs.MX_REFIT_DELTA_WORKERS
         max_inflight = 2 * workers
 
@@ -489,44 +524,11 @@ class ModelExpressTrainerClient:
             max_workers=workers,
             thread_name_prefix="modelexpress-delta",
         ) as pool:
-            bucket = []
-            bucket_bytes = 0
-            for source_name, tensor in hf_tensor_iter:
-                if not isinstance(tensor, torch.Tensor):
-                    raise TypeError(
-                        f"canonical tensor {source_name!r} must be a torch.Tensor"
-                    )
-                name = source_name.removeprefix("module.")
-                if name in seen_names:
-                    raise RuntimeError(f"duplicate canonical tensor {name!r}")
-                seen_names.add(name)
-                tensor_bytes = tensor.numel() * tensor.element_size()
-                if (
-                    bucket
-                    and bucket_bytes + tensor_bytes > bucket_limit
-                ):
+            for bucket in hf_tensor_iter:
+                if bucket:
                     inflight.append(pool.submit(self._process_delta_bucket, bucket))
-                    bucket = []
-                    bucket_bytes = 0
-                current = (
-                    tensor.detach()
-                    .cpu()
-                    .contiguous()
-                    .reshape(-1)
-                    .view(torch.uint8)
-                    .numpy()
-                    .copy()
-                )
-                bucket.append((name, current))
-                bucket_bytes += int(current.nbytes)
-                if bucket_bytes >= bucket_limit:
-                    inflight.append(pool.submit(self._process_delta_bucket, bucket))
-                    bucket = []
-                    bucket_bytes = 0
                 if len(inflight) >= max_inflight:
                     collect_one()
-            if bucket:
-                inflight.append(pool.submit(self._process_delta_bucket, bucket))
             while inflight:
                 collect_one()
 
@@ -560,7 +562,9 @@ class ModelExpressTrainerClient:
         local_map: dict[str, str] = {}
         shard_size = 0
         if staged.encoded_deltas:
-            shard = safetensors.numpy.save(staged.encoded_deltas, metadata=staged.checksums)
+            shard = safetensors.numpy.save(
+                staged.encoded_deltas, metadata=staged.checksums
+            )
             filename = f"model-{offset:05d}-of-{total:05d}.safetensors"
             self._s3.put(
                 bucket=self._s3_config.bucket,
@@ -634,14 +638,14 @@ class ModelExpressTrainerClient:
         *,
         version: WeightVersionRef,
         tensors: Any = None,
-        hf_tensor_iter: Iterable[tuple[str, torch.Tensor]] | None = None,
+        hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]] | None = None,
     ) -> StagedWeightVersionShard:
         """Capture one immutable rank-local shard for ``version``.
 
         Engine adapters receive their native ``tensors`` input. Canonical S3
-        publication instead consumes ``hf_tensor_iter`` as Hugging Face
-        ``(name, tensor)`` pairs; framework ranks must partition canonical names
-        without overlap.
+        publication instead consumes ``hf_tensor_iter`` as framework-bucketed
+        batches of Hugging Face ``(name, tensor)`` pairs; framework ranks must
+        partition canonical names without overlap.
         """
         if self._closed:
             raise RuntimeError("trainer client is closed")
@@ -663,9 +667,7 @@ class ModelExpressTrainerClient:
                 or not target.HasField("base_version_id")
             ):
                 raise RuntimeError("S3 publication requires an XOR_DELTA target")
-            if tuple(target.expected_source_slots) != (
-                CANONICAL_DELTA_SOURCE_SLOT,
-            ):
+            if tuple(target.expected_source_slots) != (CANONICAL_DELTA_SOURCE_SLOT,):
                 raise RuntimeError("S3 target must expect only canonical.delta.root")
             staged = self._stage_delta(
                 target_version_id=version.version_id,
@@ -727,7 +729,9 @@ class ModelExpressTrainerClient:
                 )
 
             if self._rank == 0:
+                started = perf_counter()
                 advertise()
+                staged.advertise_time = perf_counter() - started
             self._snapshot = staged.candidate_snapshot
             self._current_base_version_id = staged.target_version_id
             self._metric_delta = staged
@@ -830,6 +834,9 @@ class ModelExpressTrainerClient:
             self._stub = None
         self._published_shards.clear()
         self._bound_tensors = None
+        self._snapshot = {}
+        self._read_launch_tensor = None
+        self._metric_delta = None
         if self._resources is not None:
             self._resources.close()
             self._resources = None
@@ -849,7 +856,11 @@ class ModelExpressTrainerClient:
         )
         dist.all_reduce(counts, group=self._process_group)
         timings = torch.tensor(
-            [staged.stage_delta_time, staged.publish_s3_time],
+            [
+                staged.stage_delta_time,
+                staged.publish_s3_time,
+                staged.advertise_time,
+            ],
             dtype=torch.float64,
         )
         dist.all_reduce(
@@ -858,12 +869,13 @@ class ModelExpressTrainerClient:
             group=self._process_group,
         )
         changed_bytes, total_bytes, wire_bytes = counts.tolist()
-        stage_delta_time, publish_s3_time = timings.tolist()
+        stage_delta_time, publish_s3_time, advertise_time = timings.tolist()
         self._metrics = {
             "perf/update_weights_density": changed_bytes / max(total_bytes, 1),
             "perf/update_weights_wire_bytes": wire_bytes,
             "perf/mx_stage_delta_time": stage_delta_time,
             "perf/mx_publish_s3_time": publish_s3_time,
+            "perf/mx_publish_server": advertise_time,
         }
         self._metric_delta = None
 

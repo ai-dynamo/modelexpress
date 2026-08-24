@@ -93,18 +93,18 @@ def test_sglang_install_uses_the_prepared_checkpoint(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("setup_error", "load_error", "mutation_started"),
+    ("setup_error", "load_error", "message"),
     [
-        (RuntimeError("setup failed"), None, False),
-        (None, RuntimeError("load failed"), True),
+        (RuntimeError("setup failed"), None, "setup failed"),
+        (None, RuntimeError("load failed"), "load failed"),
     ],
 )
-def test_sglang_install_classifies_live_mutation(
+def test_sglang_install_wraps_errors(
     tmp_path,
     monkeypatch,
     setup_error,
     load_error,
-    mutation_started,
+    message,
 ):
     runner = _runner(tmp_path)
     adapter = object.__new__(SGLangGeneratorAdapter)
@@ -120,9 +120,7 @@ def test_sglang_install_classifies_live_mutation(
 
     _install_sglang_modules(monkeypatch, Loader(), setup_error)
 
-    with pytest.raises(ReceiverInstallError) as error:
+    with pytest.raises(ReceiverInstallError, match=message):
         adapter.install_prepared_checkpoint(
             PreparedCheckpoint("target-a", tmp_path / "prepared", {})
         )
-
-    assert error.value.mutation_started is mutation_started

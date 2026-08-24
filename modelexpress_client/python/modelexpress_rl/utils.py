@@ -130,7 +130,7 @@ def _index_tensors(
             if source_name == "__metadata__":
                 continue
             begin, end = info["data_offsets"]
-            name = source_name.removeprefix("module.")
+            name = source_name
             if name in tied:
                 continue
             if name in locations:
@@ -158,7 +158,7 @@ def make_tensor_reader(
     locations, metadata = index_checkpoint_tensors(checkpoint)
 
     def read(name: str) -> np.ndarray:
-        path, offset, size = locations[name.removeprefix("module.")]
+        path, offset, size = locations[name]
         with path.open("rb") as handle:
             handle.seek(offset)
             data = handle.read(size)
