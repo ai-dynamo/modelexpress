@@ -79,6 +79,14 @@ pub enum StatusLabel {
 }
 
 impl StatusLabel {
+    /// Every variant, so the transition family can be pre-created at zero.
+    pub(crate) const ALL: [Self; 4] = [
+        Self::Absent,
+        Self::Downloading,
+        Self::Downloaded,
+        Self::Error,
+    ];
+
     const fn as_str(self) -> &'static str {
         match self {
             Self::Absent => "absent",
@@ -121,6 +129,14 @@ pub enum ClaimResult {
 }
 
 impl ClaimResult {
+    /// Every variant, so the claim family can be pre-created at zero.
+    pub(crate) const ALL: [Self; 4] = [
+        Self::Claimed,
+        Self::Takeover,
+        Self::AlreadyExists,
+        Self::Error,
+    ];
+
     const fn as_str(self) -> &'static str {
         match self {
             Self::Claimed => "claimed",
@@ -150,6 +166,9 @@ pub enum LeaseResult {
 }
 
 impl LeaseResult {
+    /// Every variant, so the lease family can be pre-created at zero.
+    pub(crate) const ALL: [Self; 3] = [Self::Renewed, Self::Lost, Self::Error];
+
     const fn as_str(self) -> &'static str {
         match self {
             Self::Renewed => "renewed",
@@ -223,6 +242,36 @@ impl RegistryMetrics {
             "Download lease heartbeats by outcome; lost is the leading indicator of a duplicate download",
             lease_refreshes.clone(),
         );
+
+        // Create every label combination at zero.
+        //
+        // `Family` is lazy: a child appears on first `get_or_create`, so without
+        // this a counter's first-ever exported sample is 1. Prometheus has no
+        // earlier point to subtract, `rate()` and `increase()` over that window
+        // are 0, and an alert watching for a rare discrete event misses the
+        // first occurrence in every process -- silently, because an alert whose
+        // expression yields nothing simply never fires.
+        //
+        // That is the difference between catching the first takeover after a
+        // restart, which re-pulls the whole model, and only ever catching the
+        // second. Born at zero, the increment is a visible step.
+        //
+        // Scoped to these three families deliberately. Their alerts key on rare
+        // one-shot events, and the domains are small: 4 + 3 + 16 series. The
+        // gRPC and backend families would cost 154 and 93 permanently-zero
+        // series per pod for ratio alerts that need sustained traffic to fire
+        // anyway.
+        for result in ClaimResult::ALL {
+            let _ = claims.get_or_create(&ClaimLabels { result });
+        }
+        for result in LeaseResult::ALL {
+            let _ = lease_refreshes.get_or_create(&LeaseLabels { result });
+        }
+        for from in StatusLabel::ALL {
+            for to in StatusLabel::ALL {
+                let _ = transitions.get_or_create(&TransitionLabels { from, to });
+            }
+        }
 
         Self {
             transitions,
@@ -538,6 +587,65 @@ mod tests {
         assert!(
             encoded.contains(r#"mx_download_seconds_bucket{le="3600.0",outcome="downloaded"} 1"#),
             "a 40-minute download must land below the top boundary: {encoded}"
+        );
+    }
+
+    /// Counters must be exported at zero before anything happens to them.
+    ///
+    /// `Family` creates children lazily, so without pre-creation a counter's
+    /// first exported sample is 1 and Prometheus has no earlier point to
+    /// subtract: `rate()` and `increase()` over that window are 0. Every alert
+    /// keyed on a rare one-shot event -- a lost lease, a takeover -- then misses
+    /// the first occurrence in each process, and misses it *silently*, because
+    /// an expression that yields nothing simply never fires.
+    ///
+    /// The three series asserted here are the ones the shipped alert rules key
+    /// on. `takeover` is the sharpest: missing it means missing a full re-pull
+    /// of the model.
+    #[test]
+    fn alertable_counters_are_exported_at_zero_before_any_event() {
+        let mut registry = new_registry();
+        let _metrics = RegistryMetrics::register(&mut registry);
+
+        let encoded = encode_text(&registry).unwrap_or_else(|_| String::from("<encode failed>"));
+        for series in [
+            r#"mx_download_claims_total{result="takeover"} 0"#,
+            r#"mx_download_lease_refresh_total{result="lost"} 0"#,
+            r#"mx_registry_status_transitions_total{from="absent",to="downloading"} 0"#,
+        ] {
+            assert!(
+                encoded.contains(series),
+                "missing {series}; a counter born at 1 leaves rate() blind to the first event: {encoded}"
+            );
+        }
+    }
+
+    /// Pre-creation must cover exactly the declared label values -- no more.
+    ///
+    /// An invented series would sit at zero forever under a name no code can
+    /// increment, implying a condition is monitored when nothing reports it.
+    #[test]
+    fn pre_creation_covers_exactly_the_declared_label_values() {
+        let mut registry = new_registry();
+        let _metrics = RegistryMetrics::register(&mut registry);
+        let encoded = encode_text(&registry).unwrap_or_else(|_| String::from("<encode failed>"));
+
+        let count = |prefix: &str| encoded.lines().filter(|l| l.starts_with(prefix)).count();
+
+        assert_eq!(
+            count("mx_download_claims_total{"),
+            ClaimResult::ALL.len(),
+            "{encoded}"
+        );
+        assert_eq!(
+            count("mx_download_lease_refresh_total{"),
+            LeaseResult::ALL.len(),
+            "{encoded}"
+        );
+        assert_eq!(
+            count("mx_registry_status_transitions_total{"),
+            StatusLabel::ALL.len() * StatusLabel::ALL.len(),
+            "{encoded}"
         );
     }
 }

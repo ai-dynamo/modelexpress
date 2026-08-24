@@ -512,6 +512,7 @@ helm upgrade --install modelexpress ./helm \
   --set metrics.podMonitor.enabled=true \
   --set metrics.podMonitor.additionalLabels.release=kube-prometheus-stack \
   --set metrics.rules.enabled=true \
+  --set metrics.rules.additionalLabels.release=kube-prometheus-stack \
   --set metrics.dashboard.enabled=true
 ```
 

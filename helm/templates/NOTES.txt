@@ -20,22 +20,31 @@ WARNING: MX_METADATA_BACKEND is not set in values. The server will fail to start
 set env.MX_METADATA_BACKEND to "redis" or "kubernetes" (with the matching
 connection settings) and re-run `helm upgrade`.
 {{- end }}
-{{- if and .Values.metrics (or (and .Values.metrics.podMonitor .Values.metrics.podMonitor.enabled) (and .Values.metrics.rules .Values.metrics.rules.enabled)) }}
-{{- $labelled := false }}
-{{- if and .Values.metrics.podMonitor .Values.metrics.podMonitor.additionalLabels }}{{ $labelled = true }}{{ end }}
-{{- if and .Values.metrics.rules .Values.metrics.rules.additionalLabels }}{{ $labelled = true }}{{ end }}
-{{- if not $labelled }}
+{{- if .Values.metrics }}
+{{- /*
+  Checked per resource, not once for the set. A shared flag would let labels on
+  one resource suppress the warning for another that is still unlabelled — and
+  an unlabelled resource is ignored silently, which is the whole problem.
+*/}}
+{{- $unlabelled := list }}
+{{- range $key := (list "podMonitor" "clientPodMonitor" "rules") }}
+{{- $section := index $.Values.metrics $key }}
+{{- if and $section $section.enabled (not $section.additionalLabels) }}
+{{- $unlabelled = append $unlabelled (printf "metrics.%s.additionalLabels" $key) }}
+{{- end }}
+{{- end }}
+{{- if $unlabelled }}
 
-IMPORTANT: A PodMonitor or PrometheusRule was created with no additional labels.
-Prometheus only picks these up if its podMonitorSelector / ruleSelector matches
-them, and kube-prometheus-stack defaults both to `release: <its own release>`.
-Unmatched resources are ignored silently — no error, no targets, no alerts.
-Check what yours expects:
+IMPORTANT: These values were left empty: {{ join ", " $unlabelled }}
+
+Prometheus only adopts a PodMonitor or PrometheusRule whose labels match its
+podMonitorSelector / ruleSelector, and kube-prometheus-stack defaults both to
+`release: <its own release name>`. An unmatched resource is ignored silently —
+no error, no targets, no alerts. Check what yours expects:
 
   kubectl get prometheus -A -o jsonpath='{.items[*].spec.podMonitorSelector}'
 
-then set metrics.podMonitor.additionalLabels (and metrics.rules.additionalLabels)
-to match.
+then set the values listed above to match.
 {{- end }}
 {{- end }}
 

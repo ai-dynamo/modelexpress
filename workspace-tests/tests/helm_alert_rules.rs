@@ -32,17 +32,42 @@ use tower::{Layer, ServiceExt};
 /// asserts this same list against the client's real registry. The two halves
 /// cross-check: a rename on the Python side fails there, and a name added here
 /// that Python does not export fails there too. Keep them in step.
+/// Listed with the suffixes a query actually uses, since that is what the Python
+/// side matches against the exposition text.
 const CLIENT_FAMILIES: &[&str] = &[
     "mx_nixl_data_plane_errors_total",
     "mx_nixl_receive_total",
+    "mx_p2p_candidates_bucket",
     "mx_p2p_list_sources_total",
+    "mx_p2p_source_attempts_total",
+    "mx_p2p_source_selections_total",
+    "mx_p2p_transfer_seconds_bucket",
+    "mx_p2p_transfer_seconds_count",
+    "mx_p2p_transfer_seconds_sum",
 ];
 
-fn rules_template() -> PathBuf {
+fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("workspace-tests has a parent directory")
-        .join("helm/templates/prometheusrule.yaml")
+        .to_path_buf()
+}
+
+/// Every shipped artifact that names metrics in a query.
+///
+/// The dashboard is here for the same reason as the rules: a panel whose query
+/// names a family that does not exist renders empty, with no error anywhere. It
+/// is the identical silent failure, just aimed at a human instead of a pager.
+fn query_artifacts() -> Vec<PathBuf> {
+    let root = repo_root();
+    vec![
+        root.join("helm/templates/prometheusrule.yaml"),
+        root.join("helm/dashboards/modelexpress.json"),
+    ]
+}
+
+fn rules_template() -> PathBuf {
+    repo_root().join("helm/templates/prometheusrule.yaml")
 }
 
 /// Family name to OpenMetrics type, read from the `# TYPE` lines of a registry
@@ -125,6 +150,48 @@ fn referenced_names(contents: &str) -> BTreeSet<String> {
         .collect()
 }
 
+/// The subset of text that is actually a query.
+///
+/// Prose and queries need different rules. A description may name a *family* --
+/// "download latency lives in mx_download_seconds" is how a human refers to it
+/// -- while a query must name a *series*, which for a counter or histogram means
+/// the suffixed form. Holding prose to the strict rule would force documentation
+/// to spell out `mx_download_seconds_bucket`, and holding queries to the loose
+/// one is what let the dropped-`_total` slip through in the first place.
+fn query_text(contents: &str, path: &Path) -> String {
+    // Grafana panel targets: one `"expr": "..."` per line.
+    if path.extension().is_some_and(|ext| ext == "json") {
+        return contents
+            .lines()
+            .filter(|line| line.trim_start().starts_with("\"expr\":"))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+
+    // Rules YAML: an `expr:` key plus the folded lines beneath it, which are
+    // indented deeper than the key itself.
+    let mut out = String::new();
+    let mut expr_indent = None;
+    for line in contents.lines() {
+        let indent = line.len().saturating_sub(line.trim_start().len());
+        match expr_indent {
+            Some(base) if line.trim().is_empty() || indent > base => {
+                out.push_str(line);
+                out.push('\n');
+            }
+            _ => {
+                expr_indent = None;
+                if line.trim_start().starts_with("expr:") {
+                    expr_indent = Some(indent);
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Resolve a referenced name against the registry, accounting for the suffixes
 /// the encoder adds.
 ///
@@ -132,7 +199,14 @@ fn referenced_names(contents: &str) -> BTreeSet<String> {
 /// line carries the bare name while every query must use the suffixed one.
 /// Histograms expose three derived series from one registration.
 fn resolves(name: &str, families: &BTreeMap<String, String>) -> bool {
-    if CLIENT_FAMILIES.contains(&name) || families.contains_key(name) {
+    if CLIENT_FAMILIES.contains(&name) {
+        return true;
+    }
+    // Only a gauge is queried under its registered name. Accepting the bare name
+    // for a counter or histogram would wave through the most common PromQL
+    // authoring error there is -- a dropped `_total`, or a histogram queried by
+    // its family name -- which is the error this whole check exists to catch.
+    if families.get(name).is_some_and(|kind| kind == "gauge") {
         return true;
     }
     if let Some(base) = name.strip_suffix("_total")
@@ -191,21 +265,30 @@ async fn the_server_family_inventory_is_pinned() {
 }
 
 #[tokio::test]
-async fn every_metric_named_by_an_alert_rule_exists() {
-    let path = rules_template();
-    let contents =
-        fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+async fn every_metric_named_by_a_shipped_query_exists() {
     let families = registered_families().await;
-    let referenced = referenced_names(&contents);
+    let mut referenced = BTreeSet::new();
+    for path in query_artifacts() {
+        let contents =
+            fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let queries = query_text(&contents, &path);
+        assert!(
+            queries.contains("mx_"),
+            "extracted no queries from {} -- the extraction is broken, not the file",
+            path.display()
+        );
+        referenced.extend(referenced_names(&queries));
+    }
 
     // Guards against the whole check quietly becoming a no-op if the template is
     // renamed or the extraction stops matching: an empty set passes every
     // assertion below without testing anything.
     assert!(
-        referenced.len() > 5,
-        "found only {} mx_* names in {} -- the extraction is broken, not the rules",
+        referenced.len() > 20,
+        "found only {} mx_* names across {} artifacts -- the extraction is broken, \
+         not the queries",
         referenced.len(),
-        path.display()
+        query_artifacts().len()
     );
     assert!(
         families.len() > 5,
@@ -220,7 +303,7 @@ async fn every_metric_named_by_an_alert_rule_exists() {
 
     assert!(
         unknown.is_empty(),
-        "alert rules reference metrics the server does not export: {unknown:#?}\n\
+        "shipped queries reference metrics that are not exported: {unknown:#?}\n\
          Known server families (bare names; counters gain _total, histograms gain \
          _bucket/_sum/_count when queried): {:#?}\n\
          If a name belongs to the Python client, add it to CLIENT_FAMILIES here and \
@@ -240,6 +323,16 @@ async fn an_unexported_metric_name_is_rejected() {
     assert!(
         !resolves("mx_not_a_real_family", &families),
         "resolves() accepts a name that was never registered"
+    );
+    // The bare registered name of a counter or histogram is never exported as a
+    // series, so querying it returns nothing. This is the dropped-`_total` slip.
+    assert!(
+        !resolves("mx_download_claims", &families),
+        "resolves() accepts a counter's bare name, which is never a queryable series"
+    );
+    assert!(
+        !resolves("mx_download_seconds", &families),
+        "resolves() accepts a histogram's bare name, which is never a queryable series"
     );
     // A real base name with the wrong suffix class: `_bucket` is only valid on a
     // histogram, and mx_registry_entries is a gauge.
@@ -268,23 +361,36 @@ fn every_alert_carries_a_summary() {
     let contents =
         fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
 
-    let alerts: Vec<&str> = contents
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("- alert: "))
-        .collect();
-    let summaries = contents
-        .lines()
-        .filter(|line| line.trim().starts_with("summary:"))
-        .count();
+    // Paired per alert rather than counted file-wide. Two totals can agree while
+    // one alert has none, because any other line beginning `summary:` makes up
+    // the difference -- including prose inside a folded `description:` scalar,
+    // where it is body text and not an annotation key.
+    let mut alerts: Vec<(String, bool)> = Vec::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if let Some(name) = trimmed.strip_prefix("- alert: ") {
+            alerts.push((name.to_string(), false));
+        } else if trimmed.starts_with("summary:")
+            // Annotation keys sit at a fixed indent; folded body text is deeper.
+            && line.len().saturating_sub(trimmed.len()) == 12
+            && let Some(current) = alerts.last_mut()
+        {
+            current.1 = true;
+        }
+    }
 
     assert!(
         alerts.len() >= 10,
         "expected the full rule set, got {alerts:#?}"
     );
-    assert_eq!(
-        alerts.len(),
-        summaries,
-        "{} alerts but {summaries} summary annotations: {alerts:#?}",
-        alerts.len()
+    let missing: Vec<&String> = alerts
+        .iter()
+        .filter(|(_, has)| !has)
+        .map(|(name, _)| name)
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "alerts with no summary annotation, which page on-call with a bare rule \
+         name and no indication of what broke: {missing:#?}"
     );
 }

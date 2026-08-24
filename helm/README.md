@@ -94,6 +94,10 @@ The following table lists the configurable parameters of the ModelExpress chart 
 | `metrics.clientPodMonitor.namespaceSelector` | Namespaces to search. Empty means the release namespace | `{}` |
 | `metrics.clientPodMonitor.interval`          | Scrape interval                                | `30s`    |
 | `metrics.clientPodMonitor.scrapeTimeout`     | Scrape timeout                                 | `10s`    |
+| `metrics.clientPodMonitor.additionalLabels`  | Labels the Prometheus `podMonitorSelector` matches. Same caveat as `metrics.podMonitor.additionalLabels` | `{}` |
+| `metrics.clientPodMonitor.relabelings`       | Passed through to the endpoint's `relabelings` | `[]`     |
+| `metrics.clientPodMonitor.metricRelabelings` | Passed through to the endpoint's `metricRelabelings` | `[]` |
+| `metrics.dashboard.additionalLabels`         | Extra labels on the dashboard ConfigMap        | `{}`     |
 | `metrics.rules.enabled`                      | Ship alerting rules as a PrometheusRule        | `false`  |
 | `metrics.rules.client`                       | Also include client alerts, which need client metrics enabled and P2P in use | `false` |
 | `metrics.rules.additionalLabels`             | Labels the Prometheus `ruleSelector` matches. Same caveat as the PodMonitor | `{}` |

@@ -94,9 +94,14 @@ metrics:
   # a cluster the endpoint is served and never scraped, which looks exactly
   # like a broken exporter. Enable this instead of podAnnotations there.
   #
-  # Everything below renders a monitoring.coreos.com/v1 resource, so each is
-  # additionally gated on that API being present: enabling one on a cluster
-  # without the Operator renders nothing rather than failing the install.
+  # podMonitor, clientPodMonitor and rules each render a monitoring.coreos.com/v1
+  # resource and are gated on that API being present. Enabling one on a cluster
+  # without the Operator FAILS the install rather than skipping silently: a
+  # silent skip leaves you believing monitoring is configured while nothing
+  # collects, which is the failure these resources exist to prevent. Use
+  # skipApiVersionCheck if the CRDs arrive in the same apply.
+  #
+  # dashboard is a plain ConfigMap and needs none of that.
   podMonitor:
     enabled: false
     interval: 30s
@@ -122,9 +127,11 @@ metrics:
   # selector and you have to supply one. The chart refuses to render an empty
   # selector, which would otherwise match every pod in the namespace.
   #
-  # The client is also opt-in inside the workload: without MX_METRICS_ENABLED=1
-  # and PROMETHEUS_MULTIPROC_DIR set in the engine pod there is nothing on the
-  # port to scrape. See docs/METRICS.md for the pod-manifest side.
+  # The client is also opt-in inside the workload. MX_METRICS_ENABLED=1 and
+  # MX_METRICS_PORT are what create an endpoint at all -- without the port there
+  # is nothing to scrape. PROMETHEUS_MULTIPROC_DIR is separate: without it the
+  # client still serves, but only one rank of the pod is represented, which for
+  # TP=8 loses seven eighths of it. See docs/METRICS.md for the manifest side.
   clientPodMonitor:
     enabled: false
     # Required when enabled. Selects the inference pods running the client.
@@ -142,7 +149,9 @@ metrics:
     metricRelabelings: []
     skipApiVersionCheck: false
 
-  # Recording rules and alerts, as a PrometheusRule.
+  # Alerts, as a PrometheusRule. No recording rules: they would make the
+  # dashboard depend on this resource being installed, so enabling one and not
+  # the other would give empty panels with no error.
   rules:
     enabled: false
     # Same selector caveat as podMonitor.additionalLabels above, via ruleSelector.

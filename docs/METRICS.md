@@ -10,9 +10,11 @@ default, and the Python client, opt-in. This page covers how to scrape both,
 what the pipeline guarantees, and the two operational choices it leaves to the
 deployment.
 
-This documents what ships today: the exposition path, `mx_build_info`, and
-per-RPC and storage-backend coverage on the server. The load and transfer timing
-tiers and the dashboard surface come later and are not here yet.
+This documents what ships today: the exposition path, `mx_build_info`, per-RPC
+and storage-backend coverage on the server, the download lifecycle, NIXL client
+health, and the Kubernetes scrape, alerting and dashboard surface. The load and
+transfer timing tiers come later and are not here yet, so nothing below
+attributes a transfer's duration across its phases.
 
 ---
 

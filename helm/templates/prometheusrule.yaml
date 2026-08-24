@@ -5,8 +5,20 @@
 {{- /*
   Alerts only, no recording rules. Recording rules would make the shipped
   dashboard depend on this resource being installed, so a site that enabled the
-  dashboard and not the rules would get empty panels with no error. The panel
-  queries are cheap enough that there is no measured load to precompute away.
+  dashboard and not the rules would get empty panels with no error.
+
+  Two PromQL shapes here are load-bearing and easy to get wrong:
+
+  `unless X > 0` rather than `and X == 0`. When the right-hand family has no
+  series at all -- which is exactly the post-restart case some of these target --
+  the comparison yields an empty vector, and `and` against an empty vector
+  matches nothing. The alert is then silent in precisely the situation it was
+  written for.
+
+  `increase()` over a window several times longer than the `for:` hold. A
+  one-shot event is above zero for only one window-length, so a hold equal to the
+  window can never complete: the condition goes false one scrape interval before
+  the hold expires.
 */}}
 {{- $cfg := .Values.metrics.rules }}
 {{- $t := $cfg.thresholds | default dict }}
@@ -25,10 +37,15 @@ metadata:
     {{- end }}
 spec:
   groups:
+{{- if .Values.metrics.enabled }}
     - name: modelexpress.liveness
       rules:
         # Server metrics are always-on, so absence is a fault. The client is
         # opt-in and legitimately absent, which is why it has no such alert.
+        #
+        # The group is gated on metrics.enabled: with the listener off the server
+        # binds port 0, mx_build_info can never exist, and this would fire
+        # forever on a deployment that is working as configured.
         - alert: MXServerMetricsAbsent
           expr: absent(mx_build_info{component="server"})
           for: 10m
@@ -42,28 +59,35 @@ spec:
               install, check that the Prometheus podMonitorSelector matches this
               PodMonitor's labels -- an unmatched selector produces no error.
 
-        # The heartbeat is stamped only on a successful pass, so staleness is
-        # the signal. Never rate() this: it holds a unix timestamp.
+        # Deliberately not aggregated. max() across replicas would let one
+        # healthy replica mask a wedged one, which is the failure this exists to
+        # catch. Unaggregated, each instance alerts for itself.
+        #
+        # Never rate() this: it holds a unix timestamp, not a count.
         - alert: MXRegistryStatsStale
           expr: >-
-            time() - max(mx_task_last_success_timestamp_seconds{task="registry_stats_refresh"})
-            > {{ $t.registryStatsStaleSeconds | default 600 }}
+            time() - mx_task_last_success_timestamp_seconds{task="registry_stats_refresh"}
+            > {{ include "modelexpress.threshold" (list $t "registryStatsStaleSeconds" 600) }}
           for: 5m
           labels:
             severity: warning
           annotations:
-            summary: Registry statistics refresh has stopped succeeding
+            summary: 'Registry statistics refresh has stopped succeeding on {{ "{{ $labels.instance }}" }}'
             description: >-
               mx_registry_entries and mx_state_entries are written by that task and
-              are now stale. They keep their last good values on a failed pass, so
-              they still look plausible -- this alert is the only thing separating
-              a current reading from a frozen one.
+              are now stale on this replica. They keep their last good values on a
+              failed pass, so they still look plausible -- this alert is the only
+              thing separating a current reading from a frozen one.
+{{- end }}
 
     - name: modelexpress.download
       rules:
-        # Documented as the leading indicator of a duplicate download.
+        # 15m window against a 5m hold: a single lost lease is above zero for one
+        # window-length, so the hold has to sit well inside it. The counter is
+        # pre-created at zero in RegistryMetrics::register, which is what makes
+        # the first loss in a process visible at all.
         - alert: MXDownloadLeaseLost
-          expr: sum(rate(mx_download_lease_refresh_total{result="lost"}[5m])) > 0
+          expr: sum(increase(mx_download_lease_refresh_total{result="lost"}[15m])) > 0
           for: 5m
           labels:
             severity: warning
@@ -73,9 +97,10 @@ spec:
               A downloader stopped heartbeating and another replica may now claim
               its model. Expect MXDownloadTakeover next if it does.
 
-        # A takeover re-pulls the whole model: hundreds of GB for a large one.
+        # A takeover re-pulls the whole model -- hundreds of GB for a large one --
+        # so this pages on the first one rather than waiting out a hold.
         - alert: MXDownloadTakeover
-          expr: sum(rate(mx_download_claims_total{result="takeover"}[15m])) > 0
+          expr: sum(increase(mx_download_claims_total{result="takeover"}[15m])) > 0
           labels:
             severity: warning
           annotations:
@@ -84,27 +109,36 @@ spec:
               The previous downloader died mid-transfer. The bytes already fetched
               are re-fetched from scratch.
 
-        # Level without flow. The level must come from the gauge: the transition
-        # counters are process-local while DOWNLOADING persists in the store, so
-        # after a restart their difference can go negative.
+        # Level without flow.
+        #
+        # max(), not sum(): the gauge is recomputed from the shared store, so
+        # every replica publishes the same global total and summing multiplies it
+        # by the replica count.
+        #
+        # `unless` rather than `and ... == 0`: after a restart the transition
+        # counters can have no series at all, and `and` against the empty vector
+        # that produces matches nothing -- silencing the alert in exactly the
+        # restart case described below.
         - alert: MXDownloadWedged
           expr: >-
-            sum(mx_registry_entries{status="downloading"}) > 0
-            and sum(rate(mx_registry_status_transitions_total{to="downloading"}[30m])) == 0
+            max(mx_registry_entries{status="downloading"}) > 0
+            unless sum(increase(mx_registry_status_transitions_total{to="downloading"}[30m])) > 0
           for: 30m
           labels:
             severity: warning
           annotations:
             summary: Entries stuck in DOWNLOADING with nothing entering that state
             description: >-
-              Cross-check against MXRegistryStatsStale first: if the refresh task
-              is wedged, this gauge is frozen rather than genuinely stuck.
+              The transition counters are process-local while DOWNLOADING persists
+              in the store, so a restart leaves the level with no matching flow.
+              Cross-check MXRegistryStatsStale first: if the refresh task is
+              wedged, this gauge is frozen rather than genuinely stuck.
 
         - alert: MXDownloadFailureRatio
           expr: >-
             sum(rate(mx_download_seconds_count{outcome="error"}[15m]))
             / sum(rate(mx_download_seconds_count[15m]))
-            > {{ $t.downloadFailureRatio | default 0.1 }}
+            > {{ include "modelexpress.threshold" (list $t "downloadFailureRatio" 0.1) }}
           for: 15m
           labels:
             severity: warning
@@ -123,7 +157,7 @@ spec:
           expr: >-
             sum by (method) (rate(mx_grpc_requests_total{outcome!~"ok|cancelled|not_found"}[5m]))
             / sum by (method) (rate(mx_grpc_requests_total[5m]))
-            > {{ $t.grpcErrorRatio | default 0.05 }}
+            > {{ include "modelexpress.threshold" (list $t "grpcErrorRatio" 0.05) }}
           for: 10m
           labels:
             severity: warning
@@ -139,7 +173,7 @@ spec:
           expr: >-
             sum by (store) (rate(mx_backend_ops_total{result="error"}[5m]))
             / sum by (store) (rate(mx_backend_ops_total[5m]))
-            > {{ $t.backendErrorRatio | default 0.05 }}
+            > {{ include "modelexpress.threshold" (list $t "backendErrorRatio" 0.05) }}
           for: 10m
           labels:
             severity: warning
@@ -151,10 +185,13 @@ spec:
 
         # The in-flight gauges are decremented by a Drop guard on every exit path
         # including cancellation, so a standing value is real rather than drift.
+        #
+        # `unless` for the same reason as MXDownloadWedged: a store that has
+        # completed nothing may have no counter series to compare against.
         - alert: MXBackendOpsStuck
           expr: >-
             sum by (store) (mx_backend_ops_in_flight) > 0
-            and sum by (store) (rate(mx_backend_ops_total[10m])) == 0
+            unless sum by (store) (increase(mx_backend_ops_total[10m])) > 0
           for: 10m
           labels:
             severity: critical
@@ -164,8 +201,9 @@ spec:
     - name: modelexpress.capacity
       rules:
         # Registered as the OOM early warning: these maps are never evicted.
+        # Per-instance, since one replica can leak while its peers are healthy.
         - alert: MXStateEntriesGrowing
-          expr: sum by (map) (mx_state_entries) > {{ $t.stateEntriesLimit | default 10000 }}
+          expr: mx_state_entries > {{ include "modelexpress.threshold" (list $t "stateEntriesLimit" 10000) }}
           for: 30m
           labels:
             severity: warning
@@ -181,7 +219,7 @@ spec:
           expr: >-
             sum(rate(mx_nixl_receive_total{result=~"partial|empty"}[15m]))
             / sum(rate(mx_nixl_receive_total[15m]))
-            > {{ $t.nixlSilentFailureRatio | default 0.01 }}
+            > {{ include "modelexpress.threshold" (list $t "nixlSilentFailureRatio" 0.01) }}
           for: 15m
           labels:
             severity: warning
@@ -192,8 +230,8 @@ spec:
               receive is silently wrong rather than failed.
 
         - alert: MXNixlDataPlaneErrors
-          expr: sum by (kind) (rate(mx_nixl_data_plane_errors_total[15m])) > 0
-          for: 15m
+          expr: sum by (kind) (increase(mx_nixl_data_plane_errors_total[15m])) > 0
+          for: 5m
           labels:
             severity: warning
           annotations:
@@ -205,7 +243,7 @@ spec:
           expr: >-
             sum(rate(mx_p2p_list_sources_total{result="error"}[15m]))
             / sum(rate(mx_p2p_list_sources_total[15m]))
-            > {{ $t.grpcErrorRatio | default 0.05 }}
+            > {{ include "modelexpress.threshold" (list $t "grpcErrorRatio" 0.05) }}
           for: 15m
           labels:
             severity: warning

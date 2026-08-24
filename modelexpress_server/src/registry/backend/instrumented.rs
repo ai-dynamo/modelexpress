@@ -441,6 +441,19 @@ mod tests {
     /// Deliberately a local copy of the helper in [`crate::metrics::registry`]:
     /// that one proves the counter's arithmetic given hand-written labels, this
     /// one proves the decorator feeds it the right ones.
+    /// True when no transition was counted.
+    ///
+    /// Not `!encoded.contains(...)`: the transition family is pre-created at
+    /// zero for every label pair (see [`crate::metrics::registry`]), so a
+    /// booked transition and an unbooked one both have a series and only the
+    /// value distinguishes them. Asserting absence would pass whether or not
+    /// the decorator behaved.
+    fn no_transition_booked(encoded: &str) -> bool {
+        !encoded.lines().any(|line| {
+            line.starts_with("mx_registry_status_transitions_total{") && !line.ends_with(" 0")
+        })
+    }
+
     fn in_flight(encoded: &str) -> i64 {
         let mut arrivals: i64 = 0;
         let mut departures: i64 = 0;
@@ -618,7 +631,7 @@ mod tests {
 
         let encoded = scrape(&prom);
         assert!(
-            !encoded.contains("mx_registry_status_transitions_total{"),
+            no_transition_booked(&encoded),
             "a replica that lost the retry race booked a transition: {encoded}"
         );
     }
@@ -707,7 +720,7 @@ mod tests {
 
         let encoded = scrape(&prom);
         assert!(
-            !encoded.contains("mx_registry_status_transitions_total{"),
+            no_transition_booked(&encoded),
             "a fenced stale owner booked a departure it did not make: {encoded}"
         );
     }

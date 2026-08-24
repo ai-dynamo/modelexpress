@@ -54,6 +54,20 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
+Look up an alert threshold, honouring an explicit zero.
+
+sprig's `default` treats 0 as empty, so `$t.x | default 0.05` silently replaces a
+threshold deliberately set to 0 -- turning "alert on any occurrence" into the
+built-in rate. Takes (thresholds-map, key, fallback).
+*/}}
+{{- define "modelexpress.threshold" -}}
+{{- $thresholds := index . 0 -}}
+{{- $key := index . 1 -}}
+{{- $fallback := index . 2 -}}
+{{- if hasKey $thresholds $key }}{{ index $thresholds $key }}{{ else }}{{ $fallback }}{{ end -}}
+{{- end }}
+
+{{/*
 Create the name of the service account to use
 */}}
 {{- define "modelexpress.serviceAccountName" -}}

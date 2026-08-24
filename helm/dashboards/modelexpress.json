@@ -124,7 +124,7 @@
       },
       "targets": [
         {
-          "expr": "sum(mx_registry_entries{status=\"downloading\"})",
+          "expr": "max(mx_registry_entries{status=\"downloading\"})",
           "legendFormat": "downloading",
           "refId": "A",
           "datasource": {
@@ -133,7 +133,7 @@
           }
         }
       ],
-      "description": "From the gauge, not the transition counters: those are process-local while DOWNLOADING persists in the store, so their difference can go negative after a restart.",
+      "description": "max(), not sum(): the gauge is recomputed from the shared store, so every replica publishes the same global total and summing multiplies it by the replica count. From the gauge rather than the transition counters, which are process-local while DOWNLOADING persists in the store.",
       "options": {
         "reduceOptions": {
           "calcs": [
@@ -144,7 +144,7 @@
     },
     {
       "type": "stat",
-      "title": "Versions deployed",
+      "title": "Server versions deployed",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -157,7 +157,7 @@
       },
       "targets": [
         {
-          "expr": "count by (version) (mx_build_info)",
+          "expr": "count by (version) (mx_build_info{component=\"server\"})",
           "legendFormat": "{{version}}",
           "refId": "A",
           "datasource": {
@@ -166,7 +166,7 @@
           }
         }
       ],
-      "description": "More than one row means a rollout is in progress or stuck.",
+      "description": "Scoped to the server. The client is a library baked into the engine image and routinely lags the server version, so an unscoped count shows a permanent second row that reads as a stuck rollout.",
       "options": {
         "reduceOptions": {
           "calcs": [
@@ -359,7 +359,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (status) (mx_registry_entries)",
+          "expr": "max by (status) (mx_registry_entries)",
           "legendFormat": "{{status}}",
           "refId": "A",
           "datasource": {
@@ -368,7 +368,7 @@
           }
         }
       ],
-      "description": "Refreshed on MX_REGISTRY_STATS_INTERVAL_SECS (default 60s), not at scrape time. Cross-check the Registry stats age panel."
+      "description": "max(), not sum(): every replica reports the same shared-store total. Refreshed on MX_REGISTRY_STATS_INTERVAL_SECS (default 60s), not at scrape time -- cross-check the Registry stats age panel before trusting the level."
     },
     {
       "type": "row",
@@ -979,7 +979,7 @@
     },
     {
       "type": "stat",
-      "title": "Client processes exporting",
+      "title": "Client pods exporting",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -993,7 +993,7 @@
       "targets": [
         {
           "expr": "count(mx_build_info{component=\"client\"})",
-          "legendFormat": "clients",
+          "legendFormat": "pods",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -1001,7 +1001,7 @@
           }
         }
       ],
-      "description": "Proof of life for the client exporter, independent of whether any P2P activity has happened.",
+      "description": "Pods, not ranks. Multiprocess mode merges every rank in a pod into one endpoint with no pid label, so a TP=8 pod contributes exactly one series. Proof of life for the client exporter, independent of whether any P2P activity has happened.",
       "options": {
         "reduceOptions": {
           "calcs": [
