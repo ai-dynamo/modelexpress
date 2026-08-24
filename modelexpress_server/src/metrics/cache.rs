@@ -197,8 +197,46 @@ mod tests {
         assert!(!encoded.contains("_total_total"), "{encoded}");
     }
 
-    /// Gauges hold their prior value when a refresh fails. Zeroing them would be
-    /// indistinguishable from an empty registry.
+    /// Every `EvictionReason` needs a wire form, not just the two the policy can
+    /// produce today: `Manual` is a live variant and `DiskSpace` is declared, and
+    /// a typo in either arm ships a label value no dashboard query matches.
+    ///
+    /// One increment per reason, so a collision between two arms shows up as a
+    /// series holding 2 and the expected one missing.
+    #[test]
+    fn every_eviction_reason_has_its_own_label_value() {
+        let mut registry = new_registry();
+        let metrics = CacheMetrics::register(&mut registry);
+
+        for (reason, expected) in [
+            (EvictionReason::TimeThreshold, "time_threshold"),
+            (EvictionReason::CountLimit, "count_limit"),
+            (EvictionReason::DiskSpace, "disk_space"),
+            (EvictionReason::Manual, "manual"),
+        ] {
+            metrics.record_eviction(reason);
+
+            let encoded =
+                encode_text(&registry).unwrap_or_else(|_| String::from("<encode failed>"));
+            assert!(
+                encoded.contains(&format!(
+                    r#"mx_cache_evictions_total{{reason="{expected}"}} 1"#
+                )),
+                "{reason:?} did not encode as {expected}: {encoded}"
+            );
+        }
+    }
+
+    /// The three status gauges must not be cross-wired: a rotated argument list
+    /// publishes the error count under `status="downloading"`, which reads as a
+    /// plausible level and is what a wedged-download alert fires on. Distinct
+    /// values per status, so no rotation survives.
+    ///
+    /// Scope: the neighbouring invariant -- that a *failed* refresh leaves these
+    /// gauges at their previous values instead of zeroing them, since a zeroed
+    /// gauge and an empty registry are indistinguishable -- is a property of
+    /// `registry::stats_refresh::refresh_once`, not of this setter, and is not
+    /// checked here.
     #[test]
     fn registry_entry_gauges_are_set_per_status() {
         let mut registry = new_registry();
@@ -220,19 +258,30 @@ mod tests {
         );
     }
 
+    /// Stamped with the constant the production task actually publishes, not a
+    /// local copy of the string, so this exercises the same label value the
+    /// refresh task emits.
+    ///
+    /// That alone would go green on a rename, and a rename silently breaks every
+    /// dashboard and alert keyed on the old value -- hence the separate equality
+    /// on `TASK_NAME`, which pins the wire form as a contract.
     #[test]
     fn the_task_heartbeat_is_stamped_per_task() {
+        use crate::registry::stats_refresh::TASK_NAME;
+
         let mut registry = new_registry();
         let metrics = CacheMetrics::register(&mut registry);
 
-        metrics.stamp_task_success("registry_stats_refresh", 1_760_000_000);
+        assert_eq!(TASK_NAME, "registry_stats_refresh");
+
+        metrics.stamp_task_success(TASK_NAME, 1_760_000_000);
         metrics.set_state_entries("download_waiters", 3);
 
         let encoded = encode_text(&registry).unwrap_or_else(|_| String::from("<encode failed>"));
         assert!(
-            encoded.contains(
-                r#"mx_task_last_success_timestamp_seconds{task="registry_stats_refresh"} 1760000000"#
-            ),
+            encoded.contains(&format!(
+                r#"mx_task_last_success_timestamp_seconds{{task="{TASK_NAME}"}} 1760000000"#
+            )),
             "{encoded}"
         );
         assert!(

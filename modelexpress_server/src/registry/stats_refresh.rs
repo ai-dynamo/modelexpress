@@ -131,4 +131,115 @@ mod tests {
             "a failed pass stamped the heartbeat: {encoded}"
         );
     }
+
+    /// The negative assertion above only carries information if the positive
+    /// case is pinned too: "correctly not stamped because the pass failed" and
+    /// "never stamped under any circumstances" satisfy it identically.
+    ///
+    /// The three counts are deliberately distinct so a rotated or mis-ordered
+    /// tuple lands a real-looking but wrong number under each status label
+    /// rather than a value that happens to match.
+    #[tokio::test]
+    async fn a_successful_pass_publishes_each_count_under_its_own_status() {
+        let mut prom = new_registry();
+        let metrics = CacheMetrics::register(&mut prom);
+        let mut backend = crate::registry::backend::MockRegistryBackend::new();
+        backend
+            .expect_get_status_counts()
+            .times(1)
+            .returning(|| Ok((2, 7, 1)));
+        let registry = RegistryManager::with_backend(Arc::new(backend));
+        let waiters: WaiterCount = Arc::new(|| 4);
+
+        refresh_once(&registry, &metrics, &waiters).await;
+
+        let encoded = encode_text(&prom).unwrap_or_else(|_| String::from("<encode failed>"));
+        for (status, count) in [("downloading", 2), ("downloaded", 7), ("error", 1)] {
+            let expected = format!(r#"mx_registry_entries{{status="{status}"}} {count}"#);
+            assert!(encoded.contains(&expected), "missing {expected}: {encoded}");
+        }
+        // Against `TASK_NAME` rather than a copy of the string, so renaming the
+        // constant cannot leave every dashboard keyed on the old label while
+        // this stays green.
+        assert!(
+            encoded.contains(&format!(
+                r#"mx_task_last_success_timestamp_seconds{{task="{TASK_NAME}"}}"#
+            )),
+            "a successful pass did not stamp the heartbeat: {encoded}"
+        );
+    }
+
+    /// Gauges hold their previous values across a failed pass.
+    ///
+    /// Zeroing them instead makes an unreachable backend and a genuinely empty
+    /// registry produce identical output, so on-call reads
+    /// `mx_registry_entries{status="downloading"} 0` during an outage and
+    /// concludes nothing is downloading.
+    #[tokio::test]
+    async fn a_failed_pass_leaves_the_registry_gauges_at_their_last_good_values() {
+        let mut prom = new_registry();
+        let metrics = CacheMetrics::register(&mut prom);
+        let mut backend = crate::registry::backend::MockRegistryBackend::new();
+        // Succeed once, then fail: the second pass is the one under test.
+        let pass = std::sync::atomic::AtomicUsize::new(0);
+        backend
+            .expect_get_status_counts()
+            .times(2)
+            .returning(move || {
+                if pass.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    Ok((3, 9, 2))
+                } else {
+                    Err("registry unreachable".into())
+                }
+            });
+        let registry = RegistryManager::with_backend(Arc::new(backend));
+        let waiters: WaiterCount = Arc::new(|| 4);
+
+        refresh_once(&registry, &metrics, &waiters).await;
+        refresh_once(&registry, &metrics, &waiters).await;
+
+        let encoded = encode_text(&prom).unwrap_or_else(|_| String::from("<encode failed>"));
+        for (status, count) in [("downloading", 3), ("downloaded", 9), ("error", 2)] {
+            let expected = format!(r#"mx_registry_entries{{status="{status}"}} {count}"#);
+            assert!(
+                encoded.contains(&expected),
+                "the failed pass clobbered {status}, expected {expected}: {encoded}"
+            );
+        }
+    }
+
+    /// `run_server` awaits this task's join handle during shutdown, so a loop
+    /// that stops observing its oneshot does not just leak a task -- it hangs
+    /// the whole shutdown sequence until the kubelet SIGKILLs the pod.
+    ///
+    /// The `timeout` is what turns the regression into a failure instead of a
+    /// hung suite; it costs nothing on the passing path, where the task is woken
+    /// by the oneshot and joins immediately, and only elapses when the loop has
+    /// actually stopped watching for shutdown.
+    #[tokio::test]
+    async fn the_refresh_loop_stops_when_shutdown_fires() {
+        let mut prom = new_registry();
+        let metrics = CacheMetrics::register(&mut prom);
+        let mut backend = crate::registry::backend::MockRegistryBackend::new();
+        // No `times`: the immediate first tick fires one pass, and a loop that
+        // ignored shutdown would fire more.
+        backend
+            .expect_get_status_counts()
+            .returning(|| Ok((0, 0, 0)));
+        let registry = Arc::new(RegistryManager::with_backend(Arc::new(backend)));
+        let waiters: WaiterCount = Arc::new(|| 0);
+        let (tx, rx) = oneshot::channel();
+
+        let task = tokio::spawn(run_stats_refresh(registry, metrics, waiters, rx));
+        assert!(
+            tx.send(()).is_ok(),
+            "the task dropped its shutdown receiver"
+        );
+
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
+        assert!(
+            stopped.is_ok(),
+            "the refresh loop ignored shutdown and would hang run_server"
+        );
+    }
 }

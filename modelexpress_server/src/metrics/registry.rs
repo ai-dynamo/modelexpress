@@ -310,8 +310,16 @@ mod tests {
     use super::*;
     use crate::metrics::{encode_text, new_registry};
 
+    /// Each `ClaimResult` gets its own series, so a takeover is queryable apart
+    /// from a fresh claim.
+    ///
+    /// Scope: this pins the wire form only. The decision that turns a backend
+    /// `ClaimOutcome::TookOver` into `ClaimResult::Takeover` is made in
+    /// [`crate::registry::backend::instrumented`] and cannot be observed from
+    /// here -- feeding `ClaimResult` values in by hand says nothing about which
+    /// one a real takeover produces.
     #[test]
-    fn a_takeover_is_not_counted_as_a_fresh_claim() {
+    fn each_claim_result_encodes_as_its_own_label_value() {
         let mut registry = new_registry();
         let metrics = RegistryMetrics::register(&mut registry);
 
@@ -334,6 +342,62 @@ mod tests {
             "{encoded}"
         );
         assert!(!encoded.contains("_total_total"), "{encoded}");
+    }
+
+    /// `ModelStatus` reaches Prometheus only through `From<ModelStatus>`, and it
+    /// feeds two labels operators read as ground truth: the `to` side of the
+    /// finish transition and the `outcome` of `mx_download_seconds`. A swapped
+    /// arm reports every failed download as a successful one in *both* families
+    /// at once, so this asserts the encoded label rather than the enum variant.
+    ///
+    /// The counts are deliberately distinct (3 / 1 / 2) so no permutation of the
+    /// three arms leaves the assertions satisfied. `absent` is pinned here too:
+    /// it is the one `StatusLabel` with no `ModelStatus` behind it, and the
+    /// `in_flight` helper below matches on `downloading` alone, so nothing else
+    /// holds its wire form.
+    #[test]
+    fn a_model_status_keeps_its_own_label_through_the_encoder() {
+        let mut registry = new_registry();
+        let metrics = RegistryMetrics::register(&mut registry);
+        // Both families on one registry, as `server::run_server` registers them.
+        let downloads = DownloadMetrics::register(&mut registry);
+
+        for _ in 0..3 {
+            metrics.record_transition(StatusLabel::Absent, ModelStatus::DOWNLOADING.into());
+        }
+        metrics.record_transition(StatusLabel::Downloading, ModelStatus::DOWNLOADED.into());
+        for _ in 0..2 {
+            metrics.record_transition(StatusLabel::Downloading, ModelStatus::ERROR.into());
+        }
+        downloads.observe(ModelStatus::ERROR.into(), 1.0);
+
+        let encoded = encode_text(&registry).unwrap_or_else(|_| String::from("<encode failed>"));
+        assert!(
+            encoded.contains(
+                r#"mx_registry_status_transitions_total{from="absent",to="downloading"} 3"#
+            ),
+            "{encoded}"
+        );
+        assert!(
+            encoded.contains(
+                r#"mx_registry_status_transitions_total{from="downloading",to="downloaded"} 1"#
+            ),
+            "{encoded}"
+        );
+        assert!(
+            encoded.contains(
+                r#"mx_registry_status_transitions_total{from="downloading",to="error"} 2"#
+            ),
+            "{encoded}"
+        );
+        assert!(
+            encoded.contains(r#"mx_download_seconds_count{outcome="error"} 1"#),
+            "{encoded}"
+        );
+        assert!(
+            !encoded.contains(r#"mx_download_seconds_count{outcome="downloaded"}"#),
+            "a failed download must not be timed as a successful one: {encoded}"
+        );
     }
 
     /// Sum the `to="downloading"` and `from="downloading"` series the way the
@@ -360,12 +424,17 @@ mod tests {
         arrivals.saturating_sub(departures)
     }
 
-    /// One download, taken over mid-flight, then finished.
+    /// A takeover records `downloading -> downloading`: an arrival and a
+    /// departure that cancel, because ownership changed while the entry never
+    /// left `DOWNLOADING`. Recording it as `absent -> downloading` instead would
+    /// add an arrival that never leaves and the level would drift up by one per
+    /// takeover. That from-label choice lives in `record_claim`, so this test
+    /// does exercise it.
     ///
-    /// A takeover records `downloading -> downloading`: an arrival and a departure
-    /// that cancel, because ownership changed while the entry never left
-    /// `DOWNLOADING`. Recording it as `absent -> downloading` instead would add an
-    /// arrival that never leaves and the level would drift up by one per takeover.
+    /// Scope: the finish step here is a hand-written `record_transition`, not a
+    /// real one. Whether a real finish records a departure at all -- and whether
+    /// a real takeover arrives as `ClaimResult::Takeover` -- is decided in
+    /// [`crate::registry::backend::instrumented`] and is not covered from here.
     #[test]
     fn a_takeover_does_not_change_the_in_flight_level() {
         let mut registry = new_registry();
@@ -389,10 +458,15 @@ mod tests {
         assert_eq!(in_flight(&encoded), 0, "the download finished");
     }
 
-    /// Deleting a record mid-download is the third exit from `DOWNLOADING`, and
-    /// the one the claim lifecycle cannot observe for itself.
+    /// `downloading -> absent` is the third exit from `DOWNLOADING`, and the one
+    /// the claim lifecycle cannot observe for itself; it must subtract from the
+    /// level exactly as a finish does.
+    ///
+    /// Scope: arithmetic only. The caller that decides whether a delete books
+    /// this transition is `services::ModelDownloadTracker::delete_model_entries`,
+    /// which this test never reaches -- deleting that decision leaves this green.
     #[test]
-    fn a_delete_during_download_is_a_departure() {
+    fn a_downloading_to_absent_transition_is_a_departure() {
         let mut registry = new_registry();
         let metrics = RegistryMetrics::register(&mut registry);
 
@@ -400,7 +474,7 @@ mod tests {
         let encoded = encode_text(&registry).unwrap_or_else(|_| String::from("<encode failed>"));
         assert_eq!(in_flight(&encoded), 1);
 
-        // `model clear` on a model that is still downloading.
+        // What `model clear` on a still-downloading model has to book.
         metrics.record_transition(StatusLabel::Downloading, StatusLabel::Absent);
         let encoded = encode_text(&registry).unwrap_or_else(|_| String::from("<encode failed>"));
         assert_eq!(

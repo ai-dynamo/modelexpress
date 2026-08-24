@@ -1331,6 +1331,57 @@ mod tests {
         )
     }
 
+    /// As [`tracker_with_mock`], but hands back the Prometheus registry the metric
+    /// families were registered into.
+    ///
+    /// [`tracker_with_mock`] registers into a temporary registry that is dropped on
+    /// the spot, so nothing recorded through it can ever be encoded. Any metric
+    /// assertion against a tracker built that way would be vacuous by construction.
+    fn tracker_with_mock_and_registry(
+        mock: crate::registry::backend::MockRegistryBackend,
+    ) -> (ModelDownloadTracker, prometheus_client::registry::Registry) {
+        let mut metrics_registry = crate::metrics::new_registry();
+        let download_metrics = DownloadMetrics::register(&mut metrics_registry);
+        let registry_metrics = RegistryMetrics::register(&mut metrics_registry);
+        let registry = Arc::new(RegistryManager::with_backend(Arc::new(mock)));
+        (
+            ModelDownloadTracker::new(registry, download_metrics, registry_metrics),
+            metrics_registry,
+        )
+    }
+
+    fn encoded_metrics(registry: &prometheus_client::registry::Registry) -> String {
+        crate::metrics::encode_text(registry).unwrap_or_else(|_| String::from("<encode failed>"))
+    }
+
+    /// The `downloading -> absent` series, or 0 when it was never created.
+    fn departures_from_downloading(encoded: &str) -> i64 {
+        encoded
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix(
+                    r#"mx_registry_status_transitions_total{from="downloading",to="absent"} "#,
+                )
+            })
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or_default()
+    }
+
+    fn record_with_status(
+        model_name: &str,
+        status: ModelStatus,
+    ) -> crate::registry::backend::ModelRecord {
+        let now = chrono::Utc::now();
+        crate::registry::backend::ModelRecord {
+            model_name: model_name.to_string(),
+            provider: ModelProvider::HuggingFace,
+            status,
+            created_at: now,
+            last_used_at: now,
+            message: None,
+        }
+    }
+
     /// Unpinned, full-weight target: its entry key is the bare model name.
     fn test_target(model_name: &str) -> DownloadTarget {
         DownloadTarget {
@@ -1543,6 +1594,184 @@ mod tests {
             .expect("waiters lock")
             .contains_key("m");
         assert!(!waiters);
+    }
+
+    /// The bool `delete_status` returns is the sole gate on the `downloading ->
+    /// absent` departure, and no caller is forced to read it -- there is no
+    /// `#[must_use]` and two of the three call sites discard it. So the contract
+    /// is pinned here directly rather than only through the delete-path tests
+    /// below, which would still pass if the two arms were swapped in step.
+    #[tokio::test]
+    async fn delete_status_reports_whether_the_backend_removed_the_record() {
+        let mut removed = crate::registry::backend::MockRegistryBackend::new();
+        removed.expect_delete_model().once().returning(|_| Ok(()));
+        assert!(
+            tracker_with_mock(removed).delete_status("m").await,
+            "a successful delete must report true"
+        );
+
+        let mut failed = crate::registry::backend::MockRegistryBackend::new();
+        failed
+            .expect_delete_model()
+            .once()
+            .returning(|_| Err("backend unreachable".into()));
+        assert!(
+            !tracker_with_mock(failed).delete_status("m").await,
+            "the error is still swallowed, but it must not report a removal"
+        );
+    }
+
+    /// `model clear` on an entry that is still downloading is the third exit from
+    /// `DOWNLOADING`, and the only one the claim lifecycle cannot observe for
+    /// itself: once the record is gone `finish_download_claim` finds nothing to
+    /// fence and records no departure, so the deleting side has to book it.
+    /// Without this the arrival booked by the claim is never matched and the flow
+    /// accounting stays permanently ahead by one per deleted download.
+    #[tokio::test]
+    async fn deleting_a_downloading_entry_books_a_departure() {
+        let mut mock = crate::registry::backend::MockRegistryBackend::new();
+        mock.expect_get_models_by_last_used()
+            .once()
+            .returning(|_| Ok(vec![record_with_status("m", ModelStatus::DOWNLOADING)]));
+        mock.expect_delete_model().once().returning(|_| Ok(()));
+
+        let (tracker, metrics_registry) = tracker_with_mock_and_registry(mock);
+        let outcome = tracker.delete_model_entries("m").await;
+        assert_eq!(outcome.removed, 1);
+        assert!(!outcome.degraded);
+
+        let encoded = encoded_metrics(&metrics_registry);
+        assert_eq!(
+            departures_from_downloading(&encoded),
+            1,
+            "a deleted download must not stay counted as in flight: {encoded}"
+        );
+    }
+
+    /// `delete_model` failing is swallowed so waiters are still notified, which is
+    /// exactly why the departure has to be gated on the outcome. Booking it anyway
+    /// would report a departure for an entry still sitting in `DOWNLOADING` and
+    /// leave the flow count permanently short during a backend outage.
+    #[tokio::test]
+    async fn a_failed_delete_books_no_departure() {
+        let mut mock = crate::registry::backend::MockRegistryBackend::new();
+        mock.expect_get_models_by_last_used()
+            .once()
+            .returning(|_| Ok(vec![record_with_status("m", ModelStatus::DOWNLOADING)]));
+        mock.expect_delete_model()
+            .once()
+            .returning(|_| Err("backend unreachable".into()));
+
+        let (tracker, metrics_registry) = tracker_with_mock_and_registry(mock);
+        tracker.delete_model_entries("m").await;
+
+        let encoded = encoded_metrics(&metrics_registry);
+        assert_eq!(
+            departures_from_downloading(&encoded),
+            0,
+            "a swallowed delete failure must not book a departure: {encoded}"
+        );
+    }
+
+    /// Ordinary cache eviction clears `DOWNLOADED` entries. Those never occupied
+    /// the in-flight level, so counting them as departures would drive the
+    /// derivation negative on the most common delete there is.
+    #[tokio::test]
+    async fn deleting_a_downloaded_entry_books_no_departure() {
+        let mut mock = crate::registry::backend::MockRegistryBackend::new();
+        mock.expect_get_models_by_last_used()
+            .once()
+            .returning(|_| Ok(vec![record_with_status("m", ModelStatus::DOWNLOADED)]));
+        mock.expect_delete_model().once().returning(|_| Ok(()));
+
+        let (tracker, metrics_registry) = tracker_with_mock_and_registry(mock);
+        let outcome = tracker.delete_model_entries("m").await;
+        assert_eq!(outcome.removed, 1, "the record is still removed");
+
+        let encoded = encoded_metrics(&metrics_registry);
+        assert_eq!(
+            departures_from_downloading(&encoded),
+            0,
+            "a completed model was never in flight: {encoded}"
+        );
+    }
+
+    /// `waiting_count` is the sole input to `mx_state_entries{map="download_waiters"}`,
+    /// the gauge registered as "the OOM early warning". Stuck-at-zero is the failure
+    /// mode that matters: the map leaks, the server heads for OOM, and the metric
+    /// built to warn about it reads flat the whole way. The refresh task's own test
+    /// substitutes a stub closure, so nothing else executes this function.
+    #[tokio::test]
+    async fn waiting_count_tracks_the_waiter_map() {
+        let mut mock = crate::registry::backend::MockRegistryBackend::new();
+        mock.expect_delete_model().once().returning(|_| Ok(()));
+        let tracker = tracker_with_mock(mock);
+        assert_eq!(tracker.waiting_count(), 0);
+
+        let (tx_a, _rx_a) = tokio::sync::mpsc::channel(1);
+        tracker.add_waiting_channel("a", tx_a);
+        let (tx_b, _rx_b) = tokio::sync::mpsc::channel(1);
+        tracker.add_waiting_channel("b", tx_b);
+        // Keyed by model, so a second waiter on "a" does not add an entry.
+        let (tx_a2, _rx_a2) = tokio::sync::mpsc::channel(1);
+        tracker.add_waiting_channel("a", tx_a2);
+        assert_eq!(tracker.waiting_count(), 2);
+
+        tracker.delete_status("a").await;
+        assert_eq!(tracker.waiting_count(), 1);
+    }
+
+    /// The download histogram registers and exports whether or not anything ever
+    /// observes into it, so an empty series is the deceptive failure mode: the
+    /// scrape looks healthy and simply reports zero downloads. This drives the
+    /// real task to its terminal status and checks a sample landed.
+    ///
+    /// `finish_download_claim` returns `Ok(false)` on purpose -- this replica was
+    /// fenced. The bytes were still fetched, so the observation has to happen
+    /// before the fence check; returning `Ok(true)` here would leave that ordering
+    /// unpinned.
+    ///
+    /// No network: the NGC provider rejects a model name that is not
+    /// `org/name/version` before it opens a client or touches the filesystem, so
+    /// the download future resolves to `Err` immediately and the task takes the
+    /// `ERROR` outcome.
+    #[tokio::test]
+    async fn a_finished_download_is_observed_into_the_histogram_even_when_fenced() {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let done_tx = Mutex::new(Some(done_tx));
+
+        let mut mock = crate::registry::backend::MockRegistryBackend::new();
+        mock.expect_finish_download_claim()
+            .once()
+            .returning(move |_, _, _, status, _| {
+                assert_eq!(status, ModelStatus::ERROR);
+                if let Ok(mut slot) = done_tx.lock()
+                    && let Some(tx) = slot.take()
+                {
+                    let _ = tx.send(());
+                }
+                // Fenced: someone else owns the claim now.
+                Ok(false)
+            });
+
+        let (tracker, metrics_registry) = tracker_with_mock_and_registry(mock);
+        tracker.spawn_download_task(
+            DownloadTarget {
+                model_name: "not-a-valid-ngc-artifact".to_string(),
+                provider: ModelProvider::Ngc,
+                revision: None,
+                ignore_weights: false,
+            },
+            false,
+            "claim-1".to_string(),
+        );
+        done_rx.await.expect("the download task reaches the finish");
+
+        let encoded = encoded_metrics(&metrics_registry);
+        assert!(
+            encoded.contains(r#"mx_download_seconds_count{outcome="error"} 1"#),
+            "a failed download must be observed under its terminal status: {encoded}"
+        );
     }
 
     #[tokio::test]
