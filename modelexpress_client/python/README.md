@@ -136,6 +136,10 @@ Before training begins, the framework calls `prepare_delta_base()` with one
 bucket stream. ModelExpress submits each framework bucket directly for
 concurrent rank-local launch-checkpoint reads. Real delta staging therefore
 performs no launch-checkpoint reads.
+Published roots use
+`{prefix}/{encoded_model_name}/weights_v{encoded_version_id}/model.safetensors.index.json`.
+Canonical S3 versions and root advertisements remain READY for rollout recovery;
+their immutable objects are governed by the bucket's external lifecycle policy.
 
 The client owns the NIXL manager and trainer-side manifest service. `server_url`
 selects the central ModelExpress control-plane service and defaults to the

@@ -56,7 +56,6 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         self.registrations = set()
         self.shards = []
         self.deleted_shards = []
-        self.fail_delete_response_once = False
         self.target = refit_pb2.WeightVersion(
             uid="target-a",
             model_name="test/model",
@@ -91,9 +90,6 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         ):
             context.abort(grpc.StatusCode.NOT_FOUND, "shard already deleted")
         self.deleted_shards.append(request)
-        if self.fail_delete_response_once:
-            self.fail_delete_response_once = False
-            context.abort(grpc.StatusCode.UNAVAILABLE, "delete response lost")
         return refit_pb2.DeleteWeightVersionShardResponse(deleted=True)
 
 
@@ -311,7 +307,10 @@ def test_s3_stage_is_local_then_publish_advertises_one_canonical_root(
     assert shard.source_slot_id == "canonical.delta.root"
     assert shard.WhichOneof("transport") == "s3"
     assert shard.s3.bucket == "weights"
-    assert shard.s3.key.endswith("/model.safetensors.index.json")
+    assert (
+        shard.s3.key
+        == "tests/test%2Fmodel/weights_vtarget-a/model.safetensors.index.json"
+    )
     index = json.loads(storage.objects[("weights", shard.s3.key)])
     assert index["metadata"] == {
         "base_version": "base-a",
@@ -325,6 +324,10 @@ def test_s3_stage_is_local_then_publish_advertises_one_canonical_root(
     assert removed_digests.isdisjoint(index)
     shard_key = next(
         key for bucket, key in storage.objects if key.endswith(".safetensors")
+    )
+    assert (
+        shard_key
+        == "tests/test%2Fmodel/weights_vtarget-a/model-00000-of-00001.safetensors"
     )
     blob = storage.objects[("weights", shard_key)]
     (header_size,) = struct.unpack("<Q", blob[:8])
@@ -579,7 +582,7 @@ def test_s3_clean_update_still_publishes_root_index(
     assert metrics["publish_server_time"] >= 0
 
 
-def test_s3_chains_from_published_base_and_releases_previous(
+def test_s3_chains_from_published_base_and_keeps_previous_advertisement(
     monkeypatch, tmp_path, refit_server
 ):
     service, server_url = refit_server
@@ -593,6 +596,7 @@ def test_s3_chains_from_published_base_and_releases_previous(
         first.publish()
         assert first._staged.encoded_deltas == {}
         assert first._staged.checksums == {}
+        assert first._staged.candidate_snapshot == {}
 
         service.target = refit_pb2.WeightVersion(
             uid="target-b",
@@ -609,7 +613,9 @@ def test_s3_chains_from_published_base_and_releases_previous(
         second.publish()
         assert second._staged.encoded_deltas == {}
         assert second._staged.checksums == {}
+        assert second._staged.candidate_snapshot == {}
         trainer.release_version(version=WeightVersionRef("target-a"))
+        assert trainer._published_shards == {}
     finally:
         trainer.close()
 
@@ -625,10 +631,10 @@ def test_s3_chains_from_published_base_and_releases_previous(
         torch.tensor([2.0, 4.0]).view(torch.uint8),
     )
     assert decoded == expected.numpy().tobytes()
-    assert service.deleted_shards[0].version_id == "target-a"
+    assert service.deleted_shards == []
 
 
-def test_s3_release_retry_accepts_not_found_after_lost_delete_response(
+def test_s3_release_keeps_canonical_advertisement(
     monkeypatch, tmp_path, refit_server
 ):
     service, server_url = refit_server
@@ -652,19 +658,13 @@ def test_s3_release_retry_accepts_not_found_after_lost_delete_response(
             hf_tensor_iter=iter([[("weight", torch.tensor([2.0, 4.0]))]]),
         ).publish()
 
-        service.fail_delete_response_once = True
-        with pytest.raises(grpc.RpcError) as raised:
-            trainer.release_version(version=WeightVersionRef("target-a"))
-        assert raised.value.code() == grpc.StatusCode.UNAVAILABLE
-        assert raised.value.details() == "delete response lost"
-        assert "target-a" in trainer._published_shards
-
         trainer.release_version(version=WeightVersionRef("target-a"))
-        assert "target-a" not in trainer._published_shards
+        assert trainer._published_shards == {}
     finally:
         trainer.close()
 
-    assert len(service.deleted_shards) == 1
+    assert [shard.version_id for shard in service.shards] == ["target-a", "target-b"]
+    assert service.deleted_shards == []
 
 
 def test_s3_propagates_tensor_processing_error(monkeypatch, tmp_path, refit_server):

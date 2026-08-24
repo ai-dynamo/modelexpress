@@ -138,7 +138,7 @@ def _artifact(
         sort_keys=True,
         separators=(",", ":"),
     ).encode()
-    prefix = f"models/test/revisions/{version}/canonical"
+    prefix = f"test/weights_v{version}"
     return {
         f"{prefix}/model.safetensors.index.json": root,
         f"{prefix}/model-00000-of-00001.safetensors": shard,
@@ -154,7 +154,7 @@ def _inputs(
     key=None,
 ):
     if key is None:
-        key = f"models/test/revisions/{version}/canonical/model.safetensors.index.json"
+        key = f"test/weights_v{version}/model.safetensors.index.json"
     return GeneratorTransferInputs(
         version_id=version,
         base_version_id=base_version,
@@ -200,7 +200,7 @@ def test_canonical_s3_prepares_then_installs_one_global_index(monkeypatch, tmp_p
     target = target_tensor.view(torch.uint8).numpy()
     objects = _artifact(base, target)
     root = objects[
-        "models/test/revisions/target-a/canonical/model.safetensors.index.json"
+        "test/weights_vtarget-a/model.safetensors.index.json"
     ]
     adapter, storage = _build(monkeypatch, tmp_path, objects)
 
@@ -211,8 +211,8 @@ def test_canonical_s3_prepares_then_installs_one_global_index(monkeypatch, tmp_p
         load_file(staged.path / "model.safetensors")["weight"], target_tensor
     )
     assert storage.calls == [
-        "models/test/revisions/target-a/canonical/model.safetensors.index.json",
-        "models/test/revisions/target-a/canonical/model-00000-of-00001.safetensors",
+        "test/weights_vtarget-a/model.safetensors.index.json",
+        "test/weights_vtarget-a/model-00000-of-00001.safetensors",
     ]
     assert staged.metrics["perf/mx_receive_delta_download"] >= 0
     assert adapter.apply_weight(staged)["perf/mx_receive_install_time"] >= 0
@@ -222,7 +222,7 @@ def test_canonical_s3_prepares_then_installs_one_global_index(monkeypatch, tmp_p
 
 
 def test_canonical_s3_accepts_an_empty_delta(monkeypatch, tmp_path):
-    key = "models/test/revisions/target-a/canonical/model.safetensors.index.json"
+    key = "test/weights_vtarget-a/model.safetensors.index.json"
     root = json.dumps(
         {
             "metadata": {
@@ -252,7 +252,7 @@ def test_canonical_s3_uses_weight_map_without_index_validation(monkeypatch, tmp_
     base = torch.tensor([1.0, 2.0]).view(torch.uint8).numpy()
     target_tensor = torch.tensor([3.0, 4.0])
     objects = _artifact(base, target_tensor.view(torch.uint8).numpy())
-    key = "models/test/revisions/target-a/canonical/model.safetensors.index.json"
+    key = "test/weights_vtarget-a/model.safetensors.index.json"
     root = json.dumps(
         {"weight_map": {"weight": "model-00000-of-00001.safetensors"}}
     ).encode()
@@ -390,7 +390,7 @@ def test_manifest_mismatch_fails_before_checkpoint_mutation(monkeypatch, tmp_pat
     target = torch.tensor([3.0, 4.0]).view(torch.uint8).numpy()
     objects = _artifact(base, target)
     root = objects[
-        "models/test/revisions/target-a/canonical/model.safetensors.index.json"
+        "test/weights_vtarget-a/model.safetensors.index.json"
     ]
     adapter, _ = _build(monkeypatch, tmp_path, objects)
 
@@ -406,7 +406,7 @@ def test_reconstructed_checksum_failure_propagates(monkeypatch, tmp_path):
     target = torch.tensor([3.0, 4.0]).view(torch.uint8).numpy()
     objects = _artifact(base, target, checksum="00000000")
     root = objects[
-        "models/test/revisions/target-a/canonical/model.safetensors.index.json"
+        "test/weights_vtarget-a/model.safetensors.index.json"
     ]
     adapter, _ = _build(monkeypatch, tmp_path, objects)
     with pytest.raises(RuntimeError, match="target checksum differs"):
@@ -428,7 +428,7 @@ def test_wrong_base_fails_before_s3_download(monkeypatch, tmp_path):
     target = torch.tensor([3.0, 4.0]).view(torch.uint8).numpy()
     objects = _artifact(base, target)
     root = objects[
-        "models/test/revisions/target-a/canonical/model.safetensors.index.json"
+        "test/weights_vtarget-a/model.safetensors.index.json"
     ]
     adapter, storage = _build(monkeypatch, tmp_path, objects)
 
@@ -445,9 +445,9 @@ def test_child_download_failure_is_retryable(
     base = torch.tensor([1.0, 2.0]).view(torch.uint8).numpy()
     target = torch.tensor([3.0, 4.0]).view(torch.uint8).numpy()
     objects = _artifact(base, target)
-    root_key = "models/test/revisions/target-a/canonical/model.safetensors.index.json"
+    root_key = "test/weights_vtarget-a/model.safetensors.index.json"
     shard_key = (
-        "models/test/revisions/target-a/canonical/model-00000-of-00001.safetensors"
+        "test/weights_vtarget-a/model-00000-of-00001.safetensors"
     )
     adapter, storage = _build(monkeypatch, tmp_path, objects)
     storage.fail_key_once = shard_key
@@ -464,9 +464,9 @@ def test_corrupt_zstd_fails_before_checkpoint_mutation(monkeypatch, tmp_path):
     base = torch.tensor([1.0, 2.0]).view(torch.uint8).numpy()
     target = torch.tensor([3.0, 4.0]).view(torch.uint8).numpy()
     objects = _artifact(base, target)
-    root_key = "models/test/revisions/target-a/canonical/model.safetensors.index.json"
+    root_key = "test/weights_vtarget-a/model.safetensors.index.json"
     shard_key = (
-        "models/test/revisions/target-a/canonical/model-00000-of-00001.safetensors"
+        "test/weights_vtarget-a/model-00000-of-00001.safetensors"
     )
     shard = bytearray(objects[shard_key])
     header_size = int.from_bytes(shard[:8], "little")
@@ -486,9 +486,9 @@ def test_cached_target_requires_the_same_canonical_root(monkeypatch, tmp_path):
     base = torch.tensor([1.0, 2.0]).view(torch.uint8).numpy()
     target = torch.tensor([3.0, 4.0]).view(torch.uint8).numpy()
     objects = _artifact(base, target)
-    root_key = "models/test/revisions/target-a/canonical/model.safetensors.index.json"
+    root_key = "test/weights_vtarget-a/model.safetensors.index.json"
     alternate_key = (
-        "models/test/revisions/target-a/alternate/model.safetensors.index.json"
+        "test/alternate/weights_vtarget-a/model.safetensors.index.json"
     )
     objects[alternate_key] = objects[root_key]
     adapter, _ = _build(monkeypatch, tmp_path, objects)
@@ -517,14 +517,14 @@ def test_installed_target_becomes_the_next_exact_base(monkeypatch, tmp_path):
     )
     adapter, _ = _build(monkeypatch, tmp_path, objects)
     first_root = objects[
-        "models/test/revisions/target-a/canonical/model.safetensors.index.json"
+        "test/weights_vtarget-a/model.safetensors.index.json"
     ]
     staged = adapter.stage_weight(_inputs(first_root))
     adapter.apply_weight(staged)
     adapter.release_staged_weight(staged)
 
     second_root = objects[
-        "models/test/revisions/target-b/canonical/model.safetensors.index.json"
+        "test/weights_vtarget-b/model.safetensors.index.json"
     ]
     staged = adapter.stage_weight(
         _inputs(

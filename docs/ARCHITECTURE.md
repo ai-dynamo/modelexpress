@@ -386,6 +386,12 @@ During framework initialization, the same bucket stream seeds only that rank's
 owned launch-checkpoint tensors through direct, concurrent
 `prepare_delta_base()` bucket reads. The first real delta stage uses the
 prepared snapshot without checkpoint I/O.
+Canonical S3 artifacts live under
+`{prefix}/{encoded_model_name}/weights_v{encoded_version_id}/`, with the
+index and delta shards stored as siblings.
+Canonical S3 versions and their root advertisements are retained for rollout
+fault recovery. Trainer processes keep only the current base snapshot; older
+immutable S3 objects are governed by external bucket lifecycle policy.
 
 #### RL refit client architecture
 

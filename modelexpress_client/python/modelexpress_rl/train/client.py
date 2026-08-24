@@ -143,8 +143,8 @@ class _S3Root:
 
 def _s3_key(prefix: str, model_name: str, version_id: str, filename: str) -> str:
     path = (
-        f"models/{quote(model_name, safe='')}/revisions/"
-        f"{quote(version_id, safe='')}/canonical/{filename}"
+        f"{quote(model_name, safe='')}/"
+        f"weights_v{quote(version_id, safe='')}/{filename}"
     )
     return "/".join(part for part in (prefix.strip("/"), path) if part)
 
@@ -628,10 +628,6 @@ class ModelExpressTrainerClient:
             total_bytes=sum(size for _rank, _mapping, size in contributions),
         )
 
-    def _release_delta(self, staged: _StagedDelta) -> None:
-        if self._current_base_version_id == staged.target_version_id:
-            raise RuntimeError("cannot release the current canonical base version")
-
     def stage_shard(
         self,
         *,
@@ -732,11 +728,11 @@ class ModelExpressTrainerClient:
                 advertise()
                 staged.advertise_time = perf_counter() - started
             self._snapshot = staged.candidate_snapshot
+            staged.candidate_snapshot = {}
             self._current_base_version_id = staged.target_version_id
             self._metric_delta = staged
             staged.encoded_deltas.clear()
             staged.checksums.clear()
-            self._published_shards.setdefault(version.version_id, []).append(staged)
             return
 
         source_slot_id = self._get_adapter().source_slot_id
@@ -771,43 +767,21 @@ class ModelExpressTrainerClient:
         self._published_shards.setdefault(version.version_id, []).append(staged)
 
     def release_version(self, *, version: WeightVersionRef) -> None:
-        """Withdraw this worker's shard after the version is retired.
+        """Withdraw one NIXL shard after retirement; retain canonical S3.
 
-        The framework must call this only after the control plane has moved the
-        version to ``RELEASING``. Once the shard is deleted, ModelExpress no
-        longer advertises this worker's buffers as a transfer source and an
-        in-place trainer may resume mutating them.
+        For NIXL, the framework must call this only after the control plane has
+        moved the version to ``RELEASING``. Once the shard is deleted,
+        ModelExpress no longer advertises this worker's buffers as a transfer
+        source and an in-place trainer may resume mutating them.
         """
         if self._closed:
             raise RuntimeError("trainer client is closed")
         if not isinstance(version, WeightVersionRef):
             raise TypeError("version must be a WeightVersionRef")
+        if self._s3 is not None:
+            return
         staged = self._published_shards.get(version.version_id)
         if staged is None:
-            return
-        if self._s3 is not None:
-            if len(staged) != 1 or not isinstance(staged[0], _StagedDelta):
-                raise RuntimeError("invalid retained canonical S3 shard")
-            canonical = staged[0]
-            self._release_delta(canonical)
-
-            def delete() -> None:
-                try:
-                    self._service.DeleteWeightVersionShard(
-                        refit_pb2.DeleteWeightVersionShardRequest(
-                            version_id=version.version_id,
-                            source_slot_id=CANONICAL_DELTA_SOURCE_SLOT,
-                            worker_id=self.worker_id,
-                        ),
-                        timeout=self._rpc_timeout_seconds,
-                    )
-                except grpc.RpcError as error:
-                    if error.code() != grpc.StatusCode.NOT_FOUND:
-                        raise
-
-            if self._rank == 0:
-                delete()
-            del self._published_shards[version.version_id]
             return
         self._service.DeleteWeightVersionShard(
             refit_pb2.DeleteWeightVersionShardRequest(
