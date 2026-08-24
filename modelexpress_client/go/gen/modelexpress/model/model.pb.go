@@ -82,6 +82,7 @@ const (
 	ModelProvider_NGC          ModelProvider = 1
 	ModelProvider_GCS          ModelProvider = 2
 	ModelProvider_S3           ModelProvider = 3
+	ModelProvider_OCI          ModelProvider = 4
 )
 
 // Enum value maps for ModelProvider.
@@ -91,12 +92,14 @@ var (
 		1: "NGC",
 		2: "GCS",
 		3: "S3",
+		4: "OCI",
 	}
 	ModelProvider_value = map[string]int32{
 		"HUGGING_FACE": 0,
 		"NGC":          1,
 		"GCS":          2,
 		"S3":           3,
+		"OCI":          4,
 	}
 )
 
@@ -810,12 +813,13 @@ const file_model_proto_rawDesc = "" +
 	"\vDOWNLOADING\x10\x00\x12\x0e\n" +
 	"\n" +
 	"DOWNLOADED\x10\x01\x12\t\n" +
-	"\x05ERROR\x10\x02*;\n" +
+	"\x05ERROR\x10\x02*D\n" +
 	"\rModelProvider\x12\x10\n" +
 	"\fHUGGING_FACE\x10\x00\x12\a\n" +
 	"\x03NGC\x10\x01\x12\a\n" +
 	"\x03GCS\x10\x02\x12\x06\n" +
-	"\x02S3\x10\x032\x9a\x03\n" +
+	"\x02S3\x10\x03\x12\a\n" +
+	"\x03OCI\x10\x042\x9a\x03\n" +
 	"\fModelService\x12l\n" +
 	"\x15EnsureModelDownloaded\x12).model_express.model.ModelDownloadRequest\x1a&.model_express.model.ModelStatusUpdate0\x01\x12\\\n" +
 	"\x10StreamModelFiles\x12&.model_express.model.ModelFilesRequest\x1a\x1e.model_express.model.FileChunk0\x01\x12\\\n" +
