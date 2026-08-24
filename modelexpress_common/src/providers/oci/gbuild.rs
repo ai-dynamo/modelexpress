@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::path::ArtifactPath;
-use anyhow::Result;
+use super::{layer_download::TITLE_ANNOTATION, path::ArtifactPath};
+use anyhow::{Context, Result};
 use oci_client::manifest::{OciDescriptor, OciImageManifest};
 use serde::Deserialize;
+use std::{collections::HashSet, path::Path};
 
 pub const ARTIFACT_MEDIA_TYPE: &str = "application/vnd.groq.gbuild.full-compile.v1";
 pub const TRANSPORT_INDEX_MEDIA_TYPE: &str =
@@ -35,10 +36,277 @@ pub struct GbuildPayloadLayer {
 
 impl GbuildArtifact {
     pub fn from_manifest_and_transport_index(
-        _manifest: &OciImageManifest,
-        _transport_index: &[u8],
+        manifest: &OciImageManifest,
+        transport_index: &[u8],
     ) -> Result<Self> {
-        todo!("validate the GBuild OCI transport contract")
+        Self::validate_outer_manifest(manifest)?;
+        let transport: TransportIndex = serde_json::from_slice(transport_index)
+            .context("Failed to parse the GBuild OCI transport index")?;
+        if transport.version != 1 {
+            anyhow::bail!(
+                "GBuild OCI transport-index version {} is not supported",
+                transport.version
+            );
+        }
+
+        let TransportMetadata {
+            manifest_json,
+            manifest_capnp,
+            preset,
+        } = transport.metadata;
+        let metadata = [
+            Self::metadata_layer(
+                &manifest.layers[0],
+                manifest_json,
+                "manifest.json",
+                MANIFEST_JSON_MEDIA_TYPE,
+            )?,
+            Self::metadata_layer(
+                &manifest.layers[1],
+                manifest_capnp,
+                "manifest.capnp.bin",
+                MANIFEST_CAPNP_MEDIA_TYPE,
+            )?,
+            Self::preset_layer(&manifest.layers[2], preset)?,
+        ];
+
+        if transport.partitions.is_empty() {
+            anyhow::bail!("GBuild OCI transport index must contain at least one partition");
+        }
+        let partition_ids: Vec<u32> = transport
+            .partitions
+            .iter()
+            .map(|partition| partition.partition_id)
+            .collect();
+        if partition_ids.windows(2).any(|ids| ids[0] >= ids[1]) {
+            anyhow::bail!(
+                "GBuild OCI transport-index partitions must have unique IDs in canonical order"
+            );
+        }
+
+        let payload_count = usize::from(transport.tokenizer.is_some())
+            .checked_add(transport.partitions.len())
+            .and_then(|count| count.checked_add(usize::from(transport.runtime_assets.is_some())))
+            .context("GBuild OCI payload count overflowed")?;
+        let expected_layer_count = payload_count
+            .checked_add(3)
+            .context("GBuild OCI layer count overflowed")?;
+        if manifest.layers.len() != expected_layer_count {
+            anyhow::bail!(
+                "GBuild OCI outer manifest has {} layers but the transport index describes {}",
+                manifest.layers.len(),
+                expected_layer_count
+            );
+        }
+
+        let mut owned_paths = HashSet::from([
+            metadata[0].path.as_str().to_string(),
+            metadata[1].path.as_str().to_string(),
+            metadata[2].path.as_str().to_string(),
+        ]);
+        let mut payloads = Vec::with_capacity(payload_count);
+        let mut outer_payloads = manifest.layers.iter().skip(3);
+
+        if let Some(tokenizer) = transport.tokenizer {
+            payloads.push(Self::payload_layer(
+                outer_payloads
+                    .next()
+                    .context("GBuild OCI tokenizer layer is missing")?,
+                tokenizer.descriptor,
+                tokenizer.members,
+                &mut owned_paths,
+            )?);
+        }
+
+        for partition in transport.partitions {
+            payloads.push(Self::payload_layer(
+                outer_payloads
+                    .next()
+                    .context("GBuild OCI partition layer is missing")?,
+                partition.descriptor,
+                partition.members,
+                &mut owned_paths,
+            )?);
+        }
+
+        if let Some(runtime_assets) = transport.runtime_assets {
+            payloads.push(Self::payload_layer(
+                outer_payloads
+                    .next()
+                    .context("GBuild OCI runtime-assets layer is missing")?,
+                runtime_assets.descriptor,
+                runtime_assets.members,
+                &mut owned_paths,
+            )?);
+        }
+
+        Ok(Self { metadata, payloads })
+    }
+
+    fn validate_outer_manifest(manifest: &OciImageManifest) -> Result<()> {
+        if manifest.schema_version != 2
+            || manifest.media_type.as_deref() != Some("application/vnd.oci.image.manifest.v1+json")
+            || !is_gbuild_artifact(manifest)
+        {
+            anyhow::bail!("OCI manifest does not use the GBuild full-compile artifact contract");
+        }
+        if manifest.subject.is_some() || manifest.annotations.is_some() {
+            anyhow::bail!("GBuild OCI outer manifest must not contain subject or annotations");
+        }
+        if manifest.config.media_type != TRANSPORT_INDEX_MEDIA_TYPE {
+            anyhow::bail!("GBuild OCI config must use media type '{TRANSPORT_INDEX_MEDIA_TYPE}'");
+        }
+        Self::validate_outer_descriptor(&manifest.config, "GBuild OCI config")?;
+        if manifest.config.annotations.is_some() {
+            anyhow::bail!("GBuild OCI config descriptor must not contain annotations");
+        }
+        if manifest.layers.len() < 4 {
+            anyhow::bail!("GBuild OCI outer manifest must contain metadata and payload layers");
+        }
+        Ok(())
+    }
+
+    fn metadata_layer(
+        outer: &OciDescriptor,
+        transport: TransportMetadataFile,
+        expected_path: &str,
+        expected_media_type: &str,
+    ) -> Result<GbuildMetadataLayer> {
+        if transport.path != expected_path || transport.descriptor.media_type != expected_media_type
+        {
+            anyhow::bail!(
+                "GBuild OCI metadata must use path '{expected_path}' and media type '{expected_media_type}'"
+            );
+        }
+        Self::validate_transport_descriptor(&transport.descriptor, "metadata descriptor")?;
+        Self::require_matching_descriptor(outer, &transport.descriptor, "metadata descriptor")?;
+        let expected_annotations = std::collections::BTreeMap::from([(
+            TITLE_ANNOTATION.to_string(),
+            expected_path.into(),
+        )]);
+        if outer.annotations.as_ref() != Some(&expected_annotations) {
+            anyhow::bail!(
+                "GBuild OCI metadata descriptor for '{expected_path}' must contain only the title annotation"
+            );
+        }
+        let path = ArtifactPath::from_relative_path(
+            Path::new(&transport.path),
+            &format!("GBuild OCI metadata path '{}'", transport.path),
+        )?;
+        Ok(GbuildMetadataLayer {
+            descriptor: outer.clone(),
+            path,
+        })
+    }
+
+    fn preset_layer(
+        outer: &OciDescriptor,
+        transport: TransportMetadataFile,
+    ) -> Result<GbuildMetadataLayer> {
+        let path = transport.path.clone();
+        if path.contains('/')
+            || !path.ends_with("-original.json")
+            || path == "-original.json"
+            || transport.descriptor.media_type != PRESET_MEDIA_TYPE
+        {
+            anyhow::bail!("GBuild OCI preset must be a top-level *-original.json metadata layer");
+        }
+        Self::metadata_layer(outer, transport, &path, PRESET_MEDIA_TYPE)
+    }
+
+    fn payload_layer(
+        outer: &OciDescriptor,
+        transport: TransportPayloadDescriptor,
+        member_names: Vec<String>,
+        owned_paths: &mut HashSet<String>,
+    ) -> Result<GbuildPayloadLayer> {
+        if transport.media_type != PAYLOAD_MEDIA_TYPE || transport.uncompressed_size_bytes == 0 {
+            anyhow::bail!(
+                "GBuild OCI payload descriptor must use '{PAYLOAD_MEDIA_TYPE}' and positive sizes"
+            );
+        }
+        Self::validate_transport_descriptor(&transport.as_descriptor(), "payload descriptor")?;
+        Self::require_matching_descriptor(outer, &transport.as_descriptor(), "payload descriptor")?;
+        if outer.annotations.is_some() {
+            anyhow::bail!("GBuild OCI payload descriptors must not contain annotations");
+        }
+        if member_names.is_empty()
+            || member_names
+                .windows(2)
+                .any(|members| members[0] >= members[1])
+        {
+            anyhow::bail!(
+                "GBuild OCI transport-index members must be non-empty, unique, and in canonical order"
+            );
+        }
+
+        let mut members = Vec::with_capacity(member_names.len());
+        for member in member_names {
+            let path = ArtifactPath::from_relative_path(
+                Path::new(&member),
+                &format!("GBuild OCI transport-index member '{member}'"),
+            )?;
+            if !owned_paths.insert(member) {
+                anyhow::bail!(
+                    "GBuild OCI transport-index members cannot overlap metadata or another payload"
+                );
+            }
+            members.push(path);
+        }
+
+        Ok(GbuildPayloadLayer {
+            descriptor: outer.clone(),
+            members,
+            uncompressed_size_bytes: transport.uncompressed_size_bytes,
+        })
+    }
+
+    fn validate_transport_descriptor(
+        descriptor: &TransportDescriptor,
+        description: &str,
+    ) -> Result<()> {
+        if descriptor.size_bytes == 0 || !Self::is_sha256_digest(&descriptor.digest) {
+            anyhow::bail!("GBuild OCI {description} must have a positive size and SHA-256 digest");
+        }
+        Ok(())
+    }
+
+    fn validate_outer_descriptor(descriptor: &OciDescriptor, description: &str) -> Result<()> {
+        if descriptor.size <= 0
+            || !Self::is_sha256_digest(&descriptor.digest)
+            || descriptor.urls.is_some()
+        {
+            anyhow::bail!(
+                "{description} descriptor must have a positive size, SHA-256 digest, and no alternate URLs"
+            );
+        }
+        Ok(())
+    }
+
+    fn require_matching_descriptor(
+        outer: &OciDescriptor,
+        transport: &TransportDescriptor,
+        description: &str,
+    ) -> Result<()> {
+        Self::validate_outer_descriptor(outer, description)?;
+        let outer_size = u64::try_from(outer.size).context("OCI descriptor size is negative")?;
+        if outer.media_type != transport.media_type
+            || outer.digest != transport.digest
+            || outer_size != transport.size_bytes
+        {
+            anyhow::bail!("GBuild OCI {description} does not match the outer manifest");
+        }
+        Ok(())
+    }
+
+    fn is_sha256_digest(digest: &str) -> bool {
+        let Some(hash) = digest.strip_prefix("sha256:") else {
+            return false;
+        };
+        hash.len() == 64
+            && hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     }
 }
 
@@ -101,6 +369,16 @@ struct TransportPayloadDescriptor {
     digest: String,
     size_bytes: u64,
     uncompressed_size_bytes: u64,
+}
+
+impl TransportPayloadDescriptor {
+    fn as_descriptor(&self) -> TransportDescriptor {
+        TransportDescriptor {
+            media_type: self.media_type.clone(),
+            digest: self.digest.clone(),
+            size_bytes: self.size_bytes,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -206,7 +484,6 @@ mod tests {
 
     #[test]
     fn test_gbuild_artifact_maps_transport_index_to_outer_layers() {
-        // TODO: implement
         let artifact = parse_contract(&transport_index(), &manifest()).expect("valid contract");
 
         assert_eq!(artifact.metadata[0].path.as_str(), "manifest.json");
@@ -222,7 +499,6 @@ mod tests {
 
     #[test]
     fn test_gbuild_artifact_rejects_descriptor_drift() {
-        // TODO: implement
         let mut index = transport_index();
         index["partitions"][0]["descriptor"]["digest"] = json!(DIGEST_A);
 
@@ -232,12 +508,15 @@ mod tests {
 
     #[test]
     fn test_gbuild_artifact_rejects_noncanonical_members_and_ownership() {
-        // TODO: implement
         let mut index = transport_index();
         index["partitions"][0]["members"] =
             json!(["program.0.weight", "program.0.gas", "tokenizer/config.json"]);
 
         let error = parse_contract(&index, &manifest()).expect_err("member drift must fail");
         assert!(error.to_string().contains("members"));
+
+        index["partitions"][0]["members"] = json!(["tokenizer/config.json"]);
+        let error = parse_contract(&index, &manifest()).expect_err("member overlap must fail");
+        assert!(error.to_string().contains("overlap"));
     }
 }
