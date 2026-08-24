@@ -33,6 +33,7 @@ def _create_vllm_adapter(
         vllm_config=vllm_config,
         model_config=model_config,
         worker_id=worker_id,
+        convert_native_to_hf=engine_context.convert_native_to_hf,
     )
 
 

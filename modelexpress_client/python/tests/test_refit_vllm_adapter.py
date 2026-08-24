@@ -119,6 +119,7 @@ def test_vllm_adapter_composes_transfer_and_installer_lifecycles(
                 "vllm_config": "vllm-config",
                 "model_config": "model-config",
                 "device": torch.device("cuda:2"),
+                "convert_native_to_hf": None,
             },
         ),
         (

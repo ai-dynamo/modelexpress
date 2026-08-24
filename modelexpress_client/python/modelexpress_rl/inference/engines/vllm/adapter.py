@@ -23,8 +23,11 @@ from modelexpress_rl.train import WeightPayloadFormat
 from .installer import _VllmInstaller
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from torch.nn import Module
     from vllm.config import ModelConfig, VllmConfig
+
 
 class VllmGeneratorAdapter(GeneratorEngineAdapter):
     """Compose exact-version NIXL staging with graph-safe vLLM installation."""
@@ -36,6 +39,7 @@ class VllmGeneratorAdapter(GeneratorEngineAdapter):
         vllm_config: VllmConfig,
         model_config: ModelConfig,
         worker_id: str,
+        convert_native_to_hf: Callable[[dict], dict] | None = None,
     ) -> None:
         engine = VllmAdapter(vllm_config, model_config)
         device_id = engine.get_device_id()
@@ -45,6 +49,7 @@ class VllmGeneratorAdapter(GeneratorEngineAdapter):
             vllm_config=vllm_config,
             model_config=model_config,
             device=device,
+            convert_native_to_hf=convert_native_to_hf,
         )
         self._transfer = _NixlStagedTransfer(
             agent_name=f"mx-refit-{worker_id}",

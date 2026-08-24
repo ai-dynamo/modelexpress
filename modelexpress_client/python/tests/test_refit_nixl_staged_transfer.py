@@ -122,7 +122,9 @@ def test_load_agent_metadata_validates_embedded_agent_identity():
         _load_agent_metadata(_Manager(), {"agent-b": b"metadata"})
 
 
-def test_transformed_source_is_fully_reconstructed_for_verification():
+def test_transformed_source_is_fully_reconstructed_for_verification(monkeypatch):
+    # Full reconstruction + verification is the digest mode; default is minimal reads.
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
     source = SourceInfo(
         global_shape=(4, 4),
         dtype=torch.float32,
