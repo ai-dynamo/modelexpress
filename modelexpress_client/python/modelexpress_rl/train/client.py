@@ -237,7 +237,6 @@ class ModelExpressTrainerClient:
         self._current_base_version_id: str | None = None
         self._snapshot: dict[str, np.ndarray] = {}
         self._metric_delta: _StagedDelta | None = None
-        self._metrics: dict[str, float] = {}
         self._bound_tensors: Any | None = None
         self._closed = False
 
@@ -845,44 +844,20 @@ class ModelExpressTrainerClient:
             self._s3 = None
         self._closed = True
 
-    def collect_metrics(self) -> None:
-        """Collect the latest S3 publication metrics across trainer ranks."""
+    def pop_metrics(self) -> dict[str, int | float]:
+        """Return and clear rank-local trainer publication metrics."""
         staged = self._metric_delta
         if self._s3 is None or staged is None:
-            return
-        counts = torch.tensor(
-            [staged.changed_bytes, staged.total_bytes, staged.wire_bytes],
-            dtype=torch.int64,
-        )
-        dist.all_reduce(counts, group=self._process_group)
-        timings = torch.tensor(
-            [
-                staged.stage_delta_time,
-                staged.publish_s3_time,
-                staged.advertise_time,
-            ],
-            dtype=torch.float64,
-        )
-        dist.all_reduce(
-            timings,
-            op=dist.ReduceOp.MAX,
-            group=self._process_group,
-        )
-        changed_bytes, total_bytes, wire_bytes = counts.tolist()
-        stage_delta_time, publish_s3_time, advertise_time = timings.tolist()
-        self._metrics = {
-            "perf/update_weights_density": changed_bytes / max(total_bytes, 1),
-            "perf/update_weights_wire_bytes": wire_bytes,
-            "perf/mx_stage_delta_time": stage_delta_time,
-            "perf/mx_publish_s3_time": publish_s3_time,
-            "perf/mx_publish_server": advertise_time,
-        }
+            return {}
         self._metric_delta = None
-
-    def pop_metrics(self) -> dict[str, float]:
-        """Return and clear trainer publication metrics."""
-        metrics, self._metrics = self._metrics, {}
-        return metrics
+        return {
+            "changed_bytes": staged.changed_bytes,
+            "total_bytes": staged.total_bytes,
+            "wire_bytes": staged.wire_bytes,
+            "stage_delta_time": staged.stage_delta_time,
+            "publish_s3_time": staged.publish_s3_time,
+            "publish_server_time": staged.advertise_time,
+        }
 
     def __enter__(self) -> ModelExpressTrainerClient:
         return self

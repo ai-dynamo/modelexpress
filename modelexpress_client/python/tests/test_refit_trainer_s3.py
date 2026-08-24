@@ -491,7 +491,7 @@ def test_s3_preserves_framework_bucket_boundaries(monkeypatch, tmp_path, refit_s
     assert processed[1] is buckets[1]
 
 
-def test_s3_collects_byte_metrics_after_publication(
+def test_s3_exposes_local_metrics_after_publication(
     monkeypatch, tmp_path, refit_server
 ):
     _service, server_url = refit_server
@@ -535,39 +535,13 @@ def test_s3_collects_byte_metrics_after_publication(
         )
         assert staged._staged.wire_bytes == len(shard)
 
-        reductions = []
-        process_group = object()
-        trainer._process_group = process_group
-
-        def all_reduce(value, op=None, group=None):
-            reductions.append((value.tolist(), op, group))
-
-        monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
-        trainer.collect_metrics()
-        trainer.collect_metrics()
-        assert reductions == [
-            (
-                [
-                    int(torch.count_nonzero(expected_delta)),
-                    expected_delta.numel(),
-                    len(shard),
-                ],
-                None,
-                process_group,
-            ),
-            (
-                [2.0, 3.0, 4.0],
-                torch.distributed.ReduceOp.MAX,
-                process_group,
-            ),
-        ]
         assert trainer.pop_metrics() == {
-            "perf/update_weights_density": int(torch.count_nonzero(expected_delta))
-            / expected_delta.numel(),
-            "perf/update_weights_wire_bytes": len(shard),
-            "perf/mx_stage_delta_time": 2.0,
-            "perf/mx_publish_s3_time": 3.0,
-            "perf/mx_publish_server": 4.0,
+            "changed_bytes": int(torch.count_nonzero(expected_delta)),
+            "total_bytes": expected_delta.numel(),
+            "wire_bytes": len(shard),
+            "stage_delta_time": 2.0,
+            "publish_s3_time": 3.0,
+            "publish_server_time": 4.0,
         }
         assert trainer.pop_metrics() == {}
     finally:
@@ -589,7 +563,6 @@ def test_s3_clean_update_still_publishes_root_index(
         assert staged._staged.checksums == {}
         assert staged._staged.wire_bytes == 0
         staged.publish()
-        trainer.collect_metrics()
         metrics = trainer.pop_metrics()
     finally:
         trainer.close()
@@ -598,11 +571,12 @@ def test_s3_clean_update_still_publishes_root_index(
     shard = service.shards[0]
     index = json.loads(storage.objects[("weights", shard.s3.key)])
     assert index["weight_map"] == {}
-    assert metrics["perf/update_weights_density"] == 0.0
-    assert metrics["perf/update_weights_wire_bytes"] == 0
-    assert metrics["perf/mx_stage_delta_time"] >= 0
-    assert metrics["perf/mx_publish_s3_time"] >= 0
-    assert metrics["perf/mx_publish_server"] >= 0
+    assert metrics["changed_bytes"] == 0
+    assert metrics["total_bytes"] > 0
+    assert metrics["wire_bytes"] == 0
+    assert metrics["stage_delta_time"] >= 0
+    assert metrics["publish_s3_time"] >= 0
+    assert metrics["publish_server_time"] >= 0
 
 
 def test_s3_chains_from_published_base_and_releases_previous(
