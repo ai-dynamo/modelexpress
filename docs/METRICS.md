@@ -326,9 +326,12 @@ mean parsing prose into a label and the domain would grow with the wording.
 | `complete` | every locally registered tensor was filled |
 | `partial` | a source/local name mismatch; the transfer completed and reported success, but the local-only tensors still hold their dummy values |
 | `empty` | no tensors matched; returned success having moved nothing |
+| `rejected` | strict mode refused the transfer and raised, rather than completing it |
 
-Both non-`complete` outcomes return success to the caller and are logged only as
+`partial` and `empty` both return success to the caller and are logged only as
 warnings, so before this they were indistinguishable from a healthy transfer.
+`rejected` raises instead, and is counted so the family partitions every receive
+rather than only the ones that returned.
 A non-zero `partial` rate across a fleet means manifest drift between source and
 target, which shows up later as wrong model output rather than as a failure.
 

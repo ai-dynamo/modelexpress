@@ -62,7 +62,10 @@ NIXL_ERROR_KINDS = ("timeout", "status_error")
 
 # What a receive actually moved. `partial` is the dangerous one: the transfer
 # reports success while some locally registered tensors keep their dummy values.
-NIXL_RECEIVE_RESULTS = ("complete", "partial", "empty")
+# `rejected` is the strict-mode refusal, which raises rather than returning; it is
+# counted so the family is a complete partition of receives rather than of
+# successful ones.
+NIXL_RECEIVE_RESULTS = ("complete", "partial", "empty", "rejected")
 
 
 def _enabled() -> bool:
@@ -505,11 +508,13 @@ class MetricsCollector:
                 pass
 
     def record_nixl_receive(self, result: str) -> None:
-        """Record what a receive moved: ``complete``, ``partial`` or ``empty``.
+        """Record the outcome of one receive.
 
-        Both non-complete outcomes return success to the caller, so without this
-        a transfer that moved nothing and a transfer that moved everything are
-        the same observation.
+        ``complete``, ``partial`` and ``empty`` all return success to the caller,
+        so without this a transfer that moved nothing and one that moved
+        everything are the same observation. ``rejected`` is the strict-mode
+        refusal, which raises instead of returning; counting it makes the family
+        a partition of *every* receive rather than only the ones that returned.
         """
         if self._ensure():
             try:

@@ -843,12 +843,14 @@ class NixlTransferManager:
                 continue
             local_size = local_tensor.numel() * local_tensor.element_size()
             if local_size != src_tensor.size:
+                transfer_metrics.record_nixl_receive("rejected")
                 raise ManifestMismatchError(
                     f"Tensor '{src_tensor.name}' size mismatch: "
                     f"source={src_tensor.size} bytes, local={local_size} bytes"
                 )
             local_dtype = str(local_tensor.dtype)
             if local_dtype != src_tensor.dtype:
+                transfer_metrics.record_nixl_receive("rejected")
                 raise ManifestMismatchError(
                     f"Tensor '{src_tensor.name}' dtype mismatch: "
                     f"source={src_tensor.dtype!r}, local={local_dtype!r}"
@@ -883,6 +885,7 @@ class NixlTransferManager:
                 # hidden or derived tensors, so completing the transfer would
                 # leave the local-only tensors at dummy values while reporting
                 # RDMA success. Fail closed instead.
+                transfer_metrics.record_nixl_receive("rejected")
                 raise ManifestMismatchError(
                     "Tensor name mismatch on heterogeneous transfer: "
                     f"{len(local_only)} local-only "
@@ -905,6 +908,7 @@ class NixlTransferManager:
 
         if not remote_descs:
             if require_exact_match:
+                transfer_metrics.record_nixl_receive("rejected")
                 raise ManifestMismatchError(
                     "No matching tensors found for heterogeneous transfer"
                 )

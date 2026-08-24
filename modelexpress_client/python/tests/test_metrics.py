@@ -851,8 +851,9 @@ def test_nixl_labels_are_closed_enums(monkeypatch):
 
     kinds = _label_values(m.nixl_errors, "kind")
     assert kinds == {"timeout", "status_error"}, kinds
+    m.record_nixl_receive("rejected")
     results = _label_values(m.nixl_receives, "result")
-    assert results == {"complete", "partial", "empty"}, results
+    assert results == {"complete", "partial", "empty", "rejected"}, results
 
 
 def _label_values(collector, label):
