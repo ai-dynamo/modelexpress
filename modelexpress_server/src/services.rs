@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::metrics::grpc::RpcOutcome;
 use crate::registry::backend::ClaimOutcome;
 use crate::registry::entry_key::EntryKey;
 use crate::registry::state::RegistryManager;
@@ -183,6 +184,17 @@ impl HealthService for HealthServiceImpl {
 #[derive(Debug, Default)]
 pub struct ApiServiceImpl;
 
+/// Return `body` with the handler's own verdict attached.
+///
+/// See [`crate::metrics::grpc`]. Mirrors the helper in `p2p/service.rs`; kept
+/// local to each module so a handler's outcome is stated next to the handler.
+#[allow(clippy::result_large_err)] // Returns the handlers' own tonic::Status result type.
+fn tagged<T>(body: T, outcome: RpcOutcome) -> Result<Response<T>, Status> {
+    let mut response = Response::new(body);
+    response.extensions_mut().insert(outcome);
+    Ok(response)
+}
+
 #[tonic::async_trait]
 impl ApiService for ApiServiceImpl {
     async fn send_request(
@@ -199,18 +211,27 @@ impl ApiService for ApiServiceImpl {
             let data_bytes = serde_json::to_vec(&response_data)
                 .map_err(|e| Status::internal(format!("Serialization error: {e}")))?;
 
-            Ok(Response::new(ApiResponse {
-                success: true,
-                data: Some(data_bytes),
-                error: None,
-            }))
+            tagged(
+                ApiResponse {
+                    success: true,
+                    data: Some(data_bytes),
+                    error: None,
+                },
+                RpcOutcome::Ok,
+            )
         } else {
             error!("Unknown action: {}", api_request.action);
-            Ok(Response::new(ApiResponse {
-                success: false,
-                data: None,
-                error: Some(format!("Unknown action: {}", api_request.action)),
-            }))
+            // In band, like the P2P handlers: `Ok` on the wire with
+            // `success: false` in the body, so the outcome has to be stated
+            // rather than inferred from the status code.
+            tagged(
+                ApiResponse {
+                    success: false,
+                    data: None,
+                    error: Some(format!("Unknown action: {}", api_request.action)),
+                },
+                RpcOutcome::InvalidArgument,
+            )
         }
     }
 }
@@ -660,16 +681,41 @@ impl ModelService for ModelServiceImpl {
         // for metadata-only downloads). `model clear` means "forget this model", so drop
         // all of them rather than only the unpinned full-weight entry.
         let tracker = self.tracker.clone();
-        let removed = tracker.delete_model_entries(&model_name).await;
+        let outcome = tracker.delete_model_entries(&model_name).await;
+        let removed = outcome.removed;
         info!("Deleted {removed} registry record(s) for model '{model_name}'");
 
-        Ok(Response::new(DeleteModelResponse {
-            success: true,
-            message: Some(format!(
-                "Model '{model_name}' removed from registry ({removed} record(s))"
-            )),
-        }))
+        // The response stays `success: true` -- the fallback delete was still
+        // attempted and callers depend on that shape. But a registry outage and a
+        // model with no entries both return zero records here, so without the tag
+        // the RPC would be recorded as a plain success during an outage. That is
+        // the exact failure this layer exists to prevent.
+        tagged(
+            DeleteModelResponse {
+                success: true,
+                message: Some(format!(
+                    "Model '{model_name}' removed from registry ({removed} record(s))"
+                )),
+            },
+            if outcome.degraded {
+                RpcOutcome::BackendError
+            } else {
+                RpcOutcome::Ok
+            },
+        )
     }
+}
+
+/// What clearing a model's registry entries actually achieved.
+///
+/// `removed` alone cannot distinguish "this model had no entries" from "the
+/// registry was unreachable and only the fallback key was tried" -- both are
+/// zero.
+pub struct DeleteEntriesOutcome {
+    /// How many records were removed.
+    pub removed: usize,
+    /// The registry listing failed, so `removed` is a floor rather than a count.
+    pub degraded: bool,
 }
 
 /// Type alias for the complex waiting channels type
@@ -826,8 +872,13 @@ impl ModelDownloadTracker {
     }
 
     /// Deletes every registry entry belonging to `model_name`, whatever revision or
-    /// weight mode each entry covers. Returns how many records were removed.
-    pub async fn delete_model_entries(&self, model_name: &str) -> usize {
+    /// weight mode each entry covers.
+    ///
+    /// The registry-listing failure is swallowed on purpose: the fallback still
+    /// clears the common case, which is better than refusing outright. It is
+    /// reported in the return value so the caller can say so, because otherwise a
+    /// backend outage and a model with no entries are the same `0`.
+    pub async fn delete_model_entries(&self, model_name: &str) -> DeleteEntriesOutcome {
         let records = match self.registry.get_models_by_last_used(None).await {
             Ok(records) => records,
             Err(e) => {
@@ -835,7 +886,10 @@ impl ModelDownloadTracker {
                 // Fall back to the unpinned full-weight key so the common case still
                 // clears rather than failing outright.
                 self.delete_status(model_name).await;
-                return 0;
+                return DeleteEntriesOutcome {
+                    removed: 0,
+                    degraded: true,
+                };
             }
         };
 
@@ -846,7 +900,10 @@ impl ModelDownloadTracker {
                 removed = removed.saturating_add(1);
             }
         }
-        removed
+        DeleteEntriesOutcome {
+            removed,
+            degraded: false,
+        }
     }
 
     /// Spawn a background task that actually downloads the model, updating the tracker on
@@ -1129,6 +1186,26 @@ mod tests {
         assert_eq!(health_response.status, "ok");
         // uptime is u64, always >= 0, so just verify it exists
         let _uptime = health_response.uptime;
+    }
+
+    /// The unknown-action path is an in-band failure and must not read as `ok`.
+    #[tokio::test]
+    async fn unknown_action_is_tagged_invalid_argument() {
+        let service = ApiServiceImpl;
+        let response = service
+            .send_request(Request::new(ApiRequest {
+                id: "test-id".to_string(),
+                action: "not-a-real-action".to_string(),
+                payload: None,
+            }))
+            .await
+            .expect("the RPC itself succeeds");
+
+        assert_eq!(
+            response.extensions().get::<RpcOutcome>(),
+            Some(&RpcOutcome::InvalidArgument)
+        );
+        assert!(!response.into_inner().success);
     }
 
     #[tokio::test]
