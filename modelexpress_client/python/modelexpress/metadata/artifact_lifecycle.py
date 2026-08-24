@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -57,6 +58,8 @@ InstallCompleted = Callable[[P2PArtifactTransfer, p2p_pb2.SourceIdentity], None]
 _publish_leases: dict[Path, TextIO] = {}
 _MOONCAKE_INSTALL_MARKER_VERSION = 1
 _prepared_artifact_bundles: dict[tuple[int, bytes], ArtifactBundle] = {}
+_prepared_artifact_locks: dict[tuple[int, bytes], threading.Lock] = {}
+_prepared_artifact_locks_guard = threading.Lock()
 _mooncake_publish_needed: set[tuple[bytes, int, str, int, str]] = set()
 
 
@@ -523,9 +526,25 @@ def _publish_mooncake_then_p2p_artifact(
         raise RuntimeError(
             "Mooncake artifact publish failed and P2P publish is unavailable"
         )
-    if bundle is not None:
-        _prepared_artifact_bundles[_prepared_artifact_key(transfer, identity)] = bundle
-    return p2p_publish_fn(transfer, identity).endpoint.mx_source_id
+    if bundle is None:
+        return p2p_publish_fn(transfer, identity).endpoint.mx_source_id
+
+    # ``p2p_publish_fn`` synchronously calls ``publish_artifact`` in the vLLM
+    # and SGLang paths. Keep the prepared bundle available for that call without
+    # changing the callback contract. Serialize overlapping publication of the
+    # same transfer and identity so no callback can consume or remove another
+    # call's bundle.
+    prepared_key = _prepared_artifact_key(transfer, identity)
+    with _prepared_artifact_lock(prepared_key):
+        _prepared_artifact_bundles[prepared_key] = bundle
+        try:
+            return p2p_publish_fn(transfer, identity).endpoint.mx_source_id
+        finally:
+            # ``publish_artifact`` normally consumes this entry. Preserve a
+            # later publisher's entry if a future callback writes one before
+            # this call's cleanup.
+            if _prepared_artifact_bundles.get(prepared_key) is bundle:
+                _prepared_artifact_bundles.pop(prepared_key, None)
 
 
 def _mark_mooncake_publish_needed(
@@ -555,6 +574,12 @@ def _prepared_artifact_key(
     identity: p2p_pb2.SourceIdentity,
 ) -> tuple[int, bytes]:
     return id(transfer), _identity_bytes(identity)
+
+
+def _prepared_artifact_lock(key: tuple[int, bytes]) -> threading.Lock:
+    """Return the process-local lock for one temporary prepared bundle."""
+    with _prepared_artifact_locks_guard:
+        return _prepared_artifact_locks.setdefault(key, threading.Lock())
 
 
 def _identity_bytes(identity: p2p_pb2.SourceIdentity) -> bytes:
