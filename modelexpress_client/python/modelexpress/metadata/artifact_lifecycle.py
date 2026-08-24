@@ -488,15 +488,19 @@ def _publish_marker_owner(marker_path: Path) -> tuple[int, str | None] | None:
     """Return the PID and Linux process start time stored in a publish marker."""
     try:
         marker = json.loads(marker_path.read_text())
-        if marker.get("version") != _PUBLISH_MARKER_VERSION:
-            return None
+        version = marker.get("version")
         pid = marker.get("pid")
         starttime = marker.get("starttime")
+        worker_rank = marker.get("worker_rank")
         if (
-            type(pid) is not int
+            type(version) is not int
+            or version != _PUBLISH_MARKER_VERSION
+            or type(pid) is not int
             or pid <= 0
             or "starttime" not in marker
             or (starttime is not None and not isinstance(starttime, str))
+            or type(worker_rank) is not int
+            or worker_rank < 0
         ):
             return None
         return pid, starttime

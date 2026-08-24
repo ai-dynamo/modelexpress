@@ -136,6 +136,8 @@ def test_publish_marker_reclaims_legacy_rank_only_marker(monkeypatch, tmp_path):
     assert al.mark_publish_scheduled(SimpleNamespace(global_rank=1), transfer, identity) == marker_path
     assert json.loads(marker_path.read_text())["pid"] == 4242
     assert json.loads(marker_path.read_text())["starttime"] == "100"
+
+
 def test_publish_marker_reclaims_a_boolean_pid(monkeypatch, tmp_path):
     monkeypatch.setattr(al.tempfile, "gettempdir", lambda: str(tmp_path))
     monkeypatch.setattr(al.os, "getpid", lambda: 4242)
@@ -150,3 +152,32 @@ def test_publish_marker_reclaims_a_boolean_pid(monkeypatch, tmp_path):
 
     assert al.mark_publish_scheduled(SimpleNamespace(global_rank=1), transfer, identity) == marker_path
     assert json.loads(marker_path.read_text())["pid"] == 4242
+
+
+def test_publish_marker_reclaims_invalid_version_or_worker_rank(monkeypatch, tmp_path):
+    monkeypatch.setattr(al.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(al.os, "getpid", lambda: 4242)
+    monkeypatch.setattr(al, "_process_starttime", lambda pid: "100")
+    transfer = _transfer(tmp_path)
+    identity = _identity()
+    marker_path = al.artifact_marker_path(transfer, identity, "publish-scheduled")
+    marker_path.parent.mkdir(parents=True)
+
+    for invalid_marker in (
+        {"version": True, "pid": 1234, "starttime": "100", "worker_rank": 0},
+        {"version": 1, "pid": 1234, "starttime": "100"},
+        {"version": 1, "pid": 1234, "starttime": "100", "worker_rank": True},
+        {"version": 1, "pid": 1234, "starttime": "100", "worker_rank": -1},
+    ):
+        marker_path.write_text(json.dumps(invalid_marker))
+
+        assert (
+            al.mark_publish_scheduled(SimpleNamespace(global_rank=1), transfer, identity)
+            == marker_path
+        )
+        assert json.loads(marker_path.read_text()) == {
+            "pid": 4242,
+            "starttime": "100",
+            "version": 1,
+            "worker_rank": 1,
+        }
