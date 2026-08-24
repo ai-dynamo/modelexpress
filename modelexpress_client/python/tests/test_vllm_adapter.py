@@ -163,7 +163,7 @@ def test_build_vllm_load_context_uses_node_rank_as_node_rank(monkeypatch):
     assert ctx.node_rank == 1
 
 
-def test_before_rdma_receive_runs_model_specific_finalizers(monkeypatch):
+def test_before_rdma_receive_runs_layout_finalizers(monkeypatch):
     events = []
 
     def process_weights_after_loading(model, model_config, target_device):
@@ -182,11 +182,27 @@ def test_before_rdma_receive_runs_model_specific_finalizers(monkeypatch):
     ]
 
 
-def test_finalize_model_specific_weights_requires_model():
+def test_after_rdma_receive_runs_derived_weight_finalizers(monkeypatch):
+    events = []
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    model = _TopLevelModel(events)
+
+    result = adapter.after_rdma_receive(LoadResult(value=model, model=model))
+
+    assert result.model is model
+    assert events == [
+        ("finalize", "model", "finalize_mhc_broadcast_weights"),
+    ]
+
+
+def test_finalize_model_specific_weights_requires_explicit_names_and_model():
     adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
 
-    with pytest.raises(RuntimeError, match="RDMA post-load processing"):
+    with pytest.raises(TypeError, match="finalizer_names"):
         adapter._finalize_model_specific_weights(LoadResult(value=object()))
+
+    with pytest.raises(RuntimeError, match="RDMA post-load processing"):
+        adapter._finalize_model_specific_weights(LoadResult(value=object()), ())
 
 
 def test_after_weight_iter_load_does_not_rerun_model_specific_finalizers(monkeypatch):
@@ -273,6 +289,11 @@ class _MegaMoeModel(torch.nn.Module):
 
     def finalize_mega_moe_weights(self) -> None:
         self.events.append(("finalize", "model", "finalize_mega_moe_weights"))
+
+    def finalize_mhc_broadcast_weights(self) -> None:
+        self.events.append(
+            ("finalize", "model", "finalize_mhc_broadcast_weights")
+        )
 
 
 class _MegaMoeLayer(torch.nn.Module):
