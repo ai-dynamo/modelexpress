@@ -60,6 +60,8 @@ _RECORDERS = [
     ("observe_candidates", ("random", "listed", 2)),
     ("observe_selection_seconds", ("random", 0.001)),
     ("observe_transfer_seconds", ("random", "success", 1.0)),
+    ("record_nixl_error", ("timeout",)),
+    ("record_nixl_receive", ("complete",)),
 ]
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -145,6 +147,8 @@ def test_recorders_never_raise_into_load_path(monkeypatch):
     m.candidates = boom
     m.selection_seconds = boom
     m.transfer_seconds = boom
+    m.nixl_errors = boom
+    m.nixl_receives = boom
     # None of these may propagate the RuntimeError.
     for name, args in _RECORDERS:
         getattr(m, name)(*args)
@@ -825,3 +829,37 @@ def test_merged_endpoint_serves_every_rank_including_hard_killed(tmp_path, ranks
         f"mx_build_info merged to {build_info[0].rsplit(' ', 1)[1]} across {ranks} "
         f"ranks; a summing multiprocess_mode has been introduced"
     )
+
+
+def test_nixl_labels_are_closed_enums(monkeypatch):
+    """An unrecognized value must clamp rather than mint a new series.
+
+    The underlying `_data_plane_error` is formatted free text, so an
+    unclassified value reaching the label would grow the domain with the wording
+    of the message.
+    """
+    monkeypatch.setenv(ENV_ENABLED, "1")
+    m = MetricsCollector()
+    m._ensure()
+
+    m.record_nixl_error("timeout")
+    m.record_nixl_error("status_error")
+    m.record_nixl_error("QP 3 wedged on device mlx5_2")
+    m.record_nixl_receive("complete")
+    m.record_nixl_receive("partial")
+    m.record_nixl_receive("something new")
+
+    kinds = _label_values(m.nixl_errors, "kind")
+    assert kinds == {"timeout", "status_error"}, kinds
+    results = _label_values(m.nixl_receives, "result")
+    assert results == {"complete", "partial", "empty"}, results
+
+
+def _label_values(collector, label):
+    """Distinct values seen for one label of a collector."""
+    values = set()
+    for metric in collector.collect():
+        for sample in metric.samples:
+            if label in sample.labels:
+                values.add(sample.labels[label])
+    return values

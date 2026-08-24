@@ -303,6 +303,34 @@ touched.
 | `mx_p2p_candidates` | Histogram | `policy`, `scheme`, `stage` |
 | `mx_p2p_source_selection_seconds` | Histogram | `policy`, `scheme` |
 | `mx_p2p_transfer_seconds` | Histogram | `policy`, `scheme`, `outcome` |
+| `mx_nixl_data_plane_errors_total` | Counter | `scheme`, `kind` |
+| `mx_nixl_receive_total` | Counter | `scheme`, `result` |
+
+### NIXL data-plane health
+
+`mx_nixl_data_plane_errors_total{kind}` counts the failures that demote an agent
+from READY, classified as `timeout` or `status_error`. The distinction matters
+because they fail differently: a `status_error` is NIXL reporting a failed
+transfer, while a `timeout` is NIXL reporting *nothing at all* -- a wedged queue
+pair neither completes nor transitions to ERR, so the timeout is the only
+evidence anything went wrong.
+
+The kind is assigned where the failure is constructed, not derived later. The
+underlying field is a formatted message, so classifying at the consumer would
+mean parsing prose into a label and the domain would grow with the wording.
+
+`mx_nixl_receive_total{result}` records what a receive actually moved:
+
+| result | meaning |
+| --- | --- |
+| `complete` | every locally registered tensor was filled |
+| `partial` | a source/local name mismatch; the transfer completed and reported success, but the local-only tensors still hold their dummy values |
+| `empty` | no tensors matched; returned success having moved nothing |
+
+Both non-`complete` outcomes return success to the caller and are logged only as
+warnings, so before this they were indistinguishable from a healthy transfer.
+A non-zero `partial` rate across a fleet means manifest drift between source and
+target, which shows up later as wrong model output rather than as a failure.
 
 Two changes to the client families are breaking for existing dashboards:
 
