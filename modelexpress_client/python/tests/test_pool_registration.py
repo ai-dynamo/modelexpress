@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, call
 import pytest
 import torch
 
+from modelexpress import nixl_transfer
 from modelexpress.accelerators import NIXL_ACCELERATOR_MEM_TYPE
 from modelexpress.nixl_transfer import (
     _arena_single_mr_forced,
@@ -643,3 +644,218 @@ class TestMultiAllocationArena:
 
         assert "1019 physical allocations" in caplog.text
         assert "MX_ARENA_SINGLE_MR=1" in caplog.text
+
+
+class _MetricsSpy:
+    """Captures the label each ``record_nixl_*`` call site passes.
+
+    Stands in for the module-level ``transfer_metrics`` singleton. Any other
+    metric the transfer path records is irrelevant here and is swallowed.
+    """
+
+    def __init__(self) -> None:
+        self.receives: list[str] = []
+        self.errors: list[str] = []
+
+    def record_nixl_receive(self, result: str) -> None:
+        self.receives.append(result)
+
+    def record_nixl_error(self, kind: str) -> None:
+        self.errors.append(kind)
+
+    def __getattr__(self, _name):
+        return lambda *args, **kwargs: None
+
+
+class TestReceiveOutcomeLabelsAtTheCallSite:
+    """Pins which label each ``record_nixl_*`` call site in the receive path picks.
+
+    ``test_metrics.py`` proves the recorder counts once and clamps unknown values
+    *given* a label, but nothing there constrains the callers. Without these
+    tests every call site in ``nixl_transfer`` could pass the wrong constant --
+    an ``empty`` receive booked as ``complete``, a wedged QP booked as
+    ``status_error`` -- and the suite would stay green while the dashboards lied.
+    Each assertion is on the whole recorded list, not on membership, so a double
+    count fails too: ``partial`` in particular is set at one site and recorded at
+    another, and the gap between them is exactly where a second count would hide.
+    """
+
+    def _manager(self, monkeypatch, local_tensors):
+        # CPU host: the accelerator backend delegates both of these to torch.cuda.
+        monkeypatch.setattr(torch.cuda, "set_device", lambda *a, **k: None)
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+        mgr = NixlTransferManager(agent_name="test", device_id=0)
+        mgr._agent = MagicMock()
+        mgr._tensors = local_tensors
+        return mgr
+
+    def _spy(self, monkeypatch) -> _MetricsSpy:
+        spy = _MetricsSpy()
+        monkeypatch.setattr(nixl_transfer, "transfer_metrics", spy)
+        return spy
+
+    def _arm(self, mgr, state: str) -> None:
+        """Drive the RDMA calls to a chosen terminal ``check_xfer_state``."""
+        mgr._agent.prep_xfer_dlist.side_effect = ["src", "dst"]
+        mgr._agent.make_prepped_xfer.return_value = "handle"
+        mgr._agent.check_xfer_state.return_value = state
+
+    @staticmethod
+    def _matching(name: str, tensor: torch.Tensor) -> TensorDescriptor:
+        return TensorDescriptor(
+            name=name,
+            addr=0x1000,
+            size=tensor.numel() * tensor.element_size(),
+            device_id=0,
+            dtype=str(tensor.dtype),
+        )
+
+    def test_a_clean_transfer_counts_one_complete(self, monkeypatch):
+        local = torch.zeros(4, dtype=torch.float32)
+        spy = self._spy(monkeypatch)
+        mgr = self._manager(monkeypatch, {"w": local})
+        self._arm(mgr, "DONE")
+
+        mgr.receive_from_source(
+            source_metadata=b"",
+            source_tensors=[self._matching("w", local)],
+            remote_agent_name="source",
+        )
+
+        assert spy.receives == ["complete"]
+        assert spy.errors == []
+
+    def test_a_name_diff_counts_one_partial_and_not_a_complete(self, monkeypatch):
+        # A local-only tensor keeps its dummy values while the transfer still
+        # returns success, which is the whole reason `partial` exists.
+        local = torch.zeros(4, dtype=torch.float32)
+        spy = self._spy(monkeypatch)
+        mgr = self._manager(monkeypatch, {"w": local, "unmatched": local})
+        self._arm(mgr, "DONE")
+
+        mgr.receive_from_source(
+            source_metadata=b"",
+            source_tensors=[self._matching("w", local)],
+            remote_agent_name="source",
+        )
+
+        assert spy.receives == ["partial"]
+        assert spy.errors == []
+
+    def test_a_zero_match_transfer_counts_one_empty(self, monkeypatch):
+        # Returns (0, 0, 0.0) -- success to the caller, nothing moved on the wire.
+        local = torch.zeros(4, dtype=torch.float32)
+        spy = self._spy(monkeypatch)
+        mgr = self._manager(monkeypatch, {"x": local})
+
+        assert mgr.receive_from_source(
+            source_metadata=b"",
+            source_tensors=[self._matching("w", local)],
+            remote_agent_name="source",
+        ) == (0, 0, 0.0)
+
+        assert spy.receives == ["empty"]
+        assert spy.errors == []
+
+    def test_every_refusal_counts_one_rejected(self, monkeypatch):
+        """All four ``ManifestMismatchError`` sites book the same refusal label.
+
+        A refusal raises instead of returning, so without these the family would
+        only partition the receives that succeeded.
+        """
+        local = torch.zeros(10, dtype=torch.float32)
+        size = local.numel() * local.element_size()
+        refusals = {
+            "size mismatch": (
+                {"w": local},
+                [TensorDescriptor("w", 0x1000, size * 2, 0, str(local.dtype))],
+                False,
+            ),
+            "dtype mismatch": (
+                {"w": local},
+                [TensorDescriptor("w", 0x1000, size, 0, "torch.bfloat16")],
+                False,
+            ),
+            "Tensor name mismatch": (
+                {"w": local, "local_only": local},
+                [TensorDescriptor("w", 0x1000, size, 0, str(local.dtype))],
+                True,
+            ),
+            # Both sides empty: the only way past the name-diff check above,
+            # which otherwise fires first on any zero-match manifest.
+            "No matching tensors": ({}, [], True),
+        }
+
+        for match, (tensors, source, strict) in refusals.items():
+            spy = self._spy(monkeypatch)
+            mgr = self._manager(monkeypatch, tensors)
+            with pytest.raises(ManifestMismatchError, match=match):
+                mgr.receive_from_source(
+                    source_metadata=b"",
+                    source_tensors=source,
+                    remote_agent_name="source",
+                    require_exact_match=strict,
+                )
+            assert spy.receives == ["rejected"], f"{match} was not booked rejected"
+            assert spy.errors == []
+
+    def test_a_wedged_transfer_counts_a_timeout_and_no_receive(self, monkeypatch):
+        # A wedged QP yields neither a completion nor an ERR status, so the
+        # timeout is the only evidence. It must not be folded into status_error.
+        local = torch.zeros(4, dtype=torch.float32)
+        spy = self._spy(monkeypatch)
+        mgr = self._manager(monkeypatch, {"w": local})
+        self._arm(mgr, "PENDING")
+
+        with pytest.raises(TimeoutError):
+            mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=[self._matching("w", local)],
+                remote_agent_name="source",
+                timeout_seconds=0.0,
+            )
+
+        assert spy.errors == ["timeout"]
+        assert spy.receives == []
+
+    def test_an_err_status_counts_a_status_error_and_no_receive(self, monkeypatch):
+        local = torch.zeros(4, dtype=torch.float32)
+        spy = self._spy(monkeypatch)
+        mgr = self._manager(monkeypatch, {"w": local})
+        self._arm(mgr, "ERR")
+
+        with pytest.raises(RuntimeError, match="failed with status ERR"):
+            mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=[self._matching("w", local)],
+                remote_agent_name="source",
+            )
+
+        assert spy.errors == ["status_error"]
+        assert spy.receives == []
+
+    # The batched reshard path (`await_read_batches` -> `_wait_for_xfers`) has its
+    # own copy of the two failure classifications. Driving the wait directly keeps
+    # this to the classification under test rather than a fabricated batch handle.
+
+    def test_a_wedged_batch_counts_a_timeout(self, monkeypatch):
+        spy = self._spy(monkeypatch)
+        mgr = self._manager(monkeypatch, {})
+        mgr._agent.check_xfer_state.return_value = "PENDING"
+
+        with pytest.raises(TimeoutError):
+            mgr._wait_for_xfers(["h1", "h2"], 0.0, "NIXL reshard READ batch")
+
+        assert spy.errors == ["timeout"]
+        assert spy.receives == []
+
+    def test_an_err_status_in_a_batch_counts_a_status_error(self, monkeypatch):
+        spy = self._spy(monkeypatch)
+        mgr = self._manager(monkeypatch, {})
+        mgr._agent.check_xfer_state.return_value = "ERR"
+
+        with pytest.raises(RuntimeError, match="failed with status ERR"):
+            mgr._wait_for_xfers(["h1", "h2"], None, "NIXL reshard READ batch")
+
+        assert spy.errors == ["status_error"]
+        assert spy.receives == []

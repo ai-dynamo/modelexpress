@@ -5,6 +5,7 @@
 
 use crate::backend_config::BackendConfig;
 use crate::metrics::backend::{BackendMetrics, Store};
+use crate::metrics::registry::RegistryMetrics;
 use crate::registry::backend::instrumented::InstrumentedRegistryBackend;
 use crate::registry::backend::{
     ClaimOutcome, ModelRecord, RegistryBackend, RegistryResult, create_registry_backend,
@@ -19,6 +20,7 @@ pub struct RegistryManager {
     backend: Arc<RwLock<Option<Arc<dyn RegistryBackend>>>>,
     config: Option<BackendConfig>,
     metrics: Option<BackendMetrics>,
+    lifecycle: Option<RegistryMetrics>,
 }
 
 impl RegistryManager {
@@ -27,6 +29,7 @@ impl RegistryManager {
             backend: Arc::new(RwLock::new(None)),
             config: Some(config),
             metrics: None,
+            lifecycle: None,
         }
     }
 
@@ -34,8 +37,9 @@ impl RegistryManager {
     /// [`crate::p2p::state::P2pStateManager::with_metrics`] for why this is
     /// opt-in rather than a `with_config` parameter.
     #[must_use]
-    pub fn with_metrics(mut self, metrics: BackendMetrics) -> Self {
+    pub fn with_metrics(mut self, metrics: BackendMetrics, lifecycle: RegistryMetrics) -> Self {
         self.metrics = Some(metrics);
+        self.lifecycle = Some(lifecycle);
         self
     }
 
@@ -44,7 +48,8 @@ impl RegistryManager {
         &self,
         config: BackendConfig,
     ) -> RegistryResult<Arc<dyn RegistryBackend>> {
-        let Some(metrics) = self.metrics.clone() else {
+        let (Some(metrics), Some(lifecycle)) = (self.metrics.clone(), self.lifecycle.clone())
+        else {
             return create_registry_backend(config).await;
         };
         // Timed around the factory for the same reason as
@@ -53,7 +58,9 @@ impl RegistryManager {
         let backend = metrics
             .time(Store::Registry, "connect", create_registry_backend(config))
             .await?;
-        Ok(InstrumentedRegistryBackend::wrap(backend, metrics))
+        Ok(InstrumentedRegistryBackend::wrap(
+            backend, metrics, lifecycle,
+        ))
     }
 
     /// Inject a pre-built backend directly (tests only).
@@ -63,6 +70,7 @@ impl RegistryManager {
             backend: Arc::new(RwLock::new(Some(backend))),
             config: None,
             metrics: None,
+            lifecycle: None,
         }
     }
 
@@ -228,6 +236,7 @@ mod tests {
             backend: Arc::new(RwLock::new(None)),
             config: None,
             metrics: None,
+            lifecycle: None,
         };
         assert!(mgr.connect().await.is_err());
     }

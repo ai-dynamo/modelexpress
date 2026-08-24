@@ -176,6 +176,9 @@ pub async fn run_server(
     metrics::register_build_info(&mut metrics_registry, &backend);
     let grpc_metrics = metrics::grpc::GrpcMetrics::register(&mut metrics_registry);
     let backend_metrics = metrics::backend::BackendMetrics::register(&mut metrics_registry);
+    let registry_metrics = metrics::registry::RegistryMetrics::register(&mut metrics_registry);
+    let download_metrics = metrics::registry::DownloadMetrics::register(&mut metrics_registry);
+    let cache_metrics = metrics::cache::CacheMetrics::register(&mut metrics_registry);
     let metrics_registry = Arc::new(metrics_registry);
 
     let metrics_listener = MetricsListener::spawn(metrics_addr, Arc::clone(&metrics_registry));
@@ -186,7 +189,8 @@ pub async fn run_server(
     // Initialize the model registry manager (Redis or Kubernetes CRDs). Shares the
     // injected backend with the P2P state manager below.
     let registry = Arc::new(
-        RegistryManager::with_config(backend.clone()).with_metrics(backend_metrics.clone()),
+        RegistryManager::with_config(backend.clone())
+            .with_metrics(backend_metrics.clone(), registry_metrics.clone()),
     );
     match tokio::time::timeout(std::time::Duration::from_secs(10), registry.connect()).await {
         Ok(Ok(backend_name)) => info!("Model registry connected (backend: {backend_name})"),
@@ -201,13 +205,18 @@ pub async fn run_server(
     }
 
     // Initialize the download tracker, injected with the registry.
-    let tracker = Arc::new(ModelDownloadTracker::new(registry.clone()));
+    let tracker = Arc::new(ModelDownloadTracker::new(
+        registry.clone(),
+        download_metrics,
+        registry_metrics.clone(),
+    ));
 
     // Create cache eviction service
     let cache_service = CacheEvictionService::new(
         registry.clone(),
         config.cache.eviction.clone(),
         config.cache.directory.clone(),
+        cache_metrics.clone(),
     );
 
     // Create shutdown channels
@@ -229,6 +238,7 @@ pub async fn run_server(
     // Create service implementations
     let health_service = HealthServiceImpl;
     let api_service = ApiServiceImpl;
+    let stats_tracker = tracker.clone();
     let model_service = ModelServiceImpl::new(tracker);
 
     // Create standard gRPC health service (grpc.health.v1.Health)
@@ -309,6 +319,23 @@ pub async fn run_server(
         crate::p2p::reaper::run_reaper(reaper_state, reaper_shutdown_rx).await;
     });
 
+    // Registry statistics refresh. Independent of the cache-eviction service on
+    // purpose: that one ticks hourly and is skipped entirely when eviction is
+    // disabled, which would leave these gauges permanently absent rather than
+    // merely stale.
+    let (stats_shutdown_tx, stats_shutdown_rx) = tokio::sync::oneshot::channel();
+    let stats_registry = registry.clone();
+    let stats_metrics = cache_metrics.clone();
+    let stats_handle = tokio::spawn(async move {
+        crate::registry::stats_refresh::run_stats_refresh(
+            stats_registry,
+            stats_metrics,
+            std::sync::Arc::new(move || stats_tracker.waiting_count()),
+            stats_shutdown_rx,
+        )
+        .await;
+    });
+
     // Fan the caller's shutdown trigger out to the background tasks, then let
     // serve_with_shutdown observe the same trigger to stop accepting connections.
     let shutdown_signal = async move {
@@ -322,6 +349,11 @@ pub async fn run_server(
         // Signal reaper to shutdown
         if reaper_shutdown_tx.send(()).is_err() {
             error!("Failed to send shutdown signal to reaper");
+        }
+
+        // Signal registry stats refresh to shutdown
+        if stats_shutdown_tx.send(()).is_err() {
+            error!("Failed to send shutdown signal to registry stats refresh");
         }
     };
 
@@ -388,6 +420,9 @@ pub async fn run_server(
         && let Err(e) = handle.await
     {
         error!("Cache eviction service join error: {e}");
+    }
+    if let Err(e) = stats_handle.await {
+        error!("Registry stats refresh join error: {e}");
     }
     if let Err(e) = reaper_handle.await {
         error!("Reaper join error: {e}");
