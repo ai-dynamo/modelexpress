@@ -78,6 +78,30 @@ The following table lists the configurable parameters of the ModelExpress chart 
 | `securityContext`                            | Container security context                     | `{}`     |
 | `service.type`                               | Service type                                   | `ClusterIP` |
 | `service.port`                               | Service port                                   | `8001`   |
+| `metrics.enabled`                            | Serve Prometheus metrics on their own port     | `true`   |
+| `metrics.port`                               | Metrics port. Single source of truth for the env var, containerPort, annotation and Service port | `9401` |
+| `metrics.podAnnotations`                     | Emit `prometheus.io/{scrape,port,path}`. Inert on Prometheus Operator clusters -- use `metrics.podMonitor` there | `true` |
+| `metrics.service`                            | Publish the metrics port on the Service too    | `false`  |
+| `metrics.podMonitor.enabled`                 | PodMonitor for the server. Requires the Prometheus Operator CRDs | `false` |
+| `metrics.podMonitor.additionalLabels`        | Labels the Prometheus `podMonitorSelector` matches. Usually `release: <your-prometheus-release>`, without which it is silently ignored | `{}` |
+| `metrics.podMonitor.interval`                | Scrape interval                                | `30s`    |
+| `metrics.podMonitor.scrapeTimeout`           | Scrape timeout                                 | `10s`    |
+| `metrics.podMonitor.relabelings`             | Passed through to the endpoint's `relabelings` | `[]`     |
+| `metrics.podMonitor.metricRelabelings`       | Passed through to the endpoint's `metricRelabelings` | `[]` |
+| `metrics.clientPodMonitor.enabled`           | PodMonitor for client metrics in your inference pods, which this chart does not deploy | `false` |
+| `metrics.clientPodMonitor.selector`          | Label selector for those pods. Required -- an empty selector matches every pod in the namespace | `{}` |
+| `metrics.clientPodMonitor.portName`          | Named port on the engine pod                   | `mx-metrics` |
+| `metrics.clientPodMonitor.namespaceSelector` | Namespaces to search. Empty means the release namespace | `{}` |
+| `metrics.clientPodMonitor.interval`          | Scrape interval                                | `30s`    |
+| `metrics.clientPodMonitor.scrapeTimeout`     | Scrape timeout                                 | `10s`    |
+| `metrics.rules.enabled`                      | Ship alerting rules as a PrometheusRule        | `false`  |
+| `metrics.rules.client`                       | Also include client alerts, which need client metrics enabled and P2P in use | `false` |
+| `metrics.rules.additionalLabels`             | Labels the Prometheus `ruleSelector` matches. Same caveat as the PodMonitor | `{}` |
+| `metrics.rules.thresholds`                   | Per-alert thresholds. See `values.yaml`        | see values |
+| `metrics.dashboard.enabled`                  | Ship the Grafana dashboard as a ConfigMap      | `false`  |
+| `metrics.dashboard.label`                    | Grafana sidecar discovery label                | `grafana_dashboard` |
+| `metrics.dashboard.labelValue`               | Value for that label                           | `"1"`    |
+| `metrics.{podMonitor,clientPodMonitor,rules}.skipApiVersionCheck` | Render the resource even when the `monitoring.coreos.com/v1` API is not detected. For CRDs applied in the same operation as this chart; otherwise enabling one without the Operator is an install-time failure rather than a silent skip | `false` |
 | `ingress.enabled`                            | Enable ingress                                 | `false`  |
 | `ingress.className`                          | Ingress class name                             | `""`     |
 | `ingress.annotations`                        | Ingress annotations                            | `{}`     |

@@ -76,6 +76,71 @@ then represented, which for TP=8 means losing seven eighths of the pod.
 
 ---
 
+## Scraping on Kubernetes
+
+Two discovery models exist and they do not overlap. Which one your cluster uses
+decides everything below.
+
+| Your Prometheus | Honours `prometheus.io/*` annotations | Honours PodMonitor |
+| --- | --- | --- |
+| `prometheus-community/prometheus` chart | yes, by default | no |
+| **kube-prometheus-stack** (the Operator) | **no** | yes |
+
+The chart defaults to annotations (`metrics.podAnnotations: true`). On an
+Operator cluster those are inert, the endpoint is served and never visited, and
+the result is indistinguishable from a crashed exporter. Set
+`metrics.podMonitor.enabled=true` there instead.
+
+```yaml
+metrics:
+  podAnnotations: false      # inert on the Operator; off avoids double-scraping
+  podMonitor:
+    enabled: true
+    additionalLabels:
+      release: kube-prometheus-stack   # see below
+```
+
+**The selector label is the trap.** kube-prometheus-stack defaults its
+`podMonitorSelector` and `ruleSelector` to match only resources labelled with
+its own Helm release name. A PodMonitor without that label installs cleanly,
+reports no error, and is silently ignored forever. If targets never appear, this
+is almost always why. Check what your Prometheus expects:
+
+```bash
+kubectl get prometheus -A -o jsonpath='{.items[*].spec.podMonitorSelector}'
+```
+
+Leave both on only if you know your Prometheus honours exactly one. Where both
+are honoured the same pod is scraped twice under different job labels, and every
+`sum()` over the result double-counts.
+
+### Client metrics need a second PodMonitor
+
+The client is a library inside the inference engine's pod -- vLLM, TRT-LLM,
+Dynamo -- which this chart does not deploy and cannot label. The server's
+PodMonitor will never match those pods. They also use a different port name
+(`mx-metrics` in the shipped example, against the server's `metrics`), so one
+resource cannot cover both.
+
+```yaml
+metrics:
+  clientPodMonitor:
+    enabled: true
+    portName: mx-metrics
+    selector:
+      matchLabels:
+        app: mx-vllm-metrics    # whatever YOUR engine pods carry
+```
+
+The selector has no default and the chart refuses to render without one: an
+empty PodMonitor selector matches every pod in the namespace rather than none.
+There is no ModelExpress-owned label to fall back on, because the pod is not
+ours -- the labels differ per manifest across `examples/`, and under a
+`DynamoGraphDeployment` the operator generates them.
+
+Pods on the `MX_METRICS_PUSHGATEWAY` path are not scraped at all and no selector
+covers them.
+
 ## Why one endpoint per pod
 
 A ModelExpress pod runs **one worker process per GPU**, and N is a customer
@@ -400,9 +465,18 @@ mx_p2p_list_sources_total
 # Version skew across the fleet.
 count by (version, component) (mx_build_info)
 
-# Pods that intended to export metrics but are not being scraped.
-up{job="modelexpress"} == 0
+# Is anything scraping the server at all?
+absent(mx_build_info{component="server"})
 ```
+
+There is deliberately no `up{job="modelexpress"}` here. Nothing in this repo
+produces that job label: annotation-based discovery files these targets under
+whatever the Prometheus config calls its pod job (conventionally
+`kubernetes-pods`), and the Operator generates
+`podMonitor/<namespace>/<name>/0`. Both are deployment-specific, so a query
+written against a guessed job name matches nothing and reads as "no problems".
+`mx_build_info` is registered unconditionally at startup for exactly this
+purpose, and carries no such dependency.
 
 `scheme` is on `mx_build_info` **and** on every client `mx_p2p_*` family, so a
 `group_left(scheme)` join against `mx_build_info` copies a value the left side
@@ -410,6 +484,68 @@ already has. Use `scheme` directly. On the server it is on `mx_build_info` only.
 Consolidating the client families onto the join is a follow-on taxonomy change.
 
 ---
+
+## Alerts
+
+`metrics.rules.enabled=true` ships a `PrometheusRule`. Client alerts are behind a
+second flag (`metrics.rules.client`) because they fire on series that only exist
+when the client is enabled *and* P2P is in use; a server-only deployment would
+otherwise carry alerts that can never fire.
+
+Alerts only, no recording rules. Recording rules would make the dashboard depend
+on this resource being installed, so a site that enabled the dashboard and not
+the rules would get empty panels and no error.
+
+| Alert | Means | First thing to check |
+| --- | --- | --- |
+| `MXServerMetricsAbsent` | Nothing is scraping the server | The selector label above, before assuming the pods are down |
+| `MXRegistryStatsStale` | The refresh task stopped succeeding | Whether the metadata backend is reachable |
+| `MXDownloadLeaseLost` | A downloader stopped heartbeating | Expect `MXDownloadTakeover` next |
+| `MXDownloadTakeover` | A model is being pulled again from scratch | Why the previous downloader died |
+| `MXDownloadWedged` | Entries stuck in `DOWNLOADING` | `MXRegistryStatsStale` first -- a frozen gauge looks identical |
+| `MXDownloadFailureRatio` | Downloads erroring | Upstream reachability, disk |
+| `MXGrpcErrorRatio` | Errors on one method | If *every* method fired, see below |
+| `MXBackendErrorRatio` | One storage subsystem erroring | `store` is the subsystem, not the engine |
+| `MXBackendOpsStuck` | Operations in flight, none completing | The store named in the label |
+| `MXStateEntriesGrowing` | A never-evicted in-process map is large | Whether the pod is heading for OOM |
+| `MXNixlSilentReceiveFailures` | Transfers returning partial or empty data | These report *success* -- see below |
+| `MXNixlDataPlaneErrors` | NIXL timeouts or status errors | RDMA fabric, `UCX_LOG_LEVEL=DEBUG` |
+| `MXP2PListSourcesErrors` | Source lookups failing on the client | Server reachability from the engine pod |
+
+Three of these are easy to misread:
+
+**`MXGrpcErrorRatio` on every method at once is probably not the store.**
+`outcome="backend_error"` absorbs every `Code::Unavailable`, including the one
+the ServiceAccount token review returns when the Kubernetes API is unreachable.
+That lights up every method simultaneously and looks like a total metadata
+outage. A real store outage also raises
+`mx_backend_ops_total{result="error"}` -- if that is flat, suspect auth.
+
+**`MXNixlSilentReceiveFailures` is the only signal for its failure mode.**
+`partial` and `empty` receives return success to the caller. A model loaded from
+a partial receive is silently wrong rather than failed, so there is nothing else
+to notice.
+
+**`MXDownloadWedged` reads a refreshed gauge.** `mx_registry_entries` is written
+by a background task, and on a failed pass it keeps its previous values. Rule out
+`MXRegistryStatsStale` before treating the level as current.
+
+### Dashboard
+
+`metrics.dashboard.enabled=true` ships `helm/dashboards/modelexpress.json` as a
+ConfigMap for the Grafana sidecar to discover. Adjust `metrics.dashboard.label`
+if your sidecar watches something other than `grafana_dashboard`.
+
+It covers the server end to end -- gRPC, storage backend, download lifecycle,
+capacity -- and the client down to total transfer time. It does **not** attribute
+transfer time across load tiers; that needs per-tier instrumentation which does
+not exist yet, so the transfer panel can say a transfer took 90 seconds but not
+where the 90 seconds went.
+
+`ModelService/EnsureModelDownloaded` is absent from every gRPC panel by design
+(see the exclusion above); download latency lives in `mx_download_seconds`
+instead. The dashboard carries a text panel saying so, because the alternative is
+a reader concluding downloads are instantaneous.
 
 ## Environment variables
 

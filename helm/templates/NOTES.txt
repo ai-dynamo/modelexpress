@@ -20,6 +20,24 @@ WARNING: MX_METADATA_BACKEND is not set in values. The server will fail to start
 set env.MX_METADATA_BACKEND to "redis" or "kubernetes" (with the matching
 connection settings) and re-run `helm upgrade`.
 {{- end }}
+{{- if and .Values.metrics (or (and .Values.metrics.podMonitor .Values.metrics.podMonitor.enabled) (and .Values.metrics.rules .Values.metrics.rules.enabled)) }}
+{{- $labelled := false }}
+{{- if and .Values.metrics.podMonitor .Values.metrics.podMonitor.additionalLabels }}{{ $labelled = true }}{{ end }}
+{{- if and .Values.metrics.rules .Values.metrics.rules.additionalLabels }}{{ $labelled = true }}{{ end }}
+{{- if not $labelled }}
+
+IMPORTANT: A PodMonitor or PrometheusRule was created with no additional labels.
+Prometheus only picks these up if its podMonitorSelector / ruleSelector matches
+them, and kube-prometheus-stack defaults both to `release: <its own release>`.
+Unmatched resources are ignored silently — no error, no targets, no alerts.
+Check what yours expects:
+
+  kubectl get prometheus -A -o jsonpath='{.items[*].spec.podMonitorSelector}'
+
+then set metrics.podMonitor.additionalLabels (and metrics.rules.additionalLabels)
+to match.
+{{- end }}
+{{- end }}
 
 1. Get the gRPC service endpoint by running these commands:
 {{- if and .Values.ingress .Values.ingress.enabled .Values.ingress.hosts }}

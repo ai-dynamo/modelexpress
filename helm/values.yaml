@@ -74,8 +74,13 @@ metrics:
   enabled: true
   port: 9401
   # Emit prometheus.io/{scrape,port,path} pod annotations pointing at the port
-  # above. Turn this off if you scrape via a PodMonitor or ServiceMonitor
-  # instead — anything in .Values.podAnnotations still wins over these.
+  # above. Anything in .Values.podAnnotations still wins over these.
+  #
+  # These are honoured by the prometheus-community/prometheus chart and ignored
+  # entirely by kube-prometheus-stack, which discovers targets only through the
+  # PodMonitor below. Turn this off when you enable metrics.podMonitor: on a
+  # cluster that honours both, the same pod is scraped twice under different job
+  # labels and every sum() over the result double-counts.
   podAnnotations: true
   # Publish the metrics port on the Service as well. Off by default: pod
   # annotations and PodMonitors both scrape pod IPs directly, and a Service
