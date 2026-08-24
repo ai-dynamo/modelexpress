@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{Utils, cache::ProviderCache, constants, providers::ModelProviderTrait};
+use crate::{
+    Utils,
+    cache::ProviderCache,
+    constants,
+    providers::{ModelProviderTrait, ensure_crypto_provider},
+};
 use anyhow::Result;
 use std::{env, path::PathBuf};
 use tracing::info;
@@ -63,6 +68,8 @@ impl ModelProviderTrait for OciProvider {
             );
             return Ok(existing);
         }
+
+        ensure_crypto_provider()?;
 
         let staging_entry = StagingCacheEntry::new(&cache_root);
         staging_entry.create().await?;
