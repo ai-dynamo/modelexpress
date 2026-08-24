@@ -84,13 +84,7 @@ impl Display for ModelProvider {
 
 impl ValueEnum for ModelProvider {
     fn value_variants<'a>() -> &'a [Self] {
-        &[
-            Self::HuggingFace,
-            Self::Ngc,
-            Self::Gcs,
-            Self::S3,
-            Self::Oci,
-        ]
+        &[Self::HuggingFace, Self::Ngc, Self::Gcs, Self::S3, Self::Oci]
     }
 
     fn to_possible_value(&self) -> Option<PossibleValue> {

@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use std::{
     collections::HashSet,
     fs,
-    io::{BufReader, Read},
+    io::{self, BufReader, Read},
     path::{Path, PathBuf},
 };
 
@@ -63,36 +63,73 @@ impl ArchiveFormat {
         let reader = BufReader::new(file);
 
         match self {
-            Self::Tar => TarExtractor::new(output_root).extract(reader),
+            Self::Tar => TarExtractor::new(output_root, ExtractionMode::Filtered).extract(reader),
             Self::TarZstd => {
                 let decoder = zstd::stream::read::Decoder::new(reader)
                     .with_context(|| format!("Failed to create zstd decoder for {blob_path:?}"))?;
-                TarExtractor::new(output_root).extract(decoder)
+                TarExtractor::new(output_root, ExtractionMode::Filtered).extract(decoder)
             }
         }
     }
 
     pub fn extract_gbuild_payload(
         self,
-        _blob_path: &Path,
-        _output_root: &Path,
-        _expected_members: &[ArtifactPath],
-        _expected_uncompressed_size_bytes: u64,
+        blob_path: &Path,
+        output_root: &Path,
+        expected_members: &[ArtifactPath],
+        expected_uncompressed_size_bytes: u64,
     ) -> Result<()> {
-        todo!("extract and validate one complete GBuild payload")
+        if self != Self::TarZstd {
+            anyhow::bail!("GBuild OCI payloads must use tar+zstd");
+        }
+        let file = fs::File::open(blob_path)
+            .with_context(|| format!("Failed to open GBuild OCI payload {blob_path:?}"))?;
+        let decoder = zstd::stream::read::Decoder::new(BufReader::new(file))
+            .with_context(|| format!("Failed to create zstd decoder for {blob_path:?}"))?;
+        let mut reader = CountingReader::new(decoder);
+        let files = TarExtractor::new(output_root, ExtractionMode::Exact).extract(&mut reader)?;
+        io::copy(&mut reader, &mut io::sink())
+            .context("Failed to finish reading GBuild payload")?;
+
+        if reader.bytes_read != expected_uncompressed_size_bytes {
+            anyhow::bail!(
+                "GBuild OCI payload expanded to {} bytes; expected {expected_uncompressed_size_bytes}",
+                reader.bytes_read
+            );
+        }
+        if files.len() != expected_members.len()
+            || files
+                .iter()
+                .zip(expected_members)
+                .any(|(actual, expected)| actual != expected.as_str())
+        {
+            let expected: Vec<&str> = expected_members.iter().map(ArtifactPath::as_str).collect();
+            anyhow::bail!(
+                "GBuild OCI payload members do not match the transport index: expected {expected:?}, found {files:?}"
+            );
+        }
+        Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtractionMode {
+    Filtered,
+    Exact,
 }
 
 struct TarExtractor<'a> {
     output_root: &'a Path,
+    mode: ExtractionMode,
     files: Vec<String>,
     seen_paths: HashSet<ArtifactPath>,
 }
 
 impl<'a> TarExtractor<'a> {
-    fn new(output_root: &'a Path) -> Self {
+    fn new(output_root: &'a Path, mode: ExtractionMode) -> Self {
         Self {
             output_root,
+            mode,
             files: Vec::new(),
             seen_paths: HashSet::new(),
         }
@@ -114,7 +151,7 @@ impl<'a> TarExtractor<'a> {
     fn extract_entry<R: Read>(&mut self, mut entry: tar::Entry<'_, R>) -> Result<()> {
         let entry_type = entry.header().entry_type();
 
-        if entry_type.is_dir() {
+        if entry_type.is_dir() && self.mode == ExtractionMode::Filtered {
             return Ok(());
         }
 
@@ -128,7 +165,7 @@ impl<'a> TarExtractor<'a> {
 
         let relative_path = Self::member_path(&entry)?;
 
-        if relative_path.is_skipped(false) {
+        if self.mode == ExtractionMode::Filtered && relative_path.is_skipped(false) {
             tracing::debug!("Skipping OCI archive file: {relative_path}");
             return Ok(());
         }
@@ -190,6 +227,31 @@ impl<'a> TarExtractor<'a> {
             .create_new(true)
             .open(output_path)
             .with_context(|| format!("Failed to create OCI archive output file {output_path:?}"))
+    }
+}
+
+struct CountingReader<R> {
+    inner: R,
+    bytes_read: u64,
+}
+
+impl<R> CountingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            bytes_read: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let bytes_read = self.inner.read(buffer)?;
+        self.bytes_read = self
+            .bytes_read
+            .checked_add(bytes_read as u64)
+            .ok_or_else(|| io::Error::other("GBuild OCI payload size overflowed"))?;
+        Ok(bytes_read)
     }
 }
 
@@ -335,7 +397,6 @@ mod tests {
 
     #[test]
     fn test_extract_gbuild_payload_requires_exact_members_and_uncompressed_size() {
-        // TODO: implement
         let dir = TempDir::new().expect("temp dir");
         let output = dir.path().join("out");
         fs::create_dir_all(&output).expect("create output");
@@ -359,5 +420,37 @@ mod tests {
             fs::read(output.join("program.0.gas")).expect("read program"),
             b"gas"
         );
+    }
+
+    #[test]
+    fn test_extract_gbuild_payload_rejects_member_and_size_drift() {
+        let dir = TempDir::new().expect("temp dir");
+        let tar = tar_bytes(&[("README.md", b"readme"), ("program.0.gas", b"gas")]);
+        let compressed = zstd::stream::encode_all(tar.as_slice(), 3).expect("compress tar");
+        let blob = write_blob(&dir, &compressed);
+        let expected_member = ArtifactPath::from_title("README.md").expect("valid member");
+
+        let member_error = ArchiveFormat::TarZstd
+            .extract_gbuild_payload(
+                &blob,
+                &dir.path().join("members"),
+                std::slice::from_ref(&expected_member),
+                tar.len() as u64,
+            )
+            .expect_err("extra member must fail");
+        assert!(member_error.to_string().contains("members"));
+
+        let size_error = ArchiveFormat::TarZstd
+            .extract_gbuild_payload(
+                &blob,
+                &dir.path().join("size"),
+                &[
+                    expected_member,
+                    ArtifactPath::from_title("program.0.gas").expect("valid member"),
+                ],
+                (tar.len() as u64).saturating_add(1),
+            )
+            .expect_err("uncompressed size drift must fail");
+        assert!(size_error.to_string().contains("expanded to"));
     }
 }
