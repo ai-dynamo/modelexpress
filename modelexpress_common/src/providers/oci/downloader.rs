@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
+    archive_format::ArchiveFormat,
     cache_entry::StagingCacheEntry,
+    gbuild::{GbuildArtifact, is_gbuild_artifact},
     layer_download::{LayerDownload, LayerDownloadKind, LayerDownloads},
     path::ArtifactPath,
     reference::OciReference,
@@ -23,7 +25,6 @@ const MANIFEST_FILE_NAME: &str = "manifest.json";
 pub struct Downloader<'a> {
     original_ref: &'a str,
     reference: &'a OciReference,
-    auth: RegistryAuth,
     client: Client,
 }
 
@@ -32,7 +33,6 @@ impl<'a> Downloader<'a> {
         Self {
             original_ref,
             reference,
-            auth: registry_auth::from_env(),
             client: Self::client_for_reference(reference),
         }
     }
@@ -47,12 +47,30 @@ impl<'a> Downloader<'a> {
             .await
             .with_context(|| format!("Failed to create OCI staging directory {staging_files:?}"))?;
 
-        let manifest = self.pull_image_manifest().await?;
+        let auth = registry_auth::resolve(self.reference.registry_endpoint()).await?;
+        let manifest = self.pull_image_manifest(&auth).await?;
         if manifest.layers.is_empty() {
             anyhow::bail!(
                 "OCI artifact '{}' contains no layer descriptors",
                 self.original_ref
             );
+        }
+
+        if is_gbuild_artifact(&manifest) {
+            if self.reference.digest().is_none() {
+                anyhow::bail!(
+                    "GBuild OCI artifact '{}' must use an immutable digest reference",
+                    self.original_ref
+                );
+            }
+            if ignore_weights {
+                anyhow::bail!(
+                    "GBuild OCI artifacts must be materialized completely; ignore_weights is not supported"
+                );
+            }
+            return self
+                .download_gbuild_artifact(staging_entry, &staging_files, &manifest)
+                .await;
         }
 
         let downloads = LayerDownloads::from_layers(&manifest.layers, ignore_weights)?;
@@ -64,13 +82,74 @@ impl<'a> Downloader<'a> {
         Ok(())
     }
 
-    async fn pull_image_manifest(&self) -> Result<OciImageManifest> {
+    async fn pull_image_manifest(&self, auth: &RegistryAuth) -> Result<OciImageManifest> {
         let (manifest, _) = self
             .client
-            .pull_manifest(self.reference.as_client_reference(), &self.auth)
+            .pull_manifest(self.reference.as_client_reference(), auth)
             .await
             .with_context(|| format!("Failed to pull OCI manifest for '{}'", self.original_ref))?;
         Self::image_manifest(manifest)
+    }
+
+    async fn download_gbuild_artifact(
+        &self,
+        staging_entry: &StagingCacheEntry,
+        staging_files: &Path,
+        manifest: &OciImageManifest,
+    ) -> Result<()> {
+        let blob_root = staging_entry.blob_root();
+        let transport_index_path = blob_root.join("transport-index.json");
+        self.pull_blob_to_file(
+            &manifest.config,
+            &transport_index_path,
+            "GBuild OCI transport index",
+        )
+        .await?;
+        let transport_index = tokio::fs::read(&transport_index_path)
+            .await
+            .with_context(|| {
+                format!("Failed to read GBuild OCI transport index {transport_index_path:?}")
+            })?;
+        tokio::fs::remove_file(&transport_index_path)
+            .await
+            .with_context(|| {
+                format!("Failed to remove GBuild OCI transport index {transport_index_path:?}")
+            })?;
+        let artifact =
+            GbuildArtifact::from_manifest_and_transport_index(manifest, &transport_index)?;
+
+        for metadata in artifact.metadata {
+            self.pull_blob_to_file(
+                &metadata.descriptor,
+                &staging_files.join(metadata.path.as_path()),
+                "GBuild OCI metadata file",
+            )
+            .await?;
+        }
+
+        for payload in artifact.payloads {
+            let blob_path = blob_root.join(payload.descriptor.digest.replace(':', "-"));
+            self.pull_blob_to_file(&payload.descriptor, &blob_path, "GBuild OCI payload blob")
+                .await?;
+            ArchiveFormat::TarZstd
+                .extract_gbuild_payload(
+                    &blob_path,
+                    staging_files,
+                    &payload.members,
+                    payload.uncompressed_size_bytes,
+                )
+                .with_context(|| {
+                    format!(
+                        "Failed to extract GBuild OCI payload {}",
+                        payload.descriptor.digest
+                    )
+                })?;
+            tokio::fs::remove_file(&blob_path).await.with_context(|| {
+                format!("Failed to remove GBuild OCI payload blob {blob_path:?}")
+            })?;
+        }
+
+        Self::remove_blob_root(&blob_root).await
     }
 
     async fn download_manifest_json(
@@ -141,15 +220,7 @@ impl<'a> Downloader<'a> {
             }
         }
 
-        if tokio::fs::try_exists(&blob_root).await.with_context(|| {
-            format!("Failed to inspect OCI temporary blob directory {blob_root:?}")
-        })? {
-            tokio::fs::remove_dir_all(&blob_root)
-                .await
-                .with_context(|| {
-                    format!("Failed to remove OCI temporary blob directory {blob_root:?}")
-                })?;
-        }
+        Self::remove_blob_root(&blob_root).await?;
 
         Ok(file_count)
     }
@@ -229,7 +300,31 @@ impl<'a> Downloader<'a> {
             .await
             .with_context(|| format!("Failed to sync {description} {output_path:?}"))?;
 
+        let actual_size = output
+            .metadata()
+            .await
+            .with_context(|| format!("Failed to inspect {description} {output_path:?}"))?
+            .len();
+        let expected_size = u64::try_from(descriptor.size)
+            .with_context(|| format!("{description} has a negative OCI descriptor size"))?;
+        if actual_size != expected_size {
+            anyhow::bail!(
+                "Downloaded {description} has {actual_size} bytes; expected {expected_size}"
+            );
+        }
+
         Ok(())
+    }
+
+    async fn remove_blob_root(blob_root: &Path) -> Result<()> {
+        if !tokio::fs::try_exists(blob_root).await.with_context(|| {
+            format!("Failed to inspect OCI temporary blob directory {blob_root:?}")
+        })? {
+            return Ok(());
+        }
+        tokio::fs::remove_dir_all(blob_root)
+            .await
+            .with_context(|| format!("Failed to remove OCI temporary blob directory {blob_root:?}"))
     }
 
     fn client_for_reference(reference: &OciReference) -> Client {
@@ -475,6 +570,172 @@ mod tests {
         assert!(path.join("model.safetensors").is_file());
         assert!(!path.join("part-0/config.json").exists());
         assert!(!path.join("README.md").exists());
+    }
+
+    #[tokio::test]
+    async fn test_mock_registry_materializes_digest_pinned_gbuild_artifact() {
+        let cache_dir = TempDir::new().expect("temp cache");
+        let server = MockServer::start().await;
+        let registry = server
+            .uri()
+            .strip_prefix("http://")
+            .expect("wiremock should use http")
+            .to_string();
+        let repo = "team/gbuild";
+        let manifest_json = br#"{"build":{"id":"gbuild"}}"#;
+        let manifest_capnp = b"capnp";
+        let preset = br#"{"model":"llama"}"#;
+        let tar = tar_bytes(&[("README.md", b"readme"), ("program.0.gas", b"gas")]);
+        let payload = zstd::stream::encode_all(tar.as_slice(), 3).expect("compress payload");
+        let manifest_json_digest = digest_bytes(manifest_json);
+        let manifest_capnp_digest = digest_bytes(manifest_capnp);
+        let preset_digest = digest_bytes(preset);
+        let payload_digest = digest_bytes(&payload);
+        let transport_index = serde_json::to_vec(&json!({
+            "version": 1,
+            "metadata": {
+                "manifest_json": {
+                    "path": "manifest.json",
+                    "descriptor": {
+                        "media_type": "application/vnd.groq.gbuild.manifest.v1+json",
+                        "digest": manifest_json_digest,
+                        "size_bytes": manifest_json.len(),
+                    },
+                },
+                "manifest_capnp": {
+                    "path": "manifest.capnp.bin",
+                    "descriptor": {
+                        "media_type": "application/vnd.groq.gbuild.manifest.v1+capnp",
+                        "digest": manifest_capnp_digest,
+                        "size_bytes": manifest_capnp.len(),
+                    },
+                },
+                "preset": {
+                    "path": "llama-original.json",
+                    "descriptor": {
+                        "media_type": "application/vnd.groq.gbuild.preset.v1+json",
+                        "digest": preset_digest,
+                        "size_bytes": preset.len(),
+                    },
+                },
+            },
+            "tokenizer": null,
+            "partitions": [{
+                "partition_id": 0,
+                "descriptor": {
+                    "media_type": "application/vnd.oci.image.layer.v1.tar+zstd",
+                    "digest": payload_digest,
+                    "size_bytes": payload.len(),
+                    "uncompressed_size_bytes": tar.len(),
+                },
+                "members": ["README.md", "program.0.gas"],
+            }],
+            "runtime_assets": null,
+        }))
+        .expect("serialize transport index");
+        let transport_index_digest = digest_bytes(&transport_index);
+        let outer_manifest = serde_json::to_vec(&json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "artifactType": "application/vnd.groq.gbuild.full-compile.v1",
+            "config": {
+                "mediaType": "application/vnd.groq.gbuild.full-compile.transport.v1+json",
+                "size": transport_index.len(),
+                "digest": transport_index_digest,
+            },
+            "layers": [
+                {
+                    "mediaType": "application/vnd.groq.gbuild.manifest.v1+json",
+                    "size": manifest_json.len(),
+                    "digest": manifest_json_digest,
+                    "annotations": { TITLE_ANNOTATION: "manifest.json" },
+                },
+                {
+                    "mediaType": "application/vnd.groq.gbuild.manifest.v1+capnp",
+                    "size": manifest_capnp.len(),
+                    "digest": manifest_capnp_digest,
+                    "annotations": { TITLE_ANNOTATION: "manifest.capnp.bin" },
+                },
+                {
+                    "mediaType": "application/vnd.groq.gbuild.preset.v1+json",
+                    "size": preset.len(),
+                    "digest": preset_digest,
+                    "annotations": { TITLE_ANNOTATION: "llama-original.json" },
+                },
+                {
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+zstd",
+                    "size": payload.len(),
+                    "digest": payload_digest,
+                },
+            ],
+        }))
+        .expect("serialize outer manifest");
+        let outer_manifest_digest = digest_bytes(&outer_manifest);
+
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/v2/{repo}/manifests/{outer_manifest_digest}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(outer_manifest.clone()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/{repo}/manifests/latest")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(outer_manifest))
+            .mount(&server)
+            .await;
+
+        for (digest, body) in [
+            (transport_index_digest.as_str(), transport_index.as_slice()),
+            (manifest_json_digest.as_str(), manifest_json.as_slice()),
+            (manifest_capnp_digest.as_str(), manifest_capnp.as_slice()),
+            (preset_digest.as_str(), preset.as_slice()),
+            (payload_digest.as_str(), payload.as_slice()),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/v2/{repo}/blobs/{digest}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+                .mount(&server)
+                .await;
+        }
+
+        let model_ref = format!("{registry}/{repo}@{outer_manifest_digest}");
+        let path = OciProvider
+            .download_model(&model_ref, Some(cache_dir.path().to_path_buf()), false)
+            .await
+            .expect("GBuild artifact should materialize");
+
+        assert_eq!(
+            fs::read(path.join(MANIFEST_FILE_NAME)).expect("read runtime manifest"),
+            manifest_json
+        );
+        assert_eq!(
+            fs::read(path.join("manifest.capnp.bin")).expect("read Cap'n Proto manifest"),
+            manifest_capnp
+        );
+        assert_eq!(
+            fs::read(path.join("llama-original.json")).expect("read preset"),
+            preset
+        );
+        assert_eq!(
+            fs::read(path.join("README.md")).expect("read filtered filename"),
+            b"readme"
+        );
+        assert_eq!(
+            fs::read(path.join("program.0.gas")).expect("read program"),
+            b"gas"
+        );
+        assert!(!path.join("transport-index.json").exists());
+
+        let tag_error = OciProvider
+            .download_model(
+                &format!("{registry}/{repo}:latest"),
+                Some(cache_dir.path().to_path_buf()),
+                false,
+            )
+            .await
+            .expect_err("GBuild tag reference must fail");
+        assert!(tag_error.to_string().contains("immutable digest reference"));
     }
 
     #[tokio::test]

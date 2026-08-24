@@ -29,6 +29,10 @@ Archive layers are supported when their media type is `tar` or `tar+zstd`, inclu
 
 The provider rejects empty paths, absolute paths, `.` and `..` components, backslashes, non-UTF-8 path data, duplicate output paths, symlinks, hardlinks, and special archive entries. README files, dotfiles, and images are skipped. When `ignore_weights=true`, raw weight-file layers are skipped before download and archive-like layers are skipped as whole blobs.
 
+GBuild full-compile artifacts use `application/vnd.groq.gbuild.full-compile.v1`. ModelExpress requires a digest reference, validates the config transport index against every outer layer, and materializes the declared files exactly. These artifacts do not support `ignore_weights`.
+
+With `--strategy direct --format json`, the successful response includes the materialized `path`.
+
 Example artifact layout:
 
 ```bash
@@ -57,7 +61,8 @@ Authentication uses this precedence:
 1. `MODEL_EXPRESS_OCI_BEARER_TOKEN`
 2. `MODEL_EXPRESS_OCI_USERNAME` plus `MODEL_EXPRESS_OCI_PASSWORD`
 3. `MODEL_EXPRESS_OCI_USERNAME` plus `MODEL_EXPRESS_OCI_TOKEN`
-4. Anonymous access
+4. Application Default Credentials for registries under `*.pkg.dev`
+5. Anonymous access for other registries
 
 ## Cache Layout
 
