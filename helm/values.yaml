@@ -82,6 +82,94 @@ metrics:
   # would load-balance scrapes across replicas.
   service: false
 
+  # Prometheus Operator integration.
+  #
+  # kube-prometheus-stack ignores the prometheus.io/* annotations above
+  # entirely — it discovers targets only through PodMonitor resources. On such
+  # a cluster the endpoint is served and never scraped, which looks exactly
+  # like a broken exporter. Enable this instead of podAnnotations there.
+  #
+  # Everything below renders a monitoring.coreos.com/v1 resource, so each is
+  # additionally gated on that API being present: enabling one on a cluster
+  # without the Operator renders nothing rather than failing the install.
+  podMonitor:
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    # Enabling this without the Operator's CRDs is an install-time failure, not
+    # a silent skip — see the templates for why. Set this when the CRDs are
+    # applied in the same operation as this chart, which is the one case the
+    # capability check gets wrong.
+    skipApiVersionCheck: false
+    # Labels the Operator's podMonitorSelector matches on. kube-prometheus-stack
+    # defaults that selector to `release: <its own release name>`, so a
+    # PodMonitor without a matching label installs cleanly and is then silently
+    # ignored. If targets never appear in Prometheus, this is almost always why.
+    additionalLabels: {}
+    relabelings: []
+    metricRelabelings: []
+
+  # Scrape ModelExpress *client* metrics.
+  #
+  # The client is a Python library loaded inside the inference engine's pod
+  # (vLLM, TRT-LLM, Dynamo). This chart does not deploy those pods and cannot
+  # label them, so unlike the server PodMonitor there is no sensible default
+  # selector and you have to supply one. The chart refuses to render an empty
+  # selector, which would otherwise match every pod in the namespace.
+  #
+  # The client is also opt-in inside the workload: without MX_METRICS_ENABLED=1
+  # and PROMETHEUS_MULTIPROC_DIR set in the engine pod there is nothing on the
+  # port to scrape. See docs/METRICS.md for the pod-manifest side.
+  clientPodMonitor:
+    enabled: false
+    # Required when enabled. Selects the inference pods running the client.
+    selector:
+      matchLabels: {}
+    # Empty selects the release namespace only. Use `any: true` for all.
+    namespaceSelector: {}
+    # PodMonitor selects by port NAME, never by number. This is the name your
+    # engine manifest gave the port; the shipped example uses mx-metrics.
+    portName: mx-metrics
+    interval: 30s
+    scrapeTimeout: 10s
+    additionalLabels: {}
+    relabelings: []
+    metricRelabelings: []
+    skipApiVersionCheck: false
+
+  # Recording rules and alerts, as a PrometheusRule.
+  rules:
+    enabled: false
+    # Same selector caveat as podMonitor.additionalLabels above, via ruleSelector.
+    additionalLabels: {}
+    # Client alerts fire on series that exist only when the client is enabled
+    # and P2P is actually in use. Off by default so a server-only deployment
+    # does not carry alerts on metrics it will never produce.
+    client: false
+    skipApiVersionCheck: false
+    thresholds:
+      # Seconds since the registry-stats task last succeeded. The task runs on
+      # MX_REGISTRY_STATS_INTERVAL_SECS (default 60), so this is ~10 missed runs.
+      registryStatsStaleSeconds: 600
+      # Fraction of requests/operations failing before the ratio alerts fire.
+      grpcErrorRatio: 0.05
+      backendErrorRatio: 0.05
+      downloadFailureRatio: 0.1
+      # Entries in a never-evicted in-process map. The OOM early warning.
+      stateEntriesLimit: 10000
+      # Fraction of NIXL receives returning partial or empty data. Both report
+      # success today, so this is the only signal that surfaces them.
+      nixlSilentFailureRatio: 0.01
+
+  # Grafana dashboard, as a ConfigMap for the Grafana sidecar to discover.
+  dashboard:
+    enabled: false
+    # The sidecar's discovery label. This is `grafana.sidecar.dashboards.label`
+    # in kube-prometheus-stack; change both if your Grafana differs.
+    label: grafana_dashboard
+    labelValue: "1"
+    additionalLabels: {}
+
 ingress:
   enabled: false
   className: ""
