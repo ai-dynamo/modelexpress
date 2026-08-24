@@ -71,6 +71,16 @@ impl ArchiveFormat {
             }
         }
     }
+
+    pub fn extract_gbuild_payload(
+        self,
+        _blob_path: &Path,
+        _output_root: &Path,
+        _expected_members: &[ArtifactPath],
+        _expected_uncompressed_size_bytes: u64,
+    ) -> Result<()> {
+        todo!("extract and validate one complete GBuild payload")
+    }
 }
 
 struct TarExtractor<'a> {
@@ -321,5 +331,33 @@ mod tests {
 
         assert!(err.to_string().contains(".."));
         assert!(!dir.path().join("escape").exists());
+    }
+
+    #[test]
+    fn test_extract_gbuild_payload_requires_exact_members_and_uncompressed_size() {
+        // TODO: implement
+        let dir = TempDir::new().expect("temp dir");
+        let output = dir.path().join("out");
+        fs::create_dir_all(&output).expect("create output");
+        let tar = tar_bytes(&[("README.md", b"readme"), ("program.0.gas", b"gas")]);
+        let compressed = zstd::stream::encode_all(tar.as_slice(), 3).expect("compress tar");
+        let blob = write_blob(&dir, &compressed);
+        let members = [
+            ArtifactPath::from_title("README.md").expect("valid member"),
+            ArtifactPath::from_title("program.0.gas").expect("valid member"),
+        ];
+
+        ArchiveFormat::TarZstd
+            .extract_gbuild_payload(&blob, &output, &members, tar.len() as u64)
+            .expect("exact GBuild payload should extract");
+
+        assert_eq!(
+            fs::read(output.join("README.md")).expect("read README"),
+            b"readme"
+        );
+        assert_eq!(
+            fs::read(output.join("program.0.gas")).expect("read program"),
+            b"gas"
+        );
     }
 }

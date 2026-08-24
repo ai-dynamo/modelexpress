@@ -9,6 +9,7 @@ use tracing::info;
 mod archive_format;
 mod cache_entry;
 mod downloader;
+mod gbuild;
 mod layer_download;
 mod path;
 mod provider_cache;
