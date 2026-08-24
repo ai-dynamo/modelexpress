@@ -122,6 +122,7 @@ class S3Config:
 class _StagedDelta:
     base_version_id: str
     target_version_id: str
+    target_version_number: int
     candidate_snapshot: dict[str, np.ndarray]
     encoded_deltas: dict[str, np.ndarray]
     checksums: dict[str, str]
@@ -141,11 +142,8 @@ class _S3Root:
     total_bytes: int
 
 
-def _s3_key(prefix: str, model_name: str, version_id: str, filename: str) -> str:
-    path = (
-        f"{quote(model_name, safe='')}/"
-        f"weights_v{quote(version_id, safe='')}/{filename}"
-    )
+def _s3_key(prefix: str, model_name: str, version_number: int, filename: str) -> str:
+    path = f"{quote(model_name, safe='')}/v{version_number}/{filename}"
     return "/".join(part for part in (prefix.strip("/"), path) if part)
 
 
@@ -490,6 +488,7 @@ class ModelExpressTrainerClient:
         self,
         *,
         target_version_id: str,
+        target_version_number: int,
         base_version_id: str,
         hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]],
     ) -> _StagedDelta:
@@ -534,6 +533,7 @@ class ModelExpressTrainerClient:
         return _StagedDelta(
             base_version_id=base_version_id,
             target_version_id=target_version_id,
+            target_version_number=target_version_number,
             candidate_snapshot=candidate,
             encoded_deltas=encoded_deltas,
             checksums=checksums,
@@ -570,7 +570,7 @@ class ModelExpressTrainerClient:
                 key=_s3_key(
                     self._s3_config.prefix,
                     self.model_name,
-                    staged.target_version_id,
+                    staged.target_version_number,
                     filename,
                 ),
                 data=shard,
@@ -616,7 +616,7 @@ class ModelExpressTrainerClient:
             key=_s3_key(
                 self._s3_config.prefix,
                 self.model_name,
-                staged.target_version_id,
+                staged.target_version_number,
                 "model.safetensors.index.json",
             ),
             data=index,
@@ -664,8 +664,11 @@ class ModelExpressTrainerClient:
                 raise RuntimeError("S3 publication requires an XOR_DELTA target")
             if tuple(target.expected_source_slots) != (CANONICAL_DELTA_SOURCE_SLOT,):
                 raise RuntimeError("S3 target must expect only canonical.delta.root")
+            if not target.HasField("version_number"):
+                raise RuntimeError("S3 target must have a version number")
             staged = self._stage_delta(
                 target_version_id=version.version_id,
+                target_version_number=target.version_number,
                 base_version_id=target.base_version_id,
                 hf_tensor_iter=hf_tensor_iter,
             )

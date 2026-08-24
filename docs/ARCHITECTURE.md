@@ -387,7 +387,7 @@ owned launch-checkpoint tensors through direct, concurrent
 `prepare_delta_base()` bucket reads. The first real delta stage uses the
 prepared snapshot without checkpoint I/O.
 Canonical S3 artifacts live under
-`{prefix}/{encoded_model_name}/weights_v{encoded_version_id}/`, with the
+`{prefix}/{encoded_model_name}/v{version_number}/`, with the
 index and delta shards stored as siblings.
 Canonical S3 versions and their root advertisements are retained for rollout
 fault recovery. Trainer processes keep only the current base snapshot; older
@@ -490,8 +490,9 @@ engine-specific parameter and CUDA-graph handling out of the transfer layer.
 
 The final missing source slot atomically changes the version to `READY`.
 `WeightVersion.uid` is MX's opaque identity. `version_number` is the optional
-framework-provided numeric label used for correlation; MX does not use it as an
-identity or ordering key.
+framework-provided numeric label used for correlation; canonical S3 publication
+requires it for the `v{version_number}` object prefix. MX does not use it as a
+control-plane identity or ordering key.
 `WeightVersionShard` remains the name of the per-worker manifest publication.
 Its identity is `(version_id, worker_id, source_slot_id)`: `source_slot_id`
 identifies the required, version-scoped source contribution it covers, and

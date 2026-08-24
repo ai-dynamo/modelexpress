@@ -116,7 +116,13 @@ def _encoded_crc32c(data):
 
 
 def _artifact(
-    base, target, *, checksum=None, version="target-a", base_version="base-a"
+    base,
+    target,
+    *,
+    checksum=None,
+    version="target-a",
+    version_number=1,
+    base_version="base-a",
 ):
     delta, _ = compute_delta(target, base)
     assert delta is not None
@@ -138,7 +144,7 @@ def _artifact(
         sort_keys=True,
         separators=(",", ":"),
     ).encode()
-    prefix = f"test/weights_v{version}"
+    prefix = f"test/v{version_number}"
     return {
         f"{prefix}/model.safetensors.index.json": root,
         f"{prefix}/model-00000-of-00001.safetensors": shard,
@@ -151,10 +157,11 @@ def _inputs(
     digest=None,
     base_version="base-a",
     version="target-a",
+    version_number=1,
     key=None,
 ):
     if key is None:
-        key = f"test/weights_v{version}/model.safetensors.index.json"
+        key = f"test/v{version_number}/model.safetensors.index.json"
     return GeneratorTransferInputs(
         version_id=version,
         base_version_id=base_version,
@@ -199,9 +206,7 @@ def test_canonical_s3_prepares_then_installs_one_global_index(monkeypatch, tmp_p
     target_tensor = torch.tensor([3.0, 4.0])
     target = target_tensor.view(torch.uint8).numpy()
     objects = _artifact(base, target)
-    root = objects[
-        "test/weights_vtarget-a/model.safetensors.index.json"
-    ]
+    root = objects["test/v1/model.safetensors.index.json"]
     adapter, storage = _build(monkeypatch, tmp_path, objects)
 
     staged = adapter.stage_weight(_inputs(root))
@@ -211,8 +216,8 @@ def test_canonical_s3_prepares_then_installs_one_global_index(monkeypatch, tmp_p
         load_file(staged.path / "model.safetensors")["weight"], target_tensor
     )
     assert storage.calls == [
-        "test/weights_vtarget-a/model.safetensors.index.json",
-        "test/weights_vtarget-a/model-00000-of-00001.safetensors",
+        "test/v1/model.safetensors.index.json",
+        "test/v1/model-00000-of-00001.safetensors",
     ]
     assert staged.metrics["perf/mx_receive_delta_download"] >= 0
     assert adapter.apply_weight(staged)["perf/mx_receive_install_time"] >= 0
@@ -222,7 +227,7 @@ def test_canonical_s3_prepares_then_installs_one_global_index(monkeypatch, tmp_p
 
 
 def test_canonical_s3_accepts_an_empty_delta(monkeypatch, tmp_path):
-    key = "test/weights_vtarget-a/model.safetensors.index.json"
+    key = "test/v1/model.safetensors.index.json"
     root = json.dumps(
         {
             "metadata": {
@@ -252,7 +257,7 @@ def test_canonical_s3_uses_weight_map_without_index_validation(monkeypatch, tmp_
     base = torch.tensor([1.0, 2.0]).view(torch.uint8).numpy()
     target_tensor = torch.tensor([3.0, 4.0])
     objects = _artifact(base, target_tensor.view(torch.uint8).numpy())
-    key = "test/weights_vtarget-a/model.safetensors.index.json"
+    key = "test/v1/model.safetensors.index.json"
     root = json.dumps(
         {"weight_map": {"weight": "model-00000-of-00001.safetensors"}}
     ).encode()
@@ -374,9 +379,7 @@ def test_canonical_s3_applies_delta_tensors_concurrently(monkeypatch, tmp_path):
         StreamingDecompressor,
     )
 
-    checkpoint._apply_shards(
-        {"delta.safetensors": (shard, list(target))}
-    )
+    checkpoint._apply_shards({"delta.safetensors": (shard, list(target))})
 
     loaded = load_file(checkpoint.local_checkpoint / "model.safetensors")
     assert all(torch.equal(loaded[name], value) for name, value in target.items())
@@ -389,9 +392,7 @@ def test_manifest_mismatch_fails_before_checkpoint_mutation(monkeypatch, tmp_pat
     base = torch.tensor([1.0, 2.0]).view(torch.uint8).numpy()
     target = torch.tensor([3.0, 4.0]).view(torch.uint8).numpy()
     objects = _artifact(base, target)
-    root = objects[
-        "test/weights_vtarget-a/model.safetensors.index.json"
-    ]
+    root = objects["test/v1/model.safetensors.index.json"]
     adapter, _ = _build(monkeypatch, tmp_path, objects)
 
     with pytest.raises(RuntimeError, match="manifest digest mismatch"):
@@ -405,9 +406,7 @@ def test_reconstructed_checksum_failure_propagates(monkeypatch, tmp_path):
     base = torch.tensor([1.0, 2.0]).view(torch.uint8).numpy()
     target = torch.tensor([3.0, 4.0]).view(torch.uint8).numpy()
     objects = _artifact(base, target, checksum="00000000")
-    root = objects[
-        "test/weights_vtarget-a/model.safetensors.index.json"
-    ]
+    root = objects["test/v1/model.safetensors.index.json"]
     adapter, _ = _build(monkeypatch, tmp_path, objects)
     with pytest.raises(RuntimeError, match="target checksum differs"):
         adapter.stage_weight(_inputs(root))
@@ -427,9 +426,7 @@ def test_wrong_base_fails_before_s3_download(monkeypatch, tmp_path):
     base = torch.tensor([1.0, 2.0]).view(torch.uint8).numpy()
     target = torch.tensor([3.0, 4.0]).view(torch.uint8).numpy()
     objects = _artifact(base, target)
-    root = objects[
-        "test/weights_vtarget-a/model.safetensors.index.json"
-    ]
+    root = objects["test/v1/model.safetensors.index.json"]
     adapter, storage = _build(monkeypatch, tmp_path, objects)
 
     with pytest.raises(ValueError, match="exact local base"):
@@ -445,10 +442,8 @@ def test_child_download_failure_is_retryable(
     base = torch.tensor([1.0, 2.0]).view(torch.uint8).numpy()
     target = torch.tensor([3.0, 4.0]).view(torch.uint8).numpy()
     objects = _artifact(base, target)
-    root_key = "test/weights_vtarget-a/model.safetensors.index.json"
-    shard_key = (
-        "test/weights_vtarget-a/model-00000-of-00001.safetensors"
-    )
+    root_key = "test/v1/model.safetensors.index.json"
+    shard_key = "test/v1/model-00000-of-00001.safetensors"
     adapter, storage = _build(monkeypatch, tmp_path, objects)
     storage.fail_key_once = shard_key
 
@@ -464,10 +459,8 @@ def test_corrupt_zstd_fails_before_checkpoint_mutation(monkeypatch, tmp_path):
     base = torch.tensor([1.0, 2.0]).view(torch.uint8).numpy()
     target = torch.tensor([3.0, 4.0]).view(torch.uint8).numpy()
     objects = _artifact(base, target)
-    root_key = "test/weights_vtarget-a/model.safetensors.index.json"
-    shard_key = (
-        "test/weights_vtarget-a/model-00000-of-00001.safetensors"
-    )
+    root_key = "test/v1/model.safetensors.index.json"
+    shard_key = "test/v1/model-00000-of-00001.safetensors"
     shard = bytearray(objects[shard_key])
     header_size = int.from_bytes(shard[:8], "little")
     data_start = 8 + header_size
@@ -486,10 +479,8 @@ def test_cached_target_requires_the_same_canonical_root(monkeypatch, tmp_path):
     base = torch.tensor([1.0, 2.0]).view(torch.uint8).numpy()
     target = torch.tensor([3.0, 4.0]).view(torch.uint8).numpy()
     objects = _artifact(base, target)
-    root_key = "test/weights_vtarget-a/model.safetensors.index.json"
-    alternate_key = (
-        "test/alternate/weights_vtarget-a/model.safetensors.index.json"
-    )
+    root_key = "test/v1/model.safetensors.index.json"
+    alternate_key = "test/alternate/v1/model.safetensors.index.json"
     objects[alternate_key] = objects[root_key]
     adapter, _ = _build(monkeypatch, tmp_path, objects)
     staged = adapter.stage_weight(_inputs(objects[root_key]))
@@ -512,24 +503,22 @@ def test_installed_target_becomes_the_next_exact_base(monkeypatch, tmp_path):
             first,
             second,
             version="target-b",
+            version_number=2,
             base_version="target-a",
         )
     )
     adapter, _ = _build(monkeypatch, tmp_path, objects)
-    first_root = objects[
-        "test/weights_vtarget-a/model.safetensors.index.json"
-    ]
+    first_root = objects["test/v1/model.safetensors.index.json"]
     staged = adapter.stage_weight(_inputs(first_root))
     adapter.apply_weight(staged)
     adapter.release_staged_weight(staged)
 
-    second_root = objects[
-        "test/weights_vtarget-b/model.safetensors.index.json"
-    ]
+    second_root = objects["test/v2/model.safetensors.index.json"]
     staged = adapter.stage_weight(
         _inputs(
             second_root,
             version="target-b",
+            version_number=2,
             base_version="target-a",
         )
     )

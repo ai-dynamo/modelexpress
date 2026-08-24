@@ -137,7 +137,8 @@ bucket stream. ModelExpress submits each framework bucket directly for
 concurrent rank-local launch-checkpoint reads. Real delta staging therefore
 performs no launch-checkpoint reads.
 Published roots use
-`{prefix}/{encoded_model_name}/weights_v{encoded_version_id}/model.safetensors.index.json`.
+`{prefix}/{encoded_model_name}/v{version_number}/model.safetensors.index.json`.
+Canonical S3 publication requires a numeric `version_number`.
 Canonical S3 versions and root advertisements remain READY for rollout recovery;
 their immutable objects are governed by the bucket's external lifecycle policy.
 

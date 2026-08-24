@@ -59,6 +59,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         self.target = refit_pb2.WeightVersion(
             uid="target-a",
             model_name="test/model",
+            version_number=1,
             payload_format=refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA,
             base_version_id="base-a",
             expected_source_slots=["canonical.delta.root"],
@@ -307,10 +308,7 @@ def test_s3_stage_is_local_then_publish_advertises_one_canonical_root(
     assert shard.source_slot_id == "canonical.delta.root"
     assert shard.WhichOneof("transport") == "s3"
     assert shard.s3.bucket == "weights"
-    assert (
-        shard.s3.key
-        == "tests/test%2Fmodel/weights_vtarget-a/model.safetensors.index.json"
-    )
+    assert shard.s3.key == "tests/test%2Fmodel/v1/model.safetensors.index.json"
     index = json.loads(storage.objects[("weights", shard.s3.key)])
     assert index["metadata"] == {
         "base_version": "base-a",
@@ -325,10 +323,7 @@ def test_s3_stage_is_local_then_publish_advertises_one_canonical_root(
     shard_key = next(
         key for bucket, key in storage.objects if key.endswith(".safetensors")
     )
-    assert (
-        shard_key
-        == "tests/test%2Fmodel/weights_vtarget-a/model-00000-of-00001.safetensors"
-    )
+    assert shard_key == "tests/test%2Fmodel/v1/model-00000-of-00001.safetensors"
     blob = storage.objects[("weights", shard_key)]
     (header_size,) = struct.unpack("<Q", blob[:8])
     header = json.loads(blob[8 : 8 + header_size])
@@ -353,6 +348,23 @@ def test_s3_stage_is_local_then_publish_advertises_one_canonical_root(
         shard.manifest_digest
         == hashlib.sha256(storage.objects[("weights", shard.s3.key)]).hexdigest()
     )
+
+
+def test_s3_stage_requires_version_number(monkeypatch, tmp_path, refit_server):
+    service, server_url = refit_server
+    service.target.ClearField("version_number")
+    trainer, storage = _trainer(monkeypatch, tmp_path, server_url)
+
+    try:
+        with pytest.raises(RuntimeError, match="must have a version number"):
+            trainer.stage_shard(
+                version=WeightVersionRef("target-a"),
+                hf_tensor_iter=iter([[("weight", torch.tensor([1.0, 3.0]))]]),
+            )
+    finally:
+        trainer.close()
+
+    assert storage.objects == {}
 
 
 def test_s3_publish_failure_keeps_handle_retryable(monkeypatch, tmp_path, refit_server):
@@ -601,6 +613,7 @@ def test_s3_chains_from_published_base_and_keeps_previous_advertisement(
         service.target = refit_pb2.WeightVersion(
             uid="target-b",
             model_name="test/model",
+            version_number=2,
             payload_format=refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA,
             base_version_id="target-a",
             expected_source_slots=["canonical.delta.root"],
@@ -622,7 +635,7 @@ def test_s3_chains_from_published_base_and_keeps_previous_advertisement(
     second_shard = next(
         data
         for (bucket, key), data in storage.objects.items()
-        if bucket == "weights" and "target-b" in key and key.endswith(".safetensors")
+        if bucket == "weights" and "/v2/" in key and key.endswith(".safetensors")
     )
     encoded = safetensors.numpy.load(second_shard)["weight"]
     decoded = zstandard.ZstdDecompressor().decompress(encoded)
@@ -634,9 +647,7 @@ def test_s3_chains_from_published_base_and_keeps_previous_advertisement(
     assert service.deleted_shards == []
 
 
-def test_s3_release_keeps_canonical_advertisement(
-    monkeypatch, tmp_path, refit_server
-):
+def test_s3_release_keeps_canonical_advertisement(monkeypatch, tmp_path, refit_server):
     service, server_url = refit_server
     trainer, _storage = _trainer(monkeypatch, tmp_path, server_url)
 
@@ -648,6 +659,7 @@ def test_s3_release_keeps_canonical_advertisement(
         service.target = refit_pb2.WeightVersion(
             uid="target-b",
             model_name="test/model",
+            version_number=2,
             payload_format=refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA,
             base_version_id="target-a",
             expected_source_slots=["canonical.delta.root"],
