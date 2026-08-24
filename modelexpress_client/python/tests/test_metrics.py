@@ -992,6 +992,22 @@ def _client_families_claimed_by_rust() -> list[str]:
     return re.findall(r'"([^"]+)"', block.group(1))
 
 
+def _exported_series_names(exposition: str) -> set[str]:
+    """Exact series names from the exposition, one per sample line.
+
+    Not a substring search over the whole text. A removed family whose name is a
+    prefix of a surviving one -- or which still appears in a HELP line -- would
+    match anywhere in the blob and the check would pass while the series was
+    gone. These are the names a query would actually have to use.
+    """
+    names = set()
+    for line in exposition.splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        names.add(line.split("{", 1)[0].split(" ", 1)[0])
+    return names
+
+
 def test_alert_rule_client_families_exist(monkeypatch):
     """Every client family the alert rules rely on is really exported.
 
@@ -1012,13 +1028,9 @@ def test_alert_rule_client_families_exist(monkeypatch):
     claimed = _client_families_claimed_by_rust()
     assert claimed, "parsed an empty CLIENT_FAMILIES; the regex no longer matches"
 
-    missing = [family for family in claimed if family not in exposition]
-    exported = sorted(
-        line.split()[2]
-        for line in exposition.splitlines()
-        if line.startswith("# TYPE ")
-    )
+    exported = _exported_series_names(exposition)
+    missing = [family for family in claimed if family not in exported]
     assert not missing, (
         f"the alert rules name client families that are not exported: {missing}\n"
-        f"Exported: {exported}"
+        f"Exported: {sorted(exported)}"
     )

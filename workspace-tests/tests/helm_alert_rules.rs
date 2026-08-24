@@ -32,8 +32,10 @@ use tower::{Layer, ServiceExt};
 /// asserts this same list against the client's real registry. The two halves
 /// cross-check: a rename on the Python side fails there, and a name added here
 /// that Python does not export fails there too. Keep them in step.
-/// Listed with the suffixes a query actually uses, since that is what the Python
-/// side matches against the exposition text.
+///
+/// Listed with the suffixes a query actually uses: the Python side compares
+/// these against exact exported series names, not against the exposition as
+/// text, so `mx_p2p_transfer_seconds` would not stand in for its `_bucket`.
 const CLIENT_FAMILIES: &[&str] = &[
     "mx_nixl_data_plane_errors_total",
     "mx_nixl_receive_total",

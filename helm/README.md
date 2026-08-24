@@ -90,7 +90,7 @@ The following table lists the configurable parameters of the ModelExpress chart 
 | `metrics.podMonitor.metricRelabelings`       | Passed through to the endpoint's `metricRelabelings` | `[]` |
 | `metrics.clientPodMonitor.enabled`           | PodMonitor for client metrics in your inference pods, which this chart does not deploy | `false` |
 | `metrics.clientPodMonitor.selector`          | Label selector for those pods. Required -- an empty selector matches every pod in the namespace | `{}` |
-| `metrics.clientPodMonitor.portName`          | Named port on the engine pod                   | `mx-metrics` |
+| `metrics.clientPodMonitor.portName`          | Named port on the engine pod. Must match the name in YOUR manifest — the default is the one the shipped example uses, and a mismatch renders fine then matches no port | `mx-metrics` |
 | `metrics.clientPodMonitor.namespaceSelector` | Namespaces to search. Empty means the release namespace | `{}` |
 | `metrics.clientPodMonitor.interval`          | Scrape interval                                | `30s`    |
 | `metrics.clientPodMonitor.scrapeTimeout`     | Scrape timeout                                 | `10s`    |
