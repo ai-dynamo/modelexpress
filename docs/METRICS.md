@@ -103,13 +103,19 @@ metrics:
 ```
 
 **The selector label is the trap.** kube-prometheus-stack defaults its
-`podMonitorSelector` and `ruleSelector` to match only resources labelled with
-its own Helm release name. A PodMonitor without that label installs cleanly,
-reports no error, and is silently ignored forever. If targets never appear, this
-is almost always why. Check what your Prometheus expects:
+`podMonitorSelector` and `ruleSelector` to match only resources labelled with its
+own Helm release name. A resource without that label installs cleanly, reports no
+error, and is silently ignored forever.
+
+The two selectors are configured independently and often differ in practice: it
+is common to find `podMonitorSelector: {}`, which adopts every PodMonitor
+regardless of labels, alongside a `ruleSelector` that still requires the release
+label — so PodMonitors work while PrometheusRules are silently dropped. Check
+both rather than assuming they match. If targets or alerts never appear, this is
+almost always why:
 
 ```bash
-kubectl get prometheus -A -o jsonpath='{.items[*].spec.podMonitorSelector}'
+kubectl get prometheus -A -o jsonpath='{range .items[*]}{.metadata.name}{"\n  pod:  "}{.spec.podMonitorSelector}{"\n  rule: "}{.spec.ruleSelector}{"\n"}{end}'
 ```
 
 Leave both on only if you know your Prometheus honours exactly one. Where both
@@ -474,9 +480,11 @@ absent(mx_build_info{component="server"})
 There is deliberately no `up{job="modelexpress"}` here. Nothing in this repo
 produces that job label: annotation-based discovery files these targets under
 whatever the Prometheus config calls its pod job (conventionally
-`kubernetes-pods`), and the Operator generates
-`podMonitor/<namespace>/<name>/0`. Both are deployment-specific, so a query
-written against a guessed job name matches nothing and reads as "no problems".
+`kubernetes-pods`), and under the Operator the `job` label is
+`<namespace>/<podmonitor-name>`. (`podMonitor/<namespace>/<name>/0` is the
+*scrape pool* name, which is what `/api/v1/targets?scrapePool=` takes; it is not
+the `job` label.) Both are deployment-specific, so a query written against a
+guessed job name matches nothing and reads as "no problems".
 `mx_build_info` is registered unconditionally at startup for exactly this
 purpose, and carries no such dependency.
 
