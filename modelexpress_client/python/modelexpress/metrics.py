@@ -274,9 +274,10 @@ class MetricsCollector:
         )
         self.nixl_receives = Counter(
             "mx_nixl_receive_total",
-            "Receive outcomes: complete|partial|empty. `partial` and `empty` "
-            "both return success today, so they are otherwise indistinguishable "
-            "from a healthy transfer.",
+            "Receive outcomes: complete|partial|empty|rejected. `partial` and "
+            "`empty` both return success today, so they are otherwise "
+            "indistinguishable from a healthy transfer; `rejected` is the "
+            "strict-mode refusal, which raises instead of returning.",
             ["scheme", "result"],
             registry=registry,
         )

@@ -879,10 +879,19 @@ impl ModelDownloadTracker {
     }
 
     /// Deletes a model record from the registry and clears local waiters.
-    pub async fn delete_status(&self, model_name: &str) {
-        if let Err(e) = self.registry.delete_model(model_name).await {
-            error!("Failed to delete model from registry: {e}");
-        }
+    /// Returns whether the registry record was actually removed.
+    ///
+    /// The error is still swallowed -- callers proceed to notify waiters either
+    /// way -- but the outcome is reported, because a caller that records the
+    /// removal as a lifecycle event must not do so when nothing was removed.
+    pub async fn delete_status(&self, model_name: &str) -> bool {
+        let deleted = match self.registry.delete_model(model_name).await {
+            Ok(()) => true,
+            Err(e) => {
+                error!("Failed to delete model from registry: {e}");
+                false
+            }
+        };
         let mut waiting = match self.waiting_channels.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -891,6 +900,7 @@ impl ModelDownloadTracker {
             }
         };
         waiting.remove(model_name);
+        deleted
     }
 
     /// Deletes every registry entry belonging to `model_name`, whatever revision or
@@ -925,11 +935,15 @@ impl ModelDownloadTracker {
                 // arrival booked by the claim is never matched and the flow
                 // accounting stays permanently ahead. The status is already in
                 // hand here, so this costs no extra read.
-                if record.status == ModelStatus::DOWNLOADING {
+                // Only once the record is really gone. delete_model can fail and
+                // is swallowed, and recording first would book a departure for an
+                // entry still sitting in DOWNLOADING -- turning a backend outage
+                // into a permanently understated flow count.
+                let deleted = self.delete_status(&record.model_name).await;
+                if deleted && record.status == ModelStatus::DOWNLOADING {
                     self.registry_metrics
                         .record_transition(StatusLabel::Downloading, StatusLabel::Absent);
                 }
-                self.delete_status(&record.model_name).await;
                 removed = removed.saturating_add(1);
             }
         }

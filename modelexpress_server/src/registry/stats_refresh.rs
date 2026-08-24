@@ -120,9 +120,14 @@ mod tests {
             encoded.contains(r#"mx_state_entries{map="download_waiters"} 4"#),
             "{encoded}"
         );
-        // The heartbeat must NOT be stamped: the pass did not succeed.
+        // The heartbeat must NOT be stamped: the pass did not succeed. Named
+        // explicitly rather than matching the bare `task="` prefix -- both
+        // catch it, but this one cannot be misread as allowing the real task
+        // through.
         assert!(
-            !encoded.contains(r#"mx_task_last_success_timestamp_seconds{task=""#),
+            !encoded.contains(&format!(
+                r#"mx_task_last_success_timestamp_seconds{{task="{TASK_NAME}""#
+            )),
             "a failed pass stamped the heartbeat: {encoded}"
         );
     }
