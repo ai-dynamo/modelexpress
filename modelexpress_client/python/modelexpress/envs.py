@@ -104,6 +104,13 @@ if TYPE_CHECKING:
     MX_ARTIFACT_TRANSFER: bool
     MX_ARTIFACT_BUNDLE_ROOT: Optional[str]
     MX_ARTIFACT_COMPILE_CONFIG_DIGEST: str
+    MX_ARTIFACT_BACKEND: str
+    MX_ARTIFACT_MOONCAKE_NAMESPACE: str
+    MX_ARTIFACT_MOONCAKE_ENABLE_SOFT_PIN: bool
+    MX_ARTIFACT_MOONCAKE_POOL_BYTES: int
+    MX_ARTIFACT_MOONCAKE_MANIFEST_BYTES: int
+    MX_ARTIFACT_MOONCAKE_DELETE_RETRIES: int
+    MX_ARTIFACT_MOONCAKE_DELETE_RETRY_DELAY_SECS: float
     MX_ARTIFACT_READY_URL: str
     MX_ARTIFACT_READY_TIMEOUT_SECS: int
     MX_ARTIFACT_TRANSFER_CHUNK_SIZE: Optional[str]
@@ -338,6 +345,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_ARTIFACT_BUNDLE_ROOT": lambda: os.environ.get("MX_ARTIFACT_BUNDLE_ROOT"),
     "MX_ARTIFACT_COMPILE_CONFIG_DIGEST": lambda: os.environ.get(
         "MX_ARTIFACT_COMPILE_CONFIG_DIGEST", ""
+    ),
+    "MX_ARTIFACT_BACKEND": lambda: os.environ.get("MX_ARTIFACT_BACKEND", "p2p")
+    .strip()
+    .lower(),
+    "MX_ARTIFACT_MOONCAKE_NAMESPACE": lambda: os.environ.get(
+        "MX_ARTIFACT_MOONCAKE_NAMESPACE", "modelexpress/artifacts"
+    ).strip(),
+    # Soft pinning is enabled by default for published artifacts.  It only
+    # affects eviction priority; the master controls the soft-pin TTL.
+    "MX_ARTIFACT_MOONCAKE_ENABLE_SOFT_PIN": lambda: os.environ.get(
+        "MX_ARTIFACT_MOONCAKE_ENABLE_SOFT_PIN", "true"
+    ).strip().lower()
+    in _TRUTHY,
+    "MX_ARTIFACT_MOONCAKE_POOL_BYTES": lambda: _env_int(
+        "MX_ARTIFACT_MOONCAKE_POOL_BYTES", 512 * 1024 * 1024
+    ),
+    "MX_ARTIFACT_MOONCAKE_MANIFEST_BYTES": lambda: _env_int(
+        "MX_ARTIFACT_MOONCAKE_MANIFEST_BYTES", 4 * 1024 * 1024
+    ),
+    "MX_ARTIFACT_MOONCAKE_DELETE_RETRIES": lambda: _env_int(
+        "MX_ARTIFACT_MOONCAKE_DELETE_RETRIES", 10
+    ),
+    "MX_ARTIFACT_MOONCAKE_DELETE_RETRY_DELAY_SECS": lambda: _env_float(
+        "MX_ARTIFACT_MOONCAKE_DELETE_RETRY_DELAY_SECS", 0.7
     ),
     "MX_ARTIFACT_READY_URL": lambda: os.environ.get("MX_ARTIFACT_READY_URL", ""),
     "MX_ARTIFACT_READY_TIMEOUT_SECS": lambda: _env_int("MX_ARTIFACT_READY_TIMEOUT_SECS", 1800),

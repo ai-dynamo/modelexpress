@@ -30,6 +30,7 @@ def test_defaults_when_unset(monkeypatch):
         "MX_RESHARD_FUSED_WIRE",
         "MX_RESHARD_BATCH_INSTALL",
         "MX_RESHARD_CACHE_DESCRIPTORS",
+        "MX_ARTIFACT_MOONCAKE_ENABLE_SOFT_PIN",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -53,6 +54,7 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_RESHARD_FUSED_WIRE is True
     assert envs.MX_RESHARD_BATCH_INSTALL is True
     assert envs.MX_RESHARD_CACHE_DESCRIPTORS is True
+    assert envs.MX_ARTIFACT_MOONCAKE_ENABLE_SOFT_PIN is True
 
 
 def test_int_and_float_parsing(monkeypatch):
@@ -87,6 +89,9 @@ def test_bool_parsing(monkeypatch, caplog):
 
     monkeypatch.setenv("MX_VMM_ARENA", "1")
     assert envs.MX_VMM_ARENA is True
+
+    monkeypatch.setenv("MX_ARTIFACT_MOONCAKE_ENABLE_SOFT_PIN", "0")
+    assert envs.MX_ARTIFACT_MOONCAKE_ENABLE_SOFT_PIN is False
 
     for truthy in ("1", "TRUE", "yes", "On"):
         monkeypatch.setenv("MODEL_EXPRESS_NO_SHARED_STORAGE", truthy)
