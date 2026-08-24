@@ -85,6 +85,14 @@ ModelExpress/
 │       ├── backend_config.rs           # Shared BackendConfig (Redis / K8s) + env parsing
 │       ├── cache.rs                    # CacheEvictionService, LRU policy
 │       ├── services.rs                 # Health, API, Model gRPC services + ModelDownloadTracker
+│       ├── metrics.rs                   # Prometheus registry, mx_build_info, encoding
+│       ├── metrics/
+│       │   ├── exposition.rs            # HTTP/1.1 /metrics listener (separate port)
+│       │   ├── buckets.rs               # Shared histogram bucket boundaries
+│       │   ├── grpc.rs                  # Per-RPC tower layer; in-handler outcomes
+│       │   ├── backend.rs               # Backend op counters and latency
+│       │   ├── registry.rs              # Download claim, lease and status transitions
+│       │   └── cache.rs                 # Eviction reasons and refreshed gauges
 │       ├── p2p/
 │       │   ├── state.rs                # P2pStateManager wrapper
 │       │   ├── service.rs              # P2P gRPC service implementation
@@ -94,21 +102,25 @@ ModelExpress/
 │       │   ├── backend.rs              # MetadataBackend trait + types
 │       │   └── backend/
 │       │       ├── redis.rs            # P2P Redis backend
-│       │       └── kubernetes.rs       # P2P Kubernetes CRD backend
+│       │       ├── kubernetes.rs       # P2P Kubernetes CRD backend
+│       │       └── instrumented.rs     # Metrics decorator over MetadataBackend
 │       ├── refit.rs                     # Refit module exports
 │       ├── refit/
 │       │   ├── service.rs               # Backend-neutral Refit gRPC service
 │       │   ├── backend.rs               # RefitBackend contract and factory
 │       │   └── backend/
-│       │       └── redis.rs             # Redis backend and atomic Lua scripts
+│       │       ├── redis.rs             # Redis backend and atomic Lua scripts
+│       │       └── instrumented.rs      # Metrics decorator over RefitBackend
 │       ├── registry/
 │       │   ├── state.rs                # RegistryManager wrapper
+│       │   ├── stats_refresh.rs        # Background gauge refresh (own interval)
 │       │   ├── backend.rs              # RegistryBackend trait + ModelRecord
 │       │   ├── entry_key.rs            # EntryKey: model + revision + weight mode
 │       │   ├── k8s_types.rs            # ModelCacheEntry CRD type
 │       │   └── backend/
 │       │       ├── redis.rs            # Redis registry backend
-│       │       └── kubernetes.rs       # K8s ModelCacheEntry registry backend
+│       │       ├── kubernetes.rs       # K8s ModelCacheEntry registry backend
+│       │       └── instrumented.rs     # Metrics decorator over RegistryBackend
 │       └── bin/
 │           └── config_gen.rs           # Config file generator/migrator
 │
@@ -172,8 +184,7 @@ ModelExpress/
 │       │   │   ├── mdl.py              # Compatibility shim for vLLM refit
 │       │   │   └── refit/
 │       │   │       ├── __init__.py     # vLLM refit exports
-│       │   │       ├── installer.py    # Mapped Direct Load installer
-│       │   │       └── receiver.py     # Geometry capture and PWAL installation adapter
+│       │   │       └── installer.py    # Mapped Direct Load installer
 │       │   └── sglang/                 # SGLang integration
 │       │       ├── __init__.py
 │       │       ├── adapter.py          # SglangAdapter and context builder
@@ -378,6 +389,78 @@ legacy `WeightSyncService`. The initial slice stores worker registrations,
 immutable weight versions, and compact physical shard publications in Redis.
 Weight bytes and full tensor manifests remain on trainer or generator workers.
 
+#### RL refit client architecture
+
+The RL framework orchestrator calls only the public
+`ModelExpressControlClient`. Framework-native RPCs invoke rank-local trainer and
+generator clients inside their existing actors. Those clients use internal MX
+control-plane and worker APIs; tensor bytes never pass through `RefitService`.
+
+```mermaid
+flowchart LR
+    subgraph Framework["RL framework"]
+        O["RL orchestrator<br/>ModelExpressControlClient"]
+        T["Trainer actor<br/>ModelExpressTrainerClient"]
+        G["Generator actor<br/>ModelExpressGeneratorClient"]
+    end
+
+    S["MX server<br/>RefitService<br/>Redis metadata"]
+
+    subgraph Trainer["Trainer rank"]
+        TA["Trainer engine adapter"]
+        B["Registered source buffers"]
+        M["RefitWorkerService<br/>manifest endpoint"]
+    end
+
+    subgraph Generator["Generator rank"]
+        GA["Generator engine adapter"]
+        X["NIXL staged transfer<br/>plan, pull, verify"]
+        I["vLLM installer<br/>capture, apply"]
+    end
+
+    O -->|"Create / Get / Delete version"| S
+    O -->|"Framework-native RPC"| T
+    O -->|"Framework-native RPC"| G
+    T --> TA --> B
+    T -->|"Register worker; publish shard metadata"| S
+    T --> M
+    G -->|"Register worker; discover shards; lease version"| S
+    G --> GA --> X --> I
+    G -->|"Fetch exact-version manifest"| M
+    B -->|"NIXL reads"| X
+```
+
+`RefitService` is the central metadata service defined by `refit.proto`. It
+coordinates immutable versions, worker registrations, shard advertisements,
+and leases, but it does not discover engine tensor layouts or transfer weights.
+`RefitWorkerService` is the trainer-local manifest endpoint. The manifest is an
+opaque description of the exact published source buffers; the generator uses
+it to compile and validate its receiver-local transfer plan.
+
+The synchronous generator client returns a staged handle only after transfer
+and verification finish. That handle owns the version lease through graph-safe
+installation; applying the weights or releasing an unapplied handle ends the
+lease. There is no separate asynchronous wait or unimplemented direct-install
+API.
+
+The initial worker manifest channel uses plaintext gRPC and does not authenticate
+the publishing worker. Manifest digests detect corruption but do not establish
+source identity. Deploy RL refit only on a trusted, network-isolated cluster and
+prevent untrusted clients from reaching MX server and worker gRPC endpoints.
+Transport authentication and TLS require a separate protocol and deployment
+design; they are not provided by this implementation.
+
+The generator adapter deliberately composes two private implementations rather
+than inheriting from the legacy reshard receiver:
+
+- `nixl_staged_transfer.py` owns exact-manifest decoding, transfer planning,
+  reusable registered buffers, NIXL reads, transforms, and digest verification.
+- `inference/engines/vllm/installer.py` owns vLLM load-layout capture and
+  graph-safe installation through vLLM's layerwise reload and post-load path.
+
+This keeps transport and verification independent of vLLM while keeping
+engine-specific parameter and CUDA-graph handling out of the transfer layer.
+
 | RPC | Purpose |
 |-----|---------|
 | `RegisterWorker` | Register or refresh one TTL-bound worker process |
@@ -399,10 +482,11 @@ Its identity is `(version_id, worker_id, source_slot_id)`: `source_slot_id`
 identifies the required, version-scoped source contribution it covers, and
 `worker_id` identifies the publishing process. The trainer engine adapter
 derives the slot from its native topology; the Megatron adapter uses
-`publisher:global-rank:12` for global rank 12. The orchestrator uses the same
-adapter-defined convention when declaring the version's expected slots. Multiple
-publications may advertise the same source slot, including a replacement worker
-or a generator that becomes a peer source. Deployments configured with
+the logical tensor names and shard geometry, excluding physical process and DP
+replica identity. The orchestrator deduplicates those adapter-defined slots when
+declaring the version's expected contributions. Multiple DP workers may therefore
+advertise the same source slot; generators rotate through those publications on
+transfer retry. Deployments configured with
 Kubernetes or the test-only memory backend do not expose `RefitService` yet.
 
 `RegisterWorker` is also the heartbeat API. `worker_id` is a fresh process
@@ -436,14 +520,27 @@ end-to-end backend slice implementing the same transaction boundaries.
 1. Parse CLI args (`ServerArgs` via clap)
 2. Load config (`ServerConfig::load()`) - CLI > env vars > config file > defaults
 3. Initialize structured logging (tracing-subscriber)
-4. Connect to the model registry backend (`MX_METADATA_BACKEND` — same selector as P2P). Fails fast on connect error.
-5. Initialize the process-wide `ModelDownloadTracker` with the registry, seed the `MODEL_TRACKER` OnceLock
-6. Start `CacheEvictionService` background task (reads the same registry)
-7. Connect to the P2P metadata backend (`MX_METADATA_BACKEND`, Redis or Kubernetes CRD)
-8. Start reaper background task for stale source detection and GC
-9. Register the configured gRPC services with tonic (max message size: 100MB)
-10. Listen on configured address (default `0.0.0.0:8001`)
-11. Graceful shutdown on CTRL+C (signals cache eviction service and reaper)
+4. Build the Prometheus registry and register every metric family, then start the
+   `/metrics` listener on its own port. Deliberately before anything that can
+   fail, so a scrape proves the exporter came up even on a server that never
+   reaches a healthy state. A bind failure logs and continues rather than
+   aborting startup.
+5. Connect to the model registry backend (`MX_METADATA_BACKEND` — same selector as P2P). Fails fast on connect error.
+6. Initialize the process-wide `ModelDownloadTracker` with the registry, seed the `MODEL_TRACKER` OnceLock
+7. Start `CacheEvictionService` background task (reads the same registry)
+8. Connect to the P2P metadata backend (`MX_METADATA_BACKEND`, Redis or Kubernetes CRD)
+9. Start reaper background task for stale source detection and GC
+10. Start the registry-statistics refresh task (`MX_REGISTRY_STATS_INTERVAL_SECS`,
+    default 60). Independent of `CacheEvictionService`: that one ticks hourly and
+    is skipped entirely when eviction is disabled, which would leave the gauges
+    permanently absent.
+11. Register the configured gRPC services with tonic (max message size: 100MB),
+    wrapped in the per-RPC metrics layer
+12. Listen on configured address (default `0.0.0.0:8001`)
+13. Graceful shutdown on CTRL+C: signals the cache eviction service, the reaper
+    and the statistics refresh, then joins them. The `/metrics` listener stops
+    **last**, after the gRPC server has drained, so the drain window stays
+    scrapeable.
 
 ### ServerConfig
 
@@ -663,13 +760,28 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `model_client.py` | `ModelCacheClient` - `ModelService` RPCs plus stream validation for server-cached models |
 | `model_snapshot.py` | Hugging Face cache layout: path validation, atomic snapshot publication, `refs/main` |
 | `model_prefetch.py` | Pre-engine metadata prefetch and repo-id resolution for server-backed loading |
-| `engines/vllm/` | `VllmAdapter` and `MxModelLoader` map strategy hooks to vLLM loader APIs; `refit/` contains the vLLM-specific MDL installer and geometry-capture/PWAL receiver |
+| `engines/vllm/` | `VllmAdapter` and `MxModelLoader` map strategy hooks to vLLM loader APIs; `refit/` contains the separate vLLM-specific MDL installer |
 | `engines/sglang/` | `SglangAdapter` and `MxModelLoader` - maps strategy hooks to SGLang's `remote_instance` backend |
 | `tensor_utils.py` | Tensor collection, checksums, storage views, `capture_tensor_attrs` |
 | `rank_utils.py` | `get_global_rank`, `get_worker_rank` |
 | `vllm_worker.py` | `ModelExpressWorker` - compatibility worker class for older manual-registration workflows |
 | `types.py` | `TensorDescriptor`, `WorkerMetadata`, `GetMetadataResponse` dataclasses |
 | `p2p_pb2.py` / `p2p_pb2_grpc.py` | Generated protobuf/gRPC stubs |
+
+RL framework integrations live in the separate `modelexpress_rl` package:
+
+| Module | Purpose |
+|--------|---------|
+| `control.py` | Public orchestrator client for creating, reading, and retiring immutable weight versions |
+| `train/client.py` | Public rank-local trainer lifecycle; owns transport resources and bound tensor state, selects the configured engine lazily after distributed setup, and publishes shards |
+| `train/engines/megatron/selection.py` | Megatron-Bridge mapping and tensor-selection translation into MX publication specs |
+| `train/engines/megatron/adapter.py` | Stable in-place Megatron tensor registration and manifest construction |
+| `train/engines/fsdp/adapter.py` | FSDP/DTensor source capture with in-place or device-copy staging |
+| `inference/client.py` | Rank-local generator lifecycle, leases, exact-version source discovery, plan validation, staging, and apply |
+| `inference/nixl_staged_transfer.py` | Private engine-neutral exact-manifest NIXL planning, transfer, reusable buffers, and verification |
+| `inference/engines/vllm/context.py` | Public typed vLLM objects passed to `ModelExpressGeneratorClient.initialize()` |
+| `inference/engines/vllm/adapter.py` | Generator adapter that composes staged transfer with the private vLLM installer |
+| `inference/engines/vllm/installer.py` | Private vLLM load-layout capture and graph-safe installation |
 
 ### MxClient
 
@@ -730,10 +842,10 @@ trainer tensors. Those stages provide the translated tensor stream and use
 `MdlLoader.load_weights()` as the final installation callback.
 
 The package boundary is intentional: timing and future install-plan contracts
-belong in engine-agnostic `modelexpress.refit`, while vLLM loader observation,
-placement, PWAL interaction, and direct installation belong in
-`modelexpress.engines.vllm.refit`. RL-framework orchestration and trainer
-adapters are separate integrations rather than part of this vLLM installer.
+belong in engine-agnostic `modelexpress.refit`, while RL-specific vLLM loader
+observation, placement, PWAL interaction, and installation belong in
+`modelexpress_rl.inference.engines.vllm`. Trainer adapters are separate from
+the inference-engine integration.
 
 ### No-gather Refit Resharding
 
@@ -782,13 +894,13 @@ publishing the source family in the shard table and comparing both endpoints
 through that gate; a target-only check would be unable to express the constraint,
 since compatibility is a property of the source-target pair.
 
-`engines/vllm/refit/receiver.py` supplies the vLLM-specific boundaries: capture
-on an unquantized meta twin, then installation through vLLM's layerwise reload
-and `process_weights_after_loading` path. Unsupported loader operations fail
-closed because the full-pull fallback is not implemented yet. The compiled
-plan currently assumes a stable source cohort, shard layout, and registration
-addresses; topology-epoch invalidation is a follow-up requirement before
-elastic production use.
+`modelexpress_rl/inference/nixl_staged_transfer.py` owns exact-manifest planning,
+registered staging buffers, transfer, and verification. The vLLM-specific
+`installer.py` captures geometry on an unquantized meta twin and installs verified
+tensors through vLLM's layerwise reload and `process_weights_after_loading` path.
+The adapter composes those modules and rebuilds the plan when validated source
+manifests change; an incompatible destination staging layout requires an engine
+restart.
 
 See the [RL weight refit overview](../modelexpress_client/python/modelexpress/refit/README.md)
 for the end-to-end design, integration contract, implementation status, and
@@ -1037,6 +1149,7 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_HEARTBEAT_INTERVAL_SECS` | `30` | Client heartbeat frequency |
 | `MX_HEARTBEAT_TIMEOUT_SECS` | `90` | Server reaper staleness threshold |
 | `MX_REAPER_SCAN_INTERVAL_SECS` | `30` | Server reaper scan frequency |
+| `MX_REGISTRY_STATS_INTERVAL_SECS` | `60` | Registry-statistics refresh frequency. Writes `mx_registry_entries` and `mx_state_entries`; each pass walks the keyspace, so it is deliberately coarser than a scrape and runs independently of cache eviction |
 | `MX_GC_TIMEOUT_SECS` | `3600` | Time before stale entries are deleted |
 | `VLLM_RPC_TIMEOUT` | `7200000` | vLLM RPC timeout in ms |
 

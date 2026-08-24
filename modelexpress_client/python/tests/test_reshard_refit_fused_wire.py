@@ -62,6 +62,7 @@ class _Harness(ReshardReceiver):
         self._timeout = 1.0
         self._transport = transport
         self._global_rank = 0
+        self._cached_descriptors = None
         self._install_order: list[str] = []
         # The stage syncs go through the accelerator backend, so a stub backend is
         # what keeps this CPU-only rather than patching a torch device module.

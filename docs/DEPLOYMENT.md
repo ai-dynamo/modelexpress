@@ -834,6 +834,10 @@ artifact transfer only within a trusted deployment, and network-isolate the MX
 server and worker gRPC endpoints from untrusted clients. ModelExpress does not
 currently sign cache artifacts.
 
+RL refit has the same trusted-network requirement. Its trainer-local
+`RefitWorkerService` serves exact-version manifests over plaintext gRPC; the
+manifest digest detects corruption but does not authenticate the trainer.
+
 ### Server-Backed Model Cache (No Shared Storage)
 
 For workers that cannot reach the Hugging Face Hub themselves, ModelExpress Server can act as the only route to the model. The worker asks the server for repository files; the server downloads the model once on a cold miss and serves every later worker from its own cache.

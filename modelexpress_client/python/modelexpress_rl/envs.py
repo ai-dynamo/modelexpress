@@ -10,6 +10,7 @@ Rank-local identity and endpoints are derived from the initialized engine.
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
@@ -21,20 +22,30 @@ if TYPE_CHECKING:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
-    "MX_TRAINER_ENGINE": lambda: os.environ.get("MX_TRAINER_ENGINE", "MEGATRON")
-    .strip()
-    .upper(),
-    "MX_TRAINER_STAGING_MODE": lambda: os.environ.get(
-        "MX_TRAINER_STAGING_MODE", "IN_PLACE"
-    )
-    .strip()
-    .upper(),
-    "MX_WEIGHT_PAYLOAD_FORMAT": lambda: os.environ.get(
-        "MX_WEIGHT_PAYLOAD_FORMAT", "FULL_TENSOR"
-    )
-    .strip()
-    .upper(),
+    "MX_TRAINER_ENGINE": lambda: (
+        os.environ.get("MX_TRAINER_ENGINE", "MEGATRON").strip().upper()
+    ),
+    "MX_TRAINER_STAGING_MODE": lambda: (
+        os.environ.get("MX_TRAINER_STAGING_MODE", "IN_PLACE").strip().upper()
+    ),
+    "MX_WEIGHT_PAYLOAD_FORMAT": lambda: (
+        os.environ.get("MX_WEIGHT_PAYLOAD_FORMAT", "FULL_TENSOR").strip().upper()
+    ),
 }
+
+
+def require_positive_int(value: int, name: str) -> int:
+    """Return ``value`` or raise when it is not positive."""
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+    return value
+
+
+def require_positive_float(value: float, name: str) -> float:
+    """Return ``value`` or raise when it is not finite and positive."""
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be finite and positive")
+    return value
 
 
 def __getattr__(name: str) -> Any:

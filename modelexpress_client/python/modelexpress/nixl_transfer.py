@@ -25,6 +25,7 @@ import torch
 
 from . import envs
 from . import ucx_utils
+from .metrics import metrics as transfer_metrics
 from ._nixl import load_nixl_api
 from .accelerators import (
     AcceleratorBackend,
@@ -140,6 +141,10 @@ class NixlTransferManager:
         self._metadata: bytes = b""
         self._tensor_descriptors: list[TensorDescriptor] = []
         self._tensors: dict[str, torch.Tensor] = {}
+        # Registration descriptors must be deregistered before destroying the
+        # UCX-backed NIXL agent. Dropping an agent with live GPU registrations
+        # can abort inside ucp_worker_destroy during framework teardown.
+        self._registered_memory: list[Any] = []
         # Remote agents this manager has loaded, so shutdown can disconnect them.
         # Maps agent name -> (ip, port) for agents reached over the P2P socket, or
         # None for agents loaded from a metadata blob.
@@ -360,15 +365,19 @@ class NixlTransferManager:
             alloc_tuples = [
                 (base, size, self._device_id, "") for base, size in allocations
             ]
-            self._agent.register_memory(
-                alloc_tuples,
-                mem_type=self._accelerator_backend.nixl_mem_type,
-                backends=self._backends,
+            self._registered_memory.append(
+                self._agent.register_memory(
+                    alloc_tuples,
+                    mem_type=self._accelerator_backend.nixl_mem_type,
+                    backends=self._backends,
+                )
             )
             reg_count = len(allocations)
         else:
             tensor_list = list(tensors.values())
-            self._agent.register_memory(tensor_list, backends=self._backends)
+            self._registered_memory.append(
+                self._agent.register_memory(tensor_list, backends=self._backends)
+            )
             reg_count = len(tensor_list)
         nixl_reg_time = time.perf_counter() - nixl_reg_start
 
@@ -507,10 +516,12 @@ class NixlTransferManager:
             return self.register_tensors(tensors, force_per_tensor=True)
 
         nixl_reg_start = time.perf_counter()
-        self._agent.register_memory(
-            [(base, used, self._device_id, "")],
-            mem_type=self._accelerator_backend.nixl_mem_type,
-            backends=self._backends,
+        self._registered_memory.append(
+            self._agent.register_memory(
+                [(base, used, self._device_id, "")],
+                mem_type=self._accelerator_backend.nixl_mem_type,
+                backends=self._backends,
+            )
         )
         nixl_reg_time = time.perf_counter() - nixl_reg_start
 
@@ -605,6 +616,7 @@ class NixlTransferManager:
                     f"{len(pending)} transfer(s) outstanding and no error status "
                     f"from NIXL"
                 )
+                transfer_metrics.record_nixl_error("timeout")
                 raise TimeoutError(
                     f"{label} timed out with {len(pending)} transfer(s) outstanding"
                 )
@@ -615,6 +627,7 @@ class NixlTransferManager:
                     continue
                 if status in ("ERR", "ERROR", "FAIL"):
                     self._data_plane_error = f"{label} failed with status {status}"
+                    transfer_metrics.record_nixl_error("status_error")
                     raise RuntimeError(f"{label} failed with status {status}")
                 still_pending.append(handle)
             if len(still_pending) == len(pending):
@@ -652,6 +665,7 @@ class NixlTransferManager:
                     f"{label} timed out after {timeout_seconds:.1f}s with no "
                     f"completion and no error status from NIXL"
                 )
+                transfer_metrics.record_nixl_error("timeout")
                 raise TimeoutError(f"{label} timed out")
             status = self._agent.check_xfer_state(handle)
             if status in ("DONE", "SUCCESS"):
@@ -664,6 +678,7 @@ class NixlTransferManager:
                 return
             if status in ("ERR", "ERROR", "FAIL"):
                 self._data_plane_error = f"{label} failed with status {status}"
+                transfer_metrics.record_nixl_error("status_error")
                 raise RuntimeError(f"{label} failed with status {status}")
             time.sleep(0.001)
 
@@ -828,12 +843,14 @@ class NixlTransferManager:
                 continue
             local_size = local_tensor.numel() * local_tensor.element_size()
             if local_size != src_tensor.size:
+                transfer_metrics.record_nixl_receive("rejected")
                 raise ManifestMismatchError(
                     f"Tensor '{src_tensor.name}' size mismatch: "
                     f"source={src_tensor.size} bytes, local={local_size} bytes"
                 )
             local_dtype = str(local_tensor.dtype)
             if local_dtype != src_tensor.dtype:
+                transfer_metrics.record_nixl_receive("rejected")
                 raise ManifestMismatchError(
                     f"Tensor '{src_tensor.name}' dtype mismatch: "
                     f"source={src_tensor.dtype!r}, local={local_dtype!r}"
@@ -853,6 +870,10 @@ class NixlTransferManager:
         matched_tensors = len(remote_descs)
         match_time = time.perf_counter() - match_start
 
+        # Downgraded to `partial` by the name-diff check below, which does not
+        # return early.
+        receive_result = "complete"
+
         # Name-set diff between the source manifest and the locally registered
         # tensors.
         src_names = {s.name for s in source_tensors}
@@ -864,6 +885,7 @@ class NixlTransferManager:
                 # hidden or derived tensors, so completing the transfer would
                 # leave the local-only tensors at dummy values while reporting
                 # RDMA success. Fail closed instead.
+                transfer_metrics.record_nixl_receive("rejected")
                 raise ManifestMismatchError(
                     "Tensor name mismatch on heterogeneous transfer: "
                     f"{len(local_only)} local-only "
@@ -871,6 +893,12 @@ class NixlTransferManager:
                     f"{len(source_only)} source-only "
                     f"(first: {source_only[:5]})"
                 )
+            # Completing here leaves the local-only tensors at their dummy
+            # values while the transfer still reports success, so the warning is
+            # the only evidence today. Downgrade the outcome rather than
+            # recording now: this path falls through to the same return as a
+            # clean transfer, and recording here would count the receive twice.
+            receive_result = "partial"
             logger.warning(
                 "Tensor name mismatch between source manifest and local "
                 "registration: %d local-only, %d source-only",
@@ -880,10 +908,12 @@ class NixlTransferManager:
 
         if not remote_descs:
             if require_exact_match:
+                transfer_metrics.record_nixl_receive("rejected")
                 raise ManifestMismatchError(
                     "No matching tensors found for heterogeneous transfer"
                 )
             logger.warning("No matching tensors found for transfer")
+            transfer_metrics.record_nixl_receive("empty")
             return 0, 0, 0.0
 
         logger.info(
@@ -939,6 +969,7 @@ class NixlTransferManager:
             f"({bandwidth_gbps:.1f} Gbps)"
         )
 
+        transfer_metrics.record_nixl_receive(receive_result)
         return total_bytes, matched_tensors, duration
 
     def execute_read_batch(
@@ -1221,6 +1252,16 @@ class NixlTransferManager:
             atexit.unregister(self.shutdown)
             self._atexit_registered = False
         disconnected = self.disconnect_remote_agents()
+        if self._agent is not None:
+            for registered in reversed(self._registered_memory):
+                try:
+                    self._agent.deregister_memory(registered)
+                except Exception:
+                    logger.warning(
+                        "Failed to deregister NIXL memory during shutdown",
+                        exc_info=True,
+                    )
+        self._registered_memory = []
         self._agent = None
         self._metadata = b""
         self._tensor_descriptors = []

@@ -233,7 +233,6 @@ impl RefitBackend for RedisRefitBackend {
             .arg(&worker.worker_id)
             .arg(worker.role)
             .arg(&worker.model_name)
-            .arg(&worker.endpoint)
             .arg(u64::from(ttl_seconds).saturating_mul(1000))
             .invoke_async(&mut redis)
             .await

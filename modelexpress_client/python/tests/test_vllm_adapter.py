@@ -16,8 +16,10 @@ import torch.nn as nn
 from modelexpress.engines.vllm.adapter import (
     DraftShardSelection,
     VllmAdapter,
+    _SAFETENSORS_INDEX_NAME,
     _get_vllm_device_id,
     _get_vllm_worker_rank,
+    _read_safetensors_index,
     _select_draft_weight_files,
     build_vllm_load_context,
 )
@@ -395,3 +397,77 @@ class TestDraftWeightFileSelection:
                 DraftShardSelection.UNRESOLVED,
                 [],
             )
+
+
+def _stub_runai(monkeypatch, available: dict[str, str]) -> list:
+    """Install a fake runai_model_streamer whose pull_files mirrors runai's
+    real semantics: allow_pattern is fnmatched against the full object key, so
+    an unanchored bare filename matches nothing. Returns the list of
+    allow_pattern values it was called with.
+
+    ``available`` maps object basenames (relative to model_uri) to file content.
+    """
+    import fnmatch
+
+    calls: list = []
+
+    def pull_files(model_uri, dest, allow_pattern=None):
+        calls.append(allow_pattern)
+        for key, content in available.items():
+            full_key = f"{model_uri.rstrip('/')}/{key}"
+            if any(fnmatch.fnmatch(full_key, pat) for pat in (allow_pattern or ["*"])):
+                with open(os.path.join(dest, key), "w", encoding="utf-8") as handle:
+                    handle.write(content)
+
+    module = ModuleType("runai_model_streamer")
+    module.pull_files = pull_files
+    monkeypatch.setitem(sys.modules, "runai_model_streamer", module)
+    return calls
+
+
+class TestReadSafetensorsIndexObjectStore:
+    """Reading the index from an object store depends on runai's glob matching
+    the full object key; the bare filename this once used matched nothing."""
+
+    def test_reads_index_via_anchored_glob(self, monkeypatch):
+        index = {"weight_map": {"mtp.fc.weight": "model-mtp.safetensors"}}
+        calls = _stub_runai(
+            monkeypatch,
+            {
+                _SAFETENSORS_INDEX_NAME: json.dumps(index),
+                "model-00001-of-00001.safetensors": "weights",
+            },
+        )
+        # Reverting to a bare, unanchored pattern makes the fake fnmatch miss,
+        # so this returns None and the assertion fails, as it should.
+        assert _read_safetensors_index("s3://bucket/model") == index
+        assert calls == [[f"*{_SAFETENSORS_INDEX_NAME}"]]
+
+    def test_returns_none_and_warns_when_index_absent(self, monkeypatch, caplog):
+        _stub_runai(monkeypatch, {"model-00001-of-00001.safetensors": "weights"})
+        with caplog.at_level("WARNING", logger="modelexpress.engines.vllm.adapter"):
+            assert _read_safetensors_index("s3://bucket/model") is None
+        assert any("not found under" in rec.message for rec in caplog.records)
+
+    def test_selects_mtp_shard_from_object_store(self, monkeypatch):
+        index = {
+            "weight_map": {
+                "model.embed_tokens.weight": "model-00001-of-00002.safetensors",
+                "lm_head.weight": "model-00002-of-00002.safetensors",
+                "mtp.fc.weight": "model-mtp.safetensors",
+                "mtp.layers.0.input_layernorm.weight": "model-mtp.safetensors",
+            }
+        }
+        _stub_runai(monkeypatch, {_SAFETENSORS_INDEX_NAME: json.dumps(index)})
+        files = [
+            f"s3://bucket/model/{name}"
+            for name in (
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors",
+                "model-mtp.safetensors",
+            )
+        ]
+        assert _select_draft_weight_files("s3://bucket/model", files) == (
+            DraftShardSelection.SELECTED,
+            ["s3://bucket/model/model-mtp.safetensors"],
+        )

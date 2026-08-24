@@ -27,6 +27,7 @@ pub mod test_support;
 #[allow(clippy::default_trait_access)]
 #[allow(clippy::doc_markdown)]
 #[allow(clippy::must_use_candidate)]
+#[allow(clippy::result_large_err)]
 pub mod grpc {
     pub mod health {
         tonic::include_proto!("model_express.health");

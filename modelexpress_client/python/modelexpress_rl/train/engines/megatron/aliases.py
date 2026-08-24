@@ -4,11 +4,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
 from modelexpress.refit.reshard.rendezvous import PublishedShard, PublishedTensor
-from modelexpress.refit.reshard.verify import published_digest
+from modelexpress.refit.reshard.verify import tensor_digest
 
 
 @dataclass(frozen=True)
@@ -103,7 +104,7 @@ def _one_shard(
                 addr=int(tensor.data_ptr()),
                 shard_offset=tuple(offset),
                 shape=local_shape,
-                digest=published_digest(tensor),
+                digest=tensor_digest(tensor),
             )
         ],
     )
@@ -172,6 +173,187 @@ def _build_qkv_aliases(
 ) -> list[PublishedTensor]:
     if len(item.hf_names) != 3 or item.tensor.ndim != 2:
         raise ValueError(f"{item.name}: QKV aliasing requires 2D q/k/v weights")
+    has_global_q = "num_heads" in item.extras
+    has_global_kv = "num_kv_heads" in item.extras
+    if has_global_q != has_global_kv:
+        raise ValueError(
+            f"{item.name}: global QKV metadata requires both num_heads and num_kv_heads"
+        )
+    if has_global_q:
+        return _build_global_qkv_aliases(item, agent_name)
+    return _build_legacy_qkv_aliases(item, agent_name)
+
+
+def _qkv_source_interval(item: MegatronTensorSpec) -> tuple[int, int]:
+    """Return this rank's raw row interval in the global fused QKV tensor."""
+    local_rows = int(item.tensor.shape[0])
+    global_rows = int(item.global_shape[0])
+    if item.placement_kind != "SHARD":
+        if local_rows != global_rows:
+            raise ValueError(f"{item.name}: replicated QKV shape mismatch")
+        return 0, global_rows
+    if item.shard_axis != 0 or item.local_shard_range is None:
+        raise ValueError(f"{item.name}: QKV shards must carry a row range")
+    lo, hi = (int(value) for value in item.local_shard_range)
+    if not 0 <= lo < hi <= global_rows or hi - lo != local_rows:
+        raise ValueError(f"{item.name}: inconsistent QKV source row interval")
+    return lo, hi
+
+
+_Q, _K, _V = 0, 1, 2
+
+
+@dataclass(frozen=True)
+class _QkvBand:
+    """One run of fused rows that belongs to a single projection.
+
+    ``destination_start`` is where the run lands in that projection's own
+    tensor, which is not where it sits in the fused tensor.
+    """
+
+    projection: int
+    start: int
+    rows: int
+    destination_start: int
+
+
+@dataclass(frozen=True)
+class _QkvLayout:
+    """Global row layout of a fused QKV tensor, derived from head counts.
+
+    Megatron lays the tensor out as one block per KV group: that group's query
+    rows, then its single K head, then its single V head. Blocks repeat for
+    every KV group, so Q, K and V rows interleave rather than forming three
+    contiguous regions.
+    """
+
+    head_dim: int
+    q_heads: int
+    kv_heads: int
+
+    @property
+    def q_rows_per_group(self) -> int:
+        return (self.q_heads // self.kv_heads) * self.head_dim
+
+    @property
+    def group_rows(self) -> int:
+        return self.q_rows_per_group + 2 * self.head_dim
+
+    @property
+    def total_rows(self) -> int:
+        return self.kv_heads * self.group_rows
+
+    @property
+    def destination_rows(self) -> tuple[int, int, int]:
+        """Row count of the whole q, k and v tensors this layout unpacks into."""
+        kv_rows = self.kv_heads * self.head_dim
+        return self.q_heads * self.head_dim, kv_rows, kv_rows
+
+    def bands(self) -> Iterator[_QkvBand]:
+        """Yield every projection run, in global row order."""
+        for group in range(self.kv_heads):
+            group_start = group * self.group_rows
+            k_start = group_start + self.q_rows_per_group
+            yield _QkvBand(
+                _Q, group_start, self.q_rows_per_group, group * self.q_rows_per_group
+            )
+            yield _QkvBand(_K, k_start, self.head_dim, group * self.head_dim)
+            yield _QkvBand(
+                _V, k_start + self.head_dim, self.head_dim, group * self.head_dim
+            )
+
+
+def _read_qkv_layout(item: MegatronTensorSpec) -> _QkvLayout:
+    """Validate the published global head metadata and derive the row layout."""
+    if item.extras.get("qkv_interleave") != "by_head":
+        raise ValueError(
+            f"{item.name}: global QKV aliasing requires qkv_interleave='by_head'"
+        )
+    if "head_dim" not in item.extras:
+        raise ValueError(
+            f"{item.name}: global QKV aliasing requires extras['head_dim']"
+        )
+    layout = _QkvLayout(
+        head_dim=int(item.extras["head_dim"]),
+        q_heads=int(item.extras["num_heads"]),
+        kv_heads=int(item.extras["num_kv_heads"]),
+    )
+    if (
+        layout.head_dim < 1
+        or layout.q_heads < 1
+        or layout.kv_heads < 1
+        or layout.q_heads % layout.kv_heads
+    ):
+        raise ValueError(f"{item.name}: invalid global Q/KV head geometry")
+    return layout
+
+
+def _build_global_qkv_aliases(
+    item: MegatronTensorSpec, agent_name: str
+) -> list[PublishedTensor]:
+    """Map one raw TP row interval through Megatron's global QKV interleave.
+
+    This rank owns a single contiguous interval of fused rows. Intersecting it
+    with each band says which projection those rows belong to and where they
+    land, so a rank that happens to own no K or V rows simply matches no K or V
+    band.
+    """
+    layout = _read_qkv_layout(item)
+    hidden = int(item.tensor.shape[1])
+    if len(item.global_shape) != 2 or int(item.global_shape[1]) != hidden:
+        raise ValueError(f"{item.name}: QKV hidden dimension mismatch")
+    if int(item.global_shape[0]) != layout.total_rows:
+        raise ValueError(f"{item.name}: global QKV rows disagree with head metadata")
+
+    source_lo, source_hi = _qkv_source_interval(item)
+    shards: tuple[list[PublishedShard], ...] = ([], [], [])
+    mapped_rows = 0
+    for band in layout.bands():
+        overlap_lo = max(source_lo, band.start)
+        overlap_hi = min(source_hi, band.start + band.rows)
+        if overlap_lo >= overlap_hi:
+            continue
+        tensor = item.tensor.narrow(0, overlap_lo - source_lo, overlap_hi - overlap_lo)
+        shards[band.projection].append(
+            PublishedShard(
+                agent_name=agent_name,
+                device_id=int(tensor.device.index or 0),
+                addr=int(tensor.data_ptr()),
+                shard_offset=(band.destination_start + overlap_lo - band.start, 0),
+                shape=tuple(int(dim) for dim in tensor.shape),
+                digest=tensor_digest(tensor),
+            )
+        )
+        mapped_rows += overlap_hi - overlap_lo
+
+    if mapped_rows != int(item.tensor.shape[0]):
+        raise ValueError(
+            f"{item.name}: QKV interval mapping covered {mapped_rows} of "
+            f"{int(item.tensor.shape[0])} source rows"
+        )
+
+    # When KV heads are fewer than TP ranks, most publishers legitimately own no
+    # K or V rows. Other ranks contribute those destination intervals when the
+    # per-rank tables are merged.
+    return [
+        PublishedTensor(
+            name=name,
+            dtype=str(item.tensor.dtype),
+            elsize=int(item.tensor.element_size()),
+            full_shape=(rows, hidden),
+            shards=projection_shards,
+        )
+        for name, rows, projection_shards in zip(
+            item.hf_names, layout.destination_rows, shards, strict=True
+        )
+        if projection_shards
+    ]
+
+
+def _build_legacy_qkv_aliases(
+    item: MegatronTensorSpec, agent_name: str
+) -> list[PublishedTensor]:
+    """Compatibility path for descriptors whose head counts divide across TP."""
     required = ("head_dim", "num_heads_local", "num_kv_heads_local")
     missing = [key for key in required if key not in item.extras]
     if missing:
@@ -211,7 +393,7 @@ def _build_qkv_aliases(
                     shape=tuple(int(dim) for dim in tensor.shape),
                     # The narrow, not the fused parent: this is the box a receiver
                     # reads from ``addr``, so it is the box whose bytes must match.
-                    digest=published_digest(tensor),
+                    digest=tensor_digest(tensor),
                 )
             )
     return [

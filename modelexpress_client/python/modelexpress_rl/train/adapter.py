@@ -10,11 +10,20 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    import torch
 
 
 class NixlMetadataProvider(Protocol):
-    """Narrow NIXL manager surface required to publish trainer manifests."""
+    """NIXL manager surface required to publish trainer manifests.
+
+    Exposes the agent metadata every adapter needs plus ``register_tensors``.
+    NIXL can only transfer registered memory, so an adapter registers whatever
+    source buffers it owns (staging arenas, in-place local storage) before
+    building its manifest, so the published ``nixl_metadata`` covers them.
+    """
 
     @property
     def agent_name(self) -> str:
@@ -29,6 +38,10 @@ class NixlMetadataProvider(Protocol):
     @property
     def listen_port(self) -> int | None:
         """Return the local NIXL metadata-listener port, when enabled."""
+        ...
+
+    def register_tensors(self, tensors: dict[str, torch.Tensor]) -> bytes:
+        """Register buffers with NIXL and return the refreshed agent metadata."""
         ...
 
 
@@ -92,7 +105,6 @@ class StagedWeightVersionShardData:
 
     manifest: WeightVersionShardManifest
     publish_ready: CompletionFence
-    source_reuse_ready: CompletionFence
     buffer_owner: object | None = None
 
 
@@ -108,6 +120,10 @@ class TrainerEngineAdapter(ABC):
     @abstractmethod
     def source_slot_id(self) -> str:
         """Return this rank's required logical contribution identifier."""
+
+    @abstractmethod
+    def bind_tensors(self, tensors: Any) -> str:
+        """Bind stable engine tensors and return their logical source slot."""
 
     @property
     @abstractmethod

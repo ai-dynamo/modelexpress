@@ -10,9 +10,9 @@ default, and the Python client, opt-in. This page covers how to scrape both,
 what the pipeline guarantees, and the two operational choices it leaves to the
 deployment.
 
-This documents what ships today: the exposition path and `mx_build_info`, the
-family that later ones join against. Request/backend coverage, the load and
-transfer timing tiers, and the dashboard surface come later and are not here yet.
+This documents what ships today: the exposition path, `mx_build_info`, and
+per-RPC and storage-backend coverage on the server. The load and transfer timing
+tiers and the dashboard surface come later and are not here yet.
 
 ---
 
@@ -167,6 +167,129 @@ of the deployment export it, distinguished by `component`.
 | Family | Type | Labels |
 | --- | --- | --- |
 | `mx_build_info` | Gauge (= 1) | `component="server"`, `version`, `backend`, `scheme` |
+| `mx_grpc_requests_total` | Counter | `method`, `outcome` |
+| `mx_grpc_request_seconds` | Histogram | `method`, `outcome` |
+| `mx_grpc_requests_in_flight` | Gauge | `method` |
+| `mx_backend_ops_total` | Counter | `store`, `op`, `result` |
+| `mx_backend_op_seconds` | Histogram | `store`, `op`, `result` |
+| `mx_backend_ops_in_flight` | Gauge | `store`, `op` |
+| `mx_registry_status_transitions_total` | Counter | `from`, `to` |
+| `mx_download_claims_total` | Counter | `result` |
+| `mx_download_lease_refresh_total` | Counter | `result` |
+| `mx_download_seconds` | Histogram | `outcome` |
+| `mx_cache_evictions_total` | Counter | `reason` |
+| `mx_registry_entries` | Gauge | `status` |
+| `mx_state_entries` | Gauge | `map` |
+| `mx_task_last_success_timestamp_seconds` | Gauge | `task` |
+
+`method` is a closed set of the 21 routed RPCs plus `other`; an unrecognised path
+cannot mint a series.
+
+`outcome` includes `cancelled`, recorded from a drop guard when the caller goes
+away before the handler finishes -- a client disconnect, an `RST_STREAM`, or a
+deadline. Without it the gap would not be uniform: the requests most likely to be
+cancelled are the slow ones, so the latency histogram would be conditioned on
+completion and its tail would look healthy precisely because the slowest samples
+were missing. A cancellation increments the counter only and writes no latency
+sample, since a partial duration would enter the distribution as a fast one.
+
+The two `_in_flight` gauges are the direct reading of the same situation: a store
+that wedges while its peers serve normally shows up immediately as operations
+accumulating, instead of having to be inferred from an absence of samples. They
+are plain gauges rather than the `_started_total`/`_finished_total` counter pairs
+the client side uses, because that pattern exists to survive a SIGKILLed rank
+under multiprocess mode -- the server is one process with an in-process registry,
+so there is nothing to wedge.
+
+### The download lifecycle
+
+`mx_download_claims_total{result="takeover"}` is the one to watch: a takeover
+means a previous downloader died and the bytes are being pulled again, which for
+a large model is hundreds of gigabytes of repeated transfer.
+`mx_download_lease_refresh_total{result="lost"}` is its leading indicator.
+
+Downloads currently in flight:
+
+```promql
+mx_registry_entries{status="downloading"}
+```
+
+Use the gauge, not a difference over the transition counters. The gauge is
+recomputed from the registry itself, so it is correct across a restart and across
+replicas; the counters are process-local while `DOWNLOADING` persists in the
+store, so after a restart a download that began in the previous process
+contributes a departure with no matching arrival and a raw difference can go
+negative.
+
+The transition counters answer flow rather than level -- how often downloads
+start, and how often they end in error:
+
+```promql
+sum(rate(mx_registry_status_transitions_total{to="downloading"}[5m]))
+sum(rate(mx_registry_status_transitions_total{to="error"}[5m]))
+```
+
+A `mx_registry_entries{status="downloading"}` that stays non-zero with no
+`to="downloading"` rate underneath it is a model wedged in `DOWNLOADING`.
+
+### Refreshed gauges, not scrape-time collection
+
+`mx_registry_entries` and `mx_state_entries` are written by a background task on
+`MX_REGISTRY_STATS_INTERVAL_SECS` (default 60), not computed during a scrape.
+Counting registry entries walks the keyspace -- a `SCAN` plus a pipelined per-key
+fetch on Redis, an unpaginated list of every `ModelCacheEntry` on Kubernetes -- so
+collecting at scrape time would put that on the metadata store every fifteen
+seconds.
+
+The task is independent of cache eviction on purpose: that service ticks hourly
+and is skipped entirely when eviction is disabled, which would leave these gauges
+permanently absent rather than merely stale.
+
+When a refresh fails the gauges hold their previous values and the heartbeat is
+not stamped, so staleness is the signal:
+
+```promql
+time() - mx_task_last_success_timestamp_seconds{task="registry_stats_refresh"} > 300
+```
+
+`mx_registry_entries` counts *entries*, not models: one logical model holds
+several at once, one per revision plus separate ones for metadata-only downloads.
+
+**The two streaming RPCs are deliberately absent.** `EnsureModelDownloaded` and
+`StreamModelFiles` return their response head as soon as the stream is set up and
+report failure as a stream item or trailer, so recording at the head would show
+`outcome="ok"` and a sub-millisecond duration for a download that ran for forty
+minutes and failed. `Health/Watch` is excluded for the same reason. Timing these
+means instrumenting the response body, which is a later change; until then they
+are absent rather than wrong. `store` names the subsystem (`p2p`, `registry`, `refit`),
+not the storage engine -- only one engine is live per pod, so the engine is
+carried by `mx_build_info{backend=...}` and joined from there.
+
+#### `outcome` is not the gRPC status code
+
+Several handlers report failure *in band*: they return `Ok` carrying
+`success: false`, or an empty list. `ListSources` is the clearest case -- a
+backend outage and "no peers have published yet" are the same
+`Ok(ListSourcesResponse { instances: [] })` on the wire.
+
+A metric derived from the status code would therefore read 100% success straight
+through a total backend outage. Instead each handler publishes its own verdict,
+which the metrics layer prefers over anything it could infer:
+
+```promql
+# Backend outages, which a status-code-derived metric would report as success.
+sum by (method) (rate(mx_grpc_requests_total{outcome="backend_error"}[5m]))
+```
+
+`backend_error` is wider than the metadata store: every `Unavailable` maps to it,
+including the auth layer's when the Kubernetes TokenReview API is down. That case
+appears on every method at once and can read like a total store outage, so
+confirm against `mx_backend_ops_total{result="error"}` -- a real store outage
+lights that family up too.
+
+Handlers that fail honestly with `Err(Status)` need no such tag -- the status
+carries itself -- so only the handlers that would otherwise misreport are
+touched.
 
 ### Client
 
@@ -180,6 +303,37 @@ of the deployment export it, distinguished by `component`.
 | `mx_p2p_candidates` | Histogram | `policy`, `scheme`, `stage` |
 | `mx_p2p_source_selection_seconds` | Histogram | `policy`, `scheme` |
 | `mx_p2p_transfer_seconds` | Histogram | `policy`, `scheme`, `outcome` |
+| `mx_nixl_data_plane_errors_total` | Counter | `scheme`, `kind` |
+| `mx_nixl_receive_total` | Counter | `scheme`, `result` |
+
+### NIXL data-plane health
+
+`mx_nixl_data_plane_errors_total{kind}` counts the failures that demote an agent
+from READY, classified as `timeout` or `status_error`. The distinction matters
+because they fail differently: a `status_error` is NIXL reporting a failed
+transfer, while a `timeout` is NIXL reporting *nothing at all* -- a wedged queue
+pair neither completes nor transitions to ERR, so the timeout is the only
+evidence anything went wrong.
+
+The kind is assigned where the failure is constructed, not derived later. The
+underlying field is a formatted message, so classifying at the consumer would
+mean parsing prose into a label and the domain would grow with the wording.
+
+`mx_nixl_receive_total{result}` records what a receive actually moved:
+
+| result | meaning |
+| --- | --- |
+| `complete` | every locally registered tensor was filled |
+| `partial` | a source/local name mismatch; the transfer completed and reported success, but the local-only tensors still hold their dummy values |
+| `empty` | no tensors matched; returned success having moved nothing |
+| `rejected` | strict mode refused the transfer and raised, rather than completing it |
+
+`partial` and `empty` both return success to the caller and are logged only as
+warnings, so before this they were indistinguishable from a healthy transfer.
+`rejected` raises instead, and is counted so the family partitions every receive
+rather than only the ones that returned.
+A non-zero `partial` rate across a fleet means manifest drift between source and
+target, which shows up later as wrong model output rather than as a failure.
 
 Two changes to the client families are breaking for existing dashboards:
 

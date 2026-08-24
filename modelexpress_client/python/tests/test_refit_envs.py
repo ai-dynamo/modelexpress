@@ -33,3 +33,15 @@ def test_unknown_attribute_raises():
 
 def test_dir_lists_registered_names():
     assert set(envs.environment_variables).issubset(dir(envs))
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_require_positive_int_rejects_non_positive_values(value):
+    with pytest.raises(ValueError, match="count must be positive"):
+        envs.require_positive_int(value, "count")
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, float("inf"), float("nan")])
+def test_require_positive_float_rejects_non_positive_or_non_finite_values(value):
+    with pytest.raises(ValueError, match="timeout must be finite and positive"):
+        envs.require_positive_float(value, "timeout")

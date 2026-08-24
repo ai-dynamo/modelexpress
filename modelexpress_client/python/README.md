@@ -109,57 +109,45 @@ behind the client.
 ```python
 from modelexpress_rl import (
     ModelExpressTrainerClient,
+    ModelExpressTrainerConfig,
     WeightVersionRef,
-    WeightVersionShardManifestService,
-    refit_pb2_grpc,
 )
 
-manifest_service = WeightVersionShardManifestService(endpoint="trainer-0:9000")
-refit_pb2_grpc.add_RefitWorkerServiceServicer_to_server(
-    manifest_service,
-    trainer_worker_grpc_server,
-)
-
-trainer = ModelExpressTrainerClient.initialize(
-    manager=nixl_manager,
-    manifest_publisher=manifest_service,
-)
-
-shard = trainer.stage_shard(
-    version=WeightVersionRef(version.uid),
-    tensors=megatron_tensor_specs,
-)
-shard.publish()
+trainer = ModelExpressTrainerClient.initialize(ModelExpressTrainerConfig())
+trainer.bind_tensors(megatron_tensor_specs)
+trainer.publish_version(version=WeightVersionRef(version.uid))
 ```
 
 The deployment supplies `MODEL_NAME`, `MX_TRAINER_ENGINE`,
 `MX_TRAINER_STAGING_MODE`, `MX_WEIGHT_PAYLOAD_FORMAT`, `MX_WORKER_HOST`, and the
 normal ModelExpress server configuration. The Megatron adapter derives its
-source slot from the engine's global distributed rank. The NIXL metadata
-endpoint is derived from `MX_WORKER_HOST` and the supplied NIXL manager's listen
-port.
+source slot from logical tensor names and shard geometry. DP replicas of the same
+partition therefore publish redundant workers for one slot, while distinct TP
+partitions remain separate required slots. The NIXL metadata endpoint is derived
+from `MX_WORKER_HOST` and the client-owned NIXL manager's listen port. `LOCAL_RANK`
+selects the device unless `device_id` is passed to `initialize()`.
 
-`worker_endpoint` is the trainer-side manifest service address advertised to
-other workers. `server_url` selects the central ModelExpress control-plane
-service and defaults to the normal ModelExpress server configuration.
+The client owns the NIXL manager and trainer-side manifest service. `server_url`
+selects the central ModelExpress control-plane service and defaults to the
+normal ModelExpress server configuration. A Megatron worker may initialize the
+client after selecting its CUDA device but before creating NCCL resources; the
+engine adapter is created lazily when the worker first requests its source slot
+or stages a shard after distributed setup.
 
 Initialization fixes the staging mode and payload format. `publish()` hides
 manifest publication and the internal `CreateWeightVersionShard` RPC. The
-current Megatron adapter exposes its already-registered live buffers through
+current Megatron adapter registers and exposes its live buffers through
 `IN_PLACE`, so callers must keep those tensors immutable while the version is
-published. Its `source_reuse_ready` fence raises `NotImplementedError` until
-version retirement is wired to the adapter; it must not be interpreted as an
-early reuse signal. The required lifecycle is synchronous: create and publish
-the version, update every generator, retire the version, and only then resume
-training or begin the next optimizer step. The adapter does not claim fully
-asynchronous `COPY_TO_DEVICE` behavior until that staging implementation exists.
+published. The required lifecycle is synchronous: create and publish the
+version, update every generator, retire and release the version, and only then
+resume training or begin the next optimizer step.
 
 Version creation and expected-source-slot declaration remain
 framework-orchestrator responsibilities. Each trainer adapter derives its own
 source slot from the engine's native topology; the orchestrator declares the
 expected slots using the same adapter-defined convention. `initialize()`
-selects the configured trainer engine and constructs its adapter internally;
-Megatron is the first implementation. Megatron-specific APIs live under
+selects the configured trainer engine and constructs its adapter internally.
+Megatron and FSDP implementations are available. Megatron-specific APIs live under
 `modelexpress_rl`;
 `modelexpress.refit.reshard` remains the shared, engine-neutral transfer core.
 
@@ -219,6 +207,8 @@ register_modelexpress_loaders()
 | `MX_HEARTBEAT_INTERVAL_SECS` | `30` | Seconds between READY status heartbeats for published sources, including reshard rendezvous sources; keep below the server heartbeat timeout |
 | `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Maximum exact descriptors for one no-gather refit copy before a compatible dim-0-sharded source is pulled once into contiguous staging and sliced locally |
 | `MX_RESHARD_FUSED_WIRE` | `1` | Issue a refit's exact-segment, full-pull, and convert reads as one transport batch instead of draining each phase in turn. Set to `0` to restore the phased reads for an A/B comparison |
+| `MX_RESHARD_BATCH_INSTALL` | `1` | Re-slice a refit's full-pulled sources with one batched `torch._foreach_copy_` instead of one `copy_()` per captured view. Issues the same copies; a per-view loop costs thousands of kernel launches whose overhead can rival the RDMA. Set to `0` to restore the per-view loop for an A/B comparison |
+| `MX_RESHARD_CACHE_DESCRIPTORS` | `1` | Build NIXL read descriptors once per stable transfer plan and reuse them across refits. Set to `0` to rebuild the descriptor lists on every step for an A/B comparison |
 | `MX_RESHARD_REQUIRE_FULL_COVERAGE` | `0` | Fail a refit that installs less than `MX_RESHARD_COVERAGE_FLOOR` of the engine's parameter bytes. Off by default because partial and subset refit are intended; set to `1` for benchmark runs, where an incomplete refit produces timings that are the wrong magnitude |
 | `MX_RESHARD_COVERAGE_FLOOR` | `0.995` | Fraction of engine parameter bytes a gated refit must install. Not `1.0`: a few engine parameters, such as rotary `inv_freq`, are legitimately not refit material. Values outside `[0.0, 1.0]` are rejected |
 | `MX_RESHARD_HANDSHAKE_TIMEOUT_S` | `900` | Budget for the whole P2P metadata handshake, across every trainer peer and every retry. Bounds the handshake independently of the refit timeout, so one unreachable publisher cannot consume the entire refit |
