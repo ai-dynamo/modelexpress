@@ -520,14 +520,27 @@ end-to-end backend slice implementing the same transaction boundaries.
 1. Parse CLI args (`ServerArgs` via clap)
 2. Load config (`ServerConfig::load()`) - CLI > env vars > config file > defaults
 3. Initialize structured logging (tracing-subscriber)
-4. Connect to the model registry backend (`MX_METADATA_BACKEND` — same selector as P2P). Fails fast on connect error.
-5. Initialize the process-wide `ModelDownloadTracker` with the registry, seed the `MODEL_TRACKER` OnceLock
-6. Start `CacheEvictionService` background task (reads the same registry)
-7. Connect to the P2P metadata backend (`MX_METADATA_BACKEND`, Redis or Kubernetes CRD)
-8. Start reaper background task for stale source detection and GC
-9. Register the configured gRPC services with tonic (max message size: 100MB)
-10. Listen on configured address (default `0.0.0.0:8001`)
-11. Graceful shutdown on CTRL+C (signals cache eviction service and reaper)
+4. Build the Prometheus registry and register every metric family, then start the
+   `/metrics` listener on its own port. Deliberately before anything that can
+   fail, so a scrape proves the exporter came up even on a server that never
+   reaches a healthy state. A bind failure logs and continues rather than
+   aborting startup.
+5. Connect to the model registry backend (`MX_METADATA_BACKEND` — same selector as P2P). Fails fast on connect error.
+6. Initialize the process-wide `ModelDownloadTracker` with the registry, seed the `MODEL_TRACKER` OnceLock
+7. Start `CacheEvictionService` background task (reads the same registry)
+8. Connect to the P2P metadata backend (`MX_METADATA_BACKEND`, Redis or Kubernetes CRD)
+9. Start reaper background task for stale source detection and GC
+10. Start the registry-statistics refresh task (`MX_REGISTRY_STATS_INTERVAL_SECS`,
+    default 60). Independent of `CacheEvictionService`: that one ticks hourly and
+    is skipped entirely when eviction is disabled, which would leave the gauges
+    permanently absent.
+11. Register the configured gRPC services with tonic (max message size: 100MB),
+    wrapped in the per-RPC metrics layer
+12. Listen on configured address (default `0.0.0.0:8001`)
+13. Graceful shutdown on CTRL+C: signals the cache eviction service, the reaper
+    and the statistics refresh, then joins them. The `/metrics` listener stops
+    **last**, after the gRPC server has drained, so the drain window stays
+    scrapeable.
 
 ### ServerConfig
 
