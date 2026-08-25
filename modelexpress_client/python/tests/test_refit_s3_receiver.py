@@ -11,6 +11,7 @@ import zstandard
 from safetensors.torch import load_file, save_file
 
 from modelexpress_rl import S3GeneratorConfig, WeightPayloadFormat
+from modelexpress_rl import s3 as s3_module
 from modelexpress_rl.inference.adapter import GeneratorTransferInputs
 from modelexpress_rl.inference import receiver as receiver_module
 from modelexpress_rl.inference.receiver import CanonicalS3GeneratorAdapter
@@ -35,6 +36,102 @@ class _MemoryS3:
         pass
 
 
+class _TransferFuture:
+    def result(self):
+        pass
+
+
+class _TransferManager:
+    def __init__(self, client, config):
+        self.client = client
+        self.config = config
+
+    def download(self, bucket, key, target):
+        response = self.client.get_object(Bucket=bucket, Key=key)
+        body = response["Body"]
+        try:
+            target.write(body.read())
+        finally:
+            body.close()
+        return _TransferFuture()
+
+    def shutdown(self):
+        pass
+
+
+class _Body:
+    def __init__(self, data):
+        self.data = data
+
+    def read(self):
+        return self.data
+
+    def close(self):
+        pass
+
+
+class _S3Error(Exception):
+    def __init__(self, code):
+        self.response = {"Error": {"Code": code}}
+
+
+class _S3Backend:
+    def __init__(
+        self,
+        data=b"",
+        *,
+        put_error=None,
+        complete_error=None,
+        barrier=None,
+    ):
+        self.data = data
+        self.put_error = put_error
+        self.complete_error = complete_error
+        self.barrier = barrier
+        self.parts = {}
+        self.put_request = None
+        self.get_request = None
+        self.get_requests = []
+        self.completed = None
+        self.aborted = False
+
+    def put_object(self, **request):
+        self.put_request = request
+        if self.put_error is not None:
+            raise self.put_error
+
+    def get_object(self, **request):
+        self.get_request = request
+        self.get_requests.append(request)
+        return {"Body": _Body(self.data)}
+
+    def create_multipart_upload(self, **request):
+        assert request == {"Bucket": "weights", "Key": "delta"}
+        return {"UploadId": "upload-1"}
+
+    def upload_part(self, **request):
+        if self.barrier is not None and request["PartNumber"] <= 2:
+            self.barrier.wait(timeout=2)
+        self.parts[request["PartNumber"]] = request["Body"]
+        return {"ETag": f"etag-{request['PartNumber']}"}
+
+    def complete_multipart_upload(self, **request):
+        if self.complete_error is not None:
+            raise self.complete_error
+        self.completed = request
+
+    def abort_multipart_upload(self, **_request):
+        self.aborted = True
+
+    def close(self):
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _transfer_manager(monkeypatch):
+    monkeypatch.setattr(s3_module, "TransferManager", _TransferManager)
+
+
 class _Adapter(CanonicalS3GeneratorAdapter):
     def __init__(self, **kwargs):
         self.installed = []
@@ -46,27 +143,12 @@ class _Adapter(CanonicalS3GeneratorAdapter):
 
 def test_s3_read_parses_uri():
     data = b"canonical-root"
-
-    class Body:
-        def read(self):
-            return data
-
-        def close(self):
-            pass
-
-    class Client:
-        def __init__(self):
-            self.request = None
-
-        def get_object(self, **request):
-            self.request = request
-            return {"Body": Body()}
-
-    backend = Client()
+    backend = _S3Backend(data)
     s3 = object.__new__(S3Client)
     s3._client = backend
+    s3._download_manager = _TransferManager(backend, None)
     assert s3.get("s3://weights/root.json") == data
-    assert backend.request == {
+    assert backend.get_request == {
         "Bucket": "weights",
         "Key": "root.json",
     }
@@ -87,34 +169,132 @@ def test_s3_rejects_noncanonical_uri(uri):
 
 
 def test_s3_write_accepts_only_an_identical_immutable_retry():
-    class Error(Exception):
-        response = {"Error": {"Code": "PreconditionFailed"}}
-
-    class Body:
-        def __init__(self, data):
-            self.data = data
-
-        def read(self):
-            return self.data
-
-        def close(self):
-            pass
-
-    class Client:
-        existing = b"same"
-
-        def put_object(self, **request):
-            assert request["IfNoneMatch"] == "*"
-            raise Error
-
-        def get_object(self, **_request):
-            return {"Body": Body(self.existing)}
-
+    backend = _S3Backend(b"same", put_error=_S3Error("PreconditionFailed"))
     s3 = object.__new__(S3Client)
-    s3._client = Client()
+    s3._client = backend
+    s3._multipart_threshold_bytes = 100
+    s3._download_manager = _TransferManager(backend, None)
     s3.put(uri="s3://weights/root.json", data=b"same")
     with pytest.raises(ImmutableS3Conflict):
         s3.put(uri="s3://weights/root.json", data=b"different")
+    assert backend.put_request["IfNoneMatch"] == "*"
+
+
+def test_s3_client_uses_transfer_connection_and_retry_settings(monkeypatch):
+    import boto3
+
+    captured = {}
+    backend = _S3Backend()
+
+    def client(_service, **kwargs):
+        captured.update(kwargs)
+        return backend
+
+    monkeypatch.setenv("MX_S3_UPLOAD_WORKERS", "2")
+    monkeypatch.setenv("MX_S3_DOWNLOAD_WORKERS", "3")
+    monkeypatch.setenv("MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES", "4096")
+    monkeypatch.setenv("MX_S3_DOWNLOAD_RANGE_BYTES", "1024")
+    monkeypatch.setenv("MX_S3_DOWNLOAD_IO_CHUNK_BYTES", "512")
+    monkeypatch.setenv("MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS", "7")
+    monkeypatch.setenv("MX_S3_MAX_POOL_CONNECTIONS", "17")
+    monkeypatch.setenv("MX_S3_MAX_ATTEMPTS", "6")
+    monkeypatch.setenv("MX_S3_TCP_KEEPALIVE", "false")
+    monkeypatch.setattr(boto3, "client", client)
+
+    s3 = S3Client()
+    try:
+        config = captured["config"]
+        assert config.max_pool_connections == 17
+        assert config.retries == {"total_max_attempts": 6, "mode": "standard"}
+        assert config.tcp_keepalive is False
+        assert s3._upload_pool._max_workers == 2
+        transfer = s3._download_manager.config
+        assert transfer.multipart_threshold == 4096
+        assert transfer.multipart_chunksize == 1024
+        assert transfer.max_request_concurrency == 3
+        assert transfer.io_chunksize == 512
+        assert transfer.max_io_queue_size == 7
+        assert transfer.max_in_memory_download_chunks == 7
+        assert transfer.num_download_attempts == 6
+    finally:
+        s3.close()
+
+
+def test_s3_multipart_uploads_parts_concurrently_and_completes_immutably(
+    monkeypatch,
+):
+    import boto3
+
+    part_bytes = 5 * 1024**2
+    barrier = threading.Barrier(2)
+    backend = _S3Backend(barrier=barrier)
+    monkeypatch.setenv("MX_S3_MULTIPART_THRESHOLD_BYTES", "1")
+    monkeypatch.setenv("MX_S3_UPLOAD_PART_BYTES", str(part_bytes))
+    monkeypatch.setenv("MX_S3_UPLOAD_WORKERS", "2")
+    monkeypatch.setattr(boto3, "client", lambda *_args, **_kwargs: backend)
+    data = b"a" * part_bytes + b"b" * part_bytes + b"c"
+
+    s3 = S3Client()
+    try:
+        s3.put(uri="s3://weights/delta", data=data)
+    finally:
+        s3.close()
+
+    assert backend.parts == {
+        1: data[:part_bytes],
+        2: data[part_bytes : 2 * part_bytes],
+        3: b"c",
+    }
+    assert backend.completed["IfNoneMatch"] == "*"
+    assert backend.completed["MultipartUpload"] == {
+        "Parts": [
+            {"ETag": "etag-1", "PartNumber": 1},
+            {"ETag": "etag-2", "PartNumber": 2},
+            {"ETag": "etag-3", "PartNumber": 3},
+        ]
+    }
+    assert backend.aborted is False
+
+
+def test_s3_multipart_aborts_and_propagates_conditional_conflict(monkeypatch):
+    import boto3
+
+    error = _S3Error("ConditionalRequestConflict")
+    backend = _S3Backend(complete_error=error)
+    monkeypatch.setenv("MX_S3_MULTIPART_THRESHOLD_BYTES", "1")
+    monkeypatch.setenv("MX_S3_UPLOAD_PART_BYTES", str(5 * 1024**2))
+    monkeypatch.setattr(boto3, "client", lambda *_args, **_kwargs: backend)
+
+    s3 = S3Client()
+    try:
+        with pytest.raises(_S3Error) as raised:
+            s3.put(uri="s3://weights/delta", data=b"x" * (5 * 1024**2))
+    finally:
+        s3.close()
+
+    assert raised.value is error
+    assert backend.aborted is True
+
+
+def test_s3_multipart_precondition_failure_accepts_identical_retry(monkeypatch):
+    import boto3
+
+    data = b"x" * (5 * 1024**2)
+    backend = _S3Backend(
+        data,
+        complete_error=_S3Error("PreconditionFailed"),
+    )
+    monkeypatch.setenv("MX_S3_MULTIPART_THRESHOLD_BYTES", "1")
+    monkeypatch.setenv("MX_S3_UPLOAD_PART_BYTES", str(5 * 1024**2))
+    monkeypatch.setattr(boto3, "client", lambda *_args, **_kwargs: backend)
+
+    s3 = S3Client()
+    try:
+        s3.put(uri="s3://weights/delta", data=data)
+    finally:
+        s3.close()
+
+    assert backend.aborted is True
 
 
 def _artifact(

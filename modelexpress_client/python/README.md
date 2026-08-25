@@ -235,6 +235,31 @@ register_modelexpress_loaders()
 | `MX_RESHARD_MAX_GBPS` | `0` | Per-rank fabric ceiling in Gbps. A measured wire rate above it means the timing is wrong rather than the transfer being fast, so the refit is rejected. `0` disables the check, since only the operator knows the real per-rank limit |
 | `MX_RESHARD_PUBLISH_DIGEST` | `0` | Have each trainer publish a position-sensitive digest of every shard it advertises, so a receiver can later confirm it installed the bytes the publisher held. Off by default: the reduction costs a pass over every published tensor, which is large next to a ~1.5 s wire, so turn it on when qualifying a build rather than when measuring throughput |
 
+### Canonical S3 Transfer Tuning
+
+Objects below the configured thresholds use one PUT or GET. Larger uploads use
+multipart parts, and larger downloads use ranged GETs through one persistent
+`s3transfer.TransferManager` per `S3Client`. The receiver's file-level pool and
+the manager's global request concurrency use the same worker setting, so all
+whole-object and ranged data GETs share one 16-request budget. HEAD requests use
+the manager's separate submission executor. Downloads target a seekable
+`BytesIO`, so the complete downloaded object remains resident; the I/O settings
+below bound queued chunks, not the final object size.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MX_S3_MULTIPART_THRESHOLD_BYTES` | `104857600` (100 MiB) | Minimum object size for multipart upload |
+| `MX_S3_UPLOAD_PART_BYTES` | `16777216` (16 MiB) | Multipart upload part size |
+| `MX_S3_UPLOAD_WORKERS` | `8` | Maximum concurrent multipart part uploads |
+| `MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES` | `104857600` (100 MiB) | Minimum object size for parallel ranged download |
+| `MX_S3_DOWNLOAD_RANGE_BYTES` | `8388608` (8 MiB) | Byte-range size for parallel downloads |
+| `MX_S3_DOWNLOAD_WORKERS` | `16` | Receiver file-worker limit and shared whole/ranged data GET concurrency budget |
+| `MX_S3_DOWNLOAD_IO_CHUNK_BYTES` | `1048576` (1 MiB) | TransferManager I/O queue chunk size |
+| `MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS` | `16` | Sets `max_io_queue_size` and the non-seekable-output chunk limit. For the seekable `BytesIO` target, the default bounds queued I/O to about 16 MiB but does not cap the full downloaded object |
+| `MX_S3_MAX_POOL_CONNECTIONS` | `32` | Botocore HTTP connection-pool size |
+| `MX_S3_MAX_ATTEMPTS` | `5` | Botocore total request attempts and TransferManager post-200 streaming-download attempts |
+| `MX_S3_TCP_KEEPALIVE` | `true` | Enable TCP keepalive for S3 connections |
+
 ### UCX/NIXL Tuning
 
 | Variable | Recommended | Description |

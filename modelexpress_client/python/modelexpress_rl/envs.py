@@ -18,6 +18,17 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     MX_REFIT_DELTA_BUCKET_BYTES: int
     MX_REFIT_DELTA_WORKERS: int
+    MX_S3_DOWNLOAD_RANGE_BYTES: int
+    MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES: int
+    MX_S3_DOWNLOAD_IO_CHUNK_BYTES: int
+    MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS: int
+    MX_S3_DOWNLOAD_WORKERS: int
+    MX_S3_MAX_ATTEMPTS: int
+    MX_S3_MAX_POOL_CONNECTIONS: int
+    MX_S3_MULTIPART_THRESHOLD_BYTES: int
+    MX_S3_TCP_KEEPALIVE: bool
+    MX_S3_UPLOAD_PART_BYTES: int
+    MX_S3_UPLOAD_WORKERS: int
     MX_TRAINER_ENGINE: str
     MX_TRAINER_STAGING_MODE: str
     MX_WEIGHT_PAYLOAD_FORMAT: str
@@ -46,6 +57,55 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         "MX_REFIT_DELTA_WORKERS",
     ),
+    "MX_S3_MULTIPART_THRESHOLD_BYTES": lambda: require_positive_int(
+        int(os.environ.get("MX_S3_MULTIPART_THRESHOLD_BYTES", 100 * 1024**2)),
+        "MX_S3_MULTIPART_THRESHOLD_BYTES",
+    ),
+    "MX_S3_UPLOAD_PART_BYTES": lambda: require_positive_int(
+        int(os.environ.get("MX_S3_UPLOAD_PART_BYTES", 16 * 1024**2)),
+        "MX_S3_UPLOAD_PART_BYTES",
+    ),
+    "MX_S3_UPLOAD_WORKERS": lambda: require_positive_int(
+        int(os.environ.get("MX_S3_UPLOAD_WORKERS", 8)),
+        "MX_S3_UPLOAD_WORKERS",
+    ),
+    "MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES": lambda: require_positive_int(
+        int(
+            os.environ.get(
+                "MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES",
+                100 * 1024**2,
+            )
+        ),
+        "MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES",
+    ),
+    "MX_S3_DOWNLOAD_RANGE_BYTES": lambda: require_positive_int(
+        int(os.environ.get("MX_S3_DOWNLOAD_RANGE_BYTES", 8 * 1024**2)),
+        "MX_S3_DOWNLOAD_RANGE_BYTES",
+    ),
+    "MX_S3_DOWNLOAD_IO_CHUNK_BYTES": lambda: require_positive_int(
+        int(os.environ.get("MX_S3_DOWNLOAD_IO_CHUNK_BYTES", 1024**2)),
+        "MX_S3_DOWNLOAD_IO_CHUNK_BYTES",
+    ),
+    "MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS": lambda: require_positive_int(
+        int(os.environ.get("MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS", 16)),
+        "MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS",
+    ),
+    "MX_S3_DOWNLOAD_WORKERS": lambda: require_positive_int(
+        int(os.environ.get("MX_S3_DOWNLOAD_WORKERS", 16)),
+        "MX_S3_DOWNLOAD_WORKERS",
+    ),
+    "MX_S3_MAX_POOL_CONNECTIONS": lambda: require_positive_int(
+        int(os.environ.get("MX_S3_MAX_POOL_CONNECTIONS", 32)),
+        "MX_S3_MAX_POOL_CONNECTIONS",
+    ),
+    "MX_S3_MAX_ATTEMPTS": lambda: require_positive_int(
+        int(os.environ.get("MX_S3_MAX_ATTEMPTS", 5)),
+        "MX_S3_MAX_ATTEMPTS",
+    ),
+    "MX_S3_TCP_KEEPALIVE": lambda: parse_bool(
+        os.environ.get("MX_S3_TCP_KEEPALIVE", "true"),
+        "MX_S3_TCP_KEEPALIVE",
+    ),
 }
 
 
@@ -61,6 +121,16 @@ def require_positive_float(value: float, name: str) -> float:
     if not math.isfinite(value) or value <= 0:
         raise ValueError(f"{name} must be finite and positive")
     return value
+
+
+def parse_bool(value: str, name: str) -> bool:
+    """Parse one boolean environment setting."""
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
 
 
 def __getattr__(name: str) -> Any:

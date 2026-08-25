@@ -236,8 +236,8 @@ class _LocalCheckpoint:
         parent_uri = root_uri.rsplit("/", 1)[0]
         shards = {}
         with ThreadPoolExecutor(
-            max_workers=min(32, len(by_file)),
-            thread_name_prefix="modelexpress-s3-download",
+            max_workers=min(rl_envs.MX_S3_DOWNLOAD_WORKERS, len(by_file)),
+            thread_name_prefix="modelexpress-s3-download-file",
         ) as pool:
             downloads = {
                 filename: pool.submit(

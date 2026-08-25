@@ -5,7 +5,17 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, wait
+from io import BytesIO
 from urllib.parse import urlsplit
+
+from modelexpress_rl import envs as rl_envs
+from s3transfer.manager import TransferConfig, TransferManager
+
+
+_MIN_MULTIPART_PART_BYTES = 5 * 1024**2
+_MAX_MULTIPART_PART_BYTES = 5 * 1024**3
+_MAX_MULTIPART_PARTS = 10_000
 
 
 class ImmutableS3Conflict(RuntimeError):
@@ -46,16 +56,52 @@ class S3Client:
         import boto3
         from botocore.config import Config as BotoConfig
 
+        self._multipart_threshold_bytes = rl_envs.MX_S3_MULTIPART_THRESHOLD_BYTES
+        self._upload_part_bytes = rl_envs.MX_S3_UPLOAD_PART_BYTES
+        if not (
+            _MIN_MULTIPART_PART_BYTES
+            <= self._upload_part_bytes
+            <= _MAX_MULTIPART_PART_BYTES
+        ):
+            raise ValueError("MX_S3_UPLOAD_PART_BYTES must be between 5 MiB and 5 GiB")
         self._client = boto3.client(
             "s3",
             endpoint_url=endpoint_url,
             region_name=region_name,
-            config=BotoConfig(max_pool_connections=32),
+            config=BotoConfig(
+                max_pool_connections=rl_envs.MX_S3_MAX_POOL_CONNECTIONS,
+                retries={
+                    "total_max_attempts": rl_envs.MX_S3_MAX_ATTEMPTS,
+                    "mode": "standard",
+                },
+                tcp_keepalive=rl_envs.MX_S3_TCP_KEEPALIVE,
+            ),
+        )
+        self._upload_pool = ThreadPoolExecutor(
+            max_workers=rl_envs.MX_S3_UPLOAD_WORKERS,
+            thread_name_prefix="modelexpress-s3-upload",
+        )
+        self._download_manager = TransferManager(
+            self._client,
+            config=TransferConfig(
+                multipart_threshold=rl_envs.MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES,
+                multipart_chunksize=rl_envs.MX_S3_DOWNLOAD_RANGE_BYTES,
+                max_request_concurrency=rl_envs.MX_S3_DOWNLOAD_WORKERS,
+                io_chunksize=rl_envs.MX_S3_DOWNLOAD_IO_CHUNK_BYTES,
+                max_io_queue_size=(rl_envs.MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS),
+                max_in_memory_download_chunks=(
+                    rl_envs.MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS
+                ),
+                num_download_attempts=rl_envs.MX_S3_MAX_ATTEMPTS,
+            ),
         )
 
     def put(self, *, uri: str, data: bytes) -> None:
         """Create an immutable object, accepting an identical retry."""
         bucket, key = _parse_uri(uri)
+        if len(data) >= self._multipart_threshold_bytes:
+            self._put_multipart(bucket=bucket, key=key, uri=uri, data=data)
+            return
         try:
             self._client.put_object(
                 Bucket=bucket,
@@ -64,12 +110,67 @@ class S3Client:
                 IfNoneMatch="*",
             )
         except Exception as error:
-            if _error_code(error) not in {
-                "409",
-                "412",
-                "ConditionalRequestConflict",
-                "PreconditionFailed",
-            }:
+            if _error_code(error) not in {"412", "PreconditionFailed"}:
+                raise
+            existing = self.get(uri)
+            if existing != data:
+                raise ImmutableS3Conflict(
+                    f"immutable S3 object conflict for {bucket}/{key}"
+                ) from error
+
+    def _put_multipart(
+        self,
+        *,
+        bucket: str,
+        key: str,
+        uri: str,
+        data: bytes,
+    ) -> None:
+        part_count = (
+            len(data) + self._upload_part_bytes - 1
+        ) // self._upload_part_bytes
+        if part_count > _MAX_MULTIPART_PARTS:
+            raise ValueError("multipart upload exceeds 10,000 parts")
+        upload_id = self._client.create_multipart_upload(
+            Bucket=bucket,
+            Key=key,
+        )["UploadId"]
+
+        def upload_part(index: int) -> dict[str, int | str]:
+            start = index * self._upload_part_bytes
+            response = self._client.upload_part(
+                Bucket=bucket,
+                Key=key,
+                UploadId=upload_id,
+                PartNumber=index + 1,
+                Body=data[start : start + self._upload_part_bytes],
+            )
+            return {"ETag": response["ETag"], "PartNumber": index + 1}
+
+        try:
+            futures = [
+                self._upload_pool.submit(upload_part, index)
+                for index in range(part_count)
+            ]
+            try:
+                parts = [future.result() for future in futures]
+            except Exception:
+                wait(futures)
+                raise
+            self._client.complete_multipart_upload(
+                Bucket=bucket,
+                Key=key,
+                UploadId=upload_id,
+                MultipartUpload={"Parts": parts},
+                IfNoneMatch="*",
+            )
+        except Exception as error:
+            self._client.abort_multipart_upload(
+                Bucket=bucket,
+                Key=key,
+                UploadId=upload_id,
+            )
+            if _error_code(error) not in {"412", "PreconditionFailed"}:
                 raise
             existing = self.get(uri)
             if existing != data:
@@ -80,18 +181,14 @@ class S3Client:
     def get(self, uri: str) -> bytes:
         """Read one S3 object."""
         bucket, key = _parse_uri(uri)
-        request = {"Bucket": bucket, "Key": key}
-        response = self._client.get_object(**request)
-        body = response["Body"]
-        try:
-            return body.read()
-        finally:
-            close = getattr(body, "close", None)
-            if close is not None:
-                close()
+        target = BytesIO()
+        self._download_manager.download(bucket, key, target).result()
+        return target.getvalue()
 
     def close(self) -> None:
         """Close the underlying SDK client when supported."""
+        self._upload_pool.shutdown()
+        self._download_manager.shutdown()
         close = getattr(self._client, "close", None)
         if close is not None:
             close()
