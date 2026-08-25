@@ -212,8 +212,13 @@ moved. On the first mount after the upgrade the kubelet takes ownership of the
 volume for `fsGroup: 1000`; on a large cache that pass takes a while, and
 `fsGroupChangePolicy: OnRootMismatch` keeps later restarts from repeating it.
 
-Pinning `persistence.mountPath` back to `/root` will start the pod but leave the
-server unable to write its cache.
+`persistence.mountPath` and `env.MODEL_EXPRESS_CACHE_DIRECTORY` have to be
+changed together. Pinning only the mount path back to `/root` leaves the cache
+directory at `/app/cache` -- a writable directory inside the image, so the pod
+starts and looks healthy while the PVC sits mounted and unused, and every
+cached model is lost when the pod is recreated. Setting only the cache
+directory to `/root` fails the other way: the non-root server cannot write
+there.
 
 ## Uninstalling
 

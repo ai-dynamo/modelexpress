@@ -33,9 +33,13 @@ RUN apt-get update && \
 # whose image would run as root -- so the image itself has to carry a non-root
 # user, not just the chart. noble already ships a stock "ubuntu" account on
 # 1000:1000; drop it so the server owns the conventional uid.
+# userdel clears the matching primary group only while USERGROUPS_ENAB is yes,
+# so free the gid explicitly rather than trusting that default -- and key on the
+# gid, not the name, so a base image that renames the account is still caught.
 # Keep 1000 in sync with podSecurityContext runAsUser/runAsGroup/fsGroup in
 # helm/values.yaml.
 RUN if getent passwd ubuntu >/dev/null; then userdel -r ubuntu; fi && \
+    if getent group 1000 >/dev/null; then groupdel "$(getent group 1000 | cut -d: -f1)"; fi && \
     groupadd --gid 1000 modelexpress && \
     useradd --uid 1000 --gid 1000 --no-log-init --create-home \
             --home-dir /home/modelexpress --shell /usr/sbin/nologin modelexpress
