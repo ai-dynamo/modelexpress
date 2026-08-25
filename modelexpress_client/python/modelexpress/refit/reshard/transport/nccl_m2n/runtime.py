@@ -19,10 +19,10 @@ from __future__ import annotations
 
 import importlib
 import logging
-import re
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
 from numbers import Integral
@@ -179,8 +179,20 @@ def _version_tuple(version: object) -> tuple[int, int, int]:
     if isinstance(version, Integral) and not isinstance(version, bool):
         encoded = int(version)
         return encoded // 10_000, encoded // 100 % 100, encoded % 100
-    numbers = [int(value) for value in re.findall(r"\d+", str(version))[:3]]
-    return tuple((numbers + [0, 0, 0])[:3])
+
+    release = getattr(version, "release", None)
+    if not release:
+        raise TypeError(
+            "loaded libnccl version must be a packed integer or expose a "
+            f"non-empty .release tuple, got {version!r}"
+        )
+    try:
+        components = [int(value) for value in release]
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            f"loaded libnccl version has an invalid .release tuple: {release!r}"
+        ) from exc
+    return tuple((components + [0, 0, 0])[:3])
 
 
 class _M2nRuntime:
@@ -210,7 +222,9 @@ class _M2nRuntime:
         self._state = _RuntimeState.OPEN
         self._state_cv = threading.Condition()
         self._dispatcher_lock = threading.Lock()
-        self._active_updates = 0
+        self._active_operations = 0
+        self._operation_local = threading.local()
+        self._close_abandoned = False
         self._pp_groups: dict[_PPGroupKey, _M2nPPGroup] = {}
         self._topology_frozen = False
         self._handle: Any | None = None
@@ -262,9 +276,26 @@ class _M2nRuntime:
         get_version = getattr(self._nccl, "get_version", None)
         if not callable(get_version):
             raise TypeError("NCCL4Py does not expose nccl.core.get_version()")
-        version = get_version()
-        if _version_tuple(version) < (2, 30, 5):
-            raise RuntimeError(f"NCCL M2N requires NCCL >= 2.30.5, found {version}")
+        version_info = get_version()
+        if isinstance(version_info, Integral) and not isinstance(version_info, bool):
+            libnccl_version = version_info
+        else:
+            libnccl = getattr(version_info, "libnccl", None)
+            if libnccl is None:
+                raise RuntimeError(
+                    "NCCL M2N requires NCCL >= 2.30.5, but NCCL4Py could not "
+                    f"identify a loaded libnccl: {version_info!r}"
+                )
+            libnccl_version = getattr(libnccl, "version", None)
+            if libnccl_version is None:
+                raise TypeError(
+                    "NCCL4Py VersionInfo.libnccl does not expose .version"
+                )
+        if _version_tuple(libnccl_version) < (2, 30, 5):
+            raise RuntimeError(
+                "NCCL M2N requires NCCL >= 2.30.5, found "
+                f"{libnccl_version}"
+            )
 
     def _validate_m2n_api(self) -> None:
         required = (
@@ -281,6 +312,70 @@ class _M2nRuntime:
             raise RuntimeError(
                 "NCCL M2N package lacks current Python API: " + ", ".join(missing)
             )
+
+    @contextmanager
+    def _active_operation(
+        self,
+        *,
+        allow_poisoned: bool = False,
+    ) -> Iterator[None]:
+        """Keep runtime resources alive for one reentrant top-level operation."""
+        depth = getattr(self._operation_local, "depth", 0)
+        if depth:
+            with self._state_cv:
+                self._require_admitted_operation_locked(
+                    allow_poisoned=getattr(
+                        self._operation_local,
+                        "allow_poisoned",
+                        False,
+                    )
+                )
+            self._operation_local.depth = depth + 1
+            try:
+                yield
+            finally:
+                self._operation_local.depth = depth
+            return
+
+        with self._state_cv:
+            if (
+                allow_poisoned
+                and self._state is _RuntimeState.POISONED
+                and not self._close_abandoned
+            ):
+                pass
+            else:
+                self._require_open_locked()
+            self._active_operations += 1
+        self._operation_local.depth = 1
+        self._operation_local.allow_poisoned = allow_poisoned
+        try:
+            yield
+        finally:
+            del self._operation_local.depth
+            del self._operation_local.allow_poisoned
+            with self._state_cv:
+                self._active_operations -= 1
+                self._state_cv.notify_all()
+
+    def _require_admitted_operation(self) -> None:
+        with self._state_cv:
+            self._require_admitted_operation_locked()
+
+    def _require_admitted_operation_locked(
+        self,
+        *,
+        allow_poisoned: bool = False,
+    ) -> None:
+        if self._state in (_RuntimeState.OPEN, _RuntimeState.CLOSING):
+            return
+        if (
+            allow_poisoned
+            and self._state is _RuntimeState.POISONED
+            and not self._close_abandoned
+        ):
+            return
+        raise RuntimeError(f"M2N runtime is {self._state.name.lower()}")
 
     @property
     def device_id(self) -> int:
@@ -302,12 +397,12 @@ class _M2nRuntime:
         return tuple(sorted(self._pp_groups.values(), key=lambda group: group.key))
 
     def new_unique_id_bytes(self) -> bytes:
-        self._require_open()
-        unique_id = self._nccl.get_unique_id()
-        payload = getattr(unique_id, "as_bytes", None)
-        if payload is None:
-            raise TypeError("NCCL4Py UniqueId does not expose .as_bytes")
-        return bytes(payload)
+        with self._active_operation():
+            unique_id = self._nccl.get_unique_id()
+            payload = getattr(unique_id, "as_bytes", None)
+            if payload is None:
+                raise TypeError("NCCL4Py UniqueId does not expose .as_bytes")
+            return bytes(payload)
 
     def create_pp_groups(
         self,
@@ -318,54 +413,69 @@ class _M2nRuntime:
         Creation is intentionally batch-only. Thread arrival or unordered map
         iteration must never choose parent-communicator first-use order.
         """
-        ordered_specs = tuple(sorted(specs, key=lambda spec: spec.key))
-        if not ordered_specs:
-            return ()
-        self._validate_pp_group_specs(ordered_specs)
+        with self._active_operation():
+            ordered_specs = tuple(sorted(specs, key=lambda spec: spec.key))
+            if not ordered_specs:
+                return ()
+            self._validate_pp_group_specs(ordered_specs)
 
-        with self._dispatcher_lock:
-            with self._state_cv:
-                self._require_open_locked()
-                if self._topology_frozen:
-                    raise RuntimeError("M2N PP-group topology is frozen")
-                if self._pp_groups:
-                    raise RuntimeError(
-                        "all local M2N PP groups must be created in one canonical batch"
-                    )
-
-            created: list[_M2nPPGroup] = []
-            try:
-                self._torch.cuda.set_device(self._device_id)
-                for spec in ordered_specs:
-                    unique_id = self._nccl.UniqueId.from_bytes(spec.unique_id)
-                    stream = self._torch.cuda.Stream(device=self._device_id)
-                    try:
-                        communicator = self._nccl.Communicator.init(
-                            spec.nranks,
-                            spec.comm_rank,
-                            unique_id,
+            with self._dispatcher_lock:
+                self._require_admitted_operation()
+                with self._state_cv:
+                    if self._topology_frozen:
+                        raise RuntimeError("M2N PP-group topology is frozen")
+                    if self._pp_groups:
+                        raise RuntimeError(
+                            "all local M2N PP groups must be created in one "
+                            "canonical batch"
                         )
-                    except BaseException:
-                        close = getattr(stream, "close", None)
-                        if callable(close):
-                            close()
-                        raise
-                    pp_group = _M2nPPGroup(
-                        group_id=spec.group_id,
-                        key=spec.key,
-                        communicator=communicator,
-                        source_size=spec.source_size,
-                        destination_size=spec.destination_size,
-                        comm_rank=spec.comm_rank,
-                        device_id=spec.device_id,
-                        stream=stream,
-                    )
-                    self._pp_groups[pp_group.key] = pp_group
-                    created.append(pp_group)
-            except BaseException:
-                self._poison_runtime()
-                raise
-        return tuple(created)
+
+                created: list[_M2nPPGroup] = []
+                try:
+                    self._torch.cuda.set_device(self._device_id)
+                    for spec in ordered_specs:
+                        unique_id = self._nccl.UniqueId.from_bytes(spec.unique_id)
+                        stream = self._torch.cuda.Stream(device=self._device_id)
+                        try:
+                            communicator = self._nccl.Communicator.init(
+                                spec.nranks,
+                                spec.comm_rank,
+                                unique_id,
+                            )
+                        except BaseException:
+                            close = getattr(stream, "close", None)
+                            if callable(close):
+                                close()
+                            raise
+                        created.append(
+                            _M2nPPGroup(
+                                group_id=spec.group_id,
+                                key=spec.key,
+                                communicator=communicator,
+                                source_size=spec.source_size,
+                                destination_size=spec.destination_size,
+                                comm_rank=spec.comm_rank,
+                                device_id=spec.device_id,
+                                stream=stream,
+                            )
+                        )
+                except BaseException:
+                    with self._state_cv:
+                        self._pp_groups.update(
+                            {pp_group.key: pp_group for pp_group in created}
+                        )
+                    self._poison_runtime()
+                    raise
+
+                with self._state_cv:
+                    self._pp_groups = {
+                        pp_group.key: pp_group for pp_group in created
+                    }
+                    if self._state is _RuntimeState.POISONED:
+                        for pp_group in created:
+                            pp_group.state = _PPGroupState.POISONED
+                    self._require_admitted_operation_locked()
+            return tuple(created)
 
     def _validate_pp_group_specs(
         self,
@@ -404,24 +514,34 @@ class _M2nRuntime:
                 )
 
     def freeze_pp_groups(self) -> tuple[_M2nPPGroup, ...]:
-        with self._state_cv:
-            self._require_open_locked()
-            if not self._pp_groups:
-                raise RuntimeError("cannot freeze an empty M2N PP-group topology")
-            self._topology_frozen = True
-        return self.pp_groups
+        with self._active_operation(), self._dispatcher_lock:
+            with self._state_cv:
+                self._require_admitted_operation_locked()
+                if not self._pp_groups:
+                    raise RuntimeError("cannot freeze an empty M2N PP-group topology")
+                self._topology_frozen = True
+                return tuple(
+                    sorted(self._pp_groups.values(), key=lambda group: group.key)
+                )
 
     def submit_model_update(
         self,
         batches: Sequence[_M2nPPGroupBatch],
     ) -> dict[_PPGroupKey, int]:
         """Submit one complete local model update in canonical PP-group order."""
+        with self._active_operation():
+            return self._submit_model_update(batches)
+
+    def _submit_model_update(
+        self,
+        batches: Sequence[_M2nPPGroupBatch],
+    ) -> dict[_PPGroupKey, int]:
         ordered = tuple(sorted(batches, key=lambda batch: batch.pp_group.key))
         if not ordered:
             return {}
 
         with self._state_cv:
-            self._require_open_locked()
+            self._require_admitted_operation_locked()
             if not self._topology_frozen:
                 raise RuntimeError(
                     "M2N PP-group topology must be frozen before updates"
@@ -442,14 +562,13 @@ class _M2nRuntime:
                         f"M2N PP group {pp_group.group_id!r} is "
                         f"{pp_group.state.name.lower()}"
                     )
-            self._active_updates += 1
 
         with self._dispatcher_lock:
             submission_started = False
             try:
                 # Another queued update may have poisoned runtime while this
                 # caller waited for dispatcher ownership.
-                self._require_open()
+                self._require_admitted_operation()
                 self._wait_for_source_readiness(ordered)
                 if any(batch.calls for batch in ordered):
                     submission_started = True
@@ -493,14 +612,10 @@ class _M2nRuntime:
                 if submission_started:
                     for batch in ordered:
                         try:
-                            self.synchronize_pp_group(batch.pp_group)
+                            self._synchronize_pp_group_unchecked(batch.pp_group)
                         except RuntimeError:
                             self._poison_runtime()
                 raise
-            finally:
-                with self._state_cv:
-                    self._active_updates -= 1
-                    self._state_cv.notify_all()
 
         return {batch.pp_group.key: batch.total_bytes for batch in ordered}
 
@@ -521,14 +636,21 @@ class _M2nRuntime:
         for batch in source_batches:
             batch.pp_group.stream.wait_event(ready)
 
-    def stream_context(self, pp_group: _M2nPPGroup) -> Any:
-        if pp_group.stream is None:
-            raise RuntimeError(
-                f"M2N PP group {pp_group.group_id!r} stream has been released"
-            )
-        return self._torch.cuda.stream(pp_group.stream)
+    @contextmanager
+    def stream_context(self, pp_group: _M2nPPGroup) -> Iterator[None]:
+        with self._active_operation():
+            if pp_group.stream is None:
+                raise RuntimeError(
+                    f"M2N PP group {pp_group.group_id!r} stream has been released"
+                )
+            with self._torch.cuda.stream(pp_group.stream):
+                yield
 
     def synchronize_pp_group(self, pp_group: _M2nPPGroup) -> None:
+        with self._active_operation():
+            self._synchronize_pp_group_unchecked(pp_group)
+
+    def _synchronize_pp_group_unchecked(self, pp_group: _M2nPPGroup) -> None:
         self._torch.cuda.set_device(self._device_id)
         if pp_group.stream is None:
             raise RuntimeError(
@@ -547,27 +669,49 @@ class _M2nRuntime:
 
     def close(self) -> None:
         """Drain groups, finalize M2N, then destroy parent comms canonically."""
+        if getattr(self._operation_local, "depth", 0):
+            raise RuntimeError(
+                "cannot close M2N runtime from an active runtime operation"
+            )
+
         with self._state_cv:
             if self._state is _RuntimeState.CLOSED:
                 return
+            if self._close_abandoned:
+                raise RuntimeError(
+                    "M2N close previously timed out with active operations; "
+                    "resources were retained and process restart is required"
+                )
             if self._state is _RuntimeState.CLOSING:
                 raise RuntimeError("M2N runtime is already closing")
             self._state = _RuntimeState.CLOSING
+            self._state_cv.notify_all()
             deadline = time.monotonic() + self._finalize_timeout_s
-            while self._active_updates:
+            while self._active_operations:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     self._state = _RuntimeState.POISONED
-                    raise TimeoutError("timed out waiting for active M2N updates")
+                    self._close_abandoned = True
+                    for pp_group in self._pp_groups.values():
+                        if pp_group.state is not _PPGroupState.CLOSED:
+                            pp_group.state = _PPGroupState.POISONED
+                    self._state_cv.notify_all()
+                    raise TimeoutError(
+                        "timed out waiting for active M2N operations; resources "
+                        "were retained and process restart is required"
+                    )
                 self._state_cv.wait(timeout=remaining)
 
-        pp_groups = list(self.pp_groups)
         try:
-            for pp_group in pp_groups:
-                self.synchronize_pp_group(pp_group)
-
-            # M2N cache cleanup runs while every parent communicator remains valid.
             with self._dispatcher_lock:
+                pp_groups = sorted(
+                    self._pp_groups.values(), key=lambda group: group.key
+                )
+                for pp_group in pp_groups:
+                    self._synchronize_pp_group_unchecked(pp_group)
+
+                # M2N cache cleanup runs while every parent communicator remains
+                # valid.
                 if self._handle is not None:
                     self._handle.destroy()
                     self._handle = None

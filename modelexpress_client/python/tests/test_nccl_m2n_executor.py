@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -22,6 +24,7 @@ from modelexpress.refit.reshard.transport.nccl_m2n.mesh import REPLICATE
 from modelexpress.refit.reshard.transport.nccl_m2n.runtime import (
     _M2nPPGroupSpec,
     _M2nRuntime,
+    _RuntimeState,
 )
 
 
@@ -136,8 +139,12 @@ class FakeNccl:
         self.Communicator = Communicator
         self.events = events
 
-    def get_version(self) -> str:
-        return "2.30.5"
+    def get_version(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            libnccl=SimpleNamespace(
+                version=SimpleNamespace(release=(2, 30, 5)),
+            )
+        )
 
     def get_unique_id(self) -> FakeUniqueId:
         return FakeUniqueId(b"uid")
@@ -267,11 +274,13 @@ def make_executor(
     keys: tuple[tuple[int, int], ...] = ((0, 0),),
     fail_at: int | None = None,
     fail_stream_sync: bool = False,
+    finalize_timeout_s: float = 300.0,
 ):
     events: list[tuple] = []
     m2n = FakeM2n(events, payloads, fail_at=fail_at)
     runtime = _M2nRuntime(
         0,
+        finalize_timeout_s=finalize_timeout_s,
         _m2n_module=m2n,
         _nccl_module=FakeNccl(events),
         _torch_module=SimpleNamespace(
@@ -282,6 +291,43 @@ def make_executor(
     groups = runtime.create_pp_groups([make_spec(key, rank) for key in keys])
     executor = NcclM2nExecutor(runtime)
     return executor, runtime, groups, m2n, events
+
+
+def start_thread(target):
+    results = []
+    errors = []
+
+    def run() -> None:
+        try:
+            results.append(target())
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, results, errors
+
+
+def join_thread(thread: threading.Thread) -> None:
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+
+
+def wait_for_runtime_state(
+    runtime: _M2nRuntime,
+    state: _RuntimeState,
+) -> None:
+    deadline = time.monotonic() + 10
+    with runtime._state_cv:
+        while runtime._state is not state:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, f"runtime did not reach {state.name}"
+            runtime._state_cv.wait(timeout=remaining)
+
+
+def assert_active_operations(runtime: _M2nRuntime, expected: int) -> None:
+    with runtime._state_cv:
+        assert runtime._active_operations == expected
 
 
 def make_params(prefix: str = "p") -> list[ReshardParam]:
@@ -352,6 +398,8 @@ def test_reshard_failure_leaves_live_version_unchanged_and_poisons_executor():
         executor.execute({(0, 0): params})
     assert len(m2n.handle.calls) == 2
     assert ("group_abort",) in events
+    executor.teardown()
+    assert not executor._states[(0, 0)].staged
     runtime.close()
 
 
@@ -404,6 +452,175 @@ def test_source_uses_live_tensors_and_mx_owned_stream():
     assert wait_index < reshard_index
     executor.teardown()
     runtime.close()
+
+
+def test_close_waits_for_whole_source_execute_and_allows_nested_submit():
+    executor, runtime, _, m2n, events = make_executor([], rank=0)
+    params = make_params()
+    prepare_entered = threading.Event()
+    release_prepare = threading.Event()
+    original_prepare = executor._prepare_pp_group_batch
+
+    def blocking_prepare(state, update_params):
+        prepare_entered.set()
+        assert release_prepare.wait(timeout=10)
+        return original_prepare(state, update_params)
+
+    executor._prepare_pp_group_batch = blocking_prepare
+    execute_thread, execute_results, execute_errors = start_thread(
+        lambda: executor.execute({(0, 0): params})
+    )
+    assert prepare_entered.wait(timeout=10)
+
+    close_thread, _, close_errors = start_thread(runtime.close)
+    wait_for_runtime_state(runtime, _RuntimeState.CLOSING)
+    assert_active_operations(runtime, 1)
+    assert ("handle_destroy",) not in events
+
+    release_prepare.set()
+    join_thread(execute_thread)
+    join_thread(close_thread)
+
+    assert not execute_errors
+    assert not close_errors
+    assert execute_results[0][(0, 0)][0] == 7
+    assert len(m2n.handle.calls) == 2
+    assert events.index(("reshard", "0-0", 0, "pp-stream-0")) < events.index(
+        ("handle_destroy",)
+    )
+
+
+def test_close_waits_after_destination_stream_context_exits():
+    payloads = [
+        torch.tensor([10, 11, 12, 13], dtype=torch.uint8),
+        torch.tensor([20, 21, 22], dtype=torch.uint8),
+    ]
+    executor, runtime, groups, _, events = make_executor(payloads, rank=1)
+    params = make_params()
+    staging_ready = threading.Event()
+    release_preparation = threading.Event()
+    original_ensure_staging = executor._ensure_staging
+
+    def blocking_ensure_staging(state, update_params):
+        original_ensure_staging(state, update_params)
+        staging_ready.set()
+        assert release_preparation.wait(timeout=10)
+
+    executor._ensure_staging = blocking_ensure_staging
+    execute_thread, _, execute_errors = start_thread(
+        lambda: executor.execute({(0, 0): params})
+    )
+    assert staging_ready.wait(timeout=10)
+
+    close_thread, _, close_errors = start_thread(runtime.close)
+    wait_for_runtime_state(runtime, _RuntimeState.CLOSING)
+    assert_active_operations(runtime, 1)
+    assert groups[0].stream is not None
+    assert executor._states[(0, 0)].staged
+    assert ("handle_destroy",) not in events
+
+    release_preparation.set()
+    join_thread(execute_thread)
+    join_thread(close_thread)
+
+    assert not execute_errors
+    assert not close_errors
+    assert ("handle_destroy",) in events
+
+
+def test_close_waits_for_executor_teardown():
+    executor, runtime, groups, _, events = make_executor([], rank=1)
+    sync_entered = threading.Event()
+    release_sync = threading.Event()
+    original_sync = groups[0].stream.synchronize
+    sync_count = 0
+
+    def blocking_sync() -> None:
+        nonlocal sync_count
+        sync_count += 1
+        if sync_count == 1:
+            sync_entered.set()
+            assert release_sync.wait(timeout=10)
+        original_sync()
+
+    groups[0].stream.synchronize = blocking_sync
+    teardown_thread, _, teardown_errors = start_thread(executor.teardown)
+    assert sync_entered.wait(timeout=10)
+
+    close_thread, _, close_errors = start_thread(runtime.close)
+    wait_for_runtime_state(runtime, _RuntimeState.CLOSING)
+    assert_active_operations(runtime, 1)
+    assert ("handle_destroy",) not in events
+
+    release_sync.set()
+    join_thread(teardown_thread)
+    join_thread(close_thread)
+
+    assert not teardown_errors
+    assert not close_errors
+    assert sync_count == 2
+    assert ("handle_destroy",) in events
+    assert max(
+        index for index, event in enumerate(events) if event[0] == "stream_sync"
+    ) < events.index(("handle_destroy",))
+
+
+def test_close_timeout_during_executor_preparation_requires_restart():
+    executor, runtime, _, m2n, events = make_executor(
+        [],
+        rank=0,
+        finalize_timeout_s=0.01,
+    )
+    prepare_entered = threading.Event()
+    release_prepare = threading.Event()
+    original_prepare = executor._prepare_pp_group_batch
+
+    def blocking_prepare(state, update_params):
+        prepare_entered.set()
+        assert release_prepare.wait(timeout=10)
+        return original_prepare(state, update_params)
+
+    executor._prepare_pp_group_batch = blocking_prepare
+    execute_thread, _, execute_errors = start_thread(
+        lambda: executor.execute({(0, 0): make_params()})
+    )
+    assert prepare_entered.wait(timeout=10)
+
+    with pytest.raises(TimeoutError, match="process restart is required"):
+        runtime.close()
+
+    assert runtime._state is _RuntimeState.POISONED
+    assert runtime._close_abandoned
+    assert not m2n.handle.calls
+    assert not any(
+        event[0]
+        in {"handle_destroy", "stream_destroy", "comm_finalize", "comm_destroy"}
+        for event in events
+    )
+
+    release_prepare.set()
+    join_thread(execute_thread)
+    assert len(execute_errors) == 1
+    assert "poisoned" in str(execute_errors[0])
+    with pytest.raises(RuntimeError, match="poisoned"):
+        executor.teardown()
+    with pytest.raises(RuntimeError, match="process restart is required"):
+        runtime.close()
+
+
+def test_execute_preparation_exception_releases_runtime_operation():
+    executor, runtime, _, _, events = make_executor([], rank=0)
+
+    def fail_prepare(state, update_params):
+        del state, update_params
+        raise RuntimeError("injected preparation failure")
+
+    executor._prepare_pp_group_batch = fail_prepare
+    with pytest.raises(RuntimeError, match="injected preparation failure"):
+        executor.execute({(0, 0): make_params()})
+
+    runtime.close()
+    assert ("handle_destroy",) in events
 
 
 def test_multi_pp_group_submission_uses_one_group_and_sorted_first_occurrence():

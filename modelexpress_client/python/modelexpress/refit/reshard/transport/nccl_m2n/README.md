@@ -28,6 +28,13 @@ Callers may prepare update inputs concurrently. Each executor serializes
 validation, staging, descriptor construction, and M2N submission. PP-group GPU
 work uses distinct streams and may overlap after grouped submission.
 
+Runtime shutdown first rejects new top-level operations, then waits up to
+`finalize_timeout_s` for already-admitted executor operations and PP-group
+creation to finish. An admitted operation may complete nested runtime calls
+after shutdown enters `CLOSING`. If this wait expires, shutdown marks runtime
+poisoned and intentionally retains M2N handle, streams, and communicators.
+Further cleanup is unsafe; process restart is required.
+
 ## Caller contract
 
 Call `execute()` only after weight-producing work is enqueued on current CUDA

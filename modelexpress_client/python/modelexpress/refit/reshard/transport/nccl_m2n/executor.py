@@ -109,31 +109,38 @@ class NcclM2nExecutor:
         """Prepare and canonically submit one complete local model update."""
         with self._execute_lock:
             self._require_usable()
-            self._validate_update_keys(updates_by_pp_group)
-            ordered_updates = [
-                (self._states[key], list(updates_by_pp_group[key]))
-                for key in self.pp_group_keys
-            ]
-            self._validate_storage_overlap(ordered_updates)
-            batches = [
-                self._prepare_pp_group_batch(state, params)
-                for state, params in ordered_updates
-            ]
+            with self._runtime._active_operation():
+                self._validate_update_keys(updates_by_pp_group)
+                ordered_updates = [
+                    (self._states[key], list(updates_by_pp_group[key]))
+                    for key in self.pp_group_keys
+                ]
+                self._validate_storage_overlap(ordered_updates)
+                batches = [
+                    self._prepare_pp_group_batch(state, params)
+                    for state, params in ordered_updates
+                ]
 
-            start = time.perf_counter()
-            byte_counts = self._runtime.submit_model_update(batches)
-            elapsed = time.perf_counter() - start
-            results = {key: (byte_counts[key], elapsed) for key in self.pp_group_keys}
-            for key, (total_bytes, duration) in results.items():
-                gbps = (total_bytes * 8) / (duration * 1e9) if duration > 0 else 0.0
-                logger.info(
-                    "reshard complete: pp_group=%s %.2f GB in %.3fs (%.1f Gbps)",
-                    key,
-                    total_bytes / 1e9,
-                    duration,
-                    gbps,
-                )
-            return results
+                start = time.perf_counter()
+                byte_counts = self._runtime.submit_model_update(batches)
+                elapsed = time.perf_counter() - start
+                results = {
+                    key: (byte_counts[key], elapsed) for key in self.pp_group_keys
+                }
+                for key, (total_bytes, duration) in results.items():
+                    gbps = (
+                        (total_bytes * 8) / (duration * 1e9)
+                        if duration > 0
+                        else 0.0
+                    )
+                    logger.info(
+                        "reshard complete: pp_group=%s %.2f GB in %.3fs (%.1f Gbps)",
+                        key,
+                        total_bytes / 1e9,
+                        duration,
+                        gbps,
+                    )
+                return results
 
     def _require_usable(self) -> None:
         if self._poisoned:
@@ -312,9 +319,9 @@ class NcclM2nExecutor:
                 )
                 for param in params
             ]
-        for tensor in staged:
-            if tensor.is_cuda:
-                tensor.record_stream(state.pp_group.stream)
+            for tensor in staged:
+                if tensor.is_cuda:
+                    tensor.record_stream(state.pp_group.stream)
         state.staged = staged
         state.staging_signature = signature
 
@@ -428,18 +435,19 @@ class NcclM2nExecutor:
     def teardown(self) -> None:
         """Drain PP streams and release whole-version staging."""
         with self._execute_lock:
-            for state in self._states.values():
-                try:
-                    self._runtime.synchronize_pp_group(state.pp_group)
-                except BaseException as exc:
-                    self._stream_failed = True
-                    raise RuntimeError(
-                        "cannot safely tear down nccl_m2n executor because PP stream "
-                        "could not drain; staging tensors retained"
-                    ) from exc
-            for state in self._states.values():
-                state.staged = []
-                state.staging_signature = None
+            with self._runtime._active_operation(allow_poisoned=True):
+                for state in self._states.values():
+                    try:
+                        self._runtime.synchronize_pp_group(state.pp_group)
+                    except BaseException as exc:
+                        self._stream_failed = True
+                        raise RuntimeError(
+                            "cannot safely tear down nccl_m2n executor because PP "
+                            "stream could not drain; staging tensors retained"
+                        ) from exc
+                for state in self._states.values():
+                    state.staged = []
+                    state.staging_signature = None
 
 
 def build_reshard_params(tensors: Sequence[Any]) -> list[ReshardParam]:

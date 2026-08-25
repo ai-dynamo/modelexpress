@@ -24,6 +24,7 @@ from modelexpress.refit.reshard.transport.nccl_m2n.runtime import (
     _M2nPPGroupBatch,
     _M2nPPGroupSpec,
     _M2nRuntime,
+    _RuntimeState,
 )
 
 
@@ -109,6 +110,29 @@ class FakeUniqueId:
         return self.value
 
 
+@dataclass(frozen=True)
+class FakeVersion:
+    release: tuple[int, ...]
+
+    def __str__(self) -> str:
+        return ".".join(str(value) for value in self.release)
+
+    def __repr__(self) -> str:
+        return f"<Version({str(self)!r})>"
+
+
+@dataclass(frozen=True)
+class FakeLibraryInfo:
+    version: FakeVersion
+
+
+@dataclass(frozen=True)
+class FakeVersionInfo:
+    nccl4py: FakeVersion
+    nccl_bindings: FakeVersion
+    libnccl: FakeLibraryInfo | None
+
+
 class FakeNccl:
     UniqueId = FakeUniqueId
 
@@ -126,8 +150,12 @@ class FakeNccl:
 
         self.Communicator = Communicator
 
-    def get_version(self) -> str:
-        return "2.30.5"
+    def get_version(self) -> FakeVersionInfo:
+        return FakeVersionInfo(
+            nccl4py=FakeVersion((0, 4, 1)),
+            nccl_bindings=FakeVersion((2, 30, 5)),
+            libnccl=FakeLibraryInfo(FakeVersion((2, 30, 5))),
+        )
 
     def get_unique_id(self) -> FakeUniqueId:
         return FakeUniqueId(self.next_uid)
@@ -245,6 +273,7 @@ def make_runtime(
     *,
     host_delay: float = 0.0,
     fail_at: int | None = None,
+    finalize_timeout_s: float = 300.0,
 ):
     events: list[tuple] = []
     m2n = FakeM2n(events, host_delay=host_delay, fail_at=fail_at)
@@ -252,12 +281,50 @@ def make_runtime(
     runtime = _M2nRuntime(
         0,
         max_cta=8,
+        finalize_timeout_s=finalize_timeout_s,
         _m2n_module=m2n,
         _nccl_module=nccl,
         _torch_module=SimpleNamespace(cuda=FakeCuda(events)),
         _enforce_singleton=False,
     )
     return runtime, m2n, nccl, events
+
+
+def start_thread(target):
+    results = []
+    errors = []
+
+    def run() -> None:
+        try:
+            results.append(target())
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, results, errors
+
+
+def join_thread(thread: threading.Thread) -> None:
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+
+
+def wait_for_runtime_state(
+    runtime: _M2nRuntime,
+    state: _RuntimeState,
+) -> None:
+    deadline = time.monotonic() + 10
+    with runtime._state_cv:
+        while runtime._state is not state:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, f"runtime did not reach {state.name}"
+            runtime._state_cv.wait(timeout=remaining)
+
+
+def assert_active_operations(runtime: _M2nRuntime, expected: int) -> None:
+    with runtime._state_cv:
+        assert runtime._active_operations == expected
 
 
 def make_spec(
@@ -464,6 +531,121 @@ def test_shutdown_finalizes_m2n_before_comms_in_canonical_order():
     ]
 
 
+def test_close_waits_for_create_and_snapshots_complete_topology():
+    runtime, _, nccl, events = make_runtime()
+    init_entered = threading.Event()
+    release_init = threading.Event()
+    original_init = nccl.Communicator.init
+    init_count = 0
+
+    def blocking_init(nranks, rank, unique_id):
+        nonlocal init_count
+        init_count += 1
+        if init_count == 2:
+            init_entered.set()
+            assert release_init.wait(timeout=10)
+        return original_init(nranks, rank, unique_id)
+
+    nccl.Communicator.init = staticmethod(blocking_init)
+    create_thread, create_results, create_errors = start_thread(
+        lambda: runtime.create_pp_groups(
+            [make_spec((1, 0)), make_spec((0, 0))]
+        )
+    )
+    assert init_entered.wait(timeout=10)
+
+    close_thread, _, close_errors = start_thread(runtime.close)
+    wait_for_runtime_state(runtime, _RuntimeState.CLOSING)
+    assert_active_operations(runtime, 1)
+
+    assert runtime.pp_groups == ()
+    assert not any(
+        event[0]
+        in {"handle_destroy", "stream_destroy", "comm_finalize", "comm_destroy"}
+        for event in events
+    )
+    with pytest.raises(RuntimeError, match="closing"):
+        runtime.new_unique_id_bytes()
+
+    release_init.set()
+    join_thread(create_thread)
+    join_thread(close_thread)
+
+    assert not create_errors
+    assert not close_errors
+    assert [group.key for group in create_results[0]] == [(0, 0), (1, 0)]
+    assert [event[1] for event in events if event[0] == "comm_destroy"] == [
+        "0-0",
+        "1-0",
+    ]
+
+
+def test_close_timeout_retains_resources_and_requires_process_restart():
+    runtime, _, nccl, events = make_runtime(finalize_timeout_s=0.01)
+    init_entered = threading.Event()
+    release_init = threading.Event()
+    original_init = nccl.Communicator.init
+
+    def blocking_init(nranks, rank, unique_id):
+        init_entered.set()
+        assert release_init.wait(timeout=10)
+        return original_init(nranks, rank, unique_id)
+
+    nccl.Communicator.init = staticmethod(blocking_init)
+    create_thread, _, create_errors = start_thread(
+        lambda: runtime.create_pp_groups([make_spec((0, 0))])
+    )
+    assert init_entered.wait(timeout=10)
+
+    with pytest.raises(TimeoutError, match="process restart is required"):
+        runtime.close()
+
+    assert runtime._state is _RuntimeState.POISONED
+    assert runtime._close_abandoned
+    assert not any(
+        event[0]
+        in {"handle_destroy", "stream_destroy", "comm_finalize", "comm_destroy"}
+        for event in events
+    )
+
+    release_init.set()
+    join_thread(create_thread)
+    assert len(create_errors) == 1
+    assert "poisoned" in str(create_errors[0])
+    assert len(runtime.pp_groups) == 1
+
+    with pytest.raises(RuntimeError, match="process restart is required"):
+        runtime.close()
+    with pytest.raises(RuntimeError, match="poisoned"):
+        runtime.create_pp_groups([])
+    assert not any(
+        event[0]
+        in {"handle_destroy", "stream_destroy", "comm_finalize", "comm_destroy"}
+        for event in events
+    )
+
+
+def test_close_from_active_operation_fails_without_changing_state():
+    runtime, _, _, _ = make_runtime()
+
+    with runtime._active_operation():
+        with pytest.raises(RuntimeError, match="active runtime operation"):
+            runtime.close()
+        assert runtime._state is _RuntimeState.OPEN
+
+    runtime.close()
+
+
+def test_empty_operations_cannot_bypass_closed_state():
+    runtime, _, _, _ = make_runtime()
+    runtime.close()
+
+    with pytest.raises(RuntimeError, match="closed"):
+        runtime.create_pp_groups([])
+    with pytest.raises(RuntimeError, match="closed"):
+        runtime.submit_model_update([])
+
+
 @pytest.mark.parametrize("trainer_pp", [2, 4, 8])
 def test_pp_to_pp1_ownership_patterns_cannot_form_ordering_cycle(trainer_pp: int):
     keys = tuple((stage, 0) for stage in range(trainer_pp))
@@ -488,8 +670,33 @@ def test_new_unique_id_and_official_comm_api():
 def test_rejects_old_nccl_version():
     events: list[tuple] = []
     nccl = FakeNccl(events)
-    nccl.get_version = lambda: "2.30.4"
+    # Regression: old text parser extracted the "4" in the nccl4py field name
+    # and treated this VersionInfo as NCCL 4.0.4, allowing libnccl 2.27.
+    nccl.get_version = lambda: FakeVersionInfo(
+        nccl4py=FakeVersion((0, 4, 1)),
+        nccl_bindings=FakeVersion((2, 27, 0)),
+        libnccl=FakeLibraryInfo(FakeVersion((2, 27, 0))),
+    )
     with pytest.raises(RuntimeError, match="NCCL >= 2.30.5"):
+        _M2nRuntime(
+            0,
+            _m2n_module=FakeM2n(events),
+            _nccl_module=nccl,
+            _torch_module=SimpleNamespace(cuda=FakeCuda(events)),
+            _enforce_singleton=False,
+        )
+
+
+def test_rejects_version_info_without_loaded_libnccl():
+    events: list[tuple] = []
+    nccl = FakeNccl(events)
+    nccl.get_version = lambda: FakeVersionInfo(
+        nccl4py=FakeVersion((0, 4, 1)),
+        nccl_bindings=FakeVersion((2, 30, 5)),
+        libnccl=None,
+    )
+
+    with pytest.raises(RuntimeError, match="could not identify a loaded libnccl"):
         _M2nRuntime(
             0,
             _m2n_module=FakeM2n(events),
