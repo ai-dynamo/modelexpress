@@ -74,8 +74,8 @@ The following table lists the configurable parameters of the ModelExpress chart 
 | `serviceAccount.name`                        | Service account name                           | `""`     |
 | `serviceAccount.rbac.enabled`                | Create a ClusterRole and ClusterRoleBinding for the Kubernetes metadata backend | `false` |
 | `podAnnotations`                             | Pod annotations                                | `{}`     |
-| `podSecurityContext`                         | Pod security context                           | `{}`     |
-| `securityContext`                            | Container security context                     | `{}`     |
+| `podSecurityContext`                         | Pod security context. Non-root by default; the uid/gid must match the image's `USER` (see `docker/Dockerfile`) | `{runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000}` |
+| `securityContext`                            | Container security context                     | `{runAsNonRoot: true}` |
 | `service.type`                               | Service type                                   | `ClusterIP` |
 | `service.port`                               | Service port                                   | `8001`   |
 | `ingress.enabled`                            | Enable ingress                                 | `false`  |
@@ -91,10 +91,10 @@ The following table lists the configurable parameters of the ModelExpress chart 
 | `persistence.storageClass`                   | Storage class                                  | `""`     |
 | `persistence.accessMode`                     | Access mode                                    | `ReadWriteOnce` |
 | `persistence.size`                           | Storage size                                   | `10Gi`   |
-| `persistence.mountPath`                      | Mount path                                     | `/root`  |
+| `persistence.mountPath`                      | Mount path. Not root's home: the server runs as uid 1000 | `/app/cache` |
 | `env.MODEL_EXPRESS_SERVER_PORT`              | Server port                                    | `8001`   |
 | `env.MODEL_EXPRESS_LOG_LEVEL`                | Logging level                                  | `info`   |
-| `env.MODEL_EXPRESS_CACHE_DIRECTORY`          | Cache directory                                | `/root`  |
+| `env.MODEL_EXPRESS_CACHE_DIRECTORY`          | Cache directory                                | `/app/cache` |
 | `env.MX_METADATA_BACKEND`                    | Distributed backend (`redis` or `kubernetes`). Server fails to start without this. | `<required>` |
 | `env.REDIS_URL`                              | Redis connection URL; required when backend is `redis`. Chart does not bundle Redis. | `<required when backend=redis>` |
 | `livenessProbe.enabled`                      | Enable liveness probe                          | `true`   |
@@ -203,6 +203,18 @@ env:
 helm upgrade my-modelexpress ./helm
 ```
 
+### Upgrading from a chart that mounted the cache at `/root`
+
+The server now runs as uid 1000 (see `docker/Dockerfile`), so the model cache
+moved off root's home directory to `/app/cache`. The PersistentVolumeClaim is
+unchanged and its contents carry over -- only the path inside the container
+moved. On the first mount after the upgrade the kubelet takes ownership of the
+volume for `fsGroup: 1000`; on a large cache that pass takes a while, and
+`fsGroupChangePolicy: OnRootMismatch` keeps later restarts from repeating it.
+
+Pinning `persistence.mountPath` back to `/root` will start the pod but leave the
+server unable to write its cache.
+
 ## Uninstalling
 
 ```bash
@@ -210,6 +222,22 @@ helm uninstall my-modelexpress
 ```
 
 ## Troubleshooting
+
+### Pod never starts: `container has runAsNonRoot and image will run as root`
+
+The chart defaults to a non-root pod, so it requires an image whose `USER` is a
+numeric non-root uid. Images built before that `USER` directive was added to
+`docker/Dockerfile` (0.4.0 and earlier) run as root and are rejected by the
+kubelet before the container ever starts. Either use a newer image, or -- if you
+must stay on an older one -- override the uid the chart requests:
+
+```bash
+helm install my-modelexpress ./helm \
+  --set podSecurityContext.runAsNonRoot=false \
+  --set securityContext.runAsNonRoot=false \
+  --set podSecurityContext.runAsUser=0 \
+  --set podSecurityContext.runAsGroup=0
+```
 
 ### Check Pod Status
 
