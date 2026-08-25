@@ -98,25 +98,16 @@ impl<'a> Downloader<'a> {
         manifest: &OciImageManifest,
     ) -> Result<()> {
         let blob_root = staging_entry.blob_root();
-        let transport_index_path = blob_root.join("transport-index.json");
-        self.pull_blob_to_file(
-            &manifest.config,
-            &transport_index_path,
-            "GBuild OCI transport index",
-        )
-        .await?;
-        let transport_index = tokio::fs::read(&transport_index_path)
+        let config_path = blob_root.join("gbuild-config.json");
+        self.pull_blob_to_file(&manifest.config, &config_path, "GBuild OCI config")
+            .await?;
+        let config = tokio::fs::read(&config_path)
             .await
-            .with_context(|| {
-                format!("Failed to read GBuild OCI transport index {transport_index_path:?}")
-            })?;
-        tokio::fs::remove_file(&transport_index_path)
+            .with_context(|| format!("Failed to read GBuild OCI config {config_path:?}"))?;
+        tokio::fs::remove_file(&config_path)
             .await
-            .with_context(|| {
-                format!("Failed to remove GBuild OCI transport index {transport_index_path:?}")
-            })?;
-        let artifact =
-            GbuildArtifact::from_manifest_and_transport_index(manifest, &transport_index)?;
+            .with_context(|| format!("Failed to remove GBuild OCI config {config_path:?}"))?;
+        let artifact = GbuildArtifact::from_manifest_and_config(manifest, &config)?;
 
         for metadata in artifact.metadata {
             self.pull_blob_to_file(
@@ -601,67 +592,35 @@ mod tests {
         let manifest_capnp_digest = digest_bytes(manifest_capnp);
         let preset_digest = digest_bytes(preset);
         let payload_digest = digest_bytes(&payload);
-        let transport_index = serde_json::to_vec(&json!({
+        let config = serde_json::to_vec(&json!({
             "version": 1,
-            "metadata": {
-                "manifest_json": {
-                    "path": "manifest.json",
-                    "descriptor": {
-                        "media_type": "application/vnd.groq.gbuild.manifest.v1+json",
-                        "digest": manifest_json_digest,
-                        "size_bytes": manifest_json.len(),
-                    },
-                },
-                "manifest_capnp": {
-                    "path": MANIFEST_CAPNP_FILE_NAME,
-                    "descriptor": {
-                        "media_type": "application/vnd.groq.gbuild.manifest.v1+capnp",
-                        "digest": manifest_capnp_digest,
-                        "size_bytes": manifest_capnp.len(),
-                    },
-                },
-                "preset": {
-                    "path": "llama-original.json",
-                    "descriptor": {
-                        "media_type": "application/vnd.groq.gbuild.preset.v1+json",
-                        "digest": preset_digest,
-                        "size_bytes": preset.len(),
-                    },
-                },
-            },
-            "tokenizer": null,
             "partitions": [{
                 "partition_id": 0,
-                "descriptor": {
-                    "media_type": "application/vnd.oci.image.layer.v1.tar+zstd",
-                    "digest": payload_digest,
-                    "size_bytes": payload.len(),
-                    "uncompressed_size_bytes": tar.len(),
-                },
+                "layer": "payloads/0000.tar.zst",
                 "members": ["README.md", "program.0.gas"],
+                "uncompressed_size_bytes": tar.len(),
             }],
-            "runtime_assets": null,
         }))
-        .expect("serialize transport index");
-        let transport_index_digest = digest_bytes(&transport_index);
+        .expect("serialize GBuild config");
+        let config_digest = digest_bytes(&config);
         let outer_manifest = serde_json::to_vec(&json!({
             "schemaVersion": 2,
             "mediaType": "application/vnd.oci.image.manifest.v1+json",
             "artifactType": "application/vnd.groq.gbuild.full-compile.v1",
             "config": {
-                "mediaType": "application/vnd.groq.gbuild.full-compile.transport.v1+json",
-                "size": transport_index.len(),
-                "digest": transport_index_digest,
+                "mediaType": "application/vnd.groq.gbuild.full-compile.config.v1+json",
+                "size": config.len(),
+                "digest": config_digest,
             },
             "layers": [
                 {
-                    "mediaType": "application/vnd.groq.gbuild.manifest.v1+json",
+                    "mediaType": "application/vnd.groq.gbuild.runtime-manifest.v2+json",
                     "size": manifest_json.len(),
                     "digest": manifest_json_digest,
                     "annotations": { TITLE_ANNOTATION: "manifest.json" },
                 },
                 {
-                    "mediaType": "application/vnd.groq.gbuild.manifest.v1+capnp",
+                    "mediaType": "application/vnd.groq.gbuild.runtime-manifest.v2+capnp",
                     "size": manifest_capnp.len(),
                     "digest": manifest_capnp_digest,
                     "annotations": { TITLE_ANNOTATION: MANIFEST_CAPNP_FILE_NAME },
@@ -676,8 +635,10 @@ mod tests {
                     "mediaType": "application/vnd.oci.image.layer.v1.tar+zstd",
                     "size": payload.len(),
                     "digest": payload_digest,
+                    "annotations": { TITLE_ANNOTATION: "payloads/0000.tar.zst" },
                 },
             ],
+            "annotations": {"org.opencontainers.image.created": "1970-01-01T00:00:00Z"},
         }))
         .expect("serialize outer manifest");
         let outer_manifest_digest = digest_bytes(&outer_manifest);
@@ -696,7 +657,7 @@ mod tests {
             .await;
 
         for (digest, body) in [
-            (transport_index_digest.as_str(), transport_index.as_slice()),
+            (config_digest.as_str(), config.as_slice()),
             (manifest_json_digest.as_str(), manifest_json.as_slice()),
             (manifest_capnp_digest.as_str(), manifest_capnp.as_slice()),
             (preset_digest.as_str(), preset.as_slice()),
@@ -735,7 +696,7 @@ mod tests {
             fs::read(path.join("program.0.gas")).expect("read program"),
             b"gas"
         );
-        assert!(!path.join("transport-index.json").exists());
+        assert!(!path.join("gbuild-config.json").exists());
 
         let tag_error = OciProvider
             .download_model(

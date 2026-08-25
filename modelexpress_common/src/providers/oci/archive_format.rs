@@ -105,7 +105,7 @@ impl ArchiveFormat {
         {
             let expected: Vec<&str> = expected_members.iter().map(ArtifactPath::as_str).collect();
             anyhow::bail!(
-                "GBuild OCI payload members do not match the transport index: expected {expected:?}, found {files:?}"
+                "GBuild OCI payload members do not match the config: expected {expected:?}, found {files:?}"
             );
         }
         Ok(())
