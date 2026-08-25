@@ -9,7 +9,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
 
-from modelexpress_rl.s3 import S3Object
 from modelexpress_rl.train import WeightPayloadFormat
 
 
@@ -26,37 +25,20 @@ class NixlGeneratorSource:
 
 
 @dataclass(frozen=True)
-class S3GeneratorSource:
-    """Canonical S3 root for one source."""
-
-    location: S3Object
-
-
-@dataclass(frozen=True)
 class GeneratorSource:
     """One version-scoped source selected for a logical slot."""
 
     source_slot_id: str
     worker_id: str
     manifest_digest: str
-    transport: NixlGeneratorSource | S3GeneratorSource
+    transport: NixlGeneratorSource
 
     @property
     def physical_fingerprint(self) -> tuple:
         """Return the transport identity that controls plan reuse."""
-        if isinstance(self.transport, NixlGeneratorSource):
-            return (
-                "NIXL",
-                self.transport.manifest_endpoint,
-                self.manifest_digest,
-            )
-        location = self.transport.location
         return (
-            "S3",
-            location.bucket,
-            location.key,
-            location.object_version,
-            location.checksum,
+            "NIXL",
+            self.transport.manifest_endpoint,
             self.manifest_digest,
         )
 
@@ -70,6 +52,7 @@ class GeneratorTransferInputs:
     layout_signature: str
     payload_format: WeightPayloadFormat
     sources: tuple[GeneratorSource, ...]
+    s3_uri: str | None = None
 
     @property
     def physical_fingerprint(self) -> tuple:
@@ -78,6 +61,7 @@ class GeneratorTransferInputs:
             self.base_version_id,
             self.layout_signature,
             self.payload_format,
+            self.s3_uri,
             tuple(
                 (
                     source.source_slot_id,
@@ -120,5 +104,4 @@ __all__ = [
     "GeneratorSource",
     "GeneratorTransferInputs",
     "NixlGeneratorSource",
-    "S3GeneratorSource",
 ]

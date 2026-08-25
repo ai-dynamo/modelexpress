@@ -375,22 +375,22 @@ See [`metadata.md`](metadata.md) for the full metadata architecture including st
 `RefitService` is a new RL-specific control plane. It does not reuse or modify the
 legacy `WeightSyncService`. The initial slice stores worker registrations,
 immutable weight versions, and compact physical shard publications in Redis.
-Each shard has a typed transport `oneof`; the runtime accepts NIXL sources and
-canonical S3 delta roots. On the NIXL path, weight bytes and full tensor
-manifests remain on trainer workers. On the S3 path, rank zero advertises one
-`canonical.delta.root` after every trainer rank has uploaded its owned delta
-shard. Frameworks own tensor gathering, Hugging Face conversion, and
-bucketization, then pass a lazy canonical bucket stream to the trainer client,
-which owns delta processing and S3 shard construction.
+NIXL manifest endpoints belong to their physical worker shards; a canonical S3
+URI belongs directly to its durable `WeightVersion`. On the NIXL path, weight
+bytes and full tensor manifests remain on trainer workers. On the S3 path, rank
+zero uploads the version's global index after every trainer rank has uploaded
+its owned delta shard. Frameworks own tensor gathering, Hugging Face conversion,
+and bucketization, then pass a lazy canonical bucket stream to the trainer
+client, which owns delta processing and S3 shard construction.
 During framework initialization, the same bucket stream seeds only that rank's
 owned launch-checkpoint tensors through direct, concurrent
 `prepare_delta_base()` bucket reads. The first real delta stage uses the
 prepared snapshot without checkpoint I/O.
 Canonical S3 artifacts live under
-`{prefix}/{encoded_model_name}/v{version_number}/`, with the
+`{uri_prefix}/v{version_number}/`, with the
 index and delta shards stored as siblings.
-Canonical S3 versions and their root advertisements are retained for rollout
-fault recovery. Trainer processes keep only the current base snapshot; older
+Canonical S3 versions are retained for rollout fault recovery. Trainer
+processes keep only the current base snapshot; older
 immutable S3 objects are governed by external bucket lifecycle policy.
 
 #### RL refit client architecture
@@ -425,14 +425,14 @@ flowchart LR
         I["vLLM installer<br/>capture, apply"]
     end
 
-    O -->|"Create / Get / Delete version"| S
+    O -->|"Create / Get / Delete / update version state"| S
     O -->|"Framework-native RPC"| T
     O -->|"Framework-native RPC"| G
     T --> TA --> B
     T --> C --> D
-    T -->|"Register worker; publish shard metadata"| S
+    T -->|"NIXL: register worker; publish shard metadata"| S
     T --> M
-    G -->|"Register worker; discover shards; lease version"| S
+    G -->|"Register worker; lease version; NIXL: discover shards"| S
     G --> GA --> X --> I
     G -->|"Fetch exact-version manifest"| M
     B -->|"NIXL reads"| X
@@ -441,11 +441,11 @@ flowchart LR
 `RefitService` is the central metadata service defined by `refit.proto`. It
 coordinates immutable versions, worker registrations, shard advertisements,
 and leases, but it does not discover engine tensor layouts or transfer weights.
-For a `NixlTransport`, `RefitWorkerService` is the trainer-local manifest endpoint.
+For NIXL, `RefitWorkerService` is the trainer-local manifest endpoint.
 The manifest is an opaque description of the exact published source buffers;
 the generator uses it to compile and validate its receiver-local transfer plan.
-For an `S3Transport`, the advertised object is the global
-`model.safetensors.index.json`;
+For S3, `WeightVersion.s3.uri` identifies the global
+`model.safetensors.index.json` directly;
 the server validates only its typed location and does not contact S3.
 
 The synchronous generator client returns a staged handle only after transfer
@@ -479,16 +479,18 @@ engine-specific parameter and CUDA-graph handling out of the transfer layer.
 | RPC | Purpose |
 |-----|---------|
 | `RegisterWorker` | Register or refresh one TTL-bound worker process |
-| `CreateWeightVersion` | Idempotently create one immutable `STAGING` version |
+| `CreateWeightVersion` | Idempotently create one immutable `STAGING` or already-published `READY` version |
 | `GetWeightVersion` | Read the version and its lifecycle state |
-| `DeleteWeightVersion` | Move a `READY` version to `RELEASING`; existing leases remain valid |
+| `DeleteWeightVersion` | Move a `READY` version to `RELEASING` for NIXL shard retirement |
+| `UpdateWeightVersionState` | Explicitly update lifecycle state, including S3 `STAGING` to `READY` |
 | `CreateWeightVersionShard` | Publish one worker manifest for a required source slot |
 | `ListWeightVersionShards` | List the version's physical source publications |
 | `DeleteWeightVersionShard` | Evict one source shard after release when no lease protects the version |
 | `RegisterVersionLease` | Acquire protection while a version is `READY`, or renew the same owner's existing protection while it is `READY` or `RELEASING` |
 | `DeleteVersionLease` | Release a generator's protection of the version shards |
 
-The final missing source slot atomically changes the version to `READY`.
+The final missing NIXL source slot atomically changes the version to `READY`.
+For S3, the orchestrator marks the version `READY` after publication completes.
 `WeightVersion.uid` is MX's opaque identity. `version_number` is the optional
 framework-provided numeric label used for correlation; canonical S3 publication
 requires it for the `v{version_number}` object prefix. MX does not use it as a
@@ -502,8 +504,7 @@ the logical tensor names and shard geometry, excluding physical process and DP
 replica identity. The orchestrator deduplicates those adapter-defined slots when
 declaring the version's expected contributions. Multiple DP workers may therefore
 advertise the same source slot; generators rotate through those publications on
-transfer retry. Its `transport` `oneof` carries transport-specific addressing
-instead of the former untyped `manifest_endpoint` and `transport` strings.
+transfer retry. Each shard carries its trainer-local `manifest_endpoint`.
 Deployments configured with
 Kubernetes or the test-only memory backend do not expose `RefitService` yet.
 

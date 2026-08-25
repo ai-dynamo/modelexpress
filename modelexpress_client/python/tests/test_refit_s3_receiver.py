@@ -1,12 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import base64
-import hashlib
 import json
 import threading
 
-import google_crc32c
 import pytest
 import safetensors.numpy
 import torch
@@ -14,17 +11,10 @@ import zstandard
 from safetensors.torch import load_file, save_file
 
 from modelexpress_rl import S3GeneratorConfig, WeightPayloadFormat
-from modelexpress_rl.inference.adapter import (
-    GeneratorSource,
-    GeneratorTransferInputs,
-    S3GeneratorSource,
-)
+from modelexpress_rl.inference.adapter import GeneratorTransferInputs
 from modelexpress_rl.inference import receiver as receiver_module
-from modelexpress_rl.inference.receiver import (
-    CANONICAL_DELTA_SOURCE_SLOT,
-    CanonicalS3GeneratorAdapter,
-)
-from modelexpress_rl.s3 import S3Client, S3Object
+from modelexpress_rl.inference.receiver import CanonicalS3GeneratorAdapter
+from modelexpress_rl.s3 import ImmutableS3Conflict, S3Client
 from modelexpress_rl.utils import adler32_checksum, compress_delta, compute_delta
 
 
@@ -34,19 +24,12 @@ class _MemoryS3:
         self.calls = []
         self.fail_key_once = None
 
-    def get(self, location):
-        self.calls.append(location.key)
-        data = self.objects[location.key]
-        assert location.checksum == _crc32c(data)
-        return data
-
-    def get_key(self, *, bucket, key):
-        assert bucket == "weights"
-        self.calls.append(key)
-        if key == self.fail_key_once:
+    def get(self, uri):
+        self.calls.append(uri)
+        if uri == self.fail_key_once:
             self.fail_key_once = None
             raise RuntimeError("injected shard download failure")
-        return self.objects[key]
+        return self.objects[uri]
 
     def close(self):
         pass
@@ -61,11 +44,7 @@ class _Adapter(CanonicalS3GeneratorAdapter):
         self.installed.append(prepared.path)
 
 
-def _crc32c(data):
-    return f"crc32c:{google_crc32c.value(data):08x}"
-
-
-def test_s3_read_honors_object_version_and_verifies_crc32c():
+def test_s3_read_parses_uri():
     data = b"canonical-root"
 
     class Body:
@@ -81,38 +60,61 @@ def test_s3_read_honors_object_version_and_verifies_crc32c():
 
         def get_object(self, **request):
             self.request = request
-            return {"Body": Body(), "ChecksumCRC32C": _encoded_crc32c(data)}
+            return {"Body": Body()}
 
     backend = Client()
     s3 = object.__new__(S3Client)
     s3._client = backend
-    location = S3Object(
-        bucket="weights",
-        key="root.json",
-        checksum=_crc32c(data),
-        object_version="object-a",
-    )
-
-    assert s3.get(location) == data
+    assert s3.get("s3://weights/root.json") == data
     assert backend.request == {
         "Bucket": "weights",
         "Key": "root.json",
-        "VersionId": "object-a",
-        "ChecksumMode": "ENABLED",
     }
-    with pytest.raises(ValueError, match="S3 checksum mismatch"):
-        s3.get(
-            S3Object(
-                bucket="weights",
-                key="root.json",
-                checksum="crc32c:00000000",
-            )
-        )
 
 
-def _encoded_crc32c(data):
-    value = google_crc32c.value(data)
-    return base64.b64encode(value.to_bytes(4, "big")).decode()
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "s3://weights//root.json",
+        "s3://weights/root.json?query",
+        "s3://weights/root.json#fragment",
+    ],
+)
+def test_s3_rejects_noncanonical_uri(uri):
+    s3 = object.__new__(S3Client)
+    with pytest.raises(ValueError, match="invalid S3 URI"):
+        s3.get(uri)
+
+
+def test_s3_write_accepts_only_an_identical_immutable_retry():
+    class Error(Exception):
+        response = {"Error": {"Code": "PreconditionFailed"}}
+
+    class Body:
+        def __init__(self, data):
+            self.data = data
+
+        def read(self):
+            return self.data
+
+        def close(self):
+            pass
+
+    class Client:
+        existing = b"same"
+
+        def put_object(self, **request):
+            assert request["IfNoneMatch"] == "*"
+            raise Error
+
+        def get_object(self, **_request):
+            return {"Body": Body(self.existing)}
+
+    s3 = object.__new__(S3Client)
+    s3._client = Client()
+    s3.put(uri="s3://weights/root.json", data=b"same")
+    with pytest.raises(ImmutableS3Conflict):
+        s3.put(uri="s3://weights/root.json", data=b"different")
 
 
 def _artifact(
@@ -144,7 +146,7 @@ def _artifact(
         sort_keys=True,
         separators=(",", ":"),
     ).encode()
-    prefix = f"test/v{version_number}"
+    prefix = f"s3://weights/test/v{version_number}"
     return {
         f"{prefix}/model.safetensors.index.json": root,
         f"{prefix}/model-00000-of-00001.safetensors": shard,
@@ -152,35 +154,22 @@ def _artifact(
 
 
 def _inputs(
-    root,
+    _root,
     *,
-    digest=None,
     base_version="base-a",
     version="target-a",
     version_number=1,
-    key=None,
+    uri=None,
 ):
-    if key is None:
-        key = f"test/v{version_number}/model.safetensors.index.json"
+    if uri is None:
+        uri = f"s3://weights/test/v{version_number}/model.safetensors.index.json"
     return GeneratorTransferInputs(
         version_id=version,
         base_version_id=base_version,
         layout_signature="",
         payload_format=WeightPayloadFormat.XOR_DELTA,
-        sources=(
-            GeneratorSource(
-                source_slot_id=CANONICAL_DELTA_SOURCE_SLOT,
-                worker_id="trainer-0",
-                manifest_digest=digest or hashlib.sha256(root).hexdigest(),
-                transport=S3GeneratorSource(
-                    S3Object(
-                        bucket="weights",
-                        key=key,
-                        checksum=_crc32c(root),
-                    )
-                ),
-            ),
-        ),
+        sources=(),
+        s3_uri=uri,
     )
 
 
@@ -206,7 +195,7 @@ def test_canonical_s3_prepares_then_installs_one_global_index(monkeypatch, tmp_p
     target_tensor = torch.tensor([3.0, 4.0])
     target = target_tensor.view(torch.uint8).numpy()
     objects = _artifact(base, target)
-    root = objects["test/v1/model.safetensors.index.json"]
+    root = objects["s3://weights/test/v1/model.safetensors.index.json"]
     adapter, storage = _build(monkeypatch, tmp_path, objects)
 
     staged = adapter.stage_weight(_inputs(root))
@@ -216,8 +205,8 @@ def test_canonical_s3_prepares_then_installs_one_global_index(monkeypatch, tmp_p
         load_file(staged.path / "model.safetensors")["weight"], target_tensor
     )
     assert storage.calls == [
-        "test/v1/model.safetensors.index.json",
-        "test/v1/model-00000-of-00001.safetensors",
+        "s3://weights/test/v1/model.safetensors.index.json",
+        "s3://weights/test/v1/model-00000-of-00001.safetensors",
     ]
     assert staged.metrics["perf/mx_receive_delta_download"] >= 0
     assert adapter.apply_weight(staged)["perf/mx_receive_install_time"] >= 0
@@ -227,7 +216,7 @@ def test_canonical_s3_prepares_then_installs_one_global_index(monkeypatch, tmp_p
 
 
 def test_canonical_s3_accepts_an_empty_delta(monkeypatch, tmp_path):
-    key = "test/v1/model.safetensors.index.json"
+    key = "s3://weights/test/v1/model.safetensors.index.json"
     root = json.dumps(
         {
             "metadata": {
@@ -257,7 +246,7 @@ def test_canonical_s3_uses_weight_map_without_index_validation(monkeypatch, tmp_
     base = torch.tensor([1.0, 2.0]).view(torch.uint8).numpy()
     target_tensor = torch.tensor([3.0, 4.0])
     objects = _artifact(base, target_tensor.view(torch.uint8).numpy())
-    key = "test/v1/model.safetensors.index.json"
+    key = "s3://weights/test/v1/model.safetensors.index.json"
     root = json.dumps(
         {"weight_map": {"weight": "model-00000-of-00001.safetensors"}}
     ).encode()
@@ -275,17 +264,12 @@ def test_canonical_s3_downloads_unique_shards_concurrently(monkeypatch, tmp_path
     adapter, storage = _build(monkeypatch, tmp_path, {})
     barrier = threading.Barrier(2)
 
-    def get_key(*, bucket, key):
-        assert bucket == "weights"
+    def get(uri):
         barrier.wait(timeout=2)
-        return key.encode()
+        return uri.encode()
 
-    storage.get_key = get_key
-    root = S3Object(
-        bucket="weights",
-        key="prefix/model.safetensors.index.json",
-        checksum="",
-    )
+    storage.get = get
+    root = "s3://weights/prefix/model.safetensors.index.json"
 
     shards = adapter._checkpoint._download_deltas(
         {
@@ -298,11 +282,11 @@ def test_canonical_s3_downloads_unique_shards_concurrently(monkeypatch, tmp_path
 
     assert shards == {
         "model-00000-of-00002.safetensors": (
-            b"prefix/model-00000-of-00002.safetensors",
+            b"s3://weights/prefix/model-00000-of-00002.safetensors",
             ["weight_a", "weight_b"],
         ),
         "model-00001-of-00002.safetensors": (
-            b"prefix/model-00001-of-00002.safetensors",
+            b"s3://weights/prefix/model-00001-of-00002.safetensors",
             ["weight_c"],
         ),
     }
@@ -388,25 +372,11 @@ def test_canonical_s3_applies_delta_tensors_concurrently(monkeypatch, tmp_path):
     assert all(0 < size <= 2 << 20 for size in read_sizes)
 
 
-def test_manifest_mismatch_fails_before_checkpoint_mutation(monkeypatch, tmp_path):
-    base = torch.tensor([1.0, 2.0]).view(torch.uint8).numpy()
-    target = torch.tensor([3.0, 4.0]).view(torch.uint8).numpy()
-    objects = _artifact(base, target)
-    root = objects["test/v1/model.safetensors.index.json"]
-    adapter, _ = _build(monkeypatch, tmp_path, objects)
-
-    with pytest.raises(RuntimeError, match="manifest digest mismatch"):
-        adapter.stage_weight(_inputs(root, digest="0" * 64))
-
-    state = json.loads(adapter._checkpoint.state_path.read_text())
-    assert state["version"] == "base-a"
-
-
 def test_reconstructed_checksum_failure_propagates(monkeypatch, tmp_path):
     base = torch.tensor([1.0, 2.0]).view(torch.uint8).numpy()
     target = torch.tensor([3.0, 4.0]).view(torch.uint8).numpy()
     objects = _artifact(base, target, checksum="00000000")
-    root = objects["test/v1/model.safetensors.index.json"]
+    root = objects["s3://weights/test/v1/model.safetensors.index.json"]
     adapter, _ = _build(monkeypatch, tmp_path, objects)
     with pytest.raises(RuntimeError, match="target checksum differs"):
         adapter.stage_weight(_inputs(root))
@@ -426,7 +396,7 @@ def test_wrong_base_fails_before_s3_download(monkeypatch, tmp_path):
     base = torch.tensor([1.0, 2.0]).view(torch.uint8).numpy()
     target = torch.tensor([3.0, 4.0]).view(torch.uint8).numpy()
     objects = _artifact(base, target)
-    root = objects["test/v1/model.safetensors.index.json"]
+    root = objects["s3://weights/test/v1/model.safetensors.index.json"]
     adapter, storage = _build(monkeypatch, tmp_path, objects)
 
     with pytest.raises(ValueError, match="exact local base"):
@@ -442,8 +412,8 @@ def test_child_download_failure_is_retryable(
     base = torch.tensor([1.0, 2.0]).view(torch.uint8).numpy()
     target = torch.tensor([3.0, 4.0]).view(torch.uint8).numpy()
     objects = _artifact(base, target)
-    root_key = "test/v1/model.safetensors.index.json"
-    shard_key = "test/v1/model-00000-of-00001.safetensors"
+    root_key = "s3://weights/test/v1/model.safetensors.index.json"
+    shard_key = "s3://weights/test/v1/model-00000-of-00001.safetensors"
     adapter, storage = _build(monkeypatch, tmp_path, objects)
     storage.fail_key_once = shard_key
 
@@ -459,8 +429,8 @@ def test_corrupt_zstd_fails_before_checkpoint_mutation(monkeypatch, tmp_path):
     base = torch.tensor([1.0, 2.0]).view(torch.uint8).numpy()
     target = torch.tensor([3.0, 4.0]).view(torch.uint8).numpy()
     objects = _artifact(base, target)
-    root_key = "test/v1/model.safetensors.index.json"
-    shard_key = "test/v1/model-00000-of-00001.safetensors"
+    root_key = "s3://weights/test/v1/model.safetensors.index.json"
+    shard_key = "s3://weights/test/v1/model-00000-of-00001.safetensors"
     shard = bytearray(objects[shard_key])
     header_size = int.from_bytes(shard[:8], "little")
     data_start = 8 + header_size
@@ -479,8 +449,8 @@ def test_cached_target_requires_the_same_canonical_root(monkeypatch, tmp_path):
     base = torch.tensor([1.0, 2.0]).view(torch.uint8).numpy()
     target = torch.tensor([3.0, 4.0]).view(torch.uint8).numpy()
     objects = _artifact(base, target)
-    root_key = "test/v1/model.safetensors.index.json"
-    alternate_key = "test/alternate/v1/model.safetensors.index.json"
+    root_key = "s3://weights/test/v1/model.safetensors.index.json"
+    alternate_key = "s3://weights/test/alternate/v1/model.safetensors.index.json"
     objects[alternate_key] = objects[root_key]
     adapter, _ = _build(monkeypatch, tmp_path, objects)
     staged = adapter.stage_weight(_inputs(objects[root_key]))
@@ -488,7 +458,7 @@ def test_cached_target_requires_the_same_canonical_root(monkeypatch, tmp_path):
     adapter.release_staged_weight(staged)
 
     with pytest.raises(RuntimeError, match="different canonical root"):
-        adapter.stage_weight(_inputs(objects[alternate_key], key=alternate_key))
+        adapter.stage_weight(_inputs(objects[alternate_key], uri=alternate_key))
 
 
 def test_installed_target_becomes_the_next_exact_base(monkeypatch, tmp_path):
@@ -508,12 +478,12 @@ def test_installed_target_becomes_the_next_exact_base(monkeypatch, tmp_path):
         )
     )
     adapter, _ = _build(monkeypatch, tmp_path, objects)
-    first_root = objects["test/v1/model.safetensors.index.json"]
+    first_root = objects["s3://weights/test/v1/model.safetensors.index.json"]
     staged = adapter.stage_weight(_inputs(first_root))
     adapter.apply_weight(staged)
     adapter.release_staged_weight(staged)
 
-    second_root = objects["test/v2/model.safetensors.index.json"]
+    second_root = objects["s3://weights/test/v2/model.safetensors.index.json"]
     staged = adapter.stage_weight(
         _inputs(
             second_root,

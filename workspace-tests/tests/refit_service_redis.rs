@@ -18,10 +18,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use modelexpress_common::grpc::refit::{
     CreateWeightVersionRequest, CreateWeightVersionShardRequest, DeleteVersionLeaseRequest,
     DeleteWeightVersionRequest, DeleteWeightVersionShardRequest, GetWeightVersionRequest,
-    ListWeightVersionShardsRequest, NixlTransport, RegisterVersionLeaseRequest,
-    RegisterWorkerRequest, S3Transport, WeightPayloadFormat, WeightVersionShard,
+    ListWeightVersionShardsRequest, RegisterVersionLeaseRequest, RegisterWorkerRequest,
+    S3Transport, UpdateWeightVersionStateRequest, WeightPayloadFormat, WeightVersionShard,
     WeightVersionState, WorkerRegistration, WorkerRole, refit_service_client::RefitServiceClient,
-    weight_version_shard::Transport,
 };
 use modelexpress_server::backend_config::BackendConfig;
 use modelexpress_server::config::ServerConfig;
@@ -107,27 +106,22 @@ fn shard(version_id: &str, source_slot_id: &str, worker_id: &str) -> WeightVersi
         tensor_count: 10,
         total_bytes: 1024,
         manifest_digest: format!("digest-{source_slot_id}"),
-        transport: Some(Transport::Nixl(NixlTransport {
-            manifest_endpoint: format!("{worker_id}:9000"),
-        })),
+        manifest_endpoint: format!("{worker_id}:9000"),
     }
 }
 
-fn s3_shard(version_id: &str, worker_id: &str) -> WeightVersionShard {
-    WeightVersionShard {
-        version_id: version_id.to_string(),
-        source_slot_id: "canonical.delta.root".to_string(),
-        worker_id: worker_id.to_string(),
-        tensor_count: 10,
-        total_bytes: 1024,
-        manifest_digest: "sha256:delta-index".to_string(),
-        transport: Some(Transport::S3(S3Transport {
-            bucket: "weights".to_string(),
-            key: format!("test/model/{version_id}/delta-index.json"),
-            object_version: None,
-            checksum: "crc32c:00000000".to_string(),
-        })),
-    }
+async fn update_state(
+    client: &mut RefitServiceClient<tonic::transport::Channel>,
+    uid: &str,
+    state: WeightVersionState,
+) -> Result<modelexpress_common::grpc::refit::UpdateWeightVersionStateResponse, tonic::Status> {
+    client
+        .update_weight_version_state(UpdateWeightVersionStateRequest {
+            uid: uid.to_string(),
+            state: state.into(),
+        })
+        .await
+        .map(tonic::Response::into_inner)
 }
 
 #[tokio::test]
@@ -178,6 +172,8 @@ async fn version_becomes_ready_across_server_replicas() {
             "publisher:global-rank:0".to_string(),
             "publisher:global-rank:1".to_string(),
         ],
+        s3: None,
+        state: WeightVersionState::Staging.into(),
     };
     let create_a = client_a.create_weight_version(create_request.clone());
     let create_b = client_b.create_weight_version(create_request);
@@ -198,6 +194,11 @@ async fn version_becomes_ready_across_server_replicas() {
         .expect("second server reads version")
         .into_inner();
     assert_eq!(observed, version);
+
+    let manual_ready = update_state(&mut client_a, &version.uid, WeightVersionState::Ready)
+        .await
+        .expect_err("worker-sharded readiness comes only from source coverage");
+    assert_eq!(manual_ready.code(), tonic::Code::FailedPrecondition);
 
     let unexpected_source_slot = client_a
         .create_weight_version_shard(CreateWeightVersionShardRequest {
@@ -275,90 +276,110 @@ async fn version_becomes_ready_across_server_replicas() {
 
 #[tokio::test]
 #[ignore = "requires a live Redis at REDIS_URL"]
-async fn s3_root_becomes_ready_and_survives_publisher_expiry() {
+async fn s3_versions_support_staged_and_direct_ready_creation() {
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
     let port = free_port();
     let (shutdown, server) = start_server(port, &redis_url);
     let mut client = connect(port).await;
-    let worker_id = unique_id("s3-worker");
+    let uri = "s3://weights/run/policy/v42/model.safetensors.index.json";
+    let staged_request = CreateWeightVersionRequest {
+        model_name: "test/model".to_string(),
+        version_number: Some(42),
+        idempotency_key: unique_id("staged-s3-version"),
+        payload_format: WeightPayloadFormat::FullTensor.into(),
+        base_version_id: None,
+        expected_source_slots: Vec::new(),
+        s3: Some(S3Transport {
+            uri: uri.to_string(),
+        }),
+        state: WeightVersionState::Staging.into(),
+    };
+    let staged = client
+        .create_weight_version(staged_request.clone())
+        .await
+        .expect("create staged S3 version")
+        .into_inner();
+    assert_eq!(staged.state, i32::from(WeightVersionState::Staging));
+    assert_eq!(staged.s3.as_ref().expect("S3 transport").uri, uri);
+    assert!(staged.expected_source_slots.is_empty());
+    let skipped_ready = update_state(&mut client, &staged.uid, WeightVersionState::Releasing)
+        .await
+        .expect_err("STAGING cannot skip READY");
+    assert_eq!(skipped_ready.code(), tonic::Code::FailedPrecondition);
 
-    client
-        .register_worker(worker(&worker_id, WorkerRole::Trainer, 1))
+    let ready = update_state(&mut client, &staged.uid, WeightVersionState::Ready)
         .await
-        .expect("register S3 publisher");
-    let version = client
-        .create_weight_version(CreateWeightVersionRequest {
-            model_name: "test/model".to_string(),
-            version_number: Some(42),
-            idempotency_key: unique_id("s3-version"),
-            payload_format: WeightPayloadFormat::FullTensor.into(),
-            base_version_id: None,
-            expected_source_slots: vec!["canonical.delta.root".to_string()],
-        })
+        .expect("mark S3 version ready")
+        .version
+        .expect("updated version");
+    assert_eq!(ready.state, i32::from(WeightVersionState::Ready));
+    let repeated = update_state(&mut client, &staged.uid, WeightVersionState::Ready)
         .await
-        .expect("create S3 version")
+        .expect("repeated READY update is idempotent")
+        .version
+        .expect("updated version");
+    assert_eq!(repeated, ready);
+    let backward = update_state(&mut client, &staged.uid, WeightVersionState::Staging)
+        .await
+        .expect_err("READY cannot transition back to STAGING");
+    assert_eq!(backward.code(), tonic::Code::FailedPrecondition);
+
+    let releasing = update_state(&mut client, &staged.uid, WeightVersionState::Releasing)
+        .await
+        .expect("release S3 version")
+        .version
+        .expect("updated version");
+    assert_eq!(releasing.state, i32::from(WeightVersionState::Releasing));
+    update_state(&mut client, &staged.uid, WeightVersionState::Releasing)
+        .await
+        .expect("repeated RELEASING update is idempotent");
+    let released_backward = update_state(&mut client, &staged.uid, WeightVersionState::Ready)
+        .await
+        .expect_err("RELEASING cannot transition back to READY");
+    assert_eq!(released_backward.code(), tonic::Code::FailedPrecondition);
+
+    let repeated_create = client
+        .create_weight_version(staged_request.clone())
+        .await
+        .expect("idempotent create keeps the current state")
         .into_inner();
-    let root_shard = s3_shard(&version.uid, &worker_id);
-    let published = client
-        .create_weight_version_shard(CreateWeightVersionShardRequest {
-            shard: Some(root_shard.clone()),
-        })
-        .await
-        .expect("publish canonical delta root")
-        .into_inner();
-    assert_eq!(
-        published.version.expect("published version").state,
-        i32::from(WeightVersionState::Ready)
-    );
-    client
-        .create_weight_version_shard(CreateWeightVersionShardRequest {
-            shard: Some(root_shard.clone()),
-        })
-        .await
-        .expect("repeated S3 root publication is idempotent");
-    let mut conflicting_root = root_shard;
-    conflicting_root.total_bytes += 1;
+    assert_eq!(repeated_create, releasing);
+    let mut conflicting_create = staged_request;
+    conflicting_create.state = WeightVersionState::Ready.into();
     let conflict = client
-        .create_weight_version_shard(CreateWeightVersionShardRequest {
-            shard: Some(conflicting_root),
-        })
+        .create_weight_version(conflicting_create)
         .await
-        .expect_err("conflicting S3 root publication is rejected");
+        .expect_err("idempotency key cannot change the requested initial state");
     assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
 
-    tokio::time::sleep(Duration::from_millis(1_250)).await;
-    let expired_version = client
+    let direct = client
         .create_weight_version(CreateWeightVersionRequest {
             model_name: "test/model".to_string(),
             version_number: Some(43),
-            idempotency_key: unique_id("expired-s3-version"),
+            idempotency_key: unique_id("ready-s3-version"),
             payload_format: WeightPayloadFormat::FullTensor.into(),
             base_version_id: None,
-            expected_source_slots: vec!["canonical.delta.root".to_string()],
+            expected_source_slots: Vec::new(),
+            s3: Some(S3Transport {
+                uri: "s3://weights/run/policy/v43/model.safetensors.index.json".to_string(),
+            }),
+            state: WeightVersionState::Ready.into(),
         })
         .await
-        .expect("create version after publisher expiry")
+        .expect("create directly ready S3 version")
         .into_inner();
-    let expired = client
-        .create_weight_version_shard(CreateWeightVersionShardRequest {
-            shard: Some(s3_shard(&expired_version.uid, &worker_id)),
-        })
-        .await
-        .expect_err("expired worker cannot publish another S3 root");
-    assert_eq!(expired.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(direct.state, i32::from(WeightVersionState::Ready));
 
     let shards = client
         .list_weight_version_shards(ListWeightVersionShardsRequest {
-            version_id: version.uid,
+            version_id: direct.uid,
         })
         .await
-        .expect("list accepted S3 root after publisher expiry")
+        .expect("S3 version has no worker shards")
         .into_inner()
         .shards;
-    assert_eq!(shards.len(), 1);
-    assert_eq!(shards[0].source_slot_id, "canonical.delta.root");
-    assert!(matches!(shards[0].transport, Some(Transport::S3(_))));
+    assert!(shards.is_empty());
 
     stop(shutdown, server).await;
 }
@@ -390,6 +411,8 @@ async fn replacement_worker_can_publish_the_same_source_slot() {
             payload_format: WeightPayloadFormat::FullTensor.into(),
             base_version_id: None,
             expected_source_slots: vec!["publisher:global-rank:0".to_string()],
+            s3: None,
+            state: WeightVersionState::Staging.into(),
         })
         .await
         .expect("create version")
@@ -470,6 +493,8 @@ async fn live_lease_protects_releasing_version_shards() {
             payload_format: WeightPayloadFormat::FullTensor.into(),
             base_version_id: None,
             expected_source_slots: vec!["publisher:global-rank:0".to_string()],
+            s3: None,
+            state: WeightVersionState::Staging.into(),
         })
         .await
         .expect("create version")
@@ -569,6 +594,8 @@ async fn live_lease_protects_releasing_version_shards() {
             payload_format: WeightPayloadFormat::FullTensor.into(),
             base_version_id: None,
             expected_source_slots: vec!["publisher:global-rank:0".to_string()],
+            s3: None,
+            state: WeightVersionState::Staging.into(),
         })
         .await
         .expect("create version protected by an expiring lease")
@@ -649,6 +676,8 @@ async fn register_worker_refreshes_liveness_and_expires_without_renewal() {
             payload_format: WeightPayloadFormat::FullTensor.into(),
             base_version_id: None,
             expected_source_slots: vec!["publisher:global-rank:0".to_string()],
+            s3: None,
+            state: WeightVersionState::Staging.into(),
         })
         .await
         .expect("create version")
@@ -670,6 +699,8 @@ async fn register_worker_refreshes_liveness_and_expires_without_renewal() {
             payload_format: WeightPayloadFormat::FullTensor.into(),
             base_version_id: None,
             expected_source_slots: vec!["publisher:global-rank:0".to_string()],
+            s3: None,
+            state: WeightVersionState::Staging.into(),
         })
         .await
         .expect("create version after worker expiry")

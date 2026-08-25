@@ -126,20 +126,12 @@ def test_trainer_config_rejects_unspecified_payload_format():
         ModelExpressTrainerConfig(payload_format=WeightPayloadFormat.UNSPECIFIED)
 
 
-def test_refit_shard_transport_contract_uses_typed_oneof():
-    descriptor = refit_pb2.WeightVersionShard.DESCRIPTOR
+def test_refit_shard_keeps_only_its_nixl_manifest_endpoint():
+    shard = refit_pb2.WeightVersionShard(manifest_endpoint="trainer:9000")
 
-    assert [
-        (field.name, field.number)
-        for field in descriptor.oneofs_by_name["transport"].fields
-    ] == [("nixl", 7), ("s3", 8)]
-
-    shard = refit_pb2.WeightVersionShard(
-        nixl=refit_pb2.NixlTransport(manifest_endpoint="trainer:9000")
-    )
-    assert shard.WhichOneof("transport") == "nixl"
-    shard.s3.CopyFrom(refit_pb2.S3Transport(bucket="weights", key="version"))
-    assert shard.WhichOneof("transport") == "s3"
+    assert shard.manifest_endpoint == "trainer:9000"
+    assert refit_pb2.WeightVersion.DESCRIPTOR.fields_by_name["s3"].number == 11
+    assert list(refit_pb2.S3Transport.DESCRIPTOR.fields_by_name) == ["uri"]
 
 
 def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
@@ -186,7 +178,7 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
         trainer.publish_version(version=WeightVersionRef("version-a"))
 
         worker_stub = refit_pb2_grpc.RefitWorkerServiceStub(
-            grpc.insecure_channel(service.shards[0].nixl.manifest_endpoint)
+            grpc.insecure_channel(service.shards[0].manifest_endpoint)
         )
         fetched = worker_stub.GetWeightVersionShardManifest(
             refit_pb2.GetWeightVersionShardManifestRequest(
@@ -234,8 +226,7 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
     assert service.shards[0].worker_id == "trainer-0"
     assert service.shards[0].tensor_count == 2
     assert service.shards[0].total_bytes == 128
-    assert service.shards[0].WhichOneof("transport") == "nixl"
-    assert service.shards[0].nixl.manifest_endpoint == f"127.0.0.1:{port}"
+    assert service.shards[0].manifest_endpoint == f"127.0.0.1:{port}"
     assert fetched.manifest == b"manifest"
 
 

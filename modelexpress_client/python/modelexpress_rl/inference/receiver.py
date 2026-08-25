@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import fcntl
-import hashlib
 import json
 import mmap
 import shutil
@@ -15,7 +14,7 @@ import zlib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -23,15 +22,13 @@ import numpy as np
 import zstandard
 
 from modelexpress_rl import envs as rl_envs
-from modelexpress_rl.s3 import S3Client, S3Object
+from modelexpress_rl.s3 import S3Client
 from modelexpress_rl.train import WeightPayloadFormat
 from modelexpress_rl.utils import index_checkpoint_tensors, read_safetensors_header
-from modelexpress_rl.version import CANONICAL_DELTA_SOURCE_SLOT
 
 from .adapter import (
     GeneratorEngineAdapter,
     GeneratorTransferInputs,
-    S3GeneratorSource,
 )
 
 
@@ -71,8 +68,7 @@ class PreparedCheckpoint:
 class _S3Version:
     version_id: str
     base_version_id: str
-    root: S3Object
-    manifest_digest: str
+    uri: str
 
 
 def _seed_checkpoint(source: Path, target: Path) -> None:
@@ -103,14 +99,8 @@ def _write_state(path: Path, state: dict) -> None:
     temporary.replace(path)
 
 
-def _source_identity(version: _S3Version) -> dict[str, str | None]:
-    return {
-        "bucket": version.root.bucket,
-        "key": version.root.key,
-        "object_version": version.root.object_version,
-        "checksum": version.root.checksum,
-        "manifest_digest": version.manifest_digest,
-    }
+def _source_identity(version: _S3Version) -> dict[str, str]:
+    return {"uri": version.uri}
 
 
 class _LocalCheckpoint:
@@ -202,18 +192,15 @@ class _LocalCheckpoint:
 
             started = time.perf_counter()
             try:
-                index_data = self.s3.get(version.root)
+                index_data = self.s3.get(version.uri)
             except Exception as error:
                 raise RuntimeError("canonical root download failed") from error
 
             index_download_time = time.perf_counter() - started
-            if hashlib.sha256(index_data).hexdigest() != version.manifest_digest:
-                raise ValueError("canonical root manifest digest mismatch")
-
             weight_map = json.loads(index_data)["weight_map"]
 
             download_started = time.perf_counter()
-            shards = self._download_deltas(weight_map, version.root)
+            shards = self._download_deltas(weight_map, version.uri)
             download_time = time.perf_counter() - download_started
 
             apply_started = time.perf_counter()
@@ -239,14 +226,14 @@ class _LocalCheckpoint:
     def _download_deltas(
         self,
         weight_map: dict[str, str],
-        root: S3Object,
+        root_uri: str,
     ) -> dict[str, tuple[bytes, list[str]]]:
         if not weight_map:
             return {}
         by_file: dict[str, list[str]] = {}
         for name, filename in weight_map.items():
             by_file.setdefault(filename, []).append(name)
-        parent = PurePosixPath(root.key).parent
+        parent_uri = root_uri.rsplit("/", 1)[0]
         shards = {}
         with ThreadPoolExecutor(
             max_workers=min(32, len(by_file)),
@@ -254,9 +241,8 @@ class _LocalCheckpoint:
         ) as pool:
             downloads = {
                 filename: pool.submit(
-                    self.s3.get_key,
-                    bucket=root.bucket,
-                    key=str(parent / filename),
+                    self.s3.get,
+                    f"{parent_uri}/{filename}",
                 )
                 for filename in by_file
             }
@@ -401,13 +387,8 @@ class CanonicalS3GeneratorAdapter(GeneratorEngineAdapter):
             raise ValueError("canonical S3 requires XOR_DELTA payloads")
         if not inputs.base_version_id:
             raise ValueError("canonical S3 version is missing base_version_id")
-        if len(inputs.sources) != 1:
-            raise ValueError("canonical S3 requires one global root source")
-        source = inputs.sources[0]
-        if source.source_slot_id != CANONICAL_DELTA_SOURCE_SLOT or not isinstance(
-            source.transport, S3GeneratorSource
-        ):
-            raise ValueError("canonical S3 requires the canonical.delta.root source")
+        if not inputs.s3_uri:
+            raise ValueError("canonical S3 requires a version-level URI")
         if self._checkpoint.current_version not in {
             inputs.base_version_id,
             inputs.version_id,
@@ -416,8 +397,7 @@ class CanonicalS3GeneratorAdapter(GeneratorEngineAdapter):
         version = _S3Version(
             version_id=inputs.version_id,
             base_version_id=inputs.base_version_id,
-            root=source.transport.location,
-            manifest_digest=source.manifest_digest,
+            uri=inputs.s3_uri,
         )
         started = time.perf_counter()
         try:
@@ -451,7 +431,6 @@ class CanonicalS3GeneratorAdapter(GeneratorEngineAdapter):
 
 
 __all__ = [
-    "CANONICAL_DELTA_SOURCE_SLOT",
     "CanonicalS3GeneratorAdapter",
     "PreparedCheckpoint",
     "ReceiverInstallError",

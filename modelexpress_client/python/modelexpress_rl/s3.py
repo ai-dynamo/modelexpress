@@ -5,20 +5,7 @@
 
 from __future__ import annotations
 
-import base64
-from dataclasses import dataclass
-
-import google_crc32c
-
-
-@dataclass(frozen=True)
-class S3Object:
-    """Location and transport checksum of one S3 object."""
-
-    bucket: str
-    key: str
-    checksum: str
-    object_version: str | None = None
+from urllib.parse import urlsplit
 
 
 class ImmutableS3Conflict(RuntimeError):
@@ -32,10 +19,19 @@ def _error_code(error: Exception) -> str | None:
         return None
 
 
-def _checksum(data: bytes) -> tuple[str, str]:
-    value = google_crc32c.value(data)
-    encoded = base64.b64encode(value.to_bytes(4, "big")).decode()
-    return f"crc32c:{value:08x}", encoded
+def _parse_uri(uri: str) -> tuple[str, str]:
+    parsed = urlsplit(uri)
+    if (
+        parsed.scheme != "s3"
+        or not parsed.netloc
+        or not parsed.path.startswith("/")
+        or parsed.path.startswith("//")
+        or len(parsed.path) == 1
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(f"invalid S3 URI: {uri!r}")
+    return parsed.netloc, parsed.path[1:]
 
 
 class S3Client:
@@ -57,19 +53,16 @@ class S3Client:
             config=BotoConfig(max_pool_connections=32),
         )
 
-    def put(self, *, bucket: str, key: str, data: bytes) -> S3Object:
+    def put(self, *, uri: str, data: bytes) -> None:
         """Create an immutable object, accepting an identical retry."""
-        checksum, encoded_checksum = _checksum(data)
+        bucket, key = _parse_uri(uri)
         try:
-            response = self._client.put_object(
+            self._client.put_object(
                 Bucket=bucket,
                 Key=key,
                 Body=data,
-                ChecksumAlgorithm="CRC32C",
-                ChecksumCRC32C=encoded_checksum,
                 IfNoneMatch="*",
             )
-            object_version = response.get("VersionId")
         except Exception as error:
             if _error_code(error) not in {
                 "409",
@@ -78,71 +71,20 @@ class S3Client:
                 "PreconditionFailed",
             }:
                 raise
-            existing, object_version, _ = self._read(bucket=bucket, key=key)
+            existing = self.get(uri)
             if existing != data:
                 raise ImmutableS3Conflict(
                     f"immutable S3 object conflict for {bucket}/{key}"
                 ) from error
-        return S3Object(
-            bucket=bucket,
-            key=key,
-            checksum=checksum,
-            object_version=object_version,
-        )
 
-    def get(self, location: S3Object) -> bytes:
-        """Read one advertised object and verify its CRC32C checksum."""
-        data, _, response_checksum = self._read(
-            bucket=location.bucket,
-            key=location.key,
-            object_version=location.object_version,
-            checksum_mode=True,
-        )
-        checksum, encoded_checksum = _checksum(data)
-        if checksum != location.checksum:
-            raise ValueError(
-                f"S3 checksum mismatch for {location.bucket}/{location.key}"
-            )
-        if response_checksum is not None and response_checksum != encoded_checksum:
-            raise ValueError(
-                f"S3 response checksum mismatch for {location.bucket}/{location.key}"
-            )
-        return data
-
-    def get_key(self, *, bucket: str, key: str) -> bytes:
-        """Read an immutable index-referenced object."""
-        data, _, response_checksum = self._read(
-            bucket=bucket,
-            key=key,
-            checksum_mode=True,
-        )
-        if response_checksum is not None:
-            _, encoded_checksum = _checksum(data)
-            if response_checksum != encoded_checksum:
-                raise ValueError(f"S3 response checksum mismatch for {bucket}/{key}")
-        return data
-
-    def _read(
-        self,
-        *,
-        bucket: str,
-        key: str,
-        object_version: str | None = None,
-        checksum_mode: bool = False,
-    ) -> tuple[bytes, str | None, str | None]:
+    def get(self, uri: str) -> bytes:
+        """Read one S3 object."""
+        bucket, key = _parse_uri(uri)
         request = {"Bucket": bucket, "Key": key}
-        if object_version is not None:
-            request["VersionId"] = object_version
-        if checksum_mode:
-            request["ChecksumMode"] = "ENABLED"
         response = self._client.get_object(**request)
         body = response["Body"]
         try:
-            return (
-                body.read(),
-                response.get("VersionId"),
-                response.get("ChecksumCRC32C"),
-            )
+            return body.read()
         finally:
             close = getattr(body, "close", None)
             if close is not None:
@@ -155,4 +97,4 @@ class S3Client:
             close()
 
 
-__all__ = ["ImmutableS3Conflict", "S3Client", "S3Object"]
+__all__ = ["ImmutableS3Conflict", "S3Client"]

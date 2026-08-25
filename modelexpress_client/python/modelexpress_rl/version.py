@@ -8,9 +8,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-CANONICAL_DELTA_SOURCE_SLOT = "canonical.delta.root"
-
-
 @dataclass(frozen=True)
 class WeightVersionRef:
     """Opaque reference to one global WeightVersion created by the orchestrator."""
@@ -22,4 +19,4 @@ class WeightVersionRef:
             raise ValueError("version.version_id is required")
 
 
-__all__ = ["CANONICAL_DELTA_SOURCE_SLOT", "WeightVersionRef"]
+__all__ = ["WeightVersionRef"]

@@ -8,8 +8,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use modelexpress_common::grpc::refit::{
     CreateWeightVersionRequest, DeleteVersionLeaseRequest, DeleteWeightVersionShardRequest,
-    RegisterVersionLeaseRequest, VersionLease, WeightVersion, WeightVersionShard,
-    WorkerRegistration,
+    RegisterVersionLeaseRequest, UpdateWeightVersionStateRequest, VersionLease, WeightVersion,
+    WeightVersionShard, WorkerRegistration,
 };
 
 use crate::backend_config::BackendConfig;
@@ -57,6 +57,11 @@ pub trait RefitBackend: Send + Sync {
     async fn get_weight_version(&self, uid: &str) -> RefitResult<WeightVersion>;
 
     async fn delete_weight_version(&self, uid: &str) -> RefitResult<WeightVersion>;
+
+    async fn update_weight_version_state(
+        &self,
+        request: &UpdateWeightVersionStateRequest,
+    ) -> RefitResult<WeightVersion>;
 
     async fn create_weight_version_shard(
         &self,

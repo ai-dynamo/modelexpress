@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import hashlib
 import json
 import logging
 import struct
@@ -25,7 +24,6 @@ from modelexpress_rl import (
     refit_pb2,
     refit_pb2_grpc,
 )
-from modelexpress_rl.s3 import S3Object
 from modelexpress_rl.train import client as trainer_client_module
 
 
@@ -34,18 +32,13 @@ class _MemoryS3:
         self.objects = {}
         self.fail_next = False
 
-    def put(self, *, bucket, key, data):
+    def put(self, *, uri, data):
         if self.fail_next:
             self.fail_next = False
             raise RuntimeError("injected upload failure")
-        existing = self.objects.setdefault((bucket, key), data)
+        existing = self.objects.setdefault(uri, data)
         if existing != data:
             raise RuntimeError("immutable object differs")
-        return S3Object(
-            bucket=bucket,
-            key=key,
-            checksum=f"crc32c:{len(data):08x}",
-        )
 
     def close(self):
         pass
@@ -62,7 +55,9 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
             version_number=1,
             payload_format=refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA,
             base_version_id="base-a",
-            expected_source_slots=["canonical.delta.root"],
+            s3=refit_pb2.S3Transport(
+                uri="s3://weights/tests/v1/model.safetensors.index.json"
+            ),
             state=refit_pb2.WEIGHT_VERSION_STATE_STAGING,
         )
 
@@ -164,10 +159,9 @@ def _trainer(
             registration_ttl_seconds=60,
             process_group=process_group,
             s3=S3Config(
-                bucket="weights",
+                uri_prefix="s3://weights/tests",
                 initial_base_version_id="base-a",
                 launch_checkpoint=launch,
-                prefix="tests",
             ),
         )
     )
@@ -283,7 +277,7 @@ def test_s3_process_group_belongs_to_trainer_config(
         trainer.close()
 
 
-def test_s3_stage_is_local_then_publish_advertises_one_canonical_root(
+def test_s3_stage_is_local_then_publish_uploads_version_root(
     monkeypatch, tmp_path, refit_server
 ):
     service, server_url = refit_server
@@ -291,7 +285,8 @@ def test_s3_stage_is_local_then_publish_advertises_one_canonical_root(
     current = torch.tensor([1.0, 3.0])
 
     try:
-        assert trainer.source_slot_id == "canonical.delta.root"
+        with pytest.raises(RuntimeError, match="does not use source slots"):
+            _ = trainer.source_slot_id
         staged = trainer.stage_shard(
             version=WeightVersionRef("target-a"),
             hf_tensor_iter=iter([[("weight", current)]]),
@@ -303,28 +298,25 @@ def test_s3_stage_is_local_then_publish_advertises_one_canonical_root(
     finally:
         trainer.close()
 
-    assert len(service.shards) == 1
-    shard = service.shards[0]
-    assert shard.source_slot_id == "canonical.delta.root"
-    assert shard.WhichOneof("transport") == "s3"
-    assert shard.s3.bucket == "weights"
-    assert shard.s3.key == "tests/test%2Fmodel/v1/model.safetensors.index.json"
-    index = json.loads(storage.objects[("weights", shard.s3.key)])
+    assert service.registrations == set()
+    assert service.shards == []
+    root_uri = "s3://weights/tests/v1/model.safetensors.index.json"
+    index = json.loads(storage.objects[root_uri])
     assert index["metadata"] == {
         "base_version": "base-a",
         "checksum_format": "adler32",
         "compression_format": "zstd",
         "delta_encoding": "xor",
-        "version": "target-a",
+        "version": 1,
     }
     assert index["weight_map"] == {"weight": "model-00000-of-00001.safetensors"}
     removed_digests = {"base_digest", "target_digest", "format_digest"}
     assert removed_digests.isdisjoint(index)
     shard_key = next(
-        key for bucket, key in storage.objects if key.endswith(".safetensors")
+        uri for uri in storage.objects if uri.endswith(".safetensors")
     )
-    assert shard_key == "tests/test%2Fmodel/v1/model-00000-of-00001.safetensors"
-    blob = storage.objects[("weights", shard_key)]
+    assert shard_key == "s3://weights/tests/v1/model-00000-of-00001.safetensors"
+    blob = storage.objects[shard_key]
     (header_size,) = struct.unpack("<Q", blob[:8])
     header = json.loads(blob[8 : 8 + header_size])
     expected_checksum = f"{zlib.adler32(current.view(torch.uint8).numpy()):08x}"
@@ -344,10 +336,6 @@ def test_s3_stage_is_local_then_publish_advertises_one_canonical_root(
         torch.tensor([1.0, 2.0]).view(torch.uint8), current.view(torch.uint8)
     )
     assert decoded == expected_delta.numpy().tobytes()
-    assert (
-        shard.manifest_digest
-        == hashlib.sha256(storage.objects[("weights", shard.s3.key)]).hexdigest()
-    )
 
 
 def test_s3_stage_requires_version_number(monkeypatch, tmp_path, refit_server):
@@ -357,6 +345,25 @@ def test_s3_stage_requires_version_number(monkeypatch, tmp_path, refit_server):
 
     try:
         with pytest.raises(RuntimeError, match="must have a version number"):
+            trainer.stage_shard(
+                version=WeightVersionRef("target-a"),
+                hf_tensor_iter=iter([[("weight", torch.tensor([1.0, 3.0]))]]),
+            )
+    finally:
+        trainer.close()
+
+    assert storage.objects == {}
+
+
+def test_s3_stage_requires_version_uri_under_configured_prefix(
+    monkeypatch, tmp_path, refit_server
+):
+    service, server_url = refit_server
+    service.target.s3.uri = "s3://weights/other/v1/model.safetensors.index.json"
+    trainer, storage = _trainer(monkeypatch, tmp_path, server_url)
+
+    try:
+        with pytest.raises(RuntimeError, match="does not match the configured prefix"):
             trainer.stage_shard(
                 version=WeightVersionRef("target-a"),
                 hf_tensor_iter=iter([[("weight", torch.tensor([1.0, 3.0]))]]),
@@ -397,7 +404,7 @@ def test_s3_publish_failure_keeps_handle_retryable(monkeypatch, tmp_path, refit_
     finally:
         trainer.close()
 
-    assert len(service.shards) == 1
+    assert service.shards == []
 
 
 def test_s3_processes_buckets_concurrently_and_uploads_one_shard(
@@ -455,13 +462,14 @@ def test_s3_processes_buckets_concurrently_and_uploads_one_shard(
         trainer.close()
 
     filenames = sorted(
-        key.rsplit("/", 1)[-1]
-        for bucket, key in storage.objects
-        if bucket == "weights" and key.endswith(".safetensors")
+        uri.rsplit("/", 1)[-1]
+        for uri in storage.objects
+        if uri.endswith(".safetensors")
     )
     assert filenames == ["model-00000-of-00001.safetensors"]
-    root = service.shards[0]
-    index = json.loads(storage.objects[("weights", root.s3.key)])
+    index = json.loads(
+        storage.objects["s3://weights/tests/v1/model.safetensors.index.json"]
+    )
     assert set(index["weight_map"]) == {"a", "b"}
     assert set(index["weight_map"].values()) == {filenames[0]}
 
@@ -545,8 +553,8 @@ def test_s3_exposes_local_metrics_after_publication(
         assert gather_calls == 1
         shard = next(
             data
-            for (_bucket, key), data in storage.objects.items()
-            if key.endswith(".safetensors")
+            for uri, data in storage.objects.items()
+            if uri.endswith(".safetensors")
         )
         assert staged._staged.wire_bytes == len(shard)
 
@@ -556,7 +564,6 @@ def test_s3_exposes_local_metrics_after_publication(
             "wire_bytes": len(shard),
             "stage_delta_time": 2.0,
             "publish_s3_time": 3.0,
-            "publish_server_time": 4.0,
         }
         assert trainer.pop_metrics() == {}
     finally:
@@ -583,15 +590,16 @@ def test_s3_clean_update_still_publishes_root_index(
         trainer.close()
 
     assert len(storage.objects) == 1
-    shard = service.shards[0]
-    index = json.loads(storage.objects[("weights", shard.s3.key)])
+    assert service.shards == []
+    index = json.loads(
+        storage.objects["s3://weights/tests/v1/model.safetensors.index.json"]
+    )
     assert index["weight_map"] == {}
     assert metrics["changed_bytes"] == 0
     assert metrics["total_bytes"] > 0
     assert metrics["wire_bytes"] == 0
     assert metrics["stage_delta_time"] >= 0
     assert metrics["publish_s3_time"] >= 0
-    assert metrics["publish_server_time"] >= 0
 
 
 def test_s3_chains_from_published_base_and_keeps_previous_advertisement(
@@ -616,7 +624,9 @@ def test_s3_chains_from_published_base_and_keeps_previous_advertisement(
             version_number=2,
             payload_format=refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA,
             base_version_id="target-a",
-            expected_source_slots=["canonical.delta.root"],
+            s3=refit_pb2.S3Transport(
+                uri="s3://weights/tests/v2/model.safetensors.index.json"
+            ),
             state=refit_pb2.WEIGHT_VERSION_STATE_STAGING,
         )
         second = trainer.stage_shard(
@@ -634,8 +644,8 @@ def test_s3_chains_from_published_base_and_keeps_previous_advertisement(
 
     second_shard = next(
         data
-        for (bucket, key), data in storage.objects.items()
-        if bucket == "weights" and "/v2/" in key and key.endswith(".safetensors")
+        for uri, data in storage.objects.items()
+        if "/v2/" in uri and uri.endswith(".safetensors")
     )
     encoded = safetensors.numpy.load(second_shard)["weight"]
     decoded = zstandard.ZstdDecompressor().decompress(encoded)
@@ -662,7 +672,9 @@ def test_s3_release_keeps_canonical_advertisement(monkeypatch, tmp_path, refit_s
             version_number=2,
             payload_format=refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA,
             base_version_id="target-a",
-            expected_source_slots=["canonical.delta.root"],
+            s3=refit_pb2.S3Transport(
+                uri="s3://weights/tests/v2/model.safetensors.index.json"
+            ),
             state=refit_pb2.WEIGHT_VERSION_STATE_STAGING,
         )
         trainer.stage_shard(
@@ -675,7 +687,7 @@ def test_s3_release_keeps_canonical_advertisement(monkeypatch, tmp_path, refit_s
     finally:
         trainer.close()
 
-    assert [shard.version_id for shard in service.shards] == ["target-a", "target-b"]
+    assert service.shards == []
     assert service.deleted_shards == []
 
 
@@ -699,9 +711,12 @@ def test_s3_config_requires_storage_delta_pair(tmp_path):
     launch = tmp_path / "model.safetensors"
     _write_safetensors(launch, {"weight": torch.tensor([1.0])})
     s3 = S3Config(
-        bucket="weights",
+        uri_prefix="s3://weights/tests",
         initial_base_version_id="base-a",
         launch_checkpoint=launch,
+    )
+    assert s3.root_uri(42) == (
+        "s3://weights/tests/v42/model.safetensors.index.json"
     )
     with pytest.raises(ValueError, match="WRITE_TO_STORAGE and XOR_DELTA"):
         ModelExpressTrainerClient.initialize(

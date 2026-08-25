@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -18,7 +17,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 from typing import Any
-from urllib.parse import quote
 
 import grpc
 import numpy as np
@@ -27,7 +25,7 @@ import torch
 import torch.distributed as dist
 from modelexpress import auth, envs
 from modelexpress.client import _get_server_url
-from modelexpress_rl.s3 import S3Client, S3Object
+from modelexpress_rl.s3 import S3Client
 from modelexpress_rl.utils import (
     adler32_checksum,
     compress_delta,
@@ -37,7 +35,7 @@ from modelexpress_rl.utils import (
 
 from .. import envs as rl_envs
 from .. import refit_pb2, refit_pb2_grpc
-from ..version import CANONICAL_DELTA_SOURCE_SLOT, WeightVersionRef
+from ..version import WeightVersionRef
 from .adapter import (
     NixlMetadataProvider,
     StagedWeightVersionShardData,
@@ -104,18 +102,24 @@ def _payload_format(value: WeightPayloadFormat | None) -> WeightPayloadFormat:
 class S3Config:
     """Storage and launch-base settings for canonical XOR publication."""
 
-    bucket: str
+    uri_prefix: str
     initial_base_version_id: str
     launch_checkpoint: str | Path
-    prefix: str = ""
     endpoint_url: str | None = None
     region_name: str | None = None
 
     def __post_init__(self) -> None:
-        _required(self.bucket, "s3.bucket")
+        _required(self.uri_prefix, "s3.uri_prefix")
         _required(self.initial_base_version_id, "s3.initial_base_version_id")
         if not str(self.launch_checkpoint).strip():
             raise ValueError("s3.launch_checkpoint is required")
+
+    def root_uri(self, version_number: int) -> str:
+        """Return the canonical index URI for one numeric version."""
+        return (
+            f"{self.uri_prefix.rstrip('/')}/v{version_number}/"
+            "model.safetensors.index.json"
+        )
 
 
 @dataclass
@@ -123,6 +127,7 @@ class _StagedDelta:
     base_version_id: str
     target_version_id: str
     target_version_number: int
+    s3_uri: str
     candidate_snapshot: dict[str, np.ndarray]
     encoded_deltas: dict[str, np.ndarray]
     checksums: dict[str, str]
@@ -131,20 +136,6 @@ class _StagedDelta:
     wire_bytes: int = 0
     stage_delta_time: float = 0.0
     publish_s3_time: float = 0.0
-    advertise_time: float = 0.0
-
-
-@dataclass(frozen=True)
-class _S3Root:
-    location: S3Object
-    manifest_digest: str
-    tensor_count: int
-    total_bytes: int
-
-
-def _s3_key(prefix: str, model_name: str, version_number: int, filename: str) -> str:
-    path = f"{quote(model_name, safe='')}/v{version_number}/{filename}"
-    return "/".join(part for part in (prefix.strip("/"), path) if part)
 
 
 @dataclass(frozen=True)
@@ -242,7 +233,7 @@ class ModelExpressTrainerClient:
     def source_slot_id(self) -> str:
         """Return the logical source contribution owned by this client."""
         if self._s3 is not None:
-            return CANONICAL_DELTA_SOURCE_SLOT
+            raise RuntimeError("S3 publication does not use source slots")
         return self._get_adapter().source_slot_id
 
     def prepare_delta_base(
@@ -367,17 +358,15 @@ class ModelExpressTrainerClient:
         client._registration_ttl_seconds = registration_ttl_seconds
         client._rpc_timeout_seconds = config.rpc_timeout_seconds
         try:
-            client._register_worker()
-            client._registration_thread = threading.Thread(
-                target=client._renew_worker_registration,
-                name=f"modelexpress-refit-renew-{worker_id}",
-                daemon=True,
-            )
-            try:
-                client._registration_thread.start()
-            except Exception:
-                client._registration_thread = None
-                raise
+            if not use_s3:
+                client._register_worker()
+                registration_thread = threading.Thread(
+                    target=client._renew_worker_registration,
+                    name=f"modelexpress-refit-renew-{worker_id}",
+                    daemon=True,
+                )
+                registration_thread.start()
+                client._registration_thread = registration_thread
         except Exception:
             client.close()
             raise
@@ -489,6 +478,7 @@ class ModelExpressTrainerClient:
         *,
         target_version_id: str,
         target_version_number: int,
+        s3_uri: str,
         base_version_id: str,
         hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]],
     ) -> _StagedDelta:
@@ -534,6 +524,7 @@ class ModelExpressTrainerClient:
             base_version_id=base_version_id,
             target_version_id=target_version_id,
             target_version_number=target_version_number,
+            s3_uri=s3_uri,
             candidate_snapshot=candidate,
             encoded_deltas=encoded_deltas,
             checksums=checksums,
@@ -542,11 +533,11 @@ class ModelExpressTrainerClient:
             stage_delta_time=perf_counter() - started,
         )
 
-    def _publish_delta_to_s3(self, staged: _StagedDelta) -> _S3Root | None:
+    def _publish_delta_to_s3(self, staged: _StagedDelta) -> None:
         if staged.base_version_id != self._current_base_version_id:
             raise RuntimeError("staged canonical delta is stale")
-        assert self._s3_config is not None
         assert self._s3 is not None
+        parent_uri = staged.s3_uri.rsplit("/", 1)[0]
 
         counts: list[Any] = [None] * self._world_size
         dist.all_gather_object(
@@ -566,13 +557,7 @@ class ModelExpressTrainerClient:
             )
             filename = f"model-{offset:05d}-of-{total:05d}.safetensors"
             self._s3.put(
-                bucket=self._s3_config.bucket,
-                key=_s3_key(
-                    self._s3_config.prefix,
-                    self.model_name,
-                    staged.target_version_number,
-                    filename,
-                ),
+                uri=f"{parent_uri}/{filename}",
                 data=shard,
             )
             shard_size = len(shard)
@@ -587,7 +572,7 @@ class ModelExpressTrainerClient:
             group=self._process_group,
         )
         if contributions is None:
-            return None
+            return
 
         weight_map = {}
         for rank, rank_map, _size in contributions:
@@ -600,7 +585,7 @@ class ModelExpressTrainerClient:
         index = json.dumps(
             {
                 "metadata": {
-                    "version": staged.target_version_id,
+                    "version": staged.target_version_number,
                     "base_version": staged.base_version_id,
                     "delta_encoding": "xor",
                     "compression_format": "zstd",
@@ -611,22 +596,7 @@ class ModelExpressTrainerClient:
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
-        location = self._s3.put(
-            bucket=self._s3_config.bucket,
-            key=_s3_key(
-                self._s3_config.prefix,
-                self.model_name,
-                staged.target_version_number,
-                "model.safetensors.index.json",
-            ),
-            data=index,
-        )
-        return _S3Root(
-            location=location,
-            manifest_digest=hashlib.sha256(index).hexdigest(),
-            tensor_count=len(weight_map),
-            total_bytes=sum(size for _rank, _mapping, size in contributions),
-        )
+        self._s3.put(uri=staged.s3_uri, data=index)
 
     def stage_shard(
         self,
@@ -662,13 +632,17 @@ class ModelExpressTrainerClient:
                 or not target.HasField("base_version_id")
             ):
                 raise RuntimeError("S3 publication requires an XOR_DELTA target")
-            if tuple(target.expected_source_slots) != (CANONICAL_DELTA_SOURCE_SLOT,):
-                raise RuntimeError("S3 target must expect only canonical.delta.root")
             if not target.HasField("version_number"):
                 raise RuntimeError("S3 target must have a version number")
+            if not target.HasField("s3") or not target.s3.uri:
+                raise RuntimeError("S3 target is missing its URI")
+            assert self._s3_config is not None
+            if target.s3.uri != self._s3_config.root_uri(target.version_number):
+                raise RuntimeError("S3 target URI does not match the configured prefix")
             staged = self._stage_delta(
                 target_version_id=version.version_id,
                 target_version_number=target.version_number,
+                s3_uri=target.s3.uri,
                 base_version_id=target.base_version_id,
                 hf_tensor_iter=hf_tensor_iter,
             )
@@ -700,36 +674,8 @@ class ModelExpressTrainerClient:
             if self._s3 is None:
                 raise RuntimeError("S3 transport is not initialized")
             started = perf_counter()
-            root = self._publish_delta_to_s3(staged)
+            self._publish_delta_to_s3(staged)
             staged.publish_s3_time = perf_counter() - started
-
-            def advertise() -> None:
-                assert root is not None
-                s3_fields = {
-                    "bucket": root.location.bucket,
-                    "key": root.location.key,
-                    "checksum": root.location.checksum,
-                }
-                if root.location.object_version is not None:
-                    s3_fields["object_version"] = root.location.object_version
-                shard = refit_pb2.WeightVersionShard(
-                    version_id=version.version_id,
-                    source_slot_id=CANONICAL_DELTA_SOURCE_SLOT,
-                    worker_id=self.worker_id,
-                    tensor_count=root.tensor_count,
-                    total_bytes=root.total_bytes,
-                    manifest_digest=root.manifest_digest,
-                    s3=refit_pb2.S3Transport(**s3_fields),
-                )
-                self._service.CreateWeightVersionShard(
-                    refit_pb2.CreateWeightVersionShardRequest(shard=shard),
-                    timeout=self._rpc_timeout_seconds,
-                )
-
-            if self._rank == 0:
-                started = perf_counter()
-                advertise()
-                staged.advertise_time = perf_counter() - started
             self._snapshot = staged.candidate_snapshot
             staged.candidate_snapshot = {}
             self._current_base_version_id = staged.target_version_id
@@ -756,9 +702,7 @@ class ModelExpressTrainerClient:
             tensor_count=staged.manifest.tensor_count,
             total_bytes=staged.manifest.total_bytes,
             manifest_digest=staged.manifest.digest,
-            nixl=refit_pb2.NixlTransport(
-                manifest_endpoint=_required(manifest_endpoint, "manifest_endpoint"),
-            ),
+            manifest_endpoint=_required(manifest_endpoint, "manifest_endpoint"),
         )
         self._service.CreateWeightVersionShard(
             refit_pb2.CreateWeightVersionShardRequest(shard=shard),
@@ -833,7 +777,6 @@ class ModelExpressTrainerClient:
             "wire_bytes": staged.wire_bytes,
             "stage_delta_time": staged.stage_delta_time,
             "publish_s3_time": staged.publish_s3_time,
-            "publish_server_time": staged.advertise_time,
         }
 
     def __enter__(self) -> ModelExpressTrainerClient:

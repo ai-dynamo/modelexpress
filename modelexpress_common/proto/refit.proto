@@ -5,13 +5,14 @@ syntax = "proto3";
 
 package model_express.refit;
 
-// Control-plane metadata for RL weight publication. Weight bytes and full
-// manifests travel through the transport advertised by each source shard.
+// Control-plane metadata for RL weight publication. S3-backed versions own one
+// global object URI; worker-sharded versions advertise per-worker manifests.
 service RefitService {
   // External APIs: called by the RL framework orchestrator.
   rpc CreateWeightVersion(CreateWeightVersionRequest) returns (WeightVersion);
   rpc GetWeightVersion(GetWeightVersionRequest) returns (WeightVersion);
   rpc DeleteWeightVersion(DeleteWeightVersionRequest) returns (WeightVersion);
+  rpc UpdateWeightVersionState(UpdateWeightVersionStateRequest) returns (UpdateWeightVersionStateResponse);
 
   // Internal APIs: called by ModelExpress worker clients, not by the RL
   // framework orchestrator.
@@ -19,7 +20,7 @@ service RefitService {
   rpc CreateWeightVersionShard(CreateWeightVersionShardRequest) returns (CreateWeightVersionShardResponse);
   rpc ListWeightVersionShards(ListWeightVersionShardsRequest) returns (ListWeightVersionShardsResponse);
   rpc DeleteWeightVersionShard(DeleteWeightVersionShardRequest) returns (DeleteWeightVersionShardResponse);
-  // A live lease protects every shard while a generator installs the version.
+  // A live lease protects the version source while a generator installs it.
   // Re-registering the same lease owner renews its expiry.
   rpc RegisterVersionLease(RegisterVersionLeaseRequest) returns (VersionLease);
   rpc DeleteVersionLease(DeleteVersionLeaseRequest) returns (DeleteVersionLeaseResponse);
@@ -68,22 +69,24 @@ message WeightVersion {
   // MX-generated opaque identity for this WeightVersion.
   string uid = 1;
   string model_name = 2;
-  // Framework-provided version number for correlation and observability only.
+  // Framework-provided version number. Required for S3 publication.
   optional uint64 version_number = 3;
   string idempotency_key = 4;
   WeightPayloadFormat payload_format = 5;
   // Present only for XOR_DELTA; identifies the base WeightVersion to which the
   // delta is applied.
   optional string base_version_id = 6;
-  // Required version-scoped source contributions. Physical source workers are
+  // Required only for worker-sharded publication. Physical source workers are
   // not baked in; the trainer coordinator supplies opaque IDs such as a
-  // selected publisher global rank.
+  // selected publisher global rank. S3-backed versions leave this empty.
   repeated string expected_source_slots = 7;
   // Reserved placeholder for a future server-assigned layout fingerprint.
   // Content identity currently travels in the payload.
   string layout_signature = 8;
   WeightVersionState state = 9;
   uint64 created_at_unix_ms = 10;
+  // Present only when the version payload is published through S3.
+  S3Transport s3 = 11;
 }
 
 message CreateWeightVersionRequest {
@@ -93,7 +96,11 @@ message CreateWeightVersionRequest {
   WeightPayloadFormat payload_format = 4;
   // Required only for XOR_DELTA; omitted for FULL_TENSOR.
   optional string base_version_id = 5;
+  // Required for worker-sharded publication; empty for S3.
   repeated string expected_source_slots = 6;
+  // Set for an S3-backed version; omitted for worker-sharded publication.
+  S3Transport s3 = 7;
+  WeightVersionState state = 8;
 }
 
 message GetWeightVersionRequest {
@@ -102,6 +109,15 @@ message GetWeightVersionRequest {
 
 message DeleteWeightVersionRequest {
   string uid = 1;
+}
+
+message UpdateWeightVersionStateRequest {
+  string uid = 1;
+  WeightVersionState state = 2;
+}
+
+message UpdateWeightVersionStateResponse {
+  WeightVersion version = 1;
 }
 
 message WeightVersionShard {
@@ -113,22 +129,11 @@ message WeightVersionShard {
   uint64 tensor_count = 4;
   uint64 total_bytes = 5;
   string manifest_digest = 6;
-
-  oneof transport {
-    NixlTransport nixl = 7;
-    S3Transport s3 = 8;
-  }
-}
-
-message NixlTransport {
-  string manifest_endpoint = 1;
+  string manifest_endpoint = 7;
 }
 
 message S3Transport {
-  string bucket = 1;
-  string key = 2;
-  optional string object_version = 3;
-  string checksum = 4;
+  string uri = 1;
 }
 
 message CreateWeightVersionShardRequest {

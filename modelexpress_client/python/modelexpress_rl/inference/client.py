@@ -18,9 +18,8 @@ import grpc
 from modelexpress import auth, envs
 from modelexpress.client import _get_server_url
 from modelexpress_rl import envs as rl_envs
-from modelexpress_rl.s3 import S3Object
 from modelexpress_rl.train import WeightPayloadFormat
-from modelexpress_rl.version import CANONICAL_DELTA_SOURCE_SLOT, WeightVersionRef
+from modelexpress_rl.version import WeightVersionRef
 
 from .. import refit_pb2, refit_pb2_grpc
 from .adapter import (
@@ -29,7 +28,6 @@ from .adapter import (
     GeneratorSource,
     GeneratorTransferInputs,
     NixlGeneratorSource,
-    S3GeneratorSource,
 )
 from .engines import _create_generator_adapter
 from .receiver import S3GeneratorConfig
@@ -399,58 +397,36 @@ class ModelExpressGeneratorClient:
         }[self.payload_format]
 
     def _resolve_source(self, shard) -> GeneratorSource:
-        transport = shard.WhichOneof("transport")
-        if transport == "nixl":
-            source = shard.nixl
-            if not source.manifest_endpoint:
-                raise RuntimeError("NIXL source is missing its manifest endpoint")
-            with grpc.insecure_channel(source.manifest_endpoint) as channel:
-                response = refit_pb2_grpc.RefitWorkerServiceStub(
-                    channel
-                ).GetWeightVersionShardManifest(
-                    refit_pb2.GetWeightVersionShardManifestRequest(
-                        version_id=shard.version_id,
-                        source_slot_id=shard.source_slot_id,
-                    ),
-                    timeout=self._rpc_timeout_seconds,
-                )
-            digest = hashlib.sha256(response.manifest).hexdigest()
-            if (
-                response.manifest_digest != shard.manifest_digest
-                or digest != shard.manifest_digest
-            ):
-                raise RuntimeError(
-                    f"manifest digest mismatch for source slot {shard.source_slot_id!r}"
-                )
-            resolved = NixlGeneratorSource(
-                manifest_endpoint=source.manifest_endpoint,
-                manifest=response.manifest,
+        if not shard.manifest_endpoint:
+            raise RuntimeError("NIXL source is missing its manifest endpoint")
+        with grpc.insecure_channel(shard.manifest_endpoint) as channel:
+            response = refit_pb2_grpc.RefitWorkerServiceStub(
+                channel
+            ).GetWeightVersionShardManifest(
+                refit_pb2.GetWeightVersionShardManifestRequest(
+                    version_id=shard.version_id,
+                    source_slot_id=shard.source_slot_id,
+                ),
+                timeout=self._rpc_timeout_seconds,
             )
-        elif transport == "s3":
-            source = shard.s3
-            if not source.bucket or not source.key or not source.checksum:
-                raise RuntimeError("S3 source is missing its object location")
-            resolved = S3GeneratorSource(
-                location=S3Object(
-                    bucket=source.bucket,
-                    key=source.key,
-                    checksum=source.checksum,
-                    object_version=(
-                        source.object_version
-                        if source.HasField("object_version")
-                        else None
-                    ),
-                )
+        digest = hashlib.sha256(response.manifest).hexdigest()
+        if (
+            response.manifest_digest != shard.manifest_digest
+            or digest != shard.manifest_digest
+        ):
+            raise RuntimeError(
+                f"manifest digest mismatch for source slot {shard.source_slot_id!r}"
             )
-        else:
-            raise RuntimeError(f"unsupported shard transport {transport!r}")
         if not shard.manifest_digest:
             raise RuntimeError("source is missing its manifest digest")
         return GeneratorSource(
             source_slot_id=shard.source_slot_id,
             worker_id=shard.worker_id,
             manifest_digest=shard.manifest_digest,
-            transport=resolved,
+            transport=NixlGeneratorSource(
+                manifest_endpoint=shard.manifest_endpoint,
+                manifest=response.manifest,
+            ),
         )
 
     def _discover_sources(
@@ -459,13 +435,25 @@ class ModelExpressGeneratorClient:
         *,
         candidate_offset: int = 0,
     ) -> GeneratorTransferInputs:
+        if version.HasField("s3"):
+            if not version.s3.uri:
+                raise RuntimeError("S3 weight version is missing its URI")
+            return GeneratorTransferInputs(
+                version_id=version.uid,
+                base_version_id=(
+                    version.base_version_id
+                    if version.HasField("base_version_id")
+                    else None
+                ),
+                layout_signature=version.layout_signature,
+                payload_format=self.payload_format,
+                sources=(),
+                s3_uri=version.s3.uri,
+            )
         if self.payload_format is WeightPayloadFormat.XOR_DELTA:
             if not version.HasField("base_version_id"):
                 raise RuntimeError("XOR_DELTA version is missing base_version_id")
-            if tuple(version.expected_source_slots) != (CANONICAL_DELTA_SOURCE_SLOT,):
-                raise RuntimeError(
-                    "canonical S3 version must expect only canonical.delta.root"
-                )
+            raise RuntimeError("XOR_DELTA version is missing its S3 transport")
         response = self._service.ListWeightVersionShards(
             refit_pb2.ListWeightVersionShardsRequest(version_id=version.uid),
             timeout=self._rpc_timeout_seconds,
@@ -486,13 +474,6 @@ class ModelExpressGeneratorClient:
             for shard in ordered:
                 try:
                     source = self._resolve_source(shard)
-                    if (
-                        self.payload_format is WeightPayloadFormat.XOR_DELTA
-                        and not isinstance(source.transport, S3GeneratorSource)
-                    ):
-                        raise RuntimeError(
-                            "canonical.delta.root must use the S3 transport"
-                        )
                 except (grpc.RpcError, RuntimeError) as error:
                     failures.append(str(error))
                     continue

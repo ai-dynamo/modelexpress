@@ -211,7 +211,7 @@ def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
         source_slot_id = refit_client.bind_tensors(tensors)
         refit_client.publish_version(version=WeightVersionRef("version-a"))
         worker_stub = refit_pb2_grpc.RefitWorkerServiceStub(
-            grpc.insecure_channel(refit_service.shard.nixl.manifest_endpoint)
+            grpc.insecure_channel(refit_service.shard.manifest_endpoint)
         )
         fetched = worker_stub.GetWeightVersionShardManifest(
             refit_pb2.GetWeightVersionShardManifestRequest(
@@ -242,8 +242,7 @@ def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
         refit_service.shard.manifest_digest
         == hashlib.sha256(fetched.manifest).hexdigest()
     )
-    assert refit_service.shard.WhichOneof("transport") == "nixl"
-    assert refit_service.shard.nixl.manifest_endpoint == f"127.0.0.1:{port}"
+    assert refit_service.shard.manifest_endpoint == f"127.0.0.1:{port}"
     assert fetched.manifest_digest == refit_service.shard.manifest_digest
     payload = unwrap_rendezvous_blob(fetched.manifest)
     assert payload.metadata_endpoint == "10.0.0.3:19003"

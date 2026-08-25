@@ -17,7 +17,7 @@ from modelexpress_rl import (
     refit_pb2,
     refit_pb2_grpc,
 )
-from modelexpress_rl.inference.adapter import GeneratorEngineAdapter, S3GeneratorSource
+from modelexpress_rl.inference.adapter import GeneratorEngineAdapter
 
 
 class _RefitService(refit_pb2_grpc.RefitServiceServicer):
@@ -26,6 +26,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         self.active_leases = set()
         self.lease_registrations = 0
         self.lease_deletions = 0
+        self.list_calls = 0
         self.fail_lease_deletion = False
         self.version = refit_pb2.WeightVersion(
             uid="version-a",
@@ -50,9 +51,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
                 tensor_count=2,
                 total_bytes=128,
                 manifest_digest=digest,
-                nixl=refit_pb2.NixlTransport(
-                    manifest_endpoint=endpoint,
-                ),
+                manifest_endpoint=endpoint,
             )
             for rank, slot in enumerate(self.version.expected_source_slots)
         ]
@@ -71,6 +70,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         return self.version
 
     def ListWeightVersionShards(self, request, _context):
+        self.list_calls += 1
         return refit_pb2.ListWeightVersionShardsResponse(
             shards=self.shards if request.version_id == self.version.uid else []
         )
@@ -294,21 +294,8 @@ def test_generator_dispatches_canonical_s3_without_fetching_a_worker_manifest(
     server, endpoint, service = _start_server()
     service.version.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA
     service.version.base_version_id = "base-a"
-    service.version.expected_source_slots[:] = ["canonical.delta.root"]
-    service.shards[:] = [
-        refit_pb2.WeightVersionShard(
-            version_id="version-a",
-            source_slot_id="canonical.delta.root",
-            worker_id="trainer-0",
-            manifest_digest="a" * 64,
-            s3=refit_pb2.S3Transport(
-                bucket="weights",
-                key="model.safetensors.index.json",
-                object_version="object-a",
-                checksum="crc32c:12345678",
-            ),
-        )
-    ]
+    service.version.expected_source_slots[:] = []
+    service.version.s3.uri = "s3://weights/model.safetensors.index.json"
     adapter = _Adapter(service)
     generator = _initialize(
         monkeypatch,
@@ -319,10 +306,12 @@ def test_generator_dispatches_canonical_s3_without_fetching_a_worker_manifest(
 
     try:
         staged = generator.stage_weight(version=WeightVersionRef("version-a"))
-        source = adapter.stage_calls[0].sources[0]
-        assert isinstance(source.transport, S3GeneratorSource)
-        assert source.transport.location.bucket == "weights"
-        assert source.transport.location.object_version == "object-a"
+        assert adapter.stage_calls[0].sources == ()
+        assert (
+            adapter.stage_calls[0].s3_uri
+            == "s3://weights/model.safetensors.index.json"
+        )
+        assert service.list_calls == 0
         assert generator.apply_weight(staged) == "installed"
         staged.release()
         repeated = generator.stage_weight(version=WeightVersionRef("version-a"))
@@ -336,15 +325,7 @@ def test_generator_rejects_missing_s3_transport_before_adapter_mutation(monkeypa
     server, endpoint, service = _start_server()
     service.version.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA
     service.version.base_version_id = "base-a"
-    service.version.expected_source_slots[:] = ["canonical.delta.root"]
-    service.shards[:] = [
-        refit_pb2.WeightVersionShard(
-            version_id="version-a",
-            source_slot_id="canonical.delta.root",
-            worker_id="trainer-0",
-            manifest_digest="a" * 64,
-        )
-    ]
+    service.version.expected_source_slots[:] = []
     adapter = _Adapter(service)
     generator = _initialize(
         monkeypatch,
@@ -354,7 +335,7 @@ def test_generator_rejects_missing_s3_transport_before_adapter_mutation(monkeypa
     )
 
     try:
-        with pytest.raises(RuntimeError, match="unsupported shard transport"):
+        with pytest.raises(RuntimeError, match="missing its S3 transport"):
             generator.stage_weight(version=WeightVersionRef("version-a"))
     finally:
         generator.close()
@@ -368,7 +349,7 @@ def test_generator_rejects_wrong_delta_base_before_leasing(monkeypatch):
     server, endpoint, service = _start_server()
     service.version.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA
     service.version.base_version_id = "other-base"
-    service.version.expected_source_slots[:] = ["canonical.delta.root"]
+    service.version.expected_source_slots[:] = []
     adapter = _Adapter(service)
     generator = _initialize(
         monkeypatch,
