@@ -374,6 +374,7 @@ mod tests {
     use super::super::{
         OciProvider,
         cache_entry::{CACHE_ROOT_DIR_NAME, TMP_DIR_NAME},
+        gbuild::MANIFEST_CAPNP_FILE_NAME,
         layer_download::TITLE_ANNOTATION,
     };
     use super::MANIFEST_FILE_NAME;
@@ -612,7 +613,7 @@ mod tests {
                     },
                 },
                 "manifest_capnp": {
-                    "path": "manifest.capnp.bin",
+                    "path": MANIFEST_CAPNP_FILE_NAME,
                     "descriptor": {
                         "media_type": "application/vnd.groq.gbuild.manifest.v1+capnp",
                         "digest": manifest_capnp_digest,
@@ -663,7 +664,7 @@ mod tests {
                     "mediaType": "application/vnd.groq.gbuild.manifest.v1+capnp",
                     "size": manifest_capnp.len(),
                     "digest": manifest_capnp_digest,
-                    "annotations": { TITLE_ANNOTATION: "manifest.capnp.bin" },
+                    "annotations": { TITLE_ANNOTATION: MANIFEST_CAPNP_FILE_NAME },
                 },
                 {
                     "mediaType": "application/vnd.groq.gbuild.preset.v1+json",
@@ -719,7 +720,7 @@ mod tests {
             manifest_json
         );
         assert_eq!(
-            fs::read(path.join("manifest.capnp.bin")).expect("read Cap'n Proto manifest"),
+            fs::read(path.join(MANIFEST_CAPNP_FILE_NAME)).expect("read Cap'n Proto manifest"),
             manifest_capnp
         );
         assert_eq!(

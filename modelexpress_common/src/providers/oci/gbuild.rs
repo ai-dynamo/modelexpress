@@ -14,6 +14,7 @@ pub const MANIFEST_JSON_MEDIA_TYPE: &str = "application/vnd.groq.gbuild.manifest
 pub const MANIFEST_CAPNP_MEDIA_TYPE: &str = "application/vnd.groq.gbuild.manifest.v1+capnp";
 pub const PRESET_MEDIA_TYPE: &str = "application/vnd.groq.gbuild.preset.v1+json";
 pub const PAYLOAD_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
+pub(super) const MANIFEST_CAPNP_FILE_NAME: &str = "manifest.v2.capnp.bin";
 const RUNTIME_MANIFEST_REVISION: u8 = 2;
 
 #[derive(Debug)]
@@ -65,7 +66,7 @@ impl GbuildArtifact {
             Self::metadata_layer(
                 &manifest.layers[1],
                 manifest_capnp,
-                "manifest.capnp.bin",
+                MANIFEST_CAPNP_FILE_NAME,
                 MANIFEST_CAPNP_MEDIA_TYPE,
             )?,
             Self::preset_layer(&manifest.layers[2], preset)?,
@@ -443,7 +444,7 @@ mod tests {
                     "descriptor": descriptor(MANIFEST_JSON_MEDIA_TYPE, DIGEST_A, 10),
                 },
                 "manifest_capnp": {
-                    "path": "manifest.capnp.bin",
+                    "path": MANIFEST_CAPNP_FILE_NAME,
                     "descriptor": descriptor(MANIFEST_CAPNP_MEDIA_TYPE, DIGEST_B, 20),
                 },
                 "preset": {
@@ -484,7 +485,7 @@ mod tests {
             "config": outer_descriptor(TRANSPORT_INDEX_MEDIA_TYPE, DIGEST_A, 100, None),
             "layers": [
                 outer_descriptor(MANIFEST_JSON_MEDIA_TYPE, DIGEST_A, 10, Some("manifest.json")),
-                outer_descriptor(MANIFEST_CAPNP_MEDIA_TYPE, DIGEST_B, 20, Some("manifest.capnp.bin")),
+                outer_descriptor(MANIFEST_CAPNP_MEDIA_TYPE, DIGEST_B, 20, Some(MANIFEST_CAPNP_FILE_NAME)),
                 outer_descriptor(PRESET_MEDIA_TYPE, DIGEST_C, 30, Some("llama-original.json")),
                 outer_descriptor(PAYLOAD_MEDIA_TYPE, DIGEST_D, 40, None),
                 outer_descriptor(PAYLOAD_MEDIA_TYPE, DIGEST_E, 50, None),
@@ -505,7 +506,7 @@ mod tests {
         let artifact = parse_contract(&transport_index(), &manifest()).expect("valid contract");
 
         assert_eq!(artifact.metadata[0].path.as_str(), "manifest.json");
-        assert_eq!(artifact.metadata[1].path.as_str(), "manifest.capnp.bin");
+        assert_eq!(artifact.metadata[1].path.as_str(), MANIFEST_CAPNP_FILE_NAME);
         assert_eq!(artifact.metadata[2].path.as_str(), "llama-original.json");
         assert_eq!(artifact.payloads.len(), 2);
         assert_eq!(
