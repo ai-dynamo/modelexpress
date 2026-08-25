@@ -415,6 +415,43 @@ class TestPinnedRevisionLayout:
 
         assert (cache.repo_root / "refs" / MAIN_REF).read_text() == COMMIT
 
+    def test_rewriting_the_same_hash_leaves_the_ref_untouched(self, cache):
+        """Reuse of an unpinned snapshot asks for a ref that already matches.
+
+        resolve_snapshot only returns a path when refs/main already holds the
+        commit, so the reuse path lands here with nothing to change. The inode
+        is what proves nothing happened: the write lands through a rename, and
+        a rename would leave a different one.
+        """
+        cache.write_revision_ref(COMMIT, None)
+        ref = cache.repo_root / "refs" / MAIN_REF
+        before = ref.stat().st_ino
+
+        cache.write_revision_ref(COMMIT, None)
+
+        assert ref.stat().st_ino == before
+        assert ref.read_text() == COMMIT
+
+    def test_rewriting_a_different_hash_moves_the_ref(self, cache):
+        cache.write_revision_ref(COMMIT, None)
+        cache.write_revision_ref(OTHER_COMMIT, None)
+
+        assert (cache.repo_root / "refs" / MAIN_REF).read_text() == OTHER_COMMIT
+
+    def test_rejects_a_ref_whose_parent_is_already_a_ref(self, cache):
+        """A tag foo and a branch foo/bar coexist upstream; refs/ holds one."""
+        cache.write_ref("foo", COMMIT)
+
+        with pytest.raises(ModelSnapshotError):
+            cache.write_ref("foo/bar", OTHER_COMMIT)
+
+    def test_rejects_a_ref_that_is_already_a_directory(self, cache):
+        """The other order: refs/foo exists as a directory of nested refs."""
+        cache.write_ref("foo/bar", COMMIT)
+
+        with pytest.raises(ModelSnapshotError):
+            cache.write_ref("foo", OTHER_COMMIT)
+
     @pytest.mark.parametrize("name", ["../escape", "/abs", "", "a/../b"])
     def test_rejects_unsafe_ref_names(self, cache, name):
         """The name comes from engine configuration, so it is not trusted."""

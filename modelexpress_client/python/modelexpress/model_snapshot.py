@@ -473,7 +473,18 @@ class ModelSnapshotCache:
 
     def read_main_ref(self) -> str | None:
         """Return the commit hash refs/main points at, or None."""
-        ref_path = self.repo_root / "refs" / MAIN_REF
+        return self.read_ref(MAIN_REF)
+
+    def read_ref(self, ref_name: str) -> str | None:
+        """Return the commit hash ``refs/<ref_name>`` points at, or None."""
+        try:
+            ref_path = self.repo_root / "refs" / safe_relative_path(ref_name)
+        except ModelSnapshotError:
+            return None
+        return self._read_ref_path(ref_path)
+
+    @staticmethod
+    def _read_ref_path(ref_path: Path) -> str | None:
         if not ref_path.is_file() or ref_path.is_symlink():
             return None
         try:
@@ -491,11 +502,24 @@ class ModelSnapshotCache:
         A ref name may contain slashes -- ``refs/pr/1`` is a legal revision --
         so the parent directories are created here. The name comes from the
         engine's own configuration, so it is validated against the same rules
-        as a streamed file path before it becomes part of one.
+        as a streamed file path before it becomes part of one, and refused if
+        the layout cannot hold it beside a ref already on disk.
+
+        Writing a value the ref already holds is a no-op.
         """
         commit_hash = safe_commit_hash(commit_hash)
         refs_root = self.repo_root / "refs"
-        ref_path = refs_root / safe_relative_path(ref_name)
+        relative = safe_relative_path(ref_name)
+        ref_path = refs_root / relative
+        self._reject_ref_collision(refs_root, relative)
+        if self._read_ref_path(ref_path) == commit_hash:
+            # The rename below is durable, not free: a temp file, an
+            # fsync each for the file and its directory, then the rename
+            # itself -- all to land bytes that are already there.
+            # Snapshot reuse is what hits it: resolve_snapshot returns a
+            # path only when refs/main already holds the commit, so reuse
+            # arrives here with nothing to change.
+            return
         _ensure_directory(ref_path.parent, self.cache_root)
         temp_ref = ref_path.parent / f"{_TEMP_PREFIX}{uuid.uuid4().hex}"
         try:
@@ -507,6 +531,34 @@ class ModelSnapshotCache:
             _fsync_directory(ref_path.parent)
         finally:
             temp_ref.unlink(missing_ok=True)
+
+    @staticmethod
+    def _reject_ref_collision(refs_root: Path, relative: Path) -> None:
+        """Refuse a ref name that the layout cannot hold beside an existing one.
+
+        Git itself refuses a branch ``foo`` beside a branch ``foo/bar``, but
+        that rule holds within one namespace. This directory is flatter than
+        git's: a revision is written under the name the engine asked for, so
+        a tag ``foo`` and a branch ``foo/bar`` -- which coexist upstream --
+        both land in one tree, as does a full ref path like ``refs/pr/1``.
+        ``refs/foo`` cannot be a file and a directory at the same time. Left to
+        the filesystem this surfaces as a bare OSError -- FileExistsError from
+        mkdir in one order, "Is a directory" from os.replace in the other --
+        which a caller catching this module's own error type never sees.
+        """
+        ancestor = refs_root
+        for part in relative.parts[:-1]:
+            ancestor = ancestor / part
+            if ancestor.exists() and not ancestor.is_dir():
+                raise ModelSnapshotError(
+                    f"Ref name {str(relative)!r} needs {ancestor} to be a directory, "
+                    "but another ref already holds that name"
+                )
+        target = refs_root / relative
+        if target.is_dir() and not target.is_symlink():
+            raise ModelSnapshotError(
+                f"Ref name {str(relative)!r} is already a directory holding other refs"
+            )
 
     def write_revision_ref(self, commit_hash: str, requested_revision: str | None) -> None:
         """Record the alias the engine will look the snapshot up by.

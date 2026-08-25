@@ -38,7 +38,6 @@ _REPO_DIR_PREFIX = "models--"
 # helpers that take it again.
 _lock = threading.RLock()
 _snapshot_to_repo_id: dict[str, str] = {}
-_installed: set[tuple[str, str | None]] = set()
 _revision_snapshots: dict[tuple[str, str | None], str] = {}
 
 
@@ -86,17 +85,17 @@ def ensure_metadata(repo_id: str, revision: str | None = None) -> Path | None:
         # Keyed by revision as well as repo id: two revisions of one model are
         # two different installs, and returning the first one for the second
         # request would hand the engine a revision it did not ask for.
-        if (repo_id, requested) in _installed:
+        installed = _known_snapshot(repo_id, requested)
+        if installed is not None:
             # Later calls in the same process (tokenizer, processor) resolve
             # from the snapshot the first call installed.
-            return _known_snapshot(repo_id, requested)
+            return installed
 
         with ModelCacheClient(chunk_size=configured_chunk_size()) as client:
             snapshot_path = client.install_metadata_snapshot(
                 repo_id, requested_revision=requested
             )
 
-        _installed.add((repo_id, requested))
         _snapshot_to_repo_id[_normalize(snapshot_path)] = repo_id
         _revision_snapshots[(repo_id, requested)] = _normalize(snapshot_path)
         return snapshot_path
@@ -145,7 +144,6 @@ def reset() -> None:
     """Forget prefetch state. For tests."""
     with _lock:
         _snapshot_to_repo_id.clear()
-        _installed.clear()
         _revision_snapshots.clear()
 
 
