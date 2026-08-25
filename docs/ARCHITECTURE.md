@@ -405,6 +405,7 @@ flowchart LR
     end
 
     S["MX server<br/>RefitService<br/>Redis metadata"]
+    P["MX server<br/>P2pService"]
 
     subgraph Trainer["Trainer rank"]
         TA["Trainer engine adapter"]
@@ -418,6 +419,8 @@ flowchart LR
         I["vLLM installer<br/>capture, apply"]
     end
 
+    PG["Peer generator rank<br/>verified canonical buffers"]
+
     O -->|"Create / Get / Delete version"| S
     O -->|"Framework-native RPC"| T
     O -->|"Framework-native RPC"| G
@@ -425,9 +428,12 @@ flowchart LR
     T -->|"Register worker; publish shard metadata"| S
     T --> M
     G -->|"Register worker; discover shards; lease version"| S
+    G -->|"Discover exact-version same-rank peer"| P
     G --> GA --> X --> I
     G -->|"Fetch exact-version manifest"| M
     B -->|"NIXL reads"| X
+    PG -->|"Publish READY version identity"| P
+    PG -->|"Peer manifest + NIXL reads"| X
 ```
 
 `RefitService` is the central metadata service defined by `refit.proto`. It
@@ -474,6 +480,17 @@ engine-specific parameter and CUDA-graph handling out of the transfer layer.
 | `DeleteVersionLease` | Release a generator's protection of the version shards |
 
 The final missing source slot atomically changes the version to `READY`.
+
+Peer generators reuse the existing inference P2P metadata service rather than
+creating a second Refit peer registry. A generator serving an exact version
+publishes its normal `SourceIdentity` with `revision=WeightVersion.uid`; another
+generator queries `P2pService.ListSources` with the same engine-compatible
+identity and selects a READY source for its worker rank before falling back to
+trainer shard publications. Applied generators publish their verified canonical
+staging buffers—not engine-specific packed kernel tensors—under that identity.
+An identical-rank peer pulls those buffers directly with NIXL, then uses the
+same graph-safe engine installer as a trainer update.
+
 `WeightVersion.uid` is MX's opaque identity. `version_number` is the optional
 framework-provided numeric label used for correlation; MX does not use it as an
 identity or ordering key.

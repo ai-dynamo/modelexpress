@@ -778,6 +778,7 @@ class NixlTransferManager:
         timeout_seconds: float | None = None,
         remote_agent_name: str | None = None,
         require_exact_match: bool = False,
+        destination_tensors: dict[str, torch.Tensor] | None = None,
     ) -> tuple[int, int, float]:
         """
         Receive weights from a remote source via NIXL RDMA.
@@ -804,6 +805,8 @@ class NixlTransferManager:
                 derived tensors, which would otherwise leave part or all of the
                 target at dummy values while RDMA reports success. Same-family
                 transfers leave this False and tolerate subset transfers.
+            destination_tensors: Optional registered destination catalog used for
+                name matching. Defaults to the most recently registered catalog.
 
         Returns:
             Tuple of (total_bytes, total_tensors, duration)
@@ -818,6 +821,9 @@ class NixlTransferManager:
 
         start_time = time.perf_counter()
         self._accelerator_backend.set_device(self._device_id)
+        local_tensors = (
+            self._tensors if destination_tensors is None else destination_tensors
+        )
 
         if remote_agent_name is None:
             add_start = time.perf_counter()
@@ -838,7 +844,7 @@ class NixlTransferManager:
         total_bytes = 0
 
         for src_tensor in source_tensors:
-            local_tensor = self._tensors.get(src_tensor.name)
+            local_tensor = local_tensors.get(src_tensor.name)
             if local_tensor is None:
                 continue
             local_size = local_tensor.numel() * local_tensor.element_size()
@@ -877,8 +883,8 @@ class NixlTransferManager:
         # Name-set diff between the source manifest and the locally registered
         # tensors.
         src_names = {s.name for s in source_tensors}
-        local_only = sorted(set(self._tensors) - src_names)
-        source_only = sorted(src_names - set(self._tensors))
+        local_only = sorted(set(local_tensors) - src_names)
+        source_only = sorted(src_names - set(local_tensors))
         if local_only or source_only:
             if require_exact_match:
                 # Cross-family transfer: a name diff can mean vendor-specific

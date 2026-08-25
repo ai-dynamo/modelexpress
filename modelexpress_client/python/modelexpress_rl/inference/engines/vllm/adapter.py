@@ -7,8 +7,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, cast
 
+from modelexpress import p2p_pb2
+from modelexpress.client import MxClientBase
 from modelexpress.engines.vllm.adapter import VllmAdapter
-
+from modelexpress_rl import envs as rl_envs
 from modelexpress_rl.inference.adapter import (
     GeneratorEngineAdapter,
     GeneratorTransferInputs,
@@ -26,6 +28,7 @@ if TYPE_CHECKING:
     from torch.nn import Module
     from vllm.config import ModelConfig, VllmConfig
 
+
 class VllmGeneratorAdapter(GeneratorEngineAdapter):
     """Compose exact-version NIXL staging with graph-safe vLLM installation."""
 
@@ -38,6 +41,7 @@ class VllmGeneratorAdapter(GeneratorEngineAdapter):
         worker_id: str,
     ) -> None:
         engine = VllmAdapter(vllm_config, model_config)
+        self._engine = engine
         device_id = engine.get_device_id()
         device = engine.get_target_device()
         self._installer = _VllmInstaller(
@@ -50,10 +54,52 @@ class VllmGeneratorAdapter(GeneratorEngineAdapter):
             agent_name=f"mx-refit-{worker_id}",
             device_id=device_id,
             device=device,
+            listen_port=rl_envs.MX_REFIT_METADATA_PORT + device_id,
         )
         self._active_plan: _PreparedNixlTransfer | None = None
         self._active_fingerprint: tuple | None = None
         self._active_staged: _StagedNixlWeights | None = None
+
+    @property
+    def worker_rank(self) -> int:
+        return self._engine.get_worker_rank()
+
+    def build_p2p_identity(self, version_id: str) -> p2p_pb2.SourceIdentity:
+        identity = self._engine.build_identity()
+        identity.revision = version_id
+        return identity
+
+    def stage_peer_weight(
+        self, source: p2p_pb2.WorkerMetadata
+    ) -> _StagedNixlWeights:
+        self._active_plan = None
+        self._active_fingerprint = None
+        staged = self._transfer.stage_peer(
+            source=source,
+            parameter_layout=self._installer.parameter_layout(),
+        )
+        self._active_staged = staged
+        return staged
+
+    def publish_weight_version(
+        self,
+        *,
+        version_id: str,
+        staged: object,
+        p2p_client: MxClientBase,
+        worker_id: str,
+    ) -> None:
+        active_staged = self._active_staged
+        if active_staged is None or staged is not active_staged:
+            raise RuntimeError("vLLM staged weight is no longer active")
+        self._transfer.publish_peer(
+            staged=active_staged,
+            identity=self.build_p2p_identity(version_id),
+            p2p_client=p2p_client,
+            worker_rank=self.worker_rank,
+            worker_id=worker_id,
+            accelerator=self._engine.accelerator_backend.name,
+        )
 
     @property
     def supported_payload_formats(self) -> frozenset[WeightPayloadFormat]:
@@ -96,30 +142,21 @@ class VllmGeneratorAdapter(GeneratorEngineAdapter):
     def stage_weight(self, plan: object) -> _StagedNixlWeights:
         if plan is not self._active_plan:
             raise RuntimeError("vLLM transfer plan is no longer active")
+        self._transfer.unpublish_peer()
         staged = self._transfer.stage(cast(_PreparedNixlTransfer, plan))
         self._active_staged = staged
         return staged
 
     def apply_weight(self, staged: object) -> dict[str, Any]:
         active_staged = self._active_staged
-        if (
-            active_staged is None
-            or staged is not active_staged
-            or self._active_plan is None
-            or active_staged.plan_revision != self._active_plan.plan_revision
-        ):
+        if active_staged is None or staged is not active_staged:
             raise RuntimeError("vLLM staged weight is no longer active")
         self._installer.install(active_staged.tensors)
         return active_staged.metrics
 
     def release_staged_weight(self, staged: object) -> None:
         active_staged = self._active_staged
-        if (
-            active_staged is None
-            or staged is not active_staged
-            or self._active_plan is None
-            or active_staged.plan_revision != self._active_plan.plan_revision
-        ):
+        if active_staged is None or staged is not active_staged:
             raise RuntimeError("vLLM staged weight is no longer active")
         # Registered buffers are reusable plan workspace; releasing a version
         # invalidates only this staged handle.
