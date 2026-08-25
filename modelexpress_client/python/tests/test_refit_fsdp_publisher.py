@@ -18,6 +18,24 @@ class _Manager:
     listen_port = 19000
 
 
+class _ServedOn:
+    """A registered served buffer on a device this test host does not have."""
+
+    dtype = torch.bfloat16
+
+    def __init__(self, device: str) -> None:
+        self.device = torch.device(device)
+
+    def is_contiguous(self) -> bool:
+        return True
+
+    def data_ptr(self) -> int:
+        return 0x1000
+
+    def element_size(self) -> int:
+        return 2
+
+
 def test_capture_publishes_full_copies_and_skips_non_float():
     state_dict = {
         "w": torch.arange(8, dtype=torch.float32).reshape(2, 4),
@@ -73,6 +91,30 @@ def test_build_manifest_describes_the_served_buffer():
     assert pshard.addr == tensor.data_ptr()
     assert tuple(pshard.shard_offset) == (0, 0)
     assert tuple(pshard.shape) == (2, 4)
+
+
+@pytest.mark.parametrize(
+    ("device", "expected_device_id"),
+    [("cuda:3", 3), ("xpu:2", 2), ("xpu:0", 0), ("cpu", 0)],
+)
+def test_build_manifest_publishes_the_served_device_ordinal(device, expected_device_id):
+    """The published ordinal is the device the served buffer actually lives on.
+
+    A receiver feeds this ordinal straight into the remote NIXL descriptor
+    (``reshard/transport/nixl.py::_ranges_for``), so dropping it for a non-CUDA
+    device points peers at device 0 while the buffer sits elsewhere.
+    """
+    shard = LocalTensorShard("w", (2, 4), (0, 0), (2, 4), _ServedOn(device))
+
+    payload = unwrap_rendezvous_blob(
+        build_fsdp_reshard_manifest(
+            manager=_Manager(), shards=[shard], metadata_endpoint="host:1234"
+        )
+    )
+
+    (published,) = payload.tensors
+    (pshard,) = published.shards
+    assert pshard.device_id == expected_device_id
 
 
 def test_build_manifest_groups_multiple_shards_under_one_tensor():
