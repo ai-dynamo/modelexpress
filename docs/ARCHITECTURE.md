@@ -846,7 +846,10 @@ MX server, and optional S3 endpoint settings. Each update carries the opaque MX
 version through `ModelExpressGeneratorClient`. vLLM's `start_weight_update()`
 and `finish_weight_update()` hooks are no-ops because the adapter owns the full
 installation window. Draft-model updates and trainer-pushed bytes are not
-supported by this backend.
+supported by this backend. After a successful apply, the bridge merges staging
+and installation metrics and logs each numeric `perf/` phase as a separate INFO
+line in deterministic key order. `perf/mx_receive_stage_weight_time` covers the
+complete `ModelExpressGeneratorClient.stage_weight()` wall-clock call.
 
 `engines/vllm/refit/MdlLoader` implements Mapped Direct Load (MDL) for tensors that have already
 been translated into the inference model's naming and numerical format. The

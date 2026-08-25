@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import logging
 import sys
 from dataclasses import dataclass, fields
 from types import ModuleType, SimpleNamespace
@@ -145,6 +146,8 @@ def test_update_stages_applies_and_releases_exact_version(engine):
     events = []
 
     class Staged:
+        metrics = {}
+
         def release(self):
             events.append(("release",))
 
@@ -171,10 +174,50 @@ def test_update_stages_applies_and_releases_exact_version(engine):
     ]
 
 
+def test_update_logs_merged_receiver_phase_metrics(caplog, engine, monkeypatch):
+    events = []
+    clock = iter([10.0, 14.5])
+    monkeypatch.setattr(weight_transfer, "perf_counter", lambda: next(clock))
+
+    class Staged:
+        metrics = {
+            "perf/mx_receive_prepare_time": 2.0,
+            "perf/not_numeric": "ignored",
+            "receiver/detail": 7.0,
+        }
+
+        def release(self):
+            events.append("release")
+
+    class Client:
+        def stage_weight(self, *, version):
+            return Staged()
+
+        def apply_weight(self, staged):
+            return {
+                "perf/mx_receive_install_time": 3.0,
+                "receiver/attempts": 1,
+            }
+
+    engine._client = Client()
+
+    with caplog.at_level(logging.INFO, logger=weight_transfer.__name__):
+        engine.receive_weights(MxRefitUpdateInfo(version_id="opaque-a"))
+
+    assert [record.getMessage() for record in caplog.records] == [
+        "ModelExpress receiver metric perf/mx_receive_install_time=3.0",
+        "ModelExpress receiver metric perf/mx_receive_prepare_time=2.0",
+        "ModelExpress receiver metric perf/mx_receive_stage_weight_time=4.5",
+    ]
+    assert events == ["release"]
+
+
 def test_update_releases_staged_weight_when_apply_fails(engine):
     events = []
 
     class Staged:
+        metrics = {}
+
         def release(self):
             events.append("release")
 

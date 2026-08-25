@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
+from time import perf_counter
 
 import torch
 
@@ -25,6 +27,9 @@ from vllm.distributed.weight_transfer.base import (
     WeightTransferInitInfo,
     WeightTransferUpdateInfo,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -100,11 +105,20 @@ class MxRefitWeightTransferEngine(
 
     def receive_weights(self, update_info: MxRefitUpdateInfo) -> None:
         assert self._client is not None
+        stage_started = perf_counter()
         staged = self._client.stage_weight(
             version=WeightVersionRef(update_info.version_id)
         )
+        stage_weight_time = perf_counter() - stage_started
         try:
-            self._client.apply_weight(staged)
+            metrics = staged.metrics
+            apply_metrics = self._client.apply_weight(staged)
+            if isinstance(apply_metrics, dict):
+                metrics.update(apply_metrics)
+            metrics["perf/mx_receive_stage_weight_time"] = stage_weight_time
+            for key, value in sorted(metrics.items()):
+                if key.startswith("perf/") and isinstance(value, (int, float)):
+                    logger.info("ModelExpress receiver metric %s=%s", key, value)
         finally:
             staged.release()
 
