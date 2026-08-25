@@ -79,7 +79,7 @@ def test_torch_compile_artifact_identity_uses_model_cache_criteria(monkeypatch):
     ctx = SimpleNamespace(
         device_id=2,
         identity=p2p_pb2.SourceIdentity(
-            mx_version="0.5.0",
+            mx_version="0.6.0",
             mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
             model_name="test/model",
             backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
@@ -132,7 +132,7 @@ def test_triton_artifact_identity_uses_runtime_cache_criteria(monkeypatch):
     ctx = SimpleNamespace(
         device_id=0,
         identity=p2p_pb2.SourceIdentity(
-            mx_version="0.5.0",
+            mx_version="0.6.0",
             mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
             model_name="test/model",
             tensor_parallel_size=8,
@@ -166,7 +166,7 @@ def test_deep_gemm_artifact_identity_uses_deep_gemm_cache_criteria(monkeypatch):
     ctx = SimpleNamespace(
         device_id=0,
         identity=p2p_pb2.SourceIdentity(
-            mx_version="0.5.0",
+            mx_version="0.6.0",
             mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
             model_name="test/model",
             backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
