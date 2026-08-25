@@ -8,6 +8,11 @@ use serde::Deserialize;
 use std::{collections::HashSet, path::Path};
 
 pub const ARTIFACT_MEDIA_TYPE: &str = "application/vnd.groq.gbuild.full-compile.v1";
+pub const CONFIG_MEDIA_TYPE: &str = "application/vnd.groq.gbuild.full-compile.config.v1+json";
+pub const RUNTIME_MANIFEST_JSON_MEDIA_TYPE: &str =
+    "application/vnd.groq.gbuild.runtime-manifest.v2+json";
+pub const RUNTIME_MANIFEST_CAPNP_MEDIA_TYPE: &str =
+    "application/vnd.groq.gbuild.runtime-manifest.v2+capnp";
 pub const TRANSPORT_INDEX_MEDIA_TYPE: &str =
     "application/vnd.groq.gbuild.full-compile.transport.v1+json";
 pub const MANIFEST_JSON_MEDIA_TYPE: &str = "application/vnd.groq.gbuild.manifest.v1+json";
@@ -37,6 +42,10 @@ pub struct GbuildPayloadLayer {
 }
 
 impl GbuildArtifact {
+    pub fn from_manifest_and_config(_manifest: &OciImageManifest, _config: &[u8]) -> Result<Self> {
+        anyhow::bail!("GBuild OCI config contract is not implemented")
+    }
+
     pub fn from_manifest_and_transport_index(
         manifest: &OciImageManifest,
         transport_index: &[u8],
@@ -494,6 +503,52 @@ mod tests {
         .expect("valid OCI manifest fixture")
     }
 
+    fn thin_config() -> Value {
+        json!({
+            "version": 1,
+            "tokenizer": {
+                "layer": "payloads/0000.tar.zst",
+                "members": ["tokenizer/config.json"],
+                "uncompressed_size_bytes": 400,
+            },
+            "partitions": [{
+                "partition_id": 0,
+                "layer": "payloads/0001.tar.zst",
+                "members": ["program.0.gas", "program.0.weight"],
+                "uncompressed_size_bytes": 500,
+            }],
+            "runtime_assets": null,
+        })
+    }
+
+    fn oras_manifest() -> OciImageManifest {
+        serde_json::from_value(json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "artifactType": ARTIFACT_MEDIA_TYPE,
+            "config": outer_descriptor(CONFIG_MEDIA_TYPE, DIGEST_A, 100, None),
+            "layers": [
+                outer_descriptor(
+                    RUNTIME_MANIFEST_JSON_MEDIA_TYPE,
+                    DIGEST_A,
+                    10,
+                    Some("manifest.json"),
+                ),
+                outer_descriptor(
+                    RUNTIME_MANIFEST_CAPNP_MEDIA_TYPE,
+                    DIGEST_B,
+                    20,
+                    Some(MANIFEST_CAPNP_FILE_NAME),
+                ),
+                outer_descriptor(PRESET_MEDIA_TYPE, DIGEST_C, 30, Some("llama-original.json")),
+                outer_descriptor(PAYLOAD_MEDIA_TYPE, DIGEST_D, 40, Some("payloads/0000.tar.zst")),
+                outer_descriptor(PAYLOAD_MEDIA_TYPE, DIGEST_E, 50, Some("payloads/0001.tar.zst")),
+            ],
+            "annotations": {"org.opencontainers.image.created": "1970-01-01T00:00:00Z"},
+        }))
+        .expect("valid ORAS manifest fixture")
+    }
+
     fn parse_contract(index: &Value, manifest: &OciImageManifest) -> Result<GbuildArtifact> {
         GbuildArtifact::from_manifest_and_transport_index(
             manifest,
@@ -514,6 +569,25 @@ mod tests {
             "tokenizer/config.json"
         );
         assert_eq!(artifact.payloads[1].uncompressed_size_bytes, 500);
+    }
+
+    #[test]
+    fn test_gbuild_artifact_maps_thin_config_to_oras_layers() {
+        let artifact = GbuildArtifact::from_manifest_and_config(
+            &oras_manifest(),
+            &serde_json::to_vec(&thin_config()).expect("serialize config fixture"),
+        )
+        .expect("valid contract");
+
+        assert_eq!(artifact.metadata[0].path.as_str(), "manifest.json");
+        assert_eq!(artifact.metadata[1].path.as_str(), MANIFEST_CAPNP_FILE_NAME);
+        assert_eq!(artifact.metadata[2].path.as_str(), "llama-original.json");
+        assert_eq!(artifact.payloads.len(), 2);
+        assert_eq!(
+            artifact.payloads[0].descriptor.digest, DIGEST_D,
+            "the OCI manifest owns the layer descriptor"
+        );
+        assert_eq!(artifact.payloads[1].members[1].as_str(), "program.0.weight");
     }
 
     #[test]
