@@ -4,7 +4,7 @@
 use super::{
     archive_format::ArchiveFormat,
     cache_entry::StagingCacheEntry,
-    gbuild::{GbuildArtifact, is_gbuild_artifact},
+    gbuild::{GbuildArtifact, is_gbuild_artifact, validate_runtime_manifest},
     layer_download::{LayerDownload, LayerDownloadKind, LayerDownloads},
     path::ArtifactPath,
     reference::OciReference,
@@ -126,6 +126,15 @@ impl<'a> Downloader<'a> {
             )
             .await?;
         }
+
+        let runtime_manifest_path = staging_files.join(MANIFEST_FILE_NAME);
+        let runtime_manifest =
+            tokio::fs::read(&runtime_manifest_path)
+                .await
+                .with_context(|| {
+                    format!("Failed to read GBuild runtime manifest {runtime_manifest_path:?}")
+                })?;
+        validate_runtime_manifest(&runtime_manifest)?;
 
         for payload in artifact.payloads {
             let blob_path = blob_root.join(payload.descriptor.digest.replace(':', "-"));
@@ -582,7 +591,7 @@ mod tests {
             .expect("wiremock should use http")
             .to_string();
         let repo = "team/gbuild";
-        let manifest_json = br#"{"build":{"id":"gbuild"}}"#;
+        let manifest_json = br#"{"contract_revision":2,"build":{"id":"gbuild"}}"#;
         let manifest_capnp = b"capnp";
         let preset = br#"{"model":"llama"}"#;
         let tar = tar_bytes(&[("README.md", b"readme"), ("program.0.gas", b"gas")]);
