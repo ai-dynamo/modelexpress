@@ -1111,6 +1111,12 @@ graph TD
 7. **Target becomes source**: After receiving weights or installing a cache artifact, publishes own metadata and starts its own heartbeat
 8. **Stale detection**: Server-side reaper marks workers STALE if `updated_at` > 90s old; `ListSources(READY)` also applies this heartbeat freshness check at query time so expired READY records are not returned while waiting for the next reaper pass. GC deletes STALE workers after 1 hour
 
+Tarred cache artifacts carry regular files and directories only. The source
+side enumerates members explicitly and hands tar that list, so nothing else can
+enter the archive regardless of how a cache directory is laid out; the target
+side enforces the same invariant in `_validate_tar_members` before extraction.
+Symlinks are skipped at packaging time (see [`DEPLOYMENT.md`](DEPLOYMENT.md#p2p-metadata-exchange)).
+
 Cache artifact checksums protect transfer integrity but do not authenticate the
 source or attest the contents. TorchInductor, Triton, DeepGEMM, TileLang, CuTe
 DSL, and FlashInfer caches may

@@ -752,6 +752,18 @@ vLLM publishes torch compile (`VLLM_CACHE_ROOT/torch_compile_cache`), Triton (`T
 
 SGLang's NIXL loader publishes torch compile (`TORCHINDUCTOR_CACHE_DIR`, or PyTorch Inductor's runtime `cache_dir()`), Triton (`TRITON_CACHE_DIR`, or `~/.triton/cache`), TVM-FFI (`TVM_FFI_CACHE_DIR`, or `~/.cache/tvm-ffi`), DeepGEMM (`SGLANG_DG_CACHE_DIR`, or `~/.cache/deep_gemm`), TileLang (`TILELANG_CACHE_DIR`, or `~/.tilelang/cache`), CuTe DSL (`CUTE_DSL_CACHE_DIR`, or `$TMPDIR/<user>/cutlass_python_cache`), and FlashInfer (`FLASHINFER_WORKSPACE_BASE/.cache/flashinfer`, or `~/.cache/flashinfer`) caches. The FlashInfer artifact also includes SGLang's persistent autotune directory from `SGLANG_CACHE_DIR/flashinfer/autotune`, or `~/.cache/sglang/flashinfer/autotune` when unset. SGLang runs that autotuner only for eligible FlashInfer MoE or FP4 backends; DeepGEMM + DeepEP does not produce an autotune cache. SGLang TransferEngine transport currently remains weight-only for ModelExpress artifact transfer because cache artifact bytes move through the NIXL artifact path.
 
+Artifacts are sealed as tar archives holding regular files and directories
+only. Symlinks in a cache directory are left out of the archive rather than
+followed or copied verbatim, because engines treat them as derived state and
+rebuild them on demand: FlashInfer, for example, relinks each
+`trtllmGen_*_export` include path to its cubin directory on every JIT module
+lookup, so a link carried across pods would be deleted and recreated anyway.
+Skipping one costs the link entry alone -- neither the packaging walk nor tar
+descends through a symlinked directory, so no subtree is lost. A link that
+resolves inside the cache root is logged at debug (its target is archived under
+its real path); a link that leaves the root or dangles is logged as a warning
+naming the paths. Symlinks never fail an artifact publish.
+
 #### Pairing workers by compile configuration
 
 A torch compile cache is only reusable by a worker whose compile configuration
