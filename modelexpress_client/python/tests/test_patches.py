@@ -66,6 +66,11 @@ def test_vllm_entrypoint_configures_logging_before_patches(monkeypatch):
         "register_plugin_model_loader",
         lambda: calls.append(("loader", None)),
     )
+    monkeypatch.setattr(
+        registration,
+        "register_weight_transfer",
+        lambda: calls.append(("weight_transfer", None)),
+    )
 
     vllm_integration.register_modelexpress_loaders()
 
@@ -73,7 +78,45 @@ def test_vllm_entrypoint_configures_logging_before_patches(monkeypatch):
         ("logging", None),
         ("patches", vllm_integration.VLLM_PATCHES),
         ("loader", None),
+        ("weight_transfer", None),
     ]
+
+
+def test_weight_transfer_registration_is_lazy(monkeypatch):
+    from modelexpress.engines.vllm import registration
+
+    calls = []
+
+    class Factory:
+        @classmethod
+        def register_engine(cls, *args):
+            calls.append(args)
+
+    factory = ModuleType("vllm.distributed.weight_transfer.factory")
+    factory.WeightTransferEngineFactory = Factory
+    monkeypatch.setitem(sys.modules, factory.__name__, factory)
+
+    registration.register_weight_transfer()
+
+    assert calls == [
+        (
+            registration.MX_WEIGHT_TRANSFER_BACKEND,
+            registration.MX_WEIGHT_TRANSFER_MODULE,
+            registration.MX_WEIGHT_TRANSFER_CLASS,
+        )
+    ]
+
+
+def test_weight_transfer_registration_skips_unsupported_vllm(monkeypatch):
+    from modelexpress.engines.vllm import registration
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.distributed.weight_transfer.factory",
+        None,
+    )
+
+    registration.register_weight_transfer()
 
 
 def test_object_storage_patch_preserves_model_weights(monkeypatch):
@@ -192,8 +235,7 @@ def test_humming_patch_detects_customer_backport(monkeypatch):
         def is_layer_skipped(self, config, prefix):
             ignored = self.get_from_keys_or(config, ["ignore"], [])
             return any(
-                module_name.startswith("re:")
-                and re.match(module_name[3:], prefix)
+                module_name.startswith("re:") and re.match(module_name[3:], prefix)
                 for module_name in ignored
             )
 

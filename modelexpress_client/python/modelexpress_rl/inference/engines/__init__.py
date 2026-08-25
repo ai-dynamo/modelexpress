@@ -23,7 +23,7 @@ def _create_generator_adapter(
     if isinstance(engine_context, SglangGeneratorContext):
         return _create_sglang_adapter(engine_context, model_name, s3)
     if isinstance(engine_context, VllmGeneratorContext):
-        return _create_vllm_adapter(engine_context, worker_id)
+        return _create_vllm_adapter(engine_context, worker_id, model_name, s3)
     raise TypeError(f"unsupported generator context {type(engine_context).__name__}")
 
 

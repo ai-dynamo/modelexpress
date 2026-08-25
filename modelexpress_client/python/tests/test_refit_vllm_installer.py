@@ -3,7 +3,7 @@
 
 import sys
 from contextlib import contextmanager
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -37,6 +37,9 @@ def _install_fake_vllm(monkeypatch, initialize):
         ),
         "vllm.model_executor.model_loader": ModuleType(
             "vllm.model_executor.model_loader"
+        ),
+        "vllm.model_executor.model_loader.default_loader": ModuleType(
+            "vllm.model_executor.model_loader.default_loader"
         ),
         "vllm.model_executor.model_loader.reload": ModuleType(
             "vllm.model_executor.model_loader.reload"
@@ -96,6 +99,78 @@ def test_installer_rejects_parameters_left_on_meta(monkeypatch):
 
     with pytest.raises(IncompleteRefit, match="left parameters on the meta device"):
         installer._process_and_commit({"weight": torch.tensor([7.0])})
+
+
+def test_installer_loads_prepared_checkpoint_inside_vllm_config(monkeypatch, tmp_path):
+    active_config = [None]
+    events = []
+
+    @contextmanager
+    def current_config(config):
+        active_config[0] = config
+        try:
+            yield
+        finally:
+            active_config[0] = None
+
+    def initialize(_model):
+        events.append(("initialize", active_config[0]))
+
+    _install_fake_vllm(monkeypatch, initialize)
+    sys.modules["vllm.config"].set_current_vllm_config = current_config
+    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
+    layerwise.finalize_layerwise_reload = lambda _model, _config: events.append(
+        ("finalize", active_config[0])
+    )
+
+    class DefaultModelLoader:
+        def __init__(self, load_config):
+            events.append(("loader", load_config.load_format))
+
+        def load_weights(self, model, model_config):
+            events.append(
+                (
+                    "load",
+                    active_config[0],
+                    model_config.model,
+                    model_config.revision,
+                )
+            )
+            model.weight.data.fill_(7.0)
+
+    sys.modules[
+        "vllm.model_executor.model_loader.default_loader"
+    ].DefaultModelLoader = DefaultModelLoader
+    synchronized = []
+    monkeypatch.setattr(torch.cuda, "synchronize", synchronized.append)
+
+    model = nn.Linear(1, 1, bias=False)
+    model_config = SimpleNamespace(model="/launch", revision="main")
+    vllm_config = SimpleNamespace(
+        load_config=SimpleNamespace(load_format="modelexpress"),
+        quant_config=None,
+    )
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=vllm_config,
+        model_config=model_config,
+        device=torch.device("cpu"),
+    )
+    prepared = tmp_path / "prepared"
+
+    installer.install_checkpoint(prepared)
+
+    assert events == [
+        ("loader", "safetensors"),
+        ("initialize", vllm_config),
+        ("load", vllm_config, str(prepared), None),
+        ("finalize", vllm_config),
+    ]
+    assert model.weight.item() == 7.0
+    assert model_config.model == "/launch"
+    assert model_config.revision == "main"
+    assert vllm_config.load_config.load_format == "modelexpress"
+    assert synchronized == [torch.device("cpu")]
 
 
 def test_installer_rejects_quantized_mla_derived_weight_refresh():

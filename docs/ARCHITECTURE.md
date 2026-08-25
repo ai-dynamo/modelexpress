@@ -788,8 +788,9 @@ RL framework integrations live in the separate `modelexpress_rl` package:
 | `inference/nixl_staged_transfer.py` | Private engine-neutral exact-manifest NIXL planning, transfer, reusable buffers, and verification |
 | `inference/engines/sglang/` | SGLang context and native checkpoint reload adapter |
 | `inference/engines/vllm/context.py` | Public typed vLLM objects passed to `ModelExpressGeneratorClient.initialize()` |
-| `inference/engines/vllm/adapter.py` | Generator adapter that composes staged transfer with the private vLLM installer |
-| `inference/engines/vllm/installer.py` | Private vLLM load-layout capture and graph-safe installation |
+| `inference/engines/vllm/adapter.py` | Generator adapter that keeps the existing NIXL full-tensor path and directly uses canonical S3 staging for XOR deltas |
+| `inference/engines/vllm/installer.py` | Private vLLM load-layout capture plus graph-safe tensor or prepared-checkpoint installation |
+| `inference/engines/vllm/weight_transfer.py` | Native vLLM weight-transfer bridge for canonical S3/XOR refit |
 
 ### MxClient
 
@@ -827,6 +828,25 @@ Thin orchestration layer that delegates to `LoadStrategyChain.run()`. Builds a `
 **MTP two-pass load.** Multi-token-prediction models (Qwen3.5 MTP, DeepSeek MTP) call the loader twice on one worker: the target, then the draft head. `_is_speculative_draft()` detects the second pass via `model_config.runner_type == "draft"` and sets `ctx.p2p_enabled = False`. A P2P draft would collide on the target's NIXL metadata port, and since the merged draft shares the target's `SourceIdentity` it could poison source discovery, so registration, publication, and RDMA stay off for the draft while the target keeps serving. The draft loads through the ModelStreamer/default path. To avoid re-reading the whole checkpoint for a small head, `build_model_streamer_weight_iter` streams only the shards holding the draft's tensors: it reads `model.safetensors.index.json` from the directory of the shards `_prepare_weights` already resolved, which is what makes a Hugging Face model ID work, and falls back to the model URI itself (local directory, then the runai streamer's `pull_files`) for object storage. It keeps shards whose tensor names start with `mtp.`. The draft's embedding and `lm_head` come from the target, so they are not streamed. An index that holds no `mtp.` tensors is expected on a checkpoint without a draft head and streams every shard; an index that cannot be resolved at all logs a warning and also streams every shard.
 
 ### vLLM Refit Installation
+
+`VllmGeneratorAdapter` has two fixed initialization modes. Without an S3
+configuration it preserves the existing full-tensor NIXL transfer, plan reuse,
+and staged-buffer installation path. With an S3 configuration it directly uses
+`CanonicalS3GeneratorAdapter` to reconstruct and verify an exact XOR delta in a
+host-local safetensors checkpoint; no NIXL transfer manager or transfer plan is
+created. The shared private installer reloads that prepared checkpoint through
+vLLM's `DefaultModelLoader` inside the same graph-safe layerwise reload window
+used by the NIXL path.
+
+The ModelExpress vLLM plugin also registers the `modelexpress` native weight
+transfer backend for the S3/XOR path. Its initialization payload supplies the
+model name, READY launch-base version ID, launch checkpoint, preparation cache,
+MX server, and optional S3 endpoint settings. Each update carries the opaque MX
+`version_id`; the engine synchronously stages, applies, and releases that
+version through `ModelExpressGeneratorClient`. vLLM's `start_weight_update()`
+and `finish_weight_update()` hooks are no-ops because the adapter owns the full
+installation window. Draft-model updates and trainer-pushed bytes are not
+supported by this backend.
 
 `engines/vllm/refit/MdlLoader` implements Mapped Direct Load (MDL) for tensors that have already
 been translated into the inference model's naming and numerical format. The
