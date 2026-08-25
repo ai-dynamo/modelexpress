@@ -14,6 +14,7 @@ pub const MANIFEST_JSON_MEDIA_TYPE: &str = "application/vnd.groq.gbuild.manifest
 pub const MANIFEST_CAPNP_MEDIA_TYPE: &str = "application/vnd.groq.gbuild.manifest.v1+capnp";
 pub const PRESET_MEDIA_TYPE: &str = "application/vnd.groq.gbuild.preset.v1+json";
 pub const PAYLOAD_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
+const RUNTIME_MANIFEST_REVISION: u8 = 2;
 
 #[derive(Debug)]
 pub struct GbuildArtifact {
@@ -314,6 +315,23 @@ pub fn is_gbuild_artifact(manifest: &OciImageManifest) -> bool {
     manifest.artifact_type.as_deref() == Some(ARTIFACT_MEDIA_TYPE)
 }
 
+pub(super) fn validate_runtime_manifest(manifest: &[u8]) -> Result<()> {
+    let header: RuntimeManifestHeader =
+        serde_json::from_slice(manifest).context("Failed to parse the GBuild runtime manifest")?;
+    if header.contract_revision != RUNTIME_MANIFEST_REVISION {
+        anyhow::bail!(
+            "GBuild runtime manifest revision {} is not supported; expected {RUNTIME_MANIFEST_REVISION}",
+            header.contract_revision
+        );
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct RuntimeManifestHeader {
+    contract_revision: u8,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TransportIndex {
@@ -518,5 +536,27 @@ mod tests {
         index["partitions"][0]["members"] = json!(["tokenizer/config.json"]);
         let error = parse_contract(&index, &manifest()).expect_err("member overlap must fail");
         assert!(error.to_string().contains("overlap"));
+    }
+
+    #[test]
+    fn test_gbuild_artifact_accepts_runtime_manifest_revision_2() {
+        validate_runtime_manifest(br#"{"contract_revision":2,"model":{}}"#)
+            .expect("revision 2 must be accepted");
+    }
+
+    #[test]
+    fn test_gbuild_artifact_rejects_other_runtime_manifest_revisions() {
+        for manifest in [
+            br#"{"contract_revision":1}"#.as_slice(),
+            br#"{"contract_revision":3}"#.as_slice(),
+            br#"{"contract_revision":true}"#.as_slice(),
+            br#"{"model":{}}"#.as_slice(),
+        ] {
+            let error = validate_runtime_manifest(manifest).expect_err("non-v2 manifest must fail");
+            assert!(
+                error.to_string().contains("runtime manifest")
+                    || error.to_string().contains("expected 2")
+            );
+        }
     }
 }
