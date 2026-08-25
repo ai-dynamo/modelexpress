@@ -29,8 +29,8 @@ if _version_not_supported:
 
 
 class RefitServiceStub(object):
-    """Control-plane metadata for RL weight publication. Weight bytes and full
-    manifests remain on trainer and generator workers.
+    """Control-plane metadata for RL weight publication. S3-backed versions own one
+    global object URI; worker-sharded versions advertise per-worker manifests.
     """
 
     def __init__(self, channel):
@@ -53,6 +53,11 @@ class RefitServiceStub(object):
                 '/model_express.refit.RefitService/DeleteWeightVersion',
                 request_serializer=refit__pb2.DeleteWeightVersionRequest.SerializeToString,
                 response_deserializer=refit__pb2.WeightVersion.FromString,
+                _registered_method=True)
+        self.UpdateWeightVersionState = channel.unary_unary(
+                '/model_express.refit.RefitService/UpdateWeightVersionState',
+                request_serializer=refit__pb2.UpdateWeightVersionStateRequest.SerializeToString,
+                response_deserializer=refit__pb2.UpdateWeightVersionStateResponse.FromString,
                 _registered_method=True)
         self.RegisterWorker = channel.unary_unary(
                 '/model_express.refit.RefitService/RegisterWorker',
@@ -87,8 +92,8 @@ class RefitServiceStub(object):
 
 
 class RefitServiceServicer(object):
-    """Control-plane metadata for RL weight publication. Weight bytes and full
-    manifests remain on trainer and generator workers.
+    """Control-plane metadata for RL weight publication. S3-backed versions own one
+    global object URI; worker-sharded versions advertise per-worker manifests.
     """
 
     def CreateWeightVersion(self, request, context):
@@ -105,6 +110,12 @@ class RefitServiceServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def DeleteWeightVersion(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def UpdateWeightVersionState(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -137,7 +148,7 @@ class RefitServiceServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def RegisterVersionLease(self, request, context):
-        """A live lease protects every shard while a generator installs the version.
+        """A live lease protects the version source while a generator installs it.
         Re-registering the same lease owner renews its expiry.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -167,6 +178,11 @@ def add_RefitServiceServicer_to_server(servicer, server):
                     servicer.DeleteWeightVersion,
                     request_deserializer=refit__pb2.DeleteWeightVersionRequest.FromString,
                     response_serializer=refit__pb2.WeightVersion.SerializeToString,
+            ),
+            'UpdateWeightVersionState': grpc.unary_unary_rpc_method_handler(
+                    servicer.UpdateWeightVersionState,
+                    request_deserializer=refit__pb2.UpdateWeightVersionStateRequest.FromString,
+                    response_serializer=refit__pb2.UpdateWeightVersionStateResponse.SerializeToString,
             ),
             'RegisterWorker': grpc.unary_unary_rpc_method_handler(
                     servicer.RegisterWorker,
@@ -207,8 +223,8 @@ def add_RefitServiceServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class RefitService(object):
-    """Control-plane metadata for RL weight publication. Weight bytes and full
-    manifests remain on trainer and generator workers.
+    """Control-plane metadata for RL weight publication. S3-backed versions own one
+    global object URI; worker-sharded versions advertise per-worker manifests.
     """
 
     @staticmethod
@@ -282,6 +298,33 @@ class RefitService(object):
             '/model_express.refit.RefitService/DeleteWeightVersion',
             refit__pb2.DeleteWeightVersionRequest.SerializeToString,
             refit__pb2.WeightVersion.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def UpdateWeightVersionState(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.refit.RefitService/UpdateWeightVersionState',
+            refit__pb2.UpdateWeightVersionStateRequest.SerializeToString,
+            refit__pb2.UpdateWeightVersionStateResponse.FromString,
             options,
             channel_credentials,
             insecure,

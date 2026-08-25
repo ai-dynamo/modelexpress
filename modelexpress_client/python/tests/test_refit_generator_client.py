@@ -48,7 +48,6 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
                 total_bytes=128,
                 manifest_digest=digest,
                 manifest_endpoint=endpoint,
-                transport="NIXL",
             )
             for rank, slot in enumerate(self.version.expected_source_slots)
         ]

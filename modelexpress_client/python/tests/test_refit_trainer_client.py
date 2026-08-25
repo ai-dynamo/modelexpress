@@ -126,6 +126,14 @@ def test_trainer_config_rejects_unspecified_payload_format():
         ModelExpressTrainerConfig(payload_format=WeightPayloadFormat.UNSPECIFIED)
 
 
+def test_refit_shard_keeps_only_its_nixl_manifest_endpoint():
+    shard = refit_pb2.WeightVersionShard(manifest_endpoint="trainer:9000")
+
+    assert shard.manifest_endpoint == "trainer:9000"
+    assert refit_pb2.WeightVersion.DESCRIPTOR.fields_by_name["s3"].number == 11
+    assert list(refit_pb2.S3Transport.DESCRIPTOR.fields_by_name) == ["uri"]
+
+
 def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
     service = _RefitService()
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
@@ -218,6 +226,7 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
     assert service.shards[0].worker_id == "trainer-0"
     assert service.shards[0].tensor_count == 2
     assert service.shards[0].total_bytes == 128
+    assert service.shards[0].manifest_endpoint == f"127.0.0.1:{port}"
     assert fetched.manifest == b"manifest"
 
 

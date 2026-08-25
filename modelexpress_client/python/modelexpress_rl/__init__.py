@@ -12,6 +12,7 @@ from .inference import (
 from .train import (
     ModelExpressTrainerClient,
     ModelExpressTrainerConfig,
+    S3Config,
     TrainerStagingMode,
     WeightPayloadFormat,
 )
@@ -25,6 +26,7 @@ __all__ = [  # noqa: RUF022 - grouped by public API role, not alphabetically.
     # Configuration fixed when a worker client is initialized.
     "ModelExpressGeneratorConfig",
     "ModelExpressTrainerConfig",
+    "S3Config",
     "TrainerStagingMode",
     "WeightPayloadFormat",
     "VllmGeneratorContext",

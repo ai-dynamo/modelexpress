@@ -264,6 +264,9 @@ pub fn method_label(path: &str) -> &'static str {
         "/model_express.refit.RefitService/DeleteWeightVersion" => {
             "RefitService/DeleteWeightVersion"
         }
+        "/model_express.refit.RefitService/UpdateWeightVersionState" => {
+            "RefitService/UpdateWeightVersionState"
+        }
         "/model_express.refit.RefitService/RegisterWorker" => "RefitService/RegisterWorker",
         "/model_express.refit.RefitService/CreateWeightVersionShard" => {
             "RefitService/CreateWeightVersionShard"
@@ -676,8 +679,8 @@ mod tests {
         // Guards the parser itself: a change that stopped matching `rpc` lines
         // would otherwise make this test pass by checking nothing.
         assert_eq!(
-            checked, 19,
-            "expected 19 routed server RPCs, parsed {checked}"
+            checked, 20,
+            "expected 20 routed server RPCs, parsed {checked}"
         );
     }
 

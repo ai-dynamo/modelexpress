@@ -26,9 +26,13 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
             idempotency_key=request.idempotency_key,
             payload_format=request.payload_format,
             expected_source_slots=request.expected_source_slots,
-            state=refit_pb2.WEIGHT_VERSION_STATE_STAGING,
+            state=request.state,
             created_at_unix_ms=1234,
         )
+        if request.HasField("base_version_id"):
+            self.version.base_version_id = request.base_version_id
+        if request.HasField("s3"):
+            self.version.s3.CopyFrom(request.s3)
         return self.version
 
     def GetWeightVersion(self, request, context):
@@ -41,6 +45,12 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
             context.abort(grpc.StatusCode.NOT_FOUND, "version not found")
         self.version.state = refit_pb2.WEIGHT_VERSION_STATE_RELEASING
         return self.version
+
+    def UpdateWeightVersionState(self, request, context):
+        if self.version is None or request.uid != self.version.uid:
+            context.abort(grpc.StatusCode.NOT_FOUND, "version not found")
+        self.version.state = request.state
+        return refit_pb2.UpdateWeightVersionStateResponse(version=self.version)
 
 
 def test_control_client_owns_global_weight_version_lifecycle():
@@ -63,6 +73,10 @@ def test_control_client_owns_global_weight_version_lifecycle():
             ],
         )
         fetched = control.get_weight_version(created.version_id)
+        ready = control.update_weight_version_state(
+            created.version_id,
+            WeightVersionState.READY,
+        )
         deleted = control.delete_weight_version(created.version_id)
     finally:
         if "control" in locals():
@@ -78,18 +92,47 @@ def test_control_client_owns_global_weight_version_lifecycle():
     )
     assert created.state is WeightVersionState.STAGING
     assert fetched == created
+    assert ready.state is WeightVersionState.READY
     assert deleted.state is WeightVersionState.RELEASING
+
+
+def test_control_client_creates_ready_s3_version_without_source_slots():
+    service = _RefitService()
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+    refit_pb2_grpc.add_RefitServiceServicer_to_server(service, server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+
+    try:
+        control = ModelExpressControlClient.connect(server_url=f"127.0.0.1:{port}")
+        created = control.create_weight_version(
+            model_name="test/model",
+            version_number=7,
+            idempotency_key="training-step-7",
+            payload_format=WeightPayloadFormat.XOR_DELTA,
+            base_version_id="base-a",
+            s3_uri="s3://weights/run/v7/model.safetensors.index.json",
+            state=WeightVersionState.READY,
+        )
+    finally:
+        if "control" in locals():
+            control.close()
+        server.stop(grace=None).wait()
+
+    assert created.s3_uri == "s3://weights/run/v7/model.safetensors.index.json"
+    assert created.expected_source_slots == ()
+    assert created.state is WeightVersionState.READY
 
 
 def test_control_client_validates_framework_inputs_before_rpc():
     control = ModelExpressControlClient.connect(server_url="127.0.0.1:1")
     try:
-        with pytest.raises(ValueError, match="expected_source_slots"):
+        with pytest.raises(ValueError, match="state"):
             control.create_weight_version(
                 model_name="test/model",
                 idempotency_key="attempt-a",
                 payload_format=WeightPayloadFormat.FULL_TENSOR,
-                expected_source_slots=[],
+                state=WeightVersionState.RELEASING,
             )
         with pytest.raises(ValueError, match="payload_format"):
             control.create_weight_version(
@@ -97,6 +140,14 @@ def test_control_client_validates_framework_inputs_before_rpc():
                 idempotency_key="attempt-a",
                 payload_format=WeightPayloadFormat.UNSPECIFIED,
                 expected_source_slots=["rank:0"],
+            )
+        with pytest.raises(ValueError, match="version_number"):
+            control.create_weight_version(
+                model_name="test/model",
+                idempotency_key="attempt-a",
+                payload_format=WeightPayloadFormat.XOR_DELTA,
+                base_version_id="base-a",
+                s3_uri="s3://weights/run/v1/model.safetensors.index.json",
             )
     finally:
         control.close()
