@@ -24,3 +24,8 @@
 .idea/
 *.tmproj
 .vscode/
+
+# promtool unit tests for the alert rules. Developer tooling, not chart content:
+# anchored to the chart root so it cannot also match templates/tests/, which
+# holds the helm test hook.
+/tests/
