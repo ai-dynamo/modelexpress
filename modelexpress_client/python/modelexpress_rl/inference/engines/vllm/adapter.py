@@ -12,13 +12,18 @@ from modelexpress.client import MxClientBase
 from modelexpress.engines.vllm.adapter import VllmAdapter
 from modelexpress_rl import envs as rl_envs
 from modelexpress_rl.inference.adapter import (
-    GeneratorEngineAdapter,
     GeneratorTransferInputs,
+    NixlGeneratorSource,
 )
 from modelexpress_rl.inference.nixl_staged_transfer import (
     _NixlStagedTransfer,
     _PreparedNixlTransfer,
     _StagedNixlWeights,
+)
+from modelexpress_rl.inference.receiver import (
+    CanonicalS3GeneratorAdapter,
+    PreparedCheckpoint,
+    S3GeneratorConfig,
 )
 from modelexpress_rl.train import WeightPayloadFormat
 
@@ -29,8 +34,8 @@ if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
 
 
-class VllmGeneratorAdapter(GeneratorEngineAdapter):
-    """Compose exact-version NIXL staging with graph-safe vLLM installation."""
+class VllmGeneratorAdapter(CanonicalS3GeneratorAdapter):
+    """Install NIXL full tensors or canonical S3 deltas into vLLM."""
 
     def __init__(
         self,
@@ -39,7 +44,13 @@ class VllmGeneratorAdapter(GeneratorEngineAdapter):
         vllm_config: VllmConfig,
         model_config: ModelConfig,
         worker_id: str,
+        model_name: str | None = None,
+        s3: S3GeneratorConfig | None = None,
     ) -> None:
+        self._uses_s3 = s3 is not None
+        if self._uses_s3 and not model_name:
+            raise ValueError("model_name is required for canonical S3")
+
         engine = VllmAdapter(vllm_config, model_config)
         self._engine = engine
         device_id = engine.get_device_id()
@@ -50,6 +61,10 @@ class VllmGeneratorAdapter(GeneratorEngineAdapter):
             model_config=model_config,
             device=device,
         )
+        if s3 is not None:
+            super().__init__(model_name=cast(str, model_name), config=s3)
+            return
+
         self._transfer = _NixlStagedTransfer(
             agent_name=f"mx-refit-{worker_id}",
             device_id=device_id,
@@ -69,9 +84,7 @@ class VllmGeneratorAdapter(GeneratorEngineAdapter):
         identity.revision = version_id
         return identity
 
-    def stage_peer_weight(
-        self, source: p2p_pb2.WorkerMetadata
-    ) -> _StagedNixlWeights:
+    def stage_peer_weight(self, source: p2p_pb2.WorkerMetadata) -> _StagedNixlWeights:
         self._active_plan = None
         self._active_fingerprint = None
         staged = self._transfer.stage_peer(
@@ -103,6 +116,8 @@ class VllmGeneratorAdapter(GeneratorEngineAdapter):
 
     @property
     def supported_payload_formats(self) -> frozenset[WeightPayloadFormat]:
+        if self._uses_s3:
+            return super().supported_payload_formats
         return frozenset({WeightPayloadFormat.FULL_TENSOR})
 
     def create_transfer_plan(
@@ -117,12 +132,15 @@ class VllmGeneratorAdapter(GeneratorEngineAdapter):
                 f"VllmGeneratorAdapter does not support "
                 f"{inputs.payload_format.value} payloads"
             )
-        if any(source.transport.upper() != "NIXL" for source in inputs.sources):
+        if any(
+            not isinstance(source.transport, NixlGeneratorSource)
+            for source in inputs.sources
+        ):
             raise ValueError(
                 "VllmGeneratorAdapter currently supports NIXL sources only"
             )
         plan = self._transfer.prepare(
-            manifests=[source.manifest for source in inputs.sources],
+            manifests=[source.transport.manifest for source in inputs.sources],
             capture_layout=self._installer.capture,
         )
         self._active_plan = plan
@@ -139,7 +157,9 @@ class VllmGeneratorAdapter(GeneratorEngineAdapter):
             and self._active_fingerprint == inputs.physical_fingerprint
         )
 
-    def stage_weight(self, plan: object) -> _StagedNixlWeights:
+    def stage_weight(self, plan: object) -> PreparedCheckpoint | _StagedNixlWeights:
+        if self._uses_s3:
+            return super().stage_weight(cast(GeneratorTransferInputs, plan))
         if plan is not self._active_plan:
             raise RuntimeError("vLLM transfer plan is no longer active")
         self._transfer.unpublish_peer()
@@ -148,13 +168,21 @@ class VllmGeneratorAdapter(GeneratorEngineAdapter):
         return staged
 
     def apply_weight(self, staged: object) -> dict[str, Any]:
+        if self._uses_s3:
+            return super().apply_weight(staged)
         active_staged = self._active_staged
         if active_staged is None or staged is not active_staged:
             raise RuntimeError("vLLM staged weight is no longer active")
         self._installer.install(active_staged.tensors)
         return active_staged.metrics
 
+    def install_prepared_checkpoint(self, prepared: PreparedCheckpoint) -> None:
+        self._installer.install_checkpoint(prepared.path)
+
     def release_staged_weight(self, staged: object) -> None:
+        if self._uses_s3:
+            super().release_staged_weight(staged)
+            return
         active_staged = self._active_staged
         if active_staged is None or staged is not active_staged:
             raise RuntimeError("vLLM staged weight is no longer active")
@@ -163,7 +191,10 @@ class VllmGeneratorAdapter(GeneratorEngineAdapter):
         self._active_staged = None
 
     def close(self) -> None:
-        """Release the rank-local NIXL agent."""
+        """Release the selected rank-local transport."""
+        if self._uses_s3:
+            super().close()
+            return
         self._active_staged = None
         self._active_plan = None
         self._active_fingerprint = None

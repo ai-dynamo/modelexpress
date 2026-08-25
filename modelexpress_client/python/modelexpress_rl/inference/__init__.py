@@ -8,11 +8,15 @@ from .client import (
     ModelExpressGeneratorConfig,
     StagedWeightHandle,
 )
+from .engines.sglang import SglangGeneratorContext
 from .engines.vllm import VllmGeneratorContext
+from .receiver import S3GeneratorConfig
 
 __all__ = [
     "ModelExpressGeneratorClient",
     "ModelExpressGeneratorConfig",
+    "S3GeneratorConfig",
+    "SglangGeneratorContext",
     "StagedWeightHandle",
     "VllmGeneratorContext",
 ]
