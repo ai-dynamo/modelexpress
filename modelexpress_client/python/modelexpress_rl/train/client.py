@@ -84,7 +84,7 @@ class ModelExpressTrainerConfig:
 
     # CUDA device used by the rank-local NIXL manager; defaults to LOCAL_RANK.
     device_id: int | None = None
-    # NIXL process identity; generated from the distributed rank when omitted.
+    # NIXL process identity; generated from the rank and a fresh suffix when omitted.
     agent_name: str | None = None
     # Logical model identity; defaults to MODEL_NAME.
     model_name: str | None = None

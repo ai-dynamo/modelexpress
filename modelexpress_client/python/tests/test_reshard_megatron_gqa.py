@@ -166,6 +166,44 @@ def test_global_interval_aliases_cover_qkv_without_gaps_or_overlaps(
     )
 
 
+def test_global_qkv_bias_aliases_preserve_interleaved_head_order():
+    q_heads, kv_heads, head_dim = 4, 2, 2
+    fused = torch.arange(16, dtype=torch.float32)
+    aliases = build_hf_aliases(
+        [
+            MegatronTensorSpec(
+                name="linear_qkv.bias",
+                tensor=fused,
+                role="qkv_column",
+                hf_names=("q_proj.bias", "k_proj.bias", "v_proj.bias"),
+                global_shape=tuple(fused.shape),
+                placement_kind="REPLICATE",
+                shard_axis=None,
+                local_shard_range=None,
+                extras=_global_extras(q_heads, kv_heads, head_dim),
+            )
+        ],
+        agent_name="trainer-tp0",
+    )
+
+    actual = []
+    for alias in aliases:
+        destination = torch.empty(alias.full_shape, dtype=fused.dtype)
+        for shard in alias.shards:
+            source_start = (shard.addr - fused.data_ptr()) // fused.element_size()
+            destination_start = shard.shard_offset[0]
+            destination.narrow(0, destination_start, shard.shape[0]).copy_(
+                fused.narrow(0, source_start, shard.shape[0])
+            )
+        actual.append(destination)
+
+    expected = _expected_hf(fused, q_heads, kv_heads, head_dim)
+    assert [alias.full_shape for alias in aliases] == [(8,), (4,), (4,)]
+    assert all(
+        torch.equal(got, want) for got, want in zip(actual, expected, strict=True)
+    )
+
+
 def test_kv_below_tp_only_advertises_kv_on_ranks_that_own_it():
     _, _, published = _publish_all_ranks(64, 2, 8, 128)
     names_by_agent = {f"tp{rank}": set() for rank in range(8)}

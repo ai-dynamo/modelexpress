@@ -95,13 +95,15 @@ def test_explicit_mapping_roles(mapping, expected):
     )
 
 
-def test_qkv_bias_fails_until_alias_format_supports_it():
-    with pytest.raises(NotImplementedError, match="weights only"):
+def test_qkv_bias_uses_the_qkv_column_role():
+    assert (
         model_express_role_for_mapping(
             mapping=QKVMapping(),
             megatron_module=SimpleNamespace(),
             tensor_ndim=1,
         )
+        == "qkv_column"
+    )
 
 
 def test_unknown_mapping_fails_instead_of_assuming_replicated():

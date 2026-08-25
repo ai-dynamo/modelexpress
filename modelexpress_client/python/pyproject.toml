@@ -72,7 +72,7 @@ Repository = "https://github.com/ai-dynamo/modelexpress.git"
 Documentation = "https://github.com/ai-dynamo/modelexpress/tree/main/docs"
 
 [project.entry-points."vllm.general_plugins"]
-modelexpress = "modelexpress:register_modelexpress_loaders"
+modelexpress = "modelexpress:register_modelexpress"
 
 [tool.pytest.ini_options]
 markers = [
