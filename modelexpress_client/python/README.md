@@ -18,7 +18,7 @@ pip install -e .
 # With test dependencies
 pip install -e ".[dev]"
 
-# Additionally install the pinned protobuf code generator when changing p2p.proto
+# Additionally install the pinned protobuf code generator when changing protobuf APIs
 pip install -e ".[codegen]"
 ```
 
@@ -99,6 +99,58 @@ deployment.
 
 ## Programmatic Usage
 
+### RL trainer publication
+
+An RL framework creates a weight version through the external Refit API. Each
+trainer actor then invokes its rank-local client to stage and publish one shard.
+Worker registration, manifest serving, and internal shard CRUD remain hidden
+behind the client.
+
+```python
+from modelexpress_rl import (
+    ModelExpressTrainerClient,
+    ModelExpressTrainerConfig,
+    WeightVersionRef,
+)
+
+trainer = ModelExpressTrainerClient.initialize(ModelExpressTrainerConfig())
+trainer.bind_tensors(megatron_tensor_specs)
+trainer.publish_version(version=WeightVersionRef(version.uid))
+```
+
+The deployment supplies `MODEL_NAME`, `MX_TRAINER_ENGINE`,
+`MX_TRAINER_STAGING_MODE`, `MX_WEIGHT_PAYLOAD_FORMAT`, `MX_WORKER_HOST`, and the
+normal ModelExpress server configuration. The Megatron adapter derives its
+source slot from logical tensor names and shard geometry. DP replicas of the same
+partition therefore publish redundant workers for one slot, while distinct TP
+partitions remain separate required slots. The NIXL metadata endpoint is derived
+from `MX_WORKER_HOST` and the client-owned NIXL manager's listen port. `LOCAL_RANK`
+selects the device unless `device_id` is passed to `initialize()`.
+
+The client owns the NIXL manager and trainer-side manifest service. `server_url`
+selects the central ModelExpress control-plane service and defaults to the
+normal ModelExpress server configuration. A Megatron worker may initialize the
+client after selecting its CUDA device but before creating NCCL resources; the
+engine adapter is created lazily when the worker first requests its source slot
+or stages a shard after distributed setup.
+
+Initialization fixes the staging mode and payload format. `publish()` hides
+manifest publication and the internal `CreateWeightVersionShard` RPC. The
+current Megatron adapter registers and exposes its live buffers through
+`IN_PLACE`, so callers must keep those tensors immutable while the version is
+published. The required lifecycle is synchronous: create and publish the
+version, update every generator, retire and release the version, and only then
+resume training or begin the next optimizer step.
+
+Version creation and expected-source-slot declaration remain
+framework-orchestrator responsibilities. Each trainer adapter derives its own
+source slot from the engine's native topology; the orchestrator declares the
+expected slots using the same adapter-defined convention. `initialize()`
+selects the configured trainer engine and constructs its adapter internally.
+Megatron and FSDP implementations are available. Megatron-specific APIs live under
+`modelexpress_rl`;
+`modelexpress.refit.reshard` remains the shared, engine-neutral transfer core.
+
 ### MxClient
 
 `MxClient` is a lightweight gRPC client for communicating with the ModelExpress server:
@@ -140,13 +192,14 @@ register_modelexpress_loaders()
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MX_SERVER_ADDRESS` | `localhost:8001` | ModelExpress gRPC server address (recommended) |
-| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated, pending removal in a future release. Still read by all client paths and takes precedence when both are set; keep setting it during the transition. |
+| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
 | `MX_DISABLE_PATCHES` | `0` | Emergency escape hatch that skips all runtime compatibility patches. Set to `1`, `true`, `yes`, or `on` if a patch is incompatible with the installed engine. |
 | `MX_EXPECTED_WORKERS` | Auto-detected from TP size | Number of GPU workers to coordinate |
 | `MX_SYNC_PUBLISH` | `0` | Source: wait for all workers before publishing metadata |
 | `MX_SYNC_START` | `1` | Target: wait for all source workers before transferring |
 | `MX_POOL_REG` | `0` | Allocation-level NIXL registration (registers cudaMalloc blocks instead of individual tensors) |
 | `MX_P2P_METADATA` | `1` | Serve tensor and artifact manifests directly from source workers; set to `0` to route full tensor metadata through the central server |
+| `MX_REFIT_METADATA_PORT` | `7555` | Base NIXL metadata-listener port for RL generator refit; each rank adds its local device ID. Kept separate from `MX_METADATA_PORT`, which may remain owned by the boot-time loader |
 | `MX_ARTIFACT_TRANSFER` | `0` | Transfer compatible vLLM TorchInductor, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM |
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles |
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | empty | Optional compile-configuration compatibility digest for cache discovery |
@@ -155,11 +208,16 @@ register_modelexpress_loaders()
 | `MX_HEARTBEAT_INTERVAL_SECS` | `30` | Seconds between READY status heartbeats for published sources, including reshard rendezvous sources; keep below the server heartbeat timeout |
 | `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Maximum exact descriptors for one no-gather refit copy before a compatible dim-0-sharded source is pulled once into contiguous staging and sliced locally |
 | `MX_RESHARD_FUSED_WIRE` | `1` | Issue a refit's exact-segment, full-pull, and convert reads as one transport batch instead of draining each phase in turn. Set to `0` to restore the phased reads for an A/B comparison |
+| `MX_RESHARD_BATCH_INSTALL` | `1` | Re-slice a refit's full-pulled sources with one batched `torch._foreach_copy_` instead of one `copy_()` per captured view. Issues the same copies; a per-view loop costs thousands of kernel launches whose overhead can rival the RDMA. Set to `0` to restore the per-view loop for an A/B comparison |
+| `MX_RESHARD_CACHE_DESCRIPTORS` | `1` | Build NIXL read descriptors once per stable transfer plan and reuse them across refits. Set to `0` to rebuild the descriptor lists on every step for an A/B comparison |
 | `MX_RESHARD_REQUIRE_FULL_COVERAGE` | `0` | Fail a refit that installs less than `MX_RESHARD_COVERAGE_FLOOR` of the engine's parameter bytes. Off by default because partial and subset refit are intended; set to `1` for benchmark runs, where an incomplete refit produces timings that are the wrong magnitude |
 | `MX_RESHARD_COVERAGE_FLOOR` | `0.995` | Fraction of engine parameter bytes a gated refit must install. Not `1.0`: a few engine parameters, such as rotary `inv_freq`, are legitimately not refit material. Values outside `[0.0, 1.0]` are rejected |
 | `MX_RESHARD_HANDSHAKE_TIMEOUT_S` | `900` | Budget for the whole P2P metadata handshake, across every trainer peer and every retry. Bounds the handshake independently of the refit timeout, so one unreachable publisher cannot consume the entire refit |
 | `MX_RESHARD_HANDSHAKE_ATTEMPT_S` | `20` | Ceiling on a single peer dial. A reachable peer answers in well under a second, so a short attempt frees the budget to try a different peer rather than block on one |
 | `MX_RESHARD_HANDSHAKE_BACKOFF_S` | `2` | Pause after a full pass over the pending peers makes no progress, so a transient stall is waited out rather than hammered |
+| `MX_REFIT_STAGE_RECORD` | `1` | Emit one `refit-stage-v2` JSON record per refit, giving a benchmark harness the per-stage timings without parsing logs. Set to `0` to silence it |
+| `MX_RESHARD_MAX_GBPS` | `0` | Per-rank fabric ceiling in Gbps. A measured wire rate above it means the timing is wrong rather than the transfer being fast, so the refit is rejected. `0` disables the check, since only the operator knows the real per-rank limit |
+| `MX_RESHARD_PUBLISH_DIGEST` | `0` | Have each trainer publish a position-sensitive digest of every shard it advertises, so a receiver can later confirm it installed the bytes the publisher held. Off by default: the reduction costs a pass over every published tensor, which is large next to a ~1.5 s wire, so turn it on when qualifying a build rather than when measuring throughput |
 
 ### UCX/NIXL Tuning
 

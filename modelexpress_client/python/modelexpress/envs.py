@@ -42,6 +42,9 @@ if TYPE_CHECKING:
     # ModelExpress server address / logging
     MODEL_EXPRESS_URL: Optional[str]
     MX_SERVER_ADDRESS: Optional[str]
+    MODEL_EXPRESS_CACHE_DIRECTORY: Optional[str]
+    MODEL_EXPRESS_NO_SHARED_STORAGE: bool
+    MODEL_EXPRESS_TRANSFER_CHUNK_SIZE: Optional[str]
     MODEL_EXPRESS_LOG_LEVEL: str
     MODEL_NAME: Optional[str]
     # Auth (client)
@@ -60,11 +63,16 @@ if TYPE_CHECKING:
     MX_MODEL_URI: Optional[str]
     MX_P2P_METADATA: str
     MX_RESHARD_FUSED_WIRE: bool
+    MX_RESHARD_BATCH_INSTALL: bool
+    MX_RESHARD_CACHE_DESCRIPTORS: bool
     MX_RESHARD_REQUIRE_FULL_COVERAGE: bool
     MX_RESHARD_COVERAGE_FLOOR: float
     MX_RESHARD_HANDSHAKE_TIMEOUT_S: float
     MX_RESHARD_HANDSHAKE_ATTEMPT_S: float
     MX_RESHARD_HANDSHAKE_BACKOFF_S: float
+    MX_REFIT_STAGE_RECORD: bool
+    MX_RESHARD_MAX_GBPS: float
+    MX_RESHARD_PUBLISH_DIGEST: bool
     # Kubernetes service backend
     MX_K8S_SERVICE_PATTERN: str
     MX_K8S_SOURCE_RETRIES: str
@@ -91,6 +99,7 @@ if TYPE_CHECKING:
     MX_TRANSFER_LOG_DIR: str
     # VMM arena
     MX_VMM_ARENA: bool
+    MX_ARENA_SINGLE_MR: bool
     # Framework artifact (JIT cache) transfer
     MX_ARTIFACT_TRANSFER: bool
     MX_ARTIFACT_BUNDLE_ROOT: Optional[str]
@@ -99,10 +108,7 @@ if TYPE_CHECKING:
     MX_ARTIFACT_READY_TIMEOUT_SECS: int
     MX_ARTIFACT_TRANSFER_CHUNK_SIZE: Optional[str]
     # Trainer weight sync
-    MX_TRAINER_TABLE_KEY: Optional[str]
-    MX_TRAINER_SYNC_TIMEOUT: int
     MX_REDIS_URL: str
-    MX_WEIGHT_SYNC_SERVER: Optional[str]
     # P2P source selection
     MX_P2P_SOURCE_SELECTOR: Optional[str]
     # Opt-in metrics collector
@@ -110,6 +116,9 @@ if TYPE_CHECKING:
     MX_METRICS_PORT: Optional[str]
     MX_METRICS_PUSHGATEWAY: Optional[str]
     MX_METRICS_SCHEME: str
+    MX_METRICS_BIND_RETRY_SECS: float
+    MX_METRICS_SOURCE_ID_LABEL: bool
+    PROMETHEUS_MULTIPROC_DIR: Optional[str]
     # Third-party JIT/compile cache locations read for artifact transfer
     TRITON_CACHE_DIR: Optional[str]
     TVM_FFI_CACHE_DIR: Optional[str]
@@ -209,6 +218,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Site-varying defaults: return raw (None when unset), callers add defaults.
     "MODEL_EXPRESS_URL": lambda: os.environ.get("MODEL_EXPRESS_URL"),
     "MX_SERVER_ADDRESS": lambda: os.environ.get("MX_SERVER_ADDRESS"),
+    "MODEL_EXPRESS_CACHE_DIRECTORY": lambda: os.environ.get("MODEL_EXPRESS_CACHE_DIRECTORY"),
+    "MODEL_EXPRESS_NO_SHARED_STORAGE": lambda: _env_bool("MODEL_EXPRESS_NO_SHARED_STORAGE", False),
+    "MODEL_EXPRESS_TRANSFER_CHUNK_SIZE": lambda: os.environ.get(
+        "MODEL_EXPRESS_TRANSFER_CHUNK_SIZE"
+    ),
     "MODEL_EXPRESS_LOG_LEVEL": lambda: os.environ.get("MODEL_EXPRESS_LOG_LEVEL", "").upper(),
     "MODEL_NAME": lambda: os.environ.get("MODEL_NAME"),
     # ── Auth (client) ──────────────────────────────────────────────────────
@@ -228,6 +242,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_MODEL_URI": lambda: os.environ.get("MX_MODEL_URI"),
     "MX_P2P_METADATA": lambda: os.environ.get("MX_P2P_METADATA", "1"),
     "MX_RESHARD_FUSED_WIRE": lambda: _env_bool("MX_RESHARD_FUSED_WIRE", True),
+    # Issue the per-view re-slice copies of full-pulled sources as one batched
+    # _foreach_copy_ instead of a copy_() per view. On by default: it is the same
+    # set of copies, and one launch per view means thousands of launches whose
+    # Python and launch overhead can rival the RDMA itself. Set to 0 to fall back
+    # to the per-view loop. See modelexpress.refit.reshard.receiver.
+    "MX_RESHARD_BATCH_INSTALL": lambda: _env_bool("MX_RESHARD_BATCH_INSTALL", True),
+    # Build the RDMA read descriptor lists once per plan instead of once per step.
+    # The descriptors are a pure function of the cached plan and the registered
+    # buffer addresses, neither of which changes between steps, so rebuilding them
+    # every refit re-derives an identical list of hundreds of thousands of objects
+    # in Python. On by default; set to 0 to rebuild per step for an A/B. The cache
+    # is dropped whenever the plan is rebuilt. See
+    # modelexpress.refit.reshard.receiver.
+    "MX_RESHARD_CACHE_DESCRIPTORS": lambda: _env_bool(
+        "MX_RESHARD_CACHE_DESCRIPTORS", True
+    ),
     # Refit coverage gate. The floor is a fraction of the engine's parameter
     # bytes; ReshardReceiver validates its range at the point of use. What a
     # complete refit scores is engine- and model-specific, so the default is set
@@ -259,6 +289,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_RESHARD_HANDSHAKE_BACKOFF_S": lambda: _env_positive_float(
         "MX_RESHARD_HANDSHAKE_BACKOFF_S", 2.0
     ),
+    # One JSON stage record per refit. On by default: the timings are already
+    # computed, and at INFO they were never captured by a benchmark run.
+    "MX_REFIT_STAGE_RECORD": lambda: _env_bool("MX_REFIT_STAGE_RECORD", True),
+    # Per-rank fabric ceiling in Gbps used to reject impossible wire rates. Zero
+    # disables the check, and is the default because only the operator knows the
+    # real per-rank limit for their fabric.
+    "MX_RESHARD_MAX_GBPS": lambda: _env_float("MX_RESHARD_MAX_GBPS", 0.0),
+    # Have publishers digest each shard they advertise, so a receiver-side check has
+    # something to compare against. Off by default: it costs a reduction over every
+    # published tensor, which is a large relative cost against a ~1.5 s wire, so it
+    # belongs in a qualification run rather than a throughput measurement. See
+    # modelexpress.refit.reshard.verify.
+    "MX_RESHARD_PUBLISH_DIGEST": lambda: _env_bool("MX_RESHARD_PUBLISH_DIGEST", False),
     # ── Kubernetes service backend ─────────────────────────────────────────
     "MX_K8S_SERVICE_PATTERN": lambda: os.environ.get("MX_K8S_SERVICE_PATTERN", "mx-sources"),
     "MX_K8S_SOURCE_RETRIES": lambda: os.environ.get("MX_K8S_SOURCE_RETRIES", ""),
@@ -288,6 +331,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_TRANSFER_LOG_DIR": lambda: os.environ.get("MX_TRANSFER_LOG_DIR", "/tmp/mx_logs"),
     # ── VMM arena ──────────────────────────────────────────────────────────
     "MX_VMM_ARENA": lambda: os.environ.get("MX_VMM_ARENA") == "1",
+    "MX_ARENA_SINGLE_MR": lambda: os.environ.get("MX_ARENA_SINGLE_MR") == "1",
     # ── Framework artifact (JIT cache) transfer ────────────────────────────
     "MX_ARTIFACT_TRANSFER": lambda: os.environ.get("MX_ARTIFACT_TRANSFER", "").strip().lower()
     in _TRUTHY,
@@ -301,10 +345,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # int parse plus its non-positive/max-bound validation and default param.
     "MX_ARTIFACT_TRANSFER_CHUNK_SIZE": lambda: os.environ.get("MX_ARTIFACT_TRANSFER_CHUNK_SIZE"),
     # ── Trainer pull (live weight sync from a running trainer) ─────────────
-    "MX_TRAINER_TABLE_KEY": lambda: os.environ.get("MX_TRAINER_TABLE_KEY"),
-    "MX_TRAINER_SYNC_TIMEOUT": lambda: _env_int("MX_TRAINER_SYNC_TIMEOUT", 300),
     "MX_REDIS_URL": lambda: os.environ.get("MX_REDIS_URL", "redis://localhost:6379"),
-    "MX_WEIGHT_SYNC_SERVER": lambda: os.environ.get("MX_WEIGHT_SYNC_SERVER"),
     # ── P2P source selection ───────────────────────────────────────────────
     # Raw (None when unset); source_selection applies its DEFAULT_SELECTOR fallback.
     "MX_P2P_SOURCE_SELECTOR": lambda: os.environ.get("MX_P2P_SOURCE_SELECTOR"),
@@ -314,6 +355,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_METRICS_PORT": lambda: os.environ.get("MX_METRICS_PORT"),
     "MX_METRICS_PUSHGATEWAY": lambda: os.environ.get("MX_METRICS_PUSHGATEWAY"),
     "MX_METRICS_SCHEME": lambda: os.environ.get("MX_METRICS_SCHEME", ""),
+    # Interval at which a rank that lost the /metrics bind re-attempts it, so
+    # endpoint ownership migrates when the winning rank exits.
+    "MX_METRICS_BIND_RETRY_SECS": lambda: _env_float("MX_METRICS_BIND_RETRY_SECS", 15.0),
+    # Restore the per-peer source_worker_id label on
+    # mx_p2p_source_selections_total. Benchmark runs only: the id is a
+    # per-process uuid, so its label domain grows with process count over time
+    # rather than with cluster size.
+    "MX_METRICS_SOURCE_ID_LABEL": lambda: os.environ.get("MX_METRICS_SOURCE_ID_LABEL", "0")
+    .strip()
+    .lower()
+    in _TRUTHY,
+    # prometheus_client multiprocess directory. Read-only here: it MUST be set
+    # in the pod manifest, never assigned in Python. get_value_class() latches at
+    # prometheus_client import time, so an in-process assignment lands after the
+    # engine has already imported it and produces zero .db files with no error.
+    "PROMETHEUS_MULTIPROC_DIR": lambda: os.environ.get("PROMETHEUS_MULTIPROC_DIR"),
     # ── Third-party JIT/compile cache locations (raw; caller builds path) ──
     "TRITON_CACHE_DIR": lambda: os.environ.get("TRITON_CACHE_DIR"),
     "TVM_FFI_CACHE_DIR": lambda: os.environ.get("TVM_FFI_CACHE_DIR"),

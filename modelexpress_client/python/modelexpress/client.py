@@ -96,8 +96,9 @@ def _get_server_url(explicit_url: str | None = None) -> str:
 
     Priority:
     1. Explicit ``server_url`` argument
-    2. ``MODEL_EXPRESS_URL`` env var (Dynamo-consistent)
-    3. ``MX_SERVER_ADDRESS`` env var (backward compat)
+    2. ``MODEL_EXPRESS_URL`` env var (deprecated, but still takes precedence:
+       the TRT-LLM live-transfer integration reads only this name)
+    3. ``MX_SERVER_ADDRESS`` env var (the name ModelExpress is standardizing on)
     4. Default ``localhost:8001``
     """
     if explicit_url:

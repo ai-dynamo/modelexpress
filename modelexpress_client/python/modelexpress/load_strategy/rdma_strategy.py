@@ -11,7 +11,7 @@ import os
 import time
 
 from .. import envs, p2p_pb2
-from ..adapter import EngineAdapter, StrategyFailed
+from ..adapter import EngineAdapter, StrategyFailed, StrategyRecoveryError
 from ..metadata.payload import (
     accelerators_compatible,
     worker_tensor_count,
@@ -30,6 +30,7 @@ from .base import (
     LoadStrategy,
     SourceTransferError,
     _as_load_result,
+    clear_exception_tracebacks,
     register_tensors,
 )
 from .context import LoadResult
@@ -156,7 +157,6 @@ class RdmaStrategy(LoadStrategy):
 
         attempts = candidates[:MAX_SOURCE_RETRIES]
         policy = configured_policy_label()
-        needs_outer_reinit = False
         for attempt_index, instance in enumerate(attempts):
             mx_source_id = instance.mx_source_id
             worker_id = instance.worker_id
@@ -193,6 +193,9 @@ class RdmaStrategy(LoadStrategy):
                 f"({worker_tensor_count(source_worker)} tensors)"
             )
 
+            # The peer id is always passed; the collector drops it unless
+            # MX_METRICS_SOURCE_ID_LABEL=1, so the cardinality decision lives in
+            # one place rather than being duplicated at every call site.
             selection_metrics.record_selection(policy, worker_id)
             transfer_start = time.perf_counter()
             try:
@@ -215,8 +218,6 @@ class RdmaStrategy(LoadStrategy):
                     "transfer_retry" if has_next_candidate else "transfer_fallback",
                 )
                 if not has_next_candidate:
-                    if needs_outer_reinit and not e.mutated:
-                        raise StrategyFailed(str(e), mutated=True) from e
                     raise
 
                 logger.warning(
@@ -233,14 +234,20 @@ class RdmaStrategy(LoadStrategy):
                     ) from cleanup_error
                 if e.mutated:
                     try:
-                        result = ctx.adapter.reinit_for_retry(result)
+                        clear_exception_tracebacks(e)
+                        reinitialized = ctx.adapter.reinit_for_retry(result)
+                        # LoadResult is the stable envelope shared with the
+                        # outer strategy chain. Some adapters return a new
+                        # envelope, so copy its restored state back rather than
+                        # leaving the outer owner with the cleared pre-retry
+                        # object if all later candidates miss.
+                        if reinitialized is not result:
+                            vars(result).update(vars(reinitialized))
                     except Exception as reinit_error:
-                        raise StrategyFailed(
+                        raise StrategyRecoveryError(
                             f"Failed to reinitialize target after source worker "
                             f"{worker_id} failed: {reinit_error}",
-                            mutated=True,
                         ) from reinit_error
-                    needs_outer_reinit = True
                 continue
             except BaseException:
                 selection_metrics.observe_transfer_seconds(
@@ -259,11 +266,9 @@ class RdmaStrategy(LoadStrategy):
             f"[Worker {ctx.global_rank}] Tried {tried} of {len(candidates)} source workers "
             f"(max retries={MAX_SOURCE_RETRIES}), falling through"
         )
-        # An internal reinit returns a new result, but the outer strategy chain
-        # still owns the original result that the adapter cleared.
         raise StrategyFailed(
             "No RDMA source succeeded",
-            mutated=needs_outer_reinit,
+            mutated=False,
         )
 
     def _find_source_instances(
@@ -277,6 +282,7 @@ class RdmaStrategy(LoadStrategy):
         ``random``). The retry slice (MAX_SOURCE_RETRIES) is applied by the
         caller in load(), so the selector controls ordering only.
         """
+        policy = configured_policy_label()
         try:
             list_resp = ctx.mx_client.list_sources(
                 identity=ctx.identity,
@@ -286,6 +292,14 @@ class RdmaStrategy(LoadStrategy):
                 logger.debug(
                     f"[Worker {ctx.global_rank}] No ready source instances found"
                 )
+                # Record the empty funnel before returning. Without this,
+                # ``stage="listed"`` could never observe zero -- the one bucket
+                # that distinguishes "no peers published" from "peers listed but
+                # every one filtered out" was unreachable, so the two looked
+                # identical on a dashboard.
+                selection_metrics.record_list_sources(policy, "empty")
+                for stage in ("listed", "rank_matched", "accelerator_matched"):
+                    selection_metrics.observe_candidates(policy, stage, 0)
                 return []
 
             rank_matched = [
@@ -317,6 +331,7 @@ class RdmaStrategy(LoadStrategy):
             ordered = selector.order(candidates, ctx)
             select_seconds = time.perf_counter() - select_start
 
+            selection_metrics.record_list_sources(selector.name, "ok")
             selection_metrics.observe_candidates(
                 selector.name, "listed", len(list_resp.instances)
             )
@@ -346,6 +361,11 @@ class RdmaStrategy(LoadStrategy):
             logger.warning(
                 f"[Worker {ctx.global_rank}] Error listing sources, falling through: {e}"
             )
+            # A ListSources RPC failure used to record nothing at all, so a
+            # complete backend outage was indistinguishable from a cluster with
+            # no peers -- both showed up as an absence. This counter is what
+            # separates them.
+            selection_metrics.record_list_sources(policy, "error")
             return []
 
     def _accelerator_compatible(

@@ -80,7 +80,7 @@ pub struct EvictionResult {
 }
 
 /// Reason for cache eviction
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EvictionReason {
     /// Models exceeded unused time threshold
     TimeThreshold,
@@ -92,6 +92,19 @@ pub enum EvictionReason {
     Manual,
 }
 
+/// One model selected for eviction, with the rule that picked it.
+///
+/// The reason travels with the model rather than with the cycle: a single pass
+/// can evict some models for age and others for the count limit, and a
+/// cycle-level reason has to pick one and misreport the rest.
+#[derive(Debug, Clone)]
+pub struct EvictionCandidate {
+    /// Registry key of the model to evict.
+    pub model_name: String,
+    /// Which rule selected it.
+    pub reason: EvictionReason,
+}
+
 /// Trait for implementing different eviction policies
 #[async_trait::async_trait]
 pub trait EvictionPolicyTrait {
@@ -100,7 +113,7 @@ pub trait EvictionPolicyTrait {
         &self,
         models: &[ModelRecord],
         config: &CacheEvictionConfig,
-    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>>;
+    ) -> Result<Vec<EvictionCandidate>, Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// LRU (Least Recently Used) eviction policy implementation
@@ -133,7 +146,7 @@ impl EvictionPolicyTrait for LruEvictionPolicy {
         &self,
         models: &[ModelRecord],
         config: &CacheEvictionConfig,
-    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Vec<EvictionCandidate>, Box<dyn std::error::Error + Send + Sync>> {
         let EvictionPolicyType::Lru(lru_config) = &config.policy;
 
         let mut candidates_for_eviction = Vec::new();
@@ -157,7 +170,10 @@ impl EvictionPolicyTrait for LruEvictionPolicy {
                     model_name = model.model_name,
                     last_used_at = model.last_used_at
                 );
-                candidates_for_eviction.push(model.model_name.clone());
+                candidates_for_eviction.push(EvictionCandidate {
+                    model_name: model.model_name.clone(),
+                    reason: EvictionReason::TimeThreshold,
+                });
             }
         }
 
@@ -178,8 +194,14 @@ impl EvictionPolicyTrait for LruEvictionPolicy {
                 sorted_models.sort_by_key(|model| model.last_used_at);
 
                 for model in sorted_models.iter().take(models_to_remove_by_count) {
-                    if !candidates_for_eviction.contains(&model.model_name) {
-                        candidates_for_eviction.push(model.model_name.clone());
+                    if !candidates_for_eviction
+                        .iter()
+                        .any(|candidate| candidate.model_name == model.model_name)
+                    {
+                        candidates_for_eviction.push(EvictionCandidate {
+                            model_name: model.model_name.clone(),
+                            reason: EvictionReason::CountLimit,
+                        });
                     }
                 }
             }
@@ -209,6 +231,7 @@ pub struct CacheEvictionService {
     registry: Arc<RegistryManager>,
     config: CacheEvictionConfig,
     cache_directory: PathBuf,
+    metrics: crate::metrics::cache::CacheMetrics,
 }
 
 impl CacheEvictionService {
@@ -217,8 +240,10 @@ impl CacheEvictionService {
         registry: Arc<RegistryManager>,
         config: CacheEvictionConfig,
         cache_directory: PathBuf,
+        metrics: crate::metrics::cache::CacheMetrics,
     ) -> Self {
         Self {
+            metrics,
             registry,
             config,
             cache_directory,
@@ -306,10 +331,15 @@ impl CacheEvictionService {
 
         // Remove models from the database and filesystem
         let mut successfully_evicted = Vec::new();
-        for model_name in &models_to_evict {
+        for candidate in &models_to_evict {
+            let model_name = &candidate.model_name;
             match self.evict_model(model_name).await {
                 Ok(()) => {
                     successfully_evicted.push(model_name.clone());
+                    // Counted per model, with the rule that actually selected it:
+                    // one cycle can evict some models for age and others for the
+                    // count limit.
+                    self.metrics.record_eviction(candidate.reason);
                     info!(
                         "Successfully evicted model: {model_name}",
                         model_name = model_name
@@ -329,7 +359,11 @@ impl CacheEvictionService {
             evicted_count: successfully_evicted.len() as u32,
             evicted_models: successfully_evicted,
             bytes_freed: None, // Could be implemented with actual file size tracking
-            reason: EvictionReason::TimeThreshold,
+            // A summary of a cycle that may have evicted for more than one
+            // reason; the per-reason breakdown is in mx_cache_evictions_total.
+            reason: models_to_evict
+                .first()
+                .map_or(EvictionReason::TimeThreshold, |candidate| candidate.reason),
         };
 
         if result.evicted_count > 0 {
@@ -409,44 +443,6 @@ impl CacheEvictionService {
         Ok(())
     }
 
-    /// Manually trigger eviction for specific models
-    pub async fn manual_evict(
-        &self,
-        model_names: &[String],
-    ) -> Result<EvictionResult, Box<dyn std::error::Error + Send + Sync>> {
-        info!(
-            "Manual eviction requested for models: {models:?}",
-            models = model_names
-        );
-
-        let mut successfully_evicted = Vec::new();
-        for model_name in model_names {
-            match self.evict_model(model_name).await {
-                Ok(()) => {
-                    successfully_evicted.push(model_name.clone());
-                    info!(
-                        "Successfully evicted model: {model_name}",
-                        model_name = model_name
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to evict model '{model_name}': {e}",
-                        model_name = model_name,
-                        e = e
-                    );
-                }
-            }
-        }
-
-        Ok(EvictionResult {
-            evicted_count: successfully_evicted.len() as u32,
-            evicted_models: successfully_evicted,
-            bytes_freed: None,
-            reason: EvictionReason::Manual,
-        })
-    }
-
     /// Get statistics about the current cache state
     pub async fn get_cache_stats(
         &self,
@@ -505,8 +501,49 @@ mod tests {
     ) -> (CacheEvictionService, TempDir) {
         let registry = Arc::new(RegistryManager::with_backend(Arc::new(mock)));
         let cache_dir = TempDir::new().expect("Failed to create cache directory");
-        let service = CacheEvictionService::new(registry, config, cache_dir.path().to_path_buf());
+        let service = CacheEvictionService::new(
+            registry,
+            config,
+            cache_dir.path().to_path_buf(),
+            crate::metrics::cache::CacheMetrics::register(&mut crate::metrics::new_registry()),
+        );
         (service, cache_dir)
+    }
+
+    /// As [`service_with_mock`], but hands back the Prometheus registry the
+    /// eviction counter was registered into.
+    ///
+    /// [`service_with_mock`] registers into a temporary registry that is dropped on
+    /// the spot, so nothing recorded through it can ever be encoded and any metric
+    /// assertion against a service built that way would be vacuous.
+    fn service_with_mock_and_registry(
+        mock: MockRegistryBackend,
+        config: CacheEvictionConfig,
+    ) -> (
+        CacheEvictionService,
+        TempDir,
+        prometheus_client::registry::Registry,
+    ) {
+        let mut metrics_registry = crate::metrics::new_registry();
+        let metrics = crate::metrics::cache::CacheMetrics::register(&mut metrics_registry);
+        let registry = Arc::new(RegistryManager::with_backend(Arc::new(mock)));
+        let cache_dir = TempDir::new().expect("Failed to create cache directory");
+        let service =
+            CacheEvictionService::new(registry, config, cache_dir.path().to_path_buf(), metrics);
+        (service, cache_dir, metrics_registry)
+    }
+
+    /// Value of `mx_cache_evictions_total{reason=...}`, or 0 when the series was
+    /// never created. A reason that is never emitted is absent rather than zero,
+    /// which is exactly the case a `contains` assertion cannot tell apart from a
+    /// wrong count.
+    fn evictions_for(encoded: &str, reason: &str) -> i64 {
+        let prefix = format!(r#"mx_cache_evictions_total{{reason="{reason}"}} "#);
+        encoded
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix.as_str()))
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or_default()
     }
 
     #[test]
@@ -650,7 +687,8 @@ mod tests {
 
         // Should only evict the old downloaded model, not the downloading one
         assert_eq!(evicted.len(), 1);
-        assert_eq!(evicted[0], "old-model");
+        assert_eq!(evicted[0].model_name, "old-model");
+        assert_eq!(evicted[0].reason, EvictionReason::TimeThreshold);
     }
 
     #[tokio::test]
@@ -702,7 +740,11 @@ mod tests {
 
         // Should evict the oldest model to stay within the limit of 2
         assert_eq!(evicted.len(), 1);
-        assert_eq!(evicted[0], "model1");
+        assert_eq!(evicted[0].model_name, "model1");
+        // Selected by the count limit, not by age. This assertion is the whole
+        // point of carrying the reason per candidate: before, this path was
+        // reported as a time-threshold eviction.
+        assert_eq!(evicted[0].reason, EvictionReason::CountLimit);
     }
 
     #[tokio::test]
@@ -840,6 +882,150 @@ mod tests {
             evict_and_report_surviving_snapshots(&key(Some("abc123"), false), vec![])
                 .await
                 .is_empty()
+        );
+    }
+
+    fn record_used_days_ago(model_name: &str, days: i64) -> ModelRecord {
+        let then = Utc::now()
+            .checked_sub_signed(Duration::days(days))
+            .expect("timestamp in range");
+        ModelRecord {
+            model_name: model_name.to_string(),
+            provider: ModelProvider::HuggingFace,
+            status: ModelStatus::DOWNLOADED,
+            created_at: then,
+            last_used_at: then,
+            message: None,
+        }
+    }
+
+    fn lru_config(unused_threshold_days: i64, max_models: Option<u32>) -> CacheEvictionConfig {
+        CacheEvictionConfig {
+            enabled: true,
+            policy: EvictionPolicyType::Lru(LruConfig {
+                unused_threshold: DurationConfig::new(Duration::days(unused_threshold_days)),
+                max_models,
+                min_free_space_bytes: None,
+            }),
+            check_interval: DurationConfig::hours(1),
+        }
+    }
+
+    /// A mock that lets a whole cycle run against `records`: the cycle lists them
+    /// once and `evict_model` lists them again per victim, then reads and deletes
+    /// each victim's record. The cache directory is empty, which the Hugging Face
+    /// provider treats as a no-op delete, so nothing here touches the network.
+    fn mock_over(records: Vec<ModelRecord>) -> MockRegistryBackend {
+        let mut mock = MockRegistryBackend::new();
+        let listed = records.clone();
+        mock.expect_get_models_by_last_used()
+            .returning(move |_| Ok(listed.clone()));
+        mock.expect_get_model_record()
+            .returning(move |name| Ok(Some(downloaded_record(name))));
+        mock.expect_delete_model().returning(|_| Ok(()));
+        mock
+    }
+
+    /// The shipped-a-wrong-number bug, one layer below where it was fixed. The
+    /// policy now carries the rule that selected each model, but nothing checked
+    /// that the reason survives the trip to the counter: an operator tuning
+    /// `max_models` would see `reason="count_limit"` sit at zero forever while
+    /// every count-limit eviction was attributed to the time threshold.
+    ///
+    /// `test_lru_eviction_policy_count_based` asserts the candidate struct, which
+    /// is a different claim -- it stays green when the service mislabels the
+    /// counter.
+    #[tokio::test]
+    async fn a_count_limit_eviction_is_counted_as_a_count_limit() {
+        let records = vec![
+            record_used_days_ago("model1", 3),
+            record_used_days_ago("model2", 2),
+            record_used_days_ago("model3", 1),
+        ];
+        // Nothing is old enough for the time rule; only the count limit fires.
+        let (service, _cache_dir, metrics_registry) =
+            service_with_mock_and_registry(mock_over(records), lru_config(30, Some(2)));
+
+        let result = service.run_eviction_cycle().await.expect("eviction cycle");
+        assert_eq!(result.evicted_count, 1);
+        assert_eq!(result.evicted_models, vec!["model1".to_string()]);
+        // The cycle summary reports the rule that actually fired, not a default.
+        assert_eq!(result.reason, EvictionReason::CountLimit);
+
+        let encoded = crate::metrics::encode_text(&metrics_registry)
+            .unwrap_or_else(|_| String::from("<encode failed>"));
+        assert_eq!(evictions_for(&encoded, "count_limit"), 1, "{encoded}");
+        assert_eq!(
+            evictions_for(&encoded, "time_threshold"),
+            0,
+            "the count rule must not be reported as an age eviction: {encoded}"
+        );
+    }
+
+    /// One pass can evict some models for age and others for the count limit, which
+    /// is why the reason travels per candidate rather than per cycle. A single
+    /// cycle-level reason has to pick one and misreport the rest, and no
+    /// single-reason test can tell the two designs apart.
+    #[tokio::test]
+    async fn a_mixed_cycle_counts_each_model_against_its_own_rule() {
+        let records = vec![
+            record_used_days_ago("stale-model", 8),
+            record_used_days_ago("mid-model", 3),
+            record_used_days_ago("fresh-model", 1),
+        ];
+        // stale-model is past the 7-day threshold; the limit of 1 then also takes
+        // the next-oldest, and that one is selected by the count rule.
+        let (service, _cache_dir, metrics_registry) =
+            service_with_mock_and_registry(mock_over(records), lru_config(7, Some(1)));
+
+        let result = service.run_eviction_cycle().await.expect("eviction cycle");
+        assert_eq!(result.evicted_count, 2);
+
+        let encoded = crate::metrics::encode_text(&metrics_registry)
+            .unwrap_or_else(|_| String::from("<encode failed>"));
+        assert_eq!(
+            evictions_for(&encoded, "time_threshold"),
+            1,
+            "the aged model is one time-threshold eviction: {encoded}"
+        );
+        assert_eq!(
+            evictions_for(&encoded, "count_limit"),
+            1,
+            "the model taken to satisfy max_models is a count-limit eviction: {encoded}"
+        );
+    }
+
+    /// The counter is booked inside the success arm, so it stays a count of models
+    /// that actually left the cache. Counting selections instead would report disk
+    /// as reclaimed while the entries are still there and the next cycle retries
+    /// them, double-counting the same model on every pass.
+    #[tokio::test]
+    async fn an_eviction_that_fails_is_not_counted() {
+        let records = vec![
+            record_used_days_ago("model1", 3),
+            record_used_days_ago("model2", 2),
+            record_used_days_ago("model3", 1),
+        ];
+        let listed = records.clone();
+        let mut mock = MockRegistryBackend::new();
+        mock.expect_get_models_by_last_used()
+            .returning(move |_| Ok(listed.clone()));
+        // The record vanished between selection and eviction, so evict_model errors
+        // before it can delete anything.
+        mock.expect_get_model_record().returning(|_| Ok(None));
+
+        let (service, _cache_dir, metrics_registry) =
+            service_with_mock_and_registry(mock, lru_config(30, Some(2)));
+
+        let result = service.run_eviction_cycle().await.expect("eviction cycle");
+        assert_eq!(result.evicted_count, 0);
+
+        let encoded = crate::metrics::encode_text(&metrics_registry)
+            .unwrap_or_else(|_| String::from("<encode failed>"));
+        assert_eq!(
+            evictions_for(&encoded, "count_limit"),
+            0,
+            "a failed eviction freed nothing and must not be counted: {encoded}"
         );
     }
 }

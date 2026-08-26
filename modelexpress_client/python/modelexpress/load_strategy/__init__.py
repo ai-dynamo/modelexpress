@@ -16,12 +16,13 @@ import torch.nn as nn
 
 from modelexpress.tracing import tracer
 
-from ..adapter import StrategyFailed, UnsupportedCapability
+from ..adapter import StrategyFailed, StrategyRecoveryError, UnsupportedCapability
 from .base import (
     LoadContext,
     LoadResult,
     LoadStrategy,
     SourceTransferError,
+    clear_exception_tracebacks,
     publish_source_if_supported,
     register_tensors,
     publish_metadata,
@@ -61,16 +62,16 @@ class LoadStrategyChain:
         Returns the (possibly re-initialized) model on success.
         Raises RuntimeError if no strategy succeeds.
         """
-        from .trainer_pull_strategy import TrainerPullStrategy
         from .rdma_strategy import RdmaStrategy
+        from .server_cache_strategy import ServerCacheStrategy
         from .instant_tensor_strategy import InstantTensorStrategy
         from .model_streamer_strategy import ModelStreamerStrategy
         from .gds_strategy import GdsStrategy
         from .default_strategy import DefaultStrategy
 
         all_strategies: list[LoadStrategy] = [
-            TrainerPullStrategy(),
             RdmaStrategy(),
+            ServerCacheStrategy(),
             InstantTensorStrategy(),
             ModelStreamerStrategy(),
             GdsStrategy(),
@@ -92,6 +93,12 @@ class LoadStrategyChain:
                     publish_source_if_supported(result, ctx)
                     span.set_attribute("weight_loading_strategy", strategy.name)
                     return result.value
+                except StrategyRecoveryError:
+                    # Recovery already failed, so no later strategy can safely
+                    # use the current model. Fail closed and retain the original
+                    # recovery error as the exception cause.
+                    strategy.rollback(ctx)
+                    raise
                 except StrategyFailed as e:
                     logger.warning(
                         f"[Worker {ctx.global_rank}] Strategy {strategy.name} failed, "
@@ -99,6 +106,7 @@ class LoadStrategyChain:
                     )
                     strategy.rollback(ctx)
                     if e.mutated:
+                        clear_exception_tracebacks(e)
                         result = LoadStrategyChain._reinit_for_retry(result, ctx, strategy)
                     continue
                 except Exception as e:

@@ -124,6 +124,55 @@ def test_unsupported_op_falls_back_per_source():
     assert by_src["q"].dest_offset == 0 and by_src["norm"].op_chain == ()
 
 
+def test_unsupported_source_records_the_op_that_defeated_capture():
+    """The count alone cannot distinguish an unexpressible fused layout from a
+    loader that merely touched one op outside the allowlist, so keep the cause."""
+    with torch.device("meta"):
+        model = ToyModel(with_bad=True)
+    result = capture_geometry(model, _manifest(with_bad=True))
+
+    assert set(result.unsupported_reasons) == {"bad"}
+    reason = result.unsupported_reasons["bad"]
+    assert "unsupported op" in reason
+    assert "aten.mul" in reason
+    # The offending source and its op-chain stay in the message, which is what
+    # makes a single failure actionable without a re-run.
+    assert "'bad'" in reason
+
+
+def test_summarize_unsupported_groups_one_cause_across_many_sources():
+    """Thousands of sources failing for one reason must read as one cause. Each
+    message embeds its own source name, so grouping has to ignore that tail."""
+    from modelexpress.refit.reshard.types import summarize_unsupported
+
+    reasons = {
+        f"model.layers.0.mlp.experts.{i}.gate_proj.weight": (
+            f"unsupported op aten.index_copy_ on lazy "
+            f"'model.layers.0.mlp.experts.{i}.gate_proj.weight' (chain=());"
+        )
+        for i in range(128)
+    }
+    reasons["odd"] = "unsupported op aten.mul on lazy 'odd' (chain=());"
+
+    assert summarize_unsupported(reasons) == [
+        ("unsupported op aten.index_copy_", 128),
+        ("unsupported op aten.mul", 1),
+    ]
+
+
+def test_summarize_unsupported_accepts_none_for_all_causes():
+    from modelexpress.refit.reshard.types import summarize_unsupported
+
+    reasons = {
+        f"source-{index}": f"cause-{index} on lazy 'source-{index}'"
+        for index in range(4)
+    }
+
+    assert summarize_unsupported(reasons, limit=None) == [
+        (f"cause-{index}", 1) for index in range(4)
+    ]
+
+
 def test_capture_feeds_slice_plan():
     """Compose capture -> slice-plan: real captured copies drive plan_pull. The
     row-parallel source (full [4,8], need cols [0:4]) is strided -> 4 runs

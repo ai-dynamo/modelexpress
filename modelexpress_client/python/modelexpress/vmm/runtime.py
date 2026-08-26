@@ -244,10 +244,12 @@ def log_arena_post_load(ctx: "LoadContext") -> None:
     ``ibv_reg_dmabuf_mr`` over ``[base, base+used_bytes)`` already ran
     inside ``LoadStrategyChain`` via
     ``NixlTransferManager.register_arena``; this hook is purely
-    diagnostic. Empirically validated on Blackwell + ConnectX over
-    InfiniBand: the registration succeeds over a VA range with
+    diagnostic. Validated on the dmabuf/IB path, Blackwell + ConnectX
+    over InfiniBand: the registration succeeds over a VA range with
     mid-range holes from prior ``cuMemUnmap`` calls, and the dmabuf pin
-    keeps live tensor pages addressable to the HCA.
+    keeps live tensor pages addressable to the HCA. On ``cuda_ipc`` a
+    multi-allocation arena cannot be covered by one MR at all, and
+    ``register_arena`` falls back to per-tensor registration.
     """
     arena = _vmm_arenas.get(ctx.device_id)
     if arena is None:

@@ -41,7 +41,8 @@
 #                         interchangeable copies at worker_rank 0, tp_size=1); EP
 #                         uses expert parallelism (--enable-expert-parallel over a
 #                         TP=2 MoE world, rank-distinct weights, tp_size=2, the
-#                         identity hash carrying expert_parallel_size > 0). See
+#                         identity hash carrying a derived expert-parallel world
+#                         size of tp * dp * pcp rather than a constant). See
 #                         TEST_PLAN rows 5.2 and 5.3.
 #
 #   test-p2p-mla-model — vLLM + SGLang MLA/MoE P2P test on the full-GPU A100b
@@ -720,9 +721,11 @@ jobs:
   #
   # EP (--enable-expert-parallel over TP=2, MoE model): experts shard per rank,
   # so weights stay rank-distinct and transfers are rank-paired like TP
-  # (tp_size=2). The new coverage is the identity hash carrying
-  # expert_parallel_size > 0 (TEST_PLAN row 5.3) — a source/target mismatch there
-  # forces a disk fallback and fails the RDMA marker assertion.
+  # (tp_size=2). The new coverage is the identity hash carrying an
+  # expert-parallel world size derived as tp * dp * pcp rather than read from a
+  # ParallelConfig attribute that does not exist (TEST_PLAN row 5.3, MX-440) —
+  # a source/target mismatch there forces a disk fallback and fails the RDMA
+  # marker assertion.
   #
   # Both run single-node on the scarce full-GPU non-MIG pool (4 GPUs each), so
   # matrix max-parallel: 1 serializes them back-to-back to halve peak demand

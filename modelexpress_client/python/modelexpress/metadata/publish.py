@@ -41,59 +41,6 @@ def _get_worker_server(device_id: int) -> "WorkerGrpcServer | None":
     return _worker_servers.get(device_id)
 
 
-def build_source_identity(
-    vllm_config, model_config,
-) -> p2p_pb2.SourceIdentity:
-    """Build a SourceIdentity from vLLM config objects."""
-    from importlib.metadata import version as pkg_version
-
-    try:
-        mx_version = pkg_version("modelexpress")
-    except Exception:
-        mx_version = "0.0.0"
-
-    parallel = vllm_config.parallel_config
-    tp_size = getattr(parallel, "tensor_parallel_size", 1)
-    pp_size = getattr(parallel, "pipeline_parallel_size", 1)
-    ep_size = getattr(parallel, "expert_parallel_size", 0)
-
-    # torch.dtype.__str__ returns e.g. "torch.bfloat16"; strip the prefix
-    dtype = str(model_config.dtype).replace("torch.", "")
-    quantization = model_config.quantization or ""
-
-    return p2p_pb2.SourceIdentity(
-        mx_version=mx_version,
-        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
-        model_name=model_config.model,
-        backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
-        tensor_parallel_size=tp_size,
-        pipeline_parallel_size=pp_size,
-        expert_parallel_size=ep_size,
-        dtype=dtype,
-        quantization=quantization,
-        revision=_resolve_model_revision(model_config),
-    )
-
-
-def _resolve_model_revision(model_config) -> str:
-    """Resolve the model revision for content-addressed identity.
-
-    Priority:
-    1. MX_MODEL_REVISION env var (explicit deployer override, useful
-       for local checkpoints or non-HF sources).
-    2. model_config.revision (from vLLM's ModelConfig; typically the
-       HuggingFace commit SHA or branch/tag that was loaded).
-    3. Empty string (unknown revision; handshake relies on the other
-       identity fields only, and decentralized deployments lose the
-       bit-identical guarantee).
-    """
-    override = envs.MX_MODEL_REVISION
-    if override:
-        return override
-    revision = getattr(model_config, "revision", None)
-    return revision or ""
-
-
 def build_tensor_protos(
     tensors: dict[str, torch.Tensor],
     device_id: int,
@@ -146,8 +93,7 @@ def publish_metadata_and_ready(
 
         host = _get_worker_host()
 
-        grpc_base = envs.MX_WORKER_GRPC_PORT
-        worker_grpc_port = grpc_base + device_id
+        worker_grpc_port = envs.MX_WORKER_GRPC_PORT + device_id
 
         grpc_server = WorkerGrpcServer(
             tensor_protos=tensor_protos,

@@ -143,16 +143,22 @@ async fn concurrent_claims_yield_single_winner() {
     // assertion that guarantees multi-replica servers never double-download.
     let mut winners = 0;
     let mut observers = 0;
+    let mut takeovers = 0;
     for h in handles {
         let outcome = h.await.expect("spawn join").expect("claim result");
         match outcome {
             ClaimOutcome::Claimed => winners += 1,
+            ClaimOutcome::TookOver => takeovers += 1,
             ClaimOutcome::AlreadyExists(s) => {
                 assert_eq!(s, ModelStatus::DOWNLOADING);
                 observers += 1;
             }
         }
     }
+    // The key is fresh and the lease outlives the test, so nothing can expire:
+    // every owner here must be a first claim. A takeover would mean the lease
+    // check is not holding under contention.
+    assert_eq!(takeovers, 0, "no lease can expire during this test");
     assert_eq!(winners, 1, "exactly one replica must claim");
     assert_eq!(observers, 7, "the other seven must observe");
 

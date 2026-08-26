@@ -106,7 +106,7 @@ Refit has two independent optimization surfaces:
 1. **Move fewer and better-shaped bytes.** The reshard planner selects source ranges and NIXL reads them into receiver buffers.
 2. **Commit those bytes with less loader overhead.** The inference adapter updates live model storage, quantization scales, fused parameters, and derived tensors.
 
-[`VllmReshardReceiver`](../engines/vllm/refit/receiver.py) implements the receiver hooks for vLLM. It captures load-time geometry on an unquantized meta-model twin and uses vLLM's layerwise reload path to preserve storage referenced by compiled Compute Unified Device Architecture (CUDA) graphs.
+The RL path keeps transfer and engine concerns separate. [`nixl_staged_transfer.py`](../../modelexpress_rl/inference/nixl_staged_transfer.py) owns exact-manifest planning, registered staging, transfer, and verification. The private vLLM [`installer.py`](../../modelexpress_rl/inference/engines/vllm/installer.py) captures load-time geometry on an unquantized meta-model twin and uses vLLM's layerwise reload path to preserve storage referenced by compiled Compute Unified Device Architecture (CUDA) graphs.
 
 [`MdlLoader`](../engines/vllm/refit/installer.py) is a separate experimental vLLM installer called Mapped Direct Load (MDL). It caches direct, fused, and expert destination views so warm updates can copy into known slots instead of repeating general loader dispatch. MDL can consume partial input batches, but the reshard transport in this package does not yet expose a selector that reduces wire bytes for partial updates. The two features must not be treated as one end-to-end partial-refit path until that selector is wired and validated.
 
@@ -163,7 +163,8 @@ A trainer restart, reshard, scale event, or buffer replacement requires rediscov
 | Per-source batched NIXL reads | Implemented | [`transport/nixl.py`](reshard/transport/nixl.py), [`test_reshard_refit_nixl_transport.py`](../../tests/test_reshard_refit_nixl_transport.py) |
 | Same-shape dtype conversion | Implemented through staging buffers | [`receiver.py`](reshard/receiver.py) |
 | Stable-topology plan and buffer reuse | Implemented | [`ReshardReceiver`](reshard/receiver.py) |
-| vLLM geometry capture and layerwise install | Implemented adapter code | [`engines/vllm/refit/receiver.py`](../engines/vllm/refit/receiver.py) |
+| RL exact-version staged NIXL transfer | Implemented | [`modelexpress_rl/inference/nixl_staged_transfer.py`](../../modelexpress_rl/inference/nixl_staged_transfer.py) |
+| vLLM geometry capture and layerwise install | Implemented adapter code | [`modelexpress_rl/inference/engines/vllm/installer.py`](../../modelexpress_rl/inference/engines/vllm/installer.py) |
 | vLLM mapped direct install | Implemented as a separate opt-in installer | [`engines/vllm/refit/installer.py`](../engines/vllm/refit/installer.py) |
 | Normalized refit timing schema | Implemented | [`timing.py`](timing.py), [`test_refit_timing.py`](../../tests/test_refit_timing.py) |
 | Descriptor bound for strided slices | Implemented for gap-free dim-0 partitions | [`transfer_plan.py`](reshard/transfer_plan.py), [`test_reshard_refit_transfer.py`](../../tests/test_reshard_refit_transfer.py) |
@@ -180,7 +181,7 @@ A trainer restart, reshard, scale event, or buffer replacement requires rediscov
 | Topology-change handling | The cached plan is not invalidated after trainer restart, reshard, scaling, or address change. |
 | Partial/subset wire filtering | MDL accepts subset batches, but the reshard receiver currently executes its full cached plan on each update. |
 | Expert-aware wire filtering | Expert destination mapping exists in MDL; the reshard planner has no receiver-owned expert selector. |
-| Parameter digest verification | The package has reference equality tests but no distributed source-to-destination digest gate in the live receiver. |
+| Parameter digest verification | Publishers can stamp each shard with a position-sensitive digest (`MX_RESHARD_PUBLISH_DIGEST`, see `refit/reshard/verify.py`), and it is carried through discovery into the planning inputs, but the live receiver does not yet recompute and compare. The comparison needs a fresh-discovery refresh of the expectation, or ordinary training updates between prepare and a later step read as corruption. |
 | Inference-to-inference fan-out | Rollout workers do not republish installed refit buffers through this package. |
 | General engine support | The shared core is engine-neutral, but only a vLLM receiver adapter is present. |
 | General trainer support | Framework-specific FSDP, DTensor, and Megatron publisher adapters are not present here. |
@@ -299,7 +300,8 @@ Performance claims must identify the exact implementation path. Reference transp
 | [`reshard/rendezvous.py`](reshard/rendezvous.py) | Publish/discover shard ownership and NIXL endpoints |
 | [`reshard/receiver.py`](reshard/receiver.py) | Shared receiver lifecycle, buffers, staging, and install hooks |
 | [`reshard/transport/`](reshard/transport/) | Reference and NIXL transport adapters |
-| [`engines/vllm/refit/receiver.py`](../engines/vllm/refit/receiver.py) | vLLM geometry capture and graph-safe layerwise install |
+| [`modelexpress_rl/inference/nixl_staged_transfer.py`](../../modelexpress_rl/inference/nixl_staged_transfer.py) | RL exact-manifest planning, staged NIXL transfer, and verification |
+| [`modelexpress_rl/inference/engines/vllm/installer.py`](../../modelexpress_rl/inference/engines/vllm/installer.py) | vLLM geometry capture and graph-safe layerwise install |
 | [`engines/vllm/refit/installer.py`](../engines/vllm/refit/installer.py) | Optional vLLM mapped direct installer |
 
 ## Related documentation

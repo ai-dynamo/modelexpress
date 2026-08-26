@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use modelexpress_common::models::{ModelProvider, ModelStatus};
 use std::sync::Arc;
 
+pub mod instrumented;
 pub mod kubernetes;
 #[cfg(feature = "memory-backend")]
 pub mod memory;
@@ -36,11 +37,27 @@ pub struct ModelRecord {
 /// `AlreadyExists` must wait on the owner instead of spawning a duplicate download.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ClaimOutcome {
-    /// This call atomically created the registry record or took over an expired lease.
-    /// The caller is the download owner.
+    /// This call atomically created the registry record. The caller is the download
+    /// owner and this is the first download of this entry.
     Claimed,
-    /// The record already existed when we tried to claim. The caller is a waiter, not
-    /// the owner; the enclosed status is the snapshot observed during the attempt.
+    /// This call took over an **expired lease**. The caller owns the download,
+    /// exactly as for [`ClaimOutcome::Claimed`], and every caller that only cares
+    /// about ownership should match the two together.
+    ///
+    /// Expiry is what this observes, not death. The previous owner may still be
+    /// running -- a missed heartbeat or a connectivity blip expires a lease just
+    /// as a crash does -- which is precisely why `finish_download_claim` fences
+    /// the old owner rather than trusting it to stop.
+    ///
+    /// They are distinguished because the cost is not comparable. A `Claimed` is the
+    /// first fetch of a model; a `TookOver` means the bytes are being pulled again
+    /// because the previous downloader died, which for a large model is hundreds of
+    /// gigabytes of repeated transfer. Collapsing them makes that invisible.
+    TookOver,
+    /// The record already existed and its lease is still held, so **this caller
+    /// does not own the download** and must wait on the owner instead of starting
+    /// a duplicate. Returned without mutating the registry; the enclosed status is
+    /// the snapshot observed during the attempt.
     AlreadyExists(ModelStatus),
 }
 
