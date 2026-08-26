@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from modelexpress.refit.reshard.rendezvous import unwrap_rendezvous_blob
+from modelexpress.refit.reshard.verify import tensor_digest
 from modelexpress_rl.train.engines.fsdp.publisher import (
     LocalTensorShard,
     build_fsdp_reshard_manifest,
@@ -115,6 +116,20 @@ def test_build_manifest_publishes_the_served_device_ordinal(device, expected_dev
     (published,) = payload.tensors
     (pshard,) = published.shards
     assert pshard.device_id == expected_device_id
+
+
+def test_build_manifest_publishes_enabled_verification_digest(monkeypatch):
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
+    tensor = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)
+    shard = LocalTensorShard("w", (2, 4), (0, 0), (2, 4), tensor)
+
+    payload = unwrap_rendezvous_blob(
+        build_fsdp_reshard_manifest(
+            manager=_Manager(), shards=[shard], metadata_endpoint="host:1234"
+        )
+    )
+
+    assert payload.tensors[0].shards[0].digest == tensor_digest(tensor)
 
 
 def test_build_manifest_groups_multiple_shards_under_one_tensor():

@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     MX_TRAINER_ENGINE: str
     MX_TRAINER_STAGING_MODE: str
     MX_WEIGHT_PAYLOAD_FORMAT: str
+    RANK: str | None
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -36,6 +37,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_WEIGHT_PAYLOAD_FORMAT": lambda: (
         os.environ.get("MX_WEIGHT_PAYLOAD_FORMAT", "FULL_TENSOR").strip().upper()
     ),
+    "RANK": lambda: os.environ.get("RANK"),
 }
 
 
