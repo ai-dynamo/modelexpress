@@ -17,6 +17,11 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from modelexpress import p2p_pb2
+from modelexpress.client import MxClientBase
+from modelexpress.load_strategy.base import unpublish_metadata_for_worker
+from modelexpress.metadata.payload import worker_tensor_descriptors
+from modelexpress.metadata.publish import publish_metadata_and_ready
 from modelexpress.nixl_transfer import NixlTransferManager
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
 from modelexpress.refit.reshard.rendezvous import (
@@ -41,6 +46,7 @@ from modelexpress.refit.reshard.types import (
     summarize_unsupported,
 )
 from modelexpress.refit.reshard.verify import shard_region, tensor_digest
+from modelexpress.types import TensorDescriptor
 
 
 @dataclass(frozen=True)
@@ -53,27 +59,21 @@ class _ResolvedSources:
 
 @dataclass(frozen=True)
 class _PreparedNixlTransfer:
-    """One immutable physical plan over reusable registered destinations.
-
-    ``plan_revision`` is process-local and changes whenever ``prepare`` rebuilds
-    the plan. It is not a control-plane weight-version number.
-    """
+    """One immutable physical plan over reusable registered destinations."""
 
     plan: TransferPlan
     capture: CaptureResult
     sources: dict
     descriptors: tuple[ReadDescriptor, ...]
     transport: NixlReshardTransport
-    plan_revision: int
 
 
 @dataclass(frozen=True)
 class _StagedNixlWeights:
-    """Verified tensors tagged with the local plan revision that produced them."""
+    """Verified tensors ready for engine installation."""
 
     tensors: dict[str, torch.Tensor]
     metrics: dict[str, Any]
-    plan_revision: int
 
 
 def _resolve_sources(manifests: list[bytes]) -> _ResolvedSources:
@@ -241,28 +241,40 @@ class _NixlStagedTransfer:
         agent_name: str,
         device_id: int,
         device: torch.device,
+        listen_port: int,
         timeout_seconds: float = 1200.0,
     ) -> None:
+        self._device_id = device_id
         self._device = device
         self._timeout = timeout_seconds
         self._manager = NixlTransferManager(
             agent_name=agent_name,
             device_id=device_id,
+            listen_port=listen_port,
         )
         try:
             self._manager.initialize()
         except Exception:
             self._manager.shutdown()
             raise
+        # Canonical engine-layout staging buffers. Exact slices land directly
+        # here; reconstructed or converted values are copied here before these
+        # buffers are verified, installed, and advertised to peer generators.
         self._recv_buffers: dict[str, torch.Tensor] = {}
+        # Wire-dtype staging for sources whose dtype differs from the engine
+        # parameter. RDMA writes here first, then stage() casts into recv buffers.
         self._convert_buffers: dict[str, torch.Tensor] = {}
+        # Complete contiguous source tensors used when captured transforms must
+        # be replayed locally, or when direct slicing exceeds the descriptor
+        # budget. stage() reconstructs each source here, then copies its derived
+        # views into the canonical receive buffers.
         self._full_buffers: dict[str, torch.Tensor] = {}
         self._registered_recv_params: set[str] = set()
         self._convert_registered = False
         self._full_registered = False
         self._active: _PreparedNixlTransfer | None = None
         self._loaded_agent_metadata: dict[str, bytes] = {}
-        self._plan_revision = 0
+        self._published_peer_rank: int | None = None
         self._closed = False
 
     def prepare(
@@ -319,14 +331,12 @@ class _NixlStagedTransfer:
             for copy in capture.copies
             if copy.src_name in resolved.sources
         }
-        self._plan_revision += 1
         prepared = _PreparedNixlTransfer(
             plan=plan,
             capture=capture,
             sources=used_sources,
             descriptors=descriptors,
             transport=transport,
-            plan_revision=self._plan_revision,
         )
         self._active = prepared
         return prepared
@@ -403,19 +413,14 @@ class _NixlStagedTransfer:
             self._full_buffers, full_expected, label="full-pull buffer"
         )
 
-        segment_params = {segment.param_name for segment in plan.segments}
+        recv_params = set(recv_expected)
         if (
             self._registered_recv_params
-            and self._registered_recv_params != segment_params
+            and self._registered_recv_params != recv_params
         ):
             raise RuntimeError(
-                "direct receive parameter set changed; restart the generator engine"
+                "receive parameter set changed; restart the generator engine"
             )
-        if not self._registered_recv_params and segment_params:
-            self._manager.register_tensors(
-                {f"__recv__{name}": self._recv_buffers[name] for name in segment_params}
-            )
-            self._registered_recv_params = segment_params
         if convert_expected and not self._convert_registered:
             self._manager.register_tensors(
                 {
@@ -432,6 +437,9 @@ class _NixlStagedTransfer:
                 }
             )
             self._full_registered = True
+        if not self._registered_recv_params and recv_params:
+            self._manager.register_tensors(self._recv_buffers)
+            self._registered_recv_params = recv_params
 
     def _descriptors(self, plan: TransferPlan) -> list[ReadDescriptor]:
         descriptors = exact_descriptors(
@@ -498,8 +506,140 @@ class _NixlStagedTransfer:
                 "full_pull_sources": len(prepared.plan.full_pulls),
                 "converts": len(prepared.plan.converts),
             },
-            plan_revision=prepared.plan_revision,
         )
+
+    def stage_peer(
+        self,
+        *,
+        source: p2p_pb2.WorkerMetadata,
+        parameter_layout: dict[str, tuple[tuple[int, ...], torch.dtype]],
+    ) -> _StagedNixlWeights:
+        """Pull an identical-rank peer's canonical staging buffers."""
+        if self._closed:
+            raise RuntimeError("NIXL staged transfer is closed")
+        self.unpublish_peer()
+        self._ensure_buffers(
+            self._recv_buffers,
+            parameter_layout,
+            label="receive-buffer",
+        )
+        recv_params = set(parameter_layout)
+        if self._registered_recv_params and self._registered_recv_params != recv_params:
+            raise RuntimeError(
+                "receive parameter set changed; restart the generator engine"
+            )
+        if not self._registered_recv_params:
+            self._manager.register_tensors(self._recv_buffers)
+            self._registered_recv_params = recv_params
+
+        source_tensors = [
+            TensorDescriptor(
+                name=tensor.name,
+                addr=tensor.addr,
+                size=tensor.size,
+                device_id=tensor.device_id,
+                dtype=tensor.dtype,
+            )
+            for tensor in worker_tensor_descriptors(source)
+        ]
+        if not source_tensors:
+            raise RuntimeError("P2P source has no tensor descriptors")
+
+        remote_agent_name: str | None = None
+        started = time.perf_counter()
+        try:
+            if source.worker_grpc_endpoint:
+                endpoint = source.metadata_endpoint
+                try:
+                    host, port_text = endpoint.rsplit(":", 1)
+                    port = int(port_text)
+                except ValueError as error:
+                    raise RuntimeError(
+                        f"P2P source published an unusable metadata endpoint: "
+                        f"{endpoint!r}"
+                    ) from error
+                if not host or not 1 <= port <= 65535:
+                    raise RuntimeError(
+                        f"P2P source published an unusable metadata endpoint: "
+                        f"{endpoint!r}"
+                    )
+                remote_agent_name = source.agent_name
+                self._manager.fetch_remote_and_wait(
+                    remote_agent_name=remote_agent_name,
+                    ip=host,
+                    port=port,
+                    timeout_seconds=self._timeout,
+                )
+            else:
+                remote_agent_name = self._manager.add_remote_agent(
+                    source.nixl_metadata
+                )
+            bytes_received, tensor_count, wire_seconds = (
+                self._manager.receive_from_source(
+                    source_metadata=b"",
+                    source_tensors=source_tensors,
+                    timeout_seconds=self._timeout,
+                    remote_agent_name=remote_agent_name,
+                    require_exact_match=True,
+                    destination_tensors=self._recv_buffers,
+                )
+            )
+        finally:
+            if remote_agent_name is not None:
+                self._manager.remove_remote_agent(remote_agent_name)
+
+        self._active = None
+        return _StagedNixlWeights(
+            tensors=self._recv_buffers,
+            metrics={
+                "bytes_received": bytes_received,
+                "segments": tensor_count,
+                "wire_s": round(wire_seconds, 6),
+                "peer_s": round(time.perf_counter() - started, 6),
+            },
+        )
+
+    def publish_peer(
+        self,
+        *,
+        staged: _StagedNixlWeights,
+        identity: p2p_pb2.SourceIdentity,
+        p2p_client: MxClientBase,
+        worker_rank: int,
+        worker_id: str,
+        accelerator: str,
+    ) -> None:
+        """Advertise verified canonical buffers for the applied version."""
+        previous_rank = self._published_peer_rank
+        self.unpublish_peer()
+        # Supersede any boot-time source owned by this rank before binding the
+        # shared publication slot to the exact WeightVersion identity.
+        if previous_rank != worker_rank:
+            unpublish_metadata_for_worker(
+                worker_rank=worker_rank,
+                device_id=self._device_id,
+            )
+        publish_metadata_and_ready(
+            p2p_client,
+            self._manager,
+            staged.tensors,
+            worker_rank,
+            self._device_id,
+            identity,
+            worker_id,
+            accelerator=accelerator,
+        )
+        self._published_peer_rank = worker_rank
+
+    def unpublish_peer(self) -> None:
+        """Stop advertising buffers before they are reused by another stage."""
+        if self._published_peer_rank is None:
+            return
+        unpublish_metadata_for_worker(
+            worker_rank=self._published_peer_rank,
+            device_id=self._device_id,
+        )
+        self._published_peer_rank = None
 
     def _verification_tensor(self, prepared: _PreparedNixlTransfer, name: str):
         source = prepared.sources[name]
@@ -551,6 +691,7 @@ class _NixlStagedTransfer:
     def close(self) -> None:
         if self._closed:
             return
+        self.unpublish_peer()
         self._closed = True
         self._manager.shutdown()
 

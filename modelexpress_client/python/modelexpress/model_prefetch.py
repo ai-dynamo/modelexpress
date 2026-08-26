@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import threading
 from pathlib import Path
 
@@ -33,15 +32,13 @@ from . import envs
 
 logger = logging.getLogger("modelexpress.model_prefetch")
 
-COMMIT_HASH_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
-
 _REPO_DIR_PREFIX = "models--"
 
 # Reentrant: ensure_metadata holds this across the whole install and calls
 # helpers that take it again.
 _lock = threading.RLock()
 _snapshot_to_repo_id: dict[str, str] = {}
-_installed: set[str] = set()
+_revision_snapshots: dict[tuple[str, str | None], str] = {}
 
 
 def is_enabled() -> bool:
@@ -83,18 +80,24 @@ def ensure_metadata(repo_id: str, revision: str | None = None) -> Path | None:
 
     from .model_client import ModelCacheClient
 
+    requested = revision or None
     with _lock:
-        if repo_id in _installed:
+        # Keyed by revision as well as repo id: two revisions of one model are
+        # two different installs, and returning the first one for the second
+        # request would hand the engine a revision it did not ask for.
+        installed = _known_snapshot(repo_id, requested)
+        if installed is not None:
             # Later calls in the same process (tokenizer, processor) resolve
             # from the snapshot the first call installed.
-            return _known_snapshot(repo_id)
+            return installed
 
         with ModelCacheClient(chunk_size=configured_chunk_size()) as client:
-            snapshot_path = client.install_metadata_snapshot(repo_id)
+            snapshot_path = client.install_metadata_snapshot(
+                repo_id, requested_revision=requested
+            )
 
-        _warn_on_revision_mismatch(repo_id, revision, snapshot_path)
-        _installed.add(repo_id)
         _snapshot_to_repo_id[_normalize(snapshot_path)] = repo_id
+        _revision_snapshots[(repo_id, requested)] = _normalize(snapshot_path)
         return snapshot_path
 
 
@@ -141,15 +144,13 @@ def reset() -> None:
     """Forget prefetch state. For tests."""
     with _lock:
         _snapshot_to_repo_id.clear()
-        _installed.clear()
+        _revision_snapshots.clear()
 
 
-def _known_snapshot(repo_id: str) -> Path | None:
+def _known_snapshot(repo_id: str, revision: str | None) -> Path | None:
     with _lock:
-        for snapshot_path, known_repo_id in _snapshot_to_repo_id.items():
-            if known_repo_id == repo_id:
-                return Path(snapshot_path)
-    return None
+        recorded = _revision_snapshots.get((repo_id, revision))
+    return Path(recorded) if recorded is not None else None
 
 
 def _normalize(path: str | os.PathLike[str]) -> str:
@@ -181,28 +182,3 @@ def configured_chunk_size() -> int | None:
         )
         return None
     return value
-
-
-def _warn_on_revision_mismatch(repo_id: str, revision: str | None, snapshot_path: Path) -> None:
-    """Warn when the server's snapshot is not the revision the engine asked for.
-
-    The client pins its own follow-up calls to the revision the server
-    reported, but it never asks for a particular one, so the engine's choice
-    does not reach the server and the answer is whatever the default revision
-    resolves to. A mismatch is not silently unsafe -- Hugging Face addresses
-    pinned revisions by directory name, so the engine simply will not see this
-    snapshot -- but the failure that follows is unhelpful unless the real
-    reason is logged here.
-    """
-    if not revision or revision == "main":
-        return
-    if COMMIT_HASH_PATTERN.fullmatch(revision) and snapshot_path.name == revision:
-        return
-    logger.warning(
-        "ModelExpress Server returned commit %s for %s, but this worker asked for "
-        "revision %r. This client does not pin a revision on the model RPCs yet, so "
-        "the engine will not resolve this snapshot.",
-        snapshot_path.name,
-        repo_id,
-        revision,
-    )

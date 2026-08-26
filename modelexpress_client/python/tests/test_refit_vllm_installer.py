@@ -98,6 +98,30 @@ def test_installer_rejects_parameters_left_on_meta(monkeypatch):
         installer._process_and_commit({"weight": torch.tensor([7.0])})
 
 
+def test_installer_caches_parameter_layout():
+    twin = nn.Module()
+    twin.register_parameter(
+        "weight",
+        nn.Parameter(torch.empty((2, 3), dtype=torch.float16)),
+    )
+    calls = []
+    installer = object.__new__(_VllmInstaller)
+    installer._parameter_layout = None
+
+    def build_meta_twin():
+        calls.append("build")
+        return twin
+
+    installer._build_meta_twin = build_meta_twin
+
+    first = installer.parameter_layout()
+    second = installer.parameter_layout()
+
+    assert first == {"weight": ((2, 3), torch.float16)}
+    assert second is first
+    assert calls == ["build"]
+
+
 def test_installer_rejects_quantized_mla_derived_weight_refresh():
     model = nn.Module()
     mla = nn.Module()
