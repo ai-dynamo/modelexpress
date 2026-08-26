@@ -238,6 +238,8 @@ def test_vllm_adapter_uses_canonical_s3_without_creating_nixl(
 ):
     events = []
     prepared = PreparedCheckpoint("target-a", tmp_path / "prepared", {})
+    model_config = SimpleNamespace(model="config/model")
+    vllm_config = SimpleNamespace(model_config=model_config)
 
     class _Installer:
         def __init__(self, **kwargs):
@@ -251,9 +253,9 @@ def test_vllm_adapter_uses_canonical_s3_without_creating_nixl(
             pytest.fail("S3 mode must not create a NIXL transfer")
 
     class _Engine:
-        def __init__(self, vllm_config, model_config):
-            assert vllm_config == "vllm-config"
-            assert model_config == "model-config"
+        def __init__(self, received_vllm_config, received_model_config):
+            assert received_vllm_config is vllm_config
+            assert received_model_config is model_config
 
         def get_device_id(self):
             return 2
@@ -303,10 +305,9 @@ def test_vllm_adapter_uses_canonical_s3_without_creating_nixl(
     )
     adapter = VllmGeneratorAdapter(
         model="model",
-        vllm_config="vllm-config",
-        model_config="model-config",
+        vllm_config=vllm_config,
+        model_config=model_config,
         worker_id="generator-0",
-        model_name="test/model",
         object_storage=object_storage,
     )
     inputs = object()
@@ -324,14 +325,14 @@ def test_vllm_adapter_uses_canonical_s3_without_creating_nixl(
             "installer_init",
             {
                 "model": "model",
-                "vllm_config": "vllm-config",
-                "model_config": "model-config",
+                "vllm_config": vllm_config,
+                "model_config": model_config,
                 "device": torch.device("cuda:2"),
             },
         ),
         (
             "s3_init",
-            {"model_name": "test/model", "config": object_storage},
+            {"model_name": "config/model", "config": object_storage},
         ),
         ("s3_stage", inputs),
         ("s3_apply", prepared),
@@ -339,19 +340,3 @@ def test_vllm_adapter_uses_canonical_s3_without_creating_nixl(
         ("s3_release", prepared),
         ("s3_close",),
     ]
-
-
-def test_vllm_s3_requires_model_name():
-    with pytest.raises(ValueError, match="model_name is required"):
-        VllmGeneratorAdapter(
-            model="model",
-            vllm_config="vllm-config",
-            model_config="model-config",
-            worker_id="generator-0",
-            object_storage=ObjectStorageGeneratorConfig(
-                storage_type=ObjectStorageType.S3,
-                initial_base_version_id="base-a",
-                launch_checkpoint="launch",
-                preparation_cache_dir="cache",
-            ),
-        )

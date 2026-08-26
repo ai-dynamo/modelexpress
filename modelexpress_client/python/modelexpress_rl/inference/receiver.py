@@ -11,6 +11,7 @@ import mmap
 import shutil
 import time
 import zlib
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -107,6 +108,31 @@ def _source_identity(version: _S3Version) -> dict[str, str]:
     return {"uri": version.uri}
 
 
+_Decompressor = Callable[[memoryview], Any]
+
+
+_DECOMPRESSORS: dict[str, _Decompressor] = {
+    "zstd": lambda data: zstandard.ZstdDecompressor().stream_reader(data),
+}
+
+
+def _parse_delta_manifest(
+    data: bytes,
+) -> tuple[dict[str, str], _Decompressor]:
+    try:
+        manifest = json.loads(data)
+    except (TypeError, ValueError) as error:
+        raise ValueError("canonical delta manifest is not valid JSON") from error
+    compression_format = manifest["metadata"]["compression_format"]
+    try:
+        decompressor = _DECOMPRESSORS[compression_format]
+    except KeyError as error:
+        raise ValueError(
+            f"unsupported canonical delta compression format {compression_format!r}"
+        ) from error
+    return manifest["weight_map"], decompressor
+
+
 class _LocalCheckpoint:
     """One host-local checkpoint updated under an exact-base lock."""
 
@@ -125,6 +151,7 @@ class _LocalCheckpoint:
         self.state_path = self.cache / "state.json"
         self.lock_path = self.cache / ".lock"
         self.locations: dict[str, tuple[Path, int, int]] = {}
+        self.decompressor: _Decompressor | None = None
 
     def initialize(self) -> None:
         self.cache.mkdir(parents=True, exist_ok=True)
@@ -201,7 +228,7 @@ class _LocalCheckpoint:
                 raise RuntimeError("canonical root download failed") from error
 
             index_download_time = time.perf_counter() - started
-            weight_map = json.loads(index_data)["weight_map"]
+            weight_map, self.decompressor = _parse_delta_manifest(index_data)
 
             download_started = time.perf_counter()
             shards = self._download_deltas(weight_map, version.uri)
@@ -266,6 +293,7 @@ class _LocalCheckpoint:
     ) -> None:
         if not shards:
             return
+        assert self.decompressor is not None
 
         items = []
         for filename, (data, names) in shards.items():
@@ -302,27 +330,25 @@ class _LocalCheckpoint:
                 checksum = 1
                 position = 0
                 extra = b""
+                reader = self.decompressor(compressed)
                 try:
-                    reader = zstandard.ZstdDecompressor().stream_reader(compressed)
-                    try:
-                        while position < size:
-                            block = reader.read(min(2 << 20, size - position))
-                            if not block:
-                                break
-                            delta = np.frombuffer(block, dtype=np.uint8)
-                            end = position + delta.size
-                            region = target[position:end]
-                            try:
-                                np.bitwise_xor(region, delta, out=region)
-                                checksum = zlib.adler32(region, checksum)
-                            finally:
-                                del region
-                            position = end
-                        if position == size:
-                            extra = reader.read(1)
-                    finally:
-                        reader.close()
+                    while position < size:
+                        block = reader.read(min(2 << 20, size - position))
+                        if not block:
+                            break
+                        delta = np.frombuffer(block, dtype=np.uint8)
+                        end = position + delta.size
+                        region = target[position:end]
+                        try:
+                            np.bitwise_xor(region, delta, out=region)
+                            checksum = zlib.adler32(region, checksum)
+                        finally:
+                            del region
+                        position = end
+                    if position == size:
+                        extra = reader.read(1)
                 finally:
+                    reader.close()
                     del target
                 if position != size or extra:
                     raise ValueError(
@@ -395,6 +421,8 @@ class CanonicalS3GeneratorAdapter(GeneratorEngineAdapter):
             raise ValueError("canonical S3 version is missing base_version_id")
         if inputs.object_storage is None:
             raise ValueError("canonical S3 requires a version-level URI")
+        if inputs.object_storage.storage_type is not ObjectStorageType.S3:
+            raise ValueError("canonical S3 requires S3 object storage")
         if self._checkpoint.current_version not in {
             inputs.base_version_id,
             inputs.version_id,

@@ -44,12 +44,9 @@ class VllmGeneratorAdapter(CanonicalS3GeneratorAdapter):
         vllm_config: VllmConfig,
         model_config: ModelConfig,
         worker_id: str,
-        model_name: str | None = None,
         object_storage: ObjectStorageGeneratorConfig | None = None,
     ) -> None:
         self._uses_s3 = object_storage is not None
-        if self._uses_s3 and not model_name:
-            raise ValueError("model_name is required for canonical S3")
 
         engine = VllmAdapter(vllm_config, model_config)
         self._engine = engine
@@ -63,7 +60,7 @@ class VllmGeneratorAdapter(CanonicalS3GeneratorAdapter):
         )
         if object_storage is not None:
             super().__init__(
-                model_name=cast(str, model_name),
+                model_name=vllm_config.model_config.model,
                 config=object_storage,
             )
             return

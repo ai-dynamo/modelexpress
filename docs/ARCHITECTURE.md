@@ -403,6 +403,9 @@ prepared snapshot without checkpoint I/O.
 Canonical S3 artifacts live under
 `{uri_prefix}/v{version_number}/`, with the
 index and delta shards stored as siblings.
+The index's `compression_format` selects the receiver's decompressor. The
+current implementation supports Zstandard. Unknown compression formats are
+rejected before shard download.
 Canonical S3 versions are retained for rollout fault recovery. Trainer
 processes keep only the current base snapshot; older
 immutable S3 objects are governed by external bucket lifecycle policy.

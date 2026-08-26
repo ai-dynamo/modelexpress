@@ -14,7 +14,6 @@ from .context import VllmGeneratorContext
 def _create_vllm_adapter(
     engine_context: GeneratorEngineContext,
     worker_id: str,
-    model_name: str | None = None,
     object_storage: ObjectStorageGeneratorConfig | None = None,
 ) -> VllmGeneratorAdapter:
     if not isinstance(engine_context, VllmGeneratorContext):
@@ -37,7 +36,6 @@ def _create_vllm_adapter(
         vllm_config=vllm_config,
         model_config=model_config,
         worker_id=worker_id,
-        model_name=model_name,
         object_storage=object_storage,
     )
 

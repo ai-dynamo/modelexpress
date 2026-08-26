@@ -451,22 +451,30 @@ def test_canonical_s3_accepts_an_empty_delta(monkeypatch, tmp_path):
     )
 
 
-def test_canonical_s3_uses_weight_map_without_index_validation(monkeypatch, tmp_path):
+def test_canonical_s3_rejects_unsupported_compression(monkeypatch, tmp_path):
     base = torch.tensor([1.0, 2.0]).view(torch.uint8).numpy()
-    target_tensor = torch.tensor([3.0, 4.0])
-    objects = _artifact(base, target_tensor.view(torch.uint8).numpy())
+    target = torch.tensor([3.0, 4.0]).view(torch.uint8).numpy()
+    objects = _artifact(base, target)
     key = "s3://weights/test/v1/model.safetensors.index.json"
-    root = json.dumps(
-        {"weight_map": {"weight": "model-00000-of-00001.safetensors"}}
-    ).encode()
-    objects[key] = root
-    adapter, _storage = _build(monkeypatch, tmp_path, objects)
+    manifest = json.loads(objects[key])
+    manifest["metadata"]["compression_format"] = "gzip"
+    objects[key] = json.dumps(manifest).encode()
+    adapter, storage = _build(monkeypatch, tmp_path, objects)
 
-    staged = adapter.stage_weight(_inputs(root))
+    with pytest.raises(RuntimeError, match="unsupported.*compression"):
+        adapter.stage_weight(_inputs(objects[key]))
 
-    assert torch.equal(
-        load_file(staged.path / "model.safetensors")["weight"], target_tensor
-    )
+    assert storage.calls == [key]
+
+
+def test_canonical_s3_rejects_invalid_manifest_json(monkeypatch, tmp_path):
+    key = "s3://weights/test/v1/model.safetensors.index.json"
+    adapter, storage = _build(monkeypatch, tmp_path, {key: b"not-json"})
+
+    with pytest.raises(RuntimeError, match="not valid JSON"):
+        adapter.stage_weight(_inputs(None))
+
+    assert storage.calls == [key]
 
 
 def test_canonical_s3_downloads_unique_shards_concurrently(monkeypatch, tmp_path):
@@ -573,6 +581,7 @@ def test_canonical_s3_applies_delta_tensors_concurrently(monkeypatch, tmp_path):
         StreamingDecompressor,
     )
 
+    checkpoint.decompressor = receiver_module._DECOMPRESSORS["zstd"]
     checkpoint._apply_shards({"delta.safetensors": (shard, list(target))})
 
     loaded = load_file(checkpoint.local_checkpoint / "model.safetensors")

@@ -194,7 +194,6 @@ class ModelExpressGeneratorClient:
         adapter = _create_generator_adapter(
             engine_context=config.engine_context,
             worker_id=worker_id,
-            model_name=model_name,
             object_storage=config.object_storage,
         )
         client = cls()
@@ -495,6 +494,8 @@ class ModelExpressGeneratorClient:
                     raise RuntimeError(
                         "The version is missing its object storage source"
                     )
+                if version.object_storage.storage_type is not ObjectStorageType.S3:
+                    raise RuntimeError("S3 generator requires S3 object storage")
                 inputs = GeneratorTransferInputs(
                     version_id=version.version_id,
                     base_version_id=version.base_version_id,

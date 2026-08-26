@@ -26,11 +26,13 @@ class SGLangGeneratorAdapter(CanonicalS3GeneratorAdapter):
         self,
         *,
         context: SglangGeneratorContext,
-        model_name: str,
         config: ObjectStorageGeneratorConfig,
     ) -> None:
         self.model_runner = context.model_runner
-        super().__init__(model_name=model_name, config=config)
+        super().__init__(
+            model_name=self.model_runner.model_config.model_path,
+            config=config,
+        )
 
     def install_prepared_checkpoint(self, prepared: PreparedCheckpoint) -> None:
         try:
@@ -78,18 +80,6 @@ class SGLangGeneratorAdapter(CanonicalS3GeneratorAdapter):
                 device.synchronize()
         except Exception as error:
             raise ReceiverInstallError(str(error)) from error
-
-
-def _create_sglang_adapter(
-    context: SglangGeneratorContext,
-    model_name: str,
-    config: ObjectStorageGeneratorConfig,
-) -> SGLangGeneratorAdapter:
-    return SGLangGeneratorAdapter(
-        context=context,
-        model_name=model_name,
-        config=config,
-    )
 
 
 __all__ = [

@@ -10,8 +10,17 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from modelexpress_rl.inference.engines.sglang import SGLangGeneratorAdapter
-from modelexpress_rl.inference.receiver import PreparedCheckpoint, ReceiverInstallError
+from modelexpress_rl import ObjectStorageGeneratorConfig, ObjectStorageType
+from modelexpress_rl.inference.engines.sglang import (
+    SGLangGeneratorAdapter,
+    SglangGeneratorContext,
+    _create_sglang_adapter,
+)
+from modelexpress_rl.inference.receiver import (
+    CanonicalS3GeneratorAdapter,
+    PreparedCheckpoint,
+    ReceiverInstallError,
+)
 
 
 def _runner(tmp_path):
@@ -76,6 +85,29 @@ def _install_sglang_modules(monkeypatch, loader=None, setup_error=None):
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
     return loader
+
+
+def test_sglang_factory_uses_model_path_from_context(tmp_path, monkeypatch):
+    runner = _runner(tmp_path)
+    config = ObjectStorageGeneratorConfig(
+        storage_type=ObjectStorageType.S3,
+        initial_base_version_id="base-a",
+        launch_checkpoint=tmp_path / "launch",
+        preparation_cache_dir=tmp_path / "cache",
+    )
+    initialized = []
+
+    def initialize(self, **kwargs):
+        initialized.append(kwargs)
+
+    monkeypatch.setattr(CanonicalS3GeneratorAdapter, "__init__", initialize)
+
+    adapter = _create_sglang_adapter(SglangGeneratorContext(runner), config)
+
+    assert isinstance(adapter, SGLangGeneratorAdapter)
+    assert initialized == [
+        {"model_name": runner.model_config.model_path, "config": config}
+    ]
 
 
 def test_sglang_install_uses_the_prepared_checkpoint(tmp_path, monkeypatch):
