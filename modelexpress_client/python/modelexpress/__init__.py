@@ -57,9 +57,9 @@ def configure_trtllm_logging() -> None:
     _configure_engine_logging("TRT-LLM")
 
 
-def register_modelexpress_loaders():
+def register_modelexpress():
     """
-    Register ModelExpress loaders with vLLM.
+    Register ModelExpress integrations with vLLM.
 
     This function ensures loaders are registered exactly once. It can be called
     multiple times safely (idempotent).
@@ -67,6 +67,7 @@ def register_modelexpress_loaders():
     Enables:
         --load-format modelexpress  (auto-detect: RDMA -> InstantTensor -> ModelStreamer -> GDS -> disk)
         --load-format mx            (backward-compatible alias)
+        --weight-transfer-config '{"backend":"modelexpress"}'
     """
     global _loaders_registered
     if _loaders_registered:
@@ -77,7 +78,12 @@ def register_modelexpress_loaders():
     register_vllm_loaders()
 
     _loaders_registered = True
-    _logger.debug("ModelExpress loaders registered")
+    _logger.debug("ModelExpress vLLM integrations registered")
+
+
+def register_modelexpress_loaders():
+    """Backward-compatible alias for :func:`register_modelexpress`."""
+    register_modelexpress()
 
 
 from .client import MxClient  # noqa: F401
@@ -94,5 +100,6 @@ __all__ = [
     "PublisherThread",
     "configure_trtllm_logging",
     "configure_vllm_logging",
+    "register_modelexpress",
     "register_modelexpress_loaders",
 ]
