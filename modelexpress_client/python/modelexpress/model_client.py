@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -39,6 +40,11 @@ from .model_snapshot import (
 )
 
 logger = logging.getLogger("modelexpress.model_client")
+
+# Case-insensitive: huggingface_hub only treats the lowercase form as a commit
+# hash, but an uppercase one still names a commit and must not be allowed to
+# resolve to a different one.
+_COMMIT_HASH_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
 
 DEFAULT_MAX_MESSAGE_SIZE = 100 * 1024 * 1024
 # The server default is 32 KiB, which costs one round trip per 32 KiB of a
@@ -196,16 +202,48 @@ class ModelCacheClient:
         self,
         model_name: str,
         provider: int = model_pb2.HUGGING_FACE,
+        requested_revision: str | None = None,
     ) -> Path:
         """Install every non-weight file as a resolvable Hugging Face snapshot.
 
         Asks the server for a metadata-only download, so a cold server does
         not fetch the weights before ``RdmaStrategy`` has had its chance at
-        them. Returns the snapshot directory, reusing an existing local
-        snapshot only when the server named the revision it is holding and
-        that revision is the one already on disk.
+        them. Returns the snapshot directory.
+
+        ``requested_revision`` is the revision the engine asked for -- a
+        branch, a tag, or a commit hash. Asking the server for it is what
+        makes the engine's own resolution succeed afterwards, since the engine
+        looks the snapshot up by the revision it requested rather than by
+        whichever one the server holds by default. A pinned request reuses a
+        local snapshot whenever that commit is already complete on disk; an
+        unpinned one needs the server to name the revision it is holding,
+        which it does not do for a model it already has.
         """
-        revision = self.ensure_downloaded(model_name, provider, ignore_weights=True)
+        revision = self.ensure_downloaded(
+            model_name, provider, ignore_weights=True, revision=requested_revision
+        )
+        if requested_revision is not None:
+            if revision is None:
+                raise ModelCacheError(
+                    f"ModelExpress did not confirm revision {requested_revision!r} for "
+                    f"{model_name}; the server may predate pinned-revision support, and "
+                    "installing its default revision would not be what was asked for"
+                )
+            # A branch or tag legitimately resolves to some other string. A
+            # commit hash names one revision and cannot: resolving it to
+            # another would install that one and leave a ref pointing the
+            # engine's request at it.
+            if (
+                _COMMIT_HASH_PATTERN.match(requested_revision)
+                and requested_revision.lower() != revision.lower()
+            ):
+                raise ModelCacheError(
+                    f"ModelExpress resolved {requested_revision!r} to commit {revision} "
+                    f"for {model_name}; a commit hash cannot resolve to another commit"
+                )
+        # Follow-up calls carry the commit the server resolved, not the string
+        # the engine wrote: a branch or tag that moves between these calls would
+        # otherwise answer them from two different commits.
         manifest = self.list_files(
             model_name, provider, ignore_weights=True, revision=revision
         )
@@ -220,8 +258,17 @@ class ModelCacheClient:
 
         cache = ModelSnapshotCache(model_name, self.cache_directory)
         with cache.lock():
-            existing = cache.resolve_snapshot(expected, revision)
+            if requested_revision is not None:
+                existing = cache.resolve_pinned_snapshot(expected, revision)
+            else:
+                existing = cache.resolve_snapshot(expected, revision)
             if existing is not None:
+                # The ref belongs to the request, not to the snapshot: an
+                # earlier install of this same commit under a different
+                # revision left no ref this one can be found by. Reuse skips
+                # publish(), so record it here or the engine's lookup fails
+                # against a directory that is sitting right there.
+                cache.write_revision_ref(revision, requested_revision)
                 logger.info("Reusing local snapshot for %s at %s", model_name, existing)
                 return existing
 
@@ -236,7 +283,9 @@ class ModelCacheClient:
                     expected_commit=revision,
                     revision=revision,
                 )
-                snapshot_path = staging.publish(commit_hash, expected)
+                snapshot_path = staging.publish(
+                    commit_hash, expected, requested_revision=requested_revision
+                )
             except BaseException:
                 staging.discard()
                 raise

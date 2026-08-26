@@ -1,0 +1,128 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Latest DynamoGraphDeployment schema with Dynamo's native vLLM sidecar shape.
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeployment
+metadata:
+  name: mx-vllm-refit
+spec:
+  components:
+  - name: Frontend
+    type: frontend
+    replicas: 1
+    podTemplate:
+      spec:
+        containers:
+        - name: main
+          image: nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.4.1
+          env:
+          - name: DYN_ENABLE_RL
+            value: "true"
+          - name: DYN_RL_PORT
+            value: "8001"
+          ports:
+          - name: http
+            containerPort: 8000
+          - name: rl-discovery
+            containerPort: 8001
+  - name: VLLMWorker
+    type: worker
+    replicas: 1
+    podTemplate:
+      spec:
+        volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+        initContainers:
+        - name: vllm-engine
+          image: ${VLLM_ENGINE_IMAGE}
+          restartPolicy: Always
+          command:
+          - /bin/sh
+          - -c
+          - >-
+            exec "$(python3 -c 'import os,vllm; print(os.path.join(os.path.dirname(vllm.__file__), "vllm-rs"))')"
+            serve ${MODEL_NAME} --host 127.0.0.1 --grpc-port 50051
+            --enable-sleep-mode
+            --weight-transfer-config '{"backend":"modelexpress"}'
+            --gpu-memory-utilization 0.45
+            --max-model-len 2048
+            --max-num-seqs 8
+          envFrom:
+          - secretRef:
+              name: hf-token-secret
+          env:
+          - name: MODEL_NAME
+            value: ${MODEL_NAME}
+          - name: MX_SERVER_ADDRESS
+            value: mx-vllm-refit-server:8000
+          - name: VLLM_PLUGINS
+            value: modelexpress
+          - name: MX_RDMA_NIC_PIN
+            value: auto
+          - name: UCX_RNDV_SCHEME
+            value: get_zcopy
+          - name: UCX_RNDV_THRESH
+            value: "0"
+          resources:
+            requests:
+              cpu: "4"
+              memory: 16Gi
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+            limits:
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+          volumeMounts:
+          - name: dshm
+            mountPath: /dev/shm
+          startupProbe:
+            exec:
+              command:
+              - python3
+              - -c
+              - import socket; socket.create_connection(('127.0.0.1', 50051), 2).close()
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 120
+        containers:
+        - name: main
+          image: ${DYNAMO_SIDECAR_IMAGE}
+          command: ["dynamo-vllm-sidecar"]
+          args: ["--vllm-endpoint", "127.0.0.1:50051", "--enable-rl"]
+          env:
+          - name: DYN_SYSTEM_PORT
+            value: "8081"
+          - name: DYN_ENABLE_RL
+            value: "true"
+          ports:
+          - name: system
+            containerPort: 8081
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+---
+# The operator's inference Service does not expose the separate RL discovery
+# listener, so this Service selects the DGD frontend and publishes both ports.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-vllm-refit-frontend-admin
+spec:
+  selector:
+    nvidia.com/dynamo-graph-deployment-name: mx-vllm-refit
+    nvidia.com/dynamo-component: Frontend
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+  - name: rl-discovery
+    port: 8001
+    targetPort: 8001

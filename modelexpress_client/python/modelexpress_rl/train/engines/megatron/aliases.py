@@ -171,8 +171,8 @@ def _build_gated_aliases(
 def _build_qkv_aliases(
     item: MegatronTensorSpec, agent_name: str
 ) -> list[PublishedTensor]:
-    if len(item.hf_names) != 3 or item.tensor.ndim != 2:
-        raise ValueError(f"{item.name}: QKV aliasing requires 2D q/k/v weights")
+    if len(item.hf_names) != 3 or item.tensor.ndim not in {1, 2}:
+        raise ValueError(f"{item.name}: QKV aliasing requires 1D biases or 2D weights")
     has_global_q = "num_heads" in item.extras
     has_global_kv = "num_kv_heads" in item.extras
     if has_global_q != has_global_kv:
@@ -299,9 +299,9 @@ def _build_global_qkv_aliases(
     band.
     """
     layout = _read_qkv_layout(item)
-    hidden = int(item.tensor.shape[1])
-    if len(item.global_shape) != 2 or int(item.global_shape[1]) != hidden:
-        raise ValueError(f"{item.name}: QKV hidden dimension mismatch")
+    trailing_shape = tuple(int(dim) for dim in item.tensor.shape[1:])
+    if tuple(int(dim) for dim in item.global_shape[1:]) != trailing_shape:
+        raise ValueError(f"{item.name}: QKV trailing dimensions mismatch")
     if int(item.global_shape[0]) != layout.total_rows:
         raise ValueError(f"{item.name}: global QKV rows disagree with head metadata")
 
@@ -319,7 +319,8 @@ def _build_global_qkv_aliases(
                 agent_name=agent_name,
                 device_id=int(tensor.device.index or 0),
                 addr=int(tensor.data_ptr()),
-                shard_offset=(band.destination_start + overlap_lo - band.start, 0),
+                shard_offset=(band.destination_start + overlap_lo - band.start,)
+                + (0,) * len(trailing_shape),
                 shape=tuple(int(dim) for dim in tensor.shape),
                 digest=tensor_digest(tensor),
             )
@@ -340,7 +341,7 @@ def _build_global_qkv_aliases(
             name=name,
             dtype=str(item.tensor.dtype),
             elsize=int(item.tensor.element_size()),
-            full_shape=(rows, hidden),
+            full_shape=(rows,) + trailing_shape,
             shards=projection_shards,
         )
         for name, rows, projection_shards in zip(
@@ -367,7 +368,7 @@ def _build_legacy_qkv_aliases(
     if rows_per_group * kv_heads_local != int(item.tensor.shape[0]):
         raise ValueError(f"{item.name}: QKV rows disagree with head metadata")
     source_rank, source_size = _source_rank_and_size(item, 0)
-    hidden = int(item.tensor.shape[1])
+    trailing_shape = tuple(int(dim) for dim in item.tensor.shape[1:])
     q_heads_per_group = q_heads_local // kv_heads_local
     q_shards = []
     k_shards = []
@@ -389,7 +390,7 @@ def _build_legacy_qkv_aliases(
                     agent_name=agent_name,
                     device_id=int(tensor.device.index or 0),
                     addr=int(tensor.data_ptr()),
-                    shard_offset=(start, 0),
+                    shard_offset=(start,) + (0,) * len(trailing_shape),
                     shape=tuple(int(dim) for dim in tensor.shape),
                     # The narrow, not the fused parent: this is the box a receiver
                     # reads from ``addr``, so it is the box whose bytes must match.
@@ -401,7 +402,7 @@ def _build_legacy_qkv_aliases(
             name=name,
             dtype=str(item.tensor.dtype),
             elsize=int(item.tensor.element_size()),
-            full_shape=(rows, hidden),
+            full_shape=(rows,) + trailing_shape,
             shards=shards,
         )
         for name, rows, shards in (

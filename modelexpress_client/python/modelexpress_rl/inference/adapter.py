@@ -9,6 +9,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
 
+from modelexpress import p2p_pb2
+from modelexpress.client import MxClientBase
 from modelexpress_rl.train import WeightPayloadFormat
 
 
@@ -58,6 +60,30 @@ class GeneratorTransferInputs:
 
 class GeneratorEngineAdapter(ABC):
     """Engine-specific transfer planning and installation boundary."""
+
+    @property
+    @abstractmethod
+    def worker_rank(self) -> int:
+        """Return the rank used to match an inference P2P source."""
+
+    @abstractmethod
+    def build_p2p_identity(self, version_id: str) -> p2p_pb2.SourceIdentity:
+        """Build the engine-compatible P2P identity for an exact version."""
+
+    @abstractmethod
+    def stage_peer_weight(self, source: p2p_pb2.WorkerMetadata) -> object:
+        """Stage an exact version from a compatible inference peer."""
+
+    @abstractmethod
+    def publish_weight_version(
+        self,
+        *,
+        version_id: str,
+        staged: object,
+        p2p_client: MxClientBase,
+        worker_id: str,
+    ) -> None:
+        """Publish applied staging buffers as an exact-version P2P source."""
 
     @property
     @abstractmethod

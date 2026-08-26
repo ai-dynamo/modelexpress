@@ -22,6 +22,11 @@ logger = logging.getLogger("modelexpress.metadata.publisher")
 
 READY_POLL_SECS = 5
 
+# How many heartbeats in a row the server must reject (success=false) before
+# the worker assumes the server lost its registration and publishes again.
+# Errors reaching the server do not count: publishing would fail too.
+REREGISTER_AFTER_CONSECUTIVE_REJECTIONS = 2
+
 
 class PublisherThread:
     """Background thread that publishes a source and keeps it READY.
@@ -34,6 +39,14 @@ class PublisherThread:
     On normal interpreter exit, an atexit handler sends UpdateStatus(STALE)
     for immediate detection without waiting for the reaper timeout. The default
     SIGTERM disposition does not run atexit handlers.
+
+    If the server rejects a heartbeat (``success=false``), it has most likely
+    lost this worker's registration (for example after its metadata store
+    restarted empty). The server never notifies workers of that, so after
+    ``REREGISTER_AFTER_CONSECUTIVE_REJECTIONS`` rejections in a row the thread
+    drops its cached ``mx_source_id`` and publishes again via ``publish_fn``.
+    Without a ``publish_fn`` it cannot recover; it logs one warning and keeps
+    heartbeating in case the registration comes back.
 
     Args:
         mx_client: gRPC client for UpdateStatus calls.
@@ -98,6 +111,11 @@ class PublisherThread:
         # True once we have demoted this worker for an unhealthy data plane, so the
         # demotion and its log line happen once rather than every interval.
         self._unhealthy = False
+        # How many heartbeats in a row the server has rejected.
+        self._heartbeat_rejections = 0
+        # True once we warned that there is no publish_fn to re-register with,
+        # so the warning is logged only once.
+        self._reregister_unavailable_logged = False
 
         self._interval = (
             interval_secs
@@ -157,8 +175,10 @@ class PublisherThread:
                 return
             try:
                 from .. import p2p_pb2
-                self._update_status(p2p_pb2.SOURCE_STATUS_STALE)
-                logger.info(f"[Worker {self._worker_rank}] Marked STALE on shutdown")
+                if self._update_status(p2p_pb2.SOURCE_STATUS_STALE):
+                    logger.info(
+                        f"[Worker {self._worker_rank}] Marked STALE on shutdown"
+                    )
                 self._started = False
             except Exception:
                 logger.debug(
@@ -201,28 +221,66 @@ class PublisherThread:
                     exc_info=True,
                 )
 
-    def _update_status(self, status: int) -> None:
+    def _update_status(self, status: int) -> bool:
         """Send UpdateStatus RPC, refreshing the source's NIC utilization.
+
+        Returns True when the server accepted it; the caller re-registers on
+        False, so this must not swallow the result.
 
         Sampling here (once per heartbeat) makes the sampling window the
         heartbeat interval and keeps the server's advertised source_load
         tracking live load. Any sampler error yields 0.0 (idle).
         """
         if self._mx_source_id is None:
-            return
+            return False
         source_load = 0.0
         if self._source_load_provider is not None:
             try:
                 source_load = self._source_load_provider()
             except Exception:  # never let telemetry break the heartbeat
                 source_load = 0.0
-        self._mx_client.update_status(
+        return self._mx_client.update_status(
             mx_source_id=self._mx_source_id,
             worker_id=self._worker_id,
             worker_rank=self._worker_rank,
             status=status,
             source_load=source_load,
         )
+
+    def _on_heartbeat_rejected(self) -> None:
+        """Handle a heartbeat the server rejected (``success=false``).
+
+        Called with ``_status_lock`` held. The server has most likely lost
+        this worker's registration, so heartbeats alone can never succeed
+        again: after enough rejections in a row, drop the cached
+        ``mx_source_id`` so the next tick publishes again.
+        """
+        self._heartbeat_rejections += 1
+        if self._heartbeat_rejections < REREGISTER_AFTER_CONSECUTIVE_REJECTIONS:
+            return
+        self._heartbeat_rejections = 0
+
+        if self._publish_fn is None:
+            if not self._reregister_unavailable_logged:
+                self._reregister_unavailable_logged = True
+                logger.warning(
+                    f"[Worker {self._worker_rank}] Server keeps rejecting "
+                    f"heartbeats for mx_source_id={self._mx_source_id} and "
+                    f"there is no publish_fn to re-register with; heartbeats "
+                    f"continue in case the registration comes back"
+                )
+            return
+
+        logger.warning(
+            f"[Worker {self._worker_rank}] Server rejected "
+            f"{REREGISTER_AFTER_CONSECUTIVE_REJECTIONS} heartbeats in a row "
+            f"for mx_source_id={self._mx_source_id}; re-registering the source"
+        )
+        # Reset publish state so the next tick publishes again, with a fresh
+        # publish timeout.
+        self._mx_source_id = None
+        self._publish_started_at = None
+        self._publish_given_up = False
 
     def _cleanup(self) -> None:
         if self._cleanup_fn is None or self._cleaned_up:
@@ -323,7 +381,13 @@ class PublisherThread:
         with self._status_lock:
             if self._stop_event.is_set():
                 return
-            self._update_status(p2p_pb2.SOURCE_STATUS_READY)
+            if not self._update_status(p2p_pb2.SOURCE_STATUS_READY):
+                # The server answered but said no - it probably lost this
+                # worker's registration. (Errors reaching the server raise
+                # instead and are handled in _run.)
+                self._on_heartbeat_rejected()
+                return
+            self._heartbeat_rejections = 0
             if self._unhealthy:
                 # Recovered: allow a future failure to demote us again.
                 self._unhealthy = False
