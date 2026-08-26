@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+import gc
 import logging
 import uuid
 from importlib.metadata import version as pkg_version
@@ -20,6 +21,7 @@ from ...accelerators import accelerator_backend_for
 from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
 from ...tensor_utils import (
+    adopt_hidden_tensors,
     capture_tensor_attrs,
     collect_module_tensors,
 )
@@ -79,17 +81,20 @@ class SglangAdapter(EngineAdapter):
     def discover_tensors(self, result: LoadResult) -> dict[str, torch.Tensor]:
         if result.model is None:
             raise RuntimeError("SGLang tensor discovery requires result.model")
-        # adopt_hidden_tensors() would also register accelerator tensors stashed
-        # on non-Module objects (e.g. SGLang's MXFP4 FusedMoE quant_method, which
-        # holds swizzled weights after deleting the original params). It is left
-        # commented out for now: it is a no-op for DeepSeek-V2-Lite (whose derived
-        # w_kc/w_vc are direct Tensor attributes, already promoted by
-        # capture_tensor_attrs), and enabling it adds new _mx_* manifest names,
-        # i.e. a transfer-ABI change that needs a version bump to avoid mixed
-        # old/new source/target manifests plus MXFP4 + CUTLASS FP8/W4A8 smoke
-        # tests. Enable it (with those guards) when SGLang nested-object coverage
-        # is in scope.
-        # adopt_hidden_tensors(result.model, self.accelerator_backend)
+        # capture_tensor_attrs() only promotes bare Tensor attributes assigned
+        # onto Modules (self.w_kc = tensor). Accelerator tensors stashed inside
+        # containers on non-Module objects - dicts, lists, nested dataclasses -
+        # stay invisible to named_parameters()/named_buffers() and so never
+        # reach the manifest. Kimi-K3 is full of them: on the vLLM path the same
+        # scan adopts 553 per rank, 368 of which live in one dict
+        # (Mxfp4MoEMethod._cache_permute_indices, keyed by tuples), plus an
+        # attention-backend workspace buffer. A target that never receives them
+        # runs forward with whatever its own init left behind.
+        #
+        # This adds _mx_* names to the manifest, so source and target must run
+        # the same ModelExpress version; mixing old and new manifests fails
+        # tensor matching.
+        adopt_hidden_tensors(result.model, self.accelerator_backend)
         return collect_module_tensors(result.model, self.accelerator_backend)
 
     def before_rdma_receive(self, result: LoadResult) -> LoadResult:
@@ -165,27 +170,75 @@ class SglangAdapter(EngineAdapter):
         )
         from sglang.srt.model_loader.utils import set_default_torch_dtype
 
-        old_value = result.value
+        model = result.model
+        if model is None:
+            raise RuntimeError("SGLang retry reinitialization requires result.model")
+        if result.value is not model:
+            raise RuntimeError(
+                "SGLang retry reinitialization requires result.value and "
+                "result.model to reference the same model root"
+            )
+
+        publishable = result.publishable
+        metadata = result.metadata
         result.value = None
         result.model = None
-        del old_value
+
+        # SGLang's RemoteInstanceModelLoader and MxModelLoader both retain the
+        # root model object while this hook runs. Deleting LoadResult references
+        # cannot release its parameters, so constructing a replacement directly
+        # would temporarily allocate two full models. Preserve the externally
+        # owned root identity, but first turn it into an empty shell so the old
+        # CUDA allocations can be reclaimed before initialization starts.
+        model.__dict__.clear()
+        gc.collect()
         self.accelerator_backend.empty_cache()
 
         logger.info(
-            "[Worker %s] Re-initializing SGLang model after failed strategy",
+            "[Worker %s] Re-initializing SGLang model state in-place after "
+            "failed strategy",
             self.get_global_rank(),
         )
         quant_config = _get_quantization_config(self.model_config, self.load_config)
         # Match SGLang's initial load path so retry parameters use the model's
         # configured dtype instead of PyTorch's default float32.
-        with set_default_torch_dtype(self.model_config.dtype):
-            with self.target_device:
-                model = _initialize_model(
-                    self.model_config,
-                    self.load_config,
-                    quant_config,
+        try:
+            with set_default_torch_dtype(self.model_config.dtype):
+                with self.target_device:
+                    fresh_model = _initialize_model(
+                        self.model_config,
+                        self.load_config,
+                        quant_config,
+                    )
+            if type(fresh_model) is not type(model):
+                raise RuntimeError(
+                    "SGLang retry initialization returned a different model type: "
+                    f"expected {type(model).__qualname__}, "
+                    f"got {type(fresh_model).__qualname__}"
                 )
-        return LoadResult(value=model, model=model, publishable=result.publishable)
+        except BaseException:
+            # The old parameter graph was intentionally released before fresh
+            # initialization and cannot be restored without retaining the HBM
+            # that caused duplicate-model OOM. Restore the envelope to the
+            # engine-owned empty root so callers do not observe None, then let
+            # the original failure abort startup rather than attempting another
+            # strategy with an invalid model.
+            result.value = model
+            result.model = model
+            result.publishable = publishable
+            result.metadata = metadata
+            raise
+
+        # Both roots briefly reference the same new children, so there is still
+        # only one set of parameter storage. The externally owned root remains
+        # valid after the temporary fresh root is dropped.
+        model.__dict__.update(fresh_model.__dict__)
+        del fresh_model
+        result.value = model
+        result.model = model
+        result.publishable = publishable
+        result.metadata = metadata
+        return result
 
     def _process_weights_after_loading(self, result: LoadResult) -> LoadResult:
         if result.model is None:

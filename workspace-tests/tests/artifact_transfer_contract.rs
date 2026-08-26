@@ -17,7 +17,7 @@ use std::fs;
 
 fn base_identity() -> SourceIdentity {
     SourceIdentity {
-        mx_version: "0.5.0".to_string(),
+        mx_version: "0.5.1".to_string(),
         mx_source_type: MxSourceType::Weights as i32,
         model_name: "Qwen/Qwen2.5-0.5B-Instruct".to_string(),
         backend_framework: BackendFramework::Vllm as i32,

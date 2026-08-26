@@ -93,8 +93,7 @@ def publish_metadata_and_ready(
 
         host = _get_worker_host()
 
-        grpc_base = envs.MX_WORKER_GRPC_PORT
-        worker_grpc_port = grpc_base + device_id
+        worker_grpc_port = envs.MX_WORKER_GRPC_PORT + device_id
 
         grpc_server = WorkerGrpcServer(
             tensor_protos=tensor_protos,

@@ -56,8 +56,7 @@ message WorkerRegistration {
   string worker_id = 1;
   WorkerRole role = 2;
   string model_name = 3;
-  string endpoint = 4;
-  uint64 expires_at_unix_ms = 5;
+  uint64 expires_at_unix_ms = 4;
 }
 
 message RegisterWorkerRequest {

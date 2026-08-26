@@ -25,6 +25,7 @@ import torch
 
 from . import envs
 from . import ucx_utils
+from .metrics import metrics as transfer_metrics
 from ._nixl import load_nixl_api
 from .accelerators import (
     AcceleratorBackend,
@@ -615,6 +616,7 @@ class NixlTransferManager:
                     f"{len(pending)} transfer(s) outstanding and no error status "
                     f"from NIXL"
                 )
+                transfer_metrics.record_nixl_error("timeout")
                 raise TimeoutError(
                     f"{label} timed out with {len(pending)} transfer(s) outstanding"
                 )
@@ -625,6 +627,7 @@ class NixlTransferManager:
                     continue
                 if status in ("ERR", "ERROR", "FAIL"):
                     self._data_plane_error = f"{label} failed with status {status}"
+                    transfer_metrics.record_nixl_error("status_error")
                     raise RuntimeError(f"{label} failed with status {status}")
                 still_pending.append(handle)
             if len(still_pending) == len(pending):
@@ -662,6 +665,7 @@ class NixlTransferManager:
                     f"{label} timed out after {timeout_seconds:.1f}s with no "
                     f"completion and no error status from NIXL"
                 )
+                transfer_metrics.record_nixl_error("timeout")
                 raise TimeoutError(f"{label} timed out")
             status = self._agent.check_xfer_state(handle)
             if status in ("DONE", "SUCCESS"):
@@ -674,6 +678,7 @@ class NixlTransferManager:
                 return
             if status in ("ERR", "ERROR", "FAIL"):
                 self._data_plane_error = f"{label} failed with status {status}"
+                transfer_metrics.record_nixl_error("status_error")
                 raise RuntimeError(f"{label} failed with status {status}")
             time.sleep(0.001)
 
@@ -773,6 +778,7 @@ class NixlTransferManager:
         timeout_seconds: float | None = None,
         remote_agent_name: str | None = None,
         require_exact_match: bool = False,
+        destination_tensors: dict[str, torch.Tensor] | None = None,
     ) -> tuple[int, int, float]:
         """
         Receive weights from a remote source via NIXL RDMA.
@@ -799,6 +805,8 @@ class NixlTransferManager:
                 derived tensors, which would otherwise leave part or all of the
                 target at dummy values while RDMA reports success. Same-family
                 transfers leave this False and tolerate subset transfers.
+            destination_tensors: Optional registered destination catalog used for
+                name matching. Defaults to the most recently registered catalog.
 
         Returns:
             Tuple of (total_bytes, total_tensors, duration)
@@ -813,6 +821,9 @@ class NixlTransferManager:
 
         start_time = time.perf_counter()
         self._accelerator_backend.set_device(self._device_id)
+        local_tensors = (
+            self._tensors if destination_tensors is None else destination_tensors
+        )
 
         if remote_agent_name is None:
             add_start = time.perf_counter()
@@ -833,17 +844,19 @@ class NixlTransferManager:
         total_bytes = 0
 
         for src_tensor in source_tensors:
-            local_tensor = self._tensors.get(src_tensor.name)
+            local_tensor = local_tensors.get(src_tensor.name)
             if local_tensor is None:
                 continue
             local_size = local_tensor.numel() * local_tensor.element_size()
             if local_size != src_tensor.size:
+                transfer_metrics.record_nixl_receive("rejected")
                 raise ManifestMismatchError(
                     f"Tensor '{src_tensor.name}' size mismatch: "
                     f"source={src_tensor.size} bytes, local={local_size} bytes"
                 )
             local_dtype = str(local_tensor.dtype)
             if local_dtype != src_tensor.dtype:
+                transfer_metrics.record_nixl_receive("rejected")
                 raise ManifestMismatchError(
                     f"Tensor '{src_tensor.name}' dtype mismatch: "
                     f"source={src_tensor.dtype!r}, local={local_dtype!r}"
@@ -863,17 +876,22 @@ class NixlTransferManager:
         matched_tensors = len(remote_descs)
         match_time = time.perf_counter() - match_start
 
+        # Downgraded to `partial` by the name-diff check below, which does not
+        # return early.
+        receive_result = "complete"
+
         # Name-set diff between the source manifest and the locally registered
         # tensors.
         src_names = {s.name for s in source_tensors}
-        local_only = sorted(set(self._tensors) - src_names)
-        source_only = sorted(src_names - set(self._tensors))
+        local_only = sorted(set(local_tensors) - src_names)
+        source_only = sorted(src_names - set(local_tensors))
         if local_only or source_only:
             if require_exact_match:
                 # Cross-family transfer: a name diff can mean vendor-specific
                 # hidden or derived tensors, so completing the transfer would
                 # leave the local-only tensors at dummy values while reporting
                 # RDMA success. Fail closed instead.
+                transfer_metrics.record_nixl_receive("rejected")
                 raise ManifestMismatchError(
                     "Tensor name mismatch on heterogeneous transfer: "
                     f"{len(local_only)} local-only "
@@ -881,6 +899,12 @@ class NixlTransferManager:
                     f"{len(source_only)} source-only "
                     f"(first: {source_only[:5]})"
                 )
+            # Completing here leaves the local-only tensors at their dummy
+            # values while the transfer still reports success, so the warning is
+            # the only evidence today. Downgrade the outcome rather than
+            # recording now: this path falls through to the same return as a
+            # clean transfer, and recording here would count the receive twice.
+            receive_result = "partial"
             logger.warning(
                 "Tensor name mismatch between source manifest and local "
                 "registration: %d local-only, %d source-only",
@@ -890,10 +914,12 @@ class NixlTransferManager:
 
         if not remote_descs:
             if require_exact_match:
+                transfer_metrics.record_nixl_receive("rejected")
                 raise ManifestMismatchError(
                     "No matching tensors found for heterogeneous transfer"
                 )
             logger.warning("No matching tensors found for transfer")
+            transfer_metrics.record_nixl_receive("empty")
             return 0, 0, 0.0
 
         logger.info(
@@ -949,6 +975,7 @@ class NixlTransferManager:
             f"({bandwidth_gbps:.1f} Gbps)"
         )
 
+        transfer_metrics.record_nixl_receive(receive_result)
         return total_bytes, matched_tensors, duration
 
     def execute_read_batch(

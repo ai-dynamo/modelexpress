@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import traceback
 import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, ClassVar
@@ -23,6 +24,30 @@ if TYPE_CHECKING:
     from ..nixl_transfer import NixlTransferManager
 
 logger = logging.getLogger("modelexpress.load_strategy")
+
+
+def clear_exception_tracebacks(exc: BaseException) -> None:
+    """Drop completed failure frames before releasing a mutated model.
+
+    Transfer failures commonly retain target tensors through traceback frame
+    locals (for example ``local_tensor`` in the NIXL matching loop). Clearing
+    only ``LoadResult`` and ``LoadContext`` therefore does not guarantee that
+    CUDA allocations become unreachable before retry initialization.
+    """
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+        if current.__traceback__ is not None:
+            traceback.clear_frames(current.__traceback__)
+            current.__traceback__ = None
 
 
 class SourceTransferError(Exception):
@@ -261,24 +286,32 @@ def unpublish_metadata(ctx: LoadContext) -> None:
     Call publish_metadata() again after memory is valid to re-enter the
     P2P network.
     """
+    unpublish_metadata_for_worker(
+        worker_rank=ctx.worker_rank,
+        device_id=ctx.device_id,
+    )
+
+
+def unpublish_metadata_for_worker(*, worker_rank: int, device_id: int) -> None:
+    """Stop one worker's publication without requiring a boot-load context."""
     from ..metadata.publish import _heartbeat_threads, _worker_servers
 
-    hb = _heartbeat_threads.pop(ctx.worker_rank, None)
+    hb = _heartbeat_threads.pop(worker_rank, None)
     if hb is not None:
         try:
             hb.stop()  # also marks STALE on MX server
-            logger.info(f"[Worker {ctx.global_rank}] Heartbeat stopped")
+            logger.info(f"[Worker {worker_rank}] Heartbeat stopped")
         except Exception as e:
             logger.warning(
-                f"[Worker {ctx.global_rank}] Failed to stop heartbeat cleanly: {e}"
+                f"[Worker {worker_rank}] Failed to stop heartbeat cleanly: {e}"
             )
 
-    ws = _worker_servers.pop(ctx.device_id, None)
+    ws = _worker_servers.pop(device_id, None)
     if ws is not None:
         try:
             ws.stop()
-            logger.info(f"[Worker {ctx.global_rank}] Worker gRPC server stopped")
+            logger.info(f"[Worker {worker_rank}] Worker gRPC server stopped")
         except Exception as e:
             logger.warning(
-                f"[Worker {ctx.global_rank}] Failed to stop worker gRPC server cleanly: {e}"
+                f"[Worker {worker_rank}] Failed to stop worker gRPC server cleanly: {e}"
             )

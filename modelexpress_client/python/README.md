@@ -109,57 +109,45 @@ behind the client.
 ```python
 from modelexpress_rl import (
     ModelExpressTrainerClient,
+    ModelExpressTrainerConfig,
     WeightVersionRef,
-    WeightVersionShardManifestService,
-    refit_pb2_grpc,
 )
 
-manifest_service = WeightVersionShardManifestService(endpoint="trainer-0:9000")
-refit_pb2_grpc.add_RefitWorkerServiceServicer_to_server(
-    manifest_service,
-    trainer_worker_grpc_server,
-)
-
-trainer = ModelExpressTrainerClient.initialize(
-    manager=nixl_manager,
-    manifest_publisher=manifest_service,
-)
-
-shard = trainer.stage_shard(
-    version=WeightVersionRef(version.uid),
-    tensors=megatron_tensor_specs,
-)
-shard.publish()
+trainer = ModelExpressTrainerClient.initialize(ModelExpressTrainerConfig())
+trainer.bind_tensors(megatron_tensor_specs)
+trainer.publish_version(version=WeightVersionRef(version.uid))
 ```
 
 The deployment supplies `MODEL_NAME`, `MX_TRAINER_ENGINE`,
 `MX_TRAINER_STAGING_MODE`, `MX_WEIGHT_PAYLOAD_FORMAT`, `MX_WORKER_HOST`, and the
 normal ModelExpress server configuration. The Megatron adapter derives its
-source slot from the engine's global distributed rank. The NIXL metadata
-endpoint is derived from `MX_WORKER_HOST` and the supplied NIXL manager's listen
-port.
+source slot from logical tensor names and shard geometry. DP replicas of the same
+partition therefore publish redundant workers for one slot, while distinct TP
+partitions remain separate required slots. The NIXL metadata endpoint is derived
+from `MX_WORKER_HOST` and the client-owned NIXL manager's listen port. `LOCAL_RANK`
+selects the device unless `device_id` is passed to `initialize()`.
 
-`worker_endpoint` is the trainer-side manifest service address advertised to
-other workers. `server_url` selects the central ModelExpress control-plane
-service and defaults to the normal ModelExpress server configuration.
+The client owns the NIXL manager and trainer-side manifest service. `server_url`
+selects the central ModelExpress control-plane service and defaults to the
+normal ModelExpress server configuration. A Megatron worker may initialize the
+client after selecting its CUDA device but before creating NCCL resources; the
+engine adapter is created lazily when the worker first requests its source slot
+or stages a shard after distributed setup.
 
 Initialization fixes the staging mode and payload format. `publish()` hides
 manifest publication and the internal `CreateWeightVersionShard` RPC. The
-current Megatron adapter exposes its already-registered live buffers through
+current Megatron adapter registers and exposes its live buffers through
 `IN_PLACE`, so callers must keep those tensors immutable while the version is
-published. Its `source_reuse_ready` fence raises `NotImplementedError` until
-version retirement is wired to the adapter; it must not be interpreted as an
-early reuse signal. The required lifecycle is synchronous: create and publish
-the version, update every generator, retire the version, and only then resume
-training or begin the next optimizer step. The adapter does not claim fully
-asynchronous `COPY_TO_DEVICE` behavior until that staging implementation exists.
+published. The required lifecycle is synchronous: create and publish the
+version, update every generator, retire and release the version, and only then
+resume training or begin the next optimizer step.
 
 Version creation and expected-source-slot declaration remain
 framework-orchestrator responsibilities. Each trainer adapter derives its own
 source slot from the engine's native topology; the orchestrator declares the
 expected slots using the same adapter-defined convention. `initialize()`
-selects the configured trainer engine and constructs its adapter internally;
-Megatron is the first implementation. Megatron-specific APIs live under
+selects the configured trainer engine and constructs its adapter internally.
+Megatron and FSDP implementations are available. Megatron-specific APIs live under
 `modelexpress_rl`;
 `modelexpress.refit.reshard` remains the shared, engine-neutral transfer core.
 
@@ -211,6 +199,7 @@ register_modelexpress_loaders()
 | `MX_SYNC_START` | `1` | Target: wait for all source workers before transferring |
 | `MX_POOL_REG` | `0` | Allocation-level NIXL registration (registers cudaMalloc blocks instead of individual tensors) |
 | `MX_P2P_METADATA` | `1` | Serve tensor and artifact manifests directly from source workers; set to `0` to route full tensor metadata through the central server |
+| `MX_REFIT_METADATA_PORT` | `7555` | Base NIXL metadata-listener port for RL generator refit; each rank adds its local device ID. Kept separate from `MX_METADATA_PORT`, which may remain owned by the boot-time loader |
 | `MX_ARTIFACT_TRANSFER` | `0` | Transfer compatible vLLM TorchInductor, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM |
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles |
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | empty | Optional compile-configuration compatibility digest for cache discovery |

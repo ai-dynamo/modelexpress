@@ -27,11 +27,18 @@ from .source_identity import build_source_identity
 
 logger = logging.getLogger("modelexpress.engines.vllm.adapter")
 
-_VLLM_POST_LOAD_FINALIZER_NAMES = (
-    # DeepSeek V4 finalizes MegaMoE expert layouts from load_weights().
-    # The RDMA target path uses vLLM's dummy loader, which bypasses the
-    # model load_weights() method, so mirror the model-level hook here.
+_VLLM_PRE_RDMA_FINALIZER_NAMES = (
+    # MegaMoE changes the model's tensor layout. It must run before tensor
+    # discovery and RDMA registration so the target exposes the same regions
+    # that the source published.
     "finalize_mega_moe_weights",
+)
+
+_VLLM_POST_RDMA_FINALIZER_NAMES = (
+    # DeepSeek V4 derives this tensor from hc_attn_fn. Unlike MegaMoE, it is
+    # target-local and is not sent by RDMA, so it must be built only after
+    # hc_attn_fn has received its real weight values.
+    "finalize_mhc_broadcast_weights",
 )
 
 # MTP draft weights live under an "mtp." prefix in the shared checkpoint. The
@@ -217,8 +224,16 @@ class VllmAdapter(EngineAdapter):
         # post-load processing. RDMA targets use the dummy loader, so run
         # those hooks before receiving tensors to expose the same target
         # tensor layout and hidden buffers that the source published.
-        result = self._finalize_model_specific_weights(result)
+        result = self._finalize_model_specific_weights(
+            result, _VLLM_PRE_RDMA_FINALIZER_NAMES
+        )
         return self._process_weights_after_loading(result)
+
+    def after_rdma_receive(self, result: LoadResult) -> LoadResult:
+        """Build target-local tensors derived from the received weights."""
+        return self._finalize_model_specific_weights(
+            result, _VLLM_POST_RDMA_FINALIZER_NAMES
+        )
 
     def apply_weight_iter(
         self,
@@ -378,8 +393,9 @@ class VllmAdapter(EngineAdapter):
     def _finalize_model_specific_weights(
         self,
         result: LoadResult,
+        finalizer_names: tuple[str, ...],
     ) -> LoadResult:
-        """Run model finalizers that vLLM normally calls in load_weights()."""
+        """Run selected model finalizers that vLLM normally calls in load_weights()."""
 
         if result.model is None:
             raise RuntimeError("vLLM RDMA post-load processing requires result.model")
@@ -397,13 +413,13 @@ class VllmAdapter(EngineAdapter):
                     continue
 
                 module_finalized = False
-                for finalizer_name in _VLLM_POST_LOAD_FINALIZER_NAMES:
+                for finalizer_name in finalizer_names:
                     finalizer = getattr(module, finalizer_name, None)
                     if not callable(finalizer):
                         continue
 
                     logger.info(
-                        "Running vLLM model-specific post-load finalizer %s on %s",
+                        "Running vLLM model finalizer %s on %s",
                         finalizer_name,
                         name or type(module).__name__,
                     )
