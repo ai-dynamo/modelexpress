@@ -510,6 +510,24 @@ class TestReceiveFromSourceManifestValidation:
                 require_exact_match=True,
             )
 
+    def test_explicit_destination_catalog_overrides_latest_registration(
+        self, monkeypatch
+    ):
+        canonical = torch.zeros(10, dtype=torch.float32)
+        auxiliary = torch.zeros(1, dtype=torch.float32)
+        mgr = self._make_manager(monkeypatch, {"__convert__w": auxiliary})
+        src = TensorDescriptor(
+            name="w", addr=0x1000, size=80, device_id=0, dtype=str(canonical.dtype),
+        )
+        with pytest.raises(ManifestMismatchError, match="size mismatch"):
+            mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=[src],
+                remote_agent_name="dummy",
+                require_exact_match=True,
+                destination_tensors={"w": canonical},
+            )
+
 
 class TestWaitForXfer:
     @staticmethod

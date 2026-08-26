@@ -29,6 +29,10 @@ local state = redis.call('HGET', KEYS[1], 'state')
 if state ~= ARGV[5] and state ~= ARGV[6] then
   return 'VERSION_NOT_WRITABLE'
 end
+local s3_uri = redis.call('HGET', KEYS[1], 's3_uri')
+if s3_uri and s3_uri ~= '' then
+  return 'VERSION_NOT_WRITABLE'
+end
 if redis.call('SISMEMBER', KEYS[5], ARGV[4]) == 0 then
   return 'SOURCE_SLOT_NOT_REQUIRED'
 end

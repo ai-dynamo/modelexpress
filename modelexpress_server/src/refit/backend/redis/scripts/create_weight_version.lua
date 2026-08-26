@@ -5,8 +5,7 @@
 -- KEYS[3]: expected source slots set
 -- ARGV: uid, model_name, version_number, idempotency_key, payload_format,
 --       base_version_id, expected_source_slots JSON, expected_source_slot_count,
---       state,
---       created_at_unix_ms
+--       s3_uri, initial_state, state, created_at_unix_ms
 --
 -- Returns:
 --   CREATED              this invocation created the version
@@ -34,10 +33,12 @@ redis.call('HSET', KEYS[1],
   'base_version_id', ARGV[6],
   'expected_source_slots', ARGV[7],
   'expected_source_slot_count', ARGV[8],
+  's3_uri', ARGV[9],
+  'initial_state', ARGV[10],
   'layout_signature', '',
-  'state', ARGV[9],
-  'created_at_unix_ms', ARGV[10])
-for index = 11, #ARGV do
+  'state', ARGV[11],
+  'created_at_unix_ms', ARGV[12])
+for index = 13, #ARGV do
   redis.call('SADD', KEYS[3], ARGV[index])
 end
 redis.call('SET', KEYS[2], ARGV[1])

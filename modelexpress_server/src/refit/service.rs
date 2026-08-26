@@ -9,12 +9,14 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use modelexpress_common::grpc::refit::{
-    CreateWeightVersionRequest, CreateWeightVersionShardRequest, CreateWeightVersionShardResponse,
-    DeleteVersionLeaseRequest, DeleteVersionLeaseResponse, DeleteWeightVersionRequest,
-    DeleteWeightVersionShardRequest, DeleteWeightVersionShardResponse, GetWeightVersionRequest,
-    ListWeightVersionShardsRequest, ListWeightVersionShardsResponse, RegisterVersionLeaseRequest,
-    RegisterWorkerRequest, VersionLease, WeightPayloadFormat, WeightVersion, WeightVersionState,
-    WorkerRegistration, WorkerRole, refit_service_server::RefitService,
+    CreateWeightVersionRequest, CreateWeightVersionResponse, CreateWeightVersionShardRequest,
+    CreateWeightVersionShardResponse, DeleteVersionLeaseRequest, DeleteVersionLeaseResponse,
+    DeleteWeightVersionRequest, DeleteWeightVersionResponse, DeleteWeightVersionShardRequest,
+    DeleteWeightVersionShardResponse, GetWeightVersionRequest, GetWeightVersionResponse,
+    ListWeightVersionShardsRequest, ListWeightVersionShardsResponse, ObjectStorageType,
+    RegisterVersionLeaseRequest, RegisterVersionLeaseResponse, RegisterWorkerRequest,
+    RegisterWorkerResponse, UpdateWeightVersionStateRequest, UpdateWeightVersionStateResponse,
+    WeightPayloadFormat, WeightVersionState, WorkerRole, refit_service_server::RefitService,
 };
 use tonic::{Request, Response, Status};
 
@@ -36,6 +38,87 @@ fn validate_ttl(ttl_seconds: u32) -> Result<(), Status> {
     } else {
         Ok(())
     }
+}
+
+fn validate_s3_uri(uri: &str) -> Result<(), Status> {
+    if uri.contains('?') || uri.contains('#') {
+        return Err(Status::invalid_argument(
+            "object_storage.uri must not contain a query or fragment",
+        ));
+    }
+    let Some(location) = uri.strip_prefix("s3://") else {
+        return Err(Status::invalid_argument(
+            "object_storage.uri must use the s3:// scheme",
+        ));
+    };
+    let Some((bucket, key)) = location.split_once('/') else {
+        return Err(Status::invalid_argument(
+            "object_storage.uri must include a bucket and key",
+        ));
+    };
+    if bucket.trim().is_empty() || key.trim().is_empty() || key.starts_with('/') {
+        return Err(Status::invalid_argument(
+            "object_storage.uri must include a bucket and key",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_publication(request: &CreateWeightVersionRequest) -> Result<(), Status> {
+    let state =
+        WeightVersionState::try_from(request.state).unwrap_or(WeightVersionState::Unspecified);
+    if let Some(object_storage) = request.object_storage.as_ref() {
+        if request.version_number.is_none() {
+            return Err(Status::invalid_argument(
+                "version_number is required for S3 publication",
+            ));
+        }
+        if ObjectStorageType::try_from(object_storage.storage_type)
+            .unwrap_or(ObjectStorageType::Unspecified)
+            != ObjectStorageType::S3
+        {
+            return Err(Status::invalid_argument(
+                "only S3 object storage is currently supported",
+            ));
+        }
+        required(&object_storage.uri, "object_storage.uri")?;
+        validate_s3_uri(&object_storage.uri)?;
+        if !request.expected_source_slots.is_empty() {
+            return Err(Status::invalid_argument(
+                "expected_source_slots must be empty for S3 publication",
+            ));
+        }
+        if !matches!(
+            state,
+            WeightVersionState::Staging | WeightVersionState::Ready
+        ) {
+            return Err(Status::invalid_argument(
+                "S3 state must be STAGING or READY",
+            ));
+        }
+        return Ok(());
+    }
+
+    if state != WeightVersionState::Staging {
+        return Err(Status::invalid_argument(
+            "worker-sharded state must be STAGING",
+        ));
+    }
+    if request.expected_source_slots.is_empty() {
+        return Err(Status::invalid_argument(
+            "expected_source_slots must not be empty for worker-sharded publication",
+        ));
+    }
+    let mut unique = HashSet::new();
+    for source_slot_id in &request.expected_source_slots {
+        required(source_slot_id, "expected_source_slots entry")?;
+        if !unique.insert(source_slot_id) {
+            return Err(Status::invalid_argument(
+                "expected_source_slots must not contain duplicates",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn backend_status(error: RefitBackendError) -> Status {
@@ -68,7 +151,7 @@ impl RefitService for RefitServiceImpl {
     async fn register_worker(
         &self,
         request: Request<RegisterWorkerRequest>,
-    ) -> Result<Response<WorkerRegistration>, Status> {
+    ) -> Result<Response<RegisterWorkerResponse>, Status> {
         let request = request.into_inner();
         let worker = request
             .worker
@@ -82,17 +165,20 @@ impl RefitService for RefitServiceImpl {
         }
         validate_ttl(request.ttl_seconds)?;
 
-        self.backend
+        let worker = self
+            .backend
             .register_worker(worker, request.ttl_seconds)
             .await
-            .map(Response::new)
-            .map_err(backend_status)
+            .map_err(backend_status)?;
+        Ok(Response::new(RegisterWorkerResponse {
+            worker: Some(worker),
+        }))
     }
 
     async fn create_weight_version(
         &self,
         request: Request<CreateWeightVersionRequest>,
-    ) -> Result<Response<WeightVersion>, Status> {
+    ) -> Result<Response<CreateWeightVersionResponse>, Status> {
         let request = request.into_inner();
         required(&request.model_name, "model_name")?;
         required(&request.idempotency_key, "idempotency_key")?;
@@ -114,20 +200,7 @@ impl RefitService for RefitServiceImpl {
             }
             _ => {}
         }
-        if request.expected_source_slots.is_empty() {
-            return Err(Status::invalid_argument(
-                "expected_source_slots must not be empty",
-            ));
-        }
-        let mut unique = HashSet::new();
-        for source_slot_id in &request.expected_source_slots {
-            required(source_slot_id, "expected_source_slots entry")?;
-            if !unique.insert(source_slot_id) {
-                return Err(Status::invalid_argument(
-                    "expected_source_slots must not contain duplicates",
-                ));
-            }
-        }
+        validate_publication(&request)?;
         if let Some(base_version_id) = request.base_version_id.as_deref()
             && payload_format == WeightPayloadFormat::XorDelta
         {
@@ -144,37 +217,67 @@ impl RefitService for RefitServiceImpl {
                 ));
             }
         }
-        self.backend
+        let version = self
+            .backend
             .create_weight_version(&request)
             .await
-            .map(Response::new)
-            .map_err(backend_status)
+            .map_err(backend_status)?;
+        Ok(Response::new(CreateWeightVersionResponse {
+            version: Some(version),
+        }))
     }
 
     async fn get_weight_version(
         &self,
         request: Request<GetWeightVersionRequest>,
-    ) -> Result<Response<WeightVersion>, Status> {
+    ) -> Result<Response<GetWeightVersionResponse>, Status> {
         let uid = request.into_inner().uid;
         required(&uid, "uid")?;
-        self.backend
+        let version = self
+            .backend
             .get_weight_version(&uid)
             .await
-            .map(Response::new)
-            .map_err(backend_status)
+            .map_err(backend_status)?;
+        Ok(Response::new(GetWeightVersionResponse {
+            version: Some(version),
+        }))
+    }
+
+    async fn update_weight_version_state(
+        &self,
+        request: Request<UpdateWeightVersionStateRequest>,
+    ) -> Result<Response<UpdateWeightVersionStateResponse>, Status> {
+        let request = request.into_inner();
+        required(&request.uid, "uid")?;
+        if WeightVersionState::try_from(request.state).unwrap_or(WeightVersionState::Unspecified)
+            == WeightVersionState::Unspecified
+        {
+            return Err(Status::invalid_argument("state must be specified"));
+        }
+        let version = self
+            .backend
+            .update_weight_version_state(&request)
+            .await
+            .map_err(backend_status)?;
+        Ok(Response::new(UpdateWeightVersionStateResponse {
+            version: Some(version),
+        }))
     }
 
     async fn delete_weight_version(
         &self,
         request: Request<DeleteWeightVersionRequest>,
-    ) -> Result<Response<WeightVersion>, Status> {
+    ) -> Result<Response<DeleteWeightVersionResponse>, Status> {
         let uid = request.into_inner().uid;
         required(&uid, "uid")?;
-        self.backend
+        let version = self
+            .backend
             .delete_weight_version(&uid)
             .await
-            .map(Response::new)
-            .map_err(backend_status)
+            .map_err(backend_status)?;
+        Ok(Response::new(DeleteWeightVersionResponse {
+            version: Some(version),
+        }))
     }
 
     async fn create_weight_version_shard(
@@ -190,7 +293,6 @@ impl RefitService for RefitServiceImpl {
         required(&shard.worker_id, "shard.worker_id")?;
         required(&shard.manifest_digest, "shard.manifest_digest")?;
         required(&shard.manifest_endpoint, "shard.manifest_endpoint")?;
-        required(&shard.transport, "shard.transport")?;
 
         let (shard, version) = self
             .backend
@@ -234,16 +336,19 @@ impl RefitService for RefitServiceImpl {
     async fn register_version_lease(
         &self,
         request: Request<RegisterVersionLeaseRequest>,
-    ) -> Result<Response<VersionLease>, Status> {
+    ) -> Result<Response<RegisterVersionLeaseResponse>, Status> {
         let request = request.into_inner();
         required(&request.version_id, "version_id")?;
         required(&request.worker_id, "worker_id")?;
         validate_ttl(request.ttl_seconds)?;
-        self.backend
+        let lease = self
+            .backend
             .register_version_lease(&request)
             .await
-            .map(Response::new)
-            .map_err(backend_status)
+            .map_err(backend_status)?;
+        Ok(Response::new(RegisterVersionLeaseResponse {
+            lease: Some(lease),
+        }))
     }
 
     async fn delete_version_lease(
@@ -259,5 +364,149 @@ impl RefitService for RefitServiceImpl {
             .await
             .map(|deleted| Response::new(DeleteVersionLeaseResponse { deleted }))
             .map_err(backend_status)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use modelexpress_common::grpc::refit::ObjectStorageSource;
+    use tonic::Code;
+
+    use super::*;
+
+    fn error_code(result: Result<(), Status>) -> Code {
+        match result {
+            Ok(()) => panic!("publication validation unexpectedly succeeded"),
+            Err(status) => status.code(),
+        }
+    }
+
+    fn s3_source(uri: &str) -> ObjectStorageSource {
+        ObjectStorageSource {
+            uri: uri.to_string(),
+            storage_type: ObjectStorageType::S3.into(),
+        }
+    }
+
+    #[test]
+    fn valid_object_storage_and_worker_sharded_publications_are_accepted() {
+        for state in [WeightVersionState::Staging, WeightVersionState::Ready] {
+            assert!(
+                validate_publication(&CreateWeightVersionRequest {
+                    version_number: Some(42),
+                    object_storage: Some(s3_source(
+                        "s3://weights/run/policy/v42/model.safetensors.index.json",
+                    )),
+                    state: state.into(),
+                    ..Default::default()
+                })
+                .is_ok()
+            );
+        }
+        assert!(
+            validate_publication(&CreateWeightVersionRequest {
+                expected_source_slots: vec!["rank:0".to_string()],
+                state: WeightVersionState::Staging.into(),
+                ..Default::default()
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn invalid_object_storage_and_worker_sharded_publications_are_rejected() {
+        for request in [
+            CreateWeightVersionRequest {
+                version_number: Some(42),
+                object_storage: Some(ObjectStorageSource::default()),
+                state: WeightVersionState::Staging.into(),
+                ..Default::default()
+            },
+            CreateWeightVersionRequest {
+                version_number: Some(42),
+                object_storage: Some(s3_source("https://weights/root")),
+                state: WeightVersionState::Staging.into(),
+                ..Default::default()
+            },
+            CreateWeightVersionRequest {
+                version_number: Some(42),
+                object_storage: Some(s3_source("s3://weights")),
+                state: WeightVersionState::Staging.into(),
+                ..Default::default()
+            },
+            CreateWeightVersionRequest {
+                version_number: Some(42),
+                object_storage: Some(s3_source("s3:///root")),
+                state: WeightVersionState::Staging.into(),
+                ..Default::default()
+            },
+            CreateWeightVersionRequest {
+                version_number: Some(42),
+                expected_source_slots: vec!["rank:0".to_string()],
+                object_storage: Some(s3_source("s3://weights/root")),
+                state: WeightVersionState::Staging.into(),
+                ..Default::default()
+            },
+            CreateWeightVersionRequest {
+                version_number: Some(42),
+                object_storage: Some(s3_source("s3://weights/root")),
+                state: WeightVersionState::Releasing.into(),
+                ..Default::default()
+            },
+            CreateWeightVersionRequest {
+                object_storage: Some(s3_source("s3://weights/root")),
+                state: WeightVersionState::Staging.into(),
+                ..Default::default()
+            },
+            CreateWeightVersionRequest {
+                version_number: Some(42),
+                object_storage: Some(s3_source("s3://weights//root")),
+                state: WeightVersionState::Staging.into(),
+                ..Default::default()
+            },
+            CreateWeightVersionRequest {
+                version_number: Some(42),
+                object_storage: Some(s3_source("s3://weights/root?query")),
+                state: WeightVersionState::Staging.into(),
+                ..Default::default()
+            },
+            CreateWeightVersionRequest {
+                version_number: Some(42),
+                object_storage: Some(ObjectStorageSource {
+                    uri: "az://weights/root".to_string(),
+                    storage_type: ObjectStorageType::Azure.into(),
+                }),
+                state: WeightVersionState::Staging.into(),
+                ..Default::default()
+            },
+            CreateWeightVersionRequest {
+                version_number: Some(42),
+                object_storage: Some(ObjectStorageSource {
+                    uri: "gs://weights/root".to_string(),
+                    storage_type: ObjectStorageType::Gcs.into(),
+                }),
+                state: WeightVersionState::Staging.into(),
+                ..Default::default()
+            },
+            CreateWeightVersionRequest {
+                state: WeightVersionState::Staging.into(),
+                ..Default::default()
+            },
+            CreateWeightVersionRequest {
+                expected_source_slots: vec!["rank:0".to_string()],
+                state: WeightVersionState::Ready.into(),
+                ..Default::default()
+            },
+            CreateWeightVersionRequest {
+                expected_source_slots: vec!["rank:0".to_string(), "rank:0".to_string()],
+                state: WeightVersionState::Staging.into(),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                error_code(validate_publication(&request)),
+                Code::InvalidArgument
+            );
+        }
     }
 }
