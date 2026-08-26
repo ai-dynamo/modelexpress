@@ -261,24 +261,32 @@ def unpublish_metadata(ctx: LoadContext) -> None:
     Call publish_metadata() again after memory is valid to re-enter the
     P2P network.
     """
+    unpublish_metadata_for_worker(
+        worker_rank=ctx.worker_rank,
+        device_id=ctx.device_id,
+    )
+
+
+def unpublish_metadata_for_worker(*, worker_rank: int, device_id: int) -> None:
+    """Stop one worker's publication without requiring a boot-load context."""
     from ..metadata.publish import _heartbeat_threads, _worker_servers
 
-    hb = _heartbeat_threads.pop(ctx.worker_rank, None)
+    hb = _heartbeat_threads.pop(worker_rank, None)
     if hb is not None:
         try:
             hb.stop()  # also marks STALE on MX server
-            logger.info(f"[Worker {ctx.global_rank}] Heartbeat stopped")
+            logger.info(f"[Worker {worker_rank}] Heartbeat stopped")
         except Exception as e:
             logger.warning(
-                f"[Worker {ctx.global_rank}] Failed to stop heartbeat cleanly: {e}"
+                f"[Worker {worker_rank}] Failed to stop heartbeat cleanly: {e}"
             )
 
-    ws = _worker_servers.pop(ctx.device_id, None)
+    ws = _worker_servers.pop(device_id, None)
     if ws is not None:
         try:
             ws.stop()
-            logger.info(f"[Worker {ctx.global_rank}] Worker gRPC server stopped")
+            logger.info(f"[Worker {worker_rank}] Worker gRPC server stopped")
         except Exception as e:
             logger.warning(
-                f"[Worker {ctx.global_rank}] Failed to stop worker gRPC server cleanly: {e}"
+                f"[Worker {worker_rank}] Failed to stop worker gRPC server cleanly: {e}"
             )

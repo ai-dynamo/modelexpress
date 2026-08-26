@@ -44,6 +44,9 @@ class _VllmInstaller:
         self._vllm_config = vllm_config
         self._model_config = model_config
         self._device = device
+        self._parameter_layout: dict[
+            str, tuple[tuple[int, ...], torch.dtype]
+        ] | None = None
 
     @property
     def _is_quantized(self) -> bool:
@@ -85,6 +88,16 @@ class _VllmInstaller:
         with set_default_torch_dtype(self._model_config.dtype), torch.device("meta"):
             return initialize_model(twin_config)
 
+    @staticmethod
+    def _layout_of(
+        model: Module,
+    ) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+        """Describe one model's named parameter shapes and dtypes."""
+        return {
+            name: (tuple(parameter.shape), parameter.dtype)
+            for name, parameter in model.named_parameters()
+        }
+
     def capture(
         self, manifest: list[tuple[str, torch.dtype, tuple[int, ...]]]
     ) -> tuple[
@@ -115,10 +128,15 @@ class _VllmInstaller:
             len(capture.unsupported),
             self._is_quantized,
         )
-        return capture, {
-            name: (tuple(parameter.shape), parameter.dtype)
-            for name, parameter in twin.named_parameters()
-        }
+        parameter_layout = self._layout_of(twin)
+        self._parameter_layout = parameter_layout
+        return capture, parameter_layout
+
+    def parameter_layout(self) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+        """Return the canonical load-time layout used by peer staging buffers."""
+        if self._parameter_layout is None:
+            self._parameter_layout = self._layout_of(self._build_meta_twin())
+        return self._parameter_layout
 
     def install(self, tensors: dict[str, torch.Tensor]) -> None:
         """Install verified load-layout tensors without changing graph addresses."""
