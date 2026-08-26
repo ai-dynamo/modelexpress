@@ -5,8 +5,11 @@ from concurrent import futures
 
 import grpc
 import pytest
+from modelexpress_rl import control as control_module
 from modelexpress_rl import (
     ModelExpressControlClient,
+    ObjectStorageSource,
+    ObjectStorageType,
     WeightPayloadFormat,
     WeightVersionState,
     refit_pb2,
@@ -31,26 +34,34 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         )
         if request.HasField("base_version_id"):
             self.version.base_version_id = request.base_version_id
-        if request.HasField("s3"):
-            self.version.s3.CopyFrom(request.s3)
-        return self.version
+        if request.HasField("object_storage"):
+            self.version.object_storage.CopyFrom(request.object_storage)
+        return refit_pb2.CreateWeightVersionResponse(version=self.version)
 
     def GetWeightVersion(self, request, context):
         if self.version is None or request.uid != self.version.uid:
             context.abort(grpc.StatusCode.NOT_FOUND, "version not found")
-        return self.version
+        return refit_pb2.GetWeightVersionResponse(version=self.version)
 
     def DeleteWeightVersion(self, request, context):
         if self.version is None or request.uid != self.version.uid:
             context.abort(grpc.StatusCode.NOT_FOUND, "version not found")
         self.version.state = refit_pb2.WEIGHT_VERSION_STATE_RELEASING
-        return self.version
+        return refit_pb2.DeleteWeightVersionResponse(version=self.version)
 
     def UpdateWeightVersionState(self, request, context):
         if self.version is None or request.uid != self.version.uid:
             context.abort(grpc.StatusCode.NOT_FOUND, "version not found")
         self.version.state = request.state
         return refit_pb2.UpdateWeightVersionStateResponse(version=self.version)
+
+
+def test_control_client_rejects_missing_version_response():
+    with pytest.raises(RuntimeError, match="GetWeightVersion.*missing version"):
+        control_module._response_version(
+            refit_pb2.GetWeightVersionResponse(),
+            "GetWeightVersion",
+        )
 
 
 def test_control_client_owns_global_weight_version_lifecycle():
@@ -96,7 +107,15 @@ def test_control_client_owns_global_weight_version_lifecycle():
     assert deleted.state is WeightVersionState.RELEASING
 
 
-def test_control_client_creates_ready_s3_version_without_source_slots():
+@pytest.mark.parametrize(
+    ("storage_type", "uri"),
+    [
+        (ObjectStorageType.S3, "s3://weights/run/v7/index.json"),
+        (ObjectStorageType.AZURE, "az://weights/run/v7/index.json"),
+        (ObjectStorageType.GCS, "gs://weights/run/v7/index.json"),
+    ],
+)
+def test_control_client_round_trips_object_storage_source(storage_type, uri):
     service = _RefitService()
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
     refit_pb2_grpc.add_RefitServiceServicer_to_server(service, server)
@@ -111,7 +130,10 @@ def test_control_client_creates_ready_s3_version_without_source_slots():
             idempotency_key="training-step-7",
             payload_format=WeightPayloadFormat.XOR_DELTA,
             base_version_id="base-a",
-            s3_uri="s3://weights/run/v7/model.safetensors.index.json",
+            object_storage=ObjectStorageSource(
+                storage_type=storage_type,
+                uri=uri,
+            ),
             state=WeightVersionState.READY,
         )
     finally:
@@ -119,7 +141,10 @@ def test_control_client_creates_ready_s3_version_without_source_slots():
             control.close()
         server.stop(grace=None).wait()
 
-    assert created.s3_uri == "s3://weights/run/v7/model.safetensors.index.json"
+    assert created.object_storage == ObjectStorageSource(
+        storage_type=storage_type,
+        uri=uri,
+    )
     assert created.expected_source_slots == ()
     assert created.state is WeightVersionState.READY
 
@@ -147,7 +172,10 @@ def test_control_client_validates_framework_inputs_before_rpc():
                 idempotency_key="attempt-a",
                 payload_format=WeightPayloadFormat.XOR_DELTA,
                 base_version_id="base-a",
-                s3_uri="s3://weights/run/v1/model.safetensors.index.json",
+                object_storage=ObjectStorageSource(
+                    storage_type=ObjectStorageType.S3,
+                    uri="s3://weights/run/v1/model.safetensors.index.json",
+                ),
             )
     finally:
         control.close()

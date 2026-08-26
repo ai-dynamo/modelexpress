@@ -64,7 +64,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
     def RegisterWorker(self, request, _context):
         self.events.append("register-worker")
         self.registration_ttl = request.ttl_seconds
-        return request.worker
+        return refit_pb2.RegisterWorkerResponse(worker=request.worker)
 
     def CreateWeightVersionShard(self, request, _context):
         self.events.append("publish-version-shard")

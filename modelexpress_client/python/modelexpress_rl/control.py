@@ -12,6 +12,7 @@ from modelexpress import auth
 from modelexpress.client import _get_server_url
 
 from . import refit_pb2, refit_pb2_grpc
+from .object_storage import ObjectStorageSource, ObjectStorageType
 from .train import WeightPayloadFormat
 from .version import WeightVersionRef
 
@@ -33,7 +34,7 @@ class WeightVersion:
     version_number: int | None
     payload_format: WeightPayloadFormat
     base_version_id: str | None
-    s3_uri: str | None
+    object_storage: ObjectStorageSource | None
     expected_source_slots: tuple[str, ...]
     layout_signature: str
     state: WeightVersionState
@@ -61,11 +62,28 @@ def _weight_version(version: refit_pb2.WeightVersion) -> WeightVersion:
         refit_pb2.WEIGHT_VERSION_STATE_READY: WeightVersionState.READY,
         refit_pb2.WEIGHT_VERSION_STATE_RELEASING: WeightVersionState.RELEASING,
     }
+    storage_types = {
+        refit_pb2.OBJECT_STORAGE_TYPE_S3: ObjectStorageType.S3,
+        refit_pb2.OBJECT_STORAGE_TYPE_AZURE: ObjectStorageType.AZURE,
+        refit_pb2.OBJECT_STORAGE_TYPE_GCS: ObjectStorageType.GCS,
+    }
     try:
         payload_format = payload_formats[version.payload_format]
         state = states[version.state]
     except KeyError as error:
         raise RuntimeError("MX returned an unspecified WeightVersion enum") from error
+    object_storage = None
+    if version.HasField("object_storage"):
+        try:
+            storage_type = storage_types[version.object_storage.storage_type]
+        except KeyError as error:
+            raise RuntimeError(
+                "MX returned an unspecified object storage type"
+            ) from error
+        object_storage = ObjectStorageSource(
+            storage_type=storage_type,
+            uri=version.object_storage.uri,
+        )
     return WeightVersion(
         version_id=version.uid,
         model_name=version.model_name,
@@ -76,12 +94,18 @@ def _weight_version(version: refit_pb2.WeightVersion) -> WeightVersion:
         base_version_id=(
             version.base_version_id if version.HasField("base_version_id") else None
         ),
-        s3_uri=version.s3.uri if version.HasField("s3") else None,
+        object_storage=object_storage,
         expected_source_slots=tuple(version.expected_source_slots),
         layout_signature=version.layout_signature,
         state=state,
         created_at_unix_ms=version.created_at_unix_ms,
     )
+
+
+def _response_version(response, rpc_name: str) -> WeightVersion:
+    if not response.HasField("version"):
+        raise RuntimeError(f"MX {rpc_name} response is missing version")
+    return _weight_version(response.version)
 
 
 class ModelExpressControlClient:
@@ -123,7 +147,7 @@ class ModelExpressControlClient:
         expected_source_slots: list[str] | None = None,
         version_number: int | None = None,
         base_version_id: str | None = None,
-        s3_uri: str | None = None,
+        object_storage: ObjectStorageSource | None = None,
         state: WeightVersionState = WeightVersionState.STAGING,
     ) -> WeightVersion:
         """Create one global version with its initial lifecycle state."""
@@ -133,8 +157,12 @@ class ModelExpressControlClient:
             raise ValueError("payload_format must be specified")
         if state not in {WeightVersionState.STAGING, WeightVersionState.READY}:
             raise ValueError("new weight version state must be STAGING or READY")
-        if s3_uri is not None and version_number is None:
-            raise ValueError("version_number is required for S3 publication")
+        if object_storage is not None and not isinstance(
+            object_storage, ObjectStorageSource
+        ):
+            raise TypeError("object_storage must be an ObjectStorageSource")
+        if object_storage is not None and version_number is None:
+            raise ValueError("version_number is required for object storage")
         request = refit_pb2.CreateWeightVersionRequest(
             model_name=model_name,
             idempotency_key=idempotency_key,
@@ -152,14 +180,18 @@ class ModelExpressControlClient:
             request.version_number = version_number
         if base_version_id is not None:
             request.base_version_id = _required(base_version_id, "base_version_id")
-        if s3_uri is not None:
-            request.s3.uri = _required(s3_uri, "s3_uri")
-        return _weight_version(
-            self._service.CreateWeightVersion(
-                request,
-                timeout=self._rpc_timeout_seconds,
-            )
+        if object_storage is not None:
+            request.object_storage.uri = object_storage.uri
+            request.object_storage.storage_type = {
+                ObjectStorageType.S3: refit_pb2.OBJECT_STORAGE_TYPE_S3,
+                ObjectStorageType.AZURE: refit_pb2.OBJECT_STORAGE_TYPE_AZURE,
+                ObjectStorageType.GCS: refit_pb2.OBJECT_STORAGE_TYPE_GCS,
+            }[object_storage.storage_type]
+        response = self._service.CreateWeightVersion(
+            request,
+            timeout=self._rpc_timeout_seconds,
         )
+        return _response_version(response, "CreateWeightVersion")
 
     def get_weight_version(self, version_id: str) -> WeightVersion:
         """Read the current lifecycle state of one weight version."""
@@ -167,7 +199,7 @@ class ModelExpressControlClient:
             refit_pb2.GetWeightVersionRequest(uid=_required(version_id, "version_id")),
             timeout=self._rpc_timeout_seconds,
         )
-        return _weight_version(response)
+        return _response_version(response, "GetWeightVersion")
 
     def update_weight_version_state(
         self,
@@ -188,7 +220,7 @@ class ModelExpressControlClient:
             ),
             timeout=self._rpc_timeout_seconds,
         )
-        return _weight_version(response.version)
+        return _response_version(response, "UpdateWeightVersionState")
 
     def delete_weight_version(self, version_id: str) -> WeightVersion:
         """Move a STAGING or READY version to RELEASING."""
@@ -198,7 +230,7 @@ class ModelExpressControlClient:
             ),
             timeout=self._rpc_timeout_seconds,
         )
-        return _weight_version(response)
+        return _response_version(response, "DeleteWeightVersion")
 
     def close(self) -> None:
         """Close the underlying gRPC channel."""
@@ -216,6 +248,8 @@ class ModelExpressControlClient:
 
 __all__ = [
     "ModelExpressControlClient",
+    "ObjectStorageSource",
+    "ObjectStorageType",
     "WeightVersion",
     "WeightVersionState",
 ]

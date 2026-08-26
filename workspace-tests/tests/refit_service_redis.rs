@@ -18,9 +18,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use modelexpress_common::grpc::refit::{
     CreateWeightVersionRequest, CreateWeightVersionShardRequest, DeleteVersionLeaseRequest,
     DeleteWeightVersionRequest, DeleteWeightVersionShardRequest, GetWeightVersionRequest,
-    ListWeightVersionShardsRequest, RegisterVersionLeaseRequest, RegisterWorkerRequest,
-    S3Transport, UpdateWeightVersionStateRequest, WeightPayloadFormat, WeightVersionShard,
-    WeightVersionState, WorkerRegistration, WorkerRole, refit_service_client::RefitServiceClient,
+    ListWeightVersionShardsRequest, ObjectStorageSource, ObjectStorageType,
+    RegisterVersionLeaseRequest, RegisterWorkerRequest, UpdateWeightVersionStateRequest,
+    WeightPayloadFormat, WeightVersionShard, WeightVersionState, WorkerRegistration, WorkerRole,
+    refit_service_client::RefitServiceClient,
 };
 use modelexpress_server::backend_config::BackendConfig;
 use modelexpress_server::config::ServerConfig;
@@ -110,6 +111,13 @@ fn shard(version_id: &str, source_slot_id: &str, worker_id: &str) -> WeightVersi
     }
 }
 
+fn s3_source(uri: &str) -> ObjectStorageSource {
+    ObjectStorageSource {
+        uri: uri.to_string(),
+        storage_type: ObjectStorageType::S3.into(),
+    }
+}
+
 async fn update_state(
     client: &mut RefitServiceClient<tonic::transport::Channel>,
     uid: &str,
@@ -174,16 +182,22 @@ async fn version_becomes_ready_across_server_replicas() {
             "publisher:global-rank:0".to_string(),
             "publisher:global-rank:1".to_string(),
         ],
-        s3: None,
+        object_storage: None,
         state: WeightVersionState::Staging.into(),
     };
     let create_a = client_a.create_weight_version(create_request.clone());
     let create_b = client_b.create_weight_version(create_request);
     let (version_a, version_b) = tokio::join!(create_a, create_b);
-    let version = version_a.expect("create version").into_inner();
+    let version = version_a
+        .expect("create version")
+        .into_inner()
+        .version
+        .expect("version in response");
     let repeated = version_b
         .expect("concurrent create through second server")
-        .into_inner();
+        .into_inner()
+        .version
+        .expect("version in response");
     assert_eq!(version.uid.len(), 8);
     assert_eq!(version.state, i32::from(WeightVersionState::Staging));
     assert_eq!(repeated, version);
@@ -194,7 +208,9 @@ async fn version_becomes_ready_across_server_replicas() {
         })
         .await
         .expect("second server reads version")
-        .into_inner();
+        .into_inner()
+        .version
+        .expect("version in response");
     assert_eq!(observed, version);
 
     let manual_ready = update_state(&mut client_a, &version.uid, WeightVersionState::Ready)
@@ -253,7 +269,9 @@ async fn version_becomes_ready_across_server_replicas() {
         })
         .await
         .expect("second server observes READY")
-        .into_inner();
+        .into_inner()
+        .version
+        .expect("version in response");
     assert_eq!(ready.state, i32::from(WeightVersionState::Ready));
 
     let shards = client_a
@@ -292,38 +310,49 @@ async fn s3_versions_support_staged_and_direct_ready_creation() {
         payload_format: WeightPayloadFormat::FullTensor.into(),
         base_version_id: None,
         expected_source_slots: Vec::new(),
-        s3: Some(S3Transport {
-            uri: uri.to_string(),
-        }),
+        object_storage: Some(s3_source(uri)),
         state: WeightVersionState::Staging.into(),
     };
     let staged = client
         .create_weight_version(staged_request.clone())
         .await
         .expect("create staged S3 version")
-        .into_inner();
+        .into_inner()
+        .version
+        .expect("version in response");
     assert_eq!(staged.state, i32::from(WeightVersionState::Staging));
-    assert_eq!(staged.s3.as_ref().expect("S3 transport").uri, uri);
+    assert_eq!(
+        staged
+            .object_storage
+            .as_ref()
+            .expect("object storage source")
+            .uri,
+        uri
+    );
     assert!(staged.expected_source_slots.is_empty());
 
     let mut cancelled_request = staged_request.clone();
     cancelled_request.version_number = Some(43);
     cancelled_request.idempotency_key = unique_id("cancelled-s3-version");
-    cancelled_request.s3 = Some(S3Transport {
-        uri: "s3://weights/run/policy/v43/model.safetensors.index.json".to_string(),
-    });
+    cancelled_request.object_storage = Some(s3_source(
+        "s3://weights/run/policy/v43/model.safetensors.index.json",
+    ));
     let cancelled = client
         .create_weight_version(cancelled_request.clone())
         .await
         .expect("create S3 version to cancel")
-        .into_inner();
+        .into_inner()
+        .version
+        .expect("version in response");
     let cancelled = client
         .delete_weight_version(DeleteWeightVersionRequest {
             uid: cancelled.uid.clone(),
         })
         .await
         .expect("cancel staged S3 version")
-        .into_inner();
+        .into_inner()
+        .version
+        .expect("version in response");
     assert_eq!(cancelled.state, i32::from(WeightVersionState::Releasing));
     let repeated_cancel = client
         .delete_weight_version(DeleteWeightVersionRequest {
@@ -331,7 +360,9 @@ async fn s3_versions_support_staged_and_direct_ready_creation() {
         })
         .await
         .expect("repeated cancellation is idempotent")
-        .into_inner();
+        .into_inner()
+        .version
+        .expect("version in response");
     assert_eq!(repeated_cancel, cancelled);
     let cancelled_ready = update_state(&mut client, &cancelled.uid, WeightVersionState::Ready)
         .await
@@ -341,7 +372,9 @@ async fn s3_versions_support_staged_and_direct_ready_creation() {
         .create_weight_version(cancelled_request)
         .await
         .expect("idempotent create returns the cancelled version")
-        .into_inner();
+        .into_inner()
+        .version
+        .expect("version in response");
     assert_eq!(repeated_cancel_create, cancelled);
 
     let ready = update_state(&mut client, &staged.uid, WeightVersionState::Ready)
@@ -379,7 +412,9 @@ async fn s3_versions_support_staged_and_direct_ready_creation() {
         .create_weight_version(staged_request.clone())
         .await
         .expect("idempotent create keeps the current state")
-        .into_inner();
+        .into_inner()
+        .version
+        .expect("version in response");
     assert_eq!(repeated_create, releasing);
     let mut conflicting_create = staged_request;
     conflicting_create.state = WeightVersionState::Ready.into();
@@ -397,14 +432,16 @@ async fn s3_versions_support_staged_and_direct_ready_creation() {
             payload_format: WeightPayloadFormat::FullTensor.into(),
             base_version_id: None,
             expected_source_slots: Vec::new(),
-            s3: Some(S3Transport {
-                uri: "s3://weights/run/policy/v43/model.safetensors.index.json".to_string(),
-            }),
+            object_storage: Some(s3_source(
+                "s3://weights/run/policy/v43/model.safetensors.index.json",
+            )),
             state: WeightVersionState::Ready.into(),
         })
         .await
         .expect("create directly ready S3 version")
-        .into_inner();
+        .into_inner()
+        .version
+        .expect("version in response");
     assert_eq!(direct.state, i32::from(WeightVersionState::Ready));
 
     let shards = client
@@ -447,12 +484,14 @@ async fn replacement_worker_can_publish_the_same_source_slot() {
             payload_format: WeightPayloadFormat::FullTensor.into(),
             base_version_id: None,
             expected_source_slots: vec!["publisher:global-rank:0".to_string()],
-            s3: None,
+            object_storage: None,
             state: WeightVersionState::Staging.into(),
         })
         .await
         .expect("create version")
-        .into_inner();
+        .into_inner()
+        .version
+        .expect("version in response");
 
     client
         .create_weight_version_shard(CreateWeightVersionShardRequest {
@@ -529,12 +568,14 @@ async fn live_lease_protects_releasing_version_shards() {
             payload_format: WeightPayloadFormat::FullTensor.into(),
             base_version_id: None,
             expected_source_slots: vec!["publisher:global-rank:0".to_string()],
-            s3: None,
+            object_storage: None,
             state: WeightVersionState::Staging.into(),
         })
         .await
         .expect("create version")
-        .into_inner();
+        .into_inner()
+        .version
+        .expect("version in response");
     let published_shard = shard(&version.uid, "publisher:global-rank:0", &trainer_id);
     client_a
         .create_weight_version_shard(CreateWeightVersionShardRequest {
@@ -552,12 +593,16 @@ async fn live_lease_protects_releasing_version_shards() {
         .register_version_lease(register_lease.clone())
         .await
         .expect("register lease through second server")
-        .into_inner();
+        .into_inner()
+        .lease
+        .expect("lease in response");
     let repeated = client_a
         .register_version_lease(register_lease.clone())
         .await
         .expect("repeated registration renews the lease")
-        .into_inner();
+        .into_inner()
+        .lease
+        .expect("lease in response");
     assert_eq!(repeated.lease_id, lease.lease_id);
 
     let releasing = client_a
@@ -566,7 +611,9 @@ async fn live_lease_protects_releasing_version_shards() {
         })
         .await
         .expect("logically release version")
-        .into_inner();
+        .into_inner()
+        .version
+        .expect("version in response");
     assert_eq!(releasing.state, i32::from(WeightVersionState::Releasing));
 
     let late_lease = client_b
@@ -630,12 +677,14 @@ async fn live_lease_protects_releasing_version_shards() {
             payload_format: WeightPayloadFormat::FullTensor.into(),
             base_version_id: None,
             expected_source_slots: vec!["publisher:global-rank:0".to_string()],
-            s3: None,
+            object_storage: None,
             state: WeightVersionState::Staging.into(),
         })
         .await
         .expect("create version protected by an expiring lease")
-        .into_inner();
+        .into_inner()
+        .version
+        .expect("version in response");
     let expiring_shard = shard(
         &expiring_version.uid,
         "publisher:global-rank:0",
@@ -712,12 +761,14 @@ async fn register_worker_refreshes_liveness_and_expires_without_renewal() {
             payload_format: WeightPayloadFormat::FullTensor.into(),
             base_version_id: None,
             expected_source_slots: vec!["publisher:global-rank:0".to_string()],
-            s3: None,
+            object_storage: None,
             state: WeightVersionState::Staging.into(),
         })
         .await
         .expect("create version")
-        .into_inner();
+        .into_inner()
+        .version
+        .expect("version in response");
     let current_shard = shard(&version.uid, "publisher:global-rank:0", &worker_id);
     client
         .create_weight_version_shard(CreateWeightVersionShardRequest {
@@ -735,12 +786,14 @@ async fn register_worker_refreshes_liveness_and_expires_without_renewal() {
             payload_format: WeightPayloadFormat::FullTensor.into(),
             base_version_id: None,
             expected_source_slots: vec!["publisher:global-rank:0".to_string()],
-            s3: None,
+            object_storage: None,
             state: WeightVersionState::Staging.into(),
         })
         .await
         .expect("create version after worker expiry")
-        .into_inner();
+        .into_inner()
+        .version
+        .expect("version in response");
     let expired = client
         .create_weight_version_shard(CreateWeightVersionShardRequest {
             shard: Some(shard(

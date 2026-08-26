@@ -7,14 +7,14 @@ from .adapter import TrainerStagingMode, WeightPayloadFormat
 from .client import (
     ModelExpressTrainerClient,
     ModelExpressTrainerConfig,
-    S3Config,
+    ObjectStorageConfig,
     StagedWeightVersionShard,
 )
 
 __all__ = [
     "ModelExpressTrainerClient",
     "ModelExpressTrainerConfig",
-    "S3Config",
+    "ObjectStorageConfig",
     "StagedWeightVersionShard",
     "TrainerStagingMode",
     "WeightPayloadFormat",

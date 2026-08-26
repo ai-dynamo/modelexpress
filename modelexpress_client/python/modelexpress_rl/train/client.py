@@ -35,6 +35,7 @@ from modelexpress_rl.utils import (
 
 from .. import envs as rl_envs
 from .. import refit_pb2, refit_pb2_grpc
+from ..object_storage import ObjectStorageType
 from ..version import WeightVersionRef
 from .adapter import (
     NixlMetadataProvider,
@@ -99,9 +100,10 @@ def _payload_format(value: WeightPayloadFormat | None) -> WeightPayloadFormat:
 
 
 @dataclass(frozen=True)
-class S3Config:
-    """Storage and launch-base settings for canonical XOR publication."""
+class ObjectStorageConfig:
+    """Object-storage and launch-base settings for canonical XOR publication."""
 
+    storage_type: ObjectStorageType
     uri_prefix: str
     initial_base_version_id: str
     launch_checkpoint: str | Path
@@ -109,10 +111,15 @@ class S3Config:
     region_name: str | None = None
 
     def __post_init__(self) -> None:
-        _required(self.uri_prefix, "s3.uri_prefix")
-        _required(self.initial_base_version_id, "s3.initial_base_version_id")
+        if not isinstance(self.storage_type, ObjectStorageType):
+            raise TypeError("storage_type must be an ObjectStorageType")
+        _required(self.uri_prefix, "object_storage.uri_prefix")
+        _required(
+            self.initial_base_version_id,
+            "object_storage.initial_base_version_id",
+        )
         if not str(self.launch_checkpoint).strip():
-            raise ValueError("s3.launch_checkpoint is required")
+            raise ValueError("object_storage.launch_checkpoint is required")
 
     def root_uri(self, version_number: int) -> str:
         """Return the canonical index URI for one numeric version."""
@@ -127,7 +134,7 @@ class _StagedDelta:
     base_version_id: str
     target_version_id: str
     target_version_number: int
-    s3_uri: str
+    object_storage_uri: str
     candidate_snapshot: dict[str, np.ndarray]
     encoded_deltas: dict[str, np.ndarray]
     checksums: dict[str, str]
@@ -135,7 +142,7 @@ class _StagedDelta:
     total_bytes: int
     wire_bytes: int = 0
     stage_delta_time: float = 0.0
-    publish_s3_time: float = 0.0
+    publish_object_storage_time: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -162,8 +169,8 @@ class ModelExpressTrainerConfig:
     rpc_timeout_seconds: float = 30.0
     # Process group used by collective trainer publication.
     process_group: Any | None = None
-    # Canonical S3/XOR settings. Omit to use the existing NIXL path.
-    s3: S3Config | None = None
+    # Canonical object-storage/XOR settings. Omit to use the existing NIXL path.
+    object_storage: ObjectStorageConfig | None = None
 
     def __post_init__(self) -> None:
         """Validate explicit settings before client initialization."""
@@ -217,7 +224,7 @@ class ModelExpressTrainerClient:
         self._registration_thread: threading.Thread | None = None
         self._adapter: TrainerEngineAdapter | None = None
         self._resources: _TrainerResources | None = None
-        self._s3_config: S3Config | None = None
+        self._object_storage_config: ObjectStorageConfig | None = None
         self._s3: S3Client | None = None
         self._process_group: Any | None = None
         self._rank = 0
@@ -305,17 +312,27 @@ class ModelExpressTrainerClient:
         registration_ttl_seconds = rl_envs.require_positive_int(
             registration_ttl_seconds, "registration_ttl_seconds"
         )
-        use_s3 = config.s3 is not None
-        if use_s3 and (
+        use_object_storage = config.object_storage is not None
+        if (
+            config.object_storage is not None
+            and config.object_storage.storage_type is not ObjectStorageType.S3
+        ):
+            raise ValueError("only S3 object storage is currently supported")
+        if use_object_storage and (
             staging_mode is not TrainerStagingMode.WRITE_TO_STORAGE
             or payload_format is not WeightPayloadFormat.XOR_DELTA
         ):
-            raise ValueError("S3 publication requires WRITE_TO_STORAGE and XOR_DELTA")
-        if not use_s3 and staging_mode is TrainerStagingMode.WRITE_TO_STORAGE:
-            raise ValueError("WRITE_TO_STORAGE requires config.s3")
+            raise ValueError(
+                "object storage publication requires WRITE_TO_STORAGE and XOR_DELTA"
+            )
+        if (
+            not use_object_storage
+            and staging_mode is TrainerStagingMode.WRITE_TO_STORAGE
+        ):
+            raise ValueError("WRITE_TO_STORAGE requires config.object_storage")
 
         resources = None
-        if not use_s3:
+        if not use_object_storage:
             device_id = config.device_id
             if device_id is None:
                 local_rank = os.environ.get("LOCAL_RANK")
@@ -340,25 +357,26 @@ class ModelExpressTrainerClient:
             client._nixl_metadata_endpoint = _nixl_metadata_endpoint(resources.manager)
             client._manifest_publisher = resources.manifest_service
         else:
-            assert config.s3 is not None
+            assert config.object_storage is not None
+            object_storage = config.object_storage
             client.worker_endpoint = ""
-            client._s3_config = config.s3
+            client._object_storage_config = object_storage
             client._process_group = config.process_group
             client._rank = dist.get_rank(config.process_group)
             client._world_size = dist.get_world_size(config.process_group)
             client._read_launch_tensor, _ = make_tensor_reader(
-                config.s3.launch_checkpoint
+                object_storage.launch_checkpoint
             )
             client._s3 = S3Client(
-                endpoint_url=config.s3.endpoint_url,
-                region_name=config.s3.region_name,
+                endpoint_url=object_storage.endpoint_url,
+                region_name=object_storage.region_name,
             )
-            client._current_base_version_id = config.s3.initial_base_version_id
+            client._current_base_version_id = object_storage.initial_base_version_id
         client._resources = resources
         client._registration_ttl_seconds = registration_ttl_seconds
         client._rpc_timeout_seconds = config.rpc_timeout_seconds
         try:
-            if not use_s3:
+            if not use_object_storage:
                 client._register_worker()
                 registration_thread = threading.Thread(
                     target=client._renew_worker_registration,
@@ -478,7 +496,7 @@ class ModelExpressTrainerClient:
         *,
         target_version_id: str,
         target_version_number: int,
-        s3_uri: str,
+        object_storage_uri: str,
         base_version_id: str,
         hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]],
     ) -> _StagedDelta:
@@ -524,7 +542,7 @@ class ModelExpressTrainerClient:
             base_version_id=base_version_id,
             target_version_id=target_version_id,
             target_version_number=target_version_number,
-            s3_uri=s3_uri,
+            object_storage_uri=object_storage_uri,
             candidate_snapshot=candidate,
             encoded_deltas=encoded_deltas,
             checksums=checksums,
@@ -537,7 +555,7 @@ class ModelExpressTrainerClient:
         if staged.base_version_id != self._current_base_version_id:
             raise RuntimeError("staged canonical delta is stale")
         assert self._s3 is not None
-        parent_uri = staged.s3_uri.rsplit("/", 1)[0]
+        parent_uri = staged.object_storage_uri.rsplit("/", 1)[0]
 
         counts: list[Any] = [None] * self._world_size
         dist.all_gather_object(
@@ -596,7 +614,7 @@ class ModelExpressTrainerClient:
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
-        self._s3.put(uri=staged.s3_uri, data=index)
+        self._s3.put(uri=staged.object_storage_uri, data=index)
 
     def stage_shard(
         self,
@@ -621,10 +639,13 @@ class ModelExpressTrainerClient:
                 raise ValueError("S3 publication accepts hf_tensor_iter, not tensors")
             if hf_tensor_iter is None:
                 raise ValueError("hf_tensor_iter is required for S3 publication")
-            target = self._service.GetWeightVersion(
+            response = self._service.GetWeightVersion(
                 refit_pb2.GetWeightVersionRequest(uid=version.version_id),
                 timeout=self._rpc_timeout_seconds,
             )
+            if not response.HasField("version"):
+                raise RuntimeError("MX GetWeightVersion response is missing version")
+            target = response.version
             if target.model_name != self.model_name:
                 raise RuntimeError("target weight version belongs to a different model")
             if (
@@ -634,15 +655,22 @@ class ModelExpressTrainerClient:
                 raise RuntimeError("S3 publication requires an XOR_DELTA target")
             if not target.HasField("version_number"):
                 raise RuntimeError("S3 target must have a version number")
-            if not target.HasField("s3") or not target.s3.uri:
+            if (
+                not target.HasField("object_storage")
+                or target.object_storage.storage_type
+                != refit_pb2.OBJECT_STORAGE_TYPE_S3
+                or not target.object_storage.uri
+            ):
                 raise RuntimeError("S3 target is missing its URI")
-            assert self._s3_config is not None
-            if target.s3.uri != self._s3_config.root_uri(target.version_number):
+            assert self._object_storage_config is not None
+            if target.object_storage.uri != self._object_storage_config.root_uri(
+                target.version_number
+            ):
                 raise RuntimeError("S3 target URI does not match the configured prefix")
             staged = self._stage_delta(
                 target_version_id=version.version_id,
                 target_version_number=target.version_number,
-                s3_uri=target.s3.uri,
+                object_storage_uri=target.object_storage.uri,
                 base_version_id=target.base_version_id,
                 hf_tensor_iter=hf_tensor_iter,
             )
@@ -671,11 +699,9 @@ class ModelExpressTrainerClient:
         staged: StagedWeightVersionShardData | _StagedDelta,
     ) -> None:
         if isinstance(staged, _StagedDelta):
-            if self._s3 is None:
-                raise RuntimeError("S3 transport is not initialized")
             started = perf_counter()
             self._publish_delta_to_s3(staged)
-            staged.publish_s3_time = perf_counter() - started
+            staged.publish_object_storage_time = perf_counter() - started
             self._snapshot = staged.candidate_snapshot
             staged.candidate_snapshot = {}
             self._current_base_version_id = staged.target_version_id
@@ -776,7 +802,7 @@ class ModelExpressTrainerClient:
             "total_bytes": staged.total_bytes,
             "wire_bytes": staged.wire_bytes,
             "stage_delta_time": staged.stage_delta_time,
-            "publish_s3_time": staged.publish_s3_time,
+            "publish_object_storage_time": staged.publish_object_storage_time,
         }
 
     def __enter__(self) -> ModelExpressTrainerClient:
@@ -789,6 +815,6 @@ class ModelExpressTrainerClient:
 __all__ = [
     "ModelExpressTrainerClient",
     "ModelExpressTrainerConfig",
-    "S3Config",
+    "ObjectStorageConfig",
     "StagedWeightVersionShard",
 ]

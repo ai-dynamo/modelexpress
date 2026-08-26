@@ -12,10 +12,11 @@ from .inference import (
 from .train import (
     ModelExpressTrainerClient,
     ModelExpressTrainerConfig,
-    S3Config,
+    ObjectStorageConfig,
     TrainerStagingMode,
     WeightPayloadFormat,
 )
+from .object_storage import ObjectStorageSource, ObjectStorageType
 from .version import WeightVersionRef
 
 __all__ = [  # noqa: RUF022 - grouped by public API role, not alphabetically.
@@ -26,11 +27,13 @@ __all__ = [  # noqa: RUF022 - grouped by public API role, not alphabetically.
     # Configuration fixed when a worker client is initialized.
     "ModelExpressGeneratorConfig",
     "ModelExpressTrainerConfig",
-    "S3Config",
+    "ObjectStorageConfig",
     "TrainerStagingMode",
     "WeightPayloadFormat",
     "VllmGeneratorContext",
     # Version values shared across the control, trainer, and generator clients.
+    "ObjectStorageSource",
+    "ObjectStorageType",
     "WeightVersion",
     "WeightVersionRef",
     "WeightVersionState",

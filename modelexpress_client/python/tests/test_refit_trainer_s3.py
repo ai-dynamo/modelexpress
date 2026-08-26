@@ -17,7 +17,8 @@ import zstandard
 from modelexpress_rl import (
     ModelExpressTrainerClient,
     ModelExpressTrainerConfig,
-    S3Config,
+    ObjectStorageConfig,
+    ObjectStorageType,
     TrainerStagingMode,
     WeightPayloadFormat,
     WeightVersionRef,
@@ -80,20 +81,21 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
             version_number=1,
             payload_format=refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA,
             base_version_id="base-a",
-            s3=refit_pb2.S3Transport(
-                uri="s3://weights/tests/v1/model.safetensors.index.json"
+            object_storage=refit_pb2.ObjectStorageSource(
+                uri="s3://weights/tests/v1/model.safetensors.index.json",
+                storage_type=refit_pb2.OBJECT_STORAGE_TYPE_S3,
             ),
             state=refit_pb2.WEIGHT_VERSION_STATE_STAGING,
         )
 
     def RegisterWorker(self, request, _context):
         self.registrations.add(request.worker.worker_id)
-        return request.worker
+        return refit_pb2.RegisterWorkerResponse(worker=request.worker)
 
     def GetWeightVersion(self, request, context):
         if request.uid != self.target.uid:
             context.abort(grpc.StatusCode.NOT_FOUND, "version not found")
-        return self.target
+        return refit_pb2.GetWeightVersionResponse(version=self.target)
 
     def CreateWeightVersionShard(self, request, _context):
         self.shards.append(request.shard)
@@ -183,7 +185,8 @@ def _trainer(
             payload_format=WeightPayloadFormat.XOR_DELTA,
             registration_ttl_seconds=60,
             process_group=process_group,
-            s3=S3Config(
+            object_storage=ObjectStorageConfig(
+                storage_type=ObjectStorageType.S3,
                 uri_prefix="s3://weights/tests",
                 initial_base_version_id="base-a",
                 launch_checkpoint=launch,
@@ -413,7 +416,9 @@ def test_s3_stage_requires_version_uri_under_configured_prefix(
     monkeypatch, tmp_path, refit_server
 ):
     service, server_url = refit_server
-    service.target.s3.uri = "s3://weights/other/v1/model.safetensors.index.json"
+    service.target.object_storage.uri = (
+        "s3://weights/other/v1/model.safetensors.index.json"
+    )
     trainer, storage = _trainer(monkeypatch, tmp_path, server_url)
 
     try:
@@ -617,7 +622,7 @@ def test_s3_exposes_local_metrics_after_publication(
             "total_bytes": expected_delta.numel(),
             "wire_bytes": len(shard),
             "stage_delta_time": 2.0,
-            "publish_s3_time": 3.0,
+            "publish_object_storage_time": 3.0,
         }
         assert trainer.pop_metrics() == {}
     finally:
@@ -653,7 +658,7 @@ def test_s3_clean_update_still_publishes_root_index(
     assert metrics["total_bytes"] > 0
     assert metrics["wire_bytes"] == 0
     assert metrics["stage_delta_time"] >= 0
-    assert metrics["publish_s3_time"] >= 0
+    assert metrics["publish_object_storage_time"] >= 0
 
 
 def test_s3_chains_from_published_base_and_keeps_previous_advertisement(
@@ -678,8 +683,9 @@ def test_s3_chains_from_published_base_and_keeps_previous_advertisement(
             version_number=2,
             payload_format=refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA,
             base_version_id="target-a",
-            s3=refit_pb2.S3Transport(
-                uri="s3://weights/tests/v2/model.safetensors.index.json"
+            object_storage=refit_pb2.ObjectStorageSource(
+                uri="s3://weights/tests/v2/model.safetensors.index.json",
+                storage_type=refit_pb2.OBJECT_STORAGE_TYPE_S3,
             ),
             state=refit_pb2.WEIGHT_VERSION_STATE_STAGING,
         )
@@ -726,8 +732,9 @@ def test_s3_release_keeps_canonical_advertisement(monkeypatch, tmp_path, refit_s
             version_number=2,
             payload_format=refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA,
             base_version_id="target-a",
-            s3=refit_pb2.S3Transport(
-                uri="s3://weights/tests/v2/model.safetensors.index.json"
+            object_storage=refit_pb2.ObjectStorageSource(
+                uri="s3://weights/tests/v2/model.safetensors.index.json",
+                storage_type=refit_pb2.OBJECT_STORAGE_TYPE_S3,
             ),
             state=refit_pb2.WEIGHT_VERSION_STATE_STAGING,
         )
@@ -761,15 +768,16 @@ def test_s3_propagates_tensor_processing_error(monkeypatch, tmp_path, refit_serv
     assert storage.objects == {}
 
 
-def test_s3_config_requires_storage_delta_pair(tmp_path):
+def test_object_storage_config_requires_storage_delta_pair(tmp_path):
     launch = tmp_path / "model.safetensors"
     _write_safetensors(launch, {"weight": torch.tensor([1.0])})
-    s3 = S3Config(
+    object_storage = ObjectStorageConfig(
+        storage_type=ObjectStorageType.S3,
         uri_prefix="s3://weights/tests",
         initial_base_version_id="base-a",
         launch_checkpoint=launch,
     )
-    assert s3.root_uri(42) == (
+    assert object_storage.root_uri(42) == (
         "s3://weights/tests/v42/model.safetensors.index.json"
     )
     with pytest.raises(ValueError, match="WRITE_TO_STORAGE and XOR_DELTA"):
@@ -778,6 +786,26 @@ def test_s3_config_requires_storage_delta_pair(tmp_path):
                 model_name="test/model",
                 staging_mode=TrainerStagingMode.IN_PLACE,
                 payload_format=WeightPayloadFormat.XOR_DELTA,
-                s3=s3,
+                object_storage=object_storage,
+            )
+        )
+
+
+def test_object_storage_config_rejects_unsupported_provider(tmp_path):
+    launch = tmp_path / "model.safetensors"
+    _write_safetensors(launch, {"weight": torch.tensor([1.0])})
+
+    with pytest.raises(ValueError, match="only S3 object storage"):
+        ModelExpressTrainerClient.initialize(
+            ModelExpressTrainerConfig(
+                model_name="test/model",
+                staging_mode=TrainerStagingMode.WRITE_TO_STORAGE,
+                payload_format=WeightPayloadFormat.XOR_DELTA,
+                object_storage=ObjectStorageConfig(
+                    storage_type=ObjectStorageType.GCS,
+                    uri_prefix="gs://weights/tests",
+                    initial_base_version_id="base-a",
+                    launch_checkpoint=launch,
+                ),
             )
         )

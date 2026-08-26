@@ -10,8 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use modelexpress_common::grpc::refit::{
     CreateWeightVersionRequest, DeleteVersionLeaseRequest, DeleteWeightVersionShardRequest,
-    RegisterVersionLeaseRequest, S3Transport, UpdateWeightVersionStateRequest, VersionLease,
-    WeightVersion, WeightVersionShard, WeightVersionState, WorkerRegistration,
+    ObjectStorageSource, ObjectStorageType, RegisterVersionLeaseRequest,
+    UpdateWeightVersionStateRequest, VersionLease, WeightVersion, WeightVersionShard,
+    WeightVersionState, WorkerRegistration,
 };
 use prost::Message;
 use redis::aio::ConnectionManager;
@@ -140,10 +141,13 @@ fn version_from_hash(fields: HashMap<String, String>) -> RefitResult<WeightVersi
         layout_signature: hash_field(&fields, "layout_signature")?.to_string(),
         state: parse_hash_field(&fields, "state")?,
         created_at_unix_ms: parse_hash_field(&fields, "created_at_unix_ms")?,
-        s3: fields
+        object_storage: fields
             .get("s3_uri")
             .filter(|uri| !uri.is_empty())
-            .map(|uri| S3Transport { uri: uri.clone() }),
+            .map(|uri| ObjectStorageSource {
+                uri: uri.clone(),
+                storage_type: ObjectStorageType::S3.into(),
+            }),
     })
 }
 
@@ -253,7 +257,12 @@ impl RedisRefitBackend {
             .arg(request.base_version_id.as_deref().unwrap_or_default())
             .arg(expected_source_slots)
             .arg(request.expected_source_slots.len())
-            .arg(request.s3.as_ref().map_or("", |s3| s3.uri.as_str()))
+            .arg(
+                request
+                    .object_storage
+                    .as_ref()
+                    .map_or("", |source| source.uri.as_str()),
+            )
             .arg(request.state)
             .arg(request.state)
             .arg(now_unix_ms()?);
@@ -335,7 +344,7 @@ impl RefitBackend for RedisRefitBackend {
                     && existing.payload_format == request.payload_format
                     && existing.base_version_id == request.base_version_id
                     && existing.expected_source_slots == request.expected_source_slots
-                    && existing.s3 == request.s3
+                    && existing.object_storage == request.object_storage
                     && initial_state == request.state
                 {
                     return Ok(existing);
