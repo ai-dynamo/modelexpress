@@ -22,8 +22,8 @@ from modelexpress_rl.inference.nixl_staged_transfer import (
 )
 from modelexpress_rl.inference.receiver import (
     CanonicalS3GeneratorAdapter,
+    ObjectStorageGeneratorConfig,
     PreparedCheckpoint,
-    S3GeneratorConfig,
 )
 from modelexpress_rl.train import WeightPayloadFormat
 
@@ -45,9 +45,9 @@ class VllmGeneratorAdapter(CanonicalS3GeneratorAdapter):
         model_config: ModelConfig,
         worker_id: str,
         model_name: str | None = None,
-        s3: S3GeneratorConfig | None = None,
+        object_storage: ObjectStorageGeneratorConfig | None = None,
     ) -> None:
-        self._uses_s3 = s3 is not None
+        self._uses_s3 = object_storage is not None
         if self._uses_s3 and not model_name:
             raise ValueError("model_name is required for canonical S3")
 
@@ -61,8 +61,11 @@ class VllmGeneratorAdapter(CanonicalS3GeneratorAdapter):
             model_config=model_config,
             device=device,
         )
-        if s3 is not None:
-            super().__init__(model_name=cast(str, model_name), config=s3)
+        if object_storage is not None:
+            super().__init__(
+                model_name=cast(str, model_name),
+                config=object_storage,
+            )
             return
 
         self._transfer = _NixlStagedTransfer(

@@ -885,22 +885,25 @@ Thin orchestration layer that delegates to `LoadStrategyChain.run()`. Builds a `
 
 ### vLLM Refit Installation
 
-`VllmGeneratorAdapter` has two fixed initialization modes. Without an S3
-configuration it preserves the existing full-tensor NIXL transfer, plan reuse,
-and staged-buffer installation path. With an S3 configuration it directly uses
-`CanonicalS3GeneratorAdapter` to reconstruct and verify an exact XOR delta in a
-host-local safetensors checkpoint; no NIXL transfer manager or transfer plan is
-created. The shared private installer reloads that prepared checkpoint through
-vLLM's `DefaultModelLoader` inside the same graph-safe layerwise reload window
-used by the NIXL path.
+`VllmGeneratorAdapter` has two fixed initialization modes. Without an object
+storage configuration it preserves the existing full-tensor NIXL transfer,
+plan reuse, and staged-buffer installation path. With
+`ObjectStorageGeneratorConfig(storage_type=ObjectStorageType.S3, ...)` it
+directly uses `CanonicalS3GeneratorAdapter` to reconstruct and verify an exact
+XOR delta in a host-local safetensors checkpoint; no NIXL transfer manager or
+transfer plan is created. The shared private installer reloads that prepared
+checkpoint through vLLM's `DefaultModelLoader` inside the same graph-safe
+layerwise reload window used by the NIXL path.
 
 The ModelExpress vLLM plugin registers one `modelexpress` native weight-transfer
 backend for both paths. An empty initialization payload preserves the existing
 NIXL path. The payload can override the logical ModelExpress model name when it
-differs from vLLM's model path. Supplying the READY launch-base version ID,
-launch checkpoint, and preparation cache selects canonical S3/XOR; the payload
-can also override the MX server and S3 endpoint settings. Each update carries
-the opaque MX `version_id`.
+differs from vLLM's model path. Supplying `object_storage_type` with the READY
+launch-base version ID, launch checkpoint, and preparation cache selects the
+object-storage path; the initial implementation accepts only `S3`. The payload
+can also override the MX server through `server_url` and the storage connection
+through `object_storage_endpoint_url` and `object_storage_region_name`. Each
+update carries the opaque MX `version_id`.
 `start_weight_update()` opens the update window, `receive_weights()` stages and
 applies the version through `ModelExpressGeneratorClient`, and
 `finish_weight_update()` releases its staged handle. Draft-model updates remain

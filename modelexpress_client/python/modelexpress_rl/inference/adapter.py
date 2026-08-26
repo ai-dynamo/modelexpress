@@ -11,6 +11,7 @@ from typing import Any
 
 from modelexpress import p2p_pb2
 from modelexpress.client import MxClientBase
+from modelexpress_rl.object_storage import ObjectStorageSource
 from modelexpress_rl.train import WeightPayloadFormat
 
 
@@ -54,7 +55,7 @@ class GeneratorTransferInputs:
     layout_signature: str
     payload_format: WeightPayloadFormat
     sources: tuple[GeneratorSource, ...]
-    s3_uri: str | None = None
+    object_storage: ObjectStorageSource | None = None
 
     @property
     def physical_fingerprint(self) -> tuple:
@@ -63,7 +64,7 @@ class GeneratorTransferInputs:
             self.base_version_id,
             self.layout_signature,
             self.payload_format,
-            self.s3_uri,
+            self.object_storage,
             tuple(
                 (
                     source.source_slot_id,

@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from ...adapter import GeneratorEngineContext
-from ...receiver import S3GeneratorConfig
+from ...receiver import ObjectStorageGeneratorConfig
 from .adapter import VllmGeneratorAdapter
 from .context import VllmGeneratorContext
 
@@ -15,7 +15,7 @@ def _create_vllm_adapter(
     engine_context: GeneratorEngineContext,
     worker_id: str,
     model_name: str | None = None,
-    s3: S3GeneratorConfig | None = None,
+    object_storage: ObjectStorageGeneratorConfig | None = None,
 ) -> VllmGeneratorAdapter:
     if not isinstance(engine_context, VllmGeneratorContext):
         raise TypeError("VLLM requires a VllmGeneratorContext")
@@ -38,7 +38,7 @@ def _create_vllm_adapter(
         model_config=model_config,
         worker_id=worker_id,
         model_name=model_name,
-        s3=s3,
+        object_storage=object_storage,
     )
 
 

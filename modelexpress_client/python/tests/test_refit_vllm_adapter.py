@@ -8,7 +8,7 @@ import modelexpress_rl.inference.engines.vllm.adapter as vllm_adapter_module
 import pytest
 import torch
 from modelexpress import p2p_pb2
-from modelexpress_rl import WeightPayloadFormat
+from modelexpress_rl import ObjectStorageType, WeightPayloadFormat
 from modelexpress_rl.inference.adapter import (
     GeneratorSource,
     GeneratorTransferInputs,
@@ -17,8 +17,8 @@ from modelexpress_rl.inference.adapter import (
 from modelexpress_rl.inference.engines.vllm import VllmGeneratorAdapter
 from modelexpress_rl.inference.receiver import (
     CanonicalS3GeneratorAdapter,
+    ObjectStorageGeneratorConfig,
     PreparedCheckpoint,
-    S3GeneratorConfig,
 )
 
 
@@ -295,7 +295,8 @@ def test_vllm_adapter_uses_canonical_s3_without_creating_nixl(
     )
     monkeypatch.setattr(CanonicalS3GeneratorAdapter, "close", close_s3)
 
-    s3 = S3GeneratorConfig(
+    object_storage = ObjectStorageGeneratorConfig(
+        storage_type=ObjectStorageType.S3,
         initial_base_version_id="base-a",
         launch_checkpoint=tmp_path / "launch",
         preparation_cache_dir=tmp_path / "cache",
@@ -306,7 +307,7 @@ def test_vllm_adapter_uses_canonical_s3_without_creating_nixl(
         model_config="model-config",
         worker_id="generator-0",
         model_name="test/model",
-        s3=s3,
+        object_storage=object_storage,
     )
     inputs = object()
 
@@ -328,7 +329,10 @@ def test_vllm_adapter_uses_canonical_s3_without_creating_nixl(
                 "device": torch.device("cuda:2"),
             },
         ),
-        ("s3_init", {"model_name": "test/model", "config": s3}),
+        (
+            "s3_init",
+            {"model_name": "test/model", "config": object_storage},
+        ),
         ("s3_stage", inputs),
         ("s3_apply", prepared),
         ("install_checkpoint", prepared.path),
@@ -344,7 +348,8 @@ def test_vllm_s3_requires_model_name():
             vllm_config="vllm-config",
             model_config="model-config",
             worker_id="generator-0",
-            s3=S3GeneratorConfig(
+            object_storage=ObjectStorageGeneratorConfig(
+                storage_type=ObjectStorageType.S3,
                 initial_base_version_id="base-a",
                 launch_checkpoint="launch",
                 preparation_cache_dir="cache",

@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from modelexpress_rl import ObjectStorageType
 from modelexpress_rl.inference.engines.vllm import weight_transfer_engine
 from modelexpress_rl.inference.engines.vllm.weight_transfer_engine import (
     ModelExpressWeightTransferEngine,
@@ -59,10 +60,10 @@ def test_weight_transfer_engine_initializes_client_in_init_hook(monkeypatch):
     config = initialize.call_args.args[0]
     assert config.model_name == "test/model"
     assert config.engine_context.model is model
-    assert config.s3 is None
+    assert config.object_storage is None
 
 
-def test_weight_transfer_engine_parses_vime_s3_init_info(monkeypatch):
+def test_weight_transfer_engine_parses_vime_object_storage_init_info(monkeypatch):
     client = MagicMock()
     initialize = MagicMock(return_value=client)
     monkeypatch.setattr(
@@ -85,8 +86,9 @@ def test_weight_transfer_engine_parses_vime_s3_init_info(monkeypatch):
         "launch_checkpoint": "/models/launch",
         "preparation_cache_dir": "/cache/modelexpress",
         "server_url": "mx:8001",
-        "s3_endpoint_url": "http://minio:9000",
-        "s3_region_name": "us-west-2",
+        "object_storage_type": "S3",
+        "object_storage_endpoint_url": "http://minio:9000",
+        "object_storage_region_name": "us-west-2",
         "registration_ttl_seconds": 90,
         "lease_ttl_seconds": 60,
         "max_transfer_attempts": 4,
@@ -102,28 +104,47 @@ def test_weight_transfer_engine_parses_vime_s3_init_info(monkeypatch):
     assert config.lease_ttl_seconds == 60
     assert config.max_transfer_attempts == 4
     assert config.rpc_timeout_seconds == 12.5
-    assert config.s3.initial_base_version_id == "base-a"
-    assert config.s3.launch_checkpoint == "/models/launch"
-    assert config.s3.preparation_cache_dir == "/cache/modelexpress"
-    assert config.s3.endpoint_url == "http://minio:9000"
-    assert config.s3.region_name == "us-west-2"
+    assert config.object_storage.storage_type is ObjectStorageType.S3
+    assert config.object_storage.initial_base_version_id == "base-a"
+    assert config.object_storage.launch_checkpoint == "/models/launch"
+    assert config.object_storage.preparation_cache_dir == "/cache/modelexpress"
+    assert config.object_storage.endpoint_url == "http://minio:9000"
+    assert config.object_storage.region_name == "us-west-2"
 
 
 @pytest.mark.parametrize(
     "kwargs",
     [
+        {"object_storage_type": "S3"},
         {"initial_base_version_id": "base-a"},
         {"launch_checkpoint": "/models/launch"},
         {"preparation_cache_dir": "/cache/modelexpress"},
-        {"s3_endpoint_url": "http://minio:9000"},
-        {"s3_region_name": "us-west-2"},
+        {"object_storage_endpoint_url": "http://minio:9000"},
+        {"object_storage_region_name": "us-west-2"},
     ],
 )
-def test_weight_transfer_engine_requires_complete_s3_init(monkeypatch, kwargs):
+def test_weight_transfer_engine_requires_complete_object_storage_init(
+    monkeypatch,
+    kwargs,
+):
     engine, _client = _engine(monkeypatch, initialize=False)
 
-    with pytest.raises(ValueError, match="canonical S3 requires"):
+    with pytest.raises(ValueError, match="object storage requires"):
         engine.init_transfer_engine(engine.init_info_cls(**kwargs))
+
+
+def test_weight_transfer_engine_rejects_unknown_object_storage_type(monkeypatch):
+    engine, _client = _engine(monkeypatch, initialize=False)
+
+    with pytest.raises(ValueError, match="unsupported object_storage_type"):
+        engine.init_transfer_engine(
+            engine.init_info_cls(
+                object_storage_type="UNKNOWN",
+                initial_base_version_id="base-a",
+                launch_checkpoint="/models/launch",
+                preparation_cache_dir="/cache/modelexpress",
+            )
+        )
 
 
 def test_weight_transfer_engine_applies_one_exact_version(monkeypatch):

@@ -10,12 +10,12 @@ from .client import (
 )
 from .engines.sglang import SglangGeneratorContext
 from .engines.vllm import VllmGeneratorContext
-from .receiver import S3GeneratorConfig
+from .receiver import ObjectStorageGeneratorConfig
 
 __all__ = [
     "ModelExpressGeneratorClient",
     "ModelExpressGeneratorConfig",
-    "S3GeneratorConfig",
+    "ObjectStorageGeneratorConfig",
     "SglangGeneratorContext",
     "StagedWeightHandle",
     "VllmGeneratorContext",

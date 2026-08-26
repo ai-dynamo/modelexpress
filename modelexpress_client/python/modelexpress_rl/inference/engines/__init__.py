@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from ..adapter import GeneratorEngineAdapter, GeneratorEngineContext
-from ..receiver import S3GeneratorConfig
+from ..receiver import ObjectStorageGeneratorConfig
 from .sglang import SglangGeneratorContext
 from .sglang.adapter import _create_sglang_adapter
 from .vllm import VllmGeneratorContext, _create_vllm_adapter
@@ -17,13 +17,18 @@ def _create_generator_adapter(
     engine_context: GeneratorEngineContext,
     worker_id: str,
     model_name: str,
-    s3: S3GeneratorConfig | None,
+    object_storage: ObjectStorageGeneratorConfig | None,
 ) -> GeneratorEngineAdapter:
     """Construct the adapter selected by the concrete engine context."""
     if isinstance(engine_context, SglangGeneratorContext):
-        return _create_sglang_adapter(engine_context, model_name, s3)
+        return _create_sglang_adapter(engine_context, model_name, object_storage)
     if isinstance(engine_context, VllmGeneratorContext):
-        return _create_vllm_adapter(engine_context, worker_id, model_name, s3)
+        return _create_vllm_adapter(
+            engine_context,
+            worker_id,
+            model_name,
+            object_storage,
+        )
     raise TypeError(f"unsupported generator context {type(engine_context).__name__}")
 
 

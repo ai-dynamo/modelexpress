@@ -132,8 +132,9 @@ training framework. Framework-native bucket settings remain the default.
 The public trainer API accepts
 `ModelExpressTrainerConfig(object_storage=ObjectStorageConfig(...))`; its
 `storage_type` selects the provider. Weight versions use the corresponding
-typed `ObjectStorageSource` envelope. The current trainer and generator clients
-support only `ObjectStorageType.S3`.
+typed `ObjectStorageSource` envelope. Generator clients likewise accept
+`ModelExpressGeneratorConfig(object_storage=ObjectStorageGeneratorConfig(...))`.
+The current trainer and generator clients support only `ObjectStorageType.S3`.
 Integrations may use `MX_REFIT_DELTA_BUCKET_BYTES` as an explicit override, or
 its 512 MiB default when they have no native setting. CPU workers are configured
 by `MX_REFIT_DELTA_WORKERS` (default `min(32, CPU count)`).

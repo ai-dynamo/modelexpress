@@ -21,13 +21,14 @@ from modelexpress_rl.version import WeightVersionRef
 
 from .. import refit_pb2, refit_pb2_grpc
 from ..control import WeightVersion, WeightVersionState, _weight_version
+from ..object_storage import ObjectStorageType
 from .adapter import (
     GeneratorEngineAdapter,
     GeneratorEngineContext,
     GeneratorTransferInputs,
 )
 from .engines import _create_generator_adapter
-from .receiver import S3GeneratorConfig
+from .receiver import ObjectStorageGeneratorConfig
 from .refit_strategy import RefitStrategy
 from .refit_strategy.peer import _PeerRefitStrategy
 from .refit_strategy.trainer import _TrainerRefitStrategy
@@ -61,8 +62,8 @@ class ModelExpressGeneratorConfig:
     max_transfer_attempts: int = 3
     # Deadline applied independently to each control-plane or manifest RPC.
     rpc_timeout_seconds: float = 30.0
-    # Canonical S3 checkpoint settings. Omit for the existing NIXL path.
-    s3: S3GeneratorConfig | None = None
+    # Canonical object-storage checkpoint settings. Omit for the NIXL path.
+    object_storage: ObjectStorageGeneratorConfig | None = None
 
     def __post_init__(self) -> None:
         """Validate explicit settings before client initialization."""
@@ -184,12 +185,17 @@ class ModelExpressGeneratorClient:
         registration_ttl_seconds = rl_envs.require_positive_int(
             registration_ttl_seconds, "registration_ttl_seconds"
         )
+        if (
+            config.object_storage is not None
+            and config.object_storage.storage_type is not ObjectStorageType.S3
+        ):
+            raise ValueError("only S3 object storage is currently supported")
 
         adapter = _create_generator_adapter(
             engine_context=config.engine_context,
             worker_id=worker_id,
             model_name=model_name,
-            s3=config.s3,
+            object_storage=config.object_storage,
         )
         client = cls()
         client.model_name = model_name
@@ -200,9 +206,9 @@ class ModelExpressGeneratorClient:
         client._max_transfer_attempts = config.max_transfer_attempts
         client._rpc_timeout_seconds = config.rpc_timeout_seconds
         client._adapter = adapter
-        client._uses_s3 = config.s3 is not None
-        if config.s3 is not None:
-            client._serving_version_id = config.s3.initial_base_version_id
+        client._uses_s3 = config.object_storage is not None
+        if config.object_storage is not None:
+            client._serving_version_id = config.object_storage.initial_base_version_id
         else:
             client._p2p_client = MxClient(server_url=server_url)
             client._refit_strategies = (
@@ -404,12 +410,11 @@ class ModelExpressGeneratorClient:
         return version
 
     def _validate_initial_base(self, version_id: str) -> None:
-        version = _weight_version(
-            self._service.GetWeightVersion(
-                refit_pb2.GetWeightVersionRequest(uid=version_id),
-                timeout=self._rpc_timeout_seconds,
-            )
+        response = self._service.GetWeightVersion(
+            refit_pb2.GetWeightVersionRequest(uid=version_id),
+            timeout=self._rpc_timeout_seconds,
         )
+        version = _weight_version(response.version)
         if version.state is not WeightVersionState.READY:
             raise RuntimeError(f"initial base {version_id!r} is not READY")
         if version.model_name != self.model_name:
@@ -486,15 +491,17 @@ class ModelExpressGeneratorClient:
         lease = self._start_version_lease(version.version_id)
         try:
             if self._uses_s3:
-                if not version.s3_uri:
-                    raise RuntimeError("XOR_DELTA version is missing its S3 transport")
+                if version.object_storage is None:
+                    raise RuntimeError(
+                        "The version is missing its object storage source"
+                    )
                 inputs = GeneratorTransferInputs(
                     version_id=version.version_id,
                     base_version_id=version.base_version_id,
                     layout_signature=version.layout_signature,
                     payload_format=version.payload_format,
                     sources=(),
-                    s3_uri=version.s3_uri,
+                    object_storage=version.object_storage,
                 )
                 last_error: grpc.RpcError | RuntimeError | None = None
                 for _ in range(self._max_transfer_attempts):

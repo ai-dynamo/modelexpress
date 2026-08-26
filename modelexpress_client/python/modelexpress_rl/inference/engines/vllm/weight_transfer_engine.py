@@ -22,7 +22,8 @@ from modelexpress_rl.inference.client import (
     ModelExpressGeneratorConfig,
     StagedWeightHandle,
 )
-from modelexpress_rl.inference.receiver import S3GeneratorConfig
+from modelexpress_rl.inference.receiver import ObjectStorageGeneratorConfig
+from modelexpress_rl.object_storage import ObjectStorageType
 from modelexpress_rl.version import WeightVersionRef
 
 from .context import VllmGeneratorContext
@@ -32,15 +33,16 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ModelExpressWeightTransferInitInfo(WeightTransferInitInfo):
-    """Optional ModelExpress connection and canonical S3 settings."""
+    """Optional ModelExpress connection and object-storage settings."""
 
     model_name: str | None = None
     initial_base_version_id: str | None = None
     launch_checkpoint: str | None = None
     preparation_cache_dir: str | None = None
     server_url: str | None = None
-    s3_endpoint_url: str | None = None
-    s3_region_name: str | None = None
+    object_storage_type: str | None = None
+    object_storage_endpoint_url: str | None = None
+    object_storage_region_name: str | None = None
     registration_ttl_seconds: int | None = None
     lease_ttl_seconds: int | None = None
     max_transfer_attempts: int = 3
@@ -101,30 +103,41 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
             logger.warning("weight transfer engine is already initialized")
             return
 
-        s3_values = (
+        object_storage_values = (
+            init_info.object_storage_type,
             init_info.initial_base_version_id,
             init_info.launch_checkpoint,
             init_info.preparation_cache_dir,
-            init_info.s3_endpoint_url,
-            init_info.s3_region_name,
+            init_info.object_storage_endpoint_url,
+            init_info.object_storage_region_name,
         )
-        s3 = None
-        if any(value is not None for value in s3_values):
+        object_storage = None
+        if any(value is not None for value in object_storage_values):
             if (
-                init_info.initial_base_version_id is None
+                init_info.object_storage_type is None
+                or init_info.initial_base_version_id is None
                 or init_info.launch_checkpoint is None
                 or init_info.preparation_cache_dir is None
             ):
                 raise ValueError(
-                    "canonical S3 requires initial_base_version_id, "
-                    "launch_checkpoint, and preparation_cache_dir"
+                    "object storage requires object_storage_type, "
+                    "initial_base_version_id, launch_checkpoint, and "
+                    "preparation_cache_dir"
                 )
-            s3 = S3GeneratorConfig(
+            try:
+                storage_type = ObjectStorageType(init_info.object_storage_type)
+            except ValueError as error:
+                raise ValueError(
+                    f"unsupported object_storage_type="
+                    f"{init_info.object_storage_type!r}"
+                ) from error
+            object_storage = ObjectStorageGeneratorConfig(
+                storage_type=storage_type,
                 initial_base_version_id=init_info.initial_base_version_id,
                 launch_checkpoint=init_info.launch_checkpoint,
                 preparation_cache_dir=init_info.preparation_cache_dir,
-                endpoint_url=init_info.s3_endpoint_url,
-                region_name=init_info.s3_region_name,
+                endpoint_url=init_info.object_storage_endpoint_url,
+                region_name=init_info.object_storage_region_name,
             )
 
         model_name = (
@@ -141,7 +154,7 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
                 lease_ttl_seconds=init_info.lease_ttl_seconds,
                 max_transfer_attempts=init_info.max_transfer_attempts,
                 rpc_timeout_seconds=init_info.rpc_timeout_seconds,
-                s3=s3,
+                object_storage=object_storage,
             )
         )
 

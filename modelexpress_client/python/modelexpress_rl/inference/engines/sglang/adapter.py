@@ -11,9 +11,9 @@ import torch
 
 from modelexpress_rl.inference.receiver import (
     CanonicalS3GeneratorAdapter,
+    ObjectStorageGeneratorConfig,
     PreparedCheckpoint,
     ReceiverInstallError,
-    S3GeneratorConfig,
 )
 
 from .context import SglangGeneratorContext
@@ -27,7 +27,7 @@ class SGLangGeneratorAdapter(CanonicalS3GeneratorAdapter):
         *,
         context: SglangGeneratorContext,
         model_name: str,
-        config: S3GeneratorConfig,
+        config: ObjectStorageGeneratorConfig,
     ) -> None:
         self.model_runner = context.model_runner
         super().__init__(model_name=model_name, config=config)
@@ -83,7 +83,7 @@ class SGLangGeneratorAdapter(CanonicalS3GeneratorAdapter):
 def _create_sglang_adapter(
     context: SglangGeneratorContext,
     model_name: str,
-    config: S3GeneratorConfig,
+    config: ObjectStorageGeneratorConfig,
 ) -> SGLangGeneratorAdapter:
     return SGLangGeneratorAdapter(
         context=context,

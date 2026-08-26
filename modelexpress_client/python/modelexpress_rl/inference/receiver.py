@@ -22,6 +22,7 @@ import numpy as np
 import zstandard
 
 from modelexpress_rl import envs as rl_envs
+from modelexpress_rl.object_storage import ObjectStorageType
 from modelexpress_rl.s3 import S3Client
 from modelexpress_rl.train import WeightPayloadFormat
 from modelexpress_rl.utils import index_checkpoint_tensors, read_safetensors_header
@@ -33,9 +34,10 @@ from .adapter import (
 
 
 @dataclass(frozen=True)
-class S3GeneratorConfig:
-    """Canonical checkpoint and S3 settings for one generator rank."""
+class ObjectStorageGeneratorConfig:
+    """Object-storage checkpoint settings for one generator rank."""
 
+    storage_type: ObjectStorageType
     initial_base_version_id: str
     launch_checkpoint: str | Path
     preparation_cache_dir: str | Path
@@ -43,6 +45,8 @@ class S3GeneratorConfig:
     region_name: str | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.storage_type, ObjectStorageType):
+            raise TypeError("storage_type must be an ObjectStorageType")
         if not self.initial_base_version_id.strip():
             raise ValueError("initial_base_version_id is required")
         if not str(self.launch_checkpoint).strip():
@@ -110,7 +114,7 @@ class _LocalCheckpoint:
         self,
         *,
         model_name: str,
-        config: S3GeneratorConfig,
+        config: ObjectStorageGeneratorConfig,
         s3: S3Client,
     ) -> None:
         self.initial_version = config.initial_base_version_id
@@ -362,8 +366,10 @@ class CanonicalS3GeneratorAdapter(GeneratorEngineAdapter):
         self,
         *,
         model_name: str,
-        config: S3GeneratorConfig,
+        config: ObjectStorageGeneratorConfig,
     ) -> None:
+        if config.storage_type is not ObjectStorageType.S3:
+            raise ValueError("only S3 object storage is currently supported")
         self._s3 = S3Client(
             endpoint_url=config.endpoint_url,
             region_name=config.region_name,
@@ -387,7 +393,7 @@ class CanonicalS3GeneratorAdapter(GeneratorEngineAdapter):
             raise ValueError("canonical S3 requires XOR_DELTA payloads")
         if not inputs.base_version_id:
             raise ValueError("canonical S3 version is missing base_version_id")
-        if not inputs.s3_uri:
+        if inputs.object_storage is None:
             raise ValueError("canonical S3 requires a version-level URI")
         if self._checkpoint.current_version not in {
             inputs.base_version_id,
@@ -397,7 +403,7 @@ class CanonicalS3GeneratorAdapter(GeneratorEngineAdapter):
         version = _S3Version(
             version_id=inputs.version_id,
             base_version_id=inputs.base_version_id,
-            uri=inputs.s3_uri,
+            uri=inputs.object_storage.uri,
         )
         started = time.perf_counter()
         try:
@@ -434,5 +440,5 @@ __all__ = [
     "CanonicalS3GeneratorAdapter",
     "PreparedCheckpoint",
     "ReceiverInstallError",
-    "S3GeneratorConfig",
+    "ObjectStorageGeneratorConfig",
 ]

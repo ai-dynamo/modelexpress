@@ -3,6 +3,7 @@
 
 import json
 import threading
+from dataclasses import replace
 
 import pytest
 import safetensors.numpy
@@ -11,7 +12,12 @@ import torch
 import zstandard
 from safetensors.torch import load_file, save_file
 
-from modelexpress_rl import S3GeneratorConfig, WeightPayloadFormat
+from modelexpress_rl import (
+    ObjectStorageGeneratorConfig,
+    ObjectStorageSource,
+    ObjectStorageType,
+    WeightPayloadFormat,
+)
 from modelexpress_rl.inference.adapter import GeneratorTransferInputs
 from modelexpress_rl.inference import receiver as receiver_module
 from modelexpress_rl.inference.receiver import CanonicalS3GeneratorAdapter
@@ -349,7 +355,10 @@ def _inputs(
         layout_signature="",
         payload_format=WeightPayloadFormat.XOR_DELTA,
         sources=(),
-        s3_uri=uri,
+        object_storage=ObjectStorageSource(
+            storage_type=ObjectStorageType.S3,
+            uri=uri,
+        ),
     )
 
 
@@ -361,13 +370,33 @@ def _build(monkeypatch, tmp_path, objects):
     monkeypatch.setattr(receiver_module, "S3Client", lambda **_kwargs: storage)
     adapter = _Adapter(
         model_name="test/model",
-        config=S3GeneratorConfig(
+        config=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
             initial_base_version_id="base-a",
             launch_checkpoint=launch,
             preparation_cache_dir=tmp_path / "cache",
         ),
     )
     return adapter, storage
+
+
+def test_canonical_s3_rejects_non_s3_source_before_storage_access(
+    monkeypatch,
+    tmp_path,
+):
+    adapter, storage = _build(monkeypatch, tmp_path, {})
+    inputs = replace(
+        _inputs(None),
+        object_storage=ObjectStorageSource(
+            storage_type=ObjectStorageType.GCS,
+            uri="gs://weights/test/v1/model.safetensors.index.json",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="requires S3 object storage"):
+        adapter.stage_weight(inputs)
+
+    assert storage.calls == []
 
 
 def test_canonical_s3_prepares_then_installs_one_global_index(monkeypatch, tmp_path):
@@ -487,7 +516,8 @@ def test_canonical_s3_applies_delta_tensors_concurrently(monkeypatch, tmp_path):
     save_file(base, launch / "model.safetensors")
     checkpoint = receiver_module._LocalCheckpoint(
         model_name="test/model",
-        config=S3GeneratorConfig(
+        config=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
             initial_base_version_id="base-a",
             launch_checkpoint=launch,
             preparation_cache_dir=tmp_path / "cache",

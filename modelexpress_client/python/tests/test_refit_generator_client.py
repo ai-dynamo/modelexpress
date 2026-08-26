@@ -12,7 +12,9 @@ from modelexpress.types import ManifestMismatchError
 from modelexpress_rl import (
     ModelExpressGeneratorClient,
     ModelExpressGeneratorConfig,
-    S3GeneratorConfig,
+    ObjectStorageGeneratorConfig,
+    ObjectStorageSource,
+    ObjectStorageType,
     VllmGeneratorContext,
     WeightPayloadFormat,
     WeightVersion,
@@ -68,7 +70,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
 
     def GetWeightVersion(self, request, context):
         if request.uid == self.base.uid:
-            return self.base
+            return refit_pb2.GetWeightVersionResponse(version=self.base)
         if request.uid != self.version.uid:
             context.abort(grpc.StatusCode.NOT_FOUND, "version not found")
         return refit_pb2.GetWeightVersionResponse(version=self.version)
@@ -228,7 +230,7 @@ def _initialize(
     endpoint,
     adapter,
     *,
-    s3=False,
+    object_storage=False,
     max_transfer_attempts=3,
 ):
     monkeypatch.setattr(
@@ -247,13 +249,14 @@ def _initialize(
             server_url=endpoint,
             registration_ttl_seconds=60,
             lease_ttl_seconds=60,
-            s3=(
-                S3GeneratorConfig(
+            object_storage=(
+                ObjectStorageGeneratorConfig(
+                    storage_type=ObjectStorageType.S3,
                     initial_base_version_id="base-a",
                     launch_checkpoint="unused-launch",
                     preparation_cache_dir="unused-cache",
                 )
-                if s3
+                if object_storage
                 else None
             ),
             max_transfer_attempts=max_transfer_attempts,
@@ -282,6 +285,33 @@ def test_generator_config_rejects_invalid_numeric_settings(setting, value, messa
                 vllm_config=object(),
             ),
             **{setting: value},
+        )
+
+
+def test_generator_rejects_unsupported_object_storage_before_adapter_creation(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        generator_client_module,
+        "_create_generator_adapter",
+        lambda **_kwargs: pytest.fail("adapter must not be created"),
+    )
+
+    with pytest.raises(ValueError, match="only S3 object storage"):
+        ModelExpressGeneratorClient.initialize(
+            ModelExpressGeneratorConfig(
+                engine_context=VllmGeneratorContext(
+                    model=object(),
+                    vllm_config=object(),
+                ),
+                model_name="test/model",
+                object_storage=ObjectStorageGeneratorConfig(
+                    storage_type=ObjectStorageType.GCS,
+                    initial_base_version_id="base-a",
+                    launch_checkpoint="unused-launch",
+                    preparation_cache_dir="unused-cache",
+                ),
+            )
         )
 
 
@@ -404,13 +434,18 @@ def test_generator_dispatches_canonical_s3_without_fetching_a_worker_manifest(
     service.version.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA
     service.version.base_version_id = "base-a"
     service.version.expected_source_slots[:] = []
-    service.version.s3.uri = "s3://weights/model.safetensors.index.json"
+    service.version.object_storage.CopyFrom(
+        refit_pb2.ObjectStorageSource(
+            storage_type=refit_pb2.OBJECT_STORAGE_TYPE_S3,
+            uri="s3://weights/model.safetensors.index.json",
+        )
+    )
     adapter = _Adapter(service)
     generator = _initialize(
         monkeypatch,
         endpoint,
         adapter,
-        s3=True,
+        object_storage=True,
     )
     assert generator._p2p_client is None
     assert generator._refit_strategies == ()
@@ -418,9 +453,9 @@ def test_generator_dispatches_canonical_s3_without_fetching_a_worker_manifest(
     try:
         staged = generator.stage_weight(version=WeightVersionRef("version-a"))
         assert adapter.stage_calls[0].sources == ()
-        assert (
-            adapter.stage_calls[0].s3_uri
-            == "s3://weights/model.safetensors.index.json"
+        assert adapter.stage_calls[0].object_storage == ObjectStorageSource(
+            storage_type=ObjectStorageType.S3,
+            uri="s3://weights/model.safetensors.index.json",
         )
         assert service.list_calls == 0
         assert generator.apply_weight(staged) == "installed"
@@ -434,7 +469,9 @@ def test_generator_dispatches_canonical_s3_without_fetching_a_worker_manifest(
         server.stop(grace=None).wait()
 
 
-def test_generator_rejects_missing_s3_transport_before_adapter_mutation(monkeypatch):
+def test_generator_rejects_missing_object_storage_before_adapter_mutation(
+    monkeypatch,
+):
     server, endpoint, service = _start_server()
     service.version.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA
     service.version.base_version_id = "base-a"
@@ -444,11 +481,43 @@ def test_generator_rejects_missing_s3_transport_before_adapter_mutation(monkeypa
         monkeypatch,
         endpoint,
         adapter,
-        s3=True,
+        object_storage=True,
     )
 
     try:
-        with pytest.raises(RuntimeError, match="missing its S3 transport"):
+        with pytest.raises(RuntimeError, match="missing its object storage source"):
+            generator.stage_weight(version=WeightVersionRef("version-a"))
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert adapter.stage_calls == []
+    assert service.lease_deletions == 1
+
+
+def test_generator_rejects_non_s3_object_storage_before_adapter_mutation(
+    monkeypatch,
+):
+    server, endpoint, service = _start_server()
+    service.version.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA
+    service.version.base_version_id = "base-a"
+    service.version.expected_source_slots[:] = []
+    service.version.object_storage.CopyFrom(
+        refit_pb2.ObjectStorageSource(
+            storage_type=refit_pb2.OBJECT_STORAGE_TYPE_GCS,
+            uri="gs://weights/model.safetensors.index.json",
+        )
+    )
+    adapter = _Adapter(service)
+    generator = _initialize(
+        monkeypatch,
+        endpoint,
+        adapter,
+        object_storage=True,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="requires S3 object storage"):
             generator.stage_weight(version=WeightVersionRef("version-a"))
     finally:
         generator.close()
@@ -468,7 +537,7 @@ def test_generator_rejects_wrong_delta_base_before_leasing(monkeypatch):
         monkeypatch,
         endpoint,
         adapter,
-        s3=True,
+        object_storage=True,
     )
 
     try:
@@ -493,7 +562,7 @@ def test_generator_validates_the_initial_s3_base_before_registration(monkeypatch
                 monkeypatch,
                 endpoint,
                 adapter,
-                s3=True,
+                object_storage=True,
             )
     finally:
         server.stop(grace=None).wait()
