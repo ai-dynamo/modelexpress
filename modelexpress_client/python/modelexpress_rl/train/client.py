@@ -5,18 +5,37 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import threading
 import uuid
+from collections import deque
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import grpc
+import numpy as np
+import safetensors.numpy
+import torch
+import torch.distributed as dist
 from modelexpress import auth, envs
 from modelexpress.client import _get_server_url
+from modelexpress_rl.s3 import S3Client
+from modelexpress_rl.utils import (
+    adler32_checksum,
+    compress_delta,
+    compute_delta,
+    make_tensor_reader,
+)
 
 from .. import envs as rl_envs
 from .. import refit_pb2, refit_pb2_grpc
+from ..object_storage import ObjectStorageType
 from ..version import WeightVersionRef
 from .adapter import (
     NixlMetadataProvider,
@@ -26,6 +45,8 @@ from .adapter import (
     WeightPayloadFormat,
 )
 from .resources import _TrainerResources
+
+logger = logging.getLogger(__name__)
 
 
 def _required(value: str, name: str) -> str:
@@ -79,6 +100,52 @@ def _payload_format(value: WeightPayloadFormat | None) -> WeightPayloadFormat:
 
 
 @dataclass(frozen=True)
+class ObjectStorageConfig:
+    """Object-storage and launch-base settings for canonical XOR publication."""
+
+    storage_type: ObjectStorageType
+    uri_prefix: str
+    initial_base_version_id: str
+    launch_checkpoint: str | Path
+    endpoint_url: str | None = None
+    region_name: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.storage_type, ObjectStorageType):
+            raise TypeError("storage_type must be an ObjectStorageType")
+        _required(self.uri_prefix, "object_storage.uri_prefix")
+        _required(
+            self.initial_base_version_id,
+            "object_storage.initial_base_version_id",
+        )
+        if not str(self.launch_checkpoint).strip():
+            raise ValueError("object_storage.launch_checkpoint is required")
+
+    def root_uri(self, version_number: int) -> str:
+        """Return the canonical index URI for one numeric version."""
+        return (
+            f"{self.uri_prefix.rstrip('/')}/v{version_number}/"
+            "model.safetensors.index.json"
+        )
+
+
+@dataclass
+class _StagedDelta:
+    base_version_id: str
+    target_version_id: str
+    target_version_number: int
+    object_storage_uri: str
+    candidate_snapshot: dict[str, np.ndarray]
+    encoded_deltas: dict[str, np.ndarray]
+    checksums: dict[str, str]
+    changed_bytes: int
+    total_bytes: int
+    wire_bytes: int = 0
+    stage_delta_time: float = 0.0
+    publish_object_storage_time: float = 0.0
+
+
+@dataclass(frozen=True)
 class ModelExpressTrainerConfig:
     """Immutable configuration for one rank-local trainer client."""
 
@@ -100,6 +167,10 @@ class ModelExpressTrainerConfig:
     registration_ttl_seconds: int | None = None
     # Deadline applied independently to each control-plane RPC.
     rpc_timeout_seconds: float = 30.0
+    # Process group used by collective trainer publication.
+    process_group: Any | None = None
+    # Canonical object-storage/XOR settings. Omit to use the existing NIXL path.
+    object_storage: ObjectStorageConfig | None = None
 
     def __post_init__(self) -> None:
         """Validate explicit settings before client initialization."""
@@ -120,7 +191,7 @@ class StagedWeightVersionShard:
         *,
         client: ModelExpressTrainerClient,
         version: WeightVersionRef,
-        staged: StagedWeightVersionShardData,
+        staged: StagedWeightVersionShardData | _StagedDelta,
     ) -> None:
         self._client = client
         self._version = version
@@ -146,23 +217,67 @@ class ModelExpressTrainerClient:
     def __init__(self) -> None:
         self._channel: grpc.Channel | None = None
         self._stub: refit_pb2_grpc.RefitServiceStub | None = None
-        self._published_shards: dict[str, list[StagedWeightVersionShardData]] = {}
+        self._published_shards: dict[
+            str, list[StagedWeightVersionShardData | _StagedDelta]
+        ] = {}
         self._registration_stop = threading.Event()
         self._registration_thread: threading.Thread | None = None
         self._adapter: TrainerEngineAdapter | None = None
         self._resources: _TrainerResources | None = None
+        self._object_storage_config: ObjectStorageConfig | None = None
+        self._s3: S3Client | None = None
+        self._process_group: Any | None = None
+        self._rank = 0
+        self._world_size = 1
+        self._read_launch_tensor: Callable[[str], np.ndarray] | None = None
+        self._current_base_version_id: str | None = None
+        self._snapshot: dict[str, np.ndarray] = {}
+        self._metric_delta: _StagedDelta | None = None
         self._bound_tensors: Any | None = None
         self._closed = False
 
     @property
     def source_slot_id(self) -> str:
         """Return the logical source contribution owned by this client."""
+        if self._s3 is not None:
+            raise RuntimeError("S3 publication does not use source slots")
         return self._get_adapter().source_slot_id
+
+    def prepare_delta_base(
+        self,
+        *,
+        hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]],
+    ) -> None:
+        """Prepare this rank's launch snapshot before the first delta."""
+        started = perf_counter()
+        assert self._read_launch_tensor is not None
+        reader = self._read_launch_tensor
+
+        def read_bucket(
+            bucket: list[tuple[str, torch.Tensor]],
+        ) -> dict[str, np.ndarray]:
+            return {
+                name: np.asarray(reader(name), dtype=np.uint8) for name, _ in bucket
+            }
+
+        snapshot = {}
+        with ThreadPoolExecutor(
+            max_workers=rl_envs.MX_REFIT_DELTA_WORKERS,
+            thread_name_prefix="modelexpress-delta-base",
+        ) as pool:
+            futures = [pool.submit(read_bucket, bucket) for bucket in hf_tensor_iter]
+            for future in futures:
+                snapshot.update(future.result())
+        self._snapshot = snapshot
+        logger.info(
+            "ModelExpress prepare_delta_base: rank=%d tensors=%d duration=%.3fs",
+            self._rank,
+            len(snapshot),
+            perf_counter() - started,
+        )
 
     def bind_tensors(self, tensors: Any) -> str:
         """Bind the stable engine tensors used by subsequent publications."""
-        if self._closed:
-            raise RuntimeError("trainer client is closed")
         if tensors is None:
             raise ValueError("tensors must not be None")
         if self._bound_tensors is not None:
@@ -197,43 +312,79 @@ class ModelExpressTrainerClient:
         registration_ttl_seconds = rl_envs.require_positive_int(
             registration_ttl_seconds, "registration_ttl_seconds"
         )
-        device_id = config.device_id
-        if device_id is None:
-            local_rank = os.environ.get("LOCAL_RANK")
-            if local_rank is None:
-                raise ValueError("config.device_id or LOCAL_RANK is required")
-            device_id = int(local_rank)
-        resources = _TrainerResources.initialize(
-            device_id=device_id,
-            agent_name=config.agent_name,
-        )
+        use_object_storage = config.object_storage is not None
+        if (
+            config.object_storage is not None
+            and config.object_storage.storage_type is not ObjectStorageType.S3
+        ):
+            raise ValueError("only S3 object storage is currently supported")
+        if use_object_storage and (
+            staging_mode is not TrainerStagingMode.WRITE_TO_STORAGE
+            or payload_format is not WeightPayloadFormat.XOR_DELTA
+        ):
+            raise ValueError(
+                "object storage publication requires WRITE_TO_STORAGE and XOR_DELTA"
+            )
+        if (
+            not use_object_storage
+            and staging_mode is TrainerStagingMode.WRITE_TO_STORAGE
+        ):
+            raise ValueError("WRITE_TO_STORAGE requires config.object_storage")
+
+        resources = None
+        if not use_object_storage:
+            device_id = config.device_id
+            if device_id is None:
+                local_rank = os.environ.get("LOCAL_RANK")
+                if local_rank is None:
+                    raise ValueError("config.device_id or LOCAL_RANK is required")
+                device_id = int(local_rank)
+            resources = _TrainerResources.initialize(
+                device_id=device_id,
+                agent_name=config.agent_name,
+            )
 
         client = cls()
         client.model_name = model_name
         client.staging_mode = staging_mode
         client.payload_format = payload_format
         client.worker_id = worker_id
-        client.worker_endpoint = resources.worker_endpoint
         client.server_url = _get_server_url(config.server_url)
         client._adapter = None
-        client._manager = resources.manager
-        client._nixl_metadata_endpoint = _nixl_metadata_endpoint(resources.manager)
-        client._manifest_publisher = resources.manifest_service
+        if resources is not None:
+            client.worker_endpoint = resources.worker_endpoint
+            client._manager = resources.manager
+            client._nixl_metadata_endpoint = _nixl_metadata_endpoint(resources.manager)
+            client._manifest_publisher = resources.manifest_service
+        else:
+            assert config.object_storage is not None
+            object_storage = config.object_storage
+            client.worker_endpoint = ""
+            client._object_storage_config = object_storage
+            client._process_group = config.process_group
+            client._rank = dist.get_rank(config.process_group)
+            client._world_size = dist.get_world_size(config.process_group)
+            client._read_launch_tensor, _ = make_tensor_reader(
+                object_storage.launch_checkpoint
+            )
+            client._s3 = S3Client(
+                endpoint_url=object_storage.endpoint_url,
+                region_name=object_storage.region_name,
+            )
+            client._current_base_version_id = object_storage.initial_base_version_id
         client._resources = resources
         client._registration_ttl_seconds = registration_ttl_seconds
         client._rpc_timeout_seconds = config.rpc_timeout_seconds
         try:
-            client._register_worker()
-            client._registration_thread = threading.Thread(
-                target=client._renew_worker_registration,
-                name=f"modelexpress-refit-renew-{worker_id}",
-                daemon=True,
-            )
-            try:
-                client._registration_thread.start()
-            except Exception:
-                client._registration_thread = None
-                raise
+            if not use_object_storage:
+                client._register_worker()
+                registration_thread = threading.Thread(
+                    target=client._renew_worker_registration,
+                    name=f"modelexpress-refit-renew-{worker_id}",
+                    daemon=True,
+                )
+                registration_thread.start()
+                client._registration_thread = registration_thread
         except Exception:
             client.close()
             raise
@@ -257,6 +408,8 @@ class ModelExpressTrainerClient:
     def _get_adapter(self) -> TrainerEngineAdapter:
         if self._closed:
             raise RuntimeError("trainer client is closed")
+        if self._s3 is not None:
+            raise RuntimeError("S3 publication does not use a NIXL engine adapter")
         if self._adapter is None:
             try:
                 adapter = _trainer_adapter(
@@ -300,22 +453,237 @@ class ModelExpressTrainerClient:
                 # A later renewal retries after transient control-plane failure.
                 continue
 
+    def _process_delta_bucket(
+        self,
+        bucket: list[tuple[str, torch.Tensor]],
+    ) -> tuple[
+        dict[str, np.ndarray],
+        dict[str, np.ndarray],
+        dict[str, str],
+        int,
+        int,
+    ]:
+        candidate = {}
+        encoded = {}
+        checksums = {}
+        changed_bytes = 0
+        total_bytes = 0
+        for name, tensor in bucket:
+            current = (
+                tensor.detach()
+                .cpu()
+                .contiguous()
+                .reshape(-1)
+                .view(torch.uint8)
+                .numpy()
+                .copy()
+            )
+            base = self._snapshot[name]
+            if base.nbytes != current.nbytes:
+                raise RuntimeError(f"canonical tensor {name!r} changed byte size")
+            delta, changed = compute_delta(current, base)
+            candidate[name] = current
+            changed_bytes += changed
+            total_bytes += int(current.nbytes)
+            if delta is not None:
+                encoded[name] = compress_delta(delta)
+                checksums[name] = adler32_checksum(current)
+
+        return candidate, encoded, checksums, changed_bytes, total_bytes
+
+    def _stage_delta(
+        self,
+        *,
+        target_version_id: str,
+        target_version_number: int,
+        object_storage_uri: str,
+        base_version_id: str,
+        hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]],
+    ) -> _StagedDelta:
+        started = perf_counter()
+        if base_version_id != self._current_base_version_id:
+            raise RuntimeError(
+                f"target base {base_version_id!r} does not match retained base "
+                f"{self._current_base_version_id!r}"
+            )
+        candidate: dict[str, np.ndarray] = {}
+        encoded_deltas: dict[str, np.ndarray] = {}
+        checksums: dict[str, str] = {}
+        changed_bytes = 0
+        total_bytes = 0
+        inflight = deque()
+        workers = rl_envs.MX_REFIT_DELTA_WORKERS
+        max_inflight = 2 * workers
+
+        def collect_one() -> None:
+            nonlocal changed_bytes, total_bytes
+            current, encoded, bucket_checksums, changed, total = (
+                inflight.popleft().result()
+            )
+            candidate.update(current)
+            encoded_deltas.update(encoded)
+            checksums.update(bucket_checksums)
+            changed_bytes += changed
+            total_bytes += total
+
+        with ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="modelexpress-delta",
+        ) as pool:
+            for bucket in hf_tensor_iter:
+                if bucket:
+                    inflight.append(pool.submit(self._process_delta_bucket, bucket))
+                if len(inflight) >= max_inflight:
+                    collect_one()
+            while inflight:
+                collect_one()
+
+        return _StagedDelta(
+            base_version_id=base_version_id,
+            target_version_id=target_version_id,
+            target_version_number=target_version_number,
+            object_storage_uri=object_storage_uri,
+            candidate_snapshot=candidate,
+            encoded_deltas=encoded_deltas,
+            checksums=checksums,
+            changed_bytes=changed_bytes,
+            total_bytes=total_bytes,
+            stage_delta_time=perf_counter() - started,
+        )
+
+    def _publish_delta_to_s3(self, staged: _StagedDelta) -> None:
+        if staged.base_version_id != self._current_base_version_id:
+            raise RuntimeError("staged canonical delta is stale")
+        assert self._s3 is not None
+        parent_uri = staged.object_storage_uri.rsplit("/", 1)[0]
+
+        counts: list[Any] = [None] * self._world_size
+        dist.all_gather_object(
+            counts,
+            (self._rank, int(bool(staged.encoded_deltas))),
+            group=self._process_group,
+        )
+        counts.sort()
+        offset = sum(count for rank, count in counts if rank < self._rank)
+        total = sum(count for _rank, count in counts)
+
+        local_map: dict[str, str] = {}
+        shard_size = 0
+        if staged.encoded_deltas:
+            shard = safetensors.numpy.save(
+                staged.encoded_deltas, metadata=staged.checksums
+            )
+            filename = f"model-{offset:05d}-of-{total:05d}.safetensors"
+            self._s3.put(
+                uri=f"{parent_uri}/{filename}",
+                data=shard,
+            )
+            shard_size = len(shard)
+            staged.wire_bytes = shard_size
+            local_map = dict.fromkeys(staged.encoded_deltas, filename)
+
+        contributions = [None] * self._world_size if self._rank == 0 else None
+        dist.gather_object(
+            (self._rank, local_map, shard_size),
+            contributions,
+            dst=0,
+            group=self._process_group,
+        )
+        if contributions is None:
+            return
+
+        weight_map = {}
+        for rank, rank_map, _size in contributions:
+            for name, shard_name in rank_map.items():
+                if name in weight_map:
+                    raise RuntimeError(
+                        f"duplicate canonical tensor {name!r} from rank {rank}"
+                    )
+                weight_map[name] = shard_name
+        index = json.dumps(
+            {
+                "metadata": {
+                    "version": staged.target_version_number,
+                    "base_version": staged.base_version_id,
+                    "delta_encoding": "xor",
+                    "compression_format": "zstd",
+                    "checksum_format": "adler32",
+                },
+                "weight_map": weight_map,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        self._s3.put(uri=staged.object_storage_uri, data=index)
+
     def stage_shard(
         self,
         *,
         version: WeightVersionRef,
-        tensors: Any,
+        tensors: Any = None,
+        hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]] | None = None,
     ) -> StagedWeightVersionShard:
-        """Capture one immutable rank-local shard for ``version``."""
+        """Capture one immutable rank-local shard for ``version``.
+
+        Engine adapters receive their native ``tensors`` input. Canonical S3
+        publication instead consumes ``hf_tensor_iter`` as framework-bucketed
+        batches of Hugging Face ``(name, tensor)`` pairs; framework ranks must
+        partition canonical names without overlap.
+        """
         if self._closed:
             raise RuntimeError("trainer client is closed")
         if not isinstance(version, WeightVersionRef):
             raise TypeError("version must be a WeightVersionRef")
-        staged = self._get_adapter().stage_shard(
-            tensors=tensors,
-            staging_mode=self.staging_mode,
-            payload_format=self.payload_format,
-        )
+        if self._s3 is not None:
+            if tensors is not None:
+                raise ValueError("S3 publication accepts hf_tensor_iter, not tensors")
+            if hf_tensor_iter is None:
+                raise ValueError("hf_tensor_iter is required for S3 publication")
+            response = self._service.GetWeightVersion(
+                refit_pb2.GetWeightVersionRequest(uid=version.version_id),
+                timeout=self._rpc_timeout_seconds,
+            )
+            if not response.HasField("version"):
+                raise RuntimeError("MX GetWeightVersion response is missing version")
+            target = response.version
+            if target.model_name != self.model_name:
+                raise RuntimeError("target weight version belongs to a different model")
+            if (
+                target.payload_format != refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA
+                or not target.HasField("base_version_id")
+            ):
+                raise RuntimeError("S3 publication requires an XOR_DELTA target")
+            if not target.HasField("version_number"):
+                raise RuntimeError("S3 target must have a version number")
+            if (
+                not target.HasField("object_storage")
+                or target.object_storage.storage_type
+                != refit_pb2.OBJECT_STORAGE_TYPE_S3
+                or not target.object_storage.uri
+            ):
+                raise RuntimeError("S3 target is missing its URI")
+            assert self._object_storage_config is not None
+            if target.object_storage.uri != self._object_storage_config.root_uri(
+                target.version_number
+            ):
+                raise RuntimeError("S3 target URI does not match the configured prefix")
+            staged = self._stage_delta(
+                target_version_id=version.version_id,
+                target_version_number=target.version_number,
+                object_storage_uri=target.object_storage.uri,
+                base_version_id=target.base_version_id,
+                hf_tensor_iter=hf_tensor_iter,
+            )
+        else:
+            if hf_tensor_iter is not None:
+                raise ValueError("hf_tensor_iter is only supported for S3 publication")
+            if tensors is None:
+                raise ValueError("tensors is required for NIXL publication")
+            staged = self._get_adapter().stage_shard(
+                tensors=tensors,
+                staging_mode=self.staging_mode,
+                payload_format=self.payload_format,
+            )
         return StagedWeightVersionShard(client=self, version=version, staged=staged)
 
     def publish_version(self, *, version: WeightVersionRef) -> None:
@@ -328,10 +696,26 @@ class ModelExpressTrainerClient:
         self,
         *,
         version: WeightVersionRef,
-        staged: StagedWeightVersionShardData,
+        staged: StagedWeightVersionShardData | _StagedDelta,
     ) -> None:
+        if isinstance(staged, _StagedDelta):
+            started = perf_counter()
+            self._publish_delta_to_s3(staged)
+            staged.publish_object_storage_time = perf_counter() - started
+            self._snapshot = staged.candidate_snapshot
+            staged.candidate_snapshot = {}
+            self._current_base_version_id = staged.target_version_id
+            self._metric_delta = staged
+            staged.encoded_deltas.clear()
+            staged.checksums.clear()
+            return
+
         source_slot_id = self._get_adapter().source_slot_id
         staged.publish_ready.wait()
+        if staged.manifest.transport.upper() != "NIXL":
+            raise ValueError(
+                f"unsupported shard transport {staged.manifest.transport!r}"
+            )
         manifest_endpoint = self._manifest_publisher.publish_manifest(
             version_id=version.version_id,
             source_slot_id=source_slot_id,
@@ -345,7 +729,6 @@ class ModelExpressTrainerClient:
             total_bytes=staged.manifest.total_bytes,
             manifest_digest=staged.manifest.digest,
             manifest_endpoint=_required(manifest_endpoint, "manifest_endpoint"),
-            transport=staged.manifest.transport,
         )
         self._service.CreateWeightVersionShard(
             refit_pb2.CreateWeightVersionShardRequest(shard=shard),
@@ -357,17 +740,19 @@ class ModelExpressTrainerClient:
         self._published_shards.setdefault(version.version_id, []).append(staged)
 
     def release_version(self, *, version: WeightVersionRef) -> None:
-        """Withdraw this worker's shard after the version is retired.
+        """Withdraw one NIXL shard after retirement; retain canonical S3.
 
-        The framework must call this only after the control plane has moved the
-        version to ``RELEASING``. Once the shard is deleted, ModelExpress no
-        longer advertises this worker's buffers as a transfer source and an
-        in-place trainer may resume mutating them.
+        For NIXL, the framework must call this only after the control plane has
+        moved the version to ``RELEASING``. Once the shard is deleted,
+        ModelExpress no longer advertises this worker's buffers as a transfer
+        source and an in-place trainer may resume mutating them.
         """
         if self._closed:
             raise RuntimeError("trainer client is closed")
         if not isinstance(version, WeightVersionRef):
             raise TypeError("version must be a WeightVersionRef")
+        if self._s3 is not None:
+            return
         staged = self._published_shards.get(version.version_id)
         if staged is None:
             return
@@ -395,10 +780,30 @@ class ModelExpressTrainerClient:
             self._stub = None
         self._published_shards.clear()
         self._bound_tensors = None
+        self._snapshot = {}
+        self._read_launch_tensor = None
+        self._metric_delta = None
         if self._resources is not None:
             self._resources.close()
             self._resources = None
+        if self._s3 is not None:
+            self._s3.close()
+            self._s3 = None
         self._closed = True
+
+    def pop_metrics(self) -> dict[str, int | float]:
+        """Return and clear rank-local trainer publication metrics."""
+        staged = self._metric_delta
+        if self._s3 is None or staged is None:
+            return {}
+        self._metric_delta = None
+        return {
+            "changed_bytes": staged.changed_bytes,
+            "total_bytes": staged.total_bytes,
+            "wire_bytes": staged.wire_bytes,
+            "stage_delta_time": staged.stage_delta_time,
+            "publish_object_storage_time": staged.publish_object_storage_time,
+        }
 
     def __enter__(self) -> ModelExpressTrainerClient:
         return self
@@ -410,5 +815,6 @@ class ModelExpressTrainerClient:
 __all__ = [
     "ModelExpressTrainerClient",
     "ModelExpressTrainerConfig",
+    "ObjectStorageConfig",
     "StagedWeightVersionShard",
 ]

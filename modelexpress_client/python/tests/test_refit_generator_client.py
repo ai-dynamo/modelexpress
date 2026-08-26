@@ -48,7 +48,6 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
                 total_bytes=128,
                 manifest_digest=digest,
                 manifest_endpoint=endpoint,
-                transport="NIXL",
             )
             for rank, slot in enumerate(self.version.expected_source_slots)
         ]
@@ -57,12 +56,12 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         worker = request.worker
         worker.expires_at_unix_ms = 1234
         self.registrations[worker.worker_id] = worker
-        return worker
+        return refit_pb2.RegisterWorkerResponse(worker=worker)
 
     def GetWeightVersion(self, request, context):
         if request.uid != self.version.uid:
             context.abort(grpc.StatusCode.NOT_FOUND, "version not found")
-        return self.version
+        return refit_pb2.GetWeightVersionResponse(version=self.version)
 
     def ListWeightVersionShards(self, request, _context):
         return refit_pb2.ListWeightVersionShardsResponse(
@@ -78,11 +77,13 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         lease_id = f"lease-{request.worker_id}"
         self.active_leases.add(lease_id)
         self.lease_registrations += 1
-        return refit_pb2.VersionLease(
-            lease_id=lease_id,
-            version_id=request.version_id,
-            worker_id=request.worker_id,
-            expires_at_unix_ms=1234,
+        return refit_pb2.RegisterVersionLeaseResponse(
+            lease=refit_pb2.VersionLease(
+                lease_id=lease_id,
+                version_id=request.version_id,
+                worker_id=request.worker_id,
+                expires_at_unix_ms=1234,
+            )
         )
 
     def DeleteVersionLease(self, request, context):

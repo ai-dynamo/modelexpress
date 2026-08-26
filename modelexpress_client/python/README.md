@@ -127,6 +127,31 @@ partitions remain separate required slots. The NIXL metadata endpoint is derived
 from `MX_WORKER_HOST` and the client-owned NIXL manager's listen port. `LOCAL_RANK`
 selects the device unless `device_id` is passed to `initialize()`.
 
+Canonical S3/XOR staging consumes Hugging Face tensor buckets produced by the
+training framework. Framework-native bucket settings remain the default.
+The public trainer API accepts
+`ModelExpressTrainerConfig(object_storage=ObjectStorageConfig(...))`; its
+`storage_type` selects the provider. Weight versions use the corresponding
+typed `ObjectStorageSource` envelope. The current trainer and generator clients
+support only `ObjectStorageType.S3`.
+Integrations may use `MX_REFIT_DELTA_BUCKET_BYTES` as an explicit override, or
+its 512 MiB default when they have no native setting. CPU workers are configured
+by `MX_REFIT_DELTA_WORKERS` (default `min(32, CPU count)`).
+The framework integration reads the bucket-size setting while constructing the
+stream; ModelExpress processes each supplied bucket without splitting or merging
+it.
+Before training begins, the framework calls `prepare_delta_base()` with one
+bucket stream. ModelExpress submits each framework bucket directly for
+concurrent rank-local launch-checkpoint reads. Real delta staging therefore
+performs no launch-checkpoint reads.
+Published roots use
+`{uri_prefix}/v{version_number}/model.safetensors.index.json`.
+Canonical S3 publication requires a numeric `version_number`.
+The S3 URI belongs to `WeightVersion`; after upload, the orchestrator changes
+the version from `STAGING` to `READY`. S3 versions remain READY for rollout
+recovery; their immutable objects are governed by the bucket's external
+lifecycle policy.
+
 The client owns the NIXL manager and trainer-side manifest service. `server_url`
 selects the central ModelExpress control-plane service and defaults to the
 normal ModelExpress server configuration. A Megatron worker may initialize the
@@ -134,8 +159,8 @@ client after selecting its CUDA device but before creating NCCL resources; the
 engine adapter is created lazily when the worker first requests its source slot
 or stages a shard after distributed setup.
 
-Initialization fixes the staging mode and payload format. `publish()` hides
-manifest publication and the internal `CreateWeightVersionShard` RPC. The
+Initialization fixes the staging mode and payload format. On NIXL, `publish()`
+hides manifest publication and the internal `CreateWeightVersionShard` RPC. The
 current Megatron adapter registers and exposes its live buffers through
 `IN_PLACE`, so callers must keep those tensors immutable while the version is
 published. The required lifecycle is synchronous: create and publish the
@@ -218,6 +243,31 @@ register_modelexpress_loaders()
 | `MX_REFIT_STAGE_RECORD` | `1` | Emit one `refit-stage-v2` JSON record per refit, giving a benchmark harness the per-stage timings without parsing logs. Set to `0` to silence it |
 | `MX_RESHARD_MAX_GBPS` | `0` | Per-rank fabric ceiling in Gbps. A measured wire rate above it means the timing is wrong rather than the transfer being fast, so the refit is rejected. `0` disables the check, since only the operator knows the real per-rank limit |
 | `MX_RESHARD_PUBLISH_DIGEST` | `0` | Have each trainer publish a position-sensitive digest of every shard it advertises, so a receiver can later confirm it installed the bytes the publisher held. Off by default: the reduction costs a pass over every published tensor, which is large next to a ~1.5 s wire, so turn it on when qualifying a build rather than when measuring throughput |
+
+### Canonical S3 Transfer Tuning
+
+Objects below the configured thresholds use one PUT or GET. Larger uploads use
+multipart parts, and larger downloads use ranged GETs through one persistent
+`s3transfer.TransferManager` per `S3Client`. The receiver's file-level pool and
+the manager's global request concurrency use the same worker setting, so all
+whole-object and ranged data GETs share one 16-request budget. HEAD requests use
+the manager's separate submission executor. Downloads target a seekable
+`BytesIO`, so the complete downloaded object remains resident; the I/O settings
+below bound queued chunks, not the final object size.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MX_S3_MULTIPART_THRESHOLD_BYTES` | `104857600` (100 MiB) | Minimum object size for multipart upload |
+| `MX_S3_UPLOAD_PART_BYTES` | `16777216` (16 MiB) | Multipart upload part size |
+| `MX_S3_UPLOAD_WORKERS` | `8` | Maximum concurrent multipart part uploads |
+| `MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES` | `104857600` (100 MiB) | Minimum object size for parallel ranged download |
+| `MX_S3_DOWNLOAD_RANGE_BYTES` | `8388608` (8 MiB) | Byte-range size for parallel downloads |
+| `MX_S3_DOWNLOAD_WORKERS` | `16` | Receiver file-worker limit and shared whole/ranged data GET concurrency budget |
+| `MX_S3_DOWNLOAD_IO_CHUNK_BYTES` | `1048576` (1 MiB) | TransferManager I/O queue chunk size |
+| `MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS` | `16` | Sets `max_io_queue_size` and the non-seekable-output chunk limit. For the seekable `BytesIO` target, the default bounds queued I/O to about 16 MiB but does not cap the full downloaded object |
+| `MX_S3_MAX_POOL_CONNECTIONS` | `32` | Botocore HTTP connection-pool size |
+| `MX_S3_MAX_ATTEMPTS` | `5` | Botocore total request attempts and TransferManager post-200 streaming-download attempts |
+| `MX_S3_TCP_KEEPALIVE` | `true` | Enable TCP keepalive for S3 connections |
 
 ### UCX/NIXL Tuning
 

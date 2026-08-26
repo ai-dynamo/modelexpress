@@ -64,7 +64,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
     def RegisterWorker(self, request, _context):
         self.events.append("register-worker")
         self.registration_ttl = request.ttl_seconds
-        return request.worker
+        return refit_pb2.RegisterWorkerResponse(worker=request.worker)
 
     def CreateWeightVersionShard(self, request, _context):
         self.events.append("publish-version-shard")
@@ -243,7 +243,6 @@ def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
         == hashlib.sha256(fetched.manifest).hexdigest()
     )
     assert refit_service.shard.manifest_endpoint == f"127.0.0.1:{port}"
-    assert refit_service.shard.transport == "NIXL"
     assert fetched.manifest_digest == refit_service.shard.manifest_digest
     payload = unwrap_rendezvous_blob(fetched.manifest)
     assert payload.metadata_endpoint == "10.0.0.3:19003"

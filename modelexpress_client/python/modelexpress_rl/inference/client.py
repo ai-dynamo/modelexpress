@@ -350,12 +350,13 @@ class ModelExpressGeneratorClient:
                 continue
 
     def _get_ready_version(self, version_id: str) -> WeightVersion:
-        version = _weight_version(
-            self._service.GetWeightVersion(
-                refit_pb2.GetWeightVersionRequest(uid=version_id),
-                timeout=self._rpc_timeout_seconds,
-            )
+        response = self._service.GetWeightVersion(
+            refit_pb2.GetWeightVersionRequest(uid=version_id),
+            timeout=self._rpc_timeout_seconds,
         )
+        if not response.HasField("version"):
+            raise RuntimeError("MX GetWeightVersion response is missing version")
+        version = _weight_version(response.version)
         if version.state is not WeightVersionState.READY:
             raise RuntimeError(f"weight version {version_id!r} is not READY")
         if version.model_name != self.model_name:
@@ -363,7 +364,7 @@ class ModelExpressGeneratorClient:
         return version
 
     def _register_lease(self, version_id: str):
-        return self._service.RegisterVersionLease(
+        response = self._service.RegisterVersionLease(
             refit_pb2.RegisterVersionLeaseRequest(
                 version_id=version_id,
                 worker_id=self.worker_id,
@@ -371,6 +372,9 @@ class ModelExpressGeneratorClient:
             ),
             timeout=self._rpc_timeout_seconds,
         )
+        if not response.HasField("lease"):
+            raise RuntimeError("MX RegisterVersionLease response is missing lease")
+        return response.lease
 
     def _start_version_lease(self, version_id: str) -> _VersionLease:
         lease = self._register_lease(version_id)

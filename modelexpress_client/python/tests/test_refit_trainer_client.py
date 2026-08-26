@@ -38,7 +38,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         worker = request.worker
         worker.expires_at_unix_ms = 1234
         self.registrations[worker.worker_id] = worker
-        return worker
+        return refit_pb2.RegisterWorkerResponse(worker=worker)
 
     def CreateWeightVersionShard(self, request, context):
         shard = request.shard
@@ -124,6 +124,29 @@ def test_trainer_config_rejects_invalid_numeric_settings(setting, value, message
 def test_trainer_config_rejects_unspecified_payload_format():
     with pytest.raises(ValueError, match="payload_format must be specified"):
         ModelExpressTrainerConfig(payload_format=WeightPayloadFormat.UNSPECIFIED)
+
+
+def test_refit_shard_keeps_only_its_nixl_manifest_endpoint():
+    shard = refit_pb2.WeightVersionShard(manifest_endpoint="trainer:9000")
+
+    assert shard.manifest_endpoint == "trainer:9000"
+    assert (
+        refit_pb2.WeightVersion.DESCRIPTOR.fields_by_name["object_storage"].number == 11
+    )
+    assert list(refit_pb2.ObjectStorageSource.DESCRIPTOR.fields_by_name) == [
+        "uri",
+        "storage_type",
+    ]
+    assert refit_pb2.OBJECT_STORAGE_TYPE_S3 == 1
+
+
+def test_refit_service_uses_named_response_messages():
+    service = refit_pb2.DESCRIPTOR.services_by_name["RefitService"]
+
+    assert len(service.methods) == 10
+    assert all(
+        method.output_type.name.endswith("Response") for method in service.methods
+    )
 
 
 def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
@@ -218,6 +241,7 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
     assert service.shards[0].worker_id == "trainer-0"
     assert service.shards[0].tensor_count == 2
     assert service.shards[0].total_bytes == 128
+    assert service.shards[0].manifest_endpoint == f"127.0.0.1:{port}"
     assert fetched.manifest == b"manifest"
 
 

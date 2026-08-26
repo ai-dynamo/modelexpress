@@ -387,7 +387,25 @@ See [`metadata.md`](metadata.md) for the full metadata architecture including st
 `RefitService` is a new RL-specific control plane. It does not reuse or modify the
 legacy `WeightSyncService`. The initial slice stores worker registrations,
 immutable weight versions, and compact physical shard publications in Redis.
-Weight bytes and full tensor manifests remain on trainer or generator workers.
+NIXL manifest endpoints belong to their physical worker shards; a typed object
+storage source belongs directly to its durable `WeightVersion`. The protocol
+can identify S3, Azure Blob Storage, or GCS, while this initial implementation
+accepts only S3. On the NIXL path, weight bytes and full tensor manifests remain
+on trainer workers. On the S3 path, rank zero uploads the version's global index
+after every trainer rank has uploaded its owned delta shard. Frameworks own
+tensor gathering, Hugging Face conversion, and bucketization, then pass a lazy
+canonical bucket stream to the trainer client, which owns delta processing and
+S3 shard construction.
+During framework initialization, the same bucket stream seeds only that rank's
+owned launch-checkpoint tensors through direct, concurrent
+`prepare_delta_base()` bucket reads. The first real delta stage uses the
+prepared snapshot without checkpoint I/O.
+Canonical S3 artifacts live under
+`{uri_prefix}/v{version_number}/`, with the
+index and delta shards stored as siblings.
+Canonical S3 versions are retained for rollout fault recovery. Trainer
+processes keep only the current base snapshot; older
+immutable S3 objects are governed by external bucket lifecycle policy.
 
 #### RL refit client architecture
 
@@ -411,7 +429,10 @@ flowchart LR
         TA["Trainer engine adapter"]
         B["Registered source buffers"]
         M["RefitWorkerService<br/>manifest endpoint"]
+        C["Canonical HF gather<br/>XOR staging"]
     end
+
+    D["S3<br/>safetensors shards + index"]
 
     subgraph Generator["Generator rank"]
         GA["Generator engine adapter"]
@@ -421,13 +442,14 @@ flowchart LR
 
     PG["Peer generator rank<br/>verified canonical buffers"]
 
-    O -->|"Create / Get / Delete version"| S
+    O -->|"Create / Get / Delete / update version state"| S
     O -->|"Framework-native RPC"| T
     O -->|"Framework-native RPC"| G
     T --> TA --> B
-    T -->|"Register worker; publish shard metadata"| S
+    T --> C --> D
+    T -->|"NIXL: register worker; publish shard metadata"| S
     T --> M
-    G -->|"Register worker; discover shards; lease version"| S
+    G -->|"Register worker; lease version; NIXL: discover shards"| S
     G -->|"Discover exact-version same-rank peer"| P
     G --> GA --> X --> I
     G -->|"Fetch exact-version manifest"| M
@@ -439,9 +461,15 @@ flowchart LR
 `RefitService` is the central metadata service defined by `refit.proto`. It
 coordinates immutable versions, worker registrations, shard advertisements,
 and leases, but it does not discover engine tensor layouts or transfer weights.
-`RefitWorkerService` is the trainer-local manifest endpoint. The manifest is an
-opaque description of the exact published source buffers; the generator uses
-it to compile and validate its receiver-local transfer plan.
+For NIXL, `RefitWorkerService` is the trainer-local manifest endpoint.
+The manifest is an opaque description of the exact published source buffers;
+the generator uses it to compile and validate its receiver-local transfer plan.
+For S3, `WeightVersion.object_storage` identifies the storage type and global
+`model.safetensors.index.json` URI directly; the server validates only this
+typed location and does not contact S3.
+Trainer integrations provide the matching `ObjectStorageConfig` through
+`ModelExpressTrainerConfig.object_storage`; the initial implementation rejects
+providers other than S3 before creating the storage client.
 
 The synchronous generator client returns a staged handle only after transfer
 and verification finish. That handle owns the version lease through graph-safe
@@ -467,19 +495,25 @@ than inheriting from the legacy reshard receiver:
 This keeps transport and verification independent of vLLM while keeping
 engine-specific parameter and CUDA-graph handling out of the transfer layer.
 
-| RPC | Purpose |
-|-----|---------|
-| `RegisterWorker` | Register or refresh one TTL-bound worker process |
-| `CreateWeightVersion` | Idempotently create one immutable `STAGING` version |
-| `GetWeightVersion` | Read the version and its lifecycle state |
-| `DeleteWeightVersion` | Move a `READY` version to `RELEASING`; existing leases remain valid |
-| `CreateWeightVersionShard` | Publish one worker manifest for a required source slot |
-| `ListWeightVersionShards` | List the version's physical source publications |
-| `DeleteWeightVersionShard` | Evict one source shard after release when no lease protects the version |
-| `RegisterVersionLease` | Acquire protection while a version is `READY`, or renew the same owner's existing protection while it is `READY` or `RELEASING` |
-| `DeleteVersionLease` | Release a generator's protection of the version shards |
+| RPC | Request | Response | Purpose |
+|-----|---------|----------|---------|
+| `RegisterWorker` | `RegisterWorkerRequest` | `RegisterWorkerResponse` | Register or refresh one TTL-bound worker process |
+| `CreateWeightVersion` | `CreateWeightVersionRequest` | `CreateWeightVersionResponse` | Idempotently create one immutable `STAGING` or already-published `READY` version |
+| `GetWeightVersion` | `GetWeightVersionRequest` | `GetWeightVersionResponse` | Read the version and its lifecycle state |
+| `DeleteWeightVersion` | `DeleteWeightVersionRequest` | `DeleteWeightVersionResponse` | Cancel a `STAGING` version or move a `READY` version to `RELEASING` for retirement |
+| `UpdateWeightVersionState` | `UpdateWeightVersionStateRequest` | `UpdateWeightVersionStateResponse` | Explicitly update lifecycle state, including S3 `STAGING` to `READY` |
+| `CreateWeightVersionShard` | `CreateWeightVersionShardRequest` | `CreateWeightVersionShardResponse` | Publish one worker manifest for a required source slot |
+| `ListWeightVersionShards` | `ListWeightVersionShardsRequest` | `ListWeightVersionShardsResponse` | List the version's physical source publications |
+| `DeleteWeightVersionShard` | `DeleteWeightVersionShardRequest` | `DeleteWeightVersionShardResponse` | Evict one source shard after release when no lease protects the version |
+| `RegisterVersionLease` | `RegisterVersionLeaseRequest` | `RegisterVersionLeaseResponse` | Acquire or renew protection while installing a version |
+| `DeleteVersionLease` | `DeleteVersionLeaseRequest` | `DeleteVersionLeaseResponse` | Release a generator's protection of the version shards |
 
-The final missing source slot atomically changes the version to `READY`.
+`RefitWorkerService.GetWeightVersionShardManifest` is also unary and returns
+`GetWeightVersionShardManifestResponse`; tensor bytes remain on the advertised
+data-plane transport.
+
+The final missing NIXL source slot atomically changes the version to `READY`.
+For S3, the orchestrator marks the version `READY` after publication completes.
 
 Peer generators reuse the existing inference P2P metadata service rather than
 creating a second Refit peer registry. A generator serving an exact version
@@ -492,8 +526,9 @@ An identical-rank peer pulls those buffers directly with NIXL, then uses the
 same graph-safe engine installer as a trainer update.
 
 `WeightVersion.uid` is MX's opaque identity. `version_number` is the optional
-framework-provided numeric label used for correlation; MX does not use it as an
-identity or ordering key.
+framework-provided numeric label used for correlation; canonical S3 publication
+requires it for the `v{version_number}` object prefix. MX does not use it as a
+control-plane identity or ordering key.
 `WeightVersionShard` remains the name of the per-worker manifest publication.
 Its identity is `(version_id, worker_id, source_slot_id)`: `source_slot_id`
 identifies the required, version-scoped source contribution it covers, and
@@ -503,7 +538,8 @@ the logical tensor names and shard geometry, excluding physical process and DP
 replica identity. The orchestrator deduplicates those adapter-defined slots when
 declaring the version's expected contributions. Multiple DP workers may therefore
 advertise the same source slot; generators rotate through those publications on
-transfer retry. Deployments configured with
+transfer retry. Each shard carries its trainer-local `manifest_endpoint`.
+Deployments configured with
 Kubernetes or the test-only memory backend do not expose `RefitService` yet.
 
 `RegisterWorker` is also the heartbeat API. `worker_id` is a fresh process

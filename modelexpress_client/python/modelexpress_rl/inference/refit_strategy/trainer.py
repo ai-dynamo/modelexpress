@@ -109,7 +109,7 @@ class _TrainerRefitStrategy(RefitStrategy):
                         worker_id=shard.worker_id,
                         manifest_endpoint=shard.manifest_endpoint,
                         manifest_digest=shard.manifest_digest,
-                        transport=shard.transport,
+                        transport="NIXL",
                         manifest=manifest,
                     )
                 )
