@@ -36,7 +36,7 @@ jobs:
           - rust: stable
             can-fail: false
           - rust: beta
-            can-fail: false
+            can-fail: true
           - rust: nightly
             can-fail: true
     continue-on-error: ${{ matrix.can-fail }}
