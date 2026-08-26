@@ -33,6 +33,7 @@ from modelexpress.refit.reshard.rendezvous import (
     PublishedTensor,
     wrap_rendezvous_blob,
 )
+from modelexpress.refit.reshard.verify import published_digest
 from modelexpress_rl.train.adapter import NixlMetadataProvider
 
 logger = logging.getLogger("modelexpress_rl.train.engines.fsdp.publisher")
@@ -180,6 +181,7 @@ def build_fsdp_reshard_manifest(
             addr=addr,
             shard_offset=tuple(shard.shard_offset),
             shape=tuple(shard.local_shape),
+            digest=published_digest(served),
         )
         tensor = by_name.get(shard.name)
         if tensor is None:

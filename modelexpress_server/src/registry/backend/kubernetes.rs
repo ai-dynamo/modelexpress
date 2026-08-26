@@ -461,9 +461,11 @@ impl KubernetesRegistryBackend {
             .resource_version
             .as_deref()
             .ok_or("ModelCacheEntry has no resourceVersion")?;
-        if !(status_missing && claim_uninitialized)
-            && !self.lease_has_expired(cr_name, &status, lease_duration)
-        {
+        // Already computed here, so the fresh/takeover distinction costs nothing:
+        // an uninitialized claim is a first download, anything else reaching this
+        // point got here because the previous owner's lease expired.
+        let is_fresh_claim = status_missing && claim_uninitialized;
+        if !is_fresh_claim && !self.lease_has_expired(cr_name, &status, lease_duration) {
             return Ok(ClaimOutcome::AlreadyExists(ModelStatus::DOWNLOADING));
         }
         let now = Utc::now().to_rfc3339();
@@ -507,7 +509,11 @@ impl KubernetesRegistryBackend {
         {
             Ok(_) => {
                 self.clear_lease_observation(cr_name);
-                Ok(ClaimOutcome::Claimed)
+                if is_fresh_claim {
+                    Ok(ClaimOutcome::Claimed)
+                } else {
+                    Ok(ClaimOutcome::TookOver)
+                }
             }
             Err(kube::Error::Api(e)) if e.code == 409 || e.code == 422 => {
                 let current = self

@@ -20,6 +20,7 @@ from ...accelerators import accelerator_backend_for
 from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
 from ...tensor_utils import (
+    adopt_hidden_tensors,
     capture_tensor_attrs,
     collect_module_tensors,
 )
@@ -79,17 +80,20 @@ class SglangAdapter(EngineAdapter):
     def discover_tensors(self, result: LoadResult) -> dict[str, torch.Tensor]:
         if result.model is None:
             raise RuntimeError("SGLang tensor discovery requires result.model")
-        # adopt_hidden_tensors() would also register accelerator tensors stashed
-        # on non-Module objects (e.g. SGLang's MXFP4 FusedMoE quant_method, which
-        # holds swizzled weights after deleting the original params). It is left
-        # commented out for now: it is a no-op for DeepSeek-V2-Lite (whose derived
-        # w_kc/w_vc are direct Tensor attributes, already promoted by
-        # capture_tensor_attrs), and enabling it adds new _mx_* manifest names,
-        # i.e. a transfer-ABI change that needs a version bump to avoid mixed
-        # old/new source/target manifests plus MXFP4 + CUTLASS FP8/W4A8 smoke
-        # tests. Enable it (with those guards) when SGLang nested-object coverage
-        # is in scope.
-        # adopt_hidden_tensors(result.model, self.accelerator_backend)
+        # capture_tensor_attrs() only promotes bare Tensor attributes assigned
+        # onto Modules (self.w_kc = tensor). Accelerator tensors stashed inside
+        # containers on non-Module objects - dicts, lists, nested dataclasses -
+        # stay invisible to named_parameters()/named_buffers() and so never
+        # reach the manifest. Kimi-K3 is full of them: on the vLLM path the same
+        # scan adopts 553 per rank, 368 of which live in one dict
+        # (Mxfp4MoEMethod._cache_permute_indices, keyed by tuples), plus an
+        # attention-backend workspace buffer. A target that never receives them
+        # runs forward with whatever its own init left behind.
+        #
+        # This adds _mx_* names to the manifest, so source and target must run
+        # the same ModelExpress version; mixing old and new manifests fails
+        # tensor matching.
+        adopt_hidden_tensors(result.model, self.accelerator_backend)
         return collect_module_tensors(result.model, self.accelerator_backend)
 
     def before_rdma_receive(self, result: LoadResult) -> LoadResult:

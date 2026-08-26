@@ -55,6 +55,18 @@ _CANDIDATE_BUCKETS = (0, 1, 2, 4, 8, 16, 32, 64, 128)
 #: family is bounded no matter how the backend misbehaves.
 LIST_SOURCES_RESULTS = ("ok", "empty", "error")
 
+# Classified at the assignment sites in nixl_transfer, never at the consumer: the
+# underlying field is a formatted free-text string, so classifying it later would
+# mean parsing prose into a label and the domain would grow with the wording.
+NIXL_ERROR_KINDS = ("timeout", "status_error")
+
+# What a receive actually moved. `partial` is the dangerous one: the transfer
+# reports success while some locally registered tensors keep their dummy values.
+# `rejected` is the strict-mode refusal, which raises rather than returning; it is
+# counted so the family is a complete partition of receives rather than of
+# successful ones.
+NIXL_RECEIVE_RESULTS = ("complete", "partial", "empty", "rejected")
+
 
 def _enabled() -> bool:
     return envs.MX_METRICS_ENABLED
@@ -251,6 +263,22 @@ class MetricsCollector:
             "ListSources outcomes: ok|empty|error. Separates a backend outage "
             "from a healthy cluster that has published no peers yet.",
             ["policy", "scheme", "result"],
+            registry=registry,
+        )
+        self.nixl_errors = Counter(
+            "mx_nixl_data_plane_errors_total",
+            "NIXL data-plane failures by classified kind: timeout|status_error. "
+            "A non-zero rate is what demotes an agent from READY.",
+            ["scheme", "kind"],
+            registry=registry,
+        )
+        self.nixl_receives = Counter(
+            "mx_nixl_receive_total",
+            "Receive outcomes: complete|partial|empty|rejected. `partial` and "
+            "`empty` both return success today, so they are otherwise "
+            "indistinguishable from a healthy transfer; `rejected` is the "
+            "strict-mode refusal, which raises instead of returning.",
+            ["scheme", "result"],
             registry=registry,
         )
         self.candidates = Histogram(
@@ -463,6 +491,37 @@ class MetricsCollector:
                 if result not in LIST_SOURCES_RESULTS:
                     result = "error"
                 self.list_sources.labels(policy, self.scheme, result).inc()
+            except Exception:
+                pass
+
+    def record_nixl_error(self, kind: str) -> None:
+        """Record a NIXL data-plane failure by classified kind.
+
+        Unrecognized values clamp to ``status_error`` so the label stays a closed
+        enum; the free-text message stays in the log, never in a label.
+        """
+        if self._ensure():
+            try:
+                if kind not in NIXL_ERROR_KINDS:
+                    kind = "status_error"
+                self.nixl_errors.labels(self.scheme, kind).inc()
+            except Exception:
+                pass
+
+    def record_nixl_receive(self, result: str) -> None:
+        """Record the outcome of one receive.
+
+        ``complete``, ``partial`` and ``empty`` all return success to the caller,
+        so without this a transfer that moved nothing and one that moved
+        everything are the same observation. ``rejected`` is the strict-mode
+        refusal, which raises instead of returning; counting it makes the family
+        a partition of *every* receive rather than only the ones that returned.
+        """
+        if self._ensure():
+            try:
+                if result not in NIXL_RECEIVE_RESULTS:
+                    result = "empty"
+                self.nixl_receives.labels(self.scheme, result).inc()
             except Exception:
                 pass
 

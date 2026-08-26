@@ -60,6 +60,8 @@ _RECORDERS = [
     ("observe_candidates", ("random", "listed", 2)),
     ("observe_selection_seconds", ("random", 0.001)),
     ("observe_transfer_seconds", ("random", "success", 1.0)),
+    ("record_nixl_error", ("timeout",)),
+    ("record_nixl_receive", ("complete",)),
 ]
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -145,6 +147,8 @@ def test_recorders_never_raise_into_load_path(monkeypatch):
     m.candidates = boom
     m.selection_seconds = boom
     m.transfer_seconds = boom
+    m.nixl_errors = boom
+    m.nixl_receives = boom
     # None of these may propagate the RuntimeError.
     for name, args in _RECORDERS:
         getattr(m, name)(*args)
@@ -825,3 +829,143 @@ def test_merged_endpoint_serves_every_rank_including_hard_killed(tmp_path, ranks
         f"mx_build_info merged to {build_info[0].rsplit(' ', 1)[1]} across {ranks} "
         f"ranks; a summing multiprocess_mode has been introduced"
     )
+
+
+# ---------------------------------------------------------------------------
+# NIXL data-plane families
+# ---------------------------------------------------------------------------
+
+
+def test_nixl_labels_are_closed_enums(monkeypatch):
+    """An unrecognized value must clamp rather than mint a new series.
+
+    The underlying `_data_plane_error` is formatted free text, so an
+    unclassified value reaching the label would grow the domain with the wording
+    of the message.
+
+    Built through ``_fresh_collector`` like every other test here, and not on the
+    process-global registry: ``_ensure()`` also runs ``_start_exposition()``, so
+    a bare ``MetricsCollector()`` under an ambient ``MX_METRICS_PORT`` binds a
+    real listener that outlives the pytest session, and a second collector on the
+    global registry fails with "Duplicated timeseries ... mx_build_info" —
+    an error that names the wrong metric and would land on whichever test ran
+    second.
+    """
+    m = _fresh_collector(monkeypatch, MX_METRICS_PORT=None, MX_METRICS_PUSHGATEWAY=None)
+    assert m._ensure() is True
+
+    m.record_nixl_error("timeout")
+    m.record_nixl_error("status_error")
+    m.record_nixl_error("QP 3 wedged on device mlx5_2")
+    m.record_nixl_receive("complete")
+    m.record_nixl_receive("partial")
+    m.record_nixl_receive("something new")
+
+    kinds = _label_values(m.nixl_errors, "kind")
+    assert kinds == {"timeout", "status_error"}, kinds
+    m.record_nixl_receive("rejected")
+    results = _label_values(m.nixl_receives, "result")
+    assert results == {"complete", "partial", "empty", "rejected"}, results
+
+
+def test_a_nixl_recording_counts_exactly_one_event(monkeypatch):
+    """The label set is not the metric; the value is.
+
+    Every query these two families exist for is a function of the sample value —
+    ``rate(mx_nixl_data_plane_errors_total[5m])`` for the agent-health signal,
+    ``partial / sum(mx_nixl_receive_total)`` for the manifest-drift ratio. A
+    recorder that incremented by anything other than one per event would pass a
+    label-domain assertion unremarked while inflating both.
+
+    The clamped call is counted too, on the ``status_error`` series: an
+    unclassified failure is still a failure, and dropping it would understate the
+    rate exactly when the fabric is misbehaving in a way nobody has classified
+    yet.
+    """
+    collector = _fresh_collector(
+        monkeypatch, MX_METRICS_PORT=None, MX_METRICS_PUSHGATEWAY=None
+    )
+    assert collector._ensure() is True
+
+    collector.record_nixl_error("timeout")
+    collector.record_nixl_error("timeout")
+    collector.record_nixl_error("QP 3 wedged on device mlx5_2")
+    collector.record_nixl_receive("complete")
+    collector.record_nixl_receive("complete")
+    collector.record_nixl_receive("partial")
+
+    assert _label_counts(collector.nixl_errors, "kind") == {
+        "timeout": 2.0,
+        "status_error": 1.0,
+    }
+    assert _label_counts(collector.nixl_receives, "result") == {
+        "complete": 2.0,
+        "partial": 1.0,
+    }
+
+    # The family names are the dashboard's API: assert them as exposed text
+    # rather than through the attribute, which a rename would carry along.
+    body = _exposition(collector)
+    assert 'mx_nixl_data_plane_errors_total{kind="timeout"' in body, body
+    assert 'mx_nixl_receive_total{result="partial"' in body, body
+
+
+@pytest.mark.parametrize(
+    "recorder,args,family,label",
+    [
+        ("record_nixl_error", ("timeout",), "nixl_errors", "kind"),
+        ("record_nixl_receive", ("partial",), "nixl_receives", "result"),
+    ],
+)
+def test_a_nixl_event_can_be_the_first_metrics_call_of_a_process(
+    monkeypatch, recorder, args, family, label
+):
+    """D4 for the two NIXL recorders: they must route through ``_ensure()``.
+
+    A process that never selects a P2P source can still hit the data plane, so a
+    NIXL failure or a degraded receive may be the first metrics event of the run.
+    A recorder that touched its family without ``_ensure()`` would raise
+    ``AttributeError`` on a collector that had not initialized yet, and the
+    blanket ``except`` in the recorder turns that into silence: no families, no
+    endpoint, no error.
+
+    One collector per recorder, because the first call to initialize hides the
+    omission in the other: sharing a collector would let a recorder that skips
+    ``_ensure()`` free-ride on its sibling.
+    """
+    collector = _fresh_collector(
+        monkeypatch, MX_METRICS_PORT=None, MX_METRICS_PUSHGATEWAY=None
+    )
+    assert collector._ready is False, "the fixture must not pre-initialize"
+
+    getattr(collector, recorder)(*args)
+
+    assert collector._ready is True, "the recorder did not initialize the collector"
+    assert _label_counts(getattr(collector, family), label) == {args[0]: 1.0}
+
+
+def _label_values(collector, label):
+    """Distinct values seen for one label of a collector."""
+    values = set()
+    for metric in collector.collect():
+        for sample in metric.samples:
+            if label in sample.labels:
+                values.add(sample.labels[label])
+    return values
+
+
+def _label_counts(collector, label):
+    """Counter value per distinct value of one label.
+
+    Only ``_total`` samples: a Counter also emits a ``_created`` timestamp under
+    the same labels, and summing that in would swamp the counts with epoch
+    seconds.
+    """
+    counts = {}
+    for metric in collector.collect():
+        for sample in metric.samples:
+            if sample.name.endswith("_total") and label in sample.labels:
+                counts[sample.labels[label]] = (
+                    counts.get(sample.labels[label], 0.0) + sample.value
+                )
+    return counts

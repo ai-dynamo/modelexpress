@@ -3,6 +3,8 @@
 
 """Tests for the Hugging Face cache layout used by server-streamed models."""
 
+import shutil
+
 import pytest
 
 from modelexpress.model_snapshot import (
@@ -373,6 +375,123 @@ def test_published_snapshot_resolves_offline(cache, monkeypatch):
 
     resolved = snapshot_download(
         "org/model", cache_dir=str(cache.cache_root), local_files_only=True
+    )
+
+    assert resolved == str(snapshot)
+
+
+class TestPinnedRevisionLayout:
+    """What a pinned install must leave on disk for the engine to find it.
+
+    The engine looks the snapshot up by the revision *it* asked for, so the
+    layout has to answer that question rather than the one the server
+    happened to answer.
+    """
+
+    def test_commit_pin_writes_no_ref(self, cache):
+        """A commit hash resolves by directory name; a ref would be noise."""
+        cache.write_revision_ref(COMMIT, COMMIT)
+        assert not (cache.repo_root / "refs").exists()
+
+    def test_branch_pin_writes_its_own_ref(self, cache):
+        cache.write_revision_ref(COMMIT, "refs/pr/1")
+
+        ref = cache.repo_root / "refs" / "refs" / "pr" / "1"
+        assert ref.read_text() == COMMIT
+
+    def test_unpinned_still_writes_main(self, cache):
+        cache.write_revision_ref(COMMIT, None)
+        assert (cache.repo_root / "refs" / MAIN_REF).read_text() == COMMIT
+
+    def test_pinning_leaves_main_alone(self, cache):
+        """Pointing main at a pin would misdirect every later unpinned read.
+
+        The default revision and the pinned one are different questions. A
+        worker that pinned an older commit must not answer the first with the
+        second -- for itself later, or for the next worker sharing the cache.
+        """
+        cache.write_revision_ref(COMMIT, None)
+        cache.write_revision_ref(OTHER_COMMIT, "v1.0")
+
+        assert (cache.repo_root / "refs" / MAIN_REF).read_text() == COMMIT
+
+    def test_rewriting_the_same_hash_leaves_the_ref_untouched(self, cache):
+        """Reuse of an unpinned snapshot asks for a ref that already matches.
+
+        resolve_snapshot only returns a path when refs/main already holds the
+        commit, so the reuse path lands here with nothing to change. The inode
+        is what proves nothing happened: the write lands through a rename, and
+        a rename would leave a different one.
+        """
+        cache.write_revision_ref(COMMIT, None)
+        ref = cache.repo_root / "refs" / MAIN_REF
+        before = ref.stat().st_ino
+
+        cache.write_revision_ref(COMMIT, None)
+
+        assert ref.stat().st_ino == before
+        assert ref.read_text() == COMMIT
+
+    def test_rewriting_a_different_hash_moves_the_ref(self, cache):
+        cache.write_revision_ref(COMMIT, None)
+        cache.write_revision_ref(OTHER_COMMIT, None)
+
+        assert (cache.repo_root / "refs" / MAIN_REF).read_text() == OTHER_COMMIT
+
+    def test_rejects_a_ref_whose_parent_is_already_a_ref(self, cache):
+        """A tag foo and a branch foo/bar coexist upstream; refs/ holds one."""
+        cache.write_ref("foo", COMMIT)
+
+        with pytest.raises(ModelSnapshotError):
+            cache.write_ref("foo/bar", OTHER_COMMIT)
+
+    def test_rejects_a_ref_that_is_already_a_directory(self, cache):
+        """The other order: refs/foo exists as a directory of nested refs."""
+        cache.write_ref("foo/bar", COMMIT)
+
+        with pytest.raises(ModelSnapshotError):
+            cache.write_ref("foo", OTHER_COMMIT)
+
+    @pytest.mark.parametrize("name", ["../escape", "/abs", "", "a/../b"])
+    def test_rejects_unsafe_ref_names(self, cache, name):
+        """The name comes from engine configuration, so it is not trusted."""
+        with pytest.raises(ModelSnapshotError):
+            cache.write_ref(name, COMMIT)
+
+
+def test_branch_pin_resolves_offline(cache):
+    """The engine's own lookup, for a revision that is not a commit hash.
+
+    A commit hash resolves by directory name, so only this case proves the
+    ref write is what makes a branch or tag pin resolvable.
+    """
+    from huggingface_hub import snapshot_download
+
+    snapshot = _write(cache, {"config.json": b"{}"})
+    cache.write_revision_ref(COMMIT, "v1.0")
+
+    resolved = snapshot_download(
+        "org/model",
+        revision="v1.0",
+        cache_dir=str(cache.cache_root),
+        local_files_only=True,
+    )
+
+    assert resolved == str(snapshot)
+
+
+def test_commit_pin_resolves_offline_without_any_ref(cache):
+    """Confirms the rule the layout relies on, in huggingface_hub itself."""
+    from huggingface_hub import snapshot_download
+
+    snapshot = _write(cache, {"config.json": b"{}"})
+    shutil.rmtree(cache.repo_root / "refs")
+
+    resolved = snapshot_download(
+        "org/model",
+        revision=COMMIT,
+        cache_dir=str(cache.cache_root),
+        local_files_only=True,
     )
 
     assert resolved == str(snapshot)

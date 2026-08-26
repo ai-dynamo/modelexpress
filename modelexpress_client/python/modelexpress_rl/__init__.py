@@ -3,32 +3,33 @@
 
 """ModelExpress clients and protobuf bindings for RL weight refit."""
 
-from .client import (
-    ModelExpressTrainerClient,
-    StagedWeightVersionShard,
-    WeightVersionRef,
+from .control import ModelExpressControlClient, WeightVersion, WeightVersionState
+from .inference import (
+    ModelExpressGeneratorClient,
+    ModelExpressGeneratorConfig,
+    VllmGeneratorContext,
 )
 from .train import (
-    CompletionFence,
-    StagedWeightVersionShardData,
-    TrainerEngineAdapter,
+    ModelExpressTrainerClient,
+    ModelExpressTrainerConfig,
     TrainerStagingMode,
     WeightPayloadFormat,
-    WeightVersionShardManifest,
-    WeightVersionShardManifestPublisher,
-    WeightVersionShardManifestService,
 )
+from .version import WeightVersionRef
 
-__all__ = [
-    "CompletionFence",
+__all__ = [  # noqa: RUF022 - grouped by public API role, not alphabetically.
+    # Framework-facing clients.
+    "ModelExpressControlClient",
+    "ModelExpressGeneratorClient",
     "ModelExpressTrainerClient",
-    "StagedWeightVersionShard",
-    "StagedWeightVersionShardData",
-    "TrainerEngineAdapter",
+    # Configuration fixed when a worker client is initialized.
+    "ModelExpressGeneratorConfig",
+    "ModelExpressTrainerConfig",
     "TrainerStagingMode",
     "WeightPayloadFormat",
+    "VllmGeneratorContext",
+    # Version values shared across the control, trainer, and generator clients.
+    "WeightVersion",
     "WeightVersionRef",
-    "WeightVersionShardManifest",
-    "WeightVersionShardManifestPublisher",
-    "WeightVersionShardManifestService",
+    "WeightVersionState",
 ]

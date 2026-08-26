@@ -92,7 +92,6 @@ fn worker(worker_id: &str, role: WorkerRole, ttl_seconds: u32) -> RegisterWorker
             worker_id: worker_id.to_string(),
             role: role.into(),
             model_name: "test/model".to_string(),
-            endpoint: format!("{worker_id}:9000"),
             expires_at_unix_ms: 0,
         }),
         ttl_seconds,
