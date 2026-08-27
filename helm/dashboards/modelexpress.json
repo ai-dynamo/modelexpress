@@ -73,11 +73,25 @@
         },
         "graphMode": "none",
         "colorMode": "value",
-        "textMode": "auto"
+        "textMode": "auto",
+        "noValue": "0"
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "short"
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
         }
       }
     },
@@ -109,7 +123,24 @@
       "description": "Age of the STALEST replica\u2019s last successful stats refresh. The aggregation is outside the subtraction on purpose: time() - max(timestamp) is the age of the newest heartbeat, so one healthy replica would mask a wedged one -- the exact failure MXRegistryStatsStale exists to catch. The gauges elsewhere keep their last good values on a failed pass, so if this is high they are frozen rather than current.",
       "fieldConfig": {
         "defaults": {
-          "unit": "s"
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 300
+              },
+              {
+                "color": "red",
+                "value": 600
+              }
+            ]
+          }
         }
       },
       "options": {
@@ -120,7 +151,8 @@
         },
         "graphMode": "none",
         "colorMode": "value",
-        "textMode": "auto"
+        "textMode": "auto",
+        "noValue": "never run"
       }
     },
     {
@@ -157,7 +189,8 @@
         },
         "graphMode": "none",
         "colorMode": "value",
-        "textMode": "auto"
+        "textMode": "auto",
+        "noValue": "0"
       },
       "fieldConfig": {
         "defaults": {
@@ -199,7 +232,8 @@
         },
         "graphMode": "none",
         "colorMode": "value",
-        "textMode": "auto"
+        "textMode": "auto",
+        "noValue": "0"
       },
       "fieldConfig": {
         "defaults": {
@@ -382,7 +416,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (from, to) (increase(mx_registry_status_transitions_total[$__rate_interval]))",
+          "expr": "sum by (from, to) (increase(mx_registry_status_transitions_total[$__rate_interval])) > 0",
           "legendFormat": "{{from}} -> {{to}}",
           "refId": "A",
           "datasource": {
@@ -391,7 +425,7 @@
           }
         }
       ],
-      "description": "Flow, not level. Read level from the gauge in the Capacity row.",
+      "description": "Transitions that occurred in the window. Filtered to non-zero: the counters are pre-created at zero for all sixteen from/to pairs so increase() can see a first event, and without the filter the flat ones crowd out the flow. Level belongs to Registry entries by status -- these counters are process-local while the status lives in the shared store.",
       "fieldConfig": {
         "defaults": {
           "unit": "short"
@@ -1192,7 +1226,8 @@
         },
         "graphMode": "none",
         "colorMode": "value",
-        "textMode": "auto"
+        "textMode": "auto",
+        "noValue": "0"
       },
       "fieldConfig": {
         "defaults": {
