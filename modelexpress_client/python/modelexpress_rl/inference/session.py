@@ -54,6 +54,17 @@ class WeightUpdateSession:
             try:
                 for plan in self._planner.plans(version):
                     found_plan = True
+                    source = plan.source.kind.value
+                    method = type(plan.method).__name__
+                    installer = type(plan.installer).__name__
+                    logger.info(
+                        "ModelExpress weight update version=%s trying "
+                        "source=%s method=%s installer=%s",
+                        version.version_id,
+                        source,
+                        method,
+                        installer,
+                    )
                     try:
                         prepared = plan.method.prepare(
                             version=version,
@@ -65,7 +76,22 @@ class WeightUpdateSession:
                         ManifestMismatchError,
                     ) as error:
                         last_error = error
+                        logger.warning(
+                            "ModelExpress weight update version=%s preparation "
+                            "failed source=%s method=%s error=%s",
+                            version.version_id,
+                            source,
+                            method,
+                            error,
+                        )
                         continue
+                    logger.info(
+                        "ModelExpress weight update version=%s prepared "
+                        "source=%s method=%s",
+                        version.version_id,
+                        source,
+                        method,
+                    )
                     return SessionUpdate(
                         plan=plan,
                         prepared=prepared,
@@ -90,6 +116,14 @@ class WeightUpdateSession:
             return update.apply_result
         primary_error: BaseException | None = None
         try:
+            logger.info(
+                "ModelExpress weight update version=%s installing "
+                "source=%s method=%s installer=%s",
+                update.plan.version.version_id,
+                update.plan.source.kind.value,
+                type(update.plan.method).__name__,
+                type(update.plan.installer).__name__,
+            )
             with update.plan.method.installation_context(update.prepared):
                 update.apply_result = update.plan.installer.install(update.prepared)
             update.applied = True
@@ -103,6 +137,14 @@ class WeightUpdateSession:
                     "failed to publish applied version %s as a P2P source",
                     update.plan.version.version_id,
                 )
+            logger.info(
+                "ModelExpress weight update version=%s installed "
+                "source=%s method=%s installer=%s",
+                update.plan.version.version_id,
+                update.plan.source.kind.value,
+                type(update.plan.method).__name__,
+                type(update.plan.installer).__name__,
+            )
             return update.apply_result
         except BaseException as error:
             primary_error = error
@@ -120,6 +162,10 @@ class WeightUpdateSession:
         primary_error: BaseException | None = None
         try:
             update.plan.method.release(update.prepared)
+            logger.info(
+                "ModelExpress weight update version=%s released",
+                update.plan.version.version_id,
+            )
         except BaseException as error:
             primary_error = error
             raise

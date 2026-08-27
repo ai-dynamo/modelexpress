@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import hashlib
+import logging
 from concurrent import futures
 
 import grpc
@@ -588,6 +589,35 @@ def test_generator_stages_applies_releases_and_reuses_valid_plan(monkeypatch):
     )
 
 
+def test_generator_logs_weight_update_lifecycle(monkeypatch, caplog):
+    server, endpoint, service = _start_server()
+    adapter = _Adapter(service)
+    generator = _initialize(monkeypatch, endpoint, adapter)
+
+    try:
+        with caplog.at_level(
+            logging.INFO,
+            logger="modelexpress_rl.inference.session",
+        ):
+            staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+            generator.apply_weight(staged)
+            staged.release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "version=version-a trying source=TRAINER" in message for message in messages
+    )
+    assert any(
+        "version=version-a prepared source=TRAINER" in message for message in messages
+    )
+    assert any("version=version-a installing" in message for message in messages)
+    assert any("version=version-a installed" in message for message in messages)
+    assert "ModelExpress weight update version=version-a released" in messages
+
+
 def test_generator_does_not_retry_peer_publication(monkeypatch):
     server, endpoint, service = _start_server()
     adapter = _Adapter(service)
@@ -1027,7 +1057,7 @@ def test_generator_discovers_rank_matched_p2p_peer(monkeypatch):
 
 def test_generator_tries_next_peer_after_manifest_mismatch(monkeypatch):
     monkeypatch.setattr(
-        "modelexpress_rl.inference.source.peer.random.Random.shuffle",
+        "modelexpress_rl.inference.source.generator.random.Random.shuffle",
         lambda _random, _sources: None,
     )
     server, endpoint, service = _start_server()
@@ -1090,7 +1120,7 @@ def test_generator_tries_next_peer_after_manifest_mismatch(monkeypatch):
 
 def test_generator_randomizes_and_limits_peers_before_trainer_fallback(monkeypatch):
     monkeypatch.setattr(
-        "modelexpress_rl.inference.source.peer.random.Random.shuffle",
+        "modelexpress_rl.inference.source.generator.random.Random.shuffle",
         lambda _random, sources: sources.reverse(),
     )
     server, endpoint, service = _start_server()
