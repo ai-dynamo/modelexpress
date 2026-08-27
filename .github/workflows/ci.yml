@@ -44,6 +44,8 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v7
+      with:
+        persist-credentials: false
 
     - name: Check Helm CRD manifest sync
       if: matrix.rust == 'stable'
@@ -116,6 +118,8 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v7
+      with:
+        persist-credentials: false
 
     - name: Install Rust toolchain
       run: |
@@ -152,6 +156,8 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v7
+      with:
+        persist-credentials: false
 
     - name: Install Rust toolchain
       run: |
@@ -186,6 +192,8 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v7
+      with:
+        persist-credentials: false
 
     - name: Set up Python
       uses: actions/setup-python@v7
@@ -213,6 +221,8 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v7
+      with:
+        persist-credentials: false
 
     - name: Set up Go
       uses: actions/setup-go@v7
@@ -301,6 +311,8 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v7
+      with:
+        persist-credentials: false
 
     - name: Install Rust toolchain
       run: |
@@ -372,6 +384,8 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v7
+      with:
+        persist-credentials: false
 
     - name: Install Rust toolchain
       run: |
@@ -403,6 +417,8 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v7
+      with:
+        persist-credentials: false
 
     - name: Install Rust toolchain
       run: |
@@ -442,6 +458,8 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v7
+      with:
+        persist-credentials: false
 
     - name: Build Docker image
       run: |
@@ -463,6 +481,8 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v7
+      with:
+        persist-credentials: false
 
     - name: Install kubectl
       run: |
