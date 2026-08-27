@@ -228,10 +228,16 @@ env:
   # MX_METADATA_BACKEND: "redis"
   # REDIS_URL: "redis://redis.default.svc:6379"
 
+# Both probes target the gRPC listener. Leave tcpSocket unset and they follow
+# service.port, which is the only place the port should be written: a literal
+# here is a third copy that can silently disagree with service.port and the
+# containerPort, and a probe pointed at a port nothing listens on does not just
+# fail readiness — the liveness probe restarts the container, so the pod
+# CrashLoopBackOffs with no clue as to why.
 livenessProbe:
   enabled: true
-  tcpSocket:
-    port: 8001
+  # tcpSocket:
+  #   port: 8001
   initialDelaySeconds: 15
   periodSeconds: 10
   timeoutSeconds: 5
@@ -239,8 +245,8 @@ livenessProbe:
 
 readinessProbe:
   enabled: true
-  tcpSocket:
-    port: 8001
+  # tcpSocket:
+  #   port: 8001
   initialDelaySeconds: 15
   periodSeconds: 10
   timeoutSeconds: 5
