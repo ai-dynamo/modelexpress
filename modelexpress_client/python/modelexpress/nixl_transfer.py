@@ -203,6 +203,14 @@ class NixlTransferManager:
         Optional per-rank NIC pinning (MX_RDMA_NIC_PIN) is delegated to
         ucx_utils.apply_nic_pin_for_device. Default (env var unset) is a
         no-op. See ucx_utils for the topology probe and env var modes.
+
+        Defaults UCX_MEM_EVENTS to "n" unless the deployment already set
+        it. UCX's memory-event tracking (mem hooks / VMM registration
+        cache invalidation) costs roughly 2x NIXL agent creation time and
+        buys nothing here: ModelExpress-managed tensors are registered
+        explicitly (MX_POOL_REG / MX_VMM_ARENA / per-tensor reg), so UCX
+        never needs to catch an unregistered cudaFree/cudaMalloc behind
+        our back.
         """
         if not NIXL_AVAILABLE:
             raise RuntimeError("NIXL is not available")
@@ -229,6 +237,15 @@ class NixlTransferManager:
         # No-op unless MX_RDMA_NIC_PIN is set. See ucx_utils for full env
         # semantics and the topology probe.
         ucx_utils.apply_nic_pin_for_device(self._device_id)
+
+        # Default UCX_MEM_EVENTS off: cuts NIXL agent creation time roughly
+        # in half by skipping UCX's mem-hook / VMM invalidation setup, which
+        # ModelExpress's explicit tensor registration never relies on. Set
+        # permanently (no restore) so later UCP contexts inherit it too.
+        # Never override an operator-set value.
+        if not envs.is_set("UCX_MEM_EVENTS"):
+            os.environ["UCX_MEM_EVENTS"] = "n"
+            logger.info("NIXL: UCX_MEM_EVENTS=n (default; faster agent creation)")
 
         try:
             if self._listen_port is not None and nixl_agent_config:
