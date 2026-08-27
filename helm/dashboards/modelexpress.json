@@ -70,6 +70,14 @@
           "calcs": [
             "lastNotNull"
           ]
+        },
+        "graphMode": "none",
+        "colorMode": "value",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
         }
       }
     },
@@ -109,7 +117,10 @@
           "calcs": [
             "lastNotNull"
           ]
-        }
+        },
+        "graphMode": "none",
+        "colorMode": "value",
+        "textMode": "auto"
       }
     },
     {
@@ -143,6 +154,14 @@
           "calcs": [
             "lastNotNull"
           ]
+        },
+        "graphMode": "none",
+        "colorMode": "value",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
         }
       }
     },
@@ -177,6 +196,14 @@
           "calcs": [
             "lastNotNull"
           ]
+        },
+        "graphMode": "none",
+        "colorMode": "value",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
         }
       }
     },
@@ -196,7 +223,7 @@
     {
       "id": 7,
       "type": "timeseries",
-      "title": "Download duration",
+      "title": "Download duration (p50 / p95 / p99)",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -272,7 +299,8 @@
         "defaults": {
           "unit": "reqps"
         }
-      }
+      },
+      "description": "Downloads reaching a terminal status, split by outcome. Pair with Download duration: a healthy rate here with a climbing duration means downloads are completing but getting slower."
     },
     {
       "id": 9,
@@ -290,7 +318,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (result) (rate(mx_download_claims_total[$__rate_interval]))",
+          "expr": "sum by (result) (increase(mx_download_claims_total[$__rate_interval]))",
           "legendFormat": "{{result}}",
           "refId": "A",
           "datasource": {
@@ -299,7 +327,12 @@
           }
         }
       ],
-      "description": "takeover is the one to watch: a previous downloader died and the bytes are being pulled again -- hundreds of GB for a large model."
+      "description": "takeover is the one to watch: a previous downloader died and the bytes are being pulled again -- hundreds of GB for a large model.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
     },
     {
       "id": 10,
@@ -317,7 +350,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (result) (rate(mx_download_lease_refresh_total[$__rate_interval]))",
+          "expr": "sum by (result) (increase(mx_download_lease_refresh_total[$__rate_interval]))",
           "legendFormat": "{{result}}",
           "refId": "A",
           "datasource": {
@@ -326,7 +359,12 @@
           }
         }
       ],
-      "description": "result=lost is the leading indicator of a duplicate download."
+      "description": "result=lost is the leading indicator of a duplicate download.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
     },
     {
       "id": 11,
@@ -344,7 +382,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (from, to) (rate(mx_registry_status_transitions_total[$__rate_interval]))",
+          "expr": "sum by (from, to) (increase(mx_registry_status_transitions_total[$__rate_interval]))",
           "legendFormat": "{{from}} -> {{to}}",
           "refId": "A",
           "datasource": {
@@ -353,7 +391,12 @@
           }
         }
       ],
-      "description": "Flow, not level. Read level from the gauge in the Capacity row."
+      "description": "Flow, not level. Read level from the gauge in the Capacity row.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
     },
     {
       "id": 12,
@@ -380,7 +423,12 @@
           }
         }
       ],
-      "description": "max(), not sum(): every replica reports the same shared-store total. Refreshed on MX_REGISTRY_STATS_INTERVAL_SECS (default 60s), not at scrape time -- cross-check the Registry stats age panel before trusting the level."
+      "description": "max(), not sum(): every replica reports the same shared-store total. Refreshed on MX_REGISTRY_STATS_INTERVAL_SECS (default 60s), not at scrape time -- cross-check the Registry stats age panel before trusting the level.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
     },
     {
       "id": 13,
@@ -424,7 +472,8 @@
         "defaults": {
           "unit": "reqps"
         }
-      }
+      },
+      "description": "Per-method request rate. The three streaming RPCs are absent by design -- see the note below this row."
     },
     {
       "id": 15,
@@ -487,7 +536,8 @@
         "defaults": {
           "unit": "s"
         }
-      }
+      },
+      "description": "99th percentile handler latency per method. Computed from the counter's histogram, so a cancelled request contributes no sample."
     },
     {
       "id": 17,
@@ -513,7 +563,13 @@
             "uid": "${datasource}"
           }
         }
-      ]
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "description": "Requests currently being handled. Decremented by a drop guard on every exit path including cancellation, so a standing value is real."
     },
     {
       "id": 18,
@@ -604,7 +660,8 @@
         "defaults": {
           "unit": "percentunit"
         }
-      }
+      },
+      "description": "Failed operations as a fraction of all operations for that store. If every store rises together, suspect the metadata backend rather than any one subsystem."
     },
     {
       "id": 22,
@@ -635,7 +692,8 @@
         "defaults": {
           "unit": "s"
         }
-      }
+      },
+      "description": "99th percentile backend operation latency per store. store is the subsystem (p2p, registry, refit), not the storage engine."
     },
     {
       "id": 23,
@@ -662,7 +720,12 @@
           }
         }
       ],
-      "description": "Decremented by a Drop guard on every exit path including cancellation, so a standing value is real rather than drift."
+      "description": "Decremented by a Drop guard on every exit path including cancellation, so a standing value is real rather than drift.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
     },
     {
       "id": 24,
@@ -702,11 +765,16 @@
           }
         }
       ],
-      "description": "Grouped by policy, not source_worker_id: that label only exists when MX_METRICS_SOURCE_ID_LABEL=1, and grouping by an absent label silently collapses every series into one that reads as perfectly balanced."
+      "description": "Grouped by policy, not source_worker_id: that label only exists when MX_METRICS_SOURCE_ID_LABEL=1, and grouping by an absent label silently collapses every series into one that reads as perfectly balanced.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      }
     },
     {
       "id": 26,
-      "type": "timeseries",
+      "type": "bargauge",
       "title": "Candidate funnel",
       "datasource": {
         "type": "prometheus",
@@ -729,7 +797,24 @@
           }
         }
       ],
-      "description": "listed -> rank_matched -> accelerator_matched. The SGLang transfer_engine path never records accelerator_matched, so a gap there is expected rather than a broken exporter."
+      "description": "Median candidates surviving each selection stage, newest value. The bars should narrow left to right; the SGLang transfer-engine path never records accelerator_matched, so a missing third bar is expected rather than a broken exporter.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true
+      }
     },
     {
       "id": 27,
@@ -756,7 +841,12 @@
           }
         }
       ],
-      "description": "Does not partition every candidate: one rejected by the accelerator check is skipped without recording an attempt, so this understates how many peers were passed over."
+      "description": "Does not partition every candidate: one rejected by the accelerator check is skipped without recording an attempt, so this understates how many peers were passed over.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      }
     },
     {
       "id": 28,
@@ -783,7 +873,12 @@
           }
         }
       ],
-      "description": "result=error is a backend outage. result=empty is a healthy cluster that has published no peers yet."
+      "description": "result=error is a backend outage. result=empty is a healthy cluster that has published no peers yet.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      }
     },
     {
       "id": 29,
@@ -801,7 +896,7 @@
     {
       "id": 30,
       "type": "timeseries",
-      "title": "Transfer duration",
+      "title": "Transfer duration (p50 / p95 / p99)",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -845,7 +940,8 @@
         "defaults": {
           "unit": "s"
         }
-      }
+      },
+      "description": "End-to-end P2P transfer time. Buckets top out at five minutes, so a flat line at the ceiling means transfers are exceeding it."
     },
     {
       "id": 31,
@@ -904,7 +1000,12 @@
           }
         }
       ],
-      "description": "partial and empty both return success to the caller today, so this panel is the only place they are visible."
+      "description": "partial and empty both return success to the caller today, so this panel is the only place they are visible.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      }
     },
     {
       "id": 33,
@@ -922,7 +1023,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (kind) (rate(mx_nixl_data_plane_errors_total[$__rate_interval]))",
+          "expr": "sum by (kind) (increase(mx_nixl_data_plane_errors_total[$__rate_interval]))",
           "legendFormat": "{{kind}}",
           "refId": "A",
           "datasource": {
@@ -930,7 +1031,13 @@
             "uid": "${datasource}"
           }
         }
-      ]
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "description": "NIXL failures by classified kind. A non-zero count is what demotes an agent from READY."
     },
     {
       "id": 34,
@@ -985,7 +1092,12 @@
           }
         }
       ],
-      "description": "Never evicted. This is the OOM early warning."
+      "description": "Never evicted. This is the OOM early warning.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
     },
     {
       "id": 37,
@@ -1003,7 +1115,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (reason) (rate(mx_cache_evictions_total[$__rate_interval]))",
+          "expr": "sum by (reason) (increase(mx_cache_evictions_total[$__rate_interval]))",
           "legendFormat": "{{reason}}",
           "refId": "A",
           "datasource": {
@@ -1012,7 +1124,12 @@
           }
         }
       ],
-      "description": "Only time_threshold and count_limit are reachable today; disk_space and manual exist as label values with no producer."
+      "description": "Only time_threshold and count_limit are reachable today; disk_space and manual exist as label values with no producer.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
     },
     {
       "id": 38,
@@ -1045,6 +1162,14 @@
           "calcs": [
             "lastNotNull"
           ]
+        },
+        "graphMode": "none",
+        "colorMode": "value",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
         }
       }
     }
