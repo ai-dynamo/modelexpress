@@ -498,7 +498,7 @@
     {
       "id": 6,
       "type": "row",
-      "title": "Download lifecycle",
+      "title": "Downloads",
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -721,7 +721,7 @@
     {
       "id": 13,
       "type": "row",
-      "title": "gRPC",
+      "title": "Server internals",
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -734,7 +734,7 @@
     {
       "id": 14,
       "type": "timeseries",
-      "title": "Request rate by method",
+      "title": "gRPC request rate",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -766,7 +766,7 @@
     {
       "id": 15,
       "type": "timeseries",
-      "title": "Error ratio by method",
+      "title": "gRPC error ratio",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -798,7 +798,7 @@
     {
       "id": 16,
       "type": "timeseries",
-      "title": "p99 latency by method",
+      "title": "gRPC p99 latency",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -830,7 +830,7 @@
     {
       "id": 17,
       "type": "timeseries",
-      "title": "In flight by method",
+      "title": "gRPC requests in flight",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -862,7 +862,7 @@
     {
       "id": 18,
       "type": "text",
-      "title": "Why EnsureModelDownloaded is not on this row",
+      "title": "Why EnsureModelDownloaded is missing from the four panels above",
       "gridPos": {
         "h": 5,
         "w": 24,
@@ -871,26 +871,13 @@
       },
       "options": {
         "mode": "markdown",
-        "content": "`ModelService/EnsureModelDownloaded`, `ModelService/StreamModelFiles` and `Health/Watch` are **deliberately absent from all four gRPC panels on this row**.\n\nThey are streaming: the metrics layer's future resolves at stream setup, so recording them would report `outcome=\"ok\"` and a sub-millisecond duration for work that can run forty minutes and fail as a stream item. A confidently wrong number is worse than an absent one.\n\nThe in-flight gauge excludes them too, so a running `EnsureModelDownloaded` shows nothing on this row at all \u2014 use **Downloads in flight** in the Health row for that.\n\n**Download latency is in the Download lifecycle row above**, from `mx_download_seconds`."
+        "content": "`ModelService/EnsureModelDownloaded`, `ModelService/StreamModelFiles` and `Health/Watch` are **deliberately absent from the four gRPC panels above**.\n\nThey are streaming: the metrics layer's future resolves at stream setup, so recording them would report `outcome=\"ok\"` and a sub-millisecond duration for work that can run forty minutes and fail as a stream item. A confidently wrong number is worse than an absent one.\n\nThe in-flight gauge excludes them too, so a running `EnsureModelDownloaded` shows up in no gRPC panel at all -- use **Downloads in flight** in Overview for that, and the **Downloads** row for its latency, from `mx_download_seconds`."
       }
-    },
-    {
-      "id": 19,
-      "type": "row",
-      "title": "Storage backend",
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 40
-      },
-      "panels": []
     },
     {
       "id": 20,
       "type": "timeseries",
-      "title": "Operation rate",
+      "title": "Backend operation rate",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -899,7 +886,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 41
+        "y": 40
       },
       "targets": [
         {
@@ -922,7 +909,7 @@
     {
       "id": 21,
       "type": "timeseries",
-      "title": "Error ratio by store",
+      "title": "Backend error ratio",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -931,7 +918,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 41
+        "y": 40
       },
       "targets": [
         {
@@ -963,7 +950,7 @@
     {
       "id": 22,
       "type": "timeseries",
-      "title": "p99 latency by store",
+      "title": "Backend p99 latency",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -972,7 +959,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 41
+        "y": 40
       },
       "targets": [
         {
@@ -995,7 +982,7 @@
     {
       "id": 23,
       "type": "timeseries",
-      "title": "In flight",
+      "title": "Backend operations in flight",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1004,7 +991,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 41
+        "y": 40
       },
       "targets": [
         {
@@ -1027,13 +1014,13 @@
     {
       "id": 24,
       "type": "row",
-      "title": "Client: source selection",
+      "title": "P2P clients",
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 49
+        "y": 48
       },
       "panels": []
     },
@@ -1049,7 +1036,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 50
+        "y": 49
       },
       "targets": [
         {
@@ -1081,7 +1068,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 50
+        "y": 49
       },
       "targets": [
         {
@@ -1143,7 +1130,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 50
+        "y": 49
       },
       "targets": [
         {
@@ -1175,7 +1162,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 50
+        "y": 49
       },
       "targets": [
         {
@@ -1196,19 +1183,6 @@
       }
     },
     {
-      "id": 29,
-      "type": "row",
-      "title": "Client: transfer and NIXL health",
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 58
-      },
-      "panels": []
-    },
-    {
       "id": 30,
       "type": "timeseries",
       "title": "Transfer duration, successful (p50 / p95 / p99)",
@@ -1220,7 +1194,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 59
+        "y": 57
       },
       "targets": [
         {
@@ -1270,7 +1244,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 59
+        "y": 57
       },
       "targets": [
         {
@@ -1302,7 +1276,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 59
+        "y": 57
       },
       "targets": [
         {
@@ -1334,7 +1308,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 59
+        "y": 57
       },
       "targets": [
         {
@@ -1355,98 +1329,6 @@
       "description": "NIXL failures by classified kind. A non-zero count is what demotes an agent from READY."
     },
     {
-      "id": 34,
-      "type": "text",
-      "title": "If this whole section is empty",
-      "gridPos": {
-        "h": 5,
-        "w": 24,
-        "x": 0,
-        "y": 67
-      },
-      "options": {
-        "mode": "markdown",
-        "content": "Client metrics are **opt-in and live in the inference engine's pod**, not in the ModelExpress server. An empty section usually means one of:\n\n1. `MX_METRICS_ENABLED=1` is not set on the engine pod (it defaults to off);\n2. nothing is scraping those pods -- the server's PodMonitor does not match them, see `metrics.clientPodMonitor` in the chart;\n3. this deployment does not use P2P at all, in which case empty is correct.\n\n`count(mx_build_info{component=\"client\"})` tells the three apart: present with nothing else means the exporter came up and recorded no events."
-      }
-    },
-    {
-      "id": 35,
-      "type": "row",
-      "title": "Capacity",
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 72
-      },
-      "panels": []
-    },
-    {
-      "id": 36,
-      "type": "timeseries",
-      "title": "In-process map sizes",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 0,
-        "y": 73
-      },
-      "targets": [
-        {
-          "expr": "sum by (map) (mx_state_entries)",
-          "legendFormat": "{{map}}",
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          }
-        }
-      ],
-      "description": "Never evicted. This is the OOM early warning.",
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short"
-        }
-      }
-    },
-    {
-      "id": 37,
-      "type": "timeseries",
-      "title": "Evictions by reason",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 8,
-        "y": 73
-      },
-      "targets": [
-        {
-          "expr": "sum by (reason) (increase(mx_cache_evictions_total[$__rate_interval]))",
-          "legendFormat": "{{reason}}",
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          }
-        }
-      ],
-      "description": "Only time_threshold and count_limit are reachable today; disk_space and manual exist as label values with no producer.",
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short"
-        }
-      }
-    },
-    {
       "id": 38,
       "type": "stat",
       "title": "Client pods exporting",
@@ -1455,10 +1337,10 @@
         "uid": "${datasource}"
       },
       "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 16,
-        "y": 73
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 65
       },
       "targets": [
         {
@@ -1490,6 +1372,98 @@
       }
     },
     {
+      "id": 34,
+      "type": "text",
+      "title": "Why this section may be empty",
+      "gridPos": {
+        "h": 5,
+        "w": 18,
+        "x": 6,
+        "y": 65
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Client metrics are **opt-in and live in the inference engine's pod**, not in the ModelExpress server. An empty section usually means one of:\n\n1. `MX_METRICS_ENABLED=1` is not set on the engine pod (it defaults to off);\n2. nothing is scraping those pods -- the server's PodMonitor does not match them, see `metrics.clientPodMonitor` in the chart;\n3. this deployment does not use P2P at all, in which case empty is correct.\n\n`count(mx_build_info{component=\"client\"})` tells the three apart: present with nothing else means the exporter came up and recorded no events."
+      }
+    },
+    {
+      "id": 35,
+      "type": "row",
+      "title": "Capacity",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 70
+      },
+      "panels": []
+    },
+    {
+      "id": 36,
+      "type": "timeseries",
+      "title": "In-process map sizes",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 71
+      },
+      "targets": [
+        {
+          "expr": "sum by (map) (mx_state_entries)",
+          "legendFormat": "{{map}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Never evicted. This is the OOM early warning.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 37,
+      "type": "timeseries",
+      "title": "Evictions by reason",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 71
+      },
+      "targets": [
+        {
+          "expr": "sum by (reason) (increase(mx_cache_evictions_total[$__rate_interval]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Only time_threshold and count_limit are reachable today; disk_space and manual exist as label values with no producer.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
       "id": 5,
       "type": "stat",
       "title": "Server replicas by version",
@@ -1501,7 +1475,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 81
+        "y": 79
       },
       "targets": [
         {

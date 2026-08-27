@@ -552,6 +552,19 @@ transfer time across load tiers; that needs per-tier instrumentation which does
 not exist yet, so the transfer panel can say a transfer took 90 seconds but not
 where the 90 seconds went.
 
+Five rows: **Overview**, **Downloads**, **Server internals**, **P2P clients**,
+**Capacity**. Read Overview first. Six of its eight tiles are coloured by the
+same condition an alert fires on -- `MXServerMetricsAbsent`,
+`MXRegistryStatsStale`, `MXDownloadFailureRatio`, `MXDownloadTakeover`,
+`MXDownloadLeaseLost` and `MXGrpcErrorRatio` -- and each tile's description names
+its alert. The other two, downloads in flight and downloads completed, are
+uncoloured context. The four rows below are for answering *why* once a tile is
+not green.
+
+Overview is not a complete alert summary: the seven remaining alerts in the
+table above have no tile, and are read from the panels in their own rows. It
+covers the server's primary job, not the whole rule set.
+
 `ModelService/EnsureModelDownloaded` is absent from every gRPC panel by design
 (see the exclusion above); download latency lives in `mx_download_seconds`
 instead. The dashboard carries a text panel saying so, because the alternative is
