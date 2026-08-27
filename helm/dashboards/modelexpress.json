@@ -797,9 +797,27 @@
       },
       "targets": [
         {
-          "expr": "sum by (stage) (rate(mx_p2p_candidates_sum[$__rate_interval])) / sum by (stage) (rate(mx_p2p_candidates_count[$__rate_interval]))",
-          "legendFormat": "{{stage}}",
+          "expr": "sum(rate(mx_p2p_candidates_sum{stage=\"listed\"}[$__rate_interval])) / sum(rate(mx_p2p_candidates_count{stage=\"listed\"}[$__rate_interval]))",
+          "legendFormat": "listed",
           "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "sum(rate(mx_p2p_candidates_sum{stage=\"rank_matched\"}[$__rate_interval])) / sum(rate(mx_p2p_candidates_count{stage=\"rank_matched\"}[$__rate_interval]))",
+          "legendFormat": "rank_matched",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "sum(rate(mx_p2p_candidates_sum{stage=\"accelerator_matched\"}[$__rate_interval])) / sum(rate(mx_p2p_candidates_count{stage=\"accelerator_matched\"}[$__rate_interval]))",
+          "legendFormat": "accelerator_matched",
+          "refId": "C",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
