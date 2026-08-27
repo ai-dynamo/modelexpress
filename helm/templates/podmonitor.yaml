@@ -20,6 +20,7 @@
 {{- if not (or .Values.metrics.podMonitor.skipApiVersionCheck (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1")) }}
 {{- fail "metrics.podMonitor.enabled but monitoring.coreos.com/v1 is not available: install the Prometheus Operator, or use metrics.podAnnotations if your Prometheus scrapes pod annotations, or set metrics.podMonitor.skipApiVersionCheck=true if the CRDs are applied alongside this chart." }}
 {{- end }}
+{{- include "modelexpress.checkScrapeTimeout" (list .Values.metrics.podMonitor.interval .Values.metrics.podMonitor.scrapeTimeout "metrics.podMonitor") }}
 apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
 metadata:
