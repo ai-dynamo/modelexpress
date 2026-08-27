@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    archive_format::ArchiveFormat,
     cache_entry::StagingCacheEntry,
-    gbuild::{GbuildArtifact, is_gbuild_artifact, validate_runtime_manifest},
+    gbuild::{is_gbuild_artifact, validate_gbuild_manifest, validate_runtime_manifest},
     layer_download::{LayerDownload, LayerDownloadKind, LayerDownloads},
     path::ArtifactPath,
     reference::OciReference,
@@ -56,7 +55,8 @@ impl<'a> Downloader<'a> {
             );
         }
 
-        if is_gbuild_artifact(&manifest) {
+        let is_gbuild = is_gbuild_artifact(&manifest);
+        if is_gbuild {
             if self.reference.digest().is_none() {
                 anyhow::bail!(
                     "GBuild OCI artifact '{}' must use an immutable digest reference",
@@ -68,16 +68,30 @@ impl<'a> Downloader<'a> {
                     "GBuild OCI artifacts must be materialized completely; ignore_weights is not supported"
                 );
             }
-            return self
-                .download_gbuild_artifact(staging_entry, &staging_files, &manifest)
-                .await;
+            validate_gbuild_manifest(&manifest)?;
         }
 
         let downloads = LayerDownloads::from_layers(&manifest.layers, ignore_weights)?;
-        self.download_layers(staging_entry, &staging_files, downloads.as_slice())
-            .await?;
-        self.download_manifest_json(&manifest, &staging_files)
-            .await?;
+        self.download_layers(
+            staging_entry,
+            &staging_files,
+            downloads.as_slice(),
+            is_gbuild,
+        )
+        .await?;
+        if is_gbuild {
+            let runtime_manifest_path = staging_files.join(MANIFEST_FILE_NAME);
+            let runtime_manifest =
+                tokio::fs::read(&runtime_manifest_path)
+                    .await
+                    .with_context(|| {
+                        format!("Failed to read GBuild runtime manifest {runtime_manifest_path:?}")
+                    })?;
+            validate_runtime_manifest(&runtime_manifest)?;
+        } else {
+            self.download_manifest_json(&manifest, &staging_files)
+                .await?;
+        }
 
         Ok(())
     }
@@ -89,67 +103,6 @@ impl<'a> Downloader<'a> {
             .await
             .with_context(|| format!("Failed to pull OCI manifest for '{}'", self.original_ref))?;
         Self::image_manifest(manifest)
-    }
-
-    async fn download_gbuild_artifact(
-        &self,
-        staging_entry: &StagingCacheEntry,
-        staging_files: &Path,
-        manifest: &OciImageManifest,
-    ) -> Result<()> {
-        let blob_root = staging_entry.blob_root();
-        let config_path = blob_root.join("gbuild-config.json");
-        self.pull_blob_to_file(&manifest.config, &config_path, "GBuild OCI config")
-            .await?;
-        let config = tokio::fs::read(&config_path)
-            .await
-            .with_context(|| format!("Failed to read GBuild OCI config {config_path:?}"))?;
-        tokio::fs::remove_file(&config_path)
-            .await
-            .with_context(|| format!("Failed to remove GBuild OCI config {config_path:?}"))?;
-        let artifact = GbuildArtifact::from_manifest_and_config(manifest, &config)?;
-
-        for metadata in artifact.metadata {
-            self.pull_blob_to_file(
-                &metadata.descriptor,
-                &staging_files.join(metadata.path.as_path()),
-                "GBuild OCI metadata file",
-            )
-            .await?;
-        }
-
-        let runtime_manifest_path = staging_files.join(MANIFEST_FILE_NAME);
-        let runtime_manifest =
-            tokio::fs::read(&runtime_manifest_path)
-                .await
-                .with_context(|| {
-                    format!("Failed to read GBuild runtime manifest {runtime_manifest_path:?}")
-                })?;
-        validate_runtime_manifest(&runtime_manifest)?;
-
-        for payload in artifact.payloads {
-            let blob_path = blob_root.join(payload.descriptor.digest.replace(':', "-"));
-            self.pull_blob_to_file(&payload.descriptor, &blob_path, "GBuild OCI payload blob")
-                .await?;
-            ArchiveFormat::TarZstd
-                .extract_gbuild_payload(
-                    &blob_path,
-                    staging_files,
-                    &payload.members,
-                    payload.uncompressed_size_bytes,
-                )
-                .with_context(|| {
-                    format!(
-                        "Failed to extract GBuild OCI payload {}",
-                        payload.descriptor.digest
-                    )
-                })?;
-            tokio::fs::remove_file(&blob_path).await.with_context(|| {
-                format!("Failed to remove GBuild OCI payload blob {blob_path:?}")
-            })?;
-        }
-
-        Self::remove_blob_root(&blob_root).await
     }
 
     async fn download_manifest_json(
@@ -183,6 +136,7 @@ impl<'a> Downloader<'a> {
         staging_entry: &StagingCacheEntry,
         staging_files: &Path,
         downloads: &[LayerDownload],
+        complete_archives: bool,
     ) -> Result<usize> {
         let mut file_count = 0usize;
         let blob_root = staging_entry.blob_root();
@@ -203,13 +157,17 @@ impl<'a> Downloader<'a> {
                     // Archive member paths define the artifact layout. Layer title
                     // annotations are labels/debug metadata unless a manifest schema
                     // explicitly assigns placement semantics.
-                    let extracted_files =
-                        format.extract_blob(&path, staging_files).with_context(|| {
-                            format!(
-                                "Failed to extract OCI archive blob {}",
-                                download.descriptor.digest
-                            )
-                        })?;
+                    let extracted_files = if complete_archives {
+                        format.extract_all_files(&path, staging_files)
+                    } else {
+                        format.extract_blob(&path, staging_files)
+                    }
+                    .with_context(|| {
+                        format!(
+                            "Failed to extract OCI archive blob {}",
+                            download.descriptor.digest
+                        )
+                    })?;
 
                     tokio::fs::remove_file(&path).await.with_context(|| {
                         format!("Failed to remove OCI temporary blob file {path:?}")
@@ -592,23 +550,14 @@ mod tests {
         let manifest_capnp_digest = digest_bytes(manifest_capnp);
         let preset_digest = digest_bytes(preset);
         let payload_digest = digest_bytes(&payload);
-        let config = serde_json::to_vec(&json!({
-            "version": 1,
-            "partitions": [{
-                "partition_id": 0,
-                "layer": "payloads/0000.tar.zst",
-                "members": ["README.md", "program.0.gas"],
-                "uncompressed_size_bytes": tar.len(),
-            }],
-        }))
-        .expect("serialize GBuild config");
-        let config_digest = digest_bytes(&config);
+        let config = b"{}";
+        let config_digest = digest_bytes(config);
         let outer_manifest = serde_json::to_vec(&json!({
             "schemaVersion": 2,
             "mediaType": "application/vnd.oci.image.manifest.v1+json",
             "artifactType": "application/vnd.groq.gbuild.full-compile.v1",
             "config": {
-                "mediaType": "application/vnd.groq.gbuild.full-compile.config.v1+json",
+                "mediaType": "application/vnd.oci.empty.v1+json",
                 "size": config.len(),
                 "digest": config_digest,
             },
@@ -635,7 +584,7 @@ mod tests {
                     "mediaType": "application/vnd.oci.image.layer.v1.tar+zstd",
                     "size": payload.len(),
                     "digest": payload_digest,
-                    "annotations": { TITLE_ANNOTATION: "payloads/0000.tar.zst" },
+                    "annotations": { TITLE_ANNOTATION: "payload.tar.zst" },
                 },
             ],
             "annotations": {"org.opencontainers.image.created": "1970-01-01T00:00:00Z"},
@@ -696,8 +645,6 @@ mod tests {
             fs::read(path.join("program.0.gas")).expect("read program"),
             b"gas"
         );
-        assert!(!path.join("gbuild-config.json").exists());
-
         let tag_error = OciProvider
             .download_model(
                 &format!("{registry}/{repo}:latest"),
