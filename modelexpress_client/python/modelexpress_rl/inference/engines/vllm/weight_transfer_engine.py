@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from time import perf_counter
 from typing import Any
 
 from vllm.distributed.weight_transfer import WeightTransferEngine
@@ -21,6 +22,8 @@ from modelexpress_rl.inference.client import (
     ModelExpressGeneratorConfig,
     StagedWeightHandle,
 )
+from modelexpress_rl.inference.receiver import ObjectStorageGeneratorConfig
+from modelexpress_rl.object_storage import ObjectStorageType
 from modelexpress_rl.version import WeightVersionRef
 
 from .context import VllmGeneratorContext
@@ -30,7 +33,20 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ModelExpressWeightTransferInitInfo(WeightTransferInitInfo):
-    """ModelExpress initializes from the vLLM worker's live model context."""
+    """Optional ModelExpress connection and object-storage settings."""
+
+    model_name: str | None = None
+    initial_base_version_id: str | None = None
+    launch_checkpoint: str | None = None
+    preparation_cache_dir: str | None = None
+    server_url: str | None = None
+    object_storage_type: str | None = None
+    object_storage_endpoint_url: str | None = None
+    object_storage_region_name: str | None = None
+    registration_ttl_seconds: int | None = None
+    lease_ttl_seconds: int | None = None
+    max_transfer_attempts: int = 3
+    rpc_timeout_seconds: float = 30.0
 
 
 @dataclass
@@ -77,7 +93,7 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
         self._closed = False
 
     def init_transfer_engine(
-        self, _init_info: ModelExpressWeightTransferInitInfo
+        self, init_info: ModelExpressWeightTransferInitInfo
     ) -> None:
         """Initialize ModelExpress from the rank-local vLLM model context."""
         if self._closed:
@@ -86,7 +102,61 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
         if self._client is not None:
             logger.warning("weight transfer engine is already initialized")
             return
-        self._client = ModelExpressGeneratorClient.initialize(self._generator_config)
+
+        object_storage_values = (
+            init_info.object_storage_type,
+            init_info.initial_base_version_id,
+            init_info.launch_checkpoint,
+            init_info.preparation_cache_dir,
+            init_info.object_storage_endpoint_url,
+            init_info.object_storage_region_name,
+        )
+        object_storage = None
+        if any(value is not None for value in object_storage_values):
+            if (
+                init_info.object_storage_type is None
+                or init_info.initial_base_version_id is None
+                or init_info.launch_checkpoint is None
+                or init_info.preparation_cache_dir is None
+            ):
+                raise ValueError(
+                    "object storage requires object_storage_type, "
+                    "initial_base_version_id, launch_checkpoint, and "
+                    "preparation_cache_dir"
+                )
+            try:
+                storage_type = ObjectStorageType(init_info.object_storage_type)
+            except ValueError as error:
+                raise ValueError(
+                    f"unsupported object_storage_type="
+                    f"{init_info.object_storage_type!r}"
+                ) from error
+            object_storage = ObjectStorageGeneratorConfig(
+                storage_type=storage_type,
+                initial_base_version_id=init_info.initial_base_version_id,
+                launch_checkpoint=init_info.launch_checkpoint,
+                preparation_cache_dir=init_info.preparation_cache_dir,
+                endpoint_url=init_info.object_storage_endpoint_url,
+                region_name=init_info.object_storage_region_name,
+            )
+
+        model_name = (
+            init_info.model_name
+            if init_info.model_name is not None
+            else self._generator_config.model_name
+        )
+        self._client = ModelExpressGeneratorClient.initialize(
+            replace(
+                self._generator_config,
+                model_name=model_name,
+                server_url=init_info.server_url,
+                registration_ttl_seconds=init_info.registration_ttl_seconds,
+                lease_ttl_seconds=init_info.lease_ttl_seconds,
+                max_transfer_attempts=init_info.max_transfer_attempts,
+                rpc_timeout_seconds=init_info.rpc_timeout_seconds,
+                object_storage=object_storage,
+            )
+        )
 
     def start_weight_update(self) -> None:
         if self._closed:
@@ -119,10 +189,19 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
 
         staged: StagedWeightHandle | None = None
         try:
+            stage_started = perf_counter()
             staged = client.stage_weight(
                 version=WeightVersionRef(update_info.version_id)
             )
-            client.apply_weight(staged)
+            stage_weight_time = perf_counter() - stage_started
+            metrics = staged.metrics
+            apply_metrics = client.apply_weight(staged)
+            if isinstance(apply_metrics, dict):
+                metrics.update(apply_metrics)
+            metrics["perf/mx_receive_stage_weight_time"] = stage_weight_time
+            for key, value in sorted(metrics.items()):
+                if key.startswith("perf/") and isinstance(value, (int, float)):
+                    logger.info("ModelExpress receiver metric %s=%s", key, value)
             self._staged = staged
         except BaseException as error:
             if staged is not None:

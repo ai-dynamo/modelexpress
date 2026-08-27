@@ -8,9 +8,18 @@ import modelexpress_rl.inference.engines.vllm.adapter as vllm_adapter_module
 import pytest
 import torch
 from modelexpress import p2p_pb2
-from modelexpress_rl import WeightPayloadFormat
-from modelexpress_rl.inference.adapter import GeneratorSource, GeneratorTransferInputs
+from modelexpress_rl import ObjectStorageType, WeightPayloadFormat
+from modelexpress_rl.inference.adapter import (
+    GeneratorSource,
+    GeneratorTransferInputs,
+    NixlGeneratorSource,
+)
 from modelexpress_rl.inference.engines.vllm import VllmGeneratorAdapter
+from modelexpress_rl.inference.receiver import (
+    CanonicalS3GeneratorAdapter,
+    ObjectStorageGeneratorConfig,
+    PreparedCheckpoint,
+)
 
 
 def test_vllm_adapter_composes_transfer_and_installer_lifecycles(
@@ -106,16 +115,18 @@ def test_vllm_adapter_composes_transfer_and_installer_lifecycles(
     )
     inputs = GeneratorTransferInputs(
         version_id="version-a",
+        base_version_id=None,
         layout_signature="layout-a",
         payload_format=WeightPayloadFormat.FULL_TENSOR,
         sources=(
             GeneratorSource(
                 source_slot_id="rank:0",
                 worker_id="trainer-0",
-                manifest_endpoint="trainer-0:9000",
                 manifest_digest="digest",
-                transport="NIXL",
-                manifest=b"manifest",
+                transport=NixlGeneratorSource(
+                    manifest_endpoint="trainer-0:9000",
+                    manifest=b"manifest",
+                ),
             ),
         ),
     )
@@ -218,4 +229,114 @@ def test_vllm_adapter_composes_transfer_and_installer_lifecycles(
         ),
         ("install", peer_staged.tensors),
         ("close",),
+    ]
+
+
+def test_vllm_adapter_uses_canonical_s3_without_creating_nixl(
+    monkeypatch,
+    tmp_path,
+):
+    events = []
+    prepared = PreparedCheckpoint("target-a", tmp_path / "prepared", {})
+    model_config = SimpleNamespace(model="config/model")
+    vllm_config = SimpleNamespace(model_config=model_config)
+
+    class _Installer:
+        def __init__(self, **kwargs):
+            events.append(("installer_init", kwargs))
+
+        def install_checkpoint(self, path):
+            events.append(("install_checkpoint", path))
+
+    class _Transfer:
+        def __init__(self, **_kwargs):
+            pytest.fail("S3 mode must not create a NIXL transfer")
+
+    class _Engine:
+        def __init__(self, received_vllm_config, received_model_config):
+            assert received_vllm_config is vllm_config
+            assert received_model_config is model_config
+
+        def get_device_id(self):
+            return 2
+
+        def get_target_device(self):
+            return torch.device("cuda:2")
+
+    def initialize_s3(self, **kwargs):
+        events.append(("s3_init", kwargs))
+        self._active_staged = None
+
+    def stage_s3(self, inputs):
+        events.append(("s3_stage", inputs))
+        self._active_staged = prepared
+        return prepared
+
+    def apply_s3(self, staged):
+        events.append(("s3_apply", staged))
+        self.install_prepared_checkpoint(staged)
+        return {"installed": 1.0}
+
+    def release_s3(self, staged):
+        events.append(("s3_release", staged))
+        self._active_staged = None
+
+    def close_s3(self):
+        events.append(("s3_close",))
+
+    monkeypatch.setattr(vllm_adapter_module, "VllmAdapter", _Engine)
+    monkeypatch.setattr(vllm_adapter_module, "_VllmInstaller", _Installer)
+    monkeypatch.setattr(vllm_adapter_module, "_NixlStagedTransfer", _Transfer)
+    monkeypatch.setattr(CanonicalS3GeneratorAdapter, "__init__", initialize_s3)
+    monkeypatch.setattr(CanonicalS3GeneratorAdapter, "stage_weight", stage_s3)
+    monkeypatch.setattr(CanonicalS3GeneratorAdapter, "apply_weight", apply_s3)
+    monkeypatch.setattr(
+        CanonicalS3GeneratorAdapter,
+        "release_staged_weight",
+        release_s3,
+    )
+    monkeypatch.setattr(CanonicalS3GeneratorAdapter, "close", close_s3)
+
+    object_storage = ObjectStorageGeneratorConfig(
+        storage_type=ObjectStorageType.S3,
+        initial_base_version_id="base-a",
+        launch_checkpoint=tmp_path / "launch",
+        preparation_cache_dir=tmp_path / "cache",
+    )
+    adapter = VllmGeneratorAdapter(
+        model="model",
+        vllm_config=vllm_config,
+        model_config=model_config,
+        worker_id="generator-0",
+        object_storage=object_storage,
+    )
+    inputs = object()
+
+    assert adapter.supported_payload_formats == frozenset(
+        {WeightPayloadFormat.XOR_DELTA}
+    )
+    assert adapter.stage_weight(inputs) is prepared
+    assert adapter.apply_weight(prepared) == {"installed": 1.0}
+    adapter.release_staged_weight(prepared)
+    adapter.close()
+
+    assert events == [
+        (
+            "installer_init",
+            {
+                "model": "model",
+                "vllm_config": vllm_config,
+                "model_config": model_config,
+                "device": torch.device("cuda:2"),
+            },
+        ),
+        (
+            "s3_init",
+            {"model_name": "config/model", "config": object_storage},
+        ),
+        ("s3_stage", inputs),
+        ("s3_apply", prepared),
+        ("install_checkpoint", prepared.path),
+        ("s3_release", prepared),
+        ("s3_close",),
     ]

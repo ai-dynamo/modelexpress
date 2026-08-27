@@ -11,7 +11,12 @@ import grpc
 
 from ... import refit_pb2, refit_pb2_grpc
 from ...control import WeightVersion
-from ..adapter import GeneratorEngineAdapter, GeneratorSource, GeneratorTransferInputs
+from ..adapter import (
+    GeneratorEngineAdapter,
+    GeneratorSource,
+    GeneratorTransferInputs,
+    NixlGeneratorSource,
+)
 from .base import RefitStrategy
 
 
@@ -53,7 +58,9 @@ class _TrainerRefitStrategy(RefitStrategy):
         assert last_error is not None
         raise last_error
 
-    def _fetch_manifest(self, shard: refit_pb2.WeightVersionShard) -> bytes:
+    def _resolve_source(self, shard: refit_pb2.WeightVersionShard) -> GeneratorSource:
+        if not shard.manifest_endpoint:
+            raise RuntimeError("NIXL source is missing its manifest endpoint")
         with grpc.insecure_channel(shard.manifest_endpoint) as channel:
             response = refit_pb2_grpc.RefitWorkerServiceStub(
                 channel
@@ -72,7 +79,17 @@ class _TrainerRefitStrategy(RefitStrategy):
             raise RuntimeError(
                 f"manifest digest mismatch for source slot {shard.source_slot_id!r}"
             )
-        return response.manifest
+        if not shard.manifest_digest:
+            raise RuntimeError("source is missing its manifest digest")
+        return GeneratorSource(
+            source_slot_id=shard.source_slot_id,
+            worker_id=shard.worker_id,
+            manifest_digest=shard.manifest_digest,
+            transport=NixlGeneratorSource(
+                manifest_endpoint=shard.manifest_endpoint,
+                manifest=response.manifest,
+            ),
+        )
 
     def _discover_sources(
         self,
@@ -99,20 +116,11 @@ class _TrainerRefitStrategy(RefitStrategy):
                 ordered = ordered[offset:] + ordered[:offset]
             for shard in ordered:
                 try:
-                    manifest = self._fetch_manifest(shard)
+                    source = self._resolve_source(shard)
                 except (grpc.RpcError, RuntimeError) as error:
                     failures.append(str(error))
                     continue
-                selected.append(
-                    GeneratorSource(
-                        source_slot_id=source_slot_id,
-                        worker_id=shard.worker_id,
-                        manifest_endpoint=shard.manifest_endpoint,
-                        manifest_digest=shard.manifest_digest,
-                        transport="NIXL",
-                        manifest=manifest,
-                    )
-                )
+                selected.append(source)
                 break
             else:
                 detail = f": {failures[-1]}" if failures else ""
@@ -122,6 +130,7 @@ class _TrainerRefitStrategy(RefitStrategy):
 
         return GeneratorTransferInputs(
             version_id=version.version_id,
+            base_version_id=version.base_version_id,
             layout_signature=version.layout_signature,
             payload_format=version.payload_format,
             sources=tuple(selected),

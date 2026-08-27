@@ -16,12 +16,19 @@ from modelexpress import auth, envs
 from modelexpress.client import MxClient, _get_server_url
 
 from modelexpress_rl import envs as rl_envs
+from modelexpress_rl.train import WeightPayloadFormat
 from modelexpress_rl.version import WeightVersionRef
 
 from .. import refit_pb2, refit_pb2_grpc
 from ..control import WeightVersion, WeightVersionState, _weight_version
-from .adapter import GeneratorEngineAdapter, GeneratorEngineContext
+from ..object_storage import ObjectStorageType
+from .adapter import (
+    GeneratorEngineAdapter,
+    GeneratorEngineContext,
+    GeneratorTransferInputs,
+)
 from .engines import _create_generator_adapter
+from .receiver import ObjectStorageGeneratorConfig
 from .refit_strategy import RefitStrategy
 from .refit_strategy.peer import _PeerRefitStrategy
 from .refit_strategy.trainer import _TrainerRefitStrategy
@@ -55,6 +62,8 @@ class ModelExpressGeneratorConfig:
     max_transfer_attempts: int = 3
     # Deadline applied independently to each control-plane or manifest RPC.
     rpc_timeout_seconds: float = 30.0
+    # Canonical object-storage checkpoint settings. Omit for the NIXL path.
+    object_storage: ObjectStorageGeneratorConfig | None = None
 
     def __post_init__(self) -> None:
         """Validate explicit settings before client initialization."""
@@ -63,9 +72,7 @@ class ModelExpressGeneratorConfig:
                 self.registration_ttl_seconds, "registration_ttl_seconds"
             )
         if self.lease_ttl_seconds is not None:
-            rl_envs.require_positive_int(
-                self.lease_ttl_seconds, "lease_ttl_seconds"
-            )
+            rl_envs.require_positive_int(self.lease_ttl_seconds, "lease_ttl_seconds")
         rl_envs.require_positive_int(
             self.max_transfer_attempts, "max_transfer_attempts"
         )
@@ -94,6 +101,16 @@ class StagedWeightHandle:
     def release(self) -> None:
         """Release local staging buffers; repeated calls are idempotent."""
         self._client._release_staged(self)
+
+    @property
+    def metrics(self) -> dict[str, float]:
+        """Return preparation metrics exposed by the selected adapter."""
+        return dict(getattr(self._staged, "metrics", {}))
+
+    @property
+    def applied(self) -> bool:
+        """Return whether engine installation completed."""
+        return self._applied
 
 
 class _VersionLease:
@@ -141,6 +158,7 @@ class ModelExpressGeneratorClient:
         self._adapter: GeneratorEngineAdapter | None = None
         self._p2p_client: MxClient | None = None
         self._refit_strategies: tuple[RefitStrategy, ...] = ()
+        self._uses_s3 = False
         self._closed = False
 
     @classmethod
@@ -167,10 +185,16 @@ class ModelExpressGeneratorClient:
         registration_ttl_seconds = rl_envs.require_positive_int(
             registration_ttl_seconds, "registration_ttl_seconds"
         )
+        if (
+            config.object_storage is not None
+            and config.object_storage.storage_type is not ObjectStorageType.S3
+        ):
+            raise ValueError("only S3 object storage is currently supported")
 
         adapter = _create_generator_adapter(
             engine_context=config.engine_context,
             worker_id=worker_id,
+            object_storage=config.object_storage,
         )
         client = cls()
         client.model_name = model_name
@@ -178,25 +202,32 @@ class ModelExpressGeneratorClient:
         client.server_url = server_url
         client._registration_ttl_seconds = registration_ttl_seconds
         client._lease_ttl_seconds = lease_ttl_seconds
+        client._max_transfer_attempts = config.max_transfer_attempts
         client._rpc_timeout_seconds = config.rpc_timeout_seconds
         client._adapter = adapter
-        client._p2p_client = MxClient(server_url=server_url)
-        client._refit_strategies = (
-            _PeerRefitStrategy(
-                adapter=adapter,
-                p2p_client=client._p2p_client,
-                worker_id=worker_id,
-                max_transfer_attempts=config.max_transfer_attempts,
-                rpc_timeout_seconds=config.rpc_timeout_seconds,
-            ),
-            _TrainerRefitStrategy(
-                adapter=adapter,
-                service=lambda: client._service,
-                max_transfer_attempts=config.max_transfer_attempts,
-                rpc_timeout_seconds=config.rpc_timeout_seconds,
-            ),
-        )
+        client._uses_s3 = config.object_storage is not None
+        if config.object_storage is not None:
+            client._serving_version_id = config.object_storage.initial_base_version_id
+        else:
+            client._p2p_client = MxClient(server_url=server_url)
+            client._refit_strategies = (
+                _PeerRefitStrategy(
+                    adapter=adapter,
+                    p2p_client=client._p2p_client,
+                    worker_id=worker_id,
+                    max_transfer_attempts=config.max_transfer_attempts,
+                    rpc_timeout_seconds=config.rpc_timeout_seconds,
+                ),
+                _TrainerRefitStrategy(
+                    adapter=adapter,
+                    service=lambda: client._service,
+                    max_transfer_attempts=config.max_transfer_attempts,
+                    rpc_timeout_seconds=config.rpc_timeout_seconds,
+                ),
+            )
         try:
+            if client._serving_version_id is not None:
+                client._validate_initial_base(client._serving_version_id)
             client._register_worker()
             client._registration_thread = threading.Thread(
                 target=client._renew_worker_registration,
@@ -246,29 +277,30 @@ class ModelExpressGeneratorClient:
                 staged._apply_result = self._adapter.apply_weight(staged._staged)
                 staged._applied = True
                 self._serving_version_id = staged.version_id
-                for attempt in range(2):
-                    try:
-                        self._adapter.publish_weight_version(
-                            version_id=staged.version_id,
-                            staged=staged._staged,
-                            p2p_client=self._p2p_client,
-                            worker_id=self.worker_id,
-                        )
-                        break
-                    except Exception:
-                        if attempt == 0:
-                            logger.warning(
-                                "failed to publish applied version %s as a P2P "
-                                "source; retrying once",
-                                staged.version_id,
-                                exc_info=True,
+                if self._p2p_client is not None:
+                    for attempt in range(2):
+                        try:
+                            self._adapter.publish_weight_version(
+                                version_id=staged.version_id,
+                                staged=staged._staged,
+                                p2p_client=self._p2p_client,
+                                worker_id=self.worker_id,
                             )
-                        else:
-                            logger.exception(
-                                "failed to publish applied version %s as a P2P "
-                                "source after retry",
-                                staged.version_id,
-                            )
+                            break
+                        except Exception:
+                            if attempt == 0:
+                                logger.warning(
+                                    "failed to publish applied version %s as a P2P "
+                                    "source; retrying once",
+                                    staged.version_id,
+                                    exc_info=True,
+                                )
+                            else:
+                                logger.exception(
+                                    "failed to publish applied version %s as a P2P "
+                                    "source after retry",
+                                    staged.version_id,
+                                )
                 return staged._apply_result
             except BaseException as error:
                 primary_error = error
@@ -361,7 +393,33 @@ class ModelExpressGeneratorClient:
             raise RuntimeError(f"weight version {version_id!r} is not READY")
         if version.model_name != self.model_name:
             raise RuntimeError("weight version model_name does not match the generator")
+        if self._uses_s3:
+            if version.payload_format is not WeightPayloadFormat.XOR_DELTA:
+                raise RuntimeError("S3 generator requires XOR_DELTA weight versions")
+            if version.base_version_id is None:
+                raise RuntimeError("XOR_DELTA version is missing base_version_id")
+            if (
+                version.version_id != self._serving_version_id
+                and version.base_version_id != self._serving_version_id
+            ):
+                raise RuntimeError(
+                    f"weight version base {version.base_version_id!r} does not match "
+                    f"serving version {self._serving_version_id!r}"
+                )
         return version
+
+    def _validate_initial_base(self, version_id: str) -> None:
+        response = self._service.GetWeightVersion(
+            refit_pb2.GetWeightVersionRequest(uid=version_id),
+            timeout=self._rpc_timeout_seconds,
+        )
+        if not response.HasField("version"):
+            raise RuntimeError("MX GetWeightVersion response is missing version")
+        version = _weight_version(response.version)
+        if version.state is not WeightVersionState.READY:
+            raise RuntimeError(f"initial base {version_id!r} is not READY")
+        if version.model_name != self.model_name:
+            raise RuntimeError("initial base model_name does not match the generator")
 
     def _register_lease(self, version_id: str):
         response = self._service.RegisterVersionLease(
@@ -433,6 +491,30 @@ class ModelExpressGeneratorClient:
     ) -> tuple[object, _VersionLease]:
         lease = self._start_version_lease(version.version_id)
         try:
+            if self._uses_s3:
+                if version.object_storage is None:
+                    raise RuntimeError(
+                        "The version is missing its object storage source"
+                    )
+                if version.object_storage.storage_type is not ObjectStorageType.S3:
+                    raise RuntimeError("S3 generator requires S3 object storage")
+                inputs = GeneratorTransferInputs(
+                    version_id=version.version_id,
+                    base_version_id=version.base_version_id,
+                    layout_signature=version.layout_signature,
+                    payload_format=version.payload_format,
+                    sources=(),
+                    object_storage=version.object_storage,
+                )
+                last_error: grpc.RpcError | RuntimeError | None = None
+                for _ in range(self._max_transfer_attempts):
+                    try:
+                        return self._adapter.stage_weight(inputs), lease
+                    except (grpc.RpcError, RuntimeError) as error:
+                        last_error = error
+                assert last_error is not None
+                raise last_error
+
             for strategy in self._refit_strategies:
                 staged = strategy.stage(version)
                 if staged is not None:

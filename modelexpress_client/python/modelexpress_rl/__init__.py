@@ -7,6 +7,8 @@ from .control import ModelExpressControlClient, WeightVersion, WeightVersionStat
 from .inference import (
     ModelExpressGeneratorClient,
     ModelExpressGeneratorConfig,
+    ObjectStorageGeneratorConfig,
+    SglangGeneratorContext,
     VllmGeneratorContext,
 )
 from .train import (
@@ -28,6 +30,8 @@ __all__ = [  # noqa: RUF022 - grouped by public API role, not alphabetically.
     "ModelExpressGeneratorConfig",
     "ModelExpressTrainerConfig",
     "ObjectStorageConfig",
+    "ObjectStorageGeneratorConfig",
+    "SglangGeneratorContext",
     "TrainerStagingMode",
     "WeightPayloadFormat",
     "VllmGeneratorContext",
