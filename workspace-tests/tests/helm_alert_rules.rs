@@ -40,6 +40,8 @@ const CLIENT_FAMILIES: &[&str] = &[
     "mx_nixl_data_plane_errors_total",
     "mx_nixl_receive_total",
     "mx_p2p_candidates_bucket",
+    "mx_p2p_candidates_count",
+    "mx_p2p_candidates_sum",
     "mx_p2p_list_sources_total",
     "mx_p2p_source_attempts_total",
     "mx_p2p_source_selections_total",

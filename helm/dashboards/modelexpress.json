@@ -97,7 +97,7 @@
       },
       "targets": [
         {
-          "expr": "time() - max(mx_task_last_success_timestamp_seconds{task=\"registry_stats_refresh\"})",
+          "expr": "max(time() - mx_task_last_success_timestamp_seconds{task=\"registry_stats_refresh\"})",
           "legendFormat": "seconds",
           "refId": "A",
           "datasource": {
@@ -106,7 +106,7 @@
           }
         }
       ],
-      "description": "Seconds since the refresh task last SUCCEEDED. The gauges below keep their last good values on a failed pass, so this is the only thing separating a current reading from a frozen one.",
+      "description": "Age of the STALEST replica\u2019s last successful stats refresh. The aggregation is outside the subtraction on purpose: time() - max(timestamp) is the age of the newest heartbeat, so one healthy replica would mask a wedged one -- the exact failure MXRegistryStatsStale exists to catch. The gauges elsewhere keep their last good values on a failed pass, so if this is high they are frozen rather than current.",
       "fieldConfig": {
         "defaults": {
           "unit": "s"
@@ -168,7 +168,7 @@
     {
       "id": 5,
       "type": "stat",
-      "title": "Server versions deployed",
+      "title": "Server replicas by version",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -190,7 +190,7 @@
           }
         }
       ],
-      "description": "Scoped to the server. The client is a library baked into the engine image and routinely lags the server version, so an unscoped count shows a permanent second row that reads as a stuck rollout.",
+      "description": "Replicas running each version. More than one bar means a rollout is in progress, or stuck.",
       "options": {
         "reduceOptions": {
           "calcs": [
@@ -223,7 +223,7 @@
     {
       "id": 7,
       "type": "timeseries",
-      "title": "Download duration (p50 / p95 / p99)",
+      "title": "Download duration, successful (p50 / p95 / p99)",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -236,7 +236,7 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(mx_download_seconds_bucket[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(mx_download_seconds_bucket{outcome=\"downloaded\"}[$__rate_interval])))",
           "legendFormat": "p50",
           "refId": "A",
           "datasource": {
@@ -245,7 +245,7 @@
           }
         },
         {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(mx_download_seconds_bucket[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(mx_download_seconds_bucket{outcome=\"downloaded\"}[$__rate_interval])))",
           "legendFormat": "p95",
           "refId": "B",
           "datasource": {
@@ -254,7 +254,7 @@
           }
         },
         {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(mx_download_seconds_bucket[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(mx_download_seconds_bucket{outcome=\"downloaded\"}[$__rate_interval])))",
           "legendFormat": "p99",
           "refId": "C",
           "datasource": {
@@ -263,7 +263,7 @@
           }
         }
       ],
-      "description": "Buckets run to one hour: a cold DeepSeek-V3 warm-up is ~40 min.",
+      "description": "Filtered to outcome=downloaded. The histogram also carries outcome=error, and a download that fails early would otherwise pull these percentiles down and read as an improvement. Buckets run to one hour: a cold DeepSeek-V3 warm-up is around forty minutes.",
       "fieldConfig": {
         "defaults": {
           "unit": "s"
@@ -286,7 +286,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (outcome) (rate(mx_download_seconds_count[$__rate_interval]))",
+          "expr": "sum by (outcome) (increase(mx_download_seconds_count[$__rate_interval]))",
           "legendFormat": "{{outcome}}",
           "refId": "A",
           "datasource": {
@@ -297,10 +297,10 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "reqps"
+          "unit": "short"
         }
       },
-      "description": "Downloads reaching a terminal status, split by outcome. Pair with Download duration: a healthy rate here with a climbing duration means downloads are completing but getting slower."
+      "description": "Count of downloads reaching a terminal status per interval, not a rate: one download every few minutes expressed per-second is a number nobody can read. Pair with the duration panel -- a steady count with a climbing duration means downloads still finish, but slower."
     },
     {
       "id": 9,
@@ -318,7 +318,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (result) (increase(mx_download_claims_total[$__rate_interval]))",
+          "expr": "sum by (result) (increase(mx_download_claims_total{result=~\"claimed|takeover|error\"}[$__rate_interval]))",
           "legendFormat": "{{result}}",
           "refId": "A",
           "datasource": {
@@ -327,7 +327,7 @@
           }
         }
       ],
-      "description": "takeover is the one to watch: a previous downloader died and the bytes are being pulled again -- hundreds of GB for a large model.",
+      "description": "Claim outcomes per interval. takeover is the one to watch: a previous downloader died and the model is being pulled again from scratch. result=already_exists is deliberately excluded -- it is produced by each waiting client's 500ms poll loop rather than by contention, so at a few waiters it outweighs takeover by three orders of magnitude and flattens it onto the axis.",
       "fieldConfig": {
         "defaults": {
           "unit": "short"
@@ -583,7 +583,7 @@
       },
       "options": {
         "mode": "markdown",
-        "content": "`ModelService/EnsureModelDownloaded`, `ModelService/StreamModelFiles` and `Health/Watch` are **deliberately absent from all three gRPC panels**.\n\nThey are streaming: the metrics layer's future resolves at stream setup, so recording them would report `outcome=\"ok\"` and a sub-millisecond duration for work that can run forty minutes and fail as a stream item. A confidently wrong number is worse than an absent one.\n\n**Download latency is in the Download lifecycle row above**, from `mx_download_seconds`."
+        "content": "`ModelService/EnsureModelDownloaded`, `ModelService/StreamModelFiles` and `Health/Watch` are **deliberately absent from all four gRPC panels on this row**.\n\nThey are streaming: the metrics layer's future resolves at stream setup, so recording them would report `outcome=\"ok\"` and a sub-millisecond duration for work that can run forty minutes and fail as a stream item. A confidently wrong number is worse than an absent one.\n\nThe in-flight gauge excludes them too, so a running `EnsureModelDownloaded` shows nothing on this row at all \u2014 use **Downloads in flight** in the Health row for that.\n\n**Download latency is in the Download lifecycle row above**, from `mx_download_seconds`."
       }
     },
     {
@@ -648,8 +648,17 @@
       "targets": [
         {
           "expr": "sum by (store) (rate(mx_backend_ops_total{result=\"error\"}[$__rate_interval])) / sum by (store) (rate(mx_backend_ops_total[$__rate_interval]))",
-          "legendFormat": "{{store}}",
+          "legendFormat": "{{store}} error",
           "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "sum by (store) (rate(mx_backend_ops_total{result=\"cancelled\"}[$__rate_interval])) / sum by (store) (rate(mx_backend_ops_total[$__rate_interval]))",
+          "legendFormat": "{{store}} cancelled",
+          "refId": "B",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -661,7 +670,7 @@
           "unit": "percentunit"
         }
       },
-      "description": "Failed operations as a fraction of all operations for that store. If every store rises together, suspect the metadata backend rather than any one subsystem."
+      "description": "Failed and cancelled operations as a fraction of all operations for that store. Both lines matter: a cancellation is the caller giving up, so a store that hangs raises the cancelled line while the error line falls. Reading error alone would show a hanging store getting healthier."
     },
     {
       "id": 22,
@@ -775,7 +784,7 @@
     {
       "id": 26,
       "type": "bargauge",
-      "title": "Candidate funnel",
+      "title": "Candidate funnel (mean per stage)",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -788,7 +797,7 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.5, sum by (stage, le) (rate(mx_p2p_candidates_bucket[$__rate_interval])))",
+          "expr": "sum by (stage) (rate(mx_p2p_candidates_sum[$__rate_interval])) / sum by (stage) (rate(mx_p2p_candidates_count[$__rate_interval]))",
           "legendFormat": "{{stage}}",
           "refId": "A",
           "datasource": {
@@ -797,7 +806,7 @@
           }
         }
       ],
-      "description": "Median candidates surviving each selection stage, newest value. The bars should narrow left to right; the SGLang transfer-engine path never records accelerator_matched, so a missing third bar is expected rather than a broken exporter.",
+      "description": "Mean candidates surviving each selection stage. The mean, not a quantile: the buckets are 0,1,2,4,8..., and histogram_quantile interpolates inside a bucket, so it reports fractional candidates for a quantity that is always a whole number. Bars should narrow left to right; the SGLang transfer-engine path never records accelerator_matched, so a missing third bar is expected rather than a broken exporter.",
       "fieldConfig": {
         "defaults": {
           "unit": "short"
@@ -896,7 +905,7 @@
     {
       "id": 30,
       "type": "timeseries",
-      "title": "Transfer duration (p50 / p95 / p99)",
+      "title": "Transfer duration, successful (p50 / p95 / p99)",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -909,7 +918,7 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(mx_p2p_transfer_seconds_bucket[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(mx_p2p_transfer_seconds_bucket{outcome=\"success\"}[$__rate_interval])))",
           "legendFormat": "p50",
           "refId": "A",
           "datasource": {
@@ -918,7 +927,7 @@
           }
         },
         {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(mx_p2p_transfer_seconds_bucket[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(mx_p2p_transfer_seconds_bucket{outcome=\"success\"}[$__rate_interval])))",
           "legendFormat": "p95",
           "refId": "B",
           "datasource": {
@@ -927,7 +936,7 @@
           }
         },
         {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(mx_p2p_transfer_seconds_bucket[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(mx_p2p_transfer_seconds_bucket{outcome=\"success\"}[$__rate_interval])))",
           "legendFormat": "p99",
           "refId": "C",
           "datasource": {
@@ -941,7 +950,7 @@
           "unit": "s"
         }
       },
-      "description": "End-to-end P2P transfer time. Buckets top out at five minutes, so a flat line at the ceiling means transfers are exceeding it."
+      "description": "Filtered to outcome=success. retry and fallback samples are the elapsed time of attempts that did not deliver, so including them measures how long failures take and reports it as transfer latency."
     },
     {
       "id": 31,
@@ -959,7 +968,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (scheme) (rate(mx_p2p_transfer_seconds_sum[$__rate_interval])) / sum by (scheme) (rate(mx_p2p_transfer_seconds_count[$__rate_interval]))",
+          "expr": "sum by (scheme) (rate(mx_p2p_transfer_seconds_sum{outcome=\"success\"}[$__rate_interval])) / sum by (scheme) (rate(mx_p2p_transfer_seconds_count{outcome=\"success\"}[$__rate_interval]))",
           "legendFormat": "{{scheme}}",
           "refId": "A",
           "datasource": {
@@ -968,7 +977,7 @@
           }
         }
       ],
-      "description": "scheme is set from MX_METRICS_SCHEME, for comparing benchmark runs.",
+      "description": "Mean successful transfer time, for comparing benchmark runs; scheme comes from MX_METRICS_SCHEME. Filtered to outcome=success for the same reason as the panel to its left.",
       "fieldConfig": {
         "defaults": {
           "unit": "s"
