@@ -78,6 +78,43 @@ def _max_gbps() -> float:
     return ceiling
 
 
+def _min_gbps() -> float:
+    """Per-rank floor in Gbps; 0 disables the check.
+
+    Same read-at-call-time and non-finite handling as the ceiling, for the same
+    reasons.
+    """
+    floor = envs.MX_RESHARD_MIN_GBPS
+    if not math.isfinite(floor):
+        logger.warning(
+            "MX_RESHARD_MIN_GBPS=%r is not a finite number; the throughput floor "
+            "is disabled for this run",
+            floor,
+        )
+        return 0.0
+    return floor
+
+
+def _wire_seconds(stages: dict) -> float:
+    """Wire duration regardless of which arm produced it.
+
+    Fused mode reports one span; phased mode reports up to three that run in turn,
+    so summing them is the phased equivalent.
+
+    Module-level rather than a method because it reads only its argument. Both
+    throughput guards are exercised as unbound methods against a minimal stub for
+    ``self``, so putting a self-independent computation on the instance would force
+    every such test to grow a double it has no reason to carry.
+    """
+    wire_s = stages.get("wire_fused_s")
+    if wire_s is None:
+        wire_s = sum(
+            stages.get(key, 0.0)
+            for key in ("wire_exact_s", "wire_full_s", "wire_convert_s")
+        )
+    return wire_s
+
+
 def handshake_endpoints_for_plan(
     plan, session_to_agent: dict, agent_endpoints: dict
 ) -> dict:
@@ -1040,7 +1077,55 @@ class ReshardReceiver:
             # WARNING so a benchmark harness captures it without turning on INFO
             # across every dependency.
             logger.warning("MX_REFIT_STAGE %s", json.dumps(record))
+        self._check_throughput_floor(step, stats["bytes"], stages)
         return metrics
+
+    def _check_throughput_floor(
+        self, step: int, wire_bytes: int, stages: dict
+    ) -> None:
+        """Report a wire rate far below what the fabric should deliver.
+
+        This warns rather than aborting, which is the opposite of the ceiling and
+        deliberate: an impossible rate means the payload never moved, so the
+        buffers are untrustworthy, while a slow rate is still correct. Killing a
+        training run over throughput would be worse than the throughput.
+
+        The record is structured so a CI gate can fail on its presence, which is
+        where the enforcement belongs -- a perf regression should block a merge,
+        not a production refit.
+
+        Emitted after the stage record so the two sit together in the log; the
+        stage record is what someone will actually want when they see this.
+        """
+        floor = _min_gbps()
+        if floor <= 0 or wire_bytes <= 0:
+            return
+        wire_s = _wire_seconds(stages)
+        if wire_s <= 0:
+            return
+        implied_gbps = wire_bytes * 8 / wire_s / 1e9
+        if implied_gbps >= floor:
+            return
+        logger.warning(
+            "MX_REFIT_SLOW_THROUGHPUT %s",
+            json.dumps(
+                {
+                    "schema": "refit-slow-throughput-v1",
+                    "rank": self._global_rank,
+                    "step": step,
+                    "wire_bytes": wire_bytes,
+                    "wire_s": round(wire_s, 6),
+                    "implied_gbps": round(implied_gbps, 1),
+                    "floor_gbps": floor,
+                    # How far under, because "slightly below a conservative floor"
+                    # and "an order of magnitude below" are different incidents and
+                    # a gate may reasonably treat them differently.
+                    "shortfall_x": round(floor / implied_gbps, 2)
+                    if implied_gbps > 0
+                    else None,
+                }
+            ),
+        )
 
     def _check_throughput_ceiling(
         self, step: int, wire_bytes: int, stages: dict
@@ -1071,14 +1156,7 @@ class ReshardReceiver:
         ceiling = _max_gbps()
         if ceiling <= 0 or wire_bytes <= 0:
             return
-        # Fused mode reports one wire span; phased mode reports up to three, and
-        # they run in turn, so summing them is the phased equivalent.
-        wire_s = stages.get("wire_fused_s")
-        if wire_s is None:
-            wire_s = sum(
-                stages.get(key, 0.0)
-                for key in ("wire_exact_s", "wire_full_s", "wire_convert_s")
-            )
+        wire_s = _wire_seconds(stages)
         if wire_s <= 0:
             return
         implied_gbps = wire_bytes * 8 / wire_s / 1e9
