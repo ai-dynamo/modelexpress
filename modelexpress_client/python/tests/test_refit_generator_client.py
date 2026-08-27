@@ -34,6 +34,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         self.lease_deletions = 0
         self.list_calls = 0
         self.fail_lease_deletion = False
+        self.omit_base_version = False
         self.version = refit_pb2.WeightVersion(
             uid="version-a",
             model_name="test/model",
@@ -70,6 +71,8 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
 
     def GetWeightVersion(self, request, context):
         if request.uid == self.base.uid:
+            if self.omit_base_version:
+                return refit_pb2.GetWeightVersionResponse()
             return refit_pb2.GetWeightVersionResponse(version=self.base)
         if request.uid != self.version.uid:
             context.abort(grpc.StatusCode.NOT_FOUND, "version not found")
@@ -558,6 +561,26 @@ def test_generator_validates_the_initial_s3_base_before_registration(monkeypatch
 
     try:
         with pytest.raises(RuntimeError, match="initial base.*not READY"):
+            _initialize(
+                monkeypatch,
+                endpoint,
+                adapter,
+                object_storage=True,
+            )
+    finally:
+        server.stop(grace=None).wait()
+
+    assert service.registrations == {}
+    assert adapter.close_calls == 1
+
+
+def test_generator_rejects_missing_initial_s3_base_before_registration(monkeypatch):
+    server, endpoint, service = _start_server()
+    service.omit_base_version = True
+    adapter = _Adapter(service)
+
+    try:
+        with pytest.raises(RuntimeError, match="GetWeightVersion response is missing"):
             _initialize(
                 monkeypatch,
                 endpoint,

@@ -298,9 +298,27 @@ class _LocalCheckpoint:
         items = []
         for filename, (data, names) in shards.items():
             header, data_start = read_safetensors_header(data, repr(filename))
-            checksums = header["__metadata__"]
+            checksums = header.get("__metadata__")
+            if not isinstance(checksums, dict):
+                raise ValueError(
+                    f"canonical delta shard {filename!r} is missing checksum metadata"
+                )
             view = memoryview(data)
             for name in names:
+                if name not in header:
+                    raise ValueError(
+                        f"canonical delta shard {filename!r} is missing tensor {name!r}"
+                    )
+                if name not in checksums:
+                    raise ValueError(
+                        f"canonical delta shard {filename!r} is missing checksum "
+                        f"for tensor {name!r}"
+                    )
+                if name not in self.locations:
+                    raise ValueError(
+                        f"canonical delta tensor {name!r} from shard {filename!r} "
+                        "is absent from the local checkpoint"
+                    )
                 begin, end = header[name]["data_offsets"]
                 items.append(
                     (

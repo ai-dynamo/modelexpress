@@ -611,6 +611,59 @@ def test_reconstructed_checksum_failure_propagates(monkeypatch, tmp_path):
     )
 
 
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("missing_metadata", "missing checksum metadata"),
+        ("missing_tensor", "missing tensor 'weight'"),
+        ("missing_checksum", "missing checksum for tensor 'weight'"),
+        ("missing_local_tensor", "tensor 'other'.*absent from the local checkpoint"),
+    ],
+)
+def test_malformed_delta_shard_reports_context(
+    monkeypatch,
+    tmp_path,
+    case,
+    message,
+):
+    base = torch.tensor([1.0, 2.0]).view(torch.uint8).numpy()
+    target = torch.tensor([3.0, 4.0]).view(torch.uint8).numpy()
+    objects = _artifact(base, target)
+    root_key = "s3://weights/test/v1/model.safetensors.index.json"
+    filename = "model-00000-of-00001.safetensors"
+    shard_key = f"s3://weights/test/v1/{filename}"
+    delta, _ = compute_delta(target, base)
+    assert delta is not None
+    encoded = compress_delta(delta)
+    checksum = adler32_checksum(target)
+
+    if case == "missing_metadata":
+        objects[shard_key] = safetensors.numpy.save({"weight": encoded})
+    elif case == "missing_tensor":
+        objects[shard_key] = safetensors.numpy.save(
+            {"other": encoded}, metadata={"other": checksum}
+        )
+    elif case == "missing_checksum":
+        objects[shard_key] = safetensors.numpy.save(
+            {"weight": encoded}, metadata={"other": checksum}
+        )
+    else:
+        manifest = json.loads(objects[root_key])
+        manifest["weight_map"] = {"other": filename}
+        objects[root_key] = json.dumps(manifest).encode()
+        objects[shard_key] = safetensors.numpy.save(
+            {"other": encoded}, metadata={"other": checksum}
+        )
+
+    adapter, _ = _build(monkeypatch, tmp_path, objects)
+    with pytest.raises(RuntimeError, match=message) as raised:
+        adapter.stage_weight(_inputs(objects[root_key]))
+
+    assert filename in str(raised.value)
+    state = json.loads(adapter._checkpoint.state_path.read_text())
+    assert state["version"] == "base-a"
+
+
 def test_wrong_base_fails_before_s3_download(monkeypatch, tmp_path):
     base = torch.tensor([1.0, 2.0]).view(torch.uint8).numpy()
     target = torch.tensor([3.0, 4.0]).view(torch.uint8).numpy()

@@ -413,6 +413,8 @@ class ModelExpressGeneratorClient:
             refit_pb2.GetWeightVersionRequest(uid=version_id),
             timeout=self._rpc_timeout_seconds,
         )
+        if not response.HasField("version"):
+            raise RuntimeError("MX GetWeightVersion response is missing version")
         version = _weight_version(response.version)
         if version.state is not WeightVersionState.READY:
             raise RuntimeError(f"initial base {version_id!r} is not READY")
