@@ -29,7 +29,7 @@
     {
       "id": 1,
       "type": "row",
-      "title": "Health",
+      "title": "Overview",
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -156,9 +156,10 @@
       }
     },
     {
-      "id": 4,
+      "id": 101,
       "type": "stat",
       "title": "Downloads in flight",
+      "description": "From the gauge, not the transition counters: those are process-local while DOWNLOADING persists in the shared store. max(), not sum(), because every replica republishes the same shared total.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -172,7 +173,7 @@
       "targets": [
         {
           "expr": "max(mx_registry_entries{status=\"downloading\"})",
-          "legendFormat": "downloading",
+          "legendFormat": "",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -180,28 +181,39 @@
           }
         }
       ],
-      "description": "max(), not sum(): the gauge is recomputed from the shared store, so every replica publishes the same global total and summing multiplies it by the replica count. From the gauge rather than the transition counters, which are process-local while DOWNLOADING persists in the store.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        }
+      },
       "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "noValue": "0",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
-        },
-        "graphMode": "none",
-        "colorMode": "value",
-        "textMode": "auto",
-        "noValue": "0"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short"
+          ],
+          "fields": "",
+          "values": false
         }
       }
     },
     {
-      "id": 5,
+      "id": 102,
       "type": "stat",
-      "title": "Server replicas by version",
+      "title": "Downloads completed",
+      "description": "Successful downloads in the selected range. Process-local, so a restart resets it.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -214,8 +226,8 @@
       },
       "targets": [
         {
-          "expr": "count by (version) (mx_build_info{component=\"server\"})",
-          "legendFormat": "{{version}}",
+          "expr": "sum(increase(mx_download_seconds_count{outcome=\"downloaded\"}[$__range]))",
+          "legendFormat": "",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -223,21 +235,263 @@
           }
         }
       ],
-      "description": "Replicas running each version. More than one bar means a rollout is in progress, or stuck.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        }
+      },
       "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "noValue": "0",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ]
-        },
-        "graphMode": "none",
-        "colorMode": "value",
-        "textMode": "auto",
-        "noValue": "0"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 103,
+      "type": "stat",
+      "title": "Download failures",
+      "description": "Downloads that ended in ERROR. MXDownloadFailureRatio alerts when these exceed a tenth of all downloads.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
       },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 5
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(mx_download_seconds_count{outcome=\"error\"}[$__range]))",
+          "legendFormat": "",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
       "fieldConfig": {
         "defaults": {
-          "unit": "short"
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "noValue": "0",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 104,
+      "type": "stat",
+      "title": "Takeovers",
+      "description": "A previous downloader died and the model is being pulled again from scratch -- hundreds of GB for a large one. MXDownloadTakeover fires on the first. The counter is pre-created at zero so the first one is visible.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 5
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(mx_download_claims_total{result=\"takeover\"}[$__range]))",
+          "legendFormat": "",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "noValue": "0",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 105,
+      "type": "stat",
+      "title": "Leases lost",
+      "description": "A downloader stopped heartbeating; the documented leading indicator of a duplicate download. MXDownloadLeaseLost fires on this.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 5
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(mx_download_lease_refresh_total{result=\"lost\"}[$__range]))",
+          "legendFormat": "",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "noValue": "0",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 106,
+      "type": "stat",
+      "title": "gRPC errors",
+      "description": "Requests that failed for a reason the server owns. cancelled is the caller leaving and not_found is a legitimate answer, so both are excluded -- the same exclusion MXGrpcErrorRatio uses.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 5
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(mx_grpc_requests_total{outcome!~\"ok|cancelled|not_found\"}[$__range]))",
+          "legendFormat": "",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "noValue": "0",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
         }
       }
     },
@@ -250,7 +504,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 5
+        "y": 9
       },
       "panels": []
     },
@@ -266,7 +520,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 6
+        "y": 10
       },
       "targets": [
         {
@@ -316,7 +570,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 6
+        "y": 10
       },
       "targets": [
         {
@@ -348,7 +602,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 6
+        "y": 10
       },
       "targets": [
         {
@@ -380,7 +634,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 6
+        "y": 10
       },
       "targets": [
         {
@@ -412,7 +666,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 14
+        "y": 18
       },
       "targets": [
         {
@@ -444,7 +698,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 14
+        "y": 18
       },
       "targets": [
         {
@@ -473,7 +727,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 22
+        "y": 26
       },
       "panels": []
     },
@@ -489,7 +743,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 23
+        "y": 27
       },
       "targets": [
         {
@@ -521,7 +775,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 23
+        "y": 27
       },
       "targets": [
         {
@@ -553,7 +807,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 23
+        "y": 27
       },
       "targets": [
         {
@@ -585,7 +839,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 23
+        "y": 27
       },
       "targets": [
         {
@@ -613,7 +867,7 @@
         "h": 5,
         "w": 24,
         "x": 0,
-        "y": 31
+        "y": 35
       },
       "options": {
         "mode": "markdown",
@@ -629,7 +883,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 36
+        "y": 40
       },
       "panels": []
     },
@@ -645,7 +899,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 37
+        "y": 41
       },
       "targets": [
         {
@@ -677,7 +931,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 37
+        "y": 41
       },
       "targets": [
         {
@@ -718,7 +972,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 37
+        "y": 41
       },
       "targets": [
         {
@@ -750,7 +1004,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 37
+        "y": 41
       },
       "targets": [
         {
@@ -779,7 +1033,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 45
+        "y": 49
       },
       "panels": []
     },
@@ -795,7 +1049,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 46
+        "y": 50
       },
       "targets": [
         {
@@ -827,7 +1081,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 46
+        "y": 50
       },
       "targets": [
         {
@@ -889,7 +1143,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 46
+        "y": 50
       },
       "targets": [
         {
@@ -921,7 +1175,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 46
+        "y": 50
       },
       "targets": [
         {
@@ -950,7 +1204,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 54
+        "y": 58
       },
       "panels": []
     },
@@ -966,7 +1220,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 55
+        "y": 59
       },
       "targets": [
         {
@@ -1016,7 +1270,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 55
+        "y": 59
       },
       "targets": [
         {
@@ -1048,7 +1302,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 55
+        "y": 59
       },
       "targets": [
         {
@@ -1080,7 +1334,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 55
+        "y": 59
       },
       "targets": [
         {
@@ -1108,7 +1362,7 @@
         "h": 5,
         "w": 24,
         "x": 0,
-        "y": 63
+        "y": 67
       },
       "options": {
         "mode": "markdown",
@@ -1124,7 +1378,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 68
+        "y": 72
       },
       "panels": []
     },
@@ -1140,7 +1394,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 69
+        "y": 73
       },
       "targets": [
         {
@@ -1172,7 +1426,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 69
+        "y": 73
       },
       "targets": [
         {
@@ -1204,7 +1458,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 69
+        "y": 73
       },
       "targets": [
         {
@@ -1218,6 +1472,49 @@
         }
       ],
       "description": "Pods, not ranks. Multiprocess mode merges every rank in a pod into one endpoint with no pid label, so a TP=8 pod contributes exactly one series. Proof of life for the client exporter, independent of whether any P2P activity has happened.",
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "none",
+        "colorMode": "value",
+        "textMode": "auto",
+        "noValue": "0"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Server replicas by version",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 81
+      },
+      "targets": [
+        {
+          "expr": "count by (version) (mx_build_info{component=\"server\"})",
+          "legendFormat": "{{version}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Replicas running each version. More than one bar means a rollout is in progress, or stuck.",
       "options": {
         "reduceOptions": {
           "calcs": [
