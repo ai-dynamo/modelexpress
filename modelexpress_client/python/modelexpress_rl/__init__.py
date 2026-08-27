@@ -10,11 +10,15 @@ from .inference import (
     ObjectStorageGeneratorConfig,
     SglangGeneratorContext,
     VllmGeneratorContext,
+    WeightSource,
 )
 from .train import (
+    FSDPTrainerContext,
+    MegatronTrainerContext,
     ModelExpressTrainerClient,
     ModelExpressTrainerConfig,
     ObjectStorageConfig,
+    TrainerEngineContext,
     TrainerStagingMode,
     WeightPayloadFormat,
 )
@@ -29,11 +33,15 @@ __all__ = [  # noqa: RUF022 - grouped by public API role, not alphabetically.
     # Configuration fixed when a worker client is initialized.
     "ModelExpressGeneratorConfig",
     "ModelExpressTrainerConfig",
+    "FSDPTrainerContext",
+    "MegatronTrainerContext",
     "ObjectStorageConfig",
     "ObjectStorageGeneratorConfig",
     "SglangGeneratorContext",
     "TrainerStagingMode",
+    "TrainerEngineContext",
     "WeightPayloadFormat",
+    "WeightSource",
     "VllmGeneratorContext",
     # Version values shared across the control, trainer, and generator clients.
     "ObjectStorageSource",

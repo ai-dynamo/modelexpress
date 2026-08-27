@@ -10,12 +10,16 @@ from .client import (
     ObjectStorageConfig,
     StagedWeightVersionShard,
 )
+from .context import FSDPTrainerContext, MegatronTrainerContext, TrainerEngineContext
 
 __all__ = [
+    "FSDPTrainerContext",
+    "MegatronTrainerContext",
     "ModelExpressTrainerClient",
     "ModelExpressTrainerConfig",
     "ObjectStorageConfig",
     "StagedWeightVersionShard",
     "TrainerStagingMode",
+    "TrainerEngineContext",
     "WeightPayloadFormat",
 ]

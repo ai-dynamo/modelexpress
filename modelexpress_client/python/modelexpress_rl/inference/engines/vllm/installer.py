@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -21,6 +22,14 @@ import torch
 
 from modelexpress.refit.reshard.geometry import capture_geometry
 from modelexpress.refit.reshard.types import IncompleteRefit
+from modelexpress_rl.inference.plan import (
+    EngineCapabilities,
+    EngineInstaller,
+    PreparedArtifact,
+    PreparedCheckpointArtifact,
+    PreparedEngineTensors,
+)
+from modelexpress_rl.inference.receiver import PreparedCheckpoint
 
 if TYPE_CHECKING:
     from torch.nn import Module
@@ -31,7 +40,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger("modelexpress_rl.inference.engines.vllm.installer")
 
 
-class _VllmInstaller:
+class _VllmInstaller(EngineInstaller):
     """Capture vLLM's load layout and install verified staged tensors."""
 
     def __init__(
@@ -49,6 +58,32 @@ class _VllmInstaller:
         self._parameter_layout: dict[
             str, tuple[tuple[int, ...], torch.dtype]
         ] | None = None
+
+    @property
+    def capabilities(self) -> EngineCapabilities:
+        return EngineCapabilities(
+            artifact_types=frozenset(
+                {
+                    PreparedEngineTensors,
+                    PreparedCheckpointArtifact,
+                }
+            )
+        )
+
+    def install(self, prepared: PreparedArtifact) -> dict[str, float]:
+        started = time.perf_counter()
+        if isinstance(prepared, PreparedEngineTensors):
+            self.install_tensors(prepared.staged.tensors)
+        elif isinstance(prepared, PreparedCheckpointArtifact):
+            checkpoint = prepared.checkpoint
+            if not isinstance(checkpoint, PreparedCheckpoint):
+                raise TypeError("checkpoint preparation has an invalid value")
+            self.install_checkpoint(checkpoint.path)
+        else:
+            raise TypeError(
+                f"unsupported prepared artifact {type(prepared).__name__}"
+            )
+        return {"perf/mx_receive_install_time": time.perf_counter() - started}
 
     @property
     def _is_quantized(self) -> bool:
@@ -140,7 +175,7 @@ class _VllmInstaller:
             self._parameter_layout = self._layout_of(self._build_meta_twin())
         return self._parameter_layout
 
-    def install(self, tensors: dict[str, torch.Tensor]) -> None:
+    def install_tensors(self, tensors: dict[str, torch.Tensor]) -> None:
         """Install verified load-layout tensors without changing graph addresses."""
         self._process_and_commit(tensors)
         _update_mla_absorbed_weights(self._model, quantized=self._is_quantized)

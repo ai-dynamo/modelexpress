@@ -108,17 +108,20 @@ behind the client.
 
 ```python
 from modelexpress_rl import (
+    MegatronTrainerContext,
     ModelExpressTrainerClient,
     ModelExpressTrainerConfig,
     WeightVersionRef,
 )
 
-trainer = ModelExpressTrainerClient.initialize(ModelExpressTrainerConfig())
+trainer = ModelExpressTrainerClient.initialize(
+    ModelExpressTrainerConfig(engine_context=MegatronTrainerContext())
+)
 trainer.bind_tensors(megatron_tensor_specs)
 trainer.publish_version(version=WeightVersionRef(version.uid))
 ```
 
-The deployment supplies `MODEL_NAME`, `MX_TRAINER_ENGINE`,
+The deployment supplies `MODEL_NAME`,
 `MX_TRAINER_STAGING_MODE`, `MX_WEIGHT_PAYLOAD_FORMAT`, `MX_WORKER_HOST`, and the
 normal ModelExpress server configuration. The Megatron adapter derives its
 source slot from logical tensor names and shard geometry. DP replicas of the same
@@ -156,9 +159,9 @@ immutable objects are governed by the bucket's external lifecycle policy.
 The client owns the NIXL manager and trainer-side manifest service. `server_url`
 selects the central ModelExpress control-plane service and defaults to the
 normal ModelExpress server configuration. A Megatron worker may initialize the
-client after selecting its CUDA device but before creating NCCL resources; the
-engine adapter is created lazily when the worker first requests its source slot
-or stages a shard after distributed setup.
+client before its distributed process group is ready; the explicitly selected
+`engine_context` is constructed lazily on the first tensor operation. Deployment
+environment variables do not select Python implementations.
 
 Initialization fixes the staging mode and payload format. On NIXL, `publish()`
 hides manifest publication and the internal `CreateWeightVersionShard` RPC. The
@@ -172,7 +175,7 @@ Version creation and expected-source-slot declaration remain
 framework-orchestrator responsibilities. Each trainer adapter derives its own
 source slot from the engine's native topology; the orchestrator declares the
 expected slots using the same adapter-defined convention. `initialize()`
-selects the configured trainer engine and constructs its adapter internally.
+constructs the adapter selected by `engine_context` internally.
 Megatron and FSDP implementations are available. Megatron-specific APIs live under
 `modelexpress_rl`;
 `modelexpress.refit.reshard` remains the shared, engine-neutral transfer core.

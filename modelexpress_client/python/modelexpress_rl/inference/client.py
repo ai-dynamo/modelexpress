@@ -13,25 +13,19 @@ from typing import Any
 
 import grpc
 from modelexpress import auth, envs
-from modelexpress.client import MxClient, _get_server_url
+from modelexpress.client import _get_server_url
 
 from modelexpress_rl import envs as rl_envs
-from modelexpress_rl.train import WeightPayloadFormat
 from modelexpress_rl.version import WeightVersionRef
 
 from .. import refit_pb2, refit_pb2_grpc
 from ..control import WeightVersion, WeightVersionState, _weight_version
 from ..object_storage import ObjectStorageType
-from .adapter import (
-    GeneratorEngineAdapter,
-    GeneratorEngineContext,
-    GeneratorTransferInputs,
-)
-from .engines import _create_generator_adapter
+from .adapter import GeneratorEngineContext
+from .plan import WeightSource
 from .receiver import ObjectStorageGeneratorConfig
-from .refit_strategy import RefitStrategy
-from .refit_strategy.peer import _PeerRefitStrategy
-from .refit_strategy.trainer import _TrainerRefitStrategy
+from .runtime import GeneratorRuntime
+from .session import SessionUpdate
 
 logger = logging.getLogger("modelexpress_rl.inference.client")
 
@@ -62,8 +56,10 @@ class ModelExpressGeneratorConfig:
     max_transfer_attempts: int = 3
     # Deadline applied independently to each control-plane or manifest RPC.
     rpc_timeout_seconds: float = 30.0
-    # Canonical object-storage checkpoint settings. Omit for the NIXL path.
+    # Canonical object-storage checkpoint settings.
     object_storage: ObjectStorageGeneratorConfig | None = None
+    # Ordered fallback: peer then object storage or trainer, when supported.
+    source_order: tuple[WeightSource, ...] | None = None
 
     def __post_init__(self) -> None:
         """Validate explicit settings before client initialization."""
@@ -77,6 +73,22 @@ class ModelExpressGeneratorConfig:
             self.max_transfer_attempts, "max_transfer_attempts"
         )
         rl_envs.require_positive_float(self.rpc_timeout_seconds, "rpc_timeout_seconds")
+        if self.source_order is not None:
+            if not isinstance(self.source_order, tuple) or not self.source_order:
+                raise ValueError("source_order must be a non-empty tuple")
+            if any(
+                not isinstance(source, WeightSource) for source in self.source_order
+            ):
+                raise TypeError("source_order entries must be WeightSource values")
+            if len(set(self.source_order)) != len(self.source_order):
+                raise ValueError("source_order must not contain duplicates")
+            if (
+                WeightSource.OBJECT_STORAGE in self.source_order
+                and self.object_storage is None
+            ):
+                raise ValueError(
+                    "OBJECT_STORAGE source requires object_storage settings"
+                )
 
 
 class StagedWeightHandle:
@@ -87,16 +99,11 @@ class StagedWeightHandle:
         *,
         client: ModelExpressGeneratorClient,
         version_id: str,
-        staged: Any,
-        lease: _VersionLease,
+        update: SessionUpdate,
     ) -> None:
         self._client = client
         self.version_id = version_id
-        self._staged = staged
-        self._lease = lease
-        self._applied = False
-        self._apply_result: Any = None
-        self._released = False
+        self._update = update
 
     def release(self) -> None:
         """Release local staging buffers; repeated calls are idempotent."""
@@ -105,12 +112,12 @@ class StagedWeightHandle:
     @property
     def metrics(self) -> dict[str, float]:
         """Return preparation metrics exposed by the selected adapter."""
-        return dict(getattr(self._staged, "metrics", {}))
+        return self._update.prepared.metrics
 
     @property
     def applied(self) -> bool:
         """Return whether engine installation completed."""
-        return self._applied
+        return self._update.applied
 
 
 class _VersionLease:
@@ -155,10 +162,7 @@ class ModelExpressGeneratorClient:
         self._operation_lock = threading.RLock()
         self._active_handle: StagedWeightHandle | None = None
         self._serving_version_id: str | None = None
-        self._adapter: GeneratorEngineAdapter | None = None
-        self._p2p_client: MxClient | None = None
-        self._refit_strategies: tuple[RefitStrategy, ...] = ()
-        self._uses_s3 = False
+        self._runtime: GeneratorRuntime | None = None
         self._closed = False
 
     @classmethod
@@ -191,41 +195,27 @@ class ModelExpressGeneratorClient:
         ):
             raise ValueError("only S3 object storage is currently supported")
 
-        adapter = _create_generator_adapter(
-            engine_context=config.engine_context,
-            worker_id=worker_id,
-            object_storage=config.object_storage,
-        )
         client = cls()
         client.model_name = model_name
         client.worker_id = worker_id
         client.server_url = server_url
         client._registration_ttl_seconds = registration_ttl_seconds
         client._lease_ttl_seconds = lease_ttl_seconds
-        client._max_transfer_attempts = config.max_transfer_attempts
         client._rpc_timeout_seconds = config.rpc_timeout_seconds
-        client._adapter = adapter
-        client._uses_s3 = config.object_storage is not None
-        if config.object_storage is not None:
-            client._serving_version_id = config.object_storage.initial_base_version_id
-        else:
-            client._p2p_client = MxClient(server_url=server_url)
-            client._refit_strategies = (
-                _PeerRefitStrategy(
-                    adapter=adapter,
-                    p2p_client=client._p2p_client,
-                    worker_id=worker_id,
-                    max_transfer_attempts=config.max_transfer_attempts,
-                    rpc_timeout_seconds=config.rpc_timeout_seconds,
-                ),
-                _TrainerRefitStrategy(
-                    adapter=adapter,
-                    service=lambda: client._service,
-                    max_transfer_attempts=config.max_transfer_attempts,
-                    rpc_timeout_seconds=config.rpc_timeout_seconds,
-                ),
-            )
         try:
+            runtime = GeneratorRuntime.initialize(
+                engine_context=config.engine_context,
+                worker_id=worker_id,
+                server_url=server_url,
+                object_storage=config.object_storage,
+                source_order=config.source_order,
+                max_transfer_attempts=config.max_transfer_attempts,
+                rpc_timeout_seconds=config.rpc_timeout_seconds,
+                service=lambda: client._service,
+                start_lease=client._start_version_lease,
+            )
+            client._runtime = runtime
+            client._serving_version_id = runtime.initial_version_id
             if client._serving_version_id is not None:
                 client._validate_initial_base(client._serving_version_id)
             client._register_worker()
@@ -254,12 +244,12 @@ class ModelExpressGeneratorClient:
                     return self._active_handle
                 raise RuntimeError("another generator update is still active")
             ready = self._get_ready_version(version.version_id)
-            staged, lease = self._stage_with_lease(ready)
+            assert self._runtime is not None
+            update = self._runtime.session.stage(ready)
             self._active_handle = StagedWeightHandle(
                 client=self,
                 version_id=version.version_id,
-                staged=staged,
-                lease=lease,
+                update=update,
             )
             return self._active_handle
 
@@ -268,55 +258,12 @@ class ModelExpressGeneratorClient:
         if not isinstance(staged, StagedWeightHandle) or staged._client is not self:
             raise ValueError("staged handle does not belong to this client")
         with self._operation_lock:
-            if staged._released:
+            if staged._update.released:
                 raise RuntimeError("staged weight has already been released")
-            if staged._applied:
-                return staged._apply_result
-            primary_error: BaseException | None = None
-            try:
-                staged._apply_result = self._adapter.apply_weight(staged._staged)
-                staged._applied = True
-                self._serving_version_id = staged.version_id
-                if self._p2p_client is not None:
-                    for attempt in range(2):
-                        try:
-                            self._adapter.publish_weight_version(
-                                version_id=staged.version_id,
-                                staged=staged._staged,
-                                p2p_client=self._p2p_client,
-                                worker_id=self.worker_id,
-                            )
-                            break
-                        except Exception:
-                            if attempt == 0:
-                                logger.warning(
-                                    "failed to publish applied version %s as a P2P "
-                                    "source; retrying once",
-                                    staged.version_id,
-                                    exc_info=True,
-                                )
-                            else:
-                                logger.exception(
-                                    "failed to publish applied version %s as a P2P "
-                                    "source after retry",
-                                    staged.version_id,
-                                )
-                return staged._apply_result
-            except BaseException as error:
-                primary_error = error
-                raise
-            finally:
-                try:
-                    staged._lease.close()
-                except grpc.RpcError:
-                    if primary_error is None:
-                        raise
-                    logger.warning(
-                        "failed to release version %s lease while handling %s",
-                        staged.version_id,
-                        type(primary_error).__name__,
-                        exc_info=True,
-                    )
+            assert self._runtime is not None
+            result = self._runtime.session.apply(staged._update)
+            self._serving_version_id = staged.version_id
+            return result
 
     def close(self) -> None:
         """Stop renewal and release control-plane and adapter resources."""
@@ -333,13 +280,9 @@ class ModelExpressGeneratorClient:
             self._channel.close()
             self._channel = None
             self._stub = None
-        if self._adapter is not None:
-            self._adapter.close()
-            self._adapter = None
-        if self._p2p_client is not None:
-            self._p2p_client.close()
-            self._p2p_client = None
-        self._refit_strategies = ()
+        if self._runtime is not None:
+            self._runtime.close()
+            self._runtime = None
         self._closed = True
 
     def __enter__(self) -> ModelExpressGeneratorClient:
@@ -393,19 +336,8 @@ class ModelExpressGeneratorClient:
             raise RuntimeError(f"weight version {version_id!r} is not READY")
         if version.model_name != self.model_name:
             raise RuntimeError("weight version model_name does not match the generator")
-        if self._uses_s3:
-            if version.payload_format is not WeightPayloadFormat.XOR_DELTA:
-                raise RuntimeError("S3 generator requires XOR_DELTA weight versions")
-            if version.base_version_id is None:
-                raise RuntimeError("XOR_DELTA version is missing base_version_id")
-            if (
-                version.version_id != self._serving_version_id
-                and version.base_version_id != self._serving_version_id
-            ):
-                raise RuntimeError(
-                    f"weight version base {version.base_version_id!r} does not match "
-                    f"serving version {self._serving_version_id!r}"
-                )
+        assert self._runtime is not None
+        self._runtime.session.validate(version)
         return version
 
     def _validate_initial_base(self, version_id: str) -> None:
@@ -486,88 +418,21 @@ class ModelExpressGeneratorClient:
             timeout=self._rpc_timeout_seconds,
         )
 
-    def _stage_with_lease(
-        self, version: WeightVersion
-    ) -> tuple[object, _VersionLease]:
-        lease = self._start_version_lease(version.version_id)
-        try:
-            if self._uses_s3:
-                if version.object_storage is None:
-                    raise RuntimeError(
-                        "The version is missing its object storage source"
-                    )
-                if version.object_storage.storage_type is not ObjectStorageType.S3:
-                    raise RuntimeError("S3 generator requires S3 object storage")
-                inputs = GeneratorTransferInputs(
-                    version_id=version.version_id,
-                    base_version_id=version.base_version_id,
-                    layout_signature=version.layout_signature,
-                    payload_format=version.payload_format,
-                    sources=(),
-                    object_storage=version.object_storage,
-                )
-                last_error: grpc.RpcError | RuntimeError | None = None
-                for _ in range(self._max_transfer_attempts):
-                    try:
-                        return self._adapter.stage_weight(inputs), lease
-                    except (grpc.RpcError, RuntimeError) as error:
-                        last_error = error
-                assert last_error is not None
-                raise last_error
-
-            for strategy in self._refit_strategies:
-                staged = strategy.stage(version)
-                if staged is not None:
-                    return staged, lease
-            raise RuntimeError(
-                f"no usable refit source for weight version {version.version_id!r}"
-            )
-        except BaseException as primary_error:
-            try:
-                lease.close()
-            except grpc.RpcError:
-                logger.warning(
-                    "failed to release version %s lease while handling %s",
-                    version.version_id,
-                    type(primary_error).__name__,
-                    exc_info=True,
-                )
-            raise
-
     def _release_staged(self, staged: StagedWeightHandle) -> None:
         if staged._client is not self:
             raise ValueError("staged handle does not belong to this client")
         with self._operation_lock:
-            if staged._released:
+            if staged._update.released:
                 return
-            primary_error: BaseException | None = None
-            try:
-                self._adapter.release_staged_weight(staged._staged)
-            except BaseException as error:
-                primary_error = error
-                raise
-            finally:
-                lease_error: grpc.RpcError | None = None
-                try:
-                    staged._lease.close()
-                except grpc.RpcError as error:
-                    lease_error = error
-                staged._released = True
-                if self._active_handle is staged:
-                    self._active_handle = None
-                if lease_error is not None:
-                    if primary_error is None:
-                        raise lease_error
-                    logger.warning(
-                        "failed to release version %s lease while handling %s",
-                        staged.version_id,
-                        type(primary_error).__name__,
-                        exc_info=lease_error,
-                    )
+            assert self._runtime is not None
+            self._runtime.session.release(staged._update)
+            if self._active_handle is staged:
+                self._active_handle = None
 
 
 __all__ = [
     "ModelExpressGeneratorClient",
     "ModelExpressGeneratorConfig",
     "StagedWeightHandle",
+    "WeightSource",
 ]

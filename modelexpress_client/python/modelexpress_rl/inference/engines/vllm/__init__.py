@@ -5,17 +5,17 @@
 
 from __future__ import annotations
 
+from modelexpress.engines.vllm.adapter import VllmAdapter
+
 from ...adapter import GeneratorEngineContext
-from ...receiver import ObjectStorageGeneratorConfig
-from .adapter import VllmGeneratorAdapter
+from ...runtime import EngineRuntime, FullTensorEngineCapability
 from .context import VllmGeneratorContext
+from .installer import _VllmInstaller
 
 
-def _create_vllm_adapter(
+def _create_vllm_engine_runtime(
     engine_context: GeneratorEngineContext,
-    worker_id: str,
-    object_storage: ObjectStorageGeneratorConfig | None = None,
-) -> VllmGeneratorAdapter:
+) -> EngineRuntime:
     if not isinstance(engine_context, VllmGeneratorContext):
         raise TypeError("VLLM requires a VllmGeneratorContext")
 
@@ -31,13 +31,31 @@ def _create_vllm_adapter(
         raise TypeError("vLLM engine context vllm_config must be a VllmConfig")
     if not isinstance(model_config, ModelConfig):
         raise TypeError("vLLM engine context model_config must be a ModelConfig")
-    return VllmGeneratorAdapter(
+    engine = VllmAdapter(vllm_config, model_config)
+    installer = _VllmInstaller(
         model=model,
         vllm_config=vllm_config,
         model_config=model_config,
-        worker_id=worker_id,
-        object_storage=object_storage,
+        device=engine.get_target_device(),
+    )
+    def build_identity(version_id: str):
+        identity = engine.build_identity()
+        identity.revision = version_id
+        return identity
+
+    return EngineRuntime(
+        model_name=vllm_config.model_config.model,
+        installer=installer,
+        full_tensor=FullTensorEngineCapability(
+            device_id=engine.get_device_id(),
+            device=engine.get_target_device(),
+            worker_rank=engine.get_worker_rank(),
+            accelerator=engine.accelerator_backend.name,
+            capture_layout=installer.capture,
+            parameter_layout=installer.parameter_layout,
+            build_identity=build_identity,
+        ),
     )
 
 
-__all__ = ["VllmGeneratorAdapter", "VllmGeneratorContext"]
+__all__ = ["VllmGeneratorContext"]

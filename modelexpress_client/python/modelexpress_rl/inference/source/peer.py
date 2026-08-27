@@ -1,50 +1,65 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Inference-peer refit strategy."""
+"""Generator-peer source resolution."""
 
 import logging
 import random
+from collections.abc import Callable, Iterator
 
 import grpc
-
 from modelexpress import p2p_pb2
 from modelexpress.client import MxClient
 from modelexpress.metadata.worker_server import fetch_tensor_manifest
 from modelexpress.types import ManifestMismatchError
 
 from ...control import WeightVersion
-from ..adapter import GeneratorEngineAdapter
-from .base import RefitStrategy
+from ...train import WeightPayloadFormat
+from ..plan import (
+    GeneratorPeerUpdateSource,
+    ResolvedSource,
+    SourceResolver,
+    WeightSource,
+)
 
-logger = logging.getLogger("modelexpress_rl.inference.refit_strategy.peer")
+logger = logging.getLogger("modelexpress_rl.inference.source.peer")
 
 
-class _PeerRefitStrategy(RefitStrategy):
-    """Prefer an already-updated generator with the same rank and version."""
+class GeneratorSourceResolver(SourceResolver):
+    """Resolve an already-updated generator with matching engine identity."""
 
     def __init__(
         self,
         *,
-        adapter: GeneratorEngineAdapter,
         p2p_client: MxClient,
         worker_id: str,
-        max_transfer_attempts: int,
+        worker_rank: int,
+        build_identity: Callable[[str], p2p_pb2.SourceIdentity],
         rpc_timeout_seconds: float,
     ) -> None:
-        self._adapter = adapter
         self._p2p_client = p2p_client
         self._worker_id = worker_id
-        self._max_transfer_attempts = max_transfer_attempts
+        self._worker_rank = worker_rank
+        self._build_identity = build_identity
         self._rpc_timeout_seconds = rpc_timeout_seconds
 
-    def stage(self, version: WeightVersion) -> object | None:
+    @property
+    def kind(self) -> WeightSource:
+        return WeightSource.GENERATOR
+
+    def supports(self, version: WeightVersion) -> bool:
+        return version.payload_format is not WeightPayloadFormat.UNSPECIFIED
+
+    def payload_format(self, version: WeightVersion) -> WeightPayloadFormat:
+        del version
+        return WeightPayloadFormat.FULL_TENSOR
+
+    def candidates(self, version: WeightVersion) -> Iterator[ResolvedSource]:
         sources = list(self._list_ready_sources(version.version_id))
         random.Random().shuffle(sources)
-        for source in sources[: self._max_transfer_attempts]:
+        for source in sources:
             try:
                 worker = self._fetch_source(source)
-                staged = self._adapter.stage_peer_weight(worker)
             except (grpc.RpcError, RuntimeError, ManifestMismatchError) as error:
                 logger.warning(
                     "P2P peer %s failed for version %s: %s",
@@ -53,34 +68,25 @@ class _PeerRefitStrategy(RefitStrategy):
                     error,
                 )
                 continue
-            logger.info(
-                "staged weight version %s from P2P peer %s",
-                version.version_id,
-                source.worker_id,
-            )
-            return staged
-        return None
+            yield GeneratorPeerUpdateSource(worker=worker)
 
     def _list_ready_sources(
         self, version_id: str
     ) -> tuple[p2p_pb2.SourceInstanceRef, ...]:
         try:
-            identity = self._adapter.build_p2p_identity(version_id)
             response = self._p2p_client.list_sources(
-                identity=identity,
+                identity=self._build_identity(version_id),
                 status_filter=p2p_pb2.SOURCE_STATUS_READY,
             )
         except (grpc.RpcError, RuntimeError) as error:
             logger.warning(
-                "P2P peer discovery failed for version %s: %s",
-                version_id,
-                error,
+                "P2P peer discovery failed for version %s: %s", version_id, error
             )
             return ()
         return tuple(
             source
             for source in response.instances
-            if source.worker_rank == self._adapter.worker_rank
+            if source.worker_rank == self._worker_rank
             and source.worker_id != self._worker_id
         )
 
@@ -96,7 +102,7 @@ class _PeerRefitStrategy(RefitStrategy):
                 f"P2P metadata disappeared for worker {source.worker_id!r}"
             )
         worker = response.worker
-        if worker.worker_rank != self._adapter.worker_rank:
+        if worker.worker_rank != self._worker_rank:
             raise RuntimeError(
                 f"P2P worker rank changed for worker {source.worker_id!r}"
             )
@@ -112,4 +118,4 @@ class _PeerRefitStrategy(RefitStrategy):
         return worker
 
 
-__all__: list[str] = []
+__all__ = ["GeneratorSourceResolver"]
