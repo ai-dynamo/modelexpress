@@ -73,7 +73,14 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
 
     model = torch.nn.Linear(4, 4)
     config = VllmConfig()
-    runtime = _create_vllm_engine_runtime(VllmGeneratorContext(model, config))
+    convert_native_to_hf = lambda weights: weights
+    runtime = _create_vllm_engine_runtime(
+        VllmGeneratorContext(
+            model,
+            config,
+            convert_native_to_hf=convert_native_to_hf,
+        )
+    )
 
     assert runtime.model_name == "test/model"
     assert runtime.installer.kwargs == {
@@ -81,6 +88,7 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
         "vllm_config": config,
         "model_config": config.model_config,
         "device": torch.device("cuda:2"),
+        "convert_native_to_hf": convert_native_to_hf,
     }
     assert runtime.full_tensor is not None
     assert runtime.full_tensor.device_id == 2

@@ -11,13 +11,15 @@ how an inference engine captures its load layout or installs received weights.
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 import torch
-from modelexpress import p2p_pb2
+
+from modelexpress import envs, p2p_pb2
 from modelexpress.client import MxClientBase
 from modelexpress.load_strategy.base import unpublish_metadata_for_worker
 from modelexpress.metadata.payload import worker_tensor_descriptors
@@ -47,6 +49,10 @@ from modelexpress.refit.reshard.types import (
 )
 from modelexpress.refit.reshard.verify import shard_region, tensor_digest
 from modelexpress.types import TensorDescriptor
+
+# Named under modelexpress.* (not modelexpress_rl) so the per-update summary surfaces
+# in the vLLM engine process, which only configures the modelexpress logger.
+logger = logging.getLogger("modelexpress.reshard.staged_transfer")
 
 
 @dataclass(frozen=True)
@@ -166,7 +172,17 @@ def _merge_plan(target: TransferPlan, source: TransferPlan) -> None:
 
 
 def _plan_staged_transfer(capture: CaptureResult, sources: dict) -> TransferPlan:
-    """Plan each source independently, reconstructing only unverifiable views."""
+    """Plan reads for each source.
+
+    Default: minimal slice reads via plan_transfer (a partial read of a shard cannot
+    be whole-shard digest-verified, so correctness rests on the coverage gate). Under
+    MX_RESHARD_PUBLISH_DIGEST (verification mode): reconstruct every source that isn't
+    a whole-tensor identity copy as a full pull, so _verify has a complete shard to
+    digest-check.
+    """
+    if not envs.MX_RESHARD_PUBLISH_DIGEST:
+        return plan_transfer(capture, sources)
+
     result = TransferPlan()
     copies_by_source: dict[str, list[RecordedCopy]] = {}
     for copy in capture.copies:
@@ -480,6 +496,7 @@ class _NixlStagedTransfer:
         prepared.transport.read(list(prepared.descriptors))
         wire_seconds = time.perf_counter() - started
 
+        reconstruct_started = time.perf_counter()
         for full in prepared.plan.full_pulls:
             source = self._full_buffers[full.src_name]
             for copy in full.copies:
@@ -495,14 +512,32 @@ class _NixlStagedTransfer:
                 self._convert_buffers[convert.param_name]
             )
         torch.cuda.synchronize(self._device)
-        self._verify(prepared)
+        reconstruct_seconds = time.perf_counter() - reconstruct_started
+        # Only digest mode has complete tensors and stamped digests to check.
+        if envs.MX_RESHARD_PUBLISH_DIGEST:
+            self._verify(prepared)
 
+        bytes_received = sum(d.nbytes for d in prepared.descriptors)
+        logger.info(
+            "[TIMING] staged xfer: %.3f GB, %d descriptors "
+            "(seg=%d full_pull=%d convert=%d), %d tensors | "
+            "wire=%.3fs reconstruct=%.3fs",
+            bytes_received / 1e9,
+            len(prepared.descriptors),
+            len(prepared.plan.segments),
+            len(prepared.plan.full_pulls),
+            len(prepared.plan.converts),
+            len(self._recv_buffers),
+            wire_seconds,
+            reconstruct_seconds,
+        )
         return _StagedNixlWeights(
             tensors=self._recv_buffers,
             metrics={
-                "bytes_received": sum(d.nbytes for d in prepared.descriptors),
+                "bytes_received": bytes_received,
                 "segments": len(prepared.descriptors),
                 "wire_s": round(wire_seconds, 6),
+                "reconstruct_s": round(reconstruct_seconds, 6),
                 "full_pull_sources": len(prepared.plan.full_pulls),
                 "converts": len(prepared.plan.converts),
             },

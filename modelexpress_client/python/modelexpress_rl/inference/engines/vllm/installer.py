@@ -3,10 +3,11 @@
 
 """vLLM load-layout capture and graph-safe weight installation.
 
-Capture builds an unquantized meta twin and records where each published source
-lands in vLLM's load-time layout. Installation uses vLLM's layerwise reload and
-post-load processing to update the live model while preserving storage already
-referenced by compiled CUDA graphs.
+Capture records where each published source lands in vLLM's load-time layout,
+tracing the live model with its params reverted to bf16 load-time skeletons via
+layerwise reload. Installation uses vLLM's layerwise reload and post-load
+processing to update the live model while preserving storage already referenced
+by compiled CUDA graphs.
 """
 
 from __future__ import annotations
@@ -20,7 +21,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from modelexpress.refit.reshard.geometry import capture_geometry
+from modelexpress.refit.reshard.geometry import (
+    capture_weights,
+    convert_source_weights,
+)
 from modelexpress.refit.reshard.types import IncompleteRefit
 from modelexpress_rl.inference.plan import (
     EngineCapabilities,
@@ -50,11 +54,13 @@ class _VllmInstaller(EngineInstaller):
         vllm_config: VllmConfig,
         model_config: ModelConfig,
         device: torch.device,
+        convert_native_to_hf: Callable[[dict], dict] | None = None,
     ) -> None:
         self._model = model
         self._vllm_config = vllm_config
         self._model_config = model_config
         self._device = device
+        self._convert_native_to_hf = convert_native_to_hf
         self._parameter_layout: dict[
             str, tuple[tuple[int, ...], torch.dtype]
         ] | None = None
@@ -141,33 +147,62 @@ class _VllmInstaller(EngineInstaller):
         CaptureResult,
         dict[str, tuple[tuple[int, ...], torch.dtype]],
     ]:
-        """Record how published tensors map into vLLM's load-time parameters."""
+        """Record how published tensors map into vLLM's load-time parameters.
+
+        Captures on the LIVE model with its params reverted to bf16 load-time
+        skeletons via layerwise reload; graph-bound kernel tensors are restored
+        afterward without finalizing (finalizing would commit the empty skeletons
+        and corrupt the live params).
+        """
         try:
+            from vllm.config import set_current_vllm_config
+            from vllm.model_executor.model_loader.reload.layerwise import (
+                LAYERWISE_INFO,
+                _get_original_loader,
+                _place_kernel_tensors,
+                initialize_layerwise_reload,
+            )
             from vllm.model_executor.model_loader.weight_utils import (
                 default_weight_loader,
             )
         except (ImportError, AttributeError) as error:
             raise RuntimeError(
-                "ModelExpress refit requires vLLM's weight-loader APIs"
+                "ModelExpress refit requires vLLM's layerwise reload APIs"
             ) from error
 
-        # The explicit default loader stamps norm and other parameters without a
-        # custom weight_loader, so their copies are attributed rather than lost.
-        twin = self._build_meta_twin()
-        capture = capture_geometry(
-            twin,
-            manifest,
-            default_weight_loader=default_weight_loader,
-        )
+        model = self._model
+        with torch.device(self._device), set_current_vllm_config(self._vllm_config):
+            initialize_layerwise_reload(model)
+            try:
+                # Trace the ORIGINAL loaders, not the reload shims they were wrapped in.
+                for _, param in model.named_parameters():
+                    param.weight_loader = _get_original_loader(param)
+                # The explicit default loader stamps params without a custom
+                # weight_loader (norms) so their copies are attributed, not dropped.
+                capture = capture_weights(
+                    model,
+                    convert_source_weights(self._convert_native_to_hf, manifest),
+                    default_weight_loader=default_weight_loader,
+                )
+                param_layout = {
+                    name: (tuple(p.shape), p.dtype)
+                    for name, p in model.named_parameters()
+                }
+            finally:
+                for layer in model.modules():
+                    info = LAYERWISE_INFO.get(layer)
+                    if info is not None:
+                        if info.kernel_tensors is not None:
+                            _place_kernel_tensors(layer, info)
+                        info.reset()
         logger.info(
             "captured %d copies and %d unsupported sources (quantized=%s)",
             len(capture.copies),
             len(capture.unsupported),
             self._is_quantized,
         )
-        parameter_layout = self._layout_of(twin)
-        self._parameter_layout = parameter_layout
-        return capture, parameter_layout
+        self._parameter_layout = param_layout
+        return capture, param_layout
 
     def parameter_layout(self) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
         """Return the canonical load-time layout used by peer staging buffers."""

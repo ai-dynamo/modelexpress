@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING
 from ...adapter import GeneratorEngineContext
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from torch.nn import Module
     from vllm.config import VllmConfig
 
@@ -21,6 +23,8 @@ class VllmGeneratorContext(GeneratorEngineContext):
 
     model: Module
     vllm_config: VllmConfig
+    # Maps a trainer-native source state_dict to HF names/layout before capture.
+    convert_native_to_hf: Callable[[dict], dict] | None = None
 
 
 __all__ = ["VllmGeneratorContext"]

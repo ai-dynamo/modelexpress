@@ -38,7 +38,9 @@ def _create_vllm_engine_runtime(
         vllm_config=vllm_config,
         model_config=model_config,
         device=engine.get_target_device(),
+        convert_native_to_hf=engine_context.convert_native_to_hf,
     )
+
     def build_identity(version_id: str):
         identity = engine.build_identity()
         identity.revision = version_id
