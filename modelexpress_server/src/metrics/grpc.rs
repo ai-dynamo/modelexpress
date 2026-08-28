@@ -70,7 +70,10 @@ pub enum RpcOutcome {
     /// metadata-store outage. `mx_backend_ops_total` disambiguates: a real store
     /// outage lights that family up too.
     BackendError,
-    /// Rejected by the ServiceAccount auth layer.
+    /// Rejected on identity grounds: by the ServiceAccount auth layer, or by a
+    /// handler that refused what an authenticated caller asserted about itself.
+    /// `from_code` already folds `PermissionDenied` in here, so authentication
+    /// and authorization failures share one label by design.
     Unauthenticated,
     /// The caller went away before the handler finished: client disconnect,
     /// `RST_STREAM`, or a deadline. Recorded from a drop guard, never from a
