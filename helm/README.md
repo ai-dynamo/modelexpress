@@ -21,7 +21,33 @@ helm repo add modelexpress https://your-repo-url
 helm repo update
 ```
 
-### 2. Install the chart
+### 2. Install or update CRDs for the Kubernetes backend
+
+The chart ships the `ModelMetadata` and `ModelCacheEntry` CRDs in its `crds/`
+directory. Helm installs CRDs that are missing during `helm install`, but it does
+not update CRDs that already exist during either `helm install` or
+`helm upgrade`. Because CRDs are cluster-scoped, an older definition can remain
+even when installing a new release in a different namespace.
+
+Before upgrading the chart, or installing it on a cluster that already has
+ModelExpress CRDs, apply the definitions from the chart with cluster-admin
+credentials:
+
+```bash
+kubectl apply -f helm/crds/modelexpress-crds.yaml
+```
+
+When using a packaged or remote chart rather than a source checkout, extract and
+apply the CRDs from the same chart version you are about to install:
+
+```bash
+helm show crds CHART_REFERENCE --version CHART_VERSION | kubectl apply -f -
+```
+
+This step is required to deliver schema changes to existing clusters. Helm does
+not remove these CRDs when the application release is uninstalled.
+
+### 3. Install the chart
 
 To view the available tags for the official ModelExpress image, see the
 [ModelExpress Server tags](https://catalog.ngc.nvidia.com/orgs/nvidia/ai-dynamo/containers/modelexpress-server/-/tags)
@@ -200,6 +226,9 @@ env:
 ## Upgrading
 
 ```bash
+# Helm does not upgrade existing CRDs, so update them first.
+kubectl apply -f helm/crds/modelexpress-crds.yaml
+
 helm upgrade my-modelexpress ./helm
 ```
 
