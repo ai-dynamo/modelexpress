@@ -303,18 +303,29 @@ impl RefitBackend for RedisRefitBackend {
         &self,
         request: &CreateWeightVersionRequest,
     ) -> RefitResult<WeightVersion> {
-        for _ in 0..5 {
-            let uid: String = Uuid::new_v4()
-                .simple()
-                .to_string()
-                .chars()
-                .take(8)
-                .collect();
+        let requested_uid = request.uid.as_deref();
+        let attempts = if requested_uid.is_some() { 1 } else { 5 };
+        for _ in 0..attempts {
+            let uid = match requested_uid {
+                Some(uid) => uid.to_string(),
+                None => Uuid::new_v4()
+                    .simple()
+                    .to_string()
+                    .chars()
+                    .take(8)
+                    .collect(),
+            };
             let result = self.create_version_once(request, &uid).await?;
             if result == "CREATED" {
                 return self.get_weight_version(&uid).await;
             }
             if let Some(existing_uid) = result.strip_prefix("EXISTING:") {
+                if requested_uid.is_some_and(|uid| uid != existing_uid) {
+                    return Err(RefitBackendError::AlreadyExists(
+                        "idempotency_key was already used for a different WeightVersion"
+                            .to_string(),
+                    ));
+                }
                 let fields = self.get_version_fields(existing_uid).await?;
                 let initial_state = fields.get("initial_state").map_or_else(
                     || Ok(i32::from(WeightVersionState::Staging)),
@@ -339,6 +350,11 @@ impl RefitBackend for RedisRefitBackend {
                 return Err(RefitBackendError::AlreadyExists(
                     "idempotency_key was already used for a different WeightVersion".to_string(),
                 ));
+            }
+            if result == "COLLISION" && requested_uid.is_some() {
+                return Err(RefitBackendError::AlreadyExists(format!(
+                    "weight version UID {uid:?} already exists"
+                )));
             }
             if result != "COLLISION" {
                 return Err(RefitBackendError::Internal(format!(

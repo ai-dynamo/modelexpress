@@ -547,7 +547,9 @@ version-level object-storage source second. A memory-backed generator defaults
 to a peer first and trainer manifests second. `source_order` can select or
 reorder supported sources without changing an engine integration.
 
-`WeightVersion.uid` is MX's opaque version identity. For an `XOR_DELTA`,
+`WeightVersion.uid` is MX's opaque version identity. A create request may supply
+the UID; MX generates one when it is omitted. Creating another version with an
+already-used caller-supplied UID returns `ALREADY_EXISTS`. For an `XOR_DELTA`,
 `base_version_id` identifies the base version's UID. The canonical index records
 these UID strings as `metadata.version` and `metadata.base_version`. MX assigns
 no numeric ordering and requires no version-directory naming convention; the

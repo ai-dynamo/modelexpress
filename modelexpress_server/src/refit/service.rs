@@ -65,6 +65,9 @@ fn validate_s3_uri(uri: &str) -> Result<(), Status> {
 }
 
 fn validate_publication(request: &CreateWeightVersionRequest) -> Result<(), Status> {
+    if let Some(uid) = request.uid.as_deref() {
+        required(uid, "uid")?;
+    }
     let state =
         WeightVersionState::try_from(request.state).unwrap_or(WeightVersionState::Unspecified);
     if let Some(object_storage) = request.object_storage.as_ref() {
@@ -388,6 +391,7 @@ mod tests {
         for state in [WeightVersionState::Staging, WeightVersionState::Ready] {
             assert!(
                 validate_publication(&CreateWeightVersionRequest {
+                    uid: Some("caller-version".to_string()),
                     object_storage: Some(s3_source(
                         "s3://weights/run/policy/v42/model.safetensors.index.json",
                     )),
@@ -410,6 +414,12 @@ mod tests {
     #[test]
     fn invalid_object_storage_and_worker_sharded_publications_are_rejected() {
         for request in [
+            CreateWeightVersionRequest {
+                uid: Some(" \t".to_string()),
+                expected_source_slots: vec!["rank:0".to_string()],
+                state: WeightVersionState::Staging.into(),
+                ..Default::default()
+            },
             CreateWeightVersionRequest {
                 object_storage: Some(ObjectStorageSource::default()),
                 state: WeightVersionState::Staging.into(),

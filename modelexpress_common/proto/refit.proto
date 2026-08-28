@@ -79,7 +79,8 @@ message RegisterWorkerResponse {
 }
 
 message WeightVersion {
-  // MX-generated opaque identity for this WeightVersion.
+  // Opaque identity for this WeightVersion. MX generates it when the caller
+  // omits CreateWeightVersionRequest.uid.
   string uid = 1;
   string model_name = 2;
   string idempotency_key = 3;
@@ -113,6 +114,8 @@ message CreateWeightVersionRequest {
   // publication.
   ObjectStorageSource object_storage = 6;
   WeightVersionState state = 7;
+  // Optional caller-selected identity; MX generates one when omitted.
+  optional string uid = 8;
 }
 
 message CreateWeightVersionResponse {
