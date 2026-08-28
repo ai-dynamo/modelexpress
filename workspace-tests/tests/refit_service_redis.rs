@@ -334,11 +334,14 @@ async fn caller_selected_version_uid_is_unique_and_idempotency_bound() {
         .expect("version in response");
     assert_eq!(created.uid, requested_uid);
 
-    let duplicate = client
+    let repeated = client
         .create_weight_version(request.clone())
         .await
-        .expect_err("an existing caller UID is never idempotently reused");
-    assert_eq!(duplicate.code(), tonic::Code::AlreadyExists);
+        .expect("an identical request is idempotent")
+        .into_inner()
+        .version
+        .expect("version in response");
+    assert_eq!(repeated, created);
 
     let mut same_uid_different_key = request.clone();
     same_uid_different_key.idempotency_key = unique_id("different-request");
@@ -355,6 +358,65 @@ async fn caller_selected_version_uid_is_unique_and_idempotency_bound() {
         .await
         .expect_err("idempotency cannot return a different requested UID");
     assert_eq!(idempotency_conflict.code(), tonic::Code::AlreadyExists);
+
+    stop(shutdown, server).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis at REDIS_URL"]
+async fn caller_selected_version_uids_do_not_collide_with_derived_keys() {
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let port = free_port();
+    let (shutdown, server) = start_server(port, &redis_url);
+    let mut client = connect(port).await;
+    let worker_id = unique_id("key-boundary-worker");
+    client
+        .register_worker(trainer(&worker_id))
+        .await
+        .expect("register trainer");
+
+    let version_uid = unique_id("key-boundary-version");
+    let source_slot_id = "publisher:global-rank:0";
+    let request = CreateWeightVersionRequest {
+        model_name: "test/model".to_string(),
+        idempotency_key: unique_id("key-boundary-request"),
+        payload_format: WeightPayloadFormat::FullTensor.into(),
+        base_version_id: None,
+        expected_source_slots: vec![source_slot_id.to_string()],
+        object_storage: None,
+        state: WeightVersionState::Staging.into(),
+        uid: Some(version_uid.clone()),
+    };
+    client
+        .create_weight_version(request.clone())
+        .await
+        .expect("create base version");
+
+    let mut suffix_request = request;
+    suffix_request.uid = Some(format!("{version_uid}:shards"));
+    suffix_request.idempotency_key = unique_id("key-boundary-suffix-request");
+    client
+        .create_weight_version(suffix_request)
+        .await
+        .expect("create version whose UID ends with the shard-key suffix");
+
+    let published = shard(&version_uid, source_slot_id, &worker_id);
+    client
+        .create_weight_version_shard(CreateWeightVersionShardRequest {
+            shard: Some(published.clone()),
+        })
+        .await
+        .expect("publish shard");
+    let shards = client
+        .list_weight_version_shards(ListWeightVersionShardsRequest {
+            version_id: version_uid,
+        })
+        .await
+        .expect("list shards")
+        .into_inner()
+        .shards;
+    assert_eq!(shards, vec![published]);
 
     stop(shutdown, server).await;
 }

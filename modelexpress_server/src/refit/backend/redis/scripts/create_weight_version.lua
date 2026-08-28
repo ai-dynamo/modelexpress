@@ -15,13 +15,13 @@
 -- Redis executes the script atomically, so two MX server replicas cannot create
 -- different versions for the same idempotency key.
 
-if redis.call('EXISTS', KEYS[1]) == 1 then
-  return 'COLLISION'
-end
-
 local existing = redis.call('GET', KEYS[2])
 if existing then
   return 'EXISTING:' .. existing
+end
+
+if redis.call('EXISTS', KEYS[1]) == 1 then
+  return 'COLLISION'
 end
 
 redis.call('HSET', KEYS[1],

@@ -32,11 +32,11 @@ const REGISTER_LEASE_LUA: &str = include_str!("redis/scripts/register_version_le
 const DELETE_LEASE_LUA: &str = include_str!("redis/scripts/delete_version_lease.lua");
 
 fn version_key(version_id: &str) -> String {
-    format!("mx:refit:version:{version_id}")
+    format!("mx:refit:version:metadata:{version_id}")
 }
 
 fn shards_key(version_id: &str) -> String {
-    format!("mx:refit:version:{version_id}:shards")
+    format!("mx:refit:version:shards:{version_id}")
 }
 
 fn publication_key(worker_id: &str, source_slot_id: &str) -> String {
@@ -44,11 +44,11 @@ fn publication_key(worker_id: &str, source_slot_id: &str) -> String {
 }
 
 fn coverage_key(version_id: &str) -> String {
-    format!("mx:refit:version:{version_id}:coverage")
+    format!("mx:refit:version:coverage:{version_id}")
 }
 
 fn expected_source_slots_key(version_id: &str) -> String {
-    format!("mx:refit:version:{version_id}:expected-source-slots")
+    format!("mx:refit:version:expected-source-slots:{version_id}")
 }
 
 fn worker_key(worker_id: &str) -> String {
@@ -56,11 +56,11 @@ fn worker_key(worker_id: &str) -> String {
 }
 
 fn leases_key(version_id: &str) -> String {
-    format!("mx:refit:version:{version_id}:leases")
+    format!("mx:refit:version:leases:{version_id}")
 }
 
 fn lease_key(version_id: &str, lease_id: &str) -> String {
-    format!("mx:refit:version:{version_id}:lease:{lease_id}")
+    format!("mx:refit:version:lease:{version_id}:{lease_id}")
 }
 
 fn idempotency_key(model_name: &str, request_key: &str) -> String {
@@ -619,6 +619,18 @@ impl RefitBackend for RedisRefitBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_ids_cannot_collide_with_derived_keys() {
+        assert_ne!(version_key("foo:shards"), shards_key("foo"));
+        assert_ne!(version_key("foo:coverage"), coverage_key("foo"));
+        assert_ne!(
+            version_key("foo:expected-source-slots"),
+            expected_source_slots_key("foo")
+        );
+        assert_ne!(version_key("foo:leases"), leases_key("foo"));
+        assert_ne!(version_key("foo:lease:bar"), lease_key("foo", "bar"));
+    }
 
     #[test]
     fn redis_errors_distinguish_transient_and_internal_failures() {
