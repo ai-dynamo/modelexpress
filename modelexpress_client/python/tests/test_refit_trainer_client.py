@@ -131,7 +131,7 @@ def test_refit_shard_keeps_only_its_nixl_manifest_endpoint():
 
     assert shard.manifest_endpoint == "trainer:9000"
     assert (
-        refit_pb2.WeightVersion.DESCRIPTOR.fields_by_name["object_storage"].number == 11
+        refit_pb2.WeightVersion.DESCRIPTOR.fields_by_name["object_storage"].number == 10
     )
     assert list(refit_pb2.ObjectStorageSource.DESCRIPTOR.fields_by_name) == [
         "uri",
