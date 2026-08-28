@@ -10,7 +10,7 @@
 -- Returns:
 --   CREATED              this invocation created the version
 --   EXISTING:<id>        another invocation already owns the idempotency key
---   COLLISION            the randomly selected version ID already exists
+--   COLLISION            the selected version ID already exists
 --
 -- Redis executes the script atomically, so two MX server replicas cannot create
 -- different versions for the same idempotency key.

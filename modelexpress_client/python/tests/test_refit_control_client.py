@@ -23,7 +23,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
 
     def CreateWeightVersion(self, request, _context):
         self.version = refit_pb2.WeightVersion(
-            uid="version-a",
+            uid=request.uid if request.HasField("uid") else "version-a",
             model_name=request.model_name,
             idempotency_key=request.idempotency_key,
             payload_format=request.payload_format,
@@ -125,6 +125,7 @@ def test_control_client_round_trips_object_storage_source(storage_type, uri):
             model_name="test/model",
             idempotency_key="training-step-7",
             payload_format=WeightPayloadFormat.XOR_DELTA,
+            uid="caller-version",
             base_version_id="base-a",
             object_storage=ObjectStorageSource(
                 storage_type=storage_type,
@@ -141,6 +142,7 @@ def test_control_client_round_trips_object_storage_source(storage_type, uri):
         storage_type=storage_type,
         uri=uri,
     )
+    assert created.version_id == "caller-version"
     assert created.expected_source_slots == ()
     assert created.state is WeightVersionState.READY
 
@@ -161,6 +163,13 @@ def test_control_client_validates_framework_inputs_before_rpc():
                 idempotency_key="attempt-a",
                 payload_format=WeightPayloadFormat.UNSPECIFIED,
                 expected_source_slots=["rank:0"],
+            )
+        with pytest.raises(ValueError, match="uid"):
+            control.create_weight_version(
+                model_name="test/model",
+                idempotency_key="attempt-a",
+                payload_format=WeightPayloadFormat.FULL_TENSOR,
+                uid=" ",
             )
     finally:
         control.close()

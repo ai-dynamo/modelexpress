@@ -141,6 +141,7 @@ class ModelExpressControlClient:
         idempotency_key: str,
         payload_format: WeightPayloadFormat,
         expected_source_slots: list[str] | None = None,
+        uid: str | None = None,
         base_version_id: str | None = None,
         object_storage: ObjectStorageSource | None = None,
         state: WeightVersionState = WeightVersionState.STAGING,
@@ -169,6 +170,8 @@ class ModelExpressControlClient:
                 WeightVersionState.READY: refit_pb2.WEIGHT_VERSION_STATE_READY,
             }[state],
         )
+        if uid is not None:
+            request.uid = _required(uid, "uid")
         if base_version_id is not None:
             request.base_version_id = _required(base_version_id, "base_version_id")
         if object_storage is not None:

@@ -32,11 +32,11 @@ const REGISTER_LEASE_LUA: &str = include_str!("redis/scripts/register_version_le
 const DELETE_LEASE_LUA: &str = include_str!("redis/scripts/delete_version_lease.lua");
 
 fn version_key(version_id: &str) -> String {
-    format!("mx:refit:version:{version_id}")
+    format!("mx:refit:version:metadata:{version_id}")
 }
 
 fn shards_key(version_id: &str) -> String {
-    format!("mx:refit:version:{version_id}:shards")
+    format!("mx:refit:version:shards:{version_id}")
 }
 
 fn publication_key(worker_id: &str, source_slot_id: &str) -> String {
@@ -44,11 +44,11 @@ fn publication_key(worker_id: &str, source_slot_id: &str) -> String {
 }
 
 fn coverage_key(version_id: &str) -> String {
-    format!("mx:refit:version:{version_id}:coverage")
+    format!("mx:refit:version:coverage:{version_id}")
 }
 
 fn expected_source_slots_key(version_id: &str) -> String {
-    format!("mx:refit:version:{version_id}:expected-source-slots")
+    format!("mx:refit:version:expected-source-slots:{version_id}")
 }
 
 fn worker_key(worker_id: &str) -> String {
@@ -56,11 +56,11 @@ fn worker_key(worker_id: &str) -> String {
 }
 
 fn leases_key(version_id: &str) -> String {
-    format!("mx:refit:version:{version_id}:leases")
+    format!("mx:refit:version:leases:{version_id}")
 }
 
 fn lease_key(version_id: &str, lease_id: &str) -> String {
-    format!("mx:refit:version:{version_id}:lease:{lease_id}")
+    format!("mx:refit:version:lease:{version_id}:{lease_id}")
 }
 
 fn idempotency_key(model_name: &str, request_key: &str) -> String {
@@ -303,18 +303,29 @@ impl RefitBackend for RedisRefitBackend {
         &self,
         request: &CreateWeightVersionRequest,
     ) -> RefitResult<WeightVersion> {
-        for _ in 0..5 {
-            let uid: String = Uuid::new_v4()
-                .simple()
-                .to_string()
-                .chars()
-                .take(8)
-                .collect();
+        let requested_uid = request.uid.as_deref();
+        let attempts = if requested_uid.is_some() { 1 } else { 5 };
+        for _ in 0..attempts {
+            let uid = match requested_uid {
+                Some(uid) => uid.to_string(),
+                None => Uuid::new_v4()
+                    .simple()
+                    .to_string()
+                    .chars()
+                    .take(8)
+                    .collect(),
+            };
             let result = self.create_version_once(request, &uid).await?;
             if result == "CREATED" {
                 return self.get_weight_version(&uid).await;
             }
             if let Some(existing_uid) = result.strip_prefix("EXISTING:") {
+                if requested_uid.is_some_and(|uid| uid != existing_uid) {
+                    return Err(RefitBackendError::AlreadyExists(
+                        "idempotency_key was already used for a different WeightVersion"
+                            .to_string(),
+                    ));
+                }
                 let fields = self.get_version_fields(existing_uid).await?;
                 let initial_state = fields.get("initial_state").map_or_else(
                     || Ok(i32::from(WeightVersionState::Staging)),
@@ -339,6 +350,11 @@ impl RefitBackend for RedisRefitBackend {
                 return Err(RefitBackendError::AlreadyExists(
                     "idempotency_key was already used for a different WeightVersion".to_string(),
                 ));
+            }
+            if result == "COLLISION" && requested_uid.is_some() {
+                return Err(RefitBackendError::AlreadyExists(format!(
+                    "weight version UID {uid:?} already exists"
+                )));
             }
             if result != "COLLISION" {
                 return Err(RefitBackendError::Internal(format!(
@@ -603,6 +619,18 @@ impl RefitBackend for RedisRefitBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_ids_cannot_collide_with_derived_keys() {
+        assert_ne!(version_key("foo:shards"), shards_key("foo"));
+        assert_ne!(version_key("foo:coverage"), coverage_key("foo"));
+        assert_ne!(
+            version_key("foo:expected-source-slots"),
+            expected_source_slots_key("foo")
+        );
+        assert_ne!(version_key("foo:leases"), leases_key("foo"));
+        assert_ne!(version_key("foo:lease:bar"), lease_key("foo", "bar"));
+    }
 
     #[test]
     fn redis_errors_distinguish_transient_and_internal_failures() {

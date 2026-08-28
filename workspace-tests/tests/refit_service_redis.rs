@@ -183,6 +183,7 @@ async fn version_becomes_ready_across_server_replicas() {
         ],
         object_storage: None,
         state: WeightVersionState::Staging.into(),
+        uid: None,
     };
     let create_a = client_a.create_weight_version(create_request.clone());
     let create_b = client_b.create_weight_version(create_request);
@@ -295,6 +296,133 @@ async fn version_becomes_ready_across_server_replicas() {
 
 #[tokio::test]
 #[ignore = "requires a live Redis at REDIS_URL"]
+async fn caller_selected_version_uid_is_unique_and_idempotency_bound() {
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let port = free_port();
+    let (shutdown, server) = start_server(port, &redis_url);
+    let mut client = connect(port).await;
+    let requested_uid = unique_id("caller-version");
+    let request = CreateWeightVersionRequest {
+        model_name: "test/model".to_string(),
+        idempotency_key: unique_id("caller-version-request"),
+        payload_format: WeightPayloadFormat::FullTensor.into(),
+        base_version_id: None,
+        expected_source_slots: Vec::new(),
+        object_storage: Some(s3_source(
+            "s3://weights/run/policy/caller-version/model.safetensors.index.json",
+        )),
+        state: WeightVersionState::Staging.into(),
+        uid: Some(requested_uid.clone()),
+    };
+
+    let mut blank_uid = request.clone();
+    blank_uid.uid = Some(" \t".to_string());
+    blank_uid.idempotency_key = unique_id("blank-caller-version-request");
+    let invalid = client
+        .create_weight_version(blank_uid)
+        .await
+        .expect_err("a present caller UID must not be blank");
+    assert_eq!(invalid.code(), tonic::Code::InvalidArgument);
+
+    let created = client
+        .create_weight_version(request.clone())
+        .await
+        .expect("create version with caller UID")
+        .into_inner()
+        .version
+        .expect("version in response");
+    assert_eq!(created.uid, requested_uid);
+
+    let repeated = client
+        .create_weight_version(request.clone())
+        .await
+        .expect("an identical request is idempotent")
+        .into_inner()
+        .version
+        .expect("version in response");
+    assert_eq!(repeated, created);
+
+    let mut same_uid_different_key = request.clone();
+    same_uid_different_key.idempotency_key = unique_id("different-request");
+    let uid_conflict = client
+        .create_weight_version(same_uid_different_key)
+        .await
+        .expect_err("an existing caller UID rejects a different request");
+    assert_eq!(uid_conflict.code(), tonic::Code::AlreadyExists);
+
+    let mut different_uid_same_key = request;
+    different_uid_same_key.uid = Some(unique_id("different-caller-version"));
+    let idempotency_conflict = client
+        .create_weight_version(different_uid_same_key)
+        .await
+        .expect_err("idempotency cannot return a different requested UID");
+    assert_eq!(idempotency_conflict.code(), tonic::Code::AlreadyExists);
+
+    stop(shutdown, server).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis at REDIS_URL"]
+async fn caller_selected_version_uids_do_not_collide_with_derived_keys() {
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let port = free_port();
+    let (shutdown, server) = start_server(port, &redis_url);
+    let mut client = connect(port).await;
+    let worker_id = unique_id("key-boundary-worker");
+    client
+        .register_worker(trainer(&worker_id))
+        .await
+        .expect("register trainer");
+
+    let version_uid = unique_id("key-boundary-version");
+    let source_slot_id = "publisher:global-rank:0";
+    let request = CreateWeightVersionRequest {
+        model_name: "test/model".to_string(),
+        idempotency_key: unique_id("key-boundary-request"),
+        payload_format: WeightPayloadFormat::FullTensor.into(),
+        base_version_id: None,
+        expected_source_slots: vec![source_slot_id.to_string()],
+        object_storage: None,
+        state: WeightVersionState::Staging.into(),
+        uid: Some(version_uid.clone()),
+    };
+    client
+        .create_weight_version(request.clone())
+        .await
+        .expect("create base version");
+
+    let mut suffix_request = request;
+    suffix_request.uid = Some(format!("{version_uid}:shards"));
+    suffix_request.idempotency_key = unique_id("key-boundary-suffix-request");
+    client
+        .create_weight_version(suffix_request)
+        .await
+        .expect("create version whose UID ends with the shard-key suffix");
+
+    let published = shard(&version_uid, source_slot_id, &worker_id);
+    client
+        .create_weight_version_shard(CreateWeightVersionShardRequest {
+            shard: Some(published.clone()),
+        })
+        .await
+        .expect("publish shard");
+    let shards = client
+        .list_weight_version_shards(ListWeightVersionShardsRequest {
+            version_id: version_uid,
+        })
+        .await
+        .expect("list shards")
+        .into_inner()
+        .shards;
+    assert_eq!(shards, vec![published]);
+
+    stop(shutdown, server).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis at REDIS_URL"]
 async fn s3_versions_support_staged_and_direct_ready_creation() {
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
@@ -310,6 +438,7 @@ async fn s3_versions_support_staged_and_direct_ready_creation() {
         expected_source_slots: Vec::new(),
         object_storage: Some(s3_source(uri)),
         state: WeightVersionState::Staging.into(),
+        uid: None,
     };
     let staged = client
         .create_weight_version(staged_request.clone())
@@ -432,6 +561,7 @@ async fn s3_versions_support_staged_and_direct_ready_creation() {
                 "s3://weights/run/policy/v43/model.safetensors.index.json",
             )),
             state: WeightVersionState::Ready.into(),
+            uid: None,
         })
         .await
         .expect("create directly ready S3 version")
@@ -481,6 +611,7 @@ async fn replacement_worker_can_publish_the_same_source_slot() {
             expected_source_slots: vec!["publisher:global-rank:0".to_string()],
             object_storage: None,
             state: WeightVersionState::Staging.into(),
+            uid: None,
         })
         .await
         .expect("create version")
@@ -564,6 +695,7 @@ async fn live_lease_protects_releasing_version_shards() {
             expected_source_slots: vec!["publisher:global-rank:0".to_string()],
             object_storage: None,
             state: WeightVersionState::Staging.into(),
+            uid: None,
         })
         .await
         .expect("create version")
@@ -672,6 +804,7 @@ async fn live_lease_protects_releasing_version_shards() {
             expected_source_slots: vec!["publisher:global-rank:0".to_string()],
             object_storage: None,
             state: WeightVersionState::Staging.into(),
+            uid: None,
         })
         .await
         .expect("create version protected by an expiring lease")
@@ -755,6 +888,7 @@ async fn register_worker_refreshes_liveness_and_expires_without_renewal() {
             expected_source_slots: vec!["publisher:global-rank:0".to_string()],
             object_storage: None,
             state: WeightVersionState::Staging.into(),
+            uid: None,
         })
         .await
         .expect("create version")
@@ -779,6 +913,7 @@ async fn register_worker_refreshes_liveness_and_expires_without_renewal() {
             expected_source_slots: vec!["publisher:global-rank:0".to_string()],
             object_storage: None,
             state: WeightVersionState::Staging.into(),
+            uid: None,
         })
         .await
         .expect("create version after worker expiry")

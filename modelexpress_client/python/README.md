@@ -106,6 +106,11 @@ trainer actor then invokes its rank-local client to stage and publish one shard.
 Worker registration, manifest serving, and internal shard CRUD remain hidden
 behind the client.
 
+When creating a `WeightVersion`, the orchestrator may supply its UID or let MX
+generate one. A caller-supplied UID already assigned to another request returns
+`ALREADY_EXISTS`; an identical request retried with the same idempotency key
+returns the existing version.
+
 ```python
 from modelexpress_rl import (
     MegatronTrainerContext,
