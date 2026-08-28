@@ -78,7 +78,6 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         self.target = refit_pb2.WeightVersion(
             uid="target-a",
             model_name="test/model",
-            version_number=1,
             payload_format=refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA,
             base_version_id="base-a",
             object_storage=refit_pb2.ObjectStorageSource(
@@ -364,7 +363,7 @@ def test_s3_stage_is_local_then_publish_uploads_version_root(
         "checksum_format": "adler32",
         "compression_format": "zstd",
         "delta_encoding": "xor",
-        "version": 1,
+        "version": "target-a",
     }
     assert index["weight_map"] == {"weight": "model-00000-of-00001.safetensors"}
     removed_digests = {"base_digest", "target_digest", "format_digest"}
@@ -395,30 +394,18 @@ def test_s3_stage_is_local_then_publish_uploads_version_root(
     assert decoded == expected_delta.numpy().tobytes()
 
 
-def test_s3_stage_requires_version_number(monkeypatch, tmp_path, refit_server):
-    service, server_url = refit_server
-    service.target.ClearField("version_number")
-    trainer, storage = _trainer(monkeypatch, tmp_path, server_url)
-
-    try:
-        with pytest.raises(RuntimeError, match="must have a version number"):
-            trainer.stage_shard(
-                version=WeightVersionRef("target-a"),
-                hf_tensor_iter=iter([[("weight", torch.tensor([1.0, 3.0]))]]),
-            )
-    finally:
-        trainer.close()
-
-    assert storage.objects == {}
-
-
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "s3://weights/other/v1/model.safetensors.index.json",
+        "s3://weights/testsv1/model.safetensors.index.json",
+    ],
+)
 def test_s3_stage_requires_version_uri_under_configured_prefix(
-    monkeypatch, tmp_path, refit_server
+    monkeypatch, tmp_path, refit_server, uri
 ):
     service, server_url = refit_server
-    service.target.object_storage.uri = (
-        "s3://weights/other/v1/model.safetensors.index.json"
-    )
+    service.target.object_storage.uri = uri
     trainer, storage = _trainer(monkeypatch, tmp_path, server_url)
 
     try:
@@ -431,6 +418,25 @@ def test_s3_stage_requires_version_uri_under_configured_prefix(
         trainer.close()
 
     assert storage.objects == {}
+
+
+def test_s3_stage_accepts_caller_uri_under_configured_prefix(
+    monkeypatch, tmp_path, refit_server
+):
+    service, server_url = refit_server
+    uri = "s3://weights/tests/caller-owned/model.safetensors.index.json"
+    service.target.object_storage.uri = uri
+    trainer, _storage = _trainer(monkeypatch, tmp_path, server_url)
+
+    try:
+        staged = trainer.stage_shard(
+            version=WeightVersionRef("target-a"),
+            hf_tensor_iter=iter([[("weight", torch.tensor([1.0, 3.0]))]]),
+        )
+    finally:
+        trainer.close()
+
+    assert staged._staged.object_storage_uri == uri
 
 
 def test_s3_publish_failure_keeps_handle_retryable(monkeypatch, tmp_path, refit_server):
@@ -680,7 +686,6 @@ def test_s3_chains_from_published_base_and_keeps_previous_advertisement(
         service.target = refit_pb2.WeightVersion(
             uid="target-b",
             model_name="test/model",
-            version_number=2,
             payload_format=refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA,
             base_version_id="target-a",
             object_storage=refit_pb2.ObjectStorageSource(
@@ -729,7 +734,6 @@ def test_s3_release_keeps_canonical_advertisement(monkeypatch, tmp_path, refit_s
         service.target = refit_pb2.WeightVersion(
             uid="target-b",
             model_name="test/model",
-            version_number=2,
             payload_format=refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA,
             base_version_id="target-a",
             object_storage=refit_pb2.ObjectStorageSource(
@@ -776,9 +780,6 @@ def test_object_storage_config_requires_storage_delta_pair(tmp_path):
         uri_prefix="s3://weights/tests",
         initial_base_version_id="base-a",
         launch_checkpoint=launch,
-    )
-    assert object_storage.root_uri(42) == (
-        "s3://weights/tests/v42/model.safetensors.index.json"
     )
     with pytest.raises(ValueError, match="WRITE_TO_STORAGE and XOR_DELTA"):
         ModelExpressTrainerClient.initialize(

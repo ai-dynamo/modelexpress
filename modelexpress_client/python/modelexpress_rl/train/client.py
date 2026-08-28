@@ -121,19 +121,10 @@ class ObjectStorageConfig:
         if not str(self.launch_checkpoint).strip():
             raise ValueError("object_storage.launch_checkpoint is required")
 
-    def root_uri(self, version_number: int) -> str:
-        """Return the canonical index URI for one numeric version."""
-        return (
-            f"{self.uri_prefix.rstrip('/')}/v{version_number}/"
-            "model.safetensors.index.json"
-        )
-
-
 @dataclass
 class _StagedDelta:
     base_version_id: str
     target_version_id: str
-    target_version_number: int
     object_storage_uri: str
     candidate_snapshot: dict[str, np.ndarray]
     encoded_deltas: dict[str, np.ndarray]
@@ -495,7 +486,6 @@ class ModelExpressTrainerClient:
         self,
         *,
         target_version_id: str,
-        target_version_number: int,
         object_storage_uri: str,
         base_version_id: str,
         hf_tensor_iter: Iterable[list[tuple[str, torch.Tensor]]],
@@ -541,7 +531,6 @@ class ModelExpressTrainerClient:
         return _StagedDelta(
             base_version_id=base_version_id,
             target_version_id=target_version_id,
-            target_version_number=target_version_number,
             object_storage_uri=object_storage_uri,
             candidate_snapshot=candidate,
             encoded_deltas=encoded_deltas,
@@ -603,7 +592,7 @@ class ModelExpressTrainerClient:
         index = json.dumps(
             {
                 "metadata": {
-                    "version": staged.target_version_number,
+                    "version": staged.target_version_id,
                     "base_version": staged.base_version_id,
                     "delta_encoding": "xor",
                     "compression_format": "zstd",
@@ -653,8 +642,6 @@ class ModelExpressTrainerClient:
                 or not target.HasField("base_version_id")
             ):
                 raise RuntimeError("S3 publication requires an XOR_DELTA target")
-            if not target.HasField("version_number"):
-                raise RuntimeError("S3 target must have a version number")
             if (
                 not target.HasField("object_storage")
                 or target.object_storage.storage_type
@@ -663,13 +650,11 @@ class ModelExpressTrainerClient:
             ):
                 raise RuntimeError("S3 target is missing its URI")
             assert self._object_storage_config is not None
-            if target.object_storage.uri != self._object_storage_config.root_uri(
-                target.version_number
-            ):
+            uri_prefix = f"{self._object_storage_config.uri_prefix.rstrip('/')}/"
+            if not target.object_storage.uri.startswith(uri_prefix):
                 raise RuntimeError("S3 target URI does not match the configured prefix")
             staged = self._stage_delta(
                 target_version_id=version.version_id,
-                target_version_number=target.version_number,
                 object_storage_uri=target.object_storage.uri,
                 base_version_id=target.base_version_id,
                 hf_tensor_iter=hf_tensor_iter,

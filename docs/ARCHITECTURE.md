@@ -400,9 +400,9 @@ During framework initialization, the same bucket stream seeds only that rank's
 owned launch-checkpoint tensors through direct, concurrent
 `prepare_delta_base()` bucket reads. The first real delta stage uses the
 prepared snapshot without checkpoint I/O.
-Canonical S3 artifacts live under
-`{uri_prefix}/v{version_number}/`, with the
-index and delta shards stored as siblings.
+Each canonical S3 version owns an exact caller-supplied `object_storage.uri`
+under the configured `uri_prefix`. That URI names the global index; its delta
+shards are stored as siblings.
 The index's `compression_format` selects the receiver's decompressor. The
 current implementation supports Zstandard. Unknown compression formats are
 rejected before shard download.
@@ -537,10 +537,11 @@ strategies. They resolve the version-level S3 URI directly and use the canonical
 S3 receiver; peer-first selection with trainer fallback applies only to the NIXL
 path for now.
 
-`WeightVersion.uid` is MX's opaque identity. `version_number` is the optional
-framework-provided numeric label used for correlation; canonical S3 publication
-requires it for the `v{version_number}` object prefix. MX does not use it as a
-control-plane identity or ordering key.
+`WeightVersion.uid` is MX's opaque version identity. For an `XOR_DELTA`,
+`base_version_id` identifies the base version's UID. The canonical index records
+these UID strings as `metadata.version` and `metadata.base_version`. MX assigns
+no numeric ordering and requires no version-directory naming convention; the
+exact `object_storage.uri` identifies the version's global index.
 `WeightVersionShard` remains the name of the per-worker manifest publication.
 Its identity is `(version_id, worker_id, source_slot_id)`: `source_slot_id`
 identifies the required, version-scoped source contribution it covers, and

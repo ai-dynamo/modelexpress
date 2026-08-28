@@ -174,7 +174,6 @@ async fn version_becomes_ready_across_server_replicas() {
 
     let create_request = CreateWeightVersionRequest {
         model_name: "test/model".to_string(),
-        version_number: Some(42),
         idempotency_key: unique_id("publish"),
         payload_format: WeightPayloadFormat::FullTensor.into(),
         base_version_id: None,
@@ -305,7 +304,6 @@ async fn s3_versions_support_staged_and_direct_ready_creation() {
     let uri = "s3://weights/run/policy/v42/model.safetensors.index.json";
     let staged_request = CreateWeightVersionRequest {
         model_name: "test/model".to_string(),
-        version_number: Some(42),
         idempotency_key: unique_id("staged-s3-version"),
         payload_format: WeightPayloadFormat::FullTensor.into(),
         base_version_id: None,
@@ -332,7 +330,6 @@ async fn s3_versions_support_staged_and_direct_ready_creation() {
     assert!(staged.expected_source_slots.is_empty());
 
     let mut cancelled_request = staged_request.clone();
-    cancelled_request.version_number = Some(43);
     cancelled_request.idempotency_key = unique_id("cancelled-s3-version");
     cancelled_request.object_storage = Some(s3_source(
         "s3://weights/run/policy/v43/model.safetensors.index.json",
@@ -427,7 +424,6 @@ async fn s3_versions_support_staged_and_direct_ready_creation() {
     let direct = client
         .create_weight_version(CreateWeightVersionRequest {
             model_name: "test/model".to_string(),
-            version_number: Some(43),
             idempotency_key: unique_id("ready-s3-version"),
             payload_format: WeightPayloadFormat::FullTensor.into(),
             base_version_id: None,
@@ -479,7 +475,6 @@ async fn replacement_worker_can_publish_the_same_source_slot() {
     let version = client
         .create_weight_version(CreateWeightVersionRequest {
             model_name: "test/model".to_string(),
-            version_number: None,
             idempotency_key: unique_id("replacement-publish"),
             payload_format: WeightPayloadFormat::FullTensor.into(),
             base_version_id: None,
@@ -563,7 +558,6 @@ async fn live_lease_protects_releasing_version_shards() {
     let version = client_a
         .create_weight_version(CreateWeightVersionRequest {
             model_name: "test/model".to_string(),
-            version_number: Some(43),
             idempotency_key: unique_id("lease-version"),
             payload_format: WeightPayloadFormat::FullTensor.into(),
             base_version_id: None,
@@ -672,7 +666,6 @@ async fn live_lease_protects_releasing_version_shards() {
     let expiring_version = client_a
         .create_weight_version(CreateWeightVersionRequest {
             model_name: "test/model".to_string(),
-            version_number: Some(44),
             idempotency_key: unique_id("expiring-lease-version"),
             payload_format: WeightPayloadFormat::FullTensor.into(),
             base_version_id: None,
@@ -756,7 +749,6 @@ async fn register_worker_refreshes_liveness_and_expires_without_renewal() {
     let version = client
         .create_weight_version(CreateWeightVersionRequest {
             model_name: "test/model".to_string(),
-            version_number: None,
             idempotency_key: unique_id("heartbeat-version"),
             payload_format: WeightPayloadFormat::FullTensor.into(),
             base_version_id: None,
@@ -781,7 +773,6 @@ async fn register_worker_refreshes_liveness_and_expires_without_renewal() {
     let expired_version = client
         .create_weight_version(CreateWeightVersionRequest {
             model_name: "test/model".to_string(),
-            version_number: None,
             idempotency_key: unique_id("expired-worker-version"),
             payload_format: WeightPayloadFormat::FullTensor.into(),
             base_version_id: None,

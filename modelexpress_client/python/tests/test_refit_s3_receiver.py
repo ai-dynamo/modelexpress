@@ -309,7 +309,7 @@ def _artifact(
     *,
     checksum=None,
     version="target-a",
-    version_number=1,
+    version_label=1,
     base_version="base-a",
 ):
     delta, _ = compute_delta(target, base)
@@ -332,7 +332,7 @@ def _artifact(
         sort_keys=True,
         separators=(",", ":"),
     ).encode()
-    prefix = f"s3://weights/test/v{version_number}"
+    prefix = f"s3://weights/test/v{version_label}"
     return {
         f"{prefix}/model.safetensors.index.json": root,
         f"{prefix}/model-00000-of-00001.safetensors": shard,
@@ -344,11 +344,11 @@ def _inputs(
     *,
     base_version="base-a",
     version="target-a",
-    version_number=1,
+    version_label=1,
     uri=None,
 ):
     if uri is None:
-        uri = f"s3://weights/test/v{version_number}/model.safetensors.index.json"
+        uri = f"s3://weights/test/v{version_label}/model.safetensors.index.json"
     return GeneratorTransferInputs(
         version_id=version,
         base_version_id=base_version,
@@ -745,7 +745,7 @@ def test_installed_target_becomes_the_next_exact_base(monkeypatch, tmp_path):
             first,
             second,
             version="target-b",
-            version_number=2,
+            version_label=2,
             base_version="target-a",
         )
     )
@@ -760,7 +760,7 @@ def test_installed_target_becomes_the_next_exact_base(monkeypatch, tmp_path):
         _inputs(
             second_root,
             version="target-b",
-            version_number=2,
+            version_label=2,
             base_version="target-a",
         )
     )

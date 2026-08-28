@@ -118,16 +118,9 @@ where
 }
 
 fn version_from_hash(fields: HashMap<String, String>) -> RefitResult<WeightVersion> {
-    let version_number = match hash_field(&fields, "version_number")? {
-        "" => None,
-        value => Some(value.parse().map_err(|error| {
-            RefitBackendError::Internal(format!("invalid version_number: {error}"))
-        })?),
-    };
     Ok(WeightVersion {
         uid: hash_field(&fields, "uid")?.to_string(),
         model_name: hash_field(&fields, "model_name")?.to_string(),
-        version_number,
         idempotency_key: hash_field(&fields, "idempotency_key")?.to_string(),
         payload_format: parse_hash_field(&fields, "payload_format")?,
         base_version_id: match hash_field(&fields, "base_version_id")? {
@@ -247,11 +240,6 @@ impl RedisRefitBackend {
             .key(expected_source_slots_key(uid))
             .arg(uid)
             .arg(&request.model_name)
-            .arg(
-                request
-                    .version_number
-                    .map_or_else(String::new, |value| value.to_string()),
-            )
             .arg(&request.idempotency_key)
             .arg(request.payload_format)
             .arg(request.base_version_id.as_deref().unwrap_or_default())
@@ -340,7 +328,6 @@ impl RefitBackend for RedisRefitBackend {
                 )?;
                 let existing = version_from_hash(fields)?;
                 if existing.model_name == request.model_name
-                    && existing.version_number == request.version_number
                     && existing.payload_format == request.payload_format
                     && existing.base_version_id == request.base_version_id
                     && existing.expected_source_slots == request.expected_source_slots
