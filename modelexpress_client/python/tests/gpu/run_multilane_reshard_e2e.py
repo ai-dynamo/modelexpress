@@ -95,7 +95,7 @@ def main() -> int:
     intervals: dict[int, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
     recorded_order: list[int] = []
     original_reshard = runtime.handle.reshard
-    original_synchronize = runtime.synchronize_pp_group
+    original_poll_completion = runtime._poll_pp_groups_completion
     if rank == generator_rank:
         comm_to_stage = {
             id(pp_group.communicator): pp_group.key[0] for pp_group in pp_groups
@@ -122,15 +122,21 @@ def main() -> int:
                 started.add(stage)
             return original_reshard(comm, src, dst, stream=stream)
 
-        def recording_synchronize(pp_group):
-            stage = pp_group.key[0]
-            if stage not in ended:
-                intervals[stage][1].record(pp_group.stream)
-                ended.add(stage)
-            return original_synchronize(pp_group)
+        def recording_poll_completion(pp_groups, *, operation, deadline):
+            if operation == "model-version staging":
+                for pp_group in sorted(pp_groups, key=lambda group: group.key):
+                    stage = pp_group.key[0]
+                    if stage not in ended:
+                        intervals[stage][1].record(pp_group.stream)
+                        ended.add(stage)
+            return original_poll_completion(
+                pp_groups,
+                operation=operation,
+                deadline=deadline,
+            )
 
         runtime.handle.reshard = recording_reshard
-        runtime.synchronize_pp_group = recording_synchronize
+        runtime._poll_pp_groups_completion = recording_poll_completion
 
     try:
         if rank == generator_rank:
@@ -144,7 +150,7 @@ def main() -> int:
             executor.execute({(rank, 0): params[rank]})
     finally:
         runtime.handle.reshard = original_reshard
-        runtime.synchronize_pp_group = original_synchronize
+        runtime._poll_pp_groups_completion = original_poll_completion
 
     failed = False
     if rank == generator_rank:

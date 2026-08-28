@@ -146,12 +146,12 @@ class NcclM2nExecutor:
         if self._poisoned:
             raise RuntimeError(
                 "nccl_m2n executor is unusable after a failed model commit or "
-                "M2N submission; reinitialize model, runtime, and executor"
+                "M2N submission; restart the process before transferring again"
             )
         if self._stream_failed:
             raise RuntimeError(
                 "nccl_m2n executor stream could not be drained after failure; "
-                "reinitialize runtime before transferring again"
+                "restart the process before transferring again"
             )
 
     def _validate_update_keys(
@@ -346,7 +346,7 @@ class NcclM2nExecutor:
         except BaseException as exc:
             raise RuntimeError(
                 "nccl_m2n model commit failed after live-model modification began; "
-                "serving must remain stopped until model and runtime are reinitialized"
+                "serving must remain stopped until the process is restarted"
             ) from exc
 
     def _mark_complete(self, state: _PPGroupModelState) -> None:
@@ -436,15 +436,18 @@ class NcclM2nExecutor:
         """Drain PP streams and release whole-version staging."""
         with self._execute_lock:
             with self._runtime._active_operation(allow_poisoned=True):
-                for state in self._states.values():
-                    try:
-                        self._runtime.synchronize_pp_group(state.pp_group)
-                    except BaseException as exc:
-                        self._stream_failed = True
-                        raise RuntimeError(
-                            "cannot safely tear down nccl_m2n executor because PP "
-                            "stream could not drain; staging tensors retained"
-                        ) from exc
+                try:
+                    self._runtime.wait_for_pp_groups(
+                        tuple(state.pp_group for state in self._states.values()),
+                        operation="executor teardown",
+                    )
+                except BaseException as exc:
+                    self._stream_failed = True
+                    raise RuntimeError(
+                        "cannot safely tear down nccl_m2n executor because PP "
+                        "streams could not drain; staging tensors retained and "
+                        "process restart is required"
+                    ) from exc
                 for state in self._states.values():
                     state.staged = []
                     state.staging_signature = None

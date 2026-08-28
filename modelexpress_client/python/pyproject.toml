@@ -54,9 +54,11 @@ otel = [
 metrics = [
     "prometheus-client>=0.20.0",
 ]
-# Current NCCL M2N Python API. Version 0.1.0 does not identify a unique source
-# revision; production builds must use an immutable internal wheel built from
-# validated nccl-extensions revision abe83984 (or a reviewed successor).
+# Version 0.1.0 does not identify a unique source revision. Failure-tolerant
+# production builds must use a revision-stamped wheel containing bounded
+# m2nWaitCommReady support (official port-m2n-async-wait-timeout revision
+# 45c3f9b, or its reviewed merged successor). abe83984 and official main at
+# review time (5fab732a) retain an unbounded native wait.
 nccl-m2n = [
     "nccl-extensions==0.1.0",
 ]

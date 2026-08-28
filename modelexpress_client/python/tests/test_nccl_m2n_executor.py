@@ -48,9 +48,30 @@ class FakeStream:
         self.events = events
         self.fail_sync = fail_sync
         self.name = name
+        self.query_results: list[bool | BaseException] = [True]
 
     def wait_event(self, event: FakeEvent) -> None:
         self.events.append(("stream_wait_event", self.name, event.name))
+
+    def set_query_results(
+        self,
+        *results: bool | BaseException,
+    ) -> None:
+        self.query_results = list(results)
+
+    def query(self) -> bool:
+        if not self.query_results:
+            result: bool | BaseException = True
+        elif len(self.query_results) == 1:
+            result = self.query_results[0]
+        else:
+            result = self.query_results.pop(0)
+        if isinstance(result, BaseException):
+            self.events.append(("stream_query_error", self.name))
+            raise result
+        ready = bool(result)
+        self.events.append(("stream_query", self.name, ready))
+        return ready
 
     def synchronize(self) -> None:
         self.events.append(("stream_sync", self.name))
@@ -71,6 +92,7 @@ class FakeCuda:
         self.events = events
         self.fail_stream_sync = fail_stream_sync
         self.stream_count = 0
+        self.streams: list[FakeStream] = []
         self.producer_stream = FakeStream("producer", events)
 
     def set_device(self, device: int) -> None:
@@ -83,6 +105,9 @@ class FakeCuda:
             fail_sync=self.fail_stream_sync,
         )
         self.stream_count += 1
+        self.streams.append(stream)
+        if self.fail_stream_sync:
+            stream.set_query_results(RuntimeError("injected stream-query failure"))
         self.events.append(("stream_create", stream.name, device))
         return stream
 
@@ -102,9 +127,26 @@ class FakeComm:
         self.name = name
         self.events = events
         self.finalized = False
+        self.async_states: list[int | BaseException] = [0]
+
+    def set_async_states(self, *states: int | BaseException) -> None:
+        self.async_states = list(states)
 
     def get_async_error(self) -> int:
-        return 0
+        if len(self.async_states) > 1:
+            state = self.async_states.pop(0)
+        else:
+            state = self.async_states[0]
+        if isinstance(state, BaseException):
+            raise state
+        self.events.append(("comm_async", self.name, state))
+        return state
+
+    def abort(self) -> None:
+        self.events.append(
+            ("comm_abort_start", self.name, threading.current_thread().daemon)
+        )
+        self.events.append(("comm_abort_done", self.name))
 
     def finalize(self) -> None:
         self.events.append(("comm_finalize", self.name))
@@ -124,17 +166,32 @@ class FakeUniqueId:
         return FakeUniqueId(value)
 
 
+@dataclass(frozen=True)
+class FakeNCCLConfig:
+    blocking: bool | None = None
+
+
 class FakeNccl:
     UniqueId = FakeUniqueId
+    NCCLConfig = FakeNCCLConfig
 
     def __init__(self, events: list[tuple]) -> None:
         owner = self
 
-        class Communicator:
-            @staticmethod
-            def init(nranks: int, rank: int, unique_id: FakeUniqueId) -> FakeComm:
+        class Communicator(FakeComm):
+            def __init__(self) -> None:
+                super().__init__("<uninitialized>", owner.events)
+
+            def initialize(
+                self,
+                nranks: int,
+                rank: int,
+                unique_id: FakeUniqueId,
+                config: FakeNCCLConfig,
+            ) -> None:
                 del nranks, rank
-                return FakeComm(unique_id.value.decode(), owner.events)
+                self.name = unique_id.value.decode()
+                owner.events.append(("comm_init", self.name, config.blocking))
 
         self.Communicator = Communicator
         self.events = events
@@ -274,13 +331,17 @@ def make_executor(
     keys: tuple[tuple[int, int], ...] = ((0, 0),),
     fail_at: int | None = None,
     fail_stream_sync: bool = False,
+    transfer_timeout_s: float = 900.0,
     finalize_timeout_s: float = 300.0,
+    poll_interval_s: float = 0.002,
 ):
     events: list[tuple] = []
     m2n = FakeM2n(events, payloads, fail_at=fail_at)
     runtime = _M2nRuntime(
         0,
+        transfer_timeout_s=transfer_timeout_s,
         finalize_timeout_s=finalize_timeout_s,
+        _poll_interval_s=poll_interval_s,
         _m2n_module=m2n,
         _nccl_module=FakeNccl(events),
         _torch_module=SimpleNamespace(
@@ -398,9 +459,14 @@ def test_reshard_failure_leaves_live_version_unchanged_and_poisons_executor():
         executor.execute({(0, 0): params})
     assert len(m2n.handle.calls) == 2
     assert ("group_abort",) in events
-    executor.teardown()
-    assert not executor._states[(0, 0)].staged
-    runtime.close()
+    assert runtime._abort_done.wait(timeout=10)
+    assert ("comm_abort_start", "0-0", True) in events
+    with pytest.raises(RuntimeError, match="process restart is required"):
+        executor.teardown()
+    assert executor._states[(0, 0)].staged
+    with pytest.raises(RuntimeError, match="process restart is required"):
+        runtime.close()
+    assert ("handle_destroy",) not in events
 
 
 def test_commit_failure_poison_executor_until_reinitialized():
@@ -408,7 +474,7 @@ def test_commit_failure_poison_executor_until_reinitialized():
         torch.tensor([10, 11, 12, 13], dtype=torch.uint8),
         torch.tensor([20, 21, 22], dtype=torch.uint8),
     ]
-    executor, runtime, _, m2n, _ = make_executor(payloads)
+    executor, runtime, _, m2n, events = make_executor(payloads)
     params = make_params()
     copies = 0
     original_copy = executor._copy_into_live
@@ -428,7 +494,10 @@ def test_commit_failure_poison_executor_until_reinitialized():
     with pytest.raises(RuntimeError, match="unusable"):
         executor.execute({(0, 0): params})
     assert len(m2n.handle.calls) == call_count
-    runtime.close()
+    assert runtime._abort_done.wait(timeout=10)
+    with pytest.raises(RuntimeError, match="process restart is required"):
+        runtime.close()
+    assert ("handle_destroy",) not in events
 
 
 def test_source_uses_live_tensors_and_mx_owned_stream():
@@ -530,38 +599,38 @@ def test_close_waits_after_destination_stream_context_exits():
 
 def test_close_waits_for_executor_teardown():
     executor, runtime, groups, _, events = make_executor([], rank=1)
-    sync_entered = threading.Event()
-    release_sync = threading.Event()
-    original_sync = groups[0].stream.synchronize
-    sync_count = 0
+    query_entered = threading.Event()
+    release_query = threading.Event()
+    original_query = groups[0].stream.query
+    query_count = 0
 
-    def blocking_sync() -> None:
-        nonlocal sync_count
-        sync_count += 1
-        if sync_count == 1:
-            sync_entered.set()
-            assert release_sync.wait(timeout=10)
-        original_sync()
+    def blocking_query() -> bool:
+        nonlocal query_count
+        query_count += 1
+        if query_count == 1:
+            query_entered.set()
+            assert release_query.wait(timeout=10)
+        return original_query()
 
-    groups[0].stream.synchronize = blocking_sync
+    groups[0].stream.query = blocking_query
     teardown_thread, _, teardown_errors = start_thread(executor.teardown)
-    assert sync_entered.wait(timeout=10)
+    assert query_entered.wait(timeout=10)
 
     close_thread, _, close_errors = start_thread(runtime.close)
     wait_for_runtime_state(runtime, _RuntimeState.CLOSING)
     assert_active_operations(runtime, 1)
     assert ("handle_destroy",) not in events
 
-    release_sync.set()
+    release_query.set()
     join_thread(teardown_thread)
     join_thread(close_thread)
 
     assert not teardown_errors
     assert not close_errors
-    assert sync_count == 2
+    assert query_count == 2
     assert ("handle_destroy",) in events
     assert max(
-        index for index, event in enumerate(events) if event[0] == "stream_sync"
+        index for index, event in enumerate(events) if event[0] == "stream_query"
     ) < events.index(("handle_destroy",))
 
 
@@ -602,7 +671,7 @@ def test_close_timeout_during_executor_preparation_requires_restart():
     join_thread(execute_thread)
     assert len(execute_errors) == 1
     assert "poisoned" in str(execute_errors[0])
-    with pytest.raises(RuntimeError, match="poisoned"):
+    with pytest.raises(RuntimeError, match="process restart is required"):
         executor.teardown()
     with pytest.raises(RuntimeError, match="process restart is required"):
         runtime.close()
@@ -630,7 +699,7 @@ def test_multi_pp_group_submission_uses_one_group_and_sorted_first_occurrence():
         keys=((1, 0), (0, 0)),
     )
     # Same read-only source tensors may feed distinct M2N buckets by approved
-    # contract. Executor retains them through every PP-stream synchronization.
+    # contract. Executor retains them through every PP-stream completion.
     shared = make_params()
 
     executor.execute({(1, 0): shared, (0, 0): shared})
@@ -646,10 +715,10 @@ def test_multi_pp_group_submission_uses_one_group_and_sorted_first_occurrence():
     last_reshard = max(
         index for index, event in enumerate(events) if event[0] == "reshard"
     )
-    first_sync = min(
-        index for index, event in enumerate(events) if event[0] == "stream_sync"
+    first_query = min(
+        index for index, event in enumerate(events) if event[0] == "stream_query"
     )
-    assert last_reshard < first_sync
+    assert last_reshard < first_query
     executor.teardown()
     runtime.close()
 
@@ -705,15 +774,17 @@ def test_failed_stream_drain_retains_staging_and_disables_executor():
         torch.tensor([10, 11, 12, 13], dtype=torch.uint8),
         torch.tensor([20, 21, 22], dtype=torch.uint8),
     ]
-    executor, _, _, _, _ = make_executor(
+    executor, runtime, _, _, events = make_executor(
         payloads,
         fail_stream_sync=True,
     )
     params = make_params()
 
-    with pytest.raises(RuntimeError, match="injected stream-sync failure"):
+    with pytest.raises(RuntimeError, match="CUDA stream query failed"):
         executor.execute({(0, 0): params})
     assert executor._states[(0, 0)].staged
+    assert runtime._abort_done.wait(timeout=10)
+    assert ("comm_abort_start", "0-0", True) in events
     with pytest.raises(RuntimeError, match="unusable"):
         executor.execute({(0, 0): params})
 
@@ -749,3 +820,63 @@ def test_build_reshard_params_translates_megatron_specs():
     assert params[0].local_tensor is replicated.tensor
     assert params[1].global_shape == (4, 3)
     assert params[1].local_shard_index == 0
+
+
+def test_async_nccl_error_preserves_live_version_and_quarantines_staging():
+    payloads = [
+        torch.tensor([10, 11, 12, 13], dtype=torch.uint8),
+        torch.tensor([20, 21, 22], dtype=torch.uint8),
+    ]
+    executor, runtime, groups, _, events = make_executor(payloads)
+    params = make_params()
+    originals = [param.local_tensor.clone() for param in params]
+    groups[0].communicator.set_async_states(2)
+
+    with pytest.raises(RuntimeError, match="status=2"):
+        executor.execute({(0, 0): params})
+
+    assert all(
+        torch.equal(param.local_tensor, original)
+        for param, original in zip(params, originals, strict=True)
+    )
+    assert runtime._abort_done.wait(timeout=10)
+    assert runtime._quarantined_batches
+    batch = runtime._quarantined_batches[0]
+    staged = executor._states[(0, 0)].staged
+    assert [call.dst.buffer for call in batch.calls] == staged
+    assert batch.commit is not None
+    assert ("comm_abort_start", "0-0", True) in events
+    with pytest.raises(RuntimeError, match="process restart is required"):
+        executor.teardown()
+    assert executor._states[(0, 0)].staged
+    with pytest.raises(RuntimeError, match="process restart is required"):
+        runtime.close()
+
+
+def test_transfer_timeout_preserves_live_version_and_returns_before_abort_wait():
+    payloads = [
+        torch.tensor([10, 11, 12, 13], dtype=torch.uint8),
+        torch.tensor([20, 21, 22], dtype=torch.uint8),
+    ]
+    executor, runtime, groups, _, events = make_executor(
+        payloads,
+        transfer_timeout_s=0.005,
+        poll_interval_s=0.001,
+    )
+    params = make_params()
+    originals = [param.local_tensor.clone() for param in params]
+    groups[0].stream.set_query_results(False)
+
+    with pytest.raises(TimeoutError, match="model-version staging"):
+        executor.execute({(0, 0): params})
+
+    assert all(
+        torch.equal(param.local_tensor, original)
+        for param, original in zip(params, originals, strict=True)
+    )
+    assert runtime._abort_done.wait(timeout=10)
+    assert runtime._quarantined_batches
+    assert executor._states[(0, 0)].staged
+    assert ("handle_destroy",) not in events
+    with pytest.raises(RuntimeError, match="process restart is required"):
+        runtime.close()
