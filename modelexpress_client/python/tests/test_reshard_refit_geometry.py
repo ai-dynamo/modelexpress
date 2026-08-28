@@ -258,7 +258,9 @@ def test_capture_weights_records_the_converted_source_name():
     f32 = torch.float32
     with torch.device("meta"):
         model = ToyModel()
-    lazies = build_lazy_weights([("native.col", f32, [8, 4]), ("native.norm", f32, [4])])
+    lazies = build_lazy_weights(
+        [("native.col", f32, [8, 4]), ("native.norm", f32, [4])]
+    )
     converted = {"col": lazies["native.col"], "norm": lazies["native.norm"]}
 
     by_src = {c.src_name: c for c in capture_weights(model, converted).copies}
@@ -385,8 +387,14 @@ def test_moe_convert_capture_plan_reconstructs_end_to_end():
     in the right fused slot."""
     f32 = torch.float32
     router = torch.arange(_E * _H, dtype=f32).reshape(_E, _H)
-    w1 = {e: (torch.arange(_I * _H, dtype=f32) + 100 + e).reshape(_I, _H) for e in range(_E)}
-    w3 = {e: (torch.arange(_I * _H, dtype=f32) + 200 + e).reshape(_I, _H) for e in range(_E)}
+    w1 = {
+        e: (torch.arange(_I * _H, dtype=f32) + 100 + e).reshape(_I, _H)
+        for e in range(_E)
+    }
+    w3 = {
+        e: (torch.arange(_I * _H, dtype=f32) + 200 + e).reshape(_I, _H)
+        for e in range(_E)
+    }
     src_buf = {"router.gate": router.reshape(-1)}
     src_shape = {"router.gate": (_E, _H)}
     for e in range(_E):
@@ -410,7 +418,9 @@ def test_moe_convert_capture_plan_reconstructs_end_to_end():
         shard = Shard(
             shard_offset=(0,) * len(shape), shape=shape, session="s", addr=0, elsize=4
         )
-        segs = plan_pull(copy, global_shape=shape, src_dtype=f32, elsize=4, shards=[shard])
+        segs = plan_pull(
+            copy, global_shape=shape, src_dtype=f32, elsize=4, shards=[shard]
+        )
         source, dest = src_buf[copy.src_name], dst[copy.param_name]
         for seg in segs:
             s0, d0, n = seg.src_addr // 4, seg.dst_byte // 4, seg.nbytes // 4
@@ -462,7 +472,9 @@ def test_stacked_moe_convert_capture_plan_reconstructs_end_to_end():
     a zero-copy sub-range that lands in the right fused destination slot."""
     f32 = torch.float32
     router = torch.arange(_E * _H, dtype=f32).reshape(_E, _H)
-    w1 = (torch.arange(_E * _I * _H, dtype=f32) + 100).reshape(_E, _I, _H)  # stacked gate
+    w1 = (torch.arange(_E * _I * _H, dtype=f32) + 100).reshape(
+        _E, _I, _H
+    )  # stacked gate
     w3 = (torch.arange(_E * _I * _H, dtype=f32) + 200).reshape(_E, _I, _H)  # stacked up
     src_buf = {
         "router.gate": router.reshape(-1),
@@ -497,7 +509,9 @@ def test_stacked_moe_convert_capture_plan_reconstructs_end_to_end():
         shard = Shard(
             shard_offset=(0,) * len(shape), shape=shape, session="s", addr=0, elsize=4
         )
-        segs = plan_pull(copy, global_shape=shape, src_dtype=f32, elsize=4, shards=[shard])
+        segs = plan_pull(
+            copy, global_shape=shape, src_dtype=f32, elsize=4, shards=[shard]
+        )
         source, dest = src_buf[copy.src_name], dst[copy.param_name]
         for seg in segs:
             s0, d0, n = seg.src_addr // 4, seg.dst_byte // 4, seg.nbytes // 4

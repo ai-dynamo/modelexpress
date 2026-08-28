@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Public rank-local context required by the vLLM generator adapter."""
+"""Public rank-local context required by the vLLM generator integration."""
 
 from __future__ import annotations
 

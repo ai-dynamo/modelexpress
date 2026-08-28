@@ -30,8 +30,9 @@ from __future__ import annotations
 
 import functools
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 import torch
 
@@ -131,7 +132,7 @@ class LazyWeight(torch.Tensor):
         # Zero-storage meta tensor for post-op shape/dtype inference only.
         return torch.empty(self.shape, dtype=self.dtype, device="meta")
 
-    def _child(self, new_shape, new_dtype, *new_ops) -> "LazyWeight":
+    def _child(self, new_shape, new_dtype, *new_ops) -> LazyWeight:
         return LazyWeight(
             self._name,
             new_shape,
@@ -260,7 +261,7 @@ def _restore_stamps(saved: list) -> None:
 
 def build_lazy_weights(
     manifest: list[tuple[str, Any, tuple]],
-) -> dict[str, "LazyWeight"]:
+) -> dict[str, LazyWeight]:
     """One ``LazyWeight`` placeholder per published source, all sharing a recorder.
 
     ``manifest`` is ``(name, dtype, shape)`` for every full source tensor. The
@@ -277,7 +278,7 @@ def build_lazy_weights(
     }
 
 
-def _shared_recorder(weights: dict) -> "_BakeRecorder":
+def _shared_recorder(weights: dict) -> _BakeRecorder:
     # Every value must be a recording LazyWeight: an ordinary tensor would be sent
     # to load_weights and its copies dropped (the copy_ sink only fires for a
     # LazyWeight), silently under-capturing the model.

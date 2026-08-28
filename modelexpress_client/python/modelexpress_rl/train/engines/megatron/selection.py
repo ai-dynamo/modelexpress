@@ -24,9 +24,9 @@ def model_express_role_for_mapping(
             f"ModelExpress does not yet support expert mapping {mapping_name}"
         )
     if _inherits(mapping, "QKVMapping"):
-        if tensor_ndim != 2:
+        if tensor_ndim not in {1, 2}:
             raise NotImplementedError(
-                "ModelExpress QKV publication currently supports weights only"
+                "ModelExpress QKV publication supports only weights and biases"
             )
         return "qkv_column"
     if _inherits(mapping, "GatedMLPMapping"):

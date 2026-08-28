@@ -3,20 +3,38 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 import modelexpress_rl
 from modelexpress_rl.train.resources import _TrainerResources
 
 
-def test_resources_initialize_transport_and_manifest_service(monkeypatch):
+@pytest.mark.parametrize(
+    ("rank", "agent_name"),
+    [
+        ("7", "modelexpress-trainer-7-01234567"),
+        (None, "modelexpress-trainer-01234567"),
+    ],
+)
+def test_resources_initialize_transport_and_manifest_service(
+    monkeypatch, rank, agent_name
+):
     monkeypatch.setenv("MX_WORKER_HOST", "trainer.test")
     monkeypatch.setenv("MX_METADATA_PORT", "18000")
     monkeypatch.setenv("MX_WORKER_GRPC_PORT", "19000")
-    monkeypatch.setenv("RANK", "7")
+    if rank is None:
+        monkeypatch.delenv("RANK", raising=False)
+    else:
+        monkeypatch.setenv("RANK", rank)
     manager = MagicMock()
     server = MagicMock()
     server.add_insecure_port.return_value = 19002
 
     with (
+        patch(
+            "modelexpress_rl.train.resources.uuid.uuid4",
+            return_value=MagicMock(hex="0123456789abcdef"),
+        ),
         patch(
             "modelexpress.nixl_transfer.NixlTransferManager",
             return_value=manager,
@@ -29,7 +47,7 @@ def test_resources_initialize_transport_and_manifest_service(monkeypatch):
         resources = _TrainerResources.initialize(device_id=2)
 
     manager_type.assert_called_once_with(
-        agent_name="modelexpress-trainer-7",
+        agent_name=agent_name,
         device_id=2,
         listen_port=18002,
     )

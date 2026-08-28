@@ -32,10 +32,10 @@ Two properties worth noting:
     meta-tensor replay, not just ``narrow``.
 
 SCOPE: the needed slice must resolve to a permuted axis-aligned box of the source
-(narrow/getitem/transpose/permute/t). A copy (``contiguous``/``reshape`` that
-materializes), a rank change (int-index collapse, step != 1 slice), or a
-dim-merging reshape - plus src/dst dtype mismatch - raise ``UnsupportedReshard``
-and make the receiver fail closed.
+(narrow/getitem/transpose/permute/t/select/unbind). A copy
+(``contiguous``/``reshape`` that materializes), a rank increase, a strided slice,
+or a dim-merging reshape - plus src/dst dtype mismatch - raises
+``UnsupportedReshard`` and makes the receiver fail closed.
 """
 
 from __future__ import annotations
@@ -239,7 +239,7 @@ def resolve_slice(copy: RecordedCopy, global_shape) -> tuple:
     out permuted. The dest strides are reindexed from view-dim order into
     source-dim order so ``paired_runs`` (which walks the overlap in source-dim
     order) maps each source element to the right dest slot. Anything not a pure
-    permuted view (a copy, rank change, or dim-merging reshape) raises
+    permuted view (a copy, rank increase, or dim-merging reshape) raises
     ``UnsupportedReshard`` and makes the current receiver fail closed."""
     v_off, v_shape, v_stride = _replay_view(copy.op_chain, global_shape)
     box, perm = _view_to_box_perm(v_off, v_shape, v_stride, global_shape)
@@ -314,7 +314,7 @@ def plan_pull(
     tensor, return the ``PullSegment``s that read exactly the needed slice.
 
     Raises ``UnsupportedReshard`` on dtype mismatch, or an op-chain that isn't
-    a pure permuted view (copy / rank change / dim-merge)."""
+    a pure permuted view (copy / rank increase / dim-merge)."""
     if src_dtype != copy.dest_dtype:
         raise UnsupportedReshard(
             f"{copy.param_name}: source dtype {src_dtype} != dest dtype {copy.dest_dtype} "

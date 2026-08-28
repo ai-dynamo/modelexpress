@@ -6,8 +6,7 @@ Extracts the rank-local shards from an FSDP ``state_dict`` and emits MX's
 engine-neutral manifest (``PublishedTensor`` / ``PublishedShard`` +
 ``wrap_rendezvous_blob``). HF-name conversion is deliberately NOT done here: the
 receiver maps these native trainer-format sources into the HF/vLLM param layout
-(see the ``convert_native_to_hf=`` argument to ``VllmReshardReceiver`` in
-``modelexpress/engines/vllm/refit/receiver.py``).
+(see the ``convert_native_to_hf=`` field on ``VllmGeneratorContext``).
 
 Extraction rules (per state_dict tensor, floating point only):
 - unsharded (not a DTensor): every rank holds + publishes the full tensor;
@@ -178,7 +177,7 @@ def build_fsdp_reshard_manifest(
             raise ValueError(f"{shard.name}: shard has invalid address")
         published_shard = PublishedShard(
             agent_name=agent_name,
-            device_id=served.device.index if served.device.type == "cuda" else 0,
+            device_id=int(served.device.index or 0),
             addr=addr,
             shard_offset=tuple(shard.shard_offset),
             shape=tuple(shard.local_shape),

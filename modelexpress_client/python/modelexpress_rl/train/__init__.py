@@ -7,13 +7,19 @@ from .adapter import TrainerStagingMode, WeightPayloadFormat
 from .client import (
     ModelExpressTrainerClient,
     ModelExpressTrainerConfig,
+    ObjectStorageConfig,
     StagedWeightVersionShard,
 )
+from .context import FSDPTrainerContext, MegatronTrainerContext, TrainerEngineContext
 
 __all__ = [
+    "FSDPTrainerContext",
+    "MegatronTrainerContext",
     "ModelExpressTrainerClient",
     "ModelExpressTrainerConfig",
+    "ObjectStorageConfig",
     "StagedWeightVersionShard",
+    "TrainerEngineContext",
     "TrainerStagingMode",
     "WeightPayloadFormat",
 ]

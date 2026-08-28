@@ -12,17 +12,30 @@ by compiled CUDA graphs.
 
 from __future__ import annotations
 
+import copy
 import logging
+import time
+from collections.abc import Callable
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
 
-from modelexpress.refit.reshard.geometry import capture_weights, convert_source_weights
+from modelexpress.refit.reshard.geometry import (
+    capture_weights,
+    convert_source_weights,
+)
 from modelexpress.refit.reshard.types import IncompleteRefit
+from modelexpress_rl.inference.plan import (
+    EngineCapabilities,
+    EngineInstaller,
+    PreparedArtifact,
+    PreparedCheckpointArtifact,
+    PreparedEngineTensors,
+)
+from modelexpress_rl.inference.receiver import PreparedCheckpoint
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from torch.nn import Module
     from vllm.config import ModelConfig, VllmConfig
 
@@ -31,7 +44,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger("modelexpress_rl.inference.engines.vllm.installer")
 
 
-class _VllmInstaller:
+class _VllmInstaller(EngineInstaller):
     """Capture vLLM's load layout and install verified staged tensors."""
 
     def __init__(
@@ -48,11 +61,85 @@ class _VllmInstaller:
         self._model_config = model_config
         self._device = device
         self._convert_native_to_hf = convert_native_to_hf
+        self._parameter_layout: dict[
+            str, tuple[tuple[int, ...], torch.dtype]
+        ] | None = None
+
+    @property
+    def capabilities(self) -> EngineCapabilities:
+        return EngineCapabilities(
+            artifact_types=frozenset(
+                {
+                    PreparedEngineTensors,
+                    PreparedCheckpointArtifact,
+                }
+            )
+        )
+
+    def install(self, prepared: PreparedArtifact) -> dict[str, float]:
+        started = time.perf_counter()
+        if isinstance(prepared, PreparedEngineTensors):
+            self.install_tensors(prepared.staged.tensors)
+        elif isinstance(prepared, PreparedCheckpointArtifact):
+            checkpoint = prepared.checkpoint
+            if not isinstance(checkpoint, PreparedCheckpoint):
+                raise TypeError("checkpoint preparation has an invalid value")
+            self.install_checkpoint(checkpoint.path)
+        else:
+            raise TypeError(
+                f"unsupported prepared artifact {type(prepared).__name__}"
+            )
+        return {"perf/mx_receive_install_time": time.perf_counter() - started}
 
     @property
     def _is_quantized(self) -> bool:
         """Whether the live model uses a post-load quantized kernel layout."""
         return getattr(self._vllm_config, "quant_config", None) is not None
+
+    def _build_meta_twin(self) -> Module:
+        """Build an unquantized, storage-free copy of the load-time model.
+
+        Quantized live parameters are already packed for their kernels, so they
+        cannot describe where bf16 trainer weights land during normal loading.
+        The unquantized meta twin has the same structural fusion and load-time
+        parameter layout without allocating tensor storage.
+        """
+        try:
+            from vllm.model_executor.model_loader.utils import initialize_model
+            from vllm.utils.torch_utils import set_default_torch_dtype
+        except (ImportError, AttributeError) as error:
+            raise RuntimeError(
+                "ModelExpress refit requires vLLM's layerwise reload APIs"
+            ) from error
+
+        # Strip quantization so capture observes pre-PWAL load-time parameters,
+        # not fp8/Marlin kernel storage.
+        twin_config = copy.copy(self._vllm_config)
+        twin_model_config = copy.copy(self._vllm_config.model_config)
+        twin_model_config.quantization = None
+        twin_config.model_config = twin_model_config
+        twin_config.quant_config = None
+        # The live model already populated static_forward_context. The twin needs
+        # a separate empty registry or Attention initialization rejects duplicate
+        # layer prefixes.
+        twin_compilation_config = copy.copy(self._vllm_config.compilation_config)
+        twin_compilation_config.static_forward_context = {}
+        twin_config.compilation_config = twin_compilation_config
+
+        # Match vLLM's normal loader initialization; otherwise torch's fp32
+        # default would produce the wrong destination dtype during capture.
+        with set_default_torch_dtype(self._model_config.dtype), torch.device("meta"):
+            return initialize_model(twin_config)
+
+    @staticmethod
+    def _layout_of(
+        model: Module,
+    ) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+        """Describe one model's named parameter shapes and dtypes."""
+        return {
+            name: (tuple(parameter.shape), parameter.dtype)
+            for name, parameter in model.named_parameters()
+        }
 
     def capture(
         self, manifest: list[tuple[str, torch.dtype, tuple[int, ...]]]
@@ -114,11 +201,43 @@ class _VllmInstaller:
             len(capture.unsupported),
             self._is_quantized,
         )
+        self._parameter_layout = param_layout
         return capture, param_layout
 
-    def install(self, tensors: dict[str, torch.Tensor]) -> None:
+    def parameter_layout(self) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+        """Return the canonical load-time layout used by peer staging buffers."""
+        if self._parameter_layout is None:
+            self._parameter_layout = self._layout_of(self._build_meta_twin())
+        return self._parameter_layout
+
+    def install_tensors(self, tensors: dict[str, torch.Tensor]) -> None:
         """Install verified load-layout tensors without changing graph addresses."""
         self._process_and_commit(tensors)
+        _update_mla_absorbed_weights(self._model, quantized=self._is_quantized)
+        torch.cuda.synchronize(self._device)
+
+    def install_checkpoint(self, path: str | Path) -> None:
+        """Reload a prepared safetensors checkpoint into the live model."""
+        try:
+            from vllm.model_executor.model_loader.default_loader import (
+                DefaultModelLoader,
+            )
+        except (ImportError, AttributeError) as error:
+            raise RuntimeError(
+                "ModelExpress refit requires vLLM's default model loader"
+            ) from error
+
+        load_config = copy.copy(self._vllm_config.load_config)
+        try:
+            load_config.load_format = "safetensors"
+        except AttributeError:
+            object.__setattr__(load_config, "load_format", "safetensors")
+        model_config = copy.copy(self._model_config)
+        model_config.model = str(path)
+        model_config.revision = None
+        loader = DefaultModelLoader(load_config)
+
+        self._reload(lambda: loader.load_weights(self._model, model_config))
         _update_mla_absorbed_weights(self._model, quantized=self._is_quantized)
         torch.cuda.synchronize(self._device)
 
@@ -134,40 +253,19 @@ class _VllmInstaller:
         from torch import nn
 
         try:
-            from vllm.config import set_current_vllm_config
             from vllm.model_executor.layers.quantization.base_config import (
                 QuantizeMethodBase,
             )
             from vllm.model_executor.model_loader.reload.layerwise import (
                 LAYERWISE_INFO,
                 _copy_and_restore_kernel_tensors,
-                finalize_layerwise_reload,
-                initialize_layerwise_reload,
             )
         except (ImportError, AttributeError) as error:
             raise RuntimeError(
                 "ModelExpress refit requires vLLM's layerwise reload APIs"
             ) from error
 
-        # vLLM also keeps graph-bound tensors as plain object attributes rather
-        # than registered parameters or buffers. Layerwise reload does not save
-        # these. Snapshot their original storage so Marlin workspaces and MLA
-        # derived tensors are not replaced with addresses absent from the graph.
-        bare_tensors = {
-            module: {
-                name: value
-                for name, value in module.__dict__.items()
-                if isinstance(value, torch.Tensor)
-            }
-            for module in self._model.modules()
-        }
-        bare_tensors = {
-            module: values for module, values in bare_tensors.items() if values
-        }
-
-        with torch.device(self._device), set_current_vllm_config(self._vllm_config):
-            initialize_layerwise_reload(self._model)
-
+        def load() -> None:
             # Quantized models expose kernel-packed parameters before layerwise
             # reload and load-time parameters after it. Resolve the captured
             # names only after vLLM has restored that load-time hierarchy.
@@ -203,6 +301,42 @@ class _VllmInstaller:
                     _copy_and_restore_kernel_tensors(layer, info)
                 if info is not None:
                     info.reset()
+
+        self._reload(load)
+
+    @torch.no_grad()
+    def _reload(self, load: Callable[[], None]) -> None:
+        """Run one weight loader inside vLLM's graph-safe reload window."""
+        try:
+            from vllm.config import set_current_vllm_config
+            from vllm.model_executor.model_loader.reload.layerwise import (
+                finalize_layerwise_reload,
+                initialize_layerwise_reload,
+            )
+        except (ImportError, AttributeError) as error:
+            raise RuntimeError(
+                "ModelExpress refit requires vLLM's layerwise reload APIs"
+            ) from error
+
+        # vLLM also keeps graph-bound tensors as plain object attributes rather
+        # than registered parameters or buffers. Layerwise reload does not save
+        # these. Snapshot their original storage so Marlin workspaces and MLA
+        # derived tensors are not replaced with addresses absent from the graph.
+        bare_tensors = {
+            module: {
+                name: value
+                for name, value in module.__dict__.items()
+                if isinstance(value, torch.Tensor)
+            }
+            for module in self._model.modules()
+        }
+        bare_tensors = {
+            module: values for module, values in bare_tensors.items() if values
+        }
+
+        with torch.device(self._device), set_current_vllm_config(self._vllm_config):
+            initialize_layerwise_reload(self._model)
+            load()
             finalize_layerwise_reload(self._model, self._model_config)
 
             # PWAL may recreate a bare attribute. Copy meaningful derived content

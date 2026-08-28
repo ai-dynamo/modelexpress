@@ -252,7 +252,11 @@ def test_unbind_piece_reconstructs_bit_for_bit():
     src = torch.arange(4 * 3, dtype=torch.float32).reshape(4, 3)
     ground_truth = src.unbind(0)[2]  # [3]
     copy = _copy(
-        (("unbind", (0,), ()), ("__getitem__", (2,), ())), "u2", 0, (3,), (1,)
+        (("unbind", (0,), ()), ("__getitem__", (2,), ())),
+        "u2",
+        0,
+        (3,),
+        (1,),
     )
     shard = Shard(shard_offset=(0, 0), shape=(4, 3), session="s0", addr=0, elsize=EL)
     segs = plan_pull(
