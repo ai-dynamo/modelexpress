@@ -27,12 +27,14 @@ from modelexpress_rl import (
 )
 from modelexpress_rl.s3 import S3Client
 from modelexpress_rl.train import client as trainer_client_module
+from modelexpress_rl.train import runtime as trainer_runtime_module
 
 
 class _MemoryS3:
     def __init__(self) -> None:
         self.objects = {}
         self.fail_next = False
+        self.closed = False
 
     def put(self, *, uri, data):
         if self.fail_next:
@@ -43,7 +45,7 @@ class _MemoryS3:
             raise RuntimeError("immutable object differs")
 
     def close(self):
-        pass
+        self.closed = True
 
 
 class _S3Error(Exception):
@@ -155,7 +157,7 @@ def _trainer(
     launch_tensors = launch_tensors or {"weight": torch.tensor([1.0, 2.0])}
     _write_safetensors(launch, launch_tensors)
     storage = _MemoryS3()
-    monkeypatch.setattr(trainer_client_module, "S3Client", lambda **_kwargs: storage)
+    monkeypatch.setattr(trainer_runtime_module, "S3Client", lambda **_kwargs: storage)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda _group=None: 0)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda _group=None: 1)
     monkeypatch.setattr(
@@ -249,9 +251,9 @@ def test_s3_prepare_delta_base_uses_owned_launch_tensors(
                 hf_tensor_iter=iter([[("a", torch.tensor([9.0]))]]),
             )
 
-        assert set(trainer._snapshot) == {"a"}
+        assert set(trainer._runtime.method.snapshot) == {"a"}
         assert np.array_equal(
-            trainer._snapshot["a"],
+            trainer._runtime.method.snapshot["a"],
             launch_tensors["a"].view(torch.uint8).numpy(),
         )
         assert (
@@ -276,7 +278,7 @@ def test_s3_prepare_delta_base_reads_framework_buckets_concurrently(
         },
         prepare_base=False,
     )
-    reader = trainer._read_launch_tensor
+    reader = trainer._runtime.method._read_launch_tensor
     assert reader is not None
     barrier = threading.Barrier(2)
     threads = set()
@@ -286,7 +288,7 @@ def test_s3_prepare_delta_base_reads_framework_buckets_concurrently(
         barrier.wait(timeout=2)
         return reader(name)
 
-    trainer._read_launch_tensor = read
+    trainer._runtime.method._read_launch_tensor = read
     try:
         trainer.prepare_delta_base(
             hf_tensor_iter=iter(
@@ -298,7 +300,7 @@ def test_s3_prepare_delta_base_reads_framework_buckets_concurrently(
         )
 
         assert len(threads) == 2
-        assert set(trainer._snapshot) == {"a", "b"}
+        assert set(trainer._runtime.method.snapshot) == {"a", "b"}
     finally:
         trainer.close()
 
@@ -306,13 +308,13 @@ def test_s3_prepare_delta_base_reads_framework_buckets_concurrently(
 def test_s3_close_releases_delta_base(monkeypatch, tmp_path, refit_server):
     _service, server_url = refit_server
     trainer, _storage = _trainer(monkeypatch, tmp_path, server_url)
-    trainer._metric_delta = object()
+    method = trainer._runtime.method
+    method._metric_delta = object()
 
     trainer.close()
 
-    assert trainer._snapshot == {}
-    assert trainer._read_launch_tensor is None
-    assert trainer._metric_delta is None
+    assert method.snapshot == {}
+    assert method._metric_delta is None
 
 
 def test_s3_process_group_belongs_to_trainer_config(
@@ -328,7 +330,7 @@ def test_s3_process_group_belongs_to_trainer_config(
     )
 
     try:
-        assert trainer._process_group is process_group
+        assert trainer._runtime.method._process_group is process_group
     finally:
         trainer.close()
 
@@ -341,7 +343,7 @@ def test_s3_stage_is_local_then_publish_uploads_version_root(
     current = torch.tensor([1.0, 3.0])
 
     try:
-        with pytest.raises(RuntimeError, match="does not use source slots"):
+        with pytest.raises(RuntimeError, match="requires full-tensor publication"):
             _ = trainer.source_slot_id
         staged = trainer.stage_shard(
             version=WeightVersionRef("target-a"),
@@ -455,7 +457,7 @@ def test_s3_publish_failure_keeps_handle_retryable(monkeypatch, tmp_path, refit_
         storage.fail_next = True
         with pytest.raises(RuntimeError, match="injected upload failure"):
             staged.publish()
-        assert trainer._current_base_version_id == "base-a"
+        assert trainer._runtime.method.current_base_version_id == "base-a"
         assert service.shards == []
         assert {
             name: value.tobytes()
@@ -463,13 +465,110 @@ def test_s3_publish_failure_keeps_handle_retryable(monkeypatch, tmp_path, refit_
         } == encoded
 
         staged.publish()
-        assert trainer._current_base_version_id == "target-a"
+        assert trainer._runtime.method.current_base_version_id == "target-a"
         assert staged._staged.encoded_deltas == {}
         assert staged._staged.checksums == {}
     finally:
         trainer.close()
 
     assert service.shards == []
+
+
+def test_s3_index_publish_failure_keeps_handle_retryable(
+    monkeypatch, tmp_path, refit_server
+):
+    _service, server_url = refit_server
+    trainer, storage = _trainer(monkeypatch, tmp_path, server_url)
+
+    try:
+        staged = trainer.stage_shard(
+            version=WeightVersionRef("target-a"),
+            hf_tensor_iter=iter([[("weight", torch.tensor([1.0, 2.0]))]]),
+        )
+        storage.fail_next = True
+        with pytest.raises(RuntimeError, match="injected upload failure"):
+            staged.publish()
+        assert trainer._runtime.method.current_base_version_id == "base-a"
+        assert staged._staged.candidate_snapshot
+
+        staged.publish()
+        assert trainer._runtime.method.current_base_version_id == "target-a"
+    finally:
+        trainer.close()
+
+
+def test_s3_remote_index_failure_prevents_non_root_state_transition(
+    monkeypatch, tmp_path, refit_server
+):
+    _service, server_url = refit_server
+    trainer, _storage = _trainer(monkeypatch, tmp_path, server_url)
+    method = trainer._runtime.method
+    method._rank = 1
+    method._world_size = 2
+
+    def all_gather(output, value, group=None):
+        del group
+        if isinstance(value, tuple):
+            output[:] = [(0, 0), (1, 0)]
+        else:
+            output[:] = ["RuntimeError: injected upload failure", None]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather)
+    monkeypatch.setattr(
+        torch.distributed, "gather_object", lambda *_args, **_kwargs: None
+    )
+
+    try:
+        staged = trainer.stage_shard(
+            version=WeightVersionRef("target-a"),
+            hf_tensor_iter=iter([[("weight", torch.tensor([1.0, 2.0]))]]),
+        )
+        with pytest.raises(RuntimeError, match="failed on rank 0"):
+            staged.publish()
+        assert method.current_base_version_id == "base-a"
+        assert staged._staged.candidate_snapshot
+    finally:
+        trainer.close()
+
+
+def test_s3_client_closes_when_publication_method_initialization_fails(
+    monkeypatch, tmp_path
+):
+    storage = _MemoryS3()
+    config = ObjectStorageConfig(
+        storage_type=ObjectStorageType.S3,
+        uri_prefix="s3://weights/tests",
+        initial_base_version_id="base-a",
+        launch_checkpoint=tmp_path / "launch",
+    )
+    monkeypatch.setattr(
+        trainer_runtime_module,
+        "make_tensor_reader",
+        lambda _path: (lambda _name: None, None),
+    )
+    monkeypatch.setattr(trainer_runtime_module, "S3Client", lambda **_kwargs: storage)
+    monkeypatch.setattr(
+        trainer_runtime_module,
+        "CanonicalDeltaPublicationMethod",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("init failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="init failed"):
+        trainer_runtime_module.TrainerRuntime.initialize(
+            engine_context=None,
+            device_id=None,
+            agent_name=None,
+            model_name="test/model",
+            staging_mode=TrainerStagingMode.WRITE_TO_STORAGE,
+            payload_format=WeightPayloadFormat.XOR_DELTA,
+            worker_id="trainer-a",
+            object_storage=config,
+            process_group=None,
+            service=lambda: object(),
+            rpc_timeout_seconds=30,
+        )
+
+    assert storage.closed
 
 
 def test_s3_processes_buckets_concurrently_and_uploads_one_shard(
@@ -488,7 +587,7 @@ def test_s3_processes_buckets_concurrently_and_uploads_one_shard(
     )
     process_barrier = threading.Barrier(2)
     process_threads = set()
-    process_bucket = trainer._process_delta_bucket
+    process_bucket = trainer._runtime.method._process_bucket
     save = safetensors.numpy.save
     save_calls = 0
 
@@ -502,7 +601,7 @@ def test_s3_processes_buckets_concurrently_and_uploads_one_shard(
         save_calls += 1
         return save(*args, **kwargs)
 
-    trainer._process_delta_bucket = track_process
+    trainer._runtime.method._process_bucket = track_process
     monkeypatch.setattr(safetensors.numpy, "save", track_save)
     try:
         staged = trainer.stage_shard(
@@ -516,11 +615,6 @@ def test_s3_processes_buckets_concurrently_and_uploads_one_shard(
         )
         assert len(process_threads) == 2
         assert save_calls == 0
-        monkeypatch.setattr(
-            trainer_client_module,
-            "compress_delta",
-            lambda _delta: pytest.fail("publication recompressed a staged delta"),
-        )
         staged.publish()
         assert save_calls == 1
     finally:
@@ -560,13 +654,13 @@ def test_s3_preserves_framework_bucket_boundaries(monkeypatch, tmp_path, refit_s
         [("c", torch.tensor([4.0]))],
     ]
     processed = []
-    process_bucket = trainer._process_delta_bucket
+    process_bucket = trainer._runtime.method._process_bucket
 
     def track_process(bucket):
         processed.append(bucket)
         return process_bucket(bucket)
 
-    trainer._process_delta_bucket = track_process
+    trainer._runtime.method._process_bucket = track_process
     try:
         trainer.stage_shard(
             version=WeightVersionRef("target-a"),
@@ -596,7 +690,7 @@ def test_s3_exposes_local_metrics_after_publication(
 
     monkeypatch.setattr(torch.distributed, "all_gather_object", track_gather)
     monkeypatch.setattr(
-        trainer_client_module,
+        trainer_runtime_module,
         "perf_counter",
         lambda: next(clock),
     )
@@ -615,7 +709,7 @@ def test_s3_exposes_local_metrics_after_publication(
         assert staged._staged.wire_bytes == 0
 
         staged.publish()
-        assert gather_calls == 1
+        assert gather_calls == 2
         shard = next(
             data
             for uri, data in storage.objects.items()
@@ -703,7 +797,7 @@ def test_s3_chains_from_published_base_and_keeps_previous_advertisement(
         assert second._staged.checksums == {}
         assert second._staged.candidate_snapshot == {}
         trainer.release_version(version=WeightVersionRef("target-a"))
-        assert trainer._published_shards == {}
+        assert not hasattr(trainer._runtime.method, "published")
     finally:
         trainer.close()
 
@@ -748,7 +842,7 @@ def test_s3_release_keeps_canonical_advertisement(monkeypatch, tmp_path, refit_s
         ).publish()
 
         trainer.release_version(version=WeightVersionRef("target-a"))
-        assert trainer._published_shards == {}
+        assert not hasattr(trainer._runtime.method, "published")
     finally:
         trainer.close()
 

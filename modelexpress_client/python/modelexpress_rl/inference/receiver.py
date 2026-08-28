@@ -20,18 +20,12 @@ from typing import Any
 from urllib.parse import quote
 
 import numpy as np
-import zstandard
 
 from modelexpress_rl import envs as rl_envs
 from modelexpress_rl.object_storage import ObjectStorageType
 from modelexpress_rl.s3 import S3Client
-from modelexpress_rl.train import WeightPayloadFormat
 from modelexpress_rl.utils import index_checkpoint_tensors, read_safetensors_header
 
-from .adapter import (
-    GeneratorEngineAdapter,
-    GeneratorTransferInputs,
-)
 
 
 @dataclass(frozen=True)
@@ -111,8 +105,14 @@ def _source_identity(version: _S3Version) -> dict[str, str]:
 _Decompressor = Callable[[memoryview], Any]
 
 
+def _zstd_stream_reader(data: memoryview) -> Any:
+    import zstandard
+
+    return zstandard.ZstdDecompressor().stream_reader(data)
+
+
 _DECOMPRESSORS: dict[str, _Decompressor] = {
-    "zstd": lambda data: zstandard.ZstdDecompressor().stream_reader(data),
+    "zstd": _zstd_stream_reader,
 }
 
 
@@ -388,7 +388,7 @@ class _LocalCheckpoint:
                 file_handle.close()
 
     @contextmanager
-    def installation(self, prepared: PreparedCheckpoint):
+    def installation_context(self, prepared: PreparedCheckpoint):
         with self.lock_path.open("a+") as handle:
             fcntl.flock(handle, fcntl.LOCK_SH)
             state = self._state()
@@ -403,87 +403,7 @@ class _LocalCheckpoint:
             yield
 
 
-class CanonicalS3GeneratorAdapter(GeneratorEngineAdapter):
-    """Prepare one canonical S3 delta, then reload it through an engine hook."""
-
-    def __init__(
-        self,
-        *,
-        model_name: str,
-        config: ObjectStorageGeneratorConfig,
-    ) -> None:
-        if config.storage_type is not ObjectStorageType.S3:
-            raise ValueError("only S3 object storage is currently supported")
-        self._s3 = S3Client(
-            endpoint_url=config.endpoint_url,
-            region_name=config.region_name,
-        )
-        self._checkpoint = _LocalCheckpoint(
-            model_name=model_name,
-            config=config,
-            s3=self._s3,
-        )
-        self._checkpoint.initialize()
-        self._active_staged: PreparedCheckpoint | None = None
-
-    @property
-    def supported_payload_formats(self) -> frozenset[WeightPayloadFormat]:
-        return frozenset({WeightPayloadFormat.XOR_DELTA})
-
-    def stage_weight(self, inputs: GeneratorTransferInputs) -> PreparedCheckpoint:
-        if self._active_staged is not None:
-            raise RuntimeError("release staged weight before staging another version")
-        if inputs.payload_format is not WeightPayloadFormat.XOR_DELTA:
-            raise ValueError("canonical S3 requires XOR_DELTA payloads")
-        if not inputs.base_version_id:
-            raise ValueError("canonical S3 version is missing base_version_id")
-        if inputs.object_storage is None:
-            raise ValueError("canonical S3 requires a version-level URI")
-        if inputs.object_storage.storage_type is not ObjectStorageType.S3:
-            raise ValueError("canonical S3 requires S3 object storage")
-        if self._checkpoint.current_version not in {
-            inputs.base_version_id,
-            inputs.version_id,
-        }:
-            raise ValueError("canonical S3 target does not match the exact local base")
-        version = _S3Version(
-            version_id=inputs.version_id,
-            base_version_id=inputs.base_version_id,
-            uri=inputs.object_storage.uri,
-        )
-        started = time.perf_counter()
-        try:
-            staged = self._checkpoint.prepare(version)
-        except ValueError as error:
-            raise RuntimeError(str(error)) from error
-        staged.metrics["perf/mx_receive_prepare_time"] = time.perf_counter() - started
-        self._active_staged = staged
-        return staged
-
-    def apply_weight(self, staged: object) -> dict[str, float]:
-        if staged is not self._active_staged:
-            raise RuntimeError("canonical S3 staged weight is no longer active")
-        started = time.perf_counter()
-        with self._checkpoint.installation(self._active_staged):
-            self.install_prepared_checkpoint(self._active_staged)
-        return {"perf/mx_receive_install_time": time.perf_counter() - started}
-
-    def install_prepared_checkpoint(self, prepared: PreparedCheckpoint) -> None:
-        """Load ``prepared.path`` into the live engine."""
-        raise NotImplementedError
-
-    def release_staged_weight(self, staged: object) -> None:
-        if staged is not self._active_staged:
-            raise RuntimeError("canonical S3 staged weight is no longer active")
-        self._active_staged = None
-
-    def close(self) -> None:
-        self._active_staged = None
-        self._s3.close()
-
-
 __all__ = [
-    "CanonicalS3GeneratorAdapter",
     "PreparedCheckpoint",
     "ReceiverInstallError",
     "ObjectStorageGeneratorConfig",

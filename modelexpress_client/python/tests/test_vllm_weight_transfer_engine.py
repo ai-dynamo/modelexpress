@@ -161,6 +161,30 @@ def test_weight_transfer_engine_applies_one_exact_version(monkeypatch):
     staged.release.assert_called_once_with()
 
 
+def test_weight_transfer_engine_logs_lifecycle(monkeypatch, caplog):
+    engine, client = _engine(monkeypatch, initialize=False)
+    staged = SimpleNamespace(
+        version_id="version-a",
+        metrics={},
+        release=MagicMock(),
+    )
+    client.stage_weight.return_value = staged
+    client.apply_weight.return_value = {}
+
+    with caplog.at_level(logging.INFO, logger=weight_transfer_engine.__name__):
+        engine.init_transfer_engine(engine.init_info_cls())
+        engine.start_weight_update()
+        engine.update_weights({"version_id": "version-a"})
+        engine.finish_weight_update()
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert "ModelExpress weight transfer initialized model=test/model" in messages
+    assert "ModelExpress weight update started" in messages
+    assert "ModelExpress weight update receiving version=version-a" in messages
+    assert "ModelExpress weight update applied version=version-a" in messages
+    assert "ModelExpress weight update finished version=version-a" in messages
+
+
 def test_weight_transfer_engine_logs_receiver_metrics(monkeypatch, caplog):
     engine, client = _engine(monkeypatch)
     staged = SimpleNamespace(

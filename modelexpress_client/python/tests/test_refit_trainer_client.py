@@ -7,8 +7,10 @@ from unittest.mock import MagicMock
 
 import grpc
 import modelexpress_rl.train.client as client_module
+import modelexpress_rl.train.runtime as runtime_module
 import pytest
 from modelexpress_rl import (
+    FSDPTrainerContext,
     ModelExpressTrainerClient,
     ModelExpressTrainerConfig,
     TrainerStagingMode,
@@ -98,7 +100,7 @@ def _patch_resources(monkeypatch, *, manager, manifest_service, worker_endpoint)
     )
     initialize_resources = MagicMock(return_value=resources)
     monkeypatch.setattr(
-        client_module._TrainerResources,
+        runtime_module._TrainerResources,
         "initialize",
         initialize_resources,
     )
@@ -124,6 +126,15 @@ def test_trainer_config_rejects_invalid_numeric_settings(setting, value, message
 def test_trainer_config_rejects_unspecified_payload_format():
     with pytest.raises(ValueError, match="payload_format must be specified"):
         ModelExpressTrainerConfig(payload_format=WeightPayloadFormat.UNSPECIFIED)
+
+
+def test_trainer_config_preserves_original_positional_field_order():
+    config = ModelExpressTrainerConfig(2, "trainer-agent", "test/model")
+
+    assert config.device_id == 2
+    assert config.agent_name == "trainer-agent"
+    assert config.model_name == "test/model"
+    assert config.engine_context is None
 
 
 def test_refit_shard_keeps_only_its_nixl_manifest_endpoint():
@@ -158,7 +169,9 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
     refit_pb2_grpc.add_RefitWorkerServiceServicer_to_server(manifest_service, server)
     server.start()
     adapter = _Adapter()
-    monkeypatch.setattr(client_module, "_trainer_adapter", lambda **_kwargs: adapter)
+    monkeypatch.setattr(
+        runtime_module, "_create_trainer_adapter", lambda *_args, **_kwargs: adapter
+    )
     monkeypatch.setenv("MODEL_NAME", "test/model")
     monkeypatch.setenv("MX_TRAINER_STAGING_MODE", "COPY_TO_DEVICE")
     monkeypatch.setenv("MX_WEIGHT_PAYLOAD_FORMAT", "FULL_TENSOR")
@@ -174,6 +187,7 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
     try:
         trainer = ModelExpressTrainerClient.initialize(
             ModelExpressTrainerConfig(
+                engine_context=FSDPTrainerContext(),
                 device_id=0,
                 worker_id="trainer-0",
                 server_url=f"127.0.0.1:{port}",
@@ -207,12 +221,13 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
         )
         second.publish()
         second.publish()
+        method = trainer._runtime.method
         retained_owners = [
-            staged.buffer_owner for staged in trainer._published_shards["version-a"]
+            staged.buffer_owner for staged in method.published["version-a"]
         ]
         trainer.release_version(version=WeightVersionRef("version-a"))
         trainer.release_version(version=WeightVersionRef("version-a"))
-        assert "version-a" not in trainer._published_shards
+        assert "version-a" not in method.published
     finally:
         if "trainer" in locals():
             trainer.close()
@@ -250,6 +265,7 @@ def test_trainer_initialization_rejects_unspecified_fixed_settings(monkeypatch):
     with pytest.raises(ValueError, match="staging_mode must be specified"):
         ModelExpressTrainerClient.initialize(
             ModelExpressTrainerConfig(
+                engine_context=FSDPTrainerContext(),
                 model_name="test/model",
                 staging_mode=TrainerStagingMode.UNSPECIFIED,
                 payload_format=WeightPayloadFormat.FULL_TENSOR,
@@ -259,6 +275,7 @@ def test_trainer_initialization_rejects_unspecified_fixed_settings(monkeypatch):
     with pytest.raises(ValueError, match="payload_format must be specified"):
         ModelExpressTrainerClient.initialize(
             ModelExpressTrainerConfig(
+                engine_context=FSDPTrainerContext(),
                 model_name="test/model",
                 staging_mode=TrainerStagingMode.COPY_TO_DEVICE,
                 payload_format=WeightPayloadFormat.UNSPECIFIED,
@@ -268,7 +285,9 @@ def test_trainer_initialization_rejects_unspecified_fixed_settings(monkeypatch):
 
 def test_trainer_initialization_rejects_adapter_unsupported_mode(monkeypatch):
     adapter = _Adapter()
-    monkeypatch.setattr(client_module, "_trainer_adapter", lambda **_kwargs: adapter)
+    monkeypatch.setattr(
+        runtime_module, "_create_trainer_adapter", lambda *_args, **_kwargs: adapter
+    )
     monkeypatch.setenv("MX_WORKER_HOST", "trainer")
     resources = _patch_resources(
         monkeypatch,
@@ -283,6 +302,7 @@ def test_trainer_initialization_rejects_adapter_unsupported_mode(monkeypatch):
     monkeypatch.setattr(client_module.threading.Thread, "join", lambda self: None)
     trainer = ModelExpressTrainerClient.initialize(
         ModelExpressTrainerConfig(
+            engine_context=FSDPTrainerContext(),
             device_id=0,
             model_name="test/model",
             staging_mode=TrainerStagingMode.IN_PLACE,
@@ -294,8 +314,7 @@ def test_trainer_initialization_rejects_adapter_unsupported_mode(monkeypatch):
     resources.close.assert_called_once_with()
 
 
-def test_trainer_initialization_rejects_unknown_configured_engine(monkeypatch):
-    monkeypatch.setenv("MX_TRAINER_ENGINE", "unknown")
+def test_trainer_initialization_requires_explicit_engine_context(monkeypatch):
     monkeypatch.setenv("MX_WORKER_HOST", "trainer")
     resources = _patch_resources(
         monkeypatch,
@@ -308,17 +327,16 @@ def test_trainer_initialization_rejects_unknown_configured_engine(monkeypatch):
     )
     monkeypatch.setattr(client_module.threading.Thread, "start", lambda self: None)
     monkeypatch.setattr(client_module.threading.Thread, "join", lambda self: None)
-    trainer = ModelExpressTrainerClient.initialize(
-        ModelExpressTrainerConfig(
-            device_id=0,
-            model_name="test/model",
-            staging_mode=TrainerStagingMode.IN_PLACE,
-            payload_format=WeightPayloadFormat.FULL_TENSOR,
+    with pytest.raises(ValueError, match="engine_context is required"):
+        ModelExpressTrainerClient.initialize(
+            ModelExpressTrainerConfig(
+                device_id=0,
+                model_name="test/model",
+                staging_mode=TrainerStagingMode.IN_PLACE,
+                payload_format=WeightPayloadFormat.FULL_TENSOR,
+            )
         )
-    )
-    with pytest.raises(ValueError, match="unsupported MX_TRAINER_ENGINE='UNKNOWN'"):
-        _ = trainer.source_slot_id
-    resources.close.assert_called_once_with()
+    resources.close.assert_not_called()
 
 
 def test_trainer_client_owns_default_transport_resources(monkeypatch):
@@ -333,11 +351,11 @@ def test_trainer_client_owns_default_transport_resources(monkeypatch):
     monkeypatch.setenv("MX_WORKER_HOST", "trainer")
     initialize_resources = MagicMock(return_value=resources)
     monkeypatch.setattr(
-        client_module._TrainerResources,
+        runtime_module._TrainerResources,
         "initialize",
         initialize_resources,
     )
-    monkeypatch.setattr(client_module, "_trainer_adapter", adapter_factory)
+    monkeypatch.setattr(runtime_module, "_create_trainer_adapter", adapter_factory)
     monkeypatch.setattr(
         ModelExpressTrainerClient, "_register_worker", lambda self: None
     )
@@ -346,6 +364,7 @@ def test_trainer_client_owns_default_transport_resources(monkeypatch):
 
     trainer = ModelExpressTrainerClient.initialize(
         ModelExpressTrainerConfig(
+            engine_context=FSDPTrainerContext(),
             model_name="test/model",
             device_id=2,
             agent_name="trainer-agent",
@@ -354,12 +373,13 @@ def test_trainer_client_owns_default_transport_resources(monkeypatch):
         )
     )
     adapter_factory.assert_not_called()
-
     assert trainer.source_slot_id == "rank:0"
-    adapter_factory.assert_called_once_with(
-        manager=manager,
-        nixl_metadata_endpoint="trainer:19002",
-    )
+    assert len(adapter_factory.call_args.args) == 1
+    assert isinstance(adapter_factory.call_args.args[0], FSDPTrainerContext)
+    assert adapter_factory.call_args.kwargs == {
+        "manager": manager,
+        "nixl_metadata_endpoint": "trainer:19002",
+    }
     initialize_resources.assert_called_once_with(
         device_id=2,
         agent_name="trainer-agent",
@@ -379,12 +399,12 @@ def test_trainer_initialization_cleans_up_when_renewal_thread_cannot_start(
     )
     monkeypatch.setenv("MX_WORKER_HOST", "trainer")
     monkeypatch.setattr(
-        client_module,
-        "_trainer_adapter",
-        lambda **_kwargs: _Adapter(),
+        runtime_module,
+        "_create_trainer_adapter",
+        lambda *_args, **_kwargs: _Adapter(),
     )
     monkeypatch.setattr(
-        client_module._TrainerResources,
+        runtime_module._TrainerResources,
         "initialize",
         MagicMock(return_value=resources),
     )
@@ -400,6 +420,7 @@ def test_trainer_initialization_cleans_up_when_renewal_thread_cannot_start(
     with pytest.raises(RuntimeError, match="thread start failed"):
         ModelExpressTrainerClient.initialize(
             ModelExpressTrainerConfig(
+                engine_context=FSDPTrainerContext(),
                 model_name="test/model",
                 device_id=2,
                 staging_mode=TrainerStagingMode.COPY_TO_DEVICE,
