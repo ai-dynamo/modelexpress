@@ -145,13 +145,13 @@ Before training begins, the framework calls `prepare_delta_base()` with one
 bucket stream. ModelExpress submits each framework bucket directly for
 concurrent rank-local launch-checkpoint reads. Real delta staging therefore
 performs no launch-checkpoint reads.
-Published roots use
-`{uri_prefix}/v{version_number}/model.safetensors.index.json`.
-Canonical S3 publication requires a numeric `version_number`.
-The S3 URI belongs to `WeightVersion`; after upload, the orchestrator changes
-the version from `STAGING` to `READY`. S3 versions remain READY for rollout
-recovery; their immutable objects are governed by the bucket's external
-lifecycle policy.
+The framework supplies each version's exact `object_storage.uri` under the
+configured `uri_prefix`. That URI names `model.safetensors.index.json`; delta
+shards are stored beside it. The index records the target `WeightVersion.uid`
+and its `base_version_id` as the string fields `metadata.version` and
+`metadata.base_version`. After upload, the orchestrator changes the version
+from `STAGING` to `READY`. S3 versions remain READY for rollout recovery; their
+immutable objects are governed by the bucket's external lifecycle policy.
 
 The client owns the NIXL manager and trainer-side manifest service. `server_url`
 selects the central ModelExpress control-plane service and defaults to the
