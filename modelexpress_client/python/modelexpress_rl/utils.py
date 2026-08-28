@@ -12,7 +12,6 @@ from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
-import zstandard
 
 
 _SAFETENSORS_DTYPES = {
@@ -50,6 +49,8 @@ def compute_delta(
 
 def compress_delta(delta: np.ndarray) -> np.ndarray:
     """Compress one XOR delta as an independent level-1 zstd frame."""
+    import zstandard
+
     return np.frombuffer(
         zstandard.ZstdCompressor(level=1).compress(delta),
         dtype=np.uint8,

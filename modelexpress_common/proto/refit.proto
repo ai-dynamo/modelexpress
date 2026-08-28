@@ -79,43 +79,43 @@ message RegisterWorkerResponse {
 }
 
 message WeightVersion {
-  // MX-generated opaque identity for this WeightVersion.
+  // Opaque identity for this WeightVersion. MX generates it when the caller
+  // omits CreateWeightVersionRequest.uid.
   string uid = 1;
   string model_name = 2;
-  // Framework-provided version number. Required for object-storage publication.
-  optional uint64 version_number = 3;
-  string idempotency_key = 4;
-  WeightPayloadFormat payload_format = 5;
+  string idempotency_key = 3;
+  WeightPayloadFormat payload_format = 4;
   // Present only for XOR_DELTA; identifies the base WeightVersion to which the
   // delta is applied.
-  optional string base_version_id = 6;
+  optional string base_version_id = 5;
   // Required only for worker-sharded publication. Physical source workers are
   // not baked in; the trainer coordinator supplies opaque IDs such as a
   // selected publisher global rank. Object-storage-backed versions leave this
   // empty.
-  repeated string expected_source_slots = 7;
+  repeated string expected_source_slots = 6;
   // Reserved placeholder for a future server-assigned layout fingerprint.
   // Content identity currently travels in the payload.
-  string layout_signature = 8;
-  WeightVersionState state = 9;
-  uint64 created_at_unix_ms = 10;
+  string layout_signature = 7;
+  WeightVersionState state = 8;
+  uint64 created_at_unix_ms = 9;
   // Present only when the version payload is published through object storage.
-  ObjectStorageSource object_storage = 11;
+  ObjectStorageSource object_storage = 10;
 }
 
 message CreateWeightVersionRequest {
   string model_name = 1;
-  optional uint64 version_number = 2;
-  string idempotency_key = 3;
-  WeightPayloadFormat payload_format = 4;
+  string idempotency_key = 2;
+  WeightPayloadFormat payload_format = 3;
   // Required only for XOR_DELTA; omitted for FULL_TENSOR.
-  optional string base_version_id = 5;
+  optional string base_version_id = 4;
   // Required for worker-sharded publication; empty for object storage.
-  repeated string expected_source_slots = 6;
+  repeated string expected_source_slots = 5;
   // Set for an object-storage-backed version; omitted for worker-sharded
   // publication.
-  ObjectStorageSource object_storage = 7;
-  WeightVersionState state = 8;
+  ObjectStorageSource object_storage = 6;
+  WeightVersionState state = 7;
+  // Optional caller-selected identity; MX generates one when omitted.
+  optional string uid = 8;
 }
 
 message CreateWeightVersionResponse {

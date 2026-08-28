@@ -65,14 +65,12 @@ fn validate_s3_uri(uri: &str) -> Result<(), Status> {
 }
 
 fn validate_publication(request: &CreateWeightVersionRequest) -> Result<(), Status> {
+    if let Some(uid) = request.uid.as_deref() {
+        required(uid, "uid")?;
+    }
     let state =
         WeightVersionState::try_from(request.state).unwrap_or(WeightVersionState::Unspecified);
     if let Some(object_storage) = request.object_storage.as_ref() {
-        if request.version_number.is_none() {
-            return Err(Status::invalid_argument(
-                "version_number is required for S3 publication",
-            ));
-        }
         if ObjectStorageType::try_from(object_storage.storage_type)
             .unwrap_or(ObjectStorageType::Unspecified)
             != ObjectStorageType::S3
@@ -393,7 +391,7 @@ mod tests {
         for state in [WeightVersionState::Staging, WeightVersionState::Ready] {
             assert!(
                 validate_publication(&CreateWeightVersionRequest {
-                    version_number: Some(42),
+                    uid: Some("caller-version".to_string()),
                     object_storage: Some(s3_source(
                         "s3://weights/run/policy/v42/model.safetensors.index.json",
                     )),
@@ -417,61 +415,53 @@ mod tests {
     fn invalid_object_storage_and_worker_sharded_publications_are_rejected() {
         for request in [
             CreateWeightVersionRequest {
-                version_number: Some(42),
+                uid: Some(" \t".to_string()),
+                expected_source_slots: vec!["rank:0".to_string()],
+                state: WeightVersionState::Staging.into(),
+                ..Default::default()
+            },
+            CreateWeightVersionRequest {
                 object_storage: Some(ObjectStorageSource::default()),
                 state: WeightVersionState::Staging.into(),
                 ..Default::default()
             },
             CreateWeightVersionRequest {
-                version_number: Some(42),
                 object_storage: Some(s3_source("https://weights/root")),
                 state: WeightVersionState::Staging.into(),
                 ..Default::default()
             },
             CreateWeightVersionRequest {
-                version_number: Some(42),
                 object_storage: Some(s3_source("s3://weights")),
                 state: WeightVersionState::Staging.into(),
                 ..Default::default()
             },
             CreateWeightVersionRequest {
-                version_number: Some(42),
                 object_storage: Some(s3_source("s3:///root")),
                 state: WeightVersionState::Staging.into(),
                 ..Default::default()
             },
             CreateWeightVersionRequest {
-                version_number: Some(42),
                 expected_source_slots: vec!["rank:0".to_string()],
                 object_storage: Some(s3_source("s3://weights/root")),
                 state: WeightVersionState::Staging.into(),
                 ..Default::default()
             },
             CreateWeightVersionRequest {
-                version_number: Some(42),
                 object_storage: Some(s3_source("s3://weights/root")),
                 state: WeightVersionState::Releasing.into(),
                 ..Default::default()
             },
             CreateWeightVersionRequest {
-                object_storage: Some(s3_source("s3://weights/root")),
-                state: WeightVersionState::Staging.into(),
-                ..Default::default()
-            },
-            CreateWeightVersionRequest {
-                version_number: Some(42),
                 object_storage: Some(s3_source("s3://weights//root")),
                 state: WeightVersionState::Staging.into(),
                 ..Default::default()
             },
             CreateWeightVersionRequest {
-                version_number: Some(42),
                 object_storage: Some(s3_source("s3://weights/root?query")),
                 state: WeightVersionState::Staging.into(),
                 ..Default::default()
             },
             CreateWeightVersionRequest {
-                version_number: Some(42),
                 object_storage: Some(ObjectStorageSource {
                     uri: "az://weights/root".to_string(),
                     storage_type: ObjectStorageType::Azure.into(),
@@ -480,7 +470,6 @@ mod tests {
                 ..Default::default()
             },
             CreateWeightVersionRequest {
-                version_number: Some(42),
                 object_storage: Some(ObjectStorageSource {
                     uri: "gs://weights/root".to_string(),
                     storage_type: ObjectStorageType::Gcs.into(),

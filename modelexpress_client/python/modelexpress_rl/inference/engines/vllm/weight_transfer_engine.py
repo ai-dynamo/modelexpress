@@ -89,6 +89,7 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
         )
         self._client: ModelExpressGeneratorClient | None = None
         self._update_active = False
+        self._active_version_id: str | None = None
         self._staged: StagedWeightHandle | None = None
         self._closed = False
 
@@ -157,6 +158,7 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
                 object_storage=object_storage,
             )
         )
+        logger.info("ModelExpress weight transfer initialized model=%s", model_name)
 
     def start_weight_update(self) -> None:
         if self._closed:
@@ -169,7 +171,9 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
             logger.warning("weight update is already active")
             return
         self._update_active = True
+        self._active_version_id = None
         self._staged = None
+        logger.info("ModelExpress weight update started")
 
     def receive_weights(
         self, update_info: ModelExpressWeightTransferUpdateInfo
@@ -189,6 +193,10 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
 
         staged: StagedWeightHandle | None = None
         try:
+            logger.info(
+                "ModelExpress weight update receiving version=%s",
+                update_info.version_id,
+            )
             stage_started = perf_counter()
             staged = client.stage_weight(
                 version=WeightVersionRef(update_info.version_id)
@@ -203,6 +211,11 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
                 if key.startswith("perf/") and isinstance(value, (int, float)):
                     logger.info("ModelExpress receiver metric %s=%s", key, value)
             self._staged = staged
+            self._active_version_id = update_info.version_id
+            logger.info(
+                "ModelExpress weight update applied version=%s",
+                update_info.version_id,
+            )
         except BaseException as error:
             if staged is not None:
                 try:
@@ -215,6 +228,7 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
                         exc_info=True,
                     )
             self._update_active = False
+            self._active_version_id = None
             self._staged = None
             raise
 
@@ -227,10 +241,16 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
             self._update_active = False
             return
         staged = self._staged
+        version_id = self._active_version_id
         try:
             staged.release()
+            logger.info(
+                "ModelExpress weight update finished version=%s",
+                version_id,
+            )
         finally:
             self._staged = None
+            self._active_version_id = None
             self._update_active = False
 
     def shutdown(self) -> None:
@@ -241,6 +261,7 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
                 self._staged.release()
         finally:
             self._staged = None
+            self._active_version_id = None
             self._update_active = False
             if self._client is not None:
                 self._client.close()
