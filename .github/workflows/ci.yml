@@ -203,6 +203,44 @@ jobs:
       run: |
         .venv/bin/python -m pytest tests/ -v
 
+  python-proto-bindings:
+    name: Python Generated Bindings
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    # Install only the codegen extra, not the project: modelexpress depends on
+    # torch, which is a large download this job has no use for. The pin is
+    # still read from pyproject.toml so it stays single-sourced.
+    - name: Install codegen dependencies
+      run: |
+        pins=$(python - <<'EOF'
+        import pathlib, tomllib
+        pyproject = pathlib.Path("modelexpress_client/python/pyproject.toml")
+        data = tomllib.loads(pyproject.read_text())
+        print(" ".join(data["project"]["optional-dependencies"]["codegen"]))
+        EOF
+        )
+        echo "Installing: ${pins}"
+        pip install ${pins}
+
+    - name: Validate generated bindings
+      run: |
+        modelexpress_client/python/generate_proto.sh
+        if [ -n "$(git status --porcelain -- modelexpress_client/python)" ]; then
+          echo "Generated Python bindings are out of date with modelexpress_common/proto."
+          echo "Run modelexpress_client/python/generate_proto.sh and commit the result."
+          git status --porcelain -- modelexpress_client/python
+          git diff -- modelexpress_client/python
+          exit 1
+        fi
+
   go-test:
     name: Go Bindings
     runs-on: ubuntu-latest
