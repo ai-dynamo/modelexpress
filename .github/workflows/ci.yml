@@ -206,9 +206,14 @@ jobs:
   python-proto-bindings:
     name: Python Generated Bindings
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+      with:
+        persist-credentials: false
 
     - name: Set up Python
       uses: actions/setup-python@v5
