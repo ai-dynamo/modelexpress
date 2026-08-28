@@ -89,14 +89,20 @@ class NcclM2nExecutor:
 
     def __init__(self, runtime: _M2nRuntime) -> None:
         self._runtime = runtime
-        pp_groups = runtime.freeze_pp_groups()
-        self._states = {
-            pp_group.key: _PPGroupModelState(pp_group=pp_group)
-            for pp_group in pp_groups
-        }
         self._execute_lock = threading.Lock()
         self._poisoned = False
         self._stream_failed = False
+        self._torn_down = False
+        self._states: dict[_PPGroupKey, _PPGroupModelState] = {}
+        try:
+            pp_groups = runtime._freeze_and_attach_executor(self)
+            self._states = {
+                pp_group.key: _PPGroupModelState(pp_group=pp_group)
+                for pp_group in pp_groups
+            }
+        except BaseException:
+            runtime._detach_executor(self)
+            raise
 
     @property
     def pp_group_keys(self) -> tuple[_PPGroupKey, ...]:
@@ -143,6 +149,10 @@ class NcclM2nExecutor:
                 return results
 
     def _require_usable(self) -> None:
+        if self._torn_down:
+            raise RuntimeError(
+                "nccl_m2n executor has been torn down and cannot execute updates"
+            )
         if self._poisoned:
             raise RuntimeError(
                 "nccl_m2n executor is unusable after a failed model commit or "
@@ -435,6 +445,8 @@ class NcclM2nExecutor:
     def teardown(self) -> None:
         """Drain PP streams and release whole-version staging."""
         with self._execute_lock:
+            if self._torn_down:
+                return
             with self._runtime._active_operation(allow_poisoned=True):
                 try:
                     self._runtime.wait_for_pp_groups(
@@ -451,6 +463,8 @@ class NcclM2nExecutor:
                 for state in self._states.values():
                     state.staged = []
                     state.staging_signature = None
+                self._runtime._detach_executor(self)
+                self._torn_down = True
 
 
 def build_reshard_params(tensors: Sequence[Any]) -> list[ReshardParam]:

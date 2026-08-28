@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
+import gc
 import threading
 import time
+import weakref
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -523,7 +525,7 @@ def test_source_uses_live_tensors_and_mx_owned_stream():
     runtime.close()
 
 
-def test_close_waits_for_whole_source_execute_and_allows_nested_submit():
+def test_close_waits_for_source_execute_then_requires_executor_teardown():
     executor, runtime, _, m2n, events = make_executor([], rank=0)
     params = make_params()
     prepare_entered = threading.Event()
@@ -551,15 +553,21 @@ def test_close_waits_for_whole_source_execute_and_allows_nested_submit():
     join_thread(close_thread)
 
     assert not execute_errors
-    assert not close_errors
+    assert len(close_errors) == 1
+    assert "remain attached" in str(close_errors[0])
     assert execute_results[0][(0, 0)][0] == 7
     assert len(m2n.handle.calls) == 2
+    assert runtime._state is _RuntimeState.OPEN
+    assert ("handle_destroy",) not in events
+
+    executor.teardown()
+    runtime.close()
     assert events.index(("reshard", "0-0", 0, "pp-stream-0")) < events.index(
         ("handle_destroy",)
     )
 
 
-def test_close_waits_after_destination_stream_context_exits():
+def test_close_waits_after_destination_preparation_then_requires_teardown():
     payloads = [
         torch.tensor([10, 11, 12, 13], dtype=torch.uint8),
         torch.tensor([20, 21, 22], dtype=torch.uint8),
@@ -593,7 +601,13 @@ def test_close_waits_after_destination_stream_context_exits():
     join_thread(close_thread)
 
     assert not execute_errors
-    assert not close_errors
+    assert len(close_errors) == 1
+    assert "remain attached" in str(close_errors[0])
+    assert runtime._state is _RuntimeState.OPEN
+    assert ("handle_destroy",) not in events
+
+    executor.teardown()
+    runtime.close()
     assert ("handle_destroy",) in events
 
 
@@ -628,10 +642,169 @@ def test_close_waits_for_executor_teardown():
     assert not teardown_errors
     assert not close_errors
     assert query_count == 2
+    assert executor._torn_down
+    assert executor not in runtime._attached_executors
     assert ("handle_destroy",) in events
     assert max(
         index for index, event in enumerate(events) if event[0] == "stream_query"
     ) < events.index(("handle_destroy",))
+
+
+def test_close_rejects_attached_executor_before_native_mutation():
+    executor, runtime, groups, _, events = make_executor([], rank=0)
+    handle = runtime.handle
+    stream = groups[0].stream
+
+    with pytest.raises(RuntimeError, match="remain attached"):
+        runtime.close()
+
+    assert runtime._state is _RuntimeState.OPEN
+    assert runtime.handle is handle
+    assert groups[0].stream is stream
+    assert runtime._attached_executors == {executor}
+    assert not any(
+        event[0]
+        in {"handle_destroy", "stream_destroy", "comm_finalize", "comm_destroy"}
+        for event in events
+    )
+
+    executor.teardown()
+    runtime.close()
+
+
+def test_runtime_strong_reference_prevents_executor_gc_bypass():
+    executor, runtime, _, _, events = make_executor([], rank=0)
+    executor_ref = weakref.ref(executor)
+    del executor
+    gc.collect()
+
+    retained = executor_ref()
+    assert retained is not None
+    assert retained in runtime._attached_executors
+    with pytest.raises(RuntimeError, match="remain attached"):
+        runtime.close()
+    assert ("handle_destroy",) not in events
+
+    retained.teardown()
+    runtime.close()
+
+
+def test_teardown_starting_after_closing_is_rejected_then_retry_succeeds():
+    executor, runtime, _, _, events = make_executor([], rank=0)
+    blocker_entered = threading.Event()
+    release_blocker = threading.Event()
+
+    def hold_admitted_operation() -> None:
+        with runtime._active_operation():
+            blocker_entered.set()
+            assert release_blocker.wait(timeout=10)
+
+    blocker_thread, _, blocker_errors = start_thread(hold_admitted_operation)
+    assert blocker_entered.wait(timeout=10)
+
+    close_thread, _, close_errors = start_thread(runtime.close)
+    wait_for_runtime_state(runtime, _RuntimeState.CLOSING)
+    with pytest.raises(RuntimeError, match="closing"):
+        executor.teardown()
+    assert executor in runtime._attached_executors
+    assert ("handle_destroy",) not in events
+
+    release_blocker.set()
+    join_thread(blocker_thread)
+    join_thread(close_thread)
+    assert not blocker_errors
+    assert len(close_errors) == 1
+    assert "remain attached" in str(close_errors[0])
+    assert runtime._state is _RuntimeState.OPEN
+
+    executor.teardown()
+    runtime.close()
+    assert ("handle_destroy",) in events
+
+
+def test_executor_teardown_is_idempotent_and_execute_is_rejected_afterward():
+    executor, runtime, _, m2n, events = make_executor([], rank=0)
+
+    executor.teardown()
+    events_after_teardown = tuple(events)
+    executor.teardown()
+    assert tuple(events) == events_after_teardown
+    assert executor._torn_down
+    assert executor not in runtime._attached_executors
+
+    with pytest.raises(RuntimeError, match="torn down"):
+        executor.execute({(0, 0): make_params()})
+    assert not m2n.handle.calls
+    runtime.close()
+
+
+def test_failed_executor_teardown_retains_attachment_and_staging():
+    payloads = [
+        torch.tensor([10, 11, 12, 13], dtype=torch.uint8),
+        torch.tensor([20, 21, 22], dtype=torch.uint8),
+    ]
+    executor, runtime, groups, _, events = make_executor(payloads)
+    executor.execute({(0, 0): make_params()})
+    staged = tuple(executor._states[(0, 0)].staged)
+    groups[0].stream.set_query_results(RuntimeError("injected teardown stream failure"))
+
+    with pytest.raises(RuntimeError, match="cannot safely tear down"):
+        executor.teardown()
+
+    assert runtime._abort_done.wait(timeout=10)
+    assert tuple(executor._states[(0, 0)].staged) == staged
+    assert not executor._torn_down
+    assert executor in runtime._attached_executors
+    assert ("comm_abort_start", "0-0", True) in events
+
+
+def test_executor_constructor_failure_rolls_back_attachment(monkeypatch):
+    executor, runtime, _, _, _ = make_executor([], rank=0)
+    original_attach = runtime._freeze_and_attach_executor
+
+    def attach_then_fail(candidate):
+        original_attach(candidate)
+        assert candidate in runtime._attached_executors
+        raise RuntimeError("injected executor construction failure")
+
+    monkeypatch.setattr(runtime, "_freeze_and_attach_executor", attach_then_fail)
+    with pytest.raises(RuntimeError, match="construction failure"):
+        NcclM2nExecutor(runtime)
+
+    assert runtime._attached_executors == {executor}
+    executor.teardown()
+    runtime.close()
+
+
+def test_executor_detach_failure_can_retry_without_false_torn_down(monkeypatch):
+    payloads = [
+        torch.tensor([10, 11, 12, 13], dtype=torch.uint8),
+        torch.tensor([20, 21, 22], dtype=torch.uint8),
+    ]
+    executor, runtime, _, _, _ = make_executor(payloads)
+    executor.execute({(0, 0): make_params()})
+    original_detach = runtime._detach_executor
+    calls = 0
+
+    def fail_once(candidate):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("injected executor detach failure")
+        original_detach(candidate)
+
+    monkeypatch.setattr(runtime, "_detach_executor", fail_once)
+    with pytest.raises(RuntimeError, match="detach failure"):
+        executor.teardown()
+
+    assert not executor._torn_down
+    assert executor in runtime._attached_executors
+    assert not executor._states[(0, 0)].staged
+
+    executor.teardown()
+    assert executor._torn_down
+    assert executor not in runtime._attached_executors
+    runtime.close()
 
 
 def test_close_timeout_during_executor_preparation_requires_restart():
@@ -688,6 +861,7 @@ def test_execute_preparation_exception_releases_runtime_operation():
     with pytest.raises(RuntimeError, match="injected preparation failure"):
         executor.execute({(0, 0): make_params()})
 
+    executor.teardown()
     runtime.close()
     assert ("handle_destroy",) in events
 
@@ -734,6 +908,7 @@ def test_destination_overlap_across_pp_groups_is_rejected():
     with pytest.raises(ValueError, match="destination storage overlap"):
         executor.execute({(0, 0): shared, (1, 0): shared})
     assert not m2n.handle.calls
+    executor.teardown()
     runtime.close()
 
 
@@ -748,6 +923,7 @@ def test_overlap_within_one_pp_group_is_rejected():
     with pytest.raises(ValueError, match="within PP group"):
         executor.execute({(0, 0): params})
     assert not m2n.handle.calls
+    executor.teardown()
     runtime.close()
 
 
@@ -766,6 +942,7 @@ def test_shard_index_must_match_pp_group_communicator_rank():
     with pytest.raises(ValueError, match="communicator shard index 0"):
         executor.execute({(0, 0): params})
     assert not m2n.handle.calls
+    executor.teardown()
     runtime.close()
 
 

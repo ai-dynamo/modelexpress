@@ -27,6 +27,7 @@ from modelexpress.refit.reshard.transport.nccl_m2n.runtime import (
     _M2nPPGroupBatch,
     _M2nPPGroupSpec,
     _M2nRuntime,
+    _PPGroupState,
     _RuntimeState,
 )
 
@@ -347,6 +348,7 @@ def make_runtime(
     transfer_timeout_s: float = 900.0,
     finalize_timeout_s: float = 300.0,
     poll_interval_s: float = 0.002,
+    enforce_singleton: bool = False,
 ):
     events: list[tuple] = []
     m2n = FakeM2n(events, host_delay=host_delay, fail_at=fail_at)
@@ -361,7 +363,7 @@ def make_runtime(
         _m2n_module=m2n,
         _nccl_module=nccl,
         _torch_module=SimpleNamespace(cuda=FakeCuda(events)),
-        _enforce_singleton=False,
+        _enforce_singleton=enforce_singleton,
     )
     return runtime, m2n, nccl, events
 
@@ -609,6 +611,326 @@ def test_shutdown_finalizes_m2n_before_comms_in_canonical_order():
         ("comm_finalize", "1-0"),
         ("comm_destroy", "1-0"),
     ]
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_phase", "expected_key"),
+    [
+        ("handle-destroy", "m2n-finalize", None),
+        ("stream-close", "stream-release", (0, 0)),
+        ("comm-finalize", "comm-finalize", (0, 0)),
+        ("finalize-wait-error", "comm-finalize-wait", (0, 0)),
+        ("finalize-wait-timeout", "comm-finalize-wait", (0, 0)),
+        ("comm-destroy", "comm-destroy", (0, 0)),
+    ],
+)
+def test_post_drain_teardown_failure_is_terminal_and_not_retried(
+    failure: str,
+    expected_phase: str,
+    expected_key: tuple[int, int] | None,
+):
+    runtime, m2n, _, events = make_runtime(
+        finalize_timeout_s=0.003,
+        poll_interval_s=0.0005,
+    )
+    (pp_group,) = create_groups(runtime, [(0, 0)])
+    original_stream = pp_group.stream
+
+    if failure == "handle-destroy":
+
+        def fail_handle_destroy() -> None:
+            events.append(("handle_destroy_error",))
+            raise RuntimeError("injected handle destroy failure")
+
+        m2n.handle.destroy = fail_handle_destroy
+    elif failure == "stream-close":
+
+        def fail_stream_close() -> None:
+            events.append(("stream_destroy_error", original_stream.name))
+            raise RuntimeError("injected stream close failure")
+
+        original_stream.close = fail_stream_close
+    elif failure == "comm-finalize":
+
+        def fail_comm_finalize() -> None:
+            events.append(("comm_finalize_error", pp_group.group_id))
+            raise RuntimeError("injected communicator finalize failure")
+
+        pp_group.communicator.finalize = fail_comm_finalize
+    elif failure in {"finalize-wait-error", "finalize-wait-timeout"}:
+        original_get_async_error = pp_group.communicator.get_async_error
+
+        def fail_finalize_wait() -> int:
+            if not pp_group.communicator.finalized:
+                return original_get_async_error()
+            if failure == "finalize-wait-timeout":
+                events.append(("comm_async", pp_group.group_id, 7))
+                return 7
+            events.append(("comm_async_error", pp_group.group_id))
+            raise RuntimeError("injected finalize wait failure")
+
+        pp_group.communicator.get_async_error = fail_finalize_wait
+    else:
+
+        def fail_comm_destroy() -> None:
+            events.append(("comm_destroy_error", pp_group.group_id))
+            raise RuntimeError("injected communicator destroy failure")
+
+        pp_group.communicator.destroy = fail_comm_destroy
+
+    with pytest.raises((RuntimeError, TimeoutError)):
+        runtime.close()
+
+    assert runtime._state is _RuntimeState.POISONED
+    assert runtime._restart_required
+    assert runtime._close_abandoned
+    assert runtime._teardown_failure_phase == expected_phase
+    assert runtime._teardown_failure_key == expected_key
+    assert f"phase={expected_phase}" in runtime._fail_stop_reason
+    if expected_key is None:
+        assert "pp_group=" not in runtime._fail_stop_reason
+    else:
+        assert f"pp_group={expected_key}" in runtime._fail_stop_reason
+    assert pp_group.state is _PPGroupState.POISONED
+    assert runtime.pp_groups == (pp_group,)
+    assert runtime._abort_thread is None
+    assert not any(event[0] == "comm_abort_start" for event in events)
+
+    if failure == "handle-destroy":
+        assert runtime._handle is m2n.handle
+        assert runtime._handle_quarantined
+        assert pp_group.stream is original_stream
+    else:
+        assert runtime._handle is None
+        if failure == "stream-close":
+            assert pp_group.stream is original_stream
+        else:
+            assert pp_group.stream is None
+
+    events_before_retry = tuple(events)
+    with pytest.raises(RuntimeError, match="process restart is required"):
+        runtime.close()
+    assert tuple(events) == events_before_retry
+
+
+def test_partial_teardown_after_earlier_group_closed_is_not_replayed():
+    runtime, _, _, events = make_runtime()
+    early, late = create_groups(runtime, [(0, 0), (1, 0)])
+
+    def fail_late_finalize() -> None:
+        events.append(("comm_finalize_error", late.group_id))
+        raise RuntimeError("injected later-group finalize failure")
+
+    late.communicator.finalize = fail_late_finalize
+    with pytest.raises(RuntimeError, match="later-group finalize failure"):
+        runtime.close()
+
+    assert early.state is _PPGroupState.CLOSED
+    assert late.state is _PPGroupState.POISONED
+    assert runtime._teardown_failure_phase == "comm-finalize"
+    assert runtime._teardown_failure_key == (1, 0)
+    assert ("comm_destroy", early.group_id) in events
+    assert not any(event[0] == "comm_abort_start" for event in events)
+
+    events_before_retry = tuple(events)
+    with pytest.raises(RuntimeError, match="process restart is required"):
+        runtime.close()
+    assert tuple(events) == events_before_retry
+
+
+def test_pre_destructive_close_exception_restores_open_state_and_can_retry():
+    runtime, _, _, events = make_runtime()
+    create_groups(runtime, [(0, 0)])
+    dispatcher = runtime._dispatcher_lock
+
+    class FailBeforeDrain:
+        def __enter__(self):
+            raise RuntimeError("injected pre-destructive close failure")
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    runtime._dispatcher_lock = FailBeforeDrain()
+    with pytest.raises(RuntimeError, match="pre-destructive close failure"):
+        runtime.close()
+
+    assert runtime._state is _RuntimeState.OPEN
+    assert not runtime._restart_required
+    assert not runtime._close_abandoned
+    assert runtime._teardown_failure_phase is None
+    assert not any(
+        event[0]
+        in {"handle_destroy", "stream_destroy", "comm_finalize", "comm_destroy"}
+        for event in events
+    )
+
+    runtime._dispatcher_lock = dispatcher
+    runtime.close()
+    assert runtime._state is _RuntimeState.CLOSED
+
+
+def test_close_wait_exception_restores_open_state_and_can_retry():
+    runtime, _, _, events = make_runtime()
+    create_groups(runtime, [(0, 0)])
+    operation_entered = threading.Event()
+    release_operation = threading.Event()
+
+    def hold_active_operation() -> None:
+        with runtime._active_operation():
+            operation_entered.set()
+            assert release_operation.wait(timeout=10)
+
+    operation_thread, _, operation_errors = start_thread(hold_active_operation)
+    assert operation_entered.wait(timeout=10)
+    original_wait = runtime._state_cv.wait
+
+    def fail_wait(*, timeout=None):
+        del timeout
+        raise RuntimeError("injected close condition-wait failure")
+
+    runtime._state_cv.wait = fail_wait
+    with pytest.raises(RuntimeError, match="condition-wait failure"):
+        runtime.close()
+
+    assert runtime._state is _RuntimeState.OPEN
+    assert not runtime._restart_required
+    assert not runtime._close_abandoned
+    assert not any(
+        event[0]
+        in {"handle_destroy", "stream_destroy", "comm_finalize", "comm_destroy"}
+        for event in events
+    )
+
+    runtime._state_cv.wait = original_wait
+    release_operation.set()
+    join_thread(operation_thread)
+    assert not operation_errors
+    runtime.close()
+    assert runtime._state is _RuntimeState.CLOSED
+
+
+def test_close_notification_exception_restores_open_state_and_can_retry():
+    runtime, _, _, events = make_runtime()
+    create_groups(runtime, [(0, 0)])
+    original_notify_all = runtime._state_cv.notify_all
+    notify_attempts = 0
+
+    def fail_first_notify() -> None:
+        nonlocal notify_attempts
+        notify_attempts += 1
+        if notify_attempts == 1:
+            raise RuntimeError("injected close notification failure")
+        original_notify_all()
+
+    runtime._state_cv.notify_all = fail_first_notify
+    with pytest.raises(RuntimeError, match="notification failure"):
+        runtime.close()
+
+    assert runtime._state is _RuntimeState.OPEN
+    assert not runtime._restart_required
+    assert not runtime._close_abandoned
+    assert not any(
+        event[0]
+        in {"handle_destroy", "stream_destroy", "comm_finalize", "comm_destroy"}
+        for event in events
+    )
+
+    runtime._state_cv.notify_all = original_notify_all
+    runtime.close()
+    assert runtime._state is _RuntimeState.CLOSED
+
+
+def test_close_commit_failure_is_terminal_and_retains_singleton():
+    runtime, _, _, events = make_runtime(enforce_singleton=True)
+    (pp_group,) = create_groups(runtime, [(0, 0)])
+    original_groups = runtime._pp_groups
+
+    class FailClearDict(dict):
+        def clear(self) -> None:
+            events.append(("runtime_groups_clear_error",))
+            raise RuntimeError("injected runtime close commit failure")
+
+    runtime._pp_groups = FailClearDict(original_groups)
+    try:
+        with pytest.raises(RuntimeError, match="close commit failure"):
+            runtime.close()
+
+        assert runtime._state is _RuntimeState.POISONED
+        assert runtime._restart_required
+        assert runtime._close_abandoned
+        assert runtime._teardown_failure_phase == "runtime-close-commit"
+        assert runtime._teardown_failure_key is None
+        assert pp_group.state is _PPGroupState.CLOSED
+        assert runtime.pp_groups == (pp_group,)
+        assert _M2nRuntime._live_runtime is runtime
+        assert not any(event[0] == "comm_abort_start" for event in events)
+
+        events_before_retry = tuple(events)
+        with pytest.raises(RuntimeError, match="process restart is required"):
+            runtime.close()
+        assert tuple(events) == events_before_retry
+    finally:
+        runtime._clear_singleton()
+
+
+def test_healthy_close_clears_singleton_only_after_closed_bookkeeping():
+    runtime, _, _, events = make_runtime(enforce_singleton=True)
+    create_groups(runtime, [(0, 0)])
+    original_clear_singleton = runtime._clear_singleton
+
+    def checked_clear_singleton() -> None:
+        assert runtime._state is _RuntimeState.CLOSED
+        assert not runtime._pp_groups
+        events.append(("singleton_clear",))
+        original_clear_singleton()
+
+    runtime._clear_singleton = checked_clear_singleton
+    runtime.close()
+
+    assert ("singleton_clear",) in events
+    assert _M2nRuntime._live_runtime is None
+
+
+def test_closed_retry_clears_singleton_without_replaying_native_teardown():
+    runtime, _, _, events = make_runtime(enforce_singleton=True)
+    create_groups(runtime, [(0, 0)])
+    original_clear_singleton = runtime._clear_singleton
+    clear_attempts = 0
+
+    def fail_first_clear() -> None:
+        nonlocal clear_attempts
+        clear_attempts += 1
+        if clear_attempts == 1:
+            raise RuntimeError("injected singleton clear failure")
+        original_clear_singleton()
+
+    runtime._clear_singleton = fail_first_clear
+    with pytest.raises(RuntimeError, match="singleton clear failure"):
+        runtime.close()
+
+    assert runtime._state is _RuntimeState.CLOSED
+    assert not runtime.pp_groups
+    assert _M2nRuntime._live_runtime is runtime
+    native_events = tuple(
+        event
+        for event in events
+        if event[0]
+        in {"handle_destroy", "stream_destroy", "comm_finalize", "comm_destroy"}
+    )
+
+    runtime.close()
+
+    assert clear_attempts == 2
+    assert _M2nRuntime._live_runtime is None
+    assert (
+        tuple(
+            event
+            for event in events
+            if event[0]
+            in {"handle_destroy", "stream_destroy", "comm_finalize", "comm_destroy"}
+        )
+        == native_events
+    )
 
 
 def test_close_waits_for_create_and_snapshots_complete_topology():
@@ -980,7 +1302,10 @@ def test_healthy_close_drain_timeout_quarantines_without_finalizing():
         runtime.close()
 
     assert runtime._abort_done.wait(timeout=10)
+    assert runtime._state is _RuntimeState.POISONED
     assert runtime._restart_required
+    assert not runtime._close_abandoned
+    assert runtime._teardown_failure_phase is None
     assert ("comm_abort_start", "0-0", True) in events
     assert not any(
         event[0]

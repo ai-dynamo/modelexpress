@@ -9,8 +9,10 @@ ModelExpress-owned PP transfer resources.
    is globally stable `(trainer_stage, generator_stage)`.
 2. `_M2nRuntime.create_pp_groups()` sorts specs, creates nonblocking parent
    NCCL4Py communicators, and creates one explicit CUDA stream per PP group.
-3. `NcclM2nExecutor` freezes topology. `build_reshard_params()` translates
-   `MegatronTensorSpec` inputs into MX planner records.
+3. `NcclM2nExecutor` atomically freezes topology and attaches itself to the
+   runtime. Runtime keeps a strong reference until successful executor
+   teardown. `build_reshard_params()` translates `MegatronTensorSpec` inputs
+   into MX planner records.
 4. `_M2nCall.from_param()` creates official `nccl.m2n.DistTensor` source and
    destination descriptors.
 5. `_M2nRuntime.submit_model_update()` records producer readiness on current
@@ -20,8 +22,10 @@ ModelExpress-owned PP transfer resources.
    `Handle.reshard(comm, src, dst, stream=pp_group.stream)`.
 7. All destination tensors are received into MX-owned whole-version staging.
    Live parameters are updated only after every local PP stream finishes.
-8. Shutdown drains streams, destroys single M2N handle while every parent
-   communicator is valid, then releases streams and destroys communicators in
+8. Caller invokes `NcclM2nExecutor.teardown()` to drain PP streams, release
+   whole-version staging, and detach executor. Only then may
+   `_M2nRuntime.close()` destroy single M2N handle while every parent
+   communicator is valid, release streams, and destroy communicators in
    canonical PP-group order.
 
 Callers may prepare update inputs concurrently. Each executor serializes
@@ -31,9 +35,21 @@ work uses distinct streams and may overlap after grouped submission.
 Runtime shutdown first rejects new top-level operations, then waits up to
 `finalize_timeout_s` for already-admitted executor operations and PP-group
 creation to finish. An admitted operation may complete nested runtime calls
-after shutdown enters `CLOSING`. If this wait expires, shutdown marks runtime
-poisoned and intentionally retains M2N handle, streams, and communicators.
-Further cleanup is unsafe; process restart is required.
+after shutdown enters `CLOSING`. After admitted operations finish, close
+rejects attached executors before any native teardown mutation and restores its
+prior state. Dropping the caller's executor reference cannot bypass this check
+because runtime attachment is strong. Executor teardown is idempotent;
+`execute()` is rejected after successful teardown.
+
+Executor teardown and runtime close are cohort-wide orchestration steps. Every
+participating rank must finish executor teardown/detachment before any rank
+enters M2N-handle or communicator close. The local attached-executor check is
+not a distributed barrier. Allowing one rank to start native close while a peer
+still rejects locally can diverge collective teardown order.
+
+If the admitted-operation wait expires, shutdown marks runtime poisoned and
+intentionally retains M2N handle, streams, communicators, attached executors,
+and staging. Further cleanup is unsafe; process restart is required.
 
 ## Failure and timeout semantics
 
@@ -44,12 +60,26 @@ Defaults are `comm_init_timeout_s=120`, `transfer_timeout_s=900`, and
 `finalize_timeout_s=300`. These bound MX-controlled waits and polling only. In
 particular, `transfer_timeout_s` starts after `nccl.m2n.group()` returns;
 Python cannot interrupt a native call blocked inside `group_end()`.
+`finalize_timeout_s` also cannot interrupt a native `Handle.destroy()` or
+another native finalize/destroy call that does not return. Production still
+requires corresponding native timeout/bounded-wait support.
 
 After a submitted transfer times out or reports an asynchronous error, MX
 enters fail-stop: it poisons all PP groups, retains the M2N handle,
 communicators, streams, tensors, and staging buffers, and starts best-effort
 communicator abort on a daemon thread. The process cohort must restart;
 `close()` does not reclaim quarantined resources.
+
+After the shutdown drain succeeds and M2N-handle destruction begins, native
+teardown is one-shot. Any handle destruction, stream release, communicator
+finalize/wait/destroy, or final close-bookkeeping failure records the exact
+phase and PP-group key, sets restart-only fail-stop, retains remaining
+references and singleton ownership, and rejects every later operation.
+Runtime does not launch communicator abort and does not retry native teardown
+after partial progress: different ranks may have reached different PP groups,
+so replay could create collective-order divergence. Canonical PP-group order
+prevents healthy teardown cycles but cannot make rank-divergent partial
+teardown replay-safe.
 
 Production peer-failure safety therefore requires an M2N build with bounded
 `m2nWaitCommReady`. Official main at review time (`5fab732a`) and revision

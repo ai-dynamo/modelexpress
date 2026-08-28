@@ -252,10 +252,13 @@ class _M2nRuntime:
         self._restart_required = False
         self._pp_groups: dict[_PPGroupKey, _M2nPPGroup] = {}
         self._topology_frozen = False
+        self._attached_executors: set[Any] = set()
         self._handle: Any | None = None
         self._handle_quarantined = False
         self._quarantined_batches: tuple[_M2nPPGroupBatch, ...] = ()
         self._fail_stop_reason: str | None = None
+        self._teardown_failure_phase: str | None = None
+        self._teardown_failure_key: _PPGroupKey | None = None
         self._abort_lock = threading.Lock()
         self._abort_thread: threading.Thread | None = None
         self._abort_done = threading.Event()
@@ -593,13 +596,30 @@ class _M2nRuntime:
     def freeze_pp_groups(self) -> tuple[_M2nPPGroup, ...]:
         with self._active_operation(), self._dispatcher_lock:
             with self._state_cv:
-                self._require_admitted_operation_locked()
-                if not self._pp_groups:
-                    raise RuntimeError("cannot freeze an empty M2N PP-group topology")
-                self._topology_frozen = True
-                return tuple(
-                    sorted(self._pp_groups.values(), key=lambda group: group.key)
-                )
+                return self._freeze_pp_groups_locked()
+
+    def _freeze_and_attach_executor(
+        self,
+        executor: Any,
+    ) -> tuple[_M2nPPGroup, ...]:
+        """Atomically freeze topology and register its executor owner."""
+        with self._active_operation(), self._dispatcher_lock:
+            with self._state_cv:
+                pp_groups = self._freeze_pp_groups_locked()
+                self._attached_executors.add(executor)
+                return pp_groups
+
+    def _freeze_pp_groups_locked(self) -> tuple[_M2nPPGroup, ...]:
+        self._require_admitted_operation_locked()
+        if not self._pp_groups:
+            raise RuntimeError("cannot freeze an empty M2N PP-group topology")
+        self._topology_frozen = True
+        return tuple(sorted(self._pp_groups.values(), key=lambda group: group.key))
+
+    def _detach_executor(self, executor: Any) -> None:
+        with self._state_cv:
+            self._attached_executors.discard(executor)
+            self._state_cv.notify_all()
 
     def submit_model_update(
         self,
@@ -891,6 +911,39 @@ class _M2nRuntime:
             self._fail_stop_reason,
         )
 
+    def _abandon_partial_teardown(
+        self,
+        *,
+        phase: str,
+        pp_group_key: _PPGroupKey | None,
+        cause: BaseException,
+    ) -> None:
+        """Make a partially mutated native teardown terminal and non-replayable."""
+        location = f"phase={phase}"
+        if pp_group_key is not None:
+            location += f", pp_group={pp_group_key}"
+        reason = (
+            f"M2N runtime teardown failed ({location}): "
+            f"{type(cause).__name__}: {cause}"
+        )
+        with self._state_cv:
+            self._state = _RuntimeState.POISONED
+            self._restart_required = True
+            self._close_abandoned = True
+            self._handle_quarantined = self._handle is not None
+            self._teardown_failure_phase = phase
+            self._teardown_failure_key = pp_group_key
+            self._fail_stop_reason = reason
+            for pp_group in self._pp_groups.values():
+                if pp_group.state is not _PPGroupState.CLOSED:
+                    pp_group.state = _PPGroupState.POISONED
+            self._state_cv.notify_all()
+        logger.error(
+            "NCCL M2N runtime abandoned partial teardown; process restart "
+            "required: %s",
+            reason,
+        )
+
     def _start_abort_worker(self) -> None:
         with self._abort_lock:
             if self._abort_thread is not None or self._abort_done.is_set():
@@ -951,41 +1004,66 @@ class _M2nRuntime:
                 "cannot close M2N runtime from an active runtime operation"
             )
 
+        already_closed = False
         with self._state_cv:
             if self._state is _RuntimeState.CLOSED:
-                return
-            if self._restart_required or self._close_abandoned:
-                raise RuntimeError(
-                    "M2N runtime is fail-stop; resources were retained and "
-                    "process restart is required"
-                )
-            if self._state is _RuntimeState.CLOSING:
-                raise RuntimeError("M2N runtime is already closing")
-            self._state = _RuntimeState.CLOSING
-            self._state_cv.notify_all()
-            deadline = time.monotonic() + self._finalize_timeout_s
-            while self._active_operations:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    self._state = _RuntimeState.POISONED
-                    self._close_abandoned = True
-                    self._restart_required = True
-                    self._handle_quarantined = self._handle is not None
-                    for pp_group in self._pp_groups.values():
-                        if pp_group.state is not _PPGroupState.CLOSED:
-                            pp_group.state = _PPGroupState.POISONED
-                    self._state_cv.notify_all()
-                    raise TimeoutError(
-                        "timed out waiting for active M2N operations; resources "
-                        "were retained and process restart is required"
+                already_closed = True
+            else:
+                if self._restart_required or self._close_abandoned:
+                    raise RuntimeError(
+                        "M2N runtime is fail-stop; resources were retained and "
+                        "process restart is required"
                     )
-                self._state_cv.wait(timeout=remaining)
-            if self._restart_required:
-                raise RuntimeError(
-                    "M2N runtime entered fail-stop while shutdown waited; "
-                    "resources were retained and process restart is required"
-                )
+                if self._state is _RuntimeState.CLOSING:
+                    raise RuntimeError("M2N runtime is already closing")
+                prior_state = self._state
+                try:
+                    self._state = _RuntimeState.CLOSING
+                    self._state_cv.notify_all()
+                    deadline = time.monotonic() + self._finalize_timeout_s
+                    while self._active_operations:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            self._state = _RuntimeState.POISONED
+                            self._close_abandoned = True
+                            self._restart_required = True
+                            self._handle_quarantined = self._handle is not None
+                            for pp_group in self._pp_groups.values():
+                                if pp_group.state is not _PPGroupState.CLOSED:
+                                    pp_group.state = _PPGroupState.POISONED
+                            self._state_cv.notify_all()
+                            raise TimeoutError(
+                                "timed out waiting for active M2N operations; "
+                                "resources were retained and process restart is "
+                                "required"
+                            )
+                        self._state_cv.wait(timeout=remaining)
+                    if self._restart_required:
+                        raise RuntimeError(
+                            "M2N runtime entered fail-stop while shutdown waited; "
+                            "resources were retained and process restart is required"
+                        )
+                    if self._attached_executors:
+                        attached_count = len(self._attached_executors)
+                        raise RuntimeError(
+                            "cannot close M2N runtime while "
+                            f"{attached_count} executor(s) remain attached; call "
+                            "NcclM2nExecutor.teardown() before runtime.close()"
+                        )
+                except BaseException:
+                    if not self._restart_required and not self._close_abandoned:
+                        self._state = prior_state
+                        self._state_cv.notify_all()
+                    raise
 
+        if already_closed:
+            self._clear_singleton()
+            return
+
+        pp_groups: list[_M2nPPGroup] = []
+        destructive_started = False
+        phase = "runtime-shutdown-drain"
+        pp_group_key: _PPGroupKey | None = None
         try:
             with self._dispatcher_lock:
                 pp_groups = sorted(
@@ -1004,6 +1082,8 @@ class _M2nRuntime:
 
                 # M2N cache cleanup runs while every parent communicator remains
                 # valid.
+                destructive_started = True
+                phase = "m2n-finalize"
                 if self._handle is not None and not self._handle_quarantined:
                     self._handle.destroy()
                     self._handle = None
@@ -1011,33 +1091,53 @@ class _M2nRuntime:
             # nccl-rl issue #76: each process destroys a sorted subsequence of
             # one global PP-pair order, preventing communicator wait cycles.
             for pp_group in pp_groups:
+                pp_group_key = pp_group.key
+                phase = "stream-release"
                 self._release_pp_group_stream(pp_group)
+                phase = "comm-finalize"
                 pp_group.communicator.finalize()
+                phase = "comm-finalize-wait"
                 self._wait_for_finalize(
                     pp_group,
                     deadline=time.monotonic() + self._finalize_timeout_s,
                 )
+                phase = "comm-destroy"
                 pp_group.communicator.destroy()
                 pp_group.state = _PPGroupState.CLOSED
-        except BaseException:
+
+            phase = "runtime-close-commit"
+            pp_group_key = None
+            self._pp_groups.clear()
             with self._state_cv:
-                self._state = _RuntimeState.POISONED
+                self._state = _RuntimeState.CLOSED
+                self._state_cv.notify_all()
+        except BaseException as exc:
+            if destructive_started:
+                self._abandon_partial_teardown(
+                    phase=phase,
+                    pp_group_key=pp_group_key,
+                    cause=exc,
+                )
+            else:
+                with self._state_cv:
+                    if not self._restart_required and not self._close_abandoned:
+                        self._state = prior_state
+                        self._state_cv.notify_all()
             raise
 
-        self._pp_groups.clear()
-        with self._state_cv:
-            self._state = _RuntimeState.CLOSED
+        # Release singleton ownership only after all local close bookkeeping is
+        # committed. A failure here must not re-poison an already-closed runtime.
         self._clear_singleton()
 
     @staticmethod
     def _release_pp_group_stream(pp_group: _M2nPPGroup) -> None:
         """Release MX ownership of a PyTorch stream before its communicator."""
         stream = pp_group.stream
-        pp_group.stream = None
         if stream is not None:
             close = getattr(stream, "close", None)
             if callable(close):
                 close()
+            pp_group.stream = None
 
     def _wait_for_finalize(
         self,
