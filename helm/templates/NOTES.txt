@@ -11,6 +11,18 @@ or override env.REDIS_URL to point at your own instance.
 {{- end }}
 {{- if eq .Values.env.MX_METADATA_BACKEND "kubernetes" }}
 
+IMPORTANT: Helm installs missing CRDs from this chart, but does not update CRDs
+that already exist. Before upgrading, or when installing on a cluster with an
+older ModelExpress installation, apply the CRDs shipped with this chart:
+
+From a source checkout:
+
+  kubectl apply -f helm/crds/modelexpress-crds.yaml
+
+For a packaged or remote chart, extract the CRDs from the same chart version:
+
+  helm show crds CHART_REFERENCE --version {{ .Chart.Version }} | kubectl apply -f -
+
 Set serviceAccount.rbac.enabled=true so the server can manage ModelMetadata and
 ModelCacheEntry resources with the Kubernetes backend.
 {{- end }}
