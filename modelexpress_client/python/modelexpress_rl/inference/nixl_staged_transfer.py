@@ -11,6 +11,7 @@ how an inference engine captures its load layout or installs received weights.
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ from modelexpress.load_strategy.base import unpublish_metadata_for_worker
 from modelexpress.metadata.payload import worker_tensor_descriptors
 from modelexpress.metadata.publish import publish_metadata_and_ready
 from modelexpress.nixl_transfer import NixlTransferManager
+from modelexpress.refit.reshard import throughput
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
 from modelexpress.refit.reshard.rendezvous import (
     build_sources,
@@ -47,6 +49,10 @@ from modelexpress.refit.reshard.types import (
 )
 from modelexpress.refit.reshard.verify import shard_region, tensor_digest
 from modelexpress.types import TensorDescriptor
+
+# Named under modelexpress.* rather than modelexpress_rl.* so the report surfaces
+# in the vLLM engine process, which only configures the modelexpress logger.
+logger = logging.getLogger("modelexpress.reshard.staged_transfer")
 
 
 @dataclass(frozen=True)
@@ -497,10 +503,19 @@ class _NixlStagedTransfer:
         torch.cuda.synchronize(self._device)
         self._verify(prepared)
 
+        bytes_received = sum(d.nbytes for d in prepared.descriptors)
+        # This is the path the FSDP trainer refits over, and the path the 20x
+        # collapse was measured on, so it is the one the floor most needs to cover.
+        throughput.warn_if_below_floor(
+            wire_bytes=bytes_received,
+            wire_seconds=wire_seconds,
+            log=logger,
+            context={"device_id": self._device_id, "phase": "stage"},
+        )
         return _StagedNixlWeights(
             tensors=self._recv_buffers,
             metrics={
-                "bytes_received": sum(d.nbytes for d in prepared.descriptors),
+                "bytes_received": bytes_received,
                 "segments": len(prepared.descriptors),
                 "wire_s": round(wire_seconds, 6),
                 "full_pull_sources": len(prepared.plan.full_pulls),
@@ -589,6 +604,15 @@ class _NixlStagedTransfer:
                 self._manager.remove_remote_agent(remote_agent_name)
 
         self._active = None
+        # Peer pulls move the same bytes over the same rails, so a rail that
+        # collapsed for stage() collapses here too. Covering only stage() would
+        # leave a generator that refits from a peer reporting nothing at all.
+        throughput.warn_if_below_floor(
+            wire_bytes=bytes_received,
+            wire_seconds=wire_seconds,
+            log=logger,
+            context={"device_id": self._device_id, "phase": "stage_peer"},
+        )
         return _StagedNixlWeights(
             tensors=self._recv_buffers,
             metrics={

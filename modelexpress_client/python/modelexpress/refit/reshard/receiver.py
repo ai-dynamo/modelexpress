@@ -34,6 +34,7 @@ import torch
 from modelexpress import envs
 from modelexpress.client import MxClient
 from modelexpress.nixl_transfer import NixlTransferManager
+from modelexpress.refit.reshard import throughput
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
 from modelexpress.refit.reshard.rendezvous import gather_sources
 from modelexpress.refit.reshard.transfer_plan import (
@@ -82,17 +83,11 @@ def _min_gbps() -> float:
     """Per-rank floor in Gbps; 0 disables the check.
 
     Same read-at-call-time and non-finite handling as the ceiling, for the same
-    reasons.
+    reasons. The floor itself lives in ``reshard.throughput`` because the staged
+    FSDP receiver needs the identical check, and two copies of a threshold are
+    free to drift apart.
     """
-    floor = envs.MX_RESHARD_MIN_GBPS
-    if not math.isfinite(floor):
-        logger.warning(
-            "MX_RESHARD_MIN_GBPS=%r is not a finite number; the throughput floor "
-            "is disabled for this run",
-            floor,
-        )
-        return 0.0
-    return floor
+    return throughput.min_gbps(logger)
 
 
 def _wire_seconds(stages: dict) -> float:
@@ -1097,34 +1092,11 @@ class ReshardReceiver:
         Emitted after the stage record so the two sit together in the log; the
         stage record is what someone will actually want when they see this.
         """
-        floor = _min_gbps()
-        if floor <= 0 or wire_bytes <= 0:
-            return
-        wire_s = _wire_seconds(stages)
-        if wire_s <= 0:
-            return
-        implied_gbps = wire_bytes * 8 / wire_s / 1e9
-        if implied_gbps >= floor:
-            return
-        logger.warning(
-            "MX_REFIT_SLOW_THROUGHPUT %s",
-            json.dumps(
-                {
-                    "schema": "refit-slow-throughput-v1",
-                    "rank": self._global_rank,
-                    "step": step,
-                    "wire_bytes": wire_bytes,
-                    "wire_s": round(wire_s, 6),
-                    "implied_gbps": round(implied_gbps, 1),
-                    "floor_gbps": floor,
-                    # How far under, because "slightly below a conservative floor"
-                    # and "an order of magnitude below" are different incidents and
-                    # a gate may reasonably treat them differently.
-                    "shortfall_x": round(floor / implied_gbps, 2)
-                    if implied_gbps > 0
-                    else None,
-                }
-            ),
+        throughput.warn_if_below_floor(
+            wire_bytes=wire_bytes,
+            wire_seconds=_wire_seconds(stages),
+            log=logger,
+            context={"rank": self._global_rank, "step": step},
         )
 
     def _check_throughput_ceiling(
