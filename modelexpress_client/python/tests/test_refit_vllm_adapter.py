@@ -5,8 +5,8 @@ import sys
 from types import ModuleType, SimpleNamespace
 
 import torch
+
 from modelexpress import p2p_pb2
-from modelexpress_rl.inference.engines import vllm as vllm_engine_module
 from modelexpress_rl.inference.engines.vllm import (
     VllmGeneratorContext,
     _create_vllm_engine_runtime,
@@ -56,8 +56,20 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
         def parameter_layout(self):
             return {"weight": ((4,), torch.float32)}
 
-    monkeypatch.setattr(vllm_engine_module, "VllmAdapter", Engine)
-    monkeypatch.setattr(vllm_engine_module, "_VllmInstaller", Installer)
+    adapter_module = ModuleType("modelexpress.engines.vllm.adapter")
+    adapter_module.VllmAdapter = Engine
+    monkeypatch.setitem(
+        sys.modules, "modelexpress.engines.vllm.adapter", adapter_module
+    )
+    installer_module = ModuleType(
+        "modelexpress_rl.inference.engines.vllm.installer"
+    )
+    installer_module._VllmInstaller = Installer
+    monkeypatch.setitem(
+        sys.modules,
+        "modelexpress_rl.inference.engines.vllm.installer",
+        installer_module,
+    )
 
     model = torch.nn.Linear(4, 4)
     config = VllmConfig()

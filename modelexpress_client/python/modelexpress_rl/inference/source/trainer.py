@@ -119,6 +119,8 @@ class TrainerSourceResolver(SourceResolver):
                 ),
                 timeout=self._rpc_timeout_seconds,
             )
+        if not shard.manifest_digest:
+            raise RuntimeError("source is missing its manifest digest")
         digest = hashlib.sha256(response.manifest).hexdigest()
         if (
             response.manifest_digest != shard.manifest_digest
@@ -127,8 +129,6 @@ class TrainerSourceResolver(SourceResolver):
             raise RuntimeError(
                 f"manifest digest mismatch for source slot {shard.source_slot_id!r}"
             )
-        if not shard.manifest_digest:
-            raise RuntimeError("source is missing its manifest digest")
         return GeneratorSource(
             source_slot_id=shard.source_slot_id,
             worker_id=shard.worker_id,

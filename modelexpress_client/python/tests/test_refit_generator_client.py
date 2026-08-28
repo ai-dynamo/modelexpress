@@ -325,10 +325,9 @@ def _runtime(
 ):
     if source_order is None:
         source_order = (
-            WeightSource.GENERATOR,
-            WeightSource.OBJECT_STORAGE
+            (WeightSource.OBJECT_STORAGE,)
             if object_storage is not None
-            else WeightSource.TRAINER,
+            else (WeightSource.GENERATOR, WeightSource.TRAINER)
         )
     p2p_client = (
         MxClient(server_url=server_url)
@@ -340,7 +339,7 @@ def _runtime(
         if source is WeightSource.GENERATOR:
             assert p2p_client is not None
             resolvers.append(
-        GeneratorSourceResolver(
+                GeneratorSourceResolver(
                     p2p_client=p2p_client,
                     worker_id=worker_id,
                     worker_rank=adapter.worker_rank,
@@ -350,7 +349,7 @@ def _runtime(
             )
         elif source is WeightSource.TRAINER:
             resolvers.append(
-        TrainerSourceResolver(
+                TrainerSourceResolver(
                     service=service,
                     rpc_timeout_seconds=rpc_timeout_seconds,
                 )
@@ -479,6 +478,31 @@ def test_generator_config_rejects_invalid_source_order():
         ModelExpressGeneratorConfig(
             engine_context=context,
             source_order=(WeightSource.OBJECT_STORAGE,),
+        )
+    with pytest.raises(ValueError, match="require OBJECT_STORAGE in source_order"):
+        ModelExpressGeneratorConfig(
+            engine_context=context,
+            object_storage=ObjectStorageGeneratorConfig(
+                storage_type=ObjectStorageType.S3,
+                initial_base_version_id="base-a",
+                launch_checkpoint="unused-launch",
+                preparation_cache_dir="unused-cache",
+            ),
+            source_order=(WeightSource.TRAINER,),
+        )
+    with pytest.raises(ValueError, match="currently requires source_order"):
+        ModelExpressGeneratorConfig(
+            engine_context=context,
+            object_storage=ObjectStorageGeneratorConfig(
+                storage_type=ObjectStorageType.S3,
+                initial_base_version_id="base-a",
+                launch_checkpoint="unused-launch",
+                preparation_cache_dir="unused-cache",
+            ),
+            source_order=(
+                WeightSource.GENERATOR,
+                WeightSource.OBJECT_STORAGE,
+            ),
         )
 
 
@@ -654,6 +678,24 @@ def test_generator_releases_lease_when_manifest_is_invalid(monkeypatch):
     assert adapter.stage_calls == []
 
 
+def test_generator_reports_missing_trainer_manifest_digest(monkeypatch, caplog):
+    server, endpoint, service = _start_server()
+    service.shards[0].manifest_digest = ""
+    adapter = _Adapter(service)
+    generator = _initialize(monkeypatch, endpoint, adapter)
+
+    try:
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(RuntimeError, match=r"no usable refit source"):
+                generator.stage_weight(version=WeightVersionRef("version-a"))
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert "source is missing its manifest digest" in caplog.text
+    assert adapter.stage_calls == []
+
+
 def test_generator_dispatches_canonical_s3_without_fetching_a_worker_manifest(
     monkeypatch,
 ):
@@ -674,10 +716,10 @@ def test_generator_dispatches_canonical_s3_without_fetching_a_worker_manifest(
         adapter,
         object_storage=True,
     )
-    assert generator._runtime.p2p_client is not None
+    assert generator._runtime.p2p_client is None
     assert [
         resolver.kind for resolver in generator._runtime.session._planner._resolvers
-    ] == [WeightSource.GENERATOR, WeightSource.OBJECT_STORAGE]
+    ] == [WeightSource.OBJECT_STORAGE]
 
     try:
         staged = generator.stage_weight(version=WeightVersionRef("version-a"))
@@ -689,7 +731,7 @@ def test_generator_dispatches_canonical_s3_without_fetching_a_worker_manifest(
         assert service.list_calls == 0
         assert generator.apply_weight(staged) == "installed"
         assert adapter.publish_attempts == 0
-        assert len(service.p2p.requests) == 1
+        assert service.p2p.requests == []
         staged.release()
         repeated = generator.stage_weight(version=WeightVersionRef("version-a"))
         repeated.release()
@@ -746,18 +788,18 @@ def test_generator_rejects_missing_object_storage_before_adapter_mutation(
     )
 
     try:
-        with pytest.raises(RuntimeError, match="no usable refit source"):
+        with pytest.raises(RuntimeError, match="no legal source"):
             generator.stage_weight(version=WeightVersionRef("version-a"))
     finally:
         generator.close()
         server.stop(grace=None).wait()
 
     assert adapter.stage_calls == []
-    assert service.lease_registrations == 1
-    assert service.lease_deletions == 1
+    assert service.lease_registrations == 0
+    assert service.lease_deletions == 0
 
 
-def test_generator_rejects_non_s3_object_storage_before_adapter_mutation(
+def test_generator_skips_non_s3_object_storage_before_adapter_mutation(
     monkeypatch,
 ):
     server, endpoint, service = _start_server()
@@ -779,7 +821,7 @@ def test_generator_rejects_non_s3_object_storage_before_adapter_mutation(
     )
 
     try:
-        with pytest.raises(RuntimeError, match="requires S3"):
+        with pytest.raises(RuntimeError, match="no usable refit source"):
             generator.stage_weight(version=WeightVersionRef("version-a"))
     finally:
         generator.close()
@@ -790,7 +832,7 @@ def test_generator_rejects_non_s3_object_storage_before_adapter_mutation(
     assert service.lease_deletions == 1
 
 
-def test_generator_rejects_wrong_delta_base_after_peer_miss(monkeypatch):
+def test_generator_rejects_wrong_delta_base_before_lease(monkeypatch):
     server, endpoint, service = _start_server()
     service.version.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA
     service.version.base_version_id = "other-base"
@@ -810,14 +852,14 @@ def test_generator_rejects_wrong_delta_base_after_peer_miss(monkeypatch):
     )
 
     try:
-        with pytest.raises(ValueError, match="does not match the exact local base"):
+        with pytest.raises(RuntimeError, match="does not match serving version"):
             generator.stage_weight(version=WeightVersionRef("version-a"))
     finally:
         generator.close()
         server.stop(grace=None).wait()
 
-    assert service.lease_registrations == 1
-    assert service.lease_deletions == 1
+    assert service.lease_registrations == 0
+    assert service.lease_deletions == 0
     assert adapter.stage_calls == []
 
 
@@ -1165,10 +1207,16 @@ def test_generator_randomizes_and_limits_peers_before_trainer_fallback(monkeypat
     assert len(adapter.create_calls) == 1
 
 
-def test_object_storage_generator_can_use_full_peer_for_delta_version(monkeypatch):
+def test_object_storage_generator_skips_full_peer_for_delta_version(monkeypatch):
     server, endpoint, service = _start_server()
     service.version.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA
-    service.version.base_version_id = "version-base"
+    service.version.base_version_id = "base-a"
+    service.version.object_storage.CopyFrom(
+        refit_pb2.ObjectStorageSource(
+            storage_type=refit_pb2.OBJECT_STORAGE_TYPE_S3,
+            uri="s3://weights/model.safetensors.index.json",
+        )
+    )
     service.p2p.instances.append(
         p2p_pb2.SourceInstanceRef(
             mx_source_id="peer-source",
@@ -1200,8 +1248,8 @@ def test_object_storage_generator_can_use_full_peer_for_delta_version(monkeypatc
         generator.close()
         server.stop(grace=None).wait()
 
-    assert len(adapter.peer_stage_calls) == 1
-    assert adapter.create_calls == []
+    assert adapter.peer_stage_calls == []
+    assert len(adapter.create_calls) == 1
 
 
 def test_generator_closes_adapter_when_registration_fails(monkeypatch):

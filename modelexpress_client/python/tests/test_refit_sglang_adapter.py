@@ -109,6 +109,13 @@ def test_sglang_install_uses_the_prepared_checkpoint(tmp_path, monkeypatch):
     loader.load_weights_and_postprocess.assert_called_once()
 
 
+def test_sglang_install_rejects_unsupported_prepared_artifact(tmp_path):
+    installer = _SglangInstaller(_runner(tmp_path))
+
+    with pytest.raises(TypeError, match="requires a prepared checkpoint"):
+        installer.install(object())
+
+
 @pytest.mark.parametrize(
     ("setup_error", "load_error", "message"),
     [

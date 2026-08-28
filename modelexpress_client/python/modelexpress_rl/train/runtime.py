@@ -81,19 +81,24 @@ class TrainerRuntime:
             read_launch_tensor, _ = make_tensor_reader(
                 object_storage.launch_checkpoint
             )
-            method = CanonicalDeltaPublicationMethod(
-                config=object_storage,
-                model_name=model_name,
-                service=service,
-                rpc_timeout_seconds=rpc_timeout_seconds,
-                process_group=process_group,
-                read_launch_tensor=read_launch_tensor,
-                s3=S3Client(
-                    endpoint_url=object_storage.endpoint_url,
-                    region_name=object_storage.region_name,
-                ),
-                clock=lambda: perf_counter(),
+            s3 = S3Client(
+                endpoint_url=object_storage.endpoint_url,
+                region_name=object_storage.region_name,
             )
+            try:
+                method = CanonicalDeltaPublicationMethod(
+                    config=object_storage,
+                    model_name=model_name,
+                    service=service,
+                    rpc_timeout_seconds=rpc_timeout_seconds,
+                    process_group=process_group,
+                    read_launch_tensor=read_launch_tensor,
+                    s3=s3,
+                    clock=lambda: perf_counter(),
+                )
+            except Exception:
+                s3.close()
+                raise
             return cls(method=method, resources=None)
 
         if engine_context is None:

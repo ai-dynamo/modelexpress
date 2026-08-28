@@ -34,6 +34,7 @@ class _MemoryS3:
     def __init__(self) -> None:
         self.objects = {}
         self.fail_next = False
+        self.closed = False
 
     def put(self, *, uri, data):
         if self.fail_next:
@@ -44,7 +45,7 @@ class _MemoryS3:
             raise RuntimeError("immutable object differs")
 
     def close(self):
-        pass
+        self.closed = True
 
 
 class _S3Error(Exception):
@@ -473,6 +474,103 @@ def test_s3_publish_failure_keeps_handle_retryable(monkeypatch, tmp_path, refit_
     assert service.shards == []
 
 
+def test_s3_index_publish_failure_keeps_handle_retryable(
+    monkeypatch, tmp_path, refit_server
+):
+    _service, server_url = refit_server
+    trainer, storage = _trainer(monkeypatch, tmp_path, server_url)
+
+    try:
+        staged = trainer.stage_shard(
+            version=WeightVersionRef("target-a"),
+            hf_tensor_iter=iter([[("weight", torch.tensor([1.0, 2.0]))]]),
+        )
+        storage.fail_next = True
+        with pytest.raises(RuntimeError, match="injected upload failure"):
+            staged.publish()
+        assert trainer._runtime.method.current_base_version_id == "base-a"
+        assert staged._staged.candidate_snapshot
+
+        staged.publish()
+        assert trainer._runtime.method.current_base_version_id == "target-a"
+    finally:
+        trainer.close()
+
+
+def test_s3_remote_index_failure_prevents_non_root_state_transition(
+    monkeypatch, tmp_path, refit_server
+):
+    _service, server_url = refit_server
+    trainer, _storage = _trainer(monkeypatch, tmp_path, server_url)
+    method = trainer._runtime.method
+    method._rank = 1
+    method._world_size = 2
+
+    def all_gather(output, value, group=None):
+        del group
+        if isinstance(value, tuple):
+            output[:] = [(0, 0), (1, 0)]
+        else:
+            output[:] = ["RuntimeError: injected upload failure", None]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather)
+    monkeypatch.setattr(
+        torch.distributed, "gather_object", lambda *_args, **_kwargs: None
+    )
+
+    try:
+        staged = trainer.stage_shard(
+            version=WeightVersionRef("target-a"),
+            hf_tensor_iter=iter([[("weight", torch.tensor([1.0, 2.0]))]]),
+        )
+        with pytest.raises(RuntimeError, match="failed on rank 0"):
+            staged.publish()
+        assert method.current_base_version_id == "base-a"
+        assert staged._staged.candidate_snapshot
+    finally:
+        trainer.close()
+
+
+def test_s3_client_closes_when_publication_method_initialization_fails(
+    monkeypatch, tmp_path
+):
+    storage = _MemoryS3()
+    config = ObjectStorageConfig(
+        storage_type=ObjectStorageType.S3,
+        uri_prefix="s3://weights/tests",
+        initial_base_version_id="base-a",
+        launch_checkpoint=tmp_path / "launch",
+    )
+    monkeypatch.setattr(
+        trainer_runtime_module,
+        "make_tensor_reader",
+        lambda _path: (lambda _name: None, None),
+    )
+    monkeypatch.setattr(trainer_runtime_module, "S3Client", lambda **_kwargs: storage)
+    monkeypatch.setattr(
+        trainer_runtime_module,
+        "CanonicalDeltaPublicationMethod",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("init failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="init failed"):
+        trainer_runtime_module.TrainerRuntime.initialize(
+            engine_context=None,
+            device_id=None,
+            agent_name=None,
+            model_name="test/model",
+            staging_mode=TrainerStagingMode.WRITE_TO_STORAGE,
+            payload_format=WeightPayloadFormat.XOR_DELTA,
+            worker_id="trainer-a",
+            object_storage=config,
+            process_group=None,
+            service=lambda: object(),
+            rpc_timeout_seconds=30,
+        )
+
+    assert storage.closed
+
+
 def test_s3_processes_buckets_concurrently_and_uploads_one_shard(
     monkeypatch, tmp_path, refit_server
 ):
@@ -611,7 +709,7 @@ def test_s3_exposes_local_metrics_after_publication(
         assert staged._staged.wire_bytes == 0
 
         staged.publish()
-        assert gather_calls == 1
+        assert gather_calls == 2
         shard = next(
             data
             for uri, data in storage.objects.items()

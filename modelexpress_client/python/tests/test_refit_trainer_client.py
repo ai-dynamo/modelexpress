@@ -128,6 +128,15 @@ def test_trainer_config_rejects_unspecified_payload_format():
         ModelExpressTrainerConfig(payload_format=WeightPayloadFormat.UNSPECIFIED)
 
 
+def test_trainer_config_preserves_original_positional_field_order():
+    config = ModelExpressTrainerConfig(2, "trainer-agent", "test/model")
+
+    assert config.device_id == 2
+    assert config.agent_name == "trainer-agent"
+    assert config.model_name == "test/model"
+    assert config.engine_context is None
+
+
 def test_refit_shard_keeps_only_its_nixl_manifest_endpoint():
     shard = refit_pb2.WeightVersionShard(manifest_endpoint="trainer:9000")
 

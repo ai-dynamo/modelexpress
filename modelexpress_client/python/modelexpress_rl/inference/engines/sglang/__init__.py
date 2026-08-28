@@ -6,7 +6,6 @@
 from ...adapter import GeneratorEngineContext
 from ...runtime import EngineRuntime
 from .context import SglangGeneratorContext
-from .installer import _SglangInstaller
 
 
 def _create_sglang_engine_runtime(
@@ -14,6 +13,8 @@ def _create_sglang_engine_runtime(
 ) -> EngineRuntime:
     if not isinstance(engine_context, SglangGeneratorContext):
         raise TypeError("SGLang requires a SglangGeneratorContext")
+    from .installer import _SglangInstaller
+
     runner = engine_context.model_runner
     return EngineRuntime(
         model_name=runner.model_config.model_path,

@@ -19,7 +19,7 @@ __all__ = [
     "ModelExpressTrainerConfig",
     "ObjectStorageConfig",
     "StagedWeightVersionShard",
-    "TrainerStagingMode",
     "TrainerEngineContext",
+    "TrainerStagingMode",
     "WeightPayloadFormat",
 ]

@@ -21,6 +21,7 @@ from modelexpress_rl.version import WeightVersionRef
 from .. import refit_pb2, refit_pb2_grpc
 from ..control import WeightVersion, WeightVersionState, _weight_version
 from ..object_storage import ObjectStorageType
+from ..train import WeightPayloadFormat
 from .adapter import GeneratorEngineContext
 from .plan import WeightSource
 from .receiver import ObjectStorageGeneratorConfig
@@ -58,7 +59,9 @@ class ModelExpressGeneratorConfig:
     rpc_timeout_seconds: float = 30.0
     # Canonical object-storage checkpoint settings.
     object_storage: ObjectStorageGeneratorConfig | None = None
-    # Ordered fallback: peer then object storage or trainer, when supported.
+    # Ordered fallback for full-tensor sources. Canonical object storage is
+    # currently isolated because peer installation does not advance its local
+    # checkpoint base.
     source_order: tuple[WeightSource, ...] | None = None
 
     def __post_init__(self) -> None:
@@ -88,6 +91,20 @@ class ModelExpressGeneratorConfig:
             ):
                 raise ValueError(
                     "OBJECT_STORAGE source requires object_storage settings"
+                )
+            if (
+                self.object_storage is not None
+                and WeightSource.OBJECT_STORAGE not in self.source_order
+            ):
+                raise ValueError(
+                    "object_storage settings require OBJECT_STORAGE in source_order"
+                )
+            if self.object_storage is not None and self.source_order != (
+                WeightSource.OBJECT_STORAGE,
+            ):
+                raise ValueError(
+                    "object_storage currently requires source_order="
+                    "(WeightSource.OBJECT_STORAGE,)"
                 )
 
 
@@ -337,6 +354,21 @@ class ModelExpressGeneratorClient:
         if version.model_name != self.model_name:
             raise RuntimeError("weight version model_name does not match the generator")
         assert self._runtime is not None
+        if self._runtime.initial_version_id is not None:
+            if version.payload_format is not WeightPayloadFormat.XOR_DELTA:
+                raise RuntimeError(
+                    "object-storage generator requires XOR_DELTA weight versions"
+                )
+            if version.base_version_id is None:
+                raise RuntimeError("XOR_DELTA version is missing base_version_id")
+            if (
+                version.version_id != self._serving_version_id
+                and version.base_version_id != self._serving_version_id
+            ):
+                raise RuntimeError(
+                    f"weight version base {version.base_version_id!r} does not match "
+                    f"serving version {self._serving_version_id!r}"
+                )
         self._runtime.session.validate(version)
         return version
 

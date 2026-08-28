@@ -92,15 +92,14 @@ class GeneratorRuntime:
             source_order is None or WeightSource.OBJECT_STORAGE in source_order
         )
         if source_order is None:
-            defaults = []
-            if engine.full_tensor is not None:
-                defaults.append(WeightSource.GENERATOR)
-            defaults.append(
-                WeightSource.OBJECT_STORAGE
-                if enable_object_storage
-                else WeightSource.TRAINER
-            )
-            source_order = tuple(defaults)
+            if enable_object_storage:
+                source_order = (WeightSource.OBJECT_STORAGE,)
+            else:
+                defaults = []
+                if engine.full_tensor is not None:
+                    defaults.append(WeightSource.GENERATOR)
+                defaults.append(WeightSource.TRAINER)
+                source_order = tuple(defaults)
 
         needs_full_tensor = any(
             source in {WeightSource.GENERATOR, WeightSource.TRAINER}
@@ -164,6 +163,51 @@ class GeneratorRuntime:
                         p2p_client=p2p_client,
                     )
                 )
+
+            resolvers = []
+            for source in source_order:
+                if source is WeightSource.GENERATOR:
+                    assert engine.full_tensor is not None
+                    assert p2p_client is not None
+                    resolvers.append(
+                        GeneratorSourceResolver(
+                            p2p_client=p2p_client,
+                            worker_id=worker_id,
+                            worker_rank=engine.full_tensor.worker_rank,
+                            build_identity=engine.full_tensor.build_identity,
+                            rpc_timeout_seconds=rpc_timeout_seconds,
+                        )
+                    )
+                elif source is WeightSource.TRAINER:
+                    resolvers.append(
+                        TrainerSourceResolver(
+                            service=service,
+                            rpc_timeout_seconds=rpc_timeout_seconds,
+                        )
+                    )
+                else:
+                    resolvers.append(ObjectStorageSourceResolver())
+
+            methods_tuple = tuple(methods)
+            return cls(
+                engine=engine,
+                methods=methods_tuple,
+                session=WeightUpdateSession(
+                    planner=WeightUpdatePlanner(
+                        resolvers=tuple(resolvers),
+                        methods=methods_tuple,
+                        installer=engine.installer,
+                        max_transfer_attempts=max_transfer_attempts,
+                    ),
+                    start_lease=start_lease,
+                ),
+                p2p_client=p2p_client,
+                initial_version_id=(
+                    object_storage.initial_base_version_id
+                    if enable_object_storage and object_storage is not None
+                    else None
+                ),
+            )
         except Exception:
             for method in methods:
                 try:
@@ -182,51 +226,6 @@ class GeneratorRuntime:
                         exc_info=True,
                     )
             raise
-
-        resolvers = []
-        for source in source_order:
-            if source is WeightSource.GENERATOR:
-                assert engine.full_tensor is not None
-                assert p2p_client is not None
-                resolvers.append(
-                GeneratorSourceResolver(
-                        p2p_client=p2p_client,
-                        worker_id=worker_id,
-                        worker_rank=engine.full_tensor.worker_rank,
-                        build_identity=engine.full_tensor.build_identity,
-                        rpc_timeout_seconds=rpc_timeout_seconds,
-                    )
-                )
-            elif source is WeightSource.TRAINER:
-                resolvers.append(
-                TrainerSourceResolver(
-                        service=service,
-                        rpc_timeout_seconds=rpc_timeout_seconds,
-                    )
-                )
-            else:
-                resolvers.append(ObjectStorageSourceResolver())
-
-        methods_tuple = tuple(methods)
-        return cls(
-            engine=engine,
-            methods=methods_tuple,
-            session=WeightUpdateSession(
-                planner=WeightUpdatePlanner(
-                    resolvers=tuple(resolvers),
-                    methods=methods_tuple,
-                    installer=engine.installer,
-                    max_transfer_attempts=max_transfer_attempts,
-                ),
-                start_lease=start_lease,
-            ),
-            p2p_client=p2p_client,
-            initial_version_id=(
-                object_storage.initial_base_version_id
-                if enable_object_storage and object_storage is not None
-                else None
-            ),
-        )
 
     def close(self) -> None:
         if self._closed:

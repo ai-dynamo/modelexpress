@@ -3,11 +3,10 @@
 
 """Explicit trainer-engine selection for full-tensor publication."""
 
-from abc import ABC
 from dataclasses import dataclass
 
 
-class TrainerEngineContext(ABC):
+class TrainerEngineContext:
     """Identifies the trainer engine that owns the published tensors."""
 
 

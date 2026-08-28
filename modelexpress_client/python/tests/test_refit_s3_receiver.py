@@ -155,7 +155,6 @@ class _Adapter:
         version = WeightVersion(
             version_id=inputs.version_id,
             model_name="test/model",
-            version_number=None,
             payload_format=inputs.payload_format,
             base_version_id=inputs.base_version_id,
             object_storage=inputs.object_storage,

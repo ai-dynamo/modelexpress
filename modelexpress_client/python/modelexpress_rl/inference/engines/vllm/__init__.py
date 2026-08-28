@@ -5,12 +5,9 @@
 
 from __future__ import annotations
 
-from modelexpress.engines.vllm.adapter import VllmAdapter
-
 from ...adapter import GeneratorEngineContext
 from ...runtime import EngineRuntime, FullTensorEngineCapability
 from .context import VllmGeneratorContext
-from .installer import _VllmInstaller
 
 
 def _create_vllm_engine_runtime(
@@ -21,6 +18,10 @@ def _create_vllm_engine_runtime(
 
     from torch.nn import Module
     from vllm.config import ModelConfig, VllmConfig
+
+    from modelexpress.engines.vllm.adapter import VllmAdapter
+
+    from .installer import _VllmInstaller
 
     model = engine_context.model
     vllm_config = engine_context.vllm_config

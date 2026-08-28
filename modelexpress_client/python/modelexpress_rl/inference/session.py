@@ -32,7 +32,22 @@ class SessionUpdate:
 
 
 class WeightUpdateSession:
-    """Own planning, staging, installation, publication, and cleanup."""
+    """Coordinate one rank-local generator update across composed modules.
+
+    The session owns the version lease and update lifecycle, but no payload or
+    engine-specific behavior. During ``stage`` it asks the planner for ordered
+    source/method/installer plans and returns the first successfully prepared
+    artifact. During ``apply`` it installs that artifact at the caller's safe
+    point and lets the selected method advertise the applied version when that
+    method supports peer publication. ``release`` always returns method-owned
+    staging and the version lease.
+
+    For canonical object storage, the selected plan is an
+    ``ObjectStorageSourceResolver`` feeding ``CanonicalDeltaUpdateMethod``,
+    which produces a ``PreparedCheckpointArtifact`` for the engine installer.
+    The client validates the exact serving base before this session acquires a
+    lease.
+    """
 
     def __init__(
         self,

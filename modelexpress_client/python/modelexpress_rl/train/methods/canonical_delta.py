@@ -32,7 +32,6 @@ logger = logging.getLogger("modelexpress_rl.train.client")
 class StagedCanonicalDelta:
     base_version_id: str
     target_version_id: str
-    target_version_number: int
     object_storage_uri: str
     candidate_snapshot: dict[str, np.ndarray]
     encoded_deltas: dict[str, np.ndarray]
@@ -155,8 +154,6 @@ class CanonicalDeltaPublicationMethod:
             or not target.HasField("base_version_id")
         ):
             raise RuntimeError("S3 publication requires an XOR_DELTA target")
-        if not target.HasField("version_number"):
-            raise RuntimeError("S3 target must have a version number")
         if (
             not target.HasField("object_storage")
             or target.object_storage.storage_type
@@ -164,7 +161,8 @@ class CanonicalDeltaPublicationMethod:
             or not target.object_storage.uri
         ):
             raise RuntimeError("S3 target is missing its URI")
-        if target.object_storage.uri != self._config.root_uri(target.version_number):
+        uri_prefix = f"{self._config.uri_prefix.rstrip('/')}/"
+        if not target.object_storage.uri.startswith(uri_prefix):
             raise RuntimeError("S3 target URI does not match the configured prefix")
         if target.base_version_id != self.current_base_version_id:
             raise RuntimeError(
@@ -207,7 +205,6 @@ class CanonicalDeltaPublicationMethod:
         return StagedCanonicalDelta(
             base_version_id=target.base_version_id,
             target_version_id=version.version_id,
-            target_version_number=target.version_number,
             object_storage_uri=target.object_storage.uri,
             candidate_snapshot=candidate,
             encoded_deltas=encoded_deltas,
@@ -254,6 +251,8 @@ class CanonicalDeltaPublicationMethod:
             dst=0,
             group=self._process_group,
         )
+        index_error: Exception | None = None
+        index_error_message = None
         if contributions is not None:
             weight_map = {}
             for rank, rank_map, _size in contributions:
@@ -266,7 +265,7 @@ class CanonicalDeltaPublicationMethod:
             index = json.dumps(
                 {
                     "metadata": {
-                        "version": staged.target_version_number,
+                        "version": staged.target_version_id,
                         "base_version": staged.base_version_id,
                         "delta_encoding": "xor",
                         "compression_format": "zstd",
@@ -277,7 +276,25 @@ class CanonicalDeltaPublicationMethod:
                 sort_keys=True,
                 separators=(",", ":"),
             ).encode()
-            self._s3.put(uri=staged.object_storage_uri, data=index)
+            try:
+                self._s3.put(uri=staged.object_storage_uri, data=index)
+            except Exception as error:  # noqa: BLE001 - synchronize S3 failures.
+                index_error = error
+                index_error_message = f"{type(error).__name__}: {error}"
+
+        index_errors = [None] * self._world_size
+        dist.all_gather_object(
+            index_errors,
+            index_error_message,
+            group=self._process_group,
+        )
+        remote_error = next((error for error in index_errors if error), None)
+        if remote_error is not None:
+            if index_error is not None:
+                raise index_error
+            raise RuntimeError(
+                f"canonical delta index publication failed on rank 0: {remote_error}"
+            )
 
         staged.publish_object_storage_time = self._clock() - started
         self.snapshot = staged.candidate_snapshot

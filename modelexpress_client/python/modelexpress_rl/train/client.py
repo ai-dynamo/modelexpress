@@ -79,7 +79,6 @@ class ObjectStorageConfig:
 class ModelExpressTrainerConfig:
     """Immutable configuration for one rank-local trainer client."""
 
-    engine_context: TrainerEngineContext | None = None
     device_id: int | None = None
     agent_name: str | None = None
     model_name: str | None = None
@@ -91,6 +90,7 @@ class ModelExpressTrainerConfig:
     rpc_timeout_seconds: float = 30.0
     process_group: Any | None = None
     object_storage: ObjectStorageConfig | None = None
+    engine_context: TrainerEngineContext | None = None
 
     def __post_init__(self) -> None:
         if self.payload_format is WeightPayloadFormat.UNSPECIFIED:

@@ -3,6 +3,7 @@
 
 """Version-level object-storage source resolution."""
 
+import logging
 from collections.abc import Iterator
 
 from ...control import WeightVersion
@@ -13,6 +14,8 @@ from ..plan import (
     SourceResolver,
     WeightSource,
 )
+
+logger = logging.getLogger("modelexpress_rl.inference.source.object_storage")
 
 
 class ObjectStorageSourceResolver(SourceResolver):
@@ -33,7 +36,13 @@ class ObjectStorageSourceResolver(SourceResolver):
         if source is None:
             return
         if source.storage_type is not ObjectStorageType.S3:
-            raise RuntimeError("object-storage refit currently requires S3")
+            logger.warning(
+                "object-storage refit currently requires S3; skipping %s for "
+                "version %s",
+                source.storage_type,
+                version.version_id,
+            )
+            return
         yield ObjectStorageUpdateSource(
             storage=source,
             payload_format=version.payload_format,

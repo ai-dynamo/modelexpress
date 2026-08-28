@@ -27,3 +27,22 @@ import modelexpress_rl
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_package_import_does_not_load_optional_engine_implementations():
+    code = """
+import sys
+import modelexpress_rl
+
+assert "modelexpress.engines.vllm.adapter" not in sys.modules
+assert "modelexpress_rl.inference.engines.vllm.installer" not in sys.modules
+assert "modelexpress_rl.inference.engines.sglang.installer" not in sys.modules
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr

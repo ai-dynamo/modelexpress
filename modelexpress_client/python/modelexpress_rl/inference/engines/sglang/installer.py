@@ -31,7 +31,7 @@ class _SglangInstaller(EngineInstaller):
 
     def install(self, prepared: PreparedArtifact) -> dict[str, float]:
         if not isinstance(prepared, PreparedCheckpointArtifact):
-            raise ValueError("SGLang requires a prepared checkpoint")
+            raise TypeError("SGLang requires a prepared checkpoint")
         checkpoint = prepared.checkpoint
         if not isinstance(checkpoint, PreparedCheckpoint):
             raise TypeError("checkpoint preparation has an invalid value")

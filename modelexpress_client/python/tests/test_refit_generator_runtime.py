@@ -3,6 +3,8 @@
 
 from pathlib import Path
 
+import pytest
+
 import modelexpress_rl.inference.engines as engines_module
 import modelexpress_rl.inference.runtime as runtime_module
 from modelexpress import p2p_pb2
@@ -85,7 +87,7 @@ def _full_tensor_engine():
     )
 
 
-def test_generator_runtime_composes_source_policy_outside_engine_integration(
+def test_object_storage_runtime_skips_full_tensor_transport(
     monkeypatch,
     tmp_path,
 ):
@@ -129,13 +131,54 @@ def test_generator_runtime_composes_source_policy_outside_engine_integration(
         start_lease=lambda _version_id: object(),
     )
 
-    assert runtime.methods == (canonical, full_tensor)
+    assert runtime.methods == (canonical,)
     assert runtime.initial_version_id == "base-a"
     assert [
         resolver.kind for resolver in runtime.session._planner._resolvers
-    ] == [WeightSource.GENERATOR, WeightSource.OBJECT_STORAGE]
+    ] == [WeightSource.OBJECT_STORAGE]
     runtime.close()
     runtime.close()
     assert canonical.closed
+    assert not full_tensor.closed
+    assert not p2p.closed
+
+
+def test_generator_runtime_closes_resources_when_resolver_creation_fails(
+    monkeypatch,
+):
+    context = GeneratorEngineContext()
+    monkeypatch.setattr(
+        engines_module, "_create_engine_runtime", lambda received: _full_tensor_engine()
+    )
+    p2p = _P2P(server_url="mx:8000")
+    monkeypatch.setattr(runtime_module, "MxClient", lambda **_kwargs: p2p)
+    monkeypatch.setattr(
+        runtime_module, "_NixlStagedTransfer", lambda **_kwargs: object()
+    )
+    full_tensor = _Method({WeightSource.GENERATOR, WeightSource.TRAINER})
+    monkeypatch.setattr(
+        runtime_module,
+        "FullTensorNixlUpdateMethod",
+        lambda **_kwargs: full_tensor,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "GeneratorSourceResolver",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("resolver failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="resolver failed"):
+        GeneratorRuntime.initialize(
+            engine_context=context,
+            worker_id="generator-3",
+            server_url="mx:8000",
+            object_storage=None,
+            source_order=(WeightSource.GENERATOR,),
+            max_transfer_attempts=3,
+            rpc_timeout_seconds=30,
+            service=lambda: object(),
+            start_lease=lambda _version_id: object(),
+        )
+
     assert full_tensor.closed
     assert p2p.closed
