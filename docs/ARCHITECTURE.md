@@ -731,10 +731,12 @@ adapters are separate integrations rather than part of this vLLM installer.
 by an engine's own weight loader, intersects them with trainer-published
 shards, and compiles one-sided read descriptors without materializing a full
 trainer tensor. Geometry, slice planning, transfer planning, and the transport
-protocol are engine-agnostic. An optional ``nccl_m2n`` collective transport
-under ``refit.reshard.transport.nccl_m2n`` (install the ``[nccl-m2n]`` extra)
-can reshard trainer-to-generator TP tiles in one NCCL call as an alternative
-to one-sided NIXL reads.
+protocol are engine-agnostic. The optional ``nccl_m2n`` module under
+``refit.reshard.transport.nccl_m2n`` (install the ``[nccl-m2n]`` extra)
+exposes a standalone collective data-plane API for resharding
+trainer-to-generator TP tiles. It is not yet selectable through
+``ReshardReceiver``; production bootstrap, agreement, and backend selection
+belong to the external control-plane integration.
 
 The minimal rendezvous publisher is called only after its NIXL agent and source
 buffers are registered, so `publish()` stores the worker as READY and repeated

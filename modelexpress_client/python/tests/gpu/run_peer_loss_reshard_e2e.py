@@ -23,7 +23,6 @@ from datetime import timedelta
 from multiprocessing.connection import wait
 from typing import Any
 
-
 EXPECTED_M2N_REF = "45c3f9b96663276c12437bdd9eb5bcf5a4b343a8"
 SETUP_TIMEOUT_S = 180.0
 POST_FAULT_TIMEOUT_S = 660.0
@@ -48,13 +47,18 @@ def _prompt_failure(
     label: str,
     operation: Any,
     *,
+    expected_type: type[BaseException],
     required_message: str,
 ) -> dict[str, Any]:
     started = time.monotonic()
     try:
         operation()
-    except RuntimeError as exc:
+    except Exception as exc:
         elapsed = time.monotonic() - started
+        if not isinstance(exc, expected_type):
+            raise AssertionError(  # noqa: TRY004 - this reports a test failure.
+                f"{label} raised unexpected {type(exc).__name__}: {exc}"
+            ) from exc
         if elapsed > PROMPT_REJECTION_TIMEOUT_S:
             raise AssertionError(
                 f"{label} rejection took {elapsed:.3f}s; expected at most "
@@ -62,7 +66,7 @@ def _prompt_failure(
             ) from exc
         if required_message not in str(exc).lower():
             raise AssertionError(
-                f"{label} raised an unrelated RuntimeError: {exc}"
+                f"{label} raised an unrelated {type(exc).__name__}: {exc}"
             ) from exc
         return {
             "operation": label,
@@ -70,27 +74,23 @@ def _prompt_failure(
             "message": str(exc),
             "elapsed_s": elapsed,
         }
-    except Exception as exc:
-        raise AssertionError(
-            f"{label} raised unexpected {type(exc).__name__}: {exc}"
-        ) from exc
     raise AssertionError(f"{label} unexpectedly succeeded after fail-stop")
 
 
 def _run_worker(rank: int, port: int, control: Any) -> None:
     import torch
     import torch.distributed as dist
-
-    from modelexpress.refit.reshard.transport.nccl_m2n.executor import (
+    from modelexpress.refit.reshard.transport.nccl_m2n import (
+        M2nCohortRestartRequired,
+        M2nPPGroupBootstrap,
         NcclM2nExecutor,
         ReshardParam,
     )
     from modelexpress.refit.reshard.transport.nccl_m2n.runtime import (
-        _M2nPPGroupSpec,
-        _M2nRuntime,
         _PPGroupState,
         _RuntimeState,
     )
+    from nccl import core as nccl
 
     if torch.cuda.device_count() < 2:
         raise RuntimeError("peer-loss test requires at least two visible GPUs")
@@ -103,34 +103,34 @@ def _run_worker(rank: int, port: int, control: Any) -> None:
         timeout=timedelta(seconds=SETUP_TIMEOUT_S),
     )
 
-    runtime = _M2nRuntime(
-        rank,
-        max_cta=8,
-        comm_init_timeout_s=SETUP_TIMEOUT_S,
-        transfer_timeout_s=5.0,
-        finalize_timeout_s=5.0,
-    )
     bootstrap: list[bytes | None] = [
-        runtime.new_unique_id_bytes() if rank == 0 else None
+        bytes(nccl.get_unique_id().as_bytes) if rank == 0 else None
     ]
     dist.broadcast_object_list(bootstrap, src=0)
     if bootstrap[0] is None:
         raise RuntimeError("failed to broadcast NCCL unique ID")
 
-    (pp_group,) = runtime.create_pp_groups(
+    executor = NcclM2nExecutor.create(
+        rank,
         [
-            _M2nPPGroupSpec(
+            M2nPPGroupBootstrap(
                 group_id="peer-loss",
                 key=(0, 0),
                 unique_id=bootstrap[0],
                 source_size=1,
                 destination_size=1,
                 comm_rank=rank,
-                device_id=rank,
             )
-        ]
+        ],
+        max_cta=8,
+        comm_init_timeout_s=SETUP_TIMEOUT_S,
+        transfer_timeout_s=5.0,
+        finalize_timeout_s=5.0,
     )
-    executor = NcclM2nExecutor(runtime)
+    # This fault-injection runner intentionally inspects private fail-stop state;
+    # construction and caller lifecycle still use the public data-plane API.
+    runtime = executor._runtime
+    (pp_group,) = runtime.pp_groups
     elements = 4 * 1024 * 1024
     tensor = torch.full(
         (elements,),
@@ -201,13 +201,38 @@ def _run_worker(rank: int, port: int, control: Any) -> None:
     executor._copy_into_live = recording_copy
     started = time.monotonic()
     try:
-        executor.execute(updates)
-    except BaseException as exc:
+        executor.stage(updates)
+    except M2nCohortRestartRequired as exc:
         transfer_elapsed = time.monotonic() - started
+        _require(
+            isinstance(exc, M2nCohortRestartRequired),
+            "peer-loss stage did not raise M2nCohortRestartRequired: "
+            f"{type(exc).__name__}: {exc}",
+        )
+        _require(exc.operation == "stage", "typed failure operation was not stage")
+        _require(
+            exc.phase == "completion",
+            f"typed failure phase was not completion: {exc.phase!r}",
+        )
+        _require(
+            exc.group_ids == ("peer-loss",),
+            f"typed failure group scope was incomplete: {exc.group_ids!r}",
+        )
+        _require(
+            exc.pp_group_keys == ((0, 0),),
+            f"typed failure PP-key scope was incomplete: {exc.pp_group_keys!r}",
+        )
+        _require(exc.__cause__ is not None, "typed failure lost its root cause")
         transfer_error = {
             "type": type(exc).__name__,
             "message": str(exc)[:500],
             "elapsed_s": transfer_elapsed,
+            "operation": exc.operation,
+            "phase": exc.phase,
+            "group_ids": exc.group_ids,
+            "pp_group_keys": exc.pp_group_keys,
+            "cause_type": type(exc.__cause__).__name__,
+            "cause_message": str(exc.__cause__)[:500],
         }
     else:
         raise AssertionError("peer-loss transfer unexpectedly succeeded")
@@ -240,19 +265,16 @@ def _run_worker(rank: int, port: int, control: Any) -> None:
 
     prompt_failures = [
         _prompt_failure(
-            "second execute",
-            lambda: executor.execute(updates),
+            "second stage",
+            lambda: executor.stage(updates),
+            expected_type=M2nCohortRestartRequired,
             required_message="restart",
         ),
         _prompt_failure(
-            "executor teardown",
-            executor.teardown,
-            required_message="process restart is required",
-        ),
-        _prompt_failure(
-            "runtime close",
-            runtime.close,
-            required_message="fail-stop",
+            "executor close",
+            executor.close,
+            expected_type=M2nCohortRestartRequired,
+            required_message="restart",
         ),
     ]
     abort_deadline = time.monotonic() + PROMPT_REJECTION_TIMEOUT_S
@@ -283,7 +305,7 @@ def _run_worker(rank: int, port: int, control: Any) -> None:
 def _worker(rank: int, port: int, control: Any) -> None:
     try:
         _run_worker(rank, port, control)
-    except BaseException:
+    except BaseException:  # noqa: BLE001 - child must report every fatal outcome.
         try:
             control.send(("ERROR", rank, traceback.format_exc()))
             control.close()

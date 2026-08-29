@@ -15,15 +15,12 @@ import os
 
 import torch
 import torch.distributed as dist
-
-from modelexpress.refit.reshard.transport.nccl_m2n.executor import (
+from modelexpress.refit.reshard.transport.nccl_m2n import (
+    M2nPPGroupBootstrap,
     NcclM2nExecutor,
     ReshardParam,
 )
-from modelexpress.refit.reshard.transport.nccl_m2n.runtime import (
-    _M2nPPGroupSpec,
-    _M2nRuntime,
-)
+from nccl import core as nccl
 
 
 def _tensor(stage: int, *, destination: bool, device: int) -> torch.Tensor:
@@ -46,11 +43,10 @@ def main() -> int:
 
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend="gloo")
-    runtime = _M2nRuntime(local_rank, max_cta=8)
 
     unique_ids: list[bytes | None]
     if rank == generator_rank:
-        unique_ids = [runtime.new_unique_id_bytes() for _ in range(trainer_pp)]
+        unique_ids = [bytes(nccl.get_unique_id().as_bytes) for _ in range(trainer_pp)]
     else:
         unique_ids = [None] * trainer_pp
     dist.broadcast_object_list(unique_ids, src=generator_rank)
@@ -58,24 +54,30 @@ def main() -> int:
 
     owned_stages = range(trainer_pp) if rank == generator_rank else (rank,)
     params: dict[int, list[ReshardParam]] = {}
-    specs = []
+    bootstraps = []
     for stage in owned_stages:
         unique_id = unique_ids[stage]
         assert unique_id is not None
-        specs.append(
-            _M2nPPGroupSpec(
+        bootstraps.append(
+            M2nPPGroupBootstrap(
                 group_id=f"stage-{stage}-to-0",
                 key=(stage, 0),
                 unique_id=unique_id,
                 source_size=1,
                 destination_size=1,
                 comm_rank=1 if rank == generator_rank else 0,
-                device_id=local_rank,
             )
         )
 
-    pp_groups = runtime.create_pp_groups(specs)
-    executor = NcclM2nExecutor(runtime)
+    executor = NcclM2nExecutor.create(
+        local_rank,
+        bootstraps,
+        max_cta=8,
+    )
+    # Test-only instrumentation below observes canonical native submission and
+    # stream overlap; production callers use only the public executor surface.
+    runtime = executor._runtime
+    pp_groups = runtime.pp_groups
     for stage in owned_stages:
         tensor = _tensor(
             stage,
@@ -140,14 +142,16 @@ def main() -> int:
 
     try:
         if rank == generator_rank:
-            executor.execute(
+            update = executor.stage(
                 {
                     (1, 0): params[1],
                     (0, 0): params[0],
                 }
             )
         else:
-            executor.execute({(rank, 0): params[rank]})
+            update = executor.stage({(rank, 0): params[rank]})
+        executor.apply(update)
+        executor.release(update)
     finally:
         runtime.handle.reshard = original_reshard
         runtime._poll_pp_groups_completion = original_poll_completion
@@ -178,9 +182,8 @@ def main() -> int:
 
     status = torch.tensor(int(failed))
     dist.all_reduce(status, op=dist.ReduceOp.MAX)
-    executor.teardown()
     dist.barrier()
-    runtime.close()
+    executor.close()
     dist.barrier()
     dist.destroy_process_group()
     return int(status.item())

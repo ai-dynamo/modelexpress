@@ -13,7 +13,6 @@ from itertools import pairwise
 from types import SimpleNamespace
 
 import pytest
-
 from modelexpress.refit.reshard.transport.nccl_m2n import (
     runtime as runtime_module,
 )
@@ -23,6 +22,7 @@ from modelexpress.refit.reshard.transport.nccl_m2n.mesh import (
     tile_shape,
 )
 from modelexpress.refit.reshard.transport.nccl_m2n.runtime import (
+    M2nCohortRestartRequired,
     _M2nCall,
     _M2nPPGroupBatch,
     _M2nPPGroupSpec,
@@ -215,9 +215,7 @@ class FakeNccl:
                 name = unique_id.value.decode()
                 self.name = name
                 self.set_async_states(*owner.async_scripts.get(name, [0]))
-                owner.events.append(
-                    ("comm_init", name, nranks, rank, config.blocking)
-                )
+                owner.events.append(("comm_init", name, nranks, rank, config.blocking))
 
         self.Communicator = Communicator
 
@@ -375,7 +373,7 @@ def start_thread(target, *, name: str | None = None):
     def run() -> None:
         try:
             results.append(target())
-        except BaseException as exc:
+        except BaseException as exc:  # noqa: BLE001 - thread failures are assertions.
             errors.append(exc)
 
     thread = threading.Thread(target=run, daemon=True, name=name)
@@ -465,6 +463,37 @@ def test_create_pp_groups_creates_comms_and_streams_in_canonical_order():
     runtime.close()
 
 
+def test_create_failure_after_native_init_is_fail_stop_for_full_intended_scope():
+    runtime, _, nccl, events = make_runtime()
+    original_initialize = nccl.Communicator.initialize
+
+    def fail_second_initialize(self, nranks, rank, unique_id, config):
+        if unique_id.value == b"1-0":
+            raise ValueError("injected second communicator init failure")
+        return original_initialize(self, nranks, rank, unique_id, config)
+
+    nccl.Communicator.initialize = fail_second_initialize
+    with pytest.raises(M2nCohortRestartRequired) as exc_info:
+        runtime.create_pp_groups([make_spec((1, 0)), make_spec((0, 0))])
+
+    assert exc_info.value.operation == "create_pp_groups"
+    assert exc_info.value.phase == "communicator_init"
+    assert exc_info.value.group_ids == ("0-0", "1-0")
+    assert exc_info.value.pp_group_keys == ((0, 0), (1, 0))
+    assert isinstance(exc_info.value.__cause__, ValueError)
+    assert "second communicator init failure" in str(exc_info.value.__cause__)
+    assert [group.key for group in runtime.pp_groups] == [(0, 0), (1, 0)]
+    assert all(group.state is _PPGroupState.POISONED for group in runtime.pp_groups)
+    assert runtime._abort_done.wait(timeout=10)
+    assert all(group.abort_attempted for group in runtime.pp_groups)
+    assert sum(event[0] == "comm_abort_start" for event in events) == 2
+    assert not any(
+        event[0]
+        in {"handle_destroy", "stream_destroy", "comm_finalize", "comm_destroy"}
+        for event in events
+    )
+
+
 def test_submit_uses_one_group_and_canonical_pp_group_order():
     runtime, _, _, events = make_runtime()
     early, late = create_groups(runtime, [(1, 0), (0, 0)])
@@ -523,6 +552,31 @@ def test_partial_pp_group_submission_is_rejected():
     runtime.close()
 
 
+def test_all_empty_update_skips_native_submission_and_completion_polling():
+    runtime, _, _, events = make_runtime()
+    early, late = create_groups(runtime, [(1, 0), (0, 0)])
+    batches = [
+        _M2nPPGroupBatch(pp_group=late, calls=(), total_bytes=0),
+        _M2nPPGroupBatch(pp_group=early, calls=(), total_bytes=0),
+    ]
+    events.clear()
+
+    assert runtime.submit_model_update(batches) == {(0, 0): 0, (1, 0): 0}
+    assert not any(
+        event[0]
+        in {
+            "event_create",
+            "group_start",
+            "group_end",
+            "reshard",
+            "comm_async",
+            "stream_query",
+        }
+        for event in events
+    )
+    runtime.close()
+
+
 def test_two_multi_group_processes_record_same_sorted_sequence():
     sequences = []
     for insertion_order in (
@@ -578,14 +632,21 @@ def test_group_exception_aborts_and_poisons_runtime():
     runtime, _, _, events = make_runtime(fail_at=0)
     (pp_group,) = create_groups(runtime, [(0, 0)])
 
-    with pytest.raises(RuntimeError, match="injected reshard failure"):
+    with pytest.raises(M2nCohortRestartRequired) as exc_info:
         runtime.submit_model_update([make_batch(runtime, pp_group)])
+    assert exc_info.value.operation == "stage"
+    assert exc_info.value.phase == "submission"
+    assert exc_info.value.group_ids == ("0-0",)
+    assert exc_info.value.pp_group_keys == ((0, 0),)
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert "injected reshard failure" in str(exc_info.value.__cause__)
     assert ("group_abort",) in events
     assert runtime._abort_done.wait(timeout=10)
     assert ("comm_abort_start", "0-0", True) in events
-    with pytest.raises(RuntimeError, match="fail-stop"):
+    with pytest.raises(M2nCohortRestartRequired) as repeated:
         runtime.submit_model_update([make_batch(runtime, pp_group)])
-    with pytest.raises(RuntimeError, match="process restart is required"):
+    assert repeated.value.__cause__ is exc_info.value.__cause__
+    with pytest.raises(M2nCohortRestartRequired):
         runtime.close()
     assert ("handle_destroy",) not in events
 
@@ -678,8 +739,13 @@ def test_post_drain_teardown_failure_is_terminal_and_not_retried(
 
         pp_group.communicator.destroy = fail_comm_destroy
 
-    with pytest.raises((RuntimeError, TimeoutError)):
+    with pytest.raises(M2nCohortRestartRequired) as exc_info:
         runtime.close()
+    assert exc_info.value.operation == "close"
+    assert exc_info.value.phase == expected_phase
+    assert exc_info.value.group_ids == ("0-0",)
+    assert exc_info.value.pp_group_keys == ((0, 0),)
+    assert exc_info.value.__cause__ is not None
 
     assert runtime._state is _RuntimeState.POISONED
     assert runtime._restart_required
@@ -708,7 +774,7 @@ def test_post_drain_teardown_failure_is_terminal_and_not_retried(
             assert pp_group.stream is None
 
     events_before_retry = tuple(events)
-    with pytest.raises(RuntimeError, match="process restart is required"):
+    with pytest.raises(M2nCohortRestartRequired):
         runtime.close()
     assert tuple(events) == events_before_retry
 
@@ -722,8 +788,11 @@ def test_partial_teardown_after_earlier_group_closed_is_not_replayed():
         raise RuntimeError("injected later-group finalize failure")
 
     late.communicator.finalize = fail_late_finalize
-    with pytest.raises(RuntimeError, match="later-group finalize failure"):
+    with pytest.raises(M2nCohortRestartRequired) as exc_info:
         runtime.close()
+    assert exc_info.value.phase == "comm-finalize"
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert "later-group finalize failure" in str(exc_info.value.__cause__)
 
     assert early.state is _PPGroupState.CLOSED
     assert late.state is _PPGroupState.POISONED
@@ -733,7 +802,7 @@ def test_partial_teardown_after_earlier_group_closed_is_not_replayed():
     assert not any(event[0] == "comm_abort_start" for event in events)
 
     events_before_retry = tuple(events)
-    with pytest.raises(RuntimeError, match="process restart is required"):
+    with pytest.raises(M2nCohortRestartRequired):
         runtime.close()
     assert tuple(events) == events_before_retry
 
@@ -852,8 +921,11 @@ def test_close_commit_failure_is_terminal_and_retains_singleton():
 
     runtime._pp_groups = FailClearDict(original_groups)
     try:
-        with pytest.raises(RuntimeError, match="close commit failure"):
+        with pytest.raises(M2nCohortRestartRequired) as exc_info:
             runtime.close()
+        assert exc_info.value.phase == "runtime-close-commit"
+        assert isinstance(exc_info.value.__cause__, RuntimeError)
+        assert "close commit failure" in str(exc_info.value.__cause__)
 
         assert runtime._state is _RuntimeState.POISONED
         assert runtime._restart_required
@@ -866,7 +938,7 @@ def test_close_commit_failure_is_terminal_and_retains_singleton():
         assert not any(event[0] == "comm_abort_start" for event in events)
 
         events_before_retry = tuple(events)
-        with pytest.raises(RuntimeError, match="process restart is required"):
+        with pytest.raises(M2nCohortRestartRequired):
             runtime.close()
         assert tuple(events) == events_before_retry
     finally:
@@ -950,9 +1022,7 @@ def test_close_waits_for_create_and_snapshots_complete_topology():
 
     nccl.Communicator.initialize = blocking_initialize
     create_thread, create_results, create_errors = start_thread(
-        lambda: runtime.create_pp_groups(
-            [make_spec((1, 0)), make_spec((0, 0))]
-        )
+        lambda: runtime.create_pp_groups([make_spec((1, 0)), make_spec((0, 0))])
     )
     assert init_entered.wait(timeout=10)
 
@@ -999,8 +1069,12 @@ def test_close_timeout_retains_resources_and_requires_process_restart():
     )
     assert init_entered.wait(timeout=10)
 
-    with pytest.raises(TimeoutError, match="process restart is required"):
+    with pytest.raises(M2nCohortRestartRequired) as exc_info:
         runtime.close()
+    assert exc_info.value.operation == "close"
+    assert exc_info.value.phase == "active_operation_drain"
+    assert isinstance(exc_info.value.__cause__, TimeoutError)
+    assert "active M2N operations" in str(exc_info.value.__cause__)
 
     assert runtime._state is _RuntimeState.POISONED
     assert runtime._close_abandoned
@@ -1013,19 +1087,65 @@ def test_close_timeout_retains_resources_and_requires_process_restart():
     release_init.set()
     join_thread(create_thread)
     assert len(create_errors) == 1
-    assert "process restart is required" in str(create_errors[0])
+    assert isinstance(create_errors[0], M2nCohortRestartRequired)
+    assert create_errors[0].operation == "create_pp_groups"
+    assert create_errors[0].phase == "shutdown_race"
+    assert create_errors[0].group_ids == ("0-0",)
+    assert create_errors[0].pp_group_keys == ((0, 0),)
     assert len(runtime.pp_groups) == 1
     assert not any(event[0] == "comm_abort_start" for event in events)
 
-    with pytest.raises(RuntimeError, match="process restart is required"):
+    with pytest.raises(M2nCohortRestartRequired):
         runtime.close()
-    with pytest.raises(RuntimeError, match="process restart is required"):
+    with pytest.raises(M2nCohortRestartRequired):
         runtime.create_pp_groups([])
     assert not any(
         event[0]
         in {"handle_destroy", "stream_destroy", "comm_finalize", "comm_destroy"}
         for event in events
     )
+
+
+def test_close_timeout_preserves_failure_recorded_while_draining_active_op():
+    runtime, _, _, _ = make_runtime(finalize_timeout_s=0.05)
+    operation_entered = threading.Event()
+    record_failure = threading.Event()
+    failure_recorded = threading.Event()
+    release_operation = threading.Event()
+    original_failure = RuntimeError("original native operation failure")
+
+    def active_operation() -> None:
+        with runtime._active_operation():
+            operation_entered.set()
+            assert record_failure.wait(timeout=10)
+            runtime._enter_fail_stop((), (), original_failure)
+            failure_recorded.set()
+            assert release_operation.wait(timeout=10)
+
+    operation_thread, _, operation_errors = start_thread(active_operation)
+    assert operation_entered.wait(timeout=10)
+    close_thread, _, close_errors = start_thread(runtime.close)
+    wait_for_runtime_state(runtime, _RuntimeState.CLOSING)
+
+    record_failure.set()
+    assert failure_recorded.wait(timeout=10)
+    join_thread(close_thread)
+
+    assert len(close_errors) == 1
+    error = close_errors[0]
+    assert isinstance(error, M2nCohortRestartRequired)
+    assert error.operation == "close"
+    assert error.phase == "active_operation_drain"
+    assert error.reason == "RuntimeError: original native operation failure"
+    assert error.__cause__ is original_failure
+    assert runtime._fail_stop_cause is original_failure
+    assert runtime._fail_stop_reason == error.reason
+    assert runtime._close_abandoned
+    assert runtime._handle_quarantined
+
+    release_operation.set()
+    join_thread(operation_thread)
+    assert not operation_errors
 
 
 def test_close_from_active_operation_fails_without_changing_state():
@@ -1153,17 +1273,13 @@ def test_nonblocking_init_polls_all_pp_groups_round_robin():
     groups = create_groups(runtime, [(1, 0), (0, 0)])
 
     assert [group.key for group in groups] == [(0, 0), (1, 0)]
-    assert [
-        event for event in events if event[0] == "comm_init"
-    ] == [
+    assert [event for event in events if event[0] == "comm_init"] == [
         ("comm_init", "0-0", 2, 0, False),
         ("comm_init", "1-0", 2, 0, False),
     ]
-    assert [
-        (event[1], event[2])
-        for event in events
-        if event[0] == "comm_async"
-    ][:4] == [
+    assert [(event[1], event[2]) for event in events if event[0] == "comm_async"][
+        :4
+    ] == [
         ("0-0", 7),
         ("1-0", 7),
         ("0-0", 0),
@@ -1182,21 +1298,28 @@ def test_init_timeout_aborts_all_created_groups_canonically():
         "1-0": [7],
     }
 
-    with pytest.raises(TimeoutError, match="PP-group initialization"):
+    with pytest.raises(M2nCohortRestartRequired) as exc_info:
         runtime.create_pp_groups([make_spec((1, 0)), make_spec((0, 0))])
+    assert exc_info.value.operation == "create_pp_groups"
+    assert exc_info.value.phase == "communicator_init"
+    assert exc_info.value.group_ids == ("0-0", "1-0")
+    assert exc_info.value.pp_group_keys == ((0, 0), (1, 0))
+    assert isinstance(exc_info.value.__cause__, TimeoutError)
+    assert "PP-group initialization" in str(exc_info.value.__cause__)
 
     assert runtime._abort_done.wait(timeout=10)
     assert runtime._restart_required
     assert [group.key for group in runtime.pp_groups] == [(0, 0), (1, 0)]
-    assert [
-        event[1] for event in events if event[0] == "comm_abort_start"
-    ] == ["0-0", "1-0"]
+    assert [event[1] for event in events if event[0] == "comm_abort_start"] == [
+        "0-0",
+        "1-0",
+    ]
     assert not any(
         event[0]
         in {"handle_destroy", "stream_destroy", "comm_finalize", "comm_destroy"}
         for event in events
     )
-    with pytest.raises(RuntimeError, match="process restart is required"):
+    with pytest.raises(M2nCohortRestartRequired):
         runtime.close()
 
 
@@ -1208,20 +1331,19 @@ def test_completion_requires_nccl_success_and_stream_readiness():
     pp_group.communicator.set_async_states(7, 0)
     pp_group.stream.set_query_results(True)
     runtime.submit_model_update([make_batch(runtime, pp_group)])
-    assert [
-        event[2] for event in events if event[0] == "comm_async"
-    ][:2] == [7, 0]
-    assert [
-        event for event in events if event[0] == "stream_query"
-    ] == [("stream_query", "owned-0", True)]
+    assert [event[2] for event in events if event[0] == "comm_async"][:2] == [7, 0]
+    assert [event for event in events if event[0] == "stream_query"] == [
+        ("stream_query", "owned-0", True)
+    ]
 
     events.clear()
     pp_group.communicator.set_async_states(0)
     pp_group.stream.set_query_results(False, True)
     runtime.submit_model_update([make_batch(runtime, pp_group)])
-    assert [
-        event[2] for event in events if event[0] == "stream_query"
-    ][:2] == [False, True]
+    assert [event[2] for event in events if event[0] == "stream_query"][:2] == [
+        False,
+        True,
+    ]
     runtime.close()
 
 
@@ -1236,26 +1358,27 @@ def test_multi_group_completion_detects_later_error_round_robin():
     late.communicator.set_async_states(2)
     events.clear()
 
-    with pytest.raises(RuntimeError, match="status=2"):
+    with pytest.raises(M2nCohortRestartRequired) as exc_info:
         runtime.submit_model_update(
             [make_batch(runtime, late), make_batch(runtime, early)]
         )
+    assert exc_info.value.operation == "stage"
+    assert exc_info.value.phase == "completion"
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert "status=2" in str(exc_info.value.__cause__)
 
     assert runtime._abort_done.wait(timeout=10)
-    observed = [
-        event
-        for event in events
-        if event[0] in {"comm_async", "stream_query"}
-    ]
+    observed = [event for event in events if event[0] in {"comm_async", "stream_query"}]
     assert observed[:3] == [
         ("comm_async", "0-0", 0),
         ("stream_query", "owned-0", False),
         ("comm_async", "1-0", 2),
     ]
-    assert [
-        event[1] for event in events if event[0] == "comm_abort_start"
-    ] == ["0-0", "1-0"]
-    with pytest.raises(RuntimeError, match="process restart is required"):
+    assert [event[1] for event in events if event[0] == "comm_abort_start"] == [
+        "0-0",
+        "1-0",
+    ]
+    with pytest.raises(M2nCohortRestartRequired):
         runtime.close()
 
 
@@ -1272,8 +1395,12 @@ def test_hanging_abort_worker_does_not_block_transfer_failure():
     pp_group.communicator.abort_release = abort_release
 
     try:
-        with pytest.raises(TimeoutError, match="model-version staging"):
+        with pytest.raises(M2nCohortRestartRequired) as exc_info:
             runtime.submit_model_update([make_batch(runtime, pp_group)])
+        assert exc_info.value.operation == "stage"
+        assert exc_info.value.phase == "completion"
+        assert isinstance(exc_info.value.__cause__, TimeoutError)
+        assert "model-version staging" in str(exc_info.value.__cause__)
         assert abort_entered.wait(timeout=10)
         assert runtime._abort_thread is not None
         assert runtime._abort_thread.daemon
@@ -1286,7 +1413,7 @@ def test_hanging_abort_worker_does_not_block_transfer_failure():
         abort_release.set()
 
     assert runtime._abort_done.wait(timeout=10)
-    with pytest.raises(RuntimeError, match="process restart is required"):
+    with pytest.raises(M2nCohortRestartRequired):
         runtime.close()
 
 
@@ -1298,8 +1425,12 @@ def test_healthy_close_drain_timeout_quarantines_without_finalizing():
     (pp_group,) = create_groups(runtime, [(0, 0)])
     pp_group.stream.set_query_results(False)
 
-    with pytest.raises(TimeoutError, match="runtime shutdown drain"):
+    with pytest.raises(M2nCohortRestartRequired) as exc_info:
         runtime.close()
+    assert exc_info.value.operation == "close"
+    assert exc_info.value.phase == "stream_drain"
+    assert isinstance(exc_info.value.__cause__, TimeoutError)
+    assert "runtime shutdown drain" in str(exc_info.value.__cause__)
 
     assert runtime._abort_done.wait(timeout=10)
     assert runtime._state is _RuntimeState.POISONED
@@ -1351,6 +1482,7 @@ def test_healthy_drain_waits_for_dispatcher_before_poll_or_abort():
             operation=operation,
             deadline=deadline,
         )
+
     runtime._poll_pp_groups_completion = recording_poll_completion
 
     submit_thread, _, submit_errors = start_thread(
@@ -1380,7 +1512,11 @@ def test_healthy_drain_waits_for_dispatcher_before_poll_or_abort():
     assert drain_poll_entered.is_set()
     assert not submit_errors
     assert len(drain_errors) == 1
-    assert "NCCL status query failed" in str(drain_errors[0])
+    assert isinstance(drain_errors[0], M2nCohortRestartRequired)
+    assert drain_errors[0].operation == "test drain"
+    assert drain_errors[0].phase == "completion"
+    assert isinstance(drain_errors[0].__cause__, RuntimeError)
+    assert "injected drain status failure" in str(drain_errors[0].__cause__)
     assert runtime._abort_done.wait(timeout=10)
     assert events.index(("m2n_host_exit",)) < events.index(("drain_status_query",))
     abort_index = next(
@@ -1395,65 +1531,56 @@ def test_abort_failure_continues_to_later_pp_groups():
     early.communicator.abort_error = RuntimeError("injected abort failure")
     late.communicator.set_async_states(RuntimeError("injected status failure"))
 
-    with pytest.raises(RuntimeError, match="NCCL status query failed") as exc_info:
+    with pytest.raises(M2nCohortRestartRequired) as exc_info:
         runtime.submit_model_update(
             [make_batch(runtime, late), make_batch(runtime, early)]
         )
 
+    assert exc_info.value.operation == "stage"
+    assert exc_info.value.phase == "completion"
     assert "injected status failure" in str(exc_info.value.__cause__)
     assert runtime._abort_done.wait(timeout=10)
-    assert [
-        event[1] for event in events if event[0] == "comm_abort_start"
-    ] == ["0-0", "1-0"]
-    assert [
-        event[1] for event in events if event[0] == "comm_abort_done"
-    ] == ["1-0"]
+    assert [event[1] for event in events if event[0] == "comm_abort_start"] == [
+        "0-0",
+        "1-0",
+    ]
+    assert [event[1] for event in events if event[0] == "comm_abort_done"] == ["1-0"]
     assert runtime._restart_required
     assert ("handle_destroy",) not in events
 
 
-def test_quarantine_precedes_failure_callback_and_abort():
-    runtime, _, _, events = make_runtime()
+def test_quarantine_precedes_abort_and_retains_submitted_batches():
+    runtime, _, _, _events = make_runtime()
     (pp_group,) = create_groups(runtime, [(0, 0)])
     pp_group.communicator.set_async_states(2)
-    callback_snapshots = []
-    base = make_batch(runtime, pp_group)
+    abort_snapshots = []
+    original_abort = pp_group.communicator.abort
 
-    def on_failure(exc):
-        callback_snapshots.append(
+    def inspect_abort():
+        abort_snapshots.append(
             (
                 runtime._restart_required,
                 runtime._handle_quarantined,
                 bool(runtime._quarantined_batches),
                 tuple(group.state.name for group in runtime.pp_groups),
-                type(exc).__name__,
             )
         )
-        events.append(("failure_callback",))
+        original_abort()
 
-    batch = _M2nPPGroupBatch(
-        pp_group=base.pp_group,
-        calls=base.calls,
-        total_bytes=base.total_bytes,
-        on_failure=on_failure,
-    )
+    pp_group.communicator.abort = inspect_abort
+    batch = make_batch(runtime, pp_group)
 
-    with pytest.raises(RuntimeError, match="status=2"):
+    with pytest.raises(M2nCohortRestartRequired) as exc_info:
         runtime.submit_model_update([batch])
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert "status=2" in runtime._fail_stop_reason
 
     assert runtime._abort_done.wait(timeout=10)
-    assert callback_snapshots == [
-        (True, True, True, ("POISONED",), "RuntimeError")
-    ]
+    assert abort_snapshots == [(True, True, True, ("POISONED",))]
     assert runtime._quarantined_batches == (batch,)
-    callback_index = events.index(("failure_callback",))
-    abort_index = next(
-        index for index, event in enumerate(events) if event[0] == "comm_abort_start"
-    )
-    assert callback_index < abort_index
 
 
-def test_staging_and_commit_share_one_transfer_deadline(monkeypatch):
+def test_staging_uses_one_bounded_transfer_deadline(monkeypatch):
     now = [0.0]
 
     def monotonic():
@@ -1472,26 +1599,22 @@ def test_staging_and_commit_share_one_transfer_deadline(monkeypatch):
         poll_interval_s=0.6,
     )
     (pp_group,) = create_groups(runtime, [(0, 0)])
-    pp_group.stream.set_query_results(False, True, False)
-    commit_calls = []
-    base = make_batch(runtime, pp_group)
-    batch = _M2nPPGroupBatch(
-        pp_group=base.pp_group,
-        calls=base.calls,
-        total_bytes=base.total_bytes,
-        commit=lambda: commit_calls.append(now[0]),
-    )
+    pp_group.stream.set_query_results(False)
+    batch = make_batch(runtime, pp_group)
 
-    with pytest.raises(TimeoutError, match="model-version commit"):
+    with pytest.raises(M2nCohortRestartRequired) as exc_info:
         runtime.submit_model_update([batch])
 
-    assert commit_calls == [pytest.approx(0.6)]
+    assert exc_info.value.operation == "stage"
+    assert exc_info.value.phase == "completion"
+    assert isinstance(exc_info.value.__cause__, TimeoutError)
+    assert "model-version staging" in str(exc_info.value.__cause__)
     assert now[0] == pytest.approx(1.0)
     assert runtime._restart_required
     assert runtime._abort_done.wait(timeout=10)
 
 
-def test_nonquarantined_poison_keeps_existing_teardown_admission():
+def test_poisoned_state_rejects_new_runtime_operations():
     runtime, _, _, _ = make_runtime()
     (pp_group,) = create_groups(runtime, [(0, 0)])
 
@@ -1499,10 +1622,10 @@ def test_nonquarantined_poison_keeps_existing_teardown_admission():
         runtime._state = _RuntimeState.POISONED
         assert not runtime._restart_required
 
-    with runtime._active_operation(allow_poisoned=True):
+    with pytest.raises(RuntimeError, match="poisoned"):
         runtime.wait_for_pp_groups(
             (pp_group,),
-            operation="nonquarantined teardown",
+            operation="poisoned wait",
         )
 
     with runtime._state_cv:
@@ -1516,26 +1639,18 @@ def test_quarantined_teardown_fails_before_waiting_for_dispatcher():
     events.clear()
     errors = []
     thread = None
-    first_check_done = threading.Event()
-    original_restart_check = runtime._raise_if_restart_required
-
-    def recording_restart_check(operation):
-        original_restart_check(operation)
-        if threading.current_thread().name == "teardown":
-            first_check_done.set()
-
-    runtime._raise_if_restart_required = recording_restart_check
 
     def teardown_like():
         try:
-            with runtime._active_operation(allow_poisoned=True):
-                runtime.wait_for_pp_groups(
-                    (pp_group,),
-                    operation="quarantined teardown",
-                )
-        except BaseException as exc:
+            runtime.wait_for_pp_groups(
+                (pp_group,),
+                operation="quarantined teardown",
+            )
+        except BaseException as exc:  # noqa: BLE001 - thread failures are assertions.
             errors.append(exc)
 
+    original_failure = RuntimeError("original transfer failure")
+    runtime._enter_fail_stop((pp_group,), (), original_failure)
     runtime._dispatcher_lock.acquire()
     try:
         thread = threading.Thread(
@@ -1544,12 +1659,6 @@ def test_quarantined_teardown_fails_before_waiting_for_dispatcher():
             name="teardown",
         )
         thread.start()
-        assert first_check_done.wait(timeout=10)
-        runtime._enter_fail_stop(
-            (pp_group,),
-            (),
-            RuntimeError("original transfer failure"),
-        )
         thread.join(timeout=0.5)
         assert not thread.is_alive()
     finally:
@@ -1558,6 +1667,8 @@ def test_quarantined_teardown_fails_before_waiting_for_dispatcher():
             thread.join(timeout=10)
 
     assert len(errors) == 1
-    assert "process restart is required" in str(errors[0])
+    assert isinstance(errors[0], M2nCohortRestartRequired)
+    assert errors[0].phase == "admission"
+    assert errors[0].__cause__ is original_failure
     assert runtime._fail_stop_reason == "RuntimeError: original transfer failure"
     assert not any(event[0] == "comm_async" for event in events)

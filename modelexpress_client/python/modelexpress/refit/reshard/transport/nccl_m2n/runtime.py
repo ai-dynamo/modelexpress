@@ -22,12 +22,12 @@ import logging
 import math
 import threading
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, auto
 from numbers import Integral
-from typing import Any
+from typing import Any, NoReturn
 
 from .mesh import REPLICATE
 from .mesh import Mesh as PlannerMesh
@@ -36,6 +36,27 @@ _PPGroupKey = tuple[int, int]
 _NCCL_SUCCESS = 0
 _NCCL_IN_PROGRESS = 7
 logger = logging.getLogger("modelexpress.refit.reshard.nccl_m2n_runtime")
+
+
+class M2nCohortRestartRequired(Exception):
+    """The current communicator cohort is terminal and must be restarted."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        operation: str,
+        phase: str,
+        group_ids: Sequence[str] = (),
+        pp_group_keys: Sequence[_PPGroupKey] = (),
+        reason: str,
+    ) -> None:
+        super().__init__(message)
+        self.operation = operation
+        self.phase = phase
+        self.group_ids = tuple(group_ids)
+        self.pp_group_keys = tuple(pp_group_keys)
+        self.reason = reason
 
 
 class _RuntimeState(Enum):
@@ -175,9 +196,6 @@ class _M2nPPGroupBatch:
     pp_group: _M2nPPGroup
     calls: tuple[_M2nCall, ...]
     total_bytes: int
-    commit: Callable[[], None] | None = None
-    on_complete: Callable[[], None] | None = None
-    on_failure: Callable[[BaseException], None] | None = None
 
 
 def _version_tuple(version: object) -> tuple[int, int, int]:
@@ -219,6 +237,7 @@ class _M2nRuntime:
         _nccl_module: Any | None = None,
         _torch_module: Any | None = None,
         _enforce_singleton: bool = True,
+        _restart_scope: Sequence[tuple[str, _PPGroupKey]] = (),
     ) -> None:
         self._device_id = int(device_id)
         self._comm_init_timeout_s = self._positive_finite_timeout(
@@ -251,12 +270,22 @@ class _M2nRuntime:
         self._close_abandoned = False
         self._restart_required = False
         self._pp_groups: dict[_PPGroupKey, _M2nPPGroup] = {}
+        self._restart_scope = tuple(
+            sorted(
+                (
+                    (group_id, (int(key[0]), int(key[1])))
+                    for group_id, key in _restart_scope
+                ),
+                key=lambda item: item[1],
+            )
+        )
         self._topology_frozen = False
         self._attached_executors: set[Any] = set()
         self._handle: Any | None = None
         self._handle_quarantined = False
         self._quarantined_batches: tuple[_M2nPPGroupBatch, ...] = ()
         self._fail_stop_reason: str | None = None
+        self._fail_stop_cause: BaseException | None = None
         self._teardown_failure_phase: str | None = None
         self._teardown_failure_key: _PPGroupKey | None = None
         self._abort_lock = threading.Lock()
@@ -266,7 +295,7 @@ class _M2nRuntime:
         if _enforce_singleton:
             with self._singleton_lock:
                 live = type(self)._live_runtime
-                if live is not None and live._state is not _RuntimeState.CLOSED:
+                if live is not None:
                     raise RuntimeError(
                         "only one _M2nRuntime may be active in a process"
                     )
@@ -282,21 +311,50 @@ class _M2nRuntime:
                 if max_cta is None
                 else self._m2n.Config(max_cta=max_cta)
             )
+            # Contract: nccl.m2n.init() is failure-atomic when it raises. Once
+            # it returns a handle, MX retains that handle until destroy succeeds.
             self._handle = self._m2n.init(config)
-            if not all(
-                callable(getattr(self._handle, name, None))
-                for name in ("reshard", "destroy")
-            ):
-                destroy = getattr(self._handle, "destroy", None)
-                if callable(destroy):
-                    destroy()
-                self._handle = None
-                raise RuntimeError(
+            reshard = getattr(self._handle, "reshard", None)
+            destroy = getattr(self._handle, "destroy", None)
+            if not callable(reshard) or not callable(destroy):
+                api_error = RuntimeError(
                     "NCCL M2N package lacks current Handle.reshard()/destroy() API"
                 )
-        except BaseException:
-            self._clear_singleton()
+                if callable(destroy):
+                    try:
+                        destroy()
+                    except BaseException as destroy_error:  # noqa: BLE001
+                        # Native cleanup must convert every process-exit-class
+                        # failure into the same restart-only fail-stop state.
+                        self._enter_fail_stop((), (), destroy_error)
+                        self._raise_restart_required(
+                            operation="create",
+                            phase="handle_cleanup",
+                            reason="invalid M2N handle could not be destroyed",
+                            cause=destroy_error,
+                        )
+                    self._handle = None
+                    raise api_error
+                self._enter_fail_stop((), (), api_error)
+                self._raise_restart_required(
+                    operation="create",
+                    phase="handle_validation",
+                    reason="returned M2N handle cannot be safely destroyed",
+                    cause=api_error,
+                )
+        except M2nCohortRestartRequired:
             raise
+        except BaseException as exc:
+            if self._handle is None:
+                self._clear_singleton()
+                raise
+            self._enter_fail_stop((), (), exc)
+            self._raise_restart_required(
+                operation="create",
+                phase="handle_validation",
+                reason="M2N handle validation failed after initialization",
+                cause=exc,
+            )
 
     @staticmethod
     def _import_backend(module: str) -> Any:
@@ -330,13 +388,10 @@ class _M2nRuntime:
                 )
             libnccl_version = getattr(libnccl, "version", None)
             if libnccl_version is None:
-                raise TypeError(
-                    "NCCL4Py VersionInfo.libnccl does not expose .version"
-                )
+                raise TypeError("NCCL4Py VersionInfo.libnccl does not expose .version")
         if _version_tuple(libnccl_version) < (2, 30, 5):
             raise RuntimeError(
-                "NCCL M2N requires NCCL >= 2.30.5, found "
-                f"{libnccl_version}"
+                "NCCL M2N requires NCCL >= 2.30.5, found " f"{libnccl_version}"
             )
 
     def _validate_nccl_api(self) -> None:
@@ -365,6 +420,60 @@ class _M2nRuntime:
     def _new_nccl_config(self) -> Any:
         return self._nccl.NCCLConfig(blocking=False)
 
+    def _restart_error(
+        self,
+        *,
+        operation: str,
+        phase: str,
+        reason: str,
+    ) -> M2nCohortRestartRequired:
+        scope = self._restart_scope or tuple(
+            (group.group_id, group.key) for group in self.pp_groups
+        )
+        error = M2nCohortRestartRequired(
+            f"{reason}; restart the affected M2N communicator cohort",
+            operation=operation,
+            phase=phase,
+            group_ids=tuple(group_id for group_id, _ in scope),
+            pp_group_keys=tuple(key for _, key in scope),
+            reason=reason,
+        )
+        if self._fail_stop_cause is not None:
+            error.__cause__ = self._fail_stop_cause
+            error.__suppress_context__ = True
+        return error
+
+    @staticmethod
+    def _root_cause(cause: BaseException) -> BaseException:
+        """Return the deepest explicit cause without following cycles."""
+        current = cause
+        seen = {id(current)}
+        while current.__cause__ is not None and id(current.__cause__) not in seen:
+            current = current.__cause__
+            seen.add(id(current))
+        return current
+
+    def _raise_restart_required(
+        self,
+        *,
+        operation: str,
+        phase: str,
+        reason: str,
+        cause: BaseException | None = None,
+    ) -> NoReturn:
+        """Raise the typed terminal error directly from the first root cause."""
+        root = self._fail_stop_cause
+        if root is None and cause is not None:
+            root = self._root_cause(cause)
+        error = self._restart_error(
+            operation=operation,
+            phase=phase,
+            reason=reason,
+        )
+        if root is not None:
+            raise error from root
+        raise error
+
     def _validate_m2n_api(self) -> None:
         required = (
             "Config",
@@ -382,22 +491,12 @@ class _M2nRuntime:
             )
 
     @contextmanager
-    def _active_operation(
-        self,
-        *,
-        allow_poisoned: bool = False,
-    ) -> Iterator[None]:
+    def _active_operation(self) -> Iterator[None]:
         """Keep runtime resources alive for one reentrant top-level operation."""
         depth = getattr(self._operation_local, "depth", 0)
         if depth:
             with self._state_cv:
-                self._require_admitted_operation_locked(
-                    allow_poisoned=getattr(
-                        self._operation_local,
-                        "allow_poisoned",
-                        False,
-                    )
-                )
+                self._require_admitted_operation_locked()
             self._operation_local.depth = depth + 1
             try:
                 yield
@@ -406,22 +505,13 @@ class _M2nRuntime:
             return
 
         with self._state_cv:
-            if (
-                allow_poisoned
-                and self._state is _RuntimeState.POISONED
-                and not self._close_abandoned
-            ):
-                pass
-            else:
-                self._require_open_locked()
+            self._require_open_locked()
             self._active_operations += 1
         self._operation_local.depth = 1
-        self._operation_local.allow_poisoned = allow_poisoned
         try:
             yield
         finally:
             del self._operation_local.depth
-            del self._operation_local.allow_poisoned
             with self._state_cv:
                 self._active_operations -= 1
                 self._state_cv.notify_all()
@@ -430,18 +520,14 @@ class _M2nRuntime:
         with self._state_cv:
             self._require_admitted_operation_locked()
 
-    def _require_admitted_operation_locked(
-        self,
-        *,
-        allow_poisoned: bool = False,
-    ) -> None:
+    def _require_admitted_operation_locked(self) -> None:
+        if self._restart_required:
+            raise self._restart_error(
+                operation="runtime_operation",
+                phase="admission",
+                reason="M2N runtime is in fail-stop state",
+            )
         if self._state in (_RuntimeState.OPEN, _RuntimeState.CLOSING):
-            return
-        if (
-            allow_poisoned
-            and self._state is _RuntimeState.POISONED
-            and not self._close_abandoned
-        ):
             return
         raise RuntimeError(f"M2N runtime is {self._state.name.lower()}")
 
@@ -463,6 +549,11 @@ class _M2nRuntime:
     @property
     def pp_groups(self) -> tuple[_M2nPPGroup, ...]:
         return tuple(sorted(self._pp_groups.values(), key=lambda group: group.key))
+
+    @property
+    def _native_closed(self) -> bool:
+        with self._state_cv:
+            return self._state is _RuntimeState.CLOSED
 
     def new_unique_id_bytes(self) -> bytes:
         with self._active_operation():
@@ -486,6 +577,9 @@ class _M2nRuntime:
             if not ordered_specs:
                 return ()
             self._validate_pp_group_specs(ordered_specs)
+            self._restart_scope = tuple(
+                (spec.group_id, spec.key) for spec in ordered_specs
+            )
 
             with self._dispatcher_lock:
                 self._require_admitted_operation()
@@ -499,6 +593,7 @@ class _M2nRuntime:
                         )
 
                 created: list[_M2nPPGroup] = []
+                communicator_init_started = False
                 try:
                     self._torch.cuda.set_device(self._device_id)
                     for spec in ordered_specs:
@@ -522,6 +617,7 @@ class _M2nRuntime:
                             stream=stream,
                         )
                         created.append(pp_group)
+                        communicator_init_started = True
                         communicator.initialize(
                             spec.nranks,
                             spec.comm_rank,
@@ -533,6 +629,15 @@ class _M2nRuntime:
                         operation="PP-group initialization",
                         deadline=time.monotonic() + self._comm_init_timeout_s,
                     )
+                    with self._state_cv:
+                        self._pp_groups = {
+                            pp_group.key: pp_group for pp_group in created
+                        }
+                        if self._state is _RuntimeState.POISONED:
+                            for pp_group in created:
+                                pp_group.state = _PPGroupState.POISONED
+                        self._require_admitted_operation_locked()
+                    return tuple(created)
                 except BaseException as exc:
                     with self._state_cv:
                         close_abandoned = self._close_abandoned
@@ -542,20 +647,32 @@ class _M2nRuntime:
                             )
                             for group in created:
                                 group.state = _PPGroupState.POISONED
-                    if not close_abandoned:
-                        self._enter_fail_stop(created, (), exc)
-                        self._start_abort_worker()
+                    if communicator_init_started:
+                        if not close_abandoned:
+                            self._enter_fail_stop(created, (), exc)
+                            self._start_abort_worker()
+                        self._raise_restart_required(
+                            operation="create_pp_groups",
+                            phase=(
+                                "shutdown_race"
+                                if close_abandoned
+                                else "communicator_init"
+                            ),
+                            reason=(
+                                "runtime shutdown raced PP-group initialization"
+                                if close_abandoned
+                                else "native PP-group initialization failed"
+                            ),
+                            cause=exc,
+                        )
+                    if close_abandoned:
+                        self._raise_restart_required(
+                            operation="create_pp_groups",
+                            phase="shutdown_race",
+                            reason="runtime shutdown raced PP-group creation",
+                            cause=exc,
+                        )
                     raise
-
-                with self._state_cv:
-                    self._pp_groups = {
-                        pp_group.key: pp_group for pp_group in created
-                    }
-                    if self._state is _RuntimeState.POISONED:
-                        for pp_group in created:
-                            pp_group.state = _PPGroupState.POISONED
-                    self._require_admitted_operation_locked()
-            return tuple(created)
 
     def _validate_pp_group_specs(
         self,
@@ -594,20 +711,20 @@ class _M2nRuntime:
                 )
 
     def freeze_pp_groups(self) -> tuple[_M2nPPGroup, ...]:
-        with self._active_operation(), self._dispatcher_lock:
-            with self._state_cv:
-                return self._freeze_pp_groups_locked()
+        with self._active_operation(), self._dispatcher_lock, self._state_cv:
+            return self._freeze_pp_groups_locked()
 
     def _freeze_and_attach_executor(
         self,
         executor: Any,
     ) -> tuple[_M2nPPGroup, ...]:
         """Atomically freeze topology and register its executor owner."""
-        with self._active_operation(), self._dispatcher_lock:
-            with self._state_cv:
-                pp_groups = self._freeze_pp_groups_locked()
-                self._attached_executors.add(executor)
-                return pp_groups
+        with self._active_operation(), self._dispatcher_lock, self._state_cv:
+            if self._attached_executors:
+                raise RuntimeError("an M2N runtime supports exactly one executor owner")
+            pp_groups = self._freeze_pp_groups_locked()
+            self._attached_executors.add(executor)
+            return pp_groups
 
     def _freeze_pp_groups_locked(self) -> tuple[_M2nPPGroup, ...]:
         self._require_admitted_operation_locked()
@@ -667,11 +784,12 @@ class _M2nRuntime:
                 # Another queued update may have poisoned runtime while this
                 # caller waited for dispatcher ownership.
                 self._require_admitted_operation()
-                self._wait_for_source_readiness(ordered)
-                if any(batch.calls for batch in ordered):
+                active = tuple(batch for batch in ordered if batch.calls)
+                self._wait_for_source_readiness(active)
+                if active:
                     submission_started = True
                     with self._m2n.group():
-                        for batch in ordered:
+                        for batch in active:
                             for call in batch.calls:
                                 self.handle.reshard(
                                     batch.pp_group.communicator,
@@ -683,46 +801,32 @@ class _M2nRuntime:
                 # This deadline bounds MX-owned stream completion after the
                 # native grouped submission returns. Current official M2N may
                 # still block inside group_end(); Python cannot interrupt it.
-                deadline = time.monotonic() + self._transfer_timeout_s
-                completion_wait_started = True
-                self._poll_pp_groups_completion(
-                    provided,
-                    operation="model-version staging",
-                    deadline=deadline,
-                )
-
-                for batch in ordered:
-                    if batch.commit is not None:
-                        batch.commit()
-                committed = tuple(
-                    batch.pp_group for batch in ordered if batch.commit is not None
-                )
-                if committed:
+                if active:
+                    deadline = time.monotonic() + self._transfer_timeout_s
+                    completion_wait_started = True
                     self._poll_pp_groups_completion(
-                        committed,
-                        operation="model-version commit",
+                        tuple(batch.pp_group for batch in active),
+                        operation="model-version staging",
                         deadline=deadline,
                     )
+
                 self._raise_if_restart_required("model-version completion")
-                for batch in ordered:
-                    if batch.on_complete is not None:
-                        batch.on_complete()
             except BaseException as exc:
                 fail_stop = submission_started or completion_wait_started
                 if fail_stop:
                     self._enter_fail_stop(provided, ordered, exc)
-                for batch in ordered:
-                    if batch.on_failure is not None:
-                        try:
-                            batch.on_failure(exc)
-                        except Exception:
-                            logger.warning(
-                                "M2N failure callback raised while preserving "
-                                "original transfer error",
-                                exc_info=True,
-                            )
                 if fail_stop:
                     self._start_abort_worker()
+                    if isinstance(exc, M2nCohortRestartRequired):
+                        raise
+                    self._raise_restart_required(
+                        operation="stage",
+                        phase=(
+                            "completion" if completion_wait_started else "submission"
+                        ),
+                        reason="native model-version staging failed",
+                        cause=exc,
+                    )
                 raise
 
         return {batch.pp_group.key: batch.total_bytes for batch in ordered}
@@ -779,7 +883,14 @@ class _M2nRuntime:
                 except BaseException as exc:
                     self._enter_fail_stop(ordered, (), exc)
                     self._start_abort_worker()
-                    raise
+                    if isinstance(exc, M2nCohortRestartRequired):
+                        raise
+                    self._raise_restart_required(
+                        operation=operation,
+                        phase="completion",
+                        reason=f"M2N PP-group wait failed during {operation}",
+                        cause=exc,
+                    )
             finally:
                 self._dispatcher_lock.release()
 
@@ -797,7 +908,7 @@ class _M2nRuntime:
         operation: str,
         deadline: float,
     ) -> None:
-        pending = list(sorted(pp_groups, key=lambda group: group.key))
+        pending = sorted(pp_groups, key=lambda group: group.key)
         while pending:
             self._raise_if_restart_required(operation)
             for pp_group in tuple(pending):
@@ -816,7 +927,7 @@ class _M2nRuntime:
         deadline: float,
     ) -> None:
         self._torch.cuda.set_device(self._device_id)
-        pending = list(sorted(pp_groups, key=lambda group: group.key))
+        pending = sorted(pp_groups, key=lambda group: group.key)
         while pending:
             self._raise_if_restart_required(operation)
             for pp_group in tuple(pending):
@@ -880,9 +991,10 @@ class _M2nRuntime:
     def _raise_if_restart_required(self, operation: str) -> None:
         with self._state_cv:
             if self._restart_required:
-                raise RuntimeError(
-                    f"M2N runtime entered fail-stop during {operation}; "
-                    "resources were retained and process restart is required"
+                raise self._restart_error(
+                    operation=operation,
+                    phase="fail_stop",
+                    reason=(self._fail_stop_reason or "M2N runtime entered fail-stop"),
                 )
 
     def _enter_fail_stop(
@@ -895,13 +1007,16 @@ class _M2nRuntime:
         with self._state_cv:
             if self._state is _RuntimeState.CLOSED:
                 return
+            first_failure = not self._restart_required
             for pp_group in ordered_groups:
                 self._pp_groups.setdefault(pp_group.key, pp_group)
             self._state = _RuntimeState.POISONED
             self._restart_required = True
             self._handle_quarantined = self._handle is not None
             self._quarantined_batches += tuple(batches)
-            self._fail_stop_reason = f"{type(cause).__name__}: {cause}"
+            if first_failure:
+                self._fail_stop_reason = f"{type(cause).__name__}: {cause}"
+                self._fail_stop_cause = self._root_cause(cause)
             for pp_group in self._pp_groups.values():
                 if pp_group.state is not _PPGroupState.CLOSED:
                     pp_group.state = _PPGroupState.POISONED
@@ -934,6 +1049,8 @@ class _M2nRuntime:
             self._teardown_failure_phase = phase
             self._teardown_failure_key = pp_group_key
             self._fail_stop_reason = reason
+            if self._fail_stop_cause is None:
+                self._fail_stop_cause = self._root_cause(cause)
             for pp_group in self._pp_groups.values():
                 if pp_group.state is not _PPGroupState.CLOSED:
                     pp_group.state = _PPGroupState.POISONED
@@ -951,8 +1068,7 @@ class _M2nRuntime:
             pp_groups = tuple(
                 group
                 for group in self.pp_groups
-                if group.state is not _PPGroupState.CLOSED
-                and not group.abort_attempted
+                if group.state is not _PPGroupState.CLOSED and not group.abort_attempted
             )
             if not pp_groups:
                 self._abort_done.set()
@@ -997,22 +1113,36 @@ class _M2nRuntime:
         finally:
             self._abort_done.set()
 
-    def close(self) -> None:
+    def close(
+        self,
+        *,
+        owner: Any | None = None,
+        _deadline: float | None = None,
+    ) -> None:
         """Drain groups, finalize M2N, then destroy parent comms canonically."""
         if getattr(self._operation_local, "depth", 0):
             raise RuntimeError(
                 "cannot close M2N runtime from an active runtime operation"
             )
 
+        deadline = (
+            time.monotonic() + self._finalize_timeout_s
+            if _deadline is None
+            else float(_deadline)
+        )
         already_closed = False
         with self._state_cv:
             if self._state is _RuntimeState.CLOSED:
                 already_closed = True
             else:
                 if self._restart_required or self._close_abandoned:
-                    raise RuntimeError(
-                        "M2N runtime is fail-stop; resources were retained and "
-                        "process restart is required"
+                    raise self._restart_error(
+                        operation="close",
+                        phase="admission",
+                        reason=(
+                            self._fail_stop_reason
+                            or "M2N runtime is in fail-stop state"
+                        ),
                     )
                 if self._state is _RuntimeState.CLOSING:
                     raise RuntimeError("M2N runtime is already closing")
@@ -1020,35 +1150,48 @@ class _M2nRuntime:
                 try:
                     self._state = _RuntimeState.CLOSING
                     self._state_cv.notify_all()
-                    deadline = time.monotonic() + self._finalize_timeout_s
                     while self._active_operations:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
+                            timeout_error = TimeoutError(
+                                "timed out waiting for active M2N operations"
+                            )
+                            first_failure = not self._restart_required
                             self._state = _RuntimeState.POISONED
                             self._close_abandoned = True
                             self._restart_required = True
                             self._handle_quarantined = self._handle is not None
+                            if first_failure:
+                                self._fail_stop_cause = timeout_error
+                                self._fail_stop_reason = (
+                                    f"TimeoutError: {timeout_error}"
+                                )
                             for pp_group in self._pp_groups.values():
                                 if pp_group.state is not _PPGroupState.CLOSED:
                                     pp_group.state = _PPGroupState.POISONED
                             self._state_cv.notify_all()
-                            raise TimeoutError(
-                                "timed out waiting for active M2N operations; "
-                                "resources were retained and process restart is "
-                                "required"
+                            self._raise_restart_required(
+                                operation="close",
+                                phase="active_operation_drain",
+                                reason=(self._fail_stop_reason or str(timeout_error)),
+                                cause=self._fail_stop_cause or timeout_error,
                             )
                         self._state_cv.wait(timeout=remaining)
                     if self._restart_required:
-                        raise RuntimeError(
-                            "M2N runtime entered fail-stop while shutdown waited; "
-                            "resources were retained and process restart is required"
+                        raise self._restart_error(
+                            operation="close",
+                            phase="active_operation_drain",
+                            reason=(
+                                self._fail_stop_reason
+                                or "M2N runtime entered fail-stop while closing"
+                            ),
                         )
-                    if self._attached_executors:
-                        attached_count = len(self._attached_executors)
+                    expected_owners = set() if owner is None else {owner}
+                    if self._attached_executors != expected_owners:
                         raise RuntimeError(
-                            "cannot close M2N runtime while "
-                            f"{attached_count} executor(s) remain attached; call "
-                            "NcclM2nExecutor.teardown() before runtime.close()"
+                            "M2N runtime close owner mismatch; expected exactly "
+                            f"{len(expected_owners)} attached executor owner(s), "
+                            f"found {len(self._attached_executors)}"
                         )
                 except BaseException:
                     if not self._restart_required and not self._close_abandoned:
@@ -1058,6 +1201,8 @@ class _M2nRuntime:
 
         if already_closed:
             self._clear_singleton()
+            if owner is not None:
+                self._detach_executor(owner)
             return
 
         pp_groups: list[_M2nPPGroup] = []
@@ -1078,7 +1223,14 @@ class _M2nRuntime:
                 except BaseException as exc:
                     self._enter_fail_stop(pp_groups, (), exc)
                     self._start_abort_worker()
-                    raise
+                    if isinstance(exc, M2nCohortRestartRequired):
+                        raise
+                    self._raise_restart_required(
+                        operation="close",
+                        phase="stream_drain",
+                        reason="M2N runtime shutdown drain failed",
+                        cause=exc,
+                    )
 
                 # M2N cache cleanup runs while every parent communicator remains
                 # valid.
@@ -1099,7 +1251,7 @@ class _M2nRuntime:
                 phase = "comm-finalize-wait"
                 self._wait_for_finalize(
                     pp_group,
-                    deadline=time.monotonic() + self._finalize_timeout_s,
+                    deadline=deadline,
                 )
                 phase = "comm-destroy"
                 pp_group.communicator.destroy()
@@ -1118,6 +1270,14 @@ class _M2nRuntime:
                     pp_group_key=pp_group_key,
                     cause=exc,
                 )
+                if isinstance(exc, M2nCohortRestartRequired):
+                    raise
+                self._raise_restart_required(
+                    operation="close",
+                    phase=phase,
+                    reason="M2N native teardown failed after shutdown mutation",
+                    cause=exc,
+                )
             else:
                 with self._state_cv:
                     if not self._restart_required and not self._close_abandoned:
@@ -1128,6 +1288,8 @@ class _M2nRuntime:
         # Release singleton ownership only after all local close bookkeeping is
         # committed. A failure here must not re-poison an already-closed runtime.
         self._clear_singleton()
+        if owner is not None:
+            self._detach_executor(owner)
 
     @staticmethod
     def _release_pp_group_stream(pp_group: _M2nPPGroup) -> None:
@@ -1168,9 +1330,10 @@ class _M2nRuntime:
 
     def _require_open_locked(self) -> None:
         if self._restart_required:
-            raise RuntimeError(
-                "M2N runtime is fail-stop; resources were retained and "
-                "process restart is required"
+            raise self._restart_error(
+                operation="runtime_operation",
+                phase="admission",
+                reason=(self._fail_stop_reason or "M2N runtime is in fail-stop state"),
             )
         if self._state is not _RuntimeState.OPEN:
             raise RuntimeError(f"M2N runtime is {self._state.name.lower()}")
@@ -1184,9 +1347,5 @@ class _M2nRuntime:
 
 
 __all__ = [
-    "_M2nCall",
-    "_M2nPPGroup",
-    "_M2nPPGroupBatch",
-    "_M2nPPGroupSpec",
-    "_M2nRuntime",
+    "M2nCohortRestartRequired",
 ]
