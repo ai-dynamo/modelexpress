@@ -34,8 +34,8 @@ class ObjectStorageGeneratorConfig:
 
     storage_type: ObjectStorageType
     initial_base_version_id: str
-    launch_checkpoint: str | Path
-    preparation_cache_dir: str | Path
+    seed_checkpoint_path: str | Path
+    refit_checkpoint_dir: str | Path
     endpoint_url: str | None = None
     region_name: str | None = None
 
@@ -44,10 +44,10 @@ class ObjectStorageGeneratorConfig:
             raise TypeError("storage_type must be an ObjectStorageType")
         if not self.initial_base_version_id.strip():
             raise ValueError("initial_base_version_id is required")
-        if not str(self.launch_checkpoint).strip():
-            raise ValueError("launch_checkpoint is required")
-        if not str(self.preparation_cache_dir).strip():
-            raise ValueError("preparation_cache_dir is required")
+        if not str(self.seed_checkpoint_path).strip():
+            raise ValueError("seed_checkpoint_path is required")
+        if not str(self.refit_checkpoint_dir).strip():
+            raise ValueError("refit_checkpoint_dir is required")
 
 
 class ReceiverInstallError(RuntimeError):
@@ -77,7 +77,7 @@ def _seed_checkpoint(source: Path, target: Path) -> None:
         shutil.copy2(source, target / "model.safetensors")
         return
     if not source.is_dir():
-        raise FileNotFoundError(f"launch checkpoint does not exist: {source}")
+        raise FileNotFoundError(f"seed checkpoint does not exist: {source}")
     for entry in source.iterdir():
         if entry.is_file():
             shutil.copy2(entry, target / entry.name)
@@ -144,9 +144,9 @@ class _LocalCheckpoint:
         s3: S3Client,
     ) -> None:
         self.initial_version = config.initial_base_version_id
-        self.launch_checkpoint = Path(config.launch_checkpoint)
+        self.seed_checkpoint_path = Path(config.seed_checkpoint_path)
         self.s3 = s3
-        self.cache = Path(config.preparation_cache_dir) / quote(model_name, safe="")
+        self.cache = Path(config.refit_checkpoint_dir) / quote(model_name, safe="")
         self.local_checkpoint = self.cache / "checkpoint"
         self.state_path = self.cache / "state.json"
         self.lock_path = self.cache / ".lock"
@@ -167,7 +167,7 @@ class _LocalCheckpoint:
                 self.locations, _ = index_checkpoint_tensors(self.local_checkpoint)
                 reusable = state.get("files") == _checkpoint_files_state(self.locations)
             if not reusable:
-                _seed_checkpoint(self.launch_checkpoint, self.local_checkpoint)
+                _seed_checkpoint(self.seed_checkpoint_path, self.local_checkpoint)
                 self.locations, _ = index_checkpoint_tensors(self.local_checkpoint)
                 _write_state(
                     self.state_path,

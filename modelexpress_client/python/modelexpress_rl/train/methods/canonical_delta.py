@@ -54,7 +54,7 @@ class CanonicalDeltaPublicationMethod:
         service: Callable[[], refit_pb2_grpc.RefitServiceStub],
         rpc_timeout_seconds: float,
         process_group: Any,
-        read_launch_tensor: Callable[[str], np.ndarray],
+        read_seed_tensor: Callable[[str], np.ndarray],
         s3: S3Client,
         clock: Callable[[], float] = perf_counter,
     ) -> None:
@@ -65,7 +65,7 @@ class CanonicalDeltaPublicationMethod:
         self._process_group = process_group
         self._rank = dist.get_rank(process_group)
         self._world_size = dist.get_world_size(process_group)
-        self._read_launch_tensor = read_launch_tensor
+        self._read_seed_tensor = read_seed_tensor
         self._s3 = s3
         self._clock = clock
         self.current_base_version_id = config.initial_base_version_id
@@ -83,7 +83,7 @@ class CanonicalDeltaPublicationMethod:
             bucket: list[tuple[str, torch.Tensor]],
         ) -> dict[str, np.ndarray]:
             return {
-                name: np.asarray(self._read_launch_tensor(name), dtype=np.uint8)
+                name: np.asarray(self._read_seed_tensor(name), dtype=np.uint8)
                 for name, _ in bucket
             }
 

@@ -55,12 +55,12 @@ def _payload_format(value: WeightPayloadFormat | None) -> WeightPayloadFormat:
 
 @dataclass(frozen=True)
 class ObjectStorageConfig:
-    """Object-storage and launch-base settings for canonical XOR publication."""
+    """Object-storage and seed-base settings for canonical XOR publication."""
 
     storage_type: ObjectStorageType
     uri_prefix: str
     initial_base_version_id: str
-    launch_checkpoint: str | Path
+    seed_checkpoint_path: str | Path
     endpoint_url: str | None = None
     region_name: str | None = None
 
@@ -72,8 +72,8 @@ class ObjectStorageConfig:
             self.initial_base_version_id,
             "object_storage.initial_base_version_id",
         )
-        if not str(self.launch_checkpoint).strip():
-            raise ValueError("object_storage.launch_checkpoint is required")
+        if not str(self.seed_checkpoint_path).strip():
+            raise ValueError("object_storage.seed_checkpoint_path is required")
 
 @dataclass(frozen=True)
 class ModelExpressTrainerConfig:

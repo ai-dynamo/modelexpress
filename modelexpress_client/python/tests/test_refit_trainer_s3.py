@@ -149,13 +149,13 @@ def _trainer(
     monkeypatch,
     tmp_path,
     server_url,
-    launch_tensors=None,
+    seed_tensors=None,
     process_group=None,
     prepare_base=True,
 ):
     launch = tmp_path / "model.safetensors"
-    launch_tensors = launch_tensors or {"weight": torch.tensor([1.0, 2.0])}
-    _write_safetensors(launch, launch_tensors)
+    seed_tensors = seed_tensors or {"weight": torch.tensor([1.0, 2.0])}
+    _write_safetensors(launch, seed_tensors)
     storage = _MemoryS3()
     monkeypatch.setattr(trainer_runtime_module, "S3Client", lambda **_kwargs: storage)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda _group=None: 0)
@@ -190,13 +190,13 @@ def _trainer(
                 storage_type=ObjectStorageType.S3,
                 uri_prefix="s3://weights/tests",
                 initial_base_version_id="base-a",
-                launch_checkpoint=launch,
+                seed_checkpoint_path=launch,
             ),
         )
     )
     if prepare_base:
         trainer.prepare_delta_base(
-            hf_tensor_iter=iter([list(launch_tensors.items())]),
+            hf_tensor_iter=iter([list(seed_tensors.items())]),
         )
     return trainer, storage
 
@@ -230,11 +230,11 @@ def test_s3_multipart_abort_failure_preserves_upload_outcome(code, caplog):
     assert "Failed to abort multipart upload" in caplog.text
 
 
-def test_s3_prepare_delta_base_uses_owned_launch_tensors(
+def test_s3_prepare_delta_base_uses_owned_seed_tensors(
     monkeypatch, tmp_path, refit_server, caplog
 ):
     _service, server_url = refit_server
-    launch_tensors = {
+    seed_tensors = {
         "a": torch.tensor([1.0]),
         "b": torch.tensor([2.0]),
     }
@@ -242,7 +242,7 @@ def test_s3_prepare_delta_base_uses_owned_launch_tensors(
         monkeypatch,
         tmp_path,
         server_url,
-        launch_tensors,
+        seed_tensors,
         prepare_base=False,
     )
     try:
@@ -254,7 +254,7 @@ def test_s3_prepare_delta_base_uses_owned_launch_tensors(
         assert set(trainer._runtime.method.snapshot) == {"a"}
         assert np.array_equal(
             trainer._runtime.method.snapshot["a"],
-            launch_tensors["a"].view(torch.uint8).numpy(),
+            seed_tensors["a"].view(torch.uint8).numpy(),
         )
         assert (
             "ModelExpress prepare_delta_base: rank=0 tensors=1 duration=" in caplog.text
@@ -278,7 +278,7 @@ def test_s3_prepare_delta_base_reads_framework_buckets_concurrently(
         },
         prepare_base=False,
     )
-    reader = trainer._runtime.method._read_launch_tensor
+    reader = trainer._runtime.method._read_seed_tensor
     assert reader is not None
     barrier = threading.Barrier(2)
     threads = set()
@@ -288,7 +288,7 @@ def test_s3_prepare_delta_base_reads_framework_buckets_concurrently(
         barrier.wait(timeout=2)
         return reader(name)
 
-    trainer._runtime.method._read_launch_tensor = read
+    trainer._runtime.method._read_seed_tensor = read
     try:
         trainer.prepare_delta_base(
             hf_tensor_iter=iter(
@@ -539,7 +539,7 @@ def test_s3_client_closes_when_publication_method_initialization_fails(
         storage_type=ObjectStorageType.S3,
         uri_prefix="s3://weights/tests",
         initial_base_version_id="base-a",
-        launch_checkpoint=tmp_path / "launch",
+        seed_checkpoint_path=tmp_path / "launch",
     )
     monkeypatch.setattr(
         trainer_runtime_module,
@@ -873,7 +873,7 @@ def test_object_storage_config_requires_storage_delta_pair(tmp_path):
         storage_type=ObjectStorageType.S3,
         uri_prefix="s3://weights/tests",
         initial_base_version_id="base-a",
-        launch_checkpoint=launch,
+        seed_checkpoint_path=launch,
     )
     with pytest.raises(ValueError, match="WRITE_TO_STORAGE and XOR_DELTA"):
         ModelExpressTrainerClient.initialize(
@@ -900,7 +900,7 @@ def test_object_storage_config_rejects_unsupported_provider(tmp_path):
                     storage_type=ObjectStorageType.GCS,
                     uri_prefix="gs://weights/tests",
                     initial_base_version_id="base-a",
-                    launch_checkpoint=launch,
+                    seed_checkpoint_path=launch,
                 ),
             )
         )
