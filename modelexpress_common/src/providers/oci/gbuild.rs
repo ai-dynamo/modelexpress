@@ -13,7 +13,7 @@ pub const RUNTIME_MANIFEST_JSON_MEDIA_TYPE: &str =
 pub const RUNTIME_MANIFEST_CAPNP_MEDIA_TYPE: &str =
     "application/vnd.groq.gbuild.runtime-manifest.v2+capnp";
 pub const PRESET_MEDIA_TYPE: &str = "application/vnd.groq.gbuild.preset.v1+json";
-pub const PAYLOAD_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar";
+pub const PAYLOAD_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
 pub(super) const MANIFEST_CAPNP_FILE_NAME: &str = "manifest.v2.capnp.bin";
 
 const OCI_EMPTY_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.empty.v1+json";
@@ -163,7 +163,7 @@ mod tests {
                     Some(MANIFEST_CAPNP_FILE_NAME),
                 ),
                 descriptor(PRESET_MEDIA_TYPE, 'd', Some("llama-original.json")),
-                descriptor(PAYLOAD_MEDIA_TYPE, 'e', Some("payload.tar")),
+                descriptor(PAYLOAD_MEDIA_TYPE, 'e', Some("payload.tar.zst")),
             ],
         }))
         .expect("valid OCI manifest fixture")
