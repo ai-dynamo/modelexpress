@@ -2,16 +2,17 @@
 
 This guide shows how to publish XOR-delta weight updates to S3 and install them
 in a running vLLM model with ModelExpress. The trainer and generator start from
-the same local checkpoint; only the delta artifacts are transferred through S3.
-ModelExpress coordinates each version's lineage and readiness.
+the same local checkpoint; integrations may periodically publish a full HF
+checkpoint to reset that base. ModelExpress coordinates each version's lineage
+and readiness.
 
 ## Components
 
 | Component | Responsibility |
 |---|---|
 | `ModelExpressControlClient` | Create and transition immutable weight-version records in the ModelExpress catalog. |
-| `ModelExpressTrainerClient` | Capture the seed-checkpoint base, compute XOR deltas from trainer tensors, and publish delta shards plus the global index to S3. |
-| `ModelExpressGeneratorClient` | Validate READY versions, download and apply S3 deltas to its prepared checkpoint, and reload the live model. |
+| `ModelExpressTrainerClient` | Capture the seed-checkpoint base and publish either XOR deltas or full HF checkpoint batches to S3. |
+| `ModelExpressGeneratorClient` | Validate READY versions, apply the requested S3 payload to its refit checkpoint, and reload the live model. |
 
 ## Requirements
 
@@ -43,6 +44,7 @@ Environment variables used by the clients and vLLM engine:
 | `AWS_DEFAULT_REGION` | unset | S3 region when `region_name` is not supplied in client configuration. |
 | `MX_REFIT_DELTA_BUCKET_BYTES` | `536870912` (512 MiB) | Optional tensor-bucket size override for framework integrations. |
 | `MX_REFIT_DELTA_WORKERS` | `min(32, CPU count)` | CPU workers used to compute and apply XOR deltas. |
+| `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` | `4294967296` (4 GiB) | Maximum tensor bytes grouped into one full-checkpoint safetensors object. |
 | `MX_S3_UPLOAD_WORKERS` | `8` | Maximum concurrent multipart uploads per trainer rank. |
 | `MX_S3_DOWNLOAD_WORKERS` | `16` | Generator download concurrency. |
 | `MX_S3_MAX_POOL_CONNECTIONS` | `32` | Botocore HTTP connection-pool size. |
@@ -208,9 +210,14 @@ initialization, ModelExpress creates a model-specific subdirectory containing
 
 The `checkpoint/` directory starts as a full copy of `seed_checkpoint_path` and
 is updated in place as sequential deltas are applied. `state.json` records its
-current version. The file lock prevents co-located ranks from seeding or
-updating the same checkpoint concurrently. With an HF snapshot seed checkpoint,
-the resulting layout is:
+current version and whether the checkpoint is `READY` or `UPDATING`. The file
+lock prevents co-located ranks from seeding or updating the same checkpoint
+concurrently. With an HF snapshot seed checkpoint, the resulting layout is:
+
+Before seeding or mutating checkpoint bytes, ModelExpress writes `UPDATING` with
+the last READY version. It writes `READY` for the target only after all writes
+and verification succeed. Preparation and installation reject `UPDATING`; a
+fresh initialization reseeds it from `seed_checkpoint_path`.
 
 ```text
 <refit_checkpoint_dir>/<URL-quoted-vLLM-model-path-or-ID>/
@@ -270,8 +277,9 @@ The corresponding generator configuration would use:
 Ensure the host directory has space for at least one complete checkpoint copy.
 ModelExpress creates the model-specific subdirectory automatically. On
 initialization, it reuses the cache only when its recorded version is
-`initial_base_version_id` and its files match. A cache advanced to a later
-version is reseeded from `seed_checkpoint_path`.
+`initial_base_version_id`, its state is `READY`, and safetensors files are
+present. A later-version or interrupted `UPDATING` cache is reseeded from
+`seed_checkpoint_path`.
 
 #### Initialization behavior
 
@@ -391,5 +399,9 @@ finally:
     post("resume", body={})
 ```
 
-The next update must be `v2` with `base_version_id="v1"`. The current receiver
-supports only sequential S3 XOR deltas with `compression_format="zstd"`.
+The next delta must be `v2` with `base_version_id="v1"`. An integration may
+instead create a `FULL_HF_CHECKPOINT` version without `base_version_id`; that
+version becomes the exact base for the following delta. Full checkpoint batches
+carry per-tensor Adler-32 checksums and are copied directly into the existing
+refit checkpoint as they download. XOR deltas require
+`compression_format="zstd"`.

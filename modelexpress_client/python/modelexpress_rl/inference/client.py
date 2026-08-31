@@ -355,19 +355,26 @@ class ModelExpressGeneratorClient:
             raise RuntimeError("weight version model_name does not match the generator")
         assert self._runtime is not None
         if self._runtime.initial_version_id is not None:
-            if version.payload_format is not WeightPayloadFormat.XOR_DELTA:
+            if version.payload_format is WeightPayloadFormat.XOR_DELTA:
+                if version.base_version_id is None:
+                    raise RuntimeError("XOR_DELTA version is missing base_version_id")
+                if (
+                    version.version_id != self._serving_version_id
+                    and version.base_version_id != self._serving_version_id
+                ):
+                    raise RuntimeError(
+                        f"weight version base {version.base_version_id!r} does not "
+                        f"match serving version {self._serving_version_id!r}"
+                    )
+            elif version.payload_format is WeightPayloadFormat.FULL_HF_CHECKPOINT:
+                if version.base_version_id is not None:
+                    raise RuntimeError(
+                        "FULL_HF_CHECKPOINT version must not have base_version_id"
+                    )
+            else:
                 raise RuntimeError(
-                    "object-storage generator requires XOR_DELTA weight versions"
-                )
-            if version.base_version_id is None:
-                raise RuntimeError("XOR_DELTA version is missing base_version_id")
-            if (
-                version.version_id != self._serving_version_id
-                and version.base_version_id != self._serving_version_id
-            ):
-                raise RuntimeError(
-                    f"weight version base {version.base_version_id!r} does not match "
-                    f"serving version {self._serving_version_id!r}"
+                    "object-storage generator requires XOR_DELTA or "
+                    "FULL_HF_CHECKPOINT weight versions"
                 )
         self._runtime.session.validate(version)
         return version

@@ -240,7 +240,11 @@ class _TestMethod(UpdateMethod):
     def capabilities(self):
         return MethodCapabilities(
             payload_formats=frozenset(
-                {WeightPayloadFormat.FULL_TENSOR, WeightPayloadFormat.XOR_DELTA}
+                {
+                    WeightPayloadFormat.FULL_TENSOR,
+                    WeightPayloadFormat.XOR_DELTA,
+                    WeightPayloadFormat.FULL_HF_CHECKPOINT,
+                }
             ),
             sources=frozenset(WeightSource),
             artifact_type=PreparedEngineTensors,
@@ -252,7 +256,10 @@ class _TestMethod(UpdateMethod):
             staged = self._adapter.stage_peer_weight(source.worker)
         else:
             if isinstance(source, ObjectStorageUpdateSource):
-                if version.base_version_id != self._adapter.service.base.uid:
+                if (
+                    version.payload_format is WeightPayloadFormat.XOR_DELTA
+                    and version.base_version_id != self._adapter.service.base.uid
+                ):
                     raise ValueError(
                         "canonical delta target does not match the exact local base"
                     )
@@ -770,6 +777,71 @@ def test_generator_retries_canonical_s3_under_one_lease(monkeypatch):
     assert len(adapter.stage_calls) == 2
     assert service.lease_registrations == 1
     assert service.lease_deletions == 1
+
+
+def test_generator_dispatches_full_hf_checkpoint_without_an_exact_base(
+    monkeypatch,
+):
+    server, endpoint, service = _start_server()
+    service.version.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
+    service.version.ClearField("base_version_id")
+    service.version.expected_source_slots[:] = []
+    service.version.object_storage.CopyFrom(
+        refit_pb2.ObjectStorageSource(
+            storage_type=refit_pb2.OBJECT_STORAGE_TYPE_S3,
+            uri="s3://weights/model.safetensors.index.json",
+        )
+    )
+    adapter = _Adapter(service)
+    generator = _initialize(
+        monkeypatch,
+        endpoint,
+        adapter,
+        object_storage=True,
+    )
+
+    try:
+        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+        inputs = adapter.stage_calls[0]
+        assert inputs.payload_format is WeightPayloadFormat.FULL_HF_CHECKPOINT
+        assert inputs.base_version_id is None
+        assert service.list_calls == 0
+        staged.release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+
+def test_generator_rejects_full_hf_checkpoint_with_a_base_before_leasing(
+    monkeypatch,
+):
+    server, endpoint, service = _start_server()
+    service.version.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
+    service.version.base_version_id = "base-a"
+    service.version.expected_source_slots[:] = []
+    service.version.object_storage.CopyFrom(
+        refit_pb2.ObjectStorageSource(
+            storage_type=refit_pb2.OBJECT_STORAGE_TYPE_S3,
+            uri="s3://weights/model.safetensors.index.json",
+        )
+    )
+    adapter = _Adapter(service)
+    generator = _initialize(
+        monkeypatch,
+        endpoint,
+        adapter,
+        object_storage=True,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="must not have base_version_id"):
+            generator.stage_weight(version=WeightVersionRef("version-a"))
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert service.lease_registrations == 0
+    assert adapter.stage_calls == []
 
 
 def test_generator_rejects_missing_object_storage_before_adapter_mutation(
