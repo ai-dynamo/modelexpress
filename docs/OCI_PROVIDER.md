@@ -45,7 +45,7 @@ oras push registry.example.com/team/model:v1 \
 Example archive artifact layout:
 
 ```text
-layer media type: application/vnd.oci.image.layer.v1.tar+zstd
+layer media type: application/vnd.oci.image.layer.v1.tar
 tar members:
   tokenizer/tokenizer.json
   part-0/program.0.gas
