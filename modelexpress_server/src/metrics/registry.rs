@@ -333,6 +333,12 @@ fn xslow_histogram() -> Histogram {
 }
 
 impl DownloadMetrics {
+    /// The two outcomes a download can actually end in.
+    ///
+    /// `Absent` and `Downloading` are transition states, never terminal, so
+    /// pre-creating them would claim a download can finish in `downloading`.
+    const TERMINAL: [StatusLabel; 2] = [StatusLabel::Downloaded, StatusLabel::Error];
+
     /// Register the family and return a handle.
     pub fn register(registry: &mut Registry) -> Self {
         let seconds: Family<DownloadLabels, Histogram, fn() -> Histogram> =
@@ -343,6 +349,19 @@ impl DownloadMetrics {
             "End-to-end model download duration by terminal status",
             seconds.clone(),
         );
+        // Same lazy-child problem as the counters above, and the same fix. Left
+        // lazy, the first download in a process makes `_count` appear at 1 with
+        // no earlier point to subtract, so `increase()` reports 0: the first
+        // download after every restart is invisible. That silences
+        // MXDownloadFailureRatio for a first-download failure -- 0/0 is no data,
+        // not a ratio -- and made the dashboard's own "Downloads completed" tile
+        // read 0 on a cluster where a download had demonstrably just succeeded.
+        //
+        // 30 always-present series per pod: two outcomes over twelve buckets
+        // plus +Inf, _sum and _count.
+        for outcome in Self::TERMINAL {
+            let _ = seconds.get_or_create(&DownloadLabels { outcome });
+        }
         Self { seconds }
     }
 
@@ -443,10 +462,41 @@ mod tests {
             encoded.contains(r#"mx_download_seconds_count{outcome="error"} 1"#),
             "{encoded}"
         );
+        // Present because the family is pre-created, and zero because nothing
+        // succeeded. Asserting absence would now pass for the wrong reason.
         assert!(
-            !encoded.contains(r#"mx_download_seconds_count{outcome="downloaded"}"#),
+            encoded.contains(r#"mx_download_seconds_count{outcome="downloaded"} 0"#),
             "a failed download must not be timed as a successful one: {encoded}"
         );
+    }
+
+    /// Both terminal outcomes are exported at zero before any download runs, so
+    /// `increase()` has an earlier point to subtract and the first download in a
+    /// process is visible. Without this, `MXDownloadFailureRatio` cannot fire on
+    /// a first-download failure: 0/0 is no data, not a ratio.
+    #[test]
+    fn download_outcomes_are_exported_at_zero_before_any_download() {
+        let mut registry = new_registry();
+        let _downloads = DownloadMetrics::register(&mut registry);
+
+        let encoded = encode_text(&registry).unwrap_or_else(|_| String::from("<encode failed>"));
+        for outcome in ["downloaded", "error"] {
+            assert!(
+                encoded.contains(&format!(
+                    r#"mx_download_seconds_count{{outcome="{outcome}"}} 0"#
+                )),
+                "{outcome} missing before any download: {encoded}"
+            );
+        }
+        // Transition states are not download outcomes and must stay absent.
+        for outcome in ["absent", "downloading"] {
+            assert!(
+                !encoded.contains(&format!(
+                    r#"mx_download_seconds_count{{outcome="{outcome}"}}"#
+                )),
+                "{outcome} is not a terminal outcome: {encoded}"
+            );
+        }
     }
 
     /// Sum the `to="downloading"` and `from="downloading"` series the way the
