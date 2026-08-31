@@ -21,6 +21,47 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  docs-validation:
+    name: Documentation validation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Check Markdown links and anchors
+      run: python3 .github/scripts/check_docs.py
+
+    - name: Parse YAML manifests and workflow files
+      run: |
+        ruby -e '
+          require "yaml"
+          files = Dir["**/*.{yaml,yml}"]
+          files.reject! { |path| path.start_with?("helm/templates/") }
+          files.each do |path|
+            contents = File.read(path)
+            # The repository checks in envsubst templates and GitHub Actions
+            # expressions that are intentionally not valid YAML scalars until
+            # their deployment or workflow runner substitutes them.
+            contents = contents.gsub(/\$\{\{.*?\}\}/m, "github-expression")
+            contents = contents.gsub(/^\$\{(?!\{)[^}\n]+\}$/, "    envsubst-value")
+            contents = contents.gsub(/\$\{(?!\{)[^}\n]+\}/, "envsubst-value")
+            YAML.load_stream(contents)
+          end
+          puts "Parsed #{files.length} YAML files."
+        '
+
+    - name: Install Helm
+      uses: azure/setup-helm@v4
+
+    - name: Lint Helm chart
+      run: helm lint ./helm
+
+    - name: Check CRD bundle sync
+      run: cmp examples/crds.yaml helm/crds/modelexpress-crds.yaml
+
   test:
     name: Test Suite
     runs-on: ubuntu-latest

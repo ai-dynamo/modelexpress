@@ -15,7 +15,7 @@ libfabric plugin instead, which is the supported AWS path.
 
 ## Prerequisites
 
-- ModelExpress server deployed (see [`../../server/`](../../server/)).
+- ModelExpress server deployed (see [`../../../server/`](../../../server/)).
 - AWS EKS or dgxc-k8s cluster with EFA-capable nodes (e.g. `p5.48xlarge` for
   H100/EFAv2, `p6e-gb200.36xlarge` for GB200/EFAv3).
 - `aws-efa-k8s-device-plugin` DaemonSet running on the cluster. Exposes the

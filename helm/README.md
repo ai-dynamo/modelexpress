@@ -5,6 +5,8 @@ SPDX-License-Identifier: Apache-2.0
 
 # ModelExpress Helm Chart
 
+Start with the [ModelExpress documentation hub](../docs/README.md) for scenario selection, then use this page for chart installation and values.
+
 This Helm chart deploys ModelExpress, a model serving and management platform, to Kubernetes. For the broader deployment guide covering Docker, standalone K8s, and P2P transfers, see [`docs/DEPLOYMENT.md`](../docs/DEPLOYMENT.md).
 
 ## Prerequisites

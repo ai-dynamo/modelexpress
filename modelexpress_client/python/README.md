@@ -1,5 +1,7 @@
 # ModelExpress Python Client
 
+For scenario selection and current compatibility boundaries, start with the [ModelExpress documentation hub](../../docs/README.md). This page covers Python installation and programmatic APIs.
+
 Python client for ModelExpress -- high-performance GPU-to-GPU model weight transfers using NVIDIA NIXL over RDMA/InfiniBand.
 
 Instead of each inference engine instance loading model weights from storage,

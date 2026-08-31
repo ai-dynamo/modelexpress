@@ -5,6 +5,8 @@ SPDX-License-Identifier: Apache-2.0
 
 # Using ModelExpress with SGLang
 
+For the scenario map and current compatibility boundaries, start with the [ModelExpress documentation hub](README.md) and [SGLang integration guide](integrations/runtimes/sglang.md).
+
 ModelExpress can serve as the remote-instance weight loader for SGLang,
 streaming weights GPU-to-GPU over RDMA between SGLang processes instead
 of loading from disk on every replica. The SGLang-side delegation hook was

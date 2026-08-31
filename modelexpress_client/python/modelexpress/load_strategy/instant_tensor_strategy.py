@@ -25,10 +25,10 @@ logger = logging.getLogger("modelexpress.strategy_instant_tensor")
 class InstantTensorStrategy(LoadStrategy):
     """Load weights from local safetensors via the instanttensor library.
 
-    Runs right after the RDMA (P2P) strategy: when no peer source is serving,
-    InstantTensor is the fastest local-disk path before falling back to
-    ModelStreamer, GDS, or the default loader. Unlike ModelStreamer it needs no
-    streaming URI; the engine resolves the model's own weight files.
+    Runs after the server-cache strategy and before ModelStreamer: when no peer
+    source is serving, server-backed loading may supply weights first for
+    no-shared-storage deployments. Unlike ModelStreamer it needs no streaming
+    URI; the engine resolves the model's own weight files.
 
     Enabled by default and gated by ``MX_INSTANT_TENSOR``. Also requires the
     ``instanttensor`` package, a CUDA-like device, and an engine adapter that
