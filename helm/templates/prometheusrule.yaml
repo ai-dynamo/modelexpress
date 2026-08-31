@@ -86,28 +86,38 @@ spec:
         # window-length, so the hold has to sit well inside it. The counter is
         # pre-created at zero in RegistryMetrics::register, which is what makes
         # the first loss in a process visible at all.
+        #
+        # Grouped by pod rather than summed flat, so the alert says which replica
+        # lost the lease. A bare sum() answers "somewhere in the fleet", which is
+        # the wrong end of a triage that starts by reading one pod's logs. Where
+        # the pod label is missing -- a scrape config that does not add it --
+        # every series groups under pod="" and this degrades to the old
+        # fleet-wide behaviour rather than breaking.
         - alert: MXDownloadLeaseLost
-          expr: sum(increase(mx_download_lease_refresh_total{result="lost"}[15m])) > 0
+          expr: sum by (pod) (increase(mx_download_lease_refresh_total{result="lost"}[15m])) > 0
           for: 5m
           labels:
             severity: warning
           annotations:
-            summary: A download lease was lost
+            summary: A download lease was lost on {{ "{{ $labels.pod }}" }}
             description: >-
-              A downloader stopped heartbeating and another replica may now claim
-              its model. Expect MXDownloadTakeover next if it does.
+              {{ "{{ $labels.pod }}" }} stopped heartbeating and another replica
+              may now claim its model. Expect MXDownloadTakeover next if it does.
 
         # A takeover re-pulls the whole model -- hundreds of GB for a large one --
         # so this pages on the first one rather than waiting out a hold.
+        #
+        # By pod for the same reason as above: the pod named here is the one that
+        # is now re-fetching, which is where the bandwidth is going.
         - alert: MXDownloadTakeover
-          expr: sum(increase(mx_download_claims_total{result="takeover"}[15m])) > 0
+          expr: sum by (pod) (increase(mx_download_claims_total{result="takeover"}[15m])) > 0
           labels:
             severity: warning
           annotations:
-            summary: A download was taken over and is being pulled again
+            summary: A download was taken over and is being pulled again by {{ "{{ $labels.pod }}" }}
             description: >-
-              The previous downloader died mid-transfer. The bytes already fetched
-              are re-fetched from scratch.
+              The previous downloader died mid-transfer and {{ "{{ $labels.pod }}" }}
+              took over. The bytes already fetched are re-fetched from scratch.
 
         # Level without flow.
         #
