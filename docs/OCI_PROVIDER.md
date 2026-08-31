@@ -29,7 +29,7 @@ Archive layers are supported when their media type is `tar` or `tar+zstd`, inclu
 
 The provider rejects empty paths, absolute paths, `.` and `..` components, backslashes, non-UTF-8 path data, duplicate output paths, symlinks, hardlinks, and special archive entries. README files, dotfiles, and images are skipped. When `ignore_weights=true`, raw weight-file layers are skipped before download and archive-like layers are skipped as whole blobs.
 
-GBuild full-compile artifacts use `application/vnd.groq.gbuild.full-compile.v1`. ModelExpress requires a digest reference, validates the required Manifest V2 metadata layers, and materializes every payload archive. These artifacts do not support `ignore_weights`.
+GBuild full-compile artifacts use `application/vnd.groq.gbuild.full-compile.v1` with one uncompressed tar payload. ModelExpress requires a digest reference, validates the required Manifest V2 metadata layers, and materializes the payload. These artifacts do not support `ignore_weights`.
 
 With `--strategy direct --format json`, the successful response includes the materialized `path`.
 

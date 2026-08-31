@@ -544,8 +544,7 @@ mod tests {
         let manifest_json = br#"{"contract_revision":2,"build":{"id":"gbuild"}}"#;
         let manifest_capnp = b"capnp";
         let preset = br#"{"model":"llama"}"#;
-        let tar = tar_bytes(&[("README.md", b"readme"), ("program.0.gas", b"gas")]);
-        let payload = zstd::stream::encode_all(tar.as_slice(), 3).expect("compress payload");
+        let payload = tar_bytes(&[("README.md", b"readme"), ("program.0.gas", b"gas")]);
         let manifest_json_digest = digest_bytes(manifest_json);
         let manifest_capnp_digest = digest_bytes(manifest_capnp);
         let preset_digest = digest_bytes(preset);
@@ -581,10 +580,10 @@ mod tests {
                     "annotations": { TITLE_ANNOTATION: "llama-original.json" },
                 },
                 {
-                    "mediaType": "application/vnd.oci.image.layer.v1.tar+zstd",
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar",
                     "size": payload.len(),
                     "digest": payload_digest,
-                    "annotations": { TITLE_ANNOTATION: "payload.tar.zst" },
+                    "annotations": { TITLE_ANNOTATION: "payload.tar" },
                 },
             ],
             "annotations": {"org.opencontainers.image.created": "1970-01-01T00:00:00Z"},
