@@ -79,13 +79,10 @@ pub enum StatusLabel {
 }
 
 impl StatusLabel {
-    /// Every variant, so the transition family can be pre-created at zero.
-    pub(crate) const ALL: [Self; 4] = [
-        Self::Absent,
-        Self::Downloading,
-        Self::Downloaded,
-        Self::Error,
-    ];
+    // No ALL constant here, unlike ClaimResult and LeaseResult. Those families
+    // pre-create every variant; this one pre-creates only the reachable from/to
+    // pairs, listed in RegistryMetrics::REACHABLE_TRANSITIONS. An ALL over the
+    // variants would have no caller and would invite a future 4x4 sweep back in.
 
     const fn as_str(self) -> &'static str {
         match self {
