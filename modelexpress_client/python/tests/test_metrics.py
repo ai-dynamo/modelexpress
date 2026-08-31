@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import errno
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -969,3 +970,67 @@ def _label_counts(collector, label):
                     counts.get(sample.labels[label], 0.0) + sample.value
                 )
     return counts
+
+
+# ---------------------------------------------------------------------------
+# Cross-check with the alerting rules the Helm chart ships
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = _PACKAGE_ROOT.parents[1]
+_RUST_CROSS_CHECK = _REPO_ROOT / "workspace-tests" / "tests" / "helm_alert_rules.rs"
+
+
+def _client_families_claimed_by_rust() -> list[str]:
+    """The ``CLIENT_FAMILIES`` list from the Rust-side alert-rule check.
+
+    Parsed rather than duplicated so the two lists cannot drift apart while both
+    suites stay green.
+    """
+    source = _RUST_CROSS_CHECK.read_text()
+    block = re.search(r"const CLIENT_FAMILIES: &\[&str\] = &\[(.*?)\];", source, re.S)
+    assert block, f"CLIENT_FAMILIES not found in {_RUST_CROSS_CHECK}"
+    return re.findall(r'"([^"]+)"', block.group(1))
+
+
+def _exported_series_names(exposition: str) -> set[str]:
+    """Exact series names from the exposition, one per sample line.
+
+    Not a substring search over the whole text. A removed family whose name is a
+    prefix of a surviving one -- or which still appears in a HELP line -- would
+    match anywhere in the blob and the check would pass while the series was
+    gone. These are the names a query would actually have to use.
+    """
+    names = set()
+    for line in exposition.splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        names.add(line.split("{", 1)[0].split(" ", 1)[0])
+    return names
+
+
+def test_alert_rule_client_families_exist(monkeypatch):
+    """Every client family the alert rules rely on is really exported.
+
+    ``helm_alert_rules.rs`` proves each ``mx_*`` name in the rules is either a
+    server family or one of these; this closes the other half, because the Rust
+    side cannot enumerate a Python registry and would otherwise accept anything
+    written into that list.
+
+    Without this pairing a client-side rename produces no failure anywhere: the
+    Rust check keeps passing on the stale name because it is in the allowlist,
+    and the alert quietly stops matching anything.
+    """
+    collector = _fresh_collector(monkeypatch)
+    for name, args in _RECORDERS:
+        getattr(collector, name)(*args)
+    exposition = _exposition(collector)
+
+    claimed = _client_families_claimed_by_rust()
+    assert claimed, "parsed an empty CLIENT_FAMILIES; the regex no longer matches"
+
+    exported = _exported_series_names(exposition)
+    missing = [family for family in claimed if family not in exported]
+    assert not missing, (
+        f"the alert rules name client families that are not exported: {missing}\n"
+        f"Exported: {sorted(exported)}"
+    )

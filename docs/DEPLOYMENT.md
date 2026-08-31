@@ -503,6 +503,34 @@ helm/deploy.sh --namespace my-ns --values helm/values-local-storage.yaml
 
 See [`../helm/README.md`](../helm/README.md) for the full parameter reference and installation guide.
 
+### Monitoring
+
+The chart defaults to `prometheus.io/*` pod annotations, which
+**kube-prometheus-stack ignores entirely** — it discovers targets only through
+PodMonitor resources. On an Operator cluster the metrics endpoint is served and
+never scraped, which is indistinguishable from a crashed exporter. Switch:
+
+```bash
+helm upgrade --install modelexpress ./helm \
+  --set metrics.podAnnotations=false \
+  --set metrics.podMonitor.enabled=true \
+  --set metrics.podMonitor.additionalLabels.release=kube-prometheus-stack \
+  --set metrics.rules.enabled=true \
+  --set metrics.rules.additionalLabels.release=kube-prometheus-stack \
+  --set metrics.dashboard.enabled=true
+```
+
+`additionalLabels` is not optional in practice: Prometheus only adopts a
+PodMonitor or PrometheusRule whose labels match its `podMonitorSelector` /
+`ruleSelector`, and kube-prometheus-stack defaults both to its own release name.
+An unmatched resource installs cleanly and is then ignored with no error.
+
+Client metrics live in the inference engine's pod, which this chart does not
+deploy, and need `metrics.clientPodMonitor` with a selector you supply.
+
+See [METRICS.md](METRICS.md) for the discovery models, the alert runbook and the
+dashboard.
+
 ### Dynamo Model Cache Deployment
 
 For deploying ModelExpress alongside Dynamo with a vLLM worker:

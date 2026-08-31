@@ -79,6 +79,11 @@ pub enum StatusLabel {
 }
 
 impl StatusLabel {
+    // No ALL constant here, unlike ClaimResult and LeaseResult. Those families
+    // pre-create every variant; this one pre-creates only the reachable from/to
+    // pairs, listed in RegistryMetrics::REACHABLE_TRANSITIONS. An ALL over the
+    // variants would have no caller and would invite a future 4x4 sweep back in.
+
     const fn as_str(self) -> &'static str {
         match self {
             Self::Absent => "absent",
@@ -121,6 +126,14 @@ pub enum ClaimResult {
 }
 
 impl ClaimResult {
+    /// Every variant, so the claim family can be pre-created at zero.
+    pub(crate) const ALL: [Self; 4] = [
+        Self::Claimed,
+        Self::Takeover,
+        Self::AlreadyExists,
+        Self::Error,
+    ];
+
     const fn as_str(self) -> &'static str {
         match self {
             Self::Claimed => "claimed",
@@ -150,6 +163,9 @@ pub enum LeaseResult {
 }
 
 impl LeaseResult {
+    /// Every variant, so the lease family can be pre-created at zero.
+    pub(crate) const ALL: [Self; 3] = [Self::Renewed, Self::Lost, Self::Error];
+
     const fn as_str(self) -> &'static str {
         match self {
             Self::Renewed => "renewed",
@@ -197,6 +213,33 @@ pub struct RegistryMetrics {
 }
 
 impl RegistryMetrics {
+    /// The transitions the code can actually produce, and where each comes from.
+    ///
+    /// The label domain is 4x4, but ten of those sixteen pairs are unreachable:
+    /// nothing moves an entry from `downloaded` to `error`, and `absent` is only
+    /// ever a source for a first claim or a target for a delete. Pre-creating
+    /// all sixteen exported ten series that could never leave zero.
+    ///
+    /// Keep this in step with the call sites. A pair that is produced but not
+    /// listed still records correctly -- `get_or_create` makes it on demand --
+    /// but its first occurrence in each process is invisible to `increase()`,
+    /// which is the whole reason this pre-creation exists.
+    const REACHABLE_TRANSITIONS: [(StatusLabel, StatusLabel); 6] = [
+        // record_claim(Claimed): a first claim on an entry that did not exist.
+        (StatusLabel::Absent, StatusLabel::Downloading),
+        // record_claim(Takeover): ownership changed, the entry never left
+        // DOWNLOADING, so this is an arrival and a departure that cancel.
+        (StatusLabel::Downloading, StatusLabel::Downloading),
+        // reset_download_claim: an error-retry restarting a failed download.
+        (StatusLabel::Error, StatusLabel::Downloading),
+        // finish_download_claim, both terminal outcomes.
+        (StatusLabel::Downloading, StatusLabel::Downloaded),
+        (StatusLabel::Downloading, StatusLabel::Error),
+        // A delete while downloading; the deleting side books it because
+        // finish_download_claim finds no record to fence.
+        (StatusLabel::Downloading, StatusLabel::Absent),
+    ];
+
     /// Register the families and return handles.
     ///
     /// Registered without the `_total` suffix; the encoder appends it.
@@ -223,6 +266,34 @@ impl RegistryMetrics {
             "Download lease heartbeats by outcome; lost is the leading indicator of a duplicate download",
             lease_refreshes.clone(),
         );
+
+        // Create every label combination at zero.
+        //
+        // `Family` is lazy: a child appears on first `get_or_create`, so without
+        // this a counter's first-ever exported sample is 1. Prometheus has no
+        // earlier point to subtract, `rate()` and `increase()` over that window
+        // are 0, and an alert watching for a rare discrete event misses the
+        // first occurrence in every process -- silently, because an alert whose
+        // expression yields nothing simply never fires.
+        //
+        // That is the difference between catching the first takeover after a
+        // restart, which re-pulls the whole model, and only ever catching the
+        // second. Born at zero, the increment is a visible step.
+        //
+        // Scoped to these three families deliberately. Their alerts key on rare
+        // one-shot events, and the domains are small: 4 + 3 + 6 series. The
+        // gRPC and backend families would cost 154 and 93 permanently-zero
+        // series per pod for ratio alerts that need sustained traffic to fire
+        // anyway.
+        for result in ClaimResult::ALL {
+            let _ = claims.get_or_create(&ClaimLabels { result });
+        }
+        for result in LeaseResult::ALL {
+            let _ = lease_refreshes.get_or_create(&LeaseLabels { result });
+        }
+        for (from, to) in Self::REACHABLE_TRANSITIONS {
+            let _ = transitions.get_or_create(&TransitionLabels { from, to });
+        }
 
         Self {
             transitions,
@@ -284,6 +355,12 @@ fn xslow_histogram() -> Histogram {
 }
 
 impl DownloadMetrics {
+    /// The two outcomes a download can actually end in.
+    ///
+    /// `Absent` and `Downloading` are transition states, never terminal, so
+    /// pre-creating them would claim a download can finish in `downloading`.
+    const TERMINAL: [StatusLabel; 2] = [StatusLabel::Downloaded, StatusLabel::Error];
+
     /// Register the family and return a handle.
     pub fn register(registry: &mut Registry) -> Self {
         let seconds: Family<DownloadLabels, Histogram, fn() -> Histogram> =
@@ -294,6 +371,19 @@ impl DownloadMetrics {
             "End-to-end model download duration by terminal status",
             seconds.clone(),
         );
+        // Same lazy-child problem as the counters above, and the same fix. Left
+        // lazy, the first download in a process makes `_count` appear at 1 with
+        // no earlier point to subtract, so `increase()` reports 0: the first
+        // download after every restart is invisible. That silences
+        // MXDownloadFailureRatio for a first-download failure -- 0/0 is no data,
+        // not a ratio -- and made the dashboard's own "Downloads completed" tile
+        // read 0 on a cluster where a download had demonstrably just succeeded.
+        //
+        // 30 always-present series per pod: two outcomes over twelve buckets
+        // plus +Inf, _sum and _count.
+        for outcome in Self::TERMINAL {
+            let _ = seconds.get_or_create(&DownloadLabels { outcome });
+        }
         Self { seconds }
     }
 
@@ -394,10 +484,41 @@ mod tests {
             encoded.contains(r#"mx_download_seconds_count{outcome="error"} 1"#),
             "{encoded}"
         );
+        // Present because the family is pre-created, and zero because nothing
+        // succeeded. Asserting absence would now pass for the wrong reason.
         assert!(
-            !encoded.contains(r#"mx_download_seconds_count{outcome="downloaded"}"#),
+            encoded.contains(r#"mx_download_seconds_count{outcome="downloaded"} 0"#),
             "a failed download must not be timed as a successful one: {encoded}"
         );
+    }
+
+    /// Both terminal outcomes are exported at zero before any download runs, so
+    /// `increase()` has an earlier point to subtract and the first download in a
+    /// process is visible. Without this, `MXDownloadFailureRatio` cannot fire on
+    /// a first-download failure: 0/0 is no data, not a ratio.
+    #[test]
+    fn download_outcomes_are_exported_at_zero_before_any_download() {
+        let mut registry = new_registry();
+        let _downloads = DownloadMetrics::register(&mut registry);
+
+        let encoded = encode_text(&registry).unwrap_or_else(|_| String::from("<encode failed>"));
+        for outcome in ["downloaded", "error"] {
+            assert!(
+                encoded.contains(&format!(
+                    r#"mx_download_seconds_count{{outcome="{outcome}"}} 0"#
+                )),
+                "{outcome} missing before any download: {encoded}"
+            );
+        }
+        // Transition states are not download outcomes and must stay absent.
+        for outcome in ["absent", "downloading"] {
+            assert!(
+                !encoded.contains(&format!(
+                    r#"mx_download_seconds_count{{outcome="{outcome}"}}"#
+                )),
+                "{outcome} is not a terminal outcome: {encoded}"
+            );
+        }
     }
 
     /// Sum the `to="downloading"` and `from="downloading"` series the way the
@@ -538,6 +659,111 @@ mod tests {
         assert!(
             encoded.contains(r#"mx_download_seconds_bucket{le="3600.0",outcome="downloaded"} 1"#),
             "a 40-minute download must land below the top boundary: {encoded}"
+        );
+    }
+
+    /// Counters must be exported at zero before anything happens to them.
+    ///
+    /// `Family` creates children lazily, so without pre-creation a counter's
+    /// first exported sample is 1 and Prometheus has no earlier point to
+    /// subtract: `rate()` and `increase()` over that window are 0. Every alert
+    /// keyed on a rare one-shot event -- a lost lease, a takeover -- then misses
+    /// the first occurrence in each process, and misses it *silently*, because
+    /// an expression that yields nothing simply never fires.
+    ///
+    /// The three series asserted here are the ones the shipped alert rules key
+    /// on. `takeover` is the sharpest: missing it means missing a full re-pull
+    /// of the model.
+    #[test]
+    fn alertable_counters_are_exported_at_zero_before_any_event() {
+        let mut registry = new_registry();
+        let _metrics = RegistryMetrics::register(&mut registry);
+
+        let encoded = encode_text(&registry).unwrap_or_else(|_| String::from("<encode failed>"));
+        for series in [
+            r#"mx_download_claims_total{result="takeover"} 0"#,
+            r#"mx_download_lease_refresh_total{result="lost"} 0"#,
+            r#"mx_registry_status_transitions_total{from="absent",to="downloading"} 0"#,
+        ] {
+            assert!(
+                encoded.contains(series),
+                "missing {series}; a counter born at 1 leaves rate() blind to the first event: {encoded}"
+            );
+        }
+    }
+
+    /// Pre-creation must cover exactly the declared label values -- no more.
+    ///
+    /// An invented series would sit at zero forever under a name no code can
+    /// increment, implying a condition is monitored when nothing reports it.
+    #[test]
+    fn pre_creation_covers_exactly_the_declared_label_values() {
+        let mut registry = new_registry();
+        let _metrics = RegistryMetrics::register(&mut registry);
+        let encoded = encode_text(&registry).unwrap_or_else(|_| String::from("<encode failed>"));
+
+        let count = |prefix: &str| encoded.lines().filter(|l| l.starts_with(prefix)).count();
+
+        assert_eq!(
+            count("mx_download_claims_total{"),
+            ClaimResult::ALL.len(),
+            "{encoded}"
+        );
+        assert_eq!(
+            count("mx_download_lease_refresh_total{"),
+            LeaseResult::ALL.len(),
+            "{encoded}"
+        );
+        assert_eq!(
+            count("mx_registry_status_transitions_total{"),
+            RegistryMetrics::REACHABLE_TRANSITIONS.len(),
+            "{encoded}"
+        );
+
+        // The unreachable pairs must stay absent. Pre-creating the full 4x4
+        // exported ten series that could never leave zero.
+        for (from, to) in [
+            (StatusLabel::Absent, StatusLabel::Absent),
+            (StatusLabel::Absent, StatusLabel::Downloaded),
+            (StatusLabel::Downloaded, StatusLabel::Error),
+            (StatusLabel::Error, StatusLabel::Downloaded),
+        ] {
+            let needle =
+                format!(r#"mx_registry_status_transitions_total{{from="{from:?}",to="{to:?}"#)
+                    .to_lowercase();
+            assert!(!encoded.to_lowercase().contains(&needle), "{encoded}");
+        }
+    }
+
+    /// Every pair the code books is pre-created, so no first occurrence is
+    /// invisible to `increase()`. Drives the real call sites rather than
+    /// restating the list, so adding a transition without listing it fails here.
+    #[test]
+    fn every_booked_transition_was_pre_created() {
+        let mut registry = new_registry();
+        let metrics = RegistryMetrics::register(&mut registry);
+
+        let before = encode_text(&registry).unwrap_or_else(|_| String::from("<encode failed>"));
+        let series = |text: &str| {
+            text.lines()
+                .filter(|l| l.starts_with("mx_registry_status_transitions_total{"))
+                .count()
+        };
+        let baseline = series(&before);
+
+        metrics.record_claim(ClaimResult::Claimed);
+        metrics.record_claim(ClaimResult::Takeover);
+        metrics.record_transition(StatusLabel::Error, StatusLabel::Downloading);
+        metrics.record_transition(StatusLabel::Downloading, StatusLabel::Downloaded);
+        metrics.record_transition(StatusLabel::Downloading, StatusLabel::Error);
+        metrics.record_transition(StatusLabel::Downloading, StatusLabel::Absent);
+
+        let after = encode_text(&registry).unwrap_or_else(|_| String::from("<encode failed>"));
+        assert_eq!(
+            series(&after),
+            baseline,
+            "a booked transition was not pre-created, so its first occurrence is \
+             invisible to increase(): {after}"
         );
     }
 }
