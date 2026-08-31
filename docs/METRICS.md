@@ -80,6 +80,42 @@ then represented, which for TP=8 means losing seven eighths of the pod.
 
 ## Scraping on Kubernetes
 
+```mermaid
+flowchart LR
+  subgraph enginePod["Inference engine pod -- NOT deployed by this chart"]
+    client["ModelExpress client<br/>(library in vLLM / TRT-LLM / Dynamo)"]
+    cport(["port mx-metrics : 9402"])
+    client --> cport
+  end
+
+  subgraph serverPod["ModelExpress server pod -- deployed by this chart"]
+    server["modelexpress-server"]
+    sport(["port metrics : 9401"])
+    server --> sport
+  end
+
+  pm["PodMonitor<br/>metrics.podMonitor"]
+  cpm["PodMonitor<br/>metrics.clientPodMonitor"]
+  rule["PrometheusRule<br/>metrics.rules"]
+  cm["ConfigMap<br/>metrics.dashboard"]
+
+  pm -. "selects chart labels<br/>+ port name metrics" .-> sport
+  cpm -. "selects YOUR labels<br/>+ port name mx-metrics" .-> cport
+
+  prom["Prometheus"]
+  pm -- "adopted only if labels<br/>match podMonitorSelector" --> prom
+  cpm --> prom
+  rule -- "adopted only if labels<br/>match ruleSelector" --> prom
+
+  graf["Grafana"]
+  prom -- PromQL --> graf
+  cm -- "sidecar label<br/>grafana_dashboard" --> graf
+```
+
+The chart owns the left column; the Operator owns adoption. Every silent failure
+in this section is the chart creating a resource correctly and the Operator
+declining to adopt it.
+
 Two discovery models exist and they do not overlap. Which one your cluster uses
 decides everything below.
 
@@ -552,18 +588,35 @@ transfer time across load tiers; that needs per-tier instrumentation which does
 not exist yet, so the transfer panel can say a transfer took 90 seconds but not
 where the 90 seconds went.
 
-Five rows: **Overview**, **Downloads**, **Server internals**, **P2P clients**,
-**Capacity**. Read Overview first. Six of its eight tiles are coloured by the
-same condition an alert fires on -- `MXServerMetricsAbsent`,
-`MXRegistryStatsStale`, `MXDownloadFailureRatio`, `MXDownloadTakeover`,
-`MXDownloadLeaseLost` and `MXGrpcErrorRatio` -- and each tile's description names
-its alert. The other two, downloads in flight and downloads completed, are
-uncoloured context. The four rows below are for answering *why* once a tile is
-not green.
+Read **Overview** first; the rows below it answer *why* once a tile is not green.
 
-Overview is not a complete alert summary: the seven remaining alerts in the
-table above have no tile, and are read from the panels in their own rows. It
-covers the server's primary job, not the whole rule set.
+| Row | Answers | Panels |
+| --- | --- | --- |
+| **Overview** | Is anything wrong right now? | 8 stat tiles |
+| **Downloads** | Is the primary job working, and how fast? | 6 |
+| **Server internals** | gRPC and storage backend: rate, errors, p99, in flight | 8 + 1 note |
+| **P2P clients** | Selection funnel, transfer time, NIXL health | 8 + 1 note |
+| **Capacity** | Map growth, evictions, version skew | 3 |
+
+Six of the eight Overview tiles are coloured by the same condition an alert fires
+on, and each tile's description names its alert:
+
+| Tile | Alert |
+| --- | --- |
+| Server replicas exporting | `MXServerMetricsAbsent` |
+| Registry stats age | `MXRegistryStatsStale` |
+| Download failures | `MXDownloadFailureRatio` |
+| Takeovers | `MXDownloadTakeover` |
+| Leases lost | `MXDownloadLeaseLost` |
+| gRPC errors | `MXGrpcErrorRatio` |
+
+The other two -- downloads in flight, downloads completed -- are uncoloured
+context.
+
+Overview is **not** a complete alert summary. The seven remaining alerts in the
+table above have no tile and are read from the panels in their own rows. It
+covers the server's primary job, not the whole rule set, so do not treat an
+all-green Overview as an all-clear.
 
 `ModelService/EnsureModelDownloaded` is absent from every gRPC panel by design
 (see the exclusion above); download latency lives in `mx_download_seconds`
