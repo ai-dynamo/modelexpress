@@ -73,8 +73,7 @@
         },
         "graphMode": "none",
         "colorMode": "value",
-        "textMode": "auto",
-        "noValue": "0"
+        "textMode": "auto"
       },
       "fieldConfig": {
         "defaults": {
@@ -91,7 +90,8 @@
                 "value": 1
               }
             ]
-          }
+          },
+          "noValue": "0"
         }
       }
     },
@@ -140,7 +140,8 @@
                 "value": 600
               }
             ]
-          }
+          },
+          "noValue": "never run"
         }
       },
       "options": {
@@ -151,8 +152,7 @@
         },
         "graphMode": "none",
         "colorMode": "value",
-        "textMode": "auto",
-        "noValue": "never run"
+        "textMode": "auto"
       }
     },
     {
@@ -192,14 +192,14 @@
                 "value": null
               }
             ]
-          }
+          },
+          "noValue": "0"
         }
       },
       "options": {
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "auto",
-        "noValue": "0",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
@@ -246,14 +246,14 @@
                 "value": null
               }
             ]
-          }
+          },
+          "noValue": "0"
         }
       },
       "options": {
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "auto",
-        "noValue": "0",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
@@ -304,14 +304,14 @@
                 "value": 1
               }
             ]
-          }
+          },
+          "noValue": "0"
         }
       },
       "options": {
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "auto",
-        "noValue": "0",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
@@ -362,14 +362,14 @@
                 "value": 1
               }
             ]
-          }
+          },
+          "noValue": "0"
         }
       },
       "options": {
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "auto",
-        "noValue": "0",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
@@ -420,14 +420,14 @@
                 "value": 1
               }
             ]
-          }
+          },
+          "noValue": "0"
         }
       },
       "options": {
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "auto",
-        "noValue": "0",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
@@ -478,14 +478,14 @@
                 "value": 1
               }
             ]
-          }
+          },
+          "noValue": "0"
         }
       },
       "options": {
         "colorMode": "value",
         "graphMode": "none",
         "textMode": "auto",
-        "noValue": "0",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
@@ -791,7 +791,8 @@
       "description": "cancelled excluded -- that is the caller leaving, not a server fault. If every method lights up at once, suspect the auth path: outcome=backend_error absorbs Code::Unavailable.",
       "fieldConfig": {
         "defaults": {
-          "unit": "percentunit"
+          "unit": "percentunit",
+          "noValue": "0"
         }
       }
     },
@@ -942,7 +943,8 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "percentunit"
+          "unit": "percentunit",
+          "noValue": "0"
         }
       },
       "description": "Failed and cancelled operations as a fraction of all operations for that store. Both lines matter: a cancellation is the caller giving up, so a store that hangs raises the cancelled line while the error line falls. Reading error alone would show a hanging store getting healthier."
@@ -1337,7 +1339,7 @@
         "uid": "${datasource}"
       },
       "gridPos": {
-        "h": 5,
+        "h": 6,
         "w": 6,
         "x": 0,
         "y": 65
@@ -1362,12 +1364,12 @@
         },
         "graphMode": "none",
         "colorMode": "value",
-        "textMode": "auto",
-        "noValue": "0"
+        "textMode": "auto"
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "short"
+          "unit": "short",
+          "noValue": "0"
         }
       }
     },
@@ -1376,7 +1378,7 @@
       "type": "text",
       "title": "Why this section may be empty",
       "gridPos": {
-        "h": 5,
+        "h": 6,
         "w": 18,
         "x": 6,
         "y": 65
@@ -1395,7 +1397,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 70
+        "y": 71
       },
       "panels": []
     },
@@ -1409,9 +1411,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 8,
         "x": 0,
-        "y": 71
+        "y": 72
       },
       "targets": [
         {
@@ -1441,9 +1443,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 71
+        "w": 8,
+        "x": 8,
+        "y": 72
       },
       "targets": [
         {
@@ -1459,7 +1461,8 @@
       "description": "Only time_threshold and count_limit are reachable today; disk_space and manual exist as label values with no producer.",
       "fieldConfig": {
         "defaults": {
-          "unit": "short"
+          "unit": "short",
+          "noValue": "0"
         }
       }
     },
@@ -1473,9 +1476,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 24,
-        "x": 0,
-        "y": 79
+        "w": 8,
+        "x": 16,
+        "y": 72
       },
       "targets": [
         {
@@ -1497,12 +1500,12 @@
         },
         "graphMode": "none",
         "colorMode": "value",
-        "textMode": "auto",
-        "noValue": "0"
+        "textMode": "auto"
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "short"
+          "unit": "short",
+          "noValue": "0"
         }
       }
     }
