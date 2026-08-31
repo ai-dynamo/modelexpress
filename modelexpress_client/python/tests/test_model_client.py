@@ -290,6 +290,190 @@ class TestInstallMetadataSnapshot:
         assert [r.ignore_weights for r in stub.download_requests] == [True]
         assert [r.ignore_weights for r in stub.list_requests] == [True]
 
+    def test_pinned_request_reaches_the_server(self, tmp_path):
+        """The engine's revision has to be what the server is asked for.
+
+        Installing the server's default instead leaves the engine looking for
+        a snapshot directory that was never created.
+        """
+        pinned = "a" * 40
+        stub = FakeStub(
+            files={"config.json": 2},
+            chunks=[whole_file("config.json", b"{}", is_last_file=True, commit_hash=pinned)],
+            resolved_revision=pinned,
+        )
+        snapshot = make_client(tmp_path, stub).install_metadata_snapshot(
+            MODEL, requested_revision=pinned
+        )
+
+        assert stub.download_requests[0].revision == pinned
+        assert stub.list_requests[0].revision == pinned
+        assert stub.stream_requests[0].revision == pinned
+        assert snapshot.name == pinned
+
+    def test_branch_pin_lands_under_the_resolved_commit(self, tmp_path):
+        """A branch resolves server-side; the snapshot is named after the commit.
+
+        Only the first call carries the branch name. The manifest and the
+        stream carry the commit it resolved to, so a tag that moves between
+        the calls cannot answer them from two different commits.
+        """
+        stub = FakeStub(
+            files={"config.json": 2},
+            chunks=[whole_file("config.json", b"{}", is_last_file=True, commit_hash=COMMIT)],
+            resolved_revision=COMMIT,
+        )
+        client = make_client(tmp_path, stub)
+        snapshot = client.install_metadata_snapshot(MODEL, requested_revision="v1.0")
+
+        assert stub.download_requests[0].revision == "v1.0"
+        assert stub.list_requests[0].revision == COMMIT
+        assert stub.stream_requests[0].revision == COMMIT
+        assert snapshot.name == COMMIT
+        assert (snapshot.parent.parent / "refs" / "v1.0").read_text() == COMMIT
+
+    def test_pinned_install_leaves_main_alone(self, tmp_path):
+        stub = FakeStub(
+            files={"config.json": 2},
+            chunks=[whole_file("config.json", b"{}", is_last_file=True, commit_hash=COMMIT)],
+            resolved_revision=COMMIT,
+        )
+        make_client(tmp_path, stub).install_metadata_snapshot(
+            MODEL, requested_revision=COMMIT
+        )
+
+        cache = ModelSnapshotCache(MODEL, tmp_path)
+        assert cache.read_main_ref() is None
+
+    def test_unconfirmed_pin_is_refused(self, tmp_path):
+        """A server that ignores the pin would silently serve its default."""
+        stub = FakeStub(
+            files={"config.json": 2},
+            chunks=[whole_file("config.json", b"{}", is_last_file=True, commit_hash=COMMIT)],
+        )
+        with pytest.raises(ModelCacheError, match="did not confirm revision"):
+            make_client(tmp_path, stub).install_metadata_snapshot(
+                MODEL, requested_revision="a" * 40
+            )
+
+    def test_pinned_reuse_ignores_main(self, tmp_path):
+        """refs/main tracks the default revision, not the pinned one.
+
+        Gating reuse on it would restream a pinned snapshot that is already
+        complete, every time the default has moved on.
+        """
+        pinned = "a" * 40
+        stub = FakeStub(
+            files={"config.json": 2},
+            chunks=[whole_file("config.json", b"{}", is_last_file=True, commit_hash=pinned)],
+            resolved_revision=pinned,
+        )
+        client = make_client(tmp_path, stub)
+        first = client.install_metadata_snapshot(MODEL, requested_revision=pinned)
+        second = client.install_metadata_snapshot(MODEL, requested_revision=pinned)
+
+        assert first == second
+        assert len(stub.stream_requests) == 1
+
+    def test_commit_pin_resolving_elsewhere_is_refused(self, tmp_path):
+        """A commit hash names one revision and cannot resolve to another.
+
+        Accepting it would install the server's commit and leave a ref
+        pointing the engine's request at a revision it never asked for.
+        """
+        stub = FakeStub(
+            files={"config.json": 2},
+            chunks=[whole_file("config.json", b"{}", is_last_file=True, commit_hash=COMMIT)],
+            resolved_revision=COMMIT,
+        )
+        with pytest.raises(ModelCacheError, match="cannot resolve to another commit"):
+            make_client(tmp_path, stub).install_metadata_snapshot(
+                MODEL, requested_revision="d" * 40
+            )
+
+    def test_uppercase_pin_matches_its_own_commit(self, tmp_path):
+        """Case is the only difference, so this is the same revision."""
+        stub = FakeStub(
+            files={"config.json": 2},
+            chunks=[whole_file("config.json", b"{}", is_last_file=True, commit_hash=COMMIT)],
+            resolved_revision=COMMIT,
+        )
+        snapshot = make_client(tmp_path, stub).install_metadata_snapshot(
+            MODEL, requested_revision=COMMIT.upper()
+        )
+
+        assert snapshot.name == COMMIT
+        assert (tmp_path / "models--org--model" / "refs" / COMMIT.upper()).read_text() == COMMIT
+
+    def test_branch_may_resolve_to_any_commit(self, tmp_path):
+        """The check is for commit hashes only; a branch is expected to move."""
+        stub = FakeStub(
+            files={"config.json": 2},
+            chunks=[whole_file("config.json", b"{}", is_last_file=True, commit_hash=COMMIT)],
+            resolved_revision=COMMIT,
+        )
+        snapshot = make_client(tmp_path, stub).install_metadata_snapshot(
+            MODEL, requested_revision="v1.0"
+        )
+        assert snapshot.name == COMMIT
+
+    def test_reuse_records_the_ref_the_new_request_needs(self, tmp_path):
+        """A reused snapshot still has to be reachable by *this* revision.
+
+        The first install pinned the commit hash, which needs no ref. A later
+        request for a branch resolving to the same commit reuses that
+        directory -- and would leave the engine looking for a refs entry
+        nobody wrote.
+        """
+        stub = FakeStub(
+            files={"config.json": 2},
+            chunks=[whole_file("config.json", b"{}", is_last_file=True, commit_hash=COMMIT)],
+            resolved_revision=COMMIT,
+        )
+        client = make_client(tmp_path, stub)
+        client.install_metadata_snapshot(MODEL, requested_revision=COMMIT)
+        client.install_metadata_snapshot(MODEL, requested_revision="v1.0")
+
+        assert len(stub.stream_requests) == 1
+        refs = tmp_path / "models--org--model" / "refs"
+        assert (refs / "v1.0").read_text() == COMMIT
+
+    def test_reuse_records_the_ref_for_an_uppercase_pin(self, tmp_path):
+        """huggingface_hub only treats a *lowercase* 40-hex as a commit hash.
+
+        An uppercase pin is looked up through refs like any other name, so it
+        needs the same entry a branch would.
+        """
+        stub = FakeStub(
+            files={"config.json": 2},
+            chunks=[whole_file("config.json", b"{}", is_last_file=True, commit_hash=COMMIT)],
+            resolved_revision=COMMIT,
+        )
+        client = make_client(tmp_path, stub)
+        client.install_metadata_snapshot(MODEL, requested_revision=COMMIT)
+        client.install_metadata_snapshot(MODEL, requested_revision=COMMIT.upper())
+
+        refs = tmp_path / "models--org--model" / "refs"
+        assert (refs / COMMIT.upper()).read_text() == COMMIT
+
+    def test_reused_pin_resolves_offline(self, tmp_path):
+        """The engine's own lookup, on the reuse path."""
+        from huggingface_hub import snapshot_download
+
+        stub = FakeStub(
+            files={"config.json": 2},
+            chunks=[whole_file("config.json", b"{}", is_last_file=True, commit_hash=COMMIT)],
+            resolved_revision=COMMIT,
+        )
+        client = make_client(tmp_path, stub)
+        client.install_metadata_snapshot(MODEL, requested_revision=COMMIT)
+        snapshot = client.install_metadata_snapshot(MODEL, requested_revision="v1.0")
+
+        resolved = snapshot_download(
+            MODEL, revision="v1.0", cache_dir=str(tmp_path), local_files_only=True
+        )
+        assert resolved == str(snapshot)
+
     def test_rejects_manifest_without_metadata(self, tmp_path):
         stub = FakeStub(files={"model.safetensors": 7})
         with pytest.raises(ModelCacheError, match="no non-weight files"):

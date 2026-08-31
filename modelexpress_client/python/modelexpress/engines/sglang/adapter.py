@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+import gc
 import logging
 import uuid
 from importlib.metadata import version as pkg_version
@@ -169,27 +170,75 @@ class SglangAdapter(EngineAdapter):
         )
         from sglang.srt.model_loader.utils import set_default_torch_dtype
 
-        old_value = result.value
+        model = result.model
+        if model is None:
+            raise RuntimeError("SGLang retry reinitialization requires result.model")
+        if result.value is not model:
+            raise RuntimeError(
+                "SGLang retry reinitialization requires result.value and "
+                "result.model to reference the same model root"
+            )
+
+        publishable = result.publishable
+        metadata = result.metadata
         result.value = None
         result.model = None
-        del old_value
+
+        # SGLang's RemoteInstanceModelLoader and MxModelLoader both retain the
+        # root model object while this hook runs. Deleting LoadResult references
+        # cannot release its parameters, so constructing a replacement directly
+        # would temporarily allocate two full models. Preserve the externally
+        # owned root identity, but first turn it into an empty shell so the old
+        # CUDA allocations can be reclaimed before initialization starts.
+        model.__dict__.clear()
+        gc.collect()
         self.accelerator_backend.empty_cache()
 
         logger.info(
-            "[Worker %s] Re-initializing SGLang model after failed strategy",
+            "[Worker %s] Re-initializing SGLang model state in-place after "
+            "failed strategy",
             self.get_global_rank(),
         )
         quant_config = _get_quantization_config(self.model_config, self.load_config)
         # Match SGLang's initial load path so retry parameters use the model's
         # configured dtype instead of PyTorch's default float32.
-        with set_default_torch_dtype(self.model_config.dtype):
-            with self.target_device:
-                model = _initialize_model(
-                    self.model_config,
-                    self.load_config,
-                    quant_config,
+        try:
+            with set_default_torch_dtype(self.model_config.dtype):
+                with self.target_device:
+                    fresh_model = _initialize_model(
+                        self.model_config,
+                        self.load_config,
+                        quant_config,
+                    )
+            if type(fresh_model) is not type(model):
+                raise RuntimeError(
+                    "SGLang retry initialization returned a different model type: "
+                    f"expected {type(model).__qualname__}, "
+                    f"got {type(fresh_model).__qualname__}"
                 )
-        return LoadResult(value=model, model=model, publishable=result.publishable)
+        except BaseException:
+            # The old parameter graph was intentionally released before fresh
+            # initialization and cannot be restored without retaining the HBM
+            # that caused duplicate-model OOM. Restore the envelope to the
+            # engine-owned empty root so callers do not observe None, then let
+            # the original failure abort startup rather than attempting another
+            # strategy with an invalid model.
+            result.value = model
+            result.model = model
+            result.publishable = publishable
+            result.metadata = metadata
+            raise
+
+        # Both roots briefly reference the same new children, so there is still
+        # only one set of parameter storage. The externally owned root remains
+        # valid after the temporary fresh root is dropped.
+        model.__dict__.update(fresh_model.__dict__)
+        del fresh_model
+        result.value = model
+        result.model = model
+        result.publishable = publishable
+        result.metadata = metadata
+        return result
 
     def _process_weights_after_loading(self, result: LoadResult) -> LoadResult:
         if result.model is None:

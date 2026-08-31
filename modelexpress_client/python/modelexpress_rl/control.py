@@ -12,6 +12,7 @@ from modelexpress import auth
 from modelexpress.client import _get_server_url
 
 from . import refit_pb2, refit_pb2_grpc
+from .object_storage import ObjectStorageSource, ObjectStorageType
 from .train import WeightPayloadFormat
 from .version import WeightVersionRef
 
@@ -30,9 +31,9 @@ class WeightVersion:
 
     version_id: str
     model_name: str
-    version_number: int | None
     payload_format: WeightPayloadFormat
     base_version_id: str | None
+    object_storage: ObjectStorageSource | None
     expected_source_slots: tuple[str, ...]
     layout_signature: str
     state: WeightVersionState
@@ -60,26 +61,47 @@ def _weight_version(version: refit_pb2.WeightVersion) -> WeightVersion:
         refit_pb2.WEIGHT_VERSION_STATE_READY: WeightVersionState.READY,
         refit_pb2.WEIGHT_VERSION_STATE_RELEASING: WeightVersionState.RELEASING,
     }
+    storage_types = {
+        refit_pb2.OBJECT_STORAGE_TYPE_S3: ObjectStorageType.S3,
+        refit_pb2.OBJECT_STORAGE_TYPE_AZURE: ObjectStorageType.AZURE,
+        refit_pb2.OBJECT_STORAGE_TYPE_GCS: ObjectStorageType.GCS,
+    }
     try:
         payload_format = payload_formats[version.payload_format]
         state = states[version.state]
     except KeyError as error:
         raise RuntimeError("MX returned an unspecified WeightVersion enum") from error
+    object_storage = None
+    if version.HasField("object_storage"):
+        try:
+            storage_type = storage_types[version.object_storage.storage_type]
+        except KeyError as error:
+            raise RuntimeError(
+                "MX returned an unspecified object storage type"
+            ) from error
+        object_storage = ObjectStorageSource(
+            storage_type=storage_type,
+            uri=version.object_storage.uri,
+        )
     return WeightVersion(
         version_id=version.uid,
         model_name=version.model_name,
-        version_number=(
-            version.version_number if version.HasField("version_number") else None
-        ),
         payload_format=payload_format,
         base_version_id=(
             version.base_version_id if version.HasField("base_version_id") else None
         ),
+        object_storage=object_storage,
         expected_source_slots=tuple(version.expected_source_slots),
         layout_signature=version.layout_signature,
         state=state,
         created_at_unix_ms=version.created_at_unix_ms,
     )
+
+
+def _response_version(response, rpc_name: str) -> WeightVersion:
+    if not response.HasField("version"):
+        raise RuntimeError(f"MX {rpc_name} response is missing version")
+    return _weight_version(response.version)
 
 
 class ModelExpressControlClient:
@@ -118,17 +140,23 @@ class ModelExpressControlClient:
         model_name: str,
         idempotency_key: str,
         payload_format: WeightPayloadFormat,
-        expected_source_slots: list[str],
-        version_number: int | None = None,
+        expected_source_slots: list[str] | None = None,
+        uid: str | None = None,
         base_version_id: str | None = None,
+        object_storage: ObjectStorageSource | None = None,
+        state: WeightVersionState = WeightVersionState.STAGING,
     ) -> WeightVersion:
-        """Create one global STAGING version for rank-local publication."""
+        """Create one global version with its initial lifecycle state."""
         _required(model_name, "model_name")
         _required(idempotency_key, "idempotency_key")
         if payload_format is WeightPayloadFormat.UNSPECIFIED:
             raise ValueError("payload_format must be specified")
-        if not expected_source_slots:
-            raise ValueError("expected_source_slots must not be empty")
+        if state not in {WeightVersionState.STAGING, WeightVersionState.READY}:
+            raise ValueError("new weight version state must be STAGING or READY")
+        if object_storage is not None and not isinstance(
+            object_storage, ObjectStorageSource
+        ):
+            raise TypeError("object_storage must be an ObjectStorageSource")
         request = refit_pb2.CreateWeightVersionRequest(
             model_name=model_name,
             idempotency_key=idempotency_key,
@@ -136,18 +164,28 @@ class ModelExpressControlClient:
                 WeightPayloadFormat.FULL_TENSOR: refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_TENSOR,
                 WeightPayloadFormat.XOR_DELTA: refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA,
             }[payload_format],
-            expected_source_slots=expected_source_slots,
+            expected_source_slots=expected_source_slots or [],
+            state={
+                WeightVersionState.STAGING: refit_pb2.WEIGHT_VERSION_STATE_STAGING,
+                WeightVersionState.READY: refit_pb2.WEIGHT_VERSION_STATE_READY,
+            }[state],
         )
-        if version_number is not None:
-            request.version_number = version_number
+        if uid is not None:
+            request.uid = _required(uid, "uid")
         if base_version_id is not None:
             request.base_version_id = _required(base_version_id, "base_version_id")
-        return _weight_version(
-            self._service.CreateWeightVersion(
-                request,
-                timeout=self._rpc_timeout_seconds,
-            )
+        if object_storage is not None:
+            request.object_storage.uri = object_storage.uri
+            request.object_storage.storage_type = {
+                ObjectStorageType.S3: refit_pb2.OBJECT_STORAGE_TYPE_S3,
+                ObjectStorageType.AZURE: refit_pb2.OBJECT_STORAGE_TYPE_AZURE,
+                ObjectStorageType.GCS: refit_pb2.OBJECT_STORAGE_TYPE_GCS,
+            }[object_storage.storage_type]
+        response = self._service.CreateWeightVersion(
+            request,
+            timeout=self._rpc_timeout_seconds,
         )
+        return _response_version(response, "CreateWeightVersion")
 
     def get_weight_version(self, version_id: str) -> WeightVersion:
         """Read the current lifecycle state of one weight version."""
@@ -155,17 +193,38 @@ class ModelExpressControlClient:
             refit_pb2.GetWeightVersionRequest(uid=_required(version_id, "version_id")),
             timeout=self._rpc_timeout_seconds,
         )
-        return _weight_version(response)
+        return _response_version(response, "GetWeightVersion")
+
+    def update_weight_version_state(
+        self,
+        version_id: str,
+        state: WeightVersionState,
+    ) -> WeightVersion:
+        """Update one version's lifecycle state."""
+        if not isinstance(state, WeightVersionState):
+            raise TypeError("state must be a WeightVersionState")
+        response = self._service.UpdateWeightVersionState(
+            refit_pb2.UpdateWeightVersionStateRequest(
+                uid=_required(version_id, "version_id"),
+                state={
+                    WeightVersionState.STAGING: refit_pb2.WEIGHT_VERSION_STATE_STAGING,
+                    WeightVersionState.READY: refit_pb2.WEIGHT_VERSION_STATE_READY,
+                    WeightVersionState.RELEASING: refit_pb2.WEIGHT_VERSION_STATE_RELEASING,
+                }[state],
+            ),
+            timeout=self._rpc_timeout_seconds,
+        )
+        return _response_version(response, "UpdateWeightVersionState")
 
     def delete_weight_version(self, version_id: str) -> WeightVersion:
-        """Logically retire a version and reject new publication or leases."""
+        """Move a STAGING or READY version to RELEASING."""
         response = self._service.DeleteWeightVersion(
             refit_pb2.DeleteWeightVersionRequest(
                 uid=_required(version_id, "version_id")
             ),
             timeout=self._rpc_timeout_seconds,
         )
-        return _weight_version(response)
+        return _response_version(response, "DeleteWeightVersion")
 
     def close(self) -> None:
         """Close the underlying gRPC channel."""
@@ -183,6 +242,8 @@ class ModelExpressControlClient:
 
 __all__ = [
     "ModelExpressControlClient",
+    "ObjectStorageSource",
+    "ObjectStorageType",
     "WeightVersion",
     "WeightVersionState",
 ]

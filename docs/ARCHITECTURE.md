@@ -85,6 +85,14 @@ ModelExpress/
 │       ├── backend_config.rs           # Shared BackendConfig (Redis / K8s) + env parsing
 │       ├── cache.rs                    # CacheEvictionService, LRU policy
 │       ├── services.rs                 # Health, API, Model gRPC services + ModelDownloadTracker
+│       ├── metrics.rs                   # Prometheus registry, mx_build_info, encoding
+│       ├── metrics/
+│       │   ├── exposition.rs            # HTTP/1.1 /metrics listener (separate port)
+│       │   ├── buckets.rs               # Shared histogram bucket boundaries
+│       │   ├── grpc.rs                  # Per-RPC tower layer; in-handler outcomes
+│       │   ├── backend.rs               # Backend op counters and latency
+│       │   ├── registry.rs              # Download claim, lease and status transitions
+│       │   └── cache.rs                 # Eviction reasons and refreshed gauges
 │       ├── p2p/
 │       │   ├── state.rs                # P2pStateManager wrapper
 │       │   ├── service.rs              # P2P gRPC service implementation
@@ -94,21 +102,25 @@ ModelExpress/
 │       │   ├── backend.rs              # MetadataBackend trait + types
 │       │   └── backend/
 │       │       ├── redis.rs            # P2P Redis backend
-│       │       └── kubernetes.rs       # P2P Kubernetes CRD backend
+│       │       ├── kubernetes.rs       # P2P Kubernetes CRD backend
+│       │       └── instrumented.rs     # Metrics decorator over MetadataBackend
 │       ├── refit.rs                     # Refit module exports
 │       ├── refit/
 │       │   ├── service.rs               # Backend-neutral Refit gRPC service
 │       │   ├── backend.rs               # RefitBackend contract and factory
 │       │   └── backend/
-│       │       └── redis.rs             # Redis backend and atomic Lua scripts
+│       │       ├── redis.rs             # Redis backend and atomic Lua scripts
+│       │       └── instrumented.rs      # Metrics decorator over RefitBackend
 │       ├── registry/
 │       │   ├── state.rs                # RegistryManager wrapper
+│       │   ├── stats_refresh.rs        # Background gauge refresh (own interval)
 │       │   ├── backend.rs              # RegistryBackend trait + ModelRecord
 │       │   ├── entry_key.rs            # EntryKey: model + revision + weight mode
 │       │   ├── k8s_types.rs            # ModelCacheEntry CRD type
 │       │   └── backend/
 │       │       ├── redis.rs            # Redis registry backend
-│       │       └── kubernetes.rs       # K8s ModelCacheEntry registry backend
+│       │       ├── kubernetes.rs       # K8s ModelCacheEntry registry backend
+│       │       └── instrumented.rs     # Metrics decorator over RegistryBackend
 │       └── bin/
 │           └── config_gen.rs           # Config file generator/migrator
 │
@@ -375,7 +387,28 @@ See [`metadata.md`](metadata.md) for the full metadata architecture including st
 `RefitService` is a new RL-specific control plane. It does not reuse or modify the
 legacy `WeightSyncService`. The initial slice stores worker registrations,
 immutable weight versions, and compact physical shard publications in Redis.
-Weight bytes and full tensor manifests remain on trainer or generator workers.
+NIXL manifest endpoints belong to their physical worker shards; a typed object
+storage source belongs directly to its durable `WeightVersion`. The protocol
+can identify S3, Azure Blob Storage, or GCS, while this initial implementation
+accepts only S3. On the NIXL path, weight bytes and full tensor manifests remain
+on trainer workers. On the S3 path, rank zero uploads the version's global index
+after every trainer rank has uploaded its owned delta shard. Frameworks own
+tensor gathering, Hugging Face conversion, and bucketization, then pass a lazy
+canonical bucket stream to the trainer client, which owns delta processing and
+S3 shard construction.
+During framework initialization, the same bucket stream seeds only that rank's
+owned launch-checkpoint tensors through direct, concurrent
+`prepare_delta_base()` bucket reads. The first real delta stage uses the
+prepared snapshot without checkpoint I/O.
+Each canonical S3 version owns an exact caller-supplied `object_storage.uri`
+under the configured `uri_prefix`. That URI names the global index; its delta
+shards are stored as siblings.
+The index's `compression_format` selects the receiver's decompressor. The
+current implementation supports Zstandard. Unknown compression formats are
+rejected before shard download.
+Canonical S3 versions are retained for rollout fault recovery. Trainer
+processes keep only the current base snapshot; older
+immutable S3 objects are governed by external bucket lifecycle policy.
 
 #### RL refit client architecture
 
@@ -393,37 +426,57 @@ flowchart LR
     end
 
     S["MX server<br/>RefitService<br/>Redis metadata"]
+    P["MX server<br/>P2pService"]
 
     subgraph Trainer["Trainer rank"]
-        TA["Trainer engine adapter"]
+        TR["TrainerRuntime"]
+        TA["Explicit engine context<br/>Megatron or FSDP"]
+        PM["Publication method<br/>full tensor NIXL or canonical delta"]
         B["Registered source buffers"]
         M["RefitWorkerService<br/>manifest endpoint"]
+        C["Canonical HF gather<br/>XOR staging"]
     end
+
+    D["S3<br/>safetensors shards + index"]
 
     subgraph Generator["Generator rank"]
-        GA["Generator engine adapter"]
-        X["NIXL staged transfer<br/>plan, pull, verify"]
-        I["vLLM installer<br/>capture, apply"]
+        GR["GeneratorRuntime<br/>source policy + session"]
+        SR["Source resolvers<br/>generator, trainer, object storage"]
+        UM["Update methods<br/>full tensor NIXL, canonical delta"]
+        I["Engine installer<br/>vLLM or SGLang"]
     end
 
-    O -->|"Create / Get / Delete version"| S
+    PG["Peer generator rank<br/>verified canonical buffers"]
+
+    O -->|"Create / Get / Delete / update version state"| S
     O -->|"Framework-native RPC"| T
     O -->|"Framework-native RPC"| G
-    T --> TA --> B
-    T -->|"Register worker; publish shard metadata"| S
+    T --> TR --> TA --> PM
+    PM --> B
+    PM --> C --> D
+    T -->|"NIXL: register worker; publish shard metadata"| S
     T --> M
-    G -->|"Register worker; discover shards; lease version"| S
-    G --> GA --> X --> I
+    G -->|"Register worker; lease version; NIXL: discover shards"| S
+    G -->|"Discover exact-version same-rank peer"| P
+    G --> GR --> SR --> UM --> I
     G -->|"Fetch exact-version manifest"| M
-    B -->|"NIXL reads"| X
+    B -->|"NIXL reads"| UM
+    PG -->|"Publish READY version identity"| P
+    PG -->|"Peer manifest + NIXL reads"| UM
 ```
 
 `RefitService` is the central metadata service defined by `refit.proto`. It
 coordinates immutable versions, worker registrations, shard advertisements,
 and leases, but it does not discover engine tensor layouts or transfer weights.
-`RefitWorkerService` is the trainer-local manifest endpoint. The manifest is an
-opaque description of the exact published source buffers; the generator uses
-it to compile and validate its receiver-local transfer plan.
+For NIXL, `RefitWorkerService` is the trainer-local manifest endpoint.
+The manifest is an opaque description of the exact published source buffers;
+the generator uses it to compile and validate its receiver-local transfer plan.
+For S3, `WeightVersion.object_storage` identifies the storage type and global
+`model.safetensors.index.json` URI directly; the server validates only this
+typed location and does not contact S3.
+Trainer integrations provide the matching `ObjectStorageConfig` through
+`ModelExpressTrainerConfig.object_storage`; the initial implementation rejects
+providers other than S3 before creating the storage client.
 
 The synchronous generator client returns a staged handle only after transfer
 and verification finish. That handle owns the version lease through graph-safe
@@ -438,33 +491,69 @@ prevent untrusted clients from reaching MX server and worker gRPC endpoints.
 Transport authentication and TLS require a separate protocol and deployment
 design; they are not provided by this implementation.
 
-The generator adapter deliberately composes two private implementations rather
-than inheriting from the legacy reshard receiver:
+`GeneratorRuntime` composes three independent seams. Source resolvers discover
+candidate locations without moving bytes; update methods transfer and verify a
+typed artifact without mutating the live engine; the engine installer commits
+that artifact at the caller's safe point. Source fallback and retry limits live
+in the planner/session rather than in engine integrations.
 
 - `nixl_staged_transfer.py` owns exact-manifest decoding, transfer planning,
   reusable registered buffers, NIXL reads, transforms, and digest verification.
+- `inference/receiver.py` owns canonical S3 downloads, safetensors XOR
+  reconstruction, and locked host-local checkpoint state.
 - `inference/engines/vllm/installer.py` owns vLLM load-layout capture and
   graph-safe installation through vLLM's layerwise reload and post-load path.
+- `inference/engines/sglang/installer.py` reloads a prepared canonical checkpoint
+  through SGLang's native safetensors loader.
 
-This keeps transport and verification independent of vLLM while keeping
-engine-specific parameter and CUDA-graph handling out of the transfer layer.
+The corresponding trainer composition is owned by `TrainerRuntime`. Public
+`FSDPTrainerContext` and `MegatronTrainerContext` select only engine capture;
+full-tensor NIXL and canonical-delta object-storage publication remain separate
+method implementations. This keeps transport, payload preparation, engine
+geometry, and framework orchestration independently replaceable.
 
-| RPC | Purpose |
-|-----|---------|
-| `RegisterWorker` | Register or refresh one TTL-bound worker process |
-| `CreateWeightVersion` | Idempotently create one immutable `STAGING` version |
-| `GetWeightVersion` | Read the version and its lifecycle state |
-| `DeleteWeightVersion` | Move a `READY` version to `RELEASING`; existing leases remain valid |
-| `CreateWeightVersionShard` | Publish one worker manifest for a required source slot |
-| `ListWeightVersionShards` | List the version's physical source publications |
-| `DeleteWeightVersionShard` | Evict one source shard after release when no lease protects the version |
-| `RegisterVersionLease` | Acquire protection while a version is `READY`, or renew the same owner's existing protection while it is `READY` or `RELEASING` |
-| `DeleteVersionLease` | Release a generator's protection of the version shards |
+| RPC | Request | Response | Purpose |
+|-----|---------|----------|---------|
+| `RegisterWorker` | `RegisterWorkerRequest` | `RegisterWorkerResponse` | Register or refresh one TTL-bound worker process |
+| `CreateWeightVersion` | `CreateWeightVersionRequest` | `CreateWeightVersionResponse` | Idempotently create one immutable `STAGING` or already-published `READY` version |
+| `GetWeightVersion` | `GetWeightVersionRequest` | `GetWeightVersionResponse` | Read the version and its lifecycle state |
+| `DeleteWeightVersion` | `DeleteWeightVersionRequest` | `DeleteWeightVersionResponse` | Cancel a `STAGING` version or move a `READY` version to `RELEASING` for retirement |
+| `UpdateWeightVersionState` | `UpdateWeightVersionStateRequest` | `UpdateWeightVersionStateResponse` | Explicitly update lifecycle state, including S3 `STAGING` to `READY` |
+| `CreateWeightVersionShard` | `CreateWeightVersionShardRequest` | `CreateWeightVersionShardResponse` | Publish one worker manifest for a required source slot |
+| `ListWeightVersionShards` | `ListWeightVersionShardsRequest` | `ListWeightVersionShardsResponse` | List the version's physical source publications |
+| `DeleteWeightVersionShard` | `DeleteWeightVersionShardRequest` | `DeleteWeightVersionShardResponse` | Evict one source shard after release when no lease protects the version |
+| `RegisterVersionLease` | `RegisterVersionLeaseRequest` | `RegisterVersionLeaseResponse` | Acquire or renew protection while installing a version |
+| `DeleteVersionLease` | `DeleteVersionLeaseRequest` | `DeleteVersionLeaseResponse` | Release a generator's protection of the version shards |
 
-The final missing source slot atomically changes the version to `READY`.
-`WeightVersion.uid` is MX's opaque identity. `version_number` is the optional
-framework-provided numeric label used for correlation; MX does not use it as an
-identity or ordering key.
+`RefitWorkerService.GetWeightVersionShardManifest` is also unary and returns
+`GetWeightVersionShardManifestResponse`; tensor bytes remain on the advertised
+data-plane transport.
+
+The final missing NIXL source slot atomically changes the version to `READY`.
+For S3, the orchestrator marks the version `READY` after publication completes.
+
+Peer generators reuse the existing inference P2P metadata service rather than
+creating a second Refit peer registry. A generator serving an exact version
+publishes its normal `SourceIdentity` with `revision=WeightVersion.uid`; another
+generator queries `P2pService.ListSources` with the same engine-compatible
+identity and selects a READY source for its worker rank before falling back to
+trainer shard publications. Applied generators publish their verified canonical
+staging buffers—not engine-specific packed kernel tensors—under that identity.
+An identical-rank peer pulls those buffers directly with NIXL, then uses the
+same graph-safe engine installer as a trainer update.
+
+An object-storage generator defaults to a same-rank generator peer first and the
+version-level object-storage source second. A memory-backed generator defaults
+to a peer first and trainer manifests second. `source_order` can select or
+reorder supported sources without changing an engine integration.
+
+`WeightVersion.uid` is MX's opaque version identity. A create request may supply
+the UID; MX generates one when it is omitted. Creating another version with an
+already-used caller-supplied UID returns `ALREADY_EXISTS`. For an `XOR_DELTA`,
+`base_version_id` identifies the base version's UID. The canonical index records
+these UID strings as `metadata.version` and `metadata.base_version`. MX assigns
+no numeric ordering and requires no version-directory naming convention; the
+exact `object_storage.uri` identifies the version's global index.
 `WeightVersionShard` remains the name of the per-worker manifest publication.
 Its identity is `(version_id, worker_id, source_slot_id)`: `source_slot_id`
 identifies the required, version-scoped source contribution it covers, and
@@ -474,7 +563,8 @@ the logical tensor names and shard geometry, excluding physical process and DP
 replica identity. The orchestrator deduplicates those adapter-defined slots when
 declaring the version's expected contributions. Multiple DP workers may therefore
 advertise the same source slot; generators rotate through those publications on
-transfer retry. Deployments configured with
+transfer retry. Each shard carries its trainer-local `manifest_endpoint`.
+Deployments configured with
 Kubernetes or the test-only memory backend do not expose `RefitService` yet.
 
 `RegisterWorker` is also the heartbeat API. `worker_id` is a fresh process
@@ -508,14 +598,27 @@ end-to-end backend slice implementing the same transaction boundaries.
 1. Parse CLI args (`ServerArgs` via clap)
 2. Load config (`ServerConfig::load()`) - CLI > env vars > config file > defaults
 3. Initialize structured logging (tracing-subscriber)
-4. Connect to the model registry backend (`MX_METADATA_BACKEND` — same selector as P2P). Fails fast on connect error.
-5. Initialize the process-wide `ModelDownloadTracker` with the registry, seed the `MODEL_TRACKER` OnceLock
-6. Start `CacheEvictionService` background task (reads the same registry)
-7. Connect to the P2P metadata backend (`MX_METADATA_BACKEND`, Redis or Kubernetes CRD)
-8. Start reaper background task for stale source detection and GC
-9. Register the configured gRPC services with tonic (max message size: 100MB)
-10. Listen on configured address (default `0.0.0.0:8001`)
-11. Graceful shutdown on CTRL+C (signals cache eviction service and reaper)
+4. Build the Prometheus registry and register every metric family, then start the
+   `/metrics` listener on its own port. Deliberately before anything that can
+   fail, so a scrape proves the exporter came up even on a server that never
+   reaches a healthy state. A bind failure logs and continues rather than
+   aborting startup.
+5. Connect to the model registry backend (`MX_METADATA_BACKEND` — same selector as P2P). Fails fast on connect error.
+6. Initialize the process-wide `ModelDownloadTracker` with the registry, seed the `MODEL_TRACKER` OnceLock
+7. Start `CacheEvictionService` background task (reads the same registry)
+8. Connect to the P2P metadata backend (`MX_METADATA_BACKEND`, Redis or Kubernetes CRD)
+9. Start reaper background task for stale source detection and GC
+10. Start the registry-statistics refresh task (`MX_REGISTRY_STATS_INTERVAL_SECS`,
+    default 60). Independent of `CacheEvictionService`: that one ticks hourly and
+    is skipped entirely when eviction is disabled, which would leave the gauges
+    permanently absent.
+11. Register the configured gRPC services with tonic (max message size: 100MB),
+    wrapped in the per-RPC metrics layer
+12. Listen on configured address (default `0.0.0.0:8001`)
+13. Graceful shutdown on CTRL+C: signals the cache eviction service, the reaper
+    and the statistics refresh, then joins them. The `/metrics` listener stops
+    **last**, after the gRPC server has drained, so the drain window stays
+    scrapeable.
 
 ### ServerConfig
 
@@ -733,7 +836,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `metadata/` | Metadata publishing, source identity, heartbeat, worker manifest serving, metadata client selection, and engine-agnostic cache-artifact transfer |
 | `load_strategy/` | Engine-neutral loading strategy chain: `RdmaStrategy`, `ServerCacheStrategy` (weights streamed from MX Server), `InstantTensorStrategy` (fast local safetensors), `ModelStreamerStrategy` (S3/GCS/Azure/local), `GdsStrategy`, `DefaultStrategy` |
 | `model_client.py` | `ModelCacheClient` - `ModelService` RPCs plus stream validation for server-cached models |
-| `model_snapshot.py` | Hugging Face cache layout: path validation, atomic snapshot publication, `refs/main` |
+| `model_snapshot.py` | Hugging Face cache layout: path validation, atomic snapshot publication, revision refs |
 | `model_prefetch.py` | Pre-engine metadata prefetch and repo-id resolution for server-backed loading |
 | `engines/vllm/` | `VllmAdapter` and `MxModelLoader` map strategy hooks to vLLM loader APIs; `refit/` contains the separate vLLM-specific MDL installer |
 | `engines/sglang/` | `SglangAdapter` and `MxModelLoader` - maps strategy hooks to SGLang's `remote_instance` backend |
@@ -748,15 +851,23 @@ RL framework integrations live in the separate `modelexpress_rl` package:
 | Module | Purpose |
 |--------|---------|
 | `control.py` | Public orchestrator client for creating, reading, and retiring immutable weight versions |
-| `train/client.py` | Public rank-local trainer lifecycle; owns transport resources and bound tensor state, selects the configured engine lazily after distributed setup, and publishes shards |
+| `train/client.py` | Public rank-local trainer lifecycle and control-plane registration |
+| `train/runtime.py` | Trainer publication composition, bound tensor state, and transport-resource ownership |
+| `train/context.py` | Public explicit Megatron and FSDP engine selection |
+| `train/methods/` | Independent full-tensor NIXL and canonical-delta publication methods |
 | `train/engines/megatron/selection.py` | Megatron-Bridge mapping and tensor-selection translation into MX publication specs |
 | `train/engines/megatron/adapter.py` | Stable in-place Megatron tensor registration and manifest construction |
 | `train/engines/fsdp/adapter.py` | FSDP/DTensor source capture with in-place or device-copy staging |
-| `inference/client.py` | Rank-local generator lifecycle, leases, exact-version source discovery, plan validation, staging, and apply |
+| `inference/client.py` | Rank-local generator lifecycle, leases, exact-version source discovery, staging, and apply |
+| `inference/runtime.py` | Generator source policy, method/resource composition, and update-session ownership |
+| `inference/source/` | Independent generator-peer, trainer-memory, and object-storage discovery |
+| `inference/methods/` | Independent full-tensor NIXL and canonical-delta preparation |
+| `inference/receiver.py` | Canonical S3 index/shard decoding and exact-base checkpoint mutation under a local lock |
 | `inference/nixl_staged_transfer.py` | Private engine-neutral exact-manifest NIXL planning, transfer, reusable buffers, and verification |
+| `inference/engines/sglang/` | SGLang context and native checkpoint installer |
 | `inference/engines/vllm/context.py` | Public typed vLLM objects passed to `ModelExpressGeneratorClient.initialize()` |
-| `inference/engines/vllm/adapter.py` | Generator adapter that composes staged transfer with the private vLLM installer |
-| `inference/engines/vllm/installer.py` | Private vLLM load-layout capture and graph-safe installation |
+| `inference/engines/vllm/installer.py` | Private vLLM load-layout capture plus graph-safe tensor or prepared-checkpoint installation |
+| `inference/engines/vllm/weight_transfer_engine.py` | Native vLLM weight-transfer bridge for NIXL full-tensor and canonical S3/XOR refit |
 
 ### MxClient
 
@@ -794,6 +905,32 @@ Thin orchestration layer that delegates to `LoadStrategyChain.run()`. Builds a `
 **MTP two-pass load.** Multi-token-prediction models (Qwen3.5 MTP, DeepSeek MTP) call the loader twice on one worker: the target, then the draft head. `_is_speculative_draft()` detects the second pass via `model_config.runner_type == "draft"` and sets `ctx.p2p_enabled = False`. A P2P draft would collide on the target's NIXL metadata port, and since the merged draft shares the target's `SourceIdentity` it could poison source discovery, so registration, publication, and RDMA stay off for the draft while the target keeps serving. The draft loads through the ModelStreamer/default path. To avoid re-reading the whole checkpoint for a small head, `build_model_streamer_weight_iter` streams only the shards holding the draft's tensors: it reads `model.safetensors.index.json` from the directory of the shards `_prepare_weights` already resolved, which is what makes a Hugging Face model ID work, and falls back to the model URI itself (local directory, then the runai streamer's `pull_files`) for object storage. It keeps shards whose tensor names start with `mtp.`. The draft's embedding and `lm_head` come from the target, so they are not streamed. An index that holds no `mtp.` tensors is expected on a checkpoint without a draft head and streams every shard; an index that cannot be resolved at all logs a warning and also streams every shard.
 
 ### vLLM Refit Installation
+
+The vLLM integration exposes engine installation and full-tensor target geometry
+to `GeneratorRuntime`; it does not select a transport or source. Runtime
+composition adds the NIXL full-tensor method when generator or trainer memory is
+requested and adds the canonical-delta method when object storage is configured.
+Both methods feed the shared private installer, which commits staged tensors or
+reloads a prepared checkpoint through vLLM's graph-safe layerwise reload path.
+
+The ModelExpress vLLM plugin registers one `modelexpress` native weight-transfer
+backend for both paths. An empty initialization payload preserves the existing
+NIXL path. The payload can override the logical ModelExpress model name when it
+differs from vLLM's model path. Supplying `object_storage_type` with the READY
+launch-base version ID, launch checkpoint, and preparation cache selects the
+object-storage path; the initial implementation accepts only `S3`. The payload
+can also override the MX server through `server_url` and the storage connection
+through `object_storage_endpoint_url` and `object_storage_region_name`. Each
+update carries the opaque MX `version_id`.
+`start_weight_update()` opens the update window, `receive_weights()` stages and
+applies the version through `ModelExpressGeneratorClient`, and
+`finish_weight_update()` releases its staged handle. Draft-model updates remain
+unsupported, and trainer-pushed bytes are ignored because trainers publish
+WeightVersions through `ModelExpressTrainerClient`. After a successful apply,
+the bridge merges staging
+and installation metrics and logs each numeric `perf/` phase as a separate INFO
+line in deterministic key order. `perf/mx_receive_stage_weight_time` covers the
+complete `ModelExpressGeneratorClient.stage_weight()` wall-clock call.
 
 `engines/vllm/refit/MdlLoader` implements Mapped Direct Load (MDL) for tensors that have already
 been translated into the inference model's naming and numerical format. The
@@ -900,11 +1037,13 @@ So the two halves are fetched separately:
 
 Fetching metadata unconditionally does not weaken P2P-first, because no weight moves on that path — a live source still serves every byte of the weights.
 
-`model_client.py` wraps the `ModelService` RPCs (`EnsureModelDownloaded`, `ListModelFiles`, `StreamModelFiles`) and validates the stream: chunk offsets must be contiguous, sizes must match the manifest, and every listed file must arrive before the final marker. `model_snapshot.py` owns the local layout, writing `refs/main` alongside `snapshots/<commit>/` — without that ref, `snapshot_download(local_files_only=True)` cannot resolve a repo id no matter how complete the snapshot is. Metadata is published by renaming a staging directory; weights are added to the live snapshot one atomic rename at a time, and a failure part-way through rolls back the files it already published rather than leaving a partial weight set the engine would load as complete.
+`model_client.py` wraps the `ModelService` RPCs (`EnsureModelDownloaded`, `ListModelFiles`, `StreamModelFiles`) and validates the stream: chunk offsets must be contiguous, sizes must match the manifest, and every listed file must arrive before the final marker. `model_snapshot.py` owns the local layout, writing `snapshots/<commit>/` and the ref the engine will look it up by — `refs/main` for an unpinned request, `refs/<revision>` for a pinned branch or tag, and none at all for a pin that is already the commit hash. Without the ref it needs, `snapshot_download(local_files_only=True)` cannot resolve a repo id no matter how complete the snapshot is. Metadata is published by renaming a staging directory; weights are added to the live snapshot one atomic rename at a time, and a failure part-way through rolls back the files it already published rather than leaving a partial weight set the engine would load as complete.
 
 Each phase opens with `EnsureModelDownloaded` and pins everything after it to the revision that call reported, so the manifest and the stream come from one commit and a default revision that moves mid-phase cannot mix two; when the server names no revision, later calls go unpinned and the stream's commit-hash validation is what refuses a mid-phase change. Reuse of a local snapshot is gated on the same value and fails closed without it: a manifest carries only paths and sizes, so a revision that changed neither is indistinguishable from the copy on disk, and reusing it would skip the stream that would have caught the difference. The metadata phase asks with `ignore_weights=true`; the server keys its registry entry on the weight mode, so that claim cannot satisfy the weight phase's later full-weight request, and a cold server does not fetch weights before `RdmaStrategy` has had its chance at them.
 
-Two limits are worth knowing. The metadata phase never asks for a particular revision, only for whichever one the server resolves by default, so a worker that pinned a revision of its own gets a logged mismatch rather than the revision it wanted; the weight phase does pin its request — to the commit the snapshot is named after — so its download claim is scoped to that revision, and it degrades to an unpinned request when the pinned call fails with a `grpc.RpcError`, the shape a failed pin resolve takes; a download failure the server reports through the status stream is raised, not retried. And a server that already holds an unpinned model reports no revision at all, so the metadata phase restreams instead of reusing what is on disk; the files are small and the stream carries the commit, which makes restreaming the cheap way to stay correct.
+A pinned revision travels the whole way. The metadata phase asks the server for the revision the engine requested and refuses to continue unless the server confirms it: a server predating the revision field reports no `resolved_revision` at all, and a commit hash that resolves to a different commit is refused outright, since a commit names one revision and cannot resolve to another. What lands on disk is shaped by the engine's own lookup rather than by the answer: `snapshots/<commit>/` always, plus `refs/<revision>` when the requested revision is not the commit hash — the rule `huggingface_hub` applies to its own cache, since a lowercase 40-hex resolves by directory name while a branch, a tag, or an uppercase hash needs the ref. The ref belongs to the request rather than to the snapshot, so it is recorded when an existing snapshot is reused as well: a commit installed under its own hash leaves no ref behind, and a later request for a branch resolving to it would otherwise reuse the directory with nothing to find it by. A pin for anything other than `main` leaves `refs/main` untouched — the default revision is a different question, and answering it with a pin would misdirect every later unpinned resolution sharing the cache. Reuse of a pinned snapshot is decided by looking at `snapshots/<commit>/` directly, for the same reason.
+
+Two limits are worth knowing. The weight phase pins to the commit its snapshot is named after and degrades to an unpinned request when the pinned call fails with a `grpc.RpcError`, the shape a failed pin resolve takes; a download failure the server reports through the status stream is raised, not retried. And on an unpinned request a server that already holds the model reports no revision at all, so the metadata phase restreams instead of reusing what is on disk; the files are small and the stream carries the commit, which makes restreaming the cheap way to stay correct.
 
 Strategies handle the loading path and NIXL tensor registration. `LoadContext.accelerator_backend` centralizes accelerator-specific torch operations and capability gates for fast paths such as pool registration, VMM arena registration, and GDS. Backends that do not support those CUDA-specific paths, such as XPU, leave the gates disabled and use the generic fallback path. XPU transfer deployments still require a UCX/NIXL runtime that can register XPU device memory. Adapter hooks handle engine lifecycle such as vLLM `process_weights_after_loading`, and the chain performs best-effort metadata publication after a successful strategy. New strategies can be added by creating a new file in `load_strategy/` and registering it in `LoadStrategyChain.run()`.
 
@@ -1057,6 +1196,12 @@ graph TD
 7. **Target becomes source**: After receiving weights or installing a cache artifact, publishes own metadata and starts its own heartbeat
 8. **Stale detection**: Server-side reaper marks workers STALE if `updated_at` > 90s old; `ListSources(READY)` also applies this heartbeat freshness check at query time so expired READY records are not returned while waiting for the next reaper pass. GC deletes STALE workers after 1 hour
 
+Tarred cache artifacts carry regular files and directories only. The source
+side enumerates members explicitly and hands tar that list, so nothing else can
+enter the archive regardless of how a cache directory is laid out; the target
+side enforces the same invariant in `_validate_tar_members` before extraction.
+Symlinks are skipped at packaging time (see [`DEPLOYMENT.md`](DEPLOYMENT.md#p2p-metadata-exchange)).
+
 Cache artifact checksums protect transfer integrity but do not authenticate the
 source or attest the contents. TorchInductor, Triton, DeepGEMM, TileLang, CuTe
 DSL, and FlashInfer caches may
@@ -1095,6 +1240,7 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_HEARTBEAT_INTERVAL_SECS` | `30` | Client heartbeat frequency |
 | `MX_HEARTBEAT_TIMEOUT_SECS` | `90` | Server reaper staleness threshold |
 | `MX_REAPER_SCAN_INTERVAL_SECS` | `30` | Server reaper scan frequency |
+| `MX_REGISTRY_STATS_INTERVAL_SECS` | `60` | Registry-statistics refresh frequency. Writes `mx_registry_entries` and `mx_state_entries`; each pass walks the keyspace, so it is deliberately coarser than a scrape and runs independently of cache eviction |
 | `MX_GC_TIMEOUT_SECS` | `3600` | Time before stale entries are deleted |
 | `VLLM_RPC_TIMEOUT` | `7200000` | vLLM RPC timeout in ms |
 

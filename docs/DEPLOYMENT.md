@@ -111,9 +111,13 @@ reachable.
 | `REDIS_URL` | e.g. `redis://host:6379` | when Redis | Redis connection (or set `MX_REDIS_HOST` / `MX_REDIS_PORT`) |
 | `POD_NAMESPACE` / `MX_METADATA_NAMESPACE` | e.g. `default` | when Kubernetes | Namespace for the `ModelMetadata` and `ModelCacheEntry` CRDs |
 
-To use the Kubernetes backend, apply `examples/crds.yaml` at cluster install time
-(installs both the `ModelMetadata` P2P CRD and the `ModelCacheEntry` registry CRD),
-then either enable `serviceAccount.rbac.enabled=true` on the Helm chart or apply
+To use the Kubernetes backend in a standalone deployment, apply
+`examples/crds.yaml` before the first deployment and reapply it when upgrading
+ModelExpress (it installs or updates both the `ModelMetadata` P2P CRD and the
+`ModelCacheEntry` registry CRD). When using the Helm chart, follow the CRD
+installation and upgrade instructions in [`helm/README.md`](../helm/README.md);
+Helm does not update an existing CRD from the chart's `crds/` directory. Then
+either enable `serviceAccount.rbac.enabled=true` on the Helm chart or apply
 `examples/p2p_transfer_k8s/server/kubernetes_backend/rbac-modelmetadata.yaml`.
 The chart creates a `ClusterRole` and `ClusterRoleBinding`, allowing the server
 to run in a dedicated namespace while accessing metadata resources in another
@@ -605,6 +609,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MODEL_EXPRESS_LOG_LEVEL` | (inherits vLLM) | Override log level for `modelexpress.*` loggers. `DEBUG` enables per-tensor checksums and adopted tensor details |
 | `MX_P2P_METADATA` | `1` | Enable P2P metadata exchange (source workers only). Set to `0` to publish full metadata through a central-coordinator backend. This setting is ignored on backends that require P2P metadata, currently `k8s-service`. |
 | `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
+| `MX_REFIT_METADATA_PORT` | `7555` | Base NIXL listen port for an RL generator's refit client; effective port is `MX_REFIT_METADATA_PORT + device_id`, separate from a boot-time loader manager |
 | `MX_WORKER_GRPC_PORT` | `6555` | Base worker gRPC port for P2P tensor and artifact manifest serving |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
 | `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. The SGLang NIXL loader uses the same artifact path for compatible torch compile, Triton, TVM-FFI, DeepGEMM, TileLang, CuTe DSL, and FlashInfer caches. Requires the P2P metadata path; if `MX_P2P_METADATA=0`, the loader logs a warning and skips artifact transfer. |
@@ -752,6 +757,18 @@ vLLM publishes torch compile (`VLLM_CACHE_ROOT/torch_compile_cache`), Triton (`T
 
 SGLang's NIXL loader publishes torch compile (`TORCHINDUCTOR_CACHE_DIR`, or PyTorch Inductor's runtime `cache_dir()`), Triton (`TRITON_CACHE_DIR`, or `~/.triton/cache`), TVM-FFI (`TVM_FFI_CACHE_DIR`, or `~/.cache/tvm-ffi`), DeepGEMM (`SGLANG_DG_CACHE_DIR`, or `~/.cache/deep_gemm`), TileLang (`TILELANG_CACHE_DIR`, or `~/.tilelang/cache`), CuTe DSL (`CUTE_DSL_CACHE_DIR`, or `$TMPDIR/<user>/cutlass_python_cache`), and FlashInfer (`FLASHINFER_WORKSPACE_BASE/.cache/flashinfer`, or `~/.cache/flashinfer`) caches. The FlashInfer artifact also includes SGLang's persistent autotune directory from `SGLANG_CACHE_DIR/flashinfer/autotune`, or `~/.cache/sglang/flashinfer/autotune` when unset. SGLang runs that autotuner only for eligible FlashInfer MoE or FP4 backends; DeepGEMM + DeepEP does not produce an autotune cache. SGLang TransferEngine transport currently remains weight-only for ModelExpress artifact transfer because cache artifact bytes move through the NIXL artifact path.
 
+Artifacts are sealed as tar archives holding regular files and directories
+only. Symlinks in a cache directory are left out of the archive rather than
+followed or copied verbatim, because engines treat them as derived state and
+rebuild them on demand: FlashInfer, for example, relinks each
+`trtllmGen_*_export` include path to its cubin directory on every JIT module
+lookup, so a link carried across pods would be deleted and recreated anyway.
+Skipping one costs the link entry alone -- neither the packaging walk nor tar
+descends through a symlinked directory, so no subtree is lost. A link that
+resolves inside the cache root is logged at debug (its target is archived under
+its real path); a link that leaves the root or dangles is logged as a warning
+naming the paths. Symlinks never fail an artifact publish.
+
 #### Pairing workers by compile configuration
 
 A torch compile cache is only reusable by a worker whose compile configuration
@@ -838,6 +855,14 @@ RL refit has the same trusted-network requirement. Its trainer-local
 `RefitWorkerService` serves exact-version manifests over plaintext gRPC; the
 manifest digest detects corruption but does not authenticate the trainer.
 
+Canonical S3/XOR trainers consume Hugging Face tensor buckets produced by the
+training framework. Framework-native bucket settings remain the default.
+Integrations may use `MX_REFIT_DELTA_BUCKET_BYTES` as an explicit override, or
+its 512 MiB default when they have no native setting. `MX_REFIT_DELTA_WORKERS`
+(default `min(32, CPU count)`) controls delta-processing concurrency.
+Framework integrations read the bucket-size setting before constructing the
+stream; ModelExpress preserves the supplied bucket boundaries.
+
 ### Server-Backed Model Cache (No Shared Storage)
 
 For workers that cannot reach the Hugging Face Hub themselves, ModelExpress Server can act as the only route to the model. The worker asks the server for repository files; the server downloads the model once on a cold miss and serves every later worker from its own cache.
@@ -867,7 +892,9 @@ Requirements and limits:
 - ModelExpress Server needs a writable cache directory, egress to Hugging Face, and `HF_TOKEN` for private repositories. The worker needs none of these.
 - The server must be from a release newer than v0.5.0 — the first generation that keys registry entries on the weight mode. The metadata phase claims a metadata-only download; an older server records that claim against the model name alone, which marks the model complete, so the weight phase finds nothing left to fetch and the worker falls through to a native load that an offline pod cannot perform.
 - Mount the cache path as a volume shared by every container that touches it. Without a volume the snapshot lands in the container's writable layer, invisible to other containers and lost on restart.
-- Requesting a pinned revision is not supported yet: the metadata phase never asks for a particular revision, so the server picks its default. The weight phase does pin — it requests the commit the local snapshot is named after, so a server whose default revision has moved past that snapshot serves the snapshot's own weights instead of failing the phase; when the pinned call fails with a `grpc.RpcError` (resolving a pin needs the Hub, and its failure takes this shape) it degrades to the unpinned request, which is the previous behavior — a download failure the server reports through the status stream is raised, not retried. Every call after the first in a phase is pinned to the revision the server reported — when it named none, later calls stay unpinned and the stream's own commit-hash validation is the guard, which still refuses a mid-stream change. A worker that asked for a specific revision gets the mismatch logged, and weights whose commit differs from the local snapshot directory are refused rather than mixed in.
+- A pinned revision is honoured. The engine's `revision` — a commit hash, a branch, or a tag — is what the server is asked for, and the snapshot is installed so that the engine's own offline lookup finds it: under `snapshots/<commit>/`, plus a `refs/<revision>` entry unless the requested revision is already the commit hash, which resolves by directory name. A pin for anything other than `main` leaves `refs/main` untouched, so it cannot misdirect a later unpinned resolution in this worker or the next one sharing the cache. A server that does not confirm the requested revision fails the install rather than quietly serving its default — one predating pinned-revision support reports no revision at all, and a commit hash that resolves to a different commit is refused outright. This requires `MODEL_EXPRESS_CACHE_DIRECTORY` and `HF_HUB_CACHE` to be the same path, as above.
+- The weight phase pins to the commit its snapshot is named after, so a server whose default revision has moved past that snapshot serves the snapshot's own weights instead of failing the phase; when the pinned call fails with a `grpc.RpcError` (resolving a pin needs the Hub, and its failure takes this shape) it degrades to the unpinned request — a download failure the server reports through the status stream is raised, not retried. Weights whose commit differs from the local snapshot directory are refused rather than mixed in.
+- `MX_MODEL_REVISION` does not pin anything. It labels the worker's P2P source identity and accepts any string, including one that names no Hugging Face revision at all. Pin through the engine's own revision setting instead.
 - Reusing a local snapshot requires the server to name its revision. A server that already holds an unpinned model answers without naming one, so the worker restreams the metadata rather than assume the copy on disk is current. Metadata is small — well under a second — and the stream carries the commit, which makes restreaming the cheap way to stay correct.
 - On a cold server the metadata phase waits only for the non-weight files. The weights are downloaded later, and only if P2P found no source. The server keys its registry entry on the weight mode, so the metadata-only request does not mark the model complete.
 - The server dedups the upstream download but not the per-worker stream. Concurrent workers on a cold model all wait on one Hugging Face fetch, then each streams its own copy, so N replicas starting together cost N x model size in server egress. Size the server's network accordingly, or stagger large rollouts.

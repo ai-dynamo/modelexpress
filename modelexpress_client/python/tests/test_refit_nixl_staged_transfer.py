@@ -3,9 +3,11 @@
 
 from contextlib import nullcontext
 
-import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 import pytest
 import torch
+
+import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
+from modelexpress import p2p_pb2
 from modelexpress.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
@@ -122,7 +124,9 @@ def test_load_agent_metadata_validates_embedded_agent_identity():
         _load_agent_metadata(_Manager(), {"agent-b": b"metadata"})
 
 
-def test_transformed_source_is_fully_reconstructed_for_verification():
+def test_transformed_source_is_fully_reconstructed_for_verification(monkeypatch):
+    # Full reconstruction + verification is the digest mode; default is minimal reads.
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
     source = SourceInfo(
         global_shape=(4, 4),
         dtype=torch.float32,
@@ -152,6 +156,34 @@ def test_transformed_source_is_fully_reconstructed_for_verification():
         "left",
         "right",
     }
+
+
+def test_transformed_source_reads_only_required_slice_by_default(monkeypatch):
+    monkeypatch.delenv("MX_RESHARD_PUBLISH_DIGEST", raising=False)
+    source = SourceInfo(
+        global_shape=(4, 4),
+        dtype=torch.float32,
+        elsize=4,
+        shards=[
+            Shard((0, 0), (4, 2), "left", 0, 4),
+            Shard((0, 2), (4, 2), "right", 32, 4),
+        ],
+    )
+    copy = RecordedCopy(
+        src_name="weight",
+        op_chain=(("narrow", (1, 0, 2), ()),),
+        param_name="fused_weight",
+        dest_offset=0,
+        dest_shape=(4, 2),
+        dest_stride=(2, 1),
+        dest_dtype=torch.float32,
+    )
+
+    plan = _plan_staged_transfer(CaptureResult(copies=[copy]), {"weight": source})
+
+    assert plan.full_pulls == []
+    assert sum(segment.nbytes for segment in plan.segments) == 32
+    assert {segment.session for segment in plan.segments} == {"left"}
 
 
 def _prepared(tensor: torch.Tensor, digest: str | None) -> _PreparedNixlTransfer:
@@ -185,7 +217,6 @@ def _prepared(tensor: torch.Tensor, digest: str | None) -> _PreparedNixlTransfer
         sources={"weight": source},
         descriptors=(),
         transport=object(),
-        plan_revision=1,
     )
 
 
@@ -233,15 +264,177 @@ def test_transfer_manager_is_closed_after_failed_init_and_only_once(monkeypatch)
             agent_name="generator",
             device_id=0,
             device=torch.device("cpu"),
+            listen_port=19000,
         )
     assert calls == ["initialize", "shutdown"]
 
     transfer = object.__new__(_NixlStagedTransfer)
     transfer._manager = _Manager()
+    transfer._published_peer_rank = None
     transfer._closed = False
     transfer.close()
     transfer.close()
     assert calls == ["initialize", "shutdown", "shutdown"]
+
+
+def test_peer_stage_uses_exact_canonical_tensor_catalog(monkeypatch):
+    monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
+    calls = []
+
+    class _Manager:
+        def register_tensors(self, tensors):
+            calls.append(("register", tuple(tensors)))
+
+        def add_remote_agent(self, metadata):
+            calls.append(("add", metadata))
+            return "peer-agent"
+
+        def fetch_remote_and_wait(self, **kwargs):
+            calls.append(("fetch", kwargs))
+
+        def receive_from_source(self, **kwargs):
+            calls.append(("receive", kwargs))
+            return 16, 1, 0.25
+
+        def remove_remote_agent(self, agent_name):
+            calls.append(("remove", agent_name))
+
+    transfer = object.__new__(_NixlStagedTransfer)
+    transfer._device = torch.device("cpu")
+    transfer._timeout = 30.0
+    transfer._manager = _Manager()
+    transfer._recv_buffers = {}
+    transfer._registered_recv_params = set()
+    transfer._published_peer_rank = None
+    transfer._active = None
+    transfer._closed = False
+    source = p2p_pb2.WorkerMetadata(
+        nixl_metadata=b"peer-metadata",
+        tensors=[
+            p2p_pb2.TensorDescriptor(
+                name="weight",
+                addr=1234,
+                size=16,
+                device_id=0,
+                dtype="torch.float32",
+            )
+        ],
+    )
+
+    staged = transfer.stage_peer(
+        source=source,
+        parameter_layout={"weight": ((4,), torch.float32)},
+    )
+
+    assert staged.metrics["bytes_received"] == 16
+    receive = next(value for name, value in calls if name == "receive")
+    assert receive["remote_agent_name"] == "peer-agent"
+    assert receive["require_exact_match"] is True
+    assert set(receive["destination_tensors"]) == {"weight"}
+    assert calls[-1] == ("remove", "peer-agent")
+
+    calls.clear()
+    source.worker_grpc_endpoint = "127.0.0.1:18000"
+    source.metadata_endpoint = "127.0.0.1:17000"
+    source.agent_name = "live-peer-agent"
+    transfer.stage_peer(
+        source=source,
+        parameter_layout={"weight": ((4,), torch.float32)},
+    )
+    fetch = next(value for name, value in calls if name == "fetch")
+    assert fetch == {
+        "remote_agent_name": "live-peer-agent",
+        "ip": "127.0.0.1",
+        "port": 17000,
+        "timeout_seconds": 30.0,
+    }
+
+    source.metadata_endpoint = ""
+    with pytest.raises(RuntimeError, match="unusable metadata endpoint"):
+        transfer.stage_peer(
+            source=source,
+            parameter_layout={"weight": ((4,), torch.float32)},
+        )
+
+
+def test_peer_republication_unpublishes_active_same_rank_source(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        transfer_module,
+        "unpublish_metadata_for_worker",
+        lambda **kwargs: calls.append(("unpublish", kwargs)),
+    )
+    monkeypatch.setattr(
+        transfer_module,
+        "publish_metadata_and_ready",
+        lambda *args, **kwargs: calls.append(("publish", args, kwargs)),
+    )
+    transfer = object.__new__(_NixlStagedTransfer)
+    transfer._manager = object()
+    transfer._device_id = 2
+    transfer._published_peer_rank = 7
+    staged = transfer_module._StagedNixlWeights(
+        tensors={"weight": torch.ones(1)},
+        metrics={},
+    )
+
+    transfer.publish_peer(
+        staged=staged,
+        identity=p2p_pb2.SourceIdentity(model_name="model", revision="version-a"),
+        p2p_client=object(),
+        worker_rank=7,
+        worker_id="generator-7",
+        accelerator="cuda",
+    )
+    transfer.unpublish_peer()
+
+    assert calls[0] == (
+        "unpublish",
+        {"worker_rank": 7, "device_id": 2},
+    )
+    assert calls[1][0] == "publish"
+    assert "worker_grpc_port" not in calls[1][2]
+    assert calls[2] == (
+        "unpublish",
+        {"worker_rank": 7, "device_id": 2},
+    )
+
+
+def test_first_peer_publication_supersedes_boot_time_rank_source(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        transfer_module,
+        "unpublish_metadata_for_worker",
+        lambda **kwargs: calls.append(("unpublish", kwargs)),
+    )
+    monkeypatch.setattr(
+        transfer_module,
+        "publish_metadata_and_ready",
+        lambda *args, **kwargs: calls.append(("publish", args, kwargs)),
+    )
+    transfer = object.__new__(_NixlStagedTransfer)
+    transfer._manager = object()
+    transfer._device_id = 2
+    transfer._published_peer_rank = None
+    staged = transfer_module._StagedNixlWeights(
+        tensors={"weight": torch.ones(1)},
+        metrics={},
+    )
+
+    transfer.publish_peer(
+        staged=staged,
+        identity=p2p_pb2.SourceIdentity(model_name="model", revision="version-a"),
+        p2p_client=object(),
+        worker_rank=7,
+        worker_id="generator-7",
+        accelerator="cuda",
+    )
+
+    assert calls[0] == (
+        "unpublish",
+        {"worker_rank": 7, "device_id": 2},
+    )
+    assert calls[1][0] == "publish"
 
 
 def test_registered_workspace_is_reused_only_for_the_same_layout(monkeypatch):

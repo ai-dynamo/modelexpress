@@ -161,7 +161,7 @@ impl RegistryBackend for InMemoryRegistryBackend {
                         expires_at: lease_expires_at,
                     },
                 );
-                Ok(ClaimOutcome::Claimed)
+                Ok(ClaimOutcome::TookOver)
             }
             Some(existing) => Ok(ClaimOutcome::AlreadyExists(existing.status)),
             None => {
@@ -527,7 +527,7 @@ mod tests {
                 )
                 .await
                 .expect("takeover"),
-            ClaimOutcome::Claimed
+            ClaimOutcome::TookOver
         );
         assert!(
             !backend

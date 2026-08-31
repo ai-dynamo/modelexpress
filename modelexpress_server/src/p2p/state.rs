@@ -7,6 +7,8 @@
 //! All state — model metadata and source status — is persisted to the backend,
 //! making the server stateless and horizontally scalable.
 
+use crate::metrics::backend::{BackendMetrics, Store};
+use crate::p2p::backend::instrumented::InstrumentedMetadataBackend;
 use crate::p2p::backend::{BackendConfig, MetadataBackend, MetadataResult, create_backend};
 use modelexpress_common::grpc::p2p::{SourceIdentity, WorkerMetadata};
 use std::sync::Arc;
@@ -26,6 +28,7 @@ pub use crate::p2p::backend::{
 pub struct P2pStateManager {
     backend: Arc<RwLock<Option<Arc<dyn MetadataBackend>>>>,
     config: Option<BackendConfig>,
+    metrics: Option<BackendMetrics>,
 }
 
 impl P2pStateManager {
@@ -34,7 +37,43 @@ impl P2pStateManager {
         Self {
             backend: Arc::new(RwLock::new(None)),
             config: Some(config),
+            metrics: None,
         }
+    }
+
+    /// Record backend operations against `metrics`.
+    ///
+    /// Opt-in rather than a `with_config` parameter so the call sites that do not
+    /// care -- tests, and anything constructing a manager outside `run_server` --
+    /// are unchanged. Without it the backend is used bare.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: BackendMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Build the backend for `config`, wrapping it in the metrics decorator when
+    /// one is configured.
+    ///
+    /// Both connection paths route through here. Wrapping inside `create_backend`
+    /// instead would also instrument the direct-construction integration tests.
+    async fn build_backend(
+        &self,
+        config: BackendConfig,
+    ) -> MetadataResult<Arc<dyn MetadataBackend>> {
+        let Some(metrics) = self.metrics.clone() else {
+            return create_backend(config).await;
+        };
+        // The connect is timed around the factory rather than through the
+        // decorator's own `connect` forward. `create_backend` connects the
+        // concrete backend before returning it, so by the time there is anything
+        // to wrap the connection has already happened -- and this is not a
+        // startup-only path: `get_backend` reconnects lazily, so a flapping
+        // backend shows up here as repeated `connect` failures.
+        let backend = metrics
+            .time(Store::P2p, "connect", create_backend(config))
+            .await?;
+        Ok(InstrumentedMetadataBackend::wrap(backend, metrics))
     }
 
     /// Inject a pre-built backend directly (test only).
@@ -43,6 +82,7 @@ impl P2pStateManager {
         Self {
             backend: Arc::new(RwLock::new(Some(backend))),
             config: None,
+            metrics: None,
         }
     }
 
@@ -53,7 +93,7 @@ impl P2pStateManager {
         )?;
 
         let backend_name = config.to_string();
-        let backend = create_backend(config).await?;
+        let backend = self.build_backend(config).await?;
         let mut guard = self.backend.write().await;
         *guard = Some(backend);
 
@@ -79,7 +119,7 @@ impl P2pStateManager {
             "MX_METADATA_BACKEND is not set or invalid. Set it to 'redis' or 'kubernetes'.",
         )?;
 
-        let backend = create_backend(config.clone()).await?;
+        let backend = self.build_backend(config.clone()).await?;
         info!("P2pStateManager connected with {:?}", config);
         *guard = Some(backend.clone());
         Ok(backend)
@@ -217,7 +257,7 @@ mod tests {
 
     fn test_identity() -> SourceIdentity {
         SourceIdentity {
-            mx_version: "0.5.0".to_string(),
+            mx_version: "0.5.1".to_string(),
             mx_source_type: MxSourceType::Weights as i32,
             model_name: "my-model".to_string(),
             backend_framework: 1,
@@ -555,6 +595,7 @@ mod tests {
         let manager = P2pStateManager {
             backend: Arc::new(RwLock::new(None)),
             config: None,
+            metrics: None,
         };
         assert!(manager.connect().await.is_err());
     }

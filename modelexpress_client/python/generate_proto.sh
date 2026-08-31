@@ -9,8 +9,10 @@ PROTO_DIR="${SCRIPT_DIR}/../../modelexpress_common/proto"
 OUT_DIR="${SCRIPT_DIR}/modelexpress"
 RL_OUT_DIR="${SCRIPT_DIR}/modelexpress_rl"
 
-YEAR="$(date +%Y)"
-SPDX_HEADER="# SPDX-FileCopyrightText: Copyright (c) 2025-${YEAR} NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Keep the header fixed rather than stamping it from `date`, so that
+# regenerating always reproduces the committed files byte-for-byte and the
+# CI drift check does not start failing at a year boundary.
+SPDX_HEADER="# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #"
 
