@@ -81,39 +81,29 @@ then represented, which for TP=8 means losing seven eighths of the pod.
 ## Scraping on Kubernetes
 
 ```mermaid
-flowchart LR
-  subgraph enginePod["Inference engine pod -- NOT deployed by this chart"]
-    client["ModelExpress client<br/>(library in vLLM / TRT-LLM / Dynamo)"]
-    cport(["port mx-metrics : 9402"])
-    client --> cport
+flowchart TB
+  subgraph chart["created by this chart -- each adopted only if its labels match the Operator's selector"]
+    direction LR
+    cm["dashboard<br/>ConfigMap"]
+    pm["PodMonitor<br/>podMonitor"]
+    cpm["PodMonitor<br/>clientPodMonitor"]
+    rule["PrometheusRule"]
   end
-
-  subgraph serverPod["ModelExpress server pod -- deployed by this chart"]
-    server["modelexpress-server"]
-    sport(["port metrics : 9401"])
-    server --> sport
-  end
-
-  pm["PodMonitor<br/>metrics.podMonitor"]
-  cpm["PodMonitor<br/>metrics.clientPodMonitor"]
-  rule["PrometheusRule<br/>metrics.rules"]
-  cm["ConfigMap<br/>metrics.dashboard"]
-
-  pm -. "selects chart labels<br/>+ port name metrics" .-> sport
-  cpm -. "selects YOUR labels<br/>+ port name mx-metrics" .-> cport
-
+  sp["ModelExpress server pod<br/>port metrics :9401"]
+  cp["inference engine pod -- not ours<br/>port mx-metrics :9402"]
   prom["Prometheus"]
-  pm -- "adopted only if labels<br/>match podMonitorSelector" --> prom
-  cpm --> prom
-  rule -- "adopted only if labels<br/>match ruleSelector" --> prom
-
   graf["Grafana"]
+  pm -. selects .-> sp
+  cpm -. selects .-> cp
+  sp -- scrape --> prom
+  cp -- scrape --> prom
+  rule -- alerts --> prom
+  cm -- sidecar --> graf
   prom -- PromQL --> graf
-  cm -- "sidecar label<br/>grafana_dashboard" --> graf
 ```
 
-The chart owns the left column; the Operator owns adoption. Every silent failure
-in this section is the chart creating a resource correctly and the Operator
+The chart owns the top row; the Operator owns adoption. Every silent failure in
+this section is the chart creating a resource correctly and the Operator
 declining to adopt it.
 
 Two discovery models exist and they do not overlap. Which one your cluster uses
