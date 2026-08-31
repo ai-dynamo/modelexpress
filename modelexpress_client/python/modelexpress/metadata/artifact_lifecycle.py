@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import ipaddress
-import json
 import logging
 import os
 import tempfile
@@ -15,12 +14,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
-from fcntl import LOCK_EX, LOCK_UN, flock
+from fcntl import LOCK_EX, LOCK_NB, LOCK_UN, flock
 from getpass import getuser
 from hashlib import sha256
 from importlib.metadata import version as pkg_version
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Callable, Iterator, TextIO
 
 import torch
 
@@ -46,7 +45,7 @@ CACHE_SETTLE_SECS = 5
 
 ArtifactEntry = tuple[P2PArtifactTransfer, p2p_pb2.SourceIdentity]
 InstallCompleted = Callable[[P2PArtifactTransfer, p2p_pb2.SourceIdentity], None]
-_PUBLISH_MARKER_VERSION = 1
+_publish_leases: dict[Path, TextIO] = {}
 
 
 def install_artifacts(
@@ -445,112 +444,33 @@ def mark_publish_scheduled(
     transfer: P2PArtifactTransfer,
     identity: p2p_pb2.SourceIdentity,
 ) -> Path | None:
-    """Mark one live worker's artifact publisher as scheduled.
-
-    The marker coordinates workers within one engine launch. It must not become
-    a permanent "already published" flag: a restarted source needs to publish
-    its still-valid local cache again, because the old process's artifact
-    heartbeat and serving endpoint are gone.
-    """
-    marker_path = artifact_marker_path(transfer, identity, "publish-scheduled")
-    with artifact_lock(marker_path):
-        if marker_path.exists():
-            owner = _publish_marker_owner(marker_path)
-            if owner is not None and _publish_marker_owner_is_alive(*owner):
-                return None
-            logger.info(
-                "[Worker %s] Reclaiming stale artifact publish marker: "
-                "name=%s owner_pid=%s owner_starttime=%s",
-                ctx.global_rank,
-                transfer.name,
-                owner[0] if owner is not None else "legacy-or-invalid",
-                owner[1] if owner is not None else "legacy-or-invalid",
-            )
-            marker_path.unlink(missing_ok=True)
-
-        pid = os.getpid()
-        write_marker(
-            marker_path,
-            json.dumps(
-                {
-                    "version": _PUBLISH_MARKER_VERSION,
-                    "pid": pid,
-                    "starttime": _process_starttime(pid),
-                    "worker_rank": ctx.global_rank,
-                },
-                sort_keys=True,
-            ),
-        )
-        return marker_path
-
-
-def _publish_marker_owner(marker_path: Path) -> tuple[int, str | None] | None:
-    """Return the PID and Linux process start time stored in a publish marker."""
+    """Acquire one process-owned artifact publication lease."""
+    lease_path = artifact_marker_path(transfer, identity, "publish-scheduled")
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    lease = lease_path.open("a+")
     try:
-        marker = json.loads(marker_path.read_text())
-        version = marker.get("version")
-        pid = marker.get("pid")
-        starttime = marker.get("starttime")
-        worker_rank = marker.get("worker_rank")
-        if (
-            type(version) is not int
-            or version != _PUBLISH_MARKER_VERSION
-            or type(pid) is not int
-            or pid <= 0
-            or "starttime" not in marker
-            or (starttime is not None and not isinstance(starttime, str))
-            or type(worker_rank) is not int
-            or worker_rank < 0
-        ):
-            return None
-        return pid, starttime
-    except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
-        # Legacy markers contain only a worker rank. Treat them as stale so an
-        # upgraded process can publish its local cache without manual cleanup.
+        flock(lease.fileno(), LOCK_EX | LOCK_NB)
+    except BlockingIOError:
+        lease.close()
         return None
-
-
-def _publish_marker_owner_is_alive(
-    pid: int, expected_starttime: str | None
-) -> bool:
-    """True only when the owner PID still denotes the original process."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # A process outside our UID may still be the active owner in a shared
-        # PID namespace. Avoid creating duplicate publishers in that case.
-        return True
-    actual_starttime = _process_starttime(pid)
-    if expected_starttime is None or actual_starttime is None:
-        # /proc may be unavailable or restricted. A live PID is safer to retain
-        # than to reclaim: duplicate artifact publishers are more disruptive
-        # than the rare PID-reuse false positive without a start-time check.
-        return True
-    return actual_starttime == expected_starttime
-
-
-def _process_starttime(pid: int) -> str | None:
-    """Return Linux /proc process starttime (field 22) for PID-reuse detection."""
-    try:
-        # ``comm`` (field 2) is parenthesized and may contain spaces, so split
-        # only after its final closing parenthesis. The remaining fields begin
-        # at field 3; starttime is therefore index 19.
-        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
-        return fields[19]
-    except (OSError, IndexError):
-        return None
+    _publish_leases[lease_path] = lease
+    logger.debug(
+        "[Worker %s] Acquired artifact publish lease: name=%s",
+        ctx.global_rank,
+        transfer.name,
+    )
+    return lease_path
 
 
 def clear_publish_scheduled(
     publisher: PublisherThread | None,
-    marker_path: Path,
+    lease_path: Path,
 ) -> None:
     if publisher is None or publisher.mx_source_id is not None:
         return
-    with artifact_lock(marker_path):
-        marker_path.unlink(missing_ok=True)
+    lease = _publish_leases.pop(lease_path, None)
+    if lease is not None:
+        lease.close()
 
 
 def artifact_marker_path(
