@@ -71,10 +71,17 @@
 #                         (vllm / sglang). No target pod — the assertion runs
 #                         against mx-server directly via gRPC.
 #
-#   model-streamer       — matrix over vLLM and SGLang; single worker pod, no
+#   model-streamer       — matrix over frameworks; single worker pod, no
 #                          vCluster, no P2P. Streams weights directly from S3
-#                          via runai-model-streamer + IRSA, and validates both
-#                          direct loading and fallback to the native loader.
+#                          via runai-model-streamer + IRSA. Validates the
+#                          streamer path independently of the P2P plumbing.
+#                          Only vllm is active today — the SGLang adapter's
+#                          streamer path currently crashes inside
+#                          ModelStreamerStrategy.load on
+#                          `ctx.model_config.model` (vLLM-specific attribute),
+#                          and the composite action also hard-codes vLLM's
+#                          launch command. Uncomment the sglang matrix entry
+#                          once both are addressed.
 #
 #   ci-status-check     — umbrella job that needs every gating job above.
 #                         Single check that the branch-protection rule on

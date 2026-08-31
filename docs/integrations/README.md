@@ -5,20 +5,11 @@ SPDX-License-Identifier: Apache-2.0
 
 # Integrations
 
-ModelExpress integrates at two layers: runtime loaders receive or stream weight tensors, while orchestrators place and scale those runtime workers. Choose the page for the layer you are changing.
+Runtime integrations implement model loading. Orchestrator integrations place and scale those runtime workers.
 
-## Runtime loaders
+| Layer | Integrations |
+|---|---|
+| Runtime | [vLLM](runtimes/vllm.md), [SGLang](runtimes/sglang.md), [TensorRT-LLM](runtimes/tensorrt-llm.md) |
+| Orchestrator | [NVIDIA Dynamo](orchestrators/dynamo.md), [llm-d](orchestrators/llm-d.md) |
 
-- [vLLM](runtimes/vllm.md)
-- [SGLang](runtimes/sglang.md)
-- [TensorRT-LLM](runtimes/tensorrt-llm.md)
-
-## Orchestrators
-
-- [NVIDIA Dynamo](orchestrators/dynamo.md)
-- [llm-d](orchestrators/llm-d.md)
-
-## Loading paths
-
-- [P2P weight transfer](loading-paths/p2p.md)
-- [ModelStreamer storage loading](loading-paths/model-streamer.md)
+Choose the loading path first in [Choose a ModelExpress path](../guides/choose-a-path.md), then use the runtime or orchestrator page for integration-specific commands and limits.

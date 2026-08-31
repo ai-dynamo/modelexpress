@@ -1,7 +1,5 @@
 # Dynamo P2P Weight and JIT Cache Transfer Example
 
-For the integration boundary and current CI scope, see the [Dynamo integration guide](../../docs/integrations/orchestrators/dynamo.md). This directory contains the runnable Dynamo manifests.
-
 Deploys [ModelExpress](https://github.com/ai-dynamo/modelexpress) P2P RDMA weight transfer on top of [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo) using the `DynamoGraphDeployment` custom resource on Kubernetes.
 
 New worker replicas pull model weights over RDMA and install compatible vLLM JIT caches from running replicas instead of rebuilding all state locally, reducing warm-up time when scaling out large models.

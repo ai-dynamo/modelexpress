@@ -5,9 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # ModelExpress deployment
 
-This page is the deployment reference for the standalone server, Helm, Kubernetes metadata topologies, and worker rollout requirements. If you are deciding which user journey to follow, start with [Choose a ModelExpress path](guides/choose-a-path.md). For environment variables and loader eligibility, use [Configuration](CONFIGURATION.md). For runtime-specific setup, use [Integrations](integrations/README.md). For symptoms and recovery commands, use [Troubleshooting](TROUBLESHOOTING.md). Architecture details are in [ARCHITECTURE.md](ARCHITECTURE.md).
-
-The sections below preserve the detailed deployment material and existing links. The new guides above are the canonical navigation layer; this page should answer how to deploy a chosen topology, not which topology to choose.
+This page is the deployment reference for the standalone server, Helm, Kubernetes metadata topologies, and worker rollout requirements. Start with [Choose a ModelExpress path](guides/choose-a-path.md) if you have not selected a topology. See [Configuration](CONFIGURATION.md) for settings, [Integrations](integrations/README.md) for runtime setup, [Troubleshooting](TROUBLESHOOTING.md) for operational symptoms, and [Architecture](ARCHITECTURE.md) for internals.
 
 ## Server Configuration
 

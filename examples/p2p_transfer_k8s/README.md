@@ -1,7 +1,5 @@
 # Kubernetes P2P Weight Transfer Examples
 
-Start with the [ModelExpress documentation hub](../../docs/README.md) or [Choose a ModelExpress path](../../docs/guides/choose-a-path.md) before selecting a manifest. This directory contains runnable Kubernetes P2P examples.
-
 This example demonstrates how to set up ModelExpress for P2P GPU weight transfers between inference engine replicas on Kubernetes. For the broader deployment guide and environment variable reference, see [`docs/DEPLOYMENT.md`](../../docs/DEPLOYMENT.md). For NIXL architecture details, see [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md).
 
 ## Architecture

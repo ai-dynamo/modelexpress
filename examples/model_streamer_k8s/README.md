@@ -1,7 +1,5 @@
 # ModelStreamer Kubernetes Examples
 
-Start with the [ModelExpress documentation hub](../../docs/README.md) or the [storage-loading scenario](../../docs/guides/choose-a-path.md#can-i-load-from-s3-gcs-azure-blob-or-a-local-path) before selecting a manifest.
-
 These examples deploy vLLM or SGLang with a ModelExpress loader and stream model weights from storage through RunAI ModelStreamer. They do not require a ModelExpress server, RDMA resources, or a model PVC for object storage sources. The vLLM `mx` load format is kept as a backward-compatible alias.
 
 For P2P RDMA weight transfer between inference replicas, see

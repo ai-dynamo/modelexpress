@@ -174,7 +174,7 @@ MX_POOL_REG and MX_VMM_ARENA are alternative registration optimizations. Enable 
 | MX_GDS_TIMEOUT | 120 seconds | GDS operation timeout |
 | INSTANTTENSOR_BACKEND | runtime default | InstantTensor backend such as URING, AIO, CUFILE, or MMAP |
 
-ModelStreamer credentials are third-party settings. See [ModelStreamer](integrations/loading-paths/model-streamer.md).
+ModelStreamer credentials are third-party settings. See [Load from object storage or a local path](guides/choose-a-path.md#load-from-object-storage-or-a-local-path).
 
 ## Artifact transfer
 

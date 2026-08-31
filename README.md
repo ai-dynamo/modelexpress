@@ -274,9 +274,8 @@ Start with the [ModelExpress documentation hub](docs/README.md).
 | [Choose a path](docs/guides/choose-a-path.md) | Scenario-driven path selection for P2P, storage, no shared storage, and orchestrators |
 | [Deployment](docs/DEPLOYMENT.md) | Server prerequisites, Docker, Kubernetes, Helm, and rollout |
 | [Configuration](docs/CONFIGURATION.md) | ModelExpress-owned settings, defaults, and fixed loader-chain eligibility |
-| [Integrations](docs/integrations/README.md) | vLLM, SGLang, TensorRT-LLM, Dynamo, llm-d, P2P, and ModelStreamer |
+| [Integrations](docs/integrations/README.md) | vLLM, SGLang, TensorRT-LLM, Dynamo, and llm-d |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | Symptom-driven diagnostics |
-| [Compatibility](docs/COMPATIBILITY.md) | Current pins and CI-backed support boundaries |
 | [Architecture](docs/ARCHITECTURE.md) | Components, gRPC, NIXL, FP8 |
 | [Benchmarks](docs/BENCHMARKS.md) | Loading paths, NIXL registration, and artifact-transfer results |
 | [RL weight refit](modelexpress_client/python/modelexpress/refit/README.md) | Receiver-driven trainer-to-rollout resharding design and implementation status |

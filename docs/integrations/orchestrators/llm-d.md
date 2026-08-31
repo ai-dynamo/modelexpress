@@ -5,23 +5,12 @@ SPDX-License-Identifier: Apache-2.0
 
 # llm-d
 
-llm-d has a merged, runnable ModelExpress P2P guide: [llm-d ModelExpress P2P](https://github.com/llm-d/llm-d/tree/main/guides/modelexpress-p2p). It composes ModelExpress with llm-d's Optimized Baseline and uses the MX server as a metadata broker while vLLM workers transfer weights directly over NIXL/RDMA.
+Use llm-d's merged [ModelExpress P2P guide](https://github.com/llm-d/llm-d/tree/main/guides/modelexpress-p2p) for the end-to-end Optimized Baseline deployment. ModelExpress links to that guide instead of duplicating llm-d's router, Gateway API, Kustomize, and model-server manifests.
 
-## What the llm-d guide provides
-
-The upstream guide includes the end-to-end deployment, ModelExpress server and CRD manifests, Kustomize overlays, a ModelExpress-enabled image Dockerfile, a no-shared-storage setup, compile-cache transfer, security notes, benchmarks, validation, and CI metadata. ModelExpress should link to that guide rather than duplicate its llm-d-specific manifests.
-
-The guide was merged in [llm-d PR #1608](https://github.com/llm-d/llm-d/pull/1608). Its current default pins ModelExpress `v0.5.0`. This repository's current `main` and Helm chart are `0.5.1`, so treat the upstream pin as a tested integration snapshot, not as an implicit instruction to mix a `0.5.0` server/client with `0.5.1` CRDs.
+llm-d owns orchestration and routing. ModelExpress owns the vLLM load format, metadata contract, server, and NIXL transfer between workers.
 
 ## Version alignment
 
-When following the upstream guide, use one of these approaches:
+The guide merged in [llm-d PR #1608](https://github.com/llm-d/llm-d/pull/1608) currently pins ModelExpress `v0.5.0`; this repository and Helm chart are at `0.5.1`. Either reproduce the guide with its matching `v0.5.0` server, client, and CRDs, or update all ModelExpress image, package, and CRD references together and rerun the guide's validation. Do not mix versions implicitly.
 
-- Reproduce the guide exactly with its `MX_VERSION=v0.5.0` pin and matching server/client image.
-- Update the guide's `MX_VERSION`, image, and CRD references together to `v0.5.1`, then rerun its validation steps. Do not update only the Python package or only the server image.
-
-ModelExpress's `origin/main` does not currently contain an llm-d end-to-end example or CI job. The upstream llm-d guide is the integration-level validation; ModelExpress CI validates the underlying vLLM P2P path and Dynamo topologies, not the llm-d router/operator composition.
-
-## Integration boundary
-
-llm-d owns the router, Gateway API, model-server deployment, and llm-d-specific overlays. ModelExpress owns the worker load format, P2P metadata contract, NIXL transfer, and the ModelExpress server. Use [P2P weight transfer](../loading-paths/p2p.md) for MX settings and the upstream guide for llm-d commands and manifests.
+ModelExpress does not currently carry an llm-d end-to-end CI job. The upstream guide validates the llm-d composition; this repository validates the underlying vLLM P2P path. ModelExpress settings are documented in [Configuration](../../CONFIGURATION.md).

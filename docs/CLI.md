@@ -5,8 +5,6 @@ SPDX-License-Identifier: Apache-2.0
 
 # ModelExpress CLI
 
-Use the [ModelExpress documentation hub](README.md) to choose between the CLI, server-backed cache, P2P, and ModelStreamer paths. This page is the command reference.
-
 A comprehensive command-line interface for interacting with ModelExpress server, providing easy access to model downloads, cache management, health checks, and API operations.
 
 ## Features

@@ -8,10 +8,10 @@ SPDX-License-Identifier: Apache-2.0
 Rust-based model cache management service and GPU-to-GPU weight transfer system using NVIDIA NIXL over RDMA.
 
 **Reference documentation:**
-- [`docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md) - Project structure, crate catalog, gRPC services, server internals, Python client, NIXL integration
-- [`docs/DEPLOYMENT.md`](../docs/DEPLOYMENT.md) - Configuration reference, Docker, Kubernetes, Helm, P2P transfer setup, debugging
-- [`CONTRIBUTING.md`](../CONTRIBUTING.md) - Development setup, available commands, pre-commit hooks, environment variables, DCO
-- [`docs/CLI.md`](../docs/CLI.md) - CLI tool usage, commands, output formats, integration examples
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) - Project structure, crate catalog, gRPC services, server internals, Python client, NIXL integration
+- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) - Configuration reference, Docker, Kubernetes, Helm, P2P transfer setup, debugging
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) - Development setup, available commands, pre-commit hooks, environment variables, DCO
+- [`docs/CLI.md`](docs/CLI.md) - CLI tool usage, commands, output formats, integration examples
 
 ## Coding Standards
 
