@@ -216,6 +216,33 @@ pub struct RegistryMetrics {
 }
 
 impl RegistryMetrics {
+    /// The transitions the code can actually produce, and where each comes from.
+    ///
+    /// The label domain is 4x4, but ten of those sixteen pairs are unreachable:
+    /// nothing moves an entry from `downloaded` to `error`, and `absent` is only
+    /// ever a source for a first claim or a target for a delete. Pre-creating
+    /// all sixteen exported ten series that could never leave zero.
+    ///
+    /// Keep this in step with the call sites. A pair that is produced but not
+    /// listed still records correctly -- `get_or_create` makes it on demand --
+    /// but its first occurrence in each process is invisible to `increase()`,
+    /// which is the whole reason this pre-creation exists.
+    const REACHABLE_TRANSITIONS: [(StatusLabel, StatusLabel); 6] = [
+        // record_claim(Claimed): a first claim on an entry that did not exist.
+        (StatusLabel::Absent, StatusLabel::Downloading),
+        // record_claim(Takeover): ownership changed, the entry never left
+        // DOWNLOADING, so this is an arrival and a departure that cancel.
+        (StatusLabel::Downloading, StatusLabel::Downloading),
+        // reset_download_claim: an error-retry restarting a failed download.
+        (StatusLabel::Error, StatusLabel::Downloading),
+        // finish_download_claim, both terminal outcomes.
+        (StatusLabel::Downloading, StatusLabel::Downloaded),
+        (StatusLabel::Downloading, StatusLabel::Error),
+        // A delete while downloading; the deleting side books it because
+        // finish_download_claim finds no record to fence.
+        (StatusLabel::Downloading, StatusLabel::Absent),
+    ];
+
     /// Register the families and return handles.
     ///
     /// Registered without the `_total` suffix; the encoder appends it.
@@ -257,7 +284,7 @@ impl RegistryMetrics {
         // second. Born at zero, the increment is a visible step.
         //
         // Scoped to these three families deliberately. Their alerts key on rare
-        // one-shot events, and the domains are small: 4 + 3 + 16 series. The
+        // one-shot events, and the domains are small: 4 + 3 + 6 series. The
         // gRPC and backend families would cost 154 and 93 permanently-zero
         // series per pod for ratio alerts that need sustained traffic to fire
         // anyway.
@@ -267,10 +294,8 @@ impl RegistryMetrics {
         for result in LeaseResult::ALL {
             let _ = lease_refreshes.get_or_create(&LeaseLabels { result });
         }
-        for from in StatusLabel::ALL {
-            for to in StatusLabel::ALL {
-                let _ = transitions.get_or_create(&TransitionLabels { from, to });
-            }
+        for (from, to) in Self::REACHABLE_TRANSITIONS {
+            let _ = transitions.get_or_create(&TransitionLabels { from, to });
         }
 
         Self {
@@ -694,8 +719,54 @@ mod tests {
         );
         assert_eq!(
             count("mx_registry_status_transitions_total{"),
-            StatusLabel::ALL.len() * StatusLabel::ALL.len(),
+            RegistryMetrics::REACHABLE_TRANSITIONS.len(),
             "{encoded}"
+        );
+
+        // The unreachable pairs must stay absent. Pre-creating the full 4x4
+        // exported ten series that could never leave zero.
+        for (from, to) in [
+            (StatusLabel::Absent, StatusLabel::Absent),
+            (StatusLabel::Absent, StatusLabel::Downloaded),
+            (StatusLabel::Downloaded, StatusLabel::Error),
+            (StatusLabel::Error, StatusLabel::Downloaded),
+        ] {
+            let needle =
+                format!(r#"mx_registry_status_transitions_total{{from="{from:?}",to="{to:?}"#)
+                    .to_lowercase();
+            assert!(!encoded.to_lowercase().contains(&needle), "{encoded}");
+        }
+    }
+
+    /// Every pair the code books is pre-created, so no first occurrence is
+    /// invisible to `increase()`. Drives the real call sites rather than
+    /// restating the list, so adding a transition without listing it fails here.
+    #[test]
+    fn every_booked_transition_was_pre_created() {
+        let mut registry = new_registry();
+        let metrics = RegistryMetrics::register(&mut registry);
+
+        let before = encode_text(&registry).unwrap_or_else(|_| String::from("<encode failed>"));
+        let series = |text: &str| {
+            text.lines()
+                .filter(|l| l.starts_with("mx_registry_status_transitions_total{"))
+                .count()
+        };
+        let baseline = series(&before);
+
+        metrics.record_claim(ClaimResult::Claimed);
+        metrics.record_claim(ClaimResult::Takeover);
+        metrics.record_transition(StatusLabel::Error, StatusLabel::Downloading);
+        metrics.record_transition(StatusLabel::Downloading, StatusLabel::Downloaded);
+        metrics.record_transition(StatusLabel::Downloading, StatusLabel::Error);
+        metrics.record_transition(StatusLabel::Downloading, StatusLabel::Absent);
+
+        let after = encode_text(&registry).unwrap_or_else(|_| String::from("<encode failed>"));
+        assert_eq!(
+            series(&after),
+            baseline,
+            "a booked transition was not pre-created, so its first occurrence is \
+             invisible to increase(): {after}"
         );
     }
 }
