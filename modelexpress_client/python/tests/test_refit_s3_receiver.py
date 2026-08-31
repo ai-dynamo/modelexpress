@@ -413,8 +413,8 @@ def _build(monkeypatch, tmp_path, objects):
         config=ObjectStorageGeneratorConfig(
             storage_type=ObjectStorageType.S3,
             initial_base_version_id="base-a",
-            launch_checkpoint=launch,
-            preparation_cache_dir=tmp_path / "cache",
+            seed_checkpoint_path=launch,
+            refit_checkpoint_dir=tmp_path / "cache",
         ),
     )
     return adapter, storage
@@ -567,8 +567,8 @@ def test_canonical_s3_applies_delta_tensors_concurrently(monkeypatch, tmp_path):
         config=ObjectStorageGeneratorConfig(
             storage_type=ObjectStorageType.S3,
             initial_base_version_id="base-a",
-            launch_checkpoint=launch,
-            preparation_cache_dir=tmp_path / "cache",
+            seed_checkpoint_path=launch,
+            refit_checkpoint_dir=tmp_path / "cache",
         ),
         s3=_MemoryS3({}),
     )

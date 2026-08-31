@@ -37,8 +37,8 @@ class ModelExpressWeightTransferInitInfo(WeightTransferInitInfo):
 
     model_name: str | None = None
     initial_base_version_id: str | None = None
-    launch_checkpoint: str | None = None
-    preparation_cache_dir: str | None = None
+    seed_checkpoint_path: str | None = None
+    refit_checkpoint_dir: str | None = None
     server_url: str | None = None
     object_storage_type: str | None = None
     object_storage_endpoint_url: str | None = None
@@ -107,8 +107,8 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
         object_storage_values = (
             init_info.object_storage_type,
             init_info.initial_base_version_id,
-            init_info.launch_checkpoint,
-            init_info.preparation_cache_dir,
+            init_info.seed_checkpoint_path,
+            init_info.refit_checkpoint_dir,
             init_info.object_storage_endpoint_url,
             init_info.object_storage_region_name,
         )
@@ -117,13 +117,13 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
             if (
                 init_info.object_storage_type is None
                 or init_info.initial_base_version_id is None
-                or init_info.launch_checkpoint is None
-                or init_info.preparation_cache_dir is None
+                or init_info.seed_checkpoint_path is None
+                or init_info.refit_checkpoint_dir is None
             ):
                 raise ValueError(
                     "object storage requires object_storage_type, "
-                    "initial_base_version_id, launch_checkpoint, and "
-                    "preparation_cache_dir"
+                    "initial_base_version_id, seed_checkpoint_path, and "
+                    "refit_checkpoint_dir"
                 )
             try:
                 storage_type = ObjectStorageType(init_info.object_storage_type)
@@ -135,8 +135,8 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
             object_storage = ObjectStorageGeneratorConfig(
                 storage_type=storage_type,
                 initial_base_version_id=init_info.initial_base_version_id,
-                launch_checkpoint=init_info.launch_checkpoint,
-                preparation_cache_dir=init_info.preparation_cache_dir,
+                seed_checkpoint_path=init_info.seed_checkpoint_path,
+                refit_checkpoint_dir=init_info.refit_checkpoint_dir,
                 endpoint_url=init_info.object_storage_endpoint_url,
                 region_name=init_info.object_storage_region_name,
             )

@@ -429,8 +429,8 @@ def _initialize(
                 ObjectStorageGeneratorConfig(
                     storage_type=ObjectStorageType.S3,
                     initial_base_version_id="base-a",
-                    launch_checkpoint="unused-launch",
-                    preparation_cache_dir="unused-cache",
+                    seed_checkpoint_path="unused-launch",
+                    refit_checkpoint_dir="unused-cache",
                 )
                 if object_storage
                 else None
@@ -485,8 +485,8 @@ def test_generator_config_rejects_invalid_source_order():
             object_storage=ObjectStorageGeneratorConfig(
                 storage_type=ObjectStorageType.S3,
                 initial_base_version_id="base-a",
-                launch_checkpoint="unused-launch",
-                preparation_cache_dir="unused-cache",
+                seed_checkpoint_path="unused-launch",
+                refit_checkpoint_dir="unused-cache",
             ),
             source_order=(WeightSource.TRAINER,),
         )
@@ -496,8 +496,8 @@ def test_generator_config_rejects_invalid_source_order():
             object_storage=ObjectStorageGeneratorConfig(
                 storage_type=ObjectStorageType.S3,
                 initial_base_version_id="base-a",
-                launch_checkpoint="unused-launch",
-                preparation_cache_dir="unused-cache",
+                seed_checkpoint_path="unused-launch",
+                refit_checkpoint_dir="unused-cache",
             ),
             source_order=(
                 WeightSource.GENERATOR,
@@ -528,8 +528,8 @@ def test_generator_rejects_unsupported_object_storage_before_adapter_creation(
                 object_storage=ObjectStorageGeneratorConfig(
                     storage_type=ObjectStorageType.GCS,
                     initial_base_version_id="base-a",
-                    launch_checkpoint="unused-launch",
-                    preparation_cache_dir="unused-cache",
+                    seed_checkpoint_path="unused-launch",
+                    refit_checkpoint_dir="unused-cache",
                 ),
             )
         )

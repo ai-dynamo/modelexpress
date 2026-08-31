@@ -115,8 +115,8 @@ def test_object_storage_runtime_skips_full_tensor_transport(
     storage = ObjectStorageGeneratorConfig(
         storage_type=ObjectStorageType.S3,
         initial_base_version_id="base-a",
-        launch_checkpoint=Path(tmp_path / "launch"),
-        preparation_cache_dir=Path(tmp_path / "cache"),
+        seed_checkpoint_path=Path(tmp_path / "launch"),
+        refit_checkpoint_dir=Path(tmp_path / "cache"),
     )
 
     runtime = GeneratorRuntime.initialize(
