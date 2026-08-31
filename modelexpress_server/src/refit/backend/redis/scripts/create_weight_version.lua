@@ -3,15 +3,14 @@
 -- KEYS[1]: version hash
 -- KEYS[2]: create-request idempotency key
 -- KEYS[3]: expected source slots set
--- ARGV: uid, model_name, version_number, idempotency_key, payload_format,
+-- ARGV: uid, model_name, idempotency_key, payload_format,
 --       base_version_id, expected_source_slots JSON, expected_source_slot_count,
---       state,
---       created_at_unix_ms
+--       s3_uri, initial_state, state, created_at_unix_ms
 --
 -- Returns:
 --   CREATED              this invocation created the version
 --   EXISTING:<id>        another invocation already owns the idempotency key
---   COLLISION            the randomly selected version ID already exists
+--   COLLISION            the selected version ID already exists
 --
 -- Redis executes the script atomically, so two MX server replicas cannot create
 -- different versions for the same idempotency key.
@@ -28,16 +27,17 @@ end
 redis.call('HSET', KEYS[1],
   'uid', ARGV[1],
   'model_name', ARGV[2],
-  'version_number', ARGV[3],
-  'idempotency_key', ARGV[4],
-  'payload_format', ARGV[5],
-  'base_version_id', ARGV[6],
-  'expected_source_slots', ARGV[7],
-  'expected_source_slot_count', ARGV[8],
+  'idempotency_key', ARGV[3],
+  'payload_format', ARGV[4],
+  'base_version_id', ARGV[5],
+  'expected_source_slots', ARGV[6],
+  'expected_source_slot_count', ARGV[7],
+  's3_uri', ARGV[8],
+  'initial_state', ARGV[9],
   'layout_signature', '',
-  'state', ARGV[9],
-  'created_at_unix_ms', ARGV[10])
-for index = 11, #ARGV do
+  'state', ARGV[10],
+  'created_at_unix_ms', ARGV[11])
+for index = 12, #ARGV do
   redis.call('SADD', KEYS[3], ARGV[index])
 end
 redis.call('SET', KEYS[2], ARGV[1])

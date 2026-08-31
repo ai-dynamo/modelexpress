@@ -592,20 +592,89 @@ def test_tarred_p2p_artifact_transfer_rejects_target_bundle_symlink(tmp_path):
     assert outside.read_bytes() == b"keep-me"
 
 
-def test_tarred_p2p_artifact_transfer_rejects_symlink(tmp_path):
+def _prepare_and_install(source, target, bundle):
+    transfer = torch_compile_cache_artifact_transfer(source, target, bundle)
+    installed = transfer.prepare_source()
+    transfer.install(
+        p2p_pb2.GetArtifactManifestHeaderResponse(files=installed.manifest.files)
+    )
+    return transfer
+
+
+def test_tarred_p2p_artifact_transfer_skips_internal_symlink(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
-    target = source / "target.txt"
-    target.write_text("target")
-    (source / "link.txt").symlink_to(target)
-    transfer = torch_compile_cache_artifact_transfer(
-        source,
-        tmp_path / "target",
-        tmp_path / "bundle",
-    )
+    (source / "target.txt").write_text("target")
+    (source / "link.txt").symlink_to(source / "target.txt")
+    target = tmp_path / "target"
 
-    with pytest.raises(ValueError, match="symlink"):
-        transfer.prepare_source()
+    _prepare_and_install(source, target, tmp_path / "bundle")
+
+    assert (target / "target.txt").read_text() == "target"
+    assert not (target / "link.txt").exists()
+
+
+def test_tarred_p2p_artifact_transfer_skips_external_symlink(tmp_path, caplog):
+    caplog.set_level(logging.WARNING, logger="modelexpress.metadata.artifact_transfer")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "header.h").write_text("outside")
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "kernel.so").write_bytes(b"compiled")
+    (source / "include").symlink_to(outside, target_is_directory=True)
+    target = tmp_path / "target"
+
+    _prepare_and_install(source, target, tmp_path / "bundle")
+
+    assert (target / "kernel.so").read_bytes() == b"compiled"
+    assert not (target / "include").exists()
+    assert (outside / "header.h").read_text() == "outside"
+    assert "external symlink" in caplog.text
+
+
+def test_tarred_p2p_artifact_transfer_survives_broken_symlink(tmp_path, caplog):
+    caplog.set_level(logging.WARNING, logger="modelexpress.metadata.artifact_transfer")
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "kernel.so").write_bytes(b"compiled")
+    (source / "dangling").symlink_to(tmp_path / "never-created")
+    target = tmp_path / "target"
+
+    _prepare_and_install(source, target, tmp_path / "bundle")
+
+    assert (target / "kernel.so").read_bytes() == b"compiled"
+    assert not (target / "dangling").is_symlink()
+    assert "broken symlink" in caplog.text
+
+
+def test_tarred_p2p_artifact_transfer_archives_awkward_member_names(tmp_path):
+    source = tmp_path / "source"
+    (source / "gen").mkdir(parents=True)
+    (source / "gen" / "config[sm100].inc").write_text("kept")
+    (source / "gen" / "new\nline.cu").write_text("also kept")
+    (source / "gen" / "link[sm100]").symlink_to(tmp_path / "never-created")
+    (source / "gen" / "new\nline_link").symlink_to(tmp_path / "never-created")
+    target = tmp_path / "target"
+
+    _prepare_and_install(source, target, tmp_path / "bundle")
+
+    assert (target / "gen" / "config[sm100].inc").read_text() == "kept"
+    assert (target / "gen" / "new\nline.cu").read_text() == "also kept"
+    assert not (target / "gen" / "link[sm100]").is_symlink()
+    assert not (target / "gen" / "new\nline_link").is_symlink()
+
+
+def test_tarred_p2p_artifact_transfer_keeps_empty_directories(tmp_path):
+    source = tmp_path / "source"
+    (source / "cached_ops" / "tmp").mkdir(parents=True)
+    (source / "cached_ops" / "kernel.so").write_bytes(b"compiled")
+    target = tmp_path / "target"
+
+    _prepare_and_install(source, target, tmp_path / "bundle")
+
+    assert (target / "cached_ops" / "tmp").is_dir()
+    assert (target / "cached_ops" / "kernel.so").read_bytes() == b"compiled"
 
 
 def test_extract_tarred_artifact_rejects_unsafe_member(tmp_path):
@@ -841,7 +910,7 @@ def test_publish_artifact_source_registers_mx_discovery_metadata(tmp_path):
     )
     bundle = transfer.prepare_source()
     identity = p2p_pb2.SourceIdentity(
-        mx_version="0.5.0",
+        mx_version="0.5.1",
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
         model_name="test/model",
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
@@ -900,7 +969,7 @@ def test_discover_artifact_source_does_not_rank_match_by_default(tmp_path):
     )
     bundle = transfer.prepare_source()
     identity = p2p_pb2.SourceIdentity(
-        mx_version="0.5.0",
+        mx_version="0.5.1",
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
         model_name="test/model",
     )
@@ -1113,7 +1182,7 @@ def test_publish_artifact_source_stops_server_when_refresh_fails(
     )
     bundle = transfer.prepare_source()
     identity = p2p_pb2.SourceIdentity(
-        mx_version="0.5.0",
+        mx_version="0.5.1",
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
         model_name="test/model",
     )
@@ -1154,7 +1223,7 @@ def test_torch_compile_cache_transfer_discovers_source_through_mx_server(tmp_pat
     )
     bundle = transfer.prepare_source()
     identity = p2p_pb2.SourceIdentity(
-        mx_version="0.5.0",
+        mx_version="0.5.1",
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
         model_name="test/model",
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,

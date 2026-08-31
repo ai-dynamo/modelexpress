@@ -5,23 +5,26 @@ syntax = "proto3";
 
 package model_express.refit;
 
-// Control-plane metadata for RL weight publication. Weight bytes and full
-// manifests remain on trainer and generator workers.
+// Control-plane metadata for RL weight publication. Object-storage-backed
+// versions own one global object URI; worker-sharded versions advertise
+// per-worker manifests.
 service RefitService {
   // External APIs: called by the RL framework orchestrator.
-  rpc CreateWeightVersion(CreateWeightVersionRequest) returns (WeightVersion);
-  rpc GetWeightVersion(GetWeightVersionRequest) returns (WeightVersion);
-  rpc DeleteWeightVersion(DeleteWeightVersionRequest) returns (WeightVersion);
+  rpc CreateWeightVersion(CreateWeightVersionRequest) returns (CreateWeightVersionResponse);
+  rpc GetWeightVersion(GetWeightVersionRequest) returns (GetWeightVersionResponse);
+  // Cancel a STAGING version or retire a READY version.
+  rpc DeleteWeightVersion(DeleteWeightVersionRequest) returns (DeleteWeightVersionResponse);
+  rpc UpdateWeightVersionState(UpdateWeightVersionStateRequest) returns (UpdateWeightVersionStateResponse);
 
   // Internal APIs: called by ModelExpress worker clients, not by the RL
   // framework orchestrator.
-  rpc RegisterWorker(RegisterWorkerRequest) returns (WorkerRegistration);
+  rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
   rpc CreateWeightVersionShard(CreateWeightVersionShardRequest) returns (CreateWeightVersionShardResponse);
   rpc ListWeightVersionShards(ListWeightVersionShardsRequest) returns (ListWeightVersionShardsResponse);
   rpc DeleteWeightVersionShard(DeleteWeightVersionShardRequest) returns (DeleteWeightVersionShardResponse);
-  // A live lease protects every shard while a generator installs the version.
+  // A live lease protects the version source while a generator installs it.
   // Re-registering the same lease owner renews its expiry.
-  rpc RegisterVersionLease(RegisterVersionLeaseRequest) returns (VersionLease);
+  rpc RegisterVersionLease(RegisterVersionLeaseRequest) returns (RegisterVersionLeaseResponse);
   rpc DeleteVersionLease(DeleteVersionLeaseRequest) returns (DeleteVersionLeaseResponse);
 }
 
@@ -50,6 +53,13 @@ enum WeightVersionState {
   WEIGHT_VERSION_STATE_RELEASING = 3;
 }
 
+enum ObjectStorageType {
+  OBJECT_STORAGE_TYPE_UNSPECIFIED = 0;
+  OBJECT_STORAGE_TYPE_S3 = 1;
+  OBJECT_STORAGE_TYPE_AZURE = 2;
+  OBJECT_STORAGE_TYPE_GCS = 3;
+}
+
 message WorkerRegistration {
   // Fresh identity for this concrete process lifetime. A restarted worker
   // receives a new worker_id rather than fencing a prior registration.
@@ -64,44 +74,77 @@ message RegisterWorkerRequest {
   uint32 ttl_seconds = 2;
 }
 
+message RegisterWorkerResponse {
+  WorkerRegistration worker = 1;
+}
+
 message WeightVersion {
-  // MX-generated opaque identity for this WeightVersion.
+  // Opaque identity for this WeightVersion. MX generates it when the caller
+  // omits CreateWeightVersionRequest.uid.
   string uid = 1;
   string model_name = 2;
-  // Framework-provided version number for correlation and observability only.
-  optional uint64 version_number = 3;
-  string idempotency_key = 4;
-  WeightPayloadFormat payload_format = 5;
+  string idempotency_key = 3;
+  WeightPayloadFormat payload_format = 4;
   // Present only for XOR_DELTA; identifies the base WeightVersion to which the
   // delta is applied.
-  optional string base_version_id = 6;
-  // Required version-scoped source contributions. Physical source workers are
+  optional string base_version_id = 5;
+  // Required only for worker-sharded publication. Physical source workers are
   // not baked in; the trainer coordinator supplies opaque IDs such as a
-  // selected publisher global rank.
-  repeated string expected_source_slots = 7;
-  // Adapter-defined fingerprint of the model parameter layout, used to detect
-  // incompatible source manifests.
-  string layout_signature = 8;
-  WeightVersionState state = 9;
-  uint64 created_at_unix_ms = 10;
+  // selected publisher global rank. Object-storage-backed versions leave this
+  // empty.
+  repeated string expected_source_slots = 6;
+  // Reserved placeholder for a future server-assigned layout fingerprint.
+  // Content identity currently travels in the payload.
+  string layout_signature = 7;
+  WeightVersionState state = 8;
+  uint64 created_at_unix_ms = 9;
+  // Present only when the version payload is published through object storage.
+  ObjectStorageSource object_storage = 10;
 }
 
 message CreateWeightVersionRequest {
   string model_name = 1;
-  optional uint64 version_number = 2;
-  string idempotency_key = 3;
-  WeightPayloadFormat payload_format = 4;
+  string idempotency_key = 2;
+  WeightPayloadFormat payload_format = 3;
   // Required only for XOR_DELTA; omitted for FULL_TENSOR.
-  optional string base_version_id = 5;
-  repeated string expected_source_slots = 6;
+  optional string base_version_id = 4;
+  // Required for worker-sharded publication; empty for object storage.
+  repeated string expected_source_slots = 5;
+  // Set for an object-storage-backed version; omitted for worker-sharded
+  // publication.
+  ObjectStorageSource object_storage = 6;
+  WeightVersionState state = 7;
+  // Optional caller-selected identity; MX generates one when omitted.
+  optional string uid = 8;
+}
+
+message CreateWeightVersionResponse {
+  WeightVersion version = 1;
 }
 
 message GetWeightVersionRequest {
   string uid = 1;
 }
 
+message GetWeightVersionResponse {
+  WeightVersion version = 1;
+}
+
 message DeleteWeightVersionRequest {
   string uid = 1;
+}
+
+message DeleteWeightVersionResponse {
+  WeightVersion version = 1;
+}
+
+message UpdateWeightVersionStateRequest {
+  string uid = 1;
+  WeightVersionState state = 2;
+}
+
+message UpdateWeightVersionStateResponse {
+  WeightVersion version = 1;
 }
 
 message WeightVersionShard {
@@ -114,7 +157,11 @@ message WeightVersionShard {
   uint64 total_bytes = 5;
   string manifest_digest = 6;
   string manifest_endpoint = 7;
-  string transport = 8;
+}
+
+message ObjectStorageSource {
+  string uri = 1;
+  ObjectStorageType storage_type = 2;
 }
 
 message CreateWeightVersionShardRequest {
@@ -166,6 +213,10 @@ message RegisterVersionLeaseRequest {
   string version_id = 1;
   string worker_id = 2;
   uint32 ttl_seconds = 3;
+}
+
+message RegisterVersionLeaseResponse {
+  VersionLease lease = 1;
 }
 
 message DeleteVersionLeaseRequest {

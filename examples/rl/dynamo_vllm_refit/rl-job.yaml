@@ -1,0 +1,67 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mx-vllm-rl-coordinator
+data:
+  rl_coordinator.py: |
+${RL_COORDINATOR}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mx-vllm-rl-job
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: rl-coordinator
+        image: ${VLLM_ENGINE_IMAGE}
+        command: ["python3", "/opt/e2e/rl_coordinator.py"]
+        envFrom:
+        - secretRef:
+            name: hf-token-secret
+        env:
+        - name: MODEL_NAME
+          value: ${MODEL_NAME}
+        - name: MX_SERVER_ADDRESS
+          value: mx-vllm-refit-server:8000
+        - name: MX_TRAINER_STAGING_MODE
+          value: COPY_TO_DEVICE
+        - name: MX_WEIGHT_PAYLOAD_FORMAT
+          value: FULL_TENSOR
+        - name: MX_RESHARD_PUBLISH_DIGEST
+          value: "1"
+        - name: MX_WORKER_HOST
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: LOCAL_RANK
+          value: "0"
+        - name: MX_RDMA_NIC_PIN
+          value: auto
+        - name: UCX_RNDV_SCHEME
+          value: get_zcopy
+        - name: UCX_RNDV_THRESH
+          value: "0"
+        resources:
+          requests:
+            cpu: "4"
+            memory: 16Gi
+            nvidia.com/gpu: "1"
+            rdma/ib: "1"
+          limits:
+            nvidia.com/gpu: "1"
+            rdma/ib: "1"
+        volumeMounts:
+        - name: coordinator
+          mountPath: /opt/e2e
+      volumes:
+      - name: coordinator
+        configMap:
+          name: mx-vllm-rl-coordinator

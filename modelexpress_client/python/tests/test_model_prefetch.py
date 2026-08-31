@@ -24,6 +24,7 @@ class FakeClient:
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.calls = []
+        self.revisions = []
         self.snapshot = None
         self.error = None
         FakeClient.instances.append(self)
@@ -36,6 +37,7 @@ class FakeClient:
 
     def install_metadata_snapshot(self, repo_id, *args, **kwargs):
         self.calls.append(repo_id)
+        self.revisions.append(kwargs.get("requested_revision"))
         if self.error is not None:
             raise self.error
         return self.snapshot
@@ -218,26 +220,51 @@ class TestConcurrentEnsureMetadata:
         assert installs == [REPO]
 
 
-class TestRevisionMismatch:
-    def test_matching_commit_is_quiet(self, enabled, fake_client, caplog):
-        with caplog.at_level(logging.WARNING):
-            model_prefetch.ensure_metadata(REPO, COMMIT)
-        assert "does not pin a revision" not in caplog.text
+class TestRevisionForwarding:
+    """The engine's revision has to reach the client, not just be logged.
 
-    def test_main_is_quiet(self, enabled, fake_client, caplog):
-        with caplog.at_level(logging.WARNING):
-            model_prefetch.ensure_metadata(REPO, "main")
-        assert "does not pin a revision" not in caplog.text
+    Everything downstream -- which revision the server serves, which directory
+    the snapshot lands in, which ref it is reachable by -- follows from this
+    one value being passed on.
+    """
 
-    def test_pinned_mismatch_explains_itself(self, enabled, fake_client, caplog):
-        with caplog.at_level(logging.WARNING):
-            model_prefetch.ensure_metadata(REPO, "f" * 40)
-        assert "does not pin a revision" in caplog.text
+    def test_commit_hash_is_forwarded(self, enabled, fake_client):
+        model_prefetch.ensure_metadata(REPO, COMMIT)
+        assert FakeClient.instances[-1].revisions == [COMMIT]
 
-    def test_branch_name_warns(self, enabled, fake_client, caplog):
-        with caplog.at_level(logging.WARNING):
-            model_prefetch.ensure_metadata(REPO, "refs/pr/1")
-        assert "does not pin a revision" in caplog.text
+    def test_branch_name_is_forwarded(self, enabled, fake_client):
+        model_prefetch.ensure_metadata(REPO, "refs/pr/1")
+        assert FakeClient.instances[-1].revisions == ["refs/pr/1"]
+
+    def test_no_revision_stays_unpinned(self, enabled, fake_client):
+        model_prefetch.ensure_metadata(REPO)
+        assert FakeClient.instances[-1].revisions == [None]
+
+    def test_empty_revision_stays_unpinned(self, enabled, fake_client):
+        """An engine that fills the field with "" has not pinned anything."""
+        model_prefetch.ensure_metadata(REPO, "")
+        assert FakeClient.instances[-1].revisions == [None]
+
+
+class TestRevisionScopedDedup:
+    def test_same_revision_installs_once(self, enabled, fake_client):
+        first = model_prefetch.ensure_metadata(REPO, COMMIT)
+        second = model_prefetch.ensure_metadata(REPO, COMMIT)
+
+        assert first == second
+        assert len(FakeClient.instances) == 1
+
+    def test_second_revision_is_a_second_install(self, enabled, fake_client):
+        """Two revisions of one model are two installs, not one.
+
+        Keyed by repo id alone, the second request would be served the first
+        revision's snapshot -- a revision the engine never asked for.
+        """
+        model_prefetch.ensure_metadata(REPO, COMMIT)
+        model_prefetch.ensure_metadata(REPO, "f" * 40)
+
+        assert len(FakeClient.instances) == 2
+        assert FakeClient.instances[-1].revisions == ["f" * 40]
 
 
 class TestRepoIdFor:

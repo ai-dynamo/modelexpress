@@ -7,10 +7,11 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import grpc
-import modelexpress_rl.train.client as client_module
+import modelexpress_rl.train.runtime as runtime_module
 import pytest
 from modelexpress.refit.reshard.rendezvous import unwrap_rendezvous_blob
 from modelexpress_rl import (
+    MegatronTrainerContext,
     ModelExpressTrainerClient,
     ModelExpressTrainerConfig,
     TrainerStagingMode,
@@ -64,7 +65,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
     def RegisterWorker(self, request, _context):
         self.events.append("register-worker")
         self.registration_ttl = request.ttl_seconds
-        return request.worker
+        return refit_pb2.RegisterWorkerResponse(worker=request.worker)
 
     def CreateWeightVersionShard(self, request, _context):
         self.events.append("publish-version-shard")
@@ -162,7 +163,7 @@ def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
         close=lambda: None,
     )
     monkeypatch.setattr(
-        client_module._TrainerResources,
+        runtime_module._TrainerResources,
         "initialize",
         lambda **_kwargs: resources,
     )
@@ -199,6 +200,7 @@ def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
     try:
         refit_client = ModelExpressTrainerClient.initialize(
             ModelExpressTrainerConfig(
+                engine_context=MegatronTrainerContext(),
                 device_id=3,
                 server_url=f"127.0.0.1:{port}",
                 model_name="model",
@@ -209,6 +211,7 @@ def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
             )
         )
         source_slot_id = refit_client.bind_tensors(tensors)
+        selected_adapter = refit_client._runtime.method._adapter
         refit_client.publish_version(version=WeightVersionRef("version-a"))
         worker_stub = refit_pb2_grpc.RefitWorkerServiceStub(
             grpc.insecure_channel(refit_service.shard.manifest_endpoint)
@@ -225,7 +228,7 @@ def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
         server.stop(grace=None).wait()
 
     assert isinstance(adapter, TrainerEngineAdapter)
-    assert isinstance(refit_client._adapter, MegatronTrainerAdapter)
+    assert isinstance(selected_adapter, MegatronTrainerAdapter)
     assert events == [
         "register-worker",
         "publish-version-shard",
@@ -243,7 +246,6 @@ def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
         == hashlib.sha256(fetched.manifest).hexdigest()
     )
     assert refit_service.shard.manifest_endpoint == f"127.0.0.1:{port}"
-    assert refit_service.shard.transport == "NIXL"
     assert fetched.manifest_digest == refit_service.shard.manifest_digest
     payload = unwrap_rendezvous_blob(fetched.manifest)
     assert payload.metadata_endpoint == "10.0.0.3:19003"

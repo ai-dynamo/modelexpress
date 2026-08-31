@@ -21,9 +21,13 @@ concurrency:
 jobs:
   mirror_repo:
     name: Mirror Repository to GitLab
-    # Fork PRs do not receive repository secrets, so the mirror/trigger jobs
+    # Upstream-only: mirrors to ai-dynamo's GitLab using secrets a fork does not have.
+    # Fork PRs also do not receive repository secrets, so the mirror/trigger jobs
     # would fail with empty PROJECT_ACCESS_TOKEN/MIRROR_URL/PIPELINE_* values.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: >-
+      github.repository == 'ai-dynamo/modelexpress'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
     environment: GITLAB
     runs-on: gitlab
     steps:
