@@ -14,12 +14,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
-from fcntl import LOCK_EX, LOCK_UN, flock
+from fcntl import LOCK_EX, LOCK_NB, LOCK_UN, flock
 from getpass import getuser
 from hashlib import sha256
 from importlib.metadata import version as pkg_version
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Callable, Iterator, TextIO
 
 import torch
 
@@ -45,6 +45,7 @@ CACHE_SETTLE_SECS = 5
 
 ArtifactEntry = tuple[P2PArtifactTransfer, p2p_pb2.SourceIdentity]
 InstallCompleted = Callable[[P2PArtifactTransfer, p2p_pb2.SourceIdentity], None]
+_publish_leases: dict[Path, TextIO] = {}
 
 
 def install_artifacts(
@@ -443,23 +444,33 @@ def mark_publish_scheduled(
     transfer: P2PArtifactTransfer,
     identity: p2p_pb2.SourceIdentity,
 ) -> Path | None:
-    """Mark one pod-scoped publisher as scheduled."""
-    marker_path = artifact_marker_path(transfer, identity, "publish-scheduled")
-    with artifact_lock(marker_path):
-        if marker_path.exists():
-            return None
-        write_marker(marker_path, str(ctx.global_rank))
-        return marker_path
+    """Acquire one process-owned artifact publication lease."""
+    lease_path = artifact_marker_path(transfer, identity, "publish-scheduled")
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    lease = lease_path.open("a+")
+    try:
+        flock(lease.fileno(), LOCK_EX | LOCK_NB)
+    except BlockingIOError:
+        lease.close()
+        return None
+    _publish_leases[lease_path] = lease
+    logger.debug(
+        "[Worker %s] Acquired artifact publish lease: name=%s",
+        ctx.global_rank,
+        transfer.name,
+    )
+    return lease_path
 
 
 def clear_publish_scheduled(
     publisher: PublisherThread | None,
-    marker_path: Path,
+    lease_path: Path,
 ) -> None:
     if publisher is None or publisher.mx_source_id is not None:
         return
-    with artifact_lock(marker_path):
-        marker_path.unlink(missing_ok=True)
+    lease = _publish_leases.pop(lease_path, None)
+    if lease is not None:
+        lease.close()
 
 
 def artifact_marker_path(
