@@ -371,12 +371,18 @@ class NixlTransferManager:
             raise RuntimeError("NIXL agent not initialized")
 
         tensor_descriptors = self._build_tensor_descriptors(tensors)
+        registrable_descriptors = [
+            descriptor for descriptor in tensor_descriptors if descriptor.size > 0
+        ]
+        registrable_tensors = [
+            tensor for tensor in tensors.values() if tensor.numel() > 0
+        ]
 
         # Phase 1: Discover CUDA allocation boundaries (if pool reg enabled)
         alloc_discovery_start = time.perf_counter()
         if _pool_reg_enabled() and not force_per_tensor:
             if self._accelerator_backend.supports_pool_reg():
-                allocations = self._find_cuda_allocations(tensor_descriptors)
+                allocations = self._find_cuda_allocations(registrable_descriptors)
             else:
                 allocations = None
                 logger.warning(
@@ -405,12 +411,15 @@ class NixlTransferManager:
                 )
             )
             reg_count = len(allocations)
-        else:
-            tensor_list = list(tensors.values())
+        elif registrable_tensors:
             self._registered_memory.append(
-                self._agent.register_memory(tensor_list, backends=self._backends)
+                self._agent.register_memory(
+                    registrable_tensors, backends=self._backends
+                )
             )
-            reg_count = len(tensor_list)
+            reg_count = len(registrable_tensors)
+        else:
+            reg_count = 0
         nixl_reg_time = time.perf_counter() - nixl_reg_start
 
         # Phase 3: Get agent metadata blob

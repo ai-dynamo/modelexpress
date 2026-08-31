@@ -43,6 +43,7 @@ class FullTensorNixlUpdateMethod(UpdateMethod):
         worker_id: str,
         accelerator: str,
         p2p_client: MxClientBase,
+        enable_peer_publication: bool,
     ) -> None:
         self._transfer = transfer
         self._capture_layout = capture_layout
@@ -52,6 +53,7 @@ class FullTensorNixlUpdateMethod(UpdateMethod):
         self._worker_id = worker_id
         self._accelerator = accelerator
         self._p2p_client = p2p_client
+        self._enable_peer_publication = enable_peer_publication
         self._active_plan: _PreparedNixlTransfer | None = None
         self._active_fingerprint: tuple | None = None
         self._active_staged: _StagedNixlWeights | None = None
@@ -116,6 +118,8 @@ class FullTensorNixlUpdateMethod(UpdateMethod):
             raise TypeError("full-tensor method requires staged engine tensors")
         if prepared.staged is not self._active_staged:
             raise RuntimeError("full-tensor staged weight is no longer active")
+        if not self._enable_peer_publication:
+            return
         self._transfer.publish_peer(
             staged=self._active_staged,
             identity=self._build_identity(version_id),

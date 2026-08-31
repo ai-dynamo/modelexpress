@@ -234,6 +234,27 @@ class TestAcceleratorCapabilityGates:
             backends=["UCX"],
         )
 
+    def test_tensor_registration_skips_zero_sized_regions(
+        self,
+        monkeypatch,
+        mock_accelerator_backend_cls,
+    ):
+        monkeypatch.delenv("MX_POOL_REG", raising=False)
+        mgr = self._make_manager(mock_accelerator_backend_cls())
+        tensor = torch.zeros(4, dtype=torch.float32)
+        empty = torch.empty(0, dtype=torch.float32)
+
+        assert mgr.register_tensors({"w": tensor, "empty": empty}) == b"metadata"
+
+        mgr._agent.register_memory.assert_called_once_with(
+            [tensor],
+            backends=["UCX"],
+        )
+        assert [descriptor.name for descriptor in mgr.tensor_descriptors] == [
+            "w",
+            "empty",
+        ]
+
     def test_vmm_arena_unsupported_falls_back_to_tensor_registration(
         self,
         mock_accelerator_backend_cls,

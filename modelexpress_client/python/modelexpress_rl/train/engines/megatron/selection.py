@@ -19,22 +19,25 @@ def model_express_role_for_mapping(
 ) -> str:
     """Return the MX role for one supported Megatron-Bridge mapping."""
     mapping_name = type(mapping).__name__
-    if getattr(mapping, "is_expert", False):
-        raise NotImplementedError(
-            f"ModelExpress does not yet support expert mapping {mapping_name}"
-        )
+    is_expert = bool(getattr(mapping, "is_expert", False))
     if _inherits(mapping, "QKVMapping"):
+        if is_expert:
+            raise NotImplementedError(
+                "ModelExpress does not support expert QKV mapping"
+            )
         if tensor_ndim not in {1, 2}:
             raise NotImplementedError(
                 "ModelExpress QKV publication supports only weights and biases"
             )
         return "qkv_column"
     if _inherits(mapping, "GatedMLPMapping"):
-        return "gated_mlp_column"
+        return "expert_column" if is_expert else "gated_mlp_column"
     if _inherits(mapping, "ColumnParallelMapping"):
-        return "column"
+        return "expert_column" if is_expert else "column"
     if _inherits(mapping, "RowParallelMapping"):
-        return "row" if tensor_ndim > 1 else "replicated"
+        if tensor_ndim <= 1:
+            return "replicated"
+        return "expert_row" if is_expert else "row"
     if _inherits(mapping, "ReplicatedMapping") or _inherits(mapping, "DirectMapping"):
         return "replicated"
     if mapping_name == "AutoMapping":
@@ -45,9 +48,11 @@ def model_express_role_for_mapping(
             )
         detected = mapping._detect_parallelism_type(megatron_module)
         if detected == "column":
-            return "column"
+            return "expert_column" if is_expert else "column"
         if detected == "row":
-            return "row" if tensor_ndim > 1 else "replicated"
+            if tensor_ndim <= 1:
+                return "replicated"
+            return "expert_row" if is_expert else "row"
         if detected == "replicated":
             return "replicated"
         raise ValueError(f"AutoMapping returned unsupported parallelism {detected!r}")
@@ -97,8 +102,16 @@ def build_megatron_tensor_specs(
     transformer_config: Any,
     tensor_parallel_size: int,
     tensor_parallel_rank: int,
+    expert_tensor_parallel_size: int,
+    expert_tensor_parallel_rank: int,
 ) -> list[MegatronTensorSpec]:
     """Translate local Megatron-Bridge conversion tasks into MX tensor specs."""
+    for name, size, rank in (
+        ("tensor", tensor_parallel_size, tensor_parallel_rank),
+        ("expert tensor", expert_tensor_parallel_size, expert_tensor_parallel_rank),
+    ):
+        if size < 1 or not 0 <= rank < size:
+            raise ValueError(f"invalid {name} parallel rank {rank} for size {size}")
     specs = []
     for task in conversion_tasks:
         tensor = task.param_weight
@@ -110,6 +123,13 @@ def build_megatron_tensor_specs(
             tensor_ndim=tensor.ndim,
         )
         hf_param = task.mapping.hf_param
+        is_expert = bool(getattr(task.mapping, "is_expert", False))
+        parallel_size = (
+            expert_tensor_parallel_size if is_expert else tensor_parallel_size
+        )
+        parallel_rank = (
+            expert_tensor_parallel_rank if is_expert else tensor_parallel_rank
+        )
         extras: dict[str, str] = {}
         if role == "qkv_column":
             hf_names = tuple(hf_param[key] for key in ("q", "k", "v"))
@@ -119,14 +139,16 @@ def build_megatron_tensor_specs(
                 global_rows=int(tensor.shape[0]) * tensor_parallel_size,
             )
             shard_axis = 0
-        elif role == "gated_mlp_column":
+        elif role in {"gated_mlp_column", "expert_column"} and _inherits(
+            task.mapping, "GatedMLPMapping"
+        ):
             hf_names = (hf_param["gate"], hf_param["up"])
             extras = {"gated_mlp_order": "gate_then_up"}
             shard_axis = 0
-        elif role == "column":
+        elif role in {"column", "expert_column"}:
             hf_names = (str(hf_param),)
             shard_axis = 0
-        elif role == "row":
+        elif role in {"row", "expert_row"}:
             hf_names = (str(hf_param),)
             shard_axis = 1
         else:
@@ -143,11 +165,11 @@ def build_megatron_tensor_specs(
             assert shard_axis is not None
             local_extent = int(tensor.shape[shard_axis])
             global_shape_list = [int(dim) for dim in tensor.shape]
-            global_shape_list[shard_axis] *= tensor_parallel_size
+            global_shape_list[shard_axis] *= parallel_size
             global_shape = tuple(global_shape_list)
             shard_range = (
-                tensor_parallel_rank * local_extent,
-                (tensor_parallel_rank + 1) * local_extent,
+                parallel_rank * local_extent,
+                (parallel_rank + 1) * local_extent,
             )
             placement = "SHARD"
 

@@ -4,9 +4,11 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from modelexpress_rl.train.engines.megatron.selection import (
     _qkv_descriptor_extras,
+    build_megatron_tensor_specs,
     model_express_role_for_mapping,
 )
 
@@ -15,8 +17,9 @@ class AutoMapping:
     is_expert = False
     permute_dims = None
 
-    def __init__(self, detected: str):
+    def __init__(self, detected: str, *, is_expert: bool = False):
         self.detected = detected
+        self.is_expert = is_expert
 
     def _detect_parallelism_type(self, _module):
         return self.detected
@@ -40,6 +43,16 @@ class QKVMapping:
 
 class GatedMLPMapping:
     is_expert = False
+
+
+class ExpertGatedMLPMapping(GatedMLPMapping):
+    is_expert = True
+
+    def __init__(self):
+        self.hf_param = {
+            "gate": "model.layers.0.mlp.experts.4.gate_proj.weight",
+            "up": "model.layers.0.mlp.experts.4.up_proj.weight",
+        }
 
 
 @pytest.mark.parametrize(
@@ -93,6 +106,77 @@ def test_explicit_mapping_roles(mapping, expected):
         )
         == expected
     )
+
+
+@pytest.mark.parametrize(
+    ("mapping", "expected"),
+    [
+        (ExpertGatedMLPMapping(), "expert_column"),
+        (AutoMapping("row", is_expert=True), "expert_row"),
+    ],
+)
+def test_expert_mapping_roles(mapping, expected):
+    assert (
+        model_express_role_for_mapping(
+            mapping=mapping,
+            megatron_module=SimpleNamespace(),
+            tensor_ndim=2,
+        )
+        == expected
+    )
+
+
+def test_expert_specs_use_expert_tensor_parallel_geometry():
+    gated = ExpertGatedMLPMapping()
+    task = SimpleNamespace(
+        mapping=gated,
+        megatron_module=SimpleNamespace(),
+        param_weight=torch.zeros(8, 3),
+        global_param_name="decoder.layers.0.mlp.experts.linear_fc1.weight4",
+    )
+
+    specs = build_megatron_tensor_specs(
+        conversion_tasks=[task],
+        transformer_config=SimpleNamespace(),
+        tensor_parallel_size=4,
+        tensor_parallel_rank=3,
+        expert_tensor_parallel_size=2,
+        expert_tensor_parallel_rank=1,
+    )
+
+    assert len(specs) == 1
+    assert specs[0].role == "expert_column"
+    assert specs[0].global_shape == (16, 3)
+    assert specs[0].local_shard_range == (8, 16)
+    assert specs[0].hf_names == (
+        "model.layers.0.mlp.experts.4.gate_proj.weight",
+        "model.layers.0.mlp.experts.4.up_proj.weight",
+    )
+
+
+def test_expert_row_specs_use_expert_tensor_parallel_geometry():
+    mapping = AutoMapping("row", is_expert=True)
+    mapping.hf_param = "model.layers.0.mlp.experts.4.down_proj.weight"
+    task = SimpleNamespace(
+        mapping=mapping,
+        megatron_module=SimpleNamespace(),
+        param_weight=torch.zeros(3, 4),
+        global_param_name="decoder.layers.0.mlp.experts.linear_fc2.weight4",
+    )
+
+    specs = build_megatron_tensor_specs(
+        conversion_tasks=[task],
+        transformer_config=SimpleNamespace(),
+        tensor_parallel_size=4,
+        tensor_parallel_rank=3,
+        expert_tensor_parallel_size=2,
+        expert_tensor_parallel_rank=1,
+    )
+
+    assert len(specs) == 1
+    assert specs[0].role == "expert_row"
+    assert specs[0].global_shape == (3, 8)
+    assert specs[0].local_shard_range == (4, 8)
 
 
 def test_qkv_bias_uses_the_qkv_column_role():

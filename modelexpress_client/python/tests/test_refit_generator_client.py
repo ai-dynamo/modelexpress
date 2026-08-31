@@ -513,6 +513,37 @@ def test_generator_config_rejects_invalid_source_order():
         )
 
 
+def test_generator_config_reads_source_order_from_env(monkeypatch):
+    monkeypatch.setenv("MX_GENERATOR_SOURCE_ORDER", "trainer")
+
+    config = ModelExpressGeneratorConfig(
+        engine_context=VllmGeneratorContext(model=object(), vllm_config=object())
+    )
+
+    assert config.source_order == (WeightSource.TRAINER,)
+
+
+def test_generator_config_explicit_source_order_overrides_env(monkeypatch):
+    monkeypatch.setenv("MX_GENERATOR_SOURCE_ORDER", "invalid")
+
+    config = ModelExpressGeneratorConfig(
+        engine_context=VllmGeneratorContext(model=object(), vllm_config=object()),
+        source_order=(WeightSource.TRAINER,),
+    )
+
+    assert config.source_order == (WeightSource.TRAINER,)
+
+
+@pytest.mark.parametrize("value", ["", "TRAINER,", "unknown"])
+def test_generator_config_rejects_invalid_source_order_env(monkeypatch, value):
+    monkeypatch.setenv("MX_GENERATOR_SOURCE_ORDER", value)
+
+    with pytest.raises(ValueError, match="MX_GENERATOR_SOURCE_ORDER"):
+        ModelExpressGeneratorConfig(
+            engine_context=VllmGeneratorContext(model=object(), vllm_config=object())
+        )
+
+
 def test_generator_rejects_unsupported_object_storage_before_adapter_creation(
     monkeypatch,
 ):
@@ -566,6 +597,19 @@ def test_generator_uses_configured_source_order(monkeypatch):
         adapter,
         source_order=(WeightSource.TRAINER,),
     )
+    try:
+        resolvers = generator._runtime.session._planner._resolvers
+        assert [resolver.kind for resolver in resolvers] == [WeightSource.TRAINER]
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+
+def test_generator_uses_source_order_from_env(monkeypatch):
+    monkeypatch.setenv("MX_GENERATOR_SOURCE_ORDER", "TRAINER")
+    server, endpoint, service = _start_server()
+    adapter = _Adapter(service)
+    generator = _initialize(monkeypatch, endpoint, adapter)
     try:
         resolvers = generator._runtime.session._planner._resolvers
         assert [resolver.kind for resolver in resolvers] == [WeightSource.TRAINER]

@@ -143,6 +143,50 @@ def test_object_storage_runtime_skips_full_tensor_transport(
     assert not p2p.closed
 
 
+def test_trainer_only_runtime_does_not_open_generator_listener(monkeypatch):
+    context = GeneratorEngineContext()
+    monkeypatch.setattr(
+        engines_module, "_create_engine_runtime", lambda received: _full_tensor_engine()
+    )
+    p2p = _P2P(server_url="mx:8000")
+    monkeypatch.setattr(runtime_module, "MxClient", lambda **_kwargs: p2p)
+    transfer_kwargs = {}
+
+    def create_transfer(**kwargs):
+        transfer_kwargs.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(runtime_module, "_NixlStagedTransfer", create_transfer)
+    full_tensor = _Method({WeightSource.GENERATOR, WeightSource.TRAINER})
+    method_kwargs = {}
+
+    def create_method(**kwargs):
+        method_kwargs.update(kwargs)
+        return full_tensor
+
+    monkeypatch.setattr(
+        runtime_module,
+        "FullTensorNixlUpdateMethod",
+        create_method,
+    )
+
+    runtime = GeneratorRuntime.initialize(
+        engine_context=context,
+        worker_id="generator-3",
+        server_url="mx:8000",
+        object_storage=None,
+        source_order=(WeightSource.TRAINER,),
+        max_transfer_attempts=3,
+        rpc_timeout_seconds=30,
+        service=lambda: object(),
+        start_lease=lambda _version_id: object(),
+    )
+
+    assert transfer_kwargs["listen_port"] is None
+    assert method_kwargs["enable_peer_publication"] is False
+    runtime.close()
+
+
 def test_generator_runtime_closes_resources_when_resolver_creation_fails(
     monkeypatch,
 ):
