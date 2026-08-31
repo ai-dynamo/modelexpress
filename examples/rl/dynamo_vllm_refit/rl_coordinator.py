@@ -16,6 +16,7 @@ import torch.distributed as dist
 from transformers import AutoModelForCausalLM
 
 from modelexpress_rl import (
+    FSDPTrainerContext,
     ModelExpressControlClient,
     ModelExpressTrainerClient,
     ModelExpressTrainerConfig,
@@ -116,6 +117,7 @@ def main() -> None:
     baseline = _inference()
     trainer = ModelExpressTrainerClient.initialize(
         ModelExpressTrainerConfig(
+            engine_context=FSDPTrainerContext(),
             device_id=0,
             model_name=MODEL_NAME,
             server_url=MX_SERVER_ADDRESS,

@@ -400,9 +400,9 @@ During framework initialization, the same bucket stream seeds only that rank's
 owned launch-checkpoint tensors through direct, concurrent
 `prepare_delta_base()` bucket reads. The first real delta stage uses the
 prepared snapshot without checkpoint I/O.
-Canonical S3 artifacts live under
-`{uri_prefix}/v{version_number}/`, with the
-index and delta shards stored as siblings.
+Each canonical S3 version owns an exact caller-supplied `object_storage.uri`
+under the configured `uri_prefix`. That URI names the global index; its delta
+shards are stored as siblings.
 The index's `compression_format` selects the receiver's decompressor. The
 current implementation supports Zstandard. Unknown compression formats are
 rejected before shard download.
@@ -429,7 +429,9 @@ flowchart LR
     P["MX server<br/>P2pService"]
 
     subgraph Trainer["Trainer rank"]
-        TA["Trainer engine adapter"]
+        TR["TrainerRuntime"]
+        TA["Explicit engine context<br/>Megatron or FSDP"]
+        PM["Publication method<br/>full tensor NIXL or canonical delta"]
         B["Registered source buffers"]
         M["RefitWorkerService<br/>manifest endpoint"]
         C["Canonical HF gather<br/>XOR staging"]
@@ -438,9 +440,10 @@ flowchart LR
     D["S3<br/>safetensors shards + index"]
 
     subgraph Generator["Generator rank"]
-        GA["Generator engine adapter"]
-        X["NIXL staged transfer<br/>plan, pull, verify"]
-        I["vLLM installer<br/>capture, apply"]
+        GR["GeneratorRuntime<br/>source policy + session"]
+        SR["Source resolvers<br/>generator, trainer, object storage"]
+        UM["Update methods<br/>full tensor NIXL, canonical delta"]
+        I["Engine installer<br/>vLLM or SGLang"]
     end
 
     PG["Peer generator rank<br/>verified canonical buffers"]
@@ -448,17 +451,18 @@ flowchart LR
     O -->|"Create / Get / Delete / update version state"| S
     O -->|"Framework-native RPC"| T
     O -->|"Framework-native RPC"| G
-    T --> TA --> B
-    T --> C --> D
+    T --> TR --> TA --> PM
+    PM --> B
+    PM --> C --> D
     T -->|"NIXL: register worker; publish shard metadata"| S
     T --> M
     G -->|"Register worker; lease version; NIXL: discover shards"| S
     G -->|"Discover exact-version same-rank peer"| P
-    G --> GA --> X --> I
+    G --> GR --> SR --> UM --> I
     G -->|"Fetch exact-version manifest"| M
-    B -->|"NIXL reads"| X
+    B -->|"NIXL reads"| UM
     PG -->|"Publish READY version identity"| P
-    PG -->|"Peer manifest + NIXL reads"| X
+    PG -->|"Peer manifest + NIXL reads"| UM
 ```
 
 `RefitService` is the central metadata service defined by `refit.proto`. It
@@ -487,8 +491,11 @@ prevent untrusted clients from reaching MX server and worker gRPC endpoints.
 Transport authentication and TLS require a separate protocol and deployment
 design; they are not provided by this implementation.
 
-The generator adapter deliberately composes two private implementations rather
-than inheriting from the legacy reshard receiver:
+`GeneratorRuntime` composes three independent seams. Source resolvers discover
+candidate locations without moving bytes; update methods transfer and verify a
+typed artifact without mutating the live engine; the engine installer commits
+that artifact at the caller's safe point. Source fallback and retry limits live
+in the planner/session rather than in engine integrations.
 
 - `nixl_staged_transfer.py` owns exact-manifest decoding, transfer planning,
   reusable registered buffers, NIXL reads, transforms, and digest verification.
@@ -496,11 +503,14 @@ than inheriting from the legacy reshard receiver:
   reconstruction, and locked host-local checkpoint state.
 - `inference/engines/vllm/installer.py` owns vLLM load-layout capture and
   graph-safe installation through vLLM's layerwise reload and post-load path.
-- `inference/engines/sglang/adapter.py` reloads a prepared canonical checkpoint
+- `inference/engines/sglang/installer.py` reloads a prepared canonical checkpoint
   through SGLang's native safetensors loader.
 
-This keeps transport and verification independent of vLLM while keeping
-engine-specific parameter and CUDA-graph handling out of the transfer layer.
+The corresponding trainer composition is owned by `TrainerRuntime`. Public
+`FSDPTrainerContext` and `MegatronTrainerContext` select only engine capture;
+full-tensor NIXL and canonical-delta object-storage publication remain separate
+method implementations. This keeps transport, payload preparation, engine
+geometry, and framework orchestration independently replaceable.
 
 | RPC | Request | Response | Purpose |
 |-----|---------|----------|---------|
@@ -532,15 +542,18 @@ staging buffers—not engine-specific packed kernel tensors—under that identit
 An identical-rank peer pulls those buffers directly with NIXL, then uses the
 same graph-safe engine installer as a trainer update.
 
-S3-configured generator clients currently bypass the peer and trainer refit
-strategies. They resolve the version-level S3 URI directly and use the canonical
-S3 receiver; peer-first selection with trainer fallback applies only to the NIXL
-path for now.
+An object-storage generator defaults to a same-rank generator peer first and the
+version-level object-storage source second. A memory-backed generator defaults
+to a peer first and trainer manifests second. `source_order` can select or
+reorder supported sources without changing an engine integration.
 
-`WeightVersion.uid` is MX's opaque identity. `version_number` is the optional
-framework-provided numeric label used for correlation; canonical S3 publication
-requires it for the `v{version_number}` object prefix. MX does not use it as a
-control-plane identity or ordering key.
+`WeightVersion.uid` is MX's opaque version identity. A create request may supply
+the UID; MX generates one when it is omitted. Creating another version with an
+already-used caller-supplied UID returns `ALREADY_EXISTS`. For an `XOR_DELTA`,
+`base_version_id` identifies the base version's UID. The canonical index records
+these UID strings as `metadata.version` and `metadata.base_version`. MX assigns
+no numeric ordering and requires no version-directory naming convention; the
+exact `object_storage.uri` identifies the version's global index.
 `WeightVersionShard` remains the name of the per-worker manifest publication.
 Its identity is `(version_id, worker_id, source_slot_id)`: `source_slot_id`
 identifies the required, version-scoped source contribution it covers, and
@@ -838,16 +851,21 @@ RL framework integrations live in the separate `modelexpress_rl` package:
 | Module | Purpose |
 |--------|---------|
 | `control.py` | Public orchestrator client for creating, reading, and retiring immutable weight versions |
-| `train/client.py` | Public rank-local trainer lifecycle; owns transport resources and bound tensor state, selects the configured engine lazily after distributed setup, and publishes shards |
+| `train/client.py` | Public rank-local trainer lifecycle and control-plane registration |
+| `train/runtime.py` | Trainer publication composition, bound tensor state, and transport-resource ownership |
+| `train/context.py` | Public explicit Megatron and FSDP engine selection |
+| `train/methods/` | Independent full-tensor NIXL and canonical-delta publication methods |
 | `train/engines/megatron/selection.py` | Megatron-Bridge mapping and tensor-selection translation into MX publication specs |
 | `train/engines/megatron/adapter.py` | Stable in-place Megatron tensor registration and manifest construction |
 | `train/engines/fsdp/adapter.py` | FSDP/DTensor source capture with in-place or device-copy staging |
 | `inference/client.py` | Rank-local generator lifecycle, leases, exact-version source discovery, staging, and apply |
+| `inference/runtime.py` | Generator source policy, method/resource composition, and update-session ownership |
+| `inference/source/` | Independent generator-peer, trainer-memory, and object-storage discovery |
+| `inference/methods/` | Independent full-tensor NIXL and canonical-delta preparation |
 | `inference/receiver.py` | Canonical S3 index/shard decoding and exact-base checkpoint mutation under a local lock |
 | `inference/nixl_staged_transfer.py` | Private engine-neutral exact-manifest NIXL planning, transfer, reusable buffers, and verification |
-| `inference/engines/sglang/` | SGLang context and native checkpoint reload adapter |
+| `inference/engines/sglang/` | SGLang context and native checkpoint installer |
 | `inference/engines/vllm/context.py` | Public typed vLLM objects passed to `ModelExpressGeneratorClient.initialize()` |
-| `inference/engines/vllm/adapter.py` | Generator adapter that keeps the existing NIXL full-tensor path and directly uses canonical S3 staging for XOR deltas |
 | `inference/engines/vllm/installer.py` | Private vLLM load-layout capture plus graph-safe tensor or prepared-checkpoint installation |
 | `inference/engines/vllm/weight_transfer_engine.py` | Native vLLM weight-transfer bridge for NIXL full-tensor and canonical S3/XOR refit |
 
@@ -888,15 +906,12 @@ Thin orchestration layer that delegates to `LoadStrategyChain.run()`. Builds a `
 
 ### vLLM Refit Installation
 
-`VllmGeneratorAdapter` has two fixed initialization modes. Without an object
-storage configuration it preserves the existing full-tensor NIXL transfer,
-plan reuse, and staged-buffer installation path. With
-`ObjectStorageGeneratorConfig(storage_type=ObjectStorageType.S3, ...)` it
-directly uses `CanonicalS3GeneratorAdapter` to reconstruct and verify an exact
-XOR delta in a host-local safetensors checkpoint; no NIXL transfer manager or
-transfer plan is created. The shared private installer reloads that prepared
-checkpoint through vLLM's `DefaultModelLoader` inside the same graph-safe
-layerwise reload window used by the NIXL path.
+The vLLM integration exposes engine installation and full-tensor target geometry
+to `GeneratorRuntime`; it does not select a transport or source. Runtime
+composition adds the NIXL full-tensor method when generator or trainer memory is
+requested and adds the canonical-delta method when object storage is configured.
+Both methods feed the shared private installer, which commits staged tensors or
+reloads a prepared checkpoint through vLLM's graph-safe layerwise reload path.
 
 The ModelExpress vLLM plugin registers one `modelexpress` native weight-transfer
 backend for both paths. An empty initialization payload preserves the existing

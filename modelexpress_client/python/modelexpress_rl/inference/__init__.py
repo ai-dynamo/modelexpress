@@ -7,6 +7,7 @@ from .client import (
     ModelExpressGeneratorClient,
     ModelExpressGeneratorConfig,
     StagedWeightHandle,
+    WeightSource,
 )
 from .engines.sglang import SglangGeneratorContext
 from .engines.vllm import VllmGeneratorContext
@@ -19,4 +20,5 @@ __all__ = [
     "SglangGeneratorContext",
     "StagedWeightHandle",
     "VllmGeneratorContext",
+    "WeightSource",
 ]

@@ -113,7 +113,11 @@ def _prepared(tensor: torch.Tensor, nbytes: int) -> _PreparedNixlTransfer:
 
 def _stage(monkeypatch, *, nbytes: int, wire_s: float):
     """Run stage() to completion on CPU with a scripted wire duration."""
-    monkeypatch.setattr(transfer_module, "time", _Clock(0.0, wire_s))
+    monkeypatch.setattr(
+        transfer_module,
+        "time",
+        _Clock(0.0, wire_s, wire_s, wire_s),
+    )
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
     tensor = torch.arange(64, dtype=torch.int32)
     prepared = _prepared(tensor, nbytes)

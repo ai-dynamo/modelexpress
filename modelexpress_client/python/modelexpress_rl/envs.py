@@ -30,19 +30,19 @@ if TYPE_CHECKING:
     MX_S3_TCP_KEEPALIVE: bool
     MX_S3_UPLOAD_PART_BYTES: int
     MX_S3_UPLOAD_WORKERS: int
-    MX_TRAINER_ENGINE: str
     MX_TRAINER_STAGING_MODE: str
     MX_WEIGHT_PAYLOAD_FORMAT: str
+    LOCAL_RANK: int | None
     RANK: str | None
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    "LOCAL_RANK": lambda: (
+        int(os.environ["LOCAL_RANK"]) if "LOCAL_RANK" in os.environ else None
+    ),
     "MX_REFIT_METADATA_PORT": lambda: require_positive_int(
         int(os.environ.get("MX_REFIT_METADATA_PORT", "7555")),
         "MX_REFIT_METADATA_PORT",
-    ),
-    "MX_TRAINER_ENGINE": lambda: (
-        os.environ.get("MX_TRAINER_ENGINE", "MEGATRON").strip().upper()
     ),
     "MX_TRAINER_STAGING_MODE": lambda: (
         os.environ.get("MX_TRAINER_STAGING_MODE", "IN_PLACE").strip().upper()

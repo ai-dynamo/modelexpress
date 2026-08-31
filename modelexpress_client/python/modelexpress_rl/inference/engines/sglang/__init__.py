@@ -4,26 +4,22 @@
 """SGLang generator integration for ModelExpress RL refit."""
 
 from ...adapter import GeneratorEngineContext
-from ...receiver import ObjectStorageGeneratorConfig
-from .adapter import SGLangGeneratorAdapter
+from ...runtime import EngineRuntime
 from .context import SglangGeneratorContext
 
 
-def _create_sglang_adapter(
+def _create_sglang_engine_runtime(
     engine_context: GeneratorEngineContext,
-    object_storage: ObjectStorageGeneratorConfig | None,
-) -> SGLangGeneratorAdapter:
+) -> EngineRuntime:
     if not isinstance(engine_context, SglangGeneratorContext):
         raise TypeError("SGLang requires a SglangGeneratorContext")
-    if object_storage is None:
-        raise ValueError("SGLang requires object storage")
-    return SGLangGeneratorAdapter(
-        context=engine_context,
-        config=object_storage,
+    from .installer import _SglangInstaller
+
+    runner = engine_context.model_runner
+    return EngineRuntime(
+        model_name=runner.model_config.model_path,
+        installer=_SglangInstaller(runner),
     )
 
 
-__all__ = [
-    "SGLangGeneratorAdapter",
-    "SglangGeneratorContext",
-]
+__all__ = ["SglangGeneratorContext"]

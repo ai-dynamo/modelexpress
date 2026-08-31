@@ -111,9 +111,13 @@ reachable.
 | `REDIS_URL` | e.g. `redis://host:6379` | when Redis | Redis connection (or set `MX_REDIS_HOST` / `MX_REDIS_PORT`) |
 | `POD_NAMESPACE` / `MX_METADATA_NAMESPACE` | e.g. `default` | when Kubernetes | Namespace for the `ModelMetadata` and `ModelCacheEntry` CRDs |
 
-To use the Kubernetes backend, apply `examples/crds.yaml` at cluster install time
-(installs both the `ModelMetadata` P2P CRD and the `ModelCacheEntry` registry CRD),
-then either enable `serviceAccount.rbac.enabled=true` on the Helm chart or apply
+To use the Kubernetes backend in a standalone deployment, apply
+`examples/crds.yaml` before the first deployment and reapply it when upgrading
+ModelExpress (it installs or updates both the `ModelMetadata` P2P CRD and the
+`ModelCacheEntry` registry CRD). When using the Helm chart, follow the CRD
+installation and upgrade instructions in [`helm/README.md`](../helm/README.md);
+Helm does not update an existing CRD from the chart's `crds/` directory. Then
+either enable `serviceAccount.rbac.enabled=true` on the Helm chart or apply
 `examples/p2p_transfer_k8s/server/kubernetes_backend/rbac-modelmetadata.yaml`.
 The chart creates a `ClusterRole` and `ClusterRoleBinding`, allowing the server
 to run in a dedicated namespace while accessing metadata resources in another

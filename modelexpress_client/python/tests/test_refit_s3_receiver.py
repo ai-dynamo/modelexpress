@@ -17,10 +17,16 @@ from modelexpress_rl import (
     ObjectStorageSource,
     ObjectStorageType,
     WeightPayloadFormat,
+    WeightVersion,
+    WeightVersionState,
 )
 from modelexpress_rl.inference.adapter import GeneratorTransferInputs
 from modelexpress_rl.inference import receiver as receiver_module
-from modelexpress_rl.inference.receiver import CanonicalS3GeneratorAdapter
+from modelexpress_rl.inference.methods import CanonicalDeltaUpdateMethod
+import modelexpress_rl.inference.methods.canonical_delta as canonical_delta_module
+from modelexpress_rl.inference.plan import (
+    ObjectStorageUpdateSource,
+)
 from modelexpress_rl.s3 import ImmutableS3Conflict, S3Client
 from modelexpress_rl.utils import adler32_checksum, compress_delta, compute_delta
 
@@ -138,13 +144,47 @@ def _transfer_manager(monkeypatch):
     monkeypatch.setattr(s3transfer.manager, "TransferManager", _TransferManager)
 
 
-class _Adapter(CanonicalS3GeneratorAdapter):
+class _Adapter:
     def __init__(self, **kwargs):
         self.installed = []
-        super().__init__(**kwargs)
+        self._method = CanonicalDeltaUpdateMethod(**kwargs)
+        self._checkpoint = self._method._checkpoint
+        self._active = None
 
-    def install_prepared_checkpoint(self, prepared):
-        self.installed.append(prepared.path)
+    def stage_weight(self, inputs):
+        version = WeightVersion(
+            version_id=inputs.version_id,
+            model_name="test/model",
+            payload_format=inputs.payload_format,
+            base_version_id=inputs.base_version_id,
+            object_storage=inputs.object_storage,
+            expected_source_slots=(),
+            layout_signature=inputs.layout_signature,
+            state=WeightVersionState.READY,
+            created_at_unix_ms=0,
+        )
+        self._active = self._method.prepare(
+            version=version,
+            source=ObjectStorageUpdateSource(
+                storage=inputs.object_storage,
+                payload_format=inputs.payload_format,
+            ),
+        )
+        return self._active.checkpoint
+
+    def apply_weight(self, staged):
+        assert self._active is not None and self._active.checkpoint is staged
+        with self._method.installation_context(self._active):
+            self.installed.append(staged.path)
+        return {"perf/mx_receive_install_time": 0.0}
+
+    def release_staged_weight(self, staged):
+        assert self._active is not None and self._active.checkpoint is staged
+        self._method.release(self._active)
+        self._active = None
+
+    def close(self):
+        self._method.close()
 
 
 def test_s3_read_parses_uri():
@@ -309,7 +349,7 @@ def _artifact(
     *,
     checksum=None,
     version="target-a",
-    version_number=1,
+    version_label=1,
     base_version="base-a",
 ):
     delta, _ = compute_delta(target, base)
@@ -332,7 +372,7 @@ def _artifact(
         sort_keys=True,
         separators=(",", ":"),
     ).encode()
-    prefix = f"s3://weights/test/v{version_number}"
+    prefix = f"s3://weights/test/v{version_label}"
     return {
         f"{prefix}/model.safetensors.index.json": root,
         f"{prefix}/model-00000-of-00001.safetensors": shard,
@@ -344,11 +384,11 @@ def _inputs(
     *,
     base_version="base-a",
     version="target-a",
-    version_number=1,
+    version_label=1,
     uri=None,
 ):
     if uri is None:
-        uri = f"s3://weights/test/v{version_number}/model.safetensors.index.json"
+        uri = f"s3://weights/test/v{version_label}/model.safetensors.index.json"
     return GeneratorTransferInputs(
         version_id=version,
         base_version_id=base_version,
@@ -367,7 +407,7 @@ def _build(monkeypatch, tmp_path, objects):
     launch.mkdir(exist_ok=True)
     save_file({"weight": torch.tensor([1.0, 2.0])}, launch / "model.safetensors")
     storage = _MemoryS3(objects)
-    monkeypatch.setattr(receiver_module, "S3Client", lambda **_kwargs: storage)
+    monkeypatch.setattr(canonical_delta_module, "S3Client", lambda **_kwargs: storage)
     adapter = _Adapter(
         model_name="test/model",
         config=ObjectStorageGeneratorConfig(
@@ -576,7 +616,7 @@ def test_canonical_s3_applies_delta_tensors_concurrently(monkeypatch, tmp_path):
 
     monkeypatch.setenv("MX_REFIT_DELTA_WORKERS", "2")
     monkeypatch.setattr(
-        receiver_module.zstandard,
+        zstandard,
         "ZstdDecompressor",
         StreamingDecompressor,
     )
@@ -745,7 +785,7 @@ def test_installed_target_becomes_the_next_exact_base(monkeypatch, tmp_path):
             first,
             second,
             version="target-b",
-            version_number=2,
+            version_label=2,
             base_version="target-a",
         )
     )
@@ -760,7 +800,7 @@ def test_installed_target_becomes_the_next_exact_base(monkeypatch, tmp_path):
         _inputs(
             second_root,
             version="target-b",
-            version_number=2,
+            version_label=2,
             base_version="target-a",
         )
     )
