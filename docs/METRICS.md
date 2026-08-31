@@ -82,7 +82,7 @@ then represented, which for TP=8 means losing seven eighths of the pod.
 
 ```mermaid
 flowchart TB
-  subgraph chart["created by this chart -- each adopted only if its labels match the Operator's selector"]
+  subgraph chart["created by this chart -- all default off"]
     direction LR
     cm["dashboard<br/>ConfigMap"]
     pm["PodMonitor<br/>podMonitor"]
@@ -102,9 +102,20 @@ flowchart TB
   prom -- PromQL --> graf
 ```
 
-The chart owns the top row; the Operator owns adoption. Every silent failure in
-this section is the chart creating a resource correctly and the Operator
-declining to adopt it.
+**Creating these four objects is not the same as them being used.** The chart
+owns the top row and nothing else; whether each object ever takes effect is
+decided by a consumer the chart does not control, and each is gated differently:
+
+| Object | Picked up by | Gate |
+| --- | --- | --- |
+| `podMonitor`, `clientPodMonitor` | Prometheus Operator | Labels must match the Prometheus CR's `podMonitorSelector` |
+| `PrometheusRule` | Prometheus Operator | Labels must match its `ruleSelector` |
+| dashboard `ConfigMap` | Grafana sidecar | Carries the sidecar's label, `grafana_dashboard` by default |
+
+A gate that does not match is not an error. The object is created, `kubectl get`
+shows it, nothing logs a complaint, and it is ignored for as long as it exists.
+Every silent failure described in this section is that: a correctly created
+resource that no consumer ever picked up.
 
 Two discovery models exist and they do not overlap. Which one your cluster uses
 decides everything below.
