@@ -85,6 +85,7 @@ if TYPE_CHECKING:
     UCX_TLS: Optional[str]
     UCX_NET_DEVICES: Optional[str]
     UCX_MEM_EVENTS: Optional[str]
+    MX_UCX_DISABLE_MEM_EVENTS: bool
     MX_RDMA_NIC_PIN: str
     MX_RDMA_NIC_PIN_MIN_RATE_GBPS: Optional[str]
     # GPUDirect Storage
@@ -315,6 +316,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "UCX_TLS": lambda: os.environ.get("UCX_TLS"),
     "UCX_NET_DEVICES": lambda: os.environ.get("UCX_NET_DEVICES"),
     "UCX_MEM_EVENTS": lambda: os.environ.get("UCX_MEM_EVENTS"),
+    "MX_UCX_DISABLE_MEM_EVENTS": lambda: _env_bool("MX_UCX_DISABLE_MEM_EVENTS", False),
     "MX_RDMA_NIC_PIN": lambda: os.environ.get("MX_RDMA_NIC_PIN", "").strip(),
     "MX_RDMA_NIC_PIN_MIN_RATE_GBPS": lambda: os.environ.get("MX_RDMA_NIC_PIN_MIN_RATE_GBPS"),
     # ── GPUDirect Storage ──────────────────────────────────────────────────
