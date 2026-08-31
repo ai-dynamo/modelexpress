@@ -193,7 +193,8 @@
               }
             ]
           },
-          "noValue": "0"
+          "noValue": "0",
+          "decimals": 0
         }
       },
       "options": {
@@ -247,7 +248,8 @@
               }
             ]
           },
-          "noValue": "0"
+          "noValue": "0",
+          "decimals": 0
         }
       },
       "options": {
@@ -305,7 +307,8 @@
               }
             ]
           },
-          "noValue": "0"
+          "noValue": "0",
+          "decimals": 0
         }
       },
       "options": {
@@ -363,7 +366,8 @@
               }
             ]
           },
-          "noValue": "0"
+          "noValue": "0",
+          "decimals": 0
         }
       },
       "options": {
@@ -421,7 +425,8 @@
               }
             ]
           },
-          "noValue": "0"
+          "noValue": "0",
+          "decimals": 0
         }
       },
       "options": {
@@ -479,7 +484,8 @@
               }
             ]
           },
-          "noValue": "0"
+          "noValue": "0",
+          "decimals": 0
         }
       },
       "options": {
