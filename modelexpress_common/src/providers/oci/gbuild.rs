@@ -12,9 +12,12 @@ pub const RUNTIME_MANIFEST_JSON_MEDIA_TYPE: &str =
     "application/vnd.groq.gbuild.runtime-manifest.v2+json";
 pub const RUNTIME_MANIFEST_CAPNP_MEDIA_TYPE: &str =
     "application/vnd.groq.gbuild.runtime-manifest.v2+capnp";
-pub const PRESET_MEDIA_TYPE: &str = "application/vnd.groq.gbuild.preset.v1+json";
+pub const COMPILE_METADATA_MEDIA_TYPE: &str =
+    "application/vnd.groq.gbuild.compile-metadata.v1.tar+zstd";
 pub const PAYLOAD_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
 pub(super) const MANIFEST_CAPNP_FILE_NAME: &str = "manifest.v2.capnp.bin";
+pub(super) const COMPILE_METADATA_FILE_NAME: &str = "compile-metadata.tar.zst";
+pub(super) const PAYLOAD_FILE_NAME: &str = "payload.tar.zst";
 
 const OCI_EMPTY_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.empty.v1+json";
 const OCI_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
@@ -42,8 +45,8 @@ pub fn validate_gbuild_manifest(manifest: &OciImageManifest) -> Result<()> {
     let mut titles = HashSet::new();
     let mut manifest_json = false;
     let mut manifest_capnp = false;
-    let mut preset = false;
-    let mut payload_count = 0usize;
+    let mut compile_metadata = false;
+    let mut payload = false;
 
     for descriptor in &manifest.layers {
         validate_descriptor(descriptor, "GBuild OCI layer")?;
@@ -71,26 +74,27 @@ pub fn validate_gbuild_manifest(manifest: &OciImageManifest) -> Result<()> {
                 }
                 manifest_capnp = true;
             }
-            PRESET_MEDIA_TYPE => {
-                if preset
-                    || title.contains('/')
-                    || !title.ends_with("-original.json")
-                    || title == "-original.json"
-                {
+            COMPILE_METADATA_MEDIA_TYPE => {
+                if compile_metadata || title != COMPILE_METADATA_FILE_NAME {
                     anyhow::bail!(
-                        "GBuild OCI artifact must contain one top-level *-original.json layer"
+                        "GBuild OCI artifact must contain one {COMPILE_METADATA_FILE_NAME} layer"
                     );
                 }
-                preset = true;
+                compile_metadata = true;
             }
-            PAYLOAD_MEDIA_TYPE => payload_count = payload_count.saturating_add(1),
+            PAYLOAD_MEDIA_TYPE => {
+                if payload || title != PAYLOAD_FILE_NAME {
+                    anyhow::bail!("GBuild OCI artifact must contain one {PAYLOAD_FILE_NAME} layer");
+                }
+                payload = true;
+            }
             media_type => anyhow::bail!(
                 "GBuild OCI artifact contains unsupported layer media type '{media_type}'"
             ),
         }
     }
 
-    if !manifest_json || !manifest_capnp || !preset || payload_count == 0 {
+    if !manifest_json || !manifest_capnp || !compile_metadata || !payload {
         anyhow::bail!("GBuild OCI artifact is missing required metadata or payload layers");
     }
     Ok(())
@@ -114,7 +118,7 @@ fn validate_descriptor(descriptor: &OciDescriptor, description: &str) -> Result<
     Ok(())
 }
 
-pub(super) fn validate_runtime_manifest(manifest: &[u8]) -> Result<()> {
+pub(super) fn validate_runtime_manifest(manifest: &[u8], metadata_files: &[String]) -> Result<()> {
     let header: RuntimeManifestHeader =
         serde_json::from_slice(manifest).context("Failed to parse the GBuild runtime manifest")?;
     if header.contract_revision != RUNTIME_MANIFEST_REVISION {
@@ -123,12 +127,46 @@ pub(super) fn validate_runtime_manifest(manifest: &[u8]) -> Result<()> {
             header.contract_revision
         );
     }
+    let preset_path = header
+        .build
+        .preset_snapshot_path
+        .context("GBuild runtime manifest does not name its preset snapshot")?;
+    let mut expected_files = vec![preset_path];
+    if let Some(lpu_sim) = header.artifacts.lpu_sim {
+        expected_files.push(lpu_sim.path);
+    }
+    expected_files.sort();
+
+    let mut actual_files = metadata_files.to_vec();
+    actual_files.sort();
+    if actual_files != expected_files {
+        anyhow::bail!(
+            "GBuild compile metadata files do not match Manifest V2: expected {expected_files:?}, found {actual_files:?}"
+        );
+    }
     Ok(())
 }
 
 #[derive(Deserialize)]
 struct RuntimeManifestHeader {
     contract_revision: u8,
+    build: RuntimeManifestBuild,
+    artifacts: RuntimeManifestArtifacts,
+}
+
+#[derive(Deserialize)]
+struct RuntimeManifestBuild {
+    preset_snapshot_path: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RuntimeManifestArtifacts {
+    lpu_sim: Option<RuntimeManifestPath>,
+}
+
+#[derive(Deserialize)]
+struct RuntimeManifestPath {
+    path: String,
 }
 
 #[cfg(test)]
@@ -162,7 +200,11 @@ mod tests {
                     'c',
                     Some(MANIFEST_CAPNP_FILE_NAME),
                 ),
-                descriptor(PRESET_MEDIA_TYPE, 'd', Some("llama-original.json")),
+                descriptor(
+                    COMPILE_METADATA_MEDIA_TYPE,
+                    'd',
+                    Some("compile-metadata.tar.zst"),
+                ),
                 descriptor(PAYLOAD_MEDIA_TYPE, 'e', Some("payload.tar.zst")),
             ],
         }))
@@ -195,8 +237,11 @@ mod tests {
 
     #[test]
     fn test_gbuild_artifact_accepts_runtime_manifest_revision_2() {
-        validate_runtime_manifest(br#"{"contract_revision":2,"model":{}}"#)
-            .expect("revision 2 must be accepted");
+        validate_runtime_manifest(
+            br#"{"contract_revision":2,"build":{"preset_snapshot_path":"llama-original.json"},"artifacts":{"lpu_sim":null}}"#,
+            &["llama-original.json".to_string()],
+        )
+        .expect("revision 2 and referenced metadata must be accepted");
     }
 
     #[test]
@@ -207,7 +252,15 @@ mod tests {
             br#"{"contract_revision":true}"#.as_slice(),
             br#"{"model":{}}"#.as_slice(),
         ] {
-            assert!(validate_runtime_manifest(manifest).is_err());
+            assert!(validate_runtime_manifest(manifest, &[]).is_err());
         }
+    }
+
+    #[test]
+    fn test_gbuild_artifact_rejects_unreferenced_compile_metadata() {
+        let manifest = br#"{"contract_revision":2,"build":{"preset_snapshot_path":"llama-original.json"},"artifacts":{"lpu_sim":null}}"#;
+        let metadata_files = vec!["compile.log".to_string(), "llama-original.json".to_string()];
+
+        assert!(validate_runtime_manifest(manifest, &metadata_files).is_err());
     }
 }

@@ -3,7 +3,10 @@
 
 use super::{
     cache_entry::StagingCacheEntry,
-    gbuild::{is_gbuild_artifact, validate_gbuild_manifest, validate_runtime_manifest},
+    gbuild::{
+        COMPILE_METADATA_MEDIA_TYPE, is_gbuild_artifact, validate_gbuild_manifest,
+        validate_runtime_manifest,
+    },
     layer_download::{LayerDownload, LayerDownloadKind, LayerDownloads},
     path::ArtifactPath,
     reference::OciReference,
@@ -72,13 +75,14 @@ impl<'a> Downloader<'a> {
         }
 
         let downloads = LayerDownloads::from_layers(&manifest.layers, ignore_weights)?;
-        self.download_layers(
-            staging_entry,
-            &staging_files,
-            downloads.as_slice(),
-            is_gbuild,
-        )
-        .await?;
+        let compile_metadata_files = self
+            .download_layers(
+                staging_entry,
+                &staging_files,
+                downloads.as_slice(),
+                is_gbuild,
+            )
+            .await?;
         if is_gbuild {
             let runtime_manifest_path = staging_files.join(MANIFEST_FILE_NAME);
             let runtime_manifest =
@@ -87,7 +91,7 @@ impl<'a> Downloader<'a> {
                     .with_context(|| {
                         format!("Failed to read GBuild runtime manifest {runtime_manifest_path:?}")
                     })?;
-            validate_runtime_manifest(&runtime_manifest)?;
+            validate_runtime_manifest(&runtime_manifest, &compile_metadata_files)?;
         } else {
             self.download_manifest_json(&manifest, &staging_files)
                 .await?;
@@ -137,8 +141,8 @@ impl<'a> Downloader<'a> {
         staging_files: &Path,
         downloads: &[LayerDownload],
         complete_archives: bool,
-    ) -> Result<usize> {
-        let mut file_count = 0usize;
+    ) -> Result<Vec<String>> {
+        let mut compile_metadata_files = Vec::new();
         let blob_root = staging_entry.blob_root();
 
         for download in downloads {
@@ -150,7 +154,6 @@ impl<'a> Downloader<'a> {
                         "Downloaded OCI blob {} for file '{}'",
                         download.descriptor.digest, path
                     );
-                    file_count = file_count.saturating_add(1);
                 }
                 LayerDownloadKind::Archive { format } => {
                     let path = self.download_archive_blob(download, &blob_root).await?;
@@ -169,18 +172,20 @@ impl<'a> Downloader<'a> {
                         )
                     })?;
 
+                    if download.descriptor.media_type == COMPILE_METADATA_MEDIA_TYPE {
+                        compile_metadata_files = extracted_files.clone();
+                    }
+
                     tokio::fs::remove_file(&path).await.with_context(|| {
                         format!("Failed to remove OCI temporary blob file {path:?}")
                     })?;
-
-                    file_count = file_count.saturating_add(extracted_files.len());
                 }
             }
         }
 
         Self::remove_blob_root(&blob_root).await?;
 
-        Ok(file_count)
+        Ok(compile_metadata_files)
     }
 
     async fn download_raw_blob(
@@ -541,14 +546,17 @@ mod tests {
             .expect("wiremock should use http")
             .to_string();
         let repo = "team/gbuild";
-        let manifest_json = br#"{"contract_revision":2,"build":{"id":"gbuild"}}"#;
+        let manifest_json = br#"{"contract_revision":2,"build":{"id":"gbuild","preset_snapshot_path":"llama-original.json"},"artifacts":{"lpu_sim":null}}"#;
         let manifest_capnp = b"capnp";
         let preset = br#"{"model":"llama"}"#;
+        let metadata_tar = tar_bytes(&[("llama-original.json", preset)]);
+        let metadata = zstd::stream::encode_all(metadata_tar.as_slice(), 3)
+            .expect("compress compile metadata");
         let tar = tar_bytes(&[("README.md", b"readme"), ("program.0.gas", b"gas")]);
         let payload = zstd::stream::encode_all(tar.as_slice(), 3).expect("compress payload");
         let manifest_json_digest = digest_bytes(manifest_json);
         let manifest_capnp_digest = digest_bytes(manifest_capnp);
-        let preset_digest = digest_bytes(preset);
+        let metadata_digest = digest_bytes(&metadata);
         let payload_digest = digest_bytes(&payload);
         let config = b"{}";
         let config_digest = digest_bytes(config);
@@ -575,10 +583,10 @@ mod tests {
                     "annotations": { TITLE_ANNOTATION: MANIFEST_CAPNP_FILE_NAME },
                 },
                 {
-                    "mediaType": "application/vnd.groq.gbuild.preset.v1+json",
-                    "size": preset.len(),
-                    "digest": preset_digest,
-                    "annotations": { TITLE_ANNOTATION: "llama-original.json" },
+                    "mediaType": "application/vnd.groq.gbuild.compile-metadata.v1.tar+zstd",
+                    "size": metadata.len(),
+                    "digest": metadata_digest,
+                    "annotations": { TITLE_ANNOTATION: "compile-metadata.tar.zst" },
                 },
                 {
                     "mediaType": "application/vnd.oci.image.layer.v1.tar+zstd",
@@ -609,7 +617,7 @@ mod tests {
             (config_digest.as_str(), config.as_slice()),
             (manifest_json_digest.as_str(), manifest_json.as_slice()),
             (manifest_capnp_digest.as_str(), manifest_capnp.as_slice()),
-            (preset_digest.as_str(), preset.as_slice()),
+            (metadata_digest.as_str(), metadata.as_slice()),
             (payload_digest.as_str(), payload.as_slice()),
         ] {
             Mock::given(method("GET"))
