@@ -73,7 +73,7 @@ def _batch_tensors(
 
 
 class CanonicalDeltaPublicationMethod:
-    """Publish canonical XOR deltas and periodic full HF checkpoints."""
+    """Publish XOR deltas and full HF checkpoints at a selected cadence."""
 
     def __init__(
         self,

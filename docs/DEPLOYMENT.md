@@ -901,10 +901,10 @@ The receiver marks its local checkpoint `UPDATING` before mutation and `READY`
 only after success. An interrupted update remains unavailable until a fresh
 initialization reseeds it from `seed_checkpoint_path`.
 
-S3 versions normally use `XOR_DELTA`. Integrations may opt into periodic
-`FULL_HF_CHECKPOINT` versions; these publish native HF safetensor shards, omit
-`base_version_id`, and become the exact base for the next delta. The period is
-disabled by default. Slime exposes
+S3 versions normally use `XOR_DELTA`. Integrations may opt into a
+framework-selected cadence of `FULL_HF_CHECKPOINT` versions; these publish
+native HF safetensor shards, omit `base_version_id`, and become the exact base
+for the next delta. The cadence is disabled by default. Slime exposes
 `--modelexpress-full-hf-checkpoint-interval N`; Vime accepts
 `full_hf_checkpoint_interval` in `--modelexpress-config`. In both cases, `N`
 counts published ModelExpress weight versions.

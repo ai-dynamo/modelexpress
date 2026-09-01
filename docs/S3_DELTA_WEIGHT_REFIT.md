@@ -2,9 +2,9 @@
 
 This guide shows how to publish XOR-delta weight updates to S3 and install them
 in a running vLLM model with ModelExpress. The trainer and generator start from
-the same local checkpoint; integrations may periodically publish a full HF
-checkpoint to reset that base. ModelExpress coordinates each version's lineage
-and readiness.
+the same local checkpoint; integrations may use a framework-selected cadence of
+full HF checkpoints to reset that base. ModelExpress coordinates each version's
+lineage and readiness.
 
 ## Components
 
