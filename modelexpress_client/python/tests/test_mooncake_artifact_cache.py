@@ -95,6 +95,24 @@ def test_cache_key_is_stable_and_isolates_compatibility_dimensions(tmp_path, mem
     assert base != mc.compute_artifact_cache_key(transfer, _identity("other/model"), node_rank=0, accelerator="cuda")
 
 
+def test_cache_key_is_stable_when_map_entries_are_inserted_differently(
+    tmp_path, memory_store
+):
+    transfer = _transfer(tmp_path)
+    first = _identity()
+    first.extra_parameters["z-key"] = "z-value"
+    first.extra_parameters["a-key"] = "a-value"
+    second = _identity()
+    second.extra_parameters["a-key"] = "a-value"
+    second.extra_parameters["z-key"] = "z-value"
+
+    assert mc.compute_artifact_cache_key(
+        transfer, first, node_rank=0, accelerator="cuda"
+    ) == mc.compute_artifact_cache_key(
+        transfer, second, node_rank=0, accelerator="cuda"
+    )
+
+
 def test_missing_manifest_is_a_cache_miss(tmp_path, memory_store):
     with pytest.raises(mc.MooncakeArtifactCacheMiss, match="miss"):
         mc.install_from_mooncake(_transfer(tmp_path), _identity(), node_rank=0, accelerator="cuda")

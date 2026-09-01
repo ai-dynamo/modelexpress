@@ -105,9 +105,9 @@ def install_artifacts(
                 )
                 elapsed = time.perf_counter() - start
                 if result.status is MooncakeInstallStatus.ALREADY_INSTALLED:
-                    log.info(
-                        "[Worker %s] %s Mooncake artifact already installed "
-                        "by another worker: name=%s",
+                    log.debug(
+                        "[Worker %s] %s Mooncake artifact %s already installed "
+                        "by another worker; continuing to the next artifact",
                         ctx.global_rank,
                         engine_label,
                         transfer.name,
@@ -878,7 +878,7 @@ def artifact_marker_key(
     action: str,
 ) -> str:
     digest = sha256()
-    digest.update(identity.SerializeToString())
+    digest.update(_identity_bytes(identity))
     for root in transfer.roots:
         path = root.source_root if action == "publish-scheduled" else root.target_root
         digest.update(str(path.resolve()).encode())
