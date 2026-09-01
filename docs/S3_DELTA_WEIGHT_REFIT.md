@@ -204,29 +204,51 @@ snapshot directory.
 
 #### `refit_checkpoint_dir`
 
-This is the root of ModelExpress's mutable working checkpoint. During
+This is the root of ModelExpress's host-local immutable checkpoint cache. During
 initialization, ModelExpress creates a model-specific subdirectory containing
-`checkpoint/`, `state.json`, and `.lock`.
+full checkpoints, delta payloads, resolved chains, derived materializations,
+and activation state.
 
-The `checkpoint/` directory starts as a full copy of `seed_checkpoint_path` and
-is updated in place as sequential deltas are applied. `state.json` records its
-current version and whether the checkpoint is `READY` or `UPDATING`. The file
-lock prevents co-located ranks from seeding or updating the same checkpoint
-concurrently. With an HF snapshot seed checkpoint, the resulting layout is:
+`full/<version>/` and `deltas/<version>/` contain canonical immutable artifacts.
+`chains/<version>.json` resolves a version to one full checkpoint plus its
+ordered deltas. For a delta target, ModelExpress reconstructs a complete,
+version-scoped checkpoint under `materialized/<version>/`; current vLLM and
+SGLang installers consume that ordinary checkpoint directory. Materializations
+are derived cache entries and can be rebuilt from the canonical lineage.
 
-Before seeding or mutating checkpoint bytes, ModelExpress writes `UPDATING` with
-the last READY version. It writes `READY` for the target only after all writes
-and verification succeed. Preparation and installation reject `UPDATING`; a
-fresh initialization reseeds it from `seed_checkpoint_path`.
+`state.json` records whether preparation is `READY` or `UPDATING` and protects
+against interrupted writes. `active.json` changes only after engine installation
+succeeds, so a failed download, reconstruction, or install retains the previous
+active version. The file lock coordinates co-located ranks that share the cache.
 
 ```text
 <refit_checkpoint_dir>/<URL-quoted-vLLM-model-path-or-ID>/
   .lock
+  active.json
   state.json
-  checkpoint/
-    *.safetensors
-    config.json
-    ...
+  full/
+    v0/
+      *.safetensors
+      config.json
+      ...
+    v4/
+      model.safetensors.index.json
+      *.safetensors
+      config.json
+      ...
+  deltas/
+    v1/
+      model.safetensors.index.json
+      *.safetensors
+  chains/
+    v0.json
+    v1.json
+    v4.json
+  materialized/
+    v1/
+      *.safetensors
+      config.json
+      ...
 ```
 
 All ranks sharing one host filesystem can share the same cache. Each host without
@@ -248,7 +270,7 @@ spec:
           mountPath: /root/.cache/huggingface
           readOnly: true
 
-        # Mutable, host-local refit checkpoint directory.
+        # Host-local immutable artifacts and derived materializations.
         - name: mx-refit-checkpoint
           mountPath: /var/cache/modelexpress
 
@@ -274,18 +296,18 @@ The corresponding generator configuration would use:
 }
 ```
 
-Ensure the host directory has space for at least one complete checkpoint copy.
-ModelExpress creates the model-specific subdirectory automatically. On
-initialization, it reuses the cache only when its recorded version is
-`initial_base_version_id`, its state is `READY`, and safetensors files are
-present. A later-version or interrupted `UPDATING` cache is reseeded from
-`seed_checkpoint_path`.
+Capacity must cover retained full checkpoints and deltas plus the derived
+materialization being installed. ModelExpress does not yet delete canonical
+lineage artifacts automatically; provision storage or manage retention outside
+the active cache. On initialization, the configured seed is restored as the
+initial full artifact and becomes the active version. Previously downloaded
+version artifacts remain reusable when their source identity matches.
 
 #### Initialization behavior
 
 `POST /init_weight_transfer_engine` fans out to every vLLM worker. Each worker:
 
-1. initializes or reuses its refit checkpoint;
+1. initializes the seed lineage and host-local checkpoint cache;
 2. fetches `initial_base_version_id` from the ModelExpress server;
 3. verifies that the base is READY and has the configured model name; and
 4. registers itself as a ModelExpress generator worker.
@@ -402,6 +424,6 @@ finally:
 The next delta must be `v2` with `base_version_id="v1"`. An integration may
 instead create a `FULL_HF_CHECKPOINT` version without `base_version_id`; that
 version becomes the exact base for the following delta. Full checkpoint batches
-carry per-tensor Adler-32 checksums and are copied directly into the existing
-refit checkpoint as they download. XOR deltas require
-`compression_format="zstd"`.
+carry per-tensor Adler-32 checksums and are retained as an immutable full
+artifact. XOR deltas require `compression_format="zstd"` and are replayed in
+order into a version-scoped materialized checkpoint.
