@@ -494,18 +494,25 @@ sequenceDiagram
     MX-->>W: [SourceInstanceRef, ...]
     W->>W: Filter by worker_rank and accelerator, then order via SourceSelector
     W->>W: Load dummy weights, initialize NIXL agent
-    loop For each candidate (max MAX_SOURCE_RETRIES) until metadata found
+    loop For each candidate (max MAX_SOURCE_RETRIES) until transfer succeeds
         W->>MX: GetMetadata(mx_source_id, worker_id)
         MX-->>W: WorkerMetadata (tensors, nixl_metadata)
         alt Metadata missing or fetch error
             W->>W: Try next candidate
         else Accelerator mismatch and both values known
-          W->>W: Skip candidate before target preparation
+            W->>W: Skip candidate before target preparation
+        else Compatible metadata
+            W->>W: Add remote NIXL agent, execute RDMA transfers
+            alt Transfer fails (SourceTransferError / ManifestMismatchError)
+                W->>W: Roll back transfer state
+                W->>W: Reinitialize model if target state may be mutated
+                W->>W: Try next candidate
+            else Transfer succeeds
+                W->>W: Stop source retries
+            end
         end
     end
-    W->>W: Add remote NIXL agent, execute RDMA transfers
-    alt Transfer fails (SourceTransferError / ManifestMismatchError)
-        W->>W: Reinitialize model if target state may be mutated
+    opt No source succeeds within retry budget
         W->>W: Fall through to server cache, InstantTensor, ModelStreamer, GDS, or native loader
     end
     W->>W: process_weights_after_loading()
@@ -545,7 +552,7 @@ The `backend_type` discriminator is persisted in storage for unambiguous deseria
 | `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
 | `MX_REDIS_HOST` / `REDIS_HOST` | (required with port) | Redis host when `REDIS_URL` is not set |
 | `MX_REDIS_PORT` / `REDIS_PORT` | (required with host) | Redis port when `REDIS_URL` is not set |
-| `REDIS_URL` | (required for Redis) | Full Redis URL; overrides host/port |
+| `REDIS_URL` | (required unless host and port are set) | Full Redis URL; overrides host/port |
 | `MX_METADATA_NAMESPACE` / `POD_NAMESPACE` | (required for Kubernetes) | K8s namespace for CRD backend |
 | `MX_HEARTBEAT_INTERVAL_SECS` | `30` | Client heartbeat frequency |
 | `MX_HEARTBEAT_TIMEOUT_SECS` | `90` | Server reaper staleness threshold |
