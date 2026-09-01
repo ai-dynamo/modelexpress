@@ -65,6 +65,8 @@ _RECORDERS = [
     ("observe_transfer_seconds", ("random", "success", 1.0)),
     ("record_nixl_error", ("timeout",)),
     ("record_nixl_receive", ("complete",)),
+    ("observe_load_seconds", ("vllm", "main", "success", 12.0)),
+    ("observe_load_phase_seconds", ("vllm", "chain", 4.0)),
 ]
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
