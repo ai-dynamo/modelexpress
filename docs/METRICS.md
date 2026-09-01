@@ -457,11 +457,22 @@ total by construction rather than by convention:
 Not every engine has all four, and the missing ones are absences rather than
 zeros:
 
-| Engine | Phases | Why |
-| --- | --- | --- |
-| vLLM | all four | |
-| SGLang | no `model_init` | SGLang builds the module and hands it to the loader |
-| TRT-LLM | `chain` only | model arrives built; publishing happens in a separate call, outside this window |
+| Engine | Phases | Why | Confirmed on |
+| --- | --- | --- | --- |
+| vLLM | all four | | hardware |
+| SGLang | no `model_init` | SGLang builds the module and hands it to the loader | hardware |
+| TRT-LLM | `chain` only | model arrives built; publishing happens in a separate call, outside this window | unit tests only |
+
+TRT-LLM's row has not been observed on a GPU: CI builds worker images for vLLM
+and SGLang but not for TRT-LLM, so there is no image carrying this code to run.
+Treat its phase set as the intent rather than as a measurement.
+
+SGLang's `transfer_engine` transport is a further gap in the same direction. It
+never enters the strategy chain, so it records **`mx_load_seconds` and no phases
+at all**. The partition still holds — zero is bounded by the total — but the
+share panel reads 0% there, which under the rule above means "time is going
+somewhere no phase covers". On that transport it does, and the panel is telling
+the truth about instrumentation that has not been written yet.
 
 **Do not add a phase from a second call site.** The partition is the property
 that makes "which part was slow" answerable without the numbers contradicting
@@ -469,27 +480,38 @@ each other, and recording one phase twice inflates it while leaving the sum
 looking sound. `test_phases_partition_the_load` asserts `sum(phases) <= total`
 against real timings.
 
-Measured on one GPU, vLLM serving `Qwen/Qwen2.5-0.5B-Instruct` at TP=1 with no
-peer, so the chain falls through to `DefaultStrategy`:
+Measured on one GPU each, serving `Qwen/Qwen2.5-0.5B-Instruct` at TP=1 with no
+peer, so the chain falls through in both cases. Seconds, with share of that
+engine's load:
 
-| | Seconds | Share of load |
-| --- | ---: | ---: |
-| `mx_load_seconds` | 5.961791 | |
-| `artifact_install` | 0.000014 | 0.00% |
-| `model_init` | 0.470551 | 7.89% |
-| `chain` | 5.490047 | 92.09% |
-| `publish` | 0.000014 | 0.00% |
-| **sum of phases** | **5.960626** | **99.98%** |
+| Phase | vLLM | | SGLang | |
+| --- | ---: | ---: | ---: | ---: |
+| `mx_load_seconds` | 5.961791 | | 4.373961 | |
+| `artifact_install` | 0.000014 | 0.00% | 0.000007 | 0.00% |
+| `model_init` | 0.470551 | 7.89% | *absent* | |
+| `chain` | 5.490047 | 92.09% | 4.371382 | 99.94% |
+| `publish` | 0.000014 | 0.00% | 0.000014 | 0.00% |
+| **sum of phases** | **5.960626** | **99.98%** | **4.371403** | **99.94%** |
 
-The 1.16 ms the phases do not account for is the loader's own work between them.
-That is the "sums to under 1" case the share panel exists to surface, at a
-magnitude that says the instrumentation is complete rather than that a phase is
-missing.
+`sum(phases) <= total` holds on both. The 1.16 ms and 2.56 ms unaccounted are
+the loader's own work between phases — the "sums to under 1" case the share
+panel exists to surface, at a magnitude that says the instrumentation is
+complete rather than that a phase is missing.
 
-`artifact_install` and `publish` at fourteen microseconds are both real readings
-rather than broken ones: artifact transfer was off on this run, and `publish`
-hands work to a background thread, so it measures the handoff and not the
-upload.
+**SGLang genuinely has no `model_init` series**, not a zero one: the phase does
+not appear in its exposition at all, because SGLang builds the module and hands
+it to the loader. An engine's phase set is a property of that engine, so
+comparing one engine's phase against another's is only meaningful within the
+share column.
+
+`artifact_install` and `publish` in the microseconds are real readings rather
+than broken ones on both engines: artifact transfer was off on these runs, and
+`publish` hands work to a background thread, so it measures the handoff and not
+the upload.
+
+The same SGLang run also shows why `mx_load_seconds` is not the cold start. The
+load took 4.37 s; CUDA graph capture and piecewise compilation afterwards took
+26.35 s and 10.55 s, none of it inside this window.
 
 A failed load is recorded, with `outcome="error"`, and so is a phase that
 raises. Dropping either would omit exactly the observations someone goes looking
