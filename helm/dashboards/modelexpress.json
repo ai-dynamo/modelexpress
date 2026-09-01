@@ -561,7 +561,7 @@
     },
     {
       "id": 112,
-      "type": "bargauge",
+      "type": "table",
       "title": "Timing breakdown per model",
       "description": "Mean time in each phase, kept per model. The phases partition the load, so one model's bars sum to its duration in the panel to the left; this is what answers 'which part was slow'.\n\nGrouped by model deliberately. Averaging a phase across models of different sizes produces a number that belongs to no load -- on a fleet of a 0.5B, a 1.5B and a 7B it read chain = 28.0 s when the real values were 4.0, 36.3 and 43.8.\n\nA phase absent for an engine is a real absence, not a zero: SGLang has no model_init, and TRT-LLM publishes outside this window.",
       "datasource": {
@@ -577,7 +577,8 @@
       "targets": [
         {
           "expr": "sum by (model, phase) (mx_load_phase_seconds_sum) / sum by (model, phase) (mx_load_phase_seconds_count)",
-          "legendFormat": "{{model}} - {{phase}}",
+          "format": "table",
+          "instant": true,
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -589,20 +590,50 @@
         "defaults": {
           "unit": "s",
           "noValue": "0"
-        }
+        },
+        "overrides": []
       },
       "options": {
-        "displayMode": "gradient",
-        "orientation": "horizontal",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
           ],
-          "fields": "",
-          "values": false
+          "fields": ""
+        }
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "indexByName": {
+              "model": 0,
+              "phase": 1,
+              "Value": 2
+            },
+            "renameByName": {
+              "Value": "mean"
+            }
+          }
         },
-        "showUnfilled": true
-      }
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "model",
+                "desc": false
+              }
+            ]
+          }
+        }
+      ]
     },
     {
       "id": 113,
