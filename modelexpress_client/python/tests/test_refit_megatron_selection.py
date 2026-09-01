@@ -179,6 +179,30 @@ def test_expert_row_specs_use_expert_tensor_parallel_geometry():
     assert specs[0].local_shard_range == (4, 8)
 
 
+def test_replicated_expert_specs_use_expert_tensor_parallel_rank():
+    mapping = AutoMapping("row", is_expert=True)
+    mapping.hf_param = "model.layers.0.mlp.experts.4.down_proj.bias"
+    task = SimpleNamespace(
+        mapping=mapping,
+        megatron_module=SimpleNamespace(),
+        param_weight=torch.zeros(3),
+        global_param_name="decoder.layers.0.mlp.experts.linear_fc2.bias4",
+    )
+
+    specs = build_megatron_tensor_specs(
+        conversion_tasks=[task],
+        transformer_config=SimpleNamespace(),
+        tensor_parallel_size=4,
+        tensor_parallel_rank=3,
+        expert_tensor_parallel_size=2,
+        expert_tensor_parallel_rank=0,
+    )
+
+    assert len(specs) == 1
+    assert specs[0].role == "replicated"
+    assert specs[0].placement_kind == "REPLICATE"
+
+
 def test_qkv_bias_uses_the_qkv_column_role():
     assert (
         model_express_role_for_mapping(

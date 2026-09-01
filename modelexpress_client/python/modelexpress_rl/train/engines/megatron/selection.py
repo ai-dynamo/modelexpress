@@ -156,7 +156,7 @@ def build_megatron_tensor_specs(
             shard_axis = None
 
         if role == "replicated":
-            if tensor_parallel_rank != 0:
+            if parallel_rank != 0:
                 continue
             global_shape = tuple(int(dim) for dim in tensor.shape)
             shard_range = None
