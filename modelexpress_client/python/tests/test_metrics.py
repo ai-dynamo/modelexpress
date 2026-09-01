@@ -39,6 +39,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -47,6 +48,7 @@ import pytest
 from modelexpress.metrics import (
     ENV_ENABLED,
     LIST_SOURCES_RESULTS,
+    _XSLOW_BUCKETS,
     MetricsCollector,
     enable_metrics,
     push_metrics_if_enabled,
@@ -1033,4 +1035,165 @@ def test_alert_rule_client_families_exist(monkeypatch):
     assert not missing, (
         f"the alert rules name client families that are not exported: {missing}\n"
         f"Exported: {sorted(exported)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# L0 / L1 load timing
+# ---------------------------------------------------------------------------
+
+
+def _sum_for(exposition: str, family: str, **labels) -> float:
+    """The ``_sum`` of one histogram child, or 0.0 if that child has no series."""
+    import re
+
+    want = {k: v for k, v in labels.items()}
+    total = 0.0
+    for line in exposition.splitlines():
+        if not line.startswith(f"{family}_sum{{"):
+            continue
+        got = dict(re.findall(r'([a-zA-Z_]\w*)="([^"]*)"', line))
+        if all(got.get(k) == v for k, v in want.items()):
+            total += float(line.rsplit(" ", 1)[1])
+    return total
+
+
+def test_a_load_records_one_observation_with_its_outcome(monkeypatch):
+    collector = _fresh_collector(monkeypatch)
+    with collector.time_load("vllm", "main"):
+        pass
+
+    exposition = _exposition(collector)
+    assert (
+        'mx_load_seconds_count{engine="vllm",model_role="main",outcome="success",scheme=""} 1.0'
+        in exposition
+    ), exposition
+
+
+def test_a_failed_load_is_recorded_and_the_exception_still_propagates(monkeypatch):
+    """The load that raises is the one worth timing.
+
+    Recording only successes would drop exactly the observations someone goes
+    looking for, and swallowing the exception would turn a metrics concern into
+    a correctness one.
+    """
+    collector = _fresh_collector(monkeypatch)
+    with pytest.raises(RuntimeError, match="boom"):
+        with collector.time_load("vllm", "main"):
+            raise RuntimeError("boom")
+
+    exposition = _exposition(collector)
+    assert 'outcome="error"' in exposition, exposition
+    assert (
+        'mx_load_seconds_count{engine="vllm",model_role="main",outcome="error",scheme=""} 1.0'
+        in exposition
+    ), exposition
+
+
+def test_a_phase_that_raises_is_still_recorded(monkeypatch):
+    """The elapsed time was really spent inside the load.
+
+    Dropping it would make the phases stop summing to the whole on precisely the
+    failed loads being investigated.
+    """
+    collector = _fresh_collector(monkeypatch)
+    with pytest.raises(RuntimeError):
+        with collector.time_load_phase("vllm", "model_init"):
+            raise RuntimeError("boom")
+
+    exposition = _exposition(collector)
+    assert (
+        'mx_load_phase_seconds_count{engine="vllm",phase="model_init",scheme=""} 1.0'
+        in exposition
+    ), exposition
+
+
+def test_phases_partition_the_load(monkeypatch):
+    """The L1 invariant: sum(phases) <= L0, on real timings.
+
+    This is the property that makes "which part was slow" answerable without the
+    numbers contradicting each other. It holds by construction here because the
+    phases are disjoint intervals inside the L0 span -- the test exists so that
+    a future phase recorded from a second site fails rather than quietly
+    double-counting.
+    """
+    collector = _fresh_collector(monkeypatch)
+    with collector.time_load("vllm", "main"):
+        for phase in ("artifact_install", "model_init", "chain", "publish"):
+            with collector.time_load_phase("vllm", phase):
+                time.sleep(0.002)
+
+    exposition = _exposition(collector)
+    total = _sum_for(exposition, "mx_load_seconds", engine="vllm")
+    phases = _sum_for(exposition, "mx_load_phase_seconds", engine="vllm")
+
+    assert phases > 0, exposition
+    assert phases <= total, (
+        f"phases summed to {phases:.6f}s but the load took {total:.6f}s; "
+        "a phase is being recorded outside the load span or from two sites"
+    )
+
+
+def test_load_labels_are_closed_enums(monkeypatch):
+    """An out-of-tree engine clamps to `other` rather than opening the domain."""
+    collector = _fresh_collector(monkeypatch)
+    collector.observe_load_seconds("some-fork", "speculative", "weird", 1.0)
+
+    exposition = _exposition(collector)
+    assert 'engine="other"' in exposition, exposition
+    assert 'model_role="other"' in exposition, exposition
+    assert 'outcome="error"' in exposition, exposition
+    assert "some-fork" not in exposition, exposition
+
+
+def test_an_unknown_phase_is_dropped_not_clamped(monkeypatch):
+    """Folding a stray phase into a real one inflates that phase's total.
+
+    The sum would still look sound, which is worse than the observation going
+    missing: a wrong number that reads as a right one.
+    """
+    collector = _fresh_collector(monkeypatch)
+    collector.observe_load_phase_seconds("vllm", "not_a_phase", 5.0)
+
+    exposition = _exposition(collector)
+    assert "not_a_phase" not in exposition, exposition
+    assert "mx_load_phase_seconds_count" not in exposition, exposition
+
+
+def test_load_timers_never_raise_into_the_load_path(monkeypatch):
+    """Same guarantee the other recorders carry, on the new entry points."""
+    collector = _fresh_collector(monkeypatch)
+    collector._ready = True
+    collector.load_seconds = None  # force an AttributeError inside the recorder
+    collector.load_phase_seconds = None
+
+    with collector.time_load("vllm", "main"):
+        with collector.time_load_phase("vllm", "chain"):
+            pass
+
+    collector.observe_load_seconds("vllm", "main", "success", 1.0)
+    collector.observe_load_phase_seconds("vllm", "chain", 1.0)
+
+
+def test_load_buckets_match_the_rust_xslow_band():
+    """A server download and a client load are compared on one dashboard.
+
+    Quantiles from differently-bucketed histograms are not comparable, so the
+    two bands are pinned to each other here rather than trusted to stay in step.
+    """
+    rust = (
+        Path(__file__).resolve().parents[3]
+        / "modelexpress_server"
+        / "src"
+        / "metrics"
+        / "buckets.rs"
+    )
+    source = rust.read_text(encoding="utf-8")
+    match = re.search(r"pub const XSLOW: \[f64; \d+\] = \[(.*?)\];", source, re.S)
+    assert match, "could not find XSLOW in buckets.rs"
+    rust_buckets = tuple(
+        float(v.strip()) for v in match.group(1).split(",") if v.strip()
+    )
+    assert rust_buckets == tuple(float(b) for b in _XSLOW_BUCKETS), (
+        f"Rust XSLOW {rust_buckets} != Python _XSLOW_BUCKETS {_XSLOW_BUCKETS}"
     )

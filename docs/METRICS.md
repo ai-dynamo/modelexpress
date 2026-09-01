@@ -12,9 +12,13 @@ deployment.
 
 This documents what ships today: the exposition path, `mx_build_info`, per-RPC
 and storage-backend coverage on the server, the download lifecycle, NIXL client
-health, and the Kubernetes scrape, alerting and dashboard surface. The load and
-transfer timing tiers come later and are not here yet, so nothing below
-attributes a transfer's duration across its phases.
+health, the Kubernetes scrape, alerting and dashboard surface, and the first two
+load-timing tiers — the `load_model()` window and the phases that partition it.
+
+The tiers below those do not exist yet. Nothing here attributes time to an
+individual strategy attempt or splits a transfer into registration, handshake
+and wire, so the dashboard can say a load spent ninety seconds in `chain` but
+not which strategy spent it or where inside the transfer it went.
 
 ---
 
@@ -415,6 +419,53 @@ touched.
 | `mx_p2p_transfer_seconds` | Histogram | `policy`, `scheme`, `outcome` |
 | `mx_nixl_data_plane_errors_total` | Counter | `scheme`, `kind` |
 | `mx_nixl_receive_total` | Counter | `scheme`, `result` |
+| `mx_load_seconds` | Histogram | `engine`, `model_role`, `scheme`, `outcome` |
+| `mx_load_phase_seconds` | Histogram | `engine`, `phase`, `scheme` |
+
+### Load timing, and what it does not measure
+
+`mx_load_seconds` is the `load_model()` window: what the caller waited on. It is
+**not** the inference cold start. CUDA graph capture, JIT compilation and KV
+cache setup all run after the loader returns, and Dynamo already measures the
+whole thing end to end, so duplicating it here would produce a second number
+that disagrees with the first for reasons nobody can see.
+
+`mx_load_phase_seconds` splits that window into phases that **partition** it —
+each is a disjoint interval inside the load, so their sum is bounded by the
+total by construction rather than by convention:
+
+| Phase | What runs |
+| --- | --- |
+| `artifact_install` | Compile-cache artifacts fetched before the model exists |
+| `model_init` | The engine builds the module with dummy weights |
+| `chain` | The strategy chain fills those weights |
+| `publish` | This rank offers itself as a source to the next one |
+
+Not every engine has all four, and the missing ones are absences rather than
+zeros:
+
+| Engine | Phases | Why |
+| --- | --- | --- |
+| vLLM | all four | |
+| SGLang | no `model_init` | SGLang builds the module and hands it to the loader |
+| TRT-LLM | `chain` only | model arrives built; publishing happens in a separate call, outside this window |
+
+**Do not add a phase from a second call site.** The partition is the property
+that makes "which part was slow" answerable without the numbers contradicting
+each other, and recording one phase twice inflates it while leaving the sum
+looking sound. `test_phases_partition_the_load` asserts `sum(phases) <= total`
+against real timings.
+
+A failed load is recorded, with `outcome="error"`, and so is a phase that
+raises. Dropping either would omit exactly the observations someone goes looking
+for, and would make the phases stop summing to the whole on the failed loads
+being investigated.
+
+The buckets are the hour-scale band, identical to the server's `buckets::XSLOW`
+value for value — a cold DeepSeek-V3 load runs roughly forty minutes, and server
+downloads and client loads get compared on the same dashboard, where quantiles
+from differently-bucketed histograms are not comparable. A test parses
+`buckets.rs` and fails if the two drift.
 
 ### NIXL data-plane health
 
@@ -584,10 +635,11 @@ ConfigMap for the Grafana sidecar to discover. Adjust `metrics.dashboard.label`
 if your sidecar watches something other than `grafana_dashboard`.
 
 It covers the server end to end -- gRPC, storage backend, download lifecycle,
-capacity -- and the client down to total transfer time. It does **not** attribute
-transfer time across load tiers; that needs per-tier instrumentation which does
-not exist yet, so the transfer panel can say a transfer took 90 seconds but not
-where the 90 seconds went.
+capacity -- and the client down to total transfer time. It does **not** yet plot
+the load tiers: `mx_load_seconds` and `mx_load_phase_seconds` exist as of this
+change but have no panel, so a load's phase split is queryable and not yet
+visible. Below the phase level there is still nothing — the transfer panel can
+say a transfer took 90 seconds but not where inside it the 90 seconds went.
 
 Read **Overview** first; the rows below it answer *why* once a tile is not green.
 

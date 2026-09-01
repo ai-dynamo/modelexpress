@@ -34,7 +34,7 @@ import torch.nn as nn
 
 from ... import configure_vllm_logging, envs, model_prefetch
 from ...load_strategy import LoadContext, LoadStrategyChain
-from ...metrics import enable_metrics
+from ...metrics import enable_metrics, metrics
 from ...nixl_transfer import NixlTransferManager
 from ...vmm.runtime import log_arena_post_load, maybe_enter_vmm_arena
 from .adapter import _is_speculative_draft, build_vllm_load_context
@@ -104,29 +104,48 @@ class MxModelLoader(BaseModelLoader):
             f"(model={ctx.identity.model_name}, p2p_enabled={ctx.p2p_enabled})"
         )
 
-        with maybe_enter_vmm_arena(ctx):
-            if ctx.p2p_enabled:
-                install_vllm_cache_artifacts(ctx)
-            with set_default_torch_dtype(model_config.dtype):
-                with ctx.target_device:
-                    model = initialize_model(
-                        vllm_config=vllm_config,
-                        model_config=model_config,
-                        prefix=prefix,
-                    )
+        # A speculative draft loads through this same path and finishes far
+        # sooner than the model the user asked for, so timing them together
+        # makes the p99 of neither meaningful. Asked directly rather than
+        # inferred from p2p_enabled: that flag happens to agree today, but it is
+        # a capability switch and any future reason to clear it would silently
+        # relabel real loads as drafts.
+        model_role = "draft" if _is_speculative_draft(vllm_config, model_config) else "main"
 
-                model = LoadStrategyChain.run(model, ctx)
-
+        # L0 wraps everything below, and the four L1 phases inside it are
+        # disjoint, so their sum is bounded by the total by construction. The
+        # timers only bracket existing calls; nothing here changes load order.
+        with metrics.time_load("vllm", model_role):
+            with maybe_enter_vmm_arena(ctx):
                 if ctx.p2p_enabled:
-                    _tensor_registry[ctx.device_id] = ctx.tensors
-                    if ctx.nixl_manager is not None:
-                        _nixl_managers[ctx.device_id] = ctx.nixl_manager
-                    else:
-                        _nixl_managers.pop(ctx.device_id, None)
+                    with metrics.time_load_phase("vllm", "artifact_install"):
+                        install_vllm_cache_artifacts(ctx)
+                with set_default_torch_dtype(model_config.dtype):
+                    with ctx.target_device:
+                        with metrics.time_load_phase("vllm", "model_init"):
+                            model = initialize_model(
+                                vllm_config=vllm_config,
+                                model_config=model_config,
+                                prefix=prefix,
+                            )
 
-                    schedule_vllm_cache_artifact_publish(ctx)
+                    with metrics.time_load_phase("vllm", "chain"):
+                        model = LoadStrategyChain.run(model, ctx)
 
-        log_arena_post_load(ctx)
+                    if ctx.p2p_enabled:
+                        _tensor_registry[ctx.device_id] = ctx.tensors
+                        if ctx.nixl_manager is not None:
+                            _nixl_managers[ctx.device_id] = ctx.nixl_manager
+                        else:
+                            _nixl_managers.pop(ctx.device_id, None)
+
+                        # Scheduling the publish, not completing it: the work is
+                        # handed to a background thread, so this phase measures
+                        # the handoff and never the upload.
+                        with metrics.time_load_phase("vllm", "publish"):
+                            schedule_vllm_cache_artifact_publish(ctx)
+
+            log_arena_post_load(ctx)
 
         total_time = time.perf_counter() - load_start
         logger.info(
