@@ -430,6 +430,19 @@ cache setup all run after the loader returns, and Dynamo already measures the
 whole thing end to end, so duplicating it here would produce a second number
 that disagrees with the first for reasons nobody can see.
 
+One consequence is worth stating plainly, because it is not obvious from the
+phase list. `artifact_install` fetches vLLM's compile caches, and its whole
+purpose is to save a JIT recompile — but that recompile happens *after* the
+loader returns, outside this window. So these families show what the install
+**cost** and never what it **saved**: a deployment can see `artifact_install`
+take eight seconds and cannot tell from here whether that avoided two hundred
+seconds of compilation or was pure overhead on a cache that missed.
+
+Widening `mx_load_seconds` would not fix it. The compile is genuinely not inside
+`load_model()`, and stretching the span to cover it would break the partition
+below. The missing signal is a hit/miss counter on the install itself, which
+does not exist yet.
+
 `mx_load_phase_seconds` splits that window into phases that **partition** it —
 each is a disjoint interval inside the load, so their sum is bounded by the
 total by construction rather than by convention:
@@ -455,6 +468,28 @@ that makes "which part was slow" answerable without the numbers contradicting
 each other, and recording one phase twice inflates it while leaving the sum
 looking sound. `test_phases_partition_the_load` asserts `sum(phases) <= total`
 against real timings.
+
+Measured on one GPU, vLLM serving `Qwen/Qwen2.5-0.5B-Instruct` at TP=1 with no
+peer, so the chain falls through to `DefaultStrategy`:
+
+| | Seconds | Share of load |
+| --- | ---: | ---: |
+| `mx_load_seconds` | 5.961791 | |
+| `artifact_install` | 0.000014 | 0.00% |
+| `model_init` | 0.470551 | 7.89% |
+| `chain` | 5.490047 | 92.09% |
+| `publish` | 0.000014 | 0.00% |
+| **sum of phases** | **5.960626** | **99.98%** |
+
+The 1.16 ms the phases do not account for is the loader's own work between them.
+That is the "sums to under 1" case the share panel exists to surface, at a
+magnitude that says the instrumentation is complete rather than that a phase is
+missing.
+
+`artifact_install` and `publish` at fourteen microseconds are both real readings
+rather than broken ones: artifact transfer was off on this run, and `publish`
+hands work to a background thread, so it measures the handoff and not the
+upload.
 
 A failed load is recorded, with `outcome="error"`, and so is a phase that
 raises. Dropping either would omit exactly the observations someone goes looking
