@@ -4,6 +4,7 @@
 import hashlib
 import logging
 from concurrent import futures
+from contextlib import contextmanager
 
 import grpc
 import pytest
@@ -30,7 +31,6 @@ from modelexpress_rl.inference.plan import (
     GeneratorPeerUpdateSource,
     MethodCapabilities,
     ObjectStorageUpdateSource,
-    PreparedArtifact,
     PreparedEngineTensors,
     ResolvedSource,
     TrainerUpdateSource,
@@ -55,6 +55,7 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         self.list_calls = 0
         self.fail_lease_deletion = False
         self.omit_base_version = False
+        self.additional_versions = {}
         self.version = refit_pb2.WeightVersion(
             uid="version-a",
             model_name="test/model",
@@ -90,6 +91,10 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         return refit_pb2.RegisterWorkerResponse(worker=worker)
 
     def GetWeightVersion(self, request, context):
+        if request.uid in self.additional_versions:
+            return refit_pb2.GetWeightVersionResponse(
+                version=self.additional_versions[request.uid]
+            )
         if request.uid == self.base.uid:
             if self.omit_base_version:
                 return refit_pb2.GetWeightVersionResponse()
@@ -172,6 +177,8 @@ class _Adapter:
         self.publish_failures = 0
         self.stage_failures = 0
         self.apply_failure = False
+        self.installation_context_failure = False
+        self.installation_failure_calls = []
 
     @property
     def worker_rank(self):
@@ -256,13 +263,6 @@ class _TestMethod(UpdateMethod):
             staged = self._adapter.stage_peer_weight(source.worker)
         else:
             if isinstance(source, ObjectStorageUpdateSource):
-                if (
-                    version.payload_format is WeightPayloadFormat.XOR_DELTA
-                    and version.base_version_id != self._adapter.service.base.uid
-                ):
-                    raise ValueError(
-                        "canonical delta target does not match the exact local base"
-                    )
                 inputs = GeneratorTransferInputs(
                     version_id=version.version_id,
                     base_version_id=version.base_version_id,
@@ -286,8 +286,25 @@ class _TestMethod(UpdateMethod):
             staged = self._adapter.stage_weight(inputs)
         return PreparedEngineTensors(staged=staged)
 
+    def prepare_chain(self, chain):
+        prepared = None
+        for version, source in chain:
+            prepared = self.prepare(version=version, source=source)
+        assert prepared is not None
+        return prepared
+
     def release(self, prepared):
         self._adapter.release_staged_weight(prepared.staged)
+
+    @contextmanager
+    def installation_context(self, prepared):
+        del prepared
+        if self._adapter.installation_context_failure:
+            raise RuntimeError("installation context failed")
+        yield
+
+    def installation_failed(self, prepared):
+        self._adapter.installation_failure_calls.append(prepared)
 
     def publish_applied(self, *, version_id, prepared):
         if not self._publish_peer or self._active_source is WeightSource.OBJECT_STORAGE:
@@ -414,6 +431,7 @@ def _initialize(
     *,
     object_storage=False,
     max_transfer_attempts=3,
+    max_replay_chain_length=64,
     source_order=None,
 ):
     monkeypatch.setattr(
@@ -443,6 +461,7 @@ def _initialize(
                 else None
             ),
             max_transfer_attempts=max_transfer_attempts,
+            max_replay_chain_length=max_replay_chain_length,
             source_order=source_order,
         )
     )
@@ -454,6 +473,11 @@ def _initialize(
         ("registration_ttl_seconds", 0, "registration_ttl_seconds must be positive"),
         ("lease_ttl_seconds", -1, "lease_ttl_seconds must be positive"),
         ("max_transfer_attempts", 0, "max_transfer_attempts must be positive"),
+        (
+            "max_replay_chain_length",
+            0,
+            "max_replay_chain_length must be positive",
+        ),
         (
             "rpc_timeout_seconds",
             float("inf"),
@@ -741,10 +765,17 @@ def test_generator_dispatches_canonical_s3_without_fetching_a_worker_manifest(
         assert service.p2p.requests == []
         staged.release()
         repeated = generator.stage_weight(version=WeightVersionRef("version-a"))
+        assert repeated.applied is True
+        assert repeated.metrics == {}
+        assert generator.apply_weight(repeated) is None
         repeated.release()
     finally:
         generator.close()
         server.stop(grace=None).wait()
+
+    assert len(adapter.stage_calls) == 1
+    assert len(adapter.apply_calls) == 1
+    assert service.lease_registrations == 1
 
 
 def test_generator_retries_canonical_s3_under_one_lease(monkeypatch):
@@ -777,6 +808,115 @@ def test_generator_retries_canonical_s3_under_one_lease(monkeypatch):
     assert len(adapter.stage_calls) == 2
     assert service.lease_registrations == 1
     assert service.lease_deletions == 1
+
+
+def test_generator_treats_installed_initial_base_as_successful_no_op(monkeypatch):
+    server, endpoint, service = _start_server()
+    adapter = _Adapter(service)
+    generator = _initialize(monkeypatch, endpoint, adapter, object_storage=True)
+
+    try:
+        staged = generator.stage_weight(version=WeightVersionRef("base-a"))
+        assert staged.applied is True
+        assert generator.apply_weight(staged) is None
+        staged.release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert service.lease_registrations == 0
+    assert adapter.stage_calls == []
+    assert adapter.apply_calls == []
+
+
+def _canonical_version(uid, base_version_id):
+    return refit_pb2.WeightVersion(
+        uid=uid,
+        model_name="test/model",
+        payload_format=refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA,
+        base_version_id=base_version_id,
+        layout_signature="layout-a",
+        state=refit_pb2.WEIGHT_VERSION_STATE_READY,
+        object_storage=refit_pb2.ObjectStorageSource(
+            storage_type=refit_pb2.OBJECT_STORAGE_TYPE_S3,
+            uri=f"s3://weights/{uid}/model.safetensors.index.json",
+        ),
+    )
+
+
+def test_generator_resolves_and_stages_target_replay_chain(monkeypatch):
+    server, endpoint, service = _start_server()
+    service.version.CopyFrom(_canonical_version("version-c", "version-b"))
+    service.additional_versions = {
+        "version-a": _canonical_version("version-a", "base-a"),
+        "version-b": _canonical_version("version-b", "version-a"),
+    }
+    adapter = _Adapter(service)
+    generator = _initialize(monkeypatch, endpoint, adapter, object_storage=True)
+
+    try:
+        staged = generator.stage_weight(version=WeightVersionRef("version-c"))
+        assert [call.version_id for call in adapter.stage_calls] == [
+            "version-a",
+            "version-b",
+            "version-c",
+        ]
+        assert adapter.apply_calls == []
+        assert generator.apply_weight(staged) == "installed"
+        staged.release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert len(adapter.apply_calls) == 1
+    assert service.lease_registrations == 3
+    assert service.lease_deletions == 3
+
+
+def test_generator_rejects_replay_cycle_before_leasing(monkeypatch):
+    server, endpoint, service = _start_server()
+    service.version.CopyFrom(_canonical_version("version-b", "version-a"))
+    service.additional_versions = {
+        "version-a": _canonical_version("version-a", "version-b"),
+    }
+    adapter = _Adapter(service)
+    generator = _initialize(monkeypatch, endpoint, adapter, object_storage=True)
+
+    try:
+        with pytest.raises(RuntimeError, match=r"cycle detected.*version-b"):
+            generator.stage_weight(version=WeightVersionRef("version-b"))
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert service.lease_registrations == 0
+    assert adapter.stage_calls == []
+
+
+def test_generator_rejects_excessive_replay_chain_before_leasing(monkeypatch):
+    server, endpoint, service = _start_server()
+    service.version.CopyFrom(_canonical_version("version-b", "version-a"))
+    service.additional_versions = {
+        "version-a": _canonical_version("version-a", "base-a"),
+    }
+    adapter = _Adapter(service)
+    generator = _initialize(
+        monkeypatch,
+        endpoint,
+        adapter,
+        object_storage=True,
+        max_replay_chain_length=1,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match=r"maximum chain length 1.*version-a"):
+            generator.stage_weight(version=WeightVersionRef("version-b"))
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert service.lease_registrations == 0
+    assert adapter.stage_calls == []
 
 
 def test_generator_dispatches_full_hf_checkpoint_without_an_exact_base(
@@ -1063,6 +1203,64 @@ def test_generator_preserves_apply_error_when_lease_cleanup_also_fails(monkeypat
         service.fail_lease_deletion = False
         generator.close()
         server.stop(grace=None).wait()
+
+
+@pytest.mark.parametrize("recovery_version", ["base-a", "version-b"])
+def test_generator_recovers_uncertain_engine_with_active_or_new_version(
+    monkeypatch, recovery_version
+):
+    server, endpoint, service = _start_server()
+    service.version.CopyFrom(_canonical_version("version-a", "base-a"))
+    service.base.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
+    service.base.object_storage.CopyFrom(
+        refit_pb2.ObjectStorageSource(
+            storage_type=refit_pb2.OBJECT_STORAGE_TYPE_S3,
+            uri="s3://weights/base-a/model.safetensors.index.json",
+        )
+    )
+    service.additional_versions["version-b"] = _canonical_version(
+        "version-b", "base-a"
+    )
+    adapter = _Adapter(service)
+    adapter.apply_failure = True
+    generator = _initialize(monkeypatch, endpoint, adapter, object_storage=True)
+
+    try:
+        failed = generator.stage_weight(version=WeightVersionRef("version-a"))
+        with pytest.raises(RuntimeError, match="apply failed"):
+            generator.apply_weight(failed)
+        assert len(adapter.installation_failure_calls) == 1
+        failed.release()
+
+        adapter.apply_failure = False
+        recovery = generator.stage_weight(version=WeightVersionRef(recovery_version))
+        assert recovery.applied is False
+        assert generator.apply_weight(recovery) == "installed"
+        recovery.release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert len(adapter.apply_calls) == 2
+
+
+def test_generator_does_not_fence_when_installation_context_entry_fails(monkeypatch):
+    server, endpoint, service = _start_server()
+    adapter = _Adapter(service)
+    adapter.installation_context_failure = True
+    generator = _initialize(monkeypatch, endpoint, adapter)
+
+    try:
+        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+        with pytest.raises(RuntimeError, match="installation context failed"):
+            generator.apply_weight(staged)
+        staged.release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert adapter.installation_failure_calls == []
+    assert adapter.apply_calls == []
 
 
 def test_generator_rejects_non_ready_version_before_leasing(monkeypatch):

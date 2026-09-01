@@ -184,6 +184,32 @@ class _Adapter:
         )
         return self._active.checkpoint
 
+    def stage_chain(self, inputs):
+        chain = []
+        for item in inputs:
+            version = WeightVersion(
+                version_id=item.version_id,
+                model_name="test/model",
+                payload_format=item.payload_format,
+                base_version_id=item.base_version_id,
+                object_storage=item.object_storage,
+                expected_source_slots=(),
+                layout_signature=item.layout_signature,
+                state=WeightVersionState.READY,
+                created_at_unix_ms=0,
+            )
+            chain.append(
+                (
+                    version,
+                    ObjectStorageUpdateSource(
+                        storage=item.object_storage,
+                        payload_format=item.payload_format,
+                    ),
+                )
+            )
+        self._active = self._method.prepare_chain(tuple(chain))
+        return self._active.checkpoint
+
     def apply_weight(self, staged):
         assert self._active is not None and self._active.checkpoint is staged
         with self._method.installation_context(self._active):
@@ -702,6 +728,224 @@ def test_canonical_s3_prepares_then_installs_one_global_index(monkeypatch, tmp_p
     assert adapter.apply_weight(staged)["perf/mx_receive_install_time"] >= 0
     assert adapter.installed == [staged.path]
     adapter.release_staged_weight(staged)
+    adapter.close()
+
+
+def test_canonical_s3_replays_multiple_deltas_before_one_install(monkeypatch, tmp_path):
+    base = torch.tensor([1.0, 2.0])
+    first = torch.tensor([3.0, 4.0])
+    target = torch.tensor([5.0, 6.0])
+    objects = _artifact(base.view(torch.uint8).numpy(), first.view(torch.uint8).numpy())
+    objects.update(
+        _artifact(
+            first.view(torch.uint8).numpy(),
+            target.view(torch.uint8).numpy(),
+            version="target-b",
+            version_label=2,
+            base_version="target-a",
+        )
+    )
+    parse_calls = []
+    parse_delta_manifest = receiver_module._parse_delta_manifest
+
+    def track_parse(data, version):
+        parse_calls.append(version.version_id)
+        return parse_delta_manifest(data, version)
+
+    monkeypatch.setattr(receiver_module, "_parse_delta_manifest", track_parse)
+    adapter, _ = _build(monkeypatch, tmp_path, objects)
+
+    staged = adapter.stage_chain(
+        (
+            _inputs(None),
+            _inputs(
+                None,
+                version="target-b",
+                version_label=2,
+                base_version="target-a",
+            ),
+        )
+    )
+
+    assert torch.equal(load_file(staged.path / "model.safetensors")["weight"], target)
+    assert json.loads(adapter._checkpoint.store.state_path.read_text())["version"] == (
+        "target-b"
+    )
+    assert parse_calls == ["target-a", "target-b"]
+    assert adapter.installed == []
+    adapter.apply_weight(staged)
+    assert adapter.installed == [staged.path]
+    adapter.release_staged_weight(staged)
+    adapter.close()
+
+
+def test_canonical_s3_validates_all_replay_manifests_before_mutation(
+    monkeypatch, tmp_path
+):
+    base_tensor = torch.tensor([1.0, 2.0])
+    first = torch.tensor([3.0, 4.0])
+    target = torch.tensor([5.0, 6.0])
+    objects = _artifact(
+        base_tensor.view(torch.uint8).numpy(), first.view(torch.uint8).numpy()
+    )
+    objects.update(
+        _artifact(
+            first.view(torch.uint8).numpy(),
+            target.view(torch.uint8).numpy(),
+            version="target-b",
+            version_label=2,
+            base_version="target-a",
+        )
+    )
+    second_root = "s3://weights/test/v2/model.safetensors.index.json"
+    manifest = json.loads(objects[second_root])
+    manifest["metadata"]["base_version"] = "wrong-base"
+    objects[second_root] = json.dumps(manifest).encode()
+    adapter, _ = _build(monkeypatch, tmp_path, objects)
+
+    with pytest.raises(RuntimeError, match=r"base_version.*target-b"):
+        adapter.stage_chain(
+            (
+                _inputs(None),
+                _inputs(
+                    None,
+                    version="target-b",
+                    version_label=2,
+                    base_version="target-a",
+                ),
+            )
+        )
+
+    state = json.loads(adapter._checkpoint.store.state_path.read_text())
+    state.pop("files")
+    assert state == {"status": "READY", "version": "base-a"}
+    assert torch.equal(
+        load_file(adapter._checkpoint.local_checkpoint / "model.safetensors")["weight"],
+        base_tensor,
+    )
+
+
+def test_canonical_s3_keeps_checkpoint_ready_after_install_failure(
+    monkeypatch, tmp_path
+):
+    base = torch.tensor([1.0, 2.0]).view(torch.uint8).numpy()
+    target = torch.tensor([3.0, 4.0]).view(torch.uint8).numpy()
+    objects = _artifact(base, target)
+    adapter, _ = _build(monkeypatch, tmp_path, objects)
+    staged = adapter.stage_weight(_inputs(None))
+
+    with pytest.raises(RuntimeError, match="injected install failure"):
+        with adapter._method.installation_context(adapter._active):
+            raise RuntimeError("injected install failure")
+    adapter._method.installation_failed(adapter._active)
+
+    state = json.loads(adapter._checkpoint.store.state_path.read_text())
+    assert state["status"] == "READY"
+    assert state["version"] == "target-a"
+    assert adapter._checkpoint.store.active_version() == "base-a"
+    adapter.release_staged_weight(staged)
+    cached = adapter.stage_weight(_inputs(None))
+    assert cached.path == staged.path
+    adapter.release_staged_weight(cached)
+    adapter.close()
+
+
+@pytest.mark.parametrize("target_version", ["v3", "v4", "v5"])
+def test_canonical_s3_recovers_from_failed_v2_install_with_disjoint_target(
+    monkeypatch, tmp_path, target_version
+):
+    # The configured base-a checkpoint represents v1 in this lineage.
+    tensors = {
+        "v1": torch.tensor([1.0, 2.0]),
+        "v2": torch.tensor([3.0, 4.0]),
+        "v3": torch.tensor([5.0, 6.0]),
+        "v4": torch.tensor([7.0, 8.0]),
+        "v5": torch.tensor([9.0, 10.0]),
+    }
+    objects = {}
+    for version, base in (("v2", "v1"), ("v3", "v2"), ("v5", "v4")):
+        objects.update(
+            _artifact(
+                tensors[base].view(torch.uint8).numpy(),
+                tensors[version].view(torch.uint8).numpy(),
+                version=version,
+                version_label=int(version[1:]),
+                base_version="base-a" if base == "v1" else base,
+            )
+        )
+    objects.update(_full_artifact(tensors["v4"], version_label=4))
+    adapter, _storage = _build(monkeypatch, tmp_path, objects)
+
+    def delta(version, base):
+        return _inputs(
+            None,
+            version=version,
+            version_label=int(version[1:]),
+            base_version="base-a" if base == "v1" else base,
+        )
+
+    failed = adapter.stage_weight(delta("v2", "v1"))
+    with pytest.raises(RuntimeError, match="injected install failure"):
+        with adapter._method.installation_context(adapter._active):
+            raise RuntimeError("injected install failure")
+    adapter._method.installation_failed(adapter._active)
+    adapter.release_staged_weight(failed)
+    assert adapter._checkpoint.store.state()["version"] == "v2"
+    assert adapter._checkpoint.store.active_version() == "base-a"
+
+    replays = {
+        "v3": (delta("v2", "v1"), delta("v3", "v2")),
+        "v4": (_full_inputs(version="v4", version_label=4),),
+        "v5": (
+            _full_inputs(version="v4", version_label=4),
+            delta("v5", "v4"),
+        ),
+    }
+    replay = replays[target_version]
+    recovered = (
+        adapter.stage_weight(replay[0])
+        if len(replay) == 1
+        else adapter.stage_chain(replay)
+    )
+    shard = recovered.path / "model.safetensors"
+    if not shard.exists():
+        shard = recovered.path / "model-00001-of-00001.safetensors"
+    assert torch.equal(
+        load_file(shard)["weight"],
+        tensors[target_version],
+    )
+    adapter.apply_weight(recovered)
+    assert adapter._checkpoint.store.active_version() == target_version
+    adapter.release_staged_weight(recovered)
+    adapter.close()
+
+
+def test_canonical_s3_reinstalls_active_checkpoint_after_install_failure(
+    monkeypatch, tmp_path
+):
+    objects = _full_artifact(torch.tensor([7.0, 8.0]))
+    objects.update(
+        _full_artifact(
+            torch.tensor([9.0, 10.0]),
+            version_label=3,
+        )
+    )
+    adapter, _storage = _build(monkeypatch, tmp_path, objects)
+
+    active = adapter.stage_weight(_full_inputs())
+    adapter.apply_weight(active)
+    adapter.release_staged_weight(active)
+
+    failed = adapter.stage_weight(_full_inputs(version="full-b", version_label=3))
+    adapter._method.installation_failed(adapter._active)
+    adapter.release_staged_weight(failed)
+
+    recovery = adapter.stage_weight(_full_inputs())
+    assert recovery.path == adapter._checkpoint.store.full_path("full-a")
+    adapter.apply_weight(recovery)
+    adapter.release_staged_weight(recovery)
+    assert adapter._checkpoint.store.state()["status"] == "READY"
+    assert adapter._checkpoint.store.active_version() == "full-a"
     adapter.close()
 
 
@@ -1875,7 +2119,7 @@ def test_child_download_failure_leaves_checkpoint_updating(
     adapter, storage = _build(monkeypatch, tmp_path, objects)
     storage.fail_key_once = shard_key
 
-    with pytest.raises(OSError, match="injected shard download failure"):
+    with pytest.raises(RuntimeError, match="injected shard download failure"):
         adapter.stage_weight(_inputs(objects[root_key]))
 
     state = json.loads(adapter._checkpoint.store.state_path.read_text())
