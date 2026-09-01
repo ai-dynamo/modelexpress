@@ -12,9 +12,13 @@ deployment.
 
 This documents what ships today: the exposition path, `mx_build_info`, per-RPC
 and storage-backend coverage on the server, the download lifecycle, NIXL client
-health, and the Kubernetes scrape, alerting and dashboard surface. The load and
-transfer timing tiers come later and are not here yet, so nothing below
-attributes a transfer's duration across its phases.
+health, the Kubernetes scrape, alerting and dashboard surface, and the first two
+load-timing tiers — the `load_model()` window and the phases that partition it.
+
+The tiers below those do not exist yet. Nothing here attributes time to an
+individual strategy attempt or splits a transfer into registration, handshake
+and wire, so the dashboard can say a load spent ninety seconds in `chain` but
+not which strategy spent it or where inside the transfer it went.
 
 ---
 
@@ -415,6 +419,144 @@ touched.
 | `mx_p2p_transfer_seconds` | Histogram | `policy`, `scheme`, `outcome` |
 | `mx_nixl_data_plane_errors_total` | Counter | `scheme`, `kind` |
 | `mx_nixl_receive_total` | Counter | `scheme`, `result` |
+| `mx_load_seconds` | Histogram | `engine`, `model`, `model_role`, `scheme`, `outcome` |
+| `mx_load_phase_seconds` | Histogram | `engine`, `model`, `phase`, `scheme` |
+
+### Load timing, and what it does not measure
+
+`mx_load_seconds` is the `load_model()` window: what the caller waited on. It is
+**not** the inference cold start. CUDA graph capture, JIT compilation and KV
+cache setup all run after the loader returns, and Dynamo already measures the
+whole thing end to end, so duplicating it here would produce a second number
+that disagrees with the first for reasons nobody can see.
+
+One consequence is worth stating plainly, because it is not obvious from the
+phase list. `artifact_install` fetches vLLM's compile caches, and its whole
+purpose is to save a JIT recompile — but that recompile happens *after* the
+loader returns, outside this window. So these families show what the install
+**cost** and never what it **saved**: a deployment can see `artifact_install`
+take eight seconds and cannot tell from here whether that avoided two hundred
+seconds of compilation or was pure overhead on a cache that missed.
+
+Widening `mx_load_seconds` would not fix it. The compile is genuinely not inside
+`load_model()`, and stretching the span to cover it would break the partition
+below. The missing signal is a hit/miss counter on the install itself, which
+does not exist yet.
+
+`mx_load_phase_seconds` splits that window into phases that **partition** it —
+each is a disjoint interval inside the load, so their sum is bounded by the
+total by construction rather than by convention:
+
+| Phase | What runs |
+| --- | --- |
+| `artifact_install` | Compile-cache artifacts fetched before the model exists |
+| `model_init` | The engine builds the module with dummy weights |
+| `chain` | The strategy chain fills those weights |
+| `publish` | This rank offers itself as a source to the next one |
+
+Not every engine has all four, and the missing ones are absences rather than
+zeros:
+
+| Engine | Phases | Why | Confirmed on |
+| --- | --- | --- | --- |
+| vLLM | all four | | hardware |
+| SGLang | no `model_init` | SGLang builds the module and hands it to the loader | hardware |
+| TRT-LLM | `chain` only | model arrives built; publishing happens in a separate call, outside this window | unit tests only |
+
+TRT-LLM's row has not been observed on a GPU: CI builds worker images for vLLM
+and SGLang but not for TRT-LLM, so there is no image carrying this code to run.
+Treat its phase set as the intent rather than as a measurement.
+
+SGLang's `transfer_engine` transport is a further gap in the same direction. It
+never enters the strategy chain, so it records **`mx_load_seconds` and no phases
+at all**. The partition still holds — zero is bounded by the total — but the
+share panel reads 0% there, which under the rule above means "time is going
+somewhere no phase covers". On that transport it does, and the panel is telling
+the truth about instrumentation that has not been written yet.
+
+**Do not add a phase from a second call site.** The partition is the property
+that makes "which part was slow" answerable without the numbers contradicting
+each other, and recording one phase twice inflates it while leaving the sum
+looking sound. `test_phases_partition_the_load` asserts `sum(phases) <= total`
+against real timings.
+
+Measured on one GPU each, serving `Qwen/Qwen2.5-0.5B-Instruct` at TP=1 with no
+peer, so the chain falls through in both cases. Seconds, with share of that
+engine's load:
+
+| Phase | vLLM | | SGLang | |
+| --- | ---: | ---: | ---: | ---: |
+| `mx_load_seconds` | 5.961791 | | 4.373961 | |
+| `artifact_install` | 0.000014 | 0.00% | 0.000007 | 0.00% |
+| `model_init` | 0.470551 | 7.89% | *absent* | |
+| `chain` | 5.490047 | 92.09% | 4.371382 | 99.94% |
+| `publish` | 0.000014 | 0.00% | 0.000014 | 0.00% |
+| **sum of phases** | **5.960626** | **99.98%** | **4.371403** | **99.94%** |
+
+`sum(phases) <= total` holds on both. The 1.16 ms and 2.56 ms unaccounted are
+the loader's own work between phases — the "sums to under 1" case the share
+panel exists to surface, at a magnitude that says the instrumentation is
+complete rather than that a phase is missing.
+
+**SGLang genuinely has no `model_init` series**, not a zero one: the phase does
+not appear in its exposition at all, because SGLang builds the module and hands
+it to the loader. An engine's phase set is a property of that engine, so
+comparing one engine's phase against another's is only meaningful within the
+share column.
+
+`artifact_install` and `publish` in the microseconds are real readings rather
+than broken ones on both engines: artifact transfer was off on these runs, and
+`publish` hands work to a background thread, so it measures the handoff and not
+the upload.
+
+The same SGLang run also shows why `mx_load_seconds` is not the cold start. The
+load took 4.37 s; CUDA graph capture and piecewise compilation afterwards took
+26.35 s and 10.55 s, none of it inside this window.
+
+A failed load is recorded, with `outcome="error"`, and so is a phase that
+raises. Dropping either would omit exactly the observations someone goes looking
+for, and would make the phases stop summing to the whole on the failed loads
+being investigated.
+
+The buckets are the hour-scale band, identical to the server's `buckets::XSLOW`
+value for value — a cold DeepSeek-V3 load runs roughly forty minutes, and server
+downloads and client loads get compared on the same dashboard, where quantiles
+from differently-bucketed histograms are not comparable. A test parses
+`buckets.rs` and fails if the two drift.
+
+The band runs from 0.5 s, not from 5 s, and the difference is not cosmetic. With
+a 5 s floor every fast load shared the bottom bucket, and `histogram_quantile`
+interpolates linearly across it — so a load measured at 3.80 s reported a p50 of
+2.50 and a p95 of 4.75. Those are `q * 5`, not readings. A small model, a warm
+cache and a P2P transfer that works are all sub-5 s, so this was the common case
+rather than an edge.
+
+Quantiles still need observations to mean anything. A single load gives a p95
+that is bucket interpolation whatever the boundaries are; these are fleet
+statistics, and on one pod the mean per phase is the honest panel to read.
+
+### The `model` label is bounded by convention, not by code
+
+Every other label on these families is closed in code: an unrecognized `engine`
+clamps to `other`, an unknown `phase` is dropped. `model` cannot be, because its
+values are whatever the deployment chose to serve. It is bounded by the fact
+that an organization runs a finite catalogue of models, changing on the
+timescale of deployments rather than of requests.
+
+It costs nothing in practice. A process serves exactly one model, so the label
+is constant within a pod, and Prometheus already attaches `pod` to every series
+— `model` names a dimension the data carries anyway rather than multiplying it.
+Measured on a three-pod fleet: **18 series per pod either way**.
+
+This is not the `source_worker_id` situation. That label was a uuid minted fresh
+per process, so its domain grew with process count forever and it is off by
+default for that reason. A model id is stable across restarts.
+
+The guard is a 96-character cap, which can in principle merge two long ids that
+share a prefix. That is accepted over dropping the label: a merged pair still
+says more than no model at all, and 96 characters clears every id in the wild by
+a wide margin. An absent or blank id records as `unknown` rather than as an
+empty string, which would render as `model=""` and read as an exporter bug.
 
 ### NIXL data-plane health
 
@@ -584,10 +726,11 @@ ConfigMap for the Grafana sidecar to discover. Adjust `metrics.dashboard.label`
 if your sidecar watches something other than `grafana_dashboard`.
 
 It covers the server end to end -- gRPC, storage backend, download lifecycle,
-capacity -- and the client down to total transfer time. It does **not** attribute
-transfer time across load tiers; that needs per-tier instrumentation which does
-not exist yet, so the transfer panel can say a transfer took 90 seconds but not
-where the 90 seconds went.
+capacity -- and the client down to total transfer time. It does **not** yet plot
+the load tiers: `mx_load_seconds` and `mx_load_phase_seconds` exist as of this
+change but have no panel, so a load's phase split is queryable and not yet
+visible. Below the phase level there is still nothing — the transfer panel can
+say a transfer took 90 seconds but not where inside it the 90 seconds went.
 
 Read **Overview** first; the rows below it answer *why* once a tile is not green.
 

@@ -19,7 +19,7 @@ from ...load_strategy import (
     register_tensors,
     unpublish_metadata,
 )
-from ...metrics import enable_metrics
+from ...metrics import enable_metrics, metrics
 from .adapter import TrtllmAdapter, build_trtllm_load_context
 
 logger = logging.getLogger("modelexpress.engines.trtllm.loader")
@@ -89,7 +89,17 @@ class MxModelLoader:
             self._ctx.p2p_enabled,
         )
         self.adapter.current_model = model
-        value = LoadStrategyChain.run(model, self._ctx)
+        # One phase only. TRT-LLM hands in an initialized model, installs no
+        # cache artifacts here, and publishes from publish_model(), which the
+        # engine calls after post-load processing -- outside this window.
+        # Recording a publish phase there would put time outside the L0 span it
+        # is supposed to be a part of, and the phases would stop summing to the
+        # whole.
+        with metrics.time_load("trtllm", self._ctx.identity.model_name, "main"):
+            with metrics.time_load_phase(
+                "trtllm", self._ctx.identity.model_name, "chain"
+            ):
+                value = LoadStrategyChain.run(model, self._ctx)
         total_time = time.perf_counter() - load_start
         logger.info(
             "[Worker %s] TRT-LLM MxModelLoader.load_model() COMPLETE in %.2fs",

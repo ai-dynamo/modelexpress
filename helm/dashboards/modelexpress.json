@@ -502,6 +502,190 @@
       }
     },
     {
+      "id": 110,
+      "type": "row",
+      "title": "Model load",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 111,
+      "type": "bargauge",
+      "title": "Load duration by model",
+      "description": "Mean load_model() duration per engine and model, over the processes currently being scraped. Not the inference cold start: CUDA graph capture, JIT and KV cache setup all run after the loader returns.\n\nSplit by engine because a load duration is not comparable across them. vLLM builds the module inside this window and SGLang does not, so the two measure different amounts of work even for identical weights -- merged, a model loaded by both reports a mean belonging to neither.\n\nThe mean rather than a quantile: histogram_quantile reads bucket counts, so two models in one bucket draw the same value. _sum / _count is exact.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 7,
+        "x": 0,
+        "y": 10
+      },
+      "targets": [
+        {
+          "expr": "sum by (engine, model) (mx_load_seconds_sum) / sum by (engine, model) (mx_load_seconds_count)",
+          "legendFormat": "{{engine}}  {{model}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "0"
+        }
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true
+      }
+    },
+    {
+      "id": 112,
+      "type": "table",
+      "title": "Timing breakdown per model",
+      "description": "Mean time in each phase, per engine and model. The phases partition the load, so one row group sums to that model's duration in the panel to the left; this is what answers 'which part was slow'.\n\nGrouped by engine as well as model for two reasons. The phase sets differ -- vLLM records four, SGLang three because it builds the module and hands it in, TRT-LLM one because it also publishes outside this window -- so a missing row needs an engine to be attributed to. And without it, a vLLM load and an SGLang load of the same model would merge into a single mean across two engines.\n\nGrouped by model rather than aggregated because averaging a phase across model sizes produces a number belonging to no load: on a fleet of a 0.5B, a 1.5B and a 7B that read chain = 28.0 s when the real values were 4.0, 36.3 and 43.8.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 10,
+        "x": 7,
+        "y": 10
+      },
+      "targets": [
+        {
+          "expr": "sum by (engine, model, phase) (mx_load_phase_seconds_sum) / sum by (engine, model, phase) (mx_load_phase_seconds_count)",
+          "format": "table",
+          "instant": true,
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": ""
+        }
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "indexByName": {
+              "engine": 0,
+              "model": 1,
+              "phase": 2,
+              "Value": 3
+            },
+            "renameByName": {
+              "Value": "mean"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "engine",
+                "desc": false
+              },
+              {
+                "field": "model",
+                "desc": false
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": 113,
+      "type": "bargauge",
+      "title": "Loads recorded by model",
+      "description": "Loads completed by the processes currently being scraped, per engine and model. Resets when a pod restarts, because the count is process-local.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 7,
+        "x": 17,
+        "y": 10
+      },
+      "targets": [
+        {
+          "expr": "sum by (engine, model) (mx_load_seconds_count)",
+          "legendFormat": "{{engine}}  {{model}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0"
+        }
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true
+      }
+    },
+    {
       "id": 6,
       "type": "row",
       "title": "Downloads",
@@ -510,7 +694,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 9
+        "y": 20
       },
       "panels": []
     },
@@ -526,11 +710,11 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 10
+        "y": 21
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(mx_download_seconds_bucket{outcome=\"downloaded\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (mx_download_seconds_bucket{outcome=\"downloaded\"}))",
           "legendFormat": "p50",
           "refId": "A",
           "datasource": {
@@ -539,7 +723,7 @@
           }
         },
         {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(mx_download_seconds_bucket{outcome=\"downloaded\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (mx_download_seconds_bucket{outcome=\"downloaded\"}))",
           "legendFormat": "p95",
           "refId": "B",
           "datasource": {
@@ -548,7 +732,7 @@
           }
         },
         {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(mx_download_seconds_bucket{outcome=\"downloaded\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (mx_download_seconds_bucket{outcome=\"downloaded\"}))",
           "legendFormat": "p99",
           "refId": "C",
           "datasource": {
@@ -557,7 +741,7 @@
           }
         }
       ],
-      "description": "Filtered to outcome=downloaded. The histogram also carries outcome=error, and a download that fails early would otherwise pull these percentiles down and read as an improvement. Buckets run to one hour: a cold DeepSeek-V3 warm-up is around forty minutes.",
+      "description": "Duration of every successful download these server processes have done. Cumulative rather than a rate: a download is a rare event, and over the few-minute window $__rate_interval covers, the panel would be empty except in the moments just after one finished. Does not decay -- a slow download keeps affecting the quantiles until the process restarts.",
       "fieldConfig": {
         "defaults": {
           "unit": "s"
@@ -576,7 +760,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 10
+        "y": 21
       },
       "targets": [
         {
@@ -608,7 +792,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 10
+        "y": 21
       },
       "targets": [
         {
@@ -640,7 +824,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 10
+        "y": 21
       },
       "targets": [
         {
@@ -672,7 +856,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 18
+        "y": 29
       },
       "targets": [
         {
@@ -704,7 +888,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 18
+        "y": 29
       },
       "targets": [
         {
@@ -733,7 +917,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 26
+        "y": 37
       },
       "panels": []
     },
@@ -749,7 +933,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 27
+        "y": 38
       },
       "targets": [
         {
@@ -781,7 +965,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 27
+        "y": 38
       },
       "targets": [
         {
@@ -814,7 +998,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 27
+        "y": 38
       },
       "targets": [
         {
@@ -846,7 +1030,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 27
+        "y": 38
       },
       "targets": [
         {
@@ -874,7 +1058,7 @@
         "h": 5,
         "w": 24,
         "x": 0,
-        "y": 35
+        "y": 46
       },
       "options": {
         "mode": "markdown",
@@ -893,7 +1077,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 40
+        "y": 51
       },
       "targets": [
         {
@@ -925,7 +1109,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 40
+        "y": 51
       },
       "targets": [
         {
@@ -967,7 +1151,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 40
+        "y": 51
       },
       "targets": [
         {
@@ -999,7 +1183,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 40
+        "y": 51
       },
       "targets": [
         {
@@ -1028,7 +1212,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 48
+        "y": 59
       },
       "panels": []
     },
@@ -1044,7 +1228,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 49
+        "y": 60
       },
       "targets": [
         {
@@ -1076,7 +1260,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 49
+        "y": 60
       },
       "targets": [
         {
@@ -1138,7 +1322,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 49
+        "y": 60
       },
       "targets": [
         {
@@ -1170,7 +1354,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 49
+        "y": 60
       },
       "targets": [
         {
@@ -1202,7 +1386,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 57
+        "y": 68
       },
       "targets": [
         {
@@ -1252,7 +1436,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 57
+        "y": 68
       },
       "targets": [
         {
@@ -1284,7 +1468,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 57
+        "y": 68
       },
       "targets": [
         {
@@ -1316,7 +1500,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 57
+        "y": 68
       },
       "targets": [
         {
@@ -1348,7 +1532,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 65
+        "y": 76
       },
       "targets": [
         {
@@ -1387,7 +1571,7 @@
         "h": 6,
         "w": 18,
         "x": 6,
-        "y": 65
+        "y": 76
       },
       "options": {
         "mode": "markdown",
@@ -1403,7 +1587,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 71
+        "y": 82
       },
       "panels": []
     },
@@ -1419,7 +1603,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 72
+        "y": 83
       },
       "targets": [
         {
@@ -1451,7 +1635,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 72
+        "y": 83
       },
       "targets": [
         {
@@ -1484,7 +1668,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 72
+        "y": 83
       },
       "targets": [
         {
