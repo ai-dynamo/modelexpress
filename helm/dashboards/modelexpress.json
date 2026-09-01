@@ -518,21 +518,21 @@
       "id": 111,
       "type": "bargauge",
       "title": "Load duration by model",
-      "description": "Mean load_model() duration per model, over the processes currently being scraped. Not the inference cold start: CUDA graph capture, JIT and KV cache setup all run after the loader returns.\n\nThe mean rather than a quantile, and cumulative rather than a rate, because of what these series are. A load happens once per process, so rate() sees a constant and returns zero, and each pod contributes a single observation. histogram_quantile reads bucket counts only, so two models landing in one bucket draw the same line -- a 36 s load and a 44 s load are indistinguishable inside (30, 60]. _sum / _count is exact.\n\nA bar gauge rather than a timeseries: a load happens once per process, so the value never changes and a time axis draws a flat line across the whole panel. The comparison worth seeing is between models.",
+      "description": "Mean load_model() duration per engine and model, over the processes currently being scraped. Not the inference cold start: CUDA graph capture, JIT and KV cache setup all run after the loader returns.\n\nSplit by engine because a load duration is not comparable across them. vLLM builds the module inside this window and SGLang does not, so the two measure different amounts of work even for identical weights -- merged, a model loaded by both reports a mean belonging to neither.\n\nThe mean rather than a quantile: histogram_quantile reads bucket counts, so two models in one bucket draw the same value. _sum / _count is exact.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
       "gridPos": {
         "h": 10,
-        "w": 8,
+        "w": 7,
         "x": 0,
         "y": 10
       },
       "targets": [
         {
-          "expr": "sum by (model) (mx_load_seconds_sum) / sum by (model) (mx_load_seconds_count)",
-          "legendFormat": "{{model}}",
+          "expr": "sum by (engine, model) (mx_load_seconds_sum) / sum by (engine, model) (mx_load_seconds_count)",
+          "legendFormat": "{{engine}}  {{model}}",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -563,20 +563,20 @@
       "id": 112,
       "type": "table",
       "title": "Timing breakdown per model",
-      "description": "Mean time in each phase, kept per model. The phases partition the load, so one model's bars sum to its duration in the panel to the left; this is what answers 'which part was slow'.\n\nGrouped by model deliberately. Averaging a phase across models of different sizes produces a number that belongs to no load -- on a fleet of a 0.5B, a 1.5B and a 7B it read chain = 28.0 s when the real values were 4.0, 36.3 and 43.8.\n\nA phase absent for an engine is a real absence, not a zero: SGLang has no model_init, and TRT-LLM publishes outside this window.",
+      "description": "Mean time in each phase, per engine and model. The phases partition the load, so one row group sums to that model's duration in the panel to the left; this is what answers 'which part was slow'.\n\nGrouped by engine as well as model for two reasons. The phase sets differ -- vLLM records four, SGLang three because it builds the module and hands it in, TRT-LLM one because it also publishes outside this window -- so a missing row needs an engine to be attributed to. And without it, a vLLM load and an SGLang load of the same model would merge into a single mean across two engines.\n\nGrouped by model rather than aggregated because averaging a phase across model sizes produces a number belonging to no load: on a fleet of a 0.5B, a 1.5B and a 7B that read chain = 28.0 s when the real values were 4.0, 36.3 and 43.8.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
       "gridPos": {
         "h": 10,
-        "w": 8,
-        "x": 8,
+        "w": 10,
+        "x": 7,
         "y": 10
       },
       "targets": [
         {
-          "expr": "sum by (model, phase) (mx_load_phase_seconds_sum) / sum by (model, phase) (mx_load_phase_seconds_count)",
+          "expr": "sum by (engine, model, phase) (mx_load_phase_seconds_sum) / sum by (engine, model, phase) (mx_load_phase_seconds_count)",
           "format": "table",
           "instant": true,
           "refId": "A",
@@ -612,9 +612,10 @@
               "Time": true
             },
             "indexByName": {
-              "model": 0,
-              "phase": 1,
-              "Value": 2
+              "engine": 0,
+              "model": 1,
+              "phase": 2,
+              "Value": 3
             },
             "renameByName": {
               "Value": "mean"
@@ -626,6 +627,10 @@
           "options": {
             "fields": {},
             "sort": [
+              {
+                "field": "engine",
+                "desc": false
+              },
               {
                 "field": "model",
                 "desc": false
@@ -639,21 +644,21 @@
       "id": 113,
       "type": "bargauge",
       "title": "Loads recorded by model",
-      "description": "Loads completed by the processes currently being scraped, by model. Resets when a pod restarts, because the count is process-local.",
+      "description": "Loads completed by the processes currently being scraped, per engine and model. Resets when a pod restarts, because the count is process-local.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
       "gridPos": {
         "h": 10,
-        "w": 8,
-        "x": 16,
+        "w": 7,
+        "x": 17,
         "y": 10
       },
       "targets": [
         {
-          "expr": "sum by (model) (mx_load_seconds_count)",
-          "legendFormat": "{{model}}",
+          "expr": "sum by (engine, model) (mx_load_seconds_count)",
+          "legendFormat": "{{engine}}  {{model}}",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
