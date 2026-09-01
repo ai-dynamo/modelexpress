@@ -3,9 +3,9 @@ SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES.
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# ModelExpress Deployment Guide
+# ModelExpress deployment
 
-User-facing guide for configuring and deploying ModelExpress. For architecture details, see [`ARCHITECTURE.md`](ARCHITECTURE.md). For development setup, see [`../CONTRIBUTING.md`](../CONTRIBUTING.md).
+This page is the deployment reference for the standalone server, Helm, Kubernetes metadata topologies, and worker rollout requirements. Start with [Choose a ModelExpress path](guides/choose-a-path.md) if you have not selected a topology. See [Configuration](CONFIGURATION.md) for settings, [Integrations](integrations/README.md) for runtime setup, [Troubleshooting](TROUBLESHOOTING.md) for operational symptoms, and [Architecture](ARCHITECTURE.md) for internals.
 
 ## Server Configuration
 
@@ -161,7 +161,7 @@ MX has one configurable filesystem path, the model weights cache (`MODEL_EXPRESS
 | Multi-replica MX with `MODEL_EXPRESS_NO_SHARED_STORAGE=true` on clients (gRPC streaming) | RWO per replica OR ephemeral | Needs an MX-aware init container in the client pod; no ready-made vLLM recipe today (tracked MX-290) |
 | ModelStreamer from object storage on clients | none | Clients stream through a bounded CPU staging buffer without landing the checkpoint on local disk |
 | ModelStreamer from a local path on clients | Existing local/PVC path | Reads the configured local checkpoint through the pipelined ModelStreamer path |
-| P2P RDMA receivers, weights only | none on receiver | Weights land in GPU HBM; the source may have bootstrapped through InstantTensor, ModelStreamer, GDS, or the native loader |
+| P2P RDMA receivers, weights only | none on receiver | Weights land in GPU HBM; the source may have bootstrapped through server cache, InstantTensor, ModelStreamer, GDS, or the native loader |
 | P2P RDMA receivers, weights and artifacts | Writable local staging and runtime cache paths | Weights land in GPU HBM. File-backed artifacts are staged locally, verified, and installed into the target engine's filesystem caches. |
 
 For new multi-replica deployments, prefer the no-shared-storage row: each MX replica can use its own RWO or ephemeral cache while Redis or Kubernetes coordinates lifecycle state. The RWX row is mainly for existing shared-cache topologies, and the single-replica row is a local/dev simplification.
@@ -543,7 +543,7 @@ See [`../examples/dynamo_model_cache_k8s/README.md`](../examples/dynamo_model_ca
 
 ## P2P GPU Weight Transfers
 
-ModelExpress supports GPU-to-GPU model weight transfers between supported inference instances using NVIDIA NIXL over RDMA. vLLM 0.23.0 and newer recognize `--load-format modelexpress` natively, which runs the priority chain P2P RDMA -> InstantTensor -> ModelStreamer -> GDS -> native loader; the ModelExpress Python package must still be installed, and `mx` remains a backward-compatible alias. SGLang uses `remote_instance` with the `modelexpress` backend; see [SGLang Clients](#sglang-clients).
+ModelExpress supports GPU-to-GPU model weight transfers between supported inference instances using NVIDIA NIXL over RDMA. vLLM 0.23.0 and newer recognize `--load-format modelexpress` natively, which runs the fixed priority chain P2P RDMA -> server cache -> InstantTensor -> ModelStreamer -> GDS -> native loader; the ModelExpress Python package must still be installed, and `mx` remains a backward-compatible alias. SGLang uses `remote_instance` with the `modelexpress` backend; see [SGLang Clients](#sglang-clients).
 
 ### Cross-Vendor (CUDA/XPU) Compatibility
 
@@ -571,7 +571,7 @@ Quantized models are not transferred across accelerator families. This includes 
 
 The reason is that ModelExpress transfers post-processed in-memory tensor bytes, not raw checkpoint files. For quantized models, the post-processed layout can depend on the accelerator family, GPU architecture, selected kernel, and framework quantization backend. For example, FP8 scale packing or FP4/NVFP4 swizzling may differ between CUDA and XPU kernels. Copying those bytes across vendors can make the transfer succeed while causing silent inference corruption.
 
-If a target finds only cross-family sources for a quantized model, it skips P2P RDMA and falls through to the next load strategy, such as GDS or disk loading. Expect a slower cold start instead of an RDMA receive in mixed CUDA/XPU fleets serving quantized weights.
+If a target finds only cross-family sources for a quantized model, it skips P2P RDMA and falls through to the next eligible load strategy, such as server cache, InstantTensor, ModelStreamer, GDS, or native loading. Expect a slower cold start instead of an RDMA receive in mixed CUDA/XPU fleets serving quantized weights.
 
 Same-family transfer is unaffected. Quantized transfer remains allowed for:
 
@@ -884,13 +884,31 @@ RL refit has the same trusted-network requirement. Its trainer-local
 `RefitWorkerService` serves exact-version manifests over plaintext gRPC; the
 manifest digest detects corruption but does not authenticate the trainer.
 
-Canonical S3/XOR trainers consume Hugging Face tensor buckets produced by the
+Canonical S3 trainers consume Hugging Face tensor buckets produced by the
 training framework. Framework-native bucket settings remain the default.
 Integrations may use `MX_REFIT_DELTA_BUCKET_BYTES` as an explicit override, or
 its 512 MiB default when they have no native setting. `MX_REFIT_DELTA_WORKERS`
-(default `min(32, CPU count)`) controls delta-processing concurrency.
+(default `min(32, CPU count)`) controls trainer CPU work;
+`MX_S3_UPLOAD_WORKERS` controls concurrent full-checkpoint batch uploads.
 Framework integrations read the bucket-size setting before constructing the
 stream; ModelExpress preserves the supplied bucket boundaries.
+Full checkpoints are grouped into concurrently uploaded safetensors objects of
+up to `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` tensor bytes (4 GiB by default).
+A single tensor larger than the configured size is uploaded on its own.
+Generators download those objects concurrently through the ModelExpress S3
+client. Each download worker validates one batch and overwrites the matching
+regions in the existing local checkpoint mmaps.
+The receiver marks its local checkpoint `UPDATING` before mutation and `READY`
+only after success. An interrupted update remains unavailable until a fresh
+initialization reseeds it from `seed_checkpoint_path`.
+
+S3 versions normally use `XOR_DELTA`. Integrations may opt into a
+framework-selected cadence of `FULL_HF_CHECKPOINT` versions; these publish
+native HF safetensor shards, omit `base_version_id`, and become the exact base
+for the next delta. The cadence is disabled by default. Slime exposes
+`--modelexpress-full-hf-checkpoint-interval N`; Vime accepts
+`full_hf_checkpoint_interval` in `--modelexpress-config`. In both cases, `N`
+counts published ModelExpress weight versions.
 
 ### Server-Backed Model Cache (No Shared Storage)
 
@@ -931,13 +949,13 @@ Requirements and limits:
 
 ### InstantTensor (Fast Local Safetensors)
 
-InstantTensor loads the model's own safetensors directly onto CUDA using distributed loading, pipelined prefetching, and direct I/O, with GPUDirect Storage when the hardware supports it. It sits right after P2P RDMA in the loading chain: when no peer source is already serving, it is the fastest local-disk path before falling back to ModelStreamer, GDS, or the native loader. Unlike ModelStreamer it needs no `MX_MODEL_URI`; it reuses vLLM's built-in `--load-format instanttensor` path, so the engine resolves the model's weight files (downloading from the Hugging Face Hub into the local cache first if they are not already local).
+InstantTensor loads the model's own safetensors directly onto CUDA using distributed loading, pipelined prefetching, and direct I/O, with GPUDirect Storage when the hardware supports it. It follows server-backed loading in the fixed chain: when no peer source is already serving, ModelExpress tries server cache first when no-shared-storage mode is enabled, then uses InstantTensor when eligible before falling back to ModelStreamer, GDS, or the native loader. Unlike ModelStreamer it needs no `MX_MODEL_URI`; it reuses vLLM's built-in `--load-format instanttensor` path, so the engine resolves the model's weight files (downloading from the Hugging Face Hub into the local cache first if they are not already local).
 
 The strategy is enabled by default. The `instanttensor` package is a core dependency on Linux (installed automatically alongside `runai-model-streamer`), so no extra install step is needed. The strategy activates on a CUDA device **when the engine adapter implements the InstantTensor capability**. Currently only the vLLM adapter implements it; on engines that do not (for example SGLang today), the strategy falls through even when `instanttensor` and a CUDA device are available. If the package is unavailable (for example on a non-Linux platform) the chain simply skips to the next strategy.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MX_INSTANT_TENSOR` | `1` | Enable the InstantTensor strategy. Set to `0` to disable it and fall through to ModelStreamer/GDS/native loading. |
+| `MX_INSTANT_TENSOR` | `1` | Enable the InstantTensor strategy. Set to `0` to disable it and fall through to ModelStreamer/GDS/native loading after any eligible server-cache path. |
 
 InstantTensor also honors its own `INSTANTTENSOR_BACKEND` environment variable (`URING`, `AIO`, `CUFILE` for GDS, `MMAP`) for selecting the I/O backend; ModelExpress passes it through unchanged.
 
