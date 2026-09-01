@@ -115,21 +115,22 @@ class MxModelLoader(BaseModelLoader):
         # L0 wraps everything below, and the four L1 phases inside it are
         # disjoint, so their sum is bounded by the total by construction. The
         # timers only bracket existing calls; nothing here changes load order.
-        with metrics.time_load("vllm", model_role):
+        model_id = ctx.identity.model_name
+        with metrics.time_load("vllm", model_id, model_role):
             with maybe_enter_vmm_arena(ctx):
                 if ctx.p2p_enabled:
-                    with metrics.time_load_phase("vllm", "artifact_install"):
+                    with metrics.time_load_phase("vllm", model_id, "artifact_install"):
                         install_vllm_cache_artifacts(ctx)
                 with set_default_torch_dtype(model_config.dtype):
                     with ctx.target_device:
-                        with metrics.time_load_phase("vllm", "model_init"):
+                        with metrics.time_load_phase("vllm", model_id, "model_init"):
                             model = initialize_model(
                                 vllm_config=vllm_config,
                                 model_config=model_config,
                                 prefix=prefix,
                             )
 
-                    with metrics.time_load_phase("vllm", "chain"):
+                    with metrics.time_load_phase("vllm", model_id, "chain"):
                         model = LoadStrategyChain.run(model, ctx)
 
                     if ctx.p2p_enabled:
@@ -142,7 +143,7 @@ class MxModelLoader(BaseModelLoader):
                         # Scheduling the publish, not completing it: the work is
                         # handed to a background thread, so this phase measures
                         # the handoff and never the upload.
-                        with metrics.time_load_phase("vllm", "publish"):
+                        with metrics.time_load_phase("vllm", model_id, "publish"):
                             schedule_vllm_cache_artifact_publish(ctx)
 
             log_arena_post_load(ctx)

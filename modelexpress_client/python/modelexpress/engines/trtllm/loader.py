@@ -95,8 +95,10 @@ class MxModelLoader:
         # Recording a publish phase there would put time outside the L0 span it
         # is supposed to be a part of, and the phases would stop summing to the
         # whole.
-        with metrics.time_load("trtllm", "main"):
-            with metrics.time_load_phase("trtllm", "chain"):
+        with metrics.time_load("trtllm", self._ctx.identity.model_name, "main"):
+            with metrics.time_load_phase(
+                "trtllm", self._ctx.identity.model_name, "chain"
+            ):
                 value = LoadStrategyChain.run(model, self._ctx)
         total_time = time.perf_counter() - load_start
         logger.info(

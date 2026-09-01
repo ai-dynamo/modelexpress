@@ -23,7 +23,7 @@ from ...metrics import enable_metrics
 from ...nixl_transfer import NixlTransferManager
 from ...metrics import metrics as selection_metrics
 from ...source_selection import configured_policy_label, get_configured_selector
-from .adapter import build_sglang_load_context
+from .adapter import _get_model_name, build_sglang_load_context
 from .artifacts import (
     _sglang_health_ready,
     install_sglang_cache_artifacts,
@@ -75,7 +75,10 @@ class MxModelLoader:
         #
         # SGLang has no draft-model path through this loader, so model_role is
         # always main.
-        with selection_metrics.time_load("sglang", "main"):
+        # Same helper the load context uses, so the label matches the model name
+        # every other client family reports for this process.
+        model_id = _get_model_name(model_config)
+        with selection_metrics.time_load("sglang", model_id, "main"):
             if transport == "nixl":
                 return self._load_model_via_nixl(
                     model=model,
@@ -119,9 +122,13 @@ class MxModelLoader:
         # No model_init phase here, unlike vLLM: SGLang builds the module and
         # hands it in, so there is no initialization inside this window to time.
         # The phases still partition the load; this load simply has three.
-        with selection_metrics.time_load_phase("sglang", "artifact_install"):
+        with selection_metrics.time_load_phase(
+            "sglang", ctx.identity.model_name, "artifact_install"
+        ):
             install_sglang_cache_artifacts(ctx)
-        with selection_metrics.time_load_phase("sglang", "chain"):
+        with selection_metrics.time_load_phase(
+            "sglang", ctx.identity.model_name, "chain"
+        ):
             model = LoadStrategyChain.run(model, ctx)
 
         _tensor_registry[ctx.device_id] = ctx.tensors
@@ -130,7 +137,9 @@ class MxModelLoader:
         else:
             _nixl_managers.pop(ctx.device_id, None)
 
-        with selection_metrics.time_load_phase("sglang", "publish"):
+        with selection_metrics.time_load_phase(
+            "sglang", ctx.identity.model_name, "publish"
+        ):
             schedule_sglang_cache_artifact_publish(ctx)
 
         total_time = time.perf_counter() - load_start

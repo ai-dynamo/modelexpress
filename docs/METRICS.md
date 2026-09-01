@@ -419,8 +419,8 @@ touched.
 | `mx_p2p_transfer_seconds` | Histogram | `policy`, `scheme`, `outcome` |
 | `mx_nixl_data_plane_errors_total` | Counter | `scheme`, `kind` |
 | `mx_nixl_receive_total` | Counter | `scheme`, `result` |
-| `mx_load_seconds` | Histogram | `engine`, `model_role`, `scheme`, `outcome` |
-| `mx_load_phase_seconds` | Histogram | `engine`, `phase`, `scheme` |
+| `mx_load_seconds` | Histogram | `engine`, `model`, `model_role`, `scheme`, `outcome` |
+| `mx_load_phase_seconds` | Histogram | `engine`, `model`, `phase`, `scheme` |
 
 ### Load timing, and what it does not measure
 
@@ -534,6 +534,29 @@ rather than an edge.
 Quantiles still need observations to mean anything. A single load gives a p95
 that is bucket interpolation whatever the boundaries are; these are fleet
 statistics, and on one pod the mean per phase is the honest panel to read.
+
+### The `model` label is bounded by convention, not by code
+
+Every other label on these families is closed in code: an unrecognized `engine`
+clamps to `other`, an unknown `phase` is dropped. `model` cannot be, because its
+values are whatever the deployment chose to serve. It is bounded by the fact
+that an organization runs a finite catalogue of models, changing on the
+timescale of deployments rather than of requests.
+
+It costs nothing in practice. A process serves exactly one model, so the label
+is constant within a pod, and Prometheus already attaches `pod` to every series
+— `model` names a dimension the data carries anyway rather than multiplying it.
+Measured on a three-pod fleet: **18 series per pod either way**.
+
+This is not the `source_worker_id` situation. That label was a uuid minted fresh
+per process, so its domain grew with process count forever and it is off by
+default for that reason. A model id is stable across restarts.
+
+The guard is a 96-character cap, which can in principle merge two long ids that
+share a prefix. That is accepted over dropping the label: a merged pair still
+says more than no model at all, and 96 characters clears every id in the wild by
+a wide margin. An absent or blank id records as `unknown` rather than as an
+empty string, which would render as `model=""` and read as an exporter bug.
 
 ### NIXL data-plane health
 

@@ -518,7 +518,7 @@
       "id": 111,
       "type": "timeseries",
       "title": "Load duration (p50 / p95 / p99)",
-      "description": "The load_model() window, by engine, over every load the scraped processes have done. Not the inference cold start: CUDA graph capture, JIT and KV cache setup all run after the loader returns. A load happens once per process, so rate() over these series sees a constant and returns zero -- the cumulative value is the reading that means anything.",
+      "description": "The load_model() window, by model, over every load the scraped processes have done. Not the inference cold start: CUDA graph capture, JIT and KV cache setup all run after the loader returns. A load happens once per process, so rate() over these series sees a constant and returns zero -- the cumulative value is the reading that means anything, and quantiles describe the spread across pods rather than over time.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -531,8 +531,8 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.5, sum by (le, engine) (mx_load_seconds_bucket{outcome=\"success\"}))",
-          "legendFormat": "p50 {{engine}}",
+          "expr": "histogram_quantile(0.5, sum by (le, model) (mx_load_seconds_bucket{outcome=\"success\"}))",
+          "legendFormat": "p50 {{model}}",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -540,8 +540,8 @@
           }
         },
         {
-          "expr": "histogram_quantile(0.95, sum by (le, engine) (mx_load_seconds_bucket{outcome=\"success\"}))",
-          "legendFormat": "p95 {{engine}}",
+          "expr": "histogram_quantile(0.95, sum by (le, model) (mx_load_seconds_bucket{outcome=\"success\"}))",
+          "legendFormat": "p95 {{model}}",
           "refId": "B",
           "datasource": {
             "type": "prometheus",
@@ -549,8 +549,8 @@
           }
         },
         {
-          "expr": "histogram_quantile(0.99, sum by (le, engine) (mx_load_seconds_bucket{outcome=\"success\"}))",
-          "legendFormat": "p99 {{engine}}",
+          "expr": "histogram_quantile(0.99, sum by (le, model) (mx_load_seconds_bucket{outcome=\"success\"}))",
+          "legendFormat": "p99 {{model}}",
           "refId": "C",
           "datasource": {
             "type": "prometheus",
@@ -601,8 +601,8 @@
     {
       "id": 113,
       "type": "timeseries",
-      "title": "Loads recorded",
-      "description": "Loads completed by the processes currently being scraped, by outcome. A load that raised is counted too -- it is the case the timing exists to explain. Resets when a pod restarts, because the count is process-local.",
+      "title": "Loads recorded by model",
+      "description": "Loads completed by the processes currently being scraped, by model. Resets when a pod restarts, because the count is process-local.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -615,8 +615,8 @@
       },
       "targets": [
         {
-          "expr": "sum by (outcome) (mx_load_seconds_count)",
-          "legendFormat": "{{outcome}}",
+          "expr": "sum by (model) (mx_load_seconds_count)",
+          "legendFormat": "{{model}}",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
