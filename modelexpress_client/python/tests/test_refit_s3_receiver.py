@@ -686,6 +686,135 @@ def test_canonical_s3_rejects_corrupt_full_tensor_bytes(monkeypatch, tmp_path):
     adapter.close()
 
 
+@pytest.mark.parametrize(
+    ("launch_tensors", "remote_tensors"),
+    [
+        (
+            {"a": torch.tensor([1.0]), "b": torch.tensor([2.0])},
+            {"a": torch.tensor([3.0])},
+        ),
+        (
+            {"a": torch.tensor([1.0])},
+            {"a": torch.tensor([3.0]), "b": torch.tensor([4.0])},
+        ),
+    ],
+    ids=["missing-tensor", "extra-tensor"],
+)
+def test_canonical_s3_requires_exact_full_checkpoint_tensor_set(
+    monkeypatch,
+    tmp_path,
+    launch_tensors,
+    remote_tensors,
+):
+    prefix = "s3://weights/test/v2"
+    shard_name = "model-00001-of-00001.safetensors"
+    objects = {
+        f"{prefix}/model.safetensors.index.json": json.dumps(
+            {
+                "metadata": {"total_size": 0},
+                "weight_map": dict.fromkeys(remote_tensors, shard_name),
+            }
+        ).encode(),
+        f"{prefix}/{shard_name}": _save_full_tensors(remote_tensors),
+    }
+    adapter, storage = _build(
+        monkeypatch,
+        tmp_path,
+        objects,
+        launch_tensors=launch_tensors,
+    )
+
+    with pytest.raises(RuntimeError, match="tensor set differs"):
+        adapter.stage_weight(_full_inputs())
+
+    assert storage.calls == [f"{prefix}/model.safetensors.index.json"]
+    checkpoint = load_file(adapter._checkpoint.local_checkpoint / "model.safetensors")
+    assert checkpoint.keys() == launch_tensors.keys()
+    assert all(
+        torch.equal(checkpoint[name], tensor)
+        for name, tensor in launch_tensors.items()
+    )
+    state = json.loads(adapter._checkpoint.state_path.read_text())
+    assert state["status"] == "UPDATING"
+    adapter.close()
+
+
+@pytest.mark.parametrize(
+    ("local_tensor", "remote_tensor"),
+    [
+        (
+            torch.tensor([1.0, 2.0]),
+            torch.tensor([3, 4], dtype=torch.int32),
+        ),
+        (
+            torch.tensor([1.0, 2.0]),
+            torch.tensor([[3.0, 4.0]]),
+        ),
+    ],
+    ids=["dtype", "shape"],
+)
+def test_canonical_s3_rejects_incompatible_full_checkpoint_tensor_metadata(
+    monkeypatch,
+    tmp_path,
+    local_tensor,
+    remote_tensor,
+):
+    objects = _full_artifact(remote_tensor)
+    adapter, _storage = _build(
+        monkeypatch,
+        tmp_path,
+        objects,
+        launch_tensors={"weight": local_tensor},
+    )
+
+    with pytest.raises(RuntimeError, match="metadata differs"):
+        adapter.stage_weight(_full_inputs())
+
+    assert torch.equal(
+        load_file(adapter._checkpoint.local_checkpoint / "model.safetensors")[
+            "weight"
+        ],
+        local_tensor,
+    )
+    state = json.loads(adapter._checkpoint.state_path.read_text())
+    assert state["status"] == "UPDATING"
+    adapter.close()
+
+
+def test_canonical_s3_rejects_incompatible_full_checkpoint_byte_size(
+    monkeypatch,
+    tmp_path,
+):
+    local_tensor = torch.tensor([1.0, 2.0])
+    objects = _full_artifact(torch.tensor([3.0, 4.0]))
+    shard_uri = "s3://weights/test/v2/model-00001-of-00001.safetensors"
+    shard = bytearray(objects[shard_uri])
+    header_size = int.from_bytes(shard[:8], "little")
+    header = json.loads(shard[8 : 8 + header_size])
+    header["weight"]["data_offsets"][1] = 1
+    encoded_header = json.dumps(header, separators=(",", ":")).encode()
+    assert len(encoded_header) <= header_size
+    shard[8 : 8 + header_size] = encoded_header.ljust(header_size, b" ")
+    objects[shard_uri] = bytes(shard)
+    adapter, _storage = _build(
+        monkeypatch,
+        tmp_path,
+        objects,
+        launch_tensors={"weight": local_tensor},
+    )
+
+    with pytest.raises(RuntimeError, match="metadata differs"):
+        adapter.stage_weight(_full_inputs())
+
+    assert torch.equal(
+        load_file(adapter._checkpoint.local_checkpoint / "model.safetensors")[
+            "weight"
+        ],
+        local_tensor,
+    )
+    adapter.close()
+
+
 def test_canonical_s3_full_download_failure_leaves_checkpoint_updating(
     monkeypatch, tmp_path
 ):

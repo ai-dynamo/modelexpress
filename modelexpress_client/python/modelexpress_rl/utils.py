@@ -17,27 +17,6 @@ from typing import TypeVar
 import numpy as np
 
 
-_SAFETENSORS_DTYPES = {
-    "F64": "float64",
-    "F32": "float32",
-    "F16": "float16",
-    "BF16": "bfloat16",
-    "F8_E4M3": "float8_e4m3fn",
-    "F8_E4M3FNUZ": "float8_e4m3fnuz",
-    "F8_E5M2": "float8_e5m2",
-    "F8_E5M2FNUZ": "float8_e5m2fnuz",
-    "C64": "complex64",
-    "I64": "int64",
-    "I32": "int32",
-    "I16": "int16",
-    "I8": "int8",
-    "U8": "uint8",
-    "U16": "uint16",
-    "U32": "uint32",
-    "U64": "uint64",
-    "BOOL": "bool",
-}
-
 _WorkItem = TypeVar("_WorkItem")
 _WorkResult = TypeVar("_WorkResult")
 
@@ -163,17 +142,11 @@ def _index_tensors(
                 continue
             if name in locations:
                 raise ValueError(f"duplicate safetensors entry {name!r}")
-            try:
-                dtype = _SAFETENSORS_DTYPES[info["dtype"]]
-            except KeyError as error:
-                raise ValueError(
-                    f"unsupported safetensors dtype {info['dtype']!r} for {name!r}"
-                ) from error
             locations[name] = (path, 8 + header_size + begin, end - begin)
             metadata[name] = {
                 "name": name,
                 "shape": info["shape"],
-                "dtype": dtype,
+                "dtype": info["dtype"],
                 "byte_size": end - begin,
             }
     return locations, metadata

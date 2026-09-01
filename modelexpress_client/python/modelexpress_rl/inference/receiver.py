@@ -161,6 +161,7 @@ class _LocalCheckpoint:
         self.lock_path = self.cache / ".lock"
         self.checkpoint_paths: list[Path] = []
         self.locations: dict[str, tuple[Path, int, int]] = {}
+        self.tensor_metadata: dict[str, dict] = {}
         self.decompressor: _Decompressor | None = None
 
     def initialize(self) -> None:
@@ -178,7 +179,7 @@ class _LocalCheckpoint:
                 (
                     self.checkpoint_paths,
                     self.locations,
-                    _,
+                    self.tensor_metadata,
                 ) = index_checkpoint_tensors(self.local_checkpoint)
             else:
                 self.reset_initial_checkpoint()
@@ -226,7 +227,7 @@ class _LocalCheckpoint:
         (
             self.checkpoint_paths,
             self.locations,
-            _,
+            self.tensor_metadata,
         ) = index_checkpoint_tensors(self.local_checkpoint)
         self._write_state(
             status=_CheckpointState.READY,
@@ -351,6 +352,11 @@ class _LocalCheckpoint:
         weight_map: dict[str, str],
         root_uri: str,
     ) -> tuple[float, float]:
+        if set(weight_map) != set(self.locations):
+            raise ValueError(
+                "full HF checkpoint tensor set differs from local checkpoint"
+            )
+
         shard_to_tensors = _group_tensors_by_shard(weight_map)
         parent_uri = root_uri.rsplit("/", 1)[0]
 
@@ -384,7 +390,17 @@ class _LocalCheckpoint:
                 view = memoryview(data)
                 apply_started = time.perf_counter()
                 for name in tensor_names:
-                    begin, end = header[name]["data_offsets"]
+                    tensor_header = header[name]
+                    begin, end = tensor_header["data_offsets"]
+                    local_metadata = self.tensor_metadata[name]
+                    if (
+                        tensor_header["dtype"] != local_metadata["dtype"]
+                        or tensor_header["shape"] != local_metadata["shape"]
+                        or end - begin != local_metadata["byte_size"]
+                    ):
+                        raise ValueError(
+                            f"full HF checkpoint metadata differs for {name!r}"
+                        )
                     source = np.frombuffer(
                         view,
                         dtype=np.uint8,
