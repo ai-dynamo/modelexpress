@@ -380,6 +380,8 @@ def compute_artifact_cache_key(
     ``/manifest`` or a generation and chunk suffix when addressing individual
     Mooncake objects.
     """
+    from .artifact_lifecycle import _identity_bytes
+
     namespace = envs.MX_ARTIFACT_MOONCAKE_NAMESPACE or "modelexpress/artifacts"
     digest = sha256()
     digest.update(_identity_bytes(identity))
@@ -403,13 +405,6 @@ def compute_artifact_cache_key(
         f"{namespace.rstrip('/')}/{framework}/{model_slug}/"
         f"{transfer.name}/{digest.hexdigest()}"
     )
-
-
-def _identity_bytes(identity: p2p_pb2.SourceIdentity) -> bytes:
-    try:
-        return identity.SerializeToString(deterministic=True)
-    except TypeError:
-        return identity.SerializeToString()
 
 
 def _identity_debug(identity: p2p_pb2.SourceIdentity) -> str:
