@@ -40,12 +40,25 @@ def min_gbps(log: logging.Logger) -> float:
     a fat-fingered value would pass the "is it configured" test and then fail the
     "is the rate acceptable" test, warning on every single refit and turning the
     guard into noise. Infinity parses too and would condemn every refit outright.
+
+    A negative floor disables it too, but says so. ``warn_if_below_floor`` treats
+    anything at or below zero as off, so a stray minus sign would otherwise take
+    a configured gate out of service in silence - and the caller who wrote -50
+    believes a floor is in force. Only ``0`` is documented as the off switch, so
+    every other disabling value has to announce itself.
     """
     floor = envs.MX_RESHARD_MIN_GBPS
     if not math.isfinite(floor):
         log.warning(
             "MX_RESHARD_MIN_GBPS=%r is not a finite number; the throughput floor "
             "is disabled for this run",
+            floor,
+        )
+        return 0.0
+    if floor < 0.0:
+        log.warning(
+            "MX_RESHARD_MIN_GBPS=%r is negative; the throughput floor is disabled "
+            "for this run (set 0 to disable it deliberately)",
             floor,
         )
         return 0.0

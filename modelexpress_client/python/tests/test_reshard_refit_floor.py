@@ -107,13 +107,15 @@ def test_the_healthy_run_is_silent(monkeypatch, caplog):
 
 
 def test_the_shortfall_is_quantified(monkeypatch, caplog):
-    """"Slightly under a conservative floor" and "an order of magnitude under" are
+    """ "Slightly under a conservative floor" and "an order of magnitude under" are
     different incidents, and a gate may reasonably treat them differently."""
     mod = _receiver(monkeypatch, FLOOR_GBPS)
     with caplog.at_level(logging.WARNING):
         _check(mod, SLOW_BYTES, {"wire_fused_s": SLOW_WIRE_S})
 
-    assert _record(caplog)["shortfall_x"] == pytest.approx(FLOOR_GBPS / SLOW_GBPS, abs=0.1)
+    assert _record(caplog)["shortfall_x"] == pytest.approx(
+        FLOOR_GBPS / SLOW_GBPS, abs=0.1
+    )
 
 
 def test_a_rate_exactly_at_the_floor_is_allowed(monkeypatch, caplog):
@@ -149,6 +151,26 @@ def test_a_non_finite_floor_disables_rather_than_warning_on_every_refit(
         _check(mod, SLOW_BYTES, {"wire_fused_s": SLOW_WIRE_S})
 
     assert not [m for m in caplog.messages if "MX_REFIT_SLOW_THROUGHPUT" in m]
+
+
+@pytest.mark.parametrize("value", ["-50", "-0.5"])
+def test_a_negative_floor_disables_but_says_so(monkeypatch, caplog, value):
+    """A stray minus sign must not retire the gate in silence.
+
+    A negative floor is finite, so it clears the check above, and then
+    ``warn_if_below_floor`` treats anything at or below zero as off. The gate
+    stops reporting while the operator who typed -50 believes one is in force,
+    and in CI that reads as a green run rather than a missing signal. ``0`` is
+    the documented off switch, so any other disabling value has to announce
+    itself.
+    """
+    mod = _receiver(monkeypatch, value)
+    with caplog.at_level(logging.WARNING):
+        assert mod._min_gbps() == 0
+
+    assert [m for m in caplog.messages if "is negative" in m], (
+        f"a negative floor must warn, got {caplog.messages}"
+    )
 
 
 def test_an_unparseable_floor_disables_rather_than_crashes(monkeypatch):

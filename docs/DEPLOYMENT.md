@@ -674,10 +674,24 @@ and coverage are all exact. Pair this with `MX_RESHARD_MIN_GBPS` so a
 collapse is reported rather than inferred.
 
 The probe runs at worker startup, walks PCIe sysfs, and computes a
-**global** GPU-to-NIC assignment — every rank derives the same map from
+**host-wide** GPU-to-NIC assignment — every rank derives the same map from
 the same sysfs snapshot, so no coordination is needed — then sets
 `UCX_NET_DEVICES` for its own rank before the NIXL agent is constructed.
 Ranking is rail distinctness first, then PCIe depth, then NUMA locality.
+
+The GPU set comes from the PCI listing rather than from
+`torch.cuda.device_count()`, so it is the same in every rank regardless of
+how the workers were launched. That distinction is load-bearing: NeMo-RL
+and prime-RL give each worker its own `CUDA_VISIBLE_DEVICES`, and a map
+built from the visible set would have each rank see one GPU, count from
+zero, and pick the same rail as all of its peers — the convergence the
+probe exists to prevent.
+
+One case it cannot solve alone: if the container is device-isolated so
+that only one GPU appears in the PCI listing too, there is nothing to
+spread across. The probe logs a warning naming that condition rather than
+reporting a one-entry map as a success; set `UCX_NET_DEVICES` or
+`MX_RDMA_NIC_PIN` explicitly for those ranks.
 
 PCIe depth is the shared-prefix length of the two devices' sysfs paths.
 It separates PIX from everything else, but it cannot separate NODE from

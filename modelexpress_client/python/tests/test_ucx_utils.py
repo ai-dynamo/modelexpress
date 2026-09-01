@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+
 from modelexpress import ucx_utils
 
 
@@ -30,19 +32,35 @@ def test_nic_access_rejects_host_only_uverbs_device(monkeypatch):
     assert not ucx_utils._nic_has_accessible_verbs_device("mlx5_0")
 
 
-def _install_fake_topology(monkeypatch, gpus, nics):
+def _install_fake_topology(monkeypatch, gpus, nics, visible=None):
     """Drive probe_nic_pin_for_device from an in-memory topology.
 
-    ``gpus`` maps visible index -> (bdf, numa, pci_path);
+    ``gpus`` maps host GPU index -> (bdf, numa, pci_path) and describes the
+    whole machine, which is what the PCI listing reports;
     ``nics`` is the list of (name, numa, rate_gbps, pci_path) tuples that
     _list_compute_ib_nics would return for the devices actually exposed to the
     container.
+
+    ``visible`` names the subset of those host indices that CUDA exposes to this
+    process, defaulting to all of them. Passing a single index models a worker
+    launched under its own ``CUDA_VISIBLE_DEVICES`` mask: CUDA renumbers what is
+    left from 0, so the visible index a rank drives is a position in this list,
+    not a host index. Keeping the two distinguishable is the entire point of the
+    parameter - a harness that conflates them cannot reproduce the convergence.
     """
+    host_order = list(gpus) if visible is None else list(visible)
     monkeypatch.setattr(
         ucx_utils, "_list_compute_ib_nics", lambda min_rate_gbps=None: nics
     )
-    monkeypatch.setattr(ucx_utils.torch.cuda, "device_count", lambda: len(gpus))
-    monkeypatch.setattr(ucx_utils, "_gpu_pci_bdf", lambda gi: gpus[gi][0])
+    monkeypatch.setattr(ucx_utils.torch.cuda, "device_count", lambda: len(host_order))
+    monkeypatch.setattr(
+        ucx_utils,
+        "_gpu_pci_bdf",
+        lambda gi: gpus[host_order[gi]][0] if gi < len(host_order) else None,
+    )
+    monkeypatch.setattr(
+        ucx_utils, "_host_gpu_bdfs", lambda: sorted(spec[0] for spec in gpus.values())
+    )
     bdf_to_gpu = {spec[0]: spec for spec in gpus.values()}
     monkeypatch.setattr(
         ucx_utils,
@@ -106,10 +124,7 @@ def test_the_fixture_reproduces_the_depth_collapse(monkeypatch):
         )
 
     assert (
-        ucx_utils._pci_common_depth(
-            _MISAFFINE_GPUS[3][2], nic_paths["mlx5_11"]
-        )
-        > 0
+        ucx_utils._pci_common_depth(_MISAFFINE_GPUS[3][2], nic_paths["mlx5_11"]) > 0
     ), "GPU3 is the one GPU with real PCIe affinity; without it the tie is total"
 
 
@@ -135,9 +150,7 @@ def test_partial_allocation_spreads_rather_than_sharing_one_rail(monkeypatch):
     """
     _install_fake_topology(monkeypatch, _MISAFFINE_GPUS, _MISAFFINE_NICS)
 
-    chosen = {
-        gpu: ucx_utils.probe_nic_pin_for_device(gpu) for gpu in _MISAFFINE_GPUS
-    }
+    chosen = {gpu: ucx_utils.probe_nic_pin_for_device(gpu) for gpu in _MISAFFINE_GPUS}
 
     assert len(set(chosen.values())) == 4, (
         f"every GPU must get its own rail; got {chosen}"
@@ -145,6 +158,77 @@ def test_partial_allocation_spreads_rather_than_sharing_one_rail(monkeypatch):
     assert chosen[3] == "mlx5_11:1", (
         "the one GPU with PCIe affinity to the same-socket rail should keep it"
     )
+
+
+def test_rank_local_cuda_visibility_still_spreads(monkeypatch):
+    """Four one-GPU workers must still land on four rails.
+
+    The test above runs the probe four times inside one process that can see all
+    four GPUs, which is the arrangement that makes the shared assignment counter
+    work by accident: every call rebuilds the same four-GPU map. Production does
+    not look like that. NeMo-RL and prime-RL give each worker its own
+    ``CUDA_VISIBLE_DEVICES``, so each process sees one device, calls it index 0,
+    and - when the map was built from ``torch.cuda.device_count()`` - restarted
+    the tally at zero and picked the same best rail as its three peers. Four
+    workers, one rail: exactly the collapse this module exists to prevent,
+    produced by the code meant to prevent it.
+
+    So the loop below never lets a rank see more than its own GPU, and the ranks
+    never talk. Distinctness here can only come from each of them deriving the
+    same host-wide map independently, which is the property under test.
+    """
+    chosen = {}
+    for host_index in _MISAFFINE_GPUS:
+        _install_fake_topology(
+            monkeypatch, _MISAFFINE_GPUS, _MISAFFINE_NICS, visible=[host_index]
+        )
+        # Index 0 because that is what CUDA renumbers the masked device to, and
+        # what the worker passes; the rank has no way to name its host index.
+        chosen[host_index] = ucx_utils.probe_nic_pin_for_device(0)
+
+    assert len(set(chosen.values())) == 4, (
+        f"each rank-local worker must still get its own rail; got {chosen}"
+    )
+    assert chosen[3] == "mlx5_11:1", (
+        "the affinity-aware placement must survive the masking too, not just "
+        "the distinctness"
+    )
+
+
+def test_rank_local_assignment_matches_the_full_visibility_one(monkeypatch):
+    """Masking changes what a rank can see, and must change nothing it decides.
+
+    Stronger than distinctness: it pins that the two paths agree tuple-for-tuple,
+    so a future change cannot satisfy the test above by spreading rails some
+    other way while quietly giving masked and unmasked ranks different answers.
+    """
+    _install_fake_topology(monkeypatch, _MISAFFINE_GPUS, _MISAFFINE_NICS)
+    unmasked = {gpu: ucx_utils.probe_nic_pin_for_device(gpu) for gpu in _MISAFFINE_GPUS}
+
+    masked = {}
+    for host_index in _MISAFFINE_GPUS:
+        _install_fake_topology(
+            monkeypatch, _MISAFFINE_GPUS, _MISAFFINE_NICS, visible=[host_index]
+        )
+        masked[host_index] = ucx_utils.probe_nic_pin_for_device(0)
+
+    assert masked == unmasked, (
+        f"masked ranks disagree with the full-visibility map: {masked} != {unmasked}"
+    )
+
+
+def test_unreadable_pci_listing_falls_back_to_visible_devices(monkeypatch):
+    """No host listing must degrade, not crash.
+
+    ``_host_gpu_bdfs`` returns [] on any unreadable ``/sys``, and on such a host
+    the probe cannot spread across GPUs it cannot enumerate. It should still pin
+    the rank to a sensible rail from what it can see - the pre-existing
+    behaviour - because a pin on a possibly-shared rail beats no pin at all.
+    """
+    _install_fake_topology(monkeypatch, _MISAFFINE_GPUS, _MISAFFINE_NICS)
+    monkeypatch.setattr(ucx_utils, "_host_gpu_bdfs", list)
+
+    assert ucx_utils.probe_nic_pin_for_device(3) == "mlx5_11:1"
 
 
 def test_a_lone_same_socket_rail_is_not_handed_to_everyone(monkeypatch):
@@ -173,8 +257,6 @@ def test_a_lone_same_socket_rail_is_not_handed_to_everyone(monkeypatch):
     assert len(on_the_lone_rail) == 1, (
         f"only one GPU may pin to the lone same-socket rail, got {on_the_lone_rail}"
     )
-
-
 
 
 # Same cluster, node th9sn: the allocation the scheduler is supposed to produce,
@@ -212,9 +294,7 @@ def test_affine_allocation_keeps_one_to_one_mapping(monkeypatch):
     """
     _install_fake_topology(monkeypatch, _AFFINE_GPUS, _AFFINE_NICS)
 
-    chosen = {
-        gpu: ucx_utils.probe_nic_pin_for_device(gpu) for gpu in _AFFINE_GPUS
-    }
+    chosen = {gpu: ucx_utils.probe_nic_pin_for_device(gpu) for gpu in _AFFINE_GPUS}
 
     assert chosen == {
         0: "mlx5_0:1",
@@ -265,3 +345,59 @@ def test_unknown_numa_does_not_override_pcie_affinity(monkeypatch):
     _install_fake_topology(monkeypatch, gpus, nics)
 
     assert ucx_utils.probe_nic_pin_for_device(0) == "mlx5_4:1"
+
+
+def test_host_gpu_listing_ignores_cuda_visibility(monkeypatch, tmp_path):
+    """The listing must report GPUs, all of them, and nothing else.
+
+    Built against a real directory tree rather than a mocked reader, because the
+    bug this guards is a filter that is too loose or too tight, and a mock of
+    the filter's own inputs cannot show that. The tree holds one VGA-class and
+    one 3D-controller-class NVIDIA GPU (both spellings appear on real hosts), a
+    Mellanox NIC that must not be mistaken for a GPU, and a non-GPU NVIDIA
+    device, which is the entry a vendor-only check would wrongly pick up.
+    """
+    devices = tmp_path / "devices"
+    entries = {
+        "0000:9a:00.0": ("0x10de", "0x030000"),  # NVIDIA VGA controller
+        "0000:aa:00.0": ("0x10de", "0x030200"),  # NVIDIA 3D controller
+        "0000:c7:00.0": ("0x15b3", "0x020700"),  # Mellanox NIC
+        "0000:05:00.0": ("0x10de", "0x0c0330"),  # NVIDIA USB controller
+    }
+    for bdf, (vendor, pci_class) in entries.items():
+        (devices / bdf).mkdir(parents=True)
+        (devices / bdf / "vendor").write_text(f"{vendor}\n")
+        (devices / bdf / "class").write_text(f"{pci_class}\n")
+
+    real_listdir, real_open = os.listdir, open
+    monkeypatch.setattr(
+        ucx_utils.os,
+        "listdir",
+        lambda path: (
+            real_listdir(devices)
+            if path == "/sys/bus/pci/devices"
+            else real_listdir(path)
+        ),
+    )
+    monkeypatch.setattr(
+        ucx_utils,
+        "_read_str_file",
+        lambda path: (
+            real_open(str(devices) + path[len("/sys/bus/pci/devices") :]).read().strip()
+            if path.startswith("/sys/bus/pci/devices")
+            else None
+        ),
+    )
+
+    assert ucx_utils._host_gpu_bdfs() == ["0000:9a:00.0", "0000:aa:00.0"]
+
+
+def test_host_gpu_listing_is_empty_when_sysfs_is_unreadable(monkeypatch):
+    """An unreadable /sys is a degraded host, not a crashing one."""
+
+    def _boom(_path):
+        raise OSError("no /sys here")
+
+    monkeypatch.setattr(ucx_utils.os, "listdir", _boom)
+
+    assert ucx_utils._host_gpu_bdfs() == []
