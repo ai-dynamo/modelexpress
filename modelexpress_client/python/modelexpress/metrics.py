@@ -75,7 +75,13 @@ NIXL_RECEIVE_RESULTS = ("complete", "partial", "empty", "rejected")
 #: Deliberately identical across the two languages: a server-side download and a
 #: client-side load are compared against each other on the same dashboard, and
 #: quantiles from differently-bucketed histograms are not comparable.
-_XSLOW_BUCKETS = (5, 15, 30, 60, 120, 300, 600, 900, 1200, 1800, 2700, 3600)
+#:
+#: The three boundaries below 5 s are not padding. Without them every fast load
+#: shared one bucket and histogram_quantile interpolated across ``[0, 5]``,
+#: reporting p50 2.50 and p95 4.75 for a load measured at 3.80 s -- values that
+#: are ``q * 5`` rather than anything observed. A small model, a warm cache and a
+#: working P2P transfer are all sub-5 s.
+_XSLOW_BUCKETS = (0.5, 1, 2.5, 5, 15, 30, 60, 120, 300, 600, 900, 1200, 1800, 2700, 3600)
 
 #: Engines that host the loader. Closed enum with an ``other`` fallback so an
 #: out-of-tree adapter cannot open the label domain.

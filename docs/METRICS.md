@@ -524,6 +524,17 @@ downloads and client loads get compared on the same dashboard, where quantiles
 from differently-bucketed histograms are not comparable. A test parses
 `buckets.rs` and fails if the two drift.
 
+The band runs from 0.5 s, not from 5 s, and the difference is not cosmetic. With
+a 5 s floor every fast load shared the bottom bucket, and `histogram_quantile`
+interpolates linearly across it — so a load measured at 3.80 s reported a p50 of
+2.50 and a p95 of 4.75. Those are `q * 5`, not readings. A small model, a warm
+cache and a P2P transfer that works are all sub-5 s, so this was the common case
+rather than an edge.
+
+Quantiles still need observations to mean anything. A single load gives a p95
+that is bucket interpolation whatever the boundaries are; these are fleet
+statistics, and on one pod the mean per phase is the honest panel to read.
+
 ### NIXL data-plane health
 
 `mx_nixl_data_plane_errors_total{kind}` counts the failures that demote an agent
