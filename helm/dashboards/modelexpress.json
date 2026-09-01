@@ -524,8 +524,8 @@
         "uid": "${datasource}"
       },
       "gridPos": {
-        "h": 8,
-        "w": 12,
+        "h": 10,
+        "w": 8,
         "x": 0,
         "y": 10
       },
@@ -562,22 +562,22 @@
     {
       "id": 112,
       "type": "bargauge",
-      "title": "Where the load went (mean per phase)",
-      "description": "Mean time in each phase. The phases partition the load, so these stack to the whole; this is the panel that answers 'which part was slow'. A phase absent for an engine is a real absence, not a zero: SGLang has no model_init, and TRT-LLM publishes outside this window. A load happens once per process, so rate() over these series sees a constant and returns zero -- the cumulative value is the reading that means anything.\n\nA bar gauge for the same reason as the panel beside it, and because phases are compared against each other rather than followed over time.",
+      "title": "Timing breakdown per model",
+      "description": "Mean time in each phase, kept per model. The phases partition the load, so one model's bars sum to its duration in the panel to the left; this is what answers 'which part was slow'.\n\nGrouped by model deliberately. Averaging a phase across models of different sizes produces a number that belongs to no load -- on a fleet of a 0.5B, a 1.5B and a 7B it read chain = 28.0 s when the real values were 4.0, 36.3 and 43.8.\n\nA phase absent for an engine is a real absence, not a zero: SGLang has no model_init, and TRT-LLM publishes outside this window.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
+        "h": 10,
+        "w": 8,
+        "x": 8,
         "y": 10
       },
       "targets": [
         {
-          "expr": "sum by (phase) (mx_load_phase_seconds_sum) / sum by (phase) (mx_load_phase_seconds_count)",
-          "legendFormat": "{{phase}}",
+          "expr": "sum by (model, phase) (mx_load_phase_seconds_sum) / sum by (model, phase) (mx_load_phase_seconds_count)",
+          "legendFormat": "{{model}} - {{phase}}",
           "refId": "A",
           "datasource": {
             "type": "prometheus",
@@ -614,10 +614,10 @@
         "uid": "${datasource}"
       },
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 18
+        "h": 10,
+        "w": 8,
+        "x": 16,
+        "y": 10
       },
       "targets": [
         {
@@ -650,51 +650,6 @@
       }
     },
     {
-      "id": 114,
-      "type": "bargauge",
-      "title": "Phase share of the load",
-      "description": "Each phase's share of total load time. Sums to at most 1 by construction; a total well under 1 means time is going somewhere no phase covers, which is a gap in the instrumentation rather than in the load. SGLang's transfer_engine transport reads 0 here, correctly: it never enters the strategy chain and records no phases.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 18
-      },
-      "targets": [
-        {
-          "expr": "sum by (phase) (mx_load_phase_seconds_sum) / scalar(sum(mx_load_seconds_sum))",
-          "legendFormat": "{{phase}}",
-          "refId": "A",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          }
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "percentunit",
-          "noValue": "0"
-        }
-      },
-      "options": {
-        "displayMode": "gradient",
-        "orientation": "horizontal",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "showUnfilled": true
-      }
-    },
-    {
       "id": 6,
       "type": "row",
       "title": "Downloads",
@@ -703,7 +658,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 26
+        "y": 20
       },
       "panels": []
     },
@@ -719,7 +674,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 27
+        "y": 21
       },
       "targets": [
         {
@@ -769,7 +724,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 27
+        "y": 21
       },
       "targets": [
         {
@@ -801,7 +756,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 27
+        "y": 21
       },
       "targets": [
         {
@@ -833,7 +788,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 27
+        "y": 21
       },
       "targets": [
         {
@@ -865,7 +820,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 35
+        "y": 29
       },
       "targets": [
         {
@@ -897,7 +852,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 35
+        "y": 29
       },
       "targets": [
         {
@@ -926,7 +881,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 43
+        "y": 37
       },
       "panels": []
     },
@@ -942,7 +897,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 44
+        "y": 38
       },
       "targets": [
         {
@@ -974,7 +929,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 44
+        "y": 38
       },
       "targets": [
         {
@@ -1007,7 +962,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 44
+        "y": 38
       },
       "targets": [
         {
@@ -1039,7 +994,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 44
+        "y": 38
       },
       "targets": [
         {
@@ -1067,7 +1022,7 @@
         "h": 5,
         "w": 24,
         "x": 0,
-        "y": 52
+        "y": 46
       },
       "options": {
         "mode": "markdown",
@@ -1086,7 +1041,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 57
+        "y": 51
       },
       "targets": [
         {
@@ -1118,7 +1073,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 57
+        "y": 51
       },
       "targets": [
         {
@@ -1160,7 +1115,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 57
+        "y": 51
       },
       "targets": [
         {
@@ -1192,7 +1147,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 57
+        "y": 51
       },
       "targets": [
         {
@@ -1221,7 +1176,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 65
+        "y": 59
       },
       "panels": []
     },
@@ -1237,7 +1192,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 66
+        "y": 60
       },
       "targets": [
         {
@@ -1269,7 +1224,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 66
+        "y": 60
       },
       "targets": [
         {
@@ -1331,7 +1286,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 66
+        "y": 60
       },
       "targets": [
         {
@@ -1363,7 +1318,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 66
+        "y": 60
       },
       "targets": [
         {
@@ -1395,7 +1350,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 74
+        "y": 68
       },
       "targets": [
         {
@@ -1445,7 +1400,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 74
+        "y": 68
       },
       "targets": [
         {
@@ -1477,7 +1432,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 74
+        "y": 68
       },
       "targets": [
         {
@@ -1509,7 +1464,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 74
+        "y": 68
       },
       "targets": [
         {
@@ -1541,7 +1496,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 82
+        "y": 76
       },
       "targets": [
         {
@@ -1580,7 +1535,7 @@
         "h": 6,
         "w": 18,
         "x": 6,
-        "y": 82
+        "y": 76
       },
       "options": {
         "mode": "markdown",
@@ -1596,7 +1551,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 88
+        "y": 82
       },
       "panels": []
     },
@@ -1612,7 +1567,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 89
+        "y": 83
       },
       "targets": [
         {
@@ -1644,7 +1599,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 89
+        "y": 83
       },
       "targets": [
         {
@@ -1677,7 +1632,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 89
+        "y": 83
       },
       "targets": [
         {
