@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 /// Install Ring before constructing clients that use a providerless Rustls transport.
 #[cfg(any(feature = "gcs", feature = "tls-rustls"))]
-pub(crate) fn ensure_crypto_provider() -> Result<()> {
+pub fn ensure_crypto_provider() -> Result<()> {
     if rustls::crypto::CryptoProvider::get_default().is_some() {
         return Ok(());
     }
@@ -19,7 +19,7 @@ pub(crate) fn ensure_crypto_provider() -> Result<()> {
 }
 
 #[cfg(not(any(feature = "gcs", feature = "tls-rustls")))]
-pub(crate) fn ensure_crypto_provider() -> Result<()> {
+pub fn ensure_crypto_provider() -> Result<()> {
     Ok(())
 }
 
@@ -227,11 +227,13 @@ pub mod gcs;
 pub mod huggingface;
 pub(crate) mod lock_file;
 pub mod ngc;
+pub mod oci;
 pub mod s3;
 
 pub use gcs::GcsProvider;
 pub use huggingface::HuggingFaceProvider;
 pub use ngc::NgcProvider;
+pub use oci::OciProvider;
 pub use s3::S3Provider;
 
 #[cfg(not(feature = "gcs"))]

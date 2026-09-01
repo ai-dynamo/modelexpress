@@ -13,6 +13,7 @@ use modelexpress_common::grpc::{
     model::model_service_server::ModelServiceServer, p2p::p2p_service_server::P2pServiceServer,
     refit::refit_service_server::RefitServiceServer,
 };
+use modelexpress_common::providers::ensure_crypto_provider;
 use tonic::transport::Server;
 use tower::Layer;
 use tracing::{error, info, warn};
@@ -146,6 +147,8 @@ pub async fn run_server(
     backend: BackendConfig,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ensure_crypto_provider()?;
+
     info!("Starting ModelExpress server...");
     config.print_config();
 
