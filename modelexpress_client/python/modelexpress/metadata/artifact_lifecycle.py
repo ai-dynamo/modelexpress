@@ -101,6 +101,7 @@ def install_artifacts(
                     transfer,
                     identity,
                     engine_label=engine_label,
+                    on_install_completed=on_install_completed,
                 )
                 elapsed = time.perf_counter() - start
                 if result.status is MooncakeInstallStatus.ALREADY_INSTALLED:
@@ -337,6 +338,7 @@ def install_mooncake_artifact_once(
     identity: p2p_pb2.SourceIdentity,
     *,
     engine_label: str,
+    on_install_completed: InstallCompleted | None = None,
 ) -> MooncakeInstallResult:
     """Install one Mooncake artifact at most once per pod."""
     marker_path = artifact_marker_path(transfer, identity, "mooncake-install-attempted")
@@ -365,6 +367,10 @@ def install_mooncake_artifact_once(
                 # A miss/attempted marker owned by a dead process is stale and
                 # can be reclaimed for a later pod launch.
                 marker_path.unlink(missing_ok=True)
+            else:
+                # Corrupt or unknown markers cannot prove that the target
+                # cache is complete. Reclaim them and install again.
+                marker_path.unlink(missing_ok=True)
         _write_mooncake_install_marker(marker_path, "attempted")
         try:
             header = install_from_mooncake(
@@ -374,6 +380,8 @@ def install_mooncake_artifact_once(
                 accelerator=ctx.accelerator_backend.name,
             )
             transfer.install(header)
+            if on_install_completed is not None:
+                on_install_completed(transfer, identity)
             _write_mooncake_install_marker(marker_path, "installed")
             return MooncakeInstallResult(
                 MooncakeInstallStatus.INSTALLED,
@@ -802,34 +810,53 @@ def artifact_marker_path(
 
 def _write_mooncake_install_marker(marker_path: Path, status: str) -> None:
     pid = os.getpid()
-    write_marker(
-        marker_path,
-        json.dumps(
-            {
-                "version": _MOONCAKE_INSTALL_MARKER_VERSION,
-                "status": status,
-                "pid": pid,
-                "starttime": _process_starttime(pid),
-            },
-            sort_keys=True,
-        ),
+    value = json.dumps(
+        {
+            "version": _MOONCAKE_INSTALL_MARKER_VERSION,
+            "status": status,
+            "pid": pid,
+            "starttime": _process_starttime(pid),
+        },
+        sort_keys=True,
     )
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(
+        prefix=f".{marker_path.name}.",
+        suffix=".tmp",
+        dir=marker_path.parent,
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as marker_file:
+            marker_file.write(f"{value}\n")
+            marker_file.flush()
+            os.fsync(marker_file.fileno())
+        os.replace(temporary_path, marker_path)
+    finally:
+        Path(temporary_path).unlink(missing_ok=True)
 
 
 def _read_mooncake_install_marker(marker_path: Path) -> dict[str, object]:
-    """Read an install marker, accepting markers from older revisions."""
+    """Read an install marker, returning ``invalid`` for corrupt state."""
     raw = marker_path.read_text(encoding="utf-8").strip()
     try:
         marker = json.loads(raw)
     except (json.JSONDecodeError, TypeError):
-        # Older successful markers contain only the artifact id; the old
-        # literal "attempted" marker is treated as an in-progress attempt.
+        # Older in-progress markers were literal strings. Any other non-JSON
+        # value may be a torn write and must be retried rather than accepted as
+        # a completed installation.
         if raw in {"attempted", "miss"}:
             return {"status": raw, "owner": None}
-        return {"status": "installed", "owner": None}
+        return {"status": "invalid", "owner": None}
     if not isinstance(marker, dict):
-        return {"status": "attempted", "owner": None}
-    status = str(marker.get("status", "attempted"))
+        return {"status": "invalid", "owner": None}
+    status = marker.get("status")
+    if (
+        type(marker.get("version")) is not int
+        or marker["version"] != _MOONCAKE_INSTALL_MARKER_VERSION
+        or status not in {"installed", "miss", "attempted"}
+    ):
+        return {"status": "invalid", "owner": None}
     pid = marker.get("pid")
     starttime = marker.get("starttime")
     owner = (

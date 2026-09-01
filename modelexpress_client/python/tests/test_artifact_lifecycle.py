@@ -164,6 +164,149 @@ def test_install_artifact_once_calls_completion_hook(monkeypatch, tmp_path):
     on_install_completed.assert_called_once_with(transfer, _identity())
 
 
+def _mooncake_install_transfer(tmp_path):
+    target_root = tmp_path / "cache"
+    return SimpleNamespace(
+        name="torch_compile_cache",
+        roots=(
+            ArtifactCacheRoot(
+                name="primary",
+                source_root=target_root,
+                target_root=target_root,
+            ),
+        ),
+        install=MagicMock(),
+    )
+
+
+def _mooncake_install_context():
+    return SimpleNamespace(
+        node_rank=0,
+        accelerator_backend=SimpleNamespace(name="cuda"),
+    )
+
+
+def test_mooncake_install_calls_completion_hook_before_commit(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        artifact_lifecycle.tempfile, "gettempdir", lambda: str(tmp_path)
+    )
+    transfer = _mooncake_install_transfer(tmp_path)
+    identity = _identity()
+    header = p2p_pb2.GetArtifactManifestHeaderResponse(artifact_id="artifact-id")
+    marker_path = artifact_lifecycle.artifact_marker_path(
+        transfer, identity, "mooncake-install-attempted"
+    )
+    monkeypatch.setattr(
+        artifact_lifecycle, "install_from_mooncake", MagicMock(return_value=header)
+    )
+
+    def assert_marker_is_not_committed(*_args):
+        assert artifact_lifecycle._read_mooncake_install_marker(marker_path)[
+            "status"
+        ] == "attempted"
+
+    on_install_completed = MagicMock(side_effect=assert_marker_is_not_committed)
+
+    result = artifact_lifecycle.install_mooncake_artifact_once(
+        _mooncake_install_context(),
+        transfer,
+        identity,
+        engine_label="vLLM",
+        on_install_completed=on_install_completed,
+    )
+
+    assert result == artifact_lifecycle.MooncakeInstallResult(
+        artifact_lifecycle.MooncakeInstallStatus.INSTALLED, header
+    )
+    transfer.install.assert_called_once_with(header)
+    on_install_completed.assert_called_once_with(transfer, identity)
+    assert artifact_lifecycle._read_mooncake_install_marker(marker_path)["status"] == (
+        "installed"
+    )
+
+
+def test_mooncake_installed_marker_skips_completion_hook(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        artifact_lifecycle.tempfile, "gettempdir", lambda: str(tmp_path)
+    )
+    transfer = _mooncake_install_transfer(tmp_path)
+    identity = _identity()
+    target_root = transfer.roots[0].target_root
+    target_root.mkdir()
+    (target_root / "cached").write_text("ready")
+    marker_path = artifact_lifecycle.artifact_marker_path(
+        transfer, identity, "mooncake-install-attempted"
+    )
+    artifact_lifecycle._write_mooncake_install_marker(marker_path, "installed")
+    install_from_mooncake = MagicMock()
+    monkeypatch.setattr(artifact_lifecycle, "install_from_mooncake", install_from_mooncake)
+    on_install_completed = MagicMock()
+
+    result = artifact_lifecycle.install_mooncake_artifact_once(
+        _mooncake_install_context(),
+        transfer,
+        identity,
+        engine_label="vLLM",
+        on_install_completed=on_install_completed,
+    )
+
+    assert result == artifact_lifecycle.MooncakeInstallResult(
+        artifact_lifecycle.MooncakeInstallStatus.ALREADY_INSTALLED
+    )
+    install_from_mooncake.assert_not_called()
+    transfer.install.assert_not_called()
+    on_install_completed.assert_not_called()
+
+
+def test_mooncake_corrupt_installed_marker_is_reclaimed(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        artifact_lifecycle.tempfile, "gettempdir", lambda: str(tmp_path)
+    )
+    transfer = _mooncake_install_transfer(tmp_path)
+    identity = _identity()
+    target_root = transfer.roots[0].target_root
+    target_root.mkdir()
+    (target_root / "partial").write_text("incomplete")
+    marker_path = artifact_lifecycle.artifact_marker_path(
+        transfer, identity, "mooncake-install-attempted"
+    )
+    marker_path.parent.mkdir(parents=True)
+    marker_path.write_text('{"status": "inst', encoding="utf-8")
+    header = p2p_pb2.GetArtifactManifestHeaderResponse(artifact_id="artifact-id")
+    install_from_mooncake = MagicMock(return_value=header)
+    monkeypatch.setattr(artifact_lifecycle, "install_from_mooncake", install_from_mooncake)
+
+    result = artifact_lifecycle.install_mooncake_artifact_once(
+        _mooncake_install_context(),
+        transfer,
+        identity,
+        engine_label="vLLM",
+    )
+
+    assert result.status is artifact_lifecycle.MooncakeInstallStatus.INSTALLED
+    install_from_mooncake.assert_called_once()
+    transfer.install.assert_called_once_with(header)
+    assert artifact_lifecycle._read_mooncake_install_marker(marker_path)["status"] == (
+        "installed"
+    )
+
+
+def test_mooncake_marker_write_cleans_temporary_file_on_replace_failure(
+    monkeypatch, tmp_path
+):
+    marker_path = tmp_path / "marker.done"
+    monkeypatch.setattr(
+        artifact_lifecycle.os,
+        "replace",
+        MagicMock(side_effect=OSError("replace failed")),
+    )
+
+    with pytest.raises(OSError, match="replace failed"):
+        artifact_lifecycle._write_mooncake_install_marker(marker_path, "installed")
+
+    assert list(tmp_path.glob(".marker.done.*.tmp")) == []
+
+
 @pytest.fixture
 def mooncake_publish_state():
     artifact_lifecycle._prepared_artifact_bundles.clear()
