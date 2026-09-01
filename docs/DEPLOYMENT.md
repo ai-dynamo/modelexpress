@@ -884,13 +884,31 @@ RL refit has the same trusted-network requirement. Its trainer-local
 `RefitWorkerService` serves exact-version manifests over plaintext gRPC; the
 manifest digest detects corruption but does not authenticate the trainer.
 
-Canonical S3/XOR trainers consume Hugging Face tensor buckets produced by the
+Canonical S3 trainers consume Hugging Face tensor buckets produced by the
 training framework. Framework-native bucket settings remain the default.
 Integrations may use `MX_REFIT_DELTA_BUCKET_BYTES` as an explicit override, or
 its 512 MiB default when they have no native setting. `MX_REFIT_DELTA_WORKERS`
-(default `min(32, CPU count)`) controls delta-processing concurrency.
+(default `min(32, CPU count)`) controls trainer CPU work;
+`MX_S3_UPLOAD_WORKERS` controls concurrent full-checkpoint batch uploads.
 Framework integrations read the bucket-size setting before constructing the
 stream; ModelExpress preserves the supplied bucket boundaries.
+Full checkpoints are grouped into concurrently uploaded safetensors objects of
+up to `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` tensor bytes (4 GiB by default).
+A single tensor larger than the configured size is uploaded on its own.
+Generators download those objects concurrently through the ModelExpress S3
+client. Each download worker validates one batch and overwrites the matching
+regions in the existing local checkpoint mmaps.
+The receiver marks its local checkpoint `UPDATING` before mutation and `READY`
+only after success. An interrupted update remains unavailable until a fresh
+initialization reseeds it from `seed_checkpoint_path`.
+
+S3 versions normally use `XOR_DELTA`. Integrations may opt into a
+framework-selected cadence of `FULL_HF_CHECKPOINT` versions; these publish
+native HF safetensor shards, omit `base_version_id`, and become the exact base
+for the next delta. The cadence is disabled by default. Slime exposes
+`--modelexpress-full-hf-checkpoint-interval N`; Vime accepts
+`full_hf_checkpoint_interval` in `--modelexpress-config`. In both cases, `N`
+counts published ModelExpress weight versions.
 
 ### Server-Backed Model Cache (No Shared Storage)
 

@@ -1,39 +1,45 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Utilities for canonical Hugging Face checkpoint reads."""
+"""Utilities for the ModelExpress RL workflow."""
 
 from __future__ import annotations
 
 import json
 import struct
 import zlib
-from collections.abc import Callable
+from collections import deque
+from collections.abc import Callable, Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import TypeVar
 
 import numpy as np
 
 
-_SAFETENSORS_DTYPES = {
-    "F64": "float64",
-    "F32": "float32",
-    "F16": "float16",
-    "BF16": "bfloat16",
-    "F8_E4M3": "float8_e4m3fn",
-    "F8_E4M3FNUZ": "float8_e4m3fnuz",
-    "F8_E5M2": "float8_e5m2",
-    "F8_E5M2FNUZ": "float8_e5m2fnuz",
-    "C64": "complex64",
-    "I64": "int64",
-    "I32": "int32",
-    "I16": "int16",
-    "I8": "int8",
-    "U8": "uint8",
-    "U16": "uint16",
-    "U32": "uint32",
-    "U64": "uint64",
-    "BOOL": "bool",
-}
+_WorkItem = TypeVar("_WorkItem")
+_WorkResult = TypeVar("_WorkResult")
+
+
+def threadpool_map(
+    items: Iterable[_WorkItem],
+    process: Callable[[_WorkItem], _WorkResult],
+    *,
+    max_workers: int,
+    thread_name_prefix: str,
+) -> Iterator[_WorkResult]:
+    """Map work in a bounded thread pool while preserving input order."""
+    inflight = deque()
+    with ThreadPoolExecutor(
+        max_workers=max_workers,
+        thread_name_prefix=thread_name_prefix,
+    ) as pool:
+        for item in items:
+            inflight.append(pool.submit(process, item))
+            if len(inflight) >= 2 * max_workers:
+                yield inflight.popleft().result()
+        while inflight:
+            yield inflight.popleft().result()
 
 
 def compute_delta(
@@ -136,17 +142,11 @@ def _index_tensors(
                 continue
             if name in locations:
                 raise ValueError(f"duplicate safetensors entry {name!r}")
-            try:
-                dtype = _SAFETENSORS_DTYPES[info["dtype"]]
-            except KeyError as error:
-                raise ValueError(
-                    f"unsupported safetensors dtype {info['dtype']!r} for {name!r}"
-                ) from error
             locations[name] = (path, 8 + header_size + begin, end - begin)
             metadata[name] = {
                 "name": name,
                 "shape": info["shape"],
-                "dtype": dtype,
+                "dtype": info["dtype"],
                 "byte_size": end - begin,
             }
     return locations, metadata
@@ -156,7 +156,7 @@ def make_tensor_reader(
     checkpoint: str | Path,
 ) -> tuple[Callable[[str], np.ndarray], dict[str, dict]]:
     """Index safetensors once and return direct byte reads by tensor name."""
-    locations, metadata = index_checkpoint_tensors(checkpoint)
+    _, locations, metadata = index_checkpoint_tensors(checkpoint)
 
     def read(name: str) -> np.ndarray:
         path, offset, size = locations[name]
@@ -172,12 +172,13 @@ def make_tensor_reader(
 
 def index_checkpoint_tensors(
     checkpoint: str | Path,
-) -> tuple[dict[str, tuple[Path, int, int]], dict[str, dict]]:
-    """Return safetensors byte locations and metadata for a checkpoint."""
+) -> tuple[list[Path], dict[str, tuple[Path, int, int]], dict[str, dict]]:
+    """Return safetensors paths, byte locations, and metadata for a checkpoint."""
     root = Path(checkpoint)
     paths = _checkpoint_paths(root)
     tied = _tied_names(root if root.is_dir() else root.parent)
-    return _index_tensors(paths, tied)
+    locations, metadata = _index_tensors(paths, tied)
+    return paths, locations, metadata
 
 
 __all__ = [
@@ -187,4 +188,5 @@ __all__ = [
     "index_checkpoint_tensors",
     "make_tensor_reader",
     "read_safetensors_header",
+    "threadpool_map",
 ]

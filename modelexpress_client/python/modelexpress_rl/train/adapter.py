@@ -56,11 +56,12 @@ class TrainerStagingMode(str, Enum):
 
 
 class WeightPayloadFormat(str, Enum):
-    """Weight representation fixed for one initialized client."""
+    """Weight representation used by one published version."""
 
     UNSPECIFIED = "UNSPECIFIED"
     FULL_TENSOR = "FULL_TENSOR"
     XOR_DELTA = "XOR_DELTA"
+    FULL_HF_CHECKPOINT = "FULL_HF_CHECKPOINT"
 
 
 @dataclass(frozen=True)

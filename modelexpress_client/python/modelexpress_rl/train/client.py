@@ -55,7 +55,7 @@ def _payload_format(value: WeightPayloadFormat | None) -> WeightPayloadFormat:
 
 @dataclass(frozen=True)
 class ObjectStorageConfig:
-    """Object-storage and seed-base settings for canonical XOR publication."""
+    """Object-storage and seed-base settings for canonical publication."""
 
     storage_type: ObjectStorageType
     uri_prefix: str

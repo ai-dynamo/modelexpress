@@ -135,7 +135,7 @@ partitions remain separate required slots. The NIXL metadata endpoint is derived
 from `MX_WORKER_HOST` and the client-owned NIXL manager's listen port. `LOCAL_RANK`
 selects the device unless `device_id` is passed to `initialize()`.
 
-Canonical S3/XOR staging consumes Hugging Face tensor buckets produced by the
+Canonical S3 staging consumes Hugging Face tensor buckets produced by the
 training framework. Framework-native bucket settings remain the default.
 The public trainer API accepts
 `ModelExpressTrainerConfig(object_storage=ObjectStorageConfig(...))`; its
@@ -145,20 +145,37 @@ typed `ObjectStorageSource` envelope. Generator clients likewise accept
 The current trainer and generator clients support only `ObjectStorageType.S3`.
 Integrations may use `MX_REFIT_DELTA_BUCKET_BYTES` as an explicit override, or
 its 512 MiB default when they have no native setting. CPU workers are configured
-by `MX_REFIT_DELTA_WORKERS` (default `min(32, CPU count)`).
+by `MX_REFIT_DELTA_WORKERS` (default `min(32, CPU count)`), while
+`MX_S3_UPLOAD_WORKERS` controls concurrent full-checkpoint batch uploads.
 The framework integration reads the bucket-size setting while constructing the
 stream; ModelExpress processes each supplied bucket without splitting or merging
 it.
 Before training begins, the framework calls `prepare_delta_base()` with one
 bucket stream. ModelExpress submits each framework bucket directly for
-concurrent rank-local launch-checkpoint reads. Real delta staging therefore
-performs no launch-checkpoint reads.
+concurrent rank-local seed-checkpoint reads. Real delta staging therefore
+performs no seed-checkpoint reads. A `FULL_HF_CHECKPOINT` version serializes
+the current buckets as native HF safetensor shards, omits `base_version_id`, and
+replaces the retained snapshot so the next `XOR_DELTA` uses it as its exact
+base. A bounded worker pool updates the rank-local snapshot with immutable CPU
+tensors. Each publishing rank groups its snapshot into concurrently uploaded
+safetensors objects with at most `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` tensor
+bytes (4 GiB by default); an oversized tensor occupies its own object. The
+objects are sent directly to S3 without a trainer-side temporary checkpoint.
+Framework integrations own the optional full-checkpoint period; it is disabled
+by default.
+Generators use the ModelExpress S3 client to download full-checkpoint batches
+concurrently. Each worker validates one downloaded batch and copies its tensors
+into their existing local mmap destinations, without materializing a second full
+checkpoint. ModelStreamer integration remains a future optimization.
+The local checkpoint state changes from `READY` to `UPDATING` before mutation
+and returns to `READY` only after success. An interrupted update must be reseeded
+from `seed_checkpoint_path` during initialization.
 The framework supplies each version's exact `object_storage.uri` under the
-configured `uri_prefix`. That URI names `model.safetensors.index.json`; delta
-shards are stored beside it. The index records the target `WeightVersion.uid`
-and its `base_version_id` as the string fields `metadata.version` and
-`metadata.base_version`. After upload, the orchestrator changes the version
-from `STAGING` to `READY`. S3 versions remain READY for rollout recovery; their
+configured `uri_prefix`. That URI names the global safetensors index; its
+objects are stored beside it. A delta index records the target
+`WeightVersion.uid` and its `base_version_id` as `metadata.version` and
+`metadata.base_version`. After upload, the orchestrator changes the version from
+`STAGING` to `READY`. S3 versions remain READY for rollout recovery; their
 immutable objects are governed by the bucket's external lifecycle policy.
 
 The client owns the NIXL manager and trainer-side manifest service. `server_url`
@@ -168,9 +185,11 @@ client before its distributed process group is ready; the explicitly selected
 `engine_context` is constructed lazily on the first tensor operation. Deployment
 environment variables do not select Python implementations.
 
-Initialization fixes the staging mode and payload format. On NIXL, `publish()`
-hides manifest publication and the internal `CreateWeightVersionShard` RPC. The
-current Megatron adapter registers and exposes its live buffers through
+Initialization fixes the staging mode. NIXL also fixes its payload format;
+canonical S3 publication follows each target `WeightVersion`. On NIXL,
+`publish()` hides manifest publication and the internal
+`CreateWeightVersionShard` RPC. The current Megatron adapter registers and
+exposes its live buffers through
 `IN_PLACE`, so callers must keep those tensors immutable while the version is
 published. The required lifecycle is synchronous: create and publish the
 version, update every generator, retire and release the version, and only then
