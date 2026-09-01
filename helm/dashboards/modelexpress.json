@@ -518,7 +518,7 @@
       "id": 111,
       "type": "timeseries",
       "title": "Load duration (p50 / p95 / p99)",
-      "description": "The load_model() window, by engine. Not the inference cold start: CUDA graph capture, JIT and KV cache setup all run after the loader returns and are measured by the engine, not here.",
+      "description": "The load_model() window, by engine, over every load the scraped processes have done. Not the inference cold start: CUDA graph capture, JIT and KV cache setup all run after the loader returns. A load happens once per process, so rate() over these series sees a constant and returns zero -- the cumulative value is the reading that means anything.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -531,7 +531,7 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.5, sum by (le, engine) (rate(mx_load_seconds_bucket{outcome=\"success\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le, engine) (mx_load_seconds_bucket{outcome=\"success\"}))",
           "legendFormat": "p50 {{engine}}",
           "refId": "A",
           "datasource": {
@@ -540,7 +540,7 @@
           }
         },
         {
-          "expr": "histogram_quantile(0.95, sum by (le, engine) (rate(mx_load_seconds_bucket{outcome=\"success\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, engine) (mx_load_seconds_bucket{outcome=\"success\"}))",
           "legendFormat": "p95 {{engine}}",
           "refId": "B",
           "datasource": {
@@ -549,7 +549,7 @@
           }
         },
         {
-          "expr": "histogram_quantile(0.99, sum by (le, engine) (rate(mx_load_seconds_bucket{outcome=\"success\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le, engine) (mx_load_seconds_bucket{outcome=\"success\"}))",
           "legendFormat": "p99 {{engine}}",
           "refId": "C",
           "datasource": {
@@ -569,7 +569,7 @@
       "id": 112,
       "type": "timeseries",
       "title": "Where the load went (mean per phase)",
-      "description": "The phases partition the load, so these stack to the whole. This is the panel that answers 'which part was slow'. A phase absent for an engine is a real absence, not a zero: SGLang has no model_init, and TRT-LLM publishes outside this window.",
+      "description": "Mean time in each phase. The phases partition the load, so these stack to the whole; this is the panel that answers 'which part was slow'. A phase absent for an engine is a real absence, not a zero: SGLang has no model_init, and TRT-LLM publishes outside this window. A load happens once per process, so rate() over these series sees a constant and returns zero -- the cumulative value is the reading that means anything.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -582,7 +582,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (phase) (rate(mx_load_phase_seconds_sum[$__rate_interval])) / sum by (phase) (rate(mx_load_phase_seconds_count[$__rate_interval]))",
+          "expr": "sum by (phase) (mx_load_phase_seconds_sum) / sum by (phase) (mx_load_phase_seconds_count)",
           "legendFormat": "{{phase}}",
           "refId": "A",
           "datasource": {
@@ -601,8 +601,8 @@
     {
       "id": 113,
       "type": "timeseries",
-      "title": "Loads finishing",
-      "description": "By outcome. A load that raises is recorded too -- it is the case the timing exists to explain.",
+      "title": "Loads recorded",
+      "description": "Loads completed by the processes currently being scraped, by outcome. A load that raised is counted too -- it is the case the timing exists to explain. Resets when a pod restarts, because the count is process-local.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -615,7 +615,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (outcome) (increase(mx_load_seconds_count[$__rate_interval])) > 0",
+          "expr": "sum by (outcome) (mx_load_seconds_count)",
           "legendFormat": "{{outcome}}",
           "refId": "A",
           "datasource": {
@@ -635,7 +635,7 @@
       "id": 114,
       "type": "timeseries",
       "title": "Phase share of the load",
-      "description": "Each phase's mean as a fraction of the mean load. Sums to at most 1 by construction; a total well under 1 means time is going somewhere no phase covers, which is a gap in the instrumentation rather than in the load.",
+      "description": "Each phase's share of total load time. Sums to at most 1 by construction; a total well under 1 means time is going somewhere no phase covers, which is a gap in the instrumentation rather than in the load. SGLang's transfer_engine transport reads 0 here, correctly: it never enters the strategy chain and records no phases.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -648,7 +648,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (phase) (rate(mx_load_phase_seconds_sum[$__rate_interval])) / scalar(sum(rate(mx_load_seconds_sum[$__rate_interval])))",
+          "expr": "sum by (phase) (mx_load_phase_seconds_sum) / scalar(sum(mx_load_seconds_sum))",
           "legendFormat": "{{phase}}",
           "refId": "A",
           "datasource": {
