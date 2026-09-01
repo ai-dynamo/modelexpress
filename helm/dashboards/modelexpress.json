@@ -693,7 +693,7 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(mx_download_seconds_bucket{outcome=\"downloaded\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (mx_download_seconds_bucket{outcome=\"downloaded\"}))",
           "legendFormat": "p50",
           "refId": "A",
           "datasource": {
@@ -702,7 +702,7 @@
           }
         },
         {
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(mx_download_seconds_bucket{outcome=\"downloaded\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (mx_download_seconds_bucket{outcome=\"downloaded\"}))",
           "legendFormat": "p95",
           "refId": "B",
           "datasource": {
@@ -711,7 +711,7 @@
           }
         },
         {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(mx_download_seconds_bucket{outcome=\"downloaded\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (mx_download_seconds_bucket{outcome=\"downloaded\"}))",
           "legendFormat": "p99",
           "refId": "C",
           "datasource": {
@@ -720,7 +720,7 @@
           }
         }
       ],
-      "description": "Filtered to outcome=downloaded. The histogram also carries outcome=error, and a download that fails early would otherwise pull these percentiles down and read as an improvement. Buckets run to one hour: a cold DeepSeek-V3 warm-up is around forty minutes.",
+      "description": "Duration of every successful download these server processes have done. Cumulative rather than a rate: a download is a rare event, and over the few-minute window $__rate_interval covers, the panel would be empty except in the moments just after one finished. Does not decay -- a slow download keeps affecting the quantiles until the process restarts.",
       "fieldConfig": {
         "defaults": {
           "unit": "s"
