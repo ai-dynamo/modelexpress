@@ -516,9 +516,9 @@
     },
     {
       "id": 111,
-      "type": "timeseries",
+      "type": "bargauge",
       "title": "Load duration by model",
-      "description": "Mean load_model() duration per model, over the processes currently being scraped. Not the inference cold start: CUDA graph capture, JIT and KV cache setup all run after the loader returns.\n\nThe mean rather than a quantile, and cumulative rather than a rate, because of what these series are. A load happens once per process, so rate() sees a constant and returns zero, and each pod contributes a single observation. histogram_quantile reads bucket counts only, so two models landing in one bucket draw the same line -- a 36 s load and a 44 s load are indistinguishable inside (30, 60]. _sum / _count is exact.",
+      "description": "Mean load_model() duration per model, over the processes currently being scraped. Not the inference cold start: CUDA graph capture, JIT and KV cache setup all run after the loader returns.\n\nThe mean rather than a quantile, and cumulative rather than a rate, because of what these series are. A load happens once per process, so rate() sees a constant and returns zero, and each pod contributes a single observation. histogram_quantile reads bucket counts only, so two models landing in one bucket draw the same line -- a 36 s load and a 44 s load are indistinguishable inside (30, 60]. _sum / _count is exact.\n\nA bar gauge rather than a timeseries: a load happens once per process, so the value never changes and a time axis draws a flat line across the whole panel. The comparison worth seeing is between models.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -545,13 +545,25 @@
           "unit": "s",
           "noValue": "0"
         }
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true
       }
     },
     {
       "id": 112,
-      "type": "timeseries",
+      "type": "bargauge",
       "title": "Where the load went (mean per phase)",
-      "description": "Mean time in each phase. The phases partition the load, so these stack to the whole; this is the panel that answers 'which part was slow'. A phase absent for an engine is a real absence, not a zero: SGLang has no model_init, and TRT-LLM publishes outside this window. A load happens once per process, so rate() over these series sees a constant and returns zero -- the cumulative value is the reading that means anything.",
+      "description": "Mean time in each phase. The phases partition the load, so these stack to the whole; this is the panel that answers 'which part was slow'. A phase absent for an engine is a real absence, not a zero: SGLang has no model_init, and TRT-LLM publishes outside this window. A load happens once per process, so rate() over these series sees a constant and returns zero -- the cumulative value is the reading that means anything.\n\nA bar gauge for the same reason as the panel beside it, and because phases are compared against each other rather than followed over time.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -578,11 +590,23 @@
           "unit": "s",
           "noValue": "0"
         }
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true
       }
     },
     {
       "id": 113,
-      "type": "timeseries",
+      "type": "bargauge",
       "title": "Loads recorded by model",
       "description": "Loads completed by the processes currently being scraped, by model. Resets when a pod restarts, because the count is process-local.",
       "datasource": {
@@ -611,11 +635,23 @@
           "unit": "short",
           "noValue": "0"
         }
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true
       }
     },
     {
       "id": 114,
-      "type": "timeseries",
+      "type": "bargauge",
       "title": "Phase share of the load",
       "description": "Each phase's share of total load time. Sums to at most 1 by construction; a total well under 1 means time is going somewhere no phase covers, which is a gap in the instrumentation rather than in the load. SGLang's transfer_engine transport reads 0 here, correctly: it never enters the strategy chain and records no phases.",
       "datasource": {
@@ -644,6 +680,18 @@
           "unit": "percentunit",
           "noValue": "0"
         }
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true
       }
     },
     {
