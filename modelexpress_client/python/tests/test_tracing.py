@@ -51,10 +51,10 @@ def test_load_chain_emits_real_span(tracer_and_exporter, load_result, expect_use
 
     with (
         patch(f"{base}.tracer", tracer),
-        patch(f"{base}.rdma_strategy.RdmaStrategy.skip_reason", return_value="other"),
-        patch(f"{base}.model_streamer_strategy.ModelStreamerStrategy.skip_reason", return_value="other"),
-        patch(f"{base}.gds_strategy.GdsStrategy.skip_reason", return_value="other"),
-        patch(f"{base}.default_strategy.DefaultStrategy.skip_reason", return_value=None),
+        patch(f"{base}.rdma_strategy.RdmaStrategy.is_available", return_value=False),
+        patch(f"{base}.model_streamer_strategy.ModelStreamerStrategy.is_available", return_value=False),
+        patch(f"{base}.gds_strategy.GdsStrategy.is_available", return_value=False),
+        patch(f"{base}.default_strategy.DefaultStrategy.is_available", return_value=True),
         patch(
             f"{base}.default_strategy.DefaultStrategy.load",
             return_value=strategy_result,

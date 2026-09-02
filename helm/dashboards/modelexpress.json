@@ -864,8 +864,8 @@
     {
       "id": 116,
       "type": "bargauge",
-      "title": "Strategies skipped, by reason",
-      "description": "Strategies the eligibility filter dropped before the chain could try them, and why. This is what makes the panel to its left readable: without it, a strategy that recorded no attempt was either filtered out here or was eligible and never reached, and those are opposite conclusions drawn from the same empty row.\n\nExpect a steady background of these on a healthy cluster: gds with driver_unavailable, and model_streamer or instant_tensor with package_missing, are all normal on an image that ships none of them. The one worth looking at is rdma -- p2p_disabled, no_mx_server or transfer_not_allowed there means P2P is configured off rather than broken.",
+      "title": "Strategies skipped by the eligibility filter",
+      "description": "Strategies the eligibility filter dropped before the chain could try them. This is what makes the panel to its left readable: without it, a strategy that recorded no attempt was either filtered out here or was eligible and never reached, and those are opposite conclusions drawn from the same empty row.\n\nExpect a steady nonzero background on any real cluster -- gds, model_streamer and instant_tensor are all normally absent from an image that ships none of them. The counter says a strategy was unavailable, not why; the worker log names the reason at the point it was decided.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -878,8 +878,8 @@
       },
       "targets": [
         {
-          "expr": "sum by (strategy, reason) (mx_load_strategy_skipped_total)",
-          "legendFormat": "{{strategy}}  {{reason}}",
+          "expr": "sum by (engine, strategy) (mx_load_strategy_skipped_total)",
+          "legendFormat": "{{engine}}  {{strategy}}",
           "refId": "A",
           "datasource": {
             "type": "prometheus",

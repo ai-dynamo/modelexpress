@@ -145,35 +145,6 @@ LOAD_STRATEGY_OUTCOMES = (
     "error",
 )
 
-#: Why the eligibility filter dropped a strategy before the chain could try it.
-#:
-#: Every value is a literal at a fixed source line in a ``skip_reason``
-#: implementation -- none is derived from an exception message, a model name or
-#: anything else the environment controls -- so the domain is closed the same way
-#: the phase names are.
-#:
-#: What this counter deliberately does NOT count is a strategy that was eligible
-#: and simply never reached, because an earlier one succeeded and the chain
-#: returned. Those are the common case, and counting them as skips would make
-#: ``default`` look permanently skipped on every healthy load.
-LOAD_STRATEGY_SKIP_REASONS = (
-    "no_adapter",
-    "adapter_capability_missing",
-    "p2p_disabled",
-    "nixl_unavailable",
-    "accelerator_unsupported",
-    "no_mx_server",
-    "transfer_not_allowed",
-    "prefetch_disabled",
-    "no_repo_id",
-    "env_disabled",
-    "package_missing",
-    "not_cuda",
-    "not_configured",
-    "driver_unavailable",
-    "other",
-)
-
 #: Longest model id kept in the ``model`` label; longer ones are truncated.
 #:
 #: This is the one label on the load families whose domain is NOT a closed enum,
@@ -259,6 +230,15 @@ def reset_multiproc_dir(path: str | None = None) -> None:
         logger.info("Reset metrics directory %s (%d stale file(s))", directory, removed)
     except OSError as e:
         logger.warning("Failed to reset metrics directory %s: %s", directory, e)
+
+
+class _StrategyAttempt:
+    """Mutable outcome holder for :meth:`MetricsCollector.time_load_strategy`."""
+
+    __slots__ = ("outcome",)
+
+    def __init__(self) -> None:
+        self.outcome = "error"
 
 
 class MetricsCollector:
@@ -499,10 +479,12 @@ class MetricsCollector:
         # has two opposite explanations.
         self.strategy_skips = Counter(
             "mx_load_strategy_skipped_total",
-            "Strategies the eligibility filter dropped before the chain ran "
-            "them, by reason. Does not count a strategy that was eligible but "
-            "never reached because an earlier one succeeded.",
-            ["engine", "strategy", "reason", "scheme"],
+            "Strategies the eligibility filter dropped before the chain could "
+            "run them. Does not count a strategy that was eligible but never "
+            "reached because an earlier one succeeded -- that distinction is "
+            "the whole point, and without it an empty row has two opposite "
+            "readings.",
+            ["engine", "strategy", "scheme"],
             registry=registry,
         )
 
@@ -821,32 +803,50 @@ class MetricsCollector:
             except Exception:
                 pass
 
-    def record_strategy_skipped(self, engine: str, strategy: str, reason: str) -> None:
-        """Record a strategy the eligibility filter dropped (L2).
+    def record_chain_skips(self, engine: str, skipped: object) -> None:
+        """Record the strategies the eligibility filter dropped (L2).
 
-        Both unknown values clamp here rather than drop, which is the opposite of
-        the histogram above and worth stating so it does not read as an
-        inconsistency later: this counter partitions nothing, so there is no sum
-        for a catch-all to corrupt, and dropping would lose the event outright.
-        The catch-all is ``other``, which is a label value rather than a member
-        of ``LOAD_STRATEGIES`` -- seeing it at all means this module and the
-        chain's strategy list have drifted.
+        Takes the whole set so the chain spends one call on this rather than a
+        loop: the caller owns the eligibility decision, this module owns what is
+        done with it.
+
+        An unrecognized name clamps to ``other`` rather than being dropped. This
+        counter partitions nothing, so there is no sum a catch-all can corrupt,
+        whereas dropping would lose the event outright -- the opposite trade
+        from the histogram above, and deliberate.
 
         No ``model`` label. Eligibility is a property of the environment -- a
-        driver, a package, an env var -- not of the model being loaded, and the
-        engine is already enough to tell two deployments apart.
+        driver, a package, an env var -- not of the model being loaded.
         """
         if self._ensure():
             try:
-                if strategy not in LOAD_STRATEGIES:
-                    strategy = "other"
-                if reason not in LOAD_STRATEGY_SKIP_REASONS:
-                    reason = "other"
                 if engine not in LOAD_ENGINES:
                     engine = "other"
-                self.strategy_skips.labels(engine, strategy, reason, self.scheme).inc()
+                for name in skipped:
+                    if name not in LOAD_STRATEGIES:
+                        name = "other"
+                    self.strategy_skips.labels(engine, name, self.scheme).inc()
             except Exception:
                 pass
+
+    @contextlib.contextmanager
+    def time_load_strategy(self, engine: str, model: object, strategy: str):
+        """Time one strategy attempt and record it however it ends (L2).
+
+        Yields a handle whose ``outcome`` the caller sets on each terminal
+        branch. It starts at ``error`` so that an exception no handler catches --
+        KeyboardInterrupt, SystemExit, CancelledError -- is still recorded
+        rather than dropped, which is the property a ``finally`` has and an
+        ``except`` clause does not.
+        """
+        attempt = _StrategyAttempt()
+        start = time.perf_counter()
+        try:
+            yield attempt
+        finally:
+            self.observe_load_strategy_seconds(
+                engine, model, strategy, attempt.outcome, time.perf_counter() - start
+            )
 
     @contextlib.contextmanager
     def time_load(self, engine: str, model: object, model_role: str):

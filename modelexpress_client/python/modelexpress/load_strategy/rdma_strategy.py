@@ -104,21 +104,20 @@ class RdmaStrategy(LoadStrategy):
         ctx.tensors = {}
         ctx.nixl_manager = None
 
-    def skip_reason(self, ctx: LoadContext) -> str | None:
+    def is_available(self, ctx: LoadContext) -> bool:
         if not ctx.p2p_enabled:
-            return "p2p_disabled"
-        base = super().skip_reason(ctx)
-        if base is not None:
-            return base
+            return False
+        if not super().is_available(ctx):
+            return False
         if not is_nixl_available():
-            return "nixl_unavailable"
+            return False
 
         if not ctx.accelerator_backend.supports_rdma_p2p():
             logger.info(
                 f"[Worker {ctx.global_rank}] Backend "
                 f"{ctx.accelerator_backend.name} does not support RDMA P2P, skipping"
             )
-            return "accelerator_unsupported"
+            return False
 
         # Decentralized backends (k8s-service) serve their own
         # metadata; skip the central-server precondition for them.
@@ -132,14 +131,14 @@ class RdmaStrategy(LoadStrategy):
             logger.info(
                 f"[Worker {ctx.global_rank}] No MX server configured, skipping RDMA"
             )
-            return "no_mx_server"
+            return False
 
         allowed, reason = check_transfer_allowed(ctx.model_config)
         if not allowed:
             logger.info(f"[Worker {ctx.global_rank}] RDMA transfer disabled: {reason}")
-            return "transfer_not_allowed"
+            return False
 
-        return None
+        return True
 
     def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
         """Load from a READY source or raise StrategyFailed for fallback.

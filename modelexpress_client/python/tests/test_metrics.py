@@ -71,7 +71,7 @@ _RECORDERS = [
         "observe_load_strategy_seconds",
         ("vllm", "Qwen/Qwen2.5-0.5B-Instruct", "rdma", "success", 3.0),
     ),
-    ("record_strategy_skipped", ("vllm", "gds", "driver_unavailable")),
+    ("record_chain_skips", ("vllm", ["gds"])),
 ]
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]

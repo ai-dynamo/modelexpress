@@ -11,7 +11,6 @@ MxModelLoader iterates the chain until one succeeds.
 from __future__ import annotations
 
 import logging
-import time
 
 import torch.nn as nn
 
@@ -79,16 +78,10 @@ class LoadStrategyChain:
             GdsStrategy(),
             DefaultStrategy(),
         ]
-        # One evaluation, two uses. Asking each strategy for a reason rather
-        # than a bool is what lets the skip counter exist: without it, a
-        # strategy that recorded no attempt was either filtered out here or was
-        # eligible and never reached because an earlier one succeeded, and those
-        # are opposite conclusions drawn from the same absence of data.
-        reasons = [(s, s.skip_reason(ctx)) for s in all_strategies]
-        eligible = [s for s, reason in reasons if reason is None]
-        for strategy, reason in reasons:
-            if reason is not None:
-                load_metrics.record_strategy_skipped(ctx.engine, strategy.name, reason)
+        eligible = [s for s in all_strategies if s.is_available(ctx)]
+        load_metrics.record_chain_skips(
+            ctx.engine, [s.name for s in all_strategies if s not in eligible]
+        )
         logger.info(f"Eligible loaders: {[s.name for s in eligible]}")
 
         result = LoadResult(value=model, model=model)
@@ -99,66 +92,53 @@ class LoadStrategyChain:
 
             for strategy in eligible:
                 logger.info(f"[Worker {ctx.global_rank}] Trying strategy: {strategy.name}")
-                # L2. The interval opens here rather than around strategy.load()
-                # alone, so it charges a strategy for its own rollback and for
-                # the _reinit_for_retry that its mutation forced -- `finally`
-                # runs before the `continue`, so that re-init lands inside the
-                # interval of the strategy that caused it. The tighter wrap is
-                # easier to describe but leaves the most expensive operation in
-                # the chain as an unattributed gap.
-                #
-                # `outcome` starts at "error" so that a BaseException the
-                # handlers below do not catch -- KeyboardInterrupt, SystemExit,
-                # CancelledError -- is still recorded rather than dropped.
-                outcome = "error"
-                started = time.perf_counter()
-                try:
-                    result = strategy.load(result, ctx)
-                    publish_source_if_supported(result, ctx)
-                    span.set_attribute("weight_loading_strategy", strategy.name)
-                    outcome = "success"
-                    return result.value
-                except StrategyRecoveryError:
-                    # Recovery already failed, so no later strategy can safely
-                    # use the current model. Fail closed and retain the original
-                    # recovery error as the exception cause.
-                    outcome = "recovery_error"
-                    strategy.rollback(ctx)
-                    raise
-                except StrategyFailed as e:
-                    # Pessimistic until the recovery below actually completes.
-                    # rollback and _reinit_for_retry can both raise, and neither
-                    # re-enters the handler above, so recording the fallback up
-                    # front would label a chain that died here as one that moved
-                    # on -- the reverse of what happened.
-                    outcome = "recovery_error"
-                    logger.warning(
-                        f"[Worker {ctx.global_rank}] Strategy {strategy.name} failed, "
-                        f"trying next: {e}"
-                    )
-                    strategy.rollback(ctx)
-                    if e.mutated:
-                        clear_exception_tracebacks(e)
-                        result = LoadStrategyChain._reinit_for_retry(result, ctx, strategy)
-                    outcome = "fallback_dirty" if e.mutated else "fallback"
-                    continue
-                except Exception as e:
-                    # Unexpected strategy errors should be rare. Keep the engine
-                    # alive by falling through to the next strategy; expected
-                    # fallback paths should use StrategyFailed instead.
-                    logger.warning(
-                        f"[Worker {ctx.global_rank}] Strategy {strategy.name} "
-                        f"raised unexpected error, trying next: {e}"
-                    )
-                    strategy.rollback(ctx)
-                finally:
-                    load_metrics.observe_load_strategy_seconds(
-                        ctx.engine,
-                        ctx.identity.model_name,
-                        strategy.name,
-                        outcome,
-                        time.perf_counter() - started,
-                    )
+                # The span covers the rollback and any re-init a mutating
+                # failure forced, so it reads as what this strategy cost the
+                # chain rather than what it transferred. Wrapping load() alone
+                # is easier to describe but leaves the re-init -- often the most
+                # expensive operation here -- attributed to nobody.
+                with load_metrics.time_load_strategy(
+                    ctx.engine, ctx.identity.model_name, strategy.name
+                ) as attempt:
+                    try:
+                        result = strategy.load(result, ctx)
+                        publish_source_if_supported(result, ctx)
+                        span.set_attribute("weight_loading_strategy", strategy.name)
+                        attempt.outcome = "success"
+                        return result.value
+                    except StrategyRecoveryError:
+                        # Recovery already failed, so no later strategy can
+                        # safely use the current model. Fail closed and retain
+                        # the original recovery error as the exception cause.
+                        attempt.outcome = "recovery_error"
+                        strategy.rollback(ctx)
+                        raise
+                    except StrategyFailed as e:
+                        # Pessimistic until the recovery below completes.
+                        # rollback and _reinit_for_retry can both raise, and
+                        # neither re-enters the handler above, so naming the
+                        # fallback up front would label a chain that died here
+                        # as one that moved on.
+                        attempt.outcome = "recovery_error"
+                        logger.warning(
+                            f"[Worker {ctx.global_rank}] Strategy {strategy.name} failed, "
+                            f"trying next: {e}"
+                        )
+                        strategy.rollback(ctx)
+                        if e.mutated:
+                            clear_exception_tracebacks(e)
+                            result = LoadStrategyChain._reinit_for_retry(result, ctx, strategy)
+                        attempt.outcome = "fallback_dirty" if e.mutated else "fallback"
+                        continue
+                    except Exception as e:
+                        # Unexpected strategy errors should be rare. Keep the
+                        # engine alive by falling through to the next strategy;
+                        # expected fallback paths should use StrategyFailed.
+                        logger.warning(
+                            f"[Worker {ctx.global_rank}] Strategy {strategy.name} "
+                            f"raised unexpected error, trying next: {e}"
+                        )
+                        strategy.rollback(ctx)
 
         raise RuntimeError(
             f"[Worker {ctx.global_rank}] No loading strategy succeeded "

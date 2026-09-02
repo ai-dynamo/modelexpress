@@ -49,23 +49,22 @@ class ModelStreamerStrategy(LoadStrategy):
         EngineAdapter.build_model_streamer_weight_iter,
     )
 
-    def skip_reason(self, ctx: LoadContext) -> str | None:
-        base = super().skip_reason(ctx)
-        if base is not None:
-            return base
+    def is_available(self, ctx: LoadContext) -> bool:
+        if not super().is_available(ctx):
+            return False
         if importlib.util.find_spec("runai_model_streamer") is None:
             logger.info(
                 f"[Worker {ctx.global_rank}] runai_model_streamer not installed, skipping"
             )
-            return "package_missing"
+            return False
 
         model_uri = envs.MX_MODEL_URI or ""
         if not model_uri:
             logger.info(
                 f"[Worker {ctx.global_rank}] MX_MODEL_URI not set, skipping model streamer"
             )
-            return "not_configured"
-        return None
+            return False
+        return True
 
     def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
         result = _as_load_result(result)

@@ -284,26 +284,26 @@ class TestVllmInstantTensorIterator:
 
 class TestChainOrder:
     @patch(
-        "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.skip_reason",
-        return_value=None,
+        "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.is_available",
+        return_value=True,
     )
     @patch(
         "modelexpress.load_strategy.instant_tensor_strategy."
-        "InstantTensorStrategy.skip_reason",
-        return_value=None,
+        "InstantTensorStrategy.is_available",
+        return_value=True,
     )
     @patch(
         "modelexpress.load_strategy.model_streamer_strategy."
-        "ModelStreamerStrategy.skip_reason",
-        return_value=None,
+        "ModelStreamerStrategy.is_available",
+        return_value=True,
     )
     @patch(
-        "modelexpress.load_strategy.gds_strategy.GdsStrategy.skip_reason",
-        return_value=None,
+        "modelexpress.load_strategy.gds_strategy.GdsStrategy.is_available",
+        return_value=True,
     )
     @patch(
-        "modelexpress.load_strategy.default_strategy.DefaultStrategy.skip_reason",
-        return_value=None,
+        "modelexpress.load_strategy.default_strategy.DefaultStrategy.is_available",
+        return_value=True,
     )
     def test_instant_tensor_runs_after_rdma_before_model_streamer(
         self, _d, _g, _ms, _it, _r

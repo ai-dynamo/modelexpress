@@ -20,8 +20,8 @@ class DefaultStrategy(LoadStrategy):
     name = "default"
     requires = (EngineAdapter.load_via_native,)
 
-    def skip_reason(self, ctx: LoadContext) -> str | None:
-        return super().skip_reason(ctx)
+    def is_available(self, ctx: LoadContext) -> bool:
+        return super().is_available(ctx)
 
     def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
         result = _as_load_result(result)
