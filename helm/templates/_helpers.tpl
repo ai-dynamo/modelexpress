@@ -54,6 +54,59 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
+Convert a simple Prometheus duration to seconds, for comparison.
+
+Handles the single-unit forms these values realistically take (30s, 1m, 1h) and
+returns 0 for anything else, which callers treat as "cannot check" rather than
+as zero -- guessing at an exotic duration would be worse than not checking.
+*/}}
+{{- define "modelexpress.durationSeconds" -}}
+{{- $d := . | toString -}}
+{{- if regexMatch "^[0-9]+s$" $d -}}
+{{- regexReplaceAll "s$" $d "" | atoi -}}
+{{- else if regexMatch "^[0-9]+m$" $d -}}
+{{- mul (regexReplaceAll "m$" $d "" | atoi) 60 -}}
+{{- else if regexMatch "^[0-9]+h$" $d -}}
+{{- mul (regexReplaceAll "h$" $d "" | atoi) 3600 -}}
+{{- else -}}
+0
+{{- end -}}
+{{- end }}
+
+{{/*
+Reject a scrapeTimeout longer than its interval.
+
+The Prometheus Operator refuses such an endpoint with "scrapeTimeout greater
+than scrapeInterval" and drops the whole PodMonitor. It reports that only as a
+Kubernetes Warning event on the object -- which many clusters forbid it from
+writing -- so the usual symptom is simply no targets, with nothing to read.
+Since scrapeTimeout defaults to 10s here, lowering interval alone is enough to
+trigger it. Takes (interval, scrapeTimeout, values-path-for-the-message).
+*/}}
+{{- define "modelexpress.checkScrapeTimeout" -}}
+{{- $interval := include "modelexpress.durationSeconds" (index . 0) | int -}}
+{{- $timeout := include "modelexpress.durationSeconds" (index . 1) | int -}}
+{{- $path := index . 2 -}}
+{{- if and (gt $interval 0) (gt $timeout 0) (gt $timeout $interval) -}}
+{{- fail (printf "%s.scrapeTimeout (%v) is longer than %s.interval (%v): the Prometheus Operator rejects that endpoint and drops the PodMonitor, usually with no visible error. Lower scrapeTimeout to at most the interval." $path (index . 1) $path (index . 0)) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Look up an alert threshold, honouring an explicit zero.
+
+sprig's `default` treats 0 as empty, so `$t.x | default 0.05` silently replaces a
+threshold deliberately set to 0 -- turning "alert on any occurrence" into the
+built-in rate. Takes (thresholds-map, key, fallback).
+*/}}
+{{- define "modelexpress.threshold" -}}
+{{- $thresholds := index . 0 -}}
+{{- $key := index . 1 -}}
+{{- $fallback := index . 2 -}}
+{{- if hasKey $thresholds $key }}{{ index $thresholds $key }}{{ else }}{{ $fallback }}{{ end -}}
+{{- end }}
+
+{{/*
 Create the name of the service account to use
 */}}
 {{- define "modelexpress.serviceAccountName" -}}

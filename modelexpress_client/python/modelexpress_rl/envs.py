@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     MX_REFIT_DELTA_BUCKET_BYTES: int
     MX_REFIT_DELTA_WORKERS: int
+    MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
     MX_REFIT_METADATA_PORT: int
     MX_S3_DOWNLOAD_RANGE_BYTES: int
     MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES: int
@@ -64,6 +65,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
             )
         ),
         "MX_REFIT_DELTA_WORKERS",
+    ),
+    "MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES": lambda: require_positive_int(
+        int(
+            os.environ.get(
+                "MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES",
+                str(4 * 1024**3),
+            )
+        ),
+        "MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES",
     ),
     "MX_S3_MULTIPART_THRESHOLD_BYTES": lambda: require_positive_int(
         int(os.environ.get("MX_S3_MULTIPART_THRESHOLD_BYTES", 100 * 1024**2)),

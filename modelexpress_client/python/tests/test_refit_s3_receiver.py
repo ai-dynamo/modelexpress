@@ -7,6 +7,7 @@ from dataclasses import replace
 
 import pytest
 import safetensors.numpy
+import safetensors.torch
 import s3transfer.manager
 import torch
 import zstandard
@@ -41,7 +42,7 @@ class _MemoryS3:
         self.calls.append(uri)
         if uri == self.fail_key_once:
             self.fail_key_once = None
-            raise RuntimeError("injected shard download failure")
+            raise OSError("injected shard download failure")
         return self.objects[uri]
 
     def close(self):
@@ -402,10 +403,58 @@ def _inputs(
     )
 
 
-def _build(monkeypatch, tmp_path, objects):
+def _save_full_tensors(tensors):
+    checksums = {
+        name: adler32_checksum(
+            tensor.detach()
+            .cpu()
+            .contiguous()
+            .reshape(-1)
+            .view(torch.uint8)
+            .numpy()
+        )
+        for name, tensor in tensors.items()
+    }
+    return safetensors.torch.save(tensors, metadata=checksums)
+
+
+def _full_artifact(tensor, *, version_label=2):
+    shard_name = "model-00001-of-00001.safetensors"
+    shard = _save_full_tensors({"weight": tensor})
+    root = json.dumps(
+        {
+            "metadata": {"total_size": tensor.numel() * tensor.element_size()},
+            "weight_map": {"weight": shard_name},
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    prefix = f"s3://weights/test/v{version_label}"
+    return {
+        f"{prefix}/model.safetensors.index.json": root,
+        f"{prefix}/{shard_name}": shard,
+    }
+
+
+def _full_inputs(*, version="full-a", version_label=2):
+    return replace(
+        _inputs(
+            None,
+            version=version,
+            version_label=version_label,
+        ),
+        base_version_id=None,
+        payload_format=WeightPayloadFormat.FULL_HF_CHECKPOINT,
+    )
+
+
+def _build(monkeypatch, tmp_path, objects, launch_tensors=None):
     launch = tmp_path / "launch"
     launch.mkdir(exist_ok=True)
-    save_file({"weight": torch.tensor([1.0, 2.0])}, launch / "model.safetensors")
+    save_file(
+        launch_tensors or {"weight": torch.tensor([1.0, 2.0])},
+        launch / "model.safetensors",
+    )
     storage = _MemoryS3(objects)
     monkeypatch.setattr(canonical_delta_module, "S3Client", lambda **_kwargs: storage)
     adapter = _Adapter(
@@ -413,11 +462,34 @@ def _build(monkeypatch, tmp_path, objects):
         config=ObjectStorageGeneratorConfig(
             storage_type=ObjectStorageType.S3,
             initial_base_version_id="base-a",
-            launch_checkpoint=launch,
-            preparation_cache_dir=tmp_path / "cache",
+            seed_checkpoint_path=launch,
+            refit_checkpoint_dir=tmp_path / "cache",
         ),
     )
     return adapter, storage
+
+
+def test_reset_initial_checkpoint_transitions_updating_to_ready(monkeypatch, tmp_path):
+    events = []
+    write_state = receiver_module._LocalCheckpoint._write_state
+    copy2 = receiver_module.shutil.copy2
+
+    def track_state(self, *, status, version, source=None):
+        events.append(status.value)
+        write_state(self, status=status, version=version, source=source)
+
+    def track_copy(source, target):
+        events.append("COPY")
+        return copy2(source, target)
+
+    monkeypatch.setattr(receiver_module._LocalCheckpoint, "_write_state", track_state)
+    monkeypatch.setattr(receiver_module.shutil, "copy2", track_copy)
+    adapter, _storage = _build(monkeypatch, tmp_path, {})
+
+    assert events == ["UPDATING", "COPY", "READY"]
+    state = json.loads(adapter._checkpoint.state_path.read_text())
+    assert state == {"status": "READY", "version": "base-a"}
+    adapter.close()
 
 
 def test_canonical_s3_rejects_non_s3_source_before_storage_access(
@@ -449,6 +521,12 @@ def test_canonical_s3_prepares_then_installs_one_global_index(monkeypatch, tmp_p
 
     staged = adapter.stage_weight(_inputs(root))
 
+    state = json.loads(adapter._checkpoint.state_path.read_text())
+    assert state == {
+        "source": {"uri": "s3://weights/test/v1/model.safetensors.index.json"},
+        "status": "READY",
+        "version": "target-a",
+    }
     assert adapter.installed == []
     assert torch.equal(
         load_file(staged.path / "model.safetensors")["weight"], target_tensor
@@ -462,6 +540,449 @@ def test_canonical_s3_prepares_then_installs_one_global_index(monkeypatch, tmp_p
     assert adapter.installed == [staged.path]
     adapter.release_staged_weight(staged)
     adapter.close()
+
+
+def test_canonical_s3_full_checkpoint_resets_base_for_next_delta(monkeypatch, tmp_path):
+    full_tensor = torch.tensor([7.0, 8.0])
+    objects = _full_artifact(full_tensor)
+    adapter, storage = _build(monkeypatch, tmp_path, objects)
+
+    full = adapter.stage_weight(_full_inputs())
+    assert torch.equal(
+        load_file(full.path / "model.safetensors")["weight"],
+        full_tensor,
+    )
+    assert adapter.apply_weight(full)["perf/mx_receive_install_time"] >= 0
+    adapter.release_staged_weight(full)
+
+    next_tensor = torch.tensor([9.0, 10.0])
+    objects.update(
+        _artifact(
+            full_tensor.view(torch.uint8).numpy(),
+            next_tensor.view(torch.uint8).numpy(),
+            version="delta-after-full",
+            version_label=3,
+            base_version="full-a",
+        )
+    )
+    delta = adapter.stage_weight(
+        _inputs(
+            None,
+            base_version="full-a",
+            version="delta-after-full",
+            version_label=3,
+        )
+    )
+    assert torch.equal(
+        load_file(delta.path / "model.safetensors")["weight"],
+        next_tensor,
+    )
+    assert storage.calls[:2] == [
+        "s3://weights/test/v2/model.safetensors.index.json",
+        "s3://weights/test/v2/model-00001-of-00001.safetensors",
+    ]
+    adapter.release_staged_weight(delta)
+    adapter.close()
+
+
+def test_canonical_s3_downloads_and_applies_full_batches_concurrently(
+    monkeypatch, tmp_path
+):
+    target = {
+        "a": torch.tensor([3.0, 4.0]),
+        "b": torch.tensor([5.0, 6.0]),
+    }
+    prefix = "s3://weights/test/v2"
+    filenames = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
+    objects = {
+        f"{prefix}/{filenames[0]}": _save_full_tensors({"a": target["a"]}),
+        f"{prefix}/{filenames[1]}": _save_full_tensors({"b": target["b"]}),
+    }
+    objects[f"{prefix}/model.safetensors.index.json"] = json.dumps(
+        {
+            "metadata": {"total_size": 16},
+            "weight_map": {"a": filenames[0], "b": filenames[1]},
+        }
+    ).encode()
+    adapter, storage = _build(
+        monkeypatch,
+        tmp_path,
+        objects,
+        launch_tensors={
+            "a": torch.tensor([1.0, 1.0]),
+            "b": torch.tensor([2.0, 2.0]),
+        },
+    )
+    monkeypatch.setenv("MX_S3_DOWNLOAD_WORKERS", "2")
+    download_barrier = threading.Barrier(2)
+    apply_barrier = threading.Barrier(2)
+    download_threads = set()
+    apply_threads = set()
+    get = storage.get
+    copyto = receiver_module.np.copyto
+
+    def track_get(uri):
+        if uri.endswith(".safetensors"):
+            download_threads.add(threading.get_ident())
+            download_barrier.wait(timeout=5)
+        return get(uri)
+
+    def track_copyto(target_array, source_array):
+        apply_threads.add(threading.get_ident())
+        apply_barrier.wait(timeout=5)
+        return copyto(target_array, source_array)
+
+    storage.get = track_get
+    monkeypatch.setattr(receiver_module.np, "copyto", track_copyto)
+
+    staged = adapter.stage_weight(_full_inputs())
+
+    assert len(download_threads) == 2
+    assert len(apply_threads) == 2
+    checkpoint = load_file(staged.path / "model.safetensors")
+    assert torch.equal(checkpoint["a"], target["a"])
+    assert torch.equal(checkpoint["b"], target["b"])
+    assert not (adapter._checkpoint.cache / "checkpoint.tmp").exists()
+    adapter.release_staged_weight(staged)
+    adapter.close()
+
+
+def test_canonical_s3_streams_scalar_full_tensor(monkeypatch, tmp_path):
+    objects = _full_artifact(torch.tensor(2.0))
+    adapter, _storage = _build(
+        monkeypatch,
+        tmp_path,
+        objects,
+        launch_tensors={"weight": torch.tensor(1.0)},
+    )
+
+    staged = adapter.stage_weight(_full_inputs())
+
+    assert torch.equal(
+        load_file(staged.path / "model.safetensors")["weight"],
+        torch.tensor(2.0),
+    )
+    adapter.release_staged_weight(staged)
+    adapter.close()
+
+
+def test_canonical_s3_rejects_corrupt_full_tensor_bytes(monkeypatch, tmp_path):
+    objects = _full_artifact(torch.tensor([7.0, 8.0]))
+    shard_uri = "s3://weights/test/v2/model-00001-of-00001.safetensors"
+    shard = bytearray(objects[shard_uri])
+    shard[-1] ^= 1
+    objects[shard_uri] = bytes(shard)
+    adapter, _storage = _build(monkeypatch, tmp_path, objects)
+
+    with pytest.raises(RuntimeError, match="checksum differs"):
+        adapter.stage_weight(_full_inputs())
+
+    assert torch.equal(
+        load_file(adapter._checkpoint.local_checkpoint / "model.safetensors")[
+            "weight"
+        ],
+        torch.tensor([1.0, 2.0]),
+    )
+    adapter.close()
+
+
+@pytest.mark.parametrize(
+    ("launch_tensors", "remote_tensors"),
+    [
+        (
+            {"a": torch.tensor([1.0]), "b": torch.tensor([2.0])},
+            {"a": torch.tensor([3.0])},
+        ),
+        (
+            {"a": torch.tensor([1.0])},
+            {"a": torch.tensor([3.0]), "b": torch.tensor([4.0])},
+        ),
+    ],
+    ids=["missing-tensor", "extra-tensor"],
+)
+def test_canonical_s3_requires_exact_full_checkpoint_tensor_set(
+    monkeypatch,
+    tmp_path,
+    launch_tensors,
+    remote_tensors,
+):
+    prefix = "s3://weights/test/v2"
+    shard_name = "model-00001-of-00001.safetensors"
+    objects = {
+        f"{prefix}/model.safetensors.index.json": json.dumps(
+            {
+                "metadata": {"total_size": 0},
+                "weight_map": dict.fromkeys(remote_tensors, shard_name),
+            }
+        ).encode(),
+        f"{prefix}/{shard_name}": _save_full_tensors(remote_tensors),
+    }
+    adapter, storage = _build(
+        monkeypatch,
+        tmp_path,
+        objects,
+        launch_tensors=launch_tensors,
+    )
+
+    with pytest.raises(RuntimeError, match="tensor set differs"):
+        adapter.stage_weight(_full_inputs())
+
+    assert storage.calls == [f"{prefix}/model.safetensors.index.json"]
+    checkpoint = load_file(adapter._checkpoint.local_checkpoint / "model.safetensors")
+    assert checkpoint.keys() == launch_tensors.keys()
+    assert all(
+        torch.equal(checkpoint[name], tensor)
+        for name, tensor in launch_tensors.items()
+    )
+    state = json.loads(adapter._checkpoint.state_path.read_text())
+    assert state["status"] == "UPDATING"
+    adapter.close()
+
+
+@pytest.mark.parametrize(
+    ("local_tensor", "remote_tensor"),
+    [
+        (
+            torch.tensor([1.0, 2.0]),
+            torch.tensor([3, 4], dtype=torch.int32),
+        ),
+        (
+            torch.tensor([1.0, 2.0]),
+            torch.tensor([[3.0, 4.0]]),
+        ),
+    ],
+    ids=["dtype", "shape"],
+)
+def test_canonical_s3_rejects_incompatible_full_checkpoint_tensor_metadata(
+    monkeypatch,
+    tmp_path,
+    local_tensor,
+    remote_tensor,
+):
+    objects = _full_artifact(remote_tensor)
+    adapter, _storage = _build(
+        monkeypatch,
+        tmp_path,
+        objects,
+        launch_tensors={"weight": local_tensor},
+    )
+
+    with pytest.raises(RuntimeError, match="metadata differs"):
+        adapter.stage_weight(_full_inputs())
+
+    assert torch.equal(
+        load_file(adapter._checkpoint.local_checkpoint / "model.safetensors")[
+            "weight"
+        ],
+        local_tensor,
+    )
+    state = json.loads(adapter._checkpoint.state_path.read_text())
+    assert state["status"] == "UPDATING"
+    adapter.close()
+
+
+def test_canonical_s3_rejects_incompatible_full_checkpoint_byte_size(
+    monkeypatch,
+    tmp_path,
+):
+    local_tensor = torch.tensor([1.0, 2.0])
+    objects = _full_artifact(torch.tensor([3.0, 4.0]))
+    shard_uri = "s3://weights/test/v2/model-00001-of-00001.safetensors"
+    shard = bytearray(objects[shard_uri])
+    header_size = int.from_bytes(shard[:8], "little")
+    header = json.loads(shard[8 : 8 + header_size])
+    header["weight"]["data_offsets"][1] = 1
+    encoded_header = json.dumps(header, separators=(",", ":")).encode()
+    assert len(encoded_header) <= header_size
+    shard[8 : 8 + header_size] = encoded_header.ljust(header_size, b" ")
+    objects[shard_uri] = bytes(shard)
+    adapter, _storage = _build(
+        monkeypatch,
+        tmp_path,
+        objects,
+        launch_tensors={"weight": local_tensor},
+    )
+
+    with pytest.raises(RuntimeError, match="metadata differs"):
+        adapter.stage_weight(_full_inputs())
+
+    assert torch.equal(
+        load_file(adapter._checkpoint.local_checkpoint / "model.safetensors")[
+            "weight"
+        ],
+        local_tensor,
+    )
+    adapter.close()
+
+
+def test_canonical_s3_full_download_failure_leaves_checkpoint_updating(
+    monkeypatch, tmp_path
+):
+    objects = _full_artifact(torch.tensor([7.0, 8.0]))
+    adapter, storage = _build(monkeypatch, tmp_path, objects)
+    shard_uri = "s3://weights/test/v2/model-00001-of-00001.safetensors"
+    storage.fail_key_once = shard_uri
+
+    with pytest.raises(RuntimeError, match="full HF checkpoint download failed"):
+        adapter.stage_weight(_full_inputs())
+
+    state = json.loads(adapter._checkpoint.state_path.read_text())
+    assert state["status"] == "UPDATING"
+    assert state["version"] == "base-a"
+    assert torch.equal(
+        load_file(adapter._checkpoint.local_checkpoint / "model.safetensors")["weight"],
+        torch.tensor([1.0, 2.0]),
+    )
+    assert not (adapter._checkpoint.cache / "checkpoint.tmp").exists()
+
+    with pytest.raises(RuntimeError, match="update is incomplete"):
+        adapter.stage_weight(_full_inputs())
+    adapter.close()
+
+
+def test_canonical_s3_midstream_failure_leaves_cache_failed_closed(
+    monkeypatch, tmp_path
+):
+    target = {
+        "a": torch.tensor([3.0]),
+        "b": torch.tensor([4.0]),
+    }
+    filenames = [
+        "model-00001-of-00002.safetensors",
+        "model-00002-of-00002.safetensors",
+    ]
+    prefix = "s3://weights/test/v2"
+    objects = {
+        f"{prefix}/{filenames[0]}": _save_full_tensors({"a": target["a"]}),
+        f"{prefix}/{filenames[1]}": _save_full_tensors({"b": target["b"]}),
+        f"{prefix}/model.safetensors.index.json": json.dumps(
+            {
+                "metadata": {"total_size": 8},
+                "weight_map": {"a": filenames[0], "b": filenames[1]},
+            }
+        ).encode(),
+    }
+    adapter, storage = _build(
+        monkeypatch,
+        tmp_path,
+        objects,
+        launch_tensors={
+            "a": torch.tensor([1.0]),
+            "b": torch.tensor([2.0]),
+        },
+    )
+
+    monkeypatch.setenv("MX_S3_DOWNLOAD_WORKERS", "2")
+    first_applied = threading.Event()
+    get = storage.get
+    copyto = receiver_module.np.copyto
+
+    def fail_second_download(uri):
+        if uri.endswith(filenames[1]):
+            assert first_applied.wait(timeout=5)
+            raise RuntimeError("injected batch download failure")
+        return get(uri)
+
+    def track_first_apply(target_array, source_array):
+        result = copyto(target_array, source_array)
+        first_applied.set()
+        return result
+
+    storage.get = fail_second_download
+    monkeypatch.setattr(receiver_module.np, "copyto", track_first_apply)
+
+    with pytest.raises(RuntimeError, match="full HF checkpoint download failed"):
+        adapter.stage_weight(_full_inputs())
+
+    state = json.loads(adapter._checkpoint.state_path.read_text())
+    assert state["status"] == "UPDATING"
+    assert state["version"] == "base-a"
+    checkpoint = load_file(adapter._checkpoint.local_checkpoint / "model.safetensors")
+    assert torch.equal(checkpoint["a"], target["a"])
+    assert torch.equal(checkpoint["b"], torch.tensor([2.0]))
+    with pytest.raises(RuntimeError, match="update is incomplete"):
+        adapter.stage_weight(_full_inputs())
+    adapter.close()
+
+
+def test_canonical_s3_final_state_failure_leaves_checkpoint_updating(
+    monkeypatch, tmp_path
+):
+    objects = _full_artifact(torch.tensor([7.0, 8.0]))
+    adapter, _storage = _build(monkeypatch, tmp_path, objects)
+
+    write_state = adapter._checkpoint._write_state
+
+    def fail_ready_state(*, status, version, source=None):
+        if status == receiver_module._CheckpointState.READY:
+            raise OSError("state failed")
+        write_state(status=status, version=version, source=source)
+
+    monkeypatch.setattr(adapter._checkpoint, "_write_state", fail_ready_state)
+
+    with pytest.raises(OSError, match="state failed"):
+        adapter.stage_weight(_full_inputs())
+
+    state = json.loads(adapter._checkpoint.state_path.read_text())
+    assert state["status"] == "UPDATING"
+    assert state["version"] == "base-a"
+    with pytest.raises(RuntimeError, match="update is incomplete"):
+        adapter.stage_weight(_full_inputs())
+    assert torch.equal(
+        load_file(adapter._checkpoint.local_checkpoint / "model.safetensors")["weight"],
+        torch.tensor([7.0, 8.0]),
+    )
+    assert not (adapter._checkpoint.cache / "checkpoint.previous").exists()
+    adapter.close()
+
+
+def test_canonical_s3_install_rejects_updating_checkpoint(monkeypatch, tmp_path):
+    objects = _full_artifact(torch.tensor([7.0, 8.0]))
+    adapter, _storage = _build(monkeypatch, tmp_path, objects)
+    staged = adapter.stage_weight(_full_inputs())
+    adapter._checkpoint._write_state(
+        status=receiver_module._CheckpointState.UPDATING,
+        version="full-a",
+    )
+
+    with pytest.raises(RuntimeError, match="prepared checkpoint changed"):
+        adapter.apply_weight(staged)
+
+    adapter.release_staged_weight(staged)
+    adapter.close()
+
+
+def test_canonical_s3_shared_cache_observes_full_update(
+    monkeypatch, tmp_path
+):
+    full_tensor = torch.tensor([7.0, 8.0])
+    objects = _full_artifact(full_tensor)
+    first, storage = _build(monkeypatch, tmp_path, objects)
+    second = _Adapter(
+        model_name="test/model",
+        config=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="base-a",
+            seed_checkpoint_path=tmp_path / "launch",
+            refit_checkpoint_dir=tmp_path / "cache",
+        ),
+    )
+
+    first_staged = first.stage_weight(_full_inputs())
+    second_staged = second.stage_weight(_full_inputs())
+
+    assert torch.equal(
+        load_file(second_staged.path / "model.safetensors")["weight"],
+        full_tensor,
+    )
+    assert storage.calls == [
+        "s3://weights/test/v2/model.safetensors.index.json",
+        "s3://weights/test/v2/model-00001-of-00001.safetensors",
+    ]
+    first.release_staged_weight(first_staged)
+    second.release_staged_weight(second_staged)
+    first.close()
+    second.close()
 
 
 def test_canonical_s3_accepts_an_empty_delta(monkeypatch, tmp_path):
@@ -567,8 +1088,8 @@ def test_canonical_s3_applies_delta_tensors_concurrently(monkeypatch, tmp_path):
         config=ObjectStorageGeneratorConfig(
             storage_type=ObjectStorageType.S3,
             initial_base_version_id="base-a",
-            launch_checkpoint=launch,
-            preparation_cache_dir=tmp_path / "cache",
+            seed_checkpoint_path=launch,
+            refit_checkpoint_dir=tmp_path / "cache",
         ),
         s3=_MemoryS3({}),
     )
@@ -640,8 +1161,13 @@ def test_reconstructed_checksum_failure_propagates(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="target checksum differs"):
         adapter.stage_weight(_inputs(root))
 
+    failed_state = json.loads(adapter._checkpoint.state_path.read_text())
+    assert failed_state["status"] == "UPDATING"
+    assert failed_state["version"] == "base-a"
+
     recovered, _ = _build(monkeypatch, tmp_path, objects)
     state = json.loads(recovered._checkpoint.state_path.read_text())
+    assert state["status"] == "READY"
     assert state["version"] == "base-a"
     assert torch.equal(
         load_file(recovered._checkpoint.local_checkpoint / "model.safetensors")[
@@ -701,6 +1227,7 @@ def test_malformed_delta_shard_reports_context(
 
     assert filename in str(raised.value)
     state = json.loads(adapter._checkpoint.state_path.read_text())
+    assert state["status"] == "UPDATING"
     assert state["version"] == "base-a"
 
 
@@ -711,13 +1238,13 @@ def test_wrong_base_fails_before_s3_download(monkeypatch, tmp_path):
     root = objects["s3://weights/test/v1/model.safetensors.index.json"]
     adapter, storage = _build(monkeypatch, tmp_path, objects)
 
-    with pytest.raises(ValueError, match="exact local base"):
+    with pytest.raises(RuntimeError, match="exact base"):
         adapter.stage_weight(_inputs(root, base_version="other-base"))
 
     assert storage.calls == []
 
 
-def test_child_download_failure_is_retryable(
+def test_child_download_failure_leaves_checkpoint_updating(
     monkeypatch,
     tmp_path,
 ):
@@ -729,12 +1256,14 @@ def test_child_download_failure_is_retryable(
     adapter, storage = _build(monkeypatch, tmp_path, objects)
     storage.fail_key_once = shard_key
 
-    with pytest.raises(RuntimeError, match="canonical delta download failed"):
+    with pytest.raises(OSError, match="injected shard download failure"):
         adapter.stage_weight(_inputs(objects[root_key]))
 
     state = json.loads(adapter._checkpoint.state_path.read_text())
+    assert state["status"] == "UPDATING"
     assert state["version"] == "base-a"
-    assert adapter.stage_weight(_inputs(objects[root_key])).target_version == "target-a"
+    with pytest.raises(RuntimeError, match="update is incomplete"):
+        adapter.stage_weight(_inputs(objects[root_key]))
 
 
 def test_corrupt_zstd_fails_before_checkpoint_mutation(monkeypatch, tmp_path):
@@ -754,10 +1283,11 @@ def test_corrupt_zstd_fails_before_checkpoint_mutation(monkeypatch, tmp_path):
         adapter.stage_weight(_inputs(objects[root_key]))
 
     state = json.loads(adapter._checkpoint.state_path.read_text())
+    assert state["status"] == "UPDATING"
     assert state["version"] == "base-a"
 
 
-def test_cached_target_requires_the_same_canonical_root(monkeypatch, tmp_path):
+def test_cached_target_requires_the_same_source_identity(monkeypatch, tmp_path):
     base = torch.tensor([1.0, 2.0]).view(torch.uint8).numpy()
     target = torch.tensor([3.0, 4.0]).view(torch.uint8).numpy()
     objects = _artifact(base, target)
@@ -769,7 +1299,7 @@ def test_cached_target_requires_the_same_canonical_root(monkeypatch, tmp_path):
     adapter.apply_weight(staged)
     adapter.release_staged_weight(staged)
 
-    with pytest.raises(RuntimeError, match="different canonical root"):
+    with pytest.raises(RuntimeError, match="different source identity"):
         adapter.stage_weight(_inputs(objects[alternate_key], uri=alternate_key))
 
 

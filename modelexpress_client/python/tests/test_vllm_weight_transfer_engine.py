@@ -83,8 +83,8 @@ def test_weight_transfer_engine_parses_vime_object_storage_init_info(monkeypatch
     init_info = {
         "model_name": "policy",
         "initial_base_version_id": "base-a",
-        "launch_checkpoint": "/models/launch",
-        "preparation_cache_dir": "/cache/modelexpress",
+        "seed_checkpoint_path": "/models/launch",
+        "refit_checkpoint_dir": "/cache/modelexpress",
         "server_url": "mx:8001",
         "object_storage_type": "S3",
         "object_storage_endpoint_url": "http://minio:9000",
@@ -106,8 +106,8 @@ def test_weight_transfer_engine_parses_vime_object_storage_init_info(monkeypatch
     assert config.rpc_timeout_seconds == 12.5
     assert config.object_storage.storage_type is ObjectStorageType.S3
     assert config.object_storage.initial_base_version_id == "base-a"
-    assert config.object_storage.launch_checkpoint == "/models/launch"
-    assert config.object_storage.preparation_cache_dir == "/cache/modelexpress"
+    assert config.object_storage.seed_checkpoint_path == "/models/launch"
+    assert config.object_storage.refit_checkpoint_dir == "/cache/modelexpress"
     assert config.object_storage.endpoint_url == "http://minio:9000"
     assert config.object_storage.region_name == "us-west-2"
 
@@ -117,8 +117,8 @@ def test_weight_transfer_engine_parses_vime_object_storage_init_info(monkeypatch
     [
         {"object_storage_type": "S3"},
         {"initial_base_version_id": "base-a"},
-        {"launch_checkpoint": "/models/launch"},
-        {"preparation_cache_dir": "/cache/modelexpress"},
+        {"seed_checkpoint_path": "/models/launch"},
+        {"refit_checkpoint_dir": "/cache/modelexpress"},
         {"object_storage_endpoint_url": "http://minio:9000"},
         {"object_storage_region_name": "us-west-2"},
     ],
@@ -141,8 +141,8 @@ def test_weight_transfer_engine_rejects_unknown_object_storage_type(monkeypatch)
             engine.init_info_cls(
                 object_storage_type="UNKNOWN",
                 initial_base_version_id="base-a",
-                launch_checkpoint="/models/launch",
-                preparation_cache_dir="/cache/modelexpress",
+                seed_checkpoint_path="/models/launch",
+                refit_checkpoint_dir="/cache/modelexpress",
             )
         )
 

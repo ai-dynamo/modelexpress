@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import gc
 import json
 import logging
 import struct
@@ -12,6 +13,7 @@ import grpc
 import numpy as np
 import pytest
 import safetensors.numpy
+import safetensors.torch
 import torch
 import zstandard
 from modelexpress_rl import (
@@ -149,13 +151,13 @@ def _trainer(
     monkeypatch,
     tmp_path,
     server_url,
-    launch_tensors=None,
+    seed_tensors=None,
     process_group=None,
     prepare_base=True,
 ):
     launch = tmp_path / "model.safetensors"
-    launch_tensors = launch_tensors or {"weight": torch.tensor([1.0, 2.0])}
-    _write_safetensors(launch, launch_tensors)
+    seed_tensors = seed_tensors or {"weight": torch.tensor([1.0, 2.0])}
+    _write_safetensors(launch, seed_tensors)
     storage = _MemoryS3()
     monkeypatch.setattr(trainer_runtime_module, "S3Client", lambda **_kwargs: storage)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda _group=None: 0)
@@ -190,13 +192,13 @@ def _trainer(
                 storage_type=ObjectStorageType.S3,
                 uri_prefix="s3://weights/tests",
                 initial_base_version_id="base-a",
-                launch_checkpoint=launch,
+                seed_checkpoint_path=launch,
             ),
         )
     )
     if prepare_base:
         trainer.prepare_delta_base(
-            hf_tensor_iter=iter([list(launch_tensors.items())]),
+            hf_tensor_iter=iter([list(seed_tensors.items())]),
         )
     return trainer, storage
 
@@ -230,11 +232,11 @@ def test_s3_multipart_abort_failure_preserves_upload_outcome(code, caplog):
     assert "Failed to abort multipart upload" in caplog.text
 
 
-def test_s3_prepare_delta_base_uses_owned_launch_tensors(
+def test_s3_prepare_delta_base_uses_owned_seed_tensors(
     monkeypatch, tmp_path, refit_server, caplog
 ):
     _service, server_url = refit_server
-    launch_tensors = {
+    seed_tensors = {
         "a": torch.tensor([1.0]),
         "b": torch.tensor([2.0]),
     }
@@ -242,7 +244,7 @@ def test_s3_prepare_delta_base_uses_owned_launch_tensors(
         monkeypatch,
         tmp_path,
         server_url,
-        launch_tensors,
+        seed_tensors,
         prepare_base=False,
     )
     try:
@@ -254,7 +256,7 @@ def test_s3_prepare_delta_base_uses_owned_launch_tensors(
         assert set(trainer._runtime.method.snapshot) == {"a"}
         assert np.array_equal(
             trainer._runtime.method.snapshot["a"],
-            launch_tensors["a"].view(torch.uint8).numpy(),
+            seed_tensors["a"].view(torch.uint8).numpy(),
         )
         assert (
             "ModelExpress prepare_delta_base: rank=0 tensors=1 duration=" in caplog.text
@@ -278,7 +280,7 @@ def test_s3_prepare_delta_base_reads_framework_buckets_concurrently(
         },
         prepare_base=False,
     )
-    reader = trainer._runtime.method._read_launch_tensor
+    reader = trainer._runtime.method._read_seed_tensor
     assert reader is not None
     barrier = threading.Barrier(2)
     threads = set()
@@ -288,7 +290,7 @@ def test_s3_prepare_delta_base_reads_framework_buckets_concurrently(
         barrier.wait(timeout=2)
         return reader(name)
 
-    trainer._runtime.method._read_launch_tensor = read
+    trainer._runtime.method._read_seed_tensor = read
     try:
         trainer.prepare_delta_base(
             hf_tensor_iter=iter(
@@ -394,6 +396,268 @@ def test_s3_stage_is_local_then_publish_uploads_version_root(
         torch.tensor([1.0, 2.0]).view(torch.uint8), current.view(torch.uint8)
     )
     assert decoded == expected_delta.numpy().tobytes()
+
+
+def test_s3_full_hf_checkpoint_publishes_native_tensors_and_rebases(
+    monkeypatch, tmp_path, refit_server
+):
+    service, server_url = refit_server
+    service.target.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
+    service.target.ClearField("base_version_id")
+    trainer, storage = _trainer(monkeypatch, tmp_path, server_url)
+    method = trainer._runtime.method
+    current = torch.tensor([[3.0, 4.0]], dtype=torch.bfloat16)
+    expected = current.clone()
+
+    try:
+        staged = trainer.stage_shard(
+            version=WeightVersionRef("target-a"),
+            hf_tensor_iter=iter([[("weight", current)]]),
+        )
+        assert storage.objects == {}
+        staged_tensor = method.snapshot["weight"]
+        assert isinstance(staged_tensor, torch.Tensor)
+        assert staged_tensor.data_ptr() != current.data_ptr()
+        staged_bytes = staged_tensor.view(torch.uint8).numpy()
+        current.zero_()
+
+        staged.publish()
+        assert np.shares_memory(method.snapshot["weight"], staged_bytes)
+        del staged_tensor, staged_bytes
+        gc.collect()
+
+        root_uri = "s3://weights/tests/v1/model.safetensors.index.json"
+        index = json.loads(storage.objects[root_uri])
+        assert index == {
+            "metadata": {"total_size": expected.numel() * expected.element_size()},
+            "weight_map": {"weight": "model-00001-of-00001.safetensors"},
+        }
+        shard = storage.objects[
+            "s3://weights/tests/v1/model-00001-of-00001.safetensors"
+        ]
+        loaded = safetensors.torch.load(shard)
+        assert torch.equal(loaded["weight"], expected)
+        (header_size,) = struct.unpack("<Q", shard[:8])
+        header = json.loads(shard[8 : 8 + header_size])
+        assert header["__metadata__"]["weight"] == (
+            f"{zlib.adler32(expected.view(torch.uint8).numpy()):08x}"
+        )
+        assert method.current_base_version_id == "target-a"
+        assert np.array_equal(
+            method.snapshot["weight"],
+            expected.view(torch.uint8).reshape(-1).numpy(),
+        )
+
+        service.target.CopyFrom(
+            refit_pb2.WeightVersion(
+                uid="target-b",
+                model_name="test/model",
+                payload_format=refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA,
+                base_version_id="target-a",
+                object_storage=refit_pb2.ObjectStorageSource(
+                    uri="s3://weights/tests/v2/model.safetensors.index.json",
+                    storage_type=refit_pb2.OBJECT_STORAGE_TYPE_S3,
+                ),
+                state=refit_pb2.WEIGHT_VERSION_STATE_STAGING,
+            )
+        )
+        trainer.stage_shard(
+            version=WeightVersionRef("target-b"),
+            hf_tensor_iter=iter(
+                [[("weight", torch.tensor([[5.0, 6.0]], dtype=torch.bfloat16))]]
+            ),
+        ).publish()
+        assert method.current_base_version_id == "target-b"
+    finally:
+        trainer.close()
+
+
+def test_s3_full_hf_checkpoint_upload_failure_is_retryable(
+    monkeypatch, tmp_path, refit_server
+):
+    service, server_url = refit_server
+    service.target.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
+    service.target.ClearField("base_version_id")
+    trainer, storage = _trainer(monkeypatch, tmp_path, server_url)
+    method = trainer._runtime.method
+
+    try:
+        staged = trainer.stage_shard(
+            version=WeightVersionRef("target-a"),
+            hf_tensor_iter=iter([[("weight", torch.tensor([3.0, 4.0]))]]),
+        )
+        storage.fail_next = True
+        with pytest.raises(RuntimeError, match="injected upload failure"):
+            staged.publish()
+        assert method.current_base_version_id == "base-a"
+        assert isinstance(method.snapshot["weight"], torch.Tensor)
+
+        retry = trainer.stage_shard(
+            version=WeightVersionRef("target-a"),
+            hf_tensor_iter=iter([[("weight", torch.tensor([9.0, 10.0]))]]),
+        )
+        assert retry._staged is staged._staged
+        retry.publish()
+        assert method.current_base_version_id == "target-a"
+        index = json.loads(
+            storage.objects["s3://weights/tests/v1/model.safetensors.index.json"]
+        )
+        shard_uri = f"s3://weights/tests/v1/{index['weight_map']['weight']}"
+        assert torch.equal(
+            safetensors.torch.load(storage.objects[shard_uri])["weight"],
+            torch.tensor([3.0, 4.0]),
+        )
+    finally:
+        trainer.close()
+
+
+def test_s3_full_hf_checkpoint_blocks_a_second_staged_update(
+    monkeypatch, tmp_path, refit_server
+):
+    service, server_url = refit_server
+    service.target.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
+    service.target.ClearField("base_version_id")
+    trainer, storage = _trainer(monkeypatch, tmp_path, server_url)
+
+    try:
+        staged = trainer.stage_shard(
+            version=WeightVersionRef("target-a"),
+            hf_tensor_iter=iter([[("weight", torch.tensor([3.0, 4.0]))]]),
+        )
+        with pytest.raises(RuntimeError, match="before staging another"):
+            trainer.stage_shard(
+                version=WeightVersionRef("target-b"),
+                hf_tensor_iter=iter([[("weight", torch.tensor([5.0, 6.0]))]]),
+            )
+        staged.publish()
+    finally:
+        trainer.close()
+
+    index = json.loads(
+        storage.objects["s3://weights/tests/v1/model.safetensors.index.json"]
+    )
+    shard_uri = f"s3://weights/tests/v1/{index['weight_map']['weight']}"
+    assert torch.equal(
+        safetensors.torch.load(storage.objects[shard_uri])["weight"],
+        torch.tensor([3.0, 4.0]),
+    )
+
+
+def test_s3_full_hf_checkpoint_captures_buckets_concurrently(
+    monkeypatch, tmp_path, refit_server
+):
+    service, server_url = refit_server
+    service.target.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
+    service.target.ClearField("base_version_id")
+    monkeypatch.setenv("MX_REFIT_DELTA_WORKERS", "2")
+    trainer, storage = _trainer(
+        monkeypatch,
+        tmp_path,
+        server_url,
+        {"a": torch.tensor([1.0]), "b": torch.tensor([2.0])},
+    )
+    method = trainer._runtime.method
+    capture_barrier = threading.Barrier(2)
+    capture_threads = set()
+    capture_bucket = method._capture_full_checkpoint_bucket
+
+    def track_capture(bucket):
+        capture_threads.add(threading.get_ident())
+        capture_barrier.wait(timeout=5)
+        return capture_bucket(bucket)
+
+    method._capture_full_checkpoint_bucket = track_capture
+    try:
+        trainer.stage_shard(
+            version=WeightVersionRef("target-a"),
+            hf_tensor_iter=iter(
+                [
+                    [("a", torch.tensor([3.0]))],
+                    [("b", torch.tensor([4.0]))],
+                ]
+            ),
+        ).publish()
+        assert len(capture_threads) == 2
+    finally:
+        trainer.close()
+
+    index = json.loads(
+        storage.objects["s3://weights/tests/v1/model.safetensors.index.json"]
+    )
+    assert index["weight_map"] == {
+        "a": "model-00001-of-00001.safetensors",
+        "b": "model-00001-of-00001.safetensors",
+    }
+
+
+def test_s3_full_hf_checkpoint_batches_tensors_by_size(
+    monkeypatch, tmp_path, refit_server
+):
+    service, server_url = refit_server
+    service.target.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
+    service.target.ClearField("base_version_id")
+    monkeypatch.setenv("MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES", "8")
+    tensors = {
+        "a": torch.tensor([1.0]),
+        "b": torch.tensor([2.0]),
+        "oversized": torch.tensor([3.0, 4.0, 5.0]),
+        "d": torch.tensor([6.0]),
+    }
+    trainer, storage = _trainer(monkeypatch, tmp_path, server_url, tensors)
+
+    try:
+        trainer.stage_shard(
+            version=WeightVersionRef("target-a"),
+            hf_tensor_iter=iter([list(tensors.items())]),
+        ).publish()
+    finally:
+        trainer.close()
+
+    index = json.loads(
+        storage.objects["s3://weights/tests/v1/model.safetensors.index.json"]
+    )
+    assert index["weight_map"] == {
+        "a": "model-00001-of-00003.safetensors",
+        "b": "model-00001-of-00003.safetensors",
+        "oversized": "model-00002-of-00003.safetensors",
+        "d": "model-00003-of-00003.safetensors",
+    }
+    oversized = safetensors.torch.load(
+        storage.objects["s3://weights/tests/v1/model-00002-of-00003.safetensors"]
+    )
+    assert list(oversized) == ["oversized"]
+
+
+def test_s3_full_hf_checkpoint_uploads_batches_concurrently(
+    monkeypatch, tmp_path, refit_server
+):
+    service, server_url = refit_server
+    service.target.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
+    service.target.ClearField("base_version_id")
+    monkeypatch.setenv("MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES", "4")
+    monkeypatch.setenv("MX_S3_UPLOAD_WORKERS", "2")
+    tensors = {"a": torch.tensor([1.0]), "b": torch.tensor([2.0])}
+    trainer, storage = _trainer(monkeypatch, tmp_path, server_url, tensors)
+    upload = storage.put
+    upload_barrier = threading.Barrier(2)
+    upload_threads = set()
+
+    def track_upload(*, uri, data):
+        if uri.endswith(".safetensors"):
+            upload_threads.add(threading.get_ident())
+            upload_barrier.wait(timeout=5)
+        upload(uri=uri, data=data)
+
+    storage.put = track_upload
+    try:
+        trainer.stage_shard(
+            version=WeightVersionRef("target-a"),
+            hf_tensor_iter=iter([list(tensors.items())]),
+        ).publish()
+    finally:
+        trainer.close()
+
+    assert len(upload_threads) == 2
 
 
 @pytest.mark.parametrize(
@@ -539,7 +803,7 @@ def test_s3_client_closes_when_publication_method_initialization_fails(
         storage_type=ObjectStorageType.S3,
         uri_prefix="s3://weights/tests",
         initial_base_version_id="base-a",
-        launch_checkpoint=tmp_path / "launch",
+        seed_checkpoint_path=tmp_path / "launch",
     )
     monkeypatch.setattr(
         trainer_runtime_module,
@@ -873,7 +1137,7 @@ def test_object_storage_config_requires_storage_delta_pair(tmp_path):
         storage_type=ObjectStorageType.S3,
         uri_prefix="s3://weights/tests",
         initial_base_version_id="base-a",
-        launch_checkpoint=launch,
+        seed_checkpoint_path=launch,
     )
     with pytest.raises(ValueError, match="WRITE_TO_STORAGE and XOR_DELTA"):
         ModelExpressTrainerClient.initialize(
@@ -900,7 +1164,7 @@ def test_object_storage_config_rejects_unsupported_provider(tmp_path):
                     storage_type=ObjectStorageType.GCS,
                     uri_prefix="gs://weights/tests",
                     initial_base_version_id="base-a",
-                    launch_checkpoint=launch,
+                    seed_checkpoint_path=launch,
                 ),
             )
         )

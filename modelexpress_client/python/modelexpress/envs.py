@@ -17,8 +17,9 @@ This is a leaf module: it imports only the standard library, so any package
 module can import it without creating a cycle.
 
 Reads are centralized here; **writes stay at their call sites** (vLLM's
-registry is read-only). ``UCX_TLS`` and ``UCX_NET_DEVICES`` are registered for
-reading, but the code that sets them does so inline.
+registry is read-only). ``UCX_TLS``, ``UCX_NET_DEVICES``, and
+``UCX_MEM_EVENTS`` are registered for reading, but the code that sets them
+does so inline.
 
 Not covered here (intentional exceptions):
 - ``MX_SKIP_EXT`` and ``CXX`` are read by ``setup.py`` before the package is
@@ -84,6 +85,8 @@ if TYPE_CHECKING:
     NIXL_UCX_TLS: Optional[str]
     UCX_TLS: Optional[str]
     UCX_NET_DEVICES: Optional[str]
+    UCX_MEM_EVENTS: Optional[str]
+    MX_UCX_DISABLE_MEM_EVENTS: bool
     MX_RDMA_NIC_PIN: str
     MX_RDMA_NIC_PIN_MIN_RATE_GBPS: Optional[str]
     # GPUDirect Storage
@@ -323,6 +326,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "NIXL_UCX_TLS": lambda: os.environ.get("NIXL_UCX_TLS"),
     "UCX_TLS": lambda: os.environ.get("UCX_TLS"),
     "UCX_NET_DEVICES": lambda: os.environ.get("UCX_NET_DEVICES"),
+    "UCX_MEM_EVENTS": lambda: os.environ.get("UCX_MEM_EVENTS"),
+    "MX_UCX_DISABLE_MEM_EVENTS": lambda: _env_bool("MX_UCX_DISABLE_MEM_EVENTS", False),
     "MX_RDMA_NIC_PIN": lambda: os.environ.get("MX_RDMA_NIC_PIN", "").strip(),
     "MX_RDMA_NIC_PIN_MIN_RATE_GBPS": lambda: os.environ.get("MX_RDMA_NIC_PIN_MIN_RATE_GBPS"),
     # ── GPUDirect Storage ──────────────────────────────────────────────────

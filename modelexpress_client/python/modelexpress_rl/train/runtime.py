@@ -27,6 +27,7 @@ from .methods import (
     CanonicalDeltaPublicationMethod,
     FullTensorNixlPublicationMethod,
     StagedCanonicalDelta,
+    StagedFullCheckpoint,
 )
 from .resources import _TrainerResources
 
@@ -34,7 +35,9 @@ if TYPE_CHECKING:
     from .. import refit_pb2_grpc
     from .client import ObjectStorageConfig
 
-PublicationArtifact = StagedWeightVersionShardData | StagedCanonicalDelta
+PublicationArtifact = (
+    StagedWeightVersionShardData | StagedCanonicalDelta | StagedFullCheckpoint
+)
 
 logger = logging.getLogger("modelexpress_rl.train.runtime")
 
@@ -78,8 +81,8 @@ class TrainerRuntime:
         rpc_timeout_seconds: float,
     ) -> TrainerRuntime:
         if object_storage is not None:
-            read_launch_tensor, _ = make_tensor_reader(
-                object_storage.launch_checkpoint
+            read_seed_tensor, _ = make_tensor_reader(
+                object_storage.seed_checkpoint_path
             )
             s3 = S3Client(
                 endpoint_url=object_storage.endpoint_url,
@@ -92,7 +95,7 @@ class TrainerRuntime:
                     service=service,
                     rpc_timeout_seconds=rpc_timeout_seconds,
                     process_group=process_group,
-                    read_launch_tensor=read_launch_tensor,
+                    read_seed_tensor=read_seed_tensor,
                     s3=s3,
                     clock=lambda: perf_counter(),
                 )
