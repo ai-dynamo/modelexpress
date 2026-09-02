@@ -41,6 +41,12 @@ _VLLM_POST_RDMA_FINALIZER_NAMES = (
     "finalize_mhc_broadcast_weights",
 )
 
+# vLLM keeps accelerator-backed attention scales together with host mirrors
+# consumed by backends such as FlashInfer and AITER. Only the accelerator
+# tensors are part of the ModelExpress manifest, so an RDMA target must refresh
+# the mirrors after the received values overwrite its dummy-loaded tensors.
+_VLLM_ATTENTION_SCALE_NAMES: tuple[str, ...] = ("q", "k", "v")
+
 # MTP draft weights live under an "mtp." prefix in the shared checkpoint. The
 # draft's embedding and lm_head come from the target, so these are all it needs.
 _DRAFT_WEIGHT_PREFIXES: tuple[str, ...] = ("mtp.",)
@@ -231,9 +237,10 @@ class VllmAdapter(EngineAdapter):
 
     def after_rdma_receive(self, result: LoadResult) -> LoadResult:
         """Build target-local tensors derived from the received weights."""
-        return self._finalize_model_specific_weights(
+        result = self._finalize_model_specific_weights(
             result, _VLLM_POST_RDMA_FINALIZER_NAMES
         )
+        return self._refresh_host_quantization_state(result)
 
     def apply_weight_iter(
         self,
@@ -387,6 +394,84 @@ class VllmAdapter(EngineAdapter):
                 result.model,
                 self.model_config,
                 self.target_device,
+            )
+        return result
+
+    @torch.no_grad()
+    def _refresh_host_quantization_state(self, result: LoadResult) -> LoadResult:
+        """Refresh vLLM host mirrors after RDMA overwrites device scales.
+
+        vLLM's attention PWAL copies ``_q/_k/_v_scale`` into Python floats and
+        CPU tensors for backends whose launch APIs require host scalars. RDMA
+        receives only the registered accelerator tensors, leaving those mirrors
+        at values derived from the target's dummy load. Re-running PWAL is not a
+        safe repair because the incoming model is already in its processed
+        runtime representation; update only the non-transferable mirrors.
+
+        Compressed-tensors may use per-head scales. Match vLLM's own conversion
+        by using their maximum for the scalar host mirror.
+        """
+        if result.model is None:
+            raise RuntimeError("vLLM RDMA post-load processing requires result.model")
+
+        refreshed_values = 0
+        stale_values = 0
+        refreshed_modules = 0
+
+        for module_name, module in result.model.named_modules():
+            module_refreshed = False
+            for scale_name in _VLLM_ATTENTION_SCALE_NAMES:
+                tensor_name = f"_{scale_name}_scale"
+                float_name = f"{tensor_name}_float"
+                scale = getattr(module, tensor_name, None)
+                if not isinstance(scale, torch.Tensor) or not hasattr(
+                    module, float_name
+                ):
+                    continue
+                if not self.accelerator_backend.is_accel_tensor(scale):
+                    continue
+                if scale.numel() == 0:
+                    continue
+
+                value = float(scale.detach().float().max().item())
+                previous = getattr(module, float_name)
+                if previous != value:
+                    stale_values += 1
+                    logger.debug(
+                        "Refreshing vLLM host scale %s.%s: %r -> %r",
+                        module_name or type(module).__name__,
+                        float_name,
+                        previous,
+                        value,
+                    )
+                setattr(module, float_name, value)
+
+                cpu_mirror = getattr(module, f"_{scale_name}_scale_cpu", None)
+                if isinstance(cpu_mirror, torch.Tensor):
+                    cpu_mirror.fill_(value)
+
+                refreshed_values += 1
+                module_refreshed = True
+
+            if not module_refreshed:
+                continue
+
+            refreshed_modules += 1
+            # FlashInfer lazily derives these from the host scale mirrors. They
+            # should still be None during cold loading, but invalidate them to
+            # keep this hook correct if initialization order changes upstream.
+            impl = getattr(module, "impl", None)
+            for cache_name in ("bmm1_scale", "bmm2_scale"):
+                if impl is not None and hasattr(impl, cache_name):
+                    setattr(impl, cache_name, None)
+
+        if refreshed_values:
+            logger.info(
+                "Refreshed %d vLLM host attention scales across %d modules "
+                "after RDMA receive (%d stale dummy values replaced)",
+                refreshed_values,
+                refreshed_modules,
+                stale_values,
             )
         return result
 
