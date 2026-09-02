@@ -431,10 +431,13 @@ class VllmAdapter(EngineAdapter):
             configured_cache_dtype.startswith("fp8")
         )
 
-        # Validate every module before mutating any host state. This is a shim
-        # over vLLM private attributes, so an upstream contract change must fail
-        # the RDMA strategy instead of silently serving with stale scales.
-        updates: list[tuple[str, torch.nn.Module, dict[str, float]]] = []
+        # This is a shim over vLLM private attributes, so an upstream scale
+        # contract change must fail the RDMA strategy instead of silently
+        # serving with stale values. Any failure after mutation is recovered by
+        # the outer strategy reinitializing the whole model before fallback.
+        refreshed_values = 0
+        stale_values = 0
+        refreshed_modules = 0
         for module_name, module in result.model.named_modules():
             module_label = module_name or type(module).__name__
             kv_cache_dtype = getattr(module, "kv_cache_dtype", None)
@@ -475,31 +478,14 @@ class VllmAdapter(EngineAdapter):
                     )
 
             impl = getattr(module, "impl", None)
-            cache_presence = [
-                hasattr(impl, cache_name) for cache_name in flashinfer_cache_names
-            ]
-            if any(cache_presence) and not all(cache_presence):
-                missing_cache_names = [
-                    cache_name
-                    for cache_name, present in zip(
-                        flashinfer_cache_names, cache_presence, strict=True
-                    )
-                    if not present
-                ]
-                raise RuntimeError(
-                    "Incomplete vLLM FlashInfer scale cache contract on "
-                    f"{module_label}: missing {', '.join(missing_cache_names)}"
-                )
-
             initialized_cache_names = []
             if module._o_scale_float is not None:
                 initialized_cache_names.append("_o_scale_float")
-            if all(cache_presence):
-                initialized_cache_names.extend(
-                    cache_name
-                    for cache_name in flashinfer_cache_names
-                    if getattr(impl, cache_name) is not None
-                )
+            initialized_cache_names.extend(
+                cache_name
+                for cache_name in flashinfer_cache_names
+                if hasattr(impl, cache_name) and getattr(impl, cache_name) is not None
+            )
             if initialized_cache_names:
                 raise RuntimeError(
                     "vLLM attention host-scale refresh requires a cold-load "
@@ -507,7 +493,6 @@ class VllmAdapter(EngineAdapter):
                     f"{', '.join(initialized_cache_names)}"
                 )
 
-            values: dict[str, float] = {}
             for scale_name, tensor_name in zip(
                 _VLLM_ATTENTION_SCALE_NAMES, device_names, strict=True
             ):
@@ -533,20 +518,7 @@ class VllmAdapter(EngineAdapter):
                         f"{module_label}: {tensor_name} must contain only finite, "
                         "positive values"
                     )
-                values[scale_name] = float(scale_float.max().item())
-
-            updates.append((module_label, module, values))
-
-        if fp8_expected and not updates:
-            raise RuntimeError(
-                "FP8 KV cache requires recognizable vLLM q/k/v host scale state, "
-                "but no attention module was refreshed"
-            )
-
-        refreshed_values = 0
-        stale_values = 0
-        for module_label, module, values in updates:
-            for scale_name, value in values.items():
+                value = float(scale_float.max().item())
                 float_name = f"_{scale_name}_scale_float"
                 previous = getattr(module, float_name)
                 if previous != value:
@@ -565,13 +537,20 @@ class VllmAdapter(EngineAdapter):
                     cpu_mirror.fill_(value)
 
                 refreshed_values += 1
+            refreshed_modules += 1
+
+        if fp8_expected and not refreshed_modules:
+            raise RuntimeError(
+                "FP8 KV cache requires recognizable vLLM q/k/v host scale state, "
+                "but no attention module was refreshed"
+            )
 
         if refreshed_values:
             logger.info(
                 "Refreshed %d vLLM host attention scales across %d modules "
                 "after RDMA receive (%d stale dummy values replaced)",
                 refreshed_values,
-                len(updates),
+                refreshed_modules,
                 stale_values,
             )
         return result

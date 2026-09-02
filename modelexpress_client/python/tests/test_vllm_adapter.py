@@ -268,20 +268,17 @@ def test_after_rdma_receive_fails_when_fp8_scales_are_unrecognized(
 def test_after_rdma_receive_fails_on_incomplete_scale_contract(
     mock_accelerator_backend_cls,
 ):
-    """A partial private contract fails before any valid module is updated."""
+    """A partial private q/k/v scale contract fails closed."""
     adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
     adapter.accelerator_backend = mock_accelerator_backend_cls(
         torch_device_type="cpu"
     )
     model = nn.Module()
-    model.first = _AttentionWithStaleHostScales()
-    model.second = _AttentionWithStaleHostScales()
-    del model.second._v_scale_float
+    model.attn = _AttentionWithStaleHostScales()
+    del model.attn._v_scale_float
 
     with pytest.raises(RuntimeError, match="Incomplete.*_v_scale_float"):
         adapter.after_rdma_receive(LoadResult(value=model, model=model))
-
-    assert model.first._q_scale_float == pytest.approx(1.0)
 
 
 def test_after_rdma_receive_rejects_invalid_python_host_scalar(
@@ -316,10 +313,10 @@ def test_after_rdma_receive_rejects_invalid_cpu_scale(
         adapter.after_rdma_receive(LoadResult(value=model, model=model))
 
 
-def test_after_rdma_receive_rejects_incomplete_flashinfer_cache_contract(
+def test_after_rdma_receive_allows_mla_flashinfer_cache_contract(
     mock_accelerator_backend_cls,
 ):
-    """A partial FlashInfer cache family indicates an upstream contract change."""
+    """FlashInfer MLA legitimately has bmm caches without an output cache."""
     adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
     adapter.accelerator_backend = mock_accelerator_backend_cls(
         torch_device_type="cpu"
@@ -328,8 +325,11 @@ def test_after_rdma_receive_rejects_incomplete_flashinfer_cache_contract(
     model.attn = _AttentionWithStaleHostScales()
     del model.attn.impl.o_sf_scale
 
-    with pytest.raises(RuntimeError, match="Incomplete.*o_sf_scale"):
-        adapter.after_rdma_receive(LoadResult(value=model, model=model))
+    adapter.after_rdma_receive(LoadResult(value=model, model=model))
+
+    assert model.attn._q_scale_float == pytest.approx(0.25)
+    assert model.attn._k_scale_float == pytest.approx(0.5)
+    assert model.attn._v_scale_float == pytest.approx(0.75)
 
 
 @pytest.mark.parametrize(
