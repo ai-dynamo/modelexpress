@@ -401,12 +401,13 @@ class VllmAdapter(EngineAdapter):
     def _refresh_host_quantization_state(self, result: LoadResult) -> LoadResult:
         """Refresh vLLM host mirrors after RDMA overwrites device scales.
 
-        vLLM's attention PWAL copies ``_q/_k/_v_scale`` into Python floats and
-        CPU tensors for backends whose launch APIs require host scalars. RDMA
-        receives only the registered accelerator tensors, leaving those mirrors
-        at values derived from the target's dummy load. Re-running PWAL is not a
-        safe repair because the incoming model is already in its processed
-        runtime representation; update only the non-transferable mirrors.
+        vLLM's attention PWAL copies ``_q/_k/_v_scale`` into Python floats and,
+        for some backends, CPU tensors whose launch APIs require host scalars.
+        RDMA receives only the registered accelerator tensors, leaving those
+        mirrors at values derived from the target's dummy load. Re-running PWAL
+        is not a safe repair because the incoming model is already in its
+        processed runtime representation; update only the non-transferable
+        mirrors that the selected backend exposes.
 
         Compressed-tensors may use per-head scales. Match vLLM's own conversion
         by using their maximum for the scalar host mirror.
@@ -422,7 +423,7 @@ class VllmAdapter(EngineAdapter):
         device_names = tuple(
             f"_{scale_name}_scale" for scale_name in _VLLM_ATTENTION_SCALE_NAMES
         )
-        required_names = device_names + float_names + cpu_names + ("_o_scale_float",)
+        required_names = device_names + float_names + ("_o_scale_float",)
         flashinfer_cache_names = ("bmm1_scale", "bmm2_scale", "o_sf_scale")
 
         cache_config = getattr(self.vllm_config, "cache_config", None)
@@ -465,6 +466,8 @@ class VllmAdapter(EngineAdapter):
                     )
 
             for cpu_name in cpu_names:
+                if not hasattr(module, cpu_name):
+                    continue
                 cpu_mirror = getattr(module, cpu_name)
                 if (
                     not isinstance(cpu_mirror, torch.Tensor)
