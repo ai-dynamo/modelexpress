@@ -832,12 +832,12 @@ class TestLoadStrategyChainRunErrorHandling:
         model = MagicMock()
 
         with patch(
-            "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.is_available",
-            return_value=False,
+            "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.skip_reason",
+            return_value="other",
         ), patch(
             "modelexpress.load_strategy.model_streamer_strategy."
-            "ModelStreamerStrategy.is_available",
-            return_value=True,
+            "ModelStreamerStrategy.skip_reason",
+            return_value=None,
         ), patch(
             "modelexpress.load_strategy.model_streamer_strategy."
             "ModelStreamerStrategy.load",
@@ -847,11 +847,11 @@ class TestLoadStrategyChainRunErrorHandling:
             "ModelStreamerStrategy.rollback",
             rollback,
         ), patch(
-            "modelexpress.load_strategy.gds_strategy.GdsStrategy.is_available",
-            return_value=False,
+            "modelexpress.load_strategy.gds_strategy.GdsStrategy.skip_reason",
+            return_value="other",
         ), patch(
-            "modelexpress.load_strategy.default_strategy.DefaultStrategy.is_available",
-            return_value=True,
+            "modelexpress.load_strategy.default_strategy.DefaultStrategy.skip_reason",
+            return_value=None,
         ), patch(
             "modelexpress.load_strategy.default_strategy.DefaultStrategy.load",
             fallback_load,
@@ -881,12 +881,12 @@ class TestLoadStrategyChainRunErrorHandling:
         model = MagicMock()
 
         with patch(
-            "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.is_available",
-            return_value=False,
+            "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.skip_reason",
+            return_value="other",
         ), patch(
             "modelexpress.load_strategy.model_streamer_strategy."
-            "ModelStreamerStrategy.is_available",
-            return_value=True,
+            "ModelStreamerStrategy.skip_reason",
+            return_value=None,
         ), patch(
             "modelexpress.load_strategy.model_streamer_strategy."
             "ModelStreamerStrategy.load",
@@ -896,11 +896,11 @@ class TestLoadStrategyChainRunErrorHandling:
             "ModelStreamerStrategy.rollback",
             rollback,
         ), patch(
-            "modelexpress.load_strategy.gds_strategy.GdsStrategy.is_available",
-            return_value=False,
+            "modelexpress.load_strategy.gds_strategy.GdsStrategy.skip_reason",
+            return_value="other",
         ), patch(
-            "modelexpress.load_strategy.default_strategy.DefaultStrategy.is_available",
-            return_value=True,
+            "modelexpress.load_strategy.default_strategy.DefaultStrategy.skip_reason",
+            return_value=None,
         ), patch(
             "modelexpress.load_strategy.default_strategy.DefaultStrategy.load",
             fallback_load,
@@ -928,12 +928,12 @@ class TestLoadStrategyChainRunErrorHandling:
 
         ctx = _make_load_context()
         with patch(
-            "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.is_available",
-            return_value=False,
+            "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.skip_reason",
+            return_value="other",
         ), patch(
             "modelexpress.load_strategy.model_streamer_strategy."
-            "ModelStreamerStrategy.is_available",
-            return_value=True,
+            "ModelStreamerStrategy.skip_reason",
+            return_value=None,
         ), patch(
             "modelexpress.load_strategy.model_streamer_strategy."
             "ModelStreamerStrategy.load",
@@ -943,11 +943,11 @@ class TestLoadStrategyChainRunErrorHandling:
             "ModelStreamerStrategy.rollback",
             rollback,
         ), patch(
-            "modelexpress.load_strategy.gds_strategy.GdsStrategy.is_available",
-            return_value=False,
+            "modelexpress.load_strategy.gds_strategy.GdsStrategy.skip_reason",
+            return_value="other",
         ), patch(
-            "modelexpress.load_strategy.default_strategy.DefaultStrategy.is_available",
-            return_value=True,
+            "modelexpress.load_strategy.default_strategy.DefaultStrategy.skip_reason",
+            return_value=None,
         ), patch(
             "modelexpress.load_strategy.default_strategy.DefaultStrategy.load",
             fallback_load,
@@ -982,12 +982,12 @@ class TestLoadStrategyChainRunErrorHandling:
         model = MagicMock()
 
         with patch(
-            "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.is_available",
-            return_value=False,
+            "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.skip_reason",
+            return_value="other",
         ), patch(
             "modelexpress.load_strategy.model_streamer_strategy."
-            "ModelStreamerStrategy.is_available",
-            return_value=True,
+            "ModelStreamerStrategy.skip_reason",
+            return_value=None,
         ), patch(
             "modelexpress.load_strategy.model_streamer_strategy."
             "ModelStreamerStrategy.load",
@@ -997,11 +997,11 @@ class TestLoadStrategyChainRunErrorHandling:
             "ModelStreamerStrategy.rollback",
             rollback,
         ), patch(
-            "modelexpress.load_strategy.gds_strategy.GdsStrategy.is_available",
-            return_value=False,
+            "modelexpress.load_strategy.gds_strategy.GdsStrategy.skip_reason",
+            return_value="other",
         ), patch(
-            "modelexpress.load_strategy.default_strategy.DefaultStrategy.is_available",
-            return_value=True,
+            "modelexpress.load_strategy.default_strategy.DefaultStrategy.skip_reason",
+            return_value=None,
         ), patch(
             "modelexpress.load_strategy.default_strategy.DefaultStrategy.load",
             fallback_load,
@@ -1031,12 +1031,12 @@ class TestLoadStrategyChainRunErrorHandling:
         model = MagicMock()
 
         with patch(
-            "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.is_available",
-            return_value=False,
+            "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.skip_reason",
+            return_value="other",
         ), patch(
             "modelexpress.load_strategy.model_streamer_strategy."
-            "ModelStreamerStrategy.is_available",
-            return_value=True,
+            "ModelStreamerStrategy.skip_reason",
+            return_value=None,
         ), patch(
             "modelexpress.load_strategy.model_streamer_strategy."
             "ModelStreamerStrategy.load",
@@ -1046,11 +1046,11 @@ class TestLoadStrategyChainRunErrorHandling:
             "ModelStreamerStrategy.rollback",
             rollback,
         ), patch(
-            "modelexpress.load_strategy.gds_strategy.GdsStrategy.is_available",
-            return_value=False,
+            "modelexpress.load_strategy.gds_strategy.GdsStrategy.skip_reason",
+            return_value="other",
         ), patch(
-            "modelexpress.load_strategy.default_strategy.DefaultStrategy.is_available",
-            return_value=True,
+            "modelexpress.load_strategy.default_strategy.DefaultStrategy.skip_reason",
+            return_value=None,
         ), patch(
             "modelexpress.load_strategy.default_strategy.DefaultStrategy.load",
             fallback_load,

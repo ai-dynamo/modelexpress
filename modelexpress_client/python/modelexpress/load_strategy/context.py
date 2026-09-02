@@ -70,6 +70,12 @@ class LoadContext:
     # readiness URL onto this host, since loopback serves nothing there.
     head_addr: str | None = None
     adapter: EngineAdapter | None = None
+    # Which engine's loader built this context. The strategy chain is otherwise
+    # engine-agnostic, and its metrics have to carry the same `engine` label the
+    # load and phase timings do or they cannot be read against each other. The
+    # default is what a bare test fixture gets; the three real builders all set
+    # it explicitly.
+    engine: str = "other"
     accelerator_backend: AcceleratorBackend = field(
         default_factory=CudaAcceleratorBackend
     )

@@ -217,6 +217,7 @@ When making changes, update the appropriate documentation files:
 | Coding standards, build commands, new patterns | `CLAUDE.md`, `.github/copilot-instructions.md`, `.cursor/rules/rust.mdc` |
 | CLI arguments or commands | `docs/CLI.md` + all 3 agent files (Adding CLI Arguments section) |
 | Configuration, environment variables | `docs/DEPLOYMENT.md` |
+| Prometheus metrics, Grafana dashboard, alert rules | `docs/METRICS.md` |
 | Deployment (Docker, K8s, Helm, P2P) | `docs/DEPLOYMENT.md` |
 | Known issues, FP8 handling | `docs/ARCHITECTURE.md` |
 | Dev setup, scripts, pre-commit hooks | `CONTRIBUTING.md` |

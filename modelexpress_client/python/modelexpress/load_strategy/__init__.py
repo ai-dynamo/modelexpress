@@ -11,12 +11,14 @@ MxModelLoader iterates the chain until one succeeds.
 from __future__ import annotations
 
 import logging
+import time
 
 import torch.nn as nn
 
 from modelexpress.tracing import tracer
 
 from ..adapter import StrategyFailed, StrategyRecoveryError, UnsupportedCapability
+from ..metrics import metrics as load_metrics
 from .base import (
     LoadContext,
     LoadResult,
@@ -77,7 +79,16 @@ class LoadStrategyChain:
             GdsStrategy(),
             DefaultStrategy(),
         ]
-        eligible = [s for s in all_strategies if s.is_available(ctx)]
+        # One evaluation, two uses. Asking each strategy for a reason rather
+        # than a bool is what lets the skip counter exist: without it, a
+        # strategy that recorded no attempt was either filtered out here or was
+        # eligible and never reached because an earlier one succeeded, and those
+        # are opposite conclusions drawn from the same absence of data.
+        reasons = [(s, s.skip_reason(ctx)) for s in all_strategies]
+        eligible = [s for s, reason in reasons if reason is None]
+        for strategy, reason in reasons:
+            if reason is not None:
+                load_metrics.record_strategy_skipped(ctx.engine, strategy.name, reason)
         logger.info(f"Eligible loaders: {[s.name for s in eligible]}")
 
         result = LoadResult(value=model, model=model)
@@ -88,18 +99,34 @@ class LoadStrategyChain:
 
             for strategy in eligible:
                 logger.info(f"[Worker {ctx.global_rank}] Trying strategy: {strategy.name}")
+                # L2. The interval opens here rather than around strategy.load()
+                # alone, so it charges a strategy for its own rollback and for
+                # the _reinit_for_retry that its mutation forced -- `finally`
+                # runs before the `continue`, so that re-init lands inside the
+                # interval of the strategy that caused it. The tighter wrap is
+                # easier to describe but leaves the most expensive operation in
+                # the chain as an unattributed gap.
+                #
+                # `outcome` starts at "error" so that a BaseException the
+                # handlers below do not catch -- KeyboardInterrupt, SystemExit,
+                # CancelledError -- is still recorded rather than dropped.
+                outcome = "error"
+                started = time.perf_counter()
                 try:
                     result = strategy.load(result, ctx)
                     publish_source_if_supported(result, ctx)
                     span.set_attribute("weight_loading_strategy", strategy.name)
+                    outcome = "success"
                     return result.value
                 except StrategyRecoveryError:
                     # Recovery already failed, so no later strategy can safely
                     # use the current model. Fail closed and retain the original
                     # recovery error as the exception cause.
+                    outcome = "recovery_error"
                     strategy.rollback(ctx)
                     raise
                 except StrategyFailed as e:
+                    outcome = "fallback_dirty" if e.mutated else "fallback"
                     logger.warning(
                         f"[Worker {ctx.global_rank}] Strategy {strategy.name} failed, "
                         f"trying next: {e}"
@@ -118,6 +145,14 @@ class LoadStrategyChain:
                         f"raised unexpected error, trying next: {e}"
                     )
                     strategy.rollback(ctx)
+                finally:
+                    load_metrics.observe_load_strategy_seconds(
+                        ctx.engine,
+                        ctx.identity.model_name,
+                        strategy.name,
+                        outcome,
+                        time.perf_counter() - started,
+                    )
 
         raise RuntimeError(
             f"[Worker {ctx.global_rank}] No loading strategy succeeded "

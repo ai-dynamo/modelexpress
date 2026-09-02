@@ -404,21 +404,21 @@ class TestVllmModelStreamerIterator:
 
 class TestChainOrder:
     @patch(
-        "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.is_available",
-        return_value=True,
+        "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.skip_reason",
+        return_value=None,
     )
     @patch(
         "modelexpress.load_strategy.model_streamer_strategy."
-        "ModelStreamerStrategy.is_available",
-        return_value=True,
+        "ModelStreamerStrategy.skip_reason",
+        return_value=None,
     )
     @patch(
-        "modelexpress.load_strategy.gds_strategy.GdsStrategy.is_available",
-        return_value=True,
+        "modelexpress.load_strategy.gds_strategy.GdsStrategy.skip_reason",
+        return_value=None,
     )
     @patch(
-        "modelexpress.load_strategy.default_strategy.DefaultStrategy.is_available",
-        return_value=True,
+        "modelexpress.load_strategy.default_strategy.DefaultStrategy.skip_reason",
+        return_value=None,
     )
     def test_model_streamer_in_chain(self, _d, _g, _ms, _r):
         from modelexpress.load_strategy import LoadStrategyChain
@@ -455,21 +455,21 @@ class TestChainOrder:
         assert call_order == ["rdma", "model_streamer", "gds", "default"]
 
     @patch(
-        "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.is_available",
-        return_value=True,
+        "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.skip_reason",
+        return_value=None,
     )
     @patch(
         "modelexpress.load_strategy.model_streamer_strategy."
-        "ModelStreamerStrategy.is_available",
-        return_value=False,
+        "ModelStreamerStrategy.skip_reason",
+        return_value="other",
     )
     @patch(
-        "modelexpress.load_strategy.gds_strategy.GdsStrategy.is_available",
-        return_value=True,
+        "modelexpress.load_strategy.gds_strategy.GdsStrategy.skip_reason",
+        return_value=None,
     )
     @patch(
-        "modelexpress.load_strategy.default_strategy.DefaultStrategy.is_available",
-        return_value=True,
+        "modelexpress.load_strategy.default_strategy.DefaultStrategy.skip_reason",
+        return_value=None,
     )
     def test_skips_unavailable_strategy(self, _d, _g, _ms, _r):
         from modelexpress.load_strategy import LoadStrategyChain
