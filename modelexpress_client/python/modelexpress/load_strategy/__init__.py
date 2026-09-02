@@ -126,7 +126,12 @@ class LoadStrategyChain:
                     strategy.rollback(ctx)
                     raise
                 except StrategyFailed as e:
-                    outcome = "fallback_dirty" if e.mutated else "fallback"
+                    # Pessimistic until the recovery below actually completes.
+                    # rollback and _reinit_for_retry can both raise, and neither
+                    # re-enters the handler above, so recording the fallback up
+                    # front would label a chain that died here as one that moved
+                    # on -- the reverse of what happened.
+                    outcome = "recovery_error"
                     logger.warning(
                         f"[Worker {ctx.global_rank}] Strategy {strategy.name} failed, "
                         f"trying next: {e}"
@@ -135,6 +140,7 @@ class LoadStrategyChain:
                     if e.mutated:
                         clear_exception_tracebacks(e)
                         result = LoadStrategyChain._reinit_for_retry(result, ctx, strategy)
+                    outcome = "fallback_dirty" if e.mutated else "fallback"
                     continue
                 except Exception as e:
                     # Unexpected strategy errors should be rare. Keep the engine

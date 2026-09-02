@@ -100,7 +100,7 @@ def _skips(text):
     return out
 
 
-def _run(eligible, loads, ctx=None):
+def _run(eligible, loads, ctx=None, rollbacks=None):
     """Run the chain with a chosen eligibility set and per-strategy load behavior.
 
     ``eligible`` maps a strategy name to None (runnable) or a skip reason. A
@@ -116,7 +116,9 @@ def _run(eligible, loads, ctx=None):
         behavior = loads.get(name)
         if behavior is not None:
             stack.append(patch(f"{path}.load", **behavior))
-        stack.append(patch(f"{path}.rollback", return_value=None))
+        stack.append(
+            patch(f"{path}.rollback", **(rollbacks or {}).get(name, {"return_value": None}))
+        )
     for p in stack:
         p.start()
     try:
@@ -220,6 +222,39 @@ def test_a_failed_recovery_is_recorded_before_the_chain_fails_closed(collector):
                 eligible={"rdma": None, "default": None},
                 loads={"rdma": {"side_effect": StrategyRecoveryError("no way back")}},
             )
+    attempts = _attempts(_exposition(collector))
+    assert attempts == {("rdma", "recovery_error"): 1.0}
+
+
+@pytest.mark.parametrize("failing", ["rollback", "reinit_for_retry"])
+def test_a_failed_recovery_after_a_dirty_miss_is_not_reported_as_a_fallback(
+    collector, failing
+):
+    """A chain that died in recovery must not look like one that moved on.
+
+    Neither rollback nor _reinit_for_retry re-enters the StrategyRecoveryError
+    handler above them, so an outcome assigned before they run survives their
+    failure. Recording fallback_dirty there would say the strategy missed and
+    the chain continued, when in fact the load aborted.
+    """
+    ctx = _ctx()
+    rollbacks = {}
+    if failing == "rollback":
+        # rollback raises first, so the re-init is never reached.
+        rollbacks["rdma"] = {"side_effect": RuntimeError("rollback exploded")}
+        ctx.adapter.reinit_for_retry = MagicMock(return_value=MagicMock())
+    else:
+        ctx.adapter.reinit_for_retry = MagicMock(side_effect=RuntimeError("no way back"))
+
+    with patch(f"{_BASE}.publish_source_if_supported"):
+        with pytest.raises(RuntimeError):
+            _run(
+                eligible={"rdma": None, "default": None},
+                loads={"rdma": {"side_effect": StrategyFailed("dirty", mutated=True)}},
+                ctx=ctx,
+                rollbacks=rollbacks,
+            )
+
     attempts = _attempts(_exposition(collector))
     assert attempts == {("rdma", "recovery_error"): 1.0}
 
