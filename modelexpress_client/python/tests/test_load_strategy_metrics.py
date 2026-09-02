@@ -9,6 +9,10 @@ no attempt -- filtered out before the loop, eligible but never reached because
 an earlier one succeeded, or tried and recorded -- and only the first is a skip.
 Conflating the first two is the failure mode that makes the panel unreadable,
 so it is asserted directly rather than inferred.
+
+Nothing here patches anything but ``is_available``, ``load`` and ``rollback``.
+That is the whole integration surface: the chain gates on the same predicate it
+always did, and the metric is recorded around it.
 """
 
 import re
@@ -23,7 +27,6 @@ from modelexpress.load_strategy import LoadContext, LoadStrategyChain
 from modelexpress.metrics import (
     LOAD_STRATEGIES,
     LOAD_STRATEGY_OUTCOMES,
-    LOAD_STRATEGY_SKIP_REASONS,
     MetricsCollector,
 )
 
@@ -87,23 +90,22 @@ def _attempts(text):
 
 
 def _skips(text):
-    """{(strategy, reason): count} from mx_load_strategy_skipped_total."""
+    """{strategy: count} from mx_load_strategy_skipped_total."""
     out = {}
     for line in text.splitlines():
         m = re.match(
-            r'mx_load_strategy_skipped_total\{.*?reason="([^"]+)".*?'
-            r'strategy="([^"]+)".*?\} (\S+)',
+            r'mx_load_strategy_skipped_total\{.*?strategy="([^"]+)".*?\} (\S+)',
             line,
         )
         if m:
-            out[(m.group(2), m.group(1))] = float(m.group(3))
+            out[m.group(1)] = float(m.group(2))
     return out
 
 
 def _run(eligible, loads, ctx=None, rollbacks=None):
     """Run the chain with a chosen eligibility set and per-strategy load behavior.
 
-    ``eligible`` maps a strategy name to None (runnable) or a skip reason. A
+    ``eligible`` maps a strategy name to True (runnable) or False (skipped). A
     strategy the caller does not name is skipped, not made eligible: defaulting
     the other way lets an unpatched real ``load`` run inside a unit test, which
     is how this helper was wrong the first time.
@@ -112,7 +114,7 @@ def _run(eligible, loads, ctx=None, rollbacks=None):
     model = MagicMock()
     stack = []
     for name, path in _CLASSES.items():
-        stack.append(patch(f"{path}.skip_reason", return_value=eligible.get(name, "other")))
+        stack.append(patch(f"{path}.is_available", return_value=eligible.get(name, False)))
         behavior = loads.get(name)
         if behavior is not None:
             stack.append(patch(f"{path}.load", **behavior))
@@ -142,23 +144,16 @@ def _succeed():
 def test_a_skipped_strategy_is_counted_as_skipped_and_never_timed(collector):
     with patch(f"{_BASE}.publish_source_if_supported"):
         _run(
-            eligible={
-                "rdma": "nixl_unavailable",
-                "server-cache": "prefetch_disabled",
-                "instant_tensor": "package_missing",
-                "model_streamer": "package_missing",
-                "gds": "driver_unavailable",
-                "default": None,
-            },
+            eligible={"default": True},
             loads={"default": _succeed()},
         )
     text = _exposition(collector)
     assert _skips(text) == {
-        ("rdma", "nixl_unavailable"): 1.0,
-        ("server-cache", "prefetch_disabled"): 1.0,
-        ("instant_tensor", "package_missing"): 1.0,
-        ("model_streamer", "package_missing"): 1.0,
-        ("gds", "driver_unavailable"): 1.0,
+        "rdma": 1.0,
+        "server-cache": 1.0,
+        "instant_tensor": 1.0,
+        "model_streamer": 1.0,
+        "gds": 1.0,
     }
     # A skipped strategy is not an attempt of zero duration. It is not an
     # attempt, and a zero would sit in the bottom bucket looking like a fast one.
@@ -174,7 +169,7 @@ def test_an_eligible_strategy_the_chain_never_reached_records_neither(collector)
     """
     with patch(f"{_BASE}.publish_source_if_supported"):
         _run(
-            eligible=dict.fromkeys(_CLASSES, None),
+            eligible=dict.fromkeys(_CLASSES, True),
             loads={"rdma": _succeed()},
         )
     text = _exposition(collector)
@@ -200,7 +195,7 @@ def test_each_miss_records_its_own_outcome(collector, side_effect, expected):
     ctx.adapter.reinit_for_retry = MagicMock(return_value=MagicMock())
     with patch(f"{_BASE}.publish_source_if_supported"):
         _run(
-            eligible={"rdma": None, "default": None},
+            eligible={"rdma": True, "default": True},
             loads={"rdma": {"side_effect": side_effect}, "default": _succeed()},
             ctx=ctx,
         )
@@ -219,7 +214,7 @@ def test_a_failed_recovery_is_recorded_before_the_chain_fails_closed(collector):
     with patch(f"{_BASE}.publish_source_if_supported"):
         with pytest.raises(StrategyRecoveryError):
             _run(
-                eligible={"rdma": None, "default": None},
+                eligible={"rdma": True, "default": True},
                 loads={"rdma": {"side_effect": StrategyRecoveryError("no way back")}},
             )
     attempts = _attempts(_exposition(collector))
@@ -249,7 +244,7 @@ def test_a_failed_recovery_after_a_dirty_miss_is_not_reported_as_a_fallback(
     with patch(f"{_BASE}.publish_source_if_supported"):
         with pytest.raises(RuntimeError):
             _run(
-                eligible={"rdma": None, "default": None},
+                eligible={"rdma": True, "default": True},
                 loads={"rdma": {"side_effect": StrategyFailed("dirty", mutated=True)}},
                 ctx=ctx,
                 rollbacks=rollbacks,
@@ -262,7 +257,7 @@ def test_a_failed_recovery_after_a_dirty_miss_is_not_reported_as_a_fallback(
 def test_every_eligible_strategy_tried_records_exactly_one_observation(collector):
     with patch(f"{_BASE}.publish_source_if_supported"):
         _run(
-            eligible=dict.fromkeys(_CLASSES, None),
+            eligible=dict.fromkeys(_CLASSES, True),
             loads={
                 name: {"side_effect": StrategyFailed("miss", mutated=False)}
                 for name in _CLASSES
@@ -290,17 +285,17 @@ def test_an_unrecognized_strategy_is_dropped_but_an_unknown_outcome_clamps(colle
     """
     collector.observe_load_strategy_seconds("vllm", "m", "not_a_strategy", "success", 1.0)
     collector.observe_load_strategy_seconds("vllm", "m", "rdma", "not_an_outcome", 1.0)
-    collector.record_strategy_skipped("vllm", "not_a_strategy", "not_a_reason")
+    collector.record_chain_skips("vllm", ["not_a_strategy"])
 
     text = _exposition(collector)
     assert ("not_a_strategy", "success") not in _attempts(text)
     assert _attempts(text) == {("rdma", "error"): 1.0}
-    assert _skips(text) == {("other", "other"): 1.0}
+    assert _skips(text) == {"other": 1.0}
 
 
 def test_an_out_of_tree_engine_clamps_without_opening_the_label_domain(collector):
     collector.observe_load_strategy_seconds("someone_elses_engine", "m", "rdma", "success", 1.0)
-    collector.record_strategy_skipped("someone_elses_engine", "gds", "driver_unavailable")
+    collector.record_chain_skips("someone_elses_engine", ["gds"])
     text = _exposition(collector)
     assert 'engine="other"' in text
     assert "someone_elses_engine" not in text
@@ -309,38 +304,6 @@ def test_an_out_of_tree_engine_clamps_without_opening_the_label_domain(collector
 # ---------------------------------------------------------------------------
 # The contract that keeps the label domains honest
 # ---------------------------------------------------------------------------
-
-
-def test_every_strategy_overrides_skip_reason_and_none_overrides_is_available():
-    """The chain calls skip_reason, so an is_available override would be dead.
-
-    This is the drift that would not fail loudly: a strategy overriding
-    is_available still passes its own unit tests, while the chain silently
-    stops honoring it. One definition of is_available, on the base class, is
-    what makes that impossible.
-    """
-    from modelexpress.load_strategy.base import LoadStrategy
-    from modelexpress.load_strategy.default_strategy import DefaultStrategy
-    from modelexpress.load_strategy.gds_strategy import GdsStrategy
-    from modelexpress.load_strategy.instant_tensor_strategy import InstantTensorStrategy
-    from modelexpress.load_strategy.model_streamer_strategy import ModelStreamerStrategy
-    from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
-    from modelexpress.load_strategy.server_cache_strategy import ServerCacheStrategy
-
-    classes = [
-        RdmaStrategy,
-        ServerCacheStrategy,
-        InstantTensorStrategy,
-        ModelStreamerStrategy,
-        GdsStrategy,
-        DefaultStrategy,
-    ]
-    for cls in classes:
-        assert "skip_reason" in vars(cls), f"{cls.__name__} must override skip_reason"
-        assert "is_available" not in vars(cls), (
-            f"{cls.__name__} overrides is_available, which the chain no longer calls"
-        )
-    assert "is_available" in vars(LoadStrategy)
 
 
 def test_the_strategy_label_domain_matches_the_chain_and_the_names_are_the_tracers():
@@ -367,27 +330,6 @@ def test_the_strategy_label_domain_matches_the_chain_and_the_names_are_the_trace
     )
     assert built == LOAD_STRATEGIES
     assert "server-cache" in LOAD_STRATEGIES
-
-
-def test_every_skip_reason_a_strategy_can_return_is_in_the_label_domain():
-    """Grep the reasons out of the source rather than trusting the enum.
-
-    A reason that is not in LOAD_STRATEGY_SKIP_REASONS silently clamps to
-    ``other``, so the panel loses the distinction without anything failing.
-    """
-    import pathlib
-
-    pkg = pathlib.Path(__import__("modelexpress").__file__).parent
-    returned = set()
-    for path in (pkg / "load_strategy").glob("*.py"):
-        src = path.read_text()
-        body = re.search(r"def skip_reason\(.*?\n(?=    def |\Z)", src, re.S)
-        if body:
-            returned |= set(re.findall(r'return "([a-z_]+)"', body.group(0)))
-    assert returned, "no skip reasons found -- the scan is broken, not the code"
-    assert returned <= set(LOAD_STRATEGY_SKIP_REASONS), (
-        f"unlabelled skip reasons: {sorted(returned - set(LOAD_STRATEGY_SKIP_REASONS))}"
-    )
 
 
 def test_the_chain_records_only_outcomes_that_are_in_the_label_domain():

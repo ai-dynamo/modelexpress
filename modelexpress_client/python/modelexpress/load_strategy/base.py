@@ -75,35 +75,14 @@ class LoadStrategy(ABC):
     name: str
     requires: ClassVar[tuple] = ()
 
-    def skip_reason(self, ctx: LoadContext) -> str | None:
-        """Why this strategy cannot run right now, or None if it can.
-
-        The reason-returning form is the contract strategies override;
-        ``is_available`` is derived from it. A bare bool cannot say why a
-        strategy was dropped, and without that the chain's timing has a hole:
-        a strategy that recorded nothing was either filtered out here or was
-        eligible and never reached because an earlier one succeeded, and those
-        are opposite conclusions.
-
-        Every returned value must be a member of
-        ``metrics.LOAD_STRATEGY_SKIP_REASONS`` -- it becomes a label.
-        """
-        if not self.requires:
-            return None
-        if ctx.adapter is None:
-            return "no_adapter"
-        cls = type(ctx.adapter)
-        if not all(getattr(cls, m.__name__) is not m for m in self.requires):
-            return "adapter_capability_missing"
-        return None
-
     def is_available(self, ctx: LoadContext) -> bool:
-        """Check environment: is this strategy usable right now?
-
-        Retained for callers that only need the yes/no. Do not override it --
-        override ``skip_reason``, which the chain calls.
-        """
-        return self.skip_reason(ctx) is None
+        """Check environment: is this strategy usable right now?"""
+        if not self.requires:
+            return True
+        if ctx.adapter is None:
+            return False
+        cls = type(ctx.adapter)
+        return all(getattr(cls, m.__name__) is not m for m in self.requires)
 
     @abstractmethod
     def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:

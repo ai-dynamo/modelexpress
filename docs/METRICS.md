@@ -579,7 +579,7 @@ identical in the data and mean opposite things:
 
 - The eligibility filter dropped it before the chain ran — no NIXL, no GDS
   driver, the package is not installed, P2P is switched off. **This** is a skip,
-  and it is what the counter records, with the reason as a label.
+  and it is what the counter records.
 - It was eligible and simply never reached, because an earlier strategy
   succeeded and the chain returned. On a healthy load this is the common case:
   a working `rdma` means the five strategies behind it never run.
@@ -589,17 +589,16 @@ every load that worked, which is the reverse of the truth. So the counter is
 incremented once per load, only for the strategies the filter dropped, and a
 strategy that appears in neither family was eligible and not reached.
 
-Getting the reason out required the eligibility check to return one. Strategies
-override `skip_reason`, which returns `None` or a bounded label; `is_available`
-survives as a thin wrapper for callers that only want the yes/no. A bare bool
-cannot say why, and the whole value of this counter is the why.
+It records **that** a strategy was unavailable, not **why**. Carrying the reason
+would mean asking each strategy to name its own skip, which means changing the
+eligibility contract that `LoadStrategy` has today — too much interface for a
+label. The reason is already logged at the point it is decided, by the strategy
+that decided it; the counter tells you which log line to go read.
 
-Expect a steady background of skips on any real cluster. `gds` with
-`driver_unavailable`, and `model_streamer` or `instant_tensor` with
-`package_missing`, are all normal on an image that ships none of them — a flat
-nonzero line, not a problem. The one worth reading is `rdma`: `p2p_disabled`,
-`no_mx_server` or `transfer_not_allowed` there means P2P is configured off
-rather than broken, which is a different conversation from a transfer failing.
+Expect a steady nonzero background on any real cluster. `gds`,
+`model_streamer` and `instant_tensor` are all normally absent from an image that
+ships none of them — a flat line, not a problem. The one worth reading is
+`rdma`, which being skipped means P2P is configured off rather than broken.
 
 ### The `model` label is bounded by convention, not by code
 

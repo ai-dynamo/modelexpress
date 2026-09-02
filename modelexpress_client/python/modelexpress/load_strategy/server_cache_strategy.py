@@ -28,26 +28,25 @@ class ServerCacheStrategy(LoadStrategy):
     name = "server-cache"
     requires = (EngineAdapter.load_via_native,)
 
-    def skip_reason(self, ctx: LoadContext) -> str | None:
-        """Return why the server cannot supply weights for this model, or None.
+    def is_available(self, ctx: LoadContext) -> bool:
+        """Return whether the server can supply weights for this model.
 
         Needs the no-shared-storage switch, a server address, and a Hugging
         Face repo id. The repo id may have to be recovered from the resolved
         cache path, because the engine rewrites the model name in place and
         loads weights in a process that never ran the prefetch.
         """
-        base = super().skip_reason(ctx)
-        if base is not None:
-            return base
+        if not super().is_available(ctx):
+            return False
         if not model_prefetch.is_enabled():
-            return "prefetch_disabled"
+            return False
         if _repo_id(ctx) is None:
             logger.info(
                 f"[Worker {ctx.global_rank}] No Hugging Face repo id for "
                 f"{ctx.identity.model_name!r}, skipping server cache"
             )
-            return "no_repo_id"
-        return None
+            return False
+        return True
 
     def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
         """Stream the weights into the resolved snapshot, then load natively.

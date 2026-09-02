@@ -20,23 +20,20 @@ class GdsStrategy(LoadStrategy):
     name = "gds"
     requires = (EngineAdapter.apply_weight_iter,)
 
-    def skip_reason(self, ctx: LoadContext) -> str | None:
-        base = super().skip_reason(ctx)
-        if base is not None:
-            return base
+    def is_available(self, ctx: LoadContext) -> bool:
+        if not super().is_available(ctx):
+            return False
         if not ctx.accelerator_backend.supports_gds():
             logger.info(
                 f"[Worker {ctx.global_rank}] GDS not supported on "
                 f"{ctx.accelerator_backend.name}, skipping"
             )
-            return "accelerator_unsupported"
-
+            return False
         from ..gds_transfer import is_gds_available
-
-        if not is_gds_available():
+        available = is_gds_available()
+        if not available:
             logger.info(f"[Worker {ctx.global_rank}] GDS not available, skipping")
-            return "driver_unavailable"
-        return None
+        return available
 
     def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
         result = _as_load_result(result)
