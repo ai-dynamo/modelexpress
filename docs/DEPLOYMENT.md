@@ -632,7 +632,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_ARENA_SINGLE_MR` | `0` | Keep single-MR arena registration even when the arena spans several `cuMemCreate` handles. Only safe on transports that can register across handles (dmabuf/IB); cuda_ipc cannot, so the default falls back to per-tensor registration. See [VMM Arena](#vmm-arena-single-mr-registration). |
 | `UCX_CUDA_COPY_REG_WHOLE_ALLOC` | (UCX default) | Set to `off` with `MX_VMM_ARENA=1` on any UCX predating the `cuda_copy_md` length-truncation fix (openucx/ucx#11461). Scoped to the `cuda_copy` transport; it does not affect `cuda_ipc`. |
 | `MX_NIXL_BACKEND` | `UCX` | NIXL backend for GPU-to-GPU RDMA. `UCX` (default) for InfiniBand / RoCE. `LIBFABRIC` for AWS EFA — see [NIXL Backend Selection](#nixl-backend-selection). |
-| `MX_RDMA_NIC_PIN` | (unset) | Per-rank IB NIC pinning. `auto` runs a topology probe; comma-separated NIC list is an explicit override. Workaround for openucx/ucx#11259. |
+| `MX_RDMA_NIC_PIN` | (unset) | Per-rank IB NIC pinning. `auto` runs a topology probe; comma-separated NIC list is an explicit override. Addresses both openucx/ucx#11259 and rail convergence, the latter measured at 4.45x on an under-provisioned pod. |
 | `MX_RDMA_NIC_PIN_MIN_RATE_GBPS` | (auto, max-rate filter) | Override the auto-detect rate filter with an explicit lower bound (Gb/s). |
 | `MX_UCX_DISABLE_MEM_EVENTS` | `0` | Opt-in. `1` sets `UCX_MEM_EVENTS=n` before NIXL agent creation on the UCX backend (no-op on `LIBFABRIC`), which roughly halves NIXL agent creation time by skipping UCX's mem-hook / VM-unmap tracking. Off by default because the effect is process-wide and permanent: `UCX_MEM_EVENTS` backs registration-cache invalidation for every UCP context in the process, not just ModelExpress's, so this is only safe when the process owns UCX exclusively for ModelExpress transfers. Never overrides an operator-set `UCX_MEM_EVENTS`. UCX reads this option in a shared-library constructor, so if UCX was already loaded elsewhere in the process before agent creation, setting it here can be a no-op. |
 | `MODEL_EXPRESS_LOG_LEVEL` | (inherits vLLM) | Override log level for `modelexpress.*` loggers. `DEBUG` enables per-tensor checksums and adopted tensor details |
@@ -675,21 +675,84 @@ NIXL agent 'mx-auto-worker0-...' created on device 0 (backend=LIBFABRIC)
 
 ### NIC Pinning (UCX Workaround)
 
-`MX_RDMA_NIC_PIN=auto` works around
+`MX_RDMA_NIC_PIN=auto` addresses two things.
+
+The first is
 [openucx/ucx#11259](https://github.com/openucx/ucx/issues/11259), where
 UCX may pick a NIC on a different NUMA node from a worker's GPU when
 the IB device pool spans multiple NUMA domains; the resulting CUDA
 RDMA traffic crosses the CPU interconnect and loses bandwidth.
 
-The probe runs at worker startup, walks PCIe sysfs, and sets
-`UCX_NET_DEVICES` to a single NUMA-local NIC per worker before the
-NIXL agent is constructed. Same affinity metric as
-`nvidia-smi topo -m` (PIX > PXB > NODE > SYS).
+The second is **rail convergence**, which is the one measured to cost
+real throughput. UCX picks a NIC per process without knowing what the
+other ranks on the host picked. On an under-provisioned pod — fewer
+usable rails than GPUs, or rails allocated on the wrong socket — every
+rank independently makes the same locally-correct choice and they all
+land on one adapter. Measured on such a pod, with four inference GPUs
+and only one allocated rail on their NUMA node:
 
-Recommended on multi-GPU hosts where the IB pool spans NUMA. Leave
-unset on single-NUMA hosts or when you manage `UCX_NET_DEVICES` per
-rank externally. Once the upstream UCX fix lands and a patched UCX
-is deployed, drop this env var.
+| | per reader | aggregate |
+|---|---|---|
+| all four on one rail | 1.5 GB/s | 6.1 GB/s |
+| one reader per rail | 6.75 GB/s | 27.0 GB/s |
+
+Aggregate with four readers sharing was *lower* than a single reader
+alone (26.1 GB/s), so throughput is destroyed rather than divided.
+Nothing in the refit telemetry dissents: byte counts, descriptor counts
+and coverage are all exact. Pair this with `MX_RESHARD_MIN_GBPS` so a
+collapse is reported rather than inferred.
+
+The probe runs at worker startup, walks PCIe sysfs, and computes a
+**host-wide** GPU-to-NIC assignment — every rank derives the same map from
+the same sysfs snapshot, so no coordination is needed — then sets
+`UCX_NET_DEVICES` for its own rank before the NIXL agent is constructed.
+Ranking is rail distinctness first, then PCIe depth, then NUMA locality.
+
+The GPU set comes from the PCI listing rather than from
+`torch.cuda.device_count()`, so it is the same in every rank regardless of
+how the workers were launched. That distinction is load-bearing: NeMo-RL
+and prime-RL give each worker its own `CUDA_VISIBLE_DEVICES`, and a map
+built from the visible set would have each rank see one GPU, count from
+zero, and pick the same rail as all of its peers — the convergence the
+probe exists to prevent.
+
+One case it cannot solve alone: if the container is device-isolated so
+that only one GPU appears in the PCI listing too, there is nothing to
+spread across. The probe logs a warning naming that condition rather than
+reporting a one-entry map as a success; set `UCX_NET_DEVICES` or
+`MX_RDMA_NIC_PIN` explicitly for those ranks.
+
+PCIe depth is the shared-prefix length of the two devices' sysfs paths.
+It separates PIX from everything else, but it cannot separate NODE from
+SYS: the root complex appears in the path as `pci0000:97`, which is
+filtered out as not BDF-shaped, so two devices on the same root complex
+but different root ports score 0 exactly as two devices on opposite
+sockets do. The NUMA term breaks the ties that leaves, which on an
+under-provisioned pod is most of them — on the measured node, 15 of 16
+GPU-rail pairs tied at 0.
+
+Distinctness leads deliberately. On that pod, sharing a rail cost 4.45x
+while crossing a socket cost nothing measurable (6.745 GB/s on the
+affine rail against 6.747 on cross-socket ones), so ranking NUMA
+locality higher trades a large loss for an unmeasurable gain. When rails
+are adequately provisioned, one PIX rail per GPU, distinctness changes
+nothing and each GPU still gets its closest NIC.
+
+Recommended on any multi-GPU host, not only where the pool spans NUMA:
+convergence is possible whenever ranks outnumber usable rails. Leave
+unset when you manage `UCX_NET_DEVICES` per rank externally. Note the
+upstream UCX fix addresses only the affinity half; the convergence half
+needs a component that can see all ranks at once, so this probe remains
+useful after it lands.
+
+**Provisioning matters more than this flag, and co-tenancy drives
+provisioning.** On the measured node the bad rail set was a leftover: 8
+rails total, a co-tenant pod holding 4, and the 4 remaining were 3 on the
+far socket plus 1 affine rail. Requesting more rails does not fix that —
+it fails to schedule while the co-tenant is resident. What is needed is
+for GPUs to be co-scheduled with their affine rails. The probe makes the
+best of the rails a pod holds; it cannot conjure one that was never
+allocated.
 
 `MX_RDMA_NIC_PIN_MIN_RATE_GBPS` overrides the default max-rate filter
 for clusters with multiple rate tiers in the compute fabric.
