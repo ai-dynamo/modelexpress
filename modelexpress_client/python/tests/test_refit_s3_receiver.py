@@ -3,7 +3,9 @@
 
 import json
 import threading
+from contextlib import contextmanager
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 import safetensors.numpy
@@ -45,6 +47,9 @@ class _MemoryS3:
             self.fail_key_once = None
             raise OSError("injected shard download failure")
         return self.objects[uri]
+
+    def size(self, uri):
+        return len(self.objects[uri])
 
     def close(self):
         pass
@@ -106,6 +111,7 @@ class _S3Backend:
         self.put_request = None
         self.get_request = None
         self.get_requests = []
+        self.head_request = None
         self.completed = None
         self.aborted = False
 
@@ -118,6 +124,10 @@ class _S3Backend:
         self.get_request = request
         self.get_requests.append(request)
         return {"Body": _Body(self.data)}
+
+    def head_object(self, **request):
+        self.head_request = request
+        return {"ContentLength": len(self.data)}
 
     def create_multipart_upload(self, **request):
         assert request == {"Bucket": "weights", "Key": "delta"}
@@ -197,6 +207,18 @@ def test_s3_read_parses_uri():
     s3._download_manager = _TransferManager(backend, None)
     assert s3.get("s3://weights/root.json") == data
     assert backend.get_request == {
+        "Bucket": "weights",
+        "Key": "root.json",
+    }
+
+
+def test_s3_size_reads_object_content_length():
+    backend = _S3Backend(b"canonical-root")
+    s3 = object.__new__(S3Client)
+    s3._client = backend
+
+    assert s3.size("s3://weights/root.json") == len(b"canonical-root")
+    assert backend.head_request == {
         "Bucket": "weights",
         "Key": "root.json",
     }
@@ -449,7 +471,13 @@ def _full_inputs(*, version="full-a", version_label=2):
     )
 
 
-def _build(monkeypatch, tmp_path, objects, launch_tensors=None):
+def _build(
+    monkeypatch,
+    tmp_path,
+    objects,
+    launch_tensors=None,
+    checkpoint_max_size_gb=500,
+):
     launch = tmp_path / "launch"
     launch.mkdir(exist_ok=True)
     save_file(
@@ -465,9 +493,49 @@ def _build(monkeypatch, tmp_path, objects, launch_tensors=None):
             initial_base_version_id="base-a",
             seed_checkpoint_path=launch,
             refit_checkpoint_dir=tmp_path / "cache",
+            refit_checkpoint_max_size_gb=checkpoint_max_size_gb,
         ),
     )
     return adapter, storage
+
+
+@pytest.mark.parametrize("max_size_gb", [0, -1])
+def test_object_storage_generator_config_rejects_nonpositive_cache_quota(
+    tmp_path, max_size_gb
+):
+    with pytest.raises(ValueError, match="must be positive"):
+        ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="base-a",
+            seed_checkpoint_path=tmp_path / "launch",
+            refit_checkpoint_dir=tmp_path / "cache",
+            refit_checkpoint_max_size_gb=max_size_gb,
+        )
+
+
+def test_object_storage_generator_config_converts_cache_quota_to_bytes(
+    monkeypatch, tmp_path
+):
+    adapter, _storage = _build(
+        monkeypatch,
+        tmp_path,
+        {},
+        checkpoint_max_size_gb=2,
+    )
+
+    assert adapter._checkpoint.store.max_size_bytes == 2_000_000_000
+    adapter.close()
+
+
+def test_object_storage_generator_config_defaults_cache_quota(tmp_path):
+    config = ObjectStorageGeneratorConfig(
+        storage_type=ObjectStorageType.S3,
+        initial_base_version_id="base-a",
+        seed_checkpoint_path=tmp_path / "launch",
+        refit_checkpoint_dir=tmp_path / "cache",
+    )
+
+    assert config.refit_checkpoint_max_size_gb == 500
 
 
 def test_reset_initial_checkpoint_transitions_updating_to_ready(monkeypatch, tmp_path):
@@ -503,6 +571,36 @@ def test_reset_initial_checkpoint_transitions_updating_to_ready(monkeypatch, tmp
     assert files["model.safetensors"][0] > 0
     assert files["model.safetensors"][1] > 0
     assert state == {"status": "READY", "version": "base-a"}
+    adapter.close()
+
+
+def test_canonical_s3_rejects_checkpoint_that_exceeds_cache_quota(
+    monkeypatch, tmp_path
+):
+    objects = _full_artifact(torch.tensor([7.0, 8.0]))
+    adapter, _storage = _build(monkeypatch, tmp_path, objects)
+    store = adapter._checkpoint.store
+    store.max_size_bytes = store.cache_size_bytes()
+
+    with pytest.raises(
+        checkpoint_store_module.CheckpointCacheCapacityError,
+        match="checkpoint cache quota",
+    ):
+        adapter.stage_weight(_full_inputs())
+
+    assert store.active_version() == "base-a"
+    assert store.full_path("base-a").exists()
+    assert not store.full_path("full-a").exists()
+
+    state = store.state()
+    assert state is not None
+    assert state["status"] == "READY"
+    assert state["version"] == "base-a"
+
+    store.max_size_bytes = None
+    staged = adapter.stage_weight(_full_inputs())
+    assert staged.path == store.full_path("full-a")
+    adapter.release_staged_weight(staged)
     adapter.close()
 
 
@@ -726,7 +824,9 @@ def test_canonical_s3_failed_install_keeps_previous_active_version(
     adapter.close()
 
 
-def test_canonical_s3_replays_the_resolved_delta_chain(monkeypatch, tmp_path):
+def test_canonical_s3_applies_one_delta_to_the_active_checkpoint(
+    monkeypatch, tmp_path
+):
     base = torch.tensor([1.0, 2.0])
     middle = torch.tensor([3.0, 4.0])
     target = torch.tensor([5.0, 6.0])
@@ -739,6 +839,16 @@ def test_canonical_s3_replays_the_resolved_delta_chain(monkeypatch, tmp_path):
     first = adapter.stage_weight(_inputs(None))
     adapter.apply_weight(first)
     adapter.release_staged_weight(first)
+    first_materialized = adapter._checkpoint.store.materialized_path("target-a")
+    apply_shards = adapter._checkpoint._apply_shards
+    apply_calls = 0
+
+    def track_apply(shards):
+        nonlocal apply_calls
+        apply_calls += 1
+        apply_shards(shards)
+
+    monkeypatch.setattr(adapter._checkpoint, "_apply_shards", track_apply)
     objects.update(
         _artifact(
             middle.view(torch.uint8).numpy(),
@@ -767,6 +877,8 @@ def test_canonical_s3_replays_the_resolved_delta_chain(monkeypatch, tmp_path):
     assert torch.equal(
         load_file(second.path / "model.safetensors")["weight"], target
     )
+    assert apply_calls == 1
+    assert first_materialized.exists()
     assert torch.equal(
         load_file(
             adapter._checkpoint.store.full_cache
@@ -775,8 +887,114 @@ def test_canonical_s3_replays_the_resolved_delta_chain(monkeypatch, tmp_path):
         )["weight"],
         base,
     )
+    adapter.apply_weight(second)
+
+    assert first_materialized.exists()
+    assert second.path.exists()
     adapter.release_staged_weight(second)
     adapter.close()
+
+
+def test_installation_fence_blocks_prepare_until_activation(monkeypatch, tmp_path):
+    objects = _full_artifact(torch.tensor([7.0, 8.0]))
+    objects.update(
+        _full_artifact(
+            torch.tensor([9.0, 10.0]),
+            version_label=3,
+        )
+    )
+    first, storage = _build(monkeypatch, tmp_path, objects)
+    second = _Adapter(
+        model_name="test/model",
+        config=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="base-a",
+            seed_checkpoint_path=tmp_path / "launch",
+            refit_checkpoint_dir=tmp_path / "cache",
+        ),
+    )
+    first_staged = first.stage_weight(_full_inputs())
+    original_locked = first._checkpoint.store.locked
+    shared_lock_released = threading.Event()
+    allow_activation = threading.Event()
+
+    @contextmanager
+    def pause_after_shared_lock(*, shared=False):
+        with original_locked(shared=shared):
+            yield
+        if shared:
+            shared_lock_released.set()
+            assert allow_activation.wait(timeout=5)
+
+    monkeypatch.setattr(first._checkpoint.store, "locked", pause_after_shared_lock)
+    prepare_fence_entered = threading.Event()
+    installation_locked = second._checkpoint.store.installation_locked
+
+    @contextmanager
+    def track_installation_fence(*, shared=False):
+        if not shared:
+            prepare_fence_entered.set()
+        with installation_locked(shared=shared):
+            yield
+
+    monkeypatch.setattr(
+        second._checkpoint.store,
+        "installation_locked",
+        track_installation_fence,
+    )
+    install_errors = []
+
+    def install():
+        try:
+            with first._method.installation_context(first._active):
+                pass
+        except BaseException as error:
+            install_errors.append(error)
+
+    install_thread = threading.Thread(target=install)
+    install_thread.start()
+    assert shared_lock_released.wait(timeout=5)
+
+    download_started = threading.Event()
+    prepare_errors = []
+    second_staged = []
+    get = storage.get
+
+    def track_get(uri):
+        if "/v3/" in uri:
+            download_started.set()
+        return get(uri)
+
+    storage.get = track_get
+
+    def prepare():
+        try:
+            second_staged.append(
+                second.stage_weight(
+                    _full_inputs(version="full-b", version_label=3)
+                )
+            )
+        except BaseException as error:
+            prepare_errors.append(error)
+
+    prepare_thread = threading.Thread(target=prepare)
+    prepare_thread.start()
+    assert prepare_fence_entered.wait(timeout=5)
+    assert not download_started.wait(timeout=0.1)
+
+    allow_activation.set()
+    install_thread.join(timeout=5)
+    prepare_thread.join(timeout=5)
+
+    assert not install_thread.is_alive()
+    assert not prepare_thread.is_alive()
+    assert install_errors == []
+    assert prepare_errors == []
+    assert download_started.is_set()
+    first.release_staged_weight(first_staged)
+    second.release_staged_weight(second_staged[0])
+    first.close()
+    second.close()
 
 
 def test_canonical_s3_reuses_an_immutable_full_artifact_after_restart(
@@ -912,8 +1130,11 @@ def test_canonical_s3_downloads_full_shards_concurrently(
     )
     monkeypatch.setenv("MX_S3_DOWNLOAD_WORKERS", "2")
     download_barrier = threading.Barrier(2)
+    write_barrier = threading.Barrier(2)
     download_threads = set()
+    write_threads = set()
     get = storage.get
+    write_bytes = Path.write_bytes
 
     def track_get(uri):
         if uri.endswith(".safetensors"):
@@ -923,9 +1144,18 @@ def test_canonical_s3_downloads_full_shards_concurrently(
 
     storage.get = track_get
 
+    def track_write(path, data):
+        if path.name in filenames:
+            write_threads.add(threading.get_ident())
+            write_barrier.wait(timeout=5)
+        return write_bytes(path, data)
+
+    monkeypatch.setattr(Path, "write_bytes", track_write)
+
     staged = adapter.stage_weight(_full_inputs())
 
     assert len(download_threads) == 2
+    assert len(write_threads) == 2
     assert torch.equal(load_file(staged.path / filenames[0])["a"], target["a"])
     assert torch.equal(load_file(staged.path / filenames[1])["b"], target["b"])
     assert not (adapter._checkpoint.store.full_cache / "full-a.tmp").exists()
@@ -1119,7 +1349,7 @@ def test_canonical_s3_full_download_failure_leaves_checkpoint_updating(
         load_file(adapter._checkpoint.local_checkpoint / "model.safetensors")["weight"],
         torch.tensor([1.0, 2.0]),
     )
-    assert not (adapter._checkpoint.store.cache / "checkpoint.tmp").exists()
+    assert not (adapter._checkpoint.store.full_cache / "full-a.tmp").exists()
 
     with pytest.raises(RuntimeError, match="update is incomplete"):
         adapter.stage_weight(_full_inputs())

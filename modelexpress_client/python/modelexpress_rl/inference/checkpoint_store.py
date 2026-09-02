@@ -22,6 +22,10 @@ class CheckpointState(str, Enum):
     UPDATING = "UPDATING"
 
 
+class CheckpointCacheCapacityError(RuntimeError):
+    """The protected cache working set cannot admit an incoming write."""
+
+
 def checkpoint_files_state(
     paths: Iterable[Path],
 ) -> dict[str, list[int]]:
@@ -53,6 +57,7 @@ class LocalCheckpointStore:
         *,
         root: str | Path,
         model_name: str,
+        max_size_bytes: int | None = None,
     ) -> None:
         # Per-model cache layout:
         #
@@ -64,6 +69,7 @@ class LocalCheckpointStore:
         #     state.json                current preparation transaction
         #     active.json               version committed after engine install
         #     .lock                     cross-process cache coordination
+        #     .install.lock             blocks preparation during engine install
         #
         # Full checkpoints, deltas, and chain manifests are the canonical
         # lineage. Materialized checkpoints are rebuildable outputs for engines
@@ -78,6 +84,8 @@ class LocalCheckpointStore:
         self.state_path = self.cache / "state.json"
         self.active_path = self.cache / "active.json"
         self.lock_path = self.cache / ".lock"
+        self.install_lock_path = self.cache / ".install.lock"
+        self.max_size_bytes = max_size_bytes
 
     def initialize(self) -> None:
         self.cache.mkdir(parents=True, exist_ok=True)
@@ -90,11 +98,17 @@ class LocalCheckpointStore:
             path.mkdir(exist_ok=True)
 
     @contextmanager
-    def locked(self, *, shared: bool = False) -> Iterator[None]:
-        with self.lock_path.open("a+") as handle:
+    def _locked(self, path: Path, shared: bool) -> Iterator[None]:
+        with path.open("a+") as handle:
             operation = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
             fcntl.flock(handle, operation)
             yield
+
+    def locked(self, *, shared: bool = False):
+        return self._locked(self.lock_path, shared=shared)
+
+    def installation_locked(self, *, shared: bool = False):
+        return self._locked(self.install_lock_path, shared=shared)
 
     @contextmanager
     def replace_directory(
@@ -132,6 +146,145 @@ class LocalCheckpointStore:
 
     def chain_path(self, version: str) -> Path:
         return self.chain_cache / f"{quote(version, safe='')}.json"
+
+    @staticmethod
+    def path_size_bytes(path: Path) -> int:
+        if path.is_file():
+            return path.stat().st_size
+        if not path.is_dir():
+            return 0
+        return sum(file.stat().st_size for file in path.rglob("*") if file.is_file())
+
+    @staticmethod
+    def _payload_size_bytes(path: Path) -> int:
+        if path.is_file():
+            return 0 if path.name == ".source.json" else path.stat().st_size
+        if not path.is_dir():
+            return 0
+        return sum(
+            file.stat().st_size
+            for file in path.rglob("*")
+            if file.is_file() and file.name != ".source.json"
+        )
+
+    def cache_size_bytes(self) -> int:
+        return sum(
+            self._payload_size_bytes(root)
+            for root in (
+                self.full_cache,
+                self.delta_cache,
+                self.materialized_cache,
+            )
+        )
+
+    def _protected_paths(self, versions: Iterable[str]) -> set[Path]:
+        protected: set[Path] = set()
+        for version in versions:
+            protected.update(
+                {
+                    self.chain_path(version),
+                    self.full_path(version),
+                    self.delta_path(version),
+                    self.materialized_path(version),
+                }
+            )
+            chain = self.chain(version)
+            if chain is None:
+                continue
+            full_version = chain.get("full_version")
+            if isinstance(full_version, str):
+                protected.add(self.full_path(full_version))
+            deltas = chain.get("deltas")
+            if isinstance(deltas, list):
+                protected.update(
+                    self.delta_path(delta) for delta in deltas if isinstance(delta, str)
+                )
+        return protected
+
+    def _eviction_candidates(self, protected: set[Path]) -> list[Path]:
+        groups = (
+            self.materialized_cache,
+            self.delta_cache,
+            self.full_cache,
+        )
+        candidates: list[Path] = []
+        for root in groups:
+            candidates.extend(
+                sorted(
+                    (path for path in root.iterdir() if path not in protected),
+                    key=lambda path: path.stat().st_mtime_ns,
+                )
+            )
+        return candidates
+
+    def _remove_orphaned_chain(self, encoded_version: str) -> None:
+        if any(
+            (root / encoded_version).exists()
+            for root in (
+                self.full_cache,
+                self.delta_cache,
+                self.materialized_cache,
+            )
+        ):
+            return
+        (self.chain_cache / f"{encoded_version}.json").unlink(missing_ok=True)
+
+    def ensure_capacity(
+        self,
+        additional_bytes: int,
+        *,
+        protected_versions: Iterable[str] = (),
+        protected_paths: Iterable[Path] = (),
+    ) -> None:
+        """Evict stale entries before adding bytes, or reject the write."""
+        if additional_bytes < 0:
+            raise ValueError("additional_bytes must not be negative")
+
+        size = self.cache_size_bytes()
+        protected = self._protected_paths(protected_versions)
+        protected.update(protected_paths)
+
+        def has_capacity() -> bool:
+            quota_available = (
+                self.max_size_bytes is None
+                or size + additional_bytes <= self.max_size_bytes
+            )
+            return (
+                quota_available
+                and shutil.disk_usage(self.cache).free >= additional_bytes
+            )
+
+        for candidate in self._eviction_candidates(protected):
+            if has_capacity():
+                break
+            freed_bytes = self._payload_size_bytes(candidate)
+            if candidate.is_dir():
+                shutil.rmtree(candidate)
+            else:
+                candidate.unlink()
+            self._remove_orphaned_chain(candidate.name)
+            size -= freed_bytes
+
+        if not has_capacity():
+            reasons = []
+            if (
+                self.max_size_bytes is not None
+                and size + additional_bytes > self.max_size_bytes
+            ):
+                reasons.append(
+                    f"checkpoint cache quota of {self.max_size_bytes} bytes cannot "
+                    f"accommodate {additional_bytes} additional bytes"
+                )
+            free_bytes = shutil.disk_usage(self.cache).free
+            if free_bytes < additional_bytes:
+                reasons.append(
+                    f"checkpoint cache filesystem has {free_bytes} bytes free but "
+                    f"requires {additional_bytes} bytes"
+                )
+            raise CheckpointCacheCapacityError("; ".join(reasons))
+
+    def enforce_capacity(self, *, protected_versions: Iterable[str] = ()) -> None:
+        self.ensure_capacity(0, protected_versions=protected_versions)
 
     @staticmethod
     def _write_json(path: Path, value: dict[str, object]) -> None:
@@ -230,6 +383,7 @@ class LocalCheckpointStore:
 
 
 __all__ = [
+    "CheckpointCacheCapacityError",
     "CheckpointState",
     "LocalCheckpointStore",
     "checkpoint_files_state",

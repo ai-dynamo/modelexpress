@@ -178,6 +178,7 @@ response = requests.post(
             "initial_base_version_id": "v0",
             "seed_checkpoint_path": "/models/Qwen3-30B-A3B",
             "refit_checkpoint_dir": "/var/cache/modelexpress",
+            "refit_checkpoint_max_size_gb": 500,
             "object_storage_region_name": "us-west-2",
             "max_transfer_attempts": 3,
             "rpc_timeout_seconds": 30,
@@ -211,19 +212,23 @@ and activation state.
 
 `full/<version>/` and `deltas/<version>/` contain canonical immutable artifacts.
 `chains/<version>.json` resolves a version to one full checkpoint plus its
-ordered deltas. For a delta target, ModelExpress reconstructs a complete,
-version-scoped checkpoint under `materialized/<version>/`; current vLLM and
-SGLang installers consume that ordinary checkpoint directory. Materializations
-are derived cache entries and can be rebuilt from the canonical lineage.
+ordered deltas. For a delta target, ModelExpress copies the exact active
+checkpoint and applies only the incoming delta into `materialized/<version>/`;
+current vLLM and SGLang installers consume that ordinary checkpoint directory.
+Previous materializations remain cached until capacity pressure evicts them.
+Materializations are derived and can be rebuilt from the canonical lineage.
 
 `state.json` records whether preparation is `READY` or `UPDATING` and protects
 against interrupted writes. `active.json` changes only after engine installation
 succeeds, so a failed download, reconstruction, or install retains the previous
-active version. The file lock coordinates co-located ranks that share the cache.
+active version. The cache lock coordinates artifact mutations. The installation
+lock is held shared by concurrent co-located installers and exclusively by
+preparation, preventing another preparation from entering before activation.
 
 ```text
 <refit_checkpoint_dir>/<URL-quoted-vLLM-model-path-or-ID>/
   .lock
+  .install.lock
   active.json
   state.json
   full/
@@ -292,16 +297,23 @@ The corresponding generator configuration would use:
 ```json
 {
   "seed_checkpoint_path": "/root/.cache/huggingface/hub/models--ORG--MODEL/snapshots/SNAPSHOT_ID",
-  "refit_checkpoint_dir": "/var/cache/modelexpress"
+  "refit_checkpoint_dir": "/var/cache/modelexpress",
+  "refit_checkpoint_max_size_gb": 500
 }
 ```
 
-Capacity must cover retained full checkpoints and deltas plus the derived
-materialization being installed. ModelExpress does not yet delete canonical
-lineage artifacts automatically; provision storage or manage retention outside
-the active cache. On initialization, the configured seed is restored as the
-initial full artifact and becomes the active version. Previously downloaded
-version artifacts remain reusable when their source identity matches.
+`refit_checkpoint_max_size_gb` is a positive per-model quota in decimal
+gigabytes (`1 GB = 1,000,000,000 bytes`) for payload files under `full/`,
+`deltas/`, and `materialized/`. It defaults to 500 GB; set it to `null` to
+disable the configured quota.
+ModelExpress also checks available filesystem space before known writes and
+copies. It evicts stale derived materializations before stale canonical
+artifacts, but never evicts the active lineage or the checkpoint being prepared
+or installed. Capacity must therefore cover the active checkpoint plus the
+rollback-safe working set for one update. A capacity rejection preserves the
+active checkpoint as READY so a later update can retry. On initialization, the
+configured seed is restored as the initial full artifact and becomes the active
+version.
 
 #### Initialization behavior
 
@@ -426,4 +438,5 @@ instead create a `FULL_HF_CHECKPOINT` version without `base_version_id`; that
 version becomes the exact base for the following delta. Full checkpoint batches
 carry per-tensor Adler-32 checksums and are retained as an immutable full
 artifact. XOR deltas require `compression_format="zstd"` and are replayed in
-order into a version-scoped materialized checkpoint.
+order in the canonical lineage; each preparation applies only the incoming
+delta to its exact active base.

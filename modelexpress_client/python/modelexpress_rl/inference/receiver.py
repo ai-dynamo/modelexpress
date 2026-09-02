@@ -21,6 +21,7 @@ import numpy as np
 
 from modelexpress_rl import envs as rl_envs
 from modelexpress_rl.inference.checkpoint_store import (
+    CheckpointCacheCapacityError,
     CheckpointState,
     LocalCheckpointStore,
     checkpoint_files_state,
@@ -35,6 +36,9 @@ from modelexpress_rl.utils import (
     threadpool_map,
 )
 
+_BYTES_PER_GB = 1_000_000_000
+DEFAULT_REFIT_CHECKPOINT_MAX_SIZE_GB = 500
+
 
 @dataclass(frozen=True)
 class ObjectStorageGeneratorConfig:
@@ -44,6 +48,7 @@ class ObjectStorageGeneratorConfig:
     initial_base_version_id: str
     seed_checkpoint_path: str | Path
     refit_checkpoint_dir: str | Path
+    refit_checkpoint_max_size_gb: int | None = DEFAULT_REFIT_CHECKPOINT_MAX_SIZE_GB
     endpoint_url: str | None = None
     region_name: str | None = None
 
@@ -56,6 +61,11 @@ class ObjectStorageGeneratorConfig:
             raise ValueError("seed_checkpoint_path is required")
         if not str(self.refit_checkpoint_dir).strip():
             raise ValueError("refit_checkpoint_dir is required")
+        if (
+            self.refit_checkpoint_max_size_gb is not None
+            and self.refit_checkpoint_max_size_gb <= 0
+        ):
+            raise ValueError("refit_checkpoint_max_size_gb must be positive")
 
 
 class ReceiverInstallError(RuntimeError):
@@ -155,6 +165,11 @@ class _LocalCheckpoint:
         self.store = LocalCheckpointStore(
             root=config.refit_checkpoint_dir,
             model_name=model_name,
+            max_size_bytes=(
+                config.refit_checkpoint_max_size_gb * _BYTES_PER_GB
+                if config.refit_checkpoint_max_size_gb is not None
+                else None
+            ),
         )
         self.local_checkpoint = self.store.full_path(self.initial_version)
         self.checkpoint_paths: list[Path] = []
@@ -164,7 +179,7 @@ class _LocalCheckpoint:
 
     def initialize(self) -> None:
         self.store.initialize()
-        with self.store.locked():
+        with self.store.installation_locked(), self.store.locked():
             self.local_checkpoint = self.store.full_path(self.initial_version)
             state = self.store.state()
             reusable = (
@@ -190,6 +205,9 @@ class _LocalCheckpoint:
             if not reusable:
                 self.reset_initial_checkpoint()
             self.store.activate(self.initial_version)
+            self.store.enforce_capacity(
+                protected_versions={self.initial_version},
+            )
 
     def _set_local_checkpoint(self, path: Path) -> None:
         self.local_checkpoint = path
@@ -202,6 +220,11 @@ class _LocalCheckpoint:
     def reset_initial_checkpoint(self) -> None:
         """Restore the immutable initial full checkpoint from the launch seed."""
         state = self.store.state()
+        target = self.store.full_path(self.initial_version)
+        self.store.ensure_capacity(
+            self.store.path_size_bytes(self.seed_checkpoint_path),
+            protected_versions={self.initial_version},
+        )
         self.store.write_state(
             status=CheckpointState.UPDATING,
             version=(
@@ -211,7 +234,6 @@ class _LocalCheckpoint:
             ),
             checkpoint_paths=self.checkpoint_paths,
         )
-        target = self.store.full_path(self.initial_version)
         with self.store.replace_directory(target) as temporary:
             if self.seed_checkpoint_path.is_file():
                 shutil.copy2(
@@ -245,7 +267,7 @@ class _LocalCheckpoint:
         )
 
     def prepare(self, version: _S3Version) -> PreparedCheckpoint:
-        with self.store.locked():
+        with self.store.installation_locked(), self.store.locked():
             state = self.store.state()
             if state is None:
                 raise RuntimeError("local checkpoint state is missing")
@@ -263,6 +285,9 @@ class _LocalCheckpoint:
 
             # The requested immutable artifact was already prepared.
             if state["version"] == version.version_id:
+                self.store.enforce_capacity(
+                    protected_versions={active_version, version.version_id},
+                )
                 self.store.verify_artifact_source(
                     self._artifact_path(version),
                     _source_identity(version),
@@ -298,10 +323,25 @@ class _LocalCheckpoint:
                 checkpoint_paths=self.checkpoint_paths,
             )
 
-            if version.payload_format is WeightPayloadFormat.XOR_DELTA:
-                download_time, apply_time = self._prepare_delta(version, index_data)
-            else:
-                download_time, apply_time = self._prepare_full(version, index_data)
+            try:
+                if version.payload_format is WeightPayloadFormat.XOR_DELTA:
+                    download_time, apply_time = self._prepare_delta(
+                        version, index_data
+                    )
+                else:
+                    download_time, apply_time = self._prepare_full(
+                        version, index_data
+                    )
+            except CheckpointCacheCapacityError:
+                self._set_local_checkpoint(
+                    self.store.checkpoint_path(active_version)
+                )
+                self.store.write_state(
+                    status=CheckpointState.READY,
+                    version=active_version,
+                    checkpoint_paths=self.checkpoint_paths,
+                )
+                raise
 
             self.store.write_state(
                 status=CheckpointState.READY,
@@ -339,12 +379,29 @@ class _LocalCheckpoint:
             elif entry.is_file():
                 shutil.copy2(entry, destination)
 
+    @staticmethod
+    def _non_weight_files_size(source: Path) -> int:
+        if not source.is_dir():
+            return 0
+        return sum(
+            LocalCheckpointStore.path_size_bytes(entry)
+            for entry in source.iterdir()
+            if not entry.name.endswith(".safetensors")
+            and not entry.name.endswith(".safetensors.index.json")
+        )
+
     def _prepare_full(
         self, version: _S3Version, index_data: bytes
     ) -> tuple[float, float]:
         weight_map = _parse_full_checkpoint_manifest(index_data)
         target = self.store.full_path(version.version_id)
         if target.exists():
+            self.store.enforce_capacity(
+                protected_versions={
+                    self.store.active_version(),
+                    version.version_id,
+                },
+            )
             self.store.verify_artifact_source(
                 target,
                 _source_identity(version),
@@ -360,6 +417,14 @@ class _LocalCheckpoint:
             )
             return 0.0, 0.0
 
+        protected_versions = {
+            self.store.active_version(),
+            version.version_id,
+        }
+        self.store.ensure_capacity(
+            self._non_weight_files_size(self.seed_checkpoint_path) + len(index_data),
+            protected_versions=protected_versions,
+        )
         with self.store.replace_directory(target) as temporary:
             self._copy_non_weight_files(self.seed_checkpoint_path, temporary)
             index_name = Path(version.uri).name
@@ -368,6 +433,7 @@ class _LocalCheckpoint:
                 target=temporary,
                 weight_map=weight_map,
                 root_uri=version.uri,
+                protected_versions=protected_versions,
             )
             self.store.record_artifact(
                 temporary,
@@ -405,8 +471,16 @@ class _LocalCheckpoint:
                 _source_identity(version),
             )
         else:
+            protected_versions = {
+                self.store.active_version(),
+                version.version_id,
+            }
+            shards = self._download_deltas(weight_map, version.uri)
+            self.store.ensure_capacity(
+                len(index_data) + sum(len(data) for data, _names in shards.values()),
+                protected_versions=protected_versions,
+            )
             with self.store.replace_directory(artifact) as temporary:
-                shards = self._download_deltas(weight_map, version.uri)
                 (temporary / Path(version.uri).name).write_bytes(index_data)
                 for filename, (data, _names) in shards.items():
                     (temporary / filename).write_bytes(data)
@@ -423,32 +497,39 @@ class _LocalCheckpoint:
         }
         target = self.store.materialized_path(version.version_id)
         apply_started = time.perf_counter()
-        full_path = self.store.full_path(chain["full_version"])
-        self.store.verify_artifact(full_path)
+        self.store.verify_artifact(self.store.full_path(chain["full_version"]))
+        for delta_version in base_chain["deltas"]:
+            self.store.verify_artifact(self.store.delta_path(delta_version))
+        base_checkpoint = self.store.checkpoint_path(version.base_version_id)
+        self.store.ensure_capacity(
+            self.store.path_size_bytes(base_checkpoint),
+            protected_versions={
+                self.store.active_version(),
+                version.version_id,
+            },
+        )
         with self.store.replace_directory(
             target,
-            copy_from=full_path,
+            copy_from=base_checkpoint,
         ) as temporary:
             self._set_local_checkpoint(temporary)
-            for delta_version in chain["deltas"]:
-                delta_path = self.store.delta_path(delta_version)
-                self.store.verify_artifact(delta_path)
-                manifests = list(delta_path.glob("*.safetensors.index.json"))
-                if len(manifests) != 1:
-                    raise RuntimeError(
-                        f"cached delta {delta_version!r} has no unique index"
-                    )
-                delta_map, self.decompressor = _parse_delta_manifest(
-                    manifests[0].read_bytes()
+            self.store.verify_artifact(artifact)
+            manifests = list(artifact.glob("*.safetensors.index.json"))
+            if len(manifests) != 1:
+                raise RuntimeError(
+                    f"cached delta {version.version_id!r} has no unique index"
                 )
-                shards = {
-                    filename: (
-                        (delta_path / filename).read_bytes(),
-                        names,
-                    )
-                    for filename, names in _group_tensors_by_shard(delta_map).items()
-                }
-                self._apply_shards(shards)
+            delta_map, self.decompressor = _parse_delta_manifest(
+                manifests[0].read_bytes()
+            )
+            shards = {
+                filename: (
+                    (artifact / filename).read_bytes(),
+                    names,
+                )
+                for filename, names in _group_tensors_by_shard(delta_map).items()
+            }
+            self._apply_shards(shards)
 
         self._set_local_checkpoint(target)
         self.store.write_chain(version.version_id, chain)
@@ -488,6 +569,7 @@ class _LocalCheckpoint:
         target: Path,
         weight_map: dict[str, str],
         root_uri: str,
+        protected_versions: set[str],
     ) -> tuple[float, float]:
         if set(weight_map) != set(self.locations):
             raise ValueError(
@@ -496,6 +578,21 @@ class _LocalCheckpoint:
 
         shard_to_tensors = _group_tensors_by_shard(weight_map)
         parent_uri = root_uri.rsplit("/", 1)[0]
+        workers = min(
+            rl_envs.MX_S3_DOWNLOAD_WORKERS,
+            len(shard_to_tensors),
+        )
+        shard_sizes = threadpool_map(
+            shard_to_tensors,
+            lambda filename: self.s3.size(f"{parent_uri}/{filename}"),
+            max_workers=workers,
+            thread_name_prefix="modelexpress-s3-head-full",
+        )
+        self.store.ensure_capacity(
+            sum(shard_sizes),
+            protected_versions=protected_versions,
+            protected_paths={target},
+        )
 
         def download_and_validate(filename: str) -> tuple[float, float]:
             download_started = time.perf_counter()
@@ -547,10 +644,6 @@ class _LocalCheckpoint:
             (target / filename).write_bytes(data)
             return download_time, time.perf_counter() - validation_started
 
-        workers = min(
-            rl_envs.MX_S3_DOWNLOAD_WORKERS,
-            len(shard_to_tensors),
-        )
         timings = list(
             threadpool_map(
                 shard_to_tensors,
@@ -666,35 +759,40 @@ class _LocalCheckpoint:
 
     @contextmanager
     def installation_context(self, prepared: PreparedCheckpoint):
-        with self.store.locked(shared=True):
-            state = self.store.state()
-            if (
-                state is None
-                or state.get("status") != CheckpointState.READY
-                or state.get("version") != prepared.target_version
-                or state.get("files")
-                != checkpoint_files_state(self.checkpoint_paths)
-            ):
-                raise ReceiverInstallError(
-                    "prepared checkpoint changed before installation"
+        with self.store.installation_locked(shared=True):
+            with self.store.locked(shared=True):
+                state = self.store.state()
+                if (
+                    state is None
+                    or state.get("status") != CheckpointState.READY
+                    or state.get("version") != prepared.target_version
+                    or state.get("files")
+                    != checkpoint_files_state(self.checkpoint_paths)
+                ):
+                    raise ReceiverInstallError(
+                        "prepared checkpoint changed before installation"
+                    )
+                yield
+            with self.store.locked():
+                state = self.store.state()
+                if (
+                    state is None
+                    or state.get("status") != CheckpointState.READY
+                    or state.get("version") != prepared.target_version
+                    or state.get("files")
+                    != checkpoint_files_state(self.checkpoint_paths)
+                ):
+                    raise ReceiverInstallError(
+                        "prepared checkpoint changed during installation"
+                    )
+                self.store.activate(prepared.target_version)
+                self.store.enforce_capacity(
+                    protected_versions={prepared.target_version},
                 )
-            yield
-        with self.store.locked():
-            state = self.store.state()
-            if (
-                state is None
-                or state.get("status") != CheckpointState.READY
-                or state.get("version") != prepared.target_version
-                or state.get("files")
-                != checkpoint_files_state(self.checkpoint_paths)
-            ):
-                raise ReceiverInstallError(
-                    "prepared checkpoint changed during installation"
-                )
-            self.store.activate(prepared.target_version)
 
 
 __all__ = [
+    "DEFAULT_REFIT_CHECKPOINT_MAX_SIZE_GB",
     "PreparedCheckpoint",
     "ReceiverInstallError",
     "ObjectStorageGeneratorConfig",

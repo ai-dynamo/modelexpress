@@ -108,6 +108,7 @@ def test_weight_transfer_engine_parses_vime_object_storage_init_info(monkeypatch
     assert config.object_storage.initial_base_version_id == "base-a"
     assert config.object_storage.seed_checkpoint_path == "/models/launch"
     assert config.object_storage.refit_checkpoint_dir == "/cache/modelexpress"
+    assert config.object_storage.refit_checkpoint_max_size_gb == 500
     assert config.object_storage.endpoint_url == "http://minio:9000"
     assert config.object_storage.region_name == "us-west-2"
 

@@ -22,7 +22,10 @@ from modelexpress_rl.inference.client import (
     ModelExpressGeneratorConfig,
     StagedWeightHandle,
 )
-from modelexpress_rl.inference.receiver import ObjectStorageGeneratorConfig
+from modelexpress_rl.inference.receiver import (
+    DEFAULT_REFIT_CHECKPOINT_MAX_SIZE_GB,
+    ObjectStorageGeneratorConfig,
+)
 from modelexpress_rl.object_storage import ObjectStorageType
 from modelexpress_rl.version import WeightVersionRef
 
@@ -39,6 +42,7 @@ class ModelExpressWeightTransferInitInfo(WeightTransferInitInfo):
     initial_base_version_id: str | None = None
     seed_checkpoint_path: str | None = None
     refit_checkpoint_dir: str | None = None
+    refit_checkpoint_max_size_gb: int | None = DEFAULT_REFIT_CHECKPOINT_MAX_SIZE_GB
     server_url: str | None = None
     object_storage_type: str | None = None
     object_storage_endpoint_url: str | None = None
@@ -137,6 +141,9 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
                 initial_base_version_id=init_info.initial_base_version_id,
                 seed_checkpoint_path=init_info.seed_checkpoint_path,
                 refit_checkpoint_dir=init_info.refit_checkpoint_dir,
+                refit_checkpoint_max_size_gb=(
+                    init_info.refit_checkpoint_max_size_gb
+                ),
                 endpoint_url=init_info.object_storage_endpoint_url,
                 region_name=init_info.object_storage_region_name,
             )

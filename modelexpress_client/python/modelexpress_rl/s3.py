@@ -190,6 +190,11 @@ class S3Client:
         self._download_manager.download(bucket, key, target).result()
         return target.getvalue()
 
+    def size(self, uri: str) -> int:
+        """Return one S3 object's byte size without downloading its payload."""
+        bucket, key = _parse_uri(uri)
+        return int(self._client.head_object(Bucket=bucket, Key=key)["ContentLength"])
+
     def close(self) -> None:
         """Close the underlying SDK client when supported."""
         self._upload_pool.shutdown()

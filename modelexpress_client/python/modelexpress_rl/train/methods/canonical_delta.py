@@ -343,42 +343,14 @@ class CanonicalDeltaPublicationMethod:
 
         local_map: dict[str, str] = {}
         staged.wire_bytes = 0
-        upload_error: Exception | None = None
-        upload_error_message = None
-        try:
-            for batch_map, wire_bytes in threadpool_map(
-                uploads,
-                upload,
-                max_workers=rl_envs.MX_S3_UPLOAD_WORKERS,
-                thread_name_prefix="modelexpress-full-hf-upload",
-            ):
-                local_map.update(batch_map)
-                staged.wire_bytes += wire_bytes
-        except Exception as error:  # noqa: BLE001 - synchronize rank failures.
-            upload_error = error
-            upload_error_message = f"{type(error).__name__}: {error}"
-
-        upload_errors = [None] * self._world_size
-        dist.all_gather_object(
-            upload_errors,
-            upload_error_message,
-            group=self._process_group,
-        )
-        remote_upload_error = next(
-            (
-                (rank, error)
-                for rank, error in enumerate(upload_errors)
-                if error is not None
-            ),
-            None,
-        )
-        if remote_upload_error is not None:
-            if upload_error is not None:
-                raise upload_error
-            rank, error = remote_upload_error
-            raise RuntimeError(
-                f"full HF checkpoint shard publication failed on rank {rank}: {error}"
-            )
+        for batch_map, wire_bytes in threadpool_map(
+            uploads,
+            upload,
+            max_workers=rl_envs.MX_S3_UPLOAD_WORKERS,
+            thread_name_prefix="modelexpress-full-hf-upload",
+        ):
+            local_map.update(batch_map)
+            staged.wire_bytes += wire_bytes
 
         contributions = [None] * self._world_size if self._rank == 0 else None
         dist.gather_object(
@@ -387,47 +359,28 @@ class CanonicalDeltaPublicationMethod:
             dst=0,
             group=self._process_group,
         )
-        index_error: Exception | None = None
-        index_error_message = None
-        if contributions is not None:
-            try:
-                weight_map = {}
-                total_size = 0
-                for rank, rank_map, rank_size in contributions:
-                    total_size += rank_size
-                    for name, shard_name in rank_map.items():
-                        if name in weight_map:
-                            raise RuntimeError(
-                                f"duplicate canonical tensor {name!r} from rank {rank}"
-                            )
-                        weight_map[name] = shard_name
-                index = json.dumps(
-                    {
-                        "metadata": {"total_size": total_size},
-                        "weight_map": weight_map,
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode()
-                self._s3.put(uri=staged.object_storage_uri, data=index)
-            except Exception as error:  # noqa: BLE001 - synchronize rank failures.
-                index_error = error
-                index_error_message = f"{type(error).__name__}: {error}"
+        if contributions is None:
+            return
 
-        index_errors = [None] * self._world_size
-        dist.all_gather_object(
-            index_errors,
-            index_error_message,
-            group=self._process_group,
-        )
-        remote_index_error = next((error for error in index_errors if error), None)
-        if remote_index_error is not None:
-            if index_error is not None:
-                raise index_error
-            raise RuntimeError(
-                "full HF checkpoint index publication failed on rank 0: "
-                f"{remote_index_error}"
-            )
+        weight_map = {}
+        total_size = 0
+        for rank, rank_map, rank_size in contributions:
+            total_size += rank_size
+            for name, shard_name in rank_map.items():
+                if name in weight_map:
+                    raise RuntimeError(
+                        f"duplicate canonical tensor {name!r} from rank {rank}"
+                    )
+                weight_map[name] = shard_name
+        index = json.dumps(
+            {
+                "metadata": {"total_size": total_size},
+                "weight_map": weight_map,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        self._s3.put(uri=staged.object_storage_uri, data=index)
 
     def publish(self, *, version: WeightVersionRef, staged: object) -> None:
         if not isinstance(staged, (StagedCanonicalDelta, StagedFullCheckpoint)):

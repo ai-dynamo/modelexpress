@@ -1,9 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
+
 import pytest
 
 from modelexpress_rl.inference.checkpoint_store import (
+    CheckpointCacheCapacityError,
     CheckpointState,
     LocalCheckpointStore,
 )
@@ -76,3 +79,135 @@ def test_store_rejects_changed_artifacts_and_source_identity(tmp_path):
     shard.write_bytes(b"changed")
     with pytest.raises(ValueError, match="artifact changed"):
         store.verify_artifact(artifact)
+
+
+def test_store_evicts_stale_lineage_without_touching_active_lineage(
+    monkeypatch, tmp_path
+):
+    store = LocalCheckpointStore(root=tmp_path, model_name="test/model")
+    store.initialize()
+
+    active_full = store.full_path("base")
+    active_full.mkdir()
+    (active_full / "weights").write_bytes(b"base")
+    store.record_artifact(active_full)
+    active_delta = store.delta_path("active")
+    active_delta.mkdir()
+    (active_delta / "weights").write_bytes(b"delta")
+    store.record_artifact(active_delta)
+    active_materialized = store.materialized_path("active")
+    active_materialized.mkdir()
+    (active_materialized / "weights").write_bytes(b"active")
+    store.write_chain(
+        "active",
+        {"version": "active", "full_version": "base", "deltas": ["active"]},
+    )
+    store.activate("active")
+
+    stale_full = store.full_path("stale-full")
+    stale_full.mkdir()
+    (stale_full / "weights").write_bytes(b"canonical")
+    store.record_artifact(stale_full)
+    stale_delta = store.delta_path("stale-delta")
+    stale_delta.mkdir()
+    (stale_delta / "weights").write_bytes(b"stale-delta")
+    store.record_artifact(stale_delta)
+    store.write_chain(
+        "stale-full",
+        {
+            "version": "stale-full",
+            "full_version": "stale-full",
+            "deltas": [],
+        },
+    )
+    store.write_chain(
+        "stale-delta",
+        {
+            "version": "stale-delta",
+            "full_version": "stale-full",
+            "deltas": ["stale-delta"],
+        },
+    )
+    stale_materialized = store.materialized_path("stale-derived")
+    stale_materialized.mkdir()
+    (stale_materialized / "weights").write_bytes(b"derived")
+
+    active_size = sum(
+        (path / "weights").stat().st_size
+        for path in (active_full, active_delta, active_materialized)
+    )
+    limited = LocalCheckpointStore(
+        root=tmp_path,
+        model_name="test/model",
+        max_size_bytes=active_size + (stale_full / "weights").stat().st_size,
+    )
+    cache_size_bytes = limited.cache_size_bytes
+    cache_size_calls = 0
+
+    def count_cache_size_bytes():
+        nonlocal cache_size_calls
+        cache_size_calls += 1
+        return cache_size_bytes()
+
+    monkeypatch.setattr(limited, "cache_size_bytes", count_cache_size_bytes)
+    limited.enforce_capacity(protected_versions={"active"})
+
+    assert active_full.exists()
+    assert active_delta.exists()
+    assert active_materialized.exists()
+    assert stale_full.exists()
+    assert not stale_delta.exists()
+    assert not stale_materialized.exists()
+    assert store.chain_path("stale-full").exists()
+    assert not store.chain_path("stale-delta").exists()
+    assert cache_size_calls == 1
+
+    limited.max_size_bytes = active_size
+    limited.enforce_capacity(protected_versions={"active"})
+
+    assert not stale_full.exists()
+    assert not store.chain_path("stale-full").exists()
+    assert cache_size_bytes() <= active_size
+
+
+def test_store_rejects_quota_smaller_than_protected_lineage(tmp_path):
+    store = LocalCheckpointStore(root=tmp_path, model_name="test/model")
+    store.initialize()
+    active = store.full_path("active")
+    active.mkdir()
+    (active / "weights").write_bytes(b"active")
+    store.record_artifact(active)
+    store.write_chain(
+        "active",
+        {"version": "active", "full_version": "active", "deltas": []},
+    )
+    store.activate("active")
+
+    limited = LocalCheckpointStore(
+        root=tmp_path,
+        model_name="test/model",
+        max_size_bytes=store.cache_size_bytes(),
+    )
+    with pytest.raises(
+        CheckpointCacheCapacityError, match="checkpoint cache quota"
+    ):
+        limited.ensure_capacity(1, protected_versions={"active"})
+
+    assert active.exists()
+    assert limited.active_version() == "active"
+
+
+def test_store_rejects_write_larger_than_filesystem_free_space(
+    monkeypatch, tmp_path
+):
+    store = LocalCheckpointStore(root=tmp_path, model_name="test/model")
+    store.initialize()
+    monkeypatch.setattr(
+        "modelexpress_rl.inference.checkpoint_store.shutil.disk_usage",
+        lambda _path: SimpleNamespace(free=3),
+    )
+
+    with pytest.raises(
+        CheckpointCacheCapacityError, match="filesystem has 3 bytes free"
+    ):
+        store.ensure_capacity(4)
