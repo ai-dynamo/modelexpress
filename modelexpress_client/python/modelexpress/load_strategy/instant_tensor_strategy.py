@@ -41,25 +41,26 @@ class InstantTensorStrategy(LoadStrategy):
         EngineAdapter.build_instanttensor_weight_iter,
     )
 
-    def is_available(self, ctx: LoadContext) -> bool:
-        if not super().is_available(ctx):
-            return False
+    def skip_reason(self, ctx: LoadContext) -> str | None:
+        base = super().skip_reason(ctx)
+        if base is not None:
+            return base
         if not envs.MX_INSTANT_TENSOR:
             logger.info(
                 f"[Worker {ctx.global_rank}] MX_INSTANT_TENSOR disabled, skipping instant tensor"
             )
-            return False
+            return "env_disabled"
         if importlib.util.find_spec("instanttensor") is None:
             logger.info(
                 f"[Worker {ctx.global_rank}] instanttensor not installed, skipping instant tensor"
             )
-            return False
+            return "package_missing"
         if ctx.adapter is None or not ctx.adapter.is_cuda_alike():
             logger.info(
                 f"[Worker {ctx.global_rank}] InstantTensor requires a CUDA device, skipping"
             )
-            return False
-        return True
+            return "not_cuda"
+        return None
 
     def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
         result = _as_load_result(result)

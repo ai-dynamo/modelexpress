@@ -67,6 +67,11 @@ _RECORDERS = [
     ("record_nixl_receive", ("complete",)),
     ("observe_load_seconds", ("vllm", "Qwen/Qwen2.5-0.5B-Instruct", "main", "success", 12.0)),
     ("observe_load_phase_seconds", ("vllm", "Qwen/Qwen2.5-0.5B-Instruct", "chain", 4.0)),
+    (
+        "observe_load_strategy_seconds",
+        ("vllm", "Qwen/Qwen2.5-0.5B-Instruct", "rdma", "success", 3.0),
+    ),
+    ("record_strategy_skipped", ("vllm", "gds", "driver_unavailable")),
 ]
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -154,6 +159,8 @@ def test_recorders_never_raise_into_load_path(monkeypatch):
     m.transfer_seconds = boom
     m.nixl_errors = boom
     m.nixl_receives = boom
+    m.load_strategy_seconds = boom
+    m.strategy_skips = boom
     # None of these may propagate the RuntimeError.
     for name, args in _RECORDERS:
         getattr(m, name)(*args)

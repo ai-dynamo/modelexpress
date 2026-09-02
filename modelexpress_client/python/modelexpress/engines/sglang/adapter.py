@@ -374,6 +374,7 @@ def build_sglang_load_context(
     global_rank = adapter.get_global_rank()
     server_url = getattr(load_config, "modelexpress_url", None)
     return LoadContext(
+        engine="sglang",
         model_config=model_config,
         load_config=load_config,
         target_device=adapter.get_target_device(),

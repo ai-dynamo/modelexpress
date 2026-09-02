@@ -12,13 +12,13 @@ deployment.
 
 This documents what ships today: the exposition path, `mx_build_info`, per-RPC
 and storage-backend coverage on the server, the download lifecycle, NIXL client
-health, the Kubernetes scrape, alerting and dashboard surface, and the first two
-load-timing tiers — the `load_model()` window and the phases that partition it.
+health, the Kubernetes scrape, alerting and dashboard surface, and the first
+three load-timing tiers — the `load_model()` window, the phases that partition
+it, and the strategy attempts that partition the `chain` phase.
 
-The tiers below those do not exist yet. Nothing here attributes time to an
-individual strategy attempt or splits a transfer into registration, handshake
-and wire, so the dashboard can say a load spent ninety seconds in `chain` but
-not which strategy spent it or where inside the transfer it went.
+The tier below those does not exist yet. Nothing here splits a transfer into
+registration, handshake and wire, so the dashboard can say an `rdma` attempt
+spent ninety seconds but not where inside the transfer they went.
 
 ---
 
@@ -421,6 +421,8 @@ touched.
 | `mx_nixl_receive_total` | Counter | `scheme`, `result` |
 | `mx_load_seconds` | Histogram | `engine`, `model`, `model_role`, `scheme`, `outcome` |
 | `mx_load_phase_seconds` | Histogram | `engine`, `model`, `phase`, `scheme` |
+| `mx_load_strategy_seconds` | Histogram | `engine`, `model`, `strategy`, `outcome`, `scheme` |
+| `mx_load_strategy_skipped_total` | Counter | `engine`, `strategy`, `reason`, `scheme` |
 
 ### Load timing, and what it does not measure
 
@@ -534,6 +536,70 @@ rather than an edge.
 Quantiles still need observations to mean anything. A single load gives a p95
 that is bucket interpolation whatever the boundaries are; these are fleet
 statistics, and on one pod the mean per phase is the honest panel to read.
+
+### Inside the `chain` phase: which strategy spent the time
+
+`mx_load_strategy_seconds` is one observation per strategy the chain actually
+tried. The chain runs a fixed list — `rdma`, `server-cache`, `instant_tensor`,
+`model_streamer`, `gds`, `default` — in that order, stopping at the first one
+that returns weights, so the intervals are ordered and disjoint and sit wholly
+inside the `chain` phase.
+
+They do **not** sum to that phase, and never will. `chain` also covers the
+eligibility filter, the tracing span setup and the loop's own bookkeeping, none
+of which belongs to any single strategy. The residual has the same character as
+the one-to-three milliseconds already documented between the phases and the
+whole load: real work by the caller that owns the span, not time gone missing.
+`sum(strategy) <= chain <= load` is the invariant; equality is not.
+
+Two things a reading of this family should not assume:
+
+- **An `rdma` observation is an envelope, not a transfer.** That one strategy
+  retries over several source candidates, and each of those is separately timed
+  by `mx_p2p_transfer_seconds`. The nesting is strict — the transfers are inside
+  the attempt — so the two are not double counting the same seconds, but the
+  attempt is the larger number and includes the misses between.
+- **The interval charges a strategy for its own cleanup.** It opens before
+  `load()` and closes after the rollback and, where a strategy mutated the model
+  before failing, after the re-initialization its mutation forced. Read a row as
+  *what this strategy cost the chain*, not *what this strategy transferred*. The
+  alternative leaves the re-init — often the most expensive single operation in
+  the chain — attributed to nobody.
+
+`outcome` is on the family because the durations are not comparable without it.
+A `fallback` is a strategy discovering in milliseconds that it has nothing to
+offer; a `success` is a strategy moving weights for half a minute. Both are
+normal, and a mean across the two describes neither.
+
+### A strategy that recorded nothing: two opposite explanations
+
+`mx_load_strategy_skipped_total` exists because the histogram above cannot be
+read without it. A strategy can be absent from it for two reasons that look
+identical in the data and mean opposite things:
+
+- The eligibility filter dropped it before the chain ran — no NIXL, no GDS
+  driver, the package is not installed, P2P is switched off. **This** is a skip,
+  and it is what the counter records, with the reason as a label.
+- It was eligible and simply never reached, because an earlier strategy
+  succeeded and the chain returned. On a healthy load this is the common case:
+  a working `rdma` means the five strategies behind it never run.
+
+Counting the second as a skip would report `default` as permanently skipped on
+every load that worked, which is the reverse of the truth. So the counter is
+incremented once per load, only for the strategies the filter dropped, and a
+strategy that appears in neither family was eligible and not reached.
+
+Getting the reason out required the eligibility check to return one. Strategies
+override `skip_reason`, which returns `None` or a bounded label; `is_available`
+survives as a thin wrapper for callers that only want the yes/no. A bare bool
+cannot say why, and the whole value of this counter is the why.
+
+Expect a steady background of skips on any real cluster. `gds` with
+`driver_unavailable`, and `model_streamer` or `instant_tensor` with
+`package_missing`, are all normal on an image that ships none of them — a flat
+nonzero line, not a problem. The one worth reading is `rdma`: `p2p_disabled`,
+`no_mx_server` or `transfer_not_allowed` there means P2P is configured off
+rather than broken, which is a different conversation from a transfer failing.
 
 ### The `model` label is bounded by convention, not by code
 
@@ -726,20 +792,20 @@ ConfigMap for the Grafana sidecar to discover. Adjust `metrics.dashboard.label`
 if your sidecar watches something other than `grafana_dashboard`.
 
 It covers the server end to end -- gRPC, storage backend, download lifecycle,
-capacity -- and the client down to total transfer time. It does **not** yet plot
-the load tiers: `mx_load_seconds` and `mx_load_phase_seconds` exist as of this
-change but have no panel, so a load's phase split is queryable and not yet
-visible. Below the phase level there is still nothing — the transfer panel can
-say a transfer took 90 seconds but not where inside it the 90 seconds went.
+capacity -- the client down to total transfer time, and the load tiers: total
+duration, the phases that partition it, and the strategy attempts that partition
+the `chain` phase. Below the attempt there is still nothing — the transfer panel
+can say a transfer took 90 seconds but not where inside it they went.
 
 Read **Overview** first; the rows below it answer *why* once a tile is not green.
 
 | Row | Answers | Panels |
 | --- | --- | --- |
 | **Overview** | Is anything wrong right now? | 8 stat tiles |
+| **Model load** | How long a load took, and which phase and strategy spent it | 6 |
 | **Downloads** | Is the primary job working, and how fast? | 6 |
 | **Server internals** | gRPC and storage backend: rate, errors, p99, in flight | 8 + 1 note |
-| **P2P clients** | Selection funnel, transfer time, NIXL health | 8 + 1 note |
+| **P2P clients** | Selection funnel, transfer time, NIXL health | 9 + 1 note |
 | **Capacity** | Map growth, evictions, version skew | 3 |
 
 Six of the eight Overview tiles are coloured by the same condition an alert fires

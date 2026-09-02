@@ -105,6 +105,75 @@ LOAD_PHASES = ("artifact_install", "model_init", "chain", "publish")
 #: Terminal outcomes of a load. A load either returns a model or raises.
 LOAD_OUTCOMES = ("success", "error")
 
+#: The six strategies the chain builds, in the order it tries them. L2 lives one
+#: level below the ``chain`` phase of L1: ``chain`` says the strategy chain spent
+#: four seconds, L2 says which strategy spent them.
+#:
+#: Closed by construction rather than by clamping. ``LoadStrategyChain.run``
+#: rebuilds this exact list on every call -- there is no registry, no plugin
+#: hook, no out-of-tree extension point -- so a name that is not here means this
+#: tuple and that list have drifted, not that a deployment invented a strategy.
+#:
+#: ``server-cache`` keeps its hyphen. It is already the value the tracer sets as
+#: ``weight_loading_strategy`` on the load span, and normalizing it here would
+#: desynchronize the metric from the trace for nothing.
+LOAD_STRATEGIES = (
+    "rdma",
+    "server-cache",
+    "instant_tensor",
+    "model_streamer",
+    "gds",
+    "default",
+)
+
+#: How one strategy attempt ended. Not a restatement of ``LOAD_OUTCOMES``: a
+#: single load runs up to six attempts, of which at most one is a ``success``.
+#:
+#:   success         returned weights; the chain stops here
+#:   fallback        clean miss, model untouched, chain tries the next strategy
+#:   fallback_dirty  miss after mutating the model, forcing a re-init first
+#:   recovery_error  the re-init itself failed; the whole chain fails closed
+#:   error           an unexpected exception, which the chain treats as a miss
+#:
+#: ``fallback`` and ``fallback_dirty`` stay separate because only the dirty one
+#: pays for ``_reinit_for_retry``, and that is the expensive case worth seeing.
+LOAD_STRATEGY_OUTCOMES = (
+    "success",
+    "fallback",
+    "fallback_dirty",
+    "recovery_error",
+    "error",
+)
+
+#: Why the eligibility filter dropped a strategy before the chain could try it.
+#:
+#: Every value is a literal at a fixed source line in a ``skip_reason``
+#: implementation -- none is derived from an exception message, a model name or
+#: anything else the environment controls -- so the domain is closed the same way
+#: the phase names are.
+#:
+#: What this counter deliberately does NOT count is a strategy that was eligible
+#: and simply never reached, because an earlier one succeeded and the chain
+#: returned. Those are the common case, and counting them as skips would make
+#: ``default`` look permanently skipped on every healthy load.
+LOAD_STRATEGY_SKIP_REASONS = (
+    "no_adapter",
+    "adapter_capability_missing",
+    "p2p_disabled",
+    "nixl_unavailable",
+    "accelerator_unsupported",
+    "no_mx_server",
+    "transfer_not_allowed",
+    "prefetch_disabled",
+    "no_repo_id",
+    "env_disabled",
+    "package_missing",
+    "not_cuda",
+    "not_configured",
+    "driver_unavailable",
+    "other",
+)
+
 #: Longest model id kept in the ``model`` label; longer ones are truncated.
 #:
 #: This is the one label on the load families whose domain is NOT a closed enum,
@@ -321,7 +390,7 @@ class MetricsCollector:
         self.attempts = Counter(
             "mx_p2p_source_attempts_total",
             "Source attempts by result.",
-            # success|metadata_miss|transfer_retry|transfer_fallback
+            # success|metadata_miss|accelerator_reject|transfer_retry|transfer_fallback
             ["policy", "scheme", "result"],
             registry=registry,
         )
@@ -399,6 +468,41 @@ class MetricsCollector:
             "their sum is bounded by mx_load_seconds.",
             ["engine", "model", "phase", "scheme"],
             buckets=_XSLOW_BUCKETS,
+            registry=registry,
+        )
+        # L2. One observation per strategy the chain actually tried, so these
+        # are disjoint sub-intervals of the `chain` phase. Their sum is strictly
+        # LESS than that phase and always will be: `chain` also covers the
+        # eligibility filter, the span setup and the loop bookkeeping. Reading a
+        # residual here as lost time is a misreading -- see docs/METRICS.md.
+        #
+        # Reusing _XSLOW_BUCKETS, whose floor is 0.5 s, is a deliberate trade.
+        # The point of L2 is to be read against the `chain` phase on the same
+        # dashboard, and quantiles from differently-bucketed histograms are not
+        # comparable -- the reason that band is duplicated value-for-value in
+        # Rust in the first place. The cost is that a clean miss, which takes
+        # milliseconds, lands in the bottom bucket: for fast misses the count is
+        # the signal and the quantile is not.
+        self.load_strategy_seconds = Histogram(
+            "mx_load_strategy_seconds",
+            "Duration of one strategy attempt inside the chain phase of a load. "
+            "Disjoint sub-intervals of that phase, so their sum is bounded by "
+            "it. An rdma attempt is an envelope, not a transfer: it may contain "
+            "several source candidates, which mx_p2p_transfer_seconds splits.",
+            ["engine", "model", "strategy", "outcome", "scheme"],
+            buckets=_XSLOW_BUCKETS,
+            registry=registry,
+        )
+        # The companion to the histogram above, and what keeps it honest. Without
+        # it a strategy filtered out before the loop is indistinguishable from
+        # one that was eligible and never reached, and "rdma recorded nothing"
+        # has two opposite explanations.
+        self.strategy_skips = Counter(
+            "mx_load_strategy_skipped_total",
+            "Strategies the eligibility filter dropped before the chain ran "
+            "them, by reason. Does not count a strategy that was eligible but "
+            "never reached because an earlier one succeeded.",
+            ["engine", "strategy", "reason", "scheme"],
             registry=registry,
         )
 
@@ -688,6 +792,59 @@ class MetricsCollector:
                 self.load_phase_seconds.labels(
                     engine, _model_label(model), phase, self.scheme
                 ).observe(seconds)
+            except Exception:
+                pass
+
+    def observe_load_strategy_seconds(
+        self, engine: str, model: object, strategy: str, outcome: str, seconds: float
+    ) -> None:
+        """Record one strategy attempt inside the chain phase (L2).
+
+        An unknown strategy is dropped, for the same reason an unknown phase is:
+        these intervals are supposed to partition the chain phase, and folding a
+        stray name into an existing strategy would inflate that strategy while
+        the sum still looked sound. An unknown outcome is clamped instead --
+        outcomes partition nothing, so a catch-all loses a distinction rather
+        than corrupting a total.
+        """
+        if self._ensure():
+            try:
+                if strategy not in LOAD_STRATEGIES:
+                    return
+                if engine not in LOAD_ENGINES:
+                    engine = "other"
+                if outcome not in LOAD_STRATEGY_OUTCOMES:
+                    outcome = "error"
+                self.load_strategy_seconds.labels(
+                    engine, _model_label(model), strategy, outcome, self.scheme
+                ).observe(seconds)
+            except Exception:
+                pass
+
+    def record_strategy_skipped(self, engine: str, strategy: str, reason: str) -> None:
+        """Record a strategy the eligibility filter dropped (L2).
+
+        Both unknown values clamp here rather than drop, which is the opposite of
+        the histogram above and worth stating so it does not read as an
+        inconsistency later: this counter partitions nothing, so there is no sum
+        for a catch-all to corrupt, and dropping would lose the event outright.
+        The catch-all is ``other``, which is a label value rather than a member
+        of ``LOAD_STRATEGIES`` -- seeing it at all means this module and the
+        chain's strategy list have drifted.
+
+        No ``model`` label. Eligibility is a property of the environment -- a
+        driver, a package, an env var -- not of the model being loaded, and the
+        engine is already enough to tell two deployments apart.
+        """
+        if self._ensure():
+            try:
+                if strategy not in LOAD_STRATEGIES:
+                    strategy = "other"
+                if reason not in LOAD_STRATEGY_SKIP_REASONS:
+                    reason = "other"
+                if engine not in LOAD_ENGINES:
+                    engine = "other"
+                self.strategy_skips.labels(engine, strategy, reason, self.scheme).inc()
             except Exception:
                 pass
 

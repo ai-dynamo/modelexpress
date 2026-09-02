@@ -104,20 +104,21 @@ class RdmaStrategy(LoadStrategy):
         ctx.tensors = {}
         ctx.nixl_manager = None
 
-    def is_available(self, ctx: LoadContext) -> bool:
+    def skip_reason(self, ctx: LoadContext) -> str | None:
         if not ctx.p2p_enabled:
-            return False
-        if not super().is_available(ctx):
-            return False
+            return "p2p_disabled"
+        base = super().skip_reason(ctx)
+        if base is not None:
+            return base
         if not is_nixl_available():
-            return False
+            return "nixl_unavailable"
 
         if not ctx.accelerator_backend.supports_rdma_p2p():
             logger.info(
                 f"[Worker {ctx.global_rank}] Backend "
                 f"{ctx.accelerator_backend.name} does not support RDMA P2P, skipping"
             )
-            return False
+            return "accelerator_unsupported"
 
         # Decentralized backends (k8s-service) serve their own
         # metadata; skip the central-server precondition for them.
@@ -131,14 +132,14 @@ class RdmaStrategy(LoadStrategy):
             logger.info(
                 f"[Worker {ctx.global_rank}] No MX server configured, skipping RDMA"
             )
-            return False
+            return "no_mx_server"
 
         allowed, reason = check_transfer_allowed(ctx.model_config)
         if not allowed:
             logger.info(f"[Worker {ctx.global_rank}] RDMA transfer disabled: {reason}")
-            return False
+            return "transfer_not_allowed"
 
-        return True
+        return None
 
     def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
         """Load from a READY source or raise StrategyFailed for fallback.
@@ -186,6 +187,11 @@ class RdmaStrategy(LoadStrategy):
                 continue
 
             if not self._accelerator_compatible(ctx, source_worker, worker_id):
+                # Without this the counter is not a partition of the candidates:
+                # a source that passed GetMetadata and was then rejected here
+                # disappeared between metadata_miss and success, counted as
+                # neither.
+                selection_metrics.record_attempt(policy, "accelerator_reject")
                 continue
 
             logger.info(
