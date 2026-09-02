@@ -14,7 +14,7 @@ This documents what ships today: the exposition path, `mx_build_info`, per-RPC
 and storage-backend coverage on the server, the download lifecycle, NIXL client
 health, the Kubernetes scrape, alerting and dashboard surface, and the first
 three load-timing tiers — the `load_model()` window, the phases that partition
-it, and the strategy attempts that partition the `chain` phase.
+it, and the strategy attempts that run inside the `chain` phase.
 
 The tier below those does not exist yet. Nothing here splits a transfer into
 registration, handshake and wire, so the dashboard can say an `rdma` attempt
@@ -793,8 +793,8 @@ if your sidecar watches something other than `grafana_dashboard`.
 
 It covers the server end to end -- gRPC, storage backend, download lifecycle,
 capacity -- the client down to total transfer time, and the load tiers: total
-duration, the phases that partition it, and the strategy attempts that partition
-the `chain` phase. Below the attempt there is still nothing — the transfer panel
+duration, the phases that partition it, and the strategy attempts that run
+inside the `chain` phase. Below the attempt there is still nothing — the transfer panel
 can say a transfer took 90 seconds but not where inside it they went.
 
 Read **Overview** first; the rows below it answer *why* once a tile is not green.
