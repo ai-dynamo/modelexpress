@@ -471,6 +471,31 @@ def _full_inputs(*, version="full-a", version_label=2):
     )
 
 
+@pytest.mark.parametrize(
+    "filename",
+    ["/tmp/shard", "../shard", "foo/bar", "foo/bar/", ".", ".."],
+)
+def test_canonical_s3_rejects_unsafe_delta_shard_filenames(
+    monkeypatch, tmp_path, filename
+):
+    objects = _artifact(
+        torch.tensor([1.0, 2.0]).view(torch.uint8).numpy(),
+        torch.tensor([3.0, 4.0]).view(torch.uint8).numpy(),
+    )
+    root_uri = "s3://weights/test/v1/model.safetensors.index.json"
+    manifest = json.loads(objects[root_uri])
+    manifest["weight_map"] = {"weight": filename}
+    objects[root_uri] = json.dumps(manifest).encode()
+    adapter, storage = _build(monkeypatch, tmp_path, objects)
+
+    with pytest.raises(RuntimeError, match="invalid canonical delta shard filename"):
+        adapter.stage_weight(_inputs(objects[root_uri]))
+
+    assert storage.calls == [root_uri]
+    assert not adapter._checkpoint.store.delta_path("target-a").exists()
+    adapter.close()
+
+
 def _build(
     monkeypatch,
     tmp_path,
@@ -841,14 +866,25 @@ def test_canonical_s3_applies_one_delta_to_the_active_checkpoint(
     adapter.release_staged_weight(first)
     first_materialized = adapter._checkpoint.store.materialized_path("target-a")
     apply_shards = adapter._checkpoint._apply_shards
+    replace_directory = adapter._checkpoint.store.replace_directory
     apply_calls = 0
+    checkpoint_copy_calls = 0
 
     def track_apply(shards):
         nonlocal apply_calls
         apply_calls += 1
         apply_shards(shards)
 
+    @contextmanager
+    def track_replace(target, *, copy_from=None):
+        nonlocal checkpoint_copy_calls
+        if copy_from is not None:
+            checkpoint_copy_calls += 1
+        with replace_directory(target, copy_from=copy_from) as temporary:
+            yield temporary
+
     monkeypatch.setattr(adapter._checkpoint, "_apply_shards", track_apply)
+    monkeypatch.setattr(adapter._checkpoint.store, "replace_directory", track_replace)
     objects.update(
         _artifact(
             middle.view(torch.uint8).numpy(),
@@ -878,7 +914,8 @@ def test_canonical_s3_applies_one_delta_to_the_active_checkpoint(
         load_file(second.path / "model.safetensors")["weight"], target
     )
     assert apply_calls == 1
-    assert first_materialized.exists()
+    assert checkpoint_copy_calls == 0
+    assert not first_materialized.exists()
     assert torch.equal(
         load_file(
             adapter._checkpoint.store.full_cache
@@ -889,9 +926,56 @@ def test_canonical_s3_applies_one_delta_to_the_active_checkpoint(
     )
     adapter.apply_weight(second)
 
-    assert first_materialized.exists()
+    assert not first_materialized.exists()
     assert second.path.exists()
     adapter.release_staged_weight(second)
+    adapter.close()
+
+
+def test_canonical_s3_in_place_delta_failure_requires_recovery(
+    monkeypatch, tmp_path
+):
+    base = torch.tensor([1.0, 2.0])
+    middle = torch.tensor([3.0, 4.0])
+    target = torch.tensor([5.0, 6.0])
+    objects = _artifact(
+        base.view(torch.uint8).numpy(),
+        middle.view(torch.uint8).numpy(),
+    )
+    adapter, _storage = _build(monkeypatch, tmp_path, objects)
+    first = adapter.stage_weight(_inputs(None))
+    adapter.apply_weight(first)
+    adapter.release_staged_weight(first)
+    first_path = adapter._checkpoint.store.materialized_path("target-a")
+    second_path = adapter._checkpoint.store.materialized_path("target-b")
+    objects.update(
+        _artifact(
+            middle.view(torch.uint8).numpy(),
+            target.view(torch.uint8).numpy(),
+            version="target-b",
+            version_label=3,
+            base_version="target-a",
+        )
+    )
+
+    def fail_apply(_shards):
+        raise RuntimeError("injected delta failure")
+
+    monkeypatch.setattr(adapter._checkpoint, "_apply_shards", fail_apply)
+    with pytest.raises(RuntimeError, match="injected delta failure"):
+        adapter.stage_weight(
+            _inputs(
+                None,
+                base_version="target-a",
+                version="target-b",
+                version_label=3,
+            )
+        )
+
+    assert not first_path.exists()
+    assert second_path.exists()
+    assert adapter._checkpoint.store.active_version() == "target-a"
+    assert adapter._checkpoint.store.state()["status"] == "UPDATING"
     adapter.close()
 
 

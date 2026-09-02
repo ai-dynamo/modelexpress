@@ -212,18 +212,22 @@ and activation state.
 
 `full/<version>/` and `deltas/<version>/` contain canonical immutable artifacts.
 `chains/<version>.json` resolves a version to one full checkpoint plus its
-ordered deltas. For a delta target, ModelExpress copies the exact active
-checkpoint and applies only the incoming delta into `materialized/<version>/`;
-current vLLM and SGLang installers consume that ordinary checkpoint directory.
-Previous materializations remain cached until capacity pressure evicts them.
-Materializations are derived and can be rebuilt from the canonical lineage.
+ordered deltas. The first delta after a full checkpoint copies that immutable
+full checkpoint into `materialized/<version>/`. Later sequential deltas rename
+the active derived checkpoint and apply only the incoming delta in place, so
+they do not copy the full model. Current vLLM and SGLang installers consume that
+ordinary checkpoint directory. Materializations are derived and can be rebuilt
+from the canonical lineage. If an in-place delta fails, the running engine keeps
+its previous weights, the cache remains `UPDATING`, and initialization rebuilds
+the checkpoint before accepting another update.
 
 `state.json` records whether preparation is `READY` or `UPDATING` and protects
 against interrupted writes. `active.json` changes only after engine installation
 succeeds, so a failed download, reconstruction, or install retains the previous
-active version. The cache lock coordinates artifact mutations. The installation
-lock is held shared by concurrent co-located installers and exclusively by
-preparation, preventing another preparation from entering before activation.
+active engine version. The cache lock coordinates artifact mutations. The
+installation lock is held shared by concurrent co-located installers and
+exclusively by preparation, preventing another preparation from entering before
+activation.
 
 ```text
 <refit_checkpoint_dir>/<URL-quoted-vLLM-model-path-or-ID>/
