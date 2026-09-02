@@ -197,6 +197,39 @@ def test_after_rdma_receive_runs_derived_weight_finalizers(monkeypatch):
     ]
 
 
+def test_after_rdma_receive_refreshes_host_attention_scale_mirrors(
+    mock_accelerator_backend_cls,
+):
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(
+        torch_device_type="cpu"
+    )
+    model = nn.Module()
+    model.attn = _AttentionWithStaleHostScales()
+    pointers = {
+        name: tensor.data_ptr()
+        for name, tensor in model.attn.named_buffers(recurse=False)
+    }
+
+    result = adapter.after_rdma_receive(LoadResult(value=model, model=model))
+
+    assert result.model is model
+    assert model.attn._q_scale_float == pytest.approx(0.25)
+    # Match compressed-tensors' host conversion for per-head scales.
+    assert model.attn._k_scale_float == pytest.approx(0.5)
+    assert model.attn._v_scale_float == pytest.approx(0.75)
+    # vLLM does not derive a host mirror from _prob_scale.
+    assert model.attn._prob_scale_float == pytest.approx(1.0)
+    assert model.attn._k_scale_cpu.item() == pytest.approx(0.5)
+    assert model.attn._v_scale_cpu.item() == pytest.approx(0.75)
+    assert model.attn.impl.bmm1_scale is None
+    assert model.attn.impl.bmm2_scale is None
+    assert {
+        name: tensor.data_ptr()
+        for name, tensor in model.attn.named_buffers(recurse=False)
+    } == pointers
+
+
 def test_rdma_lifecycle_discovers_prepared_tensors_and_finalizes_received_weights(
     monkeypatch,
     mock_accelerator_backend_cls,
@@ -366,6 +399,22 @@ class _RdmaLifecycleModel(torch.nn.Module):
                 int(self.hc_attn_fn.item()),
             )
         )
+
+
+class _AttentionWithStaleHostScales(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("_q_scale", torch.tensor(0.25))
+        self.register_buffer("_k_scale", torch.tensor([0.1, 0.5]))
+        self.register_buffer("_v_scale", torch.tensor(0.75))
+        self.register_buffer("_prob_scale", torch.tensor(0.125))
+        self._q_scale_float = 1.0
+        self._k_scale_float = 1.0
+        self._v_scale_float = 1.0
+        self._prob_scale_float = 1.0
+        self._k_scale_cpu = torch.tensor(1.0)
+        self._v_scale_cpu = torch.tensor(1.0)
+        self.impl = SimpleNamespace(bmm1_scale=99.0, bmm2_scale=88.0)
 
 
 class _StandaloneFinalizer(torch.nn.Module):
