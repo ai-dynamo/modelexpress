@@ -414,32 +414,146 @@ class VllmAdapter(EngineAdapter):
         if result.model is None:
             raise RuntimeError("vLLM RDMA post-load processing requires result.model")
 
+        float_names = tuple(
+            f"_{scale_name}_scale_float"
+            for scale_name in _VLLM_ATTENTION_SCALE_NAMES
+        )
+        cpu_names = ("_k_scale_cpu", "_v_scale_cpu")
+        device_names = tuple(
+            f"_{scale_name}_scale" for scale_name in _VLLM_ATTENTION_SCALE_NAMES
+        )
+        required_names = device_names + float_names + cpu_names + ("_o_scale_float",)
+        flashinfer_cache_names = ("bmm1_scale", "bmm2_scale", "o_sf_scale")
+
+        cache_config = getattr(self.vllm_config, "cache_config", None)
+        configured_cache_dtype = getattr(cache_config, "cache_dtype", None)
+        fp8_expected = isinstance(configured_cache_dtype, str) and (
+            configured_cache_dtype.startswith("fp8")
+        )
+
+        # Validate every module before mutating any host state. This is a shim
+        # over vLLM private attributes, so an upstream contract change must fail
+        # the RDMA strategy instead of silently serving with stale scales.
+        updates: list[tuple[str, torch.nn.Module, dict[str, float]]] = []
+        for module_name, module in result.model.named_modules():
+            module_label = module_name or type(module).__name__
+            kv_cache_dtype = getattr(module, "kv_cache_dtype", None)
+            if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
+                fp8_expected = True
+
+            host_names = float_names + cpu_names
+            if not any(hasattr(module, name) for name in host_names):
+                continue
+
+            missing_names = [
+                name for name in required_names if not hasattr(module, name)
+            ]
+            if missing_names:
+                raise RuntimeError(
+                    "Incomplete vLLM attention scale contract on "
+                    f"{module_label}: missing {', '.join(missing_names)}"
+                )
+
+            for float_name in float_names:
+                if not isinstance(getattr(module, float_name), float):
+                    raise RuntimeError(
+                        "Invalid vLLM attention host scalar on "
+                        f"{module_label}: {float_name} must be a float"
+                    )
+
+            for cpu_name in cpu_names:
+                cpu_mirror = getattr(module, cpu_name)
+                if (
+                    not isinstance(cpu_mirror, torch.Tensor)
+                    or cpu_mirror.numel() != 1
+                    or not torch.is_floating_point(cpu_mirror)
+                ):
+                    raise RuntimeError(
+                        "Invalid vLLM attention CPU scale on "
+                        f"{module_label}: {cpu_name} must be a floating-point "
+                        "singleton tensor"
+                    )
+
+            impl = getattr(module, "impl", None)
+            cache_presence = [
+                hasattr(impl, cache_name) for cache_name in flashinfer_cache_names
+            ]
+            if any(cache_presence) and not all(cache_presence):
+                missing_cache_names = [
+                    cache_name
+                    for cache_name, present in zip(
+                        flashinfer_cache_names, cache_presence, strict=True
+                    )
+                    if not present
+                ]
+                raise RuntimeError(
+                    "Incomplete vLLM FlashInfer scale cache contract on "
+                    f"{module_label}: missing {', '.join(missing_cache_names)}"
+                )
+
+            initialized_cache_names = []
+            if module._o_scale_float is not None:
+                initialized_cache_names.append("_o_scale_float")
+            if all(cache_presence):
+                initialized_cache_names.extend(
+                    cache_name
+                    for cache_name in flashinfer_cache_names
+                    if getattr(impl, cache_name) is not None
+                )
+            if initialized_cache_names:
+                raise RuntimeError(
+                    "vLLM attention host-scale refresh requires a cold-load "
+                    f"state on {module_label}; already initialized: "
+                    f"{', '.join(initialized_cache_names)}"
+                )
+
+            values: dict[str, float] = {}
+            for scale_name, tensor_name in zip(
+                _VLLM_ATTENTION_SCALE_NAMES, device_names, strict=True
+            ):
+                scale = getattr(module, tensor_name)
+                if (
+                    not isinstance(scale, torch.Tensor)
+                    or not self.accelerator_backend.is_accel_tensor(scale)
+                    or scale.numel() == 0
+                    or not torch.is_floating_point(scale)
+                ):
+                    raise RuntimeError(
+                        "Invalid vLLM accelerator attention scale on "
+                        f"{module_label}: {tensor_name} must be a nonempty "
+                        "floating-point accelerator tensor"
+                    )
+
+                scale_float = scale.detach().float()
+                if not bool(torch.isfinite(scale_float).all().item()) or not bool(
+                    (scale_float > 0).all().item()
+                ):
+                    raise RuntimeError(
+                        "Invalid vLLM accelerator attention scale on "
+                        f"{module_label}: {tensor_name} must contain only finite, "
+                        "positive values"
+                    )
+                values[scale_name] = float(scale_float.max().item())
+
+            updates.append((module_label, module, values))
+
+        if fp8_expected and not updates:
+            raise RuntimeError(
+                "FP8 KV cache requires recognizable vLLM q/k/v host scale state, "
+                "but no attention module was refreshed"
+            )
+
         refreshed_values = 0
         stale_values = 0
-        refreshed_modules = 0
-
-        for module_name, module in result.model.named_modules():
-            module_refreshed = False
-            for scale_name in _VLLM_ATTENTION_SCALE_NAMES:
-                tensor_name = f"_{scale_name}_scale"
-                float_name = f"{tensor_name}_float"
-                scale = getattr(module, tensor_name, None)
-                if not isinstance(scale, torch.Tensor) or not hasattr(
-                    module, float_name
-                ):
-                    continue
-                if not self.accelerator_backend.is_accel_tensor(scale):
-                    continue
-                if scale.numel() == 0:
-                    continue
-
-                value = float(scale.detach().float().max().item())
+        for module_label, module, values in updates:
+            for scale_name, value in values.items():
+                float_name = f"_{scale_name}_scale_float"
                 previous = getattr(module, float_name)
                 if previous != value:
                     stale_values += 1
                     logger.debug(
                         "Refreshing vLLM host scale %s.%s: %r -> %r",
-                        module_name or type(module).__name__,
+                        module_label,
                         float_name,
                         previous,
                         value,
@@ -451,26 +565,13 @@ class VllmAdapter(EngineAdapter):
                     cpu_mirror.fill_(value)
 
                 refreshed_values += 1
-                module_refreshed = True
-
-            if not module_refreshed:
-                continue
-
-            refreshed_modules += 1
-            # FlashInfer lazily derives these from the host scale mirrors. They
-            # should still be None during cold loading, but invalidate them to
-            # keep this hook correct if initialization order changes upstream.
-            impl = getattr(module, "impl", None)
-            for cache_name in ("bmm1_scale", "bmm2_scale"):
-                if impl is not None and hasattr(impl, cache_name):
-                    setattr(impl, cache_name, None)
 
         if refreshed_values:
             logger.info(
                 "Refreshed %d vLLM host attention scales across %d modules "
                 "after RDMA receive (%d stale dummy values replaced)",
                 refreshed_values,
-                refreshed_modules,
+                len(updates),
                 stale_values,
             )
         return result
