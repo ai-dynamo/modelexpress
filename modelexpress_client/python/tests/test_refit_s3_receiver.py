@@ -949,6 +949,36 @@ def test_canonical_s3_reinstalls_active_checkpoint_after_install_failure(
     adapter.close()
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("delta_encoding", "replace"), ("checksum_format", "crc32")],
+)
+def test_canonical_s3_rejects_unsupported_delta_formats(
+    monkeypatch,
+    tmp_path,
+    field,
+    value,
+):
+    base = torch.tensor([1.0, 2.0]).view(torch.uint8).numpy()
+    target = torch.tensor([3.0, 4.0]).view(torch.uint8).numpy()
+    objects = _artifact(base, target)
+    root_uri = "s3://weights/test/v1/model.safetensors.index.json"
+    manifest = json.loads(objects[root_uri])
+    manifest["metadata"][field] = value
+    objects[root_uri] = json.dumps(manifest).encode()
+    adapter, storage = _build(monkeypatch, tmp_path, objects)
+
+    with pytest.raises(RuntimeError, match="unsupported"):
+        adapter.stage_weight(_inputs(objects[root_uri]))
+
+    assert storage.calls == [root_uri]
+    state = adapter._checkpoint.store.state()
+    assert state is not None
+    assert state["status"] == "READY"
+    assert state["version"] == "base-a"
+    adapter.close()
+
+
 def test_canonical_s3_full_checkpoint_resets_base_for_next_delta(monkeypatch, tmp_path):
     full_tensor = torch.tensor([7.0, 8.0])
     objects = _full_artifact(full_tensor)

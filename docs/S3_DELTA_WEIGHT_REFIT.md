@@ -367,10 +367,10 @@ filenames in `weight_map` are resolved relative to that index.
 }
 ```
 
-The generator requires all five metadata fields and `weight_map`. It uses
-`compression_format` to select the decompressor; the other metadata values
-describe the artifact. ModelExpress currently publishes `xor`, `zstd`, and
-`adler32` for the encoding, compression, and checksum fields.
+The generator requires all five metadata fields and `weight_map`. It requires
+`delta_encoding="xor"` and `checksum_format="adler32"`, and uses
+`compression_format` to select the decompressor. `version` and `base_version`
+describe the artifact.
 
 Each delta shard contains compressed `U8` XOR bytes. Its safetensors
 `__metadata__` must contain the Adler-32 checksum of every reconstructed full
