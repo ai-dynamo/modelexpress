@@ -60,8 +60,8 @@ def enabled(monkeypatch):
 def recorded(monkeypatch):
     calls = []
 
-    def fake_ensure(repo_id, revision=None):
-        calls.append((repo_id, revision))
+    def fake_ensure(repo_id, revision=None, *, cache_directory=None):
+        calls.append((repo_id, revision, cache_directory))
         return None
 
     monkeypatch.setattr(model_prefetch, "ensure_metadata", fake_ensure)
@@ -118,7 +118,7 @@ class TestPatchedBehavior:
 
         result = huggingface_hub.snapshot_download(REPO, revision="abc")
 
-        assert recorded == [(REPO, "abc")]
+        assert recorded == [(REPO, "abc", None)]
         assert result == "/local/snapshot"
 
     def test_reaches_the_hf_api_call_path(self, enabled, stub_download, recorded):
@@ -134,7 +134,7 @@ class TestPatchedBehavior:
 
         HfApi().snapshot_download(repo_id=REPO)
 
-        assert recorded == [(REPO, None)]
+        assert recorded == [(REPO, None, None)]
 
     def test_repo_id_as_keyword(self, enabled, stub_download, recorded):
         patch_hf_snapshot_prefetch()
@@ -142,7 +142,20 @@ class TestPatchedBehavior:
 
         huggingface_hub.snapshot_download(repo_id=REPO)
 
-        assert recorded == [(REPO, None)]
+        assert recorded == [(REPO, None, None)]
+
+    def test_forwards_the_callers_cache_dir(self, enabled, stub_download, recorded):
+        """vLLM passes its download-dir here; the snapshot has to land there.
+
+        Installing under the client's own root instead would leave the original
+        call resolving against a root the snapshot is not in.
+        """
+        patch_hf_snapshot_prefetch()
+        import huggingface_hub
+
+        huggingface_hub.snapshot_download(REPO, cache_dir="/downloads")
+
+        assert recorded == [(REPO, None, "/downloads")]
 
     def test_skips_non_model_repos(self, enabled, stub_download, recorded):
         patch_hf_snapshot_prefetch()

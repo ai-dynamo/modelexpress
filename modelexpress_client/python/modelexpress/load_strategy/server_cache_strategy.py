@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from .. import model_prefetch
+from .. import model_prefetch, model_snapshot
 from ..adapter import EngineAdapter, StrategyFailed
 from .base import LoadContext, LoadStrategy, _as_load_result, register_tensors
 from .context import LoadResult
@@ -67,12 +67,12 @@ class ServerCacheStrategy(LoadStrategy):
             raise StrategyFailed("No Hugging Face repo id for this model", mutated=False)
 
         try:
-            snapshot_path = self._snapshot_path(ctx, repo_id)
+            snapshot_path, cache_root = self._snapshot_path(ctx, repo_id)
             logger.info(
                 f"[Worker {ctx.global_rank}] Fetching {repo_id} weights from "
                 f"ModelExpress Server into {snapshot_path}"
             )
-            self._install_weights(repo_id, snapshot_path)
+            self._install_weights(repo_id, snapshot_path, cache_root)
         except StrategyFailed:
             raise
         except Exception as exc:
@@ -89,16 +89,44 @@ class ServerCacheStrategy(LoadStrategy):
         register_tensors(result, ctx)
         return result
 
-    def _snapshot_path(self, ctx: LoadContext, repo_id: str) -> Path:
-        """Return the snapshot the engine resolved, installing it if needed."""
+    def _snapshot_path(
+        self, ctx: LoadContext, repo_id: str
+    ) -> tuple[Path, Path | None]:
+        """Return the snapshot the engine resolved, and the root holding it.
+
+        The root comes back so the weight install can target it explicitly. It
+        cannot be looked up later: this runs in a separate EngineCore process
+        that never saw the prefetch, and the engine loads from the path in
+        ``ModelConfig`` no matter which root this worker would default to. A
+        root of None means nothing better than that default is known, which is
+        the case for any path that does not follow the cache layout.
+        """
         engine_path = getattr(ctx.model_config, "model", None)
         if engine_path:
             candidate = Path(str(engine_path))
+            location = model_snapshot.snapshot_location(repo_id, candidate)
+            if location is not None:
+                cache_root, commit = location
+                if candidate.is_dir():
+                    return candidate, cache_root
+                # The frontend resolved this path against its own cache; this
+                # node has nothing there yet. Install the commit the directory
+                # names, under the root the path carries -- the default root
+                # would be a snapshot the engine is not going to read.
+                return self._install_metadata(repo_id, commit, cache_root), cache_root
             if candidate.is_dir():
-                return candidate
+                return candidate, None
 
         revision = getattr(ctx.model_config, "revision", None)
-        snapshot_path = model_prefetch.ensure_metadata(repo_id, revision)
+        return self._install_metadata(repo_id, revision, None), None
+
+    @staticmethod
+    def _install_metadata(
+        repo_id: str, revision: str | None, cache_root: Path | None
+    ) -> Path:
+        snapshot_path = model_prefetch.ensure_metadata(
+            repo_id, revision, cache_directory=cache_root
+        )
         if snapshot_path is None:
             raise StrategyFailed(
                 f"No local snapshot for {repo_id} and metadata prefetch did not apply",
@@ -107,11 +135,14 @@ class ServerCacheStrategy(LoadStrategy):
         return snapshot_path
 
     @staticmethod
-    def _install_weights(repo_id: str, snapshot_path: Path) -> None:
+    def _install_weights(
+        repo_id: str, snapshot_path: Path, cache_root: Path | None = None
+    ) -> None:
         from ..model_client import ModelCacheClient
 
         with ModelCacheClient(
-            chunk_size=model_prefetch.configured_chunk_size()
+            cache_directory=cache_root,
+            chunk_size=model_prefetch.configured_chunk_size(),
         ) as client:
             client.install_weight_files(repo_id, snapshot_path)
 
