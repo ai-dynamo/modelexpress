@@ -178,6 +178,7 @@ response = requests.post(
             "initial_base_version_id": "v0",
             "seed_checkpoint_path": "/models/Qwen3-30B-A3B",
             "refit_checkpoint_dir": "/var/cache/modelexpress",
+            "refit_checkpoint_max_size_gb": 500,
             "object_storage_region_name": "us-west-2",
             "max_transfer_attempts": 3,
             "rpc_timeout_seconds": 30,
@@ -204,29 +205,55 @@ snapshot directory.
 
 #### `refit_checkpoint_dir`
 
-This is the root of ModelExpress's mutable working checkpoint. During
+This is the root of ModelExpress's host-local immutable checkpoint cache. During
 initialization, ModelExpress creates a model-specific subdirectory containing
-`checkpoint/`, `state.json`, and `.lock`.
+full checkpoints, delta payloads, resolved chains, derived materializations,
+and activation state.
 
-The `checkpoint/` directory starts as a full copy of `seed_checkpoint_path` and
-is updated in place as sequential deltas are applied. `state.json` records its
-current version and whether the checkpoint is `READY` or `UPDATING`. The file
-lock prevents co-located ranks from seeding or updating the same checkpoint
-concurrently. With an HF snapshot seed checkpoint, the resulting layout is:
+`full/<version>/` and `deltas/<version>/` contain canonical immutable artifacts.
+`chains/<version>.json` resolves a version to one full checkpoint plus its
+ordered deltas. For a delta target, ModelExpress copies the exact active
+checkpoint and applies only the incoming delta into `materialized/<version>/`;
+current vLLM and SGLang installers consume that ordinary checkpoint directory.
+Previous materializations remain cached until capacity pressure evicts them.
+Materializations are derived and can be rebuilt from the canonical lineage.
 
-Before seeding or mutating checkpoint bytes, ModelExpress writes `UPDATING` with
-the last READY version. It writes `READY` for the target only after all writes
-and verification succeed. Preparation and installation reject `UPDATING`; a
-fresh initialization reseeds it from `seed_checkpoint_path`.
+`state.json` records whether preparation is `READY` or `UPDATING` and protects
+against interrupted writes. `active.json` changes only after engine installation
+succeeds, so a failed download, reconstruction, or install retains the previous
+active version. The cache lock coordinates artifact mutations. The installation
+lock is held shared by concurrent co-located installers and exclusively by
+preparation, preventing another preparation from entering before activation.
 
 ```text
 <refit_checkpoint_dir>/<URL-quoted-vLLM-model-path-or-ID>/
   .lock
+  .install.lock
+  active.json
   state.json
-  checkpoint/
-    *.safetensors
-    config.json
-    ...
+  full/
+    v0/
+      *.safetensors
+      config.json
+      ...
+    v4/
+      model.safetensors.index.json
+      *.safetensors
+      config.json
+      ...
+  deltas/
+    v1/
+      model.safetensors.index.json
+      *.safetensors
+  chains/
+    v0.json
+    v1.json
+    v4.json
+  materialized/
+    v1/
+      *.safetensors
+      config.json
+      ...
 ```
 
 All ranks sharing one host filesystem can share the same cache. Each host without
@@ -248,7 +275,7 @@ spec:
           mountPath: /root/.cache/huggingface
           readOnly: true
 
-        # Mutable, host-local refit checkpoint directory.
+        # Host-local immutable artifacts and derived materializations.
         - name: mx-refit-checkpoint
           mountPath: /var/cache/modelexpress
 
@@ -270,22 +297,29 @@ The corresponding generator configuration would use:
 ```json
 {
   "seed_checkpoint_path": "/root/.cache/huggingface/hub/models--ORG--MODEL/snapshots/SNAPSHOT_ID",
-  "refit_checkpoint_dir": "/var/cache/modelexpress"
+  "refit_checkpoint_dir": "/var/cache/modelexpress",
+  "refit_checkpoint_max_size_gb": 500
 }
 ```
 
-Ensure the host directory has space for at least one complete checkpoint copy.
-ModelExpress creates the model-specific subdirectory automatically. On
-initialization, it reuses the cache only when its recorded version is
-`initial_base_version_id`, its state is `READY`, and safetensors files are
-present. A later-version or interrupted `UPDATING` cache is reseeded from
-`seed_checkpoint_path`.
+`refit_checkpoint_max_size_gb` is a positive per-model quota in decimal
+gigabytes (`1 GB = 1,000,000,000 bytes`) for payload files under `full/`,
+`deltas/`, and `materialized/`. It defaults to 500 GB; set it to `null` to
+disable the configured quota.
+ModelExpress also checks available filesystem space before known writes and
+copies. It evicts stale derived materializations before stale canonical
+artifacts, but never evicts the active lineage or the checkpoint being prepared
+or installed. Capacity must therefore cover the active checkpoint plus the
+rollback-safe working set for one update. A capacity rejection preserves the
+active checkpoint as READY so a later update can retry. On initialization, the
+configured seed is restored as the initial full artifact and becomes the active
+version.
 
 #### Initialization behavior
 
 `POST /init_weight_transfer_engine` fans out to every vLLM worker. Each worker:
 
-1. initializes or reuses its refit checkpoint;
+1. initializes the seed lineage and host-local checkpoint cache;
 2. fetches `initial_base_version_id` from the ModelExpress server;
 3. verifies that the base is READY and has the configured model name; and
 4. registers itself as a ModelExpress generator worker.
@@ -402,6 +436,7 @@ finally:
 The next delta must be `v2` with `base_version_id="v1"`. An integration may
 instead create a `FULL_HF_CHECKPOINT` version without `base_version_id`; that
 version becomes the exact base for the following delta. Full checkpoint batches
-carry per-tensor Adler-32 checksums and are copied directly into the existing
-refit checkpoint as they download. XOR deltas require
-`compression_format="zstd"`.
+carry per-tensor Adler-32 checksums and are retained as an immutable full
+artifact. XOR deltas require `compression_format="zstd"` and are replayed in
+order in the canonical lineage; each preparation applies only the incoming
+delta to its exact active base.

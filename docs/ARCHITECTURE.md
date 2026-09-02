@@ -509,9 +509,11 @@ in the planner/session rather than in engine integrations.
 
 - `nixl_staged_transfer.py` owns exact-manifest decoding, transfer planning,
   reusable registered buffers, NIXL reads, transforms, and digest verification.
-- `inference/receiver.py` owns canonical S3 downloads, safetensors XOR
-  reconstruction, concurrent full-batch downloads into host-local mmaps, and
-  locked checkpoint state.
+- `inference/checkpoint_store.py` owns the host-local immutable lineage layout,
+  locking, temporary-directory promotion, atomic JSON persistence, artifact
+  fingerprints, and activation state.
+- `inference/receiver.py` owns canonical S3 downloads, safetensors validation,
+  and XOR reconstruction into derived checkpoints.
 - `inference/engines/vllm/installer.py` owns vLLM load-layout capture and
   graph-safe installation through vLLM's layerwise reload and post-load path.
 - `inference/engines/sglang/installer.py` reloads a prepared canonical checkpoint
@@ -558,16 +560,21 @@ version-level object-storage source second. A memory-backed generator defaults
 to a peer first and trainer manifests second. `source_order` can select or
 reorder supported sources without changing an engine integration.
 
-The canonical receiver either applies an exact-base XOR delta or downloads full
-HF safetensors batches concurrently through the ModelExpress S3 client. Each
-download worker validates its batch and copies its tensors directly into the
-existing checkpoint's mmap locations, overlapping downloads and disk updates.
-It does not materialize a second full checkpoint. ModelStreamer integration is
-left as a future optimization. Under the local checkpoint lock, state advances
-from `READY(base)` to `UPDATING(base -> target)` before mmap mutation and to
-`READY(target)` only after the update succeeds. A failure after mutation begins
-leaves `UPDATING`, so subsequent preparation and installation fail closed;
-initialization reseeds the local refit checkpoint before reuse.
+The canonical receiver retains each full checkpoint and delta payload under its
+version, then writes a resolved chain manifest. A full target is directly
+installable. For a delta target, the disk materializer copies the exact active
+checkpoint and applies only the incoming XOR delta into a version-scoped derived
+checkpoint. Canonical artifacts are never modified during reconstruction. The
+previous materialization is retained through installation for rollback and
+pruned after activation, leaving one steady-state materialized checkpoint.
+
+Under the local checkpoint lock, preparation state advances from `READY` to
+`UPDATING` before artifact construction and back to `READY(target)` only after
+verification. `active.json` is a separate commit point: it advances only after
+the engine installer returns successfully. Download, reconstruction, and install
+failures therefore retain the previously active version and immutable lineage.
+A separate installation fence is shared by co-located installers and exclusive
+to preparation, so preparation cannot enter between engine reload and activation.
 
 `WeightVersion.uid` is MX's opaque version identity. A create request may supply
 the UID; MX generates one when it is omitted. Creating another version with an
@@ -884,7 +891,8 @@ RL framework integrations live in the separate `modelexpress_rl` package:
 | `inference/runtime.py` | Generator source policy, method/resource composition, and update-session ownership |
 | `inference/source/` | Independent generator-peer, trainer-memory, and object-storage discovery |
 | `inference/methods/` | Independent full-tensor NIXL and canonical-checkpoint preparation |
-| `inference/receiver.py` | Canonical S3 index/shard decoding, exact-base delta mutation, and concurrent full-batch downloads into local mmaps under a lock |
+| `inference/checkpoint_store.py` | Host-local immutable lineage, locking, temporary-directory promotion, atomic JSON persistence, artifact fingerprints, and activation state |
+| `inference/receiver.py` | Canonical S3 index/shard decoding, full-checkpoint validation, and XOR reconstruction into derived checkpoints |
 | `inference/nixl_staged_transfer.py` | Private engine-neutral exact-manifest NIXL planning, transfer, reusable buffers, and verification |
 | `inference/engines/sglang/` | SGLang context and native checkpoint installer |
 | `inference/engines/vllm/context.py` | Public typed vLLM objects passed to `ModelExpressGeneratorClient.initialize()` |
