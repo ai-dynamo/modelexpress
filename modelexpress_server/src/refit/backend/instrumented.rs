@@ -21,8 +21,8 @@ use crate::metrics::backend::{BackendMetrics, Store};
 use crate::refit::backend::{RefitBackend, RefitResult};
 use modelexpress_common::grpc::refit::{
     CreateWeightVersionRequest, DeleteVersionLeaseRequest, DeleteWeightVersionShardRequest,
-    RegisterVersionLeaseRequest, VersionLease, WeightVersion, WeightVersionShard,
-    WorkerRegistration,
+    RegisterVersionLeaseRequest, UpdateWeightVersionStateRequest, VersionLease, WeightVersion,
+    WeightVersionShard, WorkerRegistration,
 };
 
 /// A [`RefitBackend`] that records timing and outcome for each operation.
@@ -84,6 +84,19 @@ impl RefitBackend for InstrumentedRefitBackend {
                 Store::Refit,
                 "delete_weight_version",
                 self.inner.delete_weight_version(uid),
+            )
+            .await
+    }
+
+    async fn update_weight_version_state(
+        &self,
+        request: &UpdateWeightVersionStateRequest,
+    ) -> RefitResult<WeightVersion> {
+        self.metrics
+            .time(
+                Store::Refit,
+                "update_weight_version_state",
+                self.inner.update_weight_version_state(request),
             )
             .await
     }
@@ -210,6 +223,13 @@ mod tests {
             self.outcome()
         }
 
+        async fn update_weight_version_state(
+            &self,
+            _request: &UpdateWeightVersionStateRequest,
+        ) -> RefitResult<WeightVersion> {
+            self.outcome()
+        }
+
         async fn create_weight_version_shard(
             &self,
             _shard: WeightVersionShard,
@@ -290,7 +310,7 @@ mod tests {
         );
     }
 
-    /// Nine near-identical forwarding bodies invite a copy-pasted op literal, so
+    /// Ten near-identical forwarding bodies invite a copy-pasted op literal, so
     /// pin that each method reports under its own name and none under another's.
     #[tokio::test]
     async fn every_method_reports_under_its_own_op_name() {
@@ -308,6 +328,9 @@ mod tests {
             .await;
         let _ = backend.get_weight_version("v1").await;
         let _ = backend.delete_weight_version("v1").await;
+        let _ = backend
+            .update_weight_version_state(&UpdateWeightVersionStateRequest::default())
+            .await;
         let _ = backend
             .create_weight_version_shard(WeightVersionShard::default())
             .await;
@@ -328,6 +351,7 @@ mod tests {
             "create_weight_version",
             "get_weight_version",
             "delete_weight_version",
+            "update_weight_version_state",
             "create_weight_version_shard",
             "list_weight_version_shards",
             "delete_weight_version_shard",
@@ -338,6 +362,6 @@ mod tests {
                 format!(r#"mx_backend_ops_total{{store="refit",op="{op}",result="ok"}} 1"#);
             assert!(encoded.contains(&expected), "missing {op}: {encoded}");
         }
-        assert_eq!(stub.calls.load(Ordering::Relaxed), 9);
+        assert_eq!(stub.calls.load(Ordering::Relaxed), 10);
     }
 }

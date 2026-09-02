@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "modelexpress"
-version = "0.5.0"
+version = "0.5.1"
 description = "Python client for ModelExpress P2P GPU transfer service"
 readme = "README.md"
 license = "Apache-2.0"
@@ -33,6 +33,11 @@ dependencies = [
     "torch>=2.6.0",
     "runai-model-streamer[s3,gcs,azure]; sys_platform == 'linux'",
     "instanttensor>=0.1.9 ; sys_platform == 'linux'",
+    # First release with IfNoneMatch on CompleteMultipartUpload.
+    "boto3>=1.35.2",
+    "zstandard>=0.22.0",
+    "safetensors>=0.8.0",
+    "s3transfer>=0.10.0",
 ]
 
 [project.optional-dependencies]

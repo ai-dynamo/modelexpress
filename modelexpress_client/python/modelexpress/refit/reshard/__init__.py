@@ -21,7 +21,10 @@ from modelexpress.refit.reshard.geometry import (
     OpChain,
     RecordedCopy,
     UnsupportedReshard,
+    build_lazy_weights,
     capture_geometry,
+    capture_weights,
+    convert_source_weights,
 )
 from modelexpress.refit.reshard.types import IncompleteRefit
 from modelexpress.refit.reshard.transfer_plan import (
@@ -78,7 +81,10 @@ __all__ = [
     "Transport",
     "TransferPlan",
     "UnsupportedReshard",
+    "build_lazy_weights",
     "capture_geometry",
+    "capture_weights",
+    "convert_source_weights",
     "classic_cuda_alloc",
     "execute_transfer",
     "gather_sources",

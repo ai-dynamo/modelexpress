@@ -51,7 +51,9 @@ anyhow = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.6", features = ["html_reports"] }
+http.workspace = true
 redis = { workspace = true }
+tower.workspace = true
 
 [[bench]]
 name = "performance"

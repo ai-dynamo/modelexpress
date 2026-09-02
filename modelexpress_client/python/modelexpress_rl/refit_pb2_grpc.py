@@ -29,8 +29,9 @@ if _version_not_supported:
 
 
 class RefitServiceStub(object):
-    """Control-plane metadata for RL weight publication. Weight bytes and full
-    manifests remain on trainer and generator workers.
+    """Control-plane metadata for RL weight publication. Object-storage-backed
+    versions own one global object URI; worker-sharded versions advertise
+    per-worker manifests.
     """
 
     def __init__(self, channel):
@@ -42,22 +43,27 @@ class RefitServiceStub(object):
         self.CreateWeightVersion = channel.unary_unary(
                 '/model_express.refit.RefitService/CreateWeightVersion',
                 request_serializer=refit__pb2.CreateWeightVersionRequest.SerializeToString,
-                response_deserializer=refit__pb2.WeightVersion.FromString,
+                response_deserializer=refit__pb2.CreateWeightVersionResponse.FromString,
                 _registered_method=True)
         self.GetWeightVersion = channel.unary_unary(
                 '/model_express.refit.RefitService/GetWeightVersion',
                 request_serializer=refit__pb2.GetWeightVersionRequest.SerializeToString,
-                response_deserializer=refit__pb2.WeightVersion.FromString,
+                response_deserializer=refit__pb2.GetWeightVersionResponse.FromString,
                 _registered_method=True)
         self.DeleteWeightVersion = channel.unary_unary(
                 '/model_express.refit.RefitService/DeleteWeightVersion',
                 request_serializer=refit__pb2.DeleteWeightVersionRequest.SerializeToString,
-                response_deserializer=refit__pb2.WeightVersion.FromString,
+                response_deserializer=refit__pb2.DeleteWeightVersionResponse.FromString,
+                _registered_method=True)
+        self.UpdateWeightVersionState = channel.unary_unary(
+                '/model_express.refit.RefitService/UpdateWeightVersionState',
+                request_serializer=refit__pb2.UpdateWeightVersionStateRequest.SerializeToString,
+                response_deserializer=refit__pb2.UpdateWeightVersionStateResponse.FromString,
                 _registered_method=True)
         self.RegisterWorker = channel.unary_unary(
                 '/model_express.refit.RefitService/RegisterWorker',
                 request_serializer=refit__pb2.RegisterWorkerRequest.SerializeToString,
-                response_deserializer=refit__pb2.WorkerRegistration.FromString,
+                response_deserializer=refit__pb2.RegisterWorkerResponse.FromString,
                 _registered_method=True)
         self.CreateWeightVersionShard = channel.unary_unary(
                 '/model_express.refit.RefitService/CreateWeightVersionShard',
@@ -77,7 +83,7 @@ class RefitServiceStub(object):
         self.RegisterVersionLease = channel.unary_unary(
                 '/model_express.refit.RefitService/RegisterVersionLease',
                 request_serializer=refit__pb2.RegisterVersionLeaseRequest.SerializeToString,
-                response_deserializer=refit__pb2.VersionLease.FromString,
+                response_deserializer=refit__pb2.RegisterVersionLeaseResponse.FromString,
                 _registered_method=True)
         self.DeleteVersionLease = channel.unary_unary(
                 '/model_express.refit.RefitService/DeleteVersionLease',
@@ -87,8 +93,9 @@ class RefitServiceStub(object):
 
 
 class RefitServiceServicer(object):
-    """Control-plane metadata for RL weight publication. Weight bytes and full
-    manifests remain on trainer and generator workers.
+    """Control-plane metadata for RL weight publication. Object-storage-backed
+    versions own one global object URI; worker-sharded versions advertise
+    per-worker manifests.
     """
 
     def CreateWeightVersion(self, request, context):
@@ -105,6 +112,13 @@ class RefitServiceServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def DeleteWeightVersion(self, request, context):
+        """Cancel a STAGING version or retire a READY version.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def UpdateWeightVersionState(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -137,7 +151,7 @@ class RefitServiceServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def RegisterVersionLease(self, request, context):
-        """A live lease protects every shard while a generator installs the version.
+        """A live lease protects the version source while a generator installs it.
         Re-registering the same lease owner renews its expiry.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -156,22 +170,27 @@ def add_RefitServiceServicer_to_server(servicer, server):
             'CreateWeightVersion': grpc.unary_unary_rpc_method_handler(
                     servicer.CreateWeightVersion,
                     request_deserializer=refit__pb2.CreateWeightVersionRequest.FromString,
-                    response_serializer=refit__pb2.WeightVersion.SerializeToString,
+                    response_serializer=refit__pb2.CreateWeightVersionResponse.SerializeToString,
             ),
             'GetWeightVersion': grpc.unary_unary_rpc_method_handler(
                     servicer.GetWeightVersion,
                     request_deserializer=refit__pb2.GetWeightVersionRequest.FromString,
-                    response_serializer=refit__pb2.WeightVersion.SerializeToString,
+                    response_serializer=refit__pb2.GetWeightVersionResponse.SerializeToString,
             ),
             'DeleteWeightVersion': grpc.unary_unary_rpc_method_handler(
                     servicer.DeleteWeightVersion,
                     request_deserializer=refit__pb2.DeleteWeightVersionRequest.FromString,
-                    response_serializer=refit__pb2.WeightVersion.SerializeToString,
+                    response_serializer=refit__pb2.DeleteWeightVersionResponse.SerializeToString,
+            ),
+            'UpdateWeightVersionState': grpc.unary_unary_rpc_method_handler(
+                    servicer.UpdateWeightVersionState,
+                    request_deserializer=refit__pb2.UpdateWeightVersionStateRequest.FromString,
+                    response_serializer=refit__pb2.UpdateWeightVersionStateResponse.SerializeToString,
             ),
             'RegisterWorker': grpc.unary_unary_rpc_method_handler(
                     servicer.RegisterWorker,
                     request_deserializer=refit__pb2.RegisterWorkerRequest.FromString,
-                    response_serializer=refit__pb2.WorkerRegistration.SerializeToString,
+                    response_serializer=refit__pb2.RegisterWorkerResponse.SerializeToString,
             ),
             'CreateWeightVersionShard': grpc.unary_unary_rpc_method_handler(
                     servicer.CreateWeightVersionShard,
@@ -191,7 +210,7 @@ def add_RefitServiceServicer_to_server(servicer, server):
             'RegisterVersionLease': grpc.unary_unary_rpc_method_handler(
                     servicer.RegisterVersionLease,
                     request_deserializer=refit__pb2.RegisterVersionLeaseRequest.FromString,
-                    response_serializer=refit__pb2.VersionLease.SerializeToString,
+                    response_serializer=refit__pb2.RegisterVersionLeaseResponse.SerializeToString,
             ),
             'DeleteVersionLease': grpc.unary_unary_rpc_method_handler(
                     servicer.DeleteVersionLease,
@@ -207,8 +226,9 @@ def add_RefitServiceServicer_to_server(servicer, server):
 
  # This class is part of an EXPERIMENTAL API.
 class RefitService(object):
-    """Control-plane metadata for RL weight publication. Weight bytes and full
-    manifests remain on trainer and generator workers.
+    """Control-plane metadata for RL weight publication. Object-storage-backed
+    versions own one global object URI; worker-sharded versions advertise
+    per-worker manifests.
     """
 
     @staticmethod
@@ -227,7 +247,7 @@ class RefitService(object):
             target,
             '/model_express.refit.RefitService/CreateWeightVersion',
             refit__pb2.CreateWeightVersionRequest.SerializeToString,
-            refit__pb2.WeightVersion.FromString,
+            refit__pb2.CreateWeightVersionResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -254,7 +274,7 @@ class RefitService(object):
             target,
             '/model_express.refit.RefitService/GetWeightVersion',
             refit__pb2.GetWeightVersionRequest.SerializeToString,
-            refit__pb2.WeightVersion.FromString,
+            refit__pb2.GetWeightVersionResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -281,7 +301,34 @@ class RefitService(object):
             target,
             '/model_express.refit.RefitService/DeleteWeightVersion',
             refit__pb2.DeleteWeightVersionRequest.SerializeToString,
-            refit__pb2.WeightVersion.FromString,
+            refit__pb2.DeleteWeightVersionResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def UpdateWeightVersionState(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.refit.RefitService/UpdateWeightVersionState',
+            refit__pb2.UpdateWeightVersionStateRequest.SerializeToString,
+            refit__pb2.UpdateWeightVersionStateResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -308,7 +355,7 @@ class RefitService(object):
             target,
             '/model_express.refit.RefitService/RegisterWorker',
             refit__pb2.RegisterWorkerRequest.SerializeToString,
-            refit__pb2.WorkerRegistration.FromString,
+            refit__pb2.RegisterWorkerResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -416,7 +463,7 @@ class RefitService(object):
             target,
             '/model_express.refit.RefitService/RegisterVersionLease',
             refit__pb2.RegisterVersionLeaseRequest.SerializeToString,
-            refit__pb2.VersionLease.FromString,
+            refit__pb2.RegisterVersionLeaseResponse.FromString,
             options,
             channel_credentials,
             insecure,
