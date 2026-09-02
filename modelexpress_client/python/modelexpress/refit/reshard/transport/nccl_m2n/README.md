@@ -360,11 +360,14 @@ accepted. MX retains references and requires that storage to remain immutable
 while the staged update owns it.
 
 Current upstream M2N documentation describes cross-bucket overlap as
-unsupported. The existing PP2-to-PP1 GPU test validates canonical multi-group
-order and distinct-stream overlap using distinct source tensors. It does not
-reuse identical source storage across separate M2N buckets. The exact real-GPU
-regression required by finding #8 remains pending, and this exemption must not
-be production-approved without that test and a pinned compatible M2N revision.
+unsupported. MX intentionally treats immutable source/source reuse across PP
+groups as an empirically validated compatibility contract. The checked-in
+PP1-to-PP2 regression passes the exact same PyTorch CUDA tensor and data pointer
+to two communicator/stream buckets inside one outer M2N group. Across two model
+versions it verifies source immutability, canonical submission, distinct stream
+handles with overlapping in-flight intervals, pre-apply destination invisibility,
+and exact destination values. This behavior is validated for the pinned M2N
+revision below and must remain covered when that revision changes.
 
 ## Failure domain and recovery
 
@@ -547,7 +550,7 @@ collective correctness, so real-GPU scenarios are tracked separately.
 The final data-plane code snapshot passed:
 
 - Ruff 0.16.4;
-- Black check on all eight changed Python files;
+- Black check on all changed Python files;
 - Python bytecode compilation; and
 - `git diff --check`.
 
@@ -569,9 +572,10 @@ and TP reshard reference values.
 
 Final results:
 
-- focused suite: 111 passed in 0.87 seconds; and
-- complete Python suite: 1352 passed, 1 skipped, 16 warnings in 92.44 seconds
-  (Pretyche Slurm job `2678022`).
+- focused suite: 111 passed in 0.87 seconds;
+- finding #8 shared-source unit regression: 1 passed in 0.76 seconds; and
+- complete Python suite: 1352 passed, 1 skipped, 16 warnings in 97.15 seconds
+  (Pretyche Slurm job `2699879`).
 
 ### Real-GPU setup
 
@@ -595,13 +599,14 @@ model weights. M2N/NCCL4Py moved the weights.
 | TP2 -> TP1, two parameters, two versions | M-to-N gather/reshard and repeated-version visibility | Passed, job `2678024` |
 | TP1 -> TP2, two parameters, two versions | M-to-N split/reshard on both destination ranks | Passed, job `2678026` |
 | PP2 -> PP1 multi-group | Reverse input insertion becomes canonical `[0, 1]`; exact values; event-measured work overlaps on distinct streams | Passed, job `2678029` |
+| PP1 -> PP2 shared-source multi-group, two versions | One exact source pointer feeds two communicator/stream buckets; distinct handles and overlapping intervals; pre-apply invisibility and exact values | Passed, job `2699878` |
 | In-flight peer loss | Source killed after native group return while streams pending; survivor times out without apply, emits typed error/direct cause, retains resources, attempts abort, and promptly rejects reuse/close | Passed, job `2678030` |
 
 The peer-loss test validates bounded post-submission MX polling and fail-stop.
 It does not prove fast recovery when a peer dies while Python is blocked inside
 native `group_end()`.
 
-## Deferred findings and production limitations
+## Review findings and production limitations
 
 ### Finding #7: cross-rank plan divergence — explicitly deferred
 
@@ -615,13 +620,15 @@ The external control plane must agree the complete plan digest and round before
 any rank calls `stage()`. This remains a production integration precondition and
 must not be described as resolved by local preflight checks.
 
-### Finding #8: same-source cross-bucket GPU test — pending
+### Finding #8: same-source cross-bucket GPU test — resolved
 
-The approved MX contract permits identical read-only source storage to feed
-different PP-group M2N buckets. The checked-in PP2-to-PP1 test uses distinct
-source tensors, so it does not validate this exact case. A compute-node GPU
-test must reuse the same source storage across multiple PP communicators,
-verify every destination, and repeat model versions before production approval.
+The checked-in PP1-to-PP2 test has one trainer rank pass the exact same CUDA
+tensor and data pointer to PP groups `(0, 0)` and `(0, 1)` inside one outer M2N
+group. On two distinct streams it repeats two model versions and verifies source
+immutability, canonical order, pre-apply destination invisibility, and exact
+values on both generator ranks. Pretyche job `2699878` passed against the pinned
+M2N/NCCL environment, and the complete Python suite passed in job `2699879`.
+No production data-plane code changed for this finding.
 
 ### Other boundaries
 

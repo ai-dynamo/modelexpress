@@ -1471,6 +1471,13 @@ def test_multi_pp_group_submission_uses_one_group_and_sorted_first_occurrence():
     shared = make_params()
 
     complete_update(executor, {(1, 0): shared, (0, 0): shared})
+    first_bucket = [call for call in m2n.handle.calls if call["comm"].name == "0-0"]
+    second_bucket = [call for call in m2n.handle.calls if call["comm"].name == "1-0"]
+    assert len(first_bucket) == len(second_bucket)
+    assert all(
+        left["src"].buffer is right["src"].buffer
+        for left, right in zip(first_bucket, second_bucket, strict=True)
+    )
 
     assert [call["comm"].name for call in m2n.handle.calls] == [
         "0-0",
