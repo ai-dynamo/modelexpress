@@ -414,8 +414,8 @@ or full-checkpoint safetensors objects are stored as siblings. A delta index's
 `compression_format` selects the receiver's decompressor. The current
 implementation supports Zstandard. Unknown compression formats are rejected
 before shard download. Full versions use a standard safetensors index, carry
-per-tensor Adler-32 checksums in shard metadata, and reset the exact base for
-later deltas.
+optional per-tensor Adler-32 checksums under `mx.adler32:<tensor-name>` keys in
+shard metadata, and reset the exact base for later deltas.
 Canonical S3 versions are retained for rollout fault recovery. Trainer
 processes keep only the current base snapshot; older
 immutable S3 objects are governed by external bucket lifecycle policy.

@@ -17,6 +17,8 @@ from typing import TypeVar
 import numpy as np
 
 
+ADLER32_METADATA_PREFIX = "mx.adler32:"
+
 _WorkItem = TypeVar("_WorkItem")
 _WorkResult = TypeVar("_WorkResult")
 
@@ -182,6 +184,7 @@ def index_checkpoint_tensors(
 
 
 __all__ = [
+    "ADLER32_METADATA_PREFIX",
     "adler32_checksum",
     "compress_delta",
     "compute_delta",

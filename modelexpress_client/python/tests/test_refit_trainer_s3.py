@@ -439,9 +439,11 @@ def test_s3_full_hf_checkpoint_publishes_native_tensors_and_rebases(
         assert torch.equal(loaded["weight"], expected)
         (header_size,) = struct.unpack("<Q", shard[:8])
         header = json.loads(shard[8 : 8 + header_size])
-        assert header["__metadata__"]["weight"] == (
-            f"{zlib.adler32(expected.view(torch.uint8).numpy()):08x}"
-        )
+        assert header["__metadata__"] == {
+            "mx.adler32:weight": (
+                f"{zlib.adler32(expected.view(torch.uint8).numpy()):08x}"
+            )
+        }
         assert method.current_base_version_id == "target-a"
         assert np.array_equal(
             method.snapshot["weight"],

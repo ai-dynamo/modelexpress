@@ -21,7 +21,13 @@ import torch.distributed as dist
 from ... import envs as rl_envs
 from ... import refit_pb2, refit_pb2_grpc
 from ...s3 import S3Client
-from ...utils import adler32_checksum, compress_delta, compute_delta, threadpool_map
+from ...utils import (
+    ADLER32_METADATA_PREFIX,
+    adler32_checksum,
+    compress_delta,
+    compute_delta,
+    threadpool_map,
+)
 from ...version import WeightVersionRef
 
 logger = logging.getLogger("modelexpress_rl.train.client")
@@ -332,7 +338,7 @@ class CanonicalDeltaPublicationMethod:
         ) -> tuple[dict[str, str], int]:
             filename, tensors = item
             checksums = {
-                name: adler32_checksum(
+                f"{ADLER32_METADATA_PREFIX}{name}": adler32_checksum(
                     tensor.reshape(-1).view(torch.uint8).numpy()
                 )
                 for name, tensor in tensors.items()

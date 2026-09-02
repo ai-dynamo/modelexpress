@@ -345,6 +345,91 @@ seed checkpoint, write the cache, or validate the base version.
 
 ## Weight Update
 
+### Generator-side S3 artifact contract
+
+The weight version's `object_storage.uri` points to a global JSON index. Shard
+filenames in `weight_map` are resolved relative to that index.
+
+#### `XOR_DELTA`
+
+```json
+{
+  "metadata": {
+    "version": "v1",
+    "base_version": "v0",
+    "delta_encoding": "xor",
+    "compression_format": "zstd",
+    "checksum_format": "adler32"
+  },
+  "weight_map": {
+    "model.layers.0.example.weight": "model-00000-of-00004.safetensors"
+  }
+}
+```
+
+The generator requires all five metadata fields and `weight_map`. It uses
+`compression_format` to select the decompressor; the other metadata values
+describe the artifact. ModelExpress currently publishes `xor`, `zstd`, and
+`adler32` for the encoding, compression, and checksum fields.
+
+Each delta shard contains compressed `U8` XOR bytes. Its safetensors
+`__metadata__` must contain the Adler-32 checksum of every reconstructed full
+tensor:
+
+```json
+{
+  "__metadata__": {
+    "model.layers.0.example.weight": "12ab34cd"
+  },
+  "model.layers.0.example.weight": {
+    "dtype": "U8",
+    "shape": [1234],
+    "data_offsets": [0, 1234]
+  }
+}
+```
+
+#### `FULL_HF_CHECKPOINT`
+
+Full checkpoints use a standard Hugging Face safetensors index:
+
+```json
+{
+  "metadata": {
+    "total_size": 8
+  },
+  "weight_map": {
+    "model.layers.0.example.weight": "model-00001-of-00004.safetensors"
+  }
+}
+```
+
+The generator requires a non-empty `weight_map` covering exactly the local
+checkpoint tensors. The index `metadata` field is optional and ignored.
+
+Each referenced shard contains native HF tensors. Safetensors `__metadata__`
+is optional and may contain arbitrary string-to-string entries. A namespaced
+entry adds optional integrity checking for one tensor:
+
+```json
+{
+  "__metadata__": {
+    "format": "pt",
+    "mx.adler32:model.layers.0.example.weight": "12ab34cd"
+  },
+  "model.layers.0.example.weight": {
+    "dtype": "F32",
+    "shape": [2],
+    "data_offsets": [0, 8]
+  }
+}
+```
+
+When `mx.adler32:<tensor-name>` is present, the generator verifies it against
+the downloaded tensor bytes. When it is absent, checksum verification is
+skipped. Tensor names, dtypes, shapes, and byte sizes are always checked before
+the immutable full artifact is promoted.
+
 ### 1. Publish `v1`
 
 Create `v1` as STAGING, upload the delta shards and index, and then mark it
@@ -401,23 +486,6 @@ if dist.get_rank(group=refit_process_group) == 0:
         )
 ```
 
-The index has this shape; shard names are resolved relative to its parent URI:
-
-```json
-{
-  "metadata": {
-    "version": "v1",
-    "base_version": "v0",
-    "delta_encoding": "xor",
-    "compression_format": "zstd",
-    "checksum_format": "adler32"
-  },
-  "weight_map": {
-    "model.layers.0.example.weight": "model-00000-of-00004.safetensors"
-  }
-}
-```
-
 ### 2. Apply `v1` in vLLM
 
 Run the update while generation is paused. `mode=abort` clears active requests
@@ -452,7 +520,8 @@ finally:
 The next delta must be `v2` with `base_version_id="v1"`. An integration may
 instead create a `FULL_HF_CHECKPOINT` version without `base_version_id`; that
 version becomes the exact base for the following delta. Full checkpoint batches
-carry per-tensor Adler-32 checksums and are retained as an immutable full
-artifact. XOR deltas require `compression_format="zstd"` and are replayed in
-order in the canonical lineage; each preparation applies only the incoming
-delta to its exact active base.
+may carry optional per-tensor checksums under `mx.adler32:<tensor-name>` keys and
+are retained as an immutable full artifact. XOR deltas require the complete
+index metadata contract above and are replayed in order in the canonical
+lineage; each preparation applies only the incoming delta to its exact active
+base.

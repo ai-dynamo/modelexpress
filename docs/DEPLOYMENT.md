@@ -959,11 +959,12 @@ Full checkpoints are grouped into concurrently uploaded safetensors objects of
 up to `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` tensor bytes (4 GiB by default).
 A single tensor larger than the configured size is uploaded on its own.
 Generators download those objects concurrently through the ModelExpress S3
-client. Each download worker validates one batch and overwrites the matching
-regions in the existing local checkpoint mmaps.
-The receiver marks its local checkpoint `UPDATING` before mutation and `READY`
-only after success. An interrupted update remains unavailable until a fresh
-initialization reseeds it from `seed_checkpoint_path`.
+client. Each download worker validates one batch and writes it into a temporary,
+version-scoped full checkpoint. The target is promoted only after every batch
+succeeds. Preparation uses `UPDATING` as a transaction marker and writes
+`READY(target)` only after verification. Any preparation failure discards its
+temporary target and restores `READY(active)` for immediate retry; the active
+checkpoint is never overwritten.
 
 S3 versions normally use `XOR_DELTA`. Integrations may opt into a
 framework-selected cadence of `FULL_HF_CHECKPOINT` versions; these publish

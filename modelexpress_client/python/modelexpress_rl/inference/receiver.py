@@ -30,6 +30,7 @@ from modelexpress_rl.object_storage import ObjectStorageType
 from modelexpress_rl.s3 import S3Client
 from modelexpress_rl.train import WeightPayloadFormat
 from modelexpress_rl.utils import (
+    ADLER32_METADATA_PREFIX,
     adler32_checksum,
     index_checkpoint_tensors,
     read_safetensors_header,
@@ -714,10 +715,10 @@ class _LocalCheckpoint:
             validation_started = time.perf_counter()
             header, data_start = read_safetensors_header(data, repr(filename))
             tensor_names = shard_to_tensors[filename]
-            checksums = header.get("__metadata__")
-            if not isinstance(checksums, dict) or set(checksums) != set(tensor_names):
+            metadata = header.get("__metadata__", {})
+            if not isinstance(metadata, dict):
                 raise ValueError(
-                    f"full HF checkpoint shard {filename!r} has invalid checksums"
+                    f"full HF checkpoint shard {filename!r} has invalid metadata"
                 )
 
             view = memoryview(data)
@@ -744,7 +745,8 @@ class _LocalCheckpoint:
                     count=end - begin,
                     offset=data_start + begin,
                 )
-                if adler32_checksum(source) != checksums[name]:
+                checksum = metadata.get(f"{ADLER32_METADATA_PREFIX}{name}")
+                if checksum is not None and adler32_checksum(source) != checksum:
                     raise ValueError(
                         f"full HF checkpoint checksum differs for {name!r}"
                     )
