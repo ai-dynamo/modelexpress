@@ -16,9 +16,11 @@ import torch.nn as nn
 from modelexpress.engines.vllm.adapter import (
     DraftShardSelection,
     VllmAdapter,
+    _DRAFT_WEIGHT_PREFIXES,
     _SAFETENSORS_INDEX_NAME,
     _get_vllm_device_id,
     _get_vllm_worker_rank,
+    _mtp_layer_prefixes,
     _read_safetensors_index,
     _select_draft_weight_files,
     build_vllm_load_context,
@@ -394,22 +396,40 @@ class _StandaloneFinalizer(torch.nn.Module):
         )
 
 
+def _union_prefixes(num_hidden_layers, num_nextn_predict_layers):
+    """The prefix set the adapter actually passes to the selector: DeepSeek's
+    "mtp." unioned with GLM's config-derived layer names."""
+    config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            num_hidden_layers=num_hidden_layers,
+            num_nextn_predict_layers=num_nextn_predict_layers,
+        )
+    )
+    return _DRAFT_WEIGHT_PREFIXES + _mtp_layer_prefixes(config)
+
+
 class TestDraftWeightFileSelection:
-    """A draft load streams only its own shards, and falls back to the full
-    set when the checkpoint has no draft head."""
+    """A draft load streams only its own shards, and falls back to the full set
+    when the checkpoint has no resolvable draft head. The selector matches both
+    real conventions: DeepSeek's "mtp." prefix and GLM's extra decoder layer
+    model.layers.{num_hidden_layers + i}. Fixtures mirror DeepSeek-V4-Pro
+    (base=61, mtp.0.*) and GLM-5.3 (base=78, model.layers.78.*)."""
 
     def _write_index(self, tmp_path, weight_map):
+        """Write a safetensors index mapping tensor names to shard files."""
         (tmp_path / "model.safetensors.index.json").write_text(
             json.dumps({"weight_map": weight_map}), encoding="utf-8"
         )
 
-    def test_selects_only_mtp_shard(self, tmp_path):
+    def test_selects_glm_extra_layer_shard(self, tmp_path):
+        """GLM extra-layer MTP (base=78): only the model.layers.78 shard is selected."""
         self._write_index(
             tmp_path,
             {
-                "model.embed_tokens.weight": "model-00001-of-00002.safetensors",
-                "lm_head.weight": "model-00002-of-00002.safetensors",
-                "mtp.fc.weight": "model-mtp.safetensors",
+                "model.layers.0.self_attn.qkv_proj.weight": "model-00001-of-00002.safetensors",
+                "model.layers.77.mlp.down_proj.weight": "model-00002-of-00002.safetensors",
+                "model.layers.78.eh_proj.weight": "model-mtp.safetensors",
+                "model.layers.78.self_attn.qkv_proj.weight": "model-mtp.safetensors",
             },
         )
         files = [
@@ -420,41 +440,91 @@ class TestDraftWeightFileSelection:
                 "model-mtp.safetensors",
             )
         ]
-        assert _select_draft_weight_files(str(tmp_path), files) == (
+        assert _select_draft_weight_files(
+            str(tmp_path), files, _union_prefixes(78, 1)
+        ) == (
             DraftShardSelection.SELECTED,
             [os.path.join(str(tmp_path), "model-mtp.safetensors")],
         )
 
-    def test_selects_mtp_shard_for_hf_repo_id(self, tmp_path):
-        # model_uri is an HF repo id that only _prepare_weights can resolve;
-        # the index has to be found next to the shards it returned.
+    def test_selects_deepseek_mtp_prefix_shard(self, tmp_path):
+        """DeepSeek "mtp." prefix resolves the draft shard when the layer-index prefix matches nothing."""
         self._write_index(
             tmp_path,
             {
-                "model.embed_tokens.weight": "model-00001-of-00002.safetensors",
-                "lm_head.weight": "model-00002-of-00002.safetensors",
-                "mtp.fc.weight": "model-mtp.safetensors",
+                "layers.0.hc_attn_base": "model-00002-of-00003.safetensors",
+                "layers.60.hc_ffn_base": "model-00002-of-00003.safetensors",
+                "mtp.0.hc_head_base": "model-mtp.safetensors",
+                "mtp.0.hc_head_fn": "model-mtp.safetensors",
+            },
+        )
+        files = [
+            os.path.join(str(tmp_path), name)
+            for name in (
+                "model-00002-of-00003.safetensors",
+                "model-mtp.safetensors",
+            )
+        ]
+        assert _select_draft_weight_files(
+            str(tmp_path), files, _union_prefixes(61, 1)
+        ) == (
+            DraftShardSelection.SELECTED,
+            [os.path.join(str(tmp_path), "model-mtp.safetensors")],
+        )
+
+    def test_selects_draft_shard_for_hf_repo_id(self, tmp_path):
+        """HF repo-id URI: the index is found next to the resolved shard files."""
+        self._write_index(
+            tmp_path,
+            {
+                "model.layers.0.self_attn.qkv_proj.weight": "model-00001-of-00002.safetensors",
+                "model.layers.78.self_attn.qkv_proj.weight": "model-mtp.safetensors",
             },
         )
         files = [
             os.path.join(str(tmp_path), name)
             for name in (
                 "model-00001-of-00002.safetensors",
-                "model-00002-of-00002.safetensors",
                 "model-mtp.safetensors",
             )
         ]
-        assert _select_draft_weight_files("Qwen/Qwen3.5-27B", files) == (
+        assert _select_draft_weight_files(
+            "Qwen/Qwen3.5-27B", files, _union_prefixes(78, 1)
+        ) == (
             DraftShardSelection.SELECTED,
             [os.path.join(str(tmp_path), "model-mtp.safetensors")],
+        )
+
+    def test_does_not_match_shorter_layer_index(self, tmp_path):
+        """layers.7 must not match the layers.78 prefix (trailing-dot guard)."""
+        self._write_index(
+            tmp_path,
+            {"model.layers.7.self_attn.qkv_proj.weight": "model-00001-of-00001.safetensors"},
+        )
+        files = [os.path.join(str(tmp_path), "model-00001-of-00001.safetensors")]
+        assert _select_draft_weight_files(
+            str(tmp_path), files, _union_prefixes(78, 1)
+        ) == (
+            DraftShardSelection.NO_DRAFT_WEIGHTS,
+            [],
         )
 
     def test_falls_back_without_draft_head(self, tmp_path):
         self._write_index(
-            tmp_path, {"model.embed_tokens.weight": "model-00001-of-00001.safetensors"}
+            tmp_path, {"model.layers.0.self_attn.qkv_proj.weight": "model-00001-of-00001.safetensors"}
         )
         files = [os.path.join(str(tmp_path), "model-00001-of-00001.safetensors")]
-        assert _select_draft_weight_files(str(tmp_path), files) == (
+        assert _select_draft_weight_files(
+            str(tmp_path), files, _union_prefixes(78, 1)
+        ) == (
+            DraftShardSelection.NO_DRAFT_WEIGHTS,
+            [],
+        )
+
+    def test_empty_prefixes_reports_no_draft_weights(self, tmp_path):
+        """No prefixes: report no draft weights without reading the index."""
+        files = [os.path.join(str(tmp_path), "model-00001-of-00001.safetensors")]
+        assert _select_draft_weight_files(str(tmp_path), files, ()) == (
             DraftShardSelection.NO_DRAFT_WEIGHTS,
             [],
         )
@@ -464,7 +534,9 @@ class TestDraftWeightFileSelection:
             "{not json", encoding="utf-8"
         )
         files = [os.path.join(str(tmp_path), "model-00001-of-00001.safetensors")]
-        assert _select_draft_weight_files("Qwen/Qwen3.5-27B", files) == (
+        assert _select_draft_weight_files(
+            "Qwen/Qwen3.5-27B", files, _union_prefixes(78, 1)
+        ) == (
             DraftShardSelection.UNRESOLVED,
             [],
         )
@@ -475,10 +547,53 @@ class TestDraftWeightFileSelection:
             "modelexpress.engines.vllm.adapter._read_safetensors_index",
             return_value=None,
         ):
-            assert _select_draft_weight_files("Qwen/Qwen3.5-27B", files) == (
+            assert _select_draft_weight_files(
+                "Qwen/Qwen3.5-27B", files, _union_prefixes(78, 1)
+            ) == (
                 DraftShardSelection.UNRESOLVED,
                 [],
             )
+
+
+class TestMtpLayerPrefixes:
+    """MTP layer prefixes are derived from config.json (num_hidden_layers +
+    num_nextn_predict_layers), mirroring vLLM's spec-layer indexing."""
+
+    def test_derives_glm_extra_layer_prefixes(self):
+        """GLM config (base=92, n=1) yields the layer-92 prefix variants."""
+        config = SimpleNamespace(
+            hf_config=SimpleNamespace(num_hidden_layers=92, num_nextn_predict_layers=1)
+        )
+        assert _mtp_layer_prefixes(config) == (
+            "model.layers.92.",
+            "layers.92.",
+            "model.language_model.layers.92.",
+        )
+
+    def test_multiple_nextn_layers(self):
+        """n>1 yields prefixes for each consecutive extra layer."""
+        config = SimpleNamespace(
+            hf_config=SimpleNamespace(num_hidden_layers=61, num_nextn_predict_layers=2)
+        )
+        assert _mtp_layer_prefixes(config) == (
+            "model.layers.61.",
+            "layers.61.",
+            "model.language_model.layers.61.",
+            "model.layers.62.",
+            "layers.62.",
+            "model.language_model.layers.62.",
+        )
+
+    def test_no_mtp_layers_returns_empty(self):
+        """num_nextn_predict_layers=0 yields no prefixes."""
+        config = SimpleNamespace(
+            hf_config=SimpleNamespace(num_hidden_layers=92, num_nextn_predict_layers=0)
+        )
+        assert _mtp_layer_prefixes(config) == ()
+
+    def test_missing_fields_returns_empty(self):
+        """Missing config fields yield no prefixes."""
+        assert _mtp_layer_prefixes(SimpleNamespace(hf_config=SimpleNamespace())) == ()
 
 
 def _stub_runai(monkeypatch, available: dict[str, str]) -> list:
@@ -512,7 +627,7 @@ class TestReadSafetensorsIndexObjectStore:
     the full object key; the bare filename this once used matched nothing."""
 
     def test_reads_index_via_anchored_glob(self, monkeypatch):
-        index = {"weight_map": {"mtp.fc.weight": "model-mtp.safetensors"}}
+        index = {"weight_map": {"model.layers.92.self_attn.qkv_proj.weight": "model-mtp.safetensors"}}
         calls = _stub_runai(
             monkeypatch,
             {
@@ -531,13 +646,14 @@ class TestReadSafetensorsIndexObjectStore:
             assert _read_safetensors_index("s3://bucket/model") is None
         assert any("not found under" in rec.message for rec in caplog.records)
 
-    def test_selects_mtp_shard_from_object_store(self, monkeypatch):
+    def test_selects_draft_shard_from_object_store(self, monkeypatch):
+        """Object-store URI: selects only the draft shard via the index read over runai."""
         index = {
             "weight_map": {
-                "model.embed_tokens.weight": "model-00001-of-00002.safetensors",
-                "lm_head.weight": "model-00002-of-00002.safetensors",
-                "mtp.fc.weight": "model-mtp.safetensors",
-                "mtp.layers.0.input_layernorm.weight": "model-mtp.safetensors",
+                "model.layers.0.self_attn.qkv_proj.weight": "model-00001-of-00002.safetensors",
+                "model.layers.91.mlp.down_proj.weight": "model-00002-of-00002.safetensors",
+                "model.layers.92.self_attn.qkv_proj.weight": "model-mtp.safetensors",
+                "model.layers.92.input_layernorm.weight": "model-mtp.safetensors",
             }
         }
         _stub_runai(monkeypatch, {_SAFETENSORS_INDEX_NAME: json.dumps(index)})
@@ -549,7 +665,9 @@ class TestReadSafetensorsIndexObjectStore:
                 "model-mtp.safetensors",
             )
         ]
-        assert _select_draft_weight_files("s3://bucket/model", files) == (
+        assert _select_draft_weight_files(
+            "s3://bucket/model", files, _union_prefixes(92, 1)
+        ) == (
             DraftShardSelection.SELECTED,
             ["s3://bucket/model/model-mtp.safetensors"],
         )

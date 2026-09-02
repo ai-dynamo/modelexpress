@@ -41,8 +41,13 @@ _VLLM_POST_RDMA_FINALIZER_NAMES = (
     "finalize_mhc_broadcast_weights",
 )
 
-# MTP draft weights live under an "mtp." prefix in the shared checkpoint. The
-# draft's embedding and lm_head come from the target, so these are all it needs.
+# MTP draft weights follow one of two checkpoint conventions; match both.
+#   - "mtp." prefix: DeepSeek (DeepSeek-V4-Pro names them mtp.0.*).
+#   - extra decoder layer model.layers.{num_hidden_layers + i}: GLM-family
+#     (GLM-5.3 names them model.layers.78.*), derived from config.json in
+#     _mtp_layer_prefixes.
+# The draft's embedding and lm_head come from the target, so the head is all it
+# needs. Neither convention subsumes the other, so the selector unions them.
 _DRAFT_WEIGHT_PREFIXES: tuple[str, ...] = ("mtp.",)
 
 _SAFETENSORS_INDEX_NAME = "model.safetensors.index.json"
@@ -138,16 +143,42 @@ def _load_safetensors_index(
     return _read_safetensors_index(model_uri)
 
 
+def _mtp_layer_prefixes(model_config) -> tuple[str, ...]:
+    """Extra-decoder-layer draft prefixes derived from the checkpoint's config.
+
+    GLM-family checkpoints store the MTP head as extra decoder layers named
+    model.layers.{num_hidden_layers + i} (i < num_nextn_predict_layers), with no
+    "mtp." prefix. The three name forms mirror vLLM's
+    get_spec_layer_idx_from_weight_name. Unioned with _DRAFT_WEIGHT_PREFIXES
+    (DeepSeek's "mtp.") so both conventions resolve.
+    """
+    hf_config = getattr(model_config, "hf_config", None) or model_config
+    n = getattr(hf_config, "num_nextn_predict_layers", 0) or 0
+    base = getattr(hf_config, "num_hidden_layers", None)
+    if not n or base is None:
+        return ()
+    prefixes: list[str] = []
+    for i in range(n):
+        prefixes.append(f"model.layers.{base + i}.")
+        prefixes.append(f"layers.{base + i}.")
+        prefixes.append(f"model.language_model.layers.{base + i}.")
+    return tuple(prefixes)
+
+
 def _select_draft_weight_files(
     model_uri: str,
     hf_weights_files: list[str],
+    draft_prefixes: tuple[str, ...],
 ) -> tuple[DraftShardSelection, list[str]]:
     """Return the shards holding the draft's own weights.
 
-    Keeps shards whose index tensors carry a draft prefix. Anything other than
-    SELECTED leaves the caller streaming every shard, so a checkpoint without a
+    Keeps shards whose index tensors start with one of draft_prefixes (DeepSeek's
+    "mtp." plus GLM's config-derived layer names). Anything other than SELECTED
+    leaves the caller streaming every shard, so a checkpoint without a resolvable
     draft head (or without a readable index) is never truncated to nothing.
     """
+    if not draft_prefixes:
+        return DraftShardSelection.NO_DRAFT_WEIGHTS, []
     try:
         index = _load_safetensors_index(model_uri, hf_weights_files)
         if not index:
@@ -156,7 +187,7 @@ def _select_draft_weight_files(
         wanted = {
             fname
             for tname, fname in weight_map.items()
-            if tname.startswith(_DRAFT_WEIGHT_PREFIXES)
+            if tname.startswith(draft_prefixes)
         }
         if not wanted:
             return DraftShardSelection.NO_DRAFT_WEIGHTS, []
@@ -274,7 +305,10 @@ class VllmAdapter(EngineAdapter):
         )
 
         hf_weights_files = loader._prepare_weights(model_uri, revision)
-        selection, subset = _select_draft_weight_files(model_uri, hf_weights_files)
+        draft_prefixes = _DRAFT_WEIGHT_PREFIXES + _mtp_layer_prefixes(self.model_config)
+        selection, subset = _select_draft_weight_files(
+            model_uri, hf_weights_files, draft_prefixes
+        )
         if selection is DraftShardSelection.UNRESOLVED:
             logger.warning(
                 "[draft] could not resolve draft-only shards from %s for %s; "
@@ -286,10 +320,11 @@ class VllmAdapter(EngineAdapter):
             return loader._get_weights_iterator(model_uri, revision)
         if selection is DraftShardSelection.NO_DRAFT_WEIGHTS:
             logger.info(
-                "[draft] %s for %s contains no mtp. tensors; streaming all "
-                "%d shards",
+                "[draft] %s for %s contains no draft tensors (checked prefixes "
+                "%s); streaming all %d shards",
                 _SAFETENSORS_INDEX_NAME,
                 model_uri,
+                draft_prefixes,
                 len(hf_weights_files),
             )
             return loader._get_weights_iterator(model_uri, revision)
