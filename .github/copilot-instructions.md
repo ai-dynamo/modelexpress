@@ -38,6 +38,7 @@ cargo run --bin test_client -- --test-model "google-t5/t5-small"  # Test client
 cargo run --bin fallback_test        # Fallback test
 cargo bench                          # Criterion benchmarks
 ./run_integration_tests.sh           # Integration tests (starts server)
+python scripts/bump_version.py 0.6.0  # Bump workspace/chart/python version + source-id hashes (see scripts/README.md)
 ```
 
 ## Pre-commit Hooks
