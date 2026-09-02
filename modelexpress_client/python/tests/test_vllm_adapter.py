@@ -313,6 +313,26 @@ def test_after_rdma_receive_rejects_invalid_cpu_scale(
         adapter.after_rdma_receive(LoadResult(value=model, model=model))
 
 
+def test_after_rdma_receive_allows_missing_backend_specific_cpu_scales(
+    mock_accelerator_backend_cls,
+):
+    """Backends without CPU scale mirrors still refresh Python host state."""
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(
+        torch_device_type="cpu"
+    )
+    model = nn.Module()
+    model.attn = _AttentionWithStaleHostScales()
+    del model.attn._k_scale_cpu
+    del model.attn._v_scale_cpu
+
+    adapter.after_rdma_receive(LoadResult(value=model, model=model))
+
+    assert model.attn._q_scale_float == pytest.approx(0.25)
+    assert model.attn._k_scale_float == pytest.approx(0.5)
+    assert model.attn._v_scale_float == pytest.approx(0.75)
+
+
 def test_after_rdma_receive_allows_mla_flashinfer_cache_contract(
     mock_accelerator_backend_cls,
 ):
