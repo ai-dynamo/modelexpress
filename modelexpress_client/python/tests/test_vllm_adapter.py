@@ -641,13 +641,11 @@ class _StandaloneFinalizer(torch.nn.Module):
 
 def _union_prefixes(num_hidden_layers, num_nextn_predict_layers):
     """The prefix set the adapter actually passes to the selector: DeepSeek's
-    "mtp." unioned with GLM's config-derived layer names."""
-    config = SimpleNamespace(
-        hf_config=SimpleNamespace(
-            num_hidden_layers=num_hidden_layers,
-            num_nextn_predict_layers=num_nextn_predict_layers,
-        )
-    )
+    "mtp." unioned with GLM's config.json-derived layer names."""
+    config = {
+        "num_hidden_layers": num_hidden_layers,
+        "num_nextn_predict_layers": num_nextn_predict_layers,
+    }
     return _DRAFT_WEIGHT_PREFIXES + _mtp_layer_prefixes(config)
 
 
@@ -799,14 +797,14 @@ class TestDraftWeightFileSelection:
 
 
 class TestMtpLayerPrefixes:
-    """MTP layer prefixes are derived from config.json (num_hidden_layers +
-    num_nextn_predict_layers), mirroring vLLM's spec-layer indexing."""
+    """MTP layer prefixes are derived from the checkpoint's config.json
+    (top-level num_hidden_layers + num_nextn_predict_layers), mirroring vLLM's
+    spec-layer indexing. Any other shape falls back to no prefixes so the
+    selector streams all shards rather than truncating to the wrong ones."""
 
     def test_derives_glm_extra_layer_prefixes(self):
         """GLM config (base=92, n=1) yields the layer-92 prefix variants."""
-        config = SimpleNamespace(
-            hf_config=SimpleNamespace(num_hidden_layers=92, num_nextn_predict_layers=1)
-        )
+        config = {"num_hidden_layers": 92, "num_nextn_predict_layers": 1}
         assert _mtp_layer_prefixes(config) == (
             "model.layers.92.",
             "layers.92.",
@@ -815,9 +813,7 @@ class TestMtpLayerPrefixes:
 
     def test_multiple_nextn_layers(self):
         """n>1 yields prefixes for each consecutive extra layer."""
-        config = SimpleNamespace(
-            hf_config=SimpleNamespace(num_hidden_layers=61, num_nextn_predict_layers=2)
-        )
+        config = {"num_hidden_layers": 61, "num_nextn_predict_layers": 2}
         assert _mtp_layer_prefixes(config) == (
             "model.layers.61.",
             "layers.61.",
@@ -829,14 +825,27 @@ class TestMtpLayerPrefixes:
 
     def test_no_mtp_layers_returns_empty(self):
         """num_nextn_predict_layers=0 yields no prefixes."""
-        config = SimpleNamespace(
-            hf_config=SimpleNamespace(num_hidden_layers=92, num_nextn_predict_layers=0)
-        )
+        config = {"num_hidden_layers": 92, "num_nextn_predict_layers": 0}
         assert _mtp_layer_prefixes(config) == ()
 
     def test_missing_fields_returns_empty(self):
         """Missing config fields yield no prefixes."""
-        assert _mtp_layer_prefixes(SimpleNamespace(hf_config=SimpleNamespace())) == ()
+        assert _mtp_layer_prefixes({}) == ()
+        assert _mtp_layer_prefixes(None) == ()
+
+    def test_zeroed_base_returns_empty(self):
+        """A post-override num_hidden_layers=0 (MiMo/GLM-Lite) must not derive
+        layer-0 prefixes; that would collide with the ordinary first layer."""
+        config = {"num_hidden_layers": 0, "num_nextn_predict_layers": 1}
+        assert _mtp_layer_prefixes(config) == ()
+
+    def test_nested_text_config_returns_empty(self):
+        """Fields nested under text_config are not the supported top-level GLM
+        shape, so no prefixes are derived."""
+        config = {
+            "text_config": {"num_hidden_layers": 92, "num_nextn_predict_layers": 1}
+        }
+        assert _mtp_layer_prefixes(config) == ()
 
 
 def _stub_runai(monkeypatch, available: dict[str, str]) -> list:
