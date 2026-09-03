@@ -41,6 +41,12 @@ _VLLM_POST_RDMA_FINALIZER_NAMES = (
     "finalize_mhc_broadcast_weights",
 )
 
+# vLLM keeps accelerator-backed attention scales together with host mirrors
+# consumed by backends such as FlashInfer and AITER. Only the accelerator
+# tensors are part of the ModelExpress manifest, so an RDMA target must refresh
+# the mirrors after the received values overwrite its dummy-loaded tensors.
+_VLLM_ATTENTION_SCALE_NAMES: tuple[str, ...] = ("q", "k", "v")
+
 # MTP draft weights live under an "mtp." prefix in the shared checkpoint. The
 # draft's embedding and lm_head come from the target, so these are all it needs.
 _DRAFT_WEIGHT_PREFIXES: tuple[str, ...] = ("mtp.",)
@@ -231,9 +237,10 @@ class VllmAdapter(EngineAdapter):
 
     def after_rdma_receive(self, result: LoadResult) -> LoadResult:
         """Build target-local tensors derived from the received weights."""
-        return self._finalize_model_specific_weights(
+        result = self._finalize_model_specific_weights(
             result, _VLLM_POST_RDMA_FINALIZER_NAMES
         )
+        return self._refresh_host_quantization_state(result)
 
     def apply_weight_iter(
         self,
@@ -387,6 +394,167 @@ class VllmAdapter(EngineAdapter):
                 result.model,
                 self.model_config,
                 self.target_device,
+            )
+        return result
+
+    @torch.no_grad()
+    def _refresh_host_quantization_state(self, result: LoadResult) -> LoadResult:
+        """Refresh vLLM host mirrors after RDMA overwrites device scales.
+
+        vLLM's attention PWAL copies ``_q/_k/_v_scale`` into Python floats and,
+        for some backends, CPU tensors whose launch APIs require host scalars.
+        RDMA receives only the registered accelerator tensors, leaving those
+        mirrors at values derived from the target's dummy load. Re-running PWAL
+        is not a safe repair because the incoming model is already in its
+        processed runtime representation; update only the non-transferable
+        mirrors that the selected backend exposes.
+
+        Compressed-tensors may use per-head scales. Match vLLM's own conversion
+        by using their maximum for the scalar host mirror.
+        """
+        if result.model is None:
+            raise RuntimeError("vLLM RDMA post-load processing requires result.model")
+
+        float_names = tuple(
+            f"_{scale_name}_scale_float"
+            for scale_name in _VLLM_ATTENTION_SCALE_NAMES
+        )
+        cpu_names = ("_k_scale_cpu", "_v_scale_cpu")
+        device_names = tuple(
+            f"_{scale_name}_scale" for scale_name in _VLLM_ATTENTION_SCALE_NAMES
+        )
+        required_names = device_names + float_names + ("_o_scale_float",)
+        flashinfer_cache_names = ("bmm1_scale", "bmm2_scale", "o_sf_scale")
+
+        cache_config = getattr(self.vllm_config, "cache_config", None)
+        configured_cache_dtype = getattr(cache_config, "cache_dtype", None)
+        fp8_expected = isinstance(configured_cache_dtype, str) and (
+            configured_cache_dtype.startswith("fp8")
+        )
+
+        # This is a shim over vLLM private attributes, so an upstream scale
+        # contract change must fail the RDMA strategy instead of silently
+        # serving with stale values. Any failure after mutation is recovered by
+        # the outer strategy reinitializing the whole model before fallback.
+        refreshed_values = 0
+        stale_values = 0
+        refreshed_modules = 0
+        for module_name, module in result.model.named_modules():
+            module_label = module_name or type(module).__name__
+            kv_cache_dtype = getattr(module, "kv_cache_dtype", None)
+            if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
+                fp8_expected = True
+
+            host_names = float_names + cpu_names
+            if not any(hasattr(module, name) for name in host_names):
+                continue
+
+            missing_names = [
+                name for name in required_names if not hasattr(module, name)
+            ]
+            if missing_names:
+                raise RuntimeError(
+                    "Incomplete vLLM attention scale contract on "
+                    f"{module_label}: missing {', '.join(missing_names)}"
+                )
+
+            for float_name in float_names:
+                if not isinstance(getattr(module, float_name), float):
+                    raise RuntimeError(
+                        "Invalid vLLM attention host scalar on "
+                        f"{module_label}: {float_name} must be a float"
+                    )
+
+            for cpu_name in cpu_names:
+                if not hasattr(module, cpu_name):
+                    continue
+                cpu_mirror = getattr(module, cpu_name)
+                if (
+                    not isinstance(cpu_mirror, torch.Tensor)
+                    or cpu_mirror.numel() != 1
+                    or not torch.is_floating_point(cpu_mirror)
+                ):
+                    raise RuntimeError(
+                        "Invalid vLLM attention CPU scale on "
+                        f"{module_label}: {cpu_name} must be a floating-point "
+                        "singleton tensor"
+                    )
+
+            impl = getattr(module, "impl", None)
+            initialized_cache_names = []
+            if module._o_scale_float is not None:
+                initialized_cache_names.append("_o_scale_float")
+            initialized_cache_names.extend(
+                cache_name
+                for cache_name in flashinfer_cache_names
+                if hasattr(impl, cache_name) and getattr(impl, cache_name) is not None
+            )
+            if initialized_cache_names:
+                raise RuntimeError(
+                    "vLLM attention host-scale refresh requires a cold-load "
+                    f"state on {module_label}; already initialized: "
+                    f"{', '.join(initialized_cache_names)}"
+                )
+
+            for scale_name, tensor_name in zip(
+                _VLLM_ATTENTION_SCALE_NAMES, device_names, strict=True
+            ):
+                scale = getattr(module, tensor_name)
+                if (
+                    not isinstance(scale, torch.Tensor)
+                    or not self.accelerator_backend.is_accel_tensor(scale)
+                    or scale.numel() == 0
+                    or not torch.is_floating_point(scale)
+                ):
+                    raise RuntimeError(
+                        "Invalid vLLM accelerator attention scale on "
+                        f"{module_label}: {tensor_name} must be a nonempty "
+                        "floating-point accelerator tensor"
+                    )
+
+                scale_float = scale.detach().float()
+                if not bool(torch.isfinite(scale_float).all().item()) or not bool(
+                    (scale_float > 0).all().item()
+                ):
+                    raise RuntimeError(
+                        "Invalid vLLM accelerator attention scale on "
+                        f"{module_label}: {tensor_name} must contain only finite, "
+                        "positive values"
+                    )
+                value = float(scale_float.max().item())
+                float_name = f"_{scale_name}_scale_float"
+                previous = getattr(module, float_name)
+                if previous != value:
+                    stale_values += 1
+                    logger.debug(
+                        "Refreshing vLLM host scale %s.%s: %r -> %r",
+                        module_label,
+                        float_name,
+                        previous,
+                        value,
+                    )
+                setattr(module, float_name, value)
+
+                cpu_mirror = getattr(module, f"_{scale_name}_scale_cpu", None)
+                if isinstance(cpu_mirror, torch.Tensor):
+                    cpu_mirror.fill_(value)
+
+                refreshed_values += 1
+            refreshed_modules += 1
+
+        if fp8_expected and not refreshed_modules:
+            raise RuntimeError(
+                "FP8 KV cache requires recognizable vLLM q/k/v host scale state, "
+                "but no attention module was refreshed"
+            )
+
+        if refreshed_values:
+            logger.info(
+                "Refreshed %d vLLM host attention scales across %d modules "
+                "after RDMA receive (%d stale dummy values replaced)",
+                refreshed_values,
+                refreshed_modules,
+                stale_values,
             )
         return result
 
