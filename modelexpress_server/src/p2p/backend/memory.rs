@@ -451,4 +451,36 @@ mod tests {
             "source dropped with its last worker"
         );
     }
+
+    // source_load is Option: a worker that has never heartbeated lists as None
+    // (no reading), and a heartbeat's Some(x) is what list_workers surfaces.
+    // None and 0.0 are different answers on the wire and must stay so here.
+    #[tokio::test]
+    async fn source_load_round_trips_as_option() {
+        let backend = InMemoryMetadataBackend::new();
+        let id = identity("m");
+        let source_id = compute_mx_source_id(&id);
+        backend
+            .publish_metadata(&id, "w1", worker(0, SourceStatus::Ready), "", "", "")
+            .await
+            .expect("publish");
+
+        let before = backend
+            .list_workers(Some(source_id.clone()), None)
+            .await
+            .expect("list");
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].source_load, None);
+
+        backend
+            .update_status(&source_id, "w1", 0, SourceStatus::Ready, 7, Some(0.42))
+            .await
+            .expect("update_status");
+        let after = backend
+            .list_workers(Some(source_id), None)
+            .await
+            .expect("list");
+        assert_eq!(after[0].source_load, Some(0.42));
+        assert_eq!(after[0].updated_at, 7);
+    }
 }
