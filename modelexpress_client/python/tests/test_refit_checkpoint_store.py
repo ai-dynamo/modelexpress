@@ -43,6 +43,16 @@ def test_store_owns_the_versioned_layout_and_state(tmp_path):
     assert store.active_version() == "base/a"
 
 
+def test_store_encodes_dot_path_components(tmp_path):
+    store = LocalCheckpointStore(root=tmp_path, model_name="..")
+    store.initialize()
+
+    assert store.cache == tmp_path / "%2E%2E"
+    assert store.full_path(".") == store.full_cache / "%2E"
+    assert store.delta_path("..") == store.delta_cache / "%2E%2E"
+    assert store.chain_path("..") == store.chain_cache / "%2E%2E.json"
+
+
 def test_store_directory_replacement_rolls_back_on_failure(tmp_path):
     store = LocalCheckpointStore(root=tmp_path, model_name="test/model")
     store.initialize()
