@@ -1,0 +1,1703 @@
+{
+  "uid": "modelexpress-overview",
+  "title": "ModelExpress",
+  "description": "Server lifecycle, gRPC, storage backend and P2P client health.",
+  "tags": [
+    "modelexpress"
+  ],
+  "timezone": "browser",
+  "editable": true,
+  "schemaVersion": 39,
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Overview",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Server replicas exporting",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "expr": "count(mx_build_info{component=\"server\"})",
+          "legendFormat": "replicas",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "mx_build_info is registered unconditionally at startup, so this counts pods whose endpoint was scraped -- not pods that are up.",
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "none",
+        "colorMode": "value",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "noValue": "0"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Registry stats age",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 1
+      },
+      "targets": [
+        {
+          "expr": "max(time() - mx_task_last_success_timestamp_seconds{task=\"registry_stats_refresh\"})",
+          "legendFormat": "seconds",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Age of the STALEST replica\u2019s last successful stats refresh. The aggregation is outside the subtraction on purpose: time() - max(timestamp) is the age of the newest heartbeat, so one healthy replica would mask a wedged one -- the exact failure MXRegistryStatsStale exists to catch. The gauges elsewhere keep their last good values on a failed pass, so if this is high they are frozen rather than current.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 300
+              },
+              {
+                "color": "red",
+                "value": 600
+              }
+            ]
+          },
+          "noValue": "never run"
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "none",
+        "colorMode": "value",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 101,
+      "type": "stat",
+      "title": "Downloads in flight",
+      "description": "From the gauge, not the transition counters: those are process-local while DOWNLOADING persists in the shared store. max(), not sum(), because every replica republishes the same shared total.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 1
+      },
+      "targets": [
+        {
+          "expr": "max(mx_registry_entries{status=\"downloading\"})",
+          "legendFormat": "",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "0",
+          "decimals": 0
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 102,
+      "type": "stat",
+      "title": "Downloads completed",
+      "description": "Successful downloads in the selected range. Process-local, so a restart resets it.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 1
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(mx_download_seconds_count{outcome=\"downloaded\"}[$__range]))",
+          "legendFormat": "",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "noValue": "0",
+          "decimals": 0
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 103,
+      "type": "stat",
+      "title": "Download failures",
+      "description": "Downloads that ended in ERROR. MXDownloadFailureRatio alerts when these exceed a tenth of all downloads.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 5
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(mx_download_seconds_count{outcome=\"error\"}[$__range]))",
+          "legendFormat": "",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "noValue": "0",
+          "decimals": 0
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 104,
+      "type": "stat",
+      "title": "Takeovers",
+      "description": "A previous downloader died and the model is being pulled again from scratch -- hundreds of GB for a large one. MXDownloadTakeover fires on the first. The counter is pre-created at zero so the first one is visible.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 5
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(mx_download_claims_total{result=\"takeover\"}[$__range]))",
+          "legendFormat": "",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "noValue": "0",
+          "decimals": 0
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 105,
+      "type": "stat",
+      "title": "Leases lost",
+      "description": "A downloader stopped heartbeating; the documented leading indicator of a duplicate download. MXDownloadLeaseLost fires on this.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 5
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(mx_download_lease_refresh_total{result=\"lost\"}[$__range]))",
+          "legendFormat": "",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              }
+            ]
+          },
+          "noValue": "0",
+          "decimals": 0
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 106,
+      "type": "stat",
+      "title": "gRPC errors",
+      "description": "Requests that failed for a reason the server owns. cancelled is the caller leaving and not_found is a legitimate answer, so both are excluded -- the same exclusion MXGrpcErrorRatio uses.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 5
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(mx_grpc_requests_total{outcome!~\"ok|cancelled|not_found\"}[$__range]))",
+          "legendFormat": "",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "noValue": "0",
+          "decimals": 0
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 110,
+      "type": "row",
+      "title": "Model load",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 111,
+      "type": "bargauge",
+      "title": "Load duration by model",
+      "description": "Mean load_model() duration per engine and model, over the processes currently being scraped. Not the inference cold start: CUDA graph capture, JIT and KV cache setup all run after the loader returns.\n\nSplit by engine because a load duration is not comparable across them. vLLM builds the module inside this window and SGLang does not, so the two measure different amounts of work even for identical weights -- merged, a model loaded by both reports a mean belonging to neither.\n\nThe mean rather than a quantile: histogram_quantile reads bucket counts, so two models in one bucket draw the same value. _sum / _count is exact.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 7,
+        "x": 0,
+        "y": 10
+      },
+      "targets": [
+        {
+          "expr": "sum by (engine, model) (mx_load_seconds_sum) / sum by (engine, model) (mx_load_seconds_count)",
+          "legendFormat": "{{engine}}  {{model}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "0"
+        }
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true
+      }
+    },
+    {
+      "id": 112,
+      "type": "table",
+      "title": "Timing breakdown per model",
+      "description": "Mean time in each phase, per engine and model. The phases partition the load, so one row group sums to that model's duration in the panel to the left; this is what answers 'which part was slow'.\n\nGrouped by engine as well as model for two reasons. The phase sets differ -- vLLM records four, SGLang three because it builds the module and hands it in, TRT-LLM one because it also publishes outside this window -- so a missing row needs an engine to be attributed to. And without it, a vLLM load and an SGLang load of the same model would merge into a single mean across two engines.\n\nGrouped by model rather than aggregated because averaging a phase across model sizes produces a number belonging to no load: on a fleet of a 0.5B, a 1.5B and a 7B that read chain = 28.0 s when the real values were 4.0, 36.3 and 43.8.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 10,
+        "x": 7,
+        "y": 10
+      },
+      "targets": [
+        {
+          "expr": "sum by (engine, model, phase) (mx_load_phase_seconds_sum) / sum by (engine, model, phase) (mx_load_phase_seconds_count)",
+          "format": "table",
+          "instant": true,
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": ""
+        }
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "indexByName": {
+              "engine": 0,
+              "model": 1,
+              "phase": 2,
+              "Value": 3
+            },
+            "renameByName": {
+              "Value": "mean"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "engine",
+                "desc": false
+              },
+              {
+                "field": "model",
+                "desc": false
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": 113,
+      "type": "bargauge",
+      "title": "Loads recorded by model",
+      "description": "Loads completed by the processes currently being scraped, per engine and model. Resets when a pod restarts, because the count is process-local.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 7,
+        "x": 17,
+        "y": 10
+      },
+      "targets": [
+        {
+          "expr": "sum by (engine, model) (mx_load_seconds_count)",
+          "legendFormat": "{{engine}}  {{model}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0"
+        }
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true
+      }
+    },
+    {
+      "id": 6,
+      "type": "row",
+      "title": "Downloads",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 20
+      },
+      "panels": []
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Download duration, successful (p50 / p95 / p99)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 21
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (mx_download_seconds_bucket{outcome=\"downloaded\"}))",
+          "legendFormat": "p50",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (mx_download_seconds_bucket{outcome=\"downloaded\"}))",
+          "legendFormat": "p95",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (mx_download_seconds_bucket{outcome=\"downloaded\"}))",
+          "legendFormat": "p99",
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Duration of every successful download these server processes have done. Cumulative rather than a rate: a download is a rare event, and over the few-minute window $__rate_interval covers, the panel would be empty except in the moments just after one finished. Does not decay -- a slow download keeps affecting the quantiles until the process restarts.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Downloads finishing",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 21
+      },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (increase(mx_download_seconds_count[$__rate_interval]))",
+          "legendFormat": "{{outcome}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "description": "Count of downloads reaching a terminal status per interval, not a rate: one download every few minutes expressed per-second is a number nobody can read. Pair with the duration panel -- a steady count with a climbing duration means downloads still finish, but slower."
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Claims by result",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 21
+      },
+      "targets": [
+        {
+          "expr": "sum by (result) (increase(mx_download_claims_total{result=~\"claimed|takeover|error\"}[$__rate_interval]))",
+          "legendFormat": "{{result}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Claim outcomes per interval. takeover is the one to watch: a previous downloader died and the model is being pulled again from scratch. result=already_exists is deliberately excluded -- it is produced by each waiting client's 500ms poll loop rather than by contention, so at a few waiters it outweighs takeover by three orders of magnitude and flattens it onto the axis.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Lease heartbeats",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 21
+      },
+      "targets": [
+        {
+          "expr": "sum by (result) (increase(mx_download_lease_refresh_total[$__rate_interval]))",
+          "legendFormat": "{{result}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "result=lost is the leading indicator of a duplicate download.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Status transitions",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 29
+      },
+      "targets": [
+        {
+          "expr": "sum by (from, to) (increase(mx_registry_status_transitions_total[$__rate_interval])) > 0",
+          "legendFormat": "{{from}} -> {{to}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Transitions that occurred in the window. Filtered to non-zero: the counters are pre-created at zero for all sixteen from/to pairs so increase() can see a first event, and without the filter the flat ones crowd out the flow. Level belongs to Registry entries by status -- these counters are process-local while the status lives in the shared store.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Registry entries by status",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 29
+      },
+      "targets": [
+        {
+          "expr": "max by (status) (mx_registry_entries)",
+          "legendFormat": "{{status}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "max(), not sum(): every replica reports the same shared-store total. Refreshed on MX_REGISTRY_STATS_INTERVAL_SECS (default 60s), not at scrape time -- cross-check the Registry stats age panel before trusting the level.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "type": "row",
+      "title": "Server internals",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 37
+      },
+      "panels": []
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "gRPC request rate",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 38
+      },
+      "targets": [
+        {
+          "expr": "sum by (method) (rate(mx_grpc_requests_total[$__rate_interval]))",
+          "legendFormat": "{{method}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        }
+      },
+      "description": "Per-method request rate. The three streaming RPCs are absent by design -- see the note below this row."
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "gRPC error ratio",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 38
+      },
+      "targets": [
+        {
+          "expr": "sum by (method) (rate(mx_grpc_requests_total{outcome!~\"ok|cancelled|not_found\"}[$__rate_interval])) / sum by (method) (rate(mx_grpc_requests_total[$__rate_interval]))",
+          "legendFormat": "{{method}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "cancelled excluded -- that is the caller leaving, not a server fault. If every method lights up at once, suspect the auth path: outcome=backend_error absorbs Code::Unavailable.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "0"
+        }
+      }
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "gRPC p99 latency",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 38
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (method, le) (rate(mx_grpc_request_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "{{method}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "description": "99th percentile handler latency per method. Computed from the counter's histogram, so a cancelled request contributes no sample."
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "gRPC requests in flight",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 38
+      },
+      "targets": [
+        {
+          "expr": "sum by (method) (mx_grpc_requests_in_flight)",
+          "legendFormat": "{{method}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "description": "Requests currently being handled. Decremented by a drop guard on every exit path including cancellation, so a standing value is real."
+    },
+    {
+      "id": 18,
+      "type": "text",
+      "title": "Why EnsureModelDownloaded is missing from the four panels above",
+      "gridPos": {
+        "h": 5,
+        "w": 24,
+        "x": 0,
+        "y": 46
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "`ModelService/EnsureModelDownloaded`, `ModelService/StreamModelFiles` and `Health/Watch` are **deliberately absent from the four gRPC panels above**.\n\nThey are streaming: the metrics layer's future resolves at stream setup, so recording them would report `outcome=\"ok\"` and a sub-millisecond duration for work that can run forty minutes and fail as a stream item. A confidently wrong number is worse than an absent one.\n\nThe in-flight gauge excludes them too, so a running `EnsureModelDownloaded` shows up in no gRPC panel at all -- use **Downloads in flight** in Overview for that, and the **Downloads** row for its latency, from `mx_download_seconds`."
+      }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Backend operation rate",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 51
+      },
+      "targets": [
+        {
+          "expr": "sum by (store, op) (rate(mx_backend_ops_total[$__rate_interval]))",
+          "legendFormat": "{{store}}/{{op}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "store is the subsystem (p2p, registry, refit), not the engine. The engine is on mx_build_info{backend=...}.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        }
+      }
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Backend error ratio",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 51
+      },
+      "targets": [
+        {
+          "expr": "sum by (store) (rate(mx_backend_ops_total{result=\"error\"}[$__rate_interval])) / sum by (store) (rate(mx_backend_ops_total[$__rate_interval]))",
+          "legendFormat": "{{store}} error",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "sum by (store) (rate(mx_backend_ops_total{result=\"cancelled\"}[$__rate_interval])) / sum by (store) (rate(mx_backend_ops_total[$__rate_interval]))",
+          "legendFormat": "{{store}} cancelled",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "0"
+        }
+      },
+      "description": "Failed and cancelled operations as a fraction of all operations for that store. Both lines matter: a cancellation is the caller giving up, so a store that hangs raises the cancelled line while the error line falls. Reading error alone would show a hanging store getting healthier."
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Backend p99 latency",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 51
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (store, le) (rate(mx_backend_op_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "{{store}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "description": "99th percentile backend operation latency per store. store is the subsystem (p2p, registry, refit), not the storage engine."
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Backend operations in flight",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 51
+      },
+      "targets": [
+        {
+          "expr": "sum by (store, op) (mx_backend_ops_in_flight)",
+          "legendFormat": "{{store}}/{{op}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Decremented by a Drop guard on every exit path including cancellation, so a standing value is real rather than drift.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 24,
+      "type": "row",
+      "title": "P2P clients",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 59
+      },
+      "panels": []
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "Selections by policy",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 60
+      },
+      "targets": [
+        {
+          "expr": "sum by (policy) (rate(mx_p2p_source_selections_total[$__rate_interval]))",
+          "legendFormat": "{{policy}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Grouped by policy, not source_worker_id: that label only exists when MX_METRICS_SOURCE_ID_LABEL=1, and grouping by an absent label silently collapses every series into one that reads as perfectly balanced.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      }
+    },
+    {
+      "id": 26,
+      "type": "bargauge",
+      "title": "Candidate funnel (mean per stage)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 60
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(mx_p2p_candidates_sum{stage=\"listed\"}[$__rate_interval])) / sum(rate(mx_p2p_candidates_count{stage=\"listed\"}[$__rate_interval]))",
+          "legendFormat": "listed",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "sum(rate(mx_p2p_candidates_sum{stage=\"rank_matched\"}[$__rate_interval])) / sum(rate(mx_p2p_candidates_count{stage=\"rank_matched\"}[$__rate_interval]))",
+          "legendFormat": "rank_matched",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "sum(rate(mx_p2p_candidates_sum{stage=\"accelerator_matched\"}[$__rate_interval])) / sum(rate(mx_p2p_candidates_count{stage=\"accelerator_matched\"}[$__rate_interval]))",
+          "legendFormat": "accelerator_matched",
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Mean candidates surviving each selection stage. The mean, not a quantile: the buckets are 0,1,2,4,8..., and histogram_quantile interpolates inside a bucket, so it reports fractional candidates for a quantity that is always a whole number. Bars should narrow left to right; the SGLang transfer-engine path never records accelerator_matched, so a missing third bar is expected rather than a broken exporter.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true
+      }
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Attempts by result",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 60
+      },
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(mx_p2p_source_attempts_total[$__rate_interval]))",
+          "legendFormat": "{{result}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Does not partition every candidate: one rejected by the accelerator check is skipped without recording an attempt, so this understates how many peers were passed over.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      }
+    },
+    {
+      "id": 28,
+      "type": "timeseries",
+      "title": "ListSources outcomes",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 60
+      },
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(mx_p2p_list_sources_total[$__rate_interval]))",
+          "legendFormat": "{{result}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "result=error is a backend outage. result=empty is a healthy cluster that has published no peers yet.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      }
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Transfer duration, successful (p50 / p95 / p99)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 68
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(mx_p2p_transfer_seconds_bucket{outcome=\"success\"}[$__rate_interval])))",
+          "legendFormat": "p50",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(mx_p2p_transfer_seconds_bucket{outcome=\"success\"}[$__rate_interval])))",
+          "legendFormat": "p95",
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(mx_p2p_transfer_seconds_bucket{outcome=\"success\"}[$__rate_interval])))",
+          "legendFormat": "p99",
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "description": "Filtered to outcome=success. retry and fallback samples are the elapsed time of attempts that did not deliver, so including them measures how long failures take and reports it as transfer latency."
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Mean transfer by scheme",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 68
+      },
+      "targets": [
+        {
+          "expr": "sum by (scheme) (rate(mx_p2p_transfer_seconds_sum{outcome=\"success\"}[$__rate_interval])) / sum by (scheme) (rate(mx_p2p_transfer_seconds_count{outcome=\"success\"}[$__rate_interval]))",
+          "legendFormat": "{{scheme}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Mean successful transfer time, for comparing benchmark runs; scheme comes from MX_METRICS_SCHEME. Filtered to outcome=success for the same reason as the panel to its left.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "NIXL receive outcomes",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 68
+      },
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(mx_nixl_receive_total[$__rate_interval]))",
+          "legendFormat": "{{result}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "partial and empty both return success to the caller today, so this panel is the only place they are visible.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      }
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "NIXL data-plane errors",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 68
+      },
+      "targets": [
+        {
+          "expr": "sum by (kind) (increase(mx_nixl_data_plane_errors_total[$__rate_interval]))",
+          "legendFormat": "{{kind}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "description": "NIXL failures by classified kind. A non-zero count is what demotes an agent from READY."
+    },
+    {
+      "id": 38,
+      "type": "stat",
+      "title": "Client pods exporting",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 0,
+        "y": 76
+      },
+      "targets": [
+        {
+          "expr": "count(mx_build_info{component=\"client\"})",
+          "legendFormat": "pods",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Pods, not ranks. Multiprocess mode merges every rank in a pod into one endpoint with no pid label, so a TP=8 pod contributes exactly one series. Proof of life for the client exporter, independent of whether any P2P activity has happened.",
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "none",
+        "colorMode": "value",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0"
+        }
+      }
+    },
+    {
+      "id": 34,
+      "type": "text",
+      "title": "Why this section may be empty",
+      "gridPos": {
+        "h": 6,
+        "w": 18,
+        "x": 6,
+        "y": 76
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Client metrics are **opt-in and live in the inference engine's pod**, not in the ModelExpress server. An empty section usually means one of:\n\n1. `MX_METRICS_ENABLED=1` is not set on the engine pod (it defaults to off);\n2. nothing is scraping those pods -- the server's PodMonitor does not match them, see `metrics.clientPodMonitor` in the chart;\n3. this deployment does not use P2P at all, in which case empty is correct.\n\n`count(mx_build_info{component=\"client\"})` tells the three apart: present with nothing else means the exporter came up and recorded no events."
+      }
+    },
+    {
+      "id": 35,
+      "type": "row",
+      "title": "Capacity",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 82
+      },
+      "panels": []
+    },
+    {
+      "id": 36,
+      "type": "timeseries",
+      "title": "In-process map sizes",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 83
+      },
+      "targets": [
+        {
+          "expr": "sum by (map) (mx_state_entries)",
+          "legendFormat": "{{map}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Never evicted. This is the OOM early warning.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 37,
+      "type": "timeseries",
+      "title": "Evictions by reason",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 83
+      },
+      "targets": [
+        {
+          "expr": "sum by (reason) (increase(mx_cache_evictions_total[$__rate_interval]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Only time_threshold and count_limit are reachable today; disk_space and manual exist as label values with no producer.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Server replicas by version",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 83
+      },
+      "targets": [
+        {
+          "expr": "count by (version) (mx_build_info{component=\"server\"})",
+          "legendFormat": "{{version}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Replicas running each version. More than one bar means a rollout is in progress, or stuck.",
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "none",
+        "colorMode": "value",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0"
+        }
+      }
+    }
+  ]
+}

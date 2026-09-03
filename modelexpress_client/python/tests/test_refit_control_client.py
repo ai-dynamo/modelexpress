@@ -23,9 +23,8 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
 
     def CreateWeightVersion(self, request, _context):
         self.version = refit_pb2.WeightVersion(
-            uid="version-a",
+            uid=request.uid if request.HasField("uid") else "version-a",
             model_name=request.model_name,
-            version_number=request.version_number,
             idempotency_key=request.idempotency_key,
             payload_format=request.payload_format,
             expected_source_slots=request.expected_source_slots,
@@ -75,7 +74,6 @@ def test_control_client_owns_global_weight_version_lifecycle():
         control = ModelExpressControlClient.connect(server_url=f"127.0.0.1:{port}")
         created = control.create_weight_version(
             model_name="test/model",
-            version_number=7,
             idempotency_key="training-step-7",
             payload_format=WeightPayloadFormat.FULL_TENSOR,
             expected_source_slots=[
@@ -95,7 +93,6 @@ def test_control_client_owns_global_weight_version_lifecycle():
         server.stop(grace=None).wait()
 
     assert created.ref.version_id == "version-a"
-    assert created.version_number == 7
     assert created.payload_format is WeightPayloadFormat.FULL_TENSOR
     assert created.expected_source_slots == (
         "publisher:global-rank:0",
@@ -126,9 +123,9 @@ def test_control_client_round_trips_object_storage_source(storage_type, uri):
         control = ModelExpressControlClient.connect(server_url=f"127.0.0.1:{port}")
         created = control.create_weight_version(
             model_name="test/model",
-            version_number=7,
             idempotency_key="training-step-7",
             payload_format=WeightPayloadFormat.XOR_DELTA,
+            uid="caller-version",
             base_version_id="base-a",
             object_storage=ObjectStorageSource(
                 storage_type=storage_type,
@@ -145,8 +142,37 @@ def test_control_client_round_trips_object_storage_source(storage_type, uri):
         storage_type=storage_type,
         uri=uri,
     )
+    assert created.version_id == "caller-version"
     assert created.expected_source_slots == ()
     assert created.state is WeightVersionState.READY
+
+
+def test_control_client_round_trips_full_hf_checkpoint():
+    service = _RefitService()
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+    refit_pb2_grpc.add_RefitServiceServicer_to_server(service, server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+
+    try:
+        control = ModelExpressControlClient.connect(server_url=f"127.0.0.1:{port}")
+        created = control.create_weight_version(
+            model_name="test/model",
+            idempotency_key="training-step-25",
+            payload_format=WeightPayloadFormat.FULL_HF_CHECKPOINT,
+            object_storage=ObjectStorageSource(
+                storage_type=ObjectStorageType.S3,
+                uri="s3://weights/run/v25/model.safetensors.index.json",
+            ),
+        )
+    finally:
+        if "control" in locals():
+            control.close()
+        server.stop(grace=None).wait()
+
+    assert refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT == 3
+    assert created.payload_format is WeightPayloadFormat.FULL_HF_CHECKPOINT
+    assert created.base_version_id is None
 
 
 def test_control_client_validates_framework_inputs_before_rpc():
@@ -166,16 +192,12 @@ def test_control_client_validates_framework_inputs_before_rpc():
                 payload_format=WeightPayloadFormat.UNSPECIFIED,
                 expected_source_slots=["rank:0"],
             )
-        with pytest.raises(ValueError, match="version_number"):
+        with pytest.raises(ValueError, match="uid"):
             control.create_weight_version(
                 model_name="test/model",
                 idempotency_key="attempt-a",
-                payload_format=WeightPayloadFormat.XOR_DELTA,
-                base_version_id="base-a",
-                object_storage=ObjectStorageSource(
-                    storage_type=ObjectStorageType.S3,
-                    uri="s3://weights/run/v1/model.safetensors.index.json",
-                ),
+                payload_format=WeightPayloadFormat.FULL_TENSOR,
+                uid=" ",
             )
     finally:
         control.close()

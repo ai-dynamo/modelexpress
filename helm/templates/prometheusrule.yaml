@@ -1,0 +1,293 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- if and .Values.metrics .Values.metrics.rules .Values.metrics.rules.enabled -}}
+{{- /*
+  Alerts only, no recording rules. Recording rules would make the shipped
+  dashboard depend on this resource being installed, so a site that enabled the
+  dashboard and not the rules would get empty panels with no error.
+
+  Two PromQL shapes here are load-bearing and easy to get wrong:
+
+  `unless X > 0` rather than `and X == 0`. When the right-hand family has no
+  series at all -- which is exactly the post-restart case some of these target --
+  the comparison yields an empty vector, and `and` against an empty vector
+  matches nothing. The alert is then silent in precisely the situation it was
+  written for.
+
+  `increase()` over a window several times longer than the `for:` hold. A
+  one-shot event is above zero for only one window-length, so a hold equal to the
+  window can never complete: the condition goes false one scrape interval before
+  the hold expires.
+*/}}
+{{- $cfg := .Values.metrics.rules }}
+{{- $t := $cfg.thresholds | default dict }}
+{{- if not (or $cfg.skipApiVersionCheck (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1")) }}
+{{- fail "metrics.rules.enabled but monitoring.coreos.com/v1 is not available: install the Prometheus Operator, or set metrics.rules.skipApiVersionCheck=true if the CRDs are applied alongside this chart." }}
+{{- end }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "modelexpress.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "modelexpress.labels" . | nindent 4 }}
+    {{- with $cfg.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+{{- if .Values.metrics.enabled }}
+    - name: modelexpress.liveness
+      rules:
+        # Server metrics are always-on, so absence is a fault. The client is
+        # opt-in and legitimately absent, so its equivalent alert lives in the
+        # client group and is gated on the client PodMonitor being enabled --
+        # the one state where absence there is also wrong.
+        #
+        # The group is gated on metrics.enabled: with the listener off the server
+        # binds port 0, mx_build_info can never exist, and this would fire
+        # forever on a deployment that is working as configured.
+        - alert: MXServerMetricsAbsent
+          expr: absent(mx_build_info{component="server"})
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: ModelExpress server metrics are not being scraped
+            description: >-
+              No mx_build_info{component="server"} series. Either every replica is
+              down, or the scrape never reached them. If this fired right after
+              install, check that the Prometheus podMonitorSelector matches this
+              PodMonitor's labels -- an unmatched selector produces no error.
+
+        # Deliberately not aggregated. max() across replicas would let one
+        # healthy replica mask a wedged one, which is the failure this exists to
+        # catch. Unaggregated, each instance alerts for itself.
+        #
+        # Never rate() this: it holds a unix timestamp, not a count.
+        - alert: MXRegistryStatsStale
+          expr: >-
+            time() - mx_task_last_success_timestamp_seconds{task="registry_stats_refresh"}
+            > {{ include "modelexpress.threshold" (list $t "registryStatsStaleSeconds" 600) }}
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: 'Registry statistics refresh has stopped succeeding on {{ "{{ $labels.instance }}" }}'
+            description: >-
+              mx_registry_entries and mx_state_entries are written by that task and
+              are now stale on this replica. They keep their last good values on a
+              failed pass, so they still look plausible -- this alert is the only
+              thing separating a current reading from a frozen one.
+{{- end }}
+
+    - name: modelexpress.download
+      rules:
+        # 15m window against a 5m hold: a single lost lease is above zero for one
+        # window-length, so the hold has to sit well inside it. The counter is
+        # pre-created at zero in RegistryMetrics::register, which is what makes
+        # the first loss in a process visible at all.
+        #
+        # Grouped by pod rather than summed flat, so the alert says which replica
+        # lost the lease. A bare sum() answers "somewhere in the fleet", which is
+        # the wrong end of a triage that starts by reading one pod's logs. Where
+        # the pod label is missing -- a scrape config that does not add it --
+        # every series groups under pod="" and this degrades to the old
+        # fleet-wide behaviour rather than breaking.
+        - alert: MXDownloadLeaseLost
+          expr: sum by (pod) (increase(mx_download_lease_refresh_total{result="lost"}[15m])) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: A download lease was lost on {{ "{{ $labels.pod }}" }}
+            description: >-
+              {{ "{{ $labels.pod }}" }} stopped heartbeating and another replica
+              may now claim its model. Expect MXDownloadTakeover next if it does.
+
+        # A takeover re-pulls the whole model -- hundreds of GB for a large one --
+        # so this pages on the first one rather than waiting out a hold.
+        #
+        # By pod for the same reason as above: the pod named here is the one that
+        # is now re-fetching, which is where the bandwidth is going.
+        - alert: MXDownloadTakeover
+          expr: sum by (pod) (increase(mx_download_claims_total{result="takeover"}[15m])) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: A download was taken over and is being pulled again by {{ "{{ $labels.pod }}" }}
+            description: >-
+              The previous downloader died mid-transfer and {{ "{{ $labels.pod }}" }}
+              took over. The bytes already fetched are re-fetched from scratch.
+
+        # Level without flow.
+        #
+        # max(), not sum(): the gauge is recomputed from the shared store, so
+        # every replica publishes the same global total and summing multiplies it
+        # by the replica count.
+        #
+        # `unless` rather than `and ... == 0`: after a restart the transition
+        # counters can have no series at all, and `and` against the empty vector
+        # that produces matches nothing -- silencing the alert in exactly the
+        # restart case described below.
+        - alert: MXDownloadWedged
+          expr: >-
+            max(mx_registry_entries{status="downloading"}) > 0
+            unless sum(increase(mx_registry_status_transitions_total{to="downloading"}[30m])) > 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: Entries stuck in DOWNLOADING with nothing entering that state
+            description: >-
+              The transition counters are process-local while DOWNLOADING persists
+              in the store, so a restart leaves the level with no matching flow.
+              Cross-check MXRegistryStatsStale first: if the refresh task is
+              wedged, this gauge is frozen rather than genuinely stuck.
+
+        - alert: MXDownloadFailureRatio
+          expr: >-
+            sum(rate(mx_download_seconds_count{outcome="error"}[15m]))
+            / sum(rate(mx_download_seconds_count[15m]))
+            > {{ include "modelexpress.threshold" (list $t "downloadFailureRatio" 0.1) }}
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Model downloads are failing
+
+    - name: modelexpress.serving
+      rules:
+        # Ratio taken over the counter, not the histogram _count: a cancelled
+        # request increments the counter and writes no latency sample, so a
+        # histogram-derived denominator silently omits exactly the slow calls.
+        #
+        # cancelled is excluded from the numerator too -- that is the caller
+        # leaving, not a server fault. not_found is a legitimate answer.
+        - alert: MXGrpcErrorRatio
+          expr: >-
+            sum by (method) (rate(mx_grpc_requests_total{outcome!~"ok|cancelled|not_found"}[5m]))
+            / sum by (method) (rate(mx_grpc_requests_total[5m]))
+            > {{ include "modelexpress.threshold" (list $t "grpcErrorRatio" 0.05) }}
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: 'gRPC errors on {{ "{{ $labels.method }}" }}'
+            description: >-
+              If every method lit up at once, suspect the auth path rather than the
+              store: outcome="backend_error" absorbs Code::Unavailable, which the
+              ServiceAccount token review returns when the Kubernetes API is down.
+              A real store outage also raises mx_backend_ops_total{result="error"}.
+
+        - alert: MXBackendErrorRatio
+          expr: >-
+            sum by (store) (rate(mx_backend_ops_total{result="error"}[5m]))
+            / sum by (store) (rate(mx_backend_ops_total[5m]))
+            > {{ include "modelexpress.threshold" (list $t "backendErrorRatio" 0.05) }}
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: 'Storage backend errors in {{ "{{ $labels.store }}" }}'
+            description: >-
+              store names the subsystem (p2p, registry, refit), not the engine.
+              The engine is on mx_build_info{backend=...}.
+
+        # The in-flight gauges are decremented by a Drop guard on every exit path
+        # including cancellation, so a standing value is real rather than drift.
+        #
+        # `unless` for the same reason as MXDownloadWedged: a store that has
+        # completed nothing may have no counter series to compare against.
+        - alert: MXBackendOpsStuck
+          expr: >-
+            sum by (store) (mx_backend_ops_in_flight) > 0
+            unless sum by (store) (increase(mx_backend_ops_total[10m])) > 0
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: 'Storage backend {{ "{{ $labels.store }}" }} has operations in flight and none completing'
+
+    - name: modelexpress.capacity
+      rules:
+        # Registered as the OOM early warning: these maps are never evicted.
+        # Per-instance, since one replica can leak while its peers are healthy.
+        - alert: MXStateEntriesGrowing
+          expr: mx_state_entries > {{ include "modelexpress.threshold" (list $t "stateEntriesLimit" 10000) }}
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: 'In-process map {{ "{{ $labels.map }}" }} is large and never evicted'
+{{- if $cfg.client }}
+
+    - name: modelexpress.client
+      rules:
+{{- if and .Values.metrics.clientPodMonitor .Values.metrics.clientPodMonitor.enabled }}
+        # Gated on the client PodMonitor being enabled, because that is the only
+        # state where "no client series" is wrong rather than expected. The
+        # client is opt-in and lives in someone else's pod, so on a deployment
+        # that never turned it on, absent is the correct answer.
+        #
+        # This is the failure the clientPodMonitor is most likely to hit. Its
+        # selector and portName both point at pods this chart does not own, and a
+        # wrong port name renders cleanly, applies cleanly, and scrapes nothing --
+        # indistinguishable from a healthy cluster where P2P is simply idle.
+        #
+        # 15m rather than the server's 10m: engine pods are large and are often
+        # still pulling their own image when the ModelExpress server is already up.
+        - alert: MXClientMetricsAbsent
+          expr: absent(mx_build_info{component="client"})
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: ModelExpress client metrics are not being scraped
+            description: >-
+              A client PodMonitor is enabled but no mx_build_info{component="client"}
+              series exists. Check that metrics.clientPodMonitor.selector matches
+              the engine pods and that portName matches the port they actually
+              declare -- a wrong name produces no error, just no targets. If the
+              engine pods are up, confirm MX_METRICS_ENABLED=1 is set on them.
+{{- end }}
+
+        # partial and empty both return success today, so they are invisible to
+        # every other signal. This is the only place they surface.
+        - alert: MXNixlSilentReceiveFailures
+          expr: >-
+            sum(rate(mx_nixl_receive_total{result=~"partial|empty"}[15m]))
+            / sum(rate(mx_nixl_receive_total[15m]))
+            > {{ include "modelexpress.threshold" (list $t "nixlSilentFailureRatio" 0.01) }}
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: NIXL transfers are returning partial or empty data
+            description: >-
+              These report success to the caller. A model loaded from a partial
+              receive is silently wrong rather than failed.
+
+        - alert: MXNixlDataPlaneErrors
+          expr: sum by (kind) (increase(mx_nixl_data_plane_errors_total[15m])) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: 'NIXL data-plane errors ({{ "{{ $labels.kind }}" }})'
+
+        # result="error" is a backend outage. result="empty" is a healthy cluster
+        # that has published no peers yet, so it is deliberately not alertable.
+        - alert: MXP2PListSourcesErrors
+          expr: >-
+            sum(rate(mx_p2p_list_sources_total{result="error"}[15m]))
+            / sum(rate(mx_p2p_list_sources_total[15m]))
+            > {{ include "modelexpress.threshold" (list $t "grpcErrorRatio" 0.05) }}
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Source lookups are failing on the client
+{{- end }}
+{{- end }}

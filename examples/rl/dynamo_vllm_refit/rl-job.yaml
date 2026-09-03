@@ -31,8 +31,6 @@ spec:
           value: ${MODEL_NAME}
         - name: MX_SERVER_ADDRESS
           value: mx-vllm-refit-server:8000
-        - name: MX_TRAINER_ENGINE
-          value: FSDP
         - name: MX_TRAINER_STAGING_MODE
           value: COPY_TO_DEVICE
         - name: MX_WEIGHT_PAYLOAD_FORMAT

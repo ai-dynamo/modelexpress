@@ -221,6 +221,7 @@ spec:
                     - HuggingFace
                     - Ngc
                     - Gcs
+                    - S3
             status:
               type: object
               properties:

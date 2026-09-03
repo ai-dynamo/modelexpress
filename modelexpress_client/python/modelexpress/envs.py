@@ -17,8 +17,9 @@ This is a leaf module: it imports only the standard library, so any package
 module can import it without creating a cycle.
 
 Reads are centralized here; **writes stay at their call sites** (vLLM's
-registry is read-only). ``UCX_TLS`` and ``UCX_NET_DEVICES`` are registered for
-reading, but the code that sets them does so inline.
+registry is read-only). ``UCX_TLS``, ``UCX_NET_DEVICES``, and
+``UCX_MEM_EVENTS`` are registered for reading, but the code that sets them
+does so inline.
 
 Not covered here (intentional exceptions):
 - ``MX_SKIP_EXT`` and ``CXX`` are read by ``setup.py`` before the package is
@@ -72,6 +73,7 @@ if TYPE_CHECKING:
     MX_RESHARD_HANDSHAKE_BACKOFF_S: float
     MX_REFIT_STAGE_RECORD: bool
     MX_RESHARD_MAX_GBPS: float
+    MX_RESHARD_MIN_GBPS: float
     MX_RESHARD_PUBLISH_DIGEST: bool
     # Kubernetes service backend
     MX_K8S_SERVICE_PATTERN: str
@@ -83,6 +85,8 @@ if TYPE_CHECKING:
     NIXL_UCX_TLS: Optional[str]
     UCX_TLS: Optional[str]
     UCX_NET_DEVICES: Optional[str]
+    UCX_MEM_EVENTS: Optional[str]
+    MX_UCX_DISABLE_MEM_EVENTS: bool
     MX_RDMA_NIC_PIN: str
     MX_RDMA_NIC_PIN_MIN_RATE_GBPS: Optional[str]
     # GPUDirect Storage
@@ -300,6 +304,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # disables the check, and is the default because only the operator knows the
     # real per-rank limit for their fabric.
     "MX_RESHARD_MAX_GBPS": lambda: _env_float("MX_RESHARD_MAX_GBPS", 0.0),
+    # Per-rank floor in Gbps below which a refit is reported as degraded. Zero
+    # disables it, and is the default for the same reason as the ceiling.
+    #
+    # The ceiling catches transfers that did not happen. Nothing caught a transfer
+    # that happened 20x too slowly: four concurrent receivers collapsed from
+    # ~26 GB/s to ~1.5 GB/s with no error, no warning, byte counts exact,
+    # descriptor counts exact, coverage 100% and fallback 0. Every signal we had
+    # said the refit was healthy. A rate is only interpretable against a bound,
+    # and we only ever had the upper one.
+    "MX_RESHARD_MIN_GBPS": lambda: _env_float("MX_RESHARD_MIN_GBPS", 0.0),
     # Have publishers digest each shard they advertise, so a receiver-side check has
     # something to compare against. Off by default: it costs a reduction over every
     # published tensor, which is a large relative cost against a ~1.5 s wire, so it
@@ -316,6 +330,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "NIXL_UCX_TLS": lambda: os.environ.get("NIXL_UCX_TLS"),
     "UCX_TLS": lambda: os.environ.get("UCX_TLS"),
     "UCX_NET_DEVICES": lambda: os.environ.get("UCX_NET_DEVICES"),
+    "UCX_MEM_EVENTS": lambda: os.environ.get("UCX_MEM_EVENTS"),
+    "MX_UCX_DISABLE_MEM_EVENTS": lambda: _env_bool("MX_UCX_DISABLE_MEM_EVENTS", False),
     "MX_RDMA_NIC_PIN": lambda: os.environ.get("MX_RDMA_NIC_PIN", "").strip(),
     "MX_RDMA_NIC_PIN_MIN_RATE_GBPS": lambda: os.environ.get("MX_RDMA_NIC_PIN_MIN_RATE_GBPS"),
     # ── GPUDirect Storage ──────────────────────────────────────────────────

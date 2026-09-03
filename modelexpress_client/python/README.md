@@ -106,19 +106,27 @@ trainer actor then invokes its rank-local client to stage and publish one shard.
 Worker registration, manifest serving, and internal shard CRUD remain hidden
 behind the client.
 
+When creating a `WeightVersion`, the orchestrator may supply its UID or let MX
+generate one. A caller-supplied UID already assigned to another request returns
+`ALREADY_EXISTS`; an identical request retried with the same idempotency key
+returns the existing version.
+
 ```python
 from modelexpress_rl import (
+    MegatronTrainerContext,
     ModelExpressTrainerClient,
     ModelExpressTrainerConfig,
     WeightVersionRef,
 )
 
-trainer = ModelExpressTrainerClient.initialize(ModelExpressTrainerConfig())
+trainer = ModelExpressTrainerClient.initialize(
+    ModelExpressTrainerConfig(engine_context=MegatronTrainerContext())
+)
 trainer.bind_tensors(megatron_tensor_specs)
 trainer.publish_version(version=WeightVersionRef(version.uid))
 ```
 
-The deployment supplies `MODEL_NAME`, `MX_TRAINER_ENGINE`,
+The deployment supplies `MODEL_NAME`,
 `MX_TRAINER_STAGING_MODE`, `MX_WEIGHT_PAYLOAD_FORMAT`, `MX_WORKER_HOST`, and the
 normal ModelExpress server configuration. The Megatron adapter derives its
 source slot from logical tensor names and shard geometry. DP replicas of the same
@@ -127,41 +135,61 @@ partitions remain separate required slots. The NIXL metadata endpoint is derived
 from `MX_WORKER_HOST` and the client-owned NIXL manager's listen port. `LOCAL_RANK`
 selects the device unless `device_id` is passed to `initialize()`.
 
-Canonical S3/XOR staging consumes Hugging Face tensor buckets produced by the
+Canonical S3 staging consumes Hugging Face tensor buckets produced by the
 training framework. Framework-native bucket settings remain the default.
 The public trainer API accepts
 `ModelExpressTrainerConfig(object_storage=ObjectStorageConfig(...))`; its
 `storage_type` selects the provider. Weight versions use the corresponding
-typed `ObjectStorageSource` envelope. The current trainer and generator clients
-support only `ObjectStorageType.S3`.
+typed `ObjectStorageSource` envelope. Generator clients likewise accept
+`ModelExpressGeneratorConfig(object_storage=ObjectStorageGeneratorConfig(...))`.
+The current trainer and generator clients support only `ObjectStorageType.S3`.
 Integrations may use `MX_REFIT_DELTA_BUCKET_BYTES` as an explicit override, or
 its 512 MiB default when they have no native setting. CPU workers are configured
-by `MX_REFIT_DELTA_WORKERS` (default `min(32, CPU count)`).
+by `MX_REFIT_DELTA_WORKERS` (default `min(32, CPU count)`), while
+`MX_S3_UPLOAD_WORKERS` controls concurrent full-checkpoint batch uploads.
 The framework integration reads the bucket-size setting while constructing the
 stream; ModelExpress processes each supplied bucket without splitting or merging
 it.
 Before training begins, the framework calls `prepare_delta_base()` with one
 bucket stream. ModelExpress submits each framework bucket directly for
-concurrent rank-local launch-checkpoint reads. Real delta staging therefore
-performs no launch-checkpoint reads.
-Published roots use
-`{uri_prefix}/v{version_number}/model.safetensors.index.json`.
-Canonical S3 publication requires a numeric `version_number`.
-The S3 URI belongs to `WeightVersion`; after upload, the orchestrator changes
-the version from `STAGING` to `READY`. S3 versions remain READY for rollout
-recovery; their immutable objects are governed by the bucket's external
-lifecycle policy.
+concurrent rank-local seed-checkpoint reads. Real delta staging therefore
+performs no seed-checkpoint reads. A `FULL_HF_CHECKPOINT` version serializes
+the current buckets as native HF safetensor shards, omits `base_version_id`, and
+replaces the retained snapshot so the next `XOR_DELTA` uses it as its exact
+base. A bounded worker pool updates the rank-local snapshot with immutable CPU
+tensors. Each publishing rank groups its snapshot into concurrently uploaded
+safetensors objects with at most `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` tensor
+bytes (4 GiB by default); an oversized tensor occupies its own object. The
+objects are sent directly to S3 without a trainer-side temporary checkpoint.
+Framework integrations own the optional full-checkpoint period; it is disabled
+by default.
+Generators use the ModelExpress S3 client to download full-checkpoint batches
+concurrently. Each worker validates one downloaded batch and copies its tensors
+into their existing local mmap destinations, without materializing a second full
+checkpoint. ModelStreamer integration remains a future optimization.
+The local checkpoint state changes from `READY` to `UPDATING` before mutation
+and returns to `READY` only after success. An interrupted update must be reseeded
+from `seed_checkpoint_path` during initialization.
+The framework supplies each version's exact `object_storage.uri` under the
+configured `uri_prefix`. That URI names the global safetensors index; its
+objects are stored beside it. A delta index records the target
+`WeightVersion.uid` and its `base_version_id` as `metadata.version` and
+`metadata.base_version`. After upload, the orchestrator changes the version from
+`STAGING` to `READY`. S3 versions remain READY for rollout recovery; their
+immutable objects are governed by the bucket's external lifecycle policy.
 
 The client owns the NIXL manager and trainer-side manifest service. `server_url`
 selects the central ModelExpress control-plane service and defaults to the
 normal ModelExpress server configuration. A Megatron worker may initialize the
-client after selecting its CUDA device but before creating NCCL resources; the
-engine adapter is created lazily when the worker first requests its source slot
-or stages a shard after distributed setup.
+client before its distributed process group is ready; the explicitly selected
+`engine_context` is constructed lazily on the first tensor operation. Deployment
+environment variables do not select Python implementations.
 
-Initialization fixes the staging mode and payload format. On NIXL, `publish()`
-hides manifest publication and the internal `CreateWeightVersionShard` RPC. The
-current Megatron adapter registers and exposes its live buffers through
+Initialization fixes the staging mode. NIXL also fixes its payload format;
+canonical S3 publication follows each target `WeightVersion`. On NIXL,
+`publish()` hides manifest publication and the internal
+`CreateWeightVersionShard` RPC. The current Megatron adapter registers and
+exposes its live buffers through
 `IN_PLACE`, so callers must keep those tensors immutable while the version is
 published. The required lifecycle is synchronous: create and publish the
 version, update every generator, retire and release the version, and only then
@@ -171,7 +199,7 @@ Version creation and expected-source-slot declaration remain
 framework-orchestrator responsibilities. Each trainer adapter derives its own
 source slot from the engine's native topology; the orchestrator declares the
 expected slots using the same adapter-defined convention. `initialize()`
-selects the configured trainer engine and constructs its adapter internally.
+constructs the adapter selected by `engine_context` internally.
 Megatron and FSDP implementations are available. Megatron-specific APIs live under
 `modelexpress_rl`;
 `modelexpress.refit.reshard` remains the shared, engine-neutral transfer core.
@@ -242,6 +270,7 @@ register_modelexpress_loaders()
 | `MX_RESHARD_HANDSHAKE_BACKOFF_S` | `2` | Pause after a full pass over the pending peers makes no progress, so a transient stall is waited out rather than hammered |
 | `MX_REFIT_STAGE_RECORD` | `1` | Emit one `refit-stage-v2` JSON record per refit, giving a benchmark harness the per-stage timings without parsing logs. Set to `0` to silence it |
 | `MX_RESHARD_MAX_GBPS` | `0` | Per-rank fabric ceiling in Gbps. A measured wire rate above it means the timing is wrong rather than the transfer being fast, so the refit is rejected. `0` disables the check, since only the operator knows the real per-rank limit |
+| `MX_RESHARD_MIN_GBPS` | `0` | Per-rank floor in Gbps. Below it, the refit emits a `refit-slow-throughput-v1` JSON warning naming the rate, the bound and the shortfall. Applies to both receivers — the Megatron slice-reshard receiver and the staged receiver the FSDP trainers pull over, including its peer-to-peer pull — so one setting covers a job whichever path it refits on. Warns rather than aborting, unlike the ceiling: an impossible rate means the payload never moved, but a slow one is still correct, so enforcement belongs in a CI gate reading the record rather than in a running job. `0` disables it. Worth setting for any throughput run — a 20x collapse has been observed with byte counts exact, descriptor counts exact, coverage 100%, fallback 0 and no error anywhere, and without a lower bound there is nothing in the telemetry that dissents. When choosing a value, note that it is compared per rank against the rate one receiver sees *while its siblings are also receiving*, which is well below the rate a single receiver reaches alone; sizing it against the solo number puts the floor above the healthy concurrent rate and it will fire on good runs. Aim between the two — roughly the geometric mean of the collapsed rate and the healthy concurrent rate leaves both verdicts off a tight margin |
 | `MX_RESHARD_PUBLISH_DIGEST` | `0` | Have each trainer publish a position-sensitive digest of every shard it advertises, so a receiver can later confirm it installed the bytes the publisher held. Off by default: the reduction costs a pass over every published tensor, which is large next to a ~1.5 s wire, so turn it on when qualifying a build rather than when measuring throughput |
 
 ### Canonical S3 Transfer Tuning

@@ -3,9 +3,10 @@
 
 from contextlib import nullcontext
 
-import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 import pytest
 import torch
+
+import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 from modelexpress import p2p_pb2
 from modelexpress.refit.reshard.rendezvous import (
     PublishedShard,
@@ -123,7 +124,9 @@ def test_load_agent_metadata_validates_embedded_agent_identity():
         _load_agent_metadata(_Manager(), {"agent-b": b"metadata"})
 
 
-def test_transformed_source_is_fully_reconstructed_for_verification():
+def test_transformed_source_is_fully_reconstructed_for_verification(monkeypatch):
+    # Full reconstruction + verification is the digest mode; default is minimal reads.
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
     source = SourceInfo(
         global_shape=(4, 4),
         dtype=torch.float32,
@@ -153,6 +156,34 @@ def test_transformed_source_is_fully_reconstructed_for_verification():
         "left",
         "right",
     }
+
+
+def test_transformed_source_reads_only_required_slice_by_default(monkeypatch):
+    monkeypatch.delenv("MX_RESHARD_PUBLISH_DIGEST", raising=False)
+    source = SourceInfo(
+        global_shape=(4, 4),
+        dtype=torch.float32,
+        elsize=4,
+        shards=[
+            Shard((0, 0), (4, 2), "left", 0, 4),
+            Shard((0, 2), (4, 2), "right", 32, 4),
+        ],
+    )
+    copy = RecordedCopy(
+        src_name="weight",
+        op_chain=(("narrow", (1, 0, 2), ()),),
+        param_name="fused_weight",
+        dest_offset=0,
+        dest_shape=(4, 2),
+        dest_stride=(2, 1),
+        dest_dtype=torch.float32,
+    )
+
+    plan = _plan_staged_transfer(CaptureResult(copies=[copy]), {"weight": source})
+
+    assert plan.full_pulls == []
+    assert sum(segment.nbytes for segment in plan.segments) == 32
+    assert {segment.session for segment in plan.segments} == {"left"}
 
 
 def _prepared(tensor: torch.Tensor, digest: str | None) -> _PreparedNixlTransfer:
@@ -270,6 +301,7 @@ def test_peer_stage_uses_exact_canonical_tensor_catalog(monkeypatch):
 
     transfer = object.__new__(_NixlStagedTransfer)
     transfer._device = torch.device("cpu")
+    transfer._device_id = 0
     transfer._timeout = 30.0
     transfer._manager = _Manager()
     transfer._recv_buffers = {}

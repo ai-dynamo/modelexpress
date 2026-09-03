@@ -3,9 +3,9 @@ SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES.
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# ModelExpress Deployment Guide
+# ModelExpress deployment
 
-User-facing guide for configuring and deploying ModelExpress. For architecture details, see [`ARCHITECTURE.md`](ARCHITECTURE.md). For development setup, see [`../CONTRIBUTING.md`](../CONTRIBUTING.md).
+This page is the deployment reference for the standalone server, Helm, Kubernetes metadata topologies, and worker rollout requirements. Start with [Choose a ModelExpress path](guides/choose-a-path.md) if you have not selected a topology. See [Configuration](CONFIGURATION.md) for settings, [Integrations](integrations/README.md) for runtime setup, [Troubleshooting](TROUBLESHOOTING.md) for operational symptoms, and [Architecture](ARCHITECTURE.md) for internals.
 
 ## Server Configuration
 
@@ -111,9 +111,13 @@ reachable.
 | `REDIS_URL` | e.g. `redis://host:6379` | when Redis | Redis connection (or set `MX_REDIS_HOST` / `MX_REDIS_PORT`) |
 | `POD_NAMESPACE` / `MX_METADATA_NAMESPACE` | e.g. `default` | when Kubernetes | Namespace for the `ModelMetadata` and `ModelCacheEntry` CRDs |
 
-To use the Kubernetes backend, apply `examples/crds.yaml` at cluster install time
-(installs both the `ModelMetadata` P2P CRD and the `ModelCacheEntry` registry CRD),
-then either enable `serviceAccount.rbac.enabled=true` on the Helm chart or apply
+To use the Kubernetes backend in a standalone deployment, apply
+`examples/crds.yaml` before the first deployment and reapply it when upgrading
+ModelExpress (it installs or updates both the `ModelMetadata` P2P CRD and the
+`ModelCacheEntry` registry CRD). When using the Helm chart, follow the CRD
+installation and upgrade instructions in [`helm/README.md`](../helm/README.md);
+Helm does not update an existing CRD from the chart's `crds/` directory. Then
+either enable `serviceAccount.rbac.enabled=true` on the Helm chart or apply
 `examples/p2p_transfer_k8s/server/kubernetes_backend/rbac-modelmetadata.yaml`.
 The chart creates a `ClusterRole` and `ClusterRoleBinding`, allowing the server
 to run in a dedicated namespace while accessing metadata resources in another
@@ -157,7 +161,7 @@ MX has one configurable filesystem path, the model weights cache (`MODEL_EXPRESS
 | Multi-replica MX with `MODEL_EXPRESS_NO_SHARED_STORAGE=true` on clients (gRPC streaming) | RWO per replica OR ephemeral | Needs an MX-aware init container in the client pod; no ready-made vLLM recipe today (tracked MX-290) |
 | ModelStreamer from object storage on clients | none | Clients stream through a bounded CPU staging buffer without landing the checkpoint on local disk |
 | ModelStreamer from a local path on clients | Existing local/PVC path | Reads the configured local checkpoint through the pipelined ModelStreamer path |
-| P2P RDMA receivers, weights only | none on receiver | Weights land in GPU HBM; the source may have bootstrapped through InstantTensor, ModelStreamer, GDS, or the native loader |
+| P2P RDMA receivers, weights only | none on receiver | Weights land in GPU HBM; the source may have bootstrapped through server cache, InstantTensor, ModelStreamer, GDS, or the native loader |
 | P2P RDMA receivers, weights and artifacts | Writable local staging and runtime cache paths | Weights land in GPU HBM. File-backed artifacts are staged locally, verified, and installed into the target engine's filesystem caches. |
 
 For new multi-replica deployments, prefer the no-shared-storage row: each MX replica can use its own RWO or ephemeral cache while Redis or Kubernetes coordinates lifecycle state. The RWX row is mainly for existing shared-cache topologies, and the single-replica row is a local/dev simplification.
@@ -499,6 +503,34 @@ helm/deploy.sh --namespace my-ns --values helm/values-local-storage.yaml
 
 See [`../helm/README.md`](../helm/README.md) for the full parameter reference and installation guide.
 
+### Monitoring
+
+The chart defaults to `prometheus.io/*` pod annotations, which
+**kube-prometheus-stack ignores entirely** — it discovers targets only through
+PodMonitor resources. On an Operator cluster the metrics endpoint is served and
+never scraped, which is indistinguishable from a crashed exporter. Switch:
+
+```bash
+helm upgrade --install modelexpress ./helm \
+  --set metrics.podAnnotations=false \
+  --set metrics.podMonitor.enabled=true \
+  --set metrics.podMonitor.additionalLabels.release=kube-prometheus-stack \
+  --set metrics.rules.enabled=true \
+  --set metrics.rules.additionalLabels.release=kube-prometheus-stack \
+  --set metrics.dashboard.enabled=true
+```
+
+`additionalLabels` is not optional in practice: Prometheus only adopts a
+PodMonitor or PrometheusRule whose labels match its `podMonitorSelector` /
+`ruleSelector`, and kube-prometheus-stack defaults both to its own release name.
+An unmatched resource installs cleanly and is then ignored with no error.
+
+Client metrics live in the inference engine's pod, which this chart does not
+deploy, and need `metrics.clientPodMonitor` with a selector you supply.
+
+See [METRICS.md](METRICS.md) for the discovery models, the alert runbook and the
+dashboard.
+
 ### Dynamo Model Cache Deployment
 
 For deploying ModelExpress alongside Dynamo with a vLLM worker:
@@ -511,7 +543,7 @@ See [`../examples/dynamo_model_cache_k8s/README.md`](../examples/dynamo_model_ca
 
 ## P2P GPU Weight Transfers
 
-ModelExpress supports GPU-to-GPU model weight transfers between supported inference instances using NVIDIA NIXL over RDMA. vLLM 0.23.0 and newer recognize `--load-format modelexpress` natively, which runs the priority chain P2P RDMA -> InstantTensor -> ModelStreamer -> GDS -> native loader; the ModelExpress Python package must still be installed, and `mx` remains a backward-compatible alias. SGLang uses `remote_instance` with the `modelexpress` backend; see [SGLang Clients](#sglang-clients).
+ModelExpress supports GPU-to-GPU model weight transfers between supported inference instances using NVIDIA NIXL over RDMA. vLLM 0.23.0 and newer recognize `--load-format modelexpress` natively, which runs the fixed priority chain P2P RDMA -> server cache -> InstantTensor -> ModelStreamer -> GDS -> native loader; the ModelExpress Python package must still be installed, and `mx` remains a backward-compatible alias. SGLang uses `remote_instance` with the `modelexpress` backend; see [SGLang Clients](#sglang-clients).
 
 ### Cross-Vendor (CUDA/XPU) Compatibility
 
@@ -539,7 +571,7 @@ Quantized models are not transferred across accelerator families. This includes 
 
 The reason is that ModelExpress transfers post-processed in-memory tensor bytes, not raw checkpoint files. For quantized models, the post-processed layout can depend on the accelerator family, GPU architecture, selected kernel, and framework quantization backend. For example, FP8 scale packing or FP4/NVFP4 swizzling may differ between CUDA and XPU kernels. Copying those bytes across vendors can make the transfer succeed while causing silent inference corruption.
 
-If a target finds only cross-family sources for a quantized model, it skips P2P RDMA and falls through to the next load strategy, such as GDS or disk loading. Expect a slower cold start instead of an RDMA receive in mixed CUDA/XPU fleets serving quantized weights.
+If a target finds only cross-family sources for a quantized model, it skips P2P RDMA and falls through to the next eligible load strategy, such as server cache, InstantTensor, ModelStreamer, GDS, or native loading. Expect a slower cold start instead of an RDMA receive in mixed CUDA/XPU fleets serving quantized weights.
 
 Same-family transfer is unaffected. Quantized transfer remains allowed for:
 
@@ -602,8 +634,9 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_ARENA_SINGLE_MR` | `0` | Keep single-MR arena registration even when the arena spans several `cuMemCreate` handles. Only safe on transports that can register across handles (dmabuf/IB); cuda_ipc cannot, so the default falls back to per-tensor registration. See [VMM Arena](#vmm-arena-single-mr-registration). |
 | `UCX_CUDA_COPY_REG_WHOLE_ALLOC` | (UCX default) | Set to `off` with `MX_VMM_ARENA=1` on any UCX predating the `cuda_copy_md` length-truncation fix (openucx/ucx#11461). Scoped to the `cuda_copy` transport; it does not affect `cuda_ipc`. |
 | `MX_NIXL_BACKEND` | `UCX` | NIXL backend for GPU-to-GPU RDMA. `UCX` (default) for InfiniBand / RoCE. `LIBFABRIC` for AWS EFA — see [NIXL Backend Selection](#nixl-backend-selection). |
-| `MX_RDMA_NIC_PIN` | (unset) | Per-rank IB NIC pinning. `auto` runs a topology probe; comma-separated NIC list is an explicit override. Workaround for openucx/ucx#11259. |
+| `MX_RDMA_NIC_PIN` | (unset) | Per-rank IB NIC pinning. `auto` runs a topology probe; comma-separated NIC list is an explicit override. Addresses both openucx/ucx#11259 and rail convergence, the latter measured at 4.45x on an under-provisioned pod. |
 | `MX_RDMA_NIC_PIN_MIN_RATE_GBPS` | (auto, max-rate filter) | Override the auto-detect rate filter with an explicit lower bound (Gb/s). |
+| `MX_UCX_DISABLE_MEM_EVENTS` | `0` | Opt-in. `1` sets `UCX_MEM_EVENTS=n` before NIXL agent creation on the UCX backend (no-op on `LIBFABRIC`), which roughly halves NIXL agent creation time by skipping UCX's mem-hook / VM-unmap tracking. Off by default because the effect is process-wide and permanent: `UCX_MEM_EVENTS` backs registration-cache invalidation for every UCP context in the process, not just ModelExpress's, so this is only safe when the process owns UCX exclusively for ModelExpress transfers. Never overrides an operator-set `UCX_MEM_EVENTS`. UCX reads this option in a shared-library constructor, so if UCX was already loaded elsewhere in the process before agent creation, setting it here can be a no-op. |
 | `MODEL_EXPRESS_LOG_LEVEL` | (inherits vLLM) | Override log level for `modelexpress.*` loggers. `DEBUG` enables per-tensor checksums and adopted tensor details |
 | `MX_P2P_METADATA` | `1` | Enable P2P metadata exchange (source workers only). Set to `0` to publish full metadata through a central-coordinator backend. This setting is ignored on backends that require P2P metadata, currently `k8s-service`. |
 | `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
@@ -644,21 +677,84 @@ NIXL agent 'mx-auto-worker0-...' created on device 0 (backend=LIBFABRIC)
 
 ### NIC Pinning (UCX Workaround)
 
-`MX_RDMA_NIC_PIN=auto` works around
+`MX_RDMA_NIC_PIN=auto` addresses two things.
+
+The first is
 [openucx/ucx#11259](https://github.com/openucx/ucx/issues/11259), where
 UCX may pick a NIC on a different NUMA node from a worker's GPU when
 the IB device pool spans multiple NUMA domains; the resulting CUDA
 RDMA traffic crosses the CPU interconnect and loses bandwidth.
 
-The probe runs at worker startup, walks PCIe sysfs, and sets
-`UCX_NET_DEVICES` to a single NUMA-local NIC per worker before the
-NIXL agent is constructed. Same affinity metric as
-`nvidia-smi topo -m` (PIX > PXB > NODE > SYS).
+The second is **rail convergence**, which is the one measured to cost
+real throughput. UCX picks a NIC per process without knowing what the
+other ranks on the host picked. On an under-provisioned pod — fewer
+usable rails than GPUs, or rails allocated on the wrong socket — every
+rank independently makes the same locally-correct choice and they all
+land on one adapter. Measured on such a pod, with four inference GPUs
+and only one allocated rail on their NUMA node:
 
-Recommended on multi-GPU hosts where the IB pool spans NUMA. Leave
-unset on single-NUMA hosts or when you manage `UCX_NET_DEVICES` per
-rank externally. Once the upstream UCX fix lands and a patched UCX
-is deployed, drop this env var.
+| | per reader | aggregate |
+|---|---|---|
+| all four on one rail | 1.5 GB/s | 6.1 GB/s |
+| one reader per rail | 6.75 GB/s | 27.0 GB/s |
+
+Aggregate with four readers sharing was *lower* than a single reader
+alone (26.1 GB/s), so throughput is destroyed rather than divided.
+Nothing in the refit telemetry dissents: byte counts, descriptor counts
+and coverage are all exact. Pair this with `MX_RESHARD_MIN_GBPS` so a
+collapse is reported rather than inferred.
+
+The probe runs at worker startup, walks PCIe sysfs, and computes a
+**host-wide** GPU-to-NIC assignment — every rank derives the same map from
+the same sysfs snapshot, so no coordination is needed — then sets
+`UCX_NET_DEVICES` for its own rank before the NIXL agent is constructed.
+Ranking is rail distinctness first, then PCIe depth, then NUMA locality.
+
+The GPU set comes from the PCI listing rather than from
+`torch.cuda.device_count()`, so it is the same in every rank regardless of
+how the workers were launched. That distinction is load-bearing: NeMo-RL
+and prime-RL give each worker its own `CUDA_VISIBLE_DEVICES`, and a map
+built from the visible set would have each rank see one GPU, count from
+zero, and pick the same rail as all of its peers — the convergence the
+probe exists to prevent.
+
+One case it cannot solve alone: if the container is device-isolated so
+that only one GPU appears in the PCI listing too, there is nothing to
+spread across. The probe logs a warning naming that condition rather than
+reporting a one-entry map as a success; set `UCX_NET_DEVICES` or
+`MX_RDMA_NIC_PIN` explicitly for those ranks.
+
+PCIe depth is the shared-prefix length of the two devices' sysfs paths.
+It separates PIX from everything else, but it cannot separate NODE from
+SYS: the root complex appears in the path as `pci0000:97`, which is
+filtered out as not BDF-shaped, so two devices on the same root complex
+but different root ports score 0 exactly as two devices on opposite
+sockets do. The NUMA term breaks the ties that leaves, which on an
+under-provisioned pod is most of them — on the measured node, 15 of 16
+GPU-rail pairs tied at 0.
+
+Distinctness leads deliberately. On that pod, sharing a rail cost 4.45x
+while crossing a socket cost nothing measurable (6.745 GB/s on the
+affine rail against 6.747 on cross-socket ones), so ranking NUMA
+locality higher trades a large loss for an unmeasurable gain. When rails
+are adequately provisioned, one PIX rail per GPU, distinctness changes
+nothing and each GPU still gets its closest NIC.
+
+Recommended on any multi-GPU host, not only where the pool spans NUMA:
+convergence is possible whenever ranks outnumber usable rails. Leave
+unset when you manage `UCX_NET_DEVICES` per rank externally. Note the
+upstream UCX fix addresses only the affinity half; the convergence half
+needs a component that can see all ranks at once, so this probe remains
+useful after it lands.
+
+**Provisioning matters more than this flag, and co-tenancy drives
+provisioning.** On the measured node the bad rail set was a leftover: 8
+rails total, a co-tenant pod holding 4, and the 4 remaining were 3 on the
+far socket plus 1 affine rail. Requesting more rails does not fix that —
+it fails to schedule while the co-tenant is resident. What is needed is
+for GPUs to be co-scheduled with their affine rails. The probe makes the
+best of the rails a pod holds; it cannot conjure one that was never
+allocated.
 
 `MX_RDMA_NIC_PIN_MIN_RATE_GBPS` overrides the default max-rate filter
 for clusters with multiple rate tiers in the compute fabric.
@@ -853,13 +949,31 @@ RL refit has the same trusted-network requirement. Its trainer-local
 `RefitWorkerService` serves exact-version manifests over plaintext gRPC; the
 manifest digest detects corruption but does not authenticate the trainer.
 
-Canonical S3/XOR trainers consume Hugging Face tensor buckets produced by the
+Canonical S3 trainers consume Hugging Face tensor buckets produced by the
 training framework. Framework-native bucket settings remain the default.
 Integrations may use `MX_REFIT_DELTA_BUCKET_BYTES` as an explicit override, or
 its 512 MiB default when they have no native setting. `MX_REFIT_DELTA_WORKERS`
-(default `min(32, CPU count)`) controls delta-processing concurrency.
+(default `min(32, CPU count)`) controls trainer CPU work;
+`MX_S3_UPLOAD_WORKERS` controls concurrent full-checkpoint batch uploads.
 Framework integrations read the bucket-size setting before constructing the
 stream; ModelExpress preserves the supplied bucket boundaries.
+Full checkpoints are grouped into concurrently uploaded safetensors objects of
+up to `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` tensor bytes (4 GiB by default).
+A single tensor larger than the configured size is uploaded on its own.
+Generators download those objects concurrently through the ModelExpress S3
+client. Each download worker validates one batch and overwrites the matching
+regions in the existing local checkpoint mmaps.
+The receiver marks its local checkpoint `UPDATING` before mutation and `READY`
+only after success. An interrupted update remains unavailable until a fresh
+initialization reseeds it from `seed_checkpoint_path`.
+
+S3 versions normally use `XOR_DELTA`. Integrations may opt into a
+framework-selected cadence of `FULL_HF_CHECKPOINT` versions; these publish
+native HF safetensor shards, omit `base_version_id`, and become the exact base
+for the next delta. The cadence is disabled by default. Slime exposes
+`--modelexpress-full-hf-checkpoint-interval N`; Vime accepts
+`full_hf_checkpoint_interval` in `--modelexpress-config`. In both cases, `N`
+counts published ModelExpress weight versions.
 
 ### Server-Backed Model Cache (No Shared Storage)
 
@@ -900,13 +1014,13 @@ Requirements and limits:
 
 ### InstantTensor (Fast Local Safetensors)
 
-InstantTensor loads the model's own safetensors directly onto CUDA using distributed loading, pipelined prefetching, and direct I/O, with GPUDirect Storage when the hardware supports it. It sits right after P2P RDMA in the loading chain: when no peer source is already serving, it is the fastest local-disk path before falling back to ModelStreamer, GDS, or the native loader. Unlike ModelStreamer it needs no `MX_MODEL_URI`; it reuses vLLM's built-in `--load-format instanttensor` path, so the engine resolves the model's weight files (downloading from the Hugging Face Hub into the local cache first if they are not already local).
+InstantTensor loads the model's own safetensors directly onto CUDA using distributed loading, pipelined prefetching, and direct I/O, with GPUDirect Storage when the hardware supports it. It follows server-backed loading in the fixed chain: when no peer source is already serving, ModelExpress tries server cache first when no-shared-storage mode is enabled, then uses InstantTensor when eligible before falling back to ModelStreamer, GDS, or the native loader. Unlike ModelStreamer it needs no `MX_MODEL_URI`; it reuses vLLM's built-in `--load-format instanttensor` path, so the engine resolves the model's weight files (downloading from the Hugging Face Hub into the local cache first if they are not already local).
 
 The strategy is enabled by default. The `instanttensor` package is a core dependency on Linux (installed automatically alongside `runai-model-streamer`), so no extra install step is needed. The strategy activates on a CUDA device **when the engine adapter implements the InstantTensor capability**. Currently only the vLLM adapter implements it; on engines that do not (for example SGLang today), the strategy falls through even when `instanttensor` and a CUDA device are available. If the package is unavailable (for example on a non-Linux platform) the chain simply skips to the next strategy.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MX_INSTANT_TENSOR` | `1` | Enable the InstantTensor strategy. Set to `0` to disable it and fall through to ModelStreamer/GDS/native loading. |
+| `MX_INSTANT_TENSOR` | `1` | Enable the InstantTensor strategy. Set to `0` to disable it and fall through to ModelStreamer/GDS/native loading after any eligible server-cache path. |
 
 InstantTensor also honors its own `INSTANTTENSOR_BACKEND` environment variable (`URING`, `AIO`, `CUFILE` for GDS, `MMAP`) for selecting the I/O backend; ModelExpress passes it through unchanged.
 
