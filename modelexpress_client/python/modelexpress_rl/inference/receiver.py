@@ -107,6 +107,16 @@ _DECOMPRESSORS: dict[str, _Decompressor] = {
 }
 
 
+def _is_safe_shard_basename(value: object) -> bool:
+    """Return whether a shard is one file directly under its artifact root."""
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value not in {".", ".."}
+        and Path(value).name == value
+    )
+
+
 def _parse_delta_manifest(
     data: bytes,
 ) -> tuple[dict[str, str], _Decompressor]:
@@ -115,13 +125,21 @@ def _parse_delta_manifest(
     except (TypeError, ValueError) as error:
         raise ValueError("canonical delta manifest is not valid JSON") from error
     compression_format = manifest["metadata"]["compression_format"]
+    weight_map = manifest["weight_map"]
+    if not isinstance(weight_map, dict):
+        raise ValueError("canonical delta weight_map must be an object")
+    for name, filename in weight_map.items():
+        if not isinstance(name, str) or not _is_safe_shard_basename(filename):
+            raise ValueError(
+                f"invalid canonical delta shard filename {filename!r}"
+            )
     try:
         decompressor = _DECOMPRESSORS[compression_format]
     except KeyError as error:
         raise ValueError(
             f"unsupported canonical delta compression format {compression_format!r}"
         ) from error
-    return manifest["weight_map"], decompressor
+    return weight_map, decompressor
 
 
 def _parse_full_checkpoint_manifest(data: bytes) -> dict[str, str]:
@@ -135,7 +153,7 @@ def _parse_full_checkpoint_manifest(data: bytes) -> dict[str, str]:
     for name, filename in weight_map.items():
         if not isinstance(name, str) or not isinstance(filename, str):
             raise ValueError("full HF checkpoint weight_map must contain strings")
-        if not filename or Path(filename).name != filename:
+        if not _is_safe_shard_basename(filename):
             raise ValueError(f"invalid full HF checkpoint shard filename {filename!r}")
     return weight_map
 
@@ -501,39 +519,51 @@ class _LocalCheckpoint:
         for delta_version in base_chain["deltas"]:
             self.store.verify_artifact(self.store.delta_path(delta_version))
         base_checkpoint = self.store.checkpoint_path(version.base_version_id)
+        reuse_materialized = base_checkpoint.parent == self.store.materialized_cache
         self.store.ensure_capacity(
-            self.store.path_size_bytes(base_checkpoint),
+            0 if reuse_materialized else self.store.path_size_bytes(base_checkpoint),
             protected_versions={
                 self.store.active_version(),
                 version.version_id,
             },
         )
-        with self.store.replace_directory(
-            target,
-            copy_from=base_checkpoint,
-        ) as temporary:
-            self._set_local_checkpoint(temporary)
-            self.store.verify_artifact(artifact)
-            manifests = list(artifact.glob("*.safetensors.index.json"))
-            if len(manifests) != 1:
-                raise RuntimeError(
-                    f"cached delta {version.version_id!r} has no unique index"
-                )
-            delta_map, self.decompressor = _parse_delta_manifest(
-                manifests[0].read_bytes()
-            )
-            shards = {
-                filename: (
-                    (artifact / filename).read_bytes(),
-                    names,
-                )
-                for filename, names in _group_tensors_by_shard(delta_map).items()
-            }
-            self._apply_shards(shards)
+        if reuse_materialized:
+            # A sequential delta can take ownership of the derived base. Rename
+            # it to the target version and mutate it without another full copy.
+            shutil.rmtree(target, ignore_errors=True)
+            base_checkpoint.replace(target)
+            self._set_local_checkpoint(target)
+            self._apply_delta_artifact(artifact, version.version_id)
+        else:
+            # The first delta after a full checkpoint copies once so applying
+            # it cannot modify the canonical full artifact.
+            with self.store.replace_directory(
+                target,
+                copy_from=base_checkpoint,
+            ) as temporary:
+                self._set_local_checkpoint(temporary)
+                self._apply_delta_artifact(artifact, version.version_id)
 
         self._set_local_checkpoint(target)
         self.store.write_chain(version.version_id, chain)
         return download_time, time.perf_counter() - apply_started
+
+    def _apply_delta_artifact(self, artifact: Path, version: str) -> None:
+        self.store.verify_artifact(artifact)
+        manifests = list(artifact.glob("*.safetensors.index.json"))
+        if len(manifests) != 1:
+            raise RuntimeError(f"cached delta {version!r} has no unique index")
+        delta_map, self.decompressor = _parse_delta_manifest(
+            manifests[0].read_bytes()
+        )
+        shards = {
+            filename: (
+                (artifact / filename).read_bytes(),
+                names,
+            )
+            for filename, names in _group_tensors_by_shard(delta_map).items()
+        }
+        self._apply_shards(shards)
 
     def _download_deltas(
         self,

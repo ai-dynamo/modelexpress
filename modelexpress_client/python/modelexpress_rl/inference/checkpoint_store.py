@@ -15,6 +15,15 @@ from pathlib import Path
 from urllib.parse import quote
 
 
+def _encode_cache_component(value: str) -> str:
+    """Encode an opaque ID as exactly one filesystem path component."""
+    # quote() never escapes dots, even with safe="". Encode dot-only IDs
+    # explicitly so Path does not interpret them as the current or parent path.
+    if value in {".", ".."}:
+        return value.replace(".", "%2E")
+    return quote(value, safe="")
+
+
 class CheckpointState(str, Enum):
     """Preparation state persisted across receiver processes."""
 
@@ -76,7 +85,7 @@ class LocalCheckpointStore:
         # that require an ordinary checkpoint directory. Preparation updates
         # state.json without changing active.json; installation advances
         # active.json only after the engine reload succeeds.
-        self.cache = Path(root) / quote(model_name, safe="")
+        self.cache = Path(root) / _encode_cache_component(model_name)
         self.full_cache = self.cache / "full"
         self.delta_cache = self.cache / "deltas"
         self.chain_cache = self.cache / "chains"
@@ -133,7 +142,7 @@ class LocalCheckpointStore:
             raise
 
     def _version_path(self, root: Path, version: str) -> Path:
-        return root / quote(version, safe="")
+        return root / _encode_cache_component(version)
 
     def full_path(self, version: str) -> Path:
         return self._version_path(self.full_cache, version)
@@ -145,7 +154,7 @@ class LocalCheckpointStore:
         return self._version_path(self.materialized_cache, version)
 
     def chain_path(self, version: str) -> Path:
-        return self.chain_cache / f"{quote(version, safe='')}.json"
+        return self.chain_cache / f"{_encode_cache_component(version)}.json"
 
     @staticmethod
     def path_size_bytes(path: Path) -> int:
