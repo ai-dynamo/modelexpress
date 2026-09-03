@@ -76,6 +76,10 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y protobuf-compiler
 
+    - name: Check CRDs are up to date with Rust types
+      if: matrix.rust == 'stable'
+      run: cargo run --quiet -p modelexpress-server --bin crdgen | diff -u examples/crds.yaml -
+
     - name: Check formatting
       if: matrix.rust == 'stable'
       run: cargo fmt --all -- --check

@@ -19,8 +19,13 @@ use serde::{Deserialize, Serialize};
     kind = "ModelMetadata",
     plural = "modelmetadatas",
     shortname = "mxmeta",
+    shortname = "mm",
     namespaced,
-    status = "ModelMetadataStatus"
+    status = "ModelMetadataStatus",
+    doc = "ModelExpress P2P worker coordination metadata",
+    printcolumn = r#"{"name":"Model","type":"string","description":"Model name","jsonPath":".spec.modelName"}"#,
+    printcolumn = r#"{"name":"Type","type":"string","description":"Source type","jsonPath":".spec.sourceType"}"#,
+    printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 pub struct ModelMetadataSpec {
     /// Full model name (e.g., deepseek-ai/DeepSeek-V3)
@@ -73,6 +78,7 @@ pub struct ModelMetadataStatus {
 
     /// Timestamp when first worker published
     #[serde(rename = "publishedAt", default)]
+    #[schemars(with = "Option<chrono::DateTime<chrono::Utc>>")]
     pub published_at: Option<String>,
 }
 
@@ -85,6 +91,7 @@ pub struct WorkerStatus {
 
     /// Backend type discriminator ("nixl", "transfer_engine", "none")
     #[serde(rename = "backendType", default)]
+    #[schemars(with = "Option<BackendTypeSchema>")]
     pub backend_type: Option<String>,
 
     /// Base64-encoded NIXL agent metadata blob
@@ -104,11 +111,13 @@ pub struct WorkerStatus {
     pub tensor_config_map: Option<String>,
 
     /// Worker lifecycle status (Initializing, Ready, Stale)
-    #[serde(default)]
+    #[serde(default = "default_worker_status")]
+    #[schemars(with = "WorkerLifecycleSchema")]
     pub status: String,
 
     /// Timestamp of last status update (RFC3339)
     #[serde(rename = "updatedAt", default)]
+    #[schemars(with = "Option<chrono::DateTime<chrono::Utc>>")]
     pub updated_at: Option<String>,
 
     /// P2P: NIXL listen thread endpoint (host:port)
@@ -146,18 +155,22 @@ pub struct ArtifactSourceStatus {
     /// Total artifact bytes across all manifest files. Kubernetes OpenAPI
     /// exposes this as int64; the backend converts to/from the proto uint64.
     #[serde(rename = "totalSize")]
+    #[schemars(range(min = 0))]
     pub total_size: i64,
 
     /// Number of files in the sealed artifact manifest.
     #[serde(rename = "fileCount")]
+    #[schemars(with = "i64", range(min = 0))]
     pub file_count: u32,
 
     /// Number of transfer chunks in the sealed artifact manifest.
     #[serde(rename = "chunkCount")]
+    #[schemars(with = "i64", range(min = 0))]
     pub chunk_count: u32,
 
     /// Distributed node rank that owns this node-scoped artifact.
     #[serde(rename = "nodeRank", default)]
+    #[schemars(with = "i64", range(min = 0))]
     pub node_rank: u32,
 }
 
@@ -190,9 +203,11 @@ impl WorkerStatus {
 pub struct Condition {
     /// Condition type
     #[serde(rename = "type")]
+    #[schemars(with = "ConditionTypeSchema")]
     pub type_: String,
 
     /// Status: True, False, Unknown
+    #[schemars(with = "ConditionStatusSchema")]
     pub status: String,
 
     /// Machine-readable reason for condition
@@ -205,7 +220,44 @@ pub struct Condition {
 
     /// Timestamp of last transition
     #[serde(rename = "lastTransitionTime", default)]
+    #[schemars(with = "Option<chrono::DateTime<chrono::Utc>>")]
     pub last_transition_time: Option<String>,
+}
+
+fn default_worker_status() -> String {
+    "Unknown".to_string()
+}
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+#[schemars(rename_all = "snake_case")]
+enum BackendTypeSchema {
+    Nixl,
+    TransferEngine,
+    None,
+}
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+enum WorkerLifecycleSchema {
+    Unknown,
+    Initializing,
+    Ready,
+    Stale,
+}
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+enum ConditionStatusSchema {
+    True,
+    False,
+    Unknown,
+}
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+enum ConditionTypeSchema {
+    Ready,
 }
 
 impl ModelMetadataStatus {
@@ -362,6 +414,14 @@ mod tests {
         assert_eq!(WorkerStatus::status_proto_from_name("Unknown"), 0);
         assert_eq!(WorkerStatus::status_proto_from_name(""), 0);
         assert_eq!(WorkerStatus::status_proto_from_name("ready"), 0);
+    }
+
+    #[test]
+    fn test_worker_status_defaults_missing_status() {
+        let worker: WorkerStatus = serde_json::from_str(r#"{"workerRank":0}"#)
+            .expect("worker should deserialize without status");
+
+        assert_eq!(worker.status, "Unknown");
     }
 
     #[test]
