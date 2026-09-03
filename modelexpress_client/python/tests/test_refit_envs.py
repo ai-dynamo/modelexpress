@@ -6,6 +6,7 @@
 import os
 
 import pytest
+
 from modelexpress_rl import envs
 
 
@@ -14,11 +15,11 @@ def test_defaults_when_unset(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
     assert envs.MX_REFIT_METADATA_PORT == 7555
-    assert envs.MX_TRAINER_ENGINE == "MEGATRON"
     assert envs.MX_TRAINER_STAGING_MODE == "IN_PLACE"
     assert envs.MX_WEIGHT_PAYLOAD_FORMAT == "FULL_TENSOR"
     assert envs.MX_REFIT_DELTA_BUCKET_BYTES == 512 * 1024**2
     assert envs.MX_REFIT_DELTA_WORKERS == min(32, os.cpu_count() or 8)
+    assert envs.MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES == 4 * 1024**3
     assert envs.MX_S3_MULTIPART_THRESHOLD_BYTES == 100 * 1024**2
     assert envs.MX_S3_UPLOAD_PART_BYTES == 16 * 1024**2
     assert envs.MX_S3_UPLOAD_WORKERS == 8
@@ -34,11 +35,11 @@ def test_defaults_when_unset(monkeypatch):
 
 def test_values_are_normalized_and_read_live(monkeypatch):
     monkeypatch.setenv("MX_REFIT_METADATA_PORT", "8000")
-    monkeypatch.setenv("MX_TRAINER_ENGINE", " megatron ")
     monkeypatch.setenv("MX_TRAINER_STAGING_MODE", " copy_to_device ")
     monkeypatch.setenv("MX_WEIGHT_PAYLOAD_FORMAT", " xor_delta ")
     monkeypatch.setenv("MX_REFIT_DELTA_BUCKET_BYTES", "1024")
     monkeypatch.setenv("MX_REFIT_DELTA_WORKERS", "3")
+    monkeypatch.setenv("MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES", "8192")
     monkeypatch.setenv("MX_S3_MULTIPART_THRESHOLD_BYTES", "2048")
     monkeypatch.setenv("MX_S3_UPLOAD_PART_BYTES", str(5 * 1024**2))
     monkeypatch.setenv("MX_S3_UPLOAD_WORKERS", "4")
@@ -52,11 +53,11 @@ def test_values_are_normalized_and_read_live(monkeypatch):
     monkeypatch.setenv("MX_S3_TCP_KEEPALIVE", "off")
 
     assert envs.MX_REFIT_METADATA_PORT == 8000
-    assert envs.MX_TRAINER_ENGINE == "MEGATRON"
     assert envs.MX_TRAINER_STAGING_MODE == "COPY_TO_DEVICE"
     assert envs.MX_WEIGHT_PAYLOAD_FORMAT == "XOR_DELTA"
     assert envs.MX_REFIT_DELTA_BUCKET_BYTES == 1024
     assert envs.MX_REFIT_DELTA_WORKERS == 3
+    assert envs.MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES == 8192
     assert envs.MX_S3_MULTIPART_THRESHOLD_BYTES == 2048
     assert envs.MX_S3_UPLOAD_PART_BYTES == 5 * 1024**2
     assert envs.MX_S3_UPLOAD_WORKERS == 4
@@ -75,6 +76,7 @@ def test_values_are_normalized_and_read_live(monkeypatch):
     [
         "MX_REFIT_DELTA_BUCKET_BYTES",
         "MX_REFIT_DELTA_WORKERS",
+        "MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES",
         "MX_S3_MULTIPART_THRESHOLD_BYTES",
         "MX_S3_UPLOAD_PART_BYTES",
         "MX_S3_UPLOAD_WORKERS",

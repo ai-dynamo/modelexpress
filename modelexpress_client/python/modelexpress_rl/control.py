@@ -31,7 +31,6 @@ class WeightVersion:
 
     version_id: str
     model_name: str
-    version_number: int | None
     payload_format: WeightPayloadFormat
     base_version_id: str | None
     object_storage: ObjectStorageSource | None
@@ -56,6 +55,9 @@ def _weight_version(version: refit_pb2.WeightVersion) -> WeightVersion:
     payload_formats = {
         refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_TENSOR: WeightPayloadFormat.FULL_TENSOR,
         refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA: WeightPayloadFormat.XOR_DELTA,
+        refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT: (
+            WeightPayloadFormat.FULL_HF_CHECKPOINT
+        ),
     }
     states = {
         refit_pb2.WEIGHT_VERSION_STATE_STAGING: WeightVersionState.STAGING,
@@ -87,9 +89,6 @@ def _weight_version(version: refit_pb2.WeightVersion) -> WeightVersion:
     return WeightVersion(
         version_id=version.uid,
         model_name=version.model_name,
-        version_number=(
-            version.version_number if version.HasField("version_number") else None
-        ),
         payload_format=payload_format,
         base_version_id=(
             version.base_version_id if version.HasField("base_version_id") else None
@@ -145,7 +144,7 @@ class ModelExpressControlClient:
         idempotency_key: str,
         payload_format: WeightPayloadFormat,
         expected_source_slots: list[str] | None = None,
-        version_number: int | None = None,
+        uid: str | None = None,
         base_version_id: str | None = None,
         object_storage: ObjectStorageSource | None = None,
         state: WeightVersionState = WeightVersionState.STAGING,
@@ -161,14 +160,15 @@ class ModelExpressControlClient:
             object_storage, ObjectStorageSource
         ):
             raise TypeError("object_storage must be an ObjectStorageSource")
-        if object_storage is not None and version_number is None:
-            raise ValueError("version_number is required for object storage")
         request = refit_pb2.CreateWeightVersionRequest(
             model_name=model_name,
             idempotency_key=idempotency_key,
             payload_format={
                 WeightPayloadFormat.FULL_TENSOR: refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_TENSOR,
                 WeightPayloadFormat.XOR_DELTA: refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA,
+                WeightPayloadFormat.FULL_HF_CHECKPOINT: (
+                    refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
+                ),
             }[payload_format],
             expected_source_slots=expected_source_slots or [],
             state={
@@ -176,8 +176,8 @@ class ModelExpressControlClient:
                 WeightVersionState.READY: refit_pb2.WEIGHT_VERSION_STATE_READY,
             }[state],
         )
-        if version_number is not None:
-            request.version_number = version_number
+        if uid is not None:
+            request.uid = _required(uid, "uid")
         if base_version_id is not None:
             request.base_version_id = _required(base_version_id, "base_version_id")
         if object_storage is not None:

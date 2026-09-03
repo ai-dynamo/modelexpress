@@ -64,15 +64,46 @@ fn validate_s3_uri(uri: &str) -> Result<(), Status> {
     Ok(())
 }
 
+fn validate_payload_format(
+    request: &CreateWeightVersionRequest,
+) -> Result<WeightPayloadFormat, Status> {
+    let payload_format = WeightPayloadFormat::try_from(request.payload_format)
+        .unwrap_or(WeightPayloadFormat::Unspecified);
+    match payload_format {
+        WeightPayloadFormat::FullTensor if request.base_version_id.is_some() => Err(
+            Status::invalid_argument("base_version_id must be omitted for FULL_TENSOR"),
+        ),
+        WeightPayloadFormat::XorDelta if request.base_version_id.is_none() => Err(
+            Status::invalid_argument("base_version_id is required for XOR_DELTA"),
+        ),
+        WeightPayloadFormat::FullHfCheckpoint if request.base_version_id.is_some() => Err(
+            Status::invalid_argument("base_version_id must be omitted for FULL_HF_CHECKPOINT"),
+        ),
+        WeightPayloadFormat::FullHfCheckpoint
+            if request.object_storage.as_ref().is_none_or(|source| {
+                ObjectStorageType::try_from(source.storage_type)
+                    .unwrap_or(ObjectStorageType::Unspecified)
+                    != ObjectStorageType::S3
+            }) =>
+        {
+            Err(Status::invalid_argument(
+                "FULL_HF_CHECKPOINT requires S3 object_storage",
+            ))
+        }
+        WeightPayloadFormat::Unspecified => {
+            Err(Status::invalid_argument("payload_format must be specified"))
+        }
+        _ => Ok(payload_format),
+    }
+}
+
 fn validate_publication(request: &CreateWeightVersionRequest) -> Result<(), Status> {
+    if let Some(uid) = request.uid.as_deref() {
+        required(uid, "uid")?;
+    }
     let state =
         WeightVersionState::try_from(request.state).unwrap_or(WeightVersionState::Unspecified);
     if let Some(object_storage) = request.object_storage.as_ref() {
-        if request.version_number.is_none() {
-            return Err(Status::invalid_argument(
-                "version_number is required for S3 publication",
-            ));
-        }
         if ObjectStorageType::try_from(object_storage.storage_type)
             .unwrap_or(ObjectStorageType::Unspecified)
             != ObjectStorageType::S3
@@ -182,24 +213,7 @@ impl RefitService for RefitServiceImpl {
         let request = request.into_inner();
         required(&request.model_name, "model_name")?;
         required(&request.idempotency_key, "idempotency_key")?;
-        let payload_format = WeightPayloadFormat::try_from(request.payload_format)
-            .unwrap_or(WeightPayloadFormat::Unspecified);
-        match payload_format {
-            WeightPayloadFormat::FullTensor if request.base_version_id.is_some() => {
-                return Err(Status::invalid_argument(
-                    "base_version_id must be omitted for FULL_TENSOR",
-                ));
-            }
-            WeightPayloadFormat::XorDelta if request.base_version_id.is_none() => {
-                return Err(Status::invalid_argument(
-                    "base_version_id is required for XOR_DELTA",
-                ));
-            }
-            WeightPayloadFormat::Unspecified => {
-                return Err(Status::invalid_argument("payload_format must be specified"));
-            }
-            _ => {}
-        }
+        let payload_format = validate_payload_format(&request)?;
         validate_publication(&request)?;
         if let Some(base_version_id) = request.base_version_id.as_deref()
             && payload_format == WeightPayloadFormat::XorDelta
@@ -374,9 +388,9 @@ mod tests {
 
     use super::*;
 
-    fn error_code(result: Result<(), Status>) -> Code {
+    fn error_code<T>(result: Result<T, Status>) -> Code {
         match result {
-            Ok(()) => panic!("publication validation unexpectedly succeeded"),
+            Ok(_) => panic!("publication validation unexpectedly succeeded"),
             Err(status) => status.code(),
         }
     }
@@ -389,11 +403,70 @@ mod tests {
     }
 
     #[test]
+    fn full_hf_checkpoint_requires_s3_and_omits_base() {
+        let full_hf = CreateWeightVersionRequest {
+            payload_format: WeightPayloadFormat::FullHfCheckpoint.into(),
+            object_storage: Some(s3_source(
+                "s3://weights/run/policy/v25/model.safetensors.index.json",
+            )),
+            state: WeightVersionState::Staging.into(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            validate_payload_format(&full_hf),
+            Ok(WeightPayloadFormat::FullHfCheckpoint)
+        ));
+        assert!(validate_publication(&full_hf).is_ok());
+
+        let mut with_base = full_hf.clone();
+        with_base.base_version_id = Some("previous-version".to_string());
+        assert_eq!(
+            error_code(validate_payload_format(&with_base)),
+            Code::InvalidArgument
+        );
+
+        let mut without_storage = full_hf.clone();
+        without_storage.object_storage = None;
+        assert_eq!(
+            error_code(validate_payload_format(&without_storage)),
+            Code::InvalidArgument
+        );
+
+        let mut with_gcs = full_hf;
+        with_gcs.object_storage = Some(ObjectStorageSource {
+            uri: "gs://weights/run/policy/v25/model.safetensors.index.json".to_string(),
+            storage_type: ObjectStorageType::Gcs.into(),
+        });
+        assert_eq!(
+            error_code(validate_payload_format(&with_gcs)),
+            Code::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn full_tensor_remains_valid_for_s3_publication() {
+        let request = CreateWeightVersionRequest {
+            payload_format: WeightPayloadFormat::FullTensor.into(),
+            object_storage: Some(s3_source(
+                "s3://weights/run/policy/v42/model.safetensors.index.json",
+            )),
+            state: WeightVersionState::Staging.into(),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            validate_payload_format(&request),
+            Ok(WeightPayloadFormat::FullTensor)
+        ));
+        assert!(validate_publication(&request).is_ok());
+    }
+
+    #[test]
     fn valid_object_storage_and_worker_sharded_publications_are_accepted() {
         for state in [WeightVersionState::Staging, WeightVersionState::Ready] {
             assert!(
                 validate_publication(&CreateWeightVersionRequest {
-                    version_number: Some(42),
+                    uid: Some("caller-version".to_string()),
                     object_storage: Some(s3_source(
                         "s3://weights/run/policy/v42/model.safetensors.index.json",
                     )),
@@ -417,61 +490,53 @@ mod tests {
     fn invalid_object_storage_and_worker_sharded_publications_are_rejected() {
         for request in [
             CreateWeightVersionRequest {
-                version_number: Some(42),
+                uid: Some(" \t".to_string()),
+                expected_source_slots: vec!["rank:0".to_string()],
+                state: WeightVersionState::Staging.into(),
+                ..Default::default()
+            },
+            CreateWeightVersionRequest {
                 object_storage: Some(ObjectStorageSource::default()),
                 state: WeightVersionState::Staging.into(),
                 ..Default::default()
             },
             CreateWeightVersionRequest {
-                version_number: Some(42),
                 object_storage: Some(s3_source("https://weights/root")),
                 state: WeightVersionState::Staging.into(),
                 ..Default::default()
             },
             CreateWeightVersionRequest {
-                version_number: Some(42),
                 object_storage: Some(s3_source("s3://weights")),
                 state: WeightVersionState::Staging.into(),
                 ..Default::default()
             },
             CreateWeightVersionRequest {
-                version_number: Some(42),
                 object_storage: Some(s3_source("s3:///root")),
                 state: WeightVersionState::Staging.into(),
                 ..Default::default()
             },
             CreateWeightVersionRequest {
-                version_number: Some(42),
                 expected_source_slots: vec!["rank:0".to_string()],
                 object_storage: Some(s3_source("s3://weights/root")),
                 state: WeightVersionState::Staging.into(),
                 ..Default::default()
             },
             CreateWeightVersionRequest {
-                version_number: Some(42),
                 object_storage: Some(s3_source("s3://weights/root")),
                 state: WeightVersionState::Releasing.into(),
                 ..Default::default()
             },
             CreateWeightVersionRequest {
-                object_storage: Some(s3_source("s3://weights/root")),
-                state: WeightVersionState::Staging.into(),
-                ..Default::default()
-            },
-            CreateWeightVersionRequest {
-                version_number: Some(42),
                 object_storage: Some(s3_source("s3://weights//root")),
                 state: WeightVersionState::Staging.into(),
                 ..Default::default()
             },
             CreateWeightVersionRequest {
-                version_number: Some(42),
                 object_storage: Some(s3_source("s3://weights/root?query")),
                 state: WeightVersionState::Staging.into(),
                 ..Default::default()
             },
             CreateWeightVersionRequest {
-                version_number: Some(42),
                 object_storage: Some(ObjectStorageSource {
                     uri: "az://weights/root".to_string(),
                     storage_type: ObjectStorageType::Azure.into(),
@@ -480,7 +545,6 @@ mod tests {
                 ..Default::default()
             },
             CreateWeightVersionRequest {
-                version_number: Some(42),
                 object_storage: Some(ObjectStorageSource {
                     uri: "gs://weights/root".to_string(),
                     storage_type: ObjectStorageType::Gcs.into(),

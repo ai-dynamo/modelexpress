@@ -2512,6 +2512,7 @@ version = "0.5.1"
 dependencies = [
  "anyhow",
  "criterion",
+ "http",
  "k8s-openapi",
  "kube",
  "modelexpress-client",
@@ -2523,6 +2524,7 @@ dependencies = [
  "tokio",
  "tonic 0.13.1",
  "tonic-health",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

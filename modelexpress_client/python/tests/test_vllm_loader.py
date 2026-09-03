@@ -1779,9 +1779,10 @@ class TestConfigureVllmLogging:
 
     def _reset_mx_logger(self):
         """Clear any handlers/level from the modelexpress root logger."""
-        mx_root = logging.getLogger("modelexpress")
-        mx_root.handlers.clear()
-        mx_root.setLevel(logging.NOTSET)
+        for name in ("modelexpress", "modelexpress_rl"):
+            mx_root = logging.getLogger(name)
+            mx_root.handlers.clear()
+            mx_root.setLevel(logging.NOTSET)
 
     def _simulate_vllm_enginecore_logging(self):
         """Reproduce vLLM 0.19.0 EngineCore: only "vllm" gets a handler."""
@@ -1821,6 +1822,22 @@ class TestConfigureVllmLogging:
 
             child = logging.getLogger("modelexpress.metadata")
             assert child.getEffectiveLevel() == logging.DEBUG
+        finally:
+            self._cleanup(vllm_logger)
+
+    def test_rl_child_loggers_visible_after_configure(self):
+        from modelexpress import configure_vllm_logging
+
+        vllm_logger, handler = self._simulate_vllm_enginecore_logging()
+        try:
+            configure_vllm_logging()
+
+            rl_root = logging.getLogger("modelexpress_rl")
+            assert len(rl_root.handlers) == 1
+            assert rl_root.handlers[0] is handler
+            assert logging.getLogger(
+                "modelexpress_rl.inference.session"
+            ).getEffectiveLevel() == logging.DEBUG
         finally:
             self._cleanup(vllm_logger)
 
