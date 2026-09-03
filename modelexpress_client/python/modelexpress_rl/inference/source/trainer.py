@@ -18,6 +18,8 @@ from ..plan import ResolvedSource, SourceResolver, TrainerUpdateSource, WeightSo
 
 logger = logging.getLogger("modelexpress_rl.inference.source.trainer")
 
+_MAX_MANIFEST_MESSAGE_SIZE_BYTES = 100 * 1024 * 1024
+
 
 class TrainerSourceResolver(SourceResolver):
     """Resolve trainer shard manifests without compiling a transfer plan."""
@@ -109,7 +111,15 @@ class TrainerSourceResolver(SourceResolver):
     def _resolve_source(self, shard: refit_pb2.WeightVersionShard) -> GeneratorSource:
         if not shard.manifest_endpoint:
             raise RuntimeError("NIXL source is missing its manifest endpoint")
-        with grpc.insecure_channel(shard.manifest_endpoint) as channel:
+        with grpc.insecure_channel(
+            shard.manifest_endpoint,
+            options=[
+                (
+                    "grpc.max_receive_message_length",
+                    _MAX_MANIFEST_MESSAGE_SIZE_BYTES,
+                )
+            ],
+        ) as channel:
             response = refit_pb2_grpc.RefitWorkerServiceStub(
                 channel
             ).GetWeightVersionShardManifest(

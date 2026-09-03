@@ -132,10 +132,13 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
 
 
 class _WorkerService(refit_pb2_grpc.RefitWorkerServiceServicer):
+    def __init__(self, manifest=b"manifest"):
+        self.manifest = manifest
+
     def GetWeightVersionShardManifest(self, _request, _context):
         return refit_pb2.GetWeightVersionShardManifestResponse(
-            manifest=b"manifest",
-            manifest_digest=hashlib.sha256(b"manifest").hexdigest(),
+            manifest=self.manifest,
+            manifest_digest=hashlib.sha256(self.manifest).hexdigest(),
         )
 
 
@@ -389,17 +392,19 @@ def _runtime(
     )
 
 
-def _start_server(*, state=None, manifest_digest=None):
+def _start_server(*, state=None, manifest=b"manifest", manifest_digest=None):
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
     port = server.add_insecure_port("127.0.0.1:0")
     endpoint = f"127.0.0.1:{port}"
     service = _RefitService(
         endpoint=endpoint,
         state=state,
-        manifest_digest=manifest_digest,
+        manifest_digest=manifest_digest or hashlib.sha256(manifest).hexdigest(),
     )
     refit_pb2_grpc.add_RefitServiceServicer_to_server(service, server)
-    refit_pb2_grpc.add_RefitWorkerServiceServicer_to_server(_WorkerService(), server)
+    refit_pb2_grpc.add_RefitWorkerServiceServicer_to_server(
+        _WorkerService(manifest), server
+    )
     p2p_service = _P2pService()
     p2p_pb2_grpc.add_P2pServiceServicer_to_server(p2p_service, server)
     service.p2p = p2p_service
@@ -727,6 +732,30 @@ def test_generator_releases_lease_when_manifest_is_invalid(monkeypatch):
     assert service.lease_registrations == 1
     assert service.lease_deletions == 1
     assert adapter.stage_calls == []
+
+
+def test_generator_fetches_trainer_manifest_larger_than_grpc_default(monkeypatch):
+    manifest = b"x" * (4 * 1024 * 1024 + 1)
+    server, endpoint, service = _start_server(manifest=manifest)
+    adapter = _Adapter(service)
+    generator = _initialize(
+        monkeypatch,
+        endpoint,
+        adapter,
+        source_order=(WeightSource.TRAINER,),
+    )
+
+    try:
+        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+        staged.release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert all(
+        source.transport.manifest == manifest
+        for source in adapter.stage_calls[0].sources
+    )
 
 
 def test_generator_reports_missing_trainer_manifest_digest(monkeypatch, caplog):
