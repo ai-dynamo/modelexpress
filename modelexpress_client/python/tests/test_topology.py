@@ -271,6 +271,9 @@ def test_load_weight_falls_back_to_load_aware_env(monkeypatch):
     from modelexpress import envs as envs_mod
 
     monkeypatch.delenv("MX_P2P_TOPOLOGY_LOAD_WEIGHT", raising=False)
+    # The fallback keys on the operator having SET the shared knob, not on the
+    # load_aware feature's compiled-in 1.0 default, so it must be the env var.
+    monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "0.8")
     monkeypatch.setattr(envs_mod, "MX_P2P_LOAD_WEIGHT", 0.8, raising=False)
     assert TopologyAwareSelector().w_load == 0.8
     monkeypatch.setenv("MX_P2P_TOPOLOGY_LOAD_WEIGHT", "0.0")
@@ -348,3 +351,25 @@ def test_simulation_topology_localizes_vs_rendezvous(monkeypatch):
         total = sum(per_source.values())
         assert len(per_source) >= 2, (rack_id, per_source)
         assert max(per_source.values()) <= 0.6 * total, (rack_id, per_source)
+
+
+def test_shared_depth_is_a_hierarchical_prefix_not_deepest_match(monkeypatch):
+    """A rack label reused under a different block is not rack-adjacent.
+
+    Domain values are only unique within their parent level, so matching must
+    stop at the first level that disagrees. Otherwise a source in another block
+    that happens to reuse this rack's label outranks a source that shares the
+    block, and locality ordering inverts.
+    """
+    _set_topology(monkeypatch, "block,rack", '{"block":"b1","rack":"r3"}')
+    sel = TopologyAwareSelector()
+    same_block_other_rack = {"block": "b1", "rack": "r1"}
+    other_block_same_rack_label = {"block": "b2", "rack": "r3"}
+    truly_same_rack = {"block": "b1", "rack": "r3"}
+    assert sel._shared_depth(same_block_other_rack) == 0
+    assert sel._shared_depth(other_block_same_rack_label) == -1
+    assert sel._shared_depth(truly_same_rack) == 1
+    # Ordering must agree: same block beats a colliding rack label.
+    assert sel._shared_depth(same_block_other_rack) > sel._shared_depth(
+        other_block_same_rack_label
+    )

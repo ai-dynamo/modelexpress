@@ -193,10 +193,16 @@ class TopologyAwareSelector(ScoredSelector):
         # is set; otherwise fall back to the load_aware weight MX_P2P_LOAD_WEIGHT
         # when that feature is deployed, so a single knob turns on both
         # topology- and load-aware selection together. Default 0 (pure topology).
+        # Key the fallback on the operator having SET MX_P2P_LOAD_WEIGHT, not on
+        # the load_aware feature's compiled-in default: that default is 1.0, so
+        # reading it through envs would turn the blend on silently the moment
+        # both features ship together, and this class documents 0 as default.
         if os.environ.get("MX_P2P_TOPOLOGY_LOAD_WEIGHT") is not None:
             w = envs.MX_P2P_TOPOLOGY_LOAD_WEIGHT
-        else:
+        elif os.environ.get("MX_P2P_LOAD_WEIGHT") is not None:
             w = getattr(envs, "MX_P2P_LOAD_WEIGHT", 0.0)
+        else:
+            w = 0.0
         self.w_load = (
             w if isinstance(w, (int, float)) and math.isfinite(w) and w >= 0.0 else 0.0
         )
@@ -222,15 +228,23 @@ class TopologyAwareSelector(ScoredSelector):
         return int.from_bytes(digest, "big") / 2**64
 
     def _shared_depth(self, source_topology: dict[str, str]) -> int:
-        """Index of the narrowest level where target and source share a value.
+        """Depth of the shared hierarchical prefix between target and source.
 
-        Later level = narrower = closer; -1 when nothing is shared.
+        Later level = narrower = closer; -1 when nothing is shared. Levels are
+        a hierarchy, so matching stops at the first level where the two
+        disagree: a source in another block that happens to reuse this rack's
+        label is not rack-adjacent, and must not outrank a source that shares
+        the block. Domain values are only unique within their parent level.
         """
         depth = -1
         for i, level in enumerate(self._levels):
             local_value = self._local.get(level)
-            if local_value is not None and local_value == source_topology.get(level):
-                depth = i
+            source_value = source_topology.get(level)
+            if local_value is None and source_value is None:
+                continue  # neither side reports this level: no information
+            if local_value != source_value:
+                break  # present on one side only, or present and different
+            depth = i
         return depth
 
     def score(  # type: ignore[override]
