@@ -562,19 +562,22 @@ reorder supported sources without changing an engine integration.
 
 The canonical receiver retains each full checkpoint and delta payload under its
 version, then writes a resolved chain manifest. A full target is directly
-installable. For a delta target, the disk materializer copies the exact active
-checkpoint and applies only the incoming XOR delta into a version-scoped derived
-checkpoint. Canonical artifacts are never modified during reconstruction. The
-previous materialization is retained through installation for rollback and
-pruned after activation, leaving one steady-state materialized checkpoint.
+installable. The first delta after a full checkpoint copies that immutable full
+checkpoint into a version-scoped derived checkpoint. Later sequential deltas
+rename the active materialization and apply only the incoming XOR delta in
+place, avoiding another full-model copy. Canonical artifacts are never modified
+during reconstruction, and derived checkpoints can be rebuilt from the lineage.
+If an in-place delta fails, the cache remains `UPDATING` until initialization
+rebuilds it; the running engine retains its previously installed weights.
 
 Under the local checkpoint lock, preparation state advances from `READY` to
 `UPDATING` before artifact construction and back to `READY(target)` only after
 verification. `active.json` is a separate commit point: it advances only after
 the engine installer returns successfully. Download, reconstruction, and install
-failures therefore retain the previously active version and immutable lineage.
-A separate installation fence is shared by co-located installers and exclusive
-to preparation, so preparation cannot enter between engine reload and activation.
+failures therefore retain the previously active engine version and immutable
+lineage. A separate installation fence is shared by co-located installers and
+exclusive to preparation, so preparation cannot enter between engine reload and
+activation.
 
 `WeightVersion.uid` is MX's opaque version identity. A create request may supply
 the UID; MX generates one when it is omitted. Creating another version with an
