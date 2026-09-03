@@ -77,15 +77,21 @@ class RuntimeLoadProvider:
         self._timeout = timeout
         self._fetch = _fetch or _http_get
 
-    def sample(self) -> float:
+    def sample(self) -> Optional[float]:
+        """KV-cache utilization in ``[0, 1]``, or ``None`` when nothing was read.
+
+        An unreachable endpoint or an engine that exports none of the known
+        gauges is "no reading", not "idle"; publishing 0.0 for it would make the
+        source look free to every puller.
+        """
         text = self._fetch(self._url, self._timeout)
         if not text:
-            return 0.0
+            return None
         for name in _RATIO_METRICS:
             v = _scrape_gauge(text, name)
             if v is not None:
                 return min(1.0, max(0.0, v))
-        return 0.0
+        return None
 
 
 def _http_get(url: str, timeout: float) -> Optional[str]:

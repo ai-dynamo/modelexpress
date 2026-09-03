@@ -128,8 +128,12 @@ pub struct WorkerStatus {
     pub accelerator: String,
 
     /// Source-published busyness in [0, 1] (default: RDMA NIC utilization).
-    #[serde(default, rename = "sourceLoad")]
-    pub source_load: f32,
+    #[serde(
+        default,
+        rename = "sourceLoad",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub source_load: Option<f32>,
 
     /// Small discovery summary for file-backed artifact sources.
     #[serde(rename = "artifactSource", default)]

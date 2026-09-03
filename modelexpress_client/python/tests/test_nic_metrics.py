@@ -56,9 +56,9 @@ def _sampler(counters, clock, link_bps=400e9 / 8):
     )
 
 
-def test_first_sample_is_zero_baseline():
+def test_first_sample_is_none_baseline():
     s = _sampler(_FakeCounters(0, 0), _Clock())
-    assert s.sample() == 0.0
+    assert s.sample() is None
 
 
 def test_utilization_from_delta():
@@ -67,7 +67,7 @@ def test_utilization_from_delta():
     counters = _FakeCounters(0, 0)
     clock = _Clock()
     s = _sampler(counters, clock)
-    assert s.sample() == 0.0  # baseline
+    assert s.sample() is None  # baseline
     link_bps = 400e9 / 8  # bytes/s
     bytes_in_1s = link_bps * 0.5  # half the link
     counters.xmit = int(bytes_in_1s / 4)  # counter is in 4-byte words
@@ -109,22 +109,22 @@ def test_counter_reset_does_not_go_negative():
     assert s.sample() == 0.0
 
 
-def test_no_device_returns_zero():
+def test_no_device_returns_none():
     s = NicUtilizationSampler(None)
-    assert s.sample() == 0.0
+    assert s.sample() is None
 
 
-def test_unreadable_counters_return_zero():
+def test_unreadable_counters_return_none():
     s = _sampler(lambda path: None, _Clock())
-    assert s.sample() == 0.0
+    assert s.sample() is None
 
 
-def test_missing_link_rate_returns_zero():
+def test_missing_link_rate_returns_none():
     s = NicUtilizationSampler(
         "mlx5_0", _reader=_FakeCounters(0, 0), _clock=_Clock(), _link_bytes_per_sec=None
     )
     # link rate could not be read (device sysfs absent), so always 0.
-    assert s.sample() == 0.0
+    assert s.sample() is None
 
 
 # ---------------------------------------------------------------------------
@@ -166,21 +166,21 @@ def test_source_load_sampler_falls_back_to_busiest_node_nic():
     assert abs(s.sample() - 0.9) < 1e-9
 
 
-def test_source_load_sampler_no_nic_returns_zero():
+def test_source_load_sampler_no_nic_returns_none():
     s = SourceLoadSampler(
         0,
         _resolver=lambda did: None,
         _lister=lambda: [],
         _sampler_factory=lambda d: None,
     )
-    assert s.sample() == 0.0
+    assert s.sample() is None
 
 
 def test_make_source_load_provider_returns_callable():
     provider = make_source_load_provider(0)
     val = provider()
-    assert isinstance(val, float)
-    assert 0.0 <= val <= 1.0
+    assert val is None or isinstance(val, float)
+    assert val is None or 0.0 <= val <= 1.0
 
 
 class TestNetlinkVfFallback:
@@ -204,7 +204,7 @@ class TestNetlinkVfFallback:
             _link_bytes_per_sec=100.0,
             _nl_counters=nl,
         )
-        assert s.sample() == 0.0  # baseline
+        assert s.sample() is None  # baseline
         counters["rdma_tx_bytes"] = 50  # 50 B over 1 s against 100 B/s = 0.5
         assert s.sample() == pytest.approx(0.5)
 
@@ -224,7 +224,7 @@ class TestNetlinkVfFallback:
         # Scaling by 4 would overflow to a clamped 1.0 instead of exactly 1.0/1.
         assert s.sample() == pytest.approx(1.0)
 
-    def test_default_hwcounter_set_without_byte_totals_yields_zero(self):
+    def test_default_hwcounter_set_without_byte_totals_yields_none(self):
         """The real VF case: netlink works, but byte counters are not enabled."""
         default_set = {"rx_write_requests": 12345, "rx_read_requests": 678, "out_of_buffer": 0}
         clock = iter([0.0, 1.0, 2.0])
@@ -235,8 +235,8 @@ class TestNetlinkVfFallback:
             _link_bytes_per_sec=100.0,
             _nl_counters=lambda _d, _p: dict(default_set),
         )
-        assert s.sample() == 0.0
-        assert s.sample() == 0.0
+        assert s.sample() is None
+        assert s.sample() is None
 
     def test_netlink_failure_degrades_to_zero(self):
         def boom(_dev, _port):
@@ -264,7 +264,7 @@ class TestNetlinkVfFallback:
             _link_bytes_per_sec=100.0,
             _nl_counters=nl,
         )
-        assert s.sample() == 0.0
+        assert s.sample() is None
         assert s.sample() == 0.0  # counters static -> no traffic, no netlink call
 
 
@@ -290,3 +290,35 @@ class TestNetlinkWireEncoding:
 
     def test_parse_attrs_stops_on_truncated_attribute(self):
         assert nic_metrics._nl_parse_attrs(struct.pack("=HH", 999, 1)) == {}
+
+
+class TestNoReadingIsNotIdle:
+    """None (no reading) and 0.0 (measured idle) are different answers."""
+
+    def test_source_load_sampler_ignores_nics_without_a_reading(self):
+        class _S:
+            def __init__(self, v): self._v = v
+            def sample(self): return self._v
+        s = nic_metrics.SourceLoadSampler(
+            0, _resolver=lambda _d: None, _lister=lambda: ["a", "b", "c"],
+            _sampler_factory=lambda d: _S({"a": None, "b": 0.4, "c": None}[d]),
+        )
+        assert s.sample() == pytest.approx(0.4)
+
+    def test_source_load_sampler_all_unknown_is_none(self):
+        class _S:
+            def sample(self): return None
+        s = nic_metrics.SourceLoadSampler(
+            0, _resolver=lambda _d: None, _lister=lambda: ["a", "b"],
+            _sampler_factory=lambda d: _S(),
+        )
+        assert s.sample() is None
+
+    def test_static_counters_are_a_measured_zero_not_unknown(self):
+        clock = iter([0.0, 1.0])
+        s = nic_metrics.NicUtilizationSampler(
+            "mlx5_0", _reader=lambda p: 100, _clock=lambda: next(clock),
+            _link_bytes_per_sec=1000.0,
+        )
+        assert s.sample() is None   # baseline: no interval yet
+        assert s.sample() == 0.0    # zero delta over a real interval

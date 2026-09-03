@@ -599,8 +599,7 @@ impl MetadataBackend for KubernetesBackend {
                 .status
                 .as_ref()
                 .and_then(|s| s.worker.as_ref())
-                .map(|w| w.source_load)
-                .unwrap_or(0.0);
+                .and_then(|w| w.source_load);
 
             result.push(super::SourceInstanceInfo {
                 source_id: sid,
@@ -714,7 +713,7 @@ impl MetadataBackend for KubernetesBackend {
         worker_rank: u32,
         status: SourceStatus,
         updated_at: i64,
-        source_load: f32,
+        source_load: Option<f32>,
     ) -> MetadataResult<()> {
         let api = self.model_metadata_api();
         let cr_name = format!("mx-source-{}-{}", source_id, worker_id);

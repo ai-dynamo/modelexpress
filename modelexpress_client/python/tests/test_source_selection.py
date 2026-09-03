@@ -1086,3 +1086,77 @@ def test_load_aware_utilization_clamped(monkeypatch):
     assert [c.worker_id for c in LoadAwareSelector().order(hi, ctx)] == [
         c.worker_id for c in RendezvousHashSelector().order(srcs, ctx)
     ]
+
+
+class TestSourceLoadPresence:
+    """`source_load` is optional on the wire: unset is unknown, not idle.
+
+    Reviewer-found: with a plain proto3 float, a source that published NO load
+    (older client, provider with no signal) scored as 0.0 -- the best possible --
+    and systematically outranked sources reporting real load. Presence tracking
+    plus a neutral prior for unknown fixes the mixed-fleet case.
+    """
+
+    @staticmethod
+    def _ctx():
+        from types import SimpleNamespace
+        from modelexpress import p2p_pb2
+        return SimpleNamespace(
+            identity=p2p_pb2.SourceIdentity(model_name="m", mx_version="0.5.1"),
+            worker_id="target-0",
+            worker_rank=0,
+            model_name="m",
+        )
+
+    @staticmethod
+    def _ref(load):
+        # Identical identity => identical unit_hash, so only the load term differs.
+        from modelexpress import p2p_pb2
+        r = p2p_pb2.SourceInstanceRef(
+            mx_source_id="deadbeefdeadbeef", worker_id="src", worker_rank=0
+        )
+        if load is not None:
+            r.source_load = load
+        return r
+
+    def test_unknown_load_scores_as_the_neutral_prior(self, monkeypatch):
+        from modelexpress import source_selection as ss
+        monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "1.0")
+        sel = ss.LoadAwareSelector()
+        unknown, idle = self._ref(None), self._ref(0.0)
+        assert ss.UNKNOWN_LOAD_PRIOR == 0.5
+        assert sel.score(idle, self._ctx()) - sel.score(unknown, self._ctx()) == pytest.approx(0.5)
+
+    def test_real_reading_beats_unknown_when_real_is_lighter_than_prior(self, monkeypatch):
+        from modelexpress import source_selection as ss
+        monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "1.0")
+        sel = ss.LoadAwareSelector()
+        assert sel.score(self._ref(0.3), self._ctx()) > sel.score(self._ref(None), self._ctx())
+
+    def test_measured_idle_beats_unknown(self, monkeypatch):
+        from modelexpress import source_selection as ss
+        monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "1.0")
+        sel = ss.LoadAwareSelector()
+        assert sel.score(self._ref(0.0), self._ctx()) > sel.score(self._ref(None), self._ctx())
+
+    def test_unknown_still_beats_a_heavily_loaded_source(self, monkeypatch):
+        from modelexpress import source_selection as ss
+        monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "1.0")
+        sel = ss.LoadAwareSelector()
+        assert sel.score(self._ref(None), self._ctx()) > sel.score(self._ref(0.9), self._ctx())
+
+    def test_object_without_presence_tracking_counts_as_unknown(self, monkeypatch):
+        from types import SimpleNamespace
+        from modelexpress import source_selection as ss
+        monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "1.0")
+        sel = ss.LoadAwareSelector()
+        bare = SimpleNamespace(mx_source_id="deadbeefdeadbeef", worker_id="src", worker_rank=0, source_load=0.0)
+        assert sel.score(bare, self._ctx()) == pytest.approx(sel.score(self._ref(None), self._ctx()))
+
+    def test_all_unknown_collapses_to_rendezvous_order(self, monkeypatch):
+        from modelexpress import p2p_pb2, source_selection as ss
+        monkeypatch.setenv("MX_P2P_LOAD_WEIGHT", "1.0")
+        cands = [p2p_pb2.SourceInstanceRef(mx_source_id="deadbeefdeadbeef", worker_id=f"w{i}", worker_rank=0) for i in range(6)]
+        la = [c.worker_id for c in ss.LoadAwareSelector().order(cands, self._ctx())]
+        rz = [c.worker_id for c in ss.RendezvousHashSelector().order(cands, self._ctx())]
+        assert la == rz

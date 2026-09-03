@@ -72,7 +72,7 @@ async fn reap_once(
                     &w.worker_id,
                     w.worker_rank,
                     SourceStatus::Stale,
-                    0.0,
+                    None,
                 )
                 .await
             {
@@ -131,7 +131,7 @@ mod tests {
                 status: SourceStatus::Ready as i32,
                 updated_at: old_time,
                 accelerator: "cuda".into(),
-                source_load: 0.0,
+                source_load: None,
                 training_step: None,
                 layout_signature: None,
             }])
@@ -164,7 +164,7 @@ mod tests {
                 status: SourceStatus::Stale as i32,
                 updated_at: very_old,
                 accelerator: "cuda".into(),
-                source_load: 0.0,
+                source_load: None,
                 training_step: None,
                 layout_signature: None,
             }])
@@ -195,7 +195,7 @@ mod tests {
                 status: SourceStatus::Ready as i32,
                 updated_at: recent,
                 accelerator: "cuda".into(),
-                source_load: 0.0,
+                source_load: None,
                 training_step: None,
                 layout_signature: None,
             }])

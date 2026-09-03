@@ -241,8 +241,8 @@ fn overlay_status(
     worker_rank: u32,
     record_status: i32,
     record_updated_at: i64,
-    record_source_load: f32,
-) -> (i32, i64, f32) {
+    record_source_load: Option<f32>,
+) -> (i32, i64, Option<f32>) {
     fields
         .get(&status_field(worker_rank))
         .and_then(|value| serde_json::from_str::<WorkerSummaryJson>(value).ok())
@@ -419,7 +419,7 @@ struct WorkerRecordJson {
     pub accelerator: String,
     /// Source-published RDMA NIC utilization in [0, 1].
     #[serde(default)]
-    pub source_load: f32,
+    pub source_load: Option<f32>,
     /// Small discovery summary for file-backed artifact sources.
     #[serde(default)]
     pub artifact_source: Option<ArtifactSourceMetadataJson>,
@@ -435,7 +435,7 @@ struct WorkerSummaryJson {
     #[serde(default)]
     accelerator: String,
     #[serde(default)]
-    source_load: f32,
+    source_load: Option<f32>,
 }
 
 /// Serializable artifact source summary.
@@ -773,7 +773,7 @@ impl MetadataBackend for RedisBackend {
                         );
                         (status, updated_at, j.accelerator, source_load)
                     })
-                    .unwrap_or((0, 0, String::new(), 0.0));
+                    .unwrap_or((0, 0, String::new(), None));
 
                 result.push(super::SourceInstanceInfo {
                     source_id: sid.clone(),
@@ -940,7 +940,7 @@ impl MetadataBackend for RedisBackend {
                         );
                         (status, updated_at, record.accelerator, source_load)
                     })
-                    .unwrap_or((0, 0, String::new(), 0.0));
+                    .unwrap_or((0, 0, String::new(), None));
                 if min_updated_at.is_some_and(|minimum| updated_at < minimum) {
                     continue;
                 }
@@ -1032,7 +1032,7 @@ impl MetadataBackend for RedisBackend {
         worker_rank: u32,
         status: SourceStatus,
         updated_at: i64,
-        source_load: f32,
+        source_load: Option<f32>,
     ) -> MetadataResult<()> {
         let mut conn = self.get_conn().await?;
         let key = format!("{}{}:{}", keys::SOURCE_PREFIX, source_id, worker_id);
@@ -1166,7 +1166,7 @@ mod tests {
             agent_name: String::new(),
             worker_grpc_endpoint: String::new(),
             accelerator: "cuda".to_string(),
-            source_load: 0.625,
+            source_load: Some(0.625),
             artifact_source: Some(ArtifactSourceMetadataRecord {
                 artifact_id: "artifact123".to_string(),
                 total_size: 1_099_511_627_776,
@@ -1188,7 +1188,7 @@ mod tests {
         assert_eq!(back.tensors.len(), 1);
         assert_eq!(back.accelerator, record.accelerator);
         assert_eq!(back.source_load, record.source_load);
-        assert_eq!(back.source_load, 0.625);
+        assert_eq!(back.source_load, Some(0.625));
         assert_eq!(back.artifact_source, record.artifact_source);
         assert!(
             json.contains(r#""total_size":"#),
@@ -1214,12 +1214,12 @@ mod tests {
             status: SourceStatus::Ready as i32,
             updated_at: 1_700_000_000_000,
             accelerator: "cuda".to_string(),
-            source_load: 0.5,
+            source_load: Some(0.5),
         };
         let json = serde_json::to_string(&summary).expect("serialize");
         let parsed: WorkerSummaryJson = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.accelerator, "cuda");
-        assert_eq!(parsed.source_load, 0.5);
+        assert_eq!(parsed.source_load, Some(0.5));
     }
 
     #[test]
@@ -1260,7 +1260,7 @@ mod tests {
             ("status:0".to_string(), fresh_status.to_string()),
         ]
         .into();
-        assert_eq!(overlay_status(&with_fresh, 0, 1, 100, 0.0), (2, 200, 0.0));
+        assert_eq!(overlay_status(&with_fresh, 0, 1, 100, None), (2, 200, None));
         assert!(worker_records_match_status(
             &with_fresh,
             SourceStatus::Ready
@@ -1271,13 +1271,13 @@ mod tests {
             ("status:0".to_string(), stale_status.to_string()),
         ]
         .into();
-        assert_eq!(overlay_status(&with_stale, 0, 1, 100, 0.0), (1, 100, 0.0));
+        assert_eq!(overlay_status(&with_stale, 0, 1, 100, None), (1, 100, None));
 
         let without_status: std::collections::HashMap<String, String> =
             [("0".to_string(), record.to_string())].into();
         assert_eq!(
-            overlay_status(&without_status, 0, 1, 100, 0.0),
-            (1, 100, 0.0)
+            overlay_status(&without_status, 0, 1, 100, None),
+            (1, 100, None)
         );
     }
 
@@ -1301,8 +1301,8 @@ mod tests {
         ]
         .into();
         assert_eq!(
-            overlay_status(&fields, 0, 2, 100, 0.0),
-            (2, 200, 0.75),
+            overlay_status(&fields, 0, 2, 100, None),
+            (2, 200, Some(0.75)),
             "the heartbeat's source_load must win over the record's stale value"
         );
 
@@ -1317,8 +1317,8 @@ mod tests {
         ]
         .into();
         assert_eq!(
-            overlay_status(&stale_fields, 0, 2, 100, 0.25),
-            (2, 100, 0.25)
+            overlay_status(&stale_fields, 0, 2, 100, Some(0.25)),
+            (2, 100, Some(0.25))
         );
     }
 
@@ -1468,11 +1468,25 @@ mod tests {
             .await
             .expect("publish");
         backend
-            .update_status(&source_id, &worker_id, 0, SourceStatus::Ready, 200, 0.0)
+            .update_status(
+                &source_id,
+                &worker_id,
+                0,
+                SourceStatus::Ready,
+                200,
+                Some(0.0),
+            )
             .await
             .expect("newer update");
         backend
-            .update_status(&source_id, &worker_id, 0, SourceStatus::Stale, 100, 0.0)
+            .update_status(
+                &source_id,
+                &worker_id,
+                0,
+                SourceStatus::Stale,
+                100,
+                Some(0.0),
+            )
             .await
             .expect("older update");
 
@@ -1504,7 +1518,14 @@ mod tests {
             .await
             .expect("remove status field");
         backend
-            .update_status(&source_id, &worker_id, 0, SourceStatus::Stale, 100, 0.0)
+            .update_status(
+                &source_id,
+                &worker_id,
+                0,
+                SourceStatus::Stale,
+                100,
+                Some(0.0),
+            )
             .await
             .expect("rank-fresh legacy update");
         let metadata = backend
@@ -1522,7 +1543,14 @@ mod tests {
         assert_eq!(summaries[0].updated_at, 200);
 
         backend
-            .update_status(&source_id, &worker_id, 0, SourceStatus::Ready, 300, 0.0)
+            .update_status(
+                &source_id,
+                &worker_id,
+                0,
+                SourceStatus::Ready,
+                300,
+                Some(0.0),
+            )
             .await
             .expect("legacy record update");
         let metadata = backend
@@ -1534,7 +1562,14 @@ mod tests {
 
         assert!(
             backend
-                .update_status(&source_id, &worker_id, 99, SourceStatus::Ready, 400, 0.0)
+                .update_status(
+                    &source_id,
+                    &worker_id,
+                    99,
+                    SourceStatus::Ready,
+                    400,
+                    Some(0.0)
+                )
                 .await
                 .is_err(),
             "a heartbeat must not create a missing rank"

@@ -165,7 +165,7 @@ impl MetadataBackend for InstrumentedMetadataBackend {
         worker_rank: u32,
         status: SourceStatus,
         updated_at: i64,
-        source_load: f32,
+        source_load: Option<f32>,
     ) -> MetadataResult<()> {
         self.metrics
             .time(
@@ -278,7 +278,7 @@ mod tests {
         let _ = backend.remove_worker("source-0", "worker-0").await;
         let _ = backend.list_sources().await;
         let _ = backend
-            .update_status("source-0", "worker-0", 0, SourceStatus::Ready, 0, 0.0)
+            .update_status("source-0", "worker-0", 0, SourceStatus::Ready, 0, None)
             .await;
 
         let encoded = encode_text(&registry).unwrap_or_else(|_| String::from("<encode failed>"));

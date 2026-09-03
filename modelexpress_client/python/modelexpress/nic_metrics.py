@@ -320,21 +320,27 @@ class NicUtilizationSampler:
             return None
         return tx, rx
 
-    def sample(self) -> float:
-        """Return current NIC utilization in ``[0, 1]`` (0.0 on any failure)."""
+    def sample(self) -> Optional[float]:
+        """Return current NIC utilization in ``[0, 1]``, or ``None`` with no reading.
+
+        ``None`` is the honest answer whenever there is no counter to read (no
+        device, unreadable link rate, VF pod without the optional byte counters)
+        or no interval to divide by yet; publishing it as 0.0 would make the
+        source look idle to every puller. Only a measured zero delta is 0.0.
+        """
         if self._device is None or not self._link_bps:
-            return 0.0
+            return None
         now = self._clock()
         cur = self._read_bytes()
         if cur is None:
-            return 0.0
+            return None
         prev_t, prev = self._last_t, self._last_bytes
         self._last_t, self._last_bytes = now, cur
         if prev is None or prev_t is None:
-            return 0.0  # first sample: establish baseline
+            return None  # first sample: establish baseline
         dt = now - prev_t
         if dt <= 0:
-            return 0.0
+            return None
         # Counters are monotonic; guard against wrap/reset with max(0, .).
         tx_rate = max(0, cur[0] - prev[0]) / dt
         rx_rate = max(0, cur[1] - prev[1]) / dt
@@ -366,14 +372,17 @@ class SourceLoadSampler:
         devices = [affine] if affine else _lister()
         self._samplers = [_sampler_factory(d) for d in devices if d]
 
-    def sample(self) -> float:
-        """Return this source's load in ``[0, 1]`` (max over sampled NICs)."""
-        if not self._samplers:
-            return 0.0
-        return max((s.sample() for s in self._samplers), default=0.0)
+    def sample(self) -> Optional[float]:
+        """Return this source's load in ``[0, 1]``: max over NICs with a reading.
+
+        ``None`` when no NIC produced one, so a fleet of VF pods does not all
+        report 0.0 and look idle.
+        """
+        readings = [v for v in (s.sample() for s in self._samplers) if v is not None]
+        return max(readings) if readings else None
 
 
-def make_source_load_provider(device_id: int) -> Callable[[], float]:
+def make_source_load_provider(device_id: int) -> Callable[[], Optional[float]]:
     """Return a zero-arg provider of this source's load in ``[0, 1]``.
 
     The seam for the source-load signal. It always includes the physical
@@ -397,7 +406,10 @@ def make_source_load_provider(device_id: int) -> Callable[[], float]:
 
     runtime = RuntimeLoadProvider(url).sample
 
-    def blended() -> float:
-        return max(nic(), runtime())
+    def blended() -> Optional[float]:
+        # Max over the providers that have a reading; None only when neither
+        # does, so one silent provider cannot drag a real reading down to 0.0.
+        readings = [v for v in (nic(), runtime()) if v is not None]
+        return max(readings) if readings else None
 
     return blended

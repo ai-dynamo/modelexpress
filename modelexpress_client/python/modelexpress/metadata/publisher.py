@@ -82,7 +82,7 @@ class PublisherThread:
         publish_timeout_secs: int | None = None,
         interval_secs: int | None = None,
         heartbeat_after_publish: bool = True,
-        source_load_provider: Callable[[], float] | None = None,
+        source_load_provider: Callable[[], float | None] | None = None,
     ):
         if mx_source_id is None and publish_fn is None:
             raise ValueError("PublisherThread requires mx_source_id or publish_fn")
@@ -233,12 +233,15 @@ class PublisherThread:
         """
         if self._mx_source_id is None:
             return False
-        source_load = 0.0
+        # None means "no reading" and leaves the wire field unset, so the server
+        # and every puller can tell it apart from a measured 0.0. Coercing to 0.0
+        # here is what made sources with no signal look idle.
+        source_load: float | None = None
         if self._source_load_provider is not None:
             try:
                 source_load = self._source_load_provider()
             except Exception:  # never let telemetry break the heartbeat
-                source_load = 0.0
+                source_load = None
         return self._mx_client.update_status(
             mx_source_id=self._mx_source_id,
             worker_id=self._worker_id,

@@ -571,10 +571,12 @@ message SourceInstanceRef {
   // can supply it instead behind the same field. Consumed by the client
   // `load_aware` selector to steer new targets toward sources with spare
   // headroom, so weight transfers avoid contending with a source's in-flight
-  // inference. Ordering-only and advisory; 0 (or unset, for older servers)
-  // collapses `load_aware` to `rendezvous_hash`.
+  // inference. Ordering-only and advisory. Unset means unknown (an older
+  // client, or a provider with no signal) and ranks as a neutral prior; 0
+  // means measured idle. Presence is what keeps a source with no reading
+  // from outranking one that reports real load.
   // (#519 took fields 6-8; field 9 is reserved for #512's `topology`.)
-  float source_load = 10;
+  optional float source_load = 10;
 }
 
 message ListSourcesRequest {
@@ -652,9 +654,10 @@ message UpdateStatusRequest {
   string worker_id = 4;
 
   // Source-published busyness in [0, 1], refreshed on each heartbeat so the
-  // server's SourceInstanceRef.source_load tracks live load. 0 means
-  // idle/unknown. See SourceInstanceRef.source_load.
-  float source_load = 5;
+  // server's SourceInstanceRef.source_load tracks live load. Leave unset when
+  // no provider has a reading; 0 means measured idle. See
+  // SourceInstanceRef.source_load.
+  optional float source_load = 5;
 }
 
 message UpdateStatusResponse {

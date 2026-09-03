@@ -66,9 +66,11 @@ pub struct SourceInstanceInfo {
     /// Empty when unknown (records that predate the field).
     pub accelerator: String,
     /// Source-published busyness in [0, 1] (default provider: RDMA NIC
-    /// utilization), refreshed via UpdateStatus heartbeats. 0 when
-    /// idle/unknown. Consumed by the client `load_aware` selector.
-    pub source_load: f32,
+    /// utilization), refreshed via UpdateStatus heartbeats. `None` when the
+    /// source has not reported one (older client, or a provider with no
+    /// signal); `Some(0.0)` is a measured idle. Consumed by the client
+    /// `load_aware` selector, which ranks `None` as a neutral prior.
+    pub source_load: Option<f32>,
     /// Training step/version from SourceIdentity.extra_parameters, when present.
     pub training_step: Option<u64>,
     /// Stable topology/registry digest, when published by the source.
@@ -163,7 +165,7 @@ pub struct WorkerRecord {
     pub accelerator: String,
     /// Source-published busyness in [0, 1]. Not carried on WorkerMetadata;
     /// set by UpdateStatus heartbeats (see `update_status`).
-    pub source_load: f32,
+    pub source_load: Option<f32>,
     /// Small discovery summary for file-backed artifact sources.
     pub artifact_source: Option<ArtifactSourceMetadataRecord>,
 }
@@ -220,7 +222,7 @@ impl From<WorkerMetadata> for WorkerRecord {
             worker_grpc_endpoint: meta.worker_grpc_endpoint,
             accelerator: meta.accelerator,
             // Not on WorkerMetadata; refreshed via UpdateStatus heartbeats.
-            source_load: 0.0,
+            source_load: None,
             artifact_source,
         }
     }
@@ -406,7 +408,7 @@ pub trait MetadataBackend: Send + Sync {
         worker_rank: u32,
         status: SourceStatus,
         updated_at: i64,
-        source_load: f32,
+        source_load: Option<f32>,
     ) -> MetadataResult<()>;
 }
 

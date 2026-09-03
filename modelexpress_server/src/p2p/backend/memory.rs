@@ -129,7 +129,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
                     .get(&entry.index_rank)
                     .or_else(|| entry.ranks.values().next());
                 let (status, updated_at, accelerator, source_load) = reported.map_or_else(
-                    || (0, 0, String::new(), 0.0),
+                    || (0, 0, String::new(), None),
                     |r| (r.status, r.updated_at, r.accelerator.clone(), r.source_load),
                 );
                 result.push(SourceInstanceInfo {
@@ -181,7 +181,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
         worker_rank: u32,
         status: SourceStatus,
         updated_at: i64,
-        source_load: f32,
+        source_load: Option<f32>,
     ) -> MetadataResult<()> {
         let mut sources = self.lock();
         let record = sources

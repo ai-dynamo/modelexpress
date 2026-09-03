@@ -648,21 +648,37 @@ class MetricsCollector:
             except Exception:
                 pass
 
-    def set_source_load(self, source_worker_id: str, value: float) -> None:
-        """Record a candidate's published load.
+    def observe_candidate_loads(self, ordered) -> None:
+        """Record the source-published load seen at selection.
 
-        ``source_worker_id`` is ignored unless ``MX_METRICS_SOURCE_ID_LABEL=1``,
-        mirroring ``record_selection`` so the call site stays unconditional and
-        the cardinality decision lives in one place.
+        ``ordered`` is the selector's output, best candidate first. With
+        ``MX_METRICS_SOURCE_ID_LABEL=1`` every candidate is recorded under its
+        own ``source_worker_id``. With the label off there is exactly one
+        series, so it holds the load of the candidate that was actually chosen
+        (``ordered[0]``): writing every candidate into it left whichever came
+        last, which under ``load_aware`` is the busiest -- the opposite of what
+        the selector picked. Candidates that published no load are skipped
+        rather than recorded as 0.0.
         """
-        if self._ensure():
-            try:
+        if not ordered or not self._ensure():
+            return
+        try:
+            targets = ordered if self._source_id_label else ordered[:1]
+            for inst in targets:
+                has_field = getattr(inst, "HasField", None)
+                try:
+                    known = bool(has_field("source_load")) if has_field else False
+                except (ValueError, TypeError):
+                    known = False
+                if not known:
+                    continue
+                value = float(inst.source_load)
                 if self._source_id_label:
-                    self.source_load.labels(self.scheme, source_worker_id).set(value)
+                    self.source_load.labels(self.scheme, inst.worker_id).set(value)
                 else:
                     self.source_load.labels(self.scheme).set(value)
-            except Exception:
-                pass
+        except Exception:
+            pass
 
     def observe_transfer_seconds(self, policy: str, outcome: str, seconds: float) -> None:
         if self._ensure():

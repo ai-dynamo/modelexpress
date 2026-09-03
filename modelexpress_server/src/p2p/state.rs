@@ -230,7 +230,7 @@ impl P2pStateManager {
         worker_id: &str,
         worker_rank: u32,
         status: modelexpress_common::grpc::p2p::SourceStatus,
-        source_load: f32,
+        source_load: Option<f32>,
     ) -> MetadataResult<()> {
         let updated_at = chrono::Utc::now().timestamp_millis();
         self.get_backend()
@@ -506,7 +506,7 @@ mod tests {
                     agent_name: String::new(),
                     worker_grpc_endpoint: String::new(),
                     accelerator: String::new(),
-                    source_load: 0.0,
+                    source_load: None,
                     artifact_source: None,
                 },
                 WorkerRecord {
@@ -525,7 +525,7 @@ mod tests {
                     agent_name: String::new(),
                     worker_grpc_endpoint: String::new(),
                     accelerator: String::new(),
-                    source_load: 0.0,
+                    source_load: None,
                     artifact_source: None,
                 },
             ],
@@ -620,7 +620,7 @@ mod tests {
                 eq(2u32),
                 eq(SourceStatus::Ready),
                 mockall::predicate::always(),
-                eq(0.5f32),
+                eq(Some(0.5f32)),
             )
             .once()
             .returning(|_, _, _, _, _, _| Ok(()));
@@ -632,7 +632,7 @@ mod tests {
                 "test-instance",
                 2,
                 SourceStatus::Ready,
-                0.5,
+                Some(0.5),
             )
             .await
             .expect("update_worker_status failed");
@@ -653,7 +653,7 @@ mod tests {
                     "test-instance",
                     0,
                     SourceStatus::Ready,
-                    0.0
+                    None
                 )
                 .await
                 .is_err()
@@ -678,7 +678,7 @@ mod tests {
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
                     accelerator: "cuda".to_string(),
-                    source_load: 0.0,
+                    source_load: None,
                     training_step: None,
                     layout_signature: None,
                 }])
@@ -769,7 +769,7 @@ mod tests {
                 "test-instance",
                 7,
                 SourceStatus::Ready,
-                0.0,
+                None,
             )
             .await
             .expect("update_worker_status failed");

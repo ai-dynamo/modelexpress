@@ -165,6 +165,14 @@ class RendezvousHashSelector(ScoredSelector):
         return _identity_digest(candidate, ctx)
 
 
+#: Load assumed for a candidate that published no ``source_load`` at all. The
+#: field is ``optional`` on the wire, so "unset" is distinguishable from a
+#: measured 0.0; scoring unset as idle would steer every target toward exactly
+#: the sources whose load the client cannot see (older clients, providers with
+#: no signal). The midpoint neither rewards nor buries them.
+UNKNOWN_LOAD_PRIOR = 0.5
+
+
 class LoadAwareSelector(ScoredSelector):
     """Load-aware spreading: rendezvous ordering biased away from busy sources.
 
@@ -182,9 +190,13 @@ class LoadAwareSelector(ScoredSelector):
     Statelessness is preserved: the load signal is self-described source
     metadata read off each candidate, not a server-side counter -- so every
     replica ranks identically and MX servers stay stateless behind a load
-    balancer. When load is 0 or unset (idle sources, or servers that predate
-    the field), every penalty is 0 and ordering collapses exactly to
-    ``rendezvous_hash`` -- never worse than the deterministic baseline.
+    balancer. A measured load of 0 carries no penalty, so a fleet of idle
+    sources orders exactly as ``rendezvous_hash``. A candidate that published
+    no load at all is different: it scores as ``UNKNOWN_LOAD_PRIOR`` rather
+    than as idle, so in a mixed fleet the sources whose load is invisible
+    (older clients, providers with no signal) neither outrank nor trail the
+    ones that report it. When every candidate is unknown the penalty is a
+    constant and ordering again collapses to ``rendezvous_hash``.
     """
 
     name = "load_aware"
@@ -197,10 +209,20 @@ class LoadAwareSelector(ScoredSelector):
         candidate: p2p_pb2.SourceInstanceRef,
         ctx: LoadContext,
     ) -> float:
-        # Read defensively: old servers / disabled telemetry omit the field, and
-        # a 0 load makes this collapse to rendezvous_hash.
-        load = getattr(candidate, "source_load", 0.0)
-        load = min(1.0, max(0.0, load))
+        # Presence matters: a source with NO reading (older client, or a provider
+        # with no signal) must not outrank one reporting real load, so unknown
+        # ranks as a neutral prior rather than as idle. A measured 0.0 still gets
+        # the full bonus. Objects without presence tracking (tests, old servers)
+        # count as unknown.
+        has_field = getattr(candidate, "HasField", None)
+        try:
+            known = bool(has_field("source_load")) if has_field else False
+        except (ValueError, TypeError):
+            known = False
+        if known:
+            load = min(1.0, max(0.0, candidate.source_load))
+        else:
+            load = UNKNOWN_LOAD_PRIOR
         return _unit_hash(candidate, ctx) - self.w_load * load
 
 

@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from modelexpress.runtime_load import RuntimeLoadProvider, _scrape_gauge
 
 _VLLM = """
@@ -85,14 +87,14 @@ def test_engine_gauge_wins_over_dynamo_fallback():
     assert abs(p.sample() - 0.73) < 1e-9
 
 
-def test_provider_unreachable_returns_zero():
+def test_provider_unreachable_returns_none():
     p = RuntimeLoadProvider("http://x/metrics", _fetch=lambda u, t: None)
-    assert p.sample() == 0.0
+    assert p.sample() is None
 
 
-def test_provider_no_known_metric_returns_zero():
+def test_provider_no_known_metric_returns_none():
     p = RuntimeLoadProvider("http://x/metrics", _fetch=lambda u, t: "other_metric 5\n")
-    assert p.sample() == 0.0
+    assert p.sample() is None
 
 
 def test_provider_clamps():
@@ -114,4 +116,28 @@ def test_make_source_load_provider_blends_when_url_set(monkeypatch):
     monkeypatch.setattr(runtime_load, "_http_get", lambda url, timeout: None)
     provider = make_source_load_provider(0)
     val = provider()
-    assert isinstance(val, float) and 0.0 <= val <= 1.0
+    # No NIC here and the runtime fetch is stubbed to fail: that is "no
+    # reading", not idle, so the blend must report None rather than 0.0.
+    assert val is None or (isinstance(val, float) and 0.0 <= val <= 1.0)
+
+
+def test_blend_uses_the_provider_that_has_a_reading(monkeypatch):
+    """One silent provider must not drag a real reading down to 0.0."""
+    from modelexpress import nic_metrics, runtime_load
+
+    monkeypatch.setenv("MX_P2P_RUNTIME_METRICS_URL", "http://runtime.invalid/metrics")
+    monkeypatch.setattr(
+        runtime_load, "_http_get", lambda url, timeout: "vllm:kv_cache_usage_perc 0.7\n"
+    )
+    monkeypatch.setattr(nic_metrics.SourceLoadSampler, "sample", lambda self: None)
+    provider = nic_metrics.make_source_load_provider(0)
+    assert provider() == pytest.approx(0.7)
+
+
+def test_blend_is_none_when_neither_provider_has_a_reading(monkeypatch):
+    from modelexpress import nic_metrics, runtime_load
+
+    monkeypatch.setenv("MX_P2P_RUNTIME_METRICS_URL", "http://runtime.invalid/metrics")
+    monkeypatch.setattr(runtime_load, "_http_get", lambda url, timeout: None)
+    monkeypatch.setattr(nic_metrics.SourceLoadSampler, "sample", lambda self: None)
+    assert nic_metrics.make_source_load_provider(0)() is None
