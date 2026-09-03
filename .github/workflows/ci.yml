@@ -439,14 +439,14 @@ jobs:
       run: rustc --version
 
     - name: Install cargo-audit
-      run: cargo install cargo-audit --locked
+      run: cargo install cargo-audit
 
     - name: Run security audit
       run: cargo audit
 
     - name: Install and Run cargo-deny
       run: |
-        cargo-deny --version || cargo install cargo-deny@0.16.4 --locked
+        cargo-deny --version || cargo install cargo-deny@0.16.4
         cargo-deny --no-default-features check --hide-inclusion-graph licenses bans --config ${{ github.workspace }}/deny.toml
 
   code-coverage:
