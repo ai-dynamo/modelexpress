@@ -222,6 +222,12 @@ class VllmAdapter(EngineAdapter):
             dummy_config.load_format = "dummy"
         except AttributeError:
             object.__setattr__(dummy_config, "load_format", "dummy")
+        # DummyModelLoader rejects any model_loader_extra_config. The RDMA
+        # target only allocates empty tensors, so strip the streamer-oriented
+        # extra config (e.g. distributed / memory_limit) the source config may
+        # carry. Rebind rather than mutate: the shared dict is still used by the
+        # streamer fallback path.
+        _set_load_config_extra_config(dummy_config, {})
         DummyModelLoader(dummy_config).load_weights(result.model, self.model_config)
         return result
 
