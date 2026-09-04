@@ -16,6 +16,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    MX_REFIT_CHECKSUM_FORMAT: str
     MX_REFIT_DELTA_BUCKET_BYTES: int
     MX_REFIT_DELTA_WORKERS: int
     MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
@@ -50,6 +51,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "MX_WEIGHT_PAYLOAD_FORMAT": lambda: (
         os.environ.get("MX_WEIGHT_PAYLOAD_FORMAT", "FULL_TENSOR").strip().upper()
+    ),
+    "MX_REFIT_CHECKSUM_FORMAT": lambda: (
+        os.environ.get("MX_REFIT_CHECKSUM_FORMAT", "adler32").strip().lower()
     ),
     # Framework integrations read this while constructing ``hf_tensor_iter``;
     # ModelExpress preserves the supplied framework bucket boundaries.
