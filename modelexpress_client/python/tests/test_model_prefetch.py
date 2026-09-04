@@ -267,6 +267,48 @@ class TestRevisionScopedDedup:
         assert FakeClient.instances[-1].revisions == ["f" * 40]
 
 
+class TestCacheDirectory:
+    """An explicit root is the caller's, not this worker's default."""
+
+    def test_forwards_an_explicit_root_to_the_client(
+        self, enabled, fake_client, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("MODEL_EXPRESS_CACHE_DIRECTORY", str(tmp_path / "env-root"))
+        explicit = tmp_path / "engine-root"
+
+        model_prefetch.ensure_metadata(REPO, cache_directory=explicit)
+
+        assert FakeClient.instances[0].kwargs["cache_directory"] == explicit
+
+    def test_leaves_the_clients_own_resolution_alone_when_unset(
+        self, enabled, fake_client, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("MODEL_EXPRESS_CACHE_DIRECTORY", str(tmp_path / "env-root"))
+
+        model_prefetch.ensure_metadata(REPO)
+
+        assert FakeClient.instances[0].kwargs["cache_directory"] is None
+
+    def test_the_same_revision_under_two_roots_is_two_installs(
+        self, enabled, fake_client, tmp_path
+    ):
+        model_prefetch.ensure_metadata(REPO, COMMIT, cache_directory=tmp_path / "a")
+        model_prefetch.ensure_metadata(REPO, COMMIT, cache_directory=tmp_path / "b")
+
+        assert len(FakeClient.instances) == 2
+
+    def test_the_same_root_written_two_ways_is_one_install(
+        self, enabled, fake_client, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "root").mkdir()
+
+        model_prefetch.ensure_metadata(REPO, COMMIT, cache_directory=tmp_path / "root")
+        model_prefetch.ensure_metadata(REPO, COMMIT, cache_directory=Path("root"))
+
+        assert len(FakeClient.instances) == 1
+
+
 class TestRepoIdFor:
     def test_maps_snapshot_path_back(self, enabled, fake_client):
         snapshot = model_prefetch.ensure_metadata(REPO)
