@@ -181,6 +181,7 @@ response = requests.post(
             "refit_checkpoint_max_size_gb": 500,
             "object_storage_region_name": "us-west-2",
             "max_transfer_attempts": 3,
+            "max_replay_chain_length": 64,
             "rpc_timeout_seconds": 30,
         }
     },
@@ -259,6 +260,17 @@ activation.
       config.json
       ...
 ```
+
+The generator may request a target several revisions ahead of its active
+version. ModelExpress first resolves the complete READY chain, rejecting cycles,
+missing or incompatible revisions, and chains longer than
+`max_replay_chain_length` (64 by default). It then prepares the ordered chain as
+one immutable target checkpoint and installs only that final target. If engine
+installation starts and fails, the checkpoint remains `READY`, `active.json`
+continues to identify the last successfully installed version, and the local
+engine is marked uncertain. The next request may reinstall that active version
+or install any target reconstructed from it; either successful installation
+clears the uncertain state.
 
 All ranks sharing one host filesystem can share the same cache. Each host without
 a shared filesystem needs its own cache.
