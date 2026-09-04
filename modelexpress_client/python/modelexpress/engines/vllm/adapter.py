@@ -47,11 +47,16 @@ _VLLM_POST_RDMA_FINALIZER_NAMES = (
 # the mirrors after the received values overwrite its dummy-loaded tensors.
 _VLLM_ATTENTION_SCALE_NAMES: tuple[str, ...] = ("q", "k", "v")
 
-# MTP draft weights live under an "mtp." prefix in the shared checkpoint. The
-# draft's embedding and lm_head come from the target, so these are all it needs.
+# MTP draft weights have no single naming convention, so the selector matches a
+# small per-family allowlist and streams all shards for anything unrecognized:
+#   - "mtp." prefix: DeepSeek (e.g. mtp.0.*).
+#   - extra decoder layer model.layers.{num_hidden_layers + i}: GLM-family
+#     (Glm4MoeForCausalLM, e.g. model.layers.78.*); see _mtp_layer_prefixes.
+# The draft's embedding and lm_head come from the target.
 _DRAFT_WEIGHT_PREFIXES: tuple[str, ...] = ("mtp.",)
 
 _SAFETENSORS_INDEX_NAME = "model.safetensors.index.json"
+_CONFIG_JSON_NAME = "config.json"
 
 # Registries on compilation_config that vLLM keys by layer name.
 _LAYER_REGISTRY_FIELDS: tuple[str, ...] = (
@@ -83,54 +88,44 @@ class DraftShardSelection(Enum):
     UNRESOLVED = auto()
 
 
-def _read_local_safetensors_index(directory: str) -> dict | None:
-    """Read model.safetensors.index.json from a local directory."""
-    local_index = os.path.join(directory, _SAFETENSORS_INDEX_NAME)
-    if not os.path.isfile(local_index):
+def _read_local_json(directory: str, name: str) -> dict | None:
+    """Read a JSON file by name from a local directory."""
+    path = os.path.join(directory, name)
+    if not os.path.isfile(path):
         return None
-    with open(local_index, encoding="utf-8") as handle:
+    with open(path, encoding="utf-8") as handle:
         return json.load(handle)
 
 
-def _read_safetensors_index(model_uri: str) -> dict | None:
-    """Read model.safetensors.index.json from a local dir or object store.
+def _read_json(model_uri: str, name: str) -> dict | None:
+    """Read a JSON file by name from a local dir or object store.
 
-    Returns the parsed index, or None if it cannot be read.
+    Returns the parsed JSON, or None if it cannot be read.
     """
-    index = _read_local_safetensors_index(model_uri)
-    if index is not None:
-        return index
+    local = _read_local_json(model_uri, name)
+    if local is not None:
+        return local
 
     from runai_model_streamer import pull_files
 
     with tempfile.TemporaryDirectory() as tmp:
         # runai's allow_pattern is a glob matched against the full object key,
         # so a bare filename never matches; anchor it with a leading wildcard.
-        pull_files(model_uri, tmp, allow_pattern=[f"*{_SAFETENSORS_INDEX_NAME}"])
+        pull_files(model_uri, tmp, allow_pattern=[f"*{name}"])
         for root, _dirs, files in os.walk(tmp):
-            if _SAFETENSORS_INDEX_NAME in files:
-                with open(
-                    os.path.join(root, _SAFETENSORS_INDEX_NAME), encoding="utf-8"
-                ) as handle:
+            if name in files:
+                with open(os.path.join(root, name), encoding="utf-8") as handle:
                     return json.load(handle)
-    logger.warning(
-        "safetensors index %s not found under %s; draft-shard selection will "
-        "fall back to streaming all shards",
-        _SAFETENSORS_INDEX_NAME,
-        model_uri,
-    )
     return None
 
 
-def _load_safetensors_index(
-    model_uri: str,
-    hf_weights_files: list[str],
+def _read_local_json_near_shards(
+    hf_weights_files: list[str], name: str
 ) -> dict | None:
-    """Read the checkpoint index, preferring the resolved shards' directory.
+    """Read a JSON file from the first resolved shard directory that has it.
 
-    _prepare_weights has already resolved model_uri (which may be an HF repo
-    id) to local shard paths, so the index sits next to them. Fall back to
-    model_uri for shards the streamer hands back as remote object-store paths.
+    _prepare_weights has already resolved model_uri (which may be an HF repo id)
+    to local shard paths, so config.json and the index sit next to them.
     """
     seen: set[str] = set()
     for shard in hf_weights_files:
@@ -138,22 +133,85 @@ def _load_safetensors_index(
         if not directory or directory in seen:
             continue
         seen.add(directory)
-        index = _read_local_safetensors_index(directory)
-        if index is not None:
-            return index
-    return _read_safetensors_index(model_uri)
+        found = _read_local_json(directory, name)
+        if found is not None:
+            return found
+    return None
+
+
+def _read_safetensors_index(model_uri: str) -> dict | None:
+    """Read model.safetensors.index.json from a local dir or object store."""
+    index = _read_json(model_uri, _SAFETENSORS_INDEX_NAME)
+    if index is None:
+        logger.warning(
+            "safetensors index %s not found under %s; draft-shard selection "
+            "will fall back to streaming all shards",
+            _SAFETENSORS_INDEX_NAME,
+            model_uri,
+        )
+    return index
+
+
+def _load_safetensors_index(
+    model_uri: str,
+    hf_weights_files: list[str],
+) -> dict | None:
+    """Read the checkpoint index, preferring the resolved shards' directory,
+    then model_uri for shards the streamer hands back as object-store paths."""
+    local = _read_local_json_near_shards(hf_weights_files, _SAFETENSORS_INDEX_NAME)
+    return local if local is not None else _read_safetensors_index(model_uri)
+
+
+def _load_config(model_uri: str, hf_weights_files: list[str]) -> dict | None:
+    """Read the checkpoint's config.json, preferring the resolved shards' dir,
+    then model_uri as an object-store fallback."""
+    local = _read_local_json_near_shards(hf_weights_files, _CONFIG_JSON_NAME)
+    return local if local is not None else _read_json(model_uri, _CONFIG_JSON_NAME)
+
+
+def _mtp_layer_prefixes(config: dict | None) -> tuple[str, ...]:
+    """GLM-family draft prefixes derived from the checkpoint's config.json.
+
+    GLM (Glm4MoeForCausalLM) stores the MTP head as extra decoder layers
+    model.layers.{num_hidden_layers + i}, i < num_nextn_predict_layers, with
+    both counts at the top level. Reads the on-disk config, not the runtime
+    draft config: vLLM rewrites num_hidden_layers to 0 for some families (MiMo,
+    GLM-Lite), which would then match the ordinary layer 0. Any other shape
+    returns () so the selector safely streams all shards. Name forms mirror
+    vLLM's get_spec_layer_idx_from_weight_name.
+    """
+    if not config:
+        return ()
+    base = config.get("num_hidden_layers")
+    n = config.get("num_nextn_predict_layers")
+    if isinstance(base, bool) or isinstance(n, bool):
+        return ()
+    if not isinstance(base, int) or not isinstance(n, int):
+        return ()
+    if base <= 0 or n <= 0:
+        return ()
+    prefixes: list[str] = []
+    for i in range(n):
+        prefixes.append(f"model.layers.{base + i}.")
+        prefixes.append(f"layers.{base + i}.")
+        prefixes.append(f"model.language_model.layers.{base + i}.")
+    return tuple(prefixes)
 
 
 def _select_draft_weight_files(
     model_uri: str,
     hf_weights_files: list[str],
+    draft_prefixes: tuple[str, ...],
 ) -> tuple[DraftShardSelection, list[str]]:
     """Return the shards holding the draft's own weights.
 
-    Keeps shards whose index tensors carry a draft prefix. Anything other than
-    SELECTED leaves the caller streaming every shard, so a checkpoint without a
+    Keeps shards whose index tensors start with one of draft_prefixes (DeepSeek's
+    "mtp." plus GLM's config-derived layer names). Anything other than SELECTED
+    leaves the caller streaming every shard, so a checkpoint without a resolvable
     draft head (or without a readable index) is never truncated to nothing.
     """
+    if not draft_prefixes:
+        return DraftShardSelection.NO_DRAFT_WEIGHTS, []
     try:
         index = _load_safetensors_index(model_uri, hf_weights_files)
         if not index:
@@ -162,7 +220,7 @@ def _select_draft_weight_files(
         wanted = {
             fname
             for tname, fname in weight_map.items()
-            if tname.startswith(_DRAFT_WEIGHT_PREFIXES)
+            if tname.startswith(draft_prefixes)
         }
         if not wanted:
             return DraftShardSelection.NO_DRAFT_WEIGHTS, []
@@ -287,7 +345,11 @@ class VllmAdapter(EngineAdapter):
         )
 
         hf_weights_files = loader._prepare_weights(model_uri, revision)
-        selection, subset = _select_draft_weight_files(model_uri, hf_weights_files)
+        config = _load_config(model_uri, hf_weights_files)
+        draft_prefixes = _DRAFT_WEIGHT_PREFIXES + _mtp_layer_prefixes(config)
+        selection, subset = _select_draft_weight_files(
+            model_uri, hf_weights_files, draft_prefixes
+        )
         if selection is DraftShardSelection.UNRESOLVED:
             logger.warning(
                 "[draft] could not resolve draft-only shards from %s for %s; "
@@ -299,10 +361,11 @@ class VllmAdapter(EngineAdapter):
             return loader._get_weights_iterator(model_uri, revision)
         if selection is DraftShardSelection.NO_DRAFT_WEIGHTS:
             logger.info(
-                "[draft] %s for %s contains no mtp. tensors; streaming all "
-                "%d shards",
+                "[draft] %s for %s contains no draft tensors (checked prefixes "
+                "%s); streaming all %d shards",
                 _SAFETENSORS_INDEX_NAME,
                 model_uri,
+                draft_prefixes,
                 len(hf_weights_files),
             )
             return loader._get_weights_iterator(model_uri, revision)
