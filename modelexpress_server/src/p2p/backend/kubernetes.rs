@@ -879,8 +879,8 @@ mod tests {
     fn worker_status_topology_survives_serde_round_trip() {
         // The k8s backend stores WorkerStatus as CR JSON, so a non-empty
         // topology must survive the round trip. The deployed CRD schema must
-        // also carry status.worker.topology (examples/crds.yaml and
-        // ci/k8s/server/crd-modelmetadata.yaml) or the API server prunes it.
+        // also carry status.worker.topology (examples/crds.yaml) or the API
+        // server prunes it.
         let status = WorkerStatus {
             topology: std::collections::HashMap::from([
                 ("rack".to_string(), "r3".to_string()),
