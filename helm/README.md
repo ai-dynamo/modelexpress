@@ -289,7 +289,7 @@ helm uninstall my-modelexpress
 
 The chart defaults to a non-root pod, so it requires an image whose `USER` is a
 numeric non-root uid. Images built before that `USER` directive was added to
-`docker/Dockerfile` (0.4.0 and earlier) run as root and are rejected by the
+`docker/Dockerfile` (every tag published before this change) run as root and are rejected by the
 kubelet before the container ever starts. Either use a newer image, or -- if you
 must stay on an older one -- override the uid the chart requests:
 
