@@ -34,10 +34,12 @@ are the point, not decoration.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import errno
 import logging
 import os
 import threading
+import time
 
 from . import envs
 
@@ -54,6 +56,89 @@ _CANDIDATE_BUCKETS = (0, 1, 2, 4, 8, 16, 32, 64, 128)
 #: ``mx_p2p_list_sources_total`` outcomes. A closed three-value enum, so the
 #: family is bounded no matter how the backend misbehaves.
 LIST_SOURCES_RESULTS = ("ok", "empty", "error")
+
+# Classified at the assignment sites in nixl_transfer, never at the consumer: the
+# underlying field is a formatted free-text string, so classifying it later would
+# mean parsing prose into a label and the domain would grow with the wording.
+NIXL_ERROR_KINDS = ("timeout", "status_error")
+
+# What a receive actually moved. `partial` is the dangerous one: the transfer
+# reports success while some locally registered tensors keep their dummy values.
+# `rejected` is the strict-mode refusal, which raises rather than returning; it is
+# counted so the family is a complete partition of receives rather than of
+# successful ones.
+NIXL_RECEIVE_RESULTS = ("complete", "partial", "empty", "rejected")
+
+#: Hour-scale buckets, matching ``buckets::XSLOW`` on the Rust side value for
+#: value. A cold DeepSeek-V3 load runs roughly forty minutes, so a band topping
+#: out below an hour cannot represent the case the timing exists to explain.
+#: Deliberately identical across the two languages: a server-side download and a
+#: client-side load are compared against each other on the same dashboard, and
+#: quantiles from differently-bucketed histograms are not comparable.
+#:
+#: The three boundaries below 5 s are not padding. Without them every fast load
+#: shared one bucket and histogram_quantile interpolated across ``[0, 5]``,
+#: reporting p50 2.50 and p95 4.75 for a load measured at 3.80 s -- values that
+#: are ``q * 5`` rather than anything observed. A small model, a warm cache and a
+#: working P2P transfer are all sub-5 s.
+_XSLOW_BUCKETS = (0.5, 1, 2.5, 5, 15, 30, 60, 120, 300, 600, 900, 1200, 1800, 2700, 3600)
+
+#: Engines that host the loader. Closed enum with an ``other`` fallback so an
+#: out-of-tree adapter cannot open the label domain.
+LOAD_ENGINES = ("vllm", "sglang", "trtllm", "other")
+
+#: A speculative draft model is loaded through the same path as the model the
+#: user asked for and takes materially less time, so mixing the two makes the
+#: p99 of neither meaningful.
+LOAD_MODEL_ROLES = ("main", "draft", "other")
+
+#: The four phases of a load, in the order they run. They partition the L0 span:
+#: every one is a disjoint interval inside ``load_model()``, so their sum is
+#: bounded by the total and no duration is counted twice.
+#:
+#:   artifact_install  compile-cache artifacts fetched before the model exists
+#:   model_init        the engine builds the module with dummy weights
+#:   chain             the strategy chain fills those weights -- L2 lives here
+#:   publish           this rank offers itself as a source to the next one
+LOAD_PHASES = ("artifact_install", "model_init", "chain", "publish")
+
+#: Terminal outcomes of a load. A load either returns a model or raises.
+LOAD_OUTCOMES = ("success", "error")
+
+#: Longest model id kept in the ``model`` label; longer ones are truncated.
+#:
+#: This is the one label on the load families whose domain is NOT a closed enum,
+#: and the distinction is worth being explicit about. Every other label here is
+#: bounded by code -- an unrecognized engine clamps to ``other``, an unknown
+#: phase is dropped. A model id is whatever the deployment chose to serve, so
+#: this label is bounded by *convention*: an organization runs a finite catalogue
+#: of models, and that set changes on the timescale of deployments rather than
+#: of requests.
+#:
+#: It costs nothing in practice. A process serves exactly one model, so the label
+#: is constant within a pod, and Prometheus already attaches ``pod`` to every
+#: series -- ``model`` names a dimension the data carries anyway rather than
+#: multiplying it. Measured on a three-pod fleet: 18 series per pod either way.
+#:
+#: What it is not is ``source_worker_id`` (see the selection-skew note): that was
+#: a uuid minted fresh per process, so its domain grew with process count
+#: forever. A model id is stable across restarts.
+#:
+#: Truncation can in principle collide two long ids that share a prefix. Accepted
+#: over dropping the label: a merged pair of near-identical ids still says more
+#: than no model at all, and 96 characters clears every id in the wild by a wide
+#: margin.
+_MODEL_LABEL_MAX = 96
+
+
+def _model_label(name: object) -> str:
+    """Clamp a model id to something safe to use as a label value."""
+    if not name:
+        return "unknown"
+    text = str(name).strip()
+    if not text:
+        return "unknown"
+    return text[:_MODEL_LABEL_MAX]
 
 
 def _enabled() -> bool:
@@ -253,6 +338,22 @@ class MetricsCollector:
             ["policy", "scheme", "result"],
             registry=registry,
         )
+        self.nixl_errors = Counter(
+            "mx_nixl_data_plane_errors_total",
+            "NIXL data-plane failures by classified kind: timeout|status_error. "
+            "A non-zero rate is what demotes an agent from READY.",
+            ["scheme", "kind"],
+            registry=registry,
+        )
+        self.nixl_receives = Counter(
+            "mx_nixl_receive_total",
+            "Receive outcomes: complete|partial|empty|rejected. `partial` and "
+            "`empty` both return success today, so they are otherwise "
+            "indistinguishable from a healthy transfer; `rejected` is the "
+            "strict-mode refusal, which raises instead of returning.",
+            ["scheme", "result"],
+            registry=registry,
+        )
         self.candidates = Histogram(
             "mx_p2p_candidates",
             "Candidate count at a selection stage.",
@@ -272,6 +373,32 @@ class MetricsCollector:
             "End-to-end transfer time in seconds.",
             ["policy", "scheme", "outcome"],  # success|retry|fallback
             buckets=(0.5, 1, 2, 5, 10, 30, 60, 120, 300),
+            registry=registry,
+        )
+        # L0. The window the caller actually waited on: one observation per
+        # load_model() call. Not the full inference cold start -- CUDA graph
+        # capture, JIT compilation and KV cache setup all happen after this
+        # returns, and Dynamo already measures that end to end.
+        self.load_seconds = Histogram(
+            "mx_load_seconds",
+            "Model load duration in seconds: the load_model() window. Excludes "
+            "CUDA graph capture, JIT and KV cache setup, which run after the "
+            "loader returns and are measured by the engine.",
+            ["engine", "model", "model_role", "scheme", "outcome"],
+            buckets=_XSLOW_BUCKETS,
+            registry=registry,
+        )
+        # L1. Disjoint sub-intervals of the L0 span, so sum(L1) <= L0 by
+        # construction rather than by convention. Recording a phase from more
+        # than one site would break that, which is why the timing lives in the
+        # loader and not in the functions each phase calls.
+        self.load_phase_seconds = Histogram(
+            "mx_load_phase_seconds",
+            "Duration of one phase of a model load: artifact_install, "
+            "model_init, chain or publish. The phases partition the load, so "
+            "their sum is bounded by mx_load_seconds.",
+            ["engine", "model", "phase", "scheme"],
+            buckets=_XSLOW_BUCKETS,
             registry=registry,
         )
 
@@ -466,6 +593,37 @@ class MetricsCollector:
             except Exception:
                 pass
 
+    def record_nixl_error(self, kind: str) -> None:
+        """Record a NIXL data-plane failure by classified kind.
+
+        Unrecognized values clamp to ``status_error`` so the label stays a closed
+        enum; the free-text message stays in the log, never in a label.
+        """
+        if self._ensure():
+            try:
+                if kind not in NIXL_ERROR_KINDS:
+                    kind = "status_error"
+                self.nixl_errors.labels(self.scheme, kind).inc()
+            except Exception:
+                pass
+
+    def record_nixl_receive(self, result: str) -> None:
+        """Record the outcome of one receive.
+
+        ``complete``, ``partial`` and ``empty`` all return success to the caller,
+        so without this a transfer that moved nothing and one that moved
+        everything are the same observation. ``rejected`` is the strict-mode
+        refusal, which raises instead of returning; counting it makes the family
+        a partition of *every* receive rather than only the ones that returned.
+        """
+        if self._ensure():
+            try:
+                if result not in NIXL_RECEIVE_RESULTS:
+                    result = "empty"
+                self.nixl_receives.labels(self.scheme, result).inc()
+            except Exception:
+                pass
+
     def observe_candidates(self, policy: str, stage: str, count: int) -> None:
         if self._ensure():
             try:
@@ -486,6 +644,88 @@ class MetricsCollector:
                 self.transfer_seconds.labels(policy, self.scheme, outcome).observe(seconds)
             except Exception:
                 pass
+
+    def observe_load_seconds(
+        self, engine: str, model: object, model_role: str, outcome: str, seconds: float
+    ) -> None:
+        """Record one completed load (L0).
+
+        Unrecognized label values clamp rather than raise, so an out-of-tree
+        engine adapter contributes an ``other`` observation instead of opening
+        the label domain or losing the measurement. ``model`` is clamped by
+        length rather than to an enum -- see ``_model_label``.
+        """
+        if self._ensure():
+            try:
+                if engine not in LOAD_ENGINES:
+                    engine = "other"
+                if model_role not in LOAD_MODEL_ROLES:
+                    model_role = "other"
+                if outcome not in LOAD_OUTCOMES:
+                    outcome = "error"
+                self.load_seconds.labels(
+                    engine, _model_label(model), model_role, self.scheme, outcome
+                ).observe(seconds)
+            except Exception:
+                pass
+
+    def observe_load_phase_seconds(
+        self, engine: str, model: object, phase: str, seconds: float
+    ) -> None:
+        """Record one phase of a load (L1).
+
+        An unknown phase is dropped rather than clamped. The phases are supposed
+        to partition the load, and folding a stray name into an existing bucket
+        would inflate that phase's total while leaving the sum looking sound --
+        a wrong number that reads as a right one.
+        """
+        if self._ensure():
+            try:
+                if phase not in LOAD_PHASES:
+                    return
+                if engine not in LOAD_ENGINES:
+                    engine = "other"
+                self.load_phase_seconds.labels(
+                    engine, _model_label(model), phase, self.scheme
+                ).observe(seconds)
+            except Exception:
+                pass
+
+    @contextlib.contextmanager
+    def time_load(self, engine: str, model: object, model_role: str):
+        """Time one load and record its outcome (L0).
+
+        Records on the way out of both paths. A load that raises is the case the
+        timing exists to explain, so leaving it unrecorded would drop exactly the
+        observations worth having.
+        """
+        start = time.perf_counter()
+        try:
+            yield
+        except BaseException:
+            self.observe_load_seconds(
+                engine, model, model_role, "error", time.perf_counter() - start
+            )
+            raise
+        self.observe_load_seconds(
+            engine, model, model_role, "success", time.perf_counter() - start
+        )
+
+    @contextlib.contextmanager
+    def time_load_phase(self, engine: str, model: object, phase: str):
+        """Time one phase of a load (L1).
+
+        A phase that raises is still recorded: the elapsed time was really spent
+        inside the L0 span, and omitting it would make the phases stop summing to
+        the whole on precisely the failed loads being investigated.
+        """
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.observe_load_phase_seconds(
+                engine, model, phase, time.perf_counter() - start
+            )
 
 
 metrics = MetricsCollector()

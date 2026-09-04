@@ -1,11 +1,17 @@
----
-description: ModelExpress project rules and coding standards
-alwaysApply: true
----
-
 # ModelExpress
 
 Rust-based model cache management service and GPU-to-GPU weight transfer system using NVIDIA NIXL over RDMA.
+
+This file holds the always-on rules for every AI coding agent working in this repository. Multi-step procedures live as skills under `.agents/skills/` and load on demand. Both are shared across tools:
+
+| Tool | Always-on rules | Skills |
+|---|---|---|
+| Codex | `AGENTS.md` (native) | `.agents/skills/` (native) |
+| Cursor | `AGENTS.md` (native) | `.agents/skills/` (native) |
+| Claude Code | `CLAUDE.md` imports this file via `@AGENTS.md` | `.claude/skills/<name>` symlinks into `.agents/skills/<name>` |
+| GitHub Copilot | Coding agent reads `AGENTS.md`; Copilot Chat is pointed here by `.github/copilot-instructions.md` | via `AGENTS.md` pointers below |
+
+Edit `AGENTS.md` or the skill; never add a tool-specific copy. When a section here grows into a procedure, move it to a skill and list it below.
 
 **Reference documentation:**
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) - Project structure, crate catalog, gRPC services, server internals, Python client, NIXL integration
@@ -51,42 +57,34 @@ pre-commit run --all-files  # All files (recommended after significant changes)
 
 Hooks: `cargo fmt`, `cargo clippy` (--fix), `cargo check`, trailing whitespace, end-of-file, YAML/TOML/JSON validation, merge conflict detection, large file check.
 
-## Adding CLI Arguments
+## Procedures (skills)
 
-Client CLI arguments are defined in a shared struct to avoid duplication:
+Load the matching skill before starting any of these. Each is a `SKILL.md` under `.agents/skills/`:
 
-1. **Add to `ClientArgs`** in `modelexpress_common/src/client_config.rs`
-   - Single source of truth for shared arguments
-   - Register the variable name in `modelexpress_common/src/envs.rs` and reference the constant: `#[arg(long, env = crate::envs::MODEL_EXPRESS_...)]` (never a bare string literal, so the CLI and the `envs` getters cannot drift). All env-var names live in `modelexpress_common/src/envs.rs` (Rust) and `modelexpress/envs.py` (Python).
-   - Do NOT use `-v` short flag (reserved for CLI's verbose)
-
-2. **Update `ClientConfig::load()`** in the same file
-   - Add override logic in the "APPLY CLI ARGUMENT OVERRIDES" section
-
-3. **Do NOT duplicate in `Cli`** (`modelexpress_client/src/bin/modules/args.rs`)
-   - `Cli` embeds `ClientArgs` via `#[command(flatten)]`
-   - Only add CLI-specific arguments there (e.g., `--format`, `--verbose`)
-
-4. **Add tests** in the `tests` module of `client_config.rs`
-
-## Adding gRPC Services
-
-1. Define the service in a `.proto` file under `modelexpress_common/proto/`
-2. Add the proto file to `modelexpress_common/build.rs` compile list
-3. Add the generated module to `modelexpress_common/src/lib.rs` under `pub mod grpc`
-4. Implement the service trait in `modelexpress_server/src/` (new file or existing)
-5. Register the service in `modelexpress_server/src/main.rs` during server startup
+| Task | Skill |
+|---|---|
+| Add or change a client CLI argument or env var | `add-cli-argument` |
+| Add a gRPC service | `add-grpc-service` |
+| Bump the release version or public-image tags | `bump-version` |
+| Commit sign-off and DCO repair | `dco` |
 
 ## Git Workflow
 
 Feature branches use `<username>/feature-name` format, forked from `main`.
+
+### Commits and DCO
+
+- Every commit must carry a `Signed-off-by: Real Name <email>` trailer. Always commit with `git commit -s`. The DCO check is required CI and fails the PR otherwise.
+- Use the contributor's real name and the email configured in `git config user.name` / `user.email`. Check both before committing on an unfamiliar machine.
+- Preserve existing trailers when amending, rebasing, squashing, or cherry-picking. Use `git rebase --signoff` or `git cherry-pick --signoff` only when the person running the command is the one certifying the change.
+- Do not add `Co-Authored-By` or tool-attribution trailers.
+- See the DCO section of `CONTRIBUTING.md` for the full policy.
 
 ## Tips
 
 - Always read files to understand context before making changes.
 - Do not implement changes eagerly. When discussing a problem or new feature, investigate thoroughly first, report findings, propose changes, and ask if they are acceptable before writing code.
 - Flush Redis on redeploy: stale metadata causes P2P transfer failures.
-- Use baseline mode (`MX_CONTIGUOUS_REG=0`) until contiguous region transfers are fixed.
 - Long startup times are normal: DeepSeek-V3 takes ~40 min to warm up.
 - Set `UCX_LOG_LEVEL=DEBUG` for NIXL/RDMA diagnostics.
 - NIXL agents must match ranks: source rank 0 -> target rank 0.
@@ -98,13 +96,15 @@ When making changes, update the appropriate documentation files:
 | Change type | Files to update |
 |---|---|
 | Architecture, components, NIXL, gRPC services | `docs/ARCHITECTURE.md` |
-| Coding standards, build commands, new patterns | `CLAUDE.md`, `.github/copilot-instructions.md`, `.cursor/rules/rust.mdc` |
-| CLI arguments or commands | `docs/CLI.md` + all 3 agent files (Adding CLI Arguments section) |
+| Coding standards, build commands, new patterns, agent rules | `AGENTS.md` (the only agent-instruction file; `CLAUDE.md` and `.github/copilot-instructions.md` are pointers) |
+| CLI arguments or commands | `docs/CLI.md` + `.agents/skills/add-cli-argument/SKILL.md` |
 | Configuration, environment variables | `docs/DEPLOYMENT.md` |
 | Deployment (Docker, K8s, Helm, P2P) | `docs/DEPLOYMENT.md` |
 | Known issues, FP8 handling | `docs/ARCHITECTURE.md` |
 | Dev setup, scripts, pre-commit hooks | `CONTRIBUTING.md` |
 | Contribution process, DCO | `CONTRIBUTING.md` |
 | New binary targets, crates, Python modules | `docs/ARCHITECTURE.md` |
+| Version-bump procedure changes | `.agents/skills/bump-version/SKILL.md` |
+| Agent procedures (multi-step how-tos) | `.agents/skills/<name>/SKILL.md` + the Procedures table in `AGENTS.md` |
 
 **A feature is incomplete until documentation is updated.**

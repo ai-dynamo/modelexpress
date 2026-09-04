@@ -140,9 +140,17 @@ spec:
           {{- end }}
           {{- if and .Values.livenessProbe .Values.livenessProbe.enabled }}
           livenessProbe:
+            {{- /*
+              Falls back to service.port so the probe cannot drift from the port
+              the container actually publishes. An explicit tcpSocket still wins,
+              for anyone probing something else.
+            */}}
             {{- if .Values.livenessProbe.tcpSocket }}
             tcpSocket:
               {{- toYaml .Values.livenessProbe.tcpSocket | nindent 14 }}
+            {{- else }}
+            tcpSocket:
+              port: {{ .Values.service.port | default 8001 }}
             {{- end }}
             initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds | default 5 }}
             periodSeconds: {{ .Values.livenessProbe.periodSeconds | default 10 }}
@@ -154,6 +162,9 @@ spec:
             {{- if .Values.readinessProbe.tcpSocket }}
             tcpSocket:
               {{- toYaml .Values.readinessProbe.tcpSocket | nindent 14 }}
+            {{- else }}
+            tcpSocket:
+              port: {{ .Values.service.port | default 8001 }}
             {{- end }}
             initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds | default 5 }}
             periodSeconds: {{ .Values.readinessProbe.periodSeconds | default 10 }}

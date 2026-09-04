@@ -13,3 +13,4 @@ pub mod backend;
 pub mod entry_key;
 pub mod k8s_types;
 pub mod state;
+pub mod stats_refresh;

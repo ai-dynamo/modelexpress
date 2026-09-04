@@ -3,9 +3,9 @@ SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES.
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# ModelExpress Architecture
+# ModelExpress architecture and internals
 
-Detailed reference document for the ModelExpress codebase. For deployment and configuration, see [`DEPLOYMENT.md`](DEPLOYMENT.md). For contribution guidelines and dev setup, see [`CONTRIBUTING.md`](../CONTRIBUTING.md). For coding standards and AI assistant instructions, see `CLAUDE.md`. For CLI usage, see [`CLI.md`](CLI.md). For GCS provider internals, see [`GCS_PROVIDER.md`](GCS_PROVIDER.md).
+This is the implementation reference for the ModelExpress codebase. Start with the [documentation hub](README.md) or [Choose a ModelExpress path](guides/choose-a-path.md) for deployment questions. Use [Configuration](CONFIGURATION.md) for current defaults, [Integrations](integrations/README.md) for runtime setup, and [Troubleshooting](TROUBLESHOOTING.md) for operational symptoms. For contribution guidelines and dev setup, see [`CONTRIBUTING.md`](../CONTRIBUTING.md). For CLI usage, see [`CLI.md`](CLI.md). For GCS provider internals, see [`GCS_PROVIDER.md`](GCS_PROVIDER.md).
 
 ## Project Overview
 
@@ -85,6 +85,14 @@ ModelExpress/
 │       ├── backend_config.rs           # Shared BackendConfig (Redis / K8s) + env parsing
 │       ├── cache.rs                    # CacheEvictionService, LRU policy
 │       ├── services.rs                 # Health, API, Model gRPC services + ModelDownloadTracker
+│       ├── metrics.rs                   # Prometheus registry, mx_build_info, encoding
+│       ├── metrics/
+│       │   ├── exposition.rs            # HTTP/1.1 /metrics listener (separate port)
+│       │   ├── buckets.rs               # Shared histogram bucket boundaries
+│       │   ├── grpc.rs                  # Per-RPC tower layer; in-handler outcomes
+│       │   ├── backend.rs               # Backend op counters and latency
+│       │   ├── registry.rs              # Download claim, lease and status transitions
+│       │   └── cache.rs                 # Eviction reasons and refreshed gauges
 │       ├── p2p/
 │       │   ├── state.rs                # P2pStateManager wrapper
 │       │   ├── service.rs              # P2P gRPC service implementation
@@ -94,21 +102,25 @@ ModelExpress/
 │       │   ├── backend.rs              # MetadataBackend trait + types
 │       │   └── backend/
 │       │       ├── redis.rs            # P2P Redis backend
-│       │       └── kubernetes.rs       # P2P Kubernetes CRD backend
+│       │       ├── kubernetes.rs       # P2P Kubernetes CRD backend
+│       │       └── instrumented.rs     # Metrics decorator over MetadataBackend
 │       ├── refit.rs                     # Refit module exports
 │       ├── refit/
 │       │   ├── service.rs               # Backend-neutral Refit gRPC service
 │       │   ├── backend.rs               # RefitBackend contract and factory
 │       │   └── backend/
-│       │       └── redis.rs             # Redis backend and atomic Lua scripts
+│       │       ├── redis.rs             # Redis backend and atomic Lua scripts
+│       │       └── instrumented.rs      # Metrics decorator over RefitBackend
 │       ├── registry/
 │       │   ├── state.rs                # RegistryManager wrapper
+│       │   ├── stats_refresh.rs        # Background gauge refresh (own interval)
 │       │   ├── backend.rs              # RegistryBackend trait + ModelRecord
 │       │   ├── entry_key.rs            # EntryKey: model + revision + weight mode
 │       │   ├── k8s_types.rs            # ModelCacheEntry CRD type
 │       │   └── backend/
 │       │       ├── redis.rs            # Redis registry backend
-│       │       └── kubernetes.rs       # K8s ModelCacheEntry registry backend
+│       │       ├── kubernetes.rs       # K8s ModelCacheEntry registry backend
+│       │       └── instrumented.rs     # Metrics decorator over RegistryBackend
 │       └── bin/
 │           └── config_gen.rs           # Config file generator/migrator
 │
@@ -172,8 +184,7 @@ ModelExpress/
 │       │   │   ├── mdl.py              # Compatibility shim for vLLM refit
 │       │   │   └── refit/
 │       │   │       ├── __init__.py     # vLLM refit exports
-│       │   │       ├── installer.py    # Mapped Direct Load installer
-│       │   │       └── receiver.py     # Geometry capture and PWAL installation adapter
+│       │   │       └── installer.py    # Mapped Direct Load installer
 │       │   └── sglang/                 # SGLang integration
 │       │       ├── __init__.py
 │       │       ├── adapter.py          # SglangAdapter and context builder
@@ -273,16 +284,26 @@ ModelExpress/
 │   ├── devcontainer.json               # VSCode config: rust-analyzer, port 8001
 │   └── Dockerfile                      # Ubuntu 24.04 dev env
 │
+├── AGENTS.md                           # Always-on rules for all AI coding agents (Codex, Cursor, Copilot, Claude)
+├── CLAUDE.md                           # Claude Code entry point: imports AGENTS.md
+│
+├── .agents/
+│   └── skills/                         # Shared on-demand procedures (SKILL.md), read by Codex and Cursor
+│       ├── add-cli-argument/
+│       ├── add-grpc-service/
+│       ├── bump-version/
+│       └── dco/
+│
+├── .claude/
+│   ├── settings.json                   # Claude Code permissions
+│   └── skills/                         # Symlinks into .agents/skills/ so Claude Code sees the same skills
+│
 ├── .github/
-│   ├── copilot-instructions.md         # GitHub Copilot agent instructions
+│   ├── copilot-instructions.md         # Copilot Chat pointer to AGENTS.md
 │   ├── dco.yml                         # DCO enforcement
 │   └── workflows/
 │       ├── ci.yml                      # CI pipeline
 │       └── codeql.yml                  # Security scanning
-│
-├── .cursor/
-│   └── rules/
-│       └── rust.mdc                    # Cursor agent instructions
 │
 ├── .pre-commit-config.yaml             # Pre-commit hooks config
 └── .coderabbit.yaml                    # CodeRabbit review config
@@ -376,33 +397,217 @@ See [`metadata.md`](metadata.md) for the full metadata architecture including st
 `RefitService` is a new RL-specific control plane. It does not reuse or modify the
 legacy `WeightSyncService`. The initial slice stores worker registrations,
 immutable weight versions, and compact physical shard publications in Redis.
-Weight bytes and full tensor manifests remain on trainer or generator workers.
+NIXL manifest endpoints belong to their physical worker shards; a typed object
+storage source belongs directly to its durable `WeightVersion`. The protocol
+can identify S3, Azure Blob Storage, or GCS, while this initial implementation
+accepts only S3. On the NIXL path, weight bytes and full tensor manifests remain
+on trainer workers. On the S3 path, rank zero uploads the version's global index
+after every trainer rank has uploaded its owned shard. `XOR_DELTA` versions use
+compressed XOR shards; `FULL_HF_CHECKPOINT` versions use native Hugging Face
+safetensor shards and omit `base_version_id`. Frameworks own
+tensor gathering, Hugging Face conversion, and bucketization, then pass a lazy
+canonical bucket stream to the trainer client, which owns delta processing,
+full-checkpoint serialization, and S3 shard construction.
+Full-checkpoint staging uses the same bounded worker-pool pattern as delta
+staging to update the rank-local snapshot directly with immutable CPU tensors.
+`publish()` groups that snapshot into safetensors objects capped by
+`MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` (4 GiB by default) and uploads the
+rank-local objects concurrently. A tensor larger than the cap occupies its own
+object. The trainer does not materialize a temporary HF checkpoint on disk.
+During framework initialization, the same bucket stream seeds only that rank's
+owned seed-checkpoint tensors through direct, concurrent
+`prepare_delta_base()` bucket reads. The first real delta stage uses the
+prepared snapshot without checkpoint I/O.
+Each canonical S3 version owns an exact caller-supplied `object_storage.uri`
+under the configured `uri_prefix`. That URI names the global index; delta shards
+or full-checkpoint safetensors objects are stored as siblings. A delta index's
+`compression_format` selects the receiver's decompressor. The current
+implementation supports Zstandard. Unknown compression formats are rejected
+before shard download. Full versions use a standard safetensors index, carry
+optional per-tensor Adler-32 checksums under tensor-name keys in shard metadata
+when the index declares `checksum_format="adler32"`, and reset the exact base
+for later deltas.
+Canonical S3 versions are retained for rollout fault recovery. Trainer
+processes keep only the current base snapshot; older
+immutable S3 objects are governed by external bucket lifecycle policy.
 
-| RPC | Purpose |
-|-----|---------|
-| `RegisterWorker` | Register or refresh one TTL-bound worker process |
-| `CreateWeightVersion` | Idempotently create one immutable `STAGING` version |
-| `GetWeightVersion` | Read the version and its lifecycle state |
-| `DeleteWeightVersion` | Move a `READY` version to `RELEASING`; existing leases remain valid |
-| `CreateWeightVersionShard` | Publish one worker manifest for a required source slot |
-| `ListWeightVersionShards` | List the version's physical source publications |
-| `DeleteWeightVersionShard` | Evict one source shard after release when no lease protects the version |
-| `RegisterVersionLease` | Acquire protection while a version is `READY`, or renew the same owner's existing protection while it is `READY` or `RELEASING` |
-| `DeleteVersionLease` | Release a generator's protection of the version shards |
+#### RL refit client architecture
 
-The final missing source slot atomically changes the version to `READY`.
-`WeightVersion.uid` is MX's opaque identity. `version_number` is the optional
-framework-provided numeric label used for correlation; MX does not use it as an
-identity or ordering key.
+The RL framework orchestrator calls only the public
+`ModelExpressControlClient`. Framework-native RPCs invoke rank-local trainer and
+generator clients inside their existing actors. Those clients use internal MX
+control-plane and worker APIs; tensor bytes never pass through `RefitService`.
+
+```mermaid
+flowchart LR
+    subgraph Framework["RL framework"]
+        O["RL orchestrator<br/>ModelExpressControlClient"]
+        T["Trainer actor<br/>ModelExpressTrainerClient"]
+        G["Generator actor<br/>ModelExpressGeneratorClient"]
+    end
+
+    S["MX server<br/>RefitService<br/>Redis metadata"]
+    P["MX server<br/>P2pService"]
+
+    subgraph Trainer["Trainer rank"]
+        TR["TrainerRuntime"]
+        TA["Explicit engine context<br/>Megatron or FSDP"]
+        PM["Publication method<br/>full tensor NIXL or canonical checkpoint"]
+        B["Registered source buffers"]
+        M["RefitWorkerService<br/>manifest endpoint"]
+        C["Canonical HF gather<br/>XOR staging"]
+    end
+
+    D["S3<br/>safetensors shards + index"]
+
+    subgraph Generator["Generator rank"]
+        GR["GeneratorRuntime<br/>source policy + session"]
+        SR["Source resolvers<br/>generator, trainer, object storage"]
+        UM["Update methods<br/>full tensor NIXL, canonical checkpoint"]
+        I["Engine installer<br/>vLLM or SGLang"]
+    end
+
+    PG["Peer generator rank<br/>verified canonical buffers"]
+
+    O -->|"Create / Get / Delete / update version state"| S
+    O -->|"Framework-native RPC"| T
+    O -->|"Framework-native RPC"| G
+    T --> TR --> TA --> PM
+    PM --> B
+    PM --> C --> D
+    T -->|"NIXL: register worker; publish shard metadata"| S
+    T --> M
+    G -->|"Register worker; lease version; NIXL: discover shards"| S
+    G -->|"Discover exact-version same-rank peer"| P
+    G --> GR --> SR --> UM --> I
+    G -->|"Fetch exact-version manifest"| M
+    B -->|"NIXL reads"| UM
+    PG -->|"Publish READY version identity"| P
+    PG -->|"Peer manifest + NIXL reads"| UM
+```
+
+`RefitService` is the central metadata service defined by `refit.proto`. It
+coordinates immutable versions, worker registrations, shard advertisements,
+and leases, but it does not discover engine tensor layouts or transfer weights.
+For NIXL, `RefitWorkerService` is the trainer-local manifest endpoint.
+The manifest is an opaque description of the exact published source buffers;
+the generator uses it to compile and validate its receiver-local transfer plan.
+For S3, `WeightVersion.object_storage` identifies the storage type and global
+`model.safetensors.index.json` URI directly; the server validates only this
+typed location and does not contact S3.
+Trainer integrations provide the matching `ObjectStorageConfig` through
+`ModelExpressTrainerConfig.object_storage`; the initial implementation rejects
+providers other than S3 before creating the storage client.
+
+The synchronous generator client returns a staged handle only after transfer
+and verification finish. That handle owns the version lease through graph-safe
+installation; applying the weights or releasing an unapplied handle ends the
+lease. There is no separate asynchronous wait or unimplemented direct-install
+API.
+
+The initial worker manifest channel uses plaintext gRPC and does not authenticate
+the publishing worker. Manifest digests detect corruption but do not establish
+source identity. Deploy RL refit only on a trusted, network-isolated cluster and
+prevent untrusted clients from reaching MX server and worker gRPC endpoints.
+Transport authentication and TLS require a separate protocol and deployment
+design; they are not provided by this implementation.
+
+`GeneratorRuntime` composes three independent seams. Source resolvers discover
+candidate locations without moving bytes; update methods transfer and verify a
+typed artifact without mutating the live engine; the engine installer commits
+that artifact at the caller's safe point. Source fallback and retry limits live
+in the planner/session rather than in engine integrations.
+
+- `nixl_staged_transfer.py` owns exact-manifest decoding, transfer planning,
+  reusable registered buffers, NIXL reads, transforms, and digest verification.
+- `inference/checkpoint_store.py` owns the host-local immutable lineage layout,
+  locking, temporary-directory promotion, atomic JSON persistence, artifact
+  fingerprints, and activation state.
+- `inference/receiver.py` owns canonical S3 downloads, safetensors validation,
+  and XOR reconstruction into derived checkpoints.
+- `inference/engines/vllm/installer.py` owns vLLM load-layout capture and
+  graph-safe installation through vLLM's layerwise reload and post-load path.
+- `inference/engines/sglang/installer.py` reloads a prepared canonical checkpoint
+  through SGLang's native safetensors loader.
+
+The corresponding trainer composition is owned by `TrainerRuntime`. Public
+`FSDPTrainerContext` and `MegatronTrainerContext` select only engine capture;
+full-tensor NIXL and canonical-checkpoint object-storage publication remain separate
+method implementations. This keeps transport, payload preparation, engine
+geometry, and framework orchestration independently replaceable.
+
+| RPC | Request | Response | Purpose |
+|-----|---------|----------|---------|
+| `RegisterWorker` | `RegisterWorkerRequest` | `RegisterWorkerResponse` | Register or refresh one TTL-bound worker process |
+| `CreateWeightVersion` | `CreateWeightVersionRequest` | `CreateWeightVersionResponse` | Idempotently create one immutable `STAGING` or already-published `READY` version |
+| `GetWeightVersion` | `GetWeightVersionRequest` | `GetWeightVersionResponse` | Read the version and its lifecycle state |
+| `DeleteWeightVersion` | `DeleteWeightVersionRequest` | `DeleteWeightVersionResponse` | Cancel a `STAGING` version or move a `READY` version to `RELEASING` for retirement |
+| `UpdateWeightVersionState` | `UpdateWeightVersionStateRequest` | `UpdateWeightVersionStateResponse` | Explicitly update lifecycle state, including S3 `STAGING` to `READY` |
+| `CreateWeightVersionShard` | `CreateWeightVersionShardRequest` | `CreateWeightVersionShardResponse` | Publish one worker manifest for a required source slot |
+| `ListWeightVersionShards` | `ListWeightVersionShardsRequest` | `ListWeightVersionShardsResponse` | List the version's physical source publications |
+| `DeleteWeightVersionShard` | `DeleteWeightVersionShardRequest` | `DeleteWeightVersionShardResponse` | Evict one source shard after release when no lease protects the version |
+| `RegisterVersionLease` | `RegisterVersionLeaseRequest` | `RegisterVersionLeaseResponse` | Acquire or renew protection while installing a version |
+| `DeleteVersionLease` | `DeleteVersionLeaseRequest` | `DeleteVersionLeaseResponse` | Release a generator's protection of the version shards |
+
+`RefitWorkerService.GetWeightVersionShardManifest` is also unary and returns
+`GetWeightVersionShardManifestResponse`; tensor bytes remain on the advertised
+data-plane transport.
+
+The final missing NIXL source slot atomically changes the version to `READY`.
+For S3, the orchestrator marks the version `READY` after publication completes.
+
+Peer generators reuse the existing inference P2P metadata service rather than
+creating a second Refit peer registry. A generator serving an exact version
+publishes its normal `SourceIdentity` with `revision=WeightVersion.uid`; another
+generator queries `P2pService.ListSources` with the same engine-compatible
+identity and selects a READY source for its worker rank before falling back to
+trainer shard publications. Applied generators publish their verified canonical
+staging buffers—not engine-specific packed kernel tensors—under that identity.
+An identical-rank peer pulls those buffers directly with NIXL, then uses the
+same graph-safe engine installer as a trainer update.
+
+An object-storage generator defaults to a same-rank generator peer first and the
+version-level object-storage source second. A memory-backed generator defaults
+to a peer first and trainer manifests second. `source_order` can select or
+reorder supported sources without changing an engine integration.
+
+The canonical receiver retains each full checkpoint and delta payload under its
+version, then writes a resolved chain manifest. A full target is directly
+installable. The first delta after a full checkpoint copies that immutable full
+checkpoint into a version-scoped derived checkpoint. Later sequential deltas
+rename the active materialization and apply only the incoming XOR delta in
+place, avoiding another full-model copy. Canonical artifacts are never modified
+during reconstruction, and derived checkpoints can be rebuilt from the lineage.
+If an in-place delta fails, the cache remains `UPDATING` until initialization
+rebuilds it; the running engine retains its previously installed weights.
+
+Under the local checkpoint lock, preparation state advances from `READY` to
+`UPDATING` before artifact construction and back to `READY(target)` only after
+verification. `active.json` is a separate commit point: it advances only after
+the engine installer returns successfully. Download, reconstruction, and install
+failures therefore retain the previously active engine version and immutable
+lineage. A separate installation fence is shared by co-located installers and
+exclusive to preparation, so preparation cannot enter between engine reload and
+activation.
+
+`WeightVersion.uid` is MX's opaque version identity. A create request may supply
+the UID; MX generates one when it is omitted. Creating another version with an
+already-used caller-supplied UID returns `ALREADY_EXISTS`. For an `XOR_DELTA`,
+`base_version_id` identifies the base version's UID. The canonical index records
+these UID strings as `metadata.version` and `metadata.base_version`. MX assigns
+no numeric ordering and requires no version-directory naming convention; the
+exact `object_storage.uri` identifies the version's global index.
 `WeightVersionShard` remains the name of the per-worker manifest publication.
 Its identity is `(version_id, worker_id, source_slot_id)`: `source_slot_id`
 identifies the required, version-scoped source contribution it covers, and
 `worker_id` identifies the publishing process. The trainer engine adapter
 derives the slot from its native topology; the Megatron adapter uses
-`publisher:global-rank:12` for global rank 12. The orchestrator uses the same
-adapter-defined convention when declaring the version's expected slots. Multiple
-publications may advertise the same source slot, including a replacement worker
-or a generator that becomes a peer source. Deployments configured with
+the logical tensor names and shard geometry, excluding physical process and DP
+replica identity. The orchestrator deduplicates those adapter-defined slots when
+declaring the version's expected contributions. Multiple DP workers may therefore
+advertise the same source slot; generators rotate through those publications on
+transfer retry. Each shard carries its trainer-local `manifest_endpoint`.
+Deployments configured with
 Kubernetes or the test-only memory backend do not expose `RefitService` yet.
 
 `RegisterWorker` is also the heartbeat API. `worker_id` is a fresh process
@@ -436,14 +641,27 @@ end-to-end backend slice implementing the same transaction boundaries.
 1. Parse CLI args (`ServerArgs` via clap)
 2. Load config (`ServerConfig::load()`) - CLI > env vars > config file > defaults
 3. Initialize structured logging (tracing-subscriber)
-4. Connect to the model registry backend (`MX_METADATA_BACKEND` — same selector as P2P). Fails fast on connect error.
-5. Initialize the process-wide `ModelDownloadTracker` with the registry, seed the `MODEL_TRACKER` OnceLock
-6. Start `CacheEvictionService` background task (reads the same registry)
-7. Connect to the P2P metadata backend (`MX_METADATA_BACKEND`, Redis or Kubernetes CRD)
-8. Start reaper background task for stale source detection and GC
-9. Register the configured gRPC services with tonic (max message size: 100MB)
-10. Listen on configured address (default `0.0.0.0:8001`)
-11. Graceful shutdown on CTRL+C (signals cache eviction service and reaper)
+4. Build the Prometheus registry and register every metric family, then start the
+   `/metrics` listener on its own port. Deliberately before anything that can
+   fail, so a scrape proves the exporter came up even on a server that never
+   reaches a healthy state. A bind failure logs and continues rather than
+   aborting startup.
+5. Connect to the model registry backend (`MX_METADATA_BACKEND` — same selector as P2P). Fails fast on connect error.
+6. Initialize the process-wide `ModelDownloadTracker` with the registry, seed the `MODEL_TRACKER` OnceLock
+7. Start `CacheEvictionService` background task (reads the same registry)
+8. Connect to the P2P metadata backend (`MX_METADATA_BACKEND`, Redis or Kubernetes CRD)
+9. Start reaper background task for stale source detection and GC
+10. Start the registry-statistics refresh task (`MX_REGISTRY_STATS_INTERVAL_SECS`,
+    default 60). Independent of `CacheEvictionService`: that one ticks hourly and
+    is skipped entirely when eviction is disabled, which would leave the gauges
+    permanently absent.
+11. Register the configured gRPC services with tonic (max message size: 100MB),
+    wrapped in the per-RPC metrics layer
+12. Listen on configured address (default `0.0.0.0:8001`)
+13. Graceful shutdown on CTRL+C: signals the cache eviction service, the reaper
+    and the statistics refresh, then joins them. The `/metrics` listener stops
+    **last**, after the gRPC server has drained, so the drain window stays
+    scrapeable.
 
 ### ServerConfig
 
@@ -661,15 +879,39 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 | `metadata/` | Metadata publishing, source identity, heartbeat, worker manifest serving, metadata client selection, and engine-agnostic cache-artifact transfer |
 | `load_strategy/` | Engine-neutral loading strategy chain: `RdmaStrategy`, `ServerCacheStrategy` (weights streamed from MX Server), `InstantTensorStrategy` (fast local safetensors), `ModelStreamerStrategy` (S3/GCS/Azure/local), `GdsStrategy`, `DefaultStrategy` |
 | `model_client.py` | `ModelCacheClient` - `ModelService` RPCs plus stream validation for server-cached models |
-| `model_snapshot.py` | Hugging Face cache layout: path validation, atomic snapshot publication, `refs/main` |
+| `model_snapshot.py` | Hugging Face cache layout: path validation, atomic snapshot publication, revision refs |
 | `model_prefetch.py` | Pre-engine metadata prefetch and repo-id resolution for server-backed loading |
-| `engines/vllm/` | `VllmAdapter` and `MxModelLoader` map strategy hooks to vLLM loader APIs; `refit/` contains the vLLM-specific MDL installer and geometry-capture/PWAL receiver |
+| `engines/vllm/` | `VllmAdapter` and `MxModelLoader` map strategy hooks to vLLM loader APIs; `refit/` contains the separate vLLM-specific MDL installer |
 | `engines/sglang/` | `SglangAdapter` and `MxModelLoader` - maps strategy hooks to SGLang's `remote_instance` backend |
 | `tensor_utils.py` | Tensor collection, checksums, storage views, `capture_tensor_attrs` |
 | `rank_utils.py` | `get_global_rank`, `get_worker_rank` |
 | `vllm_worker.py` | `ModelExpressWorker` - compatibility worker class for older manual-registration workflows |
 | `types.py` | `TensorDescriptor`, `WorkerMetadata`, `GetMetadataResponse` dataclasses |
 | `p2p_pb2.py` / `p2p_pb2_grpc.py` | Generated protobuf/gRPC stubs |
+
+RL framework integrations live in the separate `modelexpress_rl` package:
+
+| Module | Purpose |
+|--------|---------|
+| `control.py` | Public orchestrator client for creating, reading, and retiring immutable weight versions |
+| `train/client.py` | Public rank-local trainer lifecycle and control-plane registration |
+| `train/runtime.py` | Trainer publication composition, bound tensor state, and transport-resource ownership |
+| `train/context.py` | Public explicit Megatron and FSDP engine selection |
+| `train/methods/` | Independent full-tensor NIXL and canonical-checkpoint publication methods |
+| `train/engines/megatron/selection.py` | Megatron-Bridge mapping and tensor-selection translation into MX publication specs |
+| `train/engines/megatron/adapter.py` | Stable in-place Megatron tensor registration and manifest construction |
+| `train/engines/fsdp/adapter.py` | FSDP/DTensor source capture with in-place or device-copy staging |
+| `inference/client.py` | Rank-local generator lifecycle, leases, exact-version source discovery, staging, and apply |
+| `inference/runtime.py` | Generator source policy, method/resource composition, and update-session ownership |
+| `inference/source/` | Independent generator-peer, trainer-memory, and object-storage discovery |
+| `inference/methods/` | Independent full-tensor NIXL and canonical-checkpoint preparation |
+| `inference/checkpoint_store.py` | Host-local immutable lineage, locking, temporary-directory promotion, atomic JSON persistence, artifact fingerprints, and activation state |
+| `inference/receiver.py` | Canonical S3 index/shard decoding, full-checkpoint validation, and XOR reconstruction into derived checkpoints |
+| `inference/nixl_staged_transfer.py` | Private engine-neutral exact-manifest NIXL planning, transfer, reusable buffers, and verification |
+| `inference/engines/sglang/` | SGLang context and native checkpoint installer |
+| `inference/engines/vllm/context.py` | Public typed vLLM objects passed to `ModelExpressGeneratorClient.initialize()` |
+| `inference/engines/vllm/installer.py` | Private vLLM load-layout capture plus graph-safe tensor or prepared-checkpoint installation |
+| `inference/engines/vllm/weight_transfer_engine.py` | Native vLLM weight-transfer bridge for NIXL full-tensor and canonical S3 checkpoint refit |
 
 ### MxClient
 
@@ -704,9 +946,37 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 
 Thin orchestration layer that delegates to `LoadStrategyChain.run()`. Builds a `LoadContext` from vLLM config, initializes the model, runs the strategy chain, and updates global registries.
 
-**MTP two-pass load.** Multi-token-prediction models (Qwen3.5 MTP, DeepSeek MTP) call the loader twice on one worker: the target, then the draft head. `_is_speculative_draft()` detects the second pass via `model_config.runner_type == "draft"` and sets `ctx.p2p_enabled = False`. A P2P draft would collide on the target's NIXL metadata port, and since the merged draft shares the target's `SourceIdentity` it could poison source discovery, so registration, publication, and RDMA stay off for the draft while the target keeps serving. The draft loads through the ModelStreamer/default path. To avoid re-reading the whole checkpoint for a small head, `build_model_streamer_weight_iter` streams only the shards holding the draft's tensors: it reads `model.safetensors.index.json` from the directory of the shards `_prepare_weights` already resolved, which is what makes a Hugging Face model ID work, and falls back to the model URI itself (local directory, then the runai streamer's `pull_files`) for object storage. It keeps shards whose tensor names start with `mtp.`. The draft's embedding and `lm_head` come from the target, so they are not streamed. An index that holds no `mtp.` tensors is expected on a checkpoint without a draft head and streams every shard; an index that cannot be resolved at all logs a warning and also streams every shard.
+**MTP two-pass load.** Multi-token-prediction models (Qwen3.5 MTP, DeepSeek MTP) call the loader twice on one worker: the target, then the draft head. `_is_speculative_draft()` detects the second pass via `model_config.runner_type == "draft"` and sets `ctx.p2p_enabled = False`. A P2P draft would collide on the target's NIXL metadata port, and since the merged draft shares the target's `SourceIdentity` it could poison source discovery, so registration, publication, and RDMA stay off for the draft while the target keeps serving. The draft uses the remaining eligible non-P2P strategies: server cache, InstantTensor, ModelStreamer, GDS, or the runtime's native loader. To avoid re-reading the whole checkpoint for a small head, `build_model_streamer_weight_iter` streams only the shards holding the draft's tensors: it reads `model.safetensors.index.json` from the directory of the shards `_prepare_weights` already resolved, which is what makes a Hugging Face model ID work, and falls back to the model URI itself (local directory, then the runai streamer's `pull_files`) for object storage. It keeps shards whose tensor names start with `mtp.`. The draft's embedding and `lm_head` come from the target, so they are not streamed. An index that holds no `mtp.` tensors is expected on a checkpoint without a draft head and streams every shard; an index that cannot be resolved at all logs a warning and also streams every shard.
 
 ### vLLM Refit Installation
+
+The vLLM integration exposes engine installation and full-tensor target geometry
+to `GeneratorRuntime`; it does not select a transport or source. Runtime
+composition adds the NIXL full-tensor method when generator or trainer memory is
+requested and adds the canonical-checkpoint method when object storage is
+configured. XOR deltas mutate an exact base; full HF checkpoints stream tensors
+into the existing mmap-backed checkpoint and become the base for later deltas.
+Both methods feed the shared private installer, which commits staged tensors or
+reloads a prepared checkpoint through vLLM's graph-safe layerwise reload path.
+
+The ModelExpress vLLM plugin registers one `modelexpress` native weight-transfer
+backend for both paths. An empty initialization payload preserves the existing
+NIXL path. The payload can override the logical ModelExpress model name when it
+differs from vLLM's model path. Supplying `object_storage_type` with the READY
+seed-base version ID, seed checkpoint path, and refit checkpoint directory
+selects the object-storage path; the initial implementation accepts only `S3`. The payload
+can also override the MX server through `server_url` and the storage connection
+through `object_storage_endpoint_url` and `object_storage_region_name`. Each
+update carries the opaque MX `version_id`.
+`start_weight_update()` opens the update window, `receive_weights()` stages and
+applies the version through `ModelExpressGeneratorClient`, and
+`finish_weight_update()` releases its staged handle. Draft-model updates remain
+unsupported, and trainer-pushed bytes are ignored because trainers publish
+WeightVersions through `ModelExpressTrainerClient`. After a successful apply,
+the bridge merges staging
+and installation metrics and logs each numeric `perf/` phase as a separate INFO
+line in deterministic key order. `perf/mx_receive_stage_weight_time` covers the
+complete `ModelExpressGeneratorClient.stage_weight()` wall-clock call.
 
 `engines/vllm/refit/MdlLoader` implements Mapped Direct Load (MDL) for tensors that have already
 been translated into the inference model's naming and numerical format. The
@@ -730,10 +1000,10 @@ trainer tensors. Those stages provide the translated tensor stream and use
 `MdlLoader.load_weights()` as the final installation callback.
 
 The package boundary is intentional: timing and future install-plan contracts
-belong in engine-agnostic `modelexpress.refit`, while vLLM loader observation,
-placement, PWAL interaction, and direct installation belong in
-`modelexpress.engines.vllm.refit`. RL-framework orchestration and trainer
-adapters are separate integrations rather than part of this vLLM installer.
+belong in engine-agnostic `modelexpress.refit`, while RL-specific vLLM loader
+observation, placement, PWAL interaction, and installation belong in
+`modelexpress_rl.inference.engines.vllm`. Trainer adapters are separate from
+the inference-engine integration.
 
 ### No-gather Refit Resharding
 
@@ -753,13 +1023,13 @@ STALE. Long-lived framework integrations still need to call `close()` from
 their lifecycle; SIGKILL and mid-transfer failure recovery remain follow-up
 work.
 
-`engines/vllm/refit/receiver.py` supplies the vLLM-specific boundaries: capture
-on an unquantized meta twin, then installation through vLLM's layerwise reload
-and `process_weights_after_loading` path. Unsupported loader operations fail
-closed because the full-pull fallback is not implemented yet. The compiled
-plan currently assumes a stable source cohort, shard layout, and registration
-addresses; topology-epoch invalidation is a follow-up requirement before
-elastic production use.
+`modelexpress_rl/inference/nixl_staged_transfer.py` owns exact-manifest planning,
+registered staging buffers, transfer, and verification. The vLLM-specific
+`installer.py` captures geometry on an unquantized meta twin and installs verified
+tensors through vLLM's layerwise reload and `process_weights_after_loading` path.
+The adapter composes those modules and rebuilds the plan when validated source
+manifests change; an incompatible destination staging layout requires an engine
+restart.
 
 See the [RL weight refit overview](../modelexpress_client/python/modelexpress/refit/README.md)
 for the end-to-end design, integration contract, implementation status, and
@@ -789,7 +1059,7 @@ Auto-detects the best loading strategy with a prioritized chain. Each strategy i
 
 | Priority | Strategy | `is_available()` | Behavior |
 |---|---|---|---|
-| p0 | `RdmaStrategy` | NIXL available | `ListSources(READY)`, filter by `worker_rank` and runtime `accelerator`, order the survivors via the configured `SourceSelector` (`MX_P2P_SOURCE_SELECTOR`: `random` default or `rendezvous_hash`), then try candidates (max 3). Filtering before the retry slice prevents incompatible sources from exhausting the retry budget; a post-`GetMetadata` accelerator check remains as defense-in-depth. Before preparing target tensors, P2P sources must serve a manifest for the selected runtime `worker_id`; generation mismatches and transfer failures retry the next candidate, reinitializing the target first when it may have been mutated. |
+| p0 | `RdmaStrategy` | NIXL available | `ListSources(READY)`, filter by `worker_rank` and runtime `accelerator`, order the survivors via the configured `SourceSelector` (`MX_P2P_SOURCE_SELECTOR`: `random` default, `rendezvous_hash`, or `topology_aware`), then try candidates (max 3). Filtering before the retry slice prevents incompatible sources from exhausting the retry budget; a post-`GetMetadata` accelerator check remains as defense-in-depth. Before preparing target tensors, P2P sources must serve a manifest for the selected runtime `worker_id`; generation mismatches and transfer failures retry the next candidate, reinitializing the target first when it may have been mutated. |
 | p1 | `ServerCacheStrategy` | `MODEL_EXPRESS_NO_SHARED_STORAGE` enabled + server address configured + adapter implements `load_via_native` | Stream the model's weight files from ModelExpress Server into the snapshot the engine already resolved, then hand off to the engine's native loader. The cold-miss path for workers with no route to Hugging Face: the server downloads and caches the model once, and every later worker is served from that cache. Non-weight files arrive earlier, before the engine starts — see [Server-Backed Model Cache](#server-backed-model-cache). Falls through on failure. |
 | p2 | `InstantTensorStrategy` | `MX_INSTANT_TENSOR` enabled (default) + `instanttensor` installed + CUDA device + adapter implements `build_instanttensor_weight_iter` (and `apply_weight_iter`) | Load the model's own safetensors directly onto CUDA via the `instanttensor` library (distributed loading, pipelined prefetch, direct I/O, GDS when available). Reuses vLLM's built-in `--load-format instanttensor` path, so it needs no `MX_MODEL_URI`; the engine resolves and (if needed) downloads the weight files. Falls through on failure. |
 | p3 | `ModelStreamerStrategy` | `MX_MODEL_URI` set + `runai_model_streamer` installed | Stream safetensors to GPU via CPU staging buffer. `MX_MODEL_URI` accepts remote URIs (`s3://`, `gs://`, `az://`), absolute local paths, or HF model IDs (resolved via `HF_HUB_CACHE`). All storage backends (S3, GCS, Azure) included by default. |
@@ -813,11 +1083,13 @@ So the two halves are fetched separately:
 
 Fetching metadata unconditionally does not weaken P2P-first, because no weight moves on that path — a live source still serves every byte of the weights.
 
-`model_client.py` wraps the `ModelService` RPCs (`EnsureModelDownloaded`, `ListModelFiles`, `StreamModelFiles`) and validates the stream: chunk offsets must be contiguous, sizes must match the manifest, and every listed file must arrive before the final marker. `model_snapshot.py` owns the local layout, writing `refs/main` alongside `snapshots/<commit>/` — without that ref, `snapshot_download(local_files_only=True)` cannot resolve a repo id no matter how complete the snapshot is. Metadata is published by renaming a staging directory; weights are added to the live snapshot one atomic rename at a time, and a failure part-way through rolls back the files it already published rather than leaving a partial weight set the engine would load as complete.
+`model_client.py` wraps the `ModelService` RPCs (`EnsureModelDownloaded`, `ListModelFiles`, `StreamModelFiles`) and validates the stream: chunk offsets must be contiguous, sizes must match the manifest, and every listed file must arrive before the final marker. `model_snapshot.py` owns the local layout, writing `snapshots/<commit>/` and the ref the engine will look it up by — `refs/main` for an unpinned request, `refs/<revision>` for a pinned branch or tag, and none at all for a pin that is already the commit hash. Without the ref it needs, `snapshot_download(local_files_only=True)` cannot resolve a repo id no matter how complete the snapshot is. Metadata is published by renaming a staging directory; weights are added to the live snapshot one atomic rename at a time, and a failure part-way through rolls back the files it already published rather than leaving a partial weight set the engine would load as complete.
 
 Each phase opens with `EnsureModelDownloaded` and pins everything after it to the revision that call reported, so the manifest and the stream come from one commit and a default revision that moves mid-phase cannot mix two; when the server names no revision, later calls go unpinned and the stream's commit-hash validation is what refuses a mid-phase change. Reuse of a local snapshot is gated on the same value and fails closed without it: a manifest carries only paths and sizes, so a revision that changed neither is indistinguishable from the copy on disk, and reusing it would skip the stream that would have caught the difference. The metadata phase asks with `ignore_weights=true`; the server keys its registry entry on the weight mode, so that claim cannot satisfy the weight phase's later full-weight request, and a cold server does not fetch weights before `RdmaStrategy` has had its chance at them.
 
-Two limits are worth knowing. The metadata phase never asks for a particular revision, only for whichever one the server resolves by default, so a worker that pinned a revision of its own gets a logged mismatch rather than the revision it wanted; the weight phase does pin its request — to the commit the snapshot is named after — so its download claim is scoped to that revision, and it degrades to an unpinned request when the pinned call fails with a `grpc.RpcError`, the shape a failed pin resolve takes; a download failure the server reports through the status stream is raised, not retried. And a server that already holds an unpinned model reports no revision at all, so the metadata phase restreams instead of reusing what is on disk; the files are small and the stream carries the commit, which makes restreaming the cheap way to stay correct.
+A pinned revision travels the whole way. The metadata phase asks the server for the revision the engine requested and refuses to continue unless the server confirms it: a server predating the revision field reports no `resolved_revision` at all, and a commit hash that resolves to a different commit is refused outright, since a commit names one revision and cannot resolve to another. What lands on disk is shaped by the engine's own lookup rather than by the answer: `snapshots/<commit>/` always, plus `refs/<revision>` when the requested revision is not the commit hash — the rule `huggingface_hub` applies to its own cache, since a lowercase 40-hex resolves by directory name while a branch, a tag, or an uppercase hash needs the ref. The ref belongs to the request rather than to the snapshot, so it is recorded when an existing snapshot is reused as well: a commit installed under its own hash leaves no ref behind, and a later request for a branch resolving to it would otherwise reuse the directory with nothing to find it by. A pin for anything other than `main` leaves `refs/main` untouched — the default revision is a different question, and answering it with a pin would misdirect every later unpinned resolution sharing the cache. Reuse of a pinned snapshot is decided by looking at `snapshots/<commit>/` directly, for the same reason.
+
+Two limits are worth knowing. The weight phase pins to the commit its snapshot is named after and degrades to an unpinned request when the pinned call fails with a `grpc.RpcError`, the shape a failed pin resolve takes; a download failure the server reports through the status stream is raised, not retried. And on an unpinned request a server that already holds the model reports no revision at all, so the metadata phase restreams instead of reusing what is on disk; the files are small and the stream carries the commit, which makes restreaming the cheap way to stay correct.
 
 Strategies handle the loading path and NIXL tensor registration. `LoadContext.accelerator_backend` centralizes accelerator-specific torch operations and capability gates for fast paths such as pool registration, VMM arena registration, and GDS. Backends that do not support those CUDA-specific paths, such as XPU, leave the gates disabled and use the generic fallback path. XPU transfer deployments still require a UCX/NIXL runtime that can register XPU device memory. Adapter hooks handle engine lifecycle such as vLLM `process_weights_after_loading`, and the chain performs best-effort metadata publication after a successful strategy. New strategies can be added by creating a new file in `load_strategy/` and registering it in `LoadStrategyChain.run()`.
 
@@ -825,12 +1097,15 @@ Strategies handle the loading path and NIXL tensor registration. `LoadContext.ac
 
 Accelerator compatibility (`metadata/payload.py::accelerators_compatible`) is the single rule shared by RDMA tensor source selection and artifact discovery, in both their pre-fetch and post-fetch checks. Empty values are unknown and accepted for backward compatibility. On the authoritative post-fetch check an unknown (empty) accelerator on a quantized weight identity fails closed — an unknown family could be a different vendor whose kernels expect a different quantized layout, so quantized weights ride P2P only on a verified same-family match. The pre-fetch check defers an unknown accelerator instead of rejecting it (the lightweight `SourceInstanceRef` may legitimately omit the accelerator — the `k8s-service` backend publishes a synthetic ref and only learns the real accelerator from `GetTensorManifest`), so a valid same-family quantized source is not stranded before its accelerator is known. Exact family matches are always compatible. Cross-family transfer is allowed only for source types in `HETEROGENEOUS_NIXL_SOURCE_TYPES` and family pairs in `HETEROGENEOUS_NIXL_WEIGHT_PAIRS` — today `MX_SOURCE_TYPE_WEIGHTS` over the `cuda`/`xpu` pair (both directions) — and only for **unquantized** weights. Unquantized weights (`SourceIdentity.quantization` empty/`none` and a non-quantized `dtype`) are plain tensor bytes whose shape and dtype are stable across accelerator families, so they carry cross-vendor. Quantized weights are rejected cross-family: `process_weights_after_loading()` repacks fp8 scales, pads/swizzles fp4/nvfp4, and stashes hidden quant-config tensors into kernel- and hardware-specific layouts, so the same logical weights have different bytes on a different vendor's kernels. Copying them cross-vendor corrupts inference silently — the transfer API succeeds and the tensor manifest and CRC match, but the receiver's kernel misreads the layout. Quantized cross-family transfer stays blocked by default; a future hardware validation may allowlist specific quantization/layout pairs that are proven inference-correct after RDMA (not just that the transfer API succeeds). ModelExpress does not dequantize/requantize or convert post-processed layouts during transfer — the RDMA path overwrites already post-processed target tensors with source bytes, so a proven pair is enabled by allowlisting it, not by correcting weights after transfer. Expressing a quantized allowlist entry would need an extension beyond the family-level `HETEROGENEOUS_NIXL_WEIGHT_PAIRS` (keyed on the accelerator pair plus quantization/dtype/backend/arch facts); it is intentionally not built until a pair is proven. See the FP8 Model Handling section. Generated artifacts (CUDA graphs, torch.compile, Triton, DeepGEMM, TileLang, CuTe, FlashInfer caches) are accelerator/arch-specific and stay strict same-family. The `mx_source_type` argument defaults to `None`, and `quantization`/`dtype` default to a sentinel, so the gate fails closed: a caller that does not explicitly pass a hetero-eligible source type and declare the identity's quantization only ever gets strict same-family compatibility. Same-family transfer is unconditional — quantization never gates it, since source and target run identical post-processing. `MX_SOURCE_TYPE_LORA` is deferred — it has no live tensor publish/transfer path yet, so heterogeneous LoRA is rejected until one exists and is tested (add it to `HETEROGENEOUS_NIXL_SOURCE_TYPES` at that point). Heterogeneous transfer still requires a UCX/NIXL runtime that can register both families' device memory; the Rust server is a pure passthrough of the runtime `accelerator` string and applies no compatibility logic.
 
-After `RdmaStrategy` filters listed READY sources to the target's `worker_rank` and to a compatible runtime `accelerator`, it ranks the surviving candidates through a `SourceSelector` (`source_selection.py`) before slicing to `MAX_SOURCE_RETRIES`. Selectors are scoring-based: `ScoredSelector` subclasses implement `score(candidate, context)` and the base orders by descending score. Two policies ship today, resolved by name through a small registry (`MX_P2P_SOURCE_SELECTOR`, default `random`, unknown values fall back to `random`):
+After `RdmaStrategy` filters listed READY sources to the target's `worker_rank` and to a compatible runtime `accelerator`, it ranks the surviving candidates through a `SourceSelector` (`source_selection.py`) before slicing to `MAX_SOURCE_RETRIES`. Selectors are scoring-based: `ScoredSelector` subclasses implement `score(candidate, context)` and the base orders by descending score. The policies below ship today, resolved by name through a small registry (`MX_P2P_SOURCE_SELECTOR`, default `random`, unknown values fall back to `random`):
 
 - `random` — behavior-preserving default; shuffles with a local RNG so it does not perturb process-global state.
 - `rendezvous_hash` — stateless deterministic spreading via HRW hashing of the target identity plus each candidate identity. Different targets get different first choices without a shared counter or server coordination, it is stable across process restarts (blake2b, not Python's salted `hash()`), and adding/removing one source perturbs only a fraction of rankings.
+- `topology_aware` — locality-first spreading for the RDMA fabric. Ranks each candidate by the **narrowest topology domain the target and source share** (same rack → block → datacenter → cross-datacenter), with the `rendezvous_hash` digest as an intra-tier tiebreak so equidistant peers still spread. The level hierarchy is not hard-coded: it comes from `MX_P2P_TOPOLOGY_LEVELS` (the ordered domains of the cluster's **Grove** `ClusterTopology` — `clustertopologies.grove.io` — `spec.levels`), and per-source domain values from each candidate's published `topology` metadata — so MX consumes the same node-label topology Grove/Dynamo already define. NVLink is not modeled (co-located replicas let NIXL auto-select the NVLink backend). See below.
 
-The selector controls ordering only; `RdmaStrategy` enforces the fixed three-candidate retry budget. Selectors read the few fields they need (`worker_rank`, `worker_id`, `identity.model_name`) directly off the live `LoadContext`, so there is no parallel context type. Load- and topology-aware policies are deferred (they need signals such as per-source load or node/rack topology); the same scoring interface accepts them as drop-ins. Selection decisions are emitted as structured logs, and an opt-in Prometheus collector (`metrics.py`, `MX_METRICS_ENABLED=1`) re-emits them as `mx_p2p_*` metrics for benchmarking different schemes.
+The selector controls ordering only; `RdmaStrategy` enforces the fixed three-candidate retry budget. Selectors read the few fields they need (`worker_rank`, `worker_id`, `identity.model_name`) directly off the live `LoadContext`, so there is no parallel context type; `topology_aware` additionally reads the target's own domain from the topology provider and each candidate's from its `topology` metadata. The load-aware policy is a separate effort (per-source load signal); the same scoring interface accepts these as drop-ins, and `topology_aware` composes with it (see the topology mechanism below). Selection decisions are emitted as structured logs, and an opt-in Prometheus collector (`metrics.py`, `MX_METRICS_ENABLED=1`) re-emits them as `mx_p2p_*` metrics for benchmarking different schemes.
+
+**Topology mechanism.** A worker reports its RDMA-fabric location as a `{domain: value}` map keyed by **Grove `ClusterTopology` domain** (the enum `region`/`zone`/`datacenter`/`block`/`rack`/`host`/`numa`), e.g. `{"block": "b1", "rack": "r3", "host": "node7"}`, read from the environment (`MX_P2P_TOPOLOGY`, populated by the operator from the node's labels via the `ClusterTopology` domain→key mapping) by `topology.py` and published **once at registration** on `WorkerMetadata.topology`. Because it is static per node, it rides the existing publish path (not the heartbeat) — the server passes it straight through onto `SourceInstanceRef.topology`, keeping it stateless. `TopologyAwareSelector.score` returns `(shared_depth, tiebreak)`: `shared_depth` is the deepest configured level at which the target and candidate maps agree, so `order()` puts the closest source first. Setting `MX_P2P_TOPOLOGY_LOAD_WEIGHT > 0` swaps the intra-tier tiebreak for `unit_hash − w·source_load` (read defensively), so **within a locality tier** selection also steers away from busy sources — this is how topology- and load-aware selection compose without either depending on the other. Missing node topology, or an old server that predates the field, collapses the policy to `rendezvous_hash`, so it is never worse than the deterministic baseline; missing levels alone do not, since `MX_P2P_TOPOLOGY_LEVELS` defaults to the full Grove order. Meaningful benefit needs a topology-diverse allocation (sources across multiple racks/blocks); packed into one rack all sources are equidistant and the policy collapses to `rendezvous_hash`.
 
 #### Selection efficacy (measured)
 
@@ -961,7 +1236,7 @@ graph TD
 
 ### Flow
 
-1. **Source loads**: Loads weights from storage (S3/GCS/Azure/local via ModelStreamer, GDS, or disk), runs `process_weights_after_loading()`
+1. **Source loads**: Loads weights through the fixed strategy chain (server cache, InstantTensor, ModelStreamer, GDS, or the native loader when no P2P source is available), or receives them over P2P, then runs `process_weights_after_loading()`
 2. **Source publishes**: Registers tensors with NIXL, or prepares a sealed cache artifact bundle, then a `PublisherThread` calls `PublishMetadata(identity, worker, worker_id)` -> gets `mx_source_id` (status=INITIALIZING). `WorkerMetadata.accelerator` records runtime accelerator family for compatibility filtering; it is not part of `SourceIdentity` or the source-id hash. In P2P mode (`MX_P2P_METADATA=1`, or auto-forced on by decentralized backends like `k8s-service`), publishes only lightweight endpoint pointers and starts a `WorkerGrpcServer` for tensor manifests or artifact manifest/chunk serving.
 3. **Publisher heartbeats**: `PublisherThread` sends `UpdateStatus(READY)` every 30s after publication succeeds, refreshing `updated_at`
 4. **Target discovers**: Calls `ListSources(identity, status=READY)`, which returns only READY workers whose `updated_at` is still within `MX_HEARTBEAT_TIMEOUT_SECS`, then filters by `worker_rank` and compatible runtime `accelerator`
@@ -969,6 +1244,12 @@ graph TD
 6. **Target transfers**: Executes RDMA reads from source; for cache artifacts, it prepares one source chunk lease at a time, receives into target registered DRAM, verifies CRC32C, writes to target-local staging, releases the lease, then installs the staged tar into the runtime cache directory. Generation mismatches and transfer failures try the next candidate (max 3); a possibly mutated target is reinitialized before retry.
 7. **Target becomes source**: After receiving weights or installing a cache artifact, publishes own metadata and starts its own heartbeat
 8. **Stale detection**: Server-side reaper marks workers STALE if `updated_at` > 90s old; `ListSources(READY)` also applies this heartbeat freshness check at query time so expired READY records are not returned while waiting for the next reaper pass. GC deletes STALE workers after 1 hour
+
+Tarred cache artifacts carry regular files and directories only. The source
+side enumerates members explicitly and hands tar that list, so nothing else can
+enter the archive regardless of how a cache directory is laid out; the target
+side enforces the same invariant in `_validate_tar_members` before extraction.
+Symlinks are skipped at packaging time (see [`DEPLOYMENT.md`](DEPLOYMENT.md#p2p-metadata-exchange)).
 
 Cache artifact checksums protect transfer integrity but do not authenticate the
 source or attest the contents. TorchInductor, Triton, DeepGEMM, TileLang, CuTe
@@ -1008,6 +1289,7 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_HEARTBEAT_INTERVAL_SECS` | `30` | Client heartbeat frequency |
 | `MX_HEARTBEAT_TIMEOUT_SECS` | `90` | Server reaper staleness threshold |
 | `MX_REAPER_SCAN_INTERVAL_SECS` | `30` | Server reaper scan frequency |
+| `MX_REGISTRY_STATS_INTERVAL_SECS` | `60` | Registry-statistics refresh frequency. Writes `mx_registry_entries` and `mx_state_entries`; each pass walks the keyspace, so it is deliberately coarser than a scrape and runs independently of cache eviction |
 | `MX_GC_TIMEOUT_SECS` | `3600` | Time before stale entries are deleted |
 | `VLLM_RPC_TIMEOUT` | `7200000` | vLLM RPC timeout in ms |
 

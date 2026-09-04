@@ -27,6 +27,7 @@ use modelexpress_common::grpc::p2p::{SourceIdentity, SourceStatus};
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
@@ -408,6 +409,9 @@ struct WorkerRecordJson {
     /// Runtime accelerator family for compatibility filtering.
     #[serde(default)]
     pub accelerator: String,
+    /// Datacenter topology domain values keyed by level.
+    #[serde(default)]
+    pub topology: HashMap<String, String>,
     /// Small discovery summary for file-backed artifact sources.
     #[serde(default)]
     pub artifact_source: Option<ArtifactSourceMetadataJson>,
@@ -422,6 +426,8 @@ struct WorkerSummaryJson {
     updated_at: i64,
     #[serde(default)]
     accelerator: String,
+    #[serde(default)]
+    topology: HashMap<String, String>,
 }
 
 /// Serializable artifact source summary.
@@ -463,6 +469,7 @@ impl WorkerRecordJson {
             agent_name: record.agent_name,
             worker_grpc_endpoint: record.worker_grpc_endpoint,
             accelerator: record.accelerator,
+            topology: record.topology,
             artifact_source: record.artifact_source.map(ArtifactSourceMetadataJson::from),
         }
     }
@@ -484,6 +491,7 @@ impl From<WorkerRecordJson> for WorkerRecord {
             agent_name: json.agent_name,
             worker_grpc_endpoint: json.worker_grpc_endpoint,
             accelerator: json.accelerator,
+            topology: json.topology,
             artifact_source: json.artifact_source.map(ArtifactSourceMetadataRecord::from),
         }
     }
@@ -603,6 +611,7 @@ impl MetadataBackend for RedisBackend {
             status: worker_record.status,
             updated_at: worker_record.updated_at,
             accelerator: worker_record.accelerator.clone(),
+            topology: worker_record.topology.clone(),
         })?;
 
         let mut pipe = redis::pipe();
@@ -741,15 +750,15 @@ impl MetadataBackend for RedisBackend {
                     continue;
                 }
 
-                let (status, updated_at, accelerator) = fields
+                let (status, updated_at, accelerator, topology) = fields
                     .get(&worker_rank.to_string())
                     .and_then(|v| serde_json::from_str::<WorkerRecordJson>(v).ok())
                     .map(|j| {
                         let (status, updated_at) =
                             overlay_status(&fields, worker_rank, j.status, j.updated_at);
-                        (status, updated_at, j.accelerator)
+                        (status, updated_at, j.accelerator, j.topology)
                     })
-                    .unwrap_or((0, 0, String::new()));
+                    .unwrap_or((0, 0, String::new(), HashMap::new()));
 
                 result.push(super::SourceInstanceInfo {
                     source_id: sid.clone(),
@@ -759,6 +768,7 @@ impl MetadataBackend for RedisBackend {
                     status,
                     updated_at,
                     accelerator,
+                    topology,
                     training_step,
                     layout_signature: layout_signature.clone(),
                 });
@@ -859,6 +869,7 @@ impl MetadataBackend for RedisBackend {
                             status: summary.status,
                             updated_at: summary.updated_at,
                             accelerator: summary.accelerator,
+                            topology: summary.topology,
                             training_step,
                             layout_signature: layout_signature.clone(),
                         });
@@ -901,15 +912,15 @@ impl MetadataBackend for RedisBackend {
                 {
                     continue;
                 }
-                let (status, updated_at, accelerator) = fields
+                let (status, updated_at, accelerator, topology) = fields
                     .get(&worker_rank.to_string())
                     .and_then(|value| serde_json::from_str::<WorkerRecordJson>(value).ok())
                     .map(|record| {
                         let (status, updated_at) =
                             overlay_status(&fields, worker_rank, record.status, record.updated_at);
-                        (status, updated_at, record.accelerator)
+                        (status, updated_at, record.accelerator, record.topology)
                     })
-                    .unwrap_or((0, 0, String::new()));
+                    .unwrap_or((0, 0, String::new(), HashMap::new()));
                 if min_updated_at.is_some_and(|minimum| updated_at < minimum) {
                     continue;
                 }
@@ -921,6 +932,7 @@ impl MetadataBackend for RedisBackend {
                     status,
                     updated_at,
                     accelerator,
+                    topology,
                     training_step,
                     layout_signature,
                 });
@@ -1006,13 +1018,17 @@ impl MetadataBackend for RedisBackend {
 
         // Heartbeats rewrite only the small `status:{rank}` field, never the record.
         let status_json: Option<String> = conn.hget(&key, status_field(worker_rank)).await?;
-        let accelerator = if let Some(summary) = status_json
+        // `topology` is static per node (published once at registration), so it is
+        // carried forward rather than recomputed -- but it must be carried, because
+        // this summary is also written into the source index that the fast list
+        // path reads topology from.
+        let (accelerator, topology) = if let Some(summary) = status_json
             .as_deref()
             .and_then(|value| serde_json::from_str::<WorkerSummaryJson>(value).ok())
         {
-            summary.accelerator
+            (summary.accelerator, summary.topology)
         } else {
-            // Record predating the status field: seed the accelerator from it once.
+            // Record predating the status field: seed both from it once.
             let value: Option<String> = conn.hget(&key, worker_rank.to_string()).await?;
             let json_str = value.ok_or_else(|| {
                 format!(
@@ -1020,7 +1036,8 @@ impl MetadataBackend for RedisBackend {
                     worker_rank, source_id, worker_id
                 )
             })?;
-            serde_json::from_str::<WorkerRecordJson>(&json_str)?.accelerator
+            let record: WorkerRecordJson = serde_json::from_str(&json_str)?;
+            (record.accelerator, record.topology)
         };
 
         let status_summary = serde_json::to_string(&WorkerSummaryJson {
@@ -1028,6 +1045,7 @@ impl MetadataBackend for RedisBackend {
             status: status as i32,
             updated_at,
             accelerator,
+            topology,
         })?;
         let source_key = format!("{}{}", keys::SOURCE_PREFIX, source_id);
         let updated = update_status_if_fresh(
@@ -1132,6 +1150,7 @@ mod tests {
             agent_name: String::new(),
             worker_grpc_endpoint: String::new(),
             accelerator: "cuda".to_string(),
+            topology: HashMap::from([("rack".to_string(), "r3".to_string())]),
             artifact_source: Some(ArtifactSourceMetadataRecord {
                 artifact_id: "artifact123".to_string(),
                 total_size: 1_099_511_627_776,
@@ -1152,6 +1171,7 @@ mod tests {
         assert_eq!(back.updated_at, record.updated_at);
         assert_eq!(back.tensors.len(), 1);
         assert_eq!(back.accelerator, record.accelerator);
+        assert_eq!(back.topology, record.topology);
         assert_eq!(back.artifact_source, record.artifact_source);
         assert!(
             json.contains(r#""total_size":"#),
@@ -1177,10 +1197,36 @@ mod tests {
             status: SourceStatus::Ready as i32,
             updated_at: 1_700_000_000_000,
             accelerator: "cuda".to_string(),
+            topology: HashMap::from([("rack".to_string(), "r3".to_string())]),
         };
         let json = serde_json::to_string(&summary).expect("serialize");
         let parsed: WorkerSummaryJson = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.accelerator, "cuda");
+        assert_eq!(parsed.topology.get("rack").map(String::as_str), Some("r3"));
+    }
+
+    #[test]
+    fn test_status_summary_carries_topology_forward() {
+        // Heartbeats write only `status:{rank}`, and that same summary is copied
+        // into the source index that the fast list path reads topology from. If a
+        // heartbeat dropped topology the field would blank out after the first
+        // beat and topology_aware would silently fall back to rendezvous ordering.
+        let summary = WorkerSummaryJson {
+            worker_rank: 0,
+            status: SourceStatus::Ready as i32,
+            updated_at: 1_700_000_000_000,
+            accelerator: "cuda".to_string(),
+            topology: HashMap::from([("rack".to_string(), "r3".to_string())]),
+        };
+        let json = serde_json::to_string(&summary).expect("serialize");
+        let parsed: WorkerSummaryJson = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.topology.get("rack").map(String::as_str), Some("r3"));
+        assert_eq!(parsed.accelerator, "cuda");
+
+        // A summary written before topology existed must still deserialize.
+        let legacy = r#"{"worker_rank":0,"status":2,"updated_at":1,"accelerator":"cuda"}"#;
+        let parsed: WorkerSummaryJson = serde_json::from_str(legacy).expect("legacy");
+        assert!(parsed.topology.is_empty());
     }
 
     #[test]
@@ -1243,7 +1289,7 @@ mod tests {
 
     fn test_identity() -> modelexpress_common::grpc::p2p::SourceIdentity {
         modelexpress_common::grpc::p2p::SourceIdentity {
-            mx_version: "0.5.0".to_string(),
+            mx_version: "0.5.1".to_string(),
             mx_source_type: 0,
             model_name: "deepseek-ai/DeepSeek-V3".to_string(),
             backend_framework: 1,
@@ -1269,7 +1315,7 @@ mod tests {
         let attr = SourceAttributesJson::from(&id);
 
         assert_eq!(attr.model_name, "deepseek-ai/DeepSeek-V3");
-        assert_eq!(attr.mx_version, "0.5.0");
+        assert_eq!(attr.mx_version, "0.5.1");
         assert_eq!(attr.tensor_parallel_size, 8);
         assert_eq!(attr.pipeline_parallel_size, 2);
         assert_eq!(attr.expert_parallel_size, 4);

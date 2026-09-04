@@ -6,6 +6,7 @@
 //! Metadata is keyed by mx_source_id, a 16-char hex hash of SourceIdentity.
 //! Clients send the full SourceIdentity; the server computes and returns the hash.
 
+use crate::metrics::grpc::RpcOutcome;
 use crate::p2p::backend::SourceInstanceInfo;
 use crate::p2p::source_identity::{compute_mx_source_id, validate_identity};
 use crate::p2p::state::P2pStateManager;
@@ -17,6 +18,25 @@ use modelexpress_common::grpc::p2p::{
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info};
+
+/// Return `body` with the handler's own verdict attached.
+///
+/// Every handler in this file reports failure **in band**: `Ok` carrying
+/// `success: false`, or an empty `instances` list, rather than `Err(Status)`.
+/// That is deliberate and stays as it is -- clients depend on it -- but it means
+/// the status code reads `Ok` straight through a backend outage, so nothing
+/// outside the handler can tell an outage from an empty-but-healthy answer.
+///
+/// This publishes the real outcome into the response extensions, where
+/// [`crate::metrics::grpc`] reads it. The tag is metrics-only: it does not touch
+/// the response body or the status code, and losing it degrades the metric to
+/// `outcome="ok"` rather than breaking the call.
+#[allow(clippy::result_large_err)] // Returns the handlers' own tonic::Status result type.
+fn tagged<T>(body: T, outcome: RpcOutcome) -> Result<Response<T>, Status> {
+    let mut response = Response::new(body);
+    response.extensions_mut().insert(outcome);
+    Ok(response)
+}
 
 /// P2P Service implementation
 pub struct P2pServiceImpl {
@@ -69,42 +89,54 @@ impl P2pService for P2pServiceImpl {
         let identity = match req.identity {
             Some(id) => id,
             None => {
-                return Ok(Response::new(PublishMetadataResponse {
-                    success: false,
-                    message: "identity is required".to_string(),
-                    mx_source_id: String::new(),
-                    worker_id: String::new(),
-                }));
+                return tagged(
+                    PublishMetadataResponse {
+                        success: false,
+                        message: "identity is required".to_string(),
+                        mx_source_id: String::new(),
+                        worker_id: String::new(),
+                    },
+                    RpcOutcome::InvalidArgument,
+                );
             }
         };
 
         if let Err(e) = validate_identity(&identity) {
-            return Ok(Response::new(PublishMetadataResponse {
-                success: false,
-                message: e,
-                mx_source_id: String::new(),
-                worker_id: String::new(),
-            }));
+            return tagged(
+                PublishMetadataResponse {
+                    success: false,
+                    message: e,
+                    mx_source_id: String::new(),
+                    worker_id: String::new(),
+                },
+                RpcOutcome::InvalidArgument,
+            );
         }
 
         if req.worker_id.is_empty() {
-            return Ok(Response::new(PublishMetadataResponse {
-                success: false,
-                message: "worker_id is required".to_string(),
-                mx_source_id: String::new(),
-                worker_id: String::new(),
-            }));
+            return tagged(
+                PublishMetadataResponse {
+                    success: false,
+                    message: "worker_id is required".to_string(),
+                    mx_source_id: String::new(),
+                    worker_id: String::new(),
+                },
+                RpcOutcome::InvalidArgument,
+            );
         }
 
         let worker = match req.worker {
             Some(w) => w,
             None => {
-                return Ok(Response::new(PublishMetadataResponse {
-                    success: false,
-                    message: "worker is required".to_string(),
-                    mx_source_id: String::new(),
-                    worker_id: String::new(),
-                }));
+                return tagged(
+                    PublishMetadataResponse {
+                        success: false,
+                        message: "worker is required".to_string(),
+                        mx_source_id: String::new(),
+                        worker_id: String::new(),
+                    },
+                    RpcOutcome::InvalidArgument,
+                );
             }
         };
 
@@ -131,24 +163,30 @@ impl P2pService for P2pServiceImpl {
                     "PublishMetadata: model='{}' source_id={} worker_id={} worker_rank={} tensors={}",
                     model_name, source_id, worker_id, worker_rank, tensor_count
                 );
-                Ok(Response::new(PublishMetadataResponse {
-                    success: true,
-                    message: format!(
-                        "Published metadata for '{}' (source_id={}, worker_id={}, worker_rank={}, {} tensors)",
-                        model_name, source_id, worker_id, worker_rank, tensor_count
-                    ),
-                    mx_source_id: source_id,
-                    worker_id,
-                }))
+                tagged(
+                    PublishMetadataResponse {
+                        success: true,
+                        message: format!(
+                            "Published metadata for '{}' (source_id={}, worker_id={}, worker_rank={}, {} tensors)",
+                            model_name, source_id, worker_id, worker_rank, tensor_count
+                        ),
+                        mx_source_id: source_id,
+                        worker_id,
+                    },
+                    RpcOutcome::Ok,
+                )
             }
             Err(e) => {
                 error!("Failed to publish metadata: {}", e);
-                Ok(Response::new(PublishMetadataResponse {
-                    success: false,
-                    message: format!("Failed to publish metadata: {e}"),
-                    mx_source_id: String::new(),
-                    worker_id: String::new(),
-                }))
+                tagged(
+                    PublishMetadataResponse {
+                        success: false,
+                        message: format!("Failed to publish metadata: {e}"),
+                        mx_source_id: String::new(),
+                        worker_id: String::new(),
+                    },
+                    RpcOutcome::BackendError,
+                )
             }
         }
     }
@@ -189,9 +227,12 @@ impl P2pService for P2pServiceImpl {
             Ok(v) => v,
             Err(e) => {
                 error!("Failed to list workers: {}", e);
-                return Ok(Response::new(ListSourcesResponse {
-                    instances: Vec::new(),
-                }));
+                return tagged(
+                    ListSourcesResponse {
+                        instances: Vec::new(),
+                    },
+                    RpcOutcome::BackendError,
+                );
             }
         };
 
@@ -218,12 +259,13 @@ impl P2pService for P2pServiceImpl {
                 updated_at: info.updated_at,
                 training_step: info.training_step,
                 layout_signature: info.layout_signature,
+                topology: info.topology,
             })
             .collect();
 
         debug!("ListSources: returning {} instances", refs.len());
 
-        Ok(Response::new(ListSourcesResponse { instances: refs }))
+        tagged(ListSourcesResponse { instances: refs }, RpcOutcome::Ok)
     }
 
     async fn get_metadata(
@@ -233,13 +275,16 @@ impl P2pService for P2pServiceImpl {
         let req = request.into_inner();
 
         if req.mx_source_id.is_empty() || req.worker_id.is_empty() {
-            return Ok(Response::new(GetMetadataResponse {
-                found: false,
-                worker: None,
-                mx_source_id: String::new(),
-                worker_id: String::new(),
-                identity: None,
-            }));
+            return tagged(
+                GetMetadataResponse {
+                    found: false,
+                    worker: None,
+                    mx_source_id: String::new(),
+                    worker_id: String::new(),
+                    identity: None,
+                },
+                RpcOutcome::InvalidArgument,
+            );
         }
 
         match self
@@ -260,36 +305,53 @@ impl P2pService for P2pServiceImpl {
                     worker.as_ref().map_or(0, worker_tensor_count),
                     identity.is_some(),
                 );
-                Ok(Response::new(GetMetadataResponse {
-                    found,
-                    worker,
-                    mx_source_id: req.mx_source_id,
-                    worker_id: req.worker_id,
-                    identity,
-                }))
+                // A record with no workers is the same answer as no record at
+                // all, so it carries the same outcome. Reporting it as Ok would
+                // make an absent worker look like a successful lookup.
+                let outcome = if found {
+                    RpcOutcome::Ok
+                } else {
+                    RpcOutcome::NotFound
+                };
+                tagged(
+                    GetMetadataResponse {
+                        found,
+                        worker,
+                        mx_source_id: req.mx_source_id,
+                        worker_id: req.worker_id,
+                        identity,
+                    },
+                    outcome,
+                )
             }
             Ok(None) => {
                 info!(
                     "No metadata found for source_id={} worker_id={}",
                     req.mx_source_id, req.worker_id
                 );
-                Ok(Response::new(GetMetadataResponse {
-                    found: false,
-                    worker: None,
-                    mx_source_id: req.mx_source_id,
-                    worker_id: req.worker_id,
-                    identity: None,
-                }))
+                tagged(
+                    GetMetadataResponse {
+                        found: false,
+                        worker: None,
+                        mx_source_id: req.mx_source_id,
+                        worker_id: req.worker_id,
+                        identity: None,
+                    },
+                    RpcOutcome::NotFound,
+                )
             }
             Err(e) => {
                 error!("Failed to get metadata: {}", e);
-                Ok(Response::new(GetMetadataResponse {
-                    found: false,
-                    worker: None,
-                    mx_source_id: String::new(),
-                    worker_id: String::new(),
-                    identity: None,
-                }))
+                tagged(
+                    GetMetadataResponse {
+                        found: false,
+                        worker: None,
+                        mx_source_id: String::new(),
+                        worker_id: String::new(),
+                        identity: None,
+                    },
+                    RpcOutcome::BackendError,
+                )
             }
         }
     }
@@ -301,26 +363,35 @@ impl P2pService for P2pServiceImpl {
         let req = request.into_inner();
 
         if req.mx_source_id.is_empty() {
-            return Ok(Response::new(UpdateStatusResponse {
-                success: false,
-                message: "mx_source_id is required".to_string(),
-            }));
+            return tagged(
+                UpdateStatusResponse {
+                    success: false,
+                    message: "mx_source_id is required".to_string(),
+                },
+                RpcOutcome::InvalidArgument,
+            );
         }
 
         if req.worker_id.is_empty() {
-            return Ok(Response::new(UpdateStatusResponse {
-                success: false,
-                message: "worker_id is required".to_string(),
-            }));
+            return tagged(
+                UpdateStatusResponse {
+                    success: false,
+                    message: "worker_id is required".to_string(),
+                },
+                RpcOutcome::InvalidArgument,
+            );
         }
 
         let status = match SourceStatus::try_from(req.status) {
             Ok(s) => s,
             Err(_) => {
-                return Ok(Response::new(UpdateStatusResponse {
-                    success: false,
-                    message: format!("invalid status value: {}", req.status),
-                }));
+                return tagged(
+                    UpdateStatusResponse {
+                        success: false,
+                        message: format!("invalid status value: {}", req.status),
+                    },
+                    RpcOutcome::InvalidArgument,
+                );
             }
         };
 
@@ -329,19 +400,25 @@ impl P2pService for P2pServiceImpl {
             .update_worker_status(&req.mx_source_id, &req.worker_id, req.worker_rank, status)
             .await
         {
-            Ok(()) => Ok(Response::new(UpdateStatusResponse {
-                success: true,
-                message: format!(
-                    "Updated status for source '{}' worker_id '{}' rank {}",
-                    req.mx_source_id, req.worker_id, req.worker_rank
-                ),
-            })),
+            Ok(()) => tagged(
+                UpdateStatusResponse {
+                    success: true,
+                    message: format!(
+                        "Updated status for source '{}' worker_id '{}' rank {}",
+                        req.mx_source_id, req.worker_id, req.worker_rank
+                    ),
+                },
+                RpcOutcome::Ok,
+            ),
             Err(e) => {
                 error!("Failed to update status: {}", e);
-                Ok(Response::new(UpdateStatusResponse {
-                    success: false,
-                    message: format!("Failed to update status: {e}"),
-                }))
+                tagged(
+                    UpdateStatusResponse {
+                        success: false,
+                        message: format!("Failed to update status: {e}"),
+                    },
+                    RpcOutcome::BackendError,
+                )
             }
         }
     }
@@ -359,6 +436,7 @@ mod tests {
     use modelexpress_common::grpc::p2p::{
         ArtifactSourceMetadata, MxSourceType, SourceIdentity, SourceStatus, TensorSourceMetadata,
     };
+    use std::collections::HashMap;
 
     fn make_service(mock: MockMetadataBackend) -> P2pServiceImpl {
         P2pServiceImpl::new(Arc::new(P2pStateManager::with_backend(Arc::new(mock))))
@@ -372,7 +450,7 @@ mod tests {
 
     fn test_identity() -> SourceIdentity {
         SourceIdentity {
-            mx_version: "0.5.0".to_string(),
+            mx_version: "0.5.1".to_string(),
             mx_source_type: MxSourceType::Weights as i32,
             model_name: "my-model".to_string(),
             backend_framework: 1,
@@ -559,6 +637,7 @@ mod tests {
                         agent_name: String::new(),
                         worker_grpc_endpoint: String::new(),
                         accelerator: String::new(),
+                        topology: Default::default(),
                         artifact_source: None,
                     }],
                     published_at: 1234567890,
@@ -733,6 +812,7 @@ mod tests {
                         status: SourceStatus::Ready as i32,
                         updated_at: now,
                         accelerator: "cuda".to_string(),
+                        topology: HashMap::from([("rack".to_string(), "r3".to_string())]),
                         training_step: Some(42),
                         layout_signature: Some("layout-a".to_string()),
                     },
@@ -744,6 +824,7 @@ mod tests {
                         status: SourceStatus::Ready as i32,
                         updated_at: now,
                         accelerator: "cuda".to_string(),
+                        topology: Default::default(),
                         training_step: Some(42),
                         layout_signature: Some("layout-a".to_string()),
                     },
@@ -767,6 +848,11 @@ mod tests {
         assert_eq!(resp.instances.len(), 2);
         assert_eq!(resp.instances[0].worker_id, "w1");
         assert_eq!(resp.instances[0].worker_rank, 0);
+        assert_eq!(
+            resp.instances[0].topology.get("rack").map(String::as_str),
+            Some("r3"),
+            "topology surfaces onto the SourceInstanceRef"
+        );
         assert_eq!(resp.instances[0].accelerator, "cuda");
         assert_eq!(resp.instances[0].updated_at, now);
         assert_eq!(resp.instances[0].training_step, Some(42));
@@ -799,6 +885,7 @@ mod tests {
                     status: SourceStatus::Ready as i32,
                     updated_at: now,
                     accelerator: "cuda".to_string(),
+                    topology: Default::default(),
                     training_step: None,
                     layout_signature: None,
                 }])
@@ -838,6 +925,7 @@ mod tests {
                         status: SourceStatus::Ready as i32,
                         updated_at: now,
                         accelerator: "cuda".to_string(),
+                        topology: Default::default(),
                         training_step: None,
                         layout_signature: None,
                     },
@@ -849,6 +937,7 @@ mod tests {
                         status: SourceStatus::Ready as i32,
                         updated_at: expired_updated_at,
                         accelerator: "cuda".to_string(),
+                        topology: Default::default(),
                         training_step: None,
                         layout_signature: None,
                     },
@@ -890,6 +979,7 @@ mod tests {
                         agent_name: "artifact-agent".to_string(),
                         worker_grpc_endpoint: "10.0.0.1:6555".to_string(),
                         accelerator: "cuda".to_string(),
+                        topology: Default::default(),
                         artifact_source: Some(
                             ArtifactSourceMetadata {
                                 artifact_id: "sha256:artifact".to_string(),
@@ -953,15 +1043,24 @@ mod tests {
             .returning(|_, _, _, _, _, _, _| Err("backend down".into()));
 
         let svc = make_service(mock);
-        let resp = svc
+        let response = svc
             .list_sources(Request::new(ListSourcesRequest {
                 identity: Some(test_identity()),
                 status_filter: None,
                 ..Default::default()
             }))
             .await
-            .expect("rpc")
-            .into_inner();
+            .expect("rpc");
+
+        // The reason the tag exists: on the wire this is indistinguishable from
+        // a healthy "no peers have published yet" -- same Ok, same empty list.
+        // Only the handler knows it was an outage, so only the handler can say so.
+        assert_eq!(
+            response.extensions().get::<RpcOutcome>(),
+            Some(&RpcOutcome::BackendError)
+        );
+
+        let resp = response.into_inner();
         assert!(resp.instances.is_empty());
     }
 
@@ -1043,14 +1142,22 @@ mod tests {
             });
 
         let svc = make_service(mock);
-        let resp = svc
+        let response = svc
             .get_metadata(Request::new(GetMetadataRequest {
                 mx_source_id: "abc123def456abcd".to_string(),
                 worker_id: "worker-uuid-1".to_string(),
             }))
             .await
-            .expect("rpc")
-            .into_inner();
+            .expect("rpc");
+
+        // A record that exists but carries no workers is the same answer as no
+        // record at all, and must not be reported as a successful lookup.
+        assert_eq!(
+            response.extensions().get::<RpcOutcome>(),
+            Some(&RpcOutcome::NotFound)
+        );
+
+        let resp = response.into_inner();
         assert!(!resp.found);
         assert!(resp.worker.is_none());
     }

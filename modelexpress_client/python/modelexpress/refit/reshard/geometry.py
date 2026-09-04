@@ -30,8 +30,9 @@ from __future__ import annotations
 
 import functools
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 import torch
 
@@ -41,6 +42,7 @@ from modelexpress.refit.reshard.types import (
     OpSpec,
     RecordedCopy,
     UnsupportedReshard,
+    summarize_unsupported,
 )
 
 logger = logging.getLogger(__name__)
@@ -52,7 +54,10 @@ __all__ = [
     "OpSpec",
     "RecordedCopy",
     "UnsupportedReshard",
+    "build_lazy_weights",
     "capture_geometry",
+    "capture_weights",
+    "convert_source_weights",
 ]
 
 # Allowlist: pure view/slice/shape ops a weight loader may call. Maps
@@ -60,6 +65,10 @@ __all__ = [
 # ``__torch_dispatch__`` and raises UnsupportedReshard.
 _SUPPORTED_OPS: dict[Callable, str] = {
     torch.Tensor.narrow: "narrow",
+    # select/split unstack a stacked source (e.g. a trainer that publishes its
+    # experts stacked -> per-expert HF weights). select is rank-reducing; split is
+    # a multi-return view like chunk. slice_plan resolves both to a source box.
+    torch.Tensor.select: "select",
     torch.Tensor.view: "view",
     torch.Tensor.reshape: "reshape",
     torch.Tensor.__getitem__: "__getitem__",
@@ -71,6 +80,14 @@ _SUPPORTED_OPS: dict[Callable, str] = {
     torch.Tensor.flatten: "flatten",
     torch.Tensor.contiguous: "contiguous",
     torch.Tensor.chunk: "chunk",
+    torch.Tensor.split: "split",
+    # vLLM's fused-MoE expert loader unifies its fused and per-expert paths by
+    # doing `experts_shard.unbind()`, reached via `unsqueeze(0)` for a per-expert
+    # source. Without this entry every expert weight in a MoE model is classified
+    # unsupported and the refit fails closed at ~5% coverage. Like `chunk` it is a
+    # pure multi-return view, so the existing tuple handling in `_intercept`
+    # applies unchanged.
+    torch.Tensor.unbind: "unbind",
 }
 
 
@@ -115,7 +132,7 @@ class LazyWeight(torch.Tensor):
         # Zero-storage meta tensor for post-op shape/dtype inference only.
         return torch.empty(self.shape, dtype=self.dtype, device="meta")
 
-    def _child(self, new_shape, new_dtype, *new_ops) -> "LazyWeight":
+    def _child(self, new_shape, new_dtype, *new_ops) -> LazyWeight:
         return LazyWeight(
             self._name,
             new_shape,
@@ -213,10 +230,14 @@ def _install_stamps(
 
         def make_stamp(inner, name):
             @functools.wraps(inner)
-            def stamp(p, *a, **kw):
+            def stamp(*a, **kw):
+                # Signature-transparent on purpose. vLLM's fused-MoE loader is
+                # invoked entirely by keyword (`param=`, `loaded_weight=`,
+                # `shard_id=`, `expert_id=`), so a stamp that named its first
+                # parameter positionally raised TypeError for every expert.
                 recorder.current = name
                 try:
-                    return inner(p, *a, **kw)
+                    return inner(*a, **kw)
                 finally:
                     recorder.current = None
 
@@ -238,39 +259,83 @@ def _restore_stamps(saved: list) -> None:
             param.weight_loader = original
 
 
-def capture_geometry(
-    model: torch.nn.Module,
+def build_lazy_weights(
     manifest: list[tuple[str, Any, tuple]],
+) -> dict[str, LazyWeight]:
+    """One ``LazyWeight`` placeholder per published source, all sharing a recorder.
+
+    ``manifest`` is ``(name, dtype, shape)`` for every full source tensor. The
+    result can be passed straight to :func:`capture_weights`, or first through a
+    source conversion (a trainer-native -> HF ``dict -> dict`` mapping) whose view
+    ops each lazy records - so a converted lazy's ``_name`` stays its ORIGINAL
+    published source and its ``_ops`` carry the conversion prefix. The shared
+    recorder is what :func:`capture_weights` reads its recorded copies from.
+    """
+    recorder = _BakeRecorder()
+    return {
+        name: LazyWeight(name, torch.Size(shape), dtype, "meta", recorder=recorder)
+        for name, dtype, shape in manifest
+    }
+
+
+def _shared_recorder(weights: dict) -> _BakeRecorder:
+    # Every value must be a recording LazyWeight: an ordinary tensor would be sent
+    # to load_weights and its copies dropped (the copy_ sink only fires for a
+    # LazyWeight), silently under-capturing the model.
+    recorders: dict = {}
+    for name, w in weights.items():
+        if not isinstance(w, LazyWeight) or w._recorder is None:
+            raise ValueError(
+                f"capture_weights requires LazyWeights from build_lazy_weights; "
+                f"{name!r} is a {type(w).__name__}"
+            )
+        recorders[id(w._recorder)] = w._recorder
+    if len(recorders) != 1:
+        raise ValueError(
+            "capture_weights expects LazyWeights that share one recorder "
+            "(build them with build_lazy_weights)"
+        )
+    return next(iter(recorders.values()))
+
+
+def capture_weights(
+    model: torch.nn.Module,
+    weights: dict[str, Any],
     default_weight_loader: Callable | None = None,
 ) -> CaptureResult:
-    """Capture per-param slice geometry by dry-running ``load_weights`` with
-    ``LazyWeight`` placeholders against ``model`` (ideally a disposable meta twin).
+    """Capture per-param slice geometry by dry-running ``load_weights`` with the
+    pre-built ``weights`` against ``model`` (ideally a disposable meta twin).
 
     Args:
         model: the engine model exposing ``load_weights([(name, tensor)])`` and
             per-param ``weight_loader`` hooks. Should be on ``meta`` so no real
             storage is touched.
-        manifest: ``(name, dtype, shape)`` for every full source tensor.
+        weights: ``{name: LazyWeight}`` from :func:`build_lazy_weights` (optionally
+            passed through a source conversion first). ``name`` is what the loader
+            routes on (HF-canonical); the lazy's ``_name`` is the original source.
         default_weight_loader: the framework's default loader, used to attribute
             copies for params that have no explicit ``weight_loader`` (e.g. vLLM's
             ``default_weight_loader``). Optional.
 
     Returns a ``CaptureResult`` (recorded copies + unsupported/unattributed).
     """
-    recorder = _BakeRecorder()
+    recorder = _shared_recorder(weights)
     saved = _install_stamps(model, recorder, default_weight_loader)
     unsupported: list[str] = []
+    unsupported_reasons: dict[str, str] = {}
     try:
         # One source at a time: a single unsupported loader is attributed only
-        # to that tensor, never the whole bake. Fused params
-        # (qkv/gate_up) still resolve - each source writes its own sub-region of
-        # the persistent (meta) dest param across separate calls.
-        for name, dtype, shape in manifest:
-            lazy = LazyWeight(name, torch.Size(shape), dtype, "meta", recorder=recorder)
+        # to that tensor, never the whole bake. Fused params (qkv/gate_up) still
+        # resolve - each source writes its own sub-region of the persistent (meta)
+        # dest param across separate calls. A converted lazy's ``_name`` is the
+        # original published source, so that is what an unsupported placement names.
+        for name, tensor in weights.items():
+            source = getattr(tensor, "_name", name)
             try:
-                model.load_weights([(name, lazy)])
-            except UnsupportedReshard:
-                unsupported.append(name)
+                model.load_weights([(name, tensor)])
+            except UnsupportedReshard as exc:
+                unsupported.append(source)
+                unsupported_reasons[source] = str(exc)
     finally:
         _restore_stamps(saved)
 
@@ -280,8 +345,65 @@ def capture_geometry(
         len(unsupported),
         recorder.unattributed,
     )
+    # A whole model class can fail for one reason (every fused expert source, say),
+    # so report the distinct causes with counts rather than a list of names. The
+    # names alone say which tensors are missing but never why.
+    for reason, count in summarize_unsupported(unsupported_reasons):
+        logger.warning(
+            "reshard capture: %d source(s) unsupported, cause: %s", count, reason
+        )
     return CaptureResult(
         copies=recorder.copies,
         unsupported=unsupported,
         unattributed=recorder.unattributed,
+        unsupported_reasons=unsupported_reasons,
     )
+
+
+def capture_geometry(
+    model: torch.nn.Module,
+    manifest: list[tuple[str, Any, tuple]],
+    default_weight_loader: Callable | None = None,
+) -> CaptureResult:
+    """Convenience wrapper: build lazies from ``manifest`` (source names already
+    HF-canonical) and capture. See :func:`build_lazy_weights` + :func:`capture_weights`
+    for the pre-built-weights entry point used when a source conversion runs first."""
+    return capture_weights(
+        model,
+        build_lazy_weights(manifest),
+        default_weight_loader=default_weight_loader,
+    )
+
+
+def convert_source_weights(
+    convert_native_to_hf: Callable[[dict], dict] | None, manifest: list
+) -> dict:
+    """Build the source placeholders and map them into the HF-canonical layout the
+    inference loader consumes.
+
+    A trainer may publish its weights under its own native (non-HF) names/shapes.
+    ``convert_native_to_hf`` is that trainer's native -> HF mapping (a
+    ``dict[str, Tensor] -> dict[str, Tensor]``); we run it on ``LazyWeight``
+    placeholders so it traces STRUCTURE ONLY (renames + view ops like expert
+    unstack) - no weight data - and each output lazy keeps ``_name`` = its original
+    published source and ``_ops`` = the native -> HF prefix. Returns
+    ``{hf_name: LazyWeight}`` ready for :func:`capture_weights`.
+
+    ``None`` means the trainer already publishes HF-canonical names (identity). A
+    conversion output that is not a traced view of a source - a dtype cast (raised
+    while tracing, the op is not in the allowlist) or a synthesized tensor (a plain
+    tensor, not a ``LazyWeight``) - raises ``UnsupportedReshard`` rather than
+    mis-mapping.
+    """
+    weights = build_lazy_weights(manifest)
+    if convert_native_to_hf is None:
+        return weights
+    hf = convert_native_to_hf(weights)
+    for name, value in hf.items():
+        if not isinstance(value, LazyWeight):
+            raise UnsupportedReshard(
+                f"{name}: conversion produced a non-traced tensor "
+                f"({type(value).__name__}); dtype casts / synthesized tensors are "
+                "not yet supported"
+            )
+    return hf

@@ -2508,10 +2508,11 @@ dependencies = [
 
 [[package]]
 name = "model-express-workspace-tests"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "criterion",
+ "http",
  "k8s-openapi",
  "kube",
  "modelexpress-client",
@@ -2523,13 +2524,14 @@ dependencies = [
  "tokio",
  "tonic 0.13.1",
  "tonic-health",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
 
 [[package]]
 name = "modelexpress-client"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2549,7 +2551,7 @@ dependencies = [
 
 [[package]]
 name = "modelexpress-common"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2584,7 +2586,7 @@ dependencies = [
 
 [[package]]
 name = "modelexpress-server"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "async-trait",

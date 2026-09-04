@@ -275,3 +275,78 @@ async fn an_early_failure_releases_the_metrics_port() {
          the listener was detached rather than stopped"
     );
 }
+
+/// The Phase 2 exit criterion, end to end: a handler that fails **in band** is
+/// reported as a failure by the metrics layer.
+///
+/// `PublishMetadata` with no identity returns `Ok` with `success: false`. The
+/// gRPC status is therefore `Ok`, so a status-code-derived metric would record
+/// this as a success -- and would likewise record a total Redis outage as a
+/// success, since `ListSources` reports that failure the same way.
+///
+/// This is also the only test that can exercise the *propagation* half of the
+/// mechanism. The handler inserts an `RpcOutcome` into its response extensions
+/// and the tower layer reads it back off the encoded `http::Response`; the step
+/// between them is `tonic::Response::into_http`, which is `pub(crate)`, so no
+/// unit test outside tonic can drive it.
+#[tokio::test]
+async fn an_in_band_failure_is_not_recorded_as_a_success() {
+    use modelexpress_common::grpc::p2p::PublishMetadataRequest;
+    use modelexpress_common::grpc::p2p::p2p_service_client::P2pServiceClient;
+
+    let [port, metrics_port] = free_ports::<2>();
+    let (shutdown, handle) = start_server_with_metrics(port, metrics_port);
+
+    // Wait for the gRPC side before driving it.
+    let mut client = connect_client(port).await;
+    client
+        .health_check()
+        .await
+        .expect("health_check round-trip should succeed");
+
+    let mut p2p = P2pServiceClient::connect(format!("http://127.0.0.1:{port}"))
+        .await
+        .expect("connect to the p2p service");
+
+    let response = p2p
+        .publish_metadata(PublishMetadataRequest {
+            identity: None,
+            ..Default::default()
+        })
+        .await
+        .expect("the RPC itself succeeds -- that is the point");
+    assert!(
+        !response.into_inner().success,
+        "expected an in-band failure, not a transport failure"
+    );
+
+    let body = scrape(metrics_port).await;
+
+    // The outcome came from the handler, not from the status code.
+    assert!(
+        body.contains(
+            r#"mx_grpc_requests_total{method="P2pService/PublishMetadata",outcome="invalid_argument"} 1"#
+        ),
+        "expected the handler's own outcome in the scrape, got: {body}"
+    );
+    // The same call must not also be counted as a success.
+    assert!(
+        !body.contains(
+            r#"mx_grpc_requests_total{method="P2pService/PublishMetadata",outcome="ok"}"#
+        ),
+        "the in-band failure was also counted as a success: {body}"
+    );
+    // Latency is observed under the same label set.
+    assert!(
+        body.contains(r#"mx_grpc_request_seconds_count{method="P2pService/PublishMetadata""#),
+        "expected a latency observation, got: {body}"
+    );
+    // The health probe that got us here is counted too, proving one layer covers
+    // services it was never explicitly attached to.
+    assert!(
+        body.contains(r#"method="HealthService/GetHealth""#),
+        "expected the health service to be covered by the same layer, got: {body}"
+    );
+
+    stop_and_join(shutdown, handle).await;
+}

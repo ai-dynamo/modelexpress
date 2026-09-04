@@ -32,10 +32,10 @@ Two properties worth noting:
     meta-tensor replay, not just ``narrow``.
 
 SCOPE: the needed slice must resolve to a permuted axis-aligned box of the source
-(narrow/getitem/transpose/permute/t). A copy (``contiguous``/``reshape`` that
-materializes), a rank change (int-index collapse, step != 1 slice), or a
-dim-merging reshape - plus src/dst dtype mismatch - raise ``UnsupportedReshard``
-and make the receiver fail closed.
+(narrow/getitem/transpose/permute/t/select/unbind). A copy
+(``contiguous``/``reshape`` that materializes), a rank increase, a strided slice,
+or a dim-merging reshape - plus src/dst dtype mismatch - raises
+``UnsupportedReshard`` and makes the receiver fail closed.
 """
 
 from __future__ import annotations
@@ -167,25 +167,31 @@ def _view_to_box_perm(
     v_offset: int, v_shape: tuple, v_stride: tuple, global_shape
 ) -> tuple:
     """From a replayed strided view ``(offset, shape, stride)``, derive the source
-    index box + the view-dim -> source-dim permutation, for a RANK-PRESERVING
-    permuted box (transpose/permute/t of a narrowed/sliced region). Raises
-    ``UnsupportedReshard`` for a rank change or a non-permutation stride (a
-    dim-merging reshape) and makes the current receiver fail closed.
+    index box + the view-dim -> source-dim permutation.
 
-    A permuted box has each ``v_stride[d]`` equal to some source dim's row-major
-    stride (the dim that view-dim ``d`` iterates); ``v_offset`` unravels to the
-    box's per-source-dim start."""
+    Handles rank-PRESERVING permuted boxes (transpose/permute/t of a
+    narrowed/sliced region) and rank-REDUCING views (select/unbind drop a dim).
+    A dropped source dim is not iterated by any view dim, so it contributes a
+    single fixed index decoded from the offset (its box is ``[idx, idx+1]``).
+    Raises ``UnsupportedReshard`` for a rank INCREASE (unsqueeze) or a
+    non-permutation stride (a dim-merging reshape) and makes the current receiver
+    fail closed.
+
+    A permuted box has each view dim's ``v_stride[d]`` equal to some source dim's
+    row-major stride (the dim that view-dim ``d`` iterates); ``v_offset`` unravels
+    to each source dim's start."""
     ndim = len(global_shape)
-    if len(v_shape) != ndim:
+    vdim = len(v_shape)
+    if vdim > ndim:
         raise UnsupportedReshard(
-            f"rank change {len(v_shape)}!={ndim} (reshape/squeeze) not box-derivable"
+            f"rank increase {vdim}>{ndim} (unsqueeze) not box-derivable"
         )
     gstrides = _row_major_strides(global_shape)
     stride_to_dim: dict = {}
     for s in range(ndim):
         stride_to_dim.setdefault(gstrides[s], s)
-    perm: list = [None] * ndim
-    for d in range(ndim):
+    perm: list = [None] * vdim
+    for d in range(vdim):
         if v_shape[d] == 1:
             continue  # size-1 dim: stride is ambiguous; assign a leftover dim below
         sdim = stride_to_dim.get(v_stride[d])
@@ -197,15 +203,18 @@ def _view_to_box_perm(
     used = {s for s in perm if s is not None}
     remaining = [s for s in range(ndim) if s not in used]
     ri = 0
-    for d in range(ndim):
+    for d in range(vdim):
         if perm[d] is None:
             perm[d] = remaining[ri]
             ri += 1
-    if sorted(perm) != list(range(ndim)):
+    # Each view dim maps to a distinct source dim. Any source dims still
+    # unassigned were COLLAPSED by a rank-reducing view (select/unbind) and keep
+    # their size-1 default box below.
+    if len(set(perm)) != vdim:
         raise UnsupportedReshard("view strides are not a permutation of source dims")
     box_lo = [(v_offset // gstrides[s]) % global_shape[s] for s in range(ndim)]
-    box = [[box_lo[s], box_lo[s]] for s in range(ndim)]
-    for d in range(ndim):
+    box = [[box_lo[s], box_lo[s] + 1] for s in range(ndim)]
+    for d in range(vdim):
         box[perm[d]][1] = box[perm[d]][0] + v_shape[d]
 
     # Self-consistency guard: the derived box must faithfully reconstruct the
@@ -230,7 +239,7 @@ def resolve_slice(copy: RecordedCopy, global_shape) -> tuple:
     out permuted. The dest strides are reindexed from view-dim order into
     source-dim order so ``paired_runs`` (which walks the overlap in source-dim
     order) maps each source element to the right dest slot. Anything not a pure
-    permuted view (a copy, rank change, or dim-merging reshape) raises
+    permuted view (a copy, rank increase, or dim-merging reshape) raises
     ``UnsupportedReshard`` and makes the current receiver fail closed."""
     v_off, v_shape, v_stride = _replay_view(copy.op_chain, global_shape)
     box, perm = _view_to_box_perm(v_off, v_shape, v_stride, global_shape)
@@ -305,7 +314,7 @@ def plan_pull(
     tensor, return the ``PullSegment``s that read exactly the needed slice.
 
     Raises ``UnsupportedReshard`` on dtype mismatch, or an op-chain that isn't
-    a pure permuted view (copy / rank change / dim-merge)."""
+    a pure permuted view (copy / rank increase / dim-merge)."""
     if src_dtype != copy.dest_dtype:
         raise UnsupportedReshard(
             f"{copy.param_name}: source dtype {src_dtype} != dest dtype {copy.dest_dtype} "

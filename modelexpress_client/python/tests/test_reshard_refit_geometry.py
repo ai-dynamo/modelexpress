@@ -10,9 +10,20 @@ unsupported op is identified without producing an incorrect copy). Runs in any
 torch env: pytest tests/test_reshard_refit_geometry.py
 """
 
+import re
+
+import pytest
 import torch
 
-from modelexpress.refit.reshard.geometry import capture_geometry
+from modelexpress.refit.reshard.geometry import (
+    LazyWeight,
+    build_lazy_weights,
+    capture_geometry,
+    capture_weights,
+    convert_source_weights,
+)
+from modelexpress.refit.reshard.slice_plan import Shard, plan_pull
+from modelexpress.refit.reshard.types import UnsupportedReshard
 
 TP_RANK = 0
 
@@ -124,6 +135,55 @@ def test_unsupported_op_falls_back_per_source():
     assert by_src["q"].dest_offset == 0 and by_src["norm"].op_chain == ()
 
 
+def test_unsupported_source_records_the_op_that_defeated_capture():
+    """The count alone cannot distinguish an unexpressible fused layout from a
+    loader that merely touched one op outside the allowlist, so keep the cause."""
+    with torch.device("meta"):
+        model = ToyModel(with_bad=True)
+    result = capture_geometry(model, _manifest(with_bad=True))
+
+    assert set(result.unsupported_reasons) == {"bad"}
+    reason = result.unsupported_reasons["bad"]
+    assert "unsupported op" in reason
+    assert "aten.mul" in reason
+    # The offending source and its op-chain stay in the message, which is what
+    # makes a single failure actionable without a re-run.
+    assert "'bad'" in reason
+
+
+def test_summarize_unsupported_groups_one_cause_across_many_sources():
+    """Thousands of sources failing for one reason must read as one cause. Each
+    message embeds its own source name, so grouping has to ignore that tail."""
+    from modelexpress.refit.reshard.types import summarize_unsupported
+
+    reasons = {
+        f"model.layers.0.mlp.experts.{i}.gate_proj.weight": (
+            f"unsupported op aten.index_copy_ on lazy "
+            f"'model.layers.0.mlp.experts.{i}.gate_proj.weight' (chain=());"
+        )
+        for i in range(128)
+    }
+    reasons["odd"] = "unsupported op aten.mul on lazy 'odd' (chain=());"
+
+    assert summarize_unsupported(reasons) == [
+        ("unsupported op aten.index_copy_", 128),
+        ("unsupported op aten.mul", 1),
+    ]
+
+
+def test_summarize_unsupported_accepts_none_for_all_causes():
+    from modelexpress.refit.reshard.types import summarize_unsupported
+
+    reasons = {
+        f"source-{index}": f"cause-{index} on lazy 'source-{index}'"
+        for index in range(4)
+    }
+
+    assert summarize_unsupported(reasons, limit=None) == [
+        (f"cause-{index}", 1) for index in range(4)
+    ]
+
+
 def test_capture_feeds_slice_plan():
     """Compose capture -> slice-plan: real captured copies drive plan_pull. The
     row-parallel source (full [4,8], need cols [0:4]) is strided -> 4 runs
@@ -190,6 +250,279 @@ def test_default_loader_param_needs_default_weight_loader():
     assert got.copies[0].param_name == "norm"
     assert got.copies[0].op_chain == () and got.copies[0].dest_shape == (4,)
     assert got.unattributed == 0
+
+
+def test_capture_weights_records_the_converted_source_name():
+    """Pre-built weights whose keys were renamed (native -> loader name): the
+    recorded copy names the ORIGINAL source (the lazy's _name), not the key."""
+    f32 = torch.float32
+    with torch.device("meta"):
+        model = ToyModel()
+    lazies = build_lazy_weights(
+        [("native.col", f32, [8, 4]), ("native.norm", f32, [4])]
+    )
+    converted = {"col": lazies["native.col"], "norm": lazies["native.norm"]}
+
+    by_src = {c.src_name: c for c in capture_weights(model, converted).copies}
+
+    assert by_src["native.col"].op_chain == (("narrow", (0, 0, 4), ()),)
+    assert by_src["native.norm"].op_chain == ()
+    assert "col" not in by_src  # keyed by source, not the loader name
+
+
+def test_capture_weights_requires_a_shared_recorder():
+    """Weights from separate build_lazy_weights calls don't share a recorder."""
+    f32 = torch.float32
+    with torch.device("meta"):
+        model = ToyModel()
+    a = build_lazy_weights([("col", f32, [8, 4])])
+    b = build_lazy_weights([("norm", f32, [4])])
+
+    with pytest.raises(ValueError, match="share one recorder"):
+        capture_weights(model, {"col": a["col"], "norm": b["norm"]})
+
+
+_CONVERT_MANIFEST = [
+    ("model.router.gate.weight", torch.bfloat16, (2, 4)),
+    ("model.experts.w13", torch.bfloat16, (3, 2, 4)),
+]
+
+
+def test_convert_source_weights_identity_when_none():
+    weights = convert_source_weights(None, _CONVERT_MANIFEST)
+
+    assert set(weights) == {"model.router.gate.weight", "model.experts.w13"}
+    for name, lazy in weights.items():
+        assert isinstance(lazy, LazyWeight)
+        assert lazy._name == name and lazy._ops == ()
+
+
+def test_convert_source_weights_traces_a_rename():
+    def convert(sd):
+        return {"model.mlp.gate.weight": sd["model.router.gate.weight"]}  # rename
+
+    weights = convert_source_weights(convert, _CONVERT_MANIFEST)
+
+    (name,) = weights  # only the renamed source survives; the other is dropped
+    assert name == "model.mlp.gate.weight"
+    renamed = weights[name]
+    assert renamed._name == "model.router.gate.weight" and renamed._ops == ()
+
+
+def test_convert_source_weights_shares_one_recorder():
+    # capture_weights relies on this: every derived lazy shares the source recorder.
+    weights = convert_source_weights(
+        lambda sd: {"a": sd["model.router.gate.weight"], "b": sd["model.experts.w13"]},
+        _CONVERT_MANIFEST,
+    )
+    assert len({id(w._recorder) for w in weights.values()}) == 1
+
+
+def test_convert_source_weights_rejects_a_synthesized_tensor():
+    def convert(sd):
+        return {
+            "a": sd["model.router.gate.weight"],
+            "synth": torch.zeros(2, dtype=torch.bfloat16),
+        }
+
+    with pytest.raises(UnsupportedReshard, match="synthesized"):
+        convert_source_weights(convert, _CONVERT_MANIFEST)
+
+
+def test_convert_source_weights_rejects_a_dtype_cast():
+    def convert(sd):
+        return {"a": sd["model.router.gate.weight"].to(torch.float32)}
+
+    with pytest.raises(UnsupportedReshard):
+        convert_source_weights(convert, _CONVERT_MANIFEST)
+
+
+_E, _I, _H = 3, 2, 4  # experts, intermediate, hidden
+
+
+class ToyMoEModel(torch.nn.Module):
+    """Router + a vLLM-style STACKED fused expert param.
+
+    Per-expert HF weights land in ``w13[expert, half]`` (half 0 = gate, 1 = up),
+    mirroring how vLLM stacks gate/up experts into one param; the router is a
+    direct copy. Exercises the native->HF conversion all the way into the fused
+    destination slots.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.gate = torch.nn.Parameter(torch.empty(_E, _H))
+        self.gate.weight_loader = lambda p, loaded: p.data.copy_(loaded)
+        self.w13 = torch.nn.Parameter(torch.empty(_E, 2, _I, _H))
+        self.w13.weight_loader = self._expert_loader
+
+    def _expert_loader(self, param, loaded, expert_id, half):
+        param.data[expert_id, half].copy_(loaded)
+
+    def load_weights(self, weights):
+        for name, loaded in weights:
+            if name == "gate.weight":
+                self.gate.weight_loader(self.gate, loaded)
+                continue
+            m = re.fullmatch(r"experts\.(\d+)\.(gate|up)_proj\.weight", name)
+            expert_id, half = int(m.group(1)), (0 if m.group(2) == "gate" else 1)
+            self.w13.weight_loader(self.w13, loaded, expert_id, half)
+
+
+def _per_expert_rename_convert(sd):
+    """Rename per-expert native projections into the HF names vLLM's loader
+    consumes. The trainer here publishes each expert separately, so this is pure
+    renaming - the stacked-source case that needs an unstack (select) is covered
+    where the view ops are added."""
+    out = {"gate.weight": sd["router.gate"]}  # rename
+    for e in range(_E):
+        out[f"experts.{e}.gate_proj.weight"] = sd[f"experts.{e}.w1"]
+        out[f"experts.{e}.up_proj.weight"] = sd[f"experts.{e}.w3"]
+    return out
+
+
+def test_moe_convert_capture_plan_reconstructs_end_to_end():
+    """Full sequence for an MoE trainer: build lazies -> native->HF convert ->
+    vLLM loader capture -> plan_pull -> reconstruct, and assert every byte lands
+    in the right fused slot."""
+    f32 = torch.float32
+    router = torch.arange(_E * _H, dtype=f32).reshape(_E, _H)
+    w1 = {
+        e: (torch.arange(_I * _H, dtype=f32) + 100 + e).reshape(_I, _H)
+        for e in range(_E)
+    }
+    w3 = {
+        e: (torch.arange(_I * _H, dtype=f32) + 200 + e).reshape(_I, _H)
+        for e in range(_E)
+    }
+    src_buf = {"router.gate": router.reshape(-1)}
+    src_shape = {"router.gate": (_E, _H)}
+    for e in range(_E):
+        src_buf[f"experts.{e}.w1"] = w1[e].reshape(-1)
+        src_buf[f"experts.{e}.w3"] = w3[e].reshape(-1)
+        src_shape[f"experts.{e}.w1"] = (_I, _H)
+        src_shape[f"experts.{e}.w3"] = (_I, _H)
+    manifest = [(n, f32, s) for n, s in src_shape.items()]
+
+    with torch.device("meta"):
+        model = ToyMoEModel()
+    hf = convert_source_weights(_per_expert_rename_convert, manifest)
+    copies = capture_weights(model, hf).copies
+
+    dst = {
+        "gate": torch.zeros(_E, _H).reshape(-1),
+        "w13": torch.zeros(_E, 2, _I, _H).reshape(-1),
+    }
+    for copy in copies:
+        shape = src_shape[copy.src_name]
+        shard = Shard(
+            shard_offset=(0,) * len(shape), shape=shape, session="s", addr=0, elsize=4
+        )
+        segs = plan_pull(
+            copy, global_shape=shape, src_dtype=f32, elsize=4, shards=[shard]
+        )
+        source, dest = src_buf[copy.src_name], dst[copy.param_name]
+        for seg in segs:
+            s0, d0, n = seg.src_addr // 4, seg.dst_byte // 4, seg.nbytes // 4
+            dest[d0 : d0 + n] = source[s0 : s0 + n]
+
+    gate_out = dst["gate"].reshape(_E, _H)
+    w13_out = dst["w13"].reshape(_E, 2, _I, _H)
+    assert torch.equal(gate_out, router)
+    for e in range(_E):
+        assert torch.equal(w13_out[e, 0], w1[e])  # gate_proj -> half 0
+        assert torch.equal(w13_out[e, 1], w3[e])  # up_proj -> half 1
+
+
+def test_capture_weights_composes_a_select_prefix_with_the_loader_op():
+    """A select in the conversion prefix survives into the recorded op-chain,
+    ahead of the loader's own ops."""
+    f32 = torch.float32
+    with torch.device("meta"):
+        model = ToyModel()
+    lazies = build_lazy_weights([("native.stack", f32, [2, 4])])
+    converted = {"norm": lazies["native.stack"].select(0, 1)}  # unstack row 1 -> [4]
+
+    (copy,) = capture_weights(model, converted).copies
+
+    assert copy.src_name == "native.stack"
+    assert copy.op_chain == (("select", (0, 1), ()),)  # prefix; copy_ is the sink
+    assert copy.dest_shape == (4,)
+
+
+def test_convert_source_weights_traces_expert_unstack():
+    def convert(sd):
+        stacked = sd["model.experts.w13"]
+        return {
+            f"model.experts.{e}.gate_proj.weight": stacked.select(0, e)
+            for e in range(stacked.shape[0])
+        }
+
+    weights = convert_source_weights(convert, _CONVERT_MANIFEST)
+
+    expert = weights["model.experts.2.gate_proj.weight"]
+    assert expert._name == "model.experts.w13"
+    assert expert._ops == (("select", (0, 2), ()),)
+    assert tuple(expert.shape) == (2, 4)
+
+
+def test_stacked_moe_convert_capture_plan_reconstructs_end_to_end():
+    """Stacked-source variant of the MoE e2e: the trainer publishes experts
+    stacked and the conversion unstacks them with select. Each per-expert slab is
+    a zero-copy sub-range that lands in the right fused destination slot."""
+    f32 = torch.float32
+    router = torch.arange(_E * _H, dtype=f32).reshape(_E, _H)
+    w1 = (torch.arange(_E * _I * _H, dtype=f32) + 100).reshape(
+        _E, _I, _H
+    )  # stacked gate
+    w3 = (torch.arange(_E * _I * _H, dtype=f32) + 200).reshape(_E, _I, _H)  # stacked up
+    src_buf = {
+        "router.gate": router.reshape(-1),
+        "experts.w1": w1.reshape(-1),
+        "experts.w3": w3.reshape(-1),
+    }
+    src_shape = {
+        "router.gate": (_E, _H),
+        "experts.w1": (_E, _I, _H),
+        "experts.w3": (_E, _I, _H),
+    }
+    manifest = [(n, f32, s) for n, s in src_shape.items()]
+
+    def convert(sd):
+        out = {"gate.weight": sd["router.gate"]}
+        for e in range(_E):
+            out[f"experts.{e}.gate_proj.weight"] = sd["experts.w1"].select(0, e)
+            out[f"experts.{e}.up_proj.weight"] = sd["experts.w3"].select(0, e)
+        return out
+
+    with torch.device("meta"):
+        model = ToyMoEModel()
+    hf = convert_source_weights(convert, manifest)
+    copies = capture_weights(model, hf).copies
+
+    dst = {
+        "gate": torch.zeros(_E, _H).reshape(-1),
+        "w13": torch.zeros(_E, 2, _I, _H).reshape(-1),
+    }
+    for copy in copies:
+        shape = src_shape[copy.src_name]
+        shard = Shard(
+            shard_offset=(0,) * len(shape), shape=shape, session="s", addr=0, elsize=4
+        )
+        segs = plan_pull(
+            copy, global_shape=shape, src_dtype=f32, elsize=4, shards=[shard]
+        )
+        source, dest = src_buf[copy.src_name], dst[copy.param_name]
+        for seg in segs:
+            s0, d0, n = seg.src_addr // 4, seg.dst_byte // 4, seg.nbytes // 4
+            dest[d0 : d0 + n] = source[s0 : s0 + n]
+
+    gate_out = dst["gate"].reshape(_E, _H)
+    w13_out = dst["w13"].reshape(_E, 2, _I, _H)
+    assert torch.equal(gate_out, router)
+    for e in range(_E):
+        assert torch.equal(w13_out[e, 0], w1[e])
+        assert torch.equal(w13_out[e, 1], w3[e])
 
 
 if __name__ == "__main__":

@@ -127,6 +127,8 @@ pub const POD_NAMESPACE: &str = "POD_NAMESPACE";
 // ── Reaper (server) ─────────────────────────────────────────────────────────
 /// Interval (seconds) between reaper scans for stale/GC worker sweeps.
 pub const MX_REAPER_SCAN_INTERVAL_SECS: &str = "MX_REAPER_SCAN_INTERVAL_SECS";
+/// Interval (seconds) between registry-statistics refresh passes.
+pub const MX_REGISTRY_STATS_INTERVAL_SECS: &str = "MX_REGISTRY_STATS_INTERVAL_SECS";
 /// Age (seconds) after which an active worker's heartbeat is considered stale.
 pub const MX_HEARTBEAT_TIMEOUT_SECS: &str = "MX_HEARTBEAT_TIMEOUT_SECS";
 /// Age (seconds) after which a STALE worker is garbage-collected.
@@ -159,6 +161,10 @@ pub const KUBECONFIG: &str = "KUBECONFIG";
 
 // ── Default reaper timings ───────────────────────────────────────────────────
 const DEFAULT_REAPER_SCAN_INTERVAL_SECS: u64 = 30;
+/// Default registry-statistics refresh interval. Each pass walks the keyspace,
+/// so this is deliberately coarser than a scrape: the gauges it writes change
+/// on the timescale of downloads, not of scrapes.
+const DEFAULT_REGISTRY_STATS_INTERVAL_SECS: u64 = 60;
 const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 90;
 const DEFAULT_GC_TIMEOUT_SECS: u64 = 3600;
 
@@ -287,6 +293,19 @@ pub fn reaper_scan_interval_secs() -> u64 {
     )
 }
 
+/// Registry-statistics refresh interval in seconds
+/// ([`MX_REGISTRY_STATS_INTERVAL_SECS`], default 60).
+///
+/// Clamped to at least 1: `tokio::time::interval` panics on a zero period, so a
+/// deployment that set this to 0 would take the refresh task down at startup.
+pub fn registry_stats_interval_secs() -> u64 {
+    env_u64(
+        MX_REGISTRY_STATS_INTERVAL_SECS,
+        DEFAULT_REGISTRY_STATS_INTERVAL_SECS,
+    )
+    .max(1)
+}
+
 /// Heartbeat staleness timeout in seconds ([`MX_HEARTBEAT_TIMEOUT_SECS`], default 90).
 pub fn heartbeat_timeout_secs() -> u64 {
     env_u64(MX_HEARTBEAT_TIMEOUT_SECS, DEFAULT_HEARTBEAT_TIMEOUT_SECS)
@@ -363,6 +382,10 @@ mod tests {
         assert_eq!(MX_METADATA_NAMESPACE, "MX_METADATA_NAMESPACE");
         assert_eq!(POD_NAMESPACE, "POD_NAMESPACE");
         assert_eq!(MX_REAPER_SCAN_INTERVAL_SECS, "MX_REAPER_SCAN_INTERVAL_SECS");
+        assert_eq!(
+            MX_REGISTRY_STATS_INTERVAL_SECS,
+            "MX_REGISTRY_STATS_INTERVAL_SECS"
+        );
         assert_eq!(MX_HEARTBEAT_TIMEOUT_SECS, "MX_HEARTBEAT_TIMEOUT_SECS");
         assert_eq!(MX_GC_TIMEOUT_SECS, "MX_GC_TIMEOUT_SECS");
         assert_eq!(MODEL_EXPRESS_SECURITY_MODE, "MODEL_EXPRESS_SECURITY_MODE");

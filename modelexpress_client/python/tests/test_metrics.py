@@ -33,11 +33,13 @@ from __future__ import annotations
 
 import errno
 import os
+import re
 import socket
 import subprocess
 import sys
 import textwrap
 import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -46,6 +48,7 @@ import pytest
 from modelexpress.metrics import (
     ENV_ENABLED,
     LIST_SOURCES_RESULTS,
+    _XSLOW_BUCKETS,
     MetricsCollector,
     enable_metrics,
     push_metrics_if_enabled,
@@ -60,6 +63,10 @@ _RECORDERS = [
     ("observe_candidates", ("random", "listed", 2)),
     ("observe_selection_seconds", ("random", 0.001)),
     ("observe_transfer_seconds", ("random", "success", 1.0)),
+    ("record_nixl_error", ("timeout",)),
+    ("record_nixl_receive", ("complete",)),
+    ("observe_load_seconds", ("vllm", "Qwen/Qwen2.5-0.5B-Instruct", "main", "success", 12.0)),
+    ("observe_load_phase_seconds", ("vllm", "Qwen/Qwen2.5-0.5B-Instruct", "chain", 4.0)),
 ]
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -145,6 +152,8 @@ def test_recorders_never_raise_into_load_path(monkeypatch):
     m.candidates = boom
     m.selection_seconds = boom
     m.transfer_seconds = boom
+    m.nixl_errors = boom
+    m.nixl_receives = boom
     # None of these may propagate the RuntimeError.
     for name, args in _RECORDERS:
         getattr(m, name)(*args)
@@ -824,4 +833,410 @@ def test_merged_endpoint_serves_every_rank_including_hard_killed(tmp_path, ranks
     assert build_info[0].endswith(" 1.0"), (
         f"mx_build_info merged to {build_info[0].rsplit(' ', 1)[1]} across {ranks} "
         f"ranks; a summing multiprocess_mode has been introduced"
+    )
+
+
+# ---------------------------------------------------------------------------
+# NIXL data-plane families
+# ---------------------------------------------------------------------------
+
+
+def test_nixl_labels_are_closed_enums(monkeypatch):
+    """An unrecognized value must clamp rather than mint a new series.
+
+    The underlying `_data_plane_error` is formatted free text, so an
+    unclassified value reaching the label would grow the domain with the wording
+    of the message.
+
+    Built through ``_fresh_collector`` like every other test here, and not on the
+    process-global registry: ``_ensure()`` also runs ``_start_exposition()``, so
+    a bare ``MetricsCollector()`` under an ambient ``MX_METRICS_PORT`` binds a
+    real listener that outlives the pytest session, and a second collector on the
+    global registry fails with "Duplicated timeseries ... mx_build_info" —
+    an error that names the wrong metric and would land on whichever test ran
+    second.
+    """
+    m = _fresh_collector(monkeypatch, MX_METRICS_PORT=None, MX_METRICS_PUSHGATEWAY=None)
+    assert m._ensure() is True
+
+    m.record_nixl_error("timeout")
+    m.record_nixl_error("status_error")
+    m.record_nixl_error("QP 3 wedged on device mlx5_2")
+    m.record_nixl_receive("complete")
+    m.record_nixl_receive("partial")
+    m.record_nixl_receive("something new")
+
+    kinds = _label_values(m.nixl_errors, "kind")
+    assert kinds == {"timeout", "status_error"}, kinds
+    m.record_nixl_receive("rejected")
+    results = _label_values(m.nixl_receives, "result")
+    assert results == {"complete", "partial", "empty", "rejected"}, results
+
+
+def test_a_nixl_recording_counts_exactly_one_event(monkeypatch):
+    """The label set is not the metric; the value is.
+
+    Every query these two families exist for is a function of the sample value —
+    ``rate(mx_nixl_data_plane_errors_total[5m])`` for the agent-health signal,
+    ``partial / sum(mx_nixl_receive_total)`` for the manifest-drift ratio. A
+    recorder that incremented by anything other than one per event would pass a
+    label-domain assertion unremarked while inflating both.
+
+    The clamped call is counted too, on the ``status_error`` series: an
+    unclassified failure is still a failure, and dropping it would understate the
+    rate exactly when the fabric is misbehaving in a way nobody has classified
+    yet.
+    """
+    collector = _fresh_collector(
+        monkeypatch, MX_METRICS_PORT=None, MX_METRICS_PUSHGATEWAY=None
+    )
+    assert collector._ensure() is True
+
+    collector.record_nixl_error("timeout")
+    collector.record_nixl_error("timeout")
+    collector.record_nixl_error("QP 3 wedged on device mlx5_2")
+    collector.record_nixl_receive("complete")
+    collector.record_nixl_receive("complete")
+    collector.record_nixl_receive("partial")
+
+    assert _label_counts(collector.nixl_errors, "kind") == {
+        "timeout": 2.0,
+        "status_error": 1.0,
+    }
+    assert _label_counts(collector.nixl_receives, "result") == {
+        "complete": 2.0,
+        "partial": 1.0,
+    }
+
+    # The family names are the dashboard's API: assert them as exposed text
+    # rather than through the attribute, which a rename would carry along.
+    body = _exposition(collector)
+    assert 'mx_nixl_data_plane_errors_total{kind="timeout"' in body, body
+    assert 'mx_nixl_receive_total{result="partial"' in body, body
+
+
+@pytest.mark.parametrize(
+    "recorder,args,family,label",
+    [
+        ("record_nixl_error", ("timeout",), "nixl_errors", "kind"),
+        ("record_nixl_receive", ("partial",), "nixl_receives", "result"),
+    ],
+)
+def test_a_nixl_event_can_be_the_first_metrics_call_of_a_process(
+    monkeypatch, recorder, args, family, label
+):
+    """D4 for the two NIXL recorders: they must route through ``_ensure()``.
+
+    A process that never selects a P2P source can still hit the data plane, so a
+    NIXL failure or a degraded receive may be the first metrics event of the run.
+    A recorder that touched its family without ``_ensure()`` would raise
+    ``AttributeError`` on a collector that had not initialized yet, and the
+    blanket ``except`` in the recorder turns that into silence: no families, no
+    endpoint, no error.
+
+    One collector per recorder, because the first call to initialize hides the
+    omission in the other: sharing a collector would let a recorder that skips
+    ``_ensure()`` free-ride on its sibling.
+    """
+    collector = _fresh_collector(
+        monkeypatch, MX_METRICS_PORT=None, MX_METRICS_PUSHGATEWAY=None
+    )
+    assert collector._ready is False, "the fixture must not pre-initialize"
+
+    getattr(collector, recorder)(*args)
+
+    assert collector._ready is True, "the recorder did not initialize the collector"
+    assert _label_counts(getattr(collector, family), label) == {args[0]: 1.0}
+
+
+def _label_values(collector, label):
+    """Distinct values seen for one label of a collector."""
+    values = set()
+    for metric in collector.collect():
+        for sample in metric.samples:
+            if label in sample.labels:
+                values.add(sample.labels[label])
+    return values
+
+
+def _label_counts(collector, label):
+    """Counter value per distinct value of one label.
+
+    Only ``_total`` samples: a Counter also emits a ``_created`` timestamp under
+    the same labels, and summing that in would swamp the counts with epoch
+    seconds.
+    """
+    counts = {}
+    for metric in collector.collect():
+        for sample in metric.samples:
+            if sample.name.endswith("_total") and label in sample.labels:
+                counts[sample.labels[label]] = (
+                    counts.get(sample.labels[label], 0.0) + sample.value
+                )
+    return counts
+
+
+# ---------------------------------------------------------------------------
+# Cross-check with the alerting rules the Helm chart ships
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = _PACKAGE_ROOT.parents[1]
+_RUST_CROSS_CHECK = _REPO_ROOT / "workspace-tests" / "tests" / "helm_alert_rules.rs"
+
+
+def _client_families_claimed_by_rust() -> list[str]:
+    """The ``CLIENT_FAMILIES`` list from the Rust-side alert-rule check.
+
+    Parsed rather than duplicated so the two lists cannot drift apart while both
+    suites stay green.
+    """
+    source = _RUST_CROSS_CHECK.read_text()
+    block = re.search(r"const CLIENT_FAMILIES: &\[&str\] = &\[(.*?)\];", source, re.S)
+    assert block, f"CLIENT_FAMILIES not found in {_RUST_CROSS_CHECK}"
+    return re.findall(r'"([^"]+)"', block.group(1))
+
+
+def _exported_series_names(exposition: str) -> set[str]:
+    """Exact series names from the exposition, one per sample line.
+
+    Not a substring search over the whole text. A removed family whose name is a
+    prefix of a surviving one -- or which still appears in a HELP line -- would
+    match anywhere in the blob and the check would pass while the series was
+    gone. These are the names a query would actually have to use.
+    """
+    names = set()
+    for line in exposition.splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        names.add(line.split("{", 1)[0].split(" ", 1)[0])
+    return names
+
+
+def test_alert_rule_client_families_exist(monkeypatch):
+    """Every client family the alert rules rely on is really exported.
+
+    ``helm_alert_rules.rs`` proves each ``mx_*`` name in the rules is either a
+    server family or one of these; this closes the other half, because the Rust
+    side cannot enumerate a Python registry and would otherwise accept anything
+    written into that list.
+
+    Without this pairing a client-side rename produces no failure anywhere: the
+    Rust check keeps passing on the stale name because it is in the allowlist,
+    and the alert quietly stops matching anything.
+    """
+    collector = _fresh_collector(monkeypatch)
+    for name, args in _RECORDERS:
+        getattr(collector, name)(*args)
+    exposition = _exposition(collector)
+
+    claimed = _client_families_claimed_by_rust()
+    assert claimed, "parsed an empty CLIENT_FAMILIES; the regex no longer matches"
+
+    exported = _exported_series_names(exposition)
+    missing = [family for family in claimed if family not in exported]
+    assert not missing, (
+        f"the alert rules name client families that are not exported: {missing}\n"
+        f"Exported: {sorted(exported)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# L0 / L1 load timing
+# ---------------------------------------------------------------------------
+
+
+def _sum_for(exposition: str, family: str, **labels) -> float:
+    """The ``_sum`` of one histogram child, or 0.0 if that child has no series."""
+    import re
+
+    want = {k: v for k, v in labels.items()}
+    total = 0.0
+    for line in exposition.splitlines():
+        if not line.startswith(f"{family}_sum{{"):
+            continue
+        got = dict(re.findall(r'([a-zA-Z_]\w*)="([^"]*)"', line))
+        if all(got.get(k) == v for k, v in want.items()):
+            total += float(line.rsplit(" ", 1)[1])
+    return total
+
+
+def test_a_load_records_one_observation_with_its_outcome(monkeypatch):
+    collector = _fresh_collector(monkeypatch)
+    with collector.time_load("vllm", "test-model", "main"):
+        pass
+
+    exposition = _exposition(collector)
+    assert (
+        'mx_load_seconds_count{engine="vllm",model="test-model",model_role="main",outcome="success",scheme=""} 1.0'
+        in exposition
+    ), exposition
+
+
+def test_a_failed_load_is_recorded_and_the_exception_still_propagates(monkeypatch):
+    """The load that raises is the one worth timing.
+
+    Recording only successes would drop exactly the observations someone goes
+    looking for, and swallowing the exception would turn a metrics concern into
+    a correctness one.
+    """
+    collector = _fresh_collector(monkeypatch)
+    with pytest.raises(RuntimeError, match="boom"):
+        with collector.time_load("vllm", "test-model", "main"):
+            raise RuntimeError("boom")
+
+    exposition = _exposition(collector)
+    assert 'outcome="error"' in exposition, exposition
+    assert (
+        'mx_load_seconds_count{engine="vllm",model="test-model",model_role="main",outcome="error",scheme=""} 1.0'
+        in exposition
+    ), exposition
+
+
+def test_a_phase_that_raises_is_still_recorded(monkeypatch):
+    """The elapsed time was really spent inside the load.
+
+    Dropping it would make the phases stop summing to the whole on precisely the
+    failed loads being investigated.
+    """
+    collector = _fresh_collector(monkeypatch)
+    with pytest.raises(RuntimeError):
+        with collector.time_load_phase("vllm", "test-model", "model_init"):
+            raise RuntimeError("boom")
+
+    exposition = _exposition(collector)
+    assert (
+        'mx_load_phase_seconds_count{engine="vllm",model="test-model",phase="model_init",scheme=""} 1.0'
+        in exposition
+    ), exposition
+
+
+def test_phases_partition_the_load(monkeypatch):
+    """The L1 invariant: sum(phases) <= L0, on real timings.
+
+    This is the property that makes "which part was slow" answerable without the
+    numbers contradicting each other. It holds by construction here because the
+    phases are disjoint intervals inside the L0 span -- the test exists so that
+    a future phase recorded from a second site fails rather than quietly
+    double-counting.
+    """
+    collector = _fresh_collector(monkeypatch)
+    with collector.time_load("vllm", "test-model", "main"):
+        for phase in ("artifact_install", "model_init", "chain", "publish"):
+            with collector.time_load_phase("vllm", "test-model", phase):
+                time.sleep(0.002)
+
+    exposition = _exposition(collector)
+    total = _sum_for(exposition, "mx_load_seconds", engine="vllm")
+    phases = _sum_for(exposition, "mx_load_phase_seconds", engine="vllm")
+
+    assert phases > 0, exposition
+    assert phases <= total, (
+        f"phases summed to {phases:.6f}s but the load took {total:.6f}s; "
+        "a phase is being recorded outside the load span or from two sites"
+    )
+
+
+def test_load_labels_are_closed_enums(monkeypatch):
+    """An out-of-tree engine clamps to `other` rather than opening the domain."""
+    collector = _fresh_collector(monkeypatch)
+    collector.observe_load_seconds("some-fork", "m", "speculative", "weird", 1.0)
+
+    exposition = _exposition(collector)
+    assert 'engine="other"' in exposition, exposition
+    assert 'model_role="other"' in exposition, exposition
+    assert 'outcome="error"' in exposition, exposition
+    assert "some-fork" not in exposition, exposition
+
+
+def test_an_unknown_phase_is_dropped_not_clamped(monkeypatch):
+    """Folding a stray phase into a real one inflates that phase's total.
+
+    The sum would still look sound, which is worse than the observation going
+    missing: a wrong number that reads as a right one.
+    """
+    collector = _fresh_collector(monkeypatch)
+    collector.observe_load_phase_seconds("vllm", "m", "not_a_phase", 5.0)
+
+    exposition = _exposition(collector)
+    assert "not_a_phase" not in exposition, exposition
+    assert "mx_load_phase_seconds_count" not in exposition, exposition
+
+
+def test_the_model_label_is_clamped_by_length_not_by_enum(monkeypatch):
+    """The one load label whose domain code cannot close.
+
+    Engine and phase are closed enums; a model id is whatever the deployment
+    serves. So the guard is a length cap, and the absent case gets a value
+    rather than an empty label -- an empty string would render as
+    ``model=""`` and read as a bug in the exporter.
+    """
+    from modelexpress.metrics import _MODEL_LABEL_MAX
+
+    collector = _fresh_collector(monkeypatch)
+    collector.observe_load_seconds("vllm", "x" * 500, "main", "success", 1.0)
+    collector.observe_load_seconds("vllm", None, "main", "success", 1.0)
+    collector.observe_load_seconds("vllm", "   ", "main", "success", 1.0)
+
+    exposition = _exposition(collector)
+    longest = max(
+        (len(m) for m in re.findall(r'model="([^"]*)"', exposition)), default=0
+    )
+    assert longest <= _MODEL_LABEL_MAX, exposition
+    assert 'model="unknown"' in exposition, exposition
+
+
+def test_the_model_label_separates_two_models_in_one_process(monkeypatch):
+    """Two models must not merge into one series.
+
+    A pod serves one model, so this is not the production shape -- but the label
+    is only worth adding if it actually partitions, and a test that records one
+    model cannot tell a working label from a constant.
+    """
+    collector = _fresh_collector(monkeypatch)
+    collector.observe_load_seconds("vllm", "org/small", "main", "success", 2.0)
+    collector.observe_load_seconds("vllm", "org/large", "main", "success", 90.0)
+
+    exposition = _exposition(collector)
+    assert 'model="org/small"' in exposition, exposition
+    assert 'model="org/large"' in exposition, exposition
+    counts = re.findall(r"mx_load_seconds_count\{[^}]*\} (\d+\.\d+)", exposition)
+    assert counts == ["1.0", "1.0"], exposition
+
+
+def test_load_timers_never_raise_into_the_load_path(monkeypatch):
+    """Same guarantee the other recorders carry, on the new entry points."""
+    collector = _fresh_collector(monkeypatch)
+    collector._ready = True
+    collector.load_seconds = None  # force an AttributeError inside the recorder
+    collector.load_phase_seconds = None
+
+    with collector.time_load("vllm", "test-model", "main"):
+        with collector.time_load_phase("vllm", "test-model", "chain"):
+            pass
+
+    collector.observe_load_seconds("vllm", "m", "main", "success", 1.0)
+    collector.observe_load_phase_seconds("vllm", "m", "chain", 1.0)
+
+
+def test_load_buckets_match_the_rust_xslow_band():
+    """A server download and a client load are compared on one dashboard.
+
+    Quantiles from differently-bucketed histograms are not comparable, so the
+    two bands are pinned to each other here rather than trusted to stay in step.
+    """
+    rust = (
+        Path(__file__).resolve().parents[3]
+        / "modelexpress_server"
+        / "src"
+        / "metrics"
+        / "buckets.rs"
+    )
+    source = rust.read_text(encoding="utf-8")
+    match = re.search(r"pub const XSLOW: \[f64; \d+\] = \[(.*?)\];", source, re.S)
+    assert match, "could not find XSLOW in buckets.rs"
+    rust_buckets = tuple(
+        float(v.strip()) for v in match.group(1).split(",") if v.strip()
+    )
+    assert rust_buckets == tuple(float(b) for b in _XSLOW_BUCKETS), (
+        f"Rust XSLOW {rust_buckets} != Python _XSLOW_BUCKETS {_XSLOW_BUCKETS}"
     )

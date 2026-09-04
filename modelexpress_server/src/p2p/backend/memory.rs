@@ -128,9 +128,16 @@ impl MetadataBackend for InMemoryMetadataBackend {
                     .ranks
                     .get(&entry.index_rank)
                     .or_else(|| entry.ranks.values().next());
-                let (status, updated_at, accelerator) = reported.map_or_else(
-                    || (0, 0, String::new()),
-                    |r| (r.status, r.updated_at, r.accelerator.clone()),
+                let (status, updated_at, accelerator, topology) = reported.map_or_else(
+                    || (0, 0, String::new(), HashMap::new()),
+                    |r| {
+                        (
+                            r.status,
+                            r.updated_at,
+                            r.accelerator.clone(),
+                            r.topology.clone(),
+                        )
+                    },
                 );
                 result.push(SourceInstanceInfo {
                     source_id: sid.clone(),
@@ -140,6 +147,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
                     status,
                     updated_at,
                     accelerator,
+                    topology,
                     training_step: super::parse_training_step(&source.extra_parameters),
                     layout_signature: super::parse_layout_signature(&source.extra_parameters),
                 });
@@ -209,7 +217,7 @@ mod tests {
 
     fn identity(model: &str) -> SourceIdentity {
         SourceIdentity {
-            mx_version: "0.5.0".to_string(),
+            mx_version: "0.5.1".to_string(),
             mx_source_type: MxSourceType::Weights as i32,
             model_name: model.to_string(),
             backend_framework: 1,

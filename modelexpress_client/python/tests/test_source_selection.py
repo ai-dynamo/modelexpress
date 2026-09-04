@@ -10,15 +10,17 @@ metadata-miss fallback, and the no-retry-after-transfer-start rule).
 
 from __future__ import annotations
 
+import gc
 import logging
+import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 from modelexpress import p2p_pb2
-from modelexpress.adapter import StrategyFailed
-from modelexpress.load_strategy.base import LoadResult
+from modelexpress.adapter import StrategyFailed, StrategyRecoveryError
+from modelexpress.load_strategy.base import LoadResult, clear_exception_tracebacks
 from modelexpress.load_strategy.rdma_strategy import MAX_SOURCE_RETRIES, RdmaStrategy
 from modelexpress.source_selection import (
     ENV_SELECTOR,
@@ -54,6 +56,27 @@ def _ref(mx_source_id, worker_id, worker_rank=0, model_name="m", accelerator="")
 
 def _sources(n, worker_rank=0):
     return [_ref(f"src{i:04x}aaaaaaaaaa", f"w{i}", worker_rank) for i in range(n)]
+
+
+def test_clear_exception_tracebacks_releases_transfer_frame_locals():
+    class Allocation:
+        pass
+
+    def fail_with_local_allocation():
+        allocation = Allocation()
+        allocation_ref = weakref.ref(allocation)
+        try:
+            raise RuntimeError("transfer failed")
+        except RuntimeError as exc:
+            return exc, allocation_ref
+
+    exc, allocation_ref = fail_with_local_allocation()
+    assert allocation_ref() is not None
+
+    clear_exception_tracebacks(exc)
+    gc.collect()
+
+    assert allocation_ref() is None
 
 
 # ---------------------------------------------------------------------------
@@ -638,8 +661,15 @@ def test_load_transfer_failure_reinitializes_and_tries_next_source():
     strat._load_as_target = MagicMock(
         side_effect=[StrategyFailed("receive failed", mutated=True), "loaded"]
     )
-    original_result = MagicMock(name="original-result")
-    retry_result = MagicMock(name="retry-result")
+    original_model = MagicMock(name="original-model")
+    retry_model = MagicMock(name="retry-model")
+    original_result = LoadResult(value=original_model, model=original_model)
+    retry_result = LoadResult(
+        value=retry_model,
+        model=retry_model,
+        publishable=False,
+        metadata={"retry": True},
+    )
     ctx = MagicMock(global_rank=0)
     ctx.accelerator_backend.name = ""  # unknown target -> accelerator gate accepts
     ctx.adapter.reinit_for_retry.return_value = retry_result
@@ -655,8 +685,32 @@ def test_load_transfer_failure_reinitializes_and_tries_next_source():
     assert strat._fetch_worker_metadata.call_count == 2
     assert strat._load_as_target.call_count == 2
     ctx.adapter.reinit_for_retry.assert_called_once()
-    assert ctx.adapter.reinit_for_retry.call_args.args[0].value is original_result
-    assert strat._load_as_target.call_args_list[1].args[0] is retry_result
+    retry_envelope = strat._load_as_target.call_args_list[1].args[0]
+    assert ctx.adapter.reinit_for_retry.call_args.args[0] is retry_envelope
+    assert retry_envelope.value is retry_result.value
+    assert retry_envelope.model is retry_result.model
+    assert retry_envelope.publishable is False
+    assert retry_envelope.metadata == {"retry": True}
+
+
+@pytest.mark.parametrize("vmm_arena", [None, object()])
+def test_load_transfer_failure_supports_identity_preserving_retry(vmm_arena):
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(2))
+    strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
+    strat._load_as_target = MagicMock(
+        side_effect=[StrategyFailed("receive failed", mutated=True), "loaded"]
+    )
+    model = MagicMock(name="engine-owned-model-root")
+    result = LoadResult(value=model, model=model)
+    ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""
+    ctx.vmm_arena = vmm_arena
+    ctx.adapter.reinit_for_retry.side_effect = lambda current: current
+
+    assert strat.load(result, ctx) == "loaded"
+    assert strat._load_as_target.call_args_list[1].args[0] is result
+    assert ctx.vmm_arena is vmm_arena
 
 
 def test_load_clean_transfer_failure_tries_next_source_without_reinit():
@@ -673,7 +727,7 @@ def test_load_clean_transfer_failure_tries_next_source_without_reinit():
     ctx.adapter.reinit_for_retry.assert_not_called()
 
 
-def test_load_requires_outer_reinit_after_reinit_then_metadata_miss():
+def test_load_internal_reinit_is_visible_after_later_metadata_miss():
     strat = RdmaStrategy()
     strat._find_source_instances = MagicMock(return_value=_sources(2))
     strat._fetch_worker_metadata = MagicMock(side_effect=[MagicMock(), None])
@@ -696,12 +750,12 @@ def test_load_requires_outer_reinit_after_reinit_then_metadata_miss():
     with pytest.raises(StrategyFailed) as exc:
         strat.load(original_result, ctx)
 
-    assert exc.value.mutated is True
-    assert original_result.model is None
+    assert exc.value.mutated is False
+    assert original_result.model is not None
     ctx.adapter.reinit_for_retry.assert_called_once()
 
 
-def test_load_requires_outer_reinit_after_reinit_then_clean_failure():
+def test_load_internal_reinit_then_clean_failure_stays_clean():
     strat = RdmaStrategy()
     strat._find_source_instances = MagicMock(return_value=_sources(2))
     strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
@@ -718,11 +772,28 @@ def test_load_requires_outer_reinit_after_reinit_then_clean_failure():
     with pytest.raises(StrategyFailed, match="clean failure") as exc:
         strat.load(MagicMock(), ctx)
 
-    assert exc.value.mutated is True
+    assert exc.value.mutated is False
     ctx.adapter.reinit_for_retry.assert_called_once()
 
 
-def test_load_reinit_failure_remains_mutated():
+def test_load_last_candidate_mutated_failure_propagates_mutated():
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(1))
+    strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
+    strat._load_as_target = MagicMock(
+        side_effect=StrategyFailed("mutated failure", mutated=True)
+    )
+    ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""
+
+    with pytest.raises(StrategyFailed, match="mutated failure") as exc:
+        strat.load(MagicMock(), ctx)
+
+    assert exc.value.mutated is True
+    ctx.adapter.reinit_for_retry.assert_not_called()
+
+
+def test_load_reinit_failure_is_unrecoverable():
     strat = RdmaStrategy()
     strat._find_source_instances = MagicMock(return_value=_sources(2))
     strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
@@ -733,10 +804,10 @@ def test_load_reinit_failure_remains_mutated():
     ctx.accelerator_backend.name = ""
     ctx.adapter.reinit_for_retry.side_effect = RuntimeError("reinit failed")
 
-    with pytest.raises(StrategyFailed, match="reinit failed") as exc:
+    with pytest.raises(StrategyRecoveryError, match="reinit failed") as exc:
         strat.load(MagicMock(), ctx)
 
-    assert exc.value.mutated is True
+    assert isinstance(exc.value.__cause__, RuntimeError)
 
 
 def test_load_cleanup_failure_aborts_before_reinit():

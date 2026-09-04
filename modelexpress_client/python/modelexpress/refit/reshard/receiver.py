@@ -34,6 +34,7 @@ import torch
 from modelexpress import envs
 from modelexpress.client import MxClient
 from modelexpress.nixl_transfer import NixlTransferManager
+from modelexpress.refit.reshard import throughput
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
 from modelexpress.refit.reshard.rendezvous import gather_sources
 from modelexpress.refit.reshard.transfer_plan import (
@@ -49,6 +50,7 @@ from modelexpress.refit.reshard.types import (
     CaptureResult,
     IncompleteRefit,
     UnsupportedReshard,
+    summarize_unsupported,
 )
 
 logger = logging.getLogger("modelexpress.refit.reshard.receiver")
@@ -75,6 +77,37 @@ def _max_gbps() -> float:
         )
         return 0.0
     return ceiling
+
+
+def _min_gbps() -> float:
+    """Per-rank floor in Gbps; 0 disables the check.
+
+    Same read-at-call-time and non-finite handling as the ceiling, for the same
+    reasons. The floor itself lives in ``reshard.throughput`` because the staged
+    FSDP receiver needs the identical check, and two copies of a threshold are
+    free to drift apart.
+    """
+    return throughput.min_gbps(logger)
+
+
+def _wire_seconds(stages: dict) -> float:
+    """Wire duration regardless of which arm produced it.
+
+    Fused mode reports one span; phased mode reports up to three that run in turn,
+    so summing them is the phased equivalent.
+
+    Module-level rather than a method because it reads only its argument. Both
+    throughput guards are exercised as unbound methods against a minimal stub for
+    ``self``, so putting a self-independent computation on the instance would force
+    every such test to grow a double it has no reason to carry.
+    """
+    wire_s = stages.get("wire_fused_s")
+    if wire_s is None:
+        wire_s = sum(
+            stages.get(key, 0.0)
+            for key in ("wire_exact_s", "wire_full_s", "wire_convert_s")
+        )
+    return wire_s
 
 
 def handshake_endpoints_for_plan(
@@ -267,6 +300,59 @@ def _fused_wire_enabled() -> bool:
     return envs.MX_RESHARD_FUSED_WIRE
 
 
+def _batch_install_enabled() -> bool:
+    """Whether to re-slice full-pulled sources with one batched copy.
+
+    Read at call time so an A/B can toggle it without re-importing. Set
+    ``MX_RESHARD_BATCH_INSTALL=0`` to fall back to one ``copy_()`` per view.
+    """
+    return envs.MX_RESHARD_BATCH_INSTALL
+
+
+def _cache_descriptors_enabled() -> bool:
+    """Whether to reuse the read descriptor lists across steps.
+
+    Read at call time so an A/B can toggle it without re-importing. Set
+    ``MX_RESHARD_CACHE_DESCRIPTORS=0`` to rebuild them on every step.
+    """
+    return envs.MX_RESHARD_CACHE_DESCRIPTORS
+
+
+def _destinations_are_disjoint(destinations: list[torch.Tensor]) -> bool:
+    """Conservatively check whether destination views occupy separate storage.
+
+    A strided view can contain holes, so its min/max storage span may overlap
+    another view even when their logical elements do not. Treating that case as
+    overlapping only loses batching; it cannot change copy order or bytes.
+    """
+    spans_by_storage: dict[int, list[tuple[int, int]]] = {}
+    for tensor in destinations:
+        if tensor.numel() == 0:
+            continue
+        min_element = int(tensor.storage_offset())
+        max_element = min_element
+        for size, stride in zip(tensor.shape, tensor.stride(), strict=True):
+            extent = (int(size) - 1) * int(stride)
+            min_element += min(0, extent)
+            max_element += max(0, extent)
+        element_size = int(tensor.element_size())
+        spans_by_storage.setdefault(
+            int(tensor.untyped_storage().data_ptr()), []
+        ).append(
+            (
+                min_element * element_size,
+                (max_element + 1) * element_size,
+            )
+        )
+    for spans in spans_by_storage.values():
+        previous_end = -1
+        for start, end in sorted(spans):
+            if start < previous_end:
+                return False
+            previous_end = max(previous_end, end)
+    return True
+
+
 def _replay_ops(tensor: torch.Tensor, op_chain: tuple) -> torch.Tensor:
     """Replay a captured loader view chain on a staged full-source tensor."""
     value = tensor
@@ -339,6 +425,10 @@ class ReshardReceiver:
         self._mx_client = MxClient(server_url=mx_server)
 
         self._plan = None  # built lazily on the first refit
+        # Read descriptors for the cached plan, reused across steps. Tied to the
+        # plan's lifetime: whatever rebuilds the plan must drop this too, or the
+        # next refit would RDMA into the previous plan's addresses.
+        self._cached_descriptors: tuple | None = None
         self._transport: NixlReshardTransport | None = None
         self._recv_buffers: dict[
             str, torch.Tensor
@@ -444,10 +534,22 @@ class ReshardReceiver:
             # installed, so they would silently keep their initial (base-model)
             # weights for the entire run. Until the full-pull/loader path exists
             # (TODO), fail loudly rather than serve stale weights.
+            #
+            # Carry the capture causes, not just the names. A rejection that
+            # reports only which tensors are missing forces the reader back onto
+            # the cluster to find out which op defeated capture.
+            causes = summarize_unsupported(
+                getattr(capture, "unsupported_reasons", {}) or {}
+            )
+            cause_text = (
+                "; ".join(f"{count} x {cause}" for cause, count in causes)
+                if causes
+                else "cause not recorded at capture"
+            )
             raise UnsupportedReshard(
                 f"[reshard] {len(plan.fallback)} source(s) need the unimplemented "
                 f"full-pull path (unsupported reshard ops); refusing to serve stale "
-                f"weights. Params: {plan.fallback[:10]}"
+                f"weights. Causes: {cause_text}. Params: {plan.fallback[:10]}"
             )
         # P2P memory handshake (mirrors MX's vLLM RDMA path): fetch each trainer's
         # NIXL metadata (incl. its memory registrations) via its listen thread, so
@@ -481,6 +583,9 @@ class ReshardReceiver:
             self._manager, session_to_agent, session_to_device, timeout_seconds=timeout
         )
         self._plan = plan
+        # New plan, so any descriptors cached for the old one are stale by
+        # construction: they carry the previous plan's source addresses.
+        self._cached_descriptors = None
 
         # dtype-mismatched sources (e.g. a bf16-served router for an fp32 dest):
         # one persistent bf16 STAGING buffer per convert param, registered as an
@@ -637,6 +742,14 @@ class ReshardReceiver:
             "copies_captured": len(capture.copies),
             "unsupported": len(unsupported),
             "unsupported_sample": [str(u)[:120] for u in unsupported[:10]],
+            # Grouped causes, so the harvested record explains an incomplete
+            # refit without needing the run's console output alongside it.
+            "unsupported_causes": [
+                {"cause": cause[:200], "sources": count}
+                for cause, count in summarize_unsupported(
+                    getattr(capture, "unsupported_reasons", {}) or {}
+                )
+            ],
             "planned_wire_bytes": plan.bytes_planned(),
             "extra_wire_bytes": plan.extra_wire_bytes(),
             "descriptors": plan.descriptor_count(),
@@ -703,33 +816,78 @@ class ReshardReceiver:
         # dtype cast) runs after all reads complete. So the phases carry no
         # ordering dependency and are issued as one batch by default. Phased mode
         # drains each in turn and is kept for the A/B.
-        full_descriptors = [
-            ReadDescriptor(
-                session=segment.session,
-                src_addr=segment.src_addr,
-                dst_addr=(
-                    self._full_staging_ptr[full_pull.src_name] + segment.dst_byte
-                ),
-                nbytes=segment.nbytes,
+        # Descriptor construction is timed and cached. Timed because it is real
+        # per-step work that used to fall outside every stage, so it surfaced only
+        # as unattributed time and pushed the record below the attribution floor a
+        # breakdown has to clear to be worth reporting. Cached because a descriptor
+        # is a (session, src_addr, dst_addr, nbytes) tuple derived from the plan and
+        # the registered buffer addresses: the plan is built once and reused, and
+        # the buffers are registered once, so every step was re-deriving an
+        # identical list of hundreds of thousands of objects in Python.
+        _t = time.perf_counter()
+        cached = _cache_descriptors_enabled()
+        fused = _fused_wire_enabled()
+        # The fused flag is part of the key, not just the payload: the phased arm
+        # does not build the exact descriptors, so a cache filled under one arm
+        # cannot serve the other. An A/B that toggles it mid-process is exactly the
+        # case this is for.
+        reusable = (
+            self._cached_descriptors is not None
+            and self._cached_descriptors[0] == fused
+        )
+        if not cached or not reusable:
+            full_descriptors = [
+                ReadDescriptor(
+                    session=segment.session,
+                    src_addr=segment.src_addr,
+                    dst_addr=(
+                        self._full_staging_ptr[full_pull.src_name] + segment.dst_byte
+                    ),
+                    nbytes=segment.nbytes,
+                )
+                for full_pull in self._plan.full_pulls
+                for segment in full_pull.segments
+            ]
+            convert_descriptors = [
+                ReadDescriptor(
+                    session=segment.session,
+                    src_addr=segment.src_addr,
+                    dst_addr=self._staging_ptr[convert.param_name] + segment.dst_byte,
+                    nbytes=segment.nbytes,
+                )
+                for convert in self._plan.converts
+                for segment in convert.segments
+            ]
+            # Only the fused path issues the exact segments as descriptors; the
+            # phased path hands the plan to execute_transfer instead, so building
+            # them here would be wasted work for that arm.
+            exact = (
+                exact_descriptors(self._plan, lambda name: self._param_ptr[name])
+                if fused
+                else None
             )
-            for full_pull in self._plan.full_pulls
-            for segment in full_pull.segments
-        ]
-        convert_descriptors = [
-            ReadDescriptor(
-                session=segment.session,
-                src_addr=segment.src_addr,
-                dst_addr=self._staging_ptr[convert.param_name] + segment.dst_byte,
-                nbytes=segment.nbytes,
+            # nbytes of the auxiliary descriptors, summed once for the same reason.
+            aux_bytes = sum(
+                descriptor.nbytes
+                for descriptor in (*full_descriptors, *convert_descriptors)
             )
-            for convert in self._plan.converts
-            for segment in convert.segments
-        ]
+            if cached:
+                self._cached_descriptors = (
+                    fused,
+                    full_descriptors,
+                    convert_descriptors,
+                    exact,
+                    aux_bytes,
+                )
+        else:
+            _, full_descriptors, convert_descriptors, exact, aux_bytes = (
+                self._cached_descriptors
+            )
+        stages["descriptor_build_s"] = time.perf_counter() - _t
 
-        if _fused_wire_enabled():
-            descriptors = exact_descriptors(
-                self._plan, lambda name: self._param_ptr[name]
-            )
+        if fused:
+            assert exact is not None
+            descriptors = exact
             stats = {
                 "segments": len(descriptors),
                 "bytes": sum(descriptor.nbytes for descriptor in descriptors),
@@ -774,10 +932,7 @@ class ReshardReceiver:
                 stages["wire_convert_s"] = time.perf_counter() - _t
 
         stats["segments"] += len(full_descriptors) + len(convert_descriptors)
-        stats["bytes"] += sum(
-            descriptor.nbytes
-            for descriptor in (*full_descriptors, *convert_descriptors)
-        )
+        stats["bytes"] += aux_bytes
 
         # Before anything reads the receive buffers, and well before _install
         # commits them to live parameters. An impossible rate means the transport
@@ -794,7 +949,15 @@ class ReshardReceiver:
         # block. Without that, launch-bound stages read as free and whichever
         # stage syncs first absorbs the whole queue.
         if self._plan.full_pulls:
+            # Local re-slice of every full-pulled source. One copy_() per captured
+            # view means thousands of individual kernel launches, whose Python and
+            # launch overhead can rival the RDMA itself; _foreach_copy_ issues the
+            # same copies as a single batched op.
             _t = time.perf_counter()
+            batched = _batch_install_enabled()
+            destinations: list[torch.Tensor] = []
+            source_views: list[torch.Tensor] = []
+            copies_done = 0
             for full_pull in self._plan.full_pulls:
                 full_tensor = self._full_staging[full_pull.src_name]
                 for copy in full_pull.copies:
@@ -805,9 +968,28 @@ class ReshardReceiver:
                         copy.dest_stride,
                         receive_buffer.storage_offset() + copy.dest_offset,
                     )
-                    destination.copy_(source_view)
+                    if batched:
+                        destinations.append(destination)
+                        source_views.append(source_view)
+                    else:
+                        destination.copy_(source_view)
+                        copies_done += 1
+            reslice_copies = len(destinations) if batched else copies_done
+            if batched and destinations:
+                if _destinations_are_disjoint(destinations):
+                    torch._foreach_copy_(destinations, source_views)
+                else:
+                    # ``_foreach_copy_`` does not define ordering for overlapping
+                    # destinations. Preserve the captured loader order instead.
+                    for destination, source_view in zip(
+                        destinations, source_views, strict=True
+                    ):
+                        destination.copy_(source_view)
             torch.cuda.synchronize(self._device)
             stages["reslice_s"] = time.perf_counter() - _t
+            # Views, not sources: the per-view launch count is what batching
+            # removes, and the source count is already reported separately.
+            stages["reslice_copies"] = float(reslice_copies)
 
         # Cast the served bf16 staging into the (fp32) receive buffer - a torch
         # op, so the RDMA never crosses dtypes. _install writes the buffer.
@@ -881,12 +1063,41 @@ class ReshardReceiver:
                 "converts": len(self._plan.converts),
                 "fallback": len(stats["fallback"]),
                 "fused_wire": _fused_wire_enabled(),
+                # The install arm this record was measured under. Without it a
+                # captured record cannot be attributed to a batched or per-view
+                # re-slice, which is the whole point of an A/B.
+                "batch_install": _batch_install_enabled(),
                 **{k: round(v, 6) for k, v in stages.items()},
             }
             # WARNING so a benchmark harness captures it without turning on INFO
             # across every dependency.
             logger.warning("MX_REFIT_STAGE %s", json.dumps(record))
+        self._check_throughput_floor(step, stats["bytes"], stages)
         return metrics
+
+    def _check_throughput_floor(
+        self, step: int, wire_bytes: int, stages: dict
+    ) -> None:
+        """Report a wire rate far below what the fabric should deliver.
+
+        This warns rather than aborting, which is the opposite of the ceiling and
+        deliberate: an impossible rate means the payload never moved, so the
+        buffers are untrustworthy, while a slow rate is still correct. Killing a
+        training run over throughput would be worse than the throughput.
+
+        The record is structured so a CI gate can fail on its presence, which is
+        where the enforcement belongs -- a perf regression should block a merge,
+        not a production refit.
+
+        Emitted after the stage record so the two sit together in the log; the
+        stage record is what someone will actually want when they see this.
+        """
+        throughput.warn_if_below_floor(
+            wire_bytes=wire_bytes,
+            wire_seconds=_wire_seconds(stages),
+            log=logger,
+            context={"rank": self._global_rank, "step": step},
+        )
 
     def _check_throughput_ceiling(
         self, step: int, wire_bytes: int, stages: dict
@@ -917,14 +1128,7 @@ class ReshardReceiver:
         ceiling = _max_gbps()
         if ceiling <= 0 or wire_bytes <= 0:
             return
-        # Fused mode reports one wire span; phased mode reports up to three, and
-        # they run in turn, so summing them is the phased equivalent.
-        wire_s = stages.get("wire_fused_s")
-        if wire_s is None:
-            wire_s = sum(
-                stages.get(key, 0.0)
-                for key in ("wire_exact_s", "wire_full_s", "wire_convert_s")
-            )
+        wire_s = _wire_seconds(stages)
         if wire_s <= 0:
             return
         implied_gbps = wire_bytes * 8 / wire_s / 1e9

@@ -165,7 +165,7 @@ def test_build_vllm_load_context_uses_node_rank_as_node_rank(monkeypatch):
     assert ctx.node_rank == 1
 
 
-def test_before_rdma_receive_runs_model_specific_finalizers(monkeypatch):
+def test_before_rdma_receive_runs_layout_finalizers(monkeypatch):
     events = []
 
     def process_weights_after_loading(model, model_config, target_device):
@@ -184,11 +184,271 @@ def test_before_rdma_receive_runs_model_specific_finalizers(monkeypatch):
     ]
 
 
-def test_finalize_model_specific_weights_requires_model():
+def test_after_rdma_receive_runs_derived_weight_finalizers(monkeypatch):
+    events = []
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    model = _TopLevelModel(events)
+
+    result = adapter.after_rdma_receive(LoadResult(value=model, model=model))
+
+    assert result.model is model
+    assert events == [
+        ("finalize", "model", "finalize_mhc_broadcast_weights"),
+    ]
+
+
+def test_after_rdma_receive_refreshes_host_attention_scale_mirrors(
+    mock_accelerator_backend_cls,
+):
+    """RDMA accelerator scales replace every stale host mirror in place."""
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(
+        torch_device_type="cpu"
+    )
+    model = nn.Module()
+    model.attn = _AttentionWithStaleHostScales()
+    pointers = {
+        name: tensor.data_ptr()
+        for name, tensor in model.attn.named_buffers(recurse=False)
+    }
+
+    result = adapter.after_rdma_receive(LoadResult(value=model, model=model))
+
+    assert result.model is model
+    assert model.attn._q_scale_float == pytest.approx(0.25)
+    # Match compressed-tensors' host conversion for per-head scales.
+    assert model.attn._k_scale_float == pytest.approx(0.5)
+    assert model.attn._v_scale_float == pytest.approx(0.75)
+    # vLLM does not derive a host mirror from _prob_scale.
+    assert model.attn._prob_scale_float == pytest.approx(1.0)
+    assert model.attn._k_scale_cpu.item() == pytest.approx(0.5)
+    assert model.attn._v_scale_cpu.item() == pytest.approx(0.75)
+    assert model.attn.impl.bmm1_scale is None
+    assert model.attn.impl.bmm2_scale is None
+    assert model.attn.impl.o_sf_scale is None
+    assert {
+        name: tensor.data_ptr()
+        for name, tensor in model.attn.named_buffers(recurse=False)
+    } == pointers
+
+
+def test_after_rdma_receive_refreshes_scales_after_model_finalizer(
+    mock_accelerator_backend_cls,
+):
+    """The mirror refresh observes scale changes made by the finalizer."""
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(
+        torch_device_type="cpu"
+    )
+    model = _AttentionScaleFinalizerModel()
+
+    adapter.after_rdma_receive(LoadResult(value=model, model=model))
+
+    assert model.finalized is True
+    assert model.attn._q_scale.item() == pytest.approx(0.625)
+    assert model.attn._q_scale_float == pytest.approx(0.625)
+
+
+def test_after_rdma_receive_fails_when_fp8_scales_are_unrecognized(
+    mock_accelerator_backend_cls,
+):
+    """An FP8 target cannot silently complete without refreshing any scales."""
+    config = _context_config(load_device="cpu")
+    config.cache_config.cache_dtype = "fp8"
+    adapter = VllmAdapter(config, _model_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(
+        torch_device_type="cpu"
+    )
+    model = nn.Module()
+
+    with pytest.raises(RuntimeError, match="no attention module was refreshed"):
+        adapter.after_rdma_receive(LoadResult(value=model, model=model))
+
+
+def test_after_rdma_receive_fails_on_incomplete_scale_contract(
+    mock_accelerator_backend_cls,
+):
+    """A partial private q/k/v scale contract fails closed."""
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(
+        torch_device_type="cpu"
+    )
+    model = nn.Module()
+    model.attn = _AttentionWithStaleHostScales()
+    del model.attn._v_scale_float
+
+    with pytest.raises(RuntimeError, match="Incomplete.*_v_scale_float"):
+        adapter.after_rdma_receive(LoadResult(value=model, model=model))
+
+
+def test_after_rdma_receive_rejects_invalid_python_host_scalar(
+    mock_accelerator_backend_cls,
+):
+    """A renamed or type-changed Python scale fails the private contract."""
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(
+        torch_device_type="cpu"
+    )
+    model = nn.Module()
+    model.attn = _AttentionWithStaleHostScales()
+    model.attn._q_scale_float = torch.tensor(1.0)
+
+    with pytest.raises(RuntimeError, match="_q_scale_float must be a float"):
+        adapter.after_rdma_receive(LoadResult(value=model, model=model))
+
+
+def test_after_rdma_receive_rejects_invalid_cpu_scale(
+    mock_accelerator_backend_cls,
+):
+    """Host tensor mirrors must preserve vLLM's singleton CPU contract."""
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(
+        torch_device_type="cpu"
+    )
+    model = nn.Module()
+    model.attn = _AttentionWithStaleHostScales()
+    model.attn._k_scale_cpu = torch.ones(2)
+
+    with pytest.raises(RuntimeError, match="_k_scale_cpu must be"):
+        adapter.after_rdma_receive(LoadResult(value=model, model=model))
+
+
+def test_after_rdma_receive_allows_missing_backend_specific_cpu_scales(
+    mock_accelerator_backend_cls,
+):
+    """Backends without CPU scale mirrors still refresh Python host state."""
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(
+        torch_device_type="cpu"
+    )
+    model = nn.Module()
+    model.attn = _AttentionWithStaleHostScales()
+    del model.attn._k_scale_cpu
+    del model.attn._v_scale_cpu
+
+    adapter.after_rdma_receive(LoadResult(value=model, model=model))
+
+    assert model.attn._q_scale_float == pytest.approx(0.25)
+    assert model.attn._k_scale_float == pytest.approx(0.5)
+    assert model.attn._v_scale_float == pytest.approx(0.75)
+
+
+def test_after_rdma_receive_allows_mla_flashinfer_cache_contract(
+    mock_accelerator_backend_cls,
+):
+    """FlashInfer MLA legitimately has bmm caches without an output cache."""
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(
+        torch_device_type="cpu"
+    )
+    model = nn.Module()
+    model.attn = _AttentionWithStaleHostScales()
+    del model.attn.impl.o_sf_scale
+
+    adapter.after_rdma_receive(LoadResult(value=model, model=model))
+
+    assert model.attn._q_scale_float == pytest.approx(0.25)
+    assert model.attn._k_scale_float == pytest.approx(0.5)
+    assert model.attn._v_scale_float == pytest.approx(0.75)
+
+
+@pytest.mark.parametrize(
+    ("scale_name", "invalid_value"),
+    (
+        ("_q_scale", torch.tensor([])),
+        ("_k_scale", torch.tensor([float("nan")])),
+        ("_v_scale", torch.tensor(0.0)),
+    ),
+)
+def test_after_rdma_receive_rejects_invalid_accelerator_scales(
+    mock_accelerator_backend_cls,
+    scale_name,
+    invalid_value,
+):
+    """Accelerator scales must be nonempty, finite, and positive."""
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(
+        torch_device_type="cpu"
+    )
+    model = nn.Module()
+    model.attn = _AttentionWithStaleHostScales()
+    setattr(model.attn, scale_name, invalid_value)
+
+    with pytest.raises(RuntimeError, match="Invalid vLLM accelerator attention scale"):
+        adapter.after_rdma_receive(LoadResult(value=model, model=model))
+
+
+@pytest.mark.parametrize(
+    ("owner_name", "cache_name"),
+    (
+        ("module", "_o_scale_float"),
+        ("impl", "bmm1_scale"),
+        ("impl", "bmm2_scale"),
+        ("impl", "o_sf_scale"),
+    ),
+)
+def test_after_rdma_receive_rejects_prewarmed_attention_scale_cache(
+    mock_accelerator_backend_cls,
+    owner_name,
+    cache_name,
+):
+    """The compatibility shim only supports vLLM's cold-load lifecycle."""
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(
+        torch_device_type="cpu"
+    )
+    model = nn.Module()
+    model.attn = _AttentionWithStaleHostScales()
+    owner = model.attn if owner_name == "module" else model.attn.impl
+    setattr(owner, cache_name, 99.0)
+
+    with pytest.raises(RuntimeError, match="requires a cold-load state"):
+        adapter.after_rdma_receive(LoadResult(value=model, model=model))
+
+
+def test_rdma_lifecycle_discovers_prepared_tensors_and_finalizes_received_weights(
+    monkeypatch,
+    mock_accelerator_backend_cls,
+):
+    """RDMA discovers the pre-finalized layout before applying source weights."""
+    events = []
+
+    def process_weights_after_loading(model, model_config, target_device):
+        events.append(("process", target_device))
+
+    _stub_vllm_process_weights_after_loading(monkeypatch, process_weights_after_loading)
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    model = _RdmaLifecycleTopLevelModel(events)
+    result = LoadResult(value=model, model=model)
+
+    result = adapter.before_rdma_receive(result)
+    tensors = adapter.discover_tensors(result)
+    events.append(("discover", sorted(tensors)))
+
+    # Simulate RDMA applying the source tensor into the region registered above.
+    tensors["model.hc_attn_fn"].fill_(7)
+    events.append(("rdma_receive", 7))
+    result = adapter.after_rdma_receive(result)
+
+    assert result.model is model
+    assert events == [
+        ("finalize", "model", "finalize_mega_moe_weights"),
+        ("process", torch.device("cpu")),
+        ("discover", ["model.hc_attn_fn"]),
+        ("rdma_receive", 7),
+        ("finalize", "model", "finalize_mhc_broadcast_weights", 7),
+    ]
+
+
+def test_finalize_model_specific_weights_requires_explicit_names_and_model():
     adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
 
-    with pytest.raises(RuntimeError, match="RDMA post-load processing"):
+    with pytest.raises(TypeError, match="finalizer_names"):
         adapter._finalize_model_specific_weights(LoadResult(value=object()))
+
+    with pytest.raises(RuntimeError, match="RDMA post-load processing"):
+        adapter._finalize_model_specific_weights(LoadResult(value=object()), ())
 
 
 def test_after_weight_iter_load_does_not_rerun_model_specific_finalizers(monkeypatch):
@@ -243,6 +503,7 @@ def _context_config(*, load_device):
     return SimpleNamespace(
         device_config=SimpleNamespace(device="cuda"),
         load_config=SimpleNamespace(device=load_device),
+        cache_config=SimpleNamespace(cache_dtype="auto"),
         parallel_config=SimpleNamespace(
             rank=0,
             tensor_parallel_size=2,
@@ -276,6 +537,11 @@ class _MegaMoeModel(torch.nn.Module):
     def finalize_mega_moe_weights(self) -> None:
         self.events.append(("finalize", "model", "finalize_mega_moe_weights"))
 
+    def finalize_mhc_broadcast_weights(self) -> None:
+        self.events.append(
+            ("finalize", "model", "finalize_mhc_broadcast_weights")
+        )
+
 
 class _MegaMoeLayer(torch.nn.Module):
     def __init__(self, events):
@@ -284,6 +550,65 @@ class _MegaMoeLayer(torch.nn.Module):
 
     def finalize_mega_moe_weights(self) -> None:
         self.events.append(("finalize", "layer", "finalize_mega_moe_weights"))
+
+
+class _RdmaLifecycleTopLevelModel(torch.nn.Module):
+    def __init__(self, events):
+        super().__init__()
+        self.model = _RdmaLifecycleModel(events)
+
+
+class _RdmaLifecycleModel(torch.nn.Module):
+    def __init__(self, events):
+        super().__init__()
+        self.events = events
+        self.register_buffer("hc_attn_fn", torch.zeros(1))
+
+    def finalize_mega_moe_weights(self) -> None:
+        self.events.append(("finalize", "model", "finalize_mega_moe_weights"))
+
+    def finalize_mhc_broadcast_weights(self) -> None:
+        self.events.append(
+            (
+                "finalize",
+                "model",
+                "finalize_mhc_broadcast_weights",
+                int(self.hc_attn_fn.item()),
+            )
+        )
+
+
+class _AttentionWithStaleHostScales(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("_q_scale", torch.tensor(0.25))
+        self.register_buffer("_k_scale", torch.tensor([0.1, 0.5]))
+        self.register_buffer("_v_scale", torch.tensor(0.75))
+        self.register_buffer("_prob_scale", torch.tensor(0.125))
+        self._q_scale_float = 1.0
+        self._k_scale_float = 1.0
+        self._v_scale_float = 1.0
+        self._prob_scale_float = 1.0
+        self._k_scale_cpu = torch.tensor(1.0)
+        self._v_scale_cpu = torch.tensor(1.0)
+        self._o_scale_float = None
+        self.kv_cache_dtype = "fp8"
+        self.impl = SimpleNamespace(
+            bmm1_scale=None,
+            bmm2_scale=None,
+            o_sf_scale=None,
+        )
+
+
+class _AttentionScaleFinalizerModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.finalized = False
+        self.attn = _AttentionWithStaleHostScales()
+
+    def finalize_mhc_broadcast_weights(self) -> None:
+        self.attn._q_scale.fill_(0.625)
+        self.finalized = True
 
 
 class _StandaloneFinalizer(torch.nn.Module):
