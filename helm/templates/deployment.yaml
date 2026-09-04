@@ -177,7 +177,7 @@ spec:
           volumeMounts:
             {{- if and .Values.persistence .Values.persistence.enabled }}
             - name: model-cache
-              mountPath: {{ .Values.persistence.mountPath | default "/app/cache" }}
+              mountPath: {{ .Values.persistence.mountPath | default "/root" }}
             {{- end }}
             {{- if .Values.extraVolumeMounts }}
             {{- toYaml .Values.extraVolumeMounts | nindent 12 }}

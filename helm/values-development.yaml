@@ -39,12 +39,12 @@ persistence:
   storageClass: ""
   accessMode: ReadWriteOnce
   size: 10Gi
-  mountPath: /app/cache
+  mountPath: /root
 
 env:
   MODEL_EXPRESS_SERVER_PORT: "8001"
   MODEL_EXPRESS_LOG_LEVEL: "debug"
-  MODEL_EXPRESS_CACHE_DIRECTORY: "/app/cache"
+  MODEL_EXPRESS_CACHE_DIRECTORY: "/root"
   # Distributed backend selection. Required — the server fails to start without it.
   # This values file opinionates on Redis for dev convenience; override to
   # "kubernetes" for the CRD backend (and set serviceAccount.rbac.enabled=true).
