@@ -1278,7 +1278,7 @@ def test_canonical_s3_in_place_delta_failure_requires_recovery(
         )
     )
 
-    def fail_apply(_shards):
+    def fail_apply(_shards, *, index_metadata):
         raise RuntimeError("injected delta failure")
 
     monkeypatch.setattr(adapter._checkpoint, "_apply_shards", fail_apply)

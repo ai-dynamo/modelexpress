@@ -160,6 +160,13 @@ def _parse_index_manifest(
                     f"The index manifest {name} does not match revision "
                     f"{version.version_id!r}"
                 )
+        compression_format = metadata.get("compression_format")
+        if compression_format not in _DECOMPRESSORS:
+            raise ValueError(
+                f"unsupported compression format {compression_format!r}"
+            )
+    elif "checksum_format" in metadata:
+        checksum_factory(metadata["checksum_format"])
     return metadata, weight_map
 
 
