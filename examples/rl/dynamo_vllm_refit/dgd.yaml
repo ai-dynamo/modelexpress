@@ -1,6 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# The orchestrator updates this DGD-scoped value after a successful active refit.
+# An empty value means there is no desired version yet.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mx-vllm-refit-desired-version
+data:
+  desired_version_uid: ""
+---
 # Latest DynamoGraphDeployment schema with Dynamo's native vLLM sidecar shape.
 apiVersion: nvidia.com/v1beta1
 kind: DynamoGraphDeployment
@@ -36,6 +45,8 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 16Gi
+        - name: mx-refit-checkpoints
+          emptyDir: {}
         initContainers:
         - name: vllm-engine
           image: ${VLLM_ENGINE_IMAGE}
@@ -46,7 +57,7 @@ spec:
           - >-
             exec "$(python3 -c 'import os,vllm; print(os.path.join(os.path.dirname(vllm.__file__), "vllm-rs"))')"
             serve ${MODEL_NAME} --host 127.0.0.1 --grpc-port 50051
-            --enable-sleep-mode
+            --load-format modelexpress
             --weight-transfer-config '{"backend":"modelexpress"}'
             --gpu-memory-utilization 0.45
             --max-model-len 2048
@@ -59,8 +70,16 @@ spec:
             value: ${MODEL_NAME}
           - name: MX_SERVER_ADDRESS
             value: mx-vllm-refit-server:8000
-          - name: VLLM_PLUGINS
-            value: modelexpress
+          - name: MX_LOAD_STRATEGY_CHAIN
+            value: RL
+          # New pods read the latest orchestrator-managed desired version.
+          - name: MX_REFIT_DESIRED_VERSION_UID
+            valueFrom:
+              configMapKeyRef:
+                name: mx-vllm-refit-desired-version
+                key: desired_version_uid
+          - name: MX_REFIT_CHECKPOINT_DIR
+            value: /var/cache/modelexpress/refit
           - name: MX_RDMA_NIC_PIN
             value: auto
           - name: UCX_RNDV_SCHEME
@@ -79,6 +98,8 @@ spec:
           volumeMounts:
           - name: dshm
             mountPath: /dev/shm
+          - name: mx-refit-checkpoints
+            mountPath: /var/cache/modelexpress/refit
           startupProbe:
             exec:
               command:

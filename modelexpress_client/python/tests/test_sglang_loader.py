@@ -572,7 +572,7 @@ def test_mx_model_loader_nixl_path_delegates_to_shared_strategy_chain(
     loader = MxModelLoader(_load_config(modelexpress_transport="nixl"))
 
     with patch.dict(os.environ, {"MX_ARTIFACT_READY_URL": ready_url}), patch(
-        "modelexpress.engines.sglang.loader.LoadStrategyChain.run",
+        "modelexpress.engines.sglang.loader.run_load_strategy_chain",
         return_value=model,
     ) as run, patch(
         "modelexpress.engines.sglang.loader.install_sglang_cache_artifacts",
