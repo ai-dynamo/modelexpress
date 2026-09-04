@@ -54,23 +54,34 @@ def _version(uid, payload_format, *, base=None):
     )
 
 
-def test_rl_chain_has_dedicated_order():
+def test_desired_version_does_not_use_version_agnostic_fallbacks(monkeypatch):
+    monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "version-7")
     model = nn.Linear(1, 1)
     ctx = _context()
+    unavailable_p2p = MagicMock(name="desired_version_p2p")
+    unavailable_p2p.is_available.return_value = False
+    unavailable_s3 = MagicMock(name="desired_version_s3")
+    unavailable_s3.is_available.return_value = False
+    fallback = MagicMock(name="default")
+    fallback.is_available.return_value = True
+    fallback.load.return_value = LoadResult(value=model, model=model)
 
     with patch(
-        "modelexpress_rl.inference.load_strategy.execute_load_strategies",
-        return_value=model,
-    ) as execute:
-        assert RLLoadStrategyChain.run(model, ctx) is model
+        "modelexpress_rl.inference.load_strategy.DesiredVersionP2PStrategy",
+        return_value=unavailable_p2p,
+    ), patch(
+        "modelexpress_rl.inference.load_strategy.DesiredVersionS3Strategy",
+        return_value=unavailable_s3,
+    ), patch(
+        "modelexpress_rl.inference.load_strategy.ModelStreamerStrategy",
+        return_value=fallback,
+    ), patch(
+        "modelexpress_rl.inference.load_strategy.DefaultStrategy",
+        return_value=fallback,
+    ), pytest.raises(RuntimeError, match="No loading strategy succeeded"):
+        RLLoadStrategyChain.run(model, ctx)
 
-    strategies = execute.call_args.args[2]
-    assert [strategy.name for strategy in strategies] == [
-        "desired_version_p2p",
-        "desired_version_s3",
-        "model_streamer",
-        "default",
-    ]
+    fallback.load.assert_not_called()
 
 
 def test_desired_p2p_is_skipped_without_desired_version(monkeypatch):

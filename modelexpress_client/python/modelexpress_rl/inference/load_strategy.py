@@ -183,15 +183,22 @@ class RLLoadStrategyChain:
 
     @staticmethod
     def run(model: nn.Module, ctx: LoadContext) -> nn.Module:
+        # A desired UID is a correctness constraint: version-agnostic fallbacks
+        # could load different weights and let the worker serve the wrong version.
+        if envs.MX_REFIT_DESIRED_VERSION_UID is not None:
+            strategies = [
+                DesiredVersionP2PStrategy(),
+                DesiredVersionS3Strategy(),
+            ]
+        else:
+            strategies = [
+                ModelStreamerStrategy(),
+                DefaultStrategy(),
+            ]
         return execute_load_strategies(
             model,
             ctx,
-            [
-                DesiredVersionP2PStrategy(),
-                DesiredVersionS3Strategy(),
-                ModelStreamerStrategy(),
-                DefaultStrategy(),
-            ],
+            strategies,
         )
 
 
