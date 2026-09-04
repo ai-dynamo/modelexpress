@@ -260,6 +260,7 @@ impl P2pService for P2pServiceImpl {
                 training_step: info.training_step,
                 layout_signature: info.layout_signature,
                 source_load: info.source_load,
+                topology: info.topology,
             })
             .collect();
 
@@ -451,6 +452,7 @@ mod tests {
     use modelexpress_common::grpc::p2p::{
         ArtifactSourceMetadata, MxSourceType, SourceIdentity, SourceStatus, TensorSourceMetadata,
     };
+    use std::collections::HashMap;
 
     fn make_service(mock: MockMetadataBackend) -> P2pServiceImpl {
         P2pServiceImpl::new(Arc::new(P2pStateManager::with_backend(Arc::new(mock))))
@@ -652,6 +654,7 @@ mod tests {
                         worker_grpc_endpoint: String::new(),
                         accelerator: String::new(),
                         source_load: None,
+                        topology: Default::default(),
                         artifact_source: None,
                     }],
                     published_at: 1234567890,
@@ -835,6 +838,7 @@ mod tests {
                         updated_at: now,
                         accelerator: "cuda".to_string(),
                         source_load: Some(0.25),
+                        topology: HashMap::from([("rack".to_string(), "r3".to_string())]),
                         training_step: Some(42),
                         layout_signature: Some("layout-a".to_string()),
                     },
@@ -847,6 +851,7 @@ mod tests {
                         updated_at: now,
                         accelerator: "cuda".to_string(),
                         source_load: Some(0.75),
+                        topology: Default::default(),
                         training_step: Some(42),
                         layout_signature: Some("layout-a".to_string()),
                     },
@@ -871,6 +876,11 @@ mod tests {
         assert_eq!(resp.instances[0].worker_id, "w1");
         assert_eq!(resp.instances[0].worker_rank, 0);
         assert_eq!(resp.instances[0].source_load, Some(0.25));
+        assert_eq!(
+            resp.instances[0].topology.get("rack").map(String::as_str),
+            Some("r3"),
+            "topology surfaces onto the SourceInstanceRef"
+        );
         assert_eq!(resp.instances[0].accelerator, "cuda");
         assert_eq!(resp.instances[0].updated_at, now);
         assert_eq!(resp.instances[0].training_step, Some(42));
@@ -905,6 +915,7 @@ mod tests {
                     updated_at: now,
                     accelerator: "cuda".to_string(),
                     source_load: None,
+                    topology: Default::default(),
                     training_step: None,
                     layout_signature: None,
                 }])
@@ -945,6 +956,7 @@ mod tests {
                         updated_at: now,
                         accelerator: "cuda".to_string(),
                         source_load: None,
+                        topology: Default::default(),
                         training_step: None,
                         layout_signature: None,
                     },
@@ -957,6 +969,7 @@ mod tests {
                         updated_at: expired_updated_at,
                         accelerator: "cuda".to_string(),
                         source_load: None,
+                        topology: Default::default(),
                         training_step: None,
                         layout_signature: None,
                     },
@@ -999,6 +1012,7 @@ mod tests {
                         worker_grpc_endpoint: "10.0.0.1:6555".to_string(),
                         accelerator: "cuda".to_string(),
                         source_load: None,
+                        topology: Default::default(),
                         artifact_source: Some(
                             ArtifactSourceMetadata {
                                 artifact_id: "sha256:artifact".to_string(),

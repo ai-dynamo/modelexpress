@@ -132,6 +132,7 @@ mod tests {
                 updated_at: old_time,
                 accelerator: "cuda".into(),
                 source_load: None,
+                topology: Default::default(),
                 training_step: None,
                 layout_signature: None,
             }])
@@ -165,6 +166,7 @@ mod tests {
                 updated_at: very_old,
                 accelerator: "cuda".into(),
                 source_load: None,
+                topology: Default::default(),
                 training_step: None,
                 layout_signature: None,
             }])
@@ -196,6 +198,7 @@ mod tests {
                 updated_at: recent,
                 accelerator: "cuda".into(),
                 source_load: None,
+                topology: Default::default(),
                 training_step: None,
                 layout_signature: None,
             }])

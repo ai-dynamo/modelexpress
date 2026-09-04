@@ -92,6 +92,11 @@ spec:
                       format: float
                       nullable: true
                       description: Source-published RDMA/serving load in [0,1] for load-aware source selection
+                    topology:
+                      type: object
+                      additionalProperties:
+                        type: string
+                      description: Datacenter topology domain values keyed by Grove ClusterTopology domain (region/zone/datacenter/block/rack/host/numa)
                     artifactSource:
                       type: object
                       description: Small discovery summary for file-backed artifact sources

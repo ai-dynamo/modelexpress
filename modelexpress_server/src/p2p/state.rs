@@ -507,6 +507,7 @@ mod tests {
                     worker_grpc_endpoint: String::new(),
                     accelerator: String::new(),
                     source_load: None,
+                    topology: Default::default(),
                     artifact_source: None,
                 },
                 WorkerRecord {
@@ -526,6 +527,7 @@ mod tests {
                     worker_grpc_endpoint: String::new(),
                     accelerator: String::new(),
                     source_load: None,
+                    topology: Default::default(),
                     artifact_source: None,
                 },
             ],
@@ -679,6 +681,7 @@ mod tests {
                     updated_at: 1234567890000,
                     accelerator: "cuda".to_string(),
                     source_load: None,
+                    topology: Default::default(),
                     training_step: None,
                     layout_signature: None,
                 }])

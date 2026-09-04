@@ -71,6 +71,8 @@ pub struct SourceInstanceInfo {
     /// signal); `Some(0.0)` is a measured idle. Consumed by the client
     /// `load_aware` selector, which ranks `None` as a neutral prior.
     pub source_load: Option<f32>,
+    /// Datacenter topology domain values keyed by level. Empty when unknown.
+    pub topology: HashMap<String, String>,
     /// Training step/version from SourceIdentity.extra_parameters, when present.
     pub training_step: Option<u64>,
     /// Stable topology/registry digest, when published by the source.
@@ -166,6 +168,8 @@ pub struct WorkerRecord {
     /// Source-published busyness in [0, 1]. Not carried on WorkerMetadata;
     /// set by UpdateStatus heartbeats (see `update_status`).
     pub source_load: Option<f32>,
+    /// Datacenter topology domain values keyed by level. Static per node.
+    pub topology: HashMap<String, String>,
     /// Small discovery summary for file-backed artifact sources.
     pub artifact_source: Option<ArtifactSourceMetadataRecord>,
 }
@@ -223,6 +227,7 @@ impl From<WorkerMetadata> for WorkerRecord {
             accelerator: meta.accelerator,
             // Not on WorkerMetadata; refreshed via UpdateStatus heartbeats.
             source_load: None,
+            topology: meta.topology,
             artifact_source,
         }
     }
@@ -279,6 +284,7 @@ impl From<WorkerRecord> for WorkerMetadata {
             agent_name: record.agent_name,
             worker_grpc_endpoint: record.worker_grpc_endpoint,
             accelerator: record.accelerator,
+            topology: record.topology,
             tensors: legacy_tensors,
             source_payload: Some(source_payload),
         }

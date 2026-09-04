@@ -328,6 +328,7 @@ impl MetadataBackend for KubernetesBackend {
             worker_grpc_endpoint: worker_record.worker_grpc_endpoint.clone(),
             accelerator: worker_record.accelerator.clone(),
             source_load: worker_record.source_load,
+            topology: worker_record.topology.clone(),
             artifact_source: worker_record
                 .artifact_source
                 .clone()
@@ -480,6 +481,7 @@ impl MetadataBackend for KubernetesBackend {
                 worker_grpc_endpoint: worker_status.worker_grpc_endpoint.clone(),
                 accelerator: worker_status.accelerator.clone(),
                 source_load: worker_status.source_load,
+                topology: worker_status.topology.clone(),
                 artifact_source: worker_status
                     .artifact_source
                     .clone()
@@ -601,6 +603,13 @@ impl MetadataBackend for KubernetesBackend {
                 .and_then(|s| s.worker.as_ref())
                 .and_then(|w| w.source_load);
 
+            let topology = cr
+                .status
+                .as_ref()
+                .and_then(|s| s.worker.as_ref())
+                .map(|w| w.topology.clone())
+                .unwrap_or_default();
+
             result.push(super::SourceInstanceInfo {
                 source_id: sid,
                 worker_id: iid,
@@ -610,6 +619,7 @@ impl MetadataBackend for KubernetesBackend {
                 updated_at,
                 accelerator,
                 source_load,
+                topology,
                 // The current CRD list shape does not round-trip
                 // SourceIdentity.extra_parameters.
                 training_step: None,
@@ -872,6 +882,26 @@ mod tests {
         };
 
         assert!(ArtifactSourceMetadataRecord::try_from(status).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn worker_status_topology_survives_serde_round_trip() {
+        // The k8s backend stores WorkerStatus as CR JSON, so a non-empty
+        // topology must survive the round trip. The deployed CRD schema must
+        // also carry status.worker.topology (examples/crds.yaml and
+        // ci/k8s/server/crd-modelmetadata.yaml) or the API server prunes it.
+        let status = WorkerStatus {
+            topology: std::collections::HashMap::from([
+                ("rack".to_string(), "r3".to_string()),
+                ("block".to_string(), "b1".to_string()),
+            ]),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&status).expect("serialize");
+        let back: WorkerStatus = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.topology, status.topology);
+        assert_eq!(back.topology.get("rack").map(String::as_str), Some("r3"));
     }
 
     #[test]

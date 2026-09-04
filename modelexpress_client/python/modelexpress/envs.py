@@ -119,6 +119,11 @@ if TYPE_CHECKING:
     MX_P2P_LOAD_WEIGHT: float
     # Optional runtime /metrics URL (vLLM/SGLang) for the source_load signal.
     MX_P2P_RUNTIME_METRICS_URL: Optional[str]
+    # Topology-aware selection: ordered levels (broad->narrow), this node's
+    # {level: value} JSON map, and the optional within-tier load-blend weight.
+    MX_P2P_TOPOLOGY_LEVELS: Optional[str]
+    MX_P2P_TOPOLOGY: Optional[str]
+    MX_P2P_TOPOLOGY_LOAD_WEIGHT: float
     # Opt-in metrics collector
     MX_METRICS_ENABLED: bool
     MX_METRICS_PORT: Optional[str]
@@ -167,15 +172,24 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _env_float(name: str, default: float) -> float:
-    """Parse a float env var, falling back to ``default`` (and warning) on error."""
+    """Parse a float env var, falling back to ``default`` (and warning) on error.
+
+    Rejects non-finite values (``inf``/``nan``): they are always a misconfig and
+    can poison arithmetic downstream (e.g. ``inf * 0.0 -> nan`` in a selector
+    score, which would break deterministic ordering).
+    """
     raw = os.environ.get(name)
     if raw is None:
         return default
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
         logger.warning("Invalid %s=%r; using default %s", name, raw, default)
         return default
+    if not math.isfinite(value):
+        logger.warning("Non-finite %s=%r; using default %s", name, raw, default)
+        return default
+    return value
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -373,6 +387,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # preferring busier sources. 0 disables the load term (== rendezvous_hash).
     "MX_P2P_LOAD_WEIGHT": lambda: max(0.0, _env_float("MX_P2P_LOAD_WEIGHT", 1.0)),
     "MX_P2P_RUNTIME_METRICS_URL": lambda: os.environ.get("MX_P2P_RUNTIME_METRICS_URL"),
+    "MX_P2P_TOPOLOGY_LEVELS": lambda: os.environ.get("MX_P2P_TOPOLOGY_LEVELS"),
+    "MX_P2P_TOPOLOGY": lambda: os.environ.get("MX_P2P_TOPOLOGY"),
+    # Clamp to >= 0: a negative weight would invert the within-tier load blend
+    # into preferring busy sources. 0 (default) keeps the pure rendezvous jitter.
+    "MX_P2P_TOPOLOGY_LOAD_WEIGHT": lambda: max(
+        0.0, _env_float("MX_P2P_TOPOLOGY_LOAD_WEIGHT", 0.0)
+    ),
     # ── Opt-in metrics collector ───────────────────────────────────────────
     "MX_METRICS_ENABLED": lambda: os.environ.get("MX_METRICS_ENABLED", "0").strip().lower()
     in _TRUTHY,
