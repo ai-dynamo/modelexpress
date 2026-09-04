@@ -149,6 +149,8 @@ class GeneratorRuntime:
                     device=full_tensor.device,
                     listen_port=(
                         rl_envs.MX_REFIT_METADATA_PORT + full_tensor.device_id
+                        if WeightSource.GENERATOR in source_order
+                        else None
                     ),
                 )
                 methods.append(
@@ -161,6 +163,9 @@ class GeneratorRuntime:
                         worker_id=worker_id,
                         accelerator=full_tensor.accelerator,
                         p2p_client=p2p_client,
+                        enable_peer_publication=(
+                            WeightSource.GENERATOR in source_order
+                        ),
                     )
                 )
 

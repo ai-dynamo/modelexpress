@@ -113,6 +113,8 @@ if TYPE_CHECKING:
     MX_ARTIFACT_TRANSFER_CHUNK_SIZE: Optional[str]
     # Trainer weight sync
     MX_REDIS_URL: str
+    # Generator weight sync
+    MX_GENERATOR_SOURCE_ORDER: Optional[str]
     # P2P source selection
     MX_P2P_SOURCE_SELECTOR: Optional[str]
     # Topology-aware selection: ordered levels (broad->narrow), this node's
@@ -376,6 +378,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_ARTIFACT_TRANSFER_CHUNK_SIZE": lambda: os.environ.get("MX_ARTIFACT_TRANSFER_CHUNK_SIZE"),
     # ── Trainer pull (live weight sync from a running trainer) ─────────────
     "MX_REDIS_URL": lambda: os.environ.get("MX_REDIS_URL", "redis://localhost:6379"),
+    # ── Generator weight sync ──────────────────────────────────────────────
+    "MX_GENERATOR_SOURCE_ORDER": lambda: os.environ.get("MX_GENERATOR_SOURCE_ORDER"),
     # ── P2P source selection ───────────────────────────────────────────────
     # Raw (None when unset); source_selection applies its DEFAULT_SELECTOR fallback.
     "MX_P2P_SOURCE_SELECTOR": lambda: os.environ.get("MX_P2P_SOURCE_SELECTOR"),

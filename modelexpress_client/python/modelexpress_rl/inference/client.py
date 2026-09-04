@@ -43,6 +43,19 @@ def _required(value: str, name: str) -> str:
     return value
 
 
+def _source_order_from_env(value: str) -> tuple[WeightSource, ...]:
+    names = tuple(item.strip().upper() for item in value.split(","))
+    if not names or any(not name for name in names):
+        raise ValueError("MX_GENERATOR_SOURCE_ORDER must be a comma-separated list")
+    try:
+        return tuple(WeightSource(name) for name in names)
+    except ValueError as exc:
+        choices = ", ".join(source.value for source in WeightSource)
+        raise ValueError(
+            f"MX_GENERATOR_SOURCE_ORDER entries must be one of: {choices}"
+        ) from exc
+
+
 @dataclass(frozen=True)
 class ModelExpressGeneratorConfig:
     """Immutable configuration for one rank-local generator client."""
@@ -74,6 +87,13 @@ class ModelExpressGeneratorConfig:
 
     def __post_init__(self) -> None:
         """Validate explicit settings before client initialization."""
+        source_order_env = envs.MX_GENERATOR_SOURCE_ORDER
+        if self.source_order is None and source_order_env is not None:
+            object.__setattr__(
+                self,
+                "source_order",
+                _source_order_from_env(source_order_env),
+            )
         if self.registration_ttl_seconds is not None:
             rl_envs.require_positive_int(
                 self.registration_ttl_seconds, "registration_ttl_seconds"

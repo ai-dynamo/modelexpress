@@ -13,6 +13,7 @@ def test_defaults_when_unset(monkeypatch):
         "MX_NIXL_BACKEND",
         "MX_METADATA_PORT",
         "MX_WORKER_GRPC_PORT",
+        "MX_GENERATOR_SOURCE_ORDER",
         "MX_POOL_REG",
         "MX_VMM_ARENA",
         "MX_MS_DISTRIBUTED",
@@ -36,6 +37,7 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_NIXL_BACKEND == "UCX"
     assert envs.MX_METADATA_PORT == 5555
     assert envs.MX_WORKER_GRPC_PORT == 6555
+    assert envs.MX_GENERATOR_SOURCE_ORDER is None
     assert envs.MX_POOL_REG is False
     assert envs.MX_VMM_ARENA is False
     assert envs.MX_MS_DISTRIBUTED is True
@@ -62,6 +64,11 @@ def test_int_and_float_parsing(monkeypatch):
     assert envs.MX_METADATA_PORT == 1234
     assert envs.MX_GDS_TIMEOUT == pytest.approx(1.5)
     assert envs.MX_SOURCE_QUERY_TIMEOUT == 42
+
+
+def test_generator_source_order_is_read_raw(monkeypatch):
+    monkeypatch.setenv("MX_GENERATOR_SOURCE_ORDER", "TRAINER,GENERATOR")
+    assert envs.MX_GENERATOR_SOURCE_ORDER == "TRAINER,GENERATOR"
 
 
 def test_invalid_int_falls_back_to_default(monkeypatch):
