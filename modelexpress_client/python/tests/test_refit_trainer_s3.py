@@ -203,6 +203,18 @@ def _trainer(
     return trainer, storage
 
 
+def test_s3_rejects_unsupported_checksum_format(
+    monkeypatch,
+    tmp_path,
+    refit_server,
+):
+    _service, server_url = refit_server
+    monkeypatch.setenv("MX_REFIT_CHECKSUM_FORMAT", "crc32")
+
+    with pytest.raises(ValueError, match="unsupported checksum format 'crc32'"):
+        _trainer(monkeypatch, tmp_path, server_url)
+
+
 @pytest.mark.parametrize("code", ["InternalError", "PreconditionFailed"])
 def test_s3_multipart_abort_failure_preserves_upload_outcome(code, caplog):
     data = b"delta"
@@ -429,7 +441,10 @@ def test_s3_full_hf_checkpoint_publishes_native_tensors_and_rebases(
         root_uri = "s3://weights/tests/v1/model.safetensors.index.json"
         index = json.loads(storage.objects[root_uri])
         assert index == {
-            "metadata": {"total_size": expected.numel() * expected.element_size()},
+            "metadata": {
+                "total_size": expected.numel() * expected.element_size(),
+                "checksum_format": "adler32",
+            },
             "weight_map": {"weight": "model-00001-of-00001.safetensors"},
         }
         shard = storage.objects[
@@ -439,9 +454,11 @@ def test_s3_full_hf_checkpoint_publishes_native_tensors_and_rebases(
         assert torch.equal(loaded["weight"], expected)
         (header_size,) = struct.unpack("<Q", shard[:8])
         header = json.loads(shard[8 : 8 + header_size])
-        assert header["__metadata__"]["weight"] == (
-            f"{zlib.adler32(expected.view(torch.uint8).numpy()):08x}"
-        )
+        assert header["__metadata__"] == {
+            "weight": (
+                f"{zlib.adler32(expected.view(torch.uint8).numpy()):08x}"
+            )
+        }
         assert method.current_base_version_id == "target-a"
         assert np.array_equal(
             method.snapshot["weight"],
