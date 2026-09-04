@@ -284,16 +284,26 @@ ModelExpress/
 │   ├── devcontainer.json               # VSCode config: rust-analyzer, port 8001
 │   └── Dockerfile                      # Ubuntu 24.04 dev env
 │
+├── AGENTS.md                           # Always-on rules for all AI coding agents (Codex, Cursor, Copilot, Claude)
+├── CLAUDE.md                           # Claude Code entry point: imports AGENTS.md
+│
+├── .agents/
+│   └── skills/                         # Shared on-demand procedures (SKILL.md), read by Codex and Cursor
+│       ├── add-cli-argument/
+│       ├── add-grpc-service/
+│       ├── bump-version/
+│       └── dco/
+│
+├── .claude/
+│   ├── settings.json                   # Claude Code permissions
+│   └── skills/                         # Symlinks into .agents/skills/ so Claude Code sees the same skills
+│
 ├── .github/
-│   ├── copilot-instructions.md         # GitHub Copilot agent instructions
+│   ├── copilot-instructions.md         # Copilot Chat pointer to AGENTS.md
 │   ├── dco.yml                         # DCO enforcement
 │   └── workflows/
 │       ├── ci.yml                      # CI pipeline
 │       └── codeql.yml                  # Security scanning
-│
-├── .cursor/
-│   └── rules/
-│       └── rust.mdc                    # Cursor agent instructions
 │
 ├── .pre-commit-config.yaml             # Pre-commit hooks config
 └── .coderabbit.yaml                    # CodeRabbit review config
