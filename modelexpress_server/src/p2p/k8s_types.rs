@@ -128,11 +128,14 @@ pub struct WorkerStatus {
     pub accelerator: String,
 
     /// Source-published busyness in [0, 1] (default: RDMA NIC utilization).
-    #[serde(
-        default,
-        rename = "sourceLoad",
-        skip_serializing_if = "Option::is_none"
-    )]
+    ///
+    /// `None` must serialize as an explicit `null`, not be skipped: both status
+    /// writes go out as a JSON merge patch, where an omitted key means "leave
+    /// unchanged" and `null` means "delete". Skipping it would let the field go
+    /// `None -> Some` but never back, so a worker the reaper marks Stale with no
+    /// reading would keep advertising its last load. The CRD schema declares the
+    /// field `nullable` so the API server accepts the null.
+    #[serde(default, rename = "sourceLoad")]
     pub source_load: Option<f32>,
 
     /// Small discovery summary for file-backed artifact sources.
@@ -545,5 +548,31 @@ mod tests {
         status.update_ready_condition(3); // Stale
         assert_eq!(status.conditions[0].status, "False");
         assert_eq!(status.conditions[0].reason.as_deref(), Some("WorkerStale"));
+    }
+
+    // Both status writes are JSON merge patches, where an omitted key means
+    // "leave unchanged" and null means "delete". A None reading must therefore
+    // reach the wire as an explicit null, or the reaper's Stale mark can never
+    // clear the last load a worker published.
+    #[test]
+    fn test_worker_status_none_source_load_serializes_as_null() {
+        let mut worker = WorkerStatus::default();
+        assert_eq!(worker.source_load, None);
+        let out = serde_json::to_value(&worker).expect("serialize");
+        assert!(
+            out.get("sourceLoad")
+                .is_some_and(serde_json::Value::is_null),
+            "None must serialize as an explicit null, got {out}"
+        );
+
+        worker.source_load = Some(0.42);
+        let out = serde_json::to_value(&worker).expect("serialize");
+        assert_eq!(out["sourceLoad"].as_f64().map(|v| v as f32), Some(0.42));
+
+        // And an explicit null on the way back in reads as None, not 0.0.
+        let back: WorkerStatus =
+            serde_json::from_value(serde_json::json!({"workerRank": 0, "sourceLoad": null}))
+                .expect("deserialize");
+        assert_eq!(back.source_load, None);
     }
 }

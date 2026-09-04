@@ -90,6 +90,7 @@ spec:
                     sourceLoad:
                       type: number
                       format: float
+                      nullable: true
                       description: Source-published RDMA/serving load in [0,1] for load-aware source selection
                     artifactSource:
                       type: object
