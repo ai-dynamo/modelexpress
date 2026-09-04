@@ -115,6 +115,10 @@ if TYPE_CHECKING:
     MX_REDIS_URL: str
     # P2P source selection
     MX_P2P_SOURCE_SELECTOR: Optional[str]
+    # Weight of the NIC-utilization penalty in the load_aware selector.
+    MX_P2P_LOAD_WEIGHT: float
+    # Optional runtime /metrics URL (vLLM/SGLang) for the source_load signal.
+    MX_P2P_RUNTIME_METRICS_URL: Optional[str]
     # Topology-aware selection: ordered levels (broad->narrow), this node's
     # {level: value} JSON map, and the optional within-tier load-blend weight.
     MX_P2P_TOPOLOGY_LEVELS: Optional[str]
@@ -379,6 +383,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ── P2P source selection ───────────────────────────────────────────────
     # Raw (None when unset); source_selection applies its DEFAULT_SELECTOR fallback.
     "MX_P2P_SOURCE_SELECTOR": lambda: os.environ.get("MX_P2P_SOURCE_SELECTOR"),
+    # Clamp to >= 0: a negative weight would invert LoadAwareSelector into
+    # preferring busier sources. 0 disables the load term (== rendezvous_hash).
+    "MX_P2P_LOAD_WEIGHT": lambda: max(0.0, _env_float("MX_P2P_LOAD_WEIGHT", 1.0)),
+    "MX_P2P_RUNTIME_METRICS_URL": lambda: os.environ.get("MX_P2P_RUNTIME_METRICS_URL"),
     "MX_P2P_TOPOLOGY_LEVELS": lambda: os.environ.get("MX_P2P_TOPOLOGY_LEVELS"),
     "MX_P2P_TOPOLOGY": lambda: os.environ.get("MX_P2P_TOPOLOGY"),
     # Clamp to >= 0: a negative weight would invert the within-tier load blend

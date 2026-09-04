@@ -165,13 +165,20 @@ impl MetadataBackend for InstrumentedMetadataBackend {
         worker_rank: u32,
         status: SourceStatus,
         updated_at: i64,
+        source_load: Option<f32>,
     ) -> MetadataResult<()> {
         self.metrics
             .time(
                 Store::P2p,
                 "update_status",
-                self.inner
-                    .update_status(source_id, worker_id, worker_rank, status, updated_at),
+                self.inner.update_status(
+                    source_id,
+                    worker_id,
+                    worker_rank,
+                    status,
+                    updated_at,
+                    source_load,
+                ),
             )
             .await
     }
@@ -245,7 +252,7 @@ mod tests {
             .returning(|| Ok(Vec::new()));
         mock.expect_update_status()
             .times(1)
-            .returning(|_, _, _, _, _| Ok(()));
+            .returning(|_, _, _, _, _, _| Ok(()));
 
         let mut registry = new_registry();
         let metrics = BackendMetrics::register(&mut registry);
@@ -271,7 +278,7 @@ mod tests {
         let _ = backend.remove_worker("source-0", "worker-0").await;
         let _ = backend.list_sources().await;
         let _ = backend
-            .update_status("source-0", "worker-0", 0, SourceStatus::Ready, 0)
+            .update_status("source-0", "worker-0", 0, SourceStatus::Ready, 0, None)
             .await;
 
         let encoded = encode_text(&registry).unwrap_or_else(|_| String::from("<encode failed>"));
