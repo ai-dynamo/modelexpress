@@ -935,6 +935,34 @@ def test_load_records_transfer_fallback_metrics(monkeypatch):
     assert m.observe_transfer_seconds.call_args.args[:2] == ("random", "fallback")
 
 
+def test_load_records_the_accelerator_reject_it_used_to_swallow(monkeypatch):
+    """A candidate rejected after GetMetadata was counted as nothing at all.
+
+    It had already passed the pre-fetch filter, so it was not a metadata_miss,
+    and it never reached a transfer, so it was not a fallback -- it simply left
+    the funnel between two counters. That made mx_p2p_source_attempts_total not
+    a partition of the candidates the selector returned, which is exactly the
+    caveat the dashboard panel carried in its own description.
+    """
+    m = _patched_metrics(monkeypatch)
+    strat = RdmaStrategy()
+    cands = _sources(1)
+    strat._find_source_instances = MagicMock(return_value=cands)
+    strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
+    strat._accelerator_compatible = MagicMock(return_value=False)
+    strat._load_as_target = MagicMock(return_value="loaded")
+    ctx = MagicMock(global_rank=0)
+
+    with pytest.raises(StrategyFailed):
+        strat.load(MagicMock(), ctx)
+
+    m.record_attempt.assert_any_call("random", "accelerator_reject")
+    # Rejected before selection, so it is not a selection and not a transfer.
+    m.record_selection.assert_not_called()
+    m.observe_transfer_seconds.assert_not_called()
+    strat._load_as_target.assert_not_called()
+
+
 def test_load_records_transfer_retry_metrics(monkeypatch):
     m = _patched_metrics(monkeypatch)
     strat = RdmaStrategy()

@@ -186,6 +186,11 @@ class RdmaStrategy(LoadStrategy):
                 continue
 
             if not self._accelerator_compatible(ctx, source_worker, worker_id):
+                # Without this the counter is not a partition of the candidates:
+                # a source that passed GetMetadata and was then rejected here
+                # disappeared between metadata_miss and success, counted as
+                # neither.
+                selection_metrics.record_attempt(policy, "accelerator_reject")
                 continue
 
             logger.info(
