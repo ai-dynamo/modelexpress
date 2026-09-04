@@ -109,7 +109,7 @@ runs:
       run: |
         echo "::group::Create namespace ${NAMESPACE} and install prerequisites"
         kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
-        kubectl apply -f ci/k8s/server/crd-modelmetadata.yaml
+        kubectl apply -f examples/crds.yaml
         NAMESPACE=${NAMESPACE} envsubst < ci/k8s/server/rbac-modelmetadata.yaml | \
           kubectl apply -n ${NAMESPACE} -f -
         echo "::endgroup::"
