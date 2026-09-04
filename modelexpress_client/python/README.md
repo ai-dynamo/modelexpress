@@ -147,6 +147,8 @@ Integrations may use `MX_REFIT_DELTA_BUCKET_BYTES` as an explicit override, or
 its 512 MiB default when they have no native setting. CPU workers are configured
 by `MX_REFIT_DELTA_WORKERS` (default `min(32, CPU count)`), while
 `MX_S3_UPLOAD_WORKERS` controls concurrent full-checkpoint batch uploads.
+`MX_REFIT_CHECKSUM_FORMAT` selects the checksum algorithm and defaults to
+`adler32`.
 The framework integration reads the bucket-size setting while constructing the
 stream; ModelExpress processes each supplied bucket without splitting or merging
 it.
