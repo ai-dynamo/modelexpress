@@ -28,6 +28,7 @@ from modelexpress.refit.reshard.receiver import ReshardReceiver
 from modelexpress.refit.reshard.slice_plan import PullSegment
 from modelexpress.refit.reshard.transfer_plan import FullPullSource, TransferPlan
 from modelexpress.refit.reshard.transport import InMemoryReferenceTransport
+from tests.conftest import MockAcceleratorBackend
 
 EL = 4  # float32 element size
 
@@ -56,6 +57,9 @@ class _Harness(ReshardReceiver):
         self._transport = transport
         self._global_rank = 0
         self._cached_descriptors = None
+        # The stage syncs go through the accelerator backend, so a stub backend is
+        # what keeps this CPU-only rather than patching a torch device module.
+        self._backend = MockAcceleratorBackend()
 
     def _install(self, recv_buffers) -> None:
         pass
@@ -166,7 +170,6 @@ def _build(transport):
 
 def _run(monkeypatch, *, batched: bool):
     monkeypatch.setenv("MX_RESHARD_BATCH_INSTALL", "1" if batched else "0")
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
     transport = InMemoryReferenceTransport()
     harness, keepalive = _build(transport)
     metrics = harness.update_weights(step=1)
@@ -203,7 +206,6 @@ def test_reconstructs_the_expected_values(monkeypatch):
 
 def test_disjoint_destinations_use_the_foreach_batch(monkeypatch):
     """The normal plan is pairwise disjoint and stays on the batched path."""
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
     monkeypatch.setenv("MX_RESHARD_BATCH_INSTALL", "1")
     calls = []
     real_foreach = torch._foreach_copy_
@@ -223,7 +225,6 @@ def test_disjoint_destinations_use_the_foreach_batch(monkeypatch):
 
 def test_overlapping_destinations_fall_back_to_plan_order(monkeypatch):
     """Overlapping views use sequential copies because foreach order is undefined."""
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
     monkeypatch.setenv("MX_RESHARD_BATCH_INSTALL", "1")
     monkeypatch.setattr(
         torch,
@@ -270,7 +271,6 @@ def test_stage_record_reports_the_install_arm(monkeypatch, caplog):
 
 def test_empty_full_pulls_is_a_no_op(monkeypatch):
     """No full pulls means no batched copy, and no crash on an empty list."""
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
 
     for batched in (True, False):
         monkeypatch.setenv("MX_RESHARD_BATCH_INSTALL", "1" if batched else "0")
