@@ -192,7 +192,7 @@ runs:
         # CRD is cluster-scoped — applied once here on bootstrap.
         # run-mx-p2p-test also applies it on every run for idempotency.
         kubectl --kubeconfig="${GITHUB_WORKSPACE}/.kubeconfig-vcluster" apply \
-          -f ci/k8s/server/crd-modelmetadata.yaml
+          -f examples/crds.yaml
         echo "::endgroup::"
 
     - name: Clone dynamo repo for operator helm chart
