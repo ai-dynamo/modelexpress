@@ -4,6 +4,7 @@
 """Tests for the snapshot_download prefetch hook."""
 
 import importlib
+import logging
 
 import pytest
 
@@ -165,16 +166,23 @@ class TestPatchedBehavior:
 
         assert recorded == []
 
-    def test_prefetch_failure_keeps_original_semantics(self, enabled, stub_download, monkeypatch):
-        def failing_ensure(repo_id, revision=None):
+    def test_prefetch_failure_keeps_original_semantics(
+        self, enabled, stub_download, monkeypatch, caplog
+    ):
+        def failing_ensure(repo_id, revision=None, *, cache_directory=None):
             raise RuntimeError("server unreachable")
 
         monkeypatch.setattr(model_prefetch, "ensure_metadata", failing_ensure)
         patch_hf_snapshot_prefetch()
         import huggingface_hub
 
-        assert huggingface_hub.snapshot_download(REPO) == "/local/snapshot"
+        with caplog.at_level(logging.WARNING):
+            assert huggingface_hub.snapshot_download(REPO) == "/local/snapshot"
+
         assert len(stub_download) == 1
+        # Named so the double cannot drift out of the signature the patch calls
+        # with and still pass: a TypeError would be swallowed the same way.
+        assert "server unreachable" in caplog.text
 
     def test_arguments_are_forwarded_untouched(self, enabled, stub_download, recorded):
         patch_hf_snapshot_prefetch()
