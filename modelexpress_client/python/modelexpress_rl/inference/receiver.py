@@ -179,6 +179,188 @@ def _group_tensors_by_shard(
     return shard_to_tensors
 
 
+def _download_full_checkpoint(
+    *,
+    s3: S3Client,
+    store: LocalCheckpointStore,
+    target: Path,
+    index_metadata: dict[str, Any],
+    weight_map: dict[str, str],
+    root_uri: str,
+    protected_versions: set[str],
+    tensor_metadata: dict[str, dict] | None = None,
+) -> tuple[float, float]:
+    """Download and validate one full HF checkpoint artifact."""
+    checksum_format = index_metadata.get("checksum_format")
+    if tensor_metadata is not None and set(weight_map) != set(tensor_metadata):
+        raise ValueError("full HF checkpoint tensor set differs from local checkpoint")
+
+    shard_to_tensors = _group_tensors_by_shard(weight_map)
+    parent_uri = root_uri.rsplit("/", 1)[0]
+    workers = min(rl_envs.MX_S3_DOWNLOAD_WORKERS, len(shard_to_tensors))
+    shard_sizes = threadpool_map(
+        shard_to_tensors,
+        lambda filename: s3.size(f"{parent_uri}/{filename}"),
+        max_workers=workers,
+        thread_name_prefix="modelexpress-s3-head-full",
+    )
+    store.ensure_capacity(
+        sum(shard_sizes),
+        protected_versions=protected_versions,
+        protected_paths={target},
+    )
+
+    def download_and_validate(filename: str) -> tuple[float, float]:
+        download_started = time.perf_counter()
+        try:
+            data = s3.get(f"{parent_uri}/{filename}")
+        except Exception as error:
+            raise RuntimeError(
+                f"full HF checkpoint download failed for {filename!r}"
+            ) from error
+        download_time = time.perf_counter() - download_started
+
+        validation_started = time.perf_counter()
+        header, data_start = read_safetensors_header(data, repr(filename))
+        tensor_names = shard_to_tensors[filename]
+        metadata = header.get("__metadata__", {})
+        if not isinstance(metadata, dict):
+            raise ValueError(
+                f"full HF checkpoint shard {filename!r} has invalid metadata"
+            )
+        if set(header) - {"__metadata__"} != set(tensor_names):
+            raise ValueError(
+                f"full HF checkpoint shard {filename!r} tensor set differs "
+                "from its index"
+            )
+
+        view = memoryview(data)
+        for name in tensor_names:
+            tensor_header = header[name]
+            begin, end = tensor_header["data_offsets"]
+            if tensor_metadata is not None:
+                local_metadata = tensor_metadata[name]
+                if (
+                    tensor_header["dtype"] != local_metadata["dtype"]
+                    or tensor_header["shape"] != local_metadata["shape"]
+                    or end - begin != local_metadata["byte_size"]
+                ):
+                    raise ValueError(
+                        f"full HF checkpoint metadata differs for {name!r}"
+                    )
+            source = np.frombuffer(
+                view,
+                dtype=np.uint8,
+                count=end - begin,
+                offset=data_start + begin,
+            )
+            if checksum_format is not None:
+                expected_checksum = metadata.get(name)
+                if expected_checksum is None:
+                    raise ValueError(
+                        f"full HF checkpoint shard {filename!r} is missing "
+                        f"checksum for tensor {name!r}"
+                    )
+                checksum = checksum_factory(checksum_format)
+                checksum.update(source)
+                if checksum.hexdigest() != expected_checksum:
+                    raise ValueError(
+                        f"full HF checkpoint checksum differs for {name!r}"
+                    )
+        (target / filename).write_bytes(data)
+        return download_time, time.perf_counter() - validation_started
+
+    timings = list(
+        threadpool_map(
+            shard_to_tensors,
+            download_and_validate,
+            max_workers=workers,
+            thread_name_prefix="modelexpress-s3-download-full",
+        )
+    )
+    return (
+        max(download for download, _ in timings),
+        max(validation for _, validation in timings),
+    )
+
+
+def bootstrap_s3_checkpoint(
+    *,
+    model_name: str,
+    version: _S3Version,
+    refit_checkpoint_dir: str | Path,
+    s3: S3Client,
+    refit_checkpoint_max_size_gb: int | None = DEFAULT_REFIT_CHECKPOINT_MAX_SIZE_GB,
+) -> Path:
+    """Download the immutable full root needed by a cold-start replay."""
+    if version.payload_format is not WeightPayloadFormat.FULL_HF_CHECKPOINT:
+        raise ValueError("cold-start replay root must be FULL_HF_CHECKPOINT")
+    if version.base_version_id is not None:
+        raise ValueError("FULL_HF_CHECKPOINT must not have base_version_id")
+
+    store = LocalCheckpointStore(
+        root=refit_checkpoint_dir,
+        model_name=model_name,
+        max_size_bytes=(
+            refit_checkpoint_max_size_gb * _BYTES_PER_GB
+            if refit_checkpoint_max_size_gb is not None
+            else None
+        ),
+    )
+    store.initialize()
+    target = store.full_path(version.version_id)
+    source = _source_identity(version)
+    with store.installation_locked(), store.locked():
+        reusable = target.exists()
+        if reusable:
+            try:
+                store.verify_artifact_source(target, source)
+                checkpoint_paths, _, _ = index_checkpoint_tensors(target)
+            except (OSError, RuntimeError, ValueError):
+                reusable = False
+        if not reusable:
+            index_data = s3.get(version.uri)
+            metadata, weight_map = _parse_index_manifest(
+                index_data,
+                is_delta=False,
+            )
+            store.ensure_capacity(
+                len(index_data),
+                protected_versions={version.version_id},
+            )
+            with store.replace_directory(target) as temporary:
+                (temporary / Path(version.uri).name).write_bytes(index_data)
+                _download_full_checkpoint(
+                    s3=s3,
+                    store=store,
+                    target=temporary,
+                    index_metadata=metadata,
+                    weight_map=weight_map,
+                    root_uri=version.uri,
+                    protected_versions={version.version_id},
+                )
+                store.record_artifact(temporary, source=source)
+            checkpoint_paths, _, _ = index_checkpoint_tensors(target)
+
+        store.write_chain(
+            version.version_id,
+            {
+                "version": version.version_id,
+                "full_version": version.version_id,
+                "deltas": [],
+            },
+        )
+        store.write_state(
+            status=CheckpointState.READY,
+            version=version.version_id,
+            checkpoint_paths=checkpoint_paths,
+            source=source,
+        )
+        store.activate(version.version_id)
+        store.enforce_capacity(protected_versions={version.version_id})
+    return target
+
+
 class _LocalCheckpoint:
     """Immutable local artifacts plus a materialized install checkpoint."""
 
@@ -671,101 +853,15 @@ class _LocalCheckpoint:
         root_uri: str,
         protected_versions: set[str],
     ) -> tuple[float, float]:
-        checksum_format = index_metadata.get("checksum_format")
-        if set(weight_map) != set(self.locations):
-            raise ValueError(
-                "full HF checkpoint tensor set differs from local checkpoint"
-            )
-
-        shard_to_tensors = _group_tensors_by_shard(weight_map)
-        parent_uri = root_uri.rsplit("/", 1)[0]
-        workers = min(
-            rl_envs.MX_S3_DOWNLOAD_WORKERS,
-            len(shard_to_tensors),
-        )
-        shard_sizes = threadpool_map(
-            shard_to_tensors,
-            lambda filename: self.s3.size(f"{parent_uri}/{filename}"),
-            max_workers=workers,
-            thread_name_prefix="modelexpress-s3-head-full",
-        )
-        self.store.ensure_capacity(
-            sum(shard_sizes),
+        return _download_full_checkpoint(
+            s3=self.s3,
+            store=self.store,
+            target=target,
+            index_metadata=index_metadata,
+            weight_map=weight_map,
+            root_uri=root_uri,
             protected_versions=protected_versions,
-            protected_paths={target},
-        )
-
-        def download_and_validate(filename: str) -> tuple[float, float]:
-            download_started = time.perf_counter()
-            try:
-                data = self.s3.get(f"{parent_uri}/{filename}")
-            except Exception as error:
-                raise RuntimeError(
-                    f"full HF checkpoint download failed for {filename!r}"
-                ) from error
-            download_time = time.perf_counter() - download_started
-
-            validation_started = time.perf_counter()
-            header, data_start = read_safetensors_header(data, repr(filename))
-            tensor_names = shard_to_tensors[filename]
-            metadata = header.get("__metadata__", {})
-            if not isinstance(metadata, dict):
-                raise ValueError(
-                    f"full HF checkpoint shard {filename!r} has invalid metadata"
-                )
-
-            view = memoryview(data)
-            for name in tensor_names:
-                if name not in header:
-                    raise ValueError(
-                        f"full HF checkpoint shard {filename!r} is missing tensor "
-                        f"{name!r}"
-                    )
-                tensor_header = header[name]
-                begin, end = tensor_header["data_offsets"]
-                local_metadata = self.tensor_metadata[name]
-                if (
-                    tensor_header["dtype"] != local_metadata["dtype"]
-                    or tensor_header["shape"] != local_metadata["shape"]
-                    or end - begin != local_metadata["byte_size"]
-                ):
-                    raise ValueError(
-                        f"full HF checkpoint metadata differs for {name!r}"
-                    )
-                source = np.frombuffer(
-                    view,
-                    dtype=np.uint8,
-                    count=end - begin,
-                    offset=data_start + begin,
-                )
-                if checksum_format is not None:
-                    expected_checksum = metadata.get(name)
-                    if expected_checksum is None:
-                        raise ValueError(
-                            f"full HF checkpoint shard {filename!r} is missing "
-                            f"checksum for tensor {name!r}"
-                        )
-                    checksum = checksum_factory(checksum_format)
-                    checksum.update(source)
-                    if checksum.hexdigest() != expected_checksum:
-                        raise ValueError(
-                            f"full HF checkpoint checksum differs for {name!r}"
-                        )
-            (target / filename).write_bytes(data)
-            return download_time, time.perf_counter() - validation_started
-
-        timings = list(
-            threadpool_map(
-                shard_to_tensors,
-                download_and_validate,
-                max_workers=workers,
-                thread_name_prefix="modelexpress-s3-download-full",
-            )
-        )
-
-        return (
-            max((download for download, _ in timings)),
-            max((apply for _, apply in timings)),
+            tensor_metadata=self.tensor_metadata,
         )
 
     def _apply_shards(
@@ -909,4 +1005,5 @@ __all__ = [
     "PreparedCheckpoint",
     "ReceiverInstallError",
     "ObjectStorageGeneratorConfig",
+    "bootstrap_s3_checkpoint",
 ]

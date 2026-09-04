@@ -137,6 +137,50 @@ def _make_load_context(**overrides):
     return LoadContext(**defaults)
 
 
+def test_initial_load_uses_inference_chain_by_default(monkeypatch):
+    from modelexpress.load_strategy import run_load_strategy_chain
+
+    monkeypatch.delenv("MX_LOAD_STRATEGY_CHAIN", raising=False)
+    model = MagicMock()
+    ctx = _make_load_context()
+
+    with patch(
+        "modelexpress.load_strategy.LoadStrategyChain.run",
+        return_value=model,
+    ) as inference_run:
+        assert run_load_strategy_chain(model, ctx) is model
+
+    inference_run.assert_called_once_with(model, ctx)
+
+
+def test_initial_load_uses_dedicated_rl_chain(monkeypatch):
+    from modelexpress.load_strategy import run_load_strategy_chain
+
+    monkeypatch.setenv("MX_LOAD_STRATEGY_CHAIN", "RL")
+    model = MagicMock()
+    ctx = _make_load_context()
+
+    with patch(
+        "modelexpress.load_strategy.LoadStrategyChain.run"
+    ) as inference_run, patch(
+        "modelexpress_rl.inference.load_strategy.RLLoadStrategyChain.run",
+        return_value=model,
+    ) as rl_run:
+        assert run_load_strategy_chain(model, ctx) is model
+
+    inference_run.assert_not_called()
+    rl_run.assert_called_once_with(model, ctx)
+
+
+def test_initial_load_rejects_unknown_chain(monkeypatch):
+    from modelexpress.load_strategy import run_load_strategy_chain
+
+    monkeypatch.setenv("MX_LOAD_STRATEGY_CHAIN", "unknown")
+
+    with pytest.raises(ValueError, match="MX_LOAD_STRATEGY_CHAIN"):
+        run_load_strategy_chain(MagicMock(), _make_load_context())
+
+
 class _FakeRpcError(grpc.RpcError):
     def __init__(self, status_code: grpc.StatusCode, details: str):
         super().__init__()
@@ -269,6 +313,14 @@ class TestAbstractMethodCompleteness:
                 loader.download_model(cfg)
                 mock_cls.return_value.download_model.assert_not_called()
 
+    def test_download_model_defers_to_rl_initial_load(self):
+        loader = _make_loader()
+        cfg = MagicMock()
+        with patch.dict("os.environ", {"MX_LOAD_STRATEGY_CHAIN": "RL"}, clear=True):
+            with patch("modelexpress.engines.vllm.loader.DefaultModelLoader") as mock_cls:
+                loader.download_model(cfg)
+                mock_cls.return_value.download_model.assert_not_called()
+
     def test_load_weights_delegates(self):
         loader = _make_loader()
         model, cfg = MagicMock(), MagicMock()
@@ -295,7 +347,7 @@ class TestAbstractMethodCompleteness:
                 "modelexpress.engines.vllm.loader.initialize_model",
                 return_value=model,
             ), patch(
-                "modelexpress.engines.vllm.loader.LoadStrategyChain.run",
+                "modelexpress.engines.vllm.loader.run_load_strategy_chain",
                 return_value=model,
             ):
                 loaded = loader.load_model(MagicMock(), MagicMock(dtype=torch.float32))
@@ -355,7 +407,7 @@ class TestAbstractMethodCompleteness:
             "modelexpress.engines.vllm.loader.initialize_model",
             side_effect=initialize_model,
         ), patch(
-            "modelexpress.engines.vllm.loader.LoadStrategyChain.run",
+            "modelexpress.engines.vllm.loader.run_load_strategy_chain",
             side_effect=run,
         ), patch(
             "modelexpress.engines.vllm.loader.schedule_vllm_cache_artifact_publish",
@@ -466,7 +518,7 @@ class TestMtpDrafterSecondLoad:
             "modelexpress.engines.vllm.loader.initialize_model",
             return_value=MagicMock(),
         ), patch(
-            "modelexpress.engines.vllm.loader.LoadStrategyChain.run",
+            "modelexpress.engines.vllm.loader.run_load_strategy_chain",
             side_effect=lambda model, _ctx: model,
         ), patch(
             "modelexpress.engines.vllm.loader.schedule_vllm_cache_artifact_publish",

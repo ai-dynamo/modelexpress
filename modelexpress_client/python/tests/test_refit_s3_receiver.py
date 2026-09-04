@@ -506,6 +506,42 @@ def _full_inputs(*, version="full-a", version_label=2):
     )
 
 
+def test_bootstrap_s3_checkpoint_downloads_and_reuses_full_root(tmp_path):
+    objects = _full_artifact(torch.tensor([7.0, 8.0]))
+    storage = _MemoryS3(objects)
+    version = receiver_module._S3Version(
+        version_id="full-a",
+        base_version_id=None,
+        payload_format=WeightPayloadFormat.FULL_HF_CHECKPOINT,
+        uri="s3://weights/test/v2/model.safetensors.index.json",
+    )
+
+    path = receiver_module.bootstrap_s3_checkpoint(
+        model_name="test/model",
+        version=version,
+        refit_checkpoint_dir=tmp_path / "cache",
+        s3=storage,
+    )
+
+    assert torch.equal(
+        load_file(path / "model-00001-of-00001.safetensors")["weight"],
+        torch.tensor([7.0, 8.0]),
+    )
+    first_calls = list(storage.calls)
+    assert first_calls == [
+        "s3://weights/test/v2/model.safetensors.index.json",
+        "s3://weights/test/v2/model-00001-of-00001.safetensors",
+    ]
+
+    assert receiver_module.bootstrap_s3_checkpoint(
+        model_name="test/model",
+        version=version,
+        refit_checkpoint_dir=tmp_path / "cache",
+        s3=storage,
+    ) == path
+    assert storage.calls == first_calls
+
+
 @pytest.mark.parametrize(
     "filename",
     ["/tmp/shard", "../shard", "foo/bar", "foo/bar/", ".", ".."],
