@@ -46,9 +46,14 @@ podAnnotations: {}
 
 podLabels: {}
 
+# Must match the uid the image runs as (docker/Dockerfile USER 1000:1000).
+# fsGroup makes the mounted cache volume writable to that uid.
 podSecurityContext:
   runAsNonRoot: true
-  # fsGroup: 2000
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  fsGroupChangePolicy: OnRootMismatch
 
 securityContext:
   runAsNonRoot: true
