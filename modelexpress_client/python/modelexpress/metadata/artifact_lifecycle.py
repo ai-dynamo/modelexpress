@@ -6,14 +6,18 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import logging
 import os
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
+from dataclasses import dataclass
+from enum import Enum
 from fcntl import LOCK_EX, LOCK_NB, LOCK_UN, flock
 from getpass import getuser
 from hashlib import sha256
@@ -30,9 +34,15 @@ from ..load_strategy.context import LoadContext
 from ..nixl_transfer import is_nixl_available
 from .artifact_transfer import (
     ArtifactCacheRoot,
+    ArtifactBundle,
     P2PArtifactTransfer,
     PublishedArtifactSource,
     publish_artifact_source,
+)
+from .mooncake_artifact_cache import (
+    MooncakeArtifactCacheMiss,
+    install_from_mooncake,
+    publish_to_mooncake,
 )
 from .publisher import PublisherThread
 from .publish import _get_worker_server, _is_p2p_metadata_enabled
@@ -46,6 +56,24 @@ CACHE_SETTLE_SECS = 5
 ArtifactEntry = tuple[P2PArtifactTransfer, p2p_pb2.SourceIdentity]
 InstallCompleted = Callable[[P2PArtifactTransfer, p2p_pb2.SourceIdentity], None]
 _publish_leases: dict[Path, TextIO] = {}
+_MOONCAKE_INSTALL_MARKER_VERSION = 1
+_prepared_artifact_bundles: dict[tuple[int, bytes], ArtifactBundle] = {}
+_prepared_artifact_locks: dict[tuple[int, bytes], threading.Lock] = {}
+_prepared_artifact_locks_guard = threading.Lock()
+_mooncake_publish_needed: set[tuple[bytes, int, str, int, str]] = set()
+
+
+class MooncakeInstallStatus(Enum):
+    """Outcome of the per-pod Mooncake artifact installation marker."""
+
+    INSTALLED = "installed"
+    ALREADY_INSTALLED = "already_installed"
+
+
+@dataclass(frozen=True)
+class MooncakeInstallResult:
+    status: MooncakeInstallStatus
+    header: p2p_pb2.GetArtifactManifestHeaderResponse | None = None
 
 
 def install_artifacts(
@@ -59,28 +87,69 @@ def install_artifacts(
     """Best-effort install of compatible artifacts before model loading."""
     if not _artifact_transfer_enabled():
         return
-    if not _p2p_metadata_enabled_for_artifacts(ctx, engine_label, log):
-        return
-    if not _metadata_publication_configured(ctx):
-        log.info(
-            "[Worker %s] No MX metadata path configured, skipping %s artifacts",
-            ctx.global_rank,
-            engine_label,
-        )
-        return
-    if not is_nixl_available():
-        log.info(
-            "[Worker %s] NIXL not available, skipping %s artifact install",
-            ctx.global_rank,
-            engine_label,
-        )
-        return
-
-    _ensure_nixl_manager(ctx, engine_label, log)
-    if ctx.nixl_manager is None:
+    mooncake_enabled = _mooncake_artifact_enabled()
+    p2p_available = _p2p_artifact_install_available(ctx, engine_label, log)
+    if not mooncake_enabled and not p2p_available:
         return
 
     for transfer, identity in transfers_factory():
+        if mooncake_enabled:
+            try:
+                start = time.perf_counter()
+                result = install_mooncake_artifact_once(
+                    ctx,
+                    transfer,
+                    identity,
+                    engine_label=engine_label,
+                    on_install_completed=on_install_completed,
+                )
+                elapsed = time.perf_counter() - start
+                if result.status is MooncakeInstallStatus.ALREADY_INSTALLED:
+                    log.debug(
+                        "[Worker %s] %s Mooncake artifact %s already installed "
+                        "by another worker; continuing to the next artifact",
+                        ctx.global_rank,
+                        engine_label,
+                        transfer.name,
+                    )
+                    continue
+                header = result.header
+                if (
+                    result.status is MooncakeInstallStatus.INSTALLED
+                    and header is not None
+                ):
+                    log.info(
+                        "[Worker %s] [TIMING] %s Mooncake artifact install complete: "
+                        "name=%s artifact_id=%s size=%.2f MiB elapsed=%.3fs",
+                        ctx.global_rank,
+                        engine_label,
+                        transfer.name,
+                        header.artifact_id,
+                        header.total_size / (1024 * 1024),
+                        elapsed,
+                    )
+                    continue
+            except MooncakeArtifactCacheMiss:
+                _mark_mooncake_publish_needed(ctx, transfer, identity)
+                log.info(
+                    "[Worker %s] Mooncake %s artifact cache miss: name=%s",
+                    ctx.global_rank,
+                    engine_label,
+                    transfer.name,
+                )
+            except Exception as exc:
+                _mark_mooncake_publish_needed(ctx, transfer, identity)
+                log.warning(
+                    "[Worker %s] Failed to install Mooncake %s artifact: "
+                    "name=%s error=%s",
+                    ctx.global_rank,
+                    engine_label,
+                    transfer.name,
+                    exc,
+                )
+
+        if not p2p_available:
+            continue
         try:
             start = time.perf_counter()
             header = install_artifact_once(
@@ -150,22 +219,37 @@ def schedule_artifact_publish(
     """Schedule readiness-gated publication of local cache artifacts."""
     if not _artifact_transfer_enabled():
         return
-    if not _p2p_metadata_enabled_for_artifacts(ctx, engine_label, log):
+    mooncake_enabled = _mooncake_artifact_enabled()
+    p2p_publish_available = True
+    if mooncake_enabled:
+        if not _is_p2p_metadata_enabled(ctx.mx_client):
+            log.info(
+                "[Worker %s] MX_P2P_METADATA is disabled; skipping P2P %s "
+                "artifact publish fallback",
+                ctx.global_rank,
+                engine_label,
+            )
+            p2p_publish_available = False
+    elif not _p2p_metadata_enabled_for_artifacts(ctx, engine_label, log):
         return
     if not _metadata_publication_configured(ctx):
-        log.info(
-            "[Worker %s] No MX metadata path configured, skipping %s artifacts",
-            ctx.global_rank,
-            engine_label,
-        )
-        return
+        if not mooncake_enabled:
+            log.info(
+                "[Worker %s] No MX metadata path configured, skipping %s artifacts",
+                ctx.global_rank,
+                engine_label,
+            )
+            return
+        p2p_publish_available = False
     if ctx.nixl_manager is None:
-        log.info(
-            "[Worker %s] No NIXL manager, skipping %s artifact publish",
-            ctx.global_rank,
-            engine_label,
-        )
-        return
+        if not mooncake_enabled:
+            log.info(
+                "[Worker %s] No NIXL manager, skipping %s artifact publish",
+                ctx.global_rank,
+                engine_label,
+            )
+            return
+        p2p_publish_available = False
 
     for transfer, identity in transfers_factory():
         marker_path = mark_publish_scheduled(ctx, transfer, identity)
@@ -185,7 +269,15 @@ def schedule_artifact_publish(
             worker_rank=ctx.worker_rank,
             nixl_manager=ctx.nixl_manager,
             publish_fn=lambda transfer=transfer, identity=identity: (
-                artifact_publish_fn(transfer, identity).endpoint.mx_source_id
+                _publish_mooncake_then_p2p_artifact(
+                    ctx,
+                    transfer,
+                    identity,
+                    engine_label=engine_label,
+                    p2p_publish_fn=artifact_publish_fn,
+                    p2p_publish_available=p2p_publish_available,
+                    log=log,
+                )
             ),
             ready_fn=ready_fn_factory(source_roots),
             publish_timeout_secs=envs.MX_ARTIFACT_READY_TIMEOUT_SECS,
@@ -240,6 +332,72 @@ def install_artifact_once(
         return header
 
 
+def install_mooncake_artifact_once(
+    ctx: LoadContext,
+    transfer: P2PArtifactTransfer,
+    identity: p2p_pb2.SourceIdentity,
+    *,
+    engine_label: str,
+    on_install_completed: InstallCompleted | None = None,
+) -> MooncakeInstallResult:
+    """Install one Mooncake artifact at most once per pod."""
+    marker_path = artifact_marker_path(transfer, identity, "mooncake-install-attempted")
+    with artifact_lock(marker_path):
+        if marker_path.exists():
+            marker = _read_mooncake_install_marker(marker_path)
+            if marker["status"] == "installed":
+                required_roots = tuple(
+                    root.target_root for root in transfer.roots if not root.optional
+                )
+                if all(has_files(path) for path in required_roots):
+                    return MooncakeInstallResult(
+                        MooncakeInstallStatus.ALREADY_INSTALLED
+                    )
+                # The marker outlived the target files (for example after a
+                # container-local cache cleanup), so it must not suppress a
+                # fresh Mooncake/P2P installation.
+                marker_path.unlink(missing_ok=True)
+            elif marker["status"] in {"miss", "attempted"}:
+                owner = marker.get("owner")
+                if owner is not None and _process_owner_is_alive(*owner):
+                    raise MooncakeArtifactCacheMiss(
+                        f"Mooncake install already {marker['status']} for "
+                        f"{transfer.name} in this pod"
+                    )
+                # A miss/attempted marker owned by a dead process is stale and
+                # can be reclaimed for a later pod launch.
+                marker_path.unlink(missing_ok=True)
+            else:
+                # Corrupt or unknown markers cannot prove that the target
+                # cache is complete. Reclaim them and install again.
+                marker_path.unlink(missing_ok=True)
+        _write_mooncake_install_marker(marker_path, "attempted")
+        try:
+            header = install_from_mooncake(
+                transfer,
+                identity,
+                node_rank=ctx.node_rank,
+                accelerator=ctx.accelerator_backend.name,
+            )
+            transfer.install(header)
+            if on_install_completed is not None:
+                on_install_completed(transfer, identity)
+            _write_mooncake_install_marker(marker_path, "installed")
+            return MooncakeInstallResult(
+                MooncakeInstallStatus.INSTALLED,
+                header,
+            )
+        except MooncakeArtifactCacheMiss:
+            # Keep a pod-level negative result so every rank does not create a
+            # Mooncake store and repeat the same miss. The owner identity makes
+            # the marker reclaimable after the process/pod exits.
+            _write_mooncake_install_marker(marker_path, "miss")
+            raise
+        except Exception:
+            marker_path.unlink(missing_ok=True)
+            raise
+
+
 def publish_artifact(
     ctx: LoadContext,
     transfer: P2PArtifactTransfer,
@@ -249,6 +407,7 @@ def publish_artifact(
     accelerator: str,
     published_sources: dict[tuple[int, int], PublishedArtifactSource],
     log: logging.Logger = logger,
+    prepared_bundle: ArtifactBundle | None = None,
 ) -> PublishedArtifactSource:
     """Prepare and publish one local artifact source."""
     if ctx.nixl_manager is None:
@@ -270,7 +429,14 @@ def publish_artifact(
         )
 
     start = time.perf_counter()
-    bundle = transfer.prepare_source()
+    bundle = (
+        prepared_bundle
+        or _prepared_artifact_bundles.pop(
+            _prepared_artifact_key(transfer, identity),
+            None,
+        )
+        or transfer.prepare_source()
+    )
     key = (ctx.device_id, transfer.mx_source_type)
     previous = published_sources.pop(key, None)
     if previous is not None:
@@ -302,6 +468,133 @@ def publish_artifact(
         elapsed,
     )
     return published
+
+
+def _publish_mooncake_then_p2p_artifact(
+    ctx: LoadContext,
+    transfer: P2PArtifactTransfer,
+    identity: p2p_pb2.SourceIdentity,
+    *,
+    engine_label: str,
+    p2p_publish_fn: Callable[
+        [P2PArtifactTransfer, p2p_pb2.SourceIdentity],
+        PublishedArtifactSource,
+    ],
+    p2p_publish_available: bool,
+    log: logging.Logger,
+) -> str:
+    bundle: ArtifactBundle | None = None
+    mooncake_published = False
+    # Do not touch Mooncake-specific context fields on the default P2P path.
+    # Besides avoiding unnecessary key work, this keeps the legacy P2P
+    # publisher compatible with lightweight contexts that do not expose
+    # node_rank or accelerator_backend.
+    publish_to_mooncake_needed = False
+    mooncake_publish_key = None
+    if _mooncake_artifact_enabled():
+        mooncake_publish_key = _mooncake_publish_key(ctx, transfer, identity)
+        publish_to_mooncake_needed = (
+            mooncake_publish_key in _mooncake_publish_needed
+        )
+    if publish_to_mooncake_needed:
+        try:
+            required_roots = tuple(
+                root.source_root for root in transfer.roots if not root.optional
+            )
+            if not all(has_files(path) for path in required_roots):
+                raise LookupError(
+                    f"Required {engine_label} artifact sources {transfer.name} are empty "
+                    f"or missing: "
+                    f"{required_roots}"
+                )
+            bundle = transfer.prepare_source()
+            publish_to_mooncake(
+                transfer,
+                identity,
+                bundle,
+                node_rank=ctx.node_rank,
+                accelerator=ctx.accelerator_backend.name,
+            )
+            mooncake_published = True
+            _mooncake_publish_needed.discard(mooncake_publish_key)
+        except Exception as exc:
+            log.warning(
+                "[Worker %s] Failed to publish %s artifact %s to Mooncake; "
+                "continuing with P2P: %s",
+                ctx.global_rank,
+                engine_label,
+                transfer.name,
+                exc,
+            )
+    if not p2p_publish_available:
+        if mooncake_published or (
+            _mooncake_artifact_enabled() and not publish_to_mooncake_needed
+        ):
+            return "mooncake-artifact-cache"
+        raise RuntimeError(
+            "Mooncake artifact publish failed and P2P publish is unavailable"
+        )
+    if bundle is None:
+        return p2p_publish_fn(transfer, identity).endpoint.mx_source_id
+
+    # ``p2p_publish_fn`` synchronously calls ``publish_artifact`` in the vLLM
+    # and SGLang paths. Keep the prepared bundle available for that call without
+    # changing the callback contract. Serialize overlapping publication of the
+    # same transfer and identity so no callback can consume or remove another
+    # call's bundle.
+    prepared_key = _prepared_artifact_key(transfer, identity)
+    with _prepared_artifact_lock(prepared_key):
+        _prepared_artifact_bundles[prepared_key] = bundle
+        try:
+            return p2p_publish_fn(transfer, identity).endpoint.mx_source_id
+        finally:
+            # ``publish_artifact`` normally consumes this entry. Preserve a
+            # later publisher's entry if a future callback writes one before
+            # this call's cleanup.
+            if _prepared_artifact_bundles.get(prepared_key) is bundle:
+                _prepared_artifact_bundles.pop(prepared_key, None)
+
+
+def _mark_mooncake_publish_needed(
+    ctx: LoadContext,
+    transfer: P2PArtifactTransfer,
+    identity: p2p_pb2.SourceIdentity,
+) -> None:
+    _mooncake_publish_needed.add(_mooncake_publish_key(ctx, transfer, identity))
+
+
+def _mooncake_publish_key(
+    ctx: LoadContext,
+    transfer: P2PArtifactTransfer,
+    identity: p2p_pb2.SourceIdentity,
+) -> tuple[bytes, int, str, int, str]:
+    return (
+        _identity_bytes(identity),
+        transfer.mx_source_type,
+        transfer.name,
+        ctx.node_rank,
+        ctx.accelerator_backend.name,
+    )
+
+
+def _prepared_artifact_key(
+    transfer: P2PArtifactTransfer,
+    identity: p2p_pb2.SourceIdentity,
+) -> tuple[int, bytes]:
+    return id(transfer), _identity_bytes(identity)
+
+
+def _prepared_artifact_lock(key: tuple[int, bytes]) -> threading.Lock:
+    """Return the process-local lock for one temporary prepared bundle."""
+    with _prepared_artifact_locks_guard:
+        return _prepared_artifact_locks.setdefault(key, threading.Lock())
+
+
+def _identity_bytes(identity: p2p_pb2.SourceIdentity) -> bytes:
+    try:
+        return identity.SerializeToString(deterministic=True)
+    except TypeError:
+        return identity.SerializeToString()
 
 
 def artifact_ready_fn(
@@ -462,6 +755,37 @@ def mark_publish_scheduled(
     return lease_path
 
 
+def _process_owner_is_alive(pid: int, expected_starttime: str | None) -> bool:
+    """True only when an install-marker owner still denotes the same process."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # A process outside our UID may still be the active owner in a shared
+        # PID namespace. Avoid creating duplicate publishers in that case.
+        return True
+    actual_starttime = _process_starttime(pid)
+    if expected_starttime is None or actual_starttime is None:
+        # /proc may be unavailable or restricted. A live PID is safer to retain
+        # than to reclaim: duplicate artifact publishers are more disruptive
+        # than the rare PID-reuse false positive without a start-time check.
+        return True
+    return actual_starttime == expected_starttime
+
+
+def _process_starttime(pid: int) -> str | None:
+    """Return Linux /proc process starttime (field 22) for PID-reuse detection."""
+    try:
+        # ``comm`` (field 2) is parenthesized and may contain spaces, so split
+        # only after its final closing parenthesis. The remaining fields begin
+        # at field 3; starttime is therefore index 19.
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return fields[19]
+    except (OSError, IndexError):
+        return None
+
+
 def clear_publish_scheduled(
     publisher: PublisherThread | None,
     lease_path: Path,
@@ -484,13 +808,77 @@ def artifact_marker_path(
     )
 
 
+def _write_mooncake_install_marker(marker_path: Path, status: str) -> None:
+    pid = os.getpid()
+    value = json.dumps(
+        {
+            "version": _MOONCAKE_INSTALL_MARKER_VERSION,
+            "status": status,
+            "pid": pid,
+            "starttime": _process_starttime(pid),
+        },
+        sort_keys=True,
+    )
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(
+        prefix=f".{marker_path.name}.",
+        suffix=".tmp",
+        dir=marker_path.parent,
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as marker_file:
+            marker_file.write(f"{value}\n")
+            marker_file.flush()
+            os.fsync(marker_file.fileno())
+        os.replace(temporary_path, marker_path)
+    finally:
+        Path(temporary_path).unlink(missing_ok=True)
+
+
+def _read_mooncake_install_marker(marker_path: Path) -> dict[str, object]:
+    """Read an install marker, returning ``invalid`` for corrupt state."""
+    raw = marker_path.read_text(encoding="utf-8").strip()
+    try:
+        marker = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        # Older in-progress markers were literal strings. Any other non-JSON
+        # value may be a torn write and must be retried rather than accepted as
+        # a completed installation.
+        if raw in {"attempted", "miss"}:
+            return {"status": raw, "owner": None}
+        return {"status": "invalid", "owner": None}
+    if not isinstance(marker, dict):
+        return {"status": "invalid", "owner": None}
+    status = marker.get("status")
+    if (
+        type(marker.get("version")) is not int
+        or marker["version"] != _MOONCAKE_INSTALL_MARKER_VERSION
+        or status not in {"installed", "miss", "attempted"}
+    ):
+        return {"status": "invalid", "owner": None}
+    pid = marker.get("pid")
+    starttime = marker.get("starttime")
+    owner = (
+        (pid, starttime)
+        if (
+            type(pid) is int
+            and pid > 0
+            and "starttime" in marker
+            and (starttime is None or isinstance(starttime, str))
+        )
+        else None
+    )
+    return {"status": status, "owner": owner}
+
+
 def artifact_marker_key(
     transfer: P2PArtifactTransfer,
     identity: p2p_pb2.SourceIdentity,
     action: str,
 ) -> str:
     digest = sha256()
-    digest.update(identity.SerializeToString())
+    digest.update(_identity_bytes(identity))
     for root in transfer.roots:
         path = root.source_root if action == "publish-scheduled" else root.target_root
         digest.update(str(path.resolve()).encode())
@@ -520,6 +908,35 @@ def write_marker(marker_path: Path, value: str) -> None:
 
 def _artifact_transfer_enabled() -> bool:
     return envs.MX_ARTIFACT_TRANSFER
+
+
+def _mooncake_artifact_enabled() -> bool:
+    return envs.MX_ARTIFACT_BACKEND in {"mooncake", "auto"}
+
+
+def _p2p_artifact_install_available(
+    ctx: LoadContext,
+    engine_label: str,
+    log: logging.Logger,
+) -> bool:
+    if not _p2p_metadata_enabled_for_artifacts(ctx, engine_label, log):
+        return False
+    if not _metadata_publication_configured(ctx):
+        log.info(
+            "[Worker %s] No MX metadata path configured, skipping %s artifacts",
+            ctx.global_rank,
+            engine_label,
+        )
+        return False
+    if not is_nixl_available():
+        log.info(
+            "[Worker %s] NIXL not available, skipping %s artifact install",
+            ctx.global_rank,
+            engine_label,
+        )
+        return False
+    _ensure_nixl_manager(ctx, engine_label, log)
+    return ctx.nixl_manager is not None
 
 
 def _p2p_metadata_enabled_for_artifacts(

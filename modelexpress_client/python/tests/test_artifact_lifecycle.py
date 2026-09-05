@@ -11,6 +11,7 @@ it.
 """
 
 import logging
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -161,3 +162,339 @@ def test_install_artifact_once_calls_completion_hook(monkeypatch, tmp_path):
     assert result is header
     transfer.install.assert_called_once_with(header)
     on_install_completed.assert_called_once_with(transfer, _identity())
+
+
+def _mooncake_install_transfer(tmp_path):
+    target_root = tmp_path / "cache"
+    return SimpleNamespace(
+        name="torch_compile_cache",
+        roots=(
+            ArtifactCacheRoot(
+                name="primary",
+                source_root=target_root,
+                target_root=target_root,
+            ),
+        ),
+        install=MagicMock(),
+    )
+
+
+def _mooncake_install_context():
+    return SimpleNamespace(
+        node_rank=0,
+        accelerator_backend=SimpleNamespace(name="cuda"),
+    )
+
+
+def test_mooncake_install_calls_completion_hook_before_commit(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        artifact_lifecycle.tempfile, "gettempdir", lambda: str(tmp_path)
+    )
+    transfer = _mooncake_install_transfer(tmp_path)
+    identity = _identity()
+    header = p2p_pb2.GetArtifactManifestHeaderResponse(artifact_id="artifact-id")
+    marker_path = artifact_lifecycle.artifact_marker_path(
+        transfer, identity, "mooncake-install-attempted"
+    )
+    monkeypatch.setattr(
+        artifact_lifecycle, "install_from_mooncake", MagicMock(return_value=header)
+    )
+
+    def assert_marker_is_not_committed(*_args):
+        assert artifact_lifecycle._read_mooncake_install_marker(marker_path)[
+            "status"
+        ] == "attempted"
+
+    on_install_completed = MagicMock(side_effect=assert_marker_is_not_committed)
+
+    result = artifact_lifecycle.install_mooncake_artifact_once(
+        _mooncake_install_context(),
+        transfer,
+        identity,
+        engine_label="vLLM",
+        on_install_completed=on_install_completed,
+    )
+
+    assert result == artifact_lifecycle.MooncakeInstallResult(
+        artifact_lifecycle.MooncakeInstallStatus.INSTALLED, header
+    )
+    transfer.install.assert_called_once_with(header)
+    on_install_completed.assert_called_once_with(transfer, identity)
+    assert artifact_lifecycle._read_mooncake_install_marker(marker_path)["status"] == (
+        "installed"
+    )
+
+
+def test_mooncake_installed_marker_skips_completion_hook(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        artifact_lifecycle.tempfile, "gettempdir", lambda: str(tmp_path)
+    )
+    transfer = _mooncake_install_transfer(tmp_path)
+    identity = _identity()
+    target_root = transfer.roots[0].target_root
+    target_root.mkdir()
+    (target_root / "cached").write_text("ready")
+    marker_path = artifact_lifecycle.artifact_marker_path(
+        transfer, identity, "mooncake-install-attempted"
+    )
+    artifact_lifecycle._write_mooncake_install_marker(marker_path, "installed")
+    install_from_mooncake = MagicMock()
+    monkeypatch.setattr(artifact_lifecycle, "install_from_mooncake", install_from_mooncake)
+    on_install_completed = MagicMock()
+
+    result = artifact_lifecycle.install_mooncake_artifact_once(
+        _mooncake_install_context(),
+        transfer,
+        identity,
+        engine_label="vLLM",
+        on_install_completed=on_install_completed,
+    )
+
+    assert result == artifact_lifecycle.MooncakeInstallResult(
+        artifact_lifecycle.MooncakeInstallStatus.ALREADY_INSTALLED
+    )
+    install_from_mooncake.assert_not_called()
+    transfer.install.assert_not_called()
+    on_install_completed.assert_not_called()
+
+
+def test_mooncake_corrupt_installed_marker_is_reclaimed(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        artifact_lifecycle.tempfile, "gettempdir", lambda: str(tmp_path)
+    )
+    transfer = _mooncake_install_transfer(tmp_path)
+    identity = _identity()
+    target_root = transfer.roots[0].target_root
+    target_root.mkdir()
+    (target_root / "partial").write_text("incomplete")
+    marker_path = artifact_lifecycle.artifact_marker_path(
+        transfer, identity, "mooncake-install-attempted"
+    )
+    marker_path.parent.mkdir(parents=True)
+    marker_path.write_text('{"status": "inst', encoding="utf-8")
+    header = p2p_pb2.GetArtifactManifestHeaderResponse(artifact_id="artifact-id")
+    install_from_mooncake = MagicMock(return_value=header)
+    monkeypatch.setattr(artifact_lifecycle, "install_from_mooncake", install_from_mooncake)
+
+    result = artifact_lifecycle.install_mooncake_artifact_once(
+        _mooncake_install_context(),
+        transfer,
+        identity,
+        engine_label="vLLM",
+    )
+
+    assert result.status is artifact_lifecycle.MooncakeInstallStatus.INSTALLED
+    install_from_mooncake.assert_called_once()
+    transfer.install.assert_called_once_with(header)
+    assert artifact_lifecycle._read_mooncake_install_marker(marker_path)["status"] == (
+        "installed"
+    )
+
+
+def test_mooncake_marker_write_cleans_temporary_file_on_replace_failure(
+    monkeypatch, tmp_path
+):
+    marker_path = tmp_path / "marker.done"
+    monkeypatch.setattr(
+        artifact_lifecycle.os,
+        "replace",
+        MagicMock(side_effect=OSError("replace failed")),
+    )
+
+    with pytest.raises(OSError, match="replace failed"):
+        artifact_lifecycle._write_mooncake_install_marker(marker_path, "installed")
+
+    assert list(tmp_path.glob(".marker.done.*.tmp")) == []
+
+
+@pytest.fixture
+def mooncake_publish_state():
+    artifact_lifecycle._prepared_artifact_bundles.clear()
+    artifact_lifecycle._prepared_artifact_locks.clear()
+    artifact_lifecycle._mooncake_publish_needed.clear()
+    yield
+    artifact_lifecycle._prepared_artifact_bundles.clear()
+    artifact_lifecycle._prepared_artifact_locks.clear()
+    artifact_lifecycle._mooncake_publish_needed.clear()
+
+
+def _mooncake_publish_context():
+    return SimpleNamespace(
+        global_rank=0,
+        node_rank=0,
+        accelerator_backend=SimpleNamespace(name="cuda"),
+    )
+
+
+def _mooncake_publish_transfer(tmp_path, bundle):
+    return SimpleNamespace(
+        name="torch_compile_cache",
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
+        roots=(SimpleNamespace(source_root=tmp_path, optional=False),),
+        prepare_source=MagicMock(return_value=bundle),
+    )
+
+
+def _publish_after_mooncake(
+    ctx,
+    transfer,
+    identity,
+    p2p_publish_fn,
+):
+    artifact_lifecycle._mark_mooncake_publish_needed(ctx, transfer, identity)
+    return artifact_lifecycle._publish_mooncake_then_p2p_artifact(
+        ctx,
+        transfer,
+        identity,
+        engine_label="vLLM",
+        p2p_publish_fn=p2p_publish_fn,
+        p2p_publish_available=True,
+        log=MagicMock(),
+    )
+
+
+def test_mooncake_prepared_bundle_is_released_when_p2p_publish_fails(
+    monkeypatch,
+    tmp_path,
+    mooncake_publish_state,
+):
+    monkeypatch.setenv("MX_ARTIFACT_BACKEND", "mooncake")
+    monkeypatch.setattr(artifact_lifecycle, "has_files", lambda _path: True)
+    monkeypatch.setattr(artifact_lifecycle, "publish_to_mooncake", MagicMock())
+    bundle = SimpleNamespace()
+    transfer = _mooncake_publish_transfer(tmp_path, bundle)
+    identity = _identity()
+
+    with pytest.raises(RuntimeError, match="P2P publish failed"):
+        _publish_after_mooncake(
+            _mooncake_publish_context(),
+            transfer,
+            identity,
+            MagicMock(side_effect=RuntimeError("P2P publish failed")),
+        )
+
+    assert artifact_lifecycle._prepared_artifact_bundles == {}
+
+
+def test_mooncake_prepared_bundle_is_released_when_p2p_callback_bypasses_publish(
+    monkeypatch,
+    tmp_path,
+    mooncake_publish_state,
+):
+    monkeypatch.setenv("MX_ARTIFACT_BACKEND", "mooncake")
+    monkeypatch.setattr(artifact_lifecycle, "has_files", lambda _path: True)
+    monkeypatch.setattr(artifact_lifecycle, "publish_to_mooncake", MagicMock())
+    bundle = SimpleNamespace()
+    transfer = _mooncake_publish_transfer(tmp_path, bundle)
+    identity = _identity()
+    p2p_publish_fn = MagicMock(
+        return_value=SimpleNamespace(endpoint=SimpleNamespace(mx_source_id="source"))
+    )
+
+    assert (
+        _publish_after_mooncake(
+            _mooncake_publish_context(), transfer, identity, p2p_publish_fn
+        )
+        == "source"
+    )
+    assert artifact_lifecycle._prepared_artifact_bundles == {}
+
+
+def test_p2p_publish_consumes_mooncake_prepared_bundle(
+    monkeypatch,
+    tmp_path,
+    mooncake_publish_state,
+):
+    bundle = SimpleNamespace(manifest=SimpleNamespace(files=[]), artifact_id="artifact")
+    transfer = _mooncake_publish_transfer(tmp_path, bundle)
+    identity = _identity()
+    prepared_key = artifact_lifecycle._prepared_artifact_key(transfer, identity)
+    artifact_lifecycle._prepared_artifact_bundles[prepared_key] = bundle
+    published = SimpleNamespace(endpoint=SimpleNamespace(mx_source_id="source"))
+    ctx = SimpleNamespace(
+        global_rank=0,
+        device_id=0,
+        mx_client=object(),
+        nixl_manager=object(),
+        worker_id="worker",
+        worker_rank=0,
+        node_rank=0,
+    )
+
+    monkeypatch.setattr(artifact_lifecycle, "has_files", lambda _path: True)
+    monkeypatch.setattr(
+        artifact_lifecycle, "_get_worker_server", lambda _device: object()
+    )
+    publish_source = MagicMock(return_value=published)
+    monkeypatch.setattr(artifact_lifecycle, "publish_artifact_source", publish_source)
+
+    result = artifact_lifecycle.publish_artifact(
+        ctx,
+        transfer,
+        identity,
+        engine_label="vLLM",
+        accelerator="cuda",
+        published_sources={},
+    )
+
+    assert result is published
+    transfer.prepare_source.assert_not_called()
+    assert artifact_lifecycle._prepared_artifact_bundles == {}
+    assert publish_source.call_args.args[2] is bundle
+
+
+def test_mooncake_prepared_bundles_are_serialized_per_transfer(
+    monkeypatch,
+    tmp_path,
+    mooncake_publish_state,
+):
+    monkeypatch.setenv("MX_ARTIFACT_BACKEND", "mooncake")
+    monkeypatch.setattr(artifact_lifecycle, "has_files", lambda _path: True)
+    monkeypatch.setattr(artifact_lifecycle, "publish_to_mooncake", MagicMock())
+    bundles = [SimpleNamespace(name="first"), SimpleNamespace(name="second")]
+    transfer = _mooncake_publish_transfer(tmp_path, bundles)
+    transfer.prepare_source.side_effect = bundles
+    identity = _identity()
+    first_callback_started = threading.Event()
+    release_first_callback = threading.Event()
+    second_callback_started = threading.Event()
+    results = []
+
+    def p2p_publish_fn(_transfer, _identity):
+        if not first_callback_started.is_set():
+            first_callback_started.set()
+            assert release_first_callback.wait(timeout=1)
+        else:
+            second_callback_started.set()
+        return SimpleNamespace(endpoint=SimpleNamespace(mx_source_id="source"))
+
+    ctx = _mooncake_publish_context()
+    artifact_lifecycle._mark_mooncake_publish_needed(ctx, transfer, identity)
+    first = threading.Thread(
+        target=lambda: results.append(
+            _publish_after_mooncake(ctx, transfer, identity, p2p_publish_fn)
+        )
+    )
+    first.start()
+    assert first_callback_started.wait(timeout=1)
+
+    # Simulate a rescheduled publisher for the same artifact while the old
+    # publisher is still inside its synchronous P2P callback.
+    artifact_lifecycle._mark_mooncake_publish_needed(ctx, transfer, identity)
+    second = threading.Thread(
+        target=lambda: results.append(
+            _publish_after_mooncake(ctx, transfer, identity, p2p_publish_fn)
+        )
+    )
+    second.start()
+    assert not second_callback_started.wait(timeout=0.1)
+
+    release_first_callback.set()
+    first.join(timeout=1)
+    second.join(timeout=1)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert sorted(results) == ["source", "source"]
+    assert transfer.prepare_source.call_count == 2
+    assert artifact_lifecycle._prepared_artifact_bundles == {}
