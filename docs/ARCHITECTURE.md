@@ -149,6 +149,7 @@ ModelExpress/
 │       │   ├── __init__.py             # Public refit exports
 │       │   ├── timing.py               # Structured refit stage timing
 │       │   └── reshard/                # Geometry capture, planning, rendezvous and transport
+│       │       └── transport/          # NIXL one-sided reads; optional nccl_m2n collective
 │       ├── refit_timing.py             # Compatibility shim for refit.timing
 │       ├── source_selection.py         # P2P source-ordering policies (random, rendezvous_hash)
 │       ├── metrics.py                   # Opt-in Prometheus metrics collector (source-selection group today)
@@ -1011,7 +1012,12 @@ the inference-engine integration.
 by an engine's own weight loader, intersects them with trainer-published
 shards, and compiles one-sided read descriptors without materializing a full
 trainer tensor. Geometry, slice planning, transfer planning, and the transport
-protocol are engine-agnostic.
+protocol are engine-agnostic. The optional ``nccl_m2n`` module under
+``refit.reshard.transport.nccl_m2n`` (install the ``[nccl-m2n]`` extra)
+exposes a standalone collective data-plane API for resharding
+trainer-to-generator TP tiles. It is not yet selectable through
+``ReshardReceiver``; production bootstrap, agreement, and backend selection
+belong to the external control-plane integration.
 
 The minimal rendezvous publisher is called only after its NIXL agent and source
 buffers are registered, so `publish()` stores the worker as READY and repeated
