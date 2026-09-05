@@ -9,7 +9,6 @@ import json
 import mmap
 import shutil
 import time
-import zlib
 from collections import defaultdict
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -30,7 +29,7 @@ from modelexpress_rl.object_storage import ObjectStorageType
 from modelexpress_rl.s3 import S3Client
 from modelexpress_rl.train import WeightPayloadFormat
 from modelexpress_rl.utils import (
-    adler32_checksum,
+    checksum_factory,
     index_checkpoint_tensors,
     read_safetensors_header,
     threadpool_map,
@@ -117,66 +116,58 @@ def _is_safe_shard_basename(value: object) -> bool:
     )
 
 
-def _parse_delta_manifest(
+def _parse_index_manifest(
     data: bytes,
-    version: _S3Version,
-) -> tuple[dict[str, str], _Decompressor]:
+    *,
+    is_delta: bool,
+    version: _S3Version | None = None,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Parse and validate an index manifest."""
     try:
-        manifest = json.loads(data)
+        index = json.loads(data)
     except (TypeError, ValueError) as error:
-        raise ValueError("canonical delta manifest is not valid JSON") from error
-    try:
-        metadata = manifest["metadata"]
-        weight_map = manifest["weight_map"]
-    except (KeyError, TypeError) as error:
-        raise ValueError(
-            "canonical delta manifest is missing required fields"
-        ) from error
-    if not isinstance(metadata, dict):
-        raise TypeError("canonical delta manifest metadata is invalid")
-    expected_metadata = {
-        "version": version.version_id,
-        "base_version": version.base_version_id,
-        "delta_encoding": "xor",
-        "checksum_format": "adler32",
-    }
-    for name, expected in expected_metadata.items():
-        if metadata.get(name) != expected:
-            raise ValueError(
-                f"canonical delta manifest {name} does not match revision "
-                f"{version.version_id!r}"
-            )
-    compression_format = metadata.get("compression_format")
-    try:
-        decompressor = _DECOMPRESSORS[compression_format]
-    except KeyError as error:
-        raise ValueError(
-            f"unsupported canonical delta compression format {compression_format!r}"
-        ) from error
+        raise ValueError("The index manifest is not valid JSON") from error
+
+    weight_map = index.get("weight_map")
+    if weight_map is None:
+        raise ValueError("The index manifest has no weight_map")
     if not isinstance(weight_map, dict):
-        raise TypeError("canonical delta manifest weight_map is invalid")
+        raise ValueError("The index manifest has invalid weight_map")
+    if not is_delta and not weight_map:
+        raise ValueError("The index manifest has no tensors")
     for name, filename in weight_map.items():
-        if not isinstance(name, str) or not isinstance(filename, str):
-            raise TypeError("canonical delta manifest weight_map must contain strings")
-        if not _is_safe_shard_basename(filename):
-            raise ValueError(f"invalid canonical delta shard filename {filename!r}")
-    return weight_map, decompressor
+        if (
+            not isinstance(name, str)
+            or not _is_safe_shard_basename(filename)
+            or not filename.endswith(".safetensors")
+        ):
+            raise ValueError("The index manifest has invalid weight_map")
 
-
-def _parse_full_checkpoint_manifest(data: bytes) -> dict[str, str]:
-    try:
-        manifest = json.loads(data)
-        weight_map = manifest["weight_map"]
-    except (KeyError, TypeError, ValueError) as error:
-        raise ValueError("full HF checkpoint index is not valid JSON") from error
-    if not isinstance(weight_map, dict) or not weight_map:
-        raise ValueError("full HF checkpoint index has no tensors")
-    for name, filename in weight_map.items():
-        if not isinstance(name, str) or not isinstance(filename, str):
-            raise ValueError("full HF checkpoint weight_map must contain strings")
-        if not _is_safe_shard_basename(filename):
-            raise ValueError(f"invalid full HF checkpoint shard filename {filename!r}")
-    return weight_map
+    metadata = index.get("metadata", {})
+    if not isinstance(metadata, dict):
+        raise ValueError("The index manifest has invalid metadata")
+    if is_delta:
+        assert version is not None
+        expected_metadata = {
+            "version": version.version_id,
+            "base_version": version.base_version_id,
+            "delta_encoding": "xor",
+            "checksum_format": "adler32",
+        }
+        for name, expected in expected_metadata.items():
+            if metadata.get(name) != expected:
+                raise ValueError(
+                    f"The index manifest {name} does not match revision "
+                    f"{version.version_id!r}"
+                )
+        compression_format = metadata.get("compression_format")
+        if compression_format not in _DECOMPRESSORS:
+            raise ValueError(
+                f"unsupported compression format {compression_format!r}"
+            )
+    elif "checksum_format" in metadata:
+        checksum_factory(metadata["checksum_format"])
+    return metadata, weight_map
 
 
 def _group_tensors_by_shard(
@@ -214,7 +205,6 @@ class _LocalCheckpoint:
         self.checkpoint_paths: list[Path] = []
         self.locations: dict[str, tuple[Path, int, int]] = {}
         self.tensor_metadata: dict[str, dict] = {}
-        self.decompressor: _Decompressor | None = None
 
     def initialize(self) -> None:
         self.store.initialize()
@@ -350,9 +340,7 @@ class _LocalCheckpoint:
                     },
                 )
             expected_base = active_version
-            manifests: list[
-                tuple[_S3Version, bytes, dict[str, str], _Decompressor | None]
-            ] = []
+            manifests = []
             index_download_time = 0.0
             for position, version in enumerate(versions):
                 if (
@@ -376,20 +364,21 @@ class _LocalCheckpoint:
                 started = time.perf_counter()
                 try:
                     index_data = self.s3.get(version.uri)
-                    if version.payload_format is WeightPayloadFormat.XOR_DELTA:
-                        weight_map, decompressor = _parse_delta_manifest(
-                            index_data, version
-                        )
-                    else:
-                        weight_map = _parse_full_checkpoint_manifest(index_data)
-                        decompressor = None
+                    is_delta = (
+                        version.payload_format is WeightPayloadFormat.XOR_DELTA
+                    )
+                    metadata, weight_map = _parse_index_manifest(
+                        index_data,
+                        is_delta=is_delta,
+                        version=version if is_delta else None,
+                    )
                 except Exception as error:
                     raise RuntimeError(
                         f"target {target.version_id!r}: replay validation failed "
                         f"at revision {version.version_id!r}: {error}"
                     ) from error
                 index_download_time += time.perf_counter() - started
-                manifests.append((version, index_data, weight_map, decompressor))
+                manifests.append((version, index_data, metadata, weight_map))
 
             self.store.write_state(
                 status=CheckpointState.UPDATING,
@@ -400,18 +389,20 @@ class _LocalCheckpoint:
             try:
                 download_time = 0.0
                 apply_time = 0.0
-                for version, index_data, weight_map, decompressor in manifests:
+                for version, index_data, metadata, weight_map in manifests:
                     if version.payload_format is WeightPayloadFormat.XOR_DELTA:
-                        assert decompressor is not None
                         downloaded, applied = self._prepare_delta(
                             version,
                             index_data,
+                            metadata,
                             weight_map,
-                            decompressor,
                         )
                     else:
                         downloaded, applied = self._prepare_full(
-                            version, index_data, weight_map
+                            version,
+                            index_data,
+                            metadata,
+                            weight_map,
                         )
                     download_time += downloaded
                     apply_time += applied
@@ -482,6 +473,7 @@ class _LocalCheckpoint:
         self,
         version: _S3Version,
         index_data: bytes,
+        metadata: dict[str, Any],
         weight_map: dict[str, str],
     ) -> tuple[float, float]:
         target = self.store.full_path(version.version_id)
@@ -521,6 +513,7 @@ class _LocalCheckpoint:
             (temporary / index_name).write_bytes(index_data)
             download_time, validation_time = self._download_full_checkpoint(
                 target=temporary,
+                index_metadata=metadata,
                 weight_map=weight_map,
                 root_uri=version.uri,
                 protected_versions=protected_versions,
@@ -545,8 +538,8 @@ class _LocalCheckpoint:
         self,
         version: _S3Version,
         index_data: bytes,
+        metadata: dict[str, Any],
         weight_map: dict[str, str],
-        decompressor: _Decompressor,
     ) -> tuple[float, float]:
         assert version.base_version_id is not None
         base_chain = self.store.chain(version.base_version_id)
@@ -610,7 +603,7 @@ class _LocalCheckpoint:
             shutil.rmtree(target, ignore_errors=True)
             base_checkpoint.replace(target)
             self._set_local_checkpoint(target)
-            self._apply_delta_artifact(artifact, weight_map, decompressor)
+            self._apply_delta_artifact(artifact, metadata, weight_map)
         else:
             # The first delta after a full checkpoint copies once so applying
             # it cannot modify the canonical full artifact.
@@ -619,7 +612,7 @@ class _LocalCheckpoint:
                 copy_from=base_checkpoint,
             ) as temporary:
                 self._set_local_checkpoint(temporary)
-                self._apply_delta_artifact(artifact, weight_map, decompressor)
+                self._apply_delta_artifact(artifact, metadata, weight_map)
 
         self._set_local_checkpoint(target)
         self.store.write_chain(version.version_id, chain)
@@ -628,11 +621,10 @@ class _LocalCheckpoint:
     def _apply_delta_artifact(
         self,
         artifact: Path,
+        index_metadata: dict[str, Any],
         weight_map: dict[str, str],
-        decompressor: _Decompressor,
     ) -> None:
         self.store.verify_artifact(artifact)
-        self.decompressor = decompressor
         shards = {
             filename: (
                 (artifact / filename).read_bytes(),
@@ -640,7 +632,7 @@ class _LocalCheckpoint:
             )
             for filename, names in _group_tensors_by_shard(weight_map).items()
         }
-        self._apply_shards(shards)
+        self._apply_shards(shards, index_metadata=index_metadata)
 
     def _download_deltas(
         self,
@@ -674,10 +666,12 @@ class _LocalCheckpoint:
         self,
         *,
         target: Path,
+        index_metadata: dict[str, Any],
         weight_map: dict[str, str],
         root_uri: str,
         protected_versions: set[str],
     ) -> tuple[float, float]:
+        checksum_format = index_metadata.get("checksum_format")
         if set(weight_map) != set(self.locations):
             raise ValueError(
                 "full HF checkpoint tensor set differs from local checkpoint"
@@ -714,10 +708,10 @@ class _LocalCheckpoint:
             validation_started = time.perf_counter()
             header, data_start = read_safetensors_header(data, repr(filename))
             tensor_names = shard_to_tensors[filename]
-            checksums = header.get("__metadata__")
-            if not isinstance(checksums, dict) or set(checksums) != set(tensor_names):
+            metadata = header.get("__metadata__", {})
+            if not isinstance(metadata, dict):
                 raise ValueError(
-                    f"full HF checkpoint shard {filename!r} has invalid checksums"
+                    f"full HF checkpoint shard {filename!r} has invalid metadata"
                 )
 
             view = memoryview(data)
@@ -744,10 +738,19 @@ class _LocalCheckpoint:
                     count=end - begin,
                     offset=data_start + begin,
                 )
-                if adler32_checksum(source) != checksums[name]:
-                    raise ValueError(
-                        f"full HF checkpoint checksum differs for {name!r}"
-                    )
+                if checksum_format is not None:
+                    expected_checksum = metadata.get(name)
+                    if expected_checksum is None:
+                        raise ValueError(
+                            f"full HF checkpoint shard {filename!r} is missing "
+                            f"checksum for tensor {name!r}"
+                        )
+                    checksum = checksum_factory(checksum_format)
+                    checksum.update(source)
+                    if checksum.hexdigest() != expected_checksum:
+                        raise ValueError(
+                            f"full HF checkpoint checksum differs for {name!r}"
+                        )
             (target / filename).write_bytes(data)
             return download_time, time.perf_counter() - validation_started
 
@@ -768,10 +771,11 @@ class _LocalCheckpoint:
     def _apply_shards(
         self,
         shards: dict[str, tuple[bytes, list[str]]],
+        *,
+        index_metadata: dict[str, Any],
     ) -> None:
         if not shards:
             return
-        assert self.decompressor is not None
 
         items = []
         for filename, (data, names) in shards.items():
@@ -823,10 +827,12 @@ class _LocalCheckpoint:
                     count=size,
                     offset=file_offset,
                 )
-                checksum = 1
+                checksum = checksum_factory(index_metadata["checksum_format"])
+                reader = _DECOMPRESSORS[index_metadata["compression_format"]](
+                    compressed
+                )
                 position = 0
                 extra = b""
-                reader = self.decompressor(compressed)
                 try:
                     while position < size:
                         block = reader.read(min(2 << 20, size - position))
@@ -837,7 +843,7 @@ class _LocalCheckpoint:
                         region = target[position:end]
                         try:
                             np.bitwise_xor(region, delta, out=region)
-                            checksum = zlib.adler32(region, checksum)
+                            checksum.update(region)
                         finally:
                             del region
                         position = end
@@ -848,7 +854,7 @@ class _LocalCheckpoint:
                     del target
                 if position != size or extra:
                     raise ValueError(f"canonical delta byte size differs for {name!r}")
-                if f"{checksum:08x}" != expected_checksum:
+                if checksum.hexdigest() != expected_checksum:
                     raise ValueError(f"canonical target checksum differs for {name!r}")
 
             list(

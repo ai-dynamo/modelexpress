@@ -498,6 +498,7 @@ mod tests {
                     agent_name: String::new(),
                     worker_grpc_endpoint: String::new(),
                     accelerator: String::new(),
+                    topology: Default::default(),
                     artifact_source: None,
                 },
                 WorkerRecord {
@@ -516,6 +517,7 @@ mod tests {
                     agent_name: String::new(),
                     worker_grpc_endpoint: String::new(),
                     accelerator: String::new(),
+                    topology: Default::default(),
                     artifact_source: None,
                 },
             ],
@@ -655,6 +657,7 @@ mod tests {
                     status: SourceStatus::Ready as i32,
                     updated_at: 1234567890000,
                     accelerator: "cuda".to_string(),
+                    topology: Default::default(),
                     training_step: None,
                     layout_signature: None,
                 }])
