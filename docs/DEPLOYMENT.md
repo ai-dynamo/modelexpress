@@ -1111,6 +1111,29 @@ kubectl -n $NAMESPACE apply -f examples/p2p_transfer_k8s/client/vllm/vllm-multi-
 
 See [`../examples/p2p_transfer_k8s/README.md`](../examples/p2p_transfer_k8s/README.md) for the full P2P transfer guide including architecture, prerequisites, and performance expectations.
 
+#### Sharing One Server Across Namespaces
+
+Workers do not have to run in the server's namespace. One server can back workers in several workload namespaces, and every worker that talks to it joins the same P2P source pool — a namespace added later boots over RDMA from the workers already registered with that server instead of reading the weights from storage. Running a separate server per namespace splits the pool instead: each namespace then loads from storage on its first start and shares sources only within itself.
+
+Only the worker's server address changes:
+
+```yaml
+# Worker pods, in any namespace
+env:
+  - name: MX_SERVER_ADDRESS
+    value: "modelexpress-server.modelexpress.svc.cluster.local:8001"
+  - name: MODEL_EXPRESS_URL   # deprecated alias; keep identical during the transition
+    value: "modelexpress-server.modelexpress.svc.cluster.local:8001"
+```
+
+`MX_METADATA_NAMESPACE` is a server setting, not a worker one: it selects the namespace the server writes `ModelMetadata` and `ModelCacheEntry` CRs into, and the client does not read it. The metadata RBAC in [Distributed backend selection](#distributed-backend-selection) is likewise needed only by the server — workers publish and list sources over gRPC and never call the Kubernetes API, and the weight transfer is Pod-to-Pod RDMA. The source pool is scoped by the server a worker connects to and by `SourceIdentity`, not by the worker's own namespace.
+
+Three consequences:
+
+- **Ownership falls back to the reaper.** Kubernetes does not let a Pod own a namespaced object in another namespace, so `ModelMetadata` CRs published by workers outside the server's `MX_METADATA_NAMESPACE` carry no `ownerReference` — the cross-namespace identity behavior described under [Distributed backend selection](#distributed-backend-selection). Rather than disappearing with the Pod, those records go STALE after `MX_HEARTBEAT_TIMEOUT_SECS` (default 90s) and are garbage-collected after `MX_GC_TIMEOUT_SECS` (default 3600s); see [Source Lifecycle](metadata.md#source-lifecycle). Setting `POD_NAME` / `POD_UID` / `POD_NAMESPACE` on such workers is harmless — ignored for ownership, and used if the worker later moves into the server's namespace.
+- **The auth allowlist is per namespace.** Under `enforce`, a shared server needs one allowlist entry per workload namespace — see [ServiceAccount Authentication](#serviceaccount-authentication).
+- **Model files stay per namespace.** PersistentVolumeClaims are namespaced, and the engine reads the model's config and tokenizer from the `--model` path even when every weight arrives over RDMA. That path must still resolve inside the worker's own namespace.
+
 #### K8s-Service-Routed Backend
 
 No `modelexpress-server`, no Redis, no CRDs. Source pods sit behind a Kubernetes Service; clients hit the Service DNS and kube-proxy load-balances. See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for when to use this backend and when to prefer the central-coordinator alternatives.
