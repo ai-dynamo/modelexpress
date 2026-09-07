@@ -500,6 +500,10 @@ def test_publish_vllm_cache_artifact_uses_ephemeral_worker_port(tmp_path):
 def test_install_vllm_cache_artifact_once_skips_after_marker(monkeypatch, tmp_path):
     monkeypatch.setattr(artifact_lifecycle.tempfile, "gettempdir", lambda: str(tmp_path))
     target_root = tmp_path / "cache"
+    def install(_header):
+        target_root.mkdir(parents=True, exist_ok=True)
+        (target_root / "cached").write_text("ready")
+
     transfer = SimpleNamespace(
         name="deep_gemm_cache",
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE,
@@ -516,7 +520,7 @@ def test_install_vllm_cache_artifact_once_skips_after_marker(monkeypatch, tmp_pa
                 total_size=8,
             )
         ),
-        install=MagicMock(),
+        install=MagicMock(side_effect=install),
     )
     identity = p2p_pb2.SourceIdentity(
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE,
@@ -545,7 +549,7 @@ def test_install_vllm_cache_artifact_once_skips_after_marker(monkeypatch, tmp_pa
     transfer.install.assert_called_once_with(first)
 
 
-def test_install_vllm_cache_artifact_once_does_not_retry_after_failure(
+def test_install_vllm_cache_artifact_once_retries_after_failure(
     monkeypatch,
     tmp_path,
 ):
@@ -577,8 +581,10 @@ def test_install_vllm_cache_artifact_once_does_not_retry_after_failure(
     with pytest.raises(RuntimeError, match="transfer failed"):
         artifacts._install_vllm_cache_artifact_once(ctx, transfer, identity)
 
-    assert artifacts._install_vllm_cache_artifact_once(ctx, transfer, identity) is None
-    transfer.discover_and_transfer.assert_called_once()
+    with pytest.raises(RuntimeError, match="transfer failed"):
+        artifacts._install_vllm_cache_artifact_once(ctx, transfer, identity)
+
+    assert transfer.discover_and_transfer.call_count == 2
     transfer.install.assert_not_called()
 
 

@@ -56,7 +56,6 @@ CACHE_SETTLE_SECS = 5
 ArtifactEntry = tuple[P2PArtifactTransfer, p2p_pb2.SourceIdentity]
 InstallCompleted = Callable[[P2PArtifactTransfer, p2p_pb2.SourceIdentity], None]
 _publish_leases: dict[Path, TextIO] = {}
-_MOONCAKE_INSTALL_MARKER_VERSION = 1
 _prepared_artifact_bundles: dict[tuple[int, bytes], ArtifactBundle] = {}
 _prepared_artifact_locks: dict[tuple[int, bytes], threading.Lock] = {}
 _prepared_artifact_locks_guard = threading.Lock()
@@ -68,6 +67,7 @@ class MooncakeInstallStatus(Enum):
 
     INSTALLED = "installed"
     ALREADY_INSTALLED = "already_installed"
+    MISS = "miss"
 
 
 @dataclass(frozen=True)
@@ -113,6 +113,15 @@ def install_artifacts(
                         transfer.name,
                     )
                     continue
+                if result.status is MooncakeInstallStatus.MISS:
+                    _mark_mooncake_publish_needed(ctx, transfer, identity)
+                    log.info(
+                        "[Worker %s] Mooncake %s artifact cache miss: name=%s "
+                        "(cached miss; skipping repeated query)",
+                        ctx.global_rank,
+                        engine_label,
+                        transfer.name,
+                    )
                 header = result.header
                 if (
                     result.status is MooncakeInstallStatus.INSTALLED
@@ -162,7 +171,7 @@ def install_artifacts(
             elapsed = time.perf_counter() - start
             if header is None:
                 log.debug(
-                    "[Worker %s] %s artifact %s already attempted in this pod",
+                    "[Worker %s] %s artifact %s already installed in this pod",
                     ctx.global_rank,
                     engine_label,
                     transfer.name,
@@ -307,29 +316,39 @@ def install_artifact_once(
     engine_label: str,
     on_install_completed: InstallCompleted | None = None,
 ) -> p2p_pb2.GetArtifactManifestHeaderResponse | None:
-    """Install one artifact at most once per pod."""
+    """Install one artifact at most once per pod.
+
+    The companion ``.lock`` file is the in-progress lease.  Only a completed
+    installation is persisted in ``marker_path``; an ``attempted`` marker from
+    an older implementation is treated as stale after this process acquires
+    the lease.
+    """
     marker_path = artifact_marker_path(transfer, identity, "install-attempted")
     with artifact_lock(marker_path):
-        if marker_path.exists():
+        if _artifact_install_marker_is_valid(marker_path, transfer):
             return None
+        marker_path.unlink(missing_ok=True)
         if ctx.nixl_manager is None:
             raise RuntimeError(
                 f"NIXL manager is required for {engine_label} artifact install"
             )
-        write_marker(marker_path, "attempted")
-        header = transfer.discover_and_transfer(
-            ctx.mx_client,
-            identity,
-            ctx.nixl_manager,
-            worker_rank=None,
-            node_rank=ctx.node_rank,
-            accelerator=ctx.accelerator_backend.name,
-        )
-        transfer.install(header)
-        if on_install_completed is not None:
-            on_install_completed(transfer, identity)
-        write_marker(marker_path, header.artifact_id)
-        return header
+        try:
+            header = transfer.discover_and_transfer(
+                ctx.mx_client,
+                identity,
+                ctx.nixl_manager,
+                worker_rank=None,
+                node_rank=ctx.node_rank,
+                accelerator=ctx.accelerator_backend.name,
+            )
+            transfer.install(header)
+            if on_install_completed is not None:
+                on_install_completed(transfer, identity)
+            _write_artifact_install_marker(marker_path, header.artifact_id)
+            return header
+        except Exception:
+            marker_path.unlink(missing_ok=True)
+            raise
 
 
 def install_mooncake_artifact_once(
@@ -340,7 +359,14 @@ def install_mooncake_artifact_once(
     engine_label: str,
     on_install_completed: InstallCompleted | None = None,
 ) -> MooncakeInstallResult:
-    """Install one Mooncake artifact at most once per pod."""
+    """Install one Mooncake artifact at most once per pod.
+
+    The companion ``.lock`` file is held for the complete installation.  The
+    marker records successful installations and deterministic cache misses. A
+    miss is a pod-local negative cache, so other ranks skip the same Mooncake
+    query and proceed to the configured fallback. Unexpected failures remove
+    the marker so a later call can retry.
+    """
     marker_path = artifact_marker_path(transfer, identity, "mooncake-install-attempted")
     with artifact_lock(marker_path):
         if marker_path.exists():
@@ -357,21 +383,19 @@ def install_mooncake_artifact_once(
                 # container-local cache cleanup), so it must not suppress a
                 # fresh Mooncake/P2P installation.
                 marker_path.unlink(missing_ok=True)
-            elif marker["status"] in {"miss", "attempted"}:
+            elif marker["status"] == "miss":
                 owner = marker.get("owner")
                 if owner is not None and _process_owner_is_alive(*owner):
-                    raise MooncakeArtifactCacheMiss(
-                        f"Mooncake install already {marker['status']} for "
-                        f"{transfer.name} in this pod"
-                    )
-                # A miss/attempted marker owned by a dead process is stale and
-                # can be reclaimed for a later pod launch.
+                    return MooncakeInstallResult(MooncakeInstallStatus.MISS)
+                # A negative marker owned by a dead process is stale. Reclaim
+                # it so a new service instance can retry a cache lookup.
                 marker_path.unlink(missing_ok=True)
             else:
-                # Corrupt or unknown markers cannot prove that the target
-                # cache is complete. Reclaim them and install again.
+                # Legacy attempted markers and corrupt markers cannot prove
+                # that the target cache is complete. Reclaim them and install
+                # again. The lease already tells us that no installer is
+                # active when this branch is reached.
                 marker_path.unlink(missing_ok=True)
-        _write_mooncake_install_marker(marker_path, "attempted")
         try:
             header = install_from_mooncake(
                 transfer,
@@ -389,8 +413,7 @@ def install_mooncake_artifact_once(
             )
         except MooncakeArtifactCacheMiss:
             # Keep a pod-level negative result so every rank does not create a
-            # Mooncake store and repeat the same miss. The owner identity makes
-            # the marker reclaimable after the process/pod exits.
+            # Mooncake store and repeat the same deterministic cache lookup.
             _write_mooncake_install_marker(marker_path, "miss")
             raise
         except Exception:
@@ -756,26 +779,23 @@ def mark_publish_scheduled(
 
 
 def _process_owner_is_alive(pid: int, expected_starttime: str | None) -> bool:
-    """True only when an install-marker owner still denotes the same process."""
+    """Return whether a marker owner still denotes the same process."""
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
         # A process outside our UID may still be the active owner in a shared
-        # PID namespace. Avoid creating duplicate publishers in that case.
+        # PID namespace. Retain the marker rather than duplicate the lookup.
         return True
     actual_starttime = _process_starttime(pid)
     if expected_starttime is None or actual_starttime is None:
-        # /proc may be unavailable or restricted. A live PID is safer to retain
-        # than to reclaim: duplicate artifact publishers are more disruptive
-        # than the rare PID-reuse false positive without a start-time check.
         return True
     return actual_starttime == expected_starttime
 
 
 def _process_starttime(pid: int) -> str | None:
-    """Return Linux /proc process starttime (field 22) for PID-reuse detection."""
+    """Return Linux ``/proc`` process starttime (field 22)."""
     try:
         # ``comm`` (field 2) is parenthesized and may contain spaces, so split
         # only after its final closing parenthesis. The remaining fields begin
@@ -808,17 +828,49 @@ def artifact_marker_path(
     )
 
 
+def _artifact_install_marker_is_valid(
+    marker_path: Path,
+    transfer: P2PArtifactTransfer,
+) -> bool:
+    """Return whether a legacy or current P2P marker proves completion."""
+    try:
+        value = marker_path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return False
+    except UnicodeDecodeError:
+        return False
+    if not value or value in {"attempted", "miss"}:
+        return False
+    required_roots = tuple(
+        root.target_root for root in transfer.roots if not root.optional
+    )
+    return all(has_files(path) for path in required_roots)
+
+
+def _write_artifact_install_marker(marker_path: Path, artifact_id: str) -> None:
+    """Atomically persist the successful P2P artifact installation marker."""
+    _write_marker_atomically(marker_path, artifact_id)
+
+
 def _write_mooncake_install_marker(marker_path: Path, status: str) -> None:
+    if status not in {"installed", "miss"}:
+        raise ValueError(
+            "Mooncake install markers only persist installed or miss state"
+        )
     pid = os.getpid()
     value = json.dumps(
         {
-            "version": _MOONCAKE_INSTALL_MARKER_VERSION,
             "status": status,
             "pid": pid,
             "starttime": _process_starttime(pid),
         },
         sort_keys=True,
     )
+    _write_marker_atomically(marker_path, value)
+
+
+def _write_marker_atomically(marker_path: Path, value: str) -> None:
+    """Write a marker without exposing a partially written success state."""
     marker_path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_path = tempfile.mkstemp(
         prefix=f".{marker_path.name}.",
@@ -851,11 +903,7 @@ def _read_mooncake_install_marker(marker_path: Path) -> dict[str, object]:
     if not isinstance(marker, dict):
         return {"status": "invalid", "owner": None}
     status = marker.get("status")
-    if (
-        type(marker.get("version")) is not int
-        or marker["version"] != _MOONCAKE_INSTALL_MARKER_VERSION
-        or status not in {"installed", "miss", "attempted"}
-    ):
+    if status not in {"installed", "miss", "attempted"}:
         return {"status": "invalid", "owner": None}
     pid = marker.get("pid")
     starttime = marker.get("starttime")
