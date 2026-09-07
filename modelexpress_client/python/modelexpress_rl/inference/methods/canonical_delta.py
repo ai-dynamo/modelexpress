@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Canonical XOR-delta preparation from object storage."""
+"""Canonical checkpoint preparation from object storage."""
 
 from __future__ import annotations
 
@@ -55,10 +55,14 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
     @property
     def capabilities(self) -> MethodCapabilities:
         return MethodCapabilities(
-            payload_formats=frozenset({WeightPayloadFormat.XOR_DELTA}),
+            payload_formats=frozenset(
+                {
+                    WeightPayloadFormat.XOR_DELTA,
+                    WeightPayloadFormat.FULL_HF_CHECKPOINT,
+                }
+            ),
             sources=frozenset({WeightSource.OBJECT_STORAGE}),
             artifact_type=PreparedCheckpointArtifact,
-            requires_base_version=True,
         )
 
     def prepare(
@@ -67,46 +71,52 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
         version: WeightVersion,
         source: ResolvedSource,
     ) -> PreparedArtifact:
+        return self.prepare_chain(((version, source),))
+
+    def prepare_chain(
+        self,
+        chain: tuple[tuple[WeightVersion, ResolvedSource], ...],
+    ) -> PreparedArtifact:
         if self._active is not None:
             raise RuntimeError("release staged weight before staging another version")
-        if not isinstance(source, ObjectStorageUpdateSource):
-            raise TypeError("canonical delta requires an object-storage source")
-        storage = source.storage
-        if storage.storage_type is not ObjectStorageType.S3:
-            raise ValueError("canonical delta requires S3 object storage")
-        assert version.base_version_id is not None
-        # TODO: Make the default object-storage fallback reconstruct the target
-        # from the most recent full canonical checkpoint followed by its ordered
-        # delta chain. Until then, require the local checkpoint to be the exact
-        # base for this single-delta update.
-        if self._checkpoint.current_version not in {
-            version.base_version_id,
-            version.version_id,
-        }:
-            raise ValueError(
-                "canonical delta target does not match the exact local base"
-            )
+        versions = [self._version(version, source) for version, source in chain]
         try:
-            checkpoint = self._checkpoint.prepare(
-                _S3Version(
-                    version_id=version.version_id,
-                    base_version_id=version.base_version_id,
-                    uri=storage.uri,
-                )
-            )
+            checkpoint = self._checkpoint.prepare_chain(tuple(versions))
         except ValueError as error:
             raise RuntimeError(str(error)) from error
         self._active = PreparedCheckpointArtifact(checkpoint=checkpoint)
         return self._active
 
+    @staticmethod
+    def _version(version: WeightVersion, source: ResolvedSource) -> _S3Version:
+        if not isinstance(source, ObjectStorageUpdateSource):
+            raise TypeError("canonical checkpoint requires an object-storage source")
+        storage = source.storage
+        if storage.storage_type is not ObjectStorageType.S3:
+            raise ValueError("canonical checkpoint requires S3 object storage")
+        if version.payload_format is WeightPayloadFormat.XOR_DELTA:
+            if version.base_version_id is None:
+                raise ValueError("canonical delta is missing base_version_id")
+        elif version.payload_format is WeightPayloadFormat.FULL_HF_CHECKPOINT:
+            if version.base_version_id is not None:
+                raise ValueError("FULL_HF_CHECKPOINT must not have base_version_id")
+        else:
+            raise ValueError("unsupported canonical S3 payload format")
+        return _S3Version(
+            version_id=version.version_id,
+            base_version_id=version.base_version_id,
+            payload_format=version.payload_format,
+            uri=storage.uri,
+        )
+
     def installation_context(self, prepared: PreparedArtifact):
         if prepared is not self._active:
-            raise RuntimeError("canonical delta staged weight is no longer active")
+            raise RuntimeError("canonical checkpoint is no longer active")
         return self._checkpoint.installation_context(prepared.checkpoint)
 
     def release(self, prepared: PreparedArtifact) -> None:
         if prepared is not self._active:
-            raise RuntimeError("canonical delta staged weight is no longer active")
+            raise RuntimeError("canonical checkpoint is no longer active")
         self._active = None
 
     def close(self) -> None:

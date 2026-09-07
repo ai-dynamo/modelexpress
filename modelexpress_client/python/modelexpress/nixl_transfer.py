@@ -203,6 +203,15 @@ class NixlTransferManager:
         Optional per-rank NIC pinning (MX_RDMA_NIC_PIN) is delegated to
         ucx_utils.apply_nic_pin_for_device. Default (env var unset) is a
         no-op. See ucx_utils for the topology probe and env var modes.
+
+        MX_UCX_DISABLE_MEM_EVENTS is an opt-in that sets UCX_MEM_EVENTS=n
+        before agent creation on the UCX backend, cutting NIXL agent
+        creation time roughly in half. Off by default: UCX_MEM_EVENTS is
+        process-wide (it backs registration-cache invalidation for every
+        UCP context in the process, not just this agent's) and the
+        assignment here is permanent, so it is only safe when this
+        process owns UCX exclusively for ModelExpress transfers. See
+        ucx_utils and docs/DEPLOYMENT.md for the full caveats.
         """
         if not NIXL_AVAILABLE:
             raise RuntimeError("NIXL is not available")
@@ -229,6 +238,29 @@ class NixlTransferManager:
         # No-op unless MX_RDMA_NIC_PIN is set. See ucx_utils for full env
         # semantics and the topology probe.
         ucx_utils.apply_nic_pin_for_device(self._device_id)
+
+        # Opt-in UCX_MEM_EVENTS=n (MX_UCX_DISABLE_MEM_EVENTS): off by
+        # default. This is process-wide, not scoped to this agent - UCX's
+        # mem-hook / VM-unmap tracking backs registration-cache
+        # invalidation for every UCP context in the process, and the
+        # assignment here is permanent, so later UCX consumers (including
+        # ones ModelExpress does not own) inherit disabled invalidation
+        # too. Only touch it on the UCX backend; LIBFABRIC never
+        # constructs a UCX context here. Never override an operator-set
+        # value. Note UCX reads this option in a shared-library
+        # constructor, so if UCX was already loaded elsewhere in this
+        # process before this call, setting the env var here is a no-op.
+        if (
+            self._backend == "UCX"
+            and envs.MX_UCX_DISABLE_MEM_EVENTS
+            and not envs.is_set("UCX_MEM_EVENTS")
+        ):
+            os.environ["UCX_MEM_EVENTS"] = "n"
+            logger.info(
+                "NIXL: UCX_MEM_EVENTS=n (MX_UCX_DISABLE_MEM_EVENTS=1; faster "
+                "agent creation, process-wide effect on UCX registration-cache "
+                "invalidation)"
+            )
 
         try:
             if self._listen_port is not None and nixl_agent_config:

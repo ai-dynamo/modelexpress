@@ -147,6 +147,34 @@ def test_control_client_round_trips_object_storage_source(storage_type, uri):
     assert created.state is WeightVersionState.READY
 
 
+def test_control_client_round_trips_full_hf_checkpoint():
+    service = _RefitService()
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
+    refit_pb2_grpc.add_RefitServiceServicer_to_server(service, server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+
+    try:
+        control = ModelExpressControlClient.connect(server_url=f"127.0.0.1:{port}")
+        created = control.create_weight_version(
+            model_name="test/model",
+            idempotency_key="training-step-25",
+            payload_format=WeightPayloadFormat.FULL_HF_CHECKPOINT,
+            object_storage=ObjectStorageSource(
+                storage_type=ObjectStorageType.S3,
+                uri="s3://weights/run/v25/model.safetensors.index.json",
+            ),
+        )
+    finally:
+        if "control" in locals():
+            control.close()
+        server.stop(grace=None).wait()
+
+    assert refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT == 3
+    assert created.payload_format is WeightPayloadFormat.FULL_HF_CHECKPOINT
+    assert created.base_version_id is None
+
+
 def test_control_client_validates_framework_inputs_before_rpc():
     control = ModelExpressControlClient.connect(server_url="127.0.0.1:1")
     try:

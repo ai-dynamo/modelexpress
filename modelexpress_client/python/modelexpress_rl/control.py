@@ -55,6 +55,9 @@ def _weight_version(version: refit_pb2.WeightVersion) -> WeightVersion:
     payload_formats = {
         refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_TENSOR: WeightPayloadFormat.FULL_TENSOR,
         refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA: WeightPayloadFormat.XOR_DELTA,
+        refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT: (
+            WeightPayloadFormat.FULL_HF_CHECKPOINT
+        ),
     }
     states = {
         refit_pb2.WEIGHT_VERSION_STATE_STAGING: WeightVersionState.STAGING,
@@ -163,6 +166,9 @@ class ModelExpressControlClient:
             payload_format={
                 WeightPayloadFormat.FULL_TENSOR: refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_TENSOR,
                 WeightPayloadFormat.XOR_DELTA: refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA,
+                WeightPayloadFormat.FULL_HF_CHECKPOINT: (
+                    refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
+                ),
             }[payload_format],
             expected_source_slots=expected_source_slots or [],
             state={

@@ -27,6 +27,7 @@ from .methods import (
     CanonicalDeltaPublicationMethod,
     FullTensorNixlPublicationMethod,
     StagedCanonicalDelta,
+    StagedFullCheckpoint,
 )
 from .resources import _TrainerResources
 
@@ -34,7 +35,9 @@ if TYPE_CHECKING:
     from .. import refit_pb2_grpc
     from .client import ObjectStorageConfig
 
-PublicationArtifact = StagedWeightVersionShardData | StagedCanonicalDelta
+PublicationArtifact = (
+    StagedWeightVersionShardData | StagedCanonicalDelta | StagedFullCheckpoint
+)
 
 logger = logging.getLogger("modelexpress_rl.train.runtime")
 

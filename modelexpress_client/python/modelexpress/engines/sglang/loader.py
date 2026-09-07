@@ -23,7 +23,7 @@ from ...metrics import enable_metrics
 from ...nixl_transfer import NixlTransferManager
 from ...metrics import metrics as selection_metrics
 from ...source_selection import configured_policy_label, get_configured_selector
-from .adapter import build_sglang_load_context
+from .adapter import _get_model_name, build_sglang_load_context
 from .artifacts import (
     _sglang_health_ready,
     install_sglang_cache_artifacts,
@@ -68,23 +68,34 @@ class MxModelLoader:
     ) -> nn.Module:
         """Load model weights through the shared ModelExpress strategy chain."""
         transport = getattr(self.load_config, "modelexpress_transport", "nixl")
-        if transport == "nixl":
-            return self._load_model_via_nixl(
-                model=model,
-                model_config=model_config,
-                device_config=device_config,
+        # L0 wraps the dispatcher rather than each transport, so the
+        # transfer_engine path -- which never touches the strategy chain -- still
+        # reports a load duration. Instrumenting only the chain would leave that
+        # whole deployment mode looking like it never loaded anything.
+        #
+        # SGLang has no draft-model path through this loader, so model_role is
+        # always main.
+        # Same helper the load context uses, so the label matches the model name
+        # every other client family reports for this process.
+        model_id = _get_model_name(model_config)
+        with selection_metrics.time_load("sglang", model_id, "main"):
+            if transport == "nixl":
+                return self._load_model_via_nixl(
+                    model=model,
+                    model_config=model_config,
+                    device_config=device_config,
+                )
+            if transport == "transfer_engine":
+                return self._load_model_via_transfer_engine(
+                    model=model,
+                    model_config=model_config,
+                    device_config=device_config,
+                )
+            raise ValueError(
+                "SGLang ModelExpress integration currently supports "
+                f"modelexpress transports 'nixl' and 'transfer_engine', "
+                f"got {transport!r}."
             )
-        if transport == "transfer_engine":
-            return self._load_model_via_transfer_engine(
-                model=model,
-                model_config=model_config,
-                device_config=device_config,
-            )
-        raise ValueError(
-            "SGLang ModelExpress integration currently supports "
-            f"modelexpress transports 'nixl' and 'transfer_engine', "
-            f"got {transport!r}."
-        )
 
     def _load_model_via_nixl(
         self,
@@ -108,8 +119,17 @@ class MxModelLoader:
             ctx.global_rank,
             ctx.identity.model_name,
         )
-        install_sglang_cache_artifacts(ctx)
-        model = LoadStrategyChain.run(model, ctx)
+        # No model_init phase here, unlike vLLM: SGLang builds the module and
+        # hands it in, so there is no initialization inside this window to time.
+        # The phases still partition the load; this load simply has three.
+        with selection_metrics.time_load_phase(
+            "sglang", ctx.identity.model_name, "artifact_install"
+        ):
+            install_sglang_cache_artifacts(ctx)
+        with selection_metrics.time_load_phase(
+            "sglang", ctx.identity.model_name, "chain"
+        ):
+            model = LoadStrategyChain.run(model, ctx)
 
         _tensor_registry[ctx.device_id] = ctx.tensors
         if ctx.nixl_manager is not None:
@@ -117,7 +137,10 @@ class MxModelLoader:
         else:
             _nixl_managers.pop(ctx.device_id, None)
 
-        schedule_sglang_cache_artifact_publish(ctx)
+        with selection_metrics.time_load_phase(
+            "sglang", ctx.identity.model_name, "publish"
+        ):
+            schedule_sglang_cache_artifact_publish(ctx)
 
         total_time = time.perf_counter() - load_start
         logger.info(

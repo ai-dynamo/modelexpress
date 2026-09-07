@@ -34,6 +34,7 @@ import torch
 from modelexpress import envs
 from modelexpress.client import MxClient
 from modelexpress.nixl_transfer import NixlTransferManager
+from modelexpress.refit.reshard import throughput
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
 from modelexpress.refit.reshard.rendezvous import gather_sources
 from modelexpress.refit.reshard.transfer_plan import (
@@ -76,6 +77,37 @@ def _max_gbps() -> float:
         )
         return 0.0
     return ceiling
+
+
+def _min_gbps() -> float:
+    """Per-rank floor in Gbps; 0 disables the check.
+
+    Same read-at-call-time and non-finite handling as the ceiling, for the same
+    reasons. The floor itself lives in ``reshard.throughput`` because the staged
+    FSDP receiver needs the identical check, and two copies of a threshold are
+    free to drift apart.
+    """
+    return throughput.min_gbps(logger)
+
+
+def _wire_seconds(stages: dict) -> float:
+    """Wire duration regardless of which arm produced it.
+
+    Fused mode reports one span; phased mode reports up to three that run in turn,
+    so summing them is the phased equivalent.
+
+    Module-level rather than a method because it reads only its argument. Both
+    throughput guards are exercised as unbound methods against a minimal stub for
+    ``self``, so putting a self-independent computation on the instance would force
+    every such test to grow a double it has no reason to carry.
+    """
+    wire_s = stages.get("wire_fused_s")
+    if wire_s is None:
+        wire_s = sum(
+            stages.get(key, 0.0)
+            for key in ("wire_exact_s", "wire_full_s", "wire_convert_s")
+        )
+    return wire_s
 
 
 def handshake_endpoints_for_plan(
@@ -1040,7 +1072,32 @@ class ReshardReceiver:
             # WARNING so a benchmark harness captures it without turning on INFO
             # across every dependency.
             logger.warning("MX_REFIT_STAGE %s", json.dumps(record))
+        self._check_throughput_floor(step, stats["bytes"], stages)
         return metrics
+
+    def _check_throughput_floor(
+        self, step: int, wire_bytes: int, stages: dict
+    ) -> None:
+        """Report a wire rate far below what the fabric should deliver.
+
+        This warns rather than aborting, which is the opposite of the ceiling and
+        deliberate: an impossible rate means the payload never moved, so the
+        buffers are untrustworthy, while a slow rate is still correct. Killing a
+        training run over throughput would be worse than the throughput.
+
+        The record is structured so a CI gate can fail on its presence, which is
+        where the enforcement belongs -- a perf regression should block a merge,
+        not a production refit.
+
+        Emitted after the stage record so the two sit together in the log; the
+        stage record is what someone will actually want when they see this.
+        """
+        throughput.warn_if_below_floor(
+            wire_bytes=wire_bytes,
+            wire_seconds=_wire_seconds(stages),
+            log=logger,
+            context={"rank": self._global_rank, "step": step},
+        )
 
     def _check_throughput_ceiling(
         self, step: int, wire_bytes: int, stages: dict
@@ -1071,14 +1128,7 @@ class ReshardReceiver:
         ceiling = _max_gbps()
         if ceiling <= 0 or wire_bytes <= 0:
             return
-        # Fused mode reports one wire span; phased mode reports up to three, and
-        # they run in turn, so summing them is the phased equivalent.
-        wire_s = stages.get("wire_fused_s")
-        if wire_s is None:
-            wire_s = sum(
-                stages.get(key, 0.0)
-                for key in ("wire_exact_s", "wire_full_s", "wire_convert_s")
-            )
+        wire_s = _wire_seconds(stages)
         if wire_s <= 0:
             return
         implied_gbps = wire_bytes * 8 / wire_s / 1e9

@@ -92,6 +92,7 @@ def test_weight_transfer_engine_parses_vime_object_storage_init_info(monkeypatch
         "registration_ttl_seconds": 90,
         "lease_ttl_seconds": 60,
         "max_transfer_attempts": 4,
+        "max_replay_chain_length": 17,
         "rpc_timeout_seconds": 12.5,
     }
     engine.init_transfer_engine(engine.init_info_cls(**init_info))
@@ -103,11 +104,13 @@ def test_weight_transfer_engine_parses_vime_object_storage_init_info(monkeypatch
     assert config.registration_ttl_seconds == 90
     assert config.lease_ttl_seconds == 60
     assert config.max_transfer_attempts == 4
+    assert config.max_replay_chain_length == 17
     assert config.rpc_timeout_seconds == 12.5
     assert config.object_storage.storage_type is ObjectStorageType.S3
     assert config.object_storage.initial_base_version_id == "base-a"
     assert config.object_storage.seed_checkpoint_path == "/models/launch"
     assert config.object_storage.refit_checkpoint_dir == "/cache/modelexpress"
+    assert config.object_storage.refit_checkpoint_max_size_gb == 500
     assert config.object_storage.endpoint_url == "http://minio:9000"
     assert config.object_storage.region_name == "us-west-2"
 

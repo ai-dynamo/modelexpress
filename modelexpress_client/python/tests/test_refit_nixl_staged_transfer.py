@@ -301,6 +301,7 @@ def test_peer_stage_uses_exact_canonical_tensor_catalog(monkeypatch):
 
     transfer = object.__new__(_NixlStagedTransfer)
     transfer._device = torch.device("cpu")
+    transfer._device_id = 0
     transfer._timeout = 30.0
     transfer._manager = _Manager()
     transfer._recv_buffers = {}

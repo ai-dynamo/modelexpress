@@ -17,8 +17,9 @@ This is a leaf module: it imports only the standard library, so any package
 module can import it without creating a cycle.
 
 Reads are centralized here; **writes stay at their call sites** (vLLM's
-registry is read-only). ``UCX_TLS`` and ``UCX_NET_DEVICES`` are registered for
-reading, but the code that sets them does so inline.
+registry is read-only). ``UCX_TLS``, ``UCX_NET_DEVICES``, and
+``UCX_MEM_EVENTS`` are registered for reading, but the code that sets them
+does so inline.
 
 Not covered here (intentional exceptions):
 - ``MX_SKIP_EXT`` and ``CXX`` are read by ``setup.py`` before the package is
@@ -72,6 +73,7 @@ if TYPE_CHECKING:
     MX_RESHARD_HANDSHAKE_BACKOFF_S: float
     MX_REFIT_STAGE_RECORD: bool
     MX_RESHARD_MAX_GBPS: float
+    MX_RESHARD_MIN_GBPS: float
     MX_RESHARD_PUBLISH_DIGEST: bool
     # Kubernetes service backend
     MX_K8S_SERVICE_PATTERN: str
@@ -83,6 +85,8 @@ if TYPE_CHECKING:
     NIXL_UCX_TLS: Optional[str]
     UCX_TLS: Optional[str]
     UCX_NET_DEVICES: Optional[str]
+    UCX_MEM_EVENTS: Optional[str]
+    MX_UCX_DISABLE_MEM_EVENTS: bool
     MX_RDMA_NIC_PIN: str
     MX_RDMA_NIC_PIN_MIN_RATE_GBPS: Optional[str]
     # GPUDirect Storage
@@ -118,6 +122,11 @@ if TYPE_CHECKING:
     MX_REDIS_URL: str
     # P2P source selection
     MX_P2P_SOURCE_SELECTOR: Optional[str]
+    # Topology-aware selection: ordered levels (broad->narrow), this node's
+    # {level: value} JSON map, and the optional within-tier load-blend weight.
+    MX_P2P_TOPOLOGY_LEVELS: Optional[str]
+    MX_P2P_TOPOLOGY: Optional[str]
+    MX_P2P_TOPOLOGY_LOAD_WEIGHT: float
     # Opt-in metrics collector
     MX_METRICS_ENABLED: bool
     MX_METRICS_PORT: Optional[str]
@@ -166,15 +175,24 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _env_float(name: str, default: float) -> float:
-    """Parse a float env var, falling back to ``default`` (and warning) on error."""
+    """Parse a float env var, falling back to ``default`` (and warning) on error.
+
+    Rejects non-finite values (``inf``/``nan``): they are always a misconfig and
+    can poison arithmetic downstream (e.g. ``inf * 0.0 -> nan`` in a selector
+    score, which would break deterministic ordering).
+    """
     raw = os.environ.get(name)
     if raw is None:
         return default
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
         logger.warning("Invalid %s=%r; using default %s", name, raw, default)
         return default
+    if not math.isfinite(value):
+        logger.warning("Non-finite %s=%r; using default %s", name, raw, default)
+        return default
+    return value
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -303,6 +321,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # disables the check, and is the default because only the operator knows the
     # real per-rank limit for their fabric.
     "MX_RESHARD_MAX_GBPS": lambda: _env_float("MX_RESHARD_MAX_GBPS", 0.0),
+    # Per-rank floor in Gbps below which a refit is reported as degraded. Zero
+    # disables it, and is the default for the same reason as the ceiling.
+    #
+    # The ceiling catches transfers that did not happen. Nothing caught a transfer
+    # that happened 20x too slowly: four concurrent receivers collapsed from
+    # ~26 GB/s to ~1.5 GB/s with no error, no warning, byte counts exact,
+    # descriptor counts exact, coverage 100% and fallback 0. Every signal we had
+    # said the refit was healthy. A rate is only interpretable against a bound,
+    # and we only ever had the upper one.
+    "MX_RESHARD_MIN_GBPS": lambda: _env_float("MX_RESHARD_MIN_GBPS", 0.0),
     # Have publishers digest each shard they advertise, so a receiver-side check has
     # something to compare against. Off by default: it costs a reduction over every
     # published tensor, which is a large relative cost against a ~1.5 s wire, so it
@@ -319,6 +347,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "NIXL_UCX_TLS": lambda: os.environ.get("NIXL_UCX_TLS"),
     "UCX_TLS": lambda: os.environ.get("UCX_TLS"),
     "UCX_NET_DEVICES": lambda: os.environ.get("UCX_NET_DEVICES"),
+    "UCX_MEM_EVENTS": lambda: os.environ.get("UCX_MEM_EVENTS"),
+    "MX_UCX_DISABLE_MEM_EVENTS": lambda: _env_bool("MX_UCX_DISABLE_MEM_EVENTS", False),
     "MX_RDMA_NIC_PIN": lambda: os.environ.get("MX_RDMA_NIC_PIN", "").strip(),
     "MX_RDMA_NIC_PIN_MIN_RATE_GBPS": lambda: os.environ.get("MX_RDMA_NIC_PIN_MIN_RATE_GBPS"),
     # ── GPUDirect Storage ──────────────────────────────────────────────────
@@ -380,6 +410,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ── P2P source selection ───────────────────────────────────────────────
     # Raw (None when unset); source_selection applies its DEFAULT_SELECTOR fallback.
     "MX_P2P_SOURCE_SELECTOR": lambda: os.environ.get("MX_P2P_SOURCE_SELECTOR"),
+    "MX_P2P_TOPOLOGY_LEVELS": lambda: os.environ.get("MX_P2P_TOPOLOGY_LEVELS"),
+    "MX_P2P_TOPOLOGY": lambda: os.environ.get("MX_P2P_TOPOLOGY"),
+    # Clamp to >= 0: a negative weight would invert the within-tier load blend
+    # into preferring busy sources. 0 (default) keeps the pure rendezvous jitter.
+    "MX_P2P_TOPOLOGY_LOAD_WEIGHT": lambda: max(
+        0.0, _env_float("MX_P2P_TOPOLOGY_LOAD_WEIGHT", 0.0)
+    ),
     # ── Opt-in metrics collector ───────────────────────────────────────────
     "MX_METRICS_ENABLED": lambda: os.environ.get("MX_METRICS_ENABLED", "0").strip().lower()
     in _TRUTHY,

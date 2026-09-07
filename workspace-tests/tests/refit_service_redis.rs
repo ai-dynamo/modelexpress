@@ -433,7 +433,7 @@ async fn s3_versions_support_staged_and_direct_ready_creation() {
     let staged_request = CreateWeightVersionRequest {
         model_name: "test/model".to_string(),
         idempotency_key: unique_id("staged-s3-version"),
-        payload_format: WeightPayloadFormat::FullTensor.into(),
+        payload_format: WeightPayloadFormat::FullHfCheckpoint.into(),
         base_version_id: None,
         expected_source_slots: Vec::new(),
         object_storage: Some(s3_source(uri)),
@@ -448,6 +448,10 @@ async fn s3_versions_support_staged_and_direct_ready_creation() {
         .version
         .expect("version in response");
     assert_eq!(staged.state, i32::from(WeightVersionState::Staging));
+    assert_eq!(
+        staged.payload_format,
+        i32::from(WeightPayloadFormat::FullHfCheckpoint)
+    );
     assert_eq!(
         staged
             .object_storage
@@ -554,7 +558,7 @@ async fn s3_versions_support_staged_and_direct_ready_creation() {
         .create_weight_version(CreateWeightVersionRequest {
             model_name: "test/model".to_string(),
             idempotency_key: unique_id("ready-s3-version"),
-            payload_format: WeightPayloadFormat::FullTensor.into(),
+            payload_format: WeightPayloadFormat::FullHfCheckpoint.into(),
             base_version_id: None,
             expected_source_slots: Vec::new(),
             object_storage: Some(s3_source(

@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+interface:
+  display_name: "DCO Compliance"
+  short_description: "Keep every contribution DCO-compliant"
+  default_prompt: "Use $dco to create or update commits with valid DCO sign-offs."

@@ -25,6 +25,7 @@ from modelexpress.load_strategy.base import unpublish_metadata_for_worker
 from modelexpress.metadata.payload import worker_tensor_descriptors
 from modelexpress.metadata.publish import publish_metadata_and_ready
 from modelexpress.nixl_transfer import NixlTransferManager
+from modelexpress.refit.reshard import throughput
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
 from modelexpress.refit.reshard.rendezvous import (
     build_sources,
@@ -518,6 +519,14 @@ class _NixlStagedTransfer:
             self._verify(prepared)
 
         bytes_received = sum(d.nbytes for d in prepared.descriptors)
+        # This is the path the FSDP trainer refits over, and the path the 20x
+        # collapse was measured on, so it is the one the floor most needs to cover.
+        throughput.warn_if_below_floor(
+            wire_bytes=bytes_received,
+            wire_seconds=wire_seconds,
+            log=logger,
+            context={"device_id": self._device_id, "phase": "stage"},
+        )
         logger.info(
             "[TIMING] staged xfer: %.3f GB, %d descriptors "
             "(seg=%d full_pull=%d convert=%d), %d tensors | "
@@ -624,6 +633,15 @@ class _NixlStagedTransfer:
                 self._manager.remove_remote_agent(remote_agent_name)
 
         self._active = None
+        # Peer pulls move the same bytes over the same rails, so a rail that
+        # collapsed for stage() collapses here too. Covering only stage() would
+        # leave a generator that refits from a peer reporting nothing at all.
+        throughput.warn_if_below_floor(
+            wire_bytes=bytes_received,
+            wire_seconds=wire_seconds,
+            log=logger,
+            context={"device_id": self._device_id, "phase": "stage_peer"},
+        )
         return _StagedNixlWeights(
             tensors=self._recv_buffers,
             metrics={

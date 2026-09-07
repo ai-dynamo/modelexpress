@@ -5,9 +5,29 @@
 
 This module collects helpers that apply only when the NIXL backend is UCX
 (InfiniBand / RoCE / OPA / EFA RDMA traffic). The headline piece is the
-per-rank NIC pinning logic that works around openucx/ucx#11259, where
-UCX's lane scoring does not honor GPU<->NIC PCIe affinity for CUDA memory
-paths and ends up picking cross-socket NICs on multi-NUMA hosts.
+per-rank NIC pinning logic, which addresses two distinct problems.
+
+The first is openucx/ucx#11259, where UCX's lane scoring does not honor
+GPU<->NIC PCIe affinity for CUDA memory paths and ends up picking
+cross-socket NICs on multi-NUMA hosts.
+
+The second is why the ranking leads with load balancing, and it is the one
+that has actually been measured to cost throughput here. UCX chooses a NIC
+per process with no knowledge of what sibling ranks on the same host chose.
+When a pod is under-provisioned - fewer usable rails than GPUs, or rails
+allocated on the wrong socket - every rank independently makes the same
+locally-correct choice and they all land on one adapter. Measured on such a
+pod: four concurrent readers sharing a rail ran at 1.5 GB/s each, 6.1 GB/s
+aggregate; spread one per rail they ran at 6.75 GB/s each, 27.0 GB/s
+aggregate. Aggregate with four readers was *lower* than one reader alone, so
+throughput was being destroyed rather than divided.
+
+Note that this second case is not UCX misbehaving. Given a pod holding
+exactly one rail on the GPUs' own NUMA node, converging every rank onto it is
+the correct answer to the question UCX is asking. It is the wrong answer to
+the question the host is posing, and only a component that can see all the
+ranks at once can tell the difference - which is what the global assignment
+in ``probe_nic_pin_for_device`` is for.
 
 Public surface:
 - ``apply_nic_pin_for_device(device_id)``: resolve ``MX_RDMA_NIC_PIN`` and
@@ -82,6 +102,50 @@ def _gpu_pci_bdf(device_id: int) -> str | None:
     return f"{domain:04x}:{bus:02x}:{dev:02x}.0"
 
 
+_NVIDIA_PCI_VENDOR = "0x10de"
+
+
+def _host_gpu_bdfs() -> list[str]:
+    """Every NVIDIA GPU on the host, whether or not this process can see it.
+
+    The assignment below spreads GPUs across rails by counting how many GPUs it
+    has already placed on each one, which only spreads anything if every rank
+    counts the same GPUs. ``torch.cuda.device_count()`` cannot supply that: under
+    a per-rank ``CUDA_VISIBLE_DEVICES`` mask - how NeMo-RL and prime-RL both
+    launch - each worker sees exactly one device, restarts the tally from zero,
+    and picks the same best rail as every one of its peers. That is the rail
+    convergence this module exists to prevent, arrived at by the code meant to
+    prevent it.
+
+    Enumerating PCI instead sidesteps it without any cross-rank coordination:
+    sysfs is not filtered by CUDA visibility, so each rank derives the same
+    host-wide map from the same snapshot and then reads off only its own row.
+
+    Returns [] when the listing is unreadable, which leaves the caller on
+    visible devices alone - degraded, and logged as such.
+    """
+    try:
+        entries = sorted(os.listdir("/sys/bus/pci/devices"))
+    except OSError:
+        return []
+
+    out: list[str] = []
+    for bdf in entries:
+        base = f"/sys/bus/pci/devices/{bdf}"
+        vendor = _read_str_file(f"{base}/vendor")
+        pci_class = _read_str_file(f"{base}/class")
+        if vendor is None or pci_class is None:
+            continue
+        # Class 0x03xxxx is "display controller"; NVIDIA GPUs enumerate as
+        # 0x030000 (VGA) or 0x030200 (3D controller), and matching the prefix
+        # covers both without pinning the check to one of them.
+        if vendor.lower() == _NVIDIA_PCI_VENDOR and pci_class.lower().startswith(
+            "0x03"
+        ):
+            out.append(bdf)
+    return out
+
+
 def _gpu_numa_node(device_id: int) -> int | None:
     """Read the NUMA node for a given CUDA visible device's GPU.
 
@@ -122,8 +186,17 @@ def _pci_common_depth(a: list[str], b: list[str]) -> int:
     Higher values mean closer in the PCIe tree:
       - 4+ shared = PIX (single PCIe bridge), best
       - 2-3 shared = PXB / PHB (multiple bridges, same root port)
-      - 1 shared = NODE (same root complex, different root ports)
-      - 0 shared = SYS (different sockets, traffic crosses CPU UPI)
+      - 1 shared = same root port
+      - 0 shared = NODE or SYS, indistinguishable here
+
+    That last line is the one to remember. ``_pci_path_components`` keeps
+    only BDF-shaped components, and the root complex appears in the
+    realpath as ``pci0000:97``, which is not BDF-shaped and so is dropped.
+    Two devices under the same root complex but different root ports
+    therefore share no retained component and score 0, exactly like two
+    devices on opposite sockets. Anything needing to tell NODE from SYS
+    must read numa_node instead; this metric cannot, and the caller's
+    cross-socket term exists for that reason.
     """
     n = min(len(a), len(b))
     for i in range(n):
@@ -264,17 +337,46 @@ def probe_nic_pin_for_device(
          set so side-fabric NICs (management, storage) at a lower
          rate are stripped. min_rate_gbps overrides this with an
          explicit absolute lower bound.
-      2. Discover every visible CUDA device's PCIe path so this rank
-         computes the same global GPU->NIC assignment that every
-         other rank computes from the same /sys snapshot. No
-         coordination.
-      3. Greedy assignment in visible-index order. Each GPU picks the
-         NIC with highest (score, fewest-prior-assignments,
-         lex-smallest name) - score dominates, then load balancing
-         across reuse, then determinism. Reuse is allowed when GPU
-         count exceeds NIC count, with cycle counts kept balanced.
+      2. Discover the PCIe path of every GPU *on the host* - read from
+         PCI, not from CUDA, so a per-rank CUDA_VISIBLE_DEVICES mask
+         cannot shrink the set - so this rank computes the same global
+         GPU->NIC assignment that every other rank computes from the
+         same /sys snapshot. No coordination. See ``_host_gpu_bdfs``
+         for why the visible set is the wrong input.
+      3. Greedy assignment, best-affinity-first. Each GPU picks the NIC
+         with lowest (prior-assignments, -score, cross-socket,
+         lex-smallest name) - rail distinctness dominates, then PCIe
+         depth, then NUMA locality, then determinism. Reuse is allowed
+         when GPU count exceeds NIC count, with cycle counts kept
+         balanced.
       4. Returns this rank's assignment as 'NICNAME:1', or None if no
          compute device is reachable.
+
+    Distinctness ranking first is a measured decision. On a pod whose four
+    GPUs shared one same-socket rail, four concurrent readers ran at
+    1.5 GB/s each (6.1 GB/s aggregate); spread one-per-rail, with three of
+    the four crossing sockets, they ran at 6.75 GB/s each (27.0 GB/s
+    aggregate). Sharing a rail cost 4.45x. Crossing a socket cost nothing
+    measurable: the one reader on its PCIe-affine rail got 6.747 GB/s
+    against 6.745 for the three cross-socket ones.
+
+    Two things this ordering is *not*. It is not a fix for a shipped bug:
+    the previous key was ``(-score, count, name)``, and traced against that
+    pod it gives three distinct rails with one doubled, because almost
+    every GPU-NIC pair there scores 0 and the count term does break those
+    ties. It is a fix for an unshipped one: an intermediate revision of
+    this function inserted the cross-socket term *above* count, giving
+    ``(-score, cross_socket, count, name)``, and that key hands the lone
+    same-socket rail to all four GPUs in turn - a same-socket rail beats
+    every free cross-socket one on every pass, and count never gets a say.
+    That is the 1.5 GB/s configuration, and it was written while diagnosing
+    the very collapse it would have caused.
+
+    Hence the cross-socket term is kept but ranked below distinctness, so
+    it is honoured only where free. Note the throughput figures above were
+    taken against a single publisher rail, so cross-socket cost is bounded
+    by that ceiling rather than shown to be zero in general - it is known
+    to be small relative to sharing, which is all this ordering needs.
     """
     nics = _list_compute_ib_nics(min_rate_gbps)
     if not nics:
@@ -291,75 +393,140 @@ def probe_nic_pin_for_device(
         )
         return None
 
-    try:
-        num_gpus = torch.cuda.device_count()
-    except Exception:
-        num_gpus = 0
-
-    gpu_paths: dict[int, list[str]] = {}
-    gpu_numa: dict[int, int] = {}
-    for gi in range(num_gpus):
-        bdf = _gpu_pci_bdf(gi)
-        if bdf is None:
-            continue
-        gpu_paths[gi] = _pci_path_components(bdf)
-        numa = _read_int_file(f"/sys/bus/pci/devices/{bdf}/numa_node")
-        gpu_numa[gi] = numa if numa is not None else -1
-
-    if device_id not in gpu_paths:
+    # The rank's own GPU is identified by PCI address rather than by visible
+    # index, because the index means nothing outside this process: under a
+    # per-rank mask every worker drives "GPU 0" and they are four different
+    # cards. The address is what the host-wide map below is keyed on.
+    own_bdf = _gpu_pci_bdf(device_id)
+    if own_bdf is None:
         logger.warning(
-            f"MX_RDMA_NIC_PIN auto-probe: GPU {device_id} not found among "
-            f"visible CUDA devices ({sorted(gpu_paths.keys())}); skipping pin"
+            f"MX_RDMA_NIC_PIN auto-probe: no readable PCI address for CUDA "
+            f"device {device_id}; skipping pin"
         )
         return None
 
-    # Greedy assignment in visible-index order. Each GPU picks the NIC
-    # with the highest PCIe-affinity score; ties broken by fewest prior
-    # assignments (load balancing across reuse), then lex-smallest NIC
-    # name (determinism so every rank computes the same map).
+    try:
+        num_visible = torch.cuda.device_count()
+    except Exception:
+        num_visible = 0
+    visible_bdfs = {
+        bdf for bdf in (_gpu_pci_bdf(gi) for gi in range(num_visible)) if bdf
+    }
+    visible_bdfs.add(own_bdf)
+
+    # Union rather than replacement. PCI is the authority on what exists, but a
+    # GPU this process is actually driving belongs in the map even if the
+    # listing missed it, and on a host where the listing is unreadable this
+    # degrades to exactly the old visible-device behaviour.
+    host_bdfs = _host_gpu_bdfs()
+    if not host_bdfs:
+        logger.warning(
+            "MX_RDMA_NIC_PIN auto-probe: could not enumerate host GPUs from "
+            "/sys/bus/pci/devices; falling back to this process's visible "
+            "devices, which may assign the same rail as a peer rank on this host"
+        )
+    gpu_bdfs = sorted(visible_bdfs | set(host_bdfs))
+
+    if len(gpu_bdfs) < 2 and len(nics) > 1:
+        # One GPU in the PCI listing too, so either the host genuinely has one
+        # or the container is device-isolated and there is nothing to spread
+        # across. Indistinguishable from in here, and only the second case is a
+        # problem, so say so rather than report a one-entry map as a success.
+        logger.warning(
+            f"MX_RDMA_NIC_PIN auto-probe: only one GPU ({own_bdf}) is visible in "
+            f"the PCI listing while {len(nics)} rails are available, so rails "
+            f"cannot be spread. If peer ranks share this host under device "
+            f"isolation, set UCX_NET_DEVICES or MX_RDMA_NIC_PIN explicitly to "
+            f"keep them off one rail."
+        )
+
+    gpu_paths: dict[str, list[str]] = {}
+    gpu_numa: dict[str, int] = {}
+    for bdf in gpu_bdfs:
+        gpu_paths[bdf] = _pci_path_components(bdf)
+        numa = _read_int_file(f"/sys/bus/pci/devices/{bdf}/numa_node")
+        gpu_numa[bdf] = numa if numa is not None else -1
+
+    # Greedy assignment. Each GPU picks the least-assigned NIC, then the
+    # closest of those, then a same-socket one, then lex-smallest name for
+    # determinism so every rank computes the same map with no coordination.
     #
-    # Note: greedy-by-index is not globally optimal. On an asymmetric
-    # topology where two GPUs both score equally on the same best NIC
-    # but each has a distinct second-best, the lower-index GPU wins the
-    # shared best and the higher-index GPU may end up on a worse NIC
-    # than a Hungarian-style global assignment would give it. In
-    # practice real GPU clusters are symmetric within a NUMA (n GPUs +
-    # n PIX-affined NICs on the same root complex), so each GPU's PIX
-    # NIC is unique and the greedy result equals the optimal. If a
-    # future topology breaks this assumption, replace with a Hungarian
-    # solve over the (gpu, nic) score matrix - same inputs, just a
-    # better assignment policy. Don't try to "fix" it by reshuffling
-    # the iteration order; that just changes which rank is the loser.
+    # GPUs are visited best-affinity-first rather than in index order,
+    # because with distinctness ranked first the visit order decides who
+    # wins a contested rail. On the measured pod only GPU 3 had any PCIe
+    # affinity to the single same-socket rail, and in index order GPU 0
+    # took that rail on a zero-depth tie, pushing GPU 3 onto a cross-socket
+    # one. Both orders give four distinct rails and so both capture the
+    # 4.45x, but visiting the GPU that has a real affinity first also
+    # honours it. Ties fall back to index, keeping the result deterministic.
+    #
+    # Greedy is still not globally optimal - a Hungarian solve over the
+    # (gpu, nic) score matrix would be, on the same inputs - but the
+    # remaining gap is now a question of which GPU gets which distinct
+    # rail, not whether rails are shared, and sharing was the term worth
+    # 4.45x.
     assigned_count: dict[str, int] = {n[0]: 0 for n in nics}
-    assignments: dict[int, tuple[str, int]] = {}
-    for gi in sorted(gpu_paths.keys()):
-        gpu_path = gpu_paths[gi]
-        ranked: list[tuple[int, int, str]] = []
-        for nic_name, _nic_numa, _nic_rate, nic_path in nics:
+    assignments: dict[str, tuple[str, int]] = {}
+
+    def _best_score(bdf: str) -> int:
+        return max(
+            (_pci_common_depth(gpu_paths[bdf], nic_path) for *_, nic_path in nics),
+            default=0,
+        )
+
+    # Ties break on PCI address rather than visible index for the same reason
+    # the map is keyed on it: the index is not comparable across ranks, so
+    # ordering by it would let two ranks walk the same GPUs in different orders
+    # and reach different assignments from identical inputs.
+    visit_order = sorted(gpu_paths.keys(), key=lambda bdf: (-_best_score(bdf), bdf))
+    for gpu_bdf in visit_order:
+        gpu_path = gpu_paths[gpu_bdf]
+        this_gpu_numa = gpu_numa.get(gpu_bdf, -1)
+        ranked: list[tuple[int, int, int, str]] = []
+        for nic_name, nic_numa, _nic_rate, nic_path in nics:
             score = _pci_common_depth(gpu_path, nic_path)
-            ranked.append((-score, assigned_count[nic_name], nic_name))
+            # NUMA locality ranks BELOW load balancing. PCIe common depth
+            # separates PIX from everything else but cannot separate NODE from
+            # SYS - see _pci_common_depth, the root complex is filtered out of
+            # the path - so without this term a same-socket rail ties with a
+            # cross-socket one at depth 0 and the tiebreak falls through to name
+            # order, leaving the local rail unused. It stays for that reason.
+            # What it must not do is outrank distinctness: measured, sharing a
+            # rail costs 4.45x and crossing a socket costs ~0, and ranking it
+            # higher forces every GPU onto a lone same-socket rail in turn. An
+            # intermediate revision did exactly that; see the function docstring.
+            cross_socket = (
+                this_gpu_numa >= 0 and nic_numa >= 0 and this_gpu_numa != nic_numa
+            )
+            ranked.append(
+                (assigned_count[nic_name], -score, 1 if cross_socket else 0, nic_name)
+            )
         ranked.sort()
-        chosen_name = ranked[0][2]
-        chosen_score = -ranked[0][0]
-        assignments[gi] = (chosen_name, chosen_score)
+        # Index 1 is -score; index 0 is the assignment count the sort now leads
+        # with. Reading the wrong slot here silently mislabels every diagnostic
+        # log line as PCIe common-depth 0.
+        chosen_name = ranked[0][3]
+        chosen_score = -ranked[0][1]
+        assignments[gpu_bdf] = (chosen_name, chosen_score)
         assigned_count[chosen_name] += 1
 
-    chosen_name, chosen_score = assignments[device_id]
+    chosen_name, chosen_score = assignments[own_bdf]
     nic_numa_map = {n[0]: n[1] for n in nics}
     nic_rate_map = {n[0]: n[2] for n in nics}
     same_numa_nics = [
-        n[0] for n in nics if n[1] == gpu_numa.get(device_id, -2) and n[1] >= 0
+        n[0] for n in nics if n[1] == gpu_numa.get(own_bdf, -2) and n[1] >= 0
     ]
-    full_map = {gi: a[0] for gi, a in sorted(assignments.items())}
+    full_map = {bdf: a[0] for bdf, a in sorted(assignments.items())}
     cross_socket = (
-        gpu_numa.get(device_id, -1) >= 0
+        gpu_numa.get(own_bdf, -1) >= 0
         and nic_numa_map.get(chosen_name, -1) >= 0
-        and gpu_numa[device_id] != nic_numa_map[chosen_name]
+        and gpu_numa[own_bdf] != nic_numa_map[chosen_name]
     )
     if cross_socket:
         logger.warning(
-            f"MX_RDMA_NIC_PIN auto-probe: GPU {device_id} -> {chosen_name}:1 "
-            f"is CROSS-SOCKET (GPU NUMA {gpu_numa[device_id]}, NIC NUMA "
+            f"MX_RDMA_NIC_PIN auto-probe: GPU {device_id} ({own_bdf}) -> "
+            f"{chosen_name}:1 "
+            f"is CROSS-SOCKET (GPU NUMA {gpu_numa[own_bdf]}, NIC NUMA "
             f"{nic_numa_map[chosen_name]}); single-flow bandwidth will be "
             f"capped by UPI / Infinity Fabric. PCIe common-depth {chosen_score}, "
             f"same-NUMA NICs available: {same_numa_nics}, full GPU->NIC map: "
@@ -367,9 +534,10 @@ def probe_nic_pin_for_device(
         )
     else:
         logger.info(
-            f"MX_RDMA_NIC_PIN auto-probe: GPU {device_id} -> {chosen_name}:1 "
+            f"MX_RDMA_NIC_PIN auto-probe: GPU {device_id} ({own_bdf}) -> "
+            f"{chosen_name}:1 "
             f"(PCIe common-depth {chosen_score}; GPU NUMA "
-            f"{gpu_numa.get(device_id)}, NIC NUMA {nic_numa_map.get(chosen_name)}, "
+            f"{gpu_numa.get(own_bdf)}, NIC NUMA {nic_numa_map.get(chosen_name)}, "
             f"NIC rate {nic_rate_map.get(chosen_name)} Gb/s; "
             f"same-NUMA NICs: {same_numa_nics}; full GPU->NIC map: {full_map})"
         )

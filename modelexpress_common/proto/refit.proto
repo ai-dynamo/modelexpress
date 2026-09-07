@@ -44,6 +44,7 @@ enum WeightPayloadFormat {
   WEIGHT_PAYLOAD_FORMAT_UNSPECIFIED = 0;
   WEIGHT_PAYLOAD_FORMAT_FULL_TENSOR = 1;
   WEIGHT_PAYLOAD_FORMAT_XOR_DELTA = 2;
+  WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT = 3;
 }
 
 enum WeightVersionState {
@@ -86,7 +87,7 @@ message WeightVersion {
   string idempotency_key = 3;
   WeightPayloadFormat payload_format = 4;
   // Present only for XOR_DELTA; identifies the base WeightVersion to which the
-  // delta is applied.
+  // delta is applied. Full payloads omit it.
   optional string base_version_id = 5;
   // Required only for worker-sharded publication. Physical source workers are
   // not baked in; the trainer coordinator supplies opaque IDs such as a
@@ -106,7 +107,7 @@ message CreateWeightVersionRequest {
   string model_name = 1;
   string idempotency_key = 2;
   WeightPayloadFormat payload_format = 3;
-  // Required only for XOR_DELTA; omitted for FULL_TENSOR.
+  // Required only for XOR_DELTA; omitted for full payloads.
   optional string base_version_id = 4;
   // Required for worker-sharded publication; empty for object storage.
   repeated string expected_source_slots = 5;

@@ -39,6 +39,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -47,6 +48,7 @@ import pytest
 from modelexpress.metrics import (
     ENV_ENABLED,
     LIST_SOURCES_RESULTS,
+    _XSLOW_BUCKETS,
     MetricsCollector,
     enable_metrics,
     push_metrics_if_enabled,
@@ -63,6 +65,8 @@ _RECORDERS = [
     ("observe_transfer_seconds", ("random", "success", 1.0)),
     ("record_nixl_error", ("timeout",)),
     ("record_nixl_receive", ("complete",)),
+    ("observe_load_seconds", ("vllm", "Qwen/Qwen2.5-0.5B-Instruct", "main", "success", 12.0)),
+    ("observe_load_phase_seconds", ("vllm", "Qwen/Qwen2.5-0.5B-Instruct", "chain", 4.0)),
 ]
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -1033,4 +1037,206 @@ def test_alert_rule_client_families_exist(monkeypatch):
     assert not missing, (
         f"the alert rules name client families that are not exported: {missing}\n"
         f"Exported: {sorted(exported)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# L0 / L1 load timing
+# ---------------------------------------------------------------------------
+
+
+def _sum_for(exposition: str, family: str, **labels) -> float:
+    """The ``_sum`` of one histogram child, or 0.0 if that child has no series."""
+    import re
+
+    want = {k: v for k, v in labels.items()}
+    total = 0.0
+    for line in exposition.splitlines():
+        if not line.startswith(f"{family}_sum{{"):
+            continue
+        got = dict(re.findall(r'([a-zA-Z_]\w*)="([^"]*)"', line))
+        if all(got.get(k) == v for k, v in want.items()):
+            total += float(line.rsplit(" ", 1)[1])
+    return total
+
+
+def test_a_load_records_one_observation_with_its_outcome(monkeypatch):
+    collector = _fresh_collector(monkeypatch)
+    with collector.time_load("vllm", "test-model", "main"):
+        pass
+
+    exposition = _exposition(collector)
+    assert (
+        'mx_load_seconds_count{engine="vllm",model="test-model",model_role="main",outcome="success",scheme=""} 1.0'
+        in exposition
+    ), exposition
+
+
+def test_a_failed_load_is_recorded_and_the_exception_still_propagates(monkeypatch):
+    """The load that raises is the one worth timing.
+
+    Recording only successes would drop exactly the observations someone goes
+    looking for, and swallowing the exception would turn a metrics concern into
+    a correctness one.
+    """
+    collector = _fresh_collector(monkeypatch)
+    with pytest.raises(RuntimeError, match="boom"):
+        with collector.time_load("vllm", "test-model", "main"):
+            raise RuntimeError("boom")
+
+    exposition = _exposition(collector)
+    assert 'outcome="error"' in exposition, exposition
+    assert (
+        'mx_load_seconds_count{engine="vllm",model="test-model",model_role="main",outcome="error",scheme=""} 1.0'
+        in exposition
+    ), exposition
+
+
+def test_a_phase_that_raises_is_still_recorded(monkeypatch):
+    """The elapsed time was really spent inside the load.
+
+    Dropping it would make the phases stop summing to the whole on precisely the
+    failed loads being investigated.
+    """
+    collector = _fresh_collector(monkeypatch)
+    with pytest.raises(RuntimeError):
+        with collector.time_load_phase("vllm", "test-model", "model_init"):
+            raise RuntimeError("boom")
+
+    exposition = _exposition(collector)
+    assert (
+        'mx_load_phase_seconds_count{engine="vllm",model="test-model",phase="model_init",scheme=""} 1.0'
+        in exposition
+    ), exposition
+
+
+def test_phases_partition_the_load(monkeypatch):
+    """The L1 invariant: sum(phases) <= L0, on real timings.
+
+    This is the property that makes "which part was slow" answerable without the
+    numbers contradicting each other. It holds by construction here because the
+    phases are disjoint intervals inside the L0 span -- the test exists so that
+    a future phase recorded from a second site fails rather than quietly
+    double-counting.
+    """
+    collector = _fresh_collector(monkeypatch)
+    with collector.time_load("vllm", "test-model", "main"):
+        for phase in ("artifact_install", "model_init", "chain", "publish"):
+            with collector.time_load_phase("vllm", "test-model", phase):
+                time.sleep(0.002)
+
+    exposition = _exposition(collector)
+    total = _sum_for(exposition, "mx_load_seconds", engine="vllm")
+    phases = _sum_for(exposition, "mx_load_phase_seconds", engine="vllm")
+
+    assert phases > 0, exposition
+    assert phases <= total, (
+        f"phases summed to {phases:.6f}s but the load took {total:.6f}s; "
+        "a phase is being recorded outside the load span or from two sites"
+    )
+
+
+def test_load_labels_are_closed_enums(monkeypatch):
+    """An out-of-tree engine clamps to `other` rather than opening the domain."""
+    collector = _fresh_collector(monkeypatch)
+    collector.observe_load_seconds("some-fork", "m", "speculative", "weird", 1.0)
+
+    exposition = _exposition(collector)
+    assert 'engine="other"' in exposition, exposition
+    assert 'model_role="other"' in exposition, exposition
+    assert 'outcome="error"' in exposition, exposition
+    assert "some-fork" not in exposition, exposition
+
+
+def test_an_unknown_phase_is_dropped_not_clamped(monkeypatch):
+    """Folding a stray phase into a real one inflates that phase's total.
+
+    The sum would still look sound, which is worse than the observation going
+    missing: a wrong number that reads as a right one.
+    """
+    collector = _fresh_collector(monkeypatch)
+    collector.observe_load_phase_seconds("vllm", "m", "not_a_phase", 5.0)
+
+    exposition = _exposition(collector)
+    assert "not_a_phase" not in exposition, exposition
+    assert "mx_load_phase_seconds_count" not in exposition, exposition
+
+
+def test_the_model_label_is_clamped_by_length_not_by_enum(monkeypatch):
+    """The one load label whose domain code cannot close.
+
+    Engine and phase are closed enums; a model id is whatever the deployment
+    serves. So the guard is a length cap, and the absent case gets a value
+    rather than an empty label -- an empty string would render as
+    ``model=""`` and read as a bug in the exporter.
+    """
+    from modelexpress.metrics import _MODEL_LABEL_MAX
+
+    collector = _fresh_collector(monkeypatch)
+    collector.observe_load_seconds("vllm", "x" * 500, "main", "success", 1.0)
+    collector.observe_load_seconds("vllm", None, "main", "success", 1.0)
+    collector.observe_load_seconds("vllm", "   ", "main", "success", 1.0)
+
+    exposition = _exposition(collector)
+    longest = max(
+        (len(m) for m in re.findall(r'model="([^"]*)"', exposition)), default=0
+    )
+    assert longest <= _MODEL_LABEL_MAX, exposition
+    assert 'model="unknown"' in exposition, exposition
+
+
+def test_the_model_label_separates_two_models_in_one_process(monkeypatch):
+    """Two models must not merge into one series.
+
+    A pod serves one model, so this is not the production shape -- but the label
+    is only worth adding if it actually partitions, and a test that records one
+    model cannot tell a working label from a constant.
+    """
+    collector = _fresh_collector(monkeypatch)
+    collector.observe_load_seconds("vllm", "org/small", "main", "success", 2.0)
+    collector.observe_load_seconds("vllm", "org/large", "main", "success", 90.0)
+
+    exposition = _exposition(collector)
+    assert 'model="org/small"' in exposition, exposition
+    assert 'model="org/large"' in exposition, exposition
+    counts = re.findall(r"mx_load_seconds_count\{[^}]*\} (\d+\.\d+)", exposition)
+    assert counts == ["1.0", "1.0"], exposition
+
+
+def test_load_timers_never_raise_into_the_load_path(monkeypatch):
+    """Same guarantee the other recorders carry, on the new entry points."""
+    collector = _fresh_collector(monkeypatch)
+    collector._ready = True
+    collector.load_seconds = None  # force an AttributeError inside the recorder
+    collector.load_phase_seconds = None
+
+    with collector.time_load("vllm", "test-model", "main"):
+        with collector.time_load_phase("vllm", "test-model", "chain"):
+            pass
+
+    collector.observe_load_seconds("vllm", "m", "main", "success", 1.0)
+    collector.observe_load_phase_seconds("vllm", "m", "chain", 1.0)
+
+
+def test_load_buckets_match_the_rust_xslow_band():
+    """A server download and a client load are compared on one dashboard.
+
+    Quantiles from differently-bucketed histograms are not comparable, so the
+    two bands are pinned to each other here rather than trusted to stay in step.
+    """
+    rust = (
+        Path(__file__).resolve().parents[3]
+        / "modelexpress_server"
+        / "src"
+        / "metrics"
+        / "buckets.rs"
+    )
+    source = rust.read_text(encoding="utf-8")
+    match = re.search(r"pub const XSLOW: \[f64; \d+\] = \[(.*?)\];", source, re.S)
+    assert match, "could not find XSLOW in buckets.rs"
+    rust_buckets = tuple(
+        float(v.strip()) for v in match.group(1).split(",") if v.strip()
+    )
+    assert rust_buckets == tuple(float(b) for b in _XSLOW_BUCKETS), (
+        f"Rust XSLOW {rust_buckets} != Python _XSLOW_BUCKETS {_XSLOW_BUCKETS}"
     )

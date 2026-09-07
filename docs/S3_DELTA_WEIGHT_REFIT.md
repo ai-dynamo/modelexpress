@@ -2,16 +2,17 @@
 
 This guide shows how to publish XOR-delta weight updates to S3 and install them
 in a running vLLM model with ModelExpress. The trainer and generator start from
-the same local checkpoint; only the delta artifacts are transferred through S3.
-ModelExpress coordinates each version's lineage and readiness.
+the same local checkpoint; integrations may use a framework-selected cadence of
+full HF checkpoints to reset that base. ModelExpress coordinates each version's
+lineage and readiness.
 
 ## Components
 
 | Component | Responsibility |
 |---|---|
 | `ModelExpressControlClient` | Create and transition immutable weight-version records in the ModelExpress catalog. |
-| `ModelExpressTrainerClient` | Capture the seed-checkpoint base, compute XOR deltas from trainer tensors, and publish delta shards plus the global index to S3. |
-| `ModelExpressGeneratorClient` | Validate READY versions, download and apply S3 deltas to its prepared checkpoint, and reload the live model. |
+| `ModelExpressTrainerClient` | Capture the seed-checkpoint base and publish either XOR deltas or full HF checkpoint batches to S3. |
+| `ModelExpressGeneratorClient` | Validate READY versions, apply the requested S3 payload to its refit checkpoint, and reload the live model. |
 
 ## Requirements
 
@@ -43,6 +44,8 @@ Environment variables used by the clients and vLLM engine:
 | `AWS_DEFAULT_REGION` | unset | S3 region when `region_name` is not supplied in client configuration. |
 | `MX_REFIT_DELTA_BUCKET_BYTES` | `536870912` (512 MiB) | Optional tensor-bucket size override for framework integrations. |
 | `MX_REFIT_DELTA_WORKERS` | `min(32, CPU count)` | CPU workers used to compute and apply XOR deltas. |
+| `MX_REFIT_CHECKSUM_FORMAT` | `adler32` | Checksum algorithm written by canonical S3 trainers. |
+| `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` | `4294967296` (4 GiB) | Maximum tensor bytes grouped into one full-checkpoint safetensors object. |
 | `MX_S3_UPLOAD_WORKERS` | `8` | Maximum concurrent multipart uploads per trainer rank. |
 | `MX_S3_DOWNLOAD_WORKERS` | `16` | Generator download concurrency. |
 | `MX_S3_MAX_POOL_CONNECTIONS` | `32` | Botocore HTTP connection-pool size. |
@@ -176,8 +179,10 @@ response = requests.post(
             "initial_base_version_id": "v0",
             "seed_checkpoint_path": "/models/Qwen3-30B-A3B",
             "refit_checkpoint_dir": "/var/cache/modelexpress",
+            "refit_checkpoint_max_size_gb": 500,
             "object_storage_region_name": "us-west-2",
             "max_transfer_attempts": 3,
+            "max_replay_chain_length": 64,
             "rpc_timeout_seconds": 30,
         }
     },
@@ -202,25 +207,71 @@ snapshot directory.
 
 #### `refit_checkpoint_dir`
 
-This is the root of ModelExpress's mutable working checkpoint. During
+This is the root of ModelExpress's host-local immutable checkpoint cache. During
 initialization, ModelExpress creates a model-specific subdirectory containing
-`checkpoint/`, `state.json`, and `.lock`.
+full checkpoints, delta payloads, resolved chains, derived materializations,
+and activation state.
 
-The `checkpoint/` directory starts as a full copy of `seed_checkpoint_path` and
-is updated in place as sequential deltas are applied. `state.json` records its
-current version. The file lock prevents co-located ranks from seeding or
-updating the same checkpoint concurrently. With an HF snapshot seed checkpoint,
-the resulting layout is:
+`full/<version>/` and `deltas/<version>/` contain canonical immutable artifacts.
+`chains/<version>.json` resolves a version to one full checkpoint plus its
+ordered deltas. The first delta after a full checkpoint copies that immutable
+full checkpoint into `materialized/<version>/`. Later sequential deltas rename
+the active derived checkpoint and apply only the incoming delta in place, so
+they do not copy the full model. Current vLLM and SGLang installers consume that
+ordinary checkpoint directory. Materializations are derived and can be rebuilt
+from the canonical lineage. If an in-place delta fails, the running engine keeps
+its previous weights, the cache remains `UPDATING`, and initialization rebuilds
+the checkpoint before accepting another update.
+
+`state.json` records whether preparation is `READY` or `UPDATING` and protects
+against interrupted writes. `active.json` changes only after engine installation
+succeeds, so a failed download, reconstruction, or install retains the previous
+active engine version. The cache lock coordinates artifact mutations. The
+installation lock is held shared by concurrent co-located installers and
+exclusively by preparation, preventing another preparation from entering before
+activation.
 
 ```text
 <refit_checkpoint_dir>/<URL-quoted-vLLM-model-path-or-ID>/
   .lock
+  .install.lock
+  active.json
   state.json
-  checkpoint/
-    *.safetensors
-    config.json
-    ...
+  full/
+    v0/
+      *.safetensors
+      config.json
+      ...
+    v4/
+      model.safetensors.index.json
+      *.safetensors
+      config.json
+      ...
+  deltas/
+    v1/
+      model.safetensors.index.json
+      *.safetensors
+  chains/
+    v0.json
+    v1.json
+    v4.json
+  materialized/
+    v1/
+      *.safetensors
+      config.json
+      ...
 ```
+
+The generator may request a target several revisions ahead of its active
+version. ModelExpress first resolves the complete READY chain, rejecting cycles,
+missing or incompatible revisions, and chains longer than
+`max_replay_chain_length` (64 by default). It then prepares the ordered chain as
+one immutable target checkpoint and installs only that final target. If engine
+installation starts and fails, the checkpoint remains `READY`, `active.json`
+continues to identify the last successfully installed version, and the local
+engine is marked uncertain. The next request may reinstall that active version
+or install any target reconstructed from it; either successful installation
+clears the uncertain state.
 
 All ranks sharing one host filesystem can share the same cache. Each host without
 a shared filesystem needs its own cache.
@@ -241,7 +292,7 @@ spec:
           mountPath: /root/.cache/huggingface
           readOnly: true
 
-        # Mutable, host-local refit checkpoint directory.
+        # Host-local immutable artifacts and derived materializations.
         - name: mx-refit-checkpoint
           mountPath: /var/cache/modelexpress
 
@@ -263,21 +314,29 @@ The corresponding generator configuration would use:
 ```json
 {
   "seed_checkpoint_path": "/root/.cache/huggingface/hub/models--ORG--MODEL/snapshots/SNAPSHOT_ID",
-  "refit_checkpoint_dir": "/var/cache/modelexpress"
+  "refit_checkpoint_dir": "/var/cache/modelexpress",
+  "refit_checkpoint_max_size_gb": 500
 }
 ```
 
-Ensure the host directory has space for at least one complete checkpoint copy.
-ModelExpress creates the model-specific subdirectory automatically. On
-initialization, it reuses the cache only when its recorded version is
-`initial_base_version_id` and its files match. A cache advanced to a later
-version is reseeded from `seed_checkpoint_path`.
+`refit_checkpoint_max_size_gb` is a positive per-model quota in decimal
+gigabytes (`1 GB = 1,000,000,000 bytes`) for payload files under `full/`,
+`deltas/`, and `materialized/`. It defaults to 500 GB; set it to `null` to
+disable the configured quota.
+ModelExpress also checks available filesystem space before known writes and
+copies. It evicts stale derived materializations before stale canonical
+artifacts, but never evicts the active lineage or the checkpoint being prepared
+or installed. Capacity must therefore cover the active checkpoint plus the
+rollback-safe working set for one update. A capacity rejection preserves the
+active checkpoint as READY so a later update can retry. On initialization, the
+configured seed is restored as the initial full artifact and becomes the active
+version.
 
 #### Initialization behavior
 
 `POST /init_weight_transfer_engine` fans out to every vLLM worker. Each worker:
 
-1. initializes or reuses its refit checkpoint;
+1. initializes the seed lineage and host-local checkpoint cache;
 2. fetches `initial_base_version_id` from the ModelExpress server;
 3. verifies that the base is READY and has the configured model name; and
 4. registers itself as a ModelExpress generator worker.
@@ -286,6 +345,94 @@ Initialization fails before serving updates if any worker cannot read the
 seed checkpoint, write the cache, or validate the base version.
 
 ## Weight Update
+
+### Generator-side S3 artifact contract
+
+The weight version's `object_storage.uri` points to a global JSON index. Shard
+filenames in `weight_map` are resolved relative to that index.
+
+#### `XOR_DELTA`
+
+```json
+{
+  "metadata": {
+    "version": "v1",
+    "base_version": "v0",
+    "delta_encoding": "xor",
+    "compression_format": "zstd",
+    "checksum_format": "adler32"
+  },
+  "weight_map": {
+    "model.layers.0.example.weight": "model-00000-of-00004.safetensors"
+  }
+}
+```
+
+The generator requires all five metadata fields and `weight_map`. It requires
+`delta_encoding="xor"` and `checksum_format="adler32"`, and uses
+`compression_format` to select the decompressor. `version` and `base_version`
+describe the artifact.
+
+Each delta shard contains compressed `U8` XOR bytes. Its safetensors
+`__metadata__` must contain the Adler-32 checksum of every reconstructed full
+tensor:
+
+```json
+{
+  "__metadata__": {
+    "model.layers.0.example.weight": "12ab34cd"
+  },
+  "model.layers.0.example.weight": {
+    "dtype": "U8",
+    "shape": [1234],
+    "data_offsets": [0, 1234]
+  }
+}
+```
+
+#### `FULL_HF_CHECKPOINT`
+
+Full checkpoints use a standard Hugging Face safetensors index:
+
+```json
+{
+  "metadata": {
+    "total_size": 8,
+    "checksum_format": "adler32"
+  },
+  "weight_map": {
+    "model.layers.0.example.weight": "model-00001-of-00004.safetensors"
+  }
+}
+```
+
+The generator requires a non-empty `weight_map` covering exactly the local
+checkpoint tensors. The index `metadata` field is optional. When it contains
+`checksum_format`, the only supported value is `adler32`.
+
+Each referenced shard contains native HF tensors. Safetensors `__metadata__`
+may contain arbitrary string-to-string entries. When the index declares
+`checksum_format="adler32"`, it must also contain a checksum keyed by tensor
+name for every referenced tensor in the shard:
+
+```json
+{
+  "__metadata__": {
+    "format": "pt",
+    "model.layers.0.example.weight": "12ab34cd"
+  },
+  "model.layers.0.example.weight": {
+    "dtype": "F32",
+    "shape": [2],
+    "data_offsets": [0, 8]
+  }
+}
+```
+
+When the index omits `checksum_format`, checksum verification is skipped and
+shard metadata is not interpreted as checksums. Tensor names, dtypes, shapes,
+and byte sizes are always checked before the immutable full artifact is
+promoted.
 
 ### 1. Publish `v1`
 
@@ -343,23 +490,6 @@ if dist.get_rank(group=refit_process_group) == 0:
         )
 ```
 
-The index has this shape; shard names are resolved relative to its parent URI:
-
-```json
-{
-  "metadata": {
-    "version": "v1",
-    "base_version": "v0",
-    "delta_encoding": "xor",
-    "compression_format": "zstd",
-    "checksum_format": "adler32"
-  },
-  "weight_map": {
-    "model.layers.0.example.weight": "model-00000-of-00004.safetensors"
-  }
-}
-```
-
 ### 2. Apply `v1` in vLLM
 
 Run the update while generation is paused. `mode=abort` clears active requests
@@ -391,5 +521,11 @@ finally:
     post("resume", body={})
 ```
 
-The next update must be `v2` with `base_version_id="v1"`. The current receiver
-supports only sequential S3 XOR deltas with `compression_format="zstd"`.
+The next delta must be `v2` with `base_version_id="v1"`. An integration may
+instead create a `FULL_HF_CHECKPOINT` version without `base_version_id`; that
+version becomes the exact base for the following delta. Full checkpoint batches
+may declare `checksum_format="adler32"` in the index and carry per-tensor
+checksums under tensor-name keys in shard metadata. They are retained as an
+immutable full artifact. XOR deltas require the complete index metadata contract
+above and are replayed in order in the canonical lineage; each preparation
+applies only the incoming delta to its exact active base.

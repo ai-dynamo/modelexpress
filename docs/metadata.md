@@ -469,7 +469,7 @@ sequenceDiagram
     participant MX as MX Server
     participant Backend as Redis / K8s
 
-    W->>W: Load via ModelStreamer, GDS, or native loader
+    W->>W: Load via server cache, InstantTensor, ModelStreamer, GDS, or native loader
     W->>W: process_weights_after_loading()
     W->>W: Collect all post-processed tensors
     W->>W: Initialize NIXL agent, register tensors
@@ -494,19 +494,26 @@ sequenceDiagram
     MX-->>W: [SourceInstanceRef, ...]
     W->>W: Filter by worker_rank and accelerator, then order via SourceSelector
     W->>W: Load dummy weights, initialize NIXL agent
-    loop For each candidate (max MAX_SOURCE_RETRIES) until metadata found
+    loop For each candidate (max MAX_SOURCE_RETRIES) until transfer succeeds
         W->>MX: GetMetadata(mx_source_id, worker_id)
         MX-->>W: WorkerMetadata (tensors, nixl_metadata)
         alt Metadata missing or fetch error
             W->>W: Try next candidate
         else Accelerator mismatch and both values known
-          W->>W: Skip candidate before target preparation
+            W->>W: Skip candidate before target preparation
+        else Compatible metadata
+            W->>W: Add remote NIXL agent, execute RDMA transfers
+            alt Transfer fails (SourceTransferError / ManifestMismatchError)
+                W->>W: Roll back transfer state
+                W->>W: Reinitialize model if target state may be mutated
+                W->>W: Try next candidate
+            else Transfer succeeds
+                W->>W: Stop source retries
+            end
         end
     end
-    W->>W: Add remote NIXL agent, execute RDMA transfers
-    alt Transfer fails (SourceTransferError / ManifestMismatchError)
-        W->>W: Reinitialize model if target state may be mutated
-        W->>W: Fall through to ModelStreamer, GDS, or native loader
+    opt No source succeeds within retry budget
+        W->>W: Fall through to server cache, InstantTensor, ModelStreamer, GDS, or native loader
     end
     W->>W: process_weights_after_loading()
     W->>W: Register and publish own metadata (become a source)
@@ -514,12 +521,14 @@ sequenceDiagram
 
 ### Loading Strategy Chain
 
-The `MxModelLoader` (`--load-format modelexpress`; `mx` alias) auto-detects the best loading strategy:
+The `MxModelLoader` (`--load-format modelexpress`; `mx` alias) filters and evaluates this fixed loading strategy chain:
 
 1. **RDMA** -- If `ListSources` returns READY instances with matching rank, and the per-candidate metadata fetch confirms a compatible accelerator, receive weights from a serving peer.
-2. **ModelStreamer** -- If `MX_MODEL_URI` is set and `runai_model_streamer` is installed, pipeline safetensor reads from S3, GCS, Azure Blob Storage, or a local path through a bounded CPU staging buffer into the engine.
-3. **GDS** -- If no higher-priority path succeeds and GPUDirect Storage is available, load directly from local storage to GPU.
-4. **Native loader** -- Use the inference engine's host-staged POSIX I/O path as the final fallback.
+2. **Server cache** -- When no-shared-storage mode is enabled and the worker has a server address, stream the model's weight files into the resolved local snapshot and use the engine's native loader.
+3. **InstantTensor** -- When enabled and supported by the installed package, device, and runtime adapter, load local safetensors through InstantTensor.
+4. **ModelStreamer** -- If `MX_MODEL_URI` is set and `runai_model_streamer` is installed, pipeline safetensor reads from S3, GCS, Azure Blob Storage, or a local path through a bounded CPU staging buffer into the engine.
+5. **GDS** -- If no higher-priority path succeeds and GPUDirect Storage is available, load directly from local storage to GPU.
+6. **Native loader** -- Use the inference engine's native path as the final fallback.
 
 The first applicable strategy runs. A failure before model mutation falls through directly; a failure after weights may have landed reinitializes the model before the next strategy runs. After loading by any path, the worker registers its tensors. Server-backed deployments then publish metadata so future workers can discover the worker as an RDMA source; `k8s-service` serves metadata through its decentralized backend.
 
@@ -541,9 +550,9 @@ The `backend_type` discriminator is persisted in storage for unambiguous deseria
 | `MX_METADATA_BACKEND` | (required) | `redis` or `kubernetes` |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | gRPC server address (recommended) |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
-| `MX_REDIS_HOST` / `REDIS_HOST` | `localhost` | Redis host |
-| `MX_REDIS_PORT` / `REDIS_PORT` | `6379` | Redis port |
-| `REDIS_URL` | (computed) | Full Redis URL (overrides host/port) |
+| `MX_REDIS_HOST` / `REDIS_HOST` | (required with port) | Redis host when `REDIS_URL` is not set |
+| `MX_REDIS_PORT` / `REDIS_PORT` | (required with host) | Redis port when `REDIS_URL` is not set |
+| `REDIS_URL` | (required unless host and port are set) | Full Redis URL; overrides host/port |
 | `MX_METADATA_NAMESPACE` / `POD_NAMESPACE` | (required for Kubernetes) | K8s namespace for CRD backend |
 | `MX_HEARTBEAT_INTERVAL_SECS` | `30` | Client heartbeat frequency |
 | `MX_HEARTBEAT_TIMEOUT_SECS` | `90` | Server reaper staleness threshold |
@@ -589,4 +598,4 @@ kubectl get configmaps -l modelexpress.nvidia.com/mx-source-id=<source_id> -n <n
 | K8s CRs missing | RBAC issue -- check source logs and service account permissions for both `modelmetadatas` and `modelcacheentries` |
 | Stale P2P metadata after redeploy | Reaper marks stale within 90s. For immediate Redis cleanup: delete `mx:source:*` keys or `FLUSHDB` in a dedicated Redis DB |
 | Stale model lifecycle metadata after redeploy | Inspect `mx:model:*` or `modelcacheentries`; delete the stale lifecycle entry if it no longer matches cache contents |
-| Transfer failure with address errors | Source pod restarted, so its GPU addresses are invalid. ModelExpress clears the failed NIXL state, reinitializes a potentially mutated target, and tries the next ranked source within the retry budget. If no source succeeds, the strategy chain continues through ModelStreamer, GDS, and the native loader. |
+| Transfer failure with address errors | Source pod restarted, so its GPU addresses are invalid. ModelExpress clears the failed NIXL state, reinitializes a potentially mutated target, and tries the next ranked source within the retry budget. If no source succeeds, the strategy chain continues through server cache, InstantTensor, ModelStreamer, GDS, and the native loader. |
