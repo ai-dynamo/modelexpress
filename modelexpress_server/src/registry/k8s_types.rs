@@ -21,7 +21,14 @@ use serde::{Deserialize, Serialize};
     plural = "modelcacheentries",
     shortname = "mxcache",
     namespaced,
-    status = "ModelCacheEntryStatus"
+    status = "ModelCacheEntryStatus",
+    doc = "ModelExpress model-download lifecycle metadata",
+    printcolumn = r#"{"name":"Model","type":"string","jsonPath":".spec.modelName"}"#,
+    printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
+    printcolumn = r#"{"name":"LastUsed","type":"date","jsonPath":".status.lastUsedAt"}"#,
+    printcolumn = r#"{"name":"Claim","type":"string","jsonPath":".status.claimId","priority":1}"#,
+    printcolumn = r#"{"name":"Lease","type":"date","jsonPath":".status.leaseExpiresAt","priority":1}"#,
+    printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 pub struct ModelCacheEntrySpec {
     /// Full model name (e.g., `meta-llama/Llama-3.1-70B`). Preserved in spec so
@@ -31,6 +38,7 @@ pub struct ModelCacheEntrySpec {
     pub model_name: String,
 
     /// Provider string — `"HuggingFace"`, `"Ngc"`, `"Gcs"`, or `"S3"`.
+    #[schemars(with = "ProviderSchema")]
     pub provider: String,
 }
 
@@ -40,14 +48,17 @@ pub struct ModelCacheEntryStatus {
     /// One of `"Downloading"`, `"Downloaded"`, `"Error"`. Empty string on freshly-created
     /// records that haven't yet received a status patch.
     #[serde(default)]
+    #[schemars(with = "PhaseSchema")]
     pub phase: String,
 
     /// RFC3339 timestamp of first write. Omitted until the first status patch.
     #[serde(rename = "createdAt", default)]
+    #[schemars(with = "Option<chrono::DateTime<chrono::Utc>>")]
     pub created_at: Option<String>,
 
     /// RFC3339 timestamp of most recent status write or touch.
     #[serde(rename = "lastUsedAt", default)]
+    #[schemars(with = "Option<chrono::DateTime<chrono::Utc>>")]
     pub last_used_at: Option<String>,
 
     /// Optional human-readable message (download progress, error reason).
@@ -61,7 +72,27 @@ pub struct ModelCacheEntryStatus {
     /// Owner-generated RFC3339 heartbeat deadline. Observers use changes in this value
     /// to measure liveness locally instead of comparing clocks across replicas.
     #[serde(rename = "leaseExpiresAt", default)]
+    #[schemars(with = "Option<chrono::DateTime<chrono::Utc>>")]
     pub lease_expires_at: Option<String>,
+}
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+enum ProviderSchema {
+    HuggingFace,
+    Ngc,
+    Gcs,
+    S3,
+}
+
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+enum PhaseSchema {
+    #[schemars(rename = "")]
+    Empty,
+    Downloading,
+    Downloaded,
+    Error,
 }
 
 /// Phase strings used by the CRD. Match `ModelStatus` one-for-one.
