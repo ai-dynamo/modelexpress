@@ -119,6 +119,8 @@ installation and upgrade instructions in [`helm/README.md`](../helm/README.md);
 Helm does not update an existing CRD from the chart's `crds/` directory. Then
 either enable `serviceAccount.rbac.enabled=true` on the Helm chart or apply
 `examples/p2p_transfer_k8s/server/kubernetes_backend/rbac-modelmetadata.yaml`.
+
+Both CRD manifests are generated from the Rust types: after editing `modelexpress_server/src/{p2p,registry}/k8s_types.rs`, run `cargo run -p modelexpress-server --bin crdgen > examples/crds.yaml` and copy the output to `helm/crds/modelexpress-crds.yaml`; CI fails when `examples/crds.yaml` is stale.
 The chart creates a `ClusterRole` and `ClusterRoleBinding`, allowing the server
 to run in a dedicated namespace while accessing metadata resources in another
 namespace.
