@@ -18,6 +18,7 @@ from ... import envs
 from ... import p2p_pb2
 from ...adapter import EngineAdapter
 from ...accelerators import accelerator_backend_for
+from ...load_strategy.base import close_weight_iterator
 from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
 from ...tensor_utils import (
@@ -166,12 +167,15 @@ class SglangAdapter(EngineAdapter):
         disk_config.load_format = LoadFormat.AUTO
         disk_loader = DefaultModelLoader(disk_config)
         weights_iter = disk_loader._get_all_weights(self.model_config, result.model)
-        # Same capture as the target path so the source publishes the derived
-        # MLA tensors under matching buffer names (symmetric manifest).
-        with capture_tensor_attrs(self.accelerator_backend):
-            DefaultModelLoader.load_weights_and_postprocess(
-                result.model, weights_iter, self.target_device,
-            )
+        try:
+            # Same capture as the target path so the source publishes the derived
+            # MLA tensors under matching buffer names (symmetric manifest).
+            with capture_tensor_attrs(self.accelerator_backend):
+                DefaultModelLoader.load_weights_and_postprocess(
+                    result.model, weights_iter, self.target_device,
+                )
+        finally:
+            close_weight_iterator(weights_iter, worker_rank=self.get_global_rank())
         return result
 
     def reinit_for_retry(self, result: LoadResult) -> LoadResult:

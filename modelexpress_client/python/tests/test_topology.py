@@ -174,6 +174,46 @@ def test_missing_topology_field_treated_as_no_share(monkeypatch):
     assert {c.mx_source_id for c in ordered} == {f"s{i}" for i in range(4)}
 
 
+def test_hard_filter_excludes_other_rdma_domain(monkeypatch):
+    from modelexpress.source_selection import filter_candidates_by_topology
+
+    _set_topology(monkeypatch, LEVELS, '{"fabric":"a"}')
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_FILTER_LEVEL", "fabric")
+    candidates = [
+        _ref("same", {"fabric": "a"}),
+        _ref("other", {"fabric": "b"}),
+        _ref("unknown", {}),
+    ]
+
+    assert [
+        c.mx_source_id for c in filter_candidates_by_topology(candidates, _ctx())
+    ] == ["same"]
+
+
+def test_hard_filter_without_local_value_fails_closed(monkeypatch):
+    from modelexpress.source_selection import filter_candidates_by_topology
+
+    _set_topology(monkeypatch, LEVELS, '{"rack":"r3"}')
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_FILTER_LEVEL", "fabric")
+
+    assert filter_candidates_by_topology(
+        [_ref("src", {"fabric": "a"})], _ctx()
+    ) == []
+
+
+def test_hard_filter_is_disabled_by_default(monkeypatch):
+    from modelexpress.source_selection import filter_candidates_by_topology
+
+    _set_topology(monkeypatch, LEVELS, '{"fabric":"a"}')
+    monkeypatch.delenv("MX_P2P_TOPOLOGY_FILTER_LEVEL", raising=False)
+    candidates = [
+        _ref("same", {"fabric": "a"}),
+        _ref("other", {"fabric": "b"}),
+    ]
+
+    assert filter_candidates_by_topology(candidates, _ctx()) == candidates
+
+
 def test_within_tier_spreads_deterministically(monkeypatch):
     # Sources all in the same rack (equidistant): topology gives no signal, so
     # the jitter tiebreak decides -- deterministic and identical to rendezvous.

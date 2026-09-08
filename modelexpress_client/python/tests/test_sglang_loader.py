@@ -539,6 +539,53 @@ def test_sglang_retry_reuses_root_for_native_fallback(monkeypatch):
     assert torch.all(initial_model.weight == 7)
 
 
+def test_sglang_native_loader_closes_weight_iterator(monkeypatch):
+    sglang_mod = ModuleType("sglang")
+    srt_mod = ModuleType("sglang.srt")
+    model_loader_mod = ModuleType("sglang.srt.model_loader")
+    loader_mod = ModuleType("sglang.srt.model_loader.loader")
+    configs_mod = ModuleType("sglang.srt.configs")
+    load_config_mod = ModuleType("sglang.srt.configs.load_config")
+
+    class ClosingIterator:
+        def __init__(self):
+            self.closed = False
+
+        def __iter__(self):
+            return iter(())
+
+        def close(self):
+            self.closed = True
+
+    weights = ClosingIterator()
+    model = nn.Linear(2, 2)
+
+    class DefaultModelLoader:
+        def __init__(self, _load_config):
+            pass
+
+        def _get_all_weights(self, _model_config, _model):
+            return weights
+
+        @staticmethod
+        def load_weights_and_postprocess(_model, _weights, _target_device):
+            pass
+
+    loader_mod.DefaultModelLoader = DefaultModelLoader
+    load_config_mod.LoadFormat = SimpleNamespace(AUTO="auto")
+    monkeypatch.setitem(sys.modules, "sglang", sglang_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt", srt_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.model_loader", model_loader_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.model_loader.loader", loader_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.configs", configs_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt.configs.load_config", load_config_mod)
+
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    adapter.load_via_native(LoadResult(value=model, model=model))
+
+    assert weights.closed is True
+
+
 def test_mx_model_loader_delegates_to_shared_strategy_chain():
     model = nn.Linear(2, 2)
     loader = MxModelLoader(_load_config(modelexpress_transport="nixl"))

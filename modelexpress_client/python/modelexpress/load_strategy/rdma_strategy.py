@@ -21,6 +21,7 @@ from ..metrics import metrics as selection_metrics
 from ..nixl_transfer import is_nixl_available
 from ..source_selection import (
     configured_policy_label,
+    filter_candidates_by_topology,
     get_configured_selector,
 )
 from ..transfer_safety import check_transfer_allowed
@@ -298,7 +299,10 @@ class RdmaStrategy(LoadStrategy):
                 # every one filtered out" was unreachable, so the two looked
                 # identical on a dashboard.
                 selection_metrics.record_list_sources(policy, "empty")
-                for stage in ("listed", "rank_matched", "accelerator_matched"):
+                empty_stages = ("listed", "rank_matched", "accelerator_matched")
+                if envs.MX_P2P_TOPOLOGY_FILTER_LEVEL:
+                    empty_stages += ("topology_matched",)
+                for stage in empty_stages:
                     selection_metrics.observe_candidates(policy, stage, 0)
                 return []
 
@@ -314,7 +318,7 @@ class RdmaStrategy(LoadStrategy):
             # incompatible ones. The post-GetMetadata check in load() stays as
             # defense-in-depth (empty refs, stale records, metadata drift).
             target_accelerator = ctx.accelerator_backend.name
-            candidates = [
+            accelerator_matched = [
                 inst
                 for inst in rank_matched
                 if accelerators_compatible(
@@ -325,6 +329,7 @@ class RdmaStrategy(LoadStrategy):
                     dtype=ctx.identity.dtype,
                 )
             ]
+            candidates = filter_candidates_by_topology(accelerator_matched, ctx)
 
             selector = get_configured_selector()
             select_start = time.perf_counter()
@@ -339,8 +344,12 @@ class RdmaStrategy(LoadStrategy):
                 selector.name, "rank_matched", len(rank_matched)
             )
             selection_metrics.observe_candidates(
-                selector.name, "accelerator_matched", len(candidates)
+                selector.name, "accelerator_matched", len(accelerator_matched)
             )
+            if envs.MX_P2P_TOPOLOGY_FILTER_LEVEL:
+                selection_metrics.observe_candidates(
+                    selector.name, "topology_matched", len(candidates)
+                )
             selection_metrics.observe_selection_seconds(selector.name, select_seconds)
 
             # Surface the source-published load the client saw, so a dashboard can
@@ -353,7 +362,8 @@ class RdmaStrategy(LoadStrategy):
                 f"source_selector={selector.name} "
                 f"source_candidates_total={len(list_resp.instances)} "
                 f"source_candidates_rank_matched={len(rank_matched)} "
-                f"source_candidates_accelerator_matched={len(candidates)}"
+                f"source_candidates_accelerator_matched={len(accelerator_matched)} "
+                f"source_candidates_topology_matched={len(candidates)}"
             )
             if ordered:
                 logger.debug(

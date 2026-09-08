@@ -283,6 +283,27 @@ class TestModelStreamerLoad:
         assert exc.value.mutated is True
         mock_register.assert_not_called()
 
+    @patch("modelexpress.load_strategy.model_streamer_strategy.register_tensors")
+    def test_closes_abandoned_iterator_before_retry(self, mock_register):
+        model = MagicMock()
+        adapter = _FakeAdapter()
+        adapter.apply_weight_iter = MagicMock(side_effect=RuntimeError("partial load"))
+        ctx = _make_load_context(adapter=adapter)
+        weights_iter = MagicMock()
+        strategy = self._make_strategy()
+
+        with patch.dict("os.environ", {"MX_MODEL_URI": "s3://bucket/model"}):
+            with patch(
+                "modelexpress.load_strategy.model_streamer_strategy."
+                "ModelStreamerStrategy._stream_weights",
+                return_value=weights_iter,
+            ):
+                with pytest.raises(StrategyFailed, match="partial load"):
+                    strategy.load(model, ctx)
+
+        weights_iter.close.assert_called_once_with()
+        mock_register.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # TestStreamWeights

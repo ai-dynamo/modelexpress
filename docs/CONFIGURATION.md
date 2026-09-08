@@ -134,7 +134,8 @@ MX_P2P_METADATA=0 only changes the central-coordinator metadata representation; 
 | MX_WORKER_HOST | auto-detect | Advertised worker host override |
 | MX_MODEL_REVISION | unset | Source-identity revision label; pin an exact revision for decentralized source pools |
 | MX_NIXL_BACKEND | UCX | NIXL backend; LIBFABRIC is used for AWS EFA |
-| MX_P2P_SOURCE_SELECTOR | random | Source ordering: random or rendezvous_hash; unknown values fall back to random |
+| MX_P2P_SOURCE_SELECTOR | random | Source ordering: random, rendezvous_hash, or topology_aware; unknown values fall back to random |
+| MX_P2P_TOPOLOGY_FILTER_LEVEL | unset | Optional hard RDMA reachability boundary; only sources with the same published topology value at this level are eligible |
 | MX_SOURCE_QUERY_TIMEOUT | 3600 seconds | TRT-LLM source query timeout |
 | MX_TRANSFER_TIMEOUT | 900 seconds for the general client; 300 seconds for RDMA when unset | Transfer timeout used by integrations; the RDMA receive path uses its 300-second fallback until this variable is explicitly set |
 | MX_HEARTBEAT_INTERVAL_SECS | 30 | Source heartbeat interval |

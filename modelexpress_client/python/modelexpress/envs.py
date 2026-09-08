@@ -124,6 +124,7 @@ if TYPE_CHECKING:
     # {level: value} JSON map, and the optional within-tier load-blend weight.
     MX_P2P_TOPOLOGY_LEVELS: Optional[str]
     MX_P2P_TOPOLOGY: Optional[str]
+    MX_P2P_TOPOLOGY_FILTER_LEVEL: Optional[str]
     MX_P2P_TOPOLOGY_LOAD_WEIGHT: float
     # Opt-in metrics collector
     MX_METRICS_ENABLED: bool
@@ -393,6 +394,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_P2P_RUNTIME_METRICS_URL": lambda: os.environ.get("MX_P2P_RUNTIME_METRICS_URL"),
     "MX_P2P_TOPOLOGY_LEVELS": lambda: os.environ.get("MX_P2P_TOPOLOGY_LEVELS"),
     "MX_P2P_TOPOLOGY": lambda: os.environ.get("MX_P2P_TOPOLOGY"),
+    # Optional hard boundary for RDMA source selection.
+    "MX_P2P_TOPOLOGY_FILTER_LEVEL": lambda: os.environ.get(
+        "MX_P2P_TOPOLOGY_FILTER_LEVEL"
+    ),
     # Clamp to >= 0: a negative weight would invert the within-tier load blend
     # into preferring busy sources. 0 (default) keeps the pure rendezvous jitter.
     "MX_P2P_TOPOLOGY_LOAD_WEIGHT": lambda: max(

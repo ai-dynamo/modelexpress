@@ -6,6 +6,8 @@
 import logging
 import logging.handlers
 import os
+import weakref
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, call
 
 import grpc
@@ -2055,3 +2057,71 @@ def test_unregister_releases_the_discarded_model():
     gc.collect()
 
     assert layer_ref() is None
+
+
+def test_vllm_retry_reuses_root_and_releases_old_parameters():
+    from modelexpress.engines.vllm.adapter import VllmAdapter
+
+    old_model = nn.Linear(2, 2)
+    old_weight_ref = weakref.ref(old_model.weight)
+    accelerator = MagicMock()
+    adapter = object.__new__(VllmAdapter)
+    adapter.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            static_forward_context={}, static_all_moe_layers=[]
+        )
+    )
+    adapter.model_config = SimpleNamespace()
+    adapter.prefix = "language_model"
+    adapter.target_device = torch.device("cpu")
+    adapter.accelerator_backend = accelerator
+
+    def initialize_model(**kwargs):
+        assert kwargs["prefix"] == "language_model"
+        assert old_weight_ref() is None
+        return nn.Linear(2, 2)
+
+    with patch(
+        "vllm.model_executor.model_loader.utils.initialize_model",
+        side_effect=initialize_model,
+    ):
+        result = LoadResult(value=old_model, model=old_model, metadata={"x": 1})
+        retried = adapter.reinit_for_retry(result)
+
+    assert retried.value is old_model
+    assert retried.model is old_model
+    assert retried.metadata == {"x": 1}
+    assert old_weight_ref() is None
+    accelerator.synchronize.assert_called_once_with()
+    accelerator.empty_cache.assert_called_once_with()
+
+
+def test_vllm_retry_failure_restores_empty_root_envelope():
+    from modelexpress.engines.vllm.adapter import VllmAdapter
+
+    model = nn.Linear(2, 2)
+    adapter = object.__new__(VllmAdapter)
+    adapter.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            static_forward_context={}, static_all_moe_layers=[]
+        )
+    )
+    adapter.model_config = SimpleNamespace()
+    adapter.prefix = ""
+    adapter.target_device = torch.device("cpu")
+    adapter.accelerator_backend = MagicMock()
+    result = LoadResult(value=model, model=model, metadata={"attempt": 1})
+    failure = RuntimeError("fresh initialization failed")
+
+    with patch(
+        "vllm.model_executor.model_loader.utils.initialize_model",
+        side_effect=failure,
+    ):
+        with pytest.raises(RuntimeError) as exc:
+            adapter.reinit_for_retry(result)
+
+    assert exc.value is failure
+    assert result.value is model
+    assert result.model is model
+    assert result.metadata == {"attempt": 1}
+    assert model.__dict__ == {}

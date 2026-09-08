@@ -99,7 +99,7 @@ class MxModelLoader(BaseModelLoader):
                 "RL initial loading does not support speculative draft models"
             )
 
-        ctx = build_vllm_load_context(vllm_config, model_config)
+        ctx = build_vllm_load_context(vllm_config, model_config, prefix=prefix)
         ctx.p2p_enabled = not is_speculative_draft
         if envs.MX_ARTIFACT_READY_URL.strip():
             ctx.source_ready_fn = lambda: _vllm_health_ready(ctx)
