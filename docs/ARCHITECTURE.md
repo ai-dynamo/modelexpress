@@ -590,6 +590,13 @@ lineage. A separate installation fence is shared by co-located installers and
 exclusive to preparation, so preparation cannot enter between engine reload and
 activation.
 
+RL cold-start bootstrap populates only the immutable full-checkpoint cache; it
+does not rewrite preparation or activation state. Generator ranks sharing that
+cache serialize reconstruction through the same store locks, so the first rank
+prepares the desired target and later ranks attach to the verified `READY`
+checkpoint. Node-local caches elect one preparer per node, while a shared volume
+elects one preparer for the volume.
+
 `WeightVersion.uid` is MX's opaque version identity. A create request may supply
 the UID; MX generates one when it is omitted. Creating another version with an
 already-used caller-supplied UID returns `ALREADY_EXISTS`. For an `XOR_DELTA`,
