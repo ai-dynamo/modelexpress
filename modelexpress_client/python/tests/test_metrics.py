@@ -1143,6 +1143,39 @@ def test_phases_partition_the_load(monkeypatch):
     )
 
 
+def test_strategy_attempts_nest_inside_the_chain_phase(monkeypatch):
+    """The L2 invariant: sum(attempts) <= chain <= load, on real timings.
+
+    The attempts are disjoint intervals inside the chain phase, which is itself
+    inside the load, so the inequality holds by construction. Strictly less,
+    not equal: the chain phase also covers the eligibility filter and the loop's
+    own bookkeeping, and the sleep outside the attempt below stands in for it.
+    The test exists so an attempt recorded from a second site, or outside the
+    chain phase, fails instead of quietly inflating a strategy.
+    """
+    collector = _fresh_collector(monkeypatch)
+    with collector.time_load("sglang", "test-model", "main"):
+        with collector.time_load_phase("sglang", "test-model", "chain"):
+            time.sleep(0.001)  # the filter and bookkeeping no attempt owns
+            with collector.time_load_strategy("sglang", "test-model", "rdma") as a:
+                time.sleep(0.002)
+                a.outcome = "fallback"
+            with collector.time_load_strategy("sglang", "test-model", "default") as b:
+                time.sleep(0.002)
+                b.outcome = "success"
+
+    exposition = _exposition(collector)
+    total = _sum_for(exposition, "mx_load_seconds", engine="sglang")
+    chain = _sum_for(exposition, "mx_load_phase_seconds", engine="sglang", phase="chain")
+    attempts = _sum_for(exposition, "mx_load_strategy_seconds", engine="sglang")
+
+    assert attempts > 0, exposition
+    assert attempts < chain <= total, (
+        f"attempts {attempts:.6f}s, chain {chain:.6f}s, load {total:.6f}s; "
+        "an attempt is being recorded outside the chain phase or from two sites"
+    )
+
+
 def test_load_labels_are_closed_enums(monkeypatch):
     """An out-of-tree engine clamps to `other` rather than opening the domain."""
     collector = _fresh_collector(monkeypatch)

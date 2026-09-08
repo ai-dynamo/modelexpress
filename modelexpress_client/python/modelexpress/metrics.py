@@ -105,14 +105,20 @@ LOAD_PHASES = ("artifact_install", "model_init", "chain", "publish")
 #: Terminal outcomes of a load. A load either returns a model or raises.
 LOAD_OUTCOMES = ("success", "error")
 
-#: The six strategies the chain builds, in the order it tries them. L2 lives one
-#: level below the ``chain`` phase of L1: ``chain`` says the strategy chain spent
-#: four seconds, L2 says which strategy spent them.
+#: The six strategies the chain builds, in the order it tries them, plus the one
+#: load path that is a chain by hand. L2 lives one level below the ``chain``
+#: phase of L1: ``chain`` says the strategy chain spent four seconds, L2 says
+#: which strategy spent them.
 #:
 #: Closed by construction rather than by clamping. ``LoadStrategyChain.run``
-#: rebuilds this exact list on every call -- there is no registry, no plugin
-#: hook, no out-of-tree extension point -- so a name that is not here means this
-#: tuple and that list have drifted, not that a deployment invented a strategy.
+#: rebuilds the first six on every call -- there is no registry, no plugin hook,
+#: no out-of-tree extension point -- so a name that is not here means this tuple
+#: and that list have drifted, not that a deployment invented a strategy.
+#:
+#: ``transfer_engine`` is SGLang's transport that never enters the chain. It
+#: tries the transfer and, on failure, re-initializes and falls through to
+#: ``default`` exactly as the chain would, so it records the same attempt spans
+#: from the same call sites -- it is simply not one of the six objects.
 #:
 #: ``server-cache`` keeps its hyphen. It is already the value the tracer sets as
 #: ``weight_loading_strategy`` on the load span, and normalizing it here would
@@ -124,6 +130,7 @@ LOAD_STRATEGIES = (
     "model_streamer",
     "gds",
     "default",
+    "transfer_engine",
 )
 
 #: How one strategy attempt ended. Not a restatement of ``LOAD_OUTCOMES``: a

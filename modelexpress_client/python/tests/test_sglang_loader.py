@@ -1109,3 +1109,117 @@ def test_te_find_source_records_the_funnel_on_success(monkeypatch):
         call.args[1]: call.args[2] for call in m.observe_candidates.call_args_list
     }
     assert observed["listed"] == 2
+
+
+# ---------------------------------------------------------------------------
+# transfer_engine transport: the chain bypass carries the same tiers
+# ---------------------------------------------------------------------------
+
+
+def _te_loader_and_ctx(*, receive_fails: bool):
+    """A transfer_engine loader whose receive either fails or finds no source.
+
+    Both end in a native load. The point of the pair is that the attempt spans
+    tell them apart -- fallback_dirty when a receive mutated the model first,
+    fallback when there was never a source -- exactly as the chain would.
+    """
+    transfer_engine = MagicMock()
+    transfer_engine.register_memory.return_value = 0
+    transfer_engine.batch_transfer_sync_read.return_value = -1 if receive_fails else 0
+    loader = MxModelLoader(
+        _load_config(
+            modelexpress_transport="transfer_engine",
+            remote_instance_weight_loader_transfer_engine=transfer_engine,
+            remote_instance_weight_loader_transfer_engine_session_id="target-session",
+        )
+    )
+    target_tensor = torch.randn(2, 3)
+    native_tensor = torch.randn(3, 2)
+    prepared = SimpleNamespace(value=nn.Linear(2, 2), model=nn.Linear(2, 2))
+    fresh = SimpleNamespace(value=nn.Linear(2, 2), model=nn.Linear(2, 2))
+    native = SimpleNamespace(value=nn.Linear(2, 2), model=nn.Linear(2, 2))
+    adapter = MagicMock()
+    adapter.before_rdma_receive.return_value = prepared
+    adapter.discover_tensors.side_effect = [{"target": target_tensor}, {"native": native_tensor}]
+    adapter.reinit_for_retry.return_value = fresh
+    adapter.load_via_native.return_value = native
+    ctx = SimpleNamespace(
+        global_rank=0,
+        identity=SimpleNamespace(model_name="org/te-model"),
+        adapter=adapter,
+        tensors={},
+    )
+    source = None
+    if receive_fails:
+        source = p2p_pb2.WorkerMetadata(
+            transfer_engine_session_id="source-session",
+            tensors=[
+                p2p_pb2.TensorDescriptor(
+                    name="target",
+                    addr=1234,
+                    size=target_tensor.numel() * target_tensor.element_size(),
+                )
+            ],
+        )
+    return loader, ctx, source
+
+
+def _te_metrics(monkeypatch):
+    from prometheus_client import CollectorRegistry
+
+    from modelexpress.metrics import MetricsCollector
+
+    monkeypatch.setenv("MX_METRICS_ENABLED", "1")
+    monkeypatch.delenv("PROMETHEUS_MULTIPROC_DIR", raising=False)
+    collector = MetricsCollector(registry=CollectorRegistry())
+    monkeypatch.setattr("modelexpress.engines.sglang.loader.selection_metrics", collector)
+    return collector
+
+
+def _te_series(collector):
+    import re
+
+    from prometheus_client import generate_latest
+
+    text = generate_latest(collector._exposition_registry()).decode()
+    phases = set(re.findall(r'mx_load_phase_seconds_count\{[^}]*phase="([^"]+)"', text))
+    attempts = {
+        (m.group(2), m.group(1))
+        for m in re.finditer(
+            r'mx_load_strategy_seconds_count\{[^}]*outcome="([^"]+)"[^}]*strategy="([^"]+)"',
+            text,
+        )
+    }
+    return phases, attempts
+
+
+@pytest.mark.parametrize(
+    "receive_fails,expected_te_outcome",
+    [(True, "fallback_dirty"), (False, "fallback")],
+)
+def test_transfer_engine_transport_records_the_same_tiers_as_the_chain(
+    monkeypatch, receive_fails, expected_te_outcome
+):
+    collector = _te_metrics(monkeypatch)
+    loader, ctx, source = _te_loader_and_ctx(receive_fails=receive_fails)
+
+    with patch(
+        "modelexpress.engines.sglang.loader.build_sglang_load_context", return_value=ctx
+    ), patch.object(
+        loader, "_find_transfer_engine_source", return_value=source
+    ), patch.object(loader, "_publish_transfer_engine_source", return_value=True):
+        loader._load_model_via_transfer_engine(
+            model=nn.Linear(2, 2),
+            model_config=_model_config(),
+            device_config=_device_config(),
+        )
+
+    phases, attempts = _te_series(collector)
+    # No artifact_install and no model_init: neither happens on this transport.
+    # Asserting the set, not membership, so a phase added here later has to
+    # justify the time it would put outside the L0 span it claims to partition.
+    assert phases == {"chain", "publish"}, phases
+    assert attempts == {
+        ("transfer_engine", expected_te_outcome),
+        ("default", "success"),
+    }, attempts

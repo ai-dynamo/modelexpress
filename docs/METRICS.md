@@ -463,18 +463,23 @@ zeros:
 | --- | --- | --- | --- |
 | vLLM | all four | | hardware |
 | SGLang | no `model_init` | SGLang builds the module and hands it to the loader | hardware |
+| SGLang, `transfer_engine` transport | `chain` and `publish` | bypasses the chain but is one by hand; installs no artifacts | unit tests only |
 | TRT-LLM | `chain` only | model arrives built; publishing happens in a separate call, outside this window | unit tests only |
 
 TRT-LLM's row has not been observed on a GPU: CI builds worker images for vLLM
 and SGLang but not for TRT-LLM, so there is no image carrying this code to run.
 Treat its phase set as the intent rather than as a measurement.
 
-SGLang's `transfer_engine` transport is a further gap in the same direction. It
-never enters the strategy chain, so it records **`mx_load_seconds` and no phases
-at all**. The partition still holds — zero is bounded by the total — but the
-share panel reads 0% there, which under the rule above means "time is going
-somewhere no phase covers". On that transport it does, and the panel is telling
-the truth about instrumentation that has not been written yet.
+SGLang's `transfer_engine` transport never enters the strategy chain, but it
+is a chain by hand — try the transfer, and on failure re-initialize and load
+natively — so it records the same two phases from the same context managers:
+`chain` around that whole decision, and `publish` around registering and
+advertising itself as a source. Below the phase it records two attempt spans,
+`transfer_engine` and, when that misses, `default`, with the same outcomes the
+chain uses: a missing source is a `fallback`, a failed receive that forced a
+re-init is `fallback_dirty`. Like TRT-LLM's row this has not run on a GPU — no
+CI image carries the mooncake transport — so treat it as intent rather than
+measurement.
 
 **Do not add a phase from a second call site.** The partition is the property
 that makes "which part was slow" answerable without the numbers contradicting

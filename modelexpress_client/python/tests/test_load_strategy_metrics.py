@@ -328,7 +328,10 @@ def test_the_strategy_label_domain_matches_the_chain_and_the_names_are_the_trace
         GdsStrategy.name,
         DefaultStrategy.name,
     )
-    assert built == LOAD_STRATEGIES
+    # The chain's six lead the tuple; the only other value is the SGLang
+    # transport that is a chain by hand and never constructs these objects.
+    assert LOAD_STRATEGIES[: len(built)] == built
+    assert set(LOAD_STRATEGIES[len(built) :]) == {"transfer_engine"}
     assert "server-cache" in LOAD_STRATEGIES
 
 
