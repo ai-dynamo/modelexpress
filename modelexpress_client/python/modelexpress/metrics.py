@@ -308,9 +308,10 @@ class MetricsCollector:
             selection_labels.append("source_worker_id")
             logger.warning(
                 "MX_METRICS_SOURCE_ID_LABEL=1: mx_p2p_source_selections_total "
-                "carries source_worker_id, whose domain grows with process "
-                "count over time rather than with cluster size. Benchmark runs "
-                "only -- never a long-lived production Prometheus."
+                "and mx_p2p_source_load carry source_worker_id, whose domain "
+                "grows with process count over time rather than with cluster "
+                "size. Benchmark runs only -- never a long-lived production "
+                "Prometheus."
             )
         self.selections = Counter(
             "mx_p2p_source_selections_total",
@@ -353,6 +354,15 @@ class MetricsCollector:
             "strict-mode refusal, which raises instead of returning.",
             ["scheme", "result"],
             registry=registry,
+        )
+        # Same label, same cardinality argument as selections above: the peer id
+        # is per-process, so it rides the same opt-in switch rather than being
+        # the one mx_p2p_* family that grows unbounded by default.
+        self.source_load = _make_gauge(
+            registry,
+            "mx_p2p_source_load",
+            "Source-published load in [0,1] observed on candidates at selection.",
+            ["scheme", "source_worker_id"] if self._source_id_label else ["scheme"],
         )
         self.candidates = Histogram(
             "mx_p2p_candidates",
@@ -637,6 +647,38 @@ class MetricsCollector:
                 self.selection_seconds.labels(policy, self.scheme).observe(seconds)
             except Exception:
                 pass
+
+    def observe_candidate_loads(self, ordered) -> None:
+        """Record the source-published load seen at selection.
+
+        ``ordered`` is the selector's output, best candidate first. With
+        ``MX_METRICS_SOURCE_ID_LABEL=1`` every candidate is recorded under its
+        own ``source_worker_id``. With the label off there is exactly one
+        series, so it holds the load of the candidate that was actually chosen
+        (``ordered[0]``): writing every candidate into it left whichever came
+        last, which under ``load_aware`` is the busiest -- the opposite of what
+        the selector picked. Candidates that published no load are skipped
+        rather than recorded as 0.0.
+        """
+        if not ordered or not self._ensure():
+            return
+        try:
+            targets = ordered if self._source_id_label else ordered[:1]
+            for inst in targets:
+                has_field = getattr(inst, "HasField", None)
+                try:
+                    known = bool(has_field("source_load")) if has_field else False
+                except (ValueError, TypeError):
+                    known = False
+                if not known:
+                    continue
+                value = float(inst.source_load)
+                if self._source_id_label:
+                    self.source_load.labels(self.scheme, inst.worker_id).set(value)
+                else:
+                    self.source_load.labels(self.scheme).set(value)
+        except Exception:
+            pass
 
     def observe_transfer_seconds(self, policy: str, outcome: str, seconds: float) -> None:
         if self._ensure():

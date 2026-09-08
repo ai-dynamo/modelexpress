@@ -53,6 +53,7 @@ class TestHeartbeatSendsReady:
             worker_id="w1",
             worker_rank=0,
             status=2,  # SOURCE_STATUS_READY
+            source_load=None,
         )
 
     def test_skips_when_unhealthy(self, heartbeat, mx_client, nixl_manager):
@@ -69,6 +70,7 @@ class TestHeartbeatSendsReady:
                 worker_id="w1",
                 worker_rank=0,
                 status=2,
+                source_load=None,
             )
         ]
         assert len(ready_calls) == 0
@@ -86,6 +88,7 @@ class TestHeartbeatSendsReady:
                 worker_id="w1",
                 worker_rank=0,
                 status=2,
+                source_load=None,
             )
         ]
         assert len(ready_calls) >= 2
@@ -111,6 +114,59 @@ class TestPublisherPublishAndReady:
                 worker_id="w1",
                 worker_rank=0,
                 status=2,
+                source_load=None,
+            )
+        ]
+
+    def test_tick_publishes_provider_source_load(self, mx_client, nixl_manager):
+        # A non-zero source_load_provider value is forwarded on update_status.
+        publisher = PublisherThread(
+            mx_client=mx_client,
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            publish_fn=lambda: "abc123",
+            interval_secs=1,
+            source_load_provider=lambda: 0.73,
+        )
+
+        publisher._tick()
+
+        assert mx_client.update_status.call_args_list == [
+            call(
+                mx_source_id="abc123",
+                worker_id="w1",
+                worker_rank=0,
+                status=2,
+                source_load=0.73,
+            )
+        ]
+
+    def test_tick_provider_error_falls_back_to_none(self, mx_client, nixl_manager):
+        # A provider that raises must not break the heartbeat; it leaves the
+        # load unset (None), never a fake 0.0 that would read as idle.
+        def boom() -> float:
+            raise RuntimeError("sampler exploded")
+
+        publisher = PublisherThread(
+            mx_client=mx_client,
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            publish_fn=lambda: "abc123",
+            interval_secs=1,
+            source_load_provider=boom,
+        )
+
+        publisher._tick()
+
+        assert mx_client.update_status.call_args_list == [
+            call(
+                mx_source_id="abc123",
+                worker_id="w1",
+                worker_rank=0,
+                status=2,
+                source_load=None,
             )
         ]
 
@@ -189,6 +245,7 @@ class TestHeartbeatStop:
                 worker_id="w1",
                 worker_rank=0,
                 status=3,  # SOURCE_STATUS_STALE
+                source_load=None,
             )
         ]
         assert len(stale_calls) == 1
@@ -207,6 +264,7 @@ class TestHeartbeatStop:
                 worker_id="w1",
                 worker_rank=0,
                 status=3,
+                source_load=None,
             )
         ]
         assert len(stale_calls) == 0
@@ -224,6 +282,7 @@ class TestHeartbeatStop:
                 worker_id="w1",
                 worker_rank=0,
                 status=3,
+                source_load=None,
             )
         ]
         assert len(stale_calls) == 1
@@ -242,6 +301,7 @@ class TestHeartbeatOnExit:
                 worker_id="w1",
                 worker_rank=0,
                 status=3,
+                source_load=None,
             )
         ]
         assert len(stale_calls) == 1
@@ -438,3 +498,32 @@ class TestHeartbeatDaemon:
         time.sleep(2.5)
 
         assert heartbeat._thread.is_alive()
+
+
+class TestSourceLoadPresence:
+    """The publisher forwards exactly what the provider knows: a reading, or None."""
+
+    def test_provider_reading_is_forwarded(self, mx_client, nixl_manager):
+        publisher = PublisherThread(
+            mx_client=mx_client,
+            mx_source_id="abc123",
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            source_load_provider=lambda: 0.3,
+        )
+        publisher._update_status(2)
+        kwargs = mx_client.update_status.call_args.kwargs
+        assert kwargs["source_load"] == 0.3
+
+    def test_provider_none_is_forwarded_as_none(self, mx_client, nixl_manager):
+        publisher = PublisherThread(
+            mx_client=mx_client,
+            mx_source_id="abc123",
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            source_load_provider=lambda: None,
+        )
+        publisher._update_status(2)
+        assert mx_client.update_status.call_args.kwargs["source_load"] is None

@@ -294,6 +294,7 @@ class MxK8sServiceClient(MxClientBase):
         worker_id: str,
         worker_rank: int,
         status: "p2p_pb2.SourceStatus",
+        source_load: float = 0.0,
     ) -> bool:
         """No-op: K8s readiness probes supersede central liveness tracking."""
         return True

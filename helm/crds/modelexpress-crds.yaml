@@ -160,6 +160,14 @@ spec:
                     default: ''
                     description: Base64-encoded NIXL agent metadata blob
                     type: string
+                  sourceLoad:
+                    description: |-
+                      Source-published busyness in [0, 1] (default: RDMA NIC utilization).
+
+                      `None` must serialize as an explicit `null`, not be skipped: both status writes go out as a JSON merge patch, where an omitted key means "leave unchanged" and `null` means "delete". Skipping it would let the field go `None -> Some` but never back, so a worker the reaper marks Stale with no reading would keep advertising its last load. The CRD schema declares the field `nullable` so the API server accepts the null.
+                    format: float
+                    nullable: true
+                    type: number
                   status:
                     default: Unknown
                     description: Worker lifecycle status (Initializing, Ready, Stale)
