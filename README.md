@@ -172,7 +172,7 @@ vllm serve deepseek-ai/DeepSeek-V4-Pro \
 
 Start the first replica with weights available through local storage or `MX_MODEL_URI`. After it becomes healthy, launch the same command on another compatible node: ModelExpress discovers the serving replica and transfers its post-processed weights directly over NIXL P2P RDMA.
 
-JIT artifact transfer requires `MX_P2P_METADATA=1`, a central-coordinator backend (`redis` or `kubernetes`), and writable target staging and runtime cache directories. With those prerequisites, `MX_ARTIFACT_TRANSFER=1` installs compatible artifacts into the new replica's filesystem caches. Omit it for weight-only transfer or when using the decentralized `k8s-service` backend.
+JIT artifact transfer requires the P2P metadata path and writable target staging and runtime cache directories. With those prerequisites, `MX_ARTIFACT_TRANSFER=1` installs compatible artifacts into the new replica's filesystem caches. This works with central-coordinator backends (`redis` or `kubernetes`) and with `k8s-service`; the latter discovers an artifact through a Service and then pins the transfer to the selected Pod's direct endpoint.
 
 See the [Kubernetes P2P example](examples/p2p_transfer_k8s/README.md) for metadata-server and inference-worker manifests.
 

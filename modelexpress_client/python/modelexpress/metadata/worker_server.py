@@ -46,6 +46,8 @@ def _tensor_read_lease_timeout_seconds() -> int:
 class _ArtifactSource:
     manifests: dict[str, p2p_pb2.ArtifactManifest]
     chunk_manager: Any
+    node_rank: int = 0
+    worker_grpc_endpoint: str = ""
 
 
 class _TensorReadLeases:
@@ -154,6 +156,9 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         artifact_id: str,
         manifest: p2p_pb2.ArtifactManifest,
         artifact_chunk_manager: Any,
+        *,
+        node_rank: int = 0,
+        worker_grpc_endpoint: str = "",
     ) -> None:
         with self._artifact_lock:
             source = self._artifact_sources.get(mx_source_id)
@@ -161,8 +166,16 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
                 self._artifact_sources[mx_source_id] = _ArtifactSource(
                     manifests={artifact_id: manifest},
                     chunk_manager=artifact_chunk_manager,
+                    node_rank=node_rank,
+                    worker_grpc_endpoint=worker_grpc_endpoint,
                 )
             else:
+                if source.node_rank != node_rank:
+                    raise ValueError(
+                        "artifact source node_rank cannot change for one mx_source_id"
+                    )
+                if worker_grpc_endpoint:
+                    source.worker_grpc_endpoint = worker_grpc_endpoint
                 source.manifests[artifact_id] = manifest
 
     def unregister_artifact_source(self, mx_source_id: str, artifact_id: str) -> None:
@@ -252,13 +265,14 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         return response
 
     def PrepareArtifactChunk(self, request, context):
-        source_id, artifact_id, manifest, artifact_chunk_manager = (
+        source_id, artifact_id, manifest, artifact_source = (
             self._select_artifact_source(
                 request.mx_source_id,
                 request.artifact_id,
                 context,
             )
         )
+        artifact_chunk_manager = artifact_source.chunk_manager
         if artifact_chunk_manager is None:
             context.abort(
                 grpc.StatusCode.FAILED_PRECONDITION,
@@ -308,13 +322,14 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         return response
 
     def ReleaseArtifactChunk(self, request, context):
-        source_id, artifact_id, _, artifact_chunk_manager = (
+        source_id, artifact_id, _, artifact_source = (
             self._select_artifact_source(
                 request.mx_source_id,
                 request.artifact_id,
                 context,
             )
         )
+        artifact_chunk_manager = artifact_source.chunk_manager
         if artifact_chunk_manager is None:
             context.abort(
                 grpc.StatusCode.FAILED_PRECONDITION,
@@ -347,10 +362,14 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         return response
 
     def GetArtifactManifestHeader(self, request, context):
-        source_id, artifact_id, manifest, _ = self._select_artifact_source(
+        requested_node_rank = (
+            request.node_rank if request.HasField("node_rank") else None
+        )
+        source_id, artifact_id, manifest, artifact_source = self._select_artifact_source(
             request.mx_source_id,
             request.artifact_id,
             context,
+            requested_node_rank=requested_node_rank,
         )
         response = p2p_pb2.GetArtifactManifestHeaderResponse(
             mx_source_id=source_id,
@@ -365,6 +384,10 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
             agent_name=self._agent_name,
             worker_rank=self._worker_rank,
             files=manifest.files,
+            worker_grpc_endpoint=artifact_source.worker_grpc_endpoint,
+            accelerator=self._accelerator,
+            worker_id=self._worker_id,
+            node_rank=artifact_source.node_rank,
         )
         logger.info(
             f"GetArtifactManifestHeader served: {len(manifest.files)} files, "
@@ -407,7 +430,9 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         mx_source_id: str,
         artifact_id: str,
         context,
-    ) -> tuple[str, str, p2p_pb2.ArtifactManifest, Any]:
+        *,
+        requested_node_rank: int | None = None,
+    ) -> tuple[str, str, p2p_pb2.ArtifactManifest, _ArtifactSource]:
         with self._artifact_lock:
             if not self._artifact_sources:
                 source = None
@@ -415,7 +440,7 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
                 source = self._artifact_sources.get(mx_source_id)
                 if source is None:
                     context.abort(
-                        grpc.StatusCode.FAILED_PRECONDITION,
+                        grpc.StatusCode.NOT_FOUND,
                         f"artifact mx_source_id not available: {mx_source_id}",
                     )
             elif len(self._artifact_sources) == 1:
@@ -428,10 +453,19 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
 
             if source is None:
                 manifests = {}
-                artifact_chunk_manager = None
             else:
                 manifests = dict(source.manifests)
-                artifact_chunk_manager = source.chunk_manager
+
+        if (
+            source is not None
+            and requested_node_rank is not None
+            and source.node_rank != requested_node_rank
+        ):
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                f"artifact node_rank mismatch: expected {source.node_rank}, "
+                f"got {requested_node_rank}",
+            )
 
         if not manifests:
             context.abort(
@@ -452,7 +486,7 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
                 grpc.StatusCode.FAILED_PRECONDITION,
                 f"artifact_id not available: {artifact_id}",
             )
-        return mx_source_id, artifact_id, manifest, artifact_chunk_manager
+        return mx_source_id, artifact_id, manifest, source
 
     def _validate_tensor_source(
         self,
@@ -528,6 +562,9 @@ class WorkerGrpcServer:
         artifact_id: str,
         manifest: p2p_pb2.ArtifactManifest,
         artifact_chunk_manager: Any,
+        *,
+        node_rank: int = 0,
+        worker_grpc_endpoint: str = "",
     ) -> None:
         if self._servicer is None:
             raise RuntimeError("Server must be started before registering artifacts")
@@ -536,6 +573,8 @@ class WorkerGrpcServer:
             artifact_id,
             manifest,
             artifact_chunk_manager,
+            node_rank=node_rank,
+            worker_grpc_endpoint=worker_grpc_endpoint,
         )
 
     def unregister_artifact_source(self, mx_source_id: str, artifact_id: str) -> None:
@@ -767,6 +806,8 @@ def fetch_artifact_manifest_header(
     mx_source_id: str,
     artifact_id: str = "",
     timeout: float = 5.0,
+    *,
+    node_rank: int | None = None,
 ) -> tuple[p2p_pb2.GetArtifactManifestHeaderResponse, int]:
     """Fetch a sealed artifact manifest header directly from a source worker."""
     with grpc.insecure_channel(endpoint) as channel:
@@ -775,6 +816,8 @@ def fetch_artifact_manifest_header(
             mx_source_id=mx_source_id,
             artifact_id=artifact_id,
         )
+        if node_rank is not None:
+            request.node_rank = node_rank
         response = stub.GetArtifactManifestHeader(request, timeout=timeout)
         response_bytes = response.ByteSize()
     logger.info(
