@@ -33,7 +33,7 @@ import torch
 import torch.nn as nn
 
 from ... import configure_vllm_logging, envs, model_prefetch
-from ...load_strategy import LoadContext, run_load_strategy_chain
+from ...load_strategy import LoadContext, LoadStrategyChain, run_load_strategy_chain
 from ...metrics import enable_metrics, metrics
 from ...nixl_transfer import NixlTransferManager
 from ...vmm.runtime import log_arena_post_load, maybe_enter_vmm_arena
@@ -94,7 +94,8 @@ class MxModelLoader(BaseModelLoader):
         load_start = time.perf_counter()
 
         ctx = build_vllm_load_context(vllm_config, model_config)
-        ctx.p2p_enabled = not _is_speculative_draft(vllm_config, model_config)
+        is_speculative_draft = _is_speculative_draft(vllm_config, model_config)
+        ctx.p2p_enabled = not is_speculative_draft
         if envs.MX_ARTIFACT_READY_URL.strip():
             ctx.source_ready_fn = lambda: _vllm_health_ready(ctx)
         self._ctx = ctx
@@ -110,7 +111,7 @@ class MxModelLoader(BaseModelLoader):
         # inferred from p2p_enabled: that flag happens to agree today, but it is
         # a capability switch and any future reason to clear it would silently
         # relabel real loads as drafts.
-        model_role = "draft" if _is_speculative_draft(vllm_config, model_config) else "main"
+        model_role = "draft" if is_speculative_draft else "main"
 
         # L0 wraps everything below, and the four L1 phases inside it are
         # disjoint, so their sum is bounded by the total by construction. The
@@ -131,7 +132,15 @@ class MxModelLoader(BaseModelLoader):
                             )
 
                     with metrics.time_load_phase("vllm", model_id, "chain"):
-                        model = run_load_strategy_chain(model, ctx)
+                        if (
+                            is_speculative_draft
+                            and envs.MX_LOAD_STRATEGY_CHAIN == "RL"
+                        ):
+                            # The desired UID belongs to the main model. Preserve
+                            # the pre-RL draft path, with P2P disabled above.
+                            model = LoadStrategyChain.run(model, ctx)
+                        else:
+                            model = run_load_strategy_chain(model, ctx)
 
                     if ctx.p2p_enabled:
                         _tensor_registry[ctx.device_id] = ctx.tensors

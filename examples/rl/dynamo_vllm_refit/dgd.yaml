@@ -46,7 +46,10 @@ spec:
             medium: Memory
             sizeLimit: 16Gi
         - name: mx-refit-checkpoints
-          emptyDir: {}
+          # This node-local cache is removed with the Pod. Replacement Pods may
+          # redownload the full checkpoint and replay its delta chain.
+          emptyDir:
+            sizeLimit: 500G
         initContainers:
         - name: vllm-engine
           image: ${VLLM_ENGINE_IMAGE}

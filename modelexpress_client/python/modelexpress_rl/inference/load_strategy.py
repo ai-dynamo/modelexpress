@@ -33,6 +33,34 @@ _MAX_REPLAY_CHAIN_LENGTH = 64
 logger = logging.getLogger(__name__)
 
 
+def _fetch_ready_version(
+    client: ModelExpressControlClient,
+    ctx: LoadContext,
+    version_uid: str,
+    *,
+    require_s3: bool,
+) -> WeightVersion:
+    """Validate the control-plane record required by a load strategy."""
+    version = client.get_weight_version(version_uid)
+    if version.version_id != version_uid:
+        raise RuntimeError(
+            f"requested revision {version_uid!r} but MX returned "
+            f"{version.version_id!r}"
+        )
+    if version.state is not WeightVersionState.READY:
+        raise RuntimeError(f"revision {version_uid!r} is not READY")
+    if version.model_name != ctx.identity.model_name:
+        raise RuntimeError(
+            f"revision {version_uid!r} model_name does not match the worker"
+        )
+    if require_s3 and (
+        version.object_storage is None
+        or version.object_storage.storage_type is not ObjectStorageType.S3
+    ):
+        raise RuntimeError(f"revision {version_uid!r} has no S3 source")
+    return version
+
+
 class DesiredVersionP2PStrategy(RdmaStrategy):
     """Load the desired immutable version from an existing generator."""
 
@@ -45,11 +73,25 @@ class DesiredVersionP2PStrategy(RdmaStrategy):
         desired_version_uid = envs.MX_REFIT_DESIRED_VERSION_UID
         if desired_version_uid is None:
             raise StrategyFailed("desired version is not configured", mutated=False)
+        try:
+            with ModelExpressControlClient.connect(
+                server_url=ctx.mx_server_url
+            ) as client:
+                _fetch_ready_version(
+                    client,
+                    ctx,
+                    desired_version_uid,
+                    require_s3=False,
+                )
+        except Exception as error:
+            raise StrategyFailed(str(error), mutated=False) from error
+
         original_revision = ctx.identity.revision
         ctx.identity.revision = desired_version_uid
         try:
             return super().load(result, ctx)
         except BaseException:
+            # P2P mutates the identity before interruptible transfer work.
             ctx.identity.revision = original_revision
             raise
 
@@ -157,19 +199,12 @@ def _resolve_s3_replay_chain(
     """Resolve and validate a target back to its full HF root."""
     with ModelExpressControlClient.connect(server_url=ctx.mx_server_url) as client:
         def fetch_ready_version(version_uid: str) -> WeightVersion:
-            version = client.get_weight_version(version_uid)
-            if version.state is not WeightVersionState.READY:
-                raise RuntimeError(f"revision {version_uid!r} is not READY")
-            if version.model_name != ctx.identity.model_name:
-                raise RuntimeError(
-                    f"revision {version_uid!r} model_name does not match the worker"
-                )
-            if (
-                version.object_storage is None
-                or version.object_storage.storage_type is not ObjectStorageType.S3
-            ):
-                raise RuntimeError(f"revision {version_uid!r} has no S3 source")
-            return version
+            return _fetch_ready_version(
+                client,
+                ctx,
+                version_uid,
+                require_s3=True,
+            )
 
         return resolve_replay_chain(
             target_version_id=target_version_uid,
@@ -191,6 +226,11 @@ class RLLoadStrategyChain:
                 DesiredVersionS3Strategy(),
             ]
         else:
+            logger.warning(
+                "[Worker %s] RL initial load has no desired version; using "
+                "version-agnostic ModelStreamer and engine-default fallbacks",
+                ctx.global_rank,
+            )
             strategies = [
                 ModelStreamerStrategy(),
                 DefaultStrategy(),

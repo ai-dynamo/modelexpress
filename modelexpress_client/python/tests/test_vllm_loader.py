@@ -552,6 +552,38 @@ class TestMtpDrafterSecondLoad:
             loader_mod._tensor_registry.pop(0, None)
             loader_mod._nixl_managers.pop(0, None)
 
+    def test_rl_drafter_uses_inference_chain(self):
+        """The main model's desired UID must not constrain its draft model."""
+        loader = _make_loader()
+        model = MagicMock()
+        ctx = _make_load_context(device_id=0)
+        vllm_config = MagicMock()
+        model_config = MagicMock(dtype=torch.float32, runner_type="draft")
+
+        with patch.dict(
+            os.environ,
+            {
+                "MX_LOAD_STRATEGY_CHAIN": "RL",
+                "MX_REFIT_DESIRED_VERSION_UID": "main-version",
+            },
+            clear=True,
+        ), patch(
+            "modelexpress.engines.vllm.loader.build_vllm_load_context",
+            return_value=ctx,
+        ), patch(
+            "modelexpress.engines.vllm.loader.initialize_model",
+            return_value=model,
+        ), patch(
+            "modelexpress.engines.vllm.loader.LoadStrategyChain.run",
+            return_value=model,
+        ) as inference_run, patch(
+            "modelexpress.engines.vllm.loader.run_load_strategy_chain"
+        ) as configured_run:
+            loader.load_model(vllm_config, model_config)
+
+        inference_run.assert_called_once_with(model, ctx)
+        configured_run.assert_not_called()
+
     def test_is_speculative_draft(self):
         from modelexpress.engines.vllm.loader import _is_speculative_draft
 
