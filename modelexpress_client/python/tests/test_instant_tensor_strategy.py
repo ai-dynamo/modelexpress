@@ -105,35 +105,56 @@ class TestInstantTensorIsAvailable:
     def test_available_when_explicitly_enabled(self):
         ctx = _make_load_context()
         strategy = _make_strategy()
-        with patch.dict("os.environ", {"MX_INSTANT_TENSOR": "1"}):
+        with patch.dict("os.environ", {"MX_INSTANT_TENSOR": "1"}, clear=True):
             with patch("importlib.util.find_spec", return_value=MagicMock()):
                 assert strategy.is_available(ctx) is True
 
     def test_unavailable_when_disabled(self):
         ctx = _make_load_context()
         strategy = _make_strategy()
-        with patch.dict("os.environ", {"MX_INSTANT_TENSOR": "0"}):
+        with patch.dict("os.environ", {"MX_INSTANT_TENSOR": "0"}, clear=True):
+            with patch("importlib.util.find_spec", return_value=MagicMock()):
+                assert strategy.is_available(ctx) is False
+
+    @pytest.mark.parametrize(
+        "model_uri",
+        [
+            "s3://bucket/model",
+            "gs://bucket/model",
+            "az://container/model",
+            "/models/qwen",
+            "org/model",
+        ],
+    )
+    def test_unavailable_when_model_streamer_uri_is_configured(self, model_uri):
+        ctx = _make_load_context()
+        strategy = _make_strategy()
+        with patch.dict(
+            "os.environ",
+            {"MX_INSTANT_TENSOR": "1", "MX_MODEL_URI": model_uri},
+            clear=True,
+        ):
             with patch("importlib.util.find_spec", return_value=MagicMock()):
                 assert strategy.is_available(ctx) is False
 
     def test_unavailable_no_package(self):
         ctx = _make_load_context()
         strategy = _make_strategy()
-        with patch.dict("os.environ", {"MX_INSTANT_TENSOR": "1"}):
+        with patch.dict("os.environ", {"MX_INSTANT_TENSOR": "1"}, clear=True):
             with patch("importlib.util.find_spec", return_value=None):
                 assert strategy.is_available(ctx) is False
 
     def test_unavailable_not_cuda(self):
         ctx = _make_load_context(adapter=_FakeAdapter(is_cuda_alike=False))
         strategy = _make_strategy()
-        with patch.dict("os.environ", {"MX_INSTANT_TENSOR": "1"}):
+        with patch.dict("os.environ", {"MX_INSTANT_TENSOR": "1"}, clear=True):
             with patch("importlib.util.find_spec", return_value=MagicMock()):
                 assert strategy.is_available(ctx) is False
 
     def test_unavailable_when_adapter_lacks_capability(self):
         ctx = _make_load_context(adapter=_NoInstantTensorAdapter())
         strategy = _make_strategy()
-        with patch.dict("os.environ", {"MX_INSTANT_TENSOR": "1"}):
+        with patch.dict("os.environ", {"MX_INSTANT_TENSOR": "1"}, clear=True):
             with patch("importlib.util.find_spec", return_value=MagicMock()):
                 assert strategy.is_available(ctx) is False
 
@@ -142,7 +163,7 @@ class TestInstantTensorIsAvailable:
         # cleanly instead of hitting the gated apply_weight_iter default at load.
         ctx = _make_load_context(adapter=_IterOnlyAdapter())
         strategy = _make_strategy()
-        with patch.dict("os.environ", {"MX_INSTANT_TENSOR": "1"}):
+        with patch.dict("os.environ", {"MX_INSTANT_TENSOR": "1"}, clear=True):
             with patch("importlib.util.find_spec", return_value=MagicMock()):
                 assert strategy.is_available(ctx) is False
 
