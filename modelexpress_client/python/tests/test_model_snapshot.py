@@ -11,11 +11,13 @@ from modelexpress.model_snapshot import (
     MAIN_REF,
     ModelSnapshotCache,
     ModelSnapshotError,
+    is_snapshot_commit_directory,
     is_weight_file,
     repo_dir_name,
     resolve_cache_root,
     safe_commit_hash,
     safe_relative_path,
+    snapshot_location,
     split_by_weight,
 )
 
@@ -509,3 +511,68 @@ def test_snapshot_without_ref_is_unresolvable(cache):
         snapshot_download(
             "org/model", cache_dir=str(cache.cache_root), local_files_only=True
         )
+
+
+class TestSnapshotLocation:
+    """Splitting a resolved snapshot path back into its root and commit."""
+
+    def test_standard_layout_yields_root_and_commit(self, tmp_path):
+        path = tmp_path / "models--org--model" / "snapshots" / COMMIT
+
+        assert snapshot_location("org/model", path) == (tmp_path, COMMIT)
+
+    def test_reports_the_paths_own_root_not_the_default(self, tmp_path):
+        """The point of the helper: a path from another node carries its root."""
+        other_root = tmp_path / "cache-b"
+        path = other_root / "models--org--model" / "snapshots" / COMMIT
+
+        root, _ = snapshot_location("org/model", path)
+
+        assert root == other_root
+
+    def test_matches_without_touching_the_filesystem(self, tmp_path):
+        path = tmp_path / "models--org--model" / "snapshots" / COMMIT
+
+        assert snapshot_location("org/model", path) is not None
+        assert not path.exists()
+
+    def test_rejects_a_repo_directory_for_another_model(self, tmp_path):
+        path = tmp_path / "models--org--other" / "snapshots" / COMMIT
+
+        assert snapshot_location("org/model", path) is None
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            MAIN_REF,
+            COMMIT[:39],
+            COMMIT.upper(),
+            f"{COMMIT}x",
+        ],
+    )
+    def test_rejects_directories_that_are_not_immutable_commits(self, tmp_path, name):
+        path = tmp_path / "models--org--model" / "snapshots" / name
+
+        assert snapshot_location("org/model", path) is None
+
+    def test_rejects_the_repo_root_and_the_refs_tree(self, tmp_path):
+        repo_root = tmp_path / "models--org--model"
+
+        assert snapshot_location("org/model", repo_root) is None
+        assert snapshot_location("org/model", repo_root / "refs" / MAIN_REF) is None
+
+    def test_rejects_an_invalid_model_name(self, tmp_path):
+        path = tmp_path / "models--org--model" / "snapshots" / COMMIT
+
+        assert snapshot_location("/absolute", path) is None
+
+
+class TestIsSnapshotCommitDirectory:
+    """Directory names are the lowercase form huggingface_hub resolves against."""
+
+    def test_accepts_a_lowercase_sha(self):
+        assert is_snapshot_commit_directory(COMMIT) is True
+
+    @pytest.mark.parametrize("name", [COMMIT.upper(), MAIN_REF, "", COMMIT[:39]])
+    def test_rejects_everything_else(self, name):
+        assert is_snapshot_commit_directory(name) is False
