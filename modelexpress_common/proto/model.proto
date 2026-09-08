@@ -67,6 +67,7 @@ enum ModelProvider {
   NGC = 1;
   GCS = 2;
   S3 = 3;
+  OCI = 4;
 }
 
 // Request for streaming model files
