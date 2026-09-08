@@ -100,8 +100,8 @@ The following table lists the configurable parameters of the ModelExpress chart 
 | `serviceAccount.name`                        | Service account name                           | `""`     |
 | `serviceAccount.rbac.enabled`                | Create a ClusterRole and ClusterRoleBinding for the Kubernetes metadata backend | `false` |
 | `podAnnotations`                             | Pod annotations                                | `{}`     |
-| `podSecurityContext`                         | Pod security context                           | `{}`     |
-| `securityContext`                            | Container security context                     | `{}`     |
+| `podSecurityContext`                         | Pod security context                           | `{runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000}` |
+| `securityContext`                            | Container security context                     | `{runAsNonRoot: true}` |
 | `service.type`                               | Service type                                   | `ClusterIP` |
 | `service.port`                               | Service port                                   | `8001`   |
 | `metrics.enabled`                            | Serve Prometheus metrics on their own port     | `true`   |

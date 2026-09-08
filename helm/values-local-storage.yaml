@@ -27,11 +27,8 @@ podAnnotations: {}
 
 podLabels: {}
 
-# Disable security context for local testing - allow running as root
-podSecurityContext: {}
-
-securityContext:
-  runAsNonRoot: false
+# No securityContext override: CI deploys this file, so it must exercise the
+# non-root defaults from values.yaml.
 
 service:
   type: ClusterIP
