@@ -2144,8 +2144,22 @@ type SourceInstanceRef struct {
 	// registration. The topology_aware selector prefers sources in the narrowest
 	// RDMA-fabric domain the target and source share. Empty means unknown (the
 	// selector then falls back to rendezvous ordering for that source).
-	// (#519 took fields 6-8; the load-aware PR's `source_load` will rebase to 10.)
-	Topology      map[string]string `protobuf:"bytes,9,rep,name=topology,proto3" json:"topology,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// (#519 took fields 6-8, #512 took 9, #510 took 10.)
+	Topology map[string]string `protobuf:"bytes,9,rep,name=topology,proto3" json:"topology,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// Source-published busyness estimate in [0, 1] (0 = idle, 1 = saturated).
+	// The source computes it about itself and publishes it; the server only
+	// passes it through (never accumulates it), keeping servers stateless. The
+	// default provider measures the source's RDMA NIC utilization (from its
+	// own port counters); a runtime provider (e.g. vLLM/SGLang serving load)
+	// can supply it instead behind the same field. Consumed by the client
+	// `load_aware` selector to steer new targets toward sources with spare
+	// headroom, so weight transfers avoid contending with a source's in-flight
+	// inference. Ordering-only and advisory. Unset means unknown (an older
+	// client, or a provider with no signal) and ranks as a neutral prior; 0
+	// means measured idle. Presence is what keeps a source with no reading
+	// from outranking one that reports real load.
+	// (#519 took fields 6-8, #512 took 9, #510 took 10.)
+	SourceLoad    *float32 `protobuf:"fixed32,10,opt,name=source_load,json=sourceLoad,proto3,oneof" json:"source_load,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2241,6 +2255,13 @@ func (x *SourceInstanceRef) GetTopology() map[string]string {
 		return x.Topology
 	}
 	return nil
+}
+
+func (x *SourceInstanceRef) GetSourceLoad() float32 {
+	if x != nil && x.SourceLoad != nil {
+		return *x.SourceLoad
+	}
+	return 0
 }
 
 type ListSourcesRequest struct {
@@ -2534,7 +2555,12 @@ type UpdateStatusRequest struct {
 	// New status
 	Status SourceStatus `protobuf:"varint,3,opt,name=status,proto3,enum=model_express.p2p.SourceStatus" json:"status,omitempty"`
 	// worker_id returned from PublishMetadata
-	WorkerId      string `protobuf:"bytes,4,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	WorkerId string `protobuf:"bytes,4,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	// Source-published busyness in [0, 1], refreshed on each heartbeat so the
+	// server's SourceInstanceRef.source_load tracks live load. Leave unset when
+	// no provider has a reading; 0 means measured idle. See
+	// SourceInstanceRef.source_load.
+	SourceLoad    *float32 `protobuf:"fixed32,5,opt,name=source_load,json=sourceLoad,proto3,oneof" json:"source_load,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2595,6 +2621,13 @@ func (x *UpdateStatusRequest) GetWorkerId() string {
 		return x.WorkerId
 	}
 	return ""
+}
+
+func (x *UpdateStatusRequest) GetSourceLoad() float32 {
+	if x != nil && x.SourceLoad != nil {
+		return *x.SourceLoad
+	}
+	return 0
 }
 
 type UpdateStatusResponse struct {
@@ -2847,7 +2880,7 @@ const file_p2p_proto_rawDesc = "" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12 \n" +
 	"\fmx_source_id\x18\x03 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
-	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"\xe1\x03\n" +
+	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"\x97\x04\n" +
 	"\x11SourceInstanceRef\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
@@ -2861,12 +2894,16 @@ const file_p2p_proto_rawDesc = "" +
 	"updated_at\x18\x06 \x01(\x03R\tupdatedAt\x12(\n" +
 	"\rtraining_step\x18\a \x01(\x04H\x00R\ftrainingStep\x88\x01\x01\x12.\n" +
 	"\x10layout_signature\x18\b \x01(\tH\x01R\x0flayoutSignature\x88\x01\x01\x12N\n" +
-	"\btopology\x18\t \x03(\v22.model_express.p2p.SourceInstanceRef.TopologyEntryR\btopology\x1a;\n" +
+	"\btopology\x18\t \x03(\v22.model_express.p2p.SourceInstanceRef.TopologyEntryR\btopology\x12$\n" +
+	"\vsource_load\x18\n" +
+	" \x01(\x02H\x02R\n" +
+	"sourceLoad\x88\x01\x01\x1a;\n" +
 	"\rTopologyEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\x10\n" +
 	"\x0e_training_stepB\x13\n" +
-	"\x11_layout_signature\"\xeb\x03\n" +
+	"\x11_layout_signatureB\x0e\n" +
+	"\f_source_load\"\xeb\x03\n" +
 	"\x12ListSourcesRequest\x12=\n" +
 	"\bidentity\x18\x01 \x01(\v2!.model_express.p2p.SourceIdentityR\bidentity\x12I\n" +
 	"\rstatus_filter\x18\x02 \x01(\x0e2\x1f.model_express.p2p.SourceStatusH\x00R\fstatusFilter\x88\x01\x01\x12/\n" +
@@ -2893,14 +2930,17 @@ const file_p2p_proto_rawDesc = "" +
 	"\fmx_source_id\x18\x03 \x01(\tR\n" +
 	"mxSourceId\x12\x1b\n" +
 	"\tworker_id\x18\x04 \x01(\tR\bworkerId\x12=\n" +
-	"\bidentity\x18\x05 \x01(\v2!.model_express.p2p.SourceIdentityR\bidentity\"\xae\x01\n" +
+	"\bidentity\x18\x05 \x01(\v2!.model_express.p2p.SourceIdentityR\bidentity\"\xe4\x01\n" +
 	"\x13UpdateStatusRequest\x12 \n" +
 	"\fmx_source_id\x18\x01 \x01(\tR\n" +
 	"mxSourceId\x12\x1f\n" +
 	"\vworker_rank\x18\x02 \x01(\rR\n" +
 	"workerRank\x127\n" +
 	"\x06status\x18\x03 \x01(\x0e2\x1f.model_express.p2p.SourceStatusR\x06status\x12\x1b\n" +
-	"\tworker_id\x18\x04 \x01(\tR\bworkerId\"J\n" +
+	"\tworker_id\x18\x04 \x01(\tR\bworkerId\x12$\n" +
+	"\vsource_load\x18\x05 \x01(\x02H\x00R\n" +
+	"sourceLoad\x88\x01\x01B\x0e\n" +
+	"\f_source_load\"J\n" +
 	"\x14UpdateStatusResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage*\x8a\x01\n" +
@@ -3057,6 +3097,7 @@ func file_p2p_proto_init() {
 	file_p2p_proto_msgTypes[9].OneofWrappers = []any{}
 	file_p2p_proto_msgTypes[21].OneofWrappers = []any{}
 	file_p2p_proto_msgTypes[22].OneofWrappers = []any{}
+	file_p2p_proto_msgTypes[26].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
