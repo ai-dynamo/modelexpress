@@ -61,6 +61,8 @@ P2P transfers weight tensors, not the whole model repository. Targets still need
 
 Verify `MX_MODEL_URI` and storage access from inside the runtime container. The prefix must contain the expected safetensors and index/configuration files. Direct ModelStreamer does not use the ModelExpress server.
 
+For vLLM object-storage URIs, set `MX_INSTANT_TENSOR=0`. If logs show InstantTensor reporting weight files referenced by the safetensors index as missing, it has inspected ModelStreamer's partially materialized local cache before ModelStreamer ran. Disabling InstantTensor avoids the failed partial load and subsequent model reinitialization. Complete checkpoints synchronized to local disk can continue to use InstantTensor.
+
 For SGLang, keep the model identity in `--model-path` and the object URI in `MX_MODEL_URI`. Passing the object URI as `--model-path` selects SGLang's native loader. Use the checked-in [vLLM](../examples/model_streamer_k8s/client/vllm/README.md) or [SGLang](../examples/model_streamer_k8s/client/sglang/README.md) examples as the baseline.
 
 ## Kubernetes rollout

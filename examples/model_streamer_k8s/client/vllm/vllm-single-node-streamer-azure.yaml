@@ -73,6 +73,10 @@ spec:
             # Azure Blob path format: az://<container>/<model-prefix>
             - name: MX_MODEL_URI
               value: "az://models/models/deepseek-ai/DeepSeek-V3"
+            # InstantTensor expects a complete local checkpoint; disable it for
+            # object-storage ModelStreamer caches that materialize shards lazily.
+            - name: MX_INSTANT_TENSOR
+              value: "0"
             - name: VLLM_PLUGINS
               value: "modelexpress"
             - name: MX_MS_DISTRIBUTED

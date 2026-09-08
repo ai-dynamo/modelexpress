@@ -1016,6 +1016,8 @@ InstantTensor loads the model's own safetensors directly onto CUDA using distrib
 
 The strategy is enabled by default. The `instanttensor` package is a core dependency on Linux (installed automatically alongside `runai-model-streamer`), so no extra install step is needed. The strategy activates on a CUDA device **when the engine adapter implements the InstantTensor capability**. Currently only the vLLM adapter implements it; on engines that do not (for example SGLang today), the strategy falls through even when `instanttensor` and a CUDA device are available. If the package is unavailable (for example on a non-Linux platform) the chain simply skips to the next strategy.
 
+For vLLM deployments that set `MX_MODEL_URI` to an object-storage URI, set `MX_INSTANT_TENSOR=0`. InstantTensor precedes ModelStreamer in the strategy chain and expects a complete local checkpoint. A ModelStreamer cache may contain the safetensors index before every referenced shard is materialized locally, causing InstantTensor to fail after weight loading has begun and forcing a model reinitialization before ModelStreamer can run. Keep InstantTensor enabled for complete local checkpoints, including weights synchronized to local disk by an init container.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MX_INSTANT_TENSOR` | `1` | Enable the InstantTensor strategy. Set to `0` to disable it and fall through to ModelStreamer/GDS/native loading after any eligible server-cache path. |
@@ -1028,11 +1030,14 @@ ModelStreamer reads safetensor ranges concurrently through a bounded CPU staging
 
 All storage backends (S3, GCS, Azure) are included as core dependencies — no extra install step needed. The strategy activates when `MX_MODEL_URI` is set. See [`../examples/model_streamer_k8s/`](../examples/model_streamer_k8s/) for Kubernetes examples, including the Azure Blob recipe.
 
+For vLLM with an object-storage URI, explicitly set `MX_INSTANT_TENSOR=0` to select ModelStreamer without first probing its partially materialized cache through InstantTensor. This is not required for SGLang, whose adapter does not currently implement the InstantTensor strategy.
+
 **General configuration:**
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MX_MODEL_URI` | (none) | Model location. Must be set to enable ModelStreamer. Accepts a remote URI (`s3://bucket/model`, `gs://...`, `az://...`) or absolute local path (`/models/deepseek-ai/DeepSeek-V4-Pro`). |
+| `MX_INSTANT_TENSOR` | `1` | For vLLM object-storage URIs, set to `0` so ModelStreamer runs after the P2P and server-cache strategies. |
 | `MX_MS_DISTRIBUTED` | `1` | Divide ModelStreamer reads across tensor-parallel ranks and share the results instead of having every rank read the full checkpoint. Requires tensor parallelism > 1 and a CUDA-capable platform; a no-op at TP1. On by default. Set to `0` to disable. |
 | `RUNAI_STREAMER_CONCURRENCY` | `8` | Number of concurrent read threads |
 | `RUNAI_STREAMER_MEMORY_LIMIT` | (none) | CPU staging buffer size in bytes. `0` reuses a single-tensor buffer (most memory efficient). See [runai-model-streamer docs](https://github.com/run-ai/runai-model-streamer). |

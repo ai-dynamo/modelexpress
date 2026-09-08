@@ -102,6 +102,7 @@ Edit [`vllm-single-node-streamer-azure.yaml`](vllm-single-node-streamer-azure.ya
 - Set the `image` to a vLLM image that includes ModelExpress and vLLM `0.18.0` or newer.
 - Set `MODEL_NAME` to the Hugging Face model ID.
 - Set `MX_MODEL_URI` to the `az://<container>/<model-prefix>` URI.
+- Keep `MX_INSTANT_TENSOR=0` so InstantTensor does not inspect ModelStreamer's partially materialized local cache before ModelStreamer runs.
 - Set `--tensor-parallel-size` and GPU requests to match the target model and node shape.
 - Keep `VLLM_PLUGINS=modelexpress`.
 - Keep `MX_MS_DISTRIBUTED=1` for tensor-parallel deployments with TP > 1. It is ignored for TP1.
@@ -149,6 +150,7 @@ kubectl exec deployment/mx-vllm-azure -c vllm -- curl -s http://localhost:8000/v
 
 - Use `az://<container>/<model-prefix>` for `MX_MODEL_URI`; do not use an HTTPS blob URL.
 - Use vLLM `0.18.0` or newer for Azure Blob ModelStreamer support.
+- Keep `MX_INSTANT_TENSOR=0` for object-storage URIs. A missing-shard warning from InstantTensor means it inspected ModelStreamer's local cache before all referenced shards were materialized.
 - If the pod cannot list or read blobs, verify the pod identity has `Storage Blob Data Reader` and that `AZURE_STORAGE_ACCOUNT_NAME` is set.
 - If the upload command fails with missing permissions, the uploader identity needs `Storage Blob Data Contributor`.
 - For TP > 1, keep `MX_MS_DISTRIBUTED=1` so ModelExpress passes distributed streaming to vLLM's native RunAI ModelStreamer loader.
