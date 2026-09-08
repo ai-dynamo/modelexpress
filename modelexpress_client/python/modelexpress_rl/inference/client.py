@@ -15,8 +15,9 @@ from typing import Any
 import grpc
 from modelexpress import auth, envs
 from modelexpress.client import _get_server_url
+from modelexpress.refit.timing import RefitTimingRecorder
 
-from modelexpress_rl import envs as rl_envs
+from modelexpress_rl import envs as rl_envs, timing
 from modelexpress_rl.version import WeightVersionRef
 
 from .. import refit_pb2, refit_pb2_grpc
@@ -155,11 +156,15 @@ class StagedWeightHandle:
         client: ModelExpressGeneratorClient,
         version_id: str,
         update: SessionUpdate | None,
+        timing: RefitTimingRecorder | None = None,
     ) -> None:
         self._client = client
         self.version_id = version_id
         self._update = update
         self._no_op_released = False
+        # A refit's stages are measured across two client calls, so the cycle's
+        # recorder travels on the handle that connects them.
+        self._timing = timing
 
     def release(self) -> None:
         """Release local staging buffers; repeated calls are idempotent."""
@@ -331,20 +336,28 @@ class ModelExpressGeneratorClient:
                     update=None,
                 )
                 return self._active_handle
-            if self._runtime.initial_version_id is not None:
-                chain = self._resolve_replay_chain(version.version_id)
-                update = (
-                    self._runtime.session.stage(chain[0])
-                    if len(chain) == 1
-                    else self._runtime.session.stage_chain(chain)
-                )
-            else:
-                ready = self._get_ready_version(version.version_id)
-                update = self._runtime.session.stage(ready)
+            recorder = timing.start_cycle(
+                version_id=version.version_id,
+                rank=rl_envs.LOCAL_RANK,
+            )
+            with timing.active(recorder):
+                if self._runtime.initial_version_id is not None:
+                    with timing.refit_span("control_discovery"):
+                        chain = self._resolve_replay_chain(version.version_id)
+                    update = (
+                        self._runtime.session.stage(chain[0])
+                        if len(chain) == 1
+                        else self._runtime.session.stage_chain(chain)
+                    )
+                else:
+                    with timing.refit_span("control_discovery"):
+                        ready = self._get_ready_version(version.version_id)
+                    update = self._runtime.session.stage(ready)
             self._active_handle = StagedWeightHandle(
                 client=self,
                 version_id=version.version_id,
                 update=update,
+                timing=recorder,
             )
             return self._active_handle
 
@@ -361,11 +374,18 @@ class ModelExpressGeneratorClient:
                 raise RuntimeError("staged weight has already been released")
             assert self._runtime is not None
             try:
-                result = self._runtime.session.apply(staged._update)
+                with timing.active(staged._timing):
+                    result = self._runtime.session.apply(staged._update)
             except BaseException:
                 if staged._update.installation_started and not staged._update.applied:
                     self._engine_state = _EngineState.UNCERTAIN
                 raise
+            finally:
+                # Reported even when the install raised: a refit that failed
+                # after seconds on the wire is exactly the case the split has to
+                # explain, and dropping the record would leave the failure with
+                # no timing at all.
+                timing.emit(staged._timing, logger)
             self._serving_version_id = staged.version_id
             self._engine_state = _EngineState.READY
             return result
@@ -596,6 +616,10 @@ class ModelExpressGeneratorClient:
                 return
             assert self._runtime is not None
             self._runtime.session.release(staged._update)
+            # Covers a version that was staged and dropped without ever being
+            # installed, which the apply path never sees. A no-op once the apply
+            # has already reported the cycle.
+            timing.emit(staged._timing, logger)
             if self._active_handle is staged:
                 self._active_handle = None
 

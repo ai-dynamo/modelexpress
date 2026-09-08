@@ -10,6 +10,7 @@ from collections.abc import Callable
 from modelexpress import p2p_pb2
 from modelexpress.client import MxClientBase
 
+from ... import timing
 from ...train import WeightPayloadFormat
 from ..adapter import NixlGeneratorSource
 from ..nixl_staged_transfer import (
@@ -27,6 +28,28 @@ from ..plan import (
     WeightSource,
     UpdateMethod,
 )
+
+
+def _attribute_transfer(metrics: dict[str, float]) -> None:
+    """Hand the staging path's own measurements to the active refit cycle.
+
+    Timed inside ``_NixlStagedTransfer`` rather than here, because the wire read
+    and the reconstruction are consecutive statements in one method and cannot be
+    separated from outside it. Both numbers were already on the staged handle;
+    without this they stayed there, and the cycle charged the whole staging call
+    as a single opaque span.
+
+    ``reconstruct_s`` covers replaying the copy chain, the dtype conversions and
+    the device synchronize that makes them observable, which is receive-side
+    work on data already pulled -- so it lands in ``receive_sync`` and not in
+    ``wire_transfer``. Keeping them apart is what distinguishes a slow fabric
+    from an expensive layout.
+    """
+    timing.record_bytes(metrics.get("bytes_received", 0))
+    if "wire_s" in metrics:
+        timing.record_measured("wire_transfer", metrics["wire_s"])
+    if "reconstruct_s" in metrics:
+        timing.record_measured("receive_sync", metrics["reconstruct_s"])
 
 
 class FullTensorNixlUpdateMethod(UpdateMethod):
@@ -94,15 +117,18 @@ class FullTensorNixlUpdateMethod(UpdateMethod):
                 self._active_plan is not None
                 and self._active_fingerprint == inputs.physical_fingerprint
             )
+            timing.record_cold(not reusable)
             if not reusable:
-                self._active_plan = self._transfer.prepare(
-                    manifests=[item.transport.manifest for item in inputs.sources],
-                    capture_layout=self._capture_layout,
-                )
+                with timing.refit_span("transfer_planning"):
+                    self._active_plan = self._transfer.prepare(
+                        manifests=[item.transport.manifest for item in inputs.sources],
+                        capture_layout=self._capture_layout,
+                    )
                 self._active_fingerprint = inputs.physical_fingerprint
             staged = self._transfer.stage(self._active_plan)
         else:
             raise TypeError("full-tensor method received an unsupported source")
+        _attribute_transfer(staged.metrics)
         self._active_staged = staged
         return PreparedEngineTensors(staged=staged)
 

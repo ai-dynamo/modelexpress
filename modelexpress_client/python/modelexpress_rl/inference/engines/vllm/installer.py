@@ -26,6 +26,7 @@ from modelexpress.refit.reshard.geometry import (
     convert_source_weights,
 )
 from modelexpress.refit.reshard.types import IncompleteRefit
+from modelexpress.refit.timing import refit_span
 from modelexpress_rl.inference.plan import (
     EngineCapabilities,
     EngineInstaller,
@@ -213,8 +214,13 @@ class _VllmInstaller(EngineInstaller):
     def install_tensors(self, tensors: dict[str, torch.Tensor]) -> None:
         """Install verified load-layout tensors without changing graph addresses."""
         self._process_and_commit(tensors)
-        _update_mla_absorbed_weights(self._model, quantized=self._is_quantized)
-        torch.cuda.synchronize(self._device)
+        # Derived-weight fixups plus the synchronize that makes the whole
+        # install observable. Separate from the per-layer stages because it is
+        # paid once and does not scale with the number of layers, so folding it
+        # in would make those look worse than they are on small models.
+        with refit_span("post_install"):
+            _update_mla_absorbed_weights(self._model, quantized=self._is_quantized)
+            torch.cuda.synchronize(self._device)
 
     def install_checkpoint(self, path: str | Path) -> None:
         """Reload a prepared safetensors checkpoint into the live model."""
@@ -284,6 +290,12 @@ class _VllmInstaller(EngineInstaller):
                     f"unmatched={unmatched[:10]}"
                 )
 
+            # Per-layer spans, accumulated across every layer into two stages.
+            # This loop is the whole of what a framework sees as "install", and
+            # the two things it does have unrelated costs: post-load processing
+            # is compute that scales with quantization scheme, while the copy
+            # back is bandwidth into storage the CUDA graphs already point at.
+            # Charged together they cannot be acted on.
             for layer, parameters in groups.items():
                 info = LAYERWISE_INFO.get(layer)
                 for full_name, leaf in parameters:
@@ -296,9 +308,11 @@ class _VllmInstaller(EngineInstaller):
                 if isinstance(quant_method, QuantizeMethodBase):
                     if hasattr(layer, "_already_called_process_weights_after_loading"):
                         delattr(layer, "_already_called_process_weights_after_loading")
-                    quant_method.process_weights_after_loading(layer)
+                    with refit_span("transformation"):
+                        quant_method.process_weights_after_loading(layer)
                 if info is not None and info.kernel_tensors is not None:
-                    _copy_and_restore_kernel_tensors(layer, info)
+                    with refit_span("installation"):
+                        _copy_and_restore_kernel_tensors(layer, info)
                 if info is not None:
                     info.reset()
 
