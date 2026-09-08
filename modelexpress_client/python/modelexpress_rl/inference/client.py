@@ -9,6 +9,7 @@ import logging
 import threading
 import uuid
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 import grpc
@@ -29,6 +30,11 @@ from .runtime import GeneratorRuntime
 from .session import SessionUpdate
 
 logger = logging.getLogger("modelexpress_rl.inference.client")
+
+
+class _EngineState(str, Enum):
+    READY = "READY"
+    UNCERTAIN = "UNCERTAIN"
 
 
 def _required(value: str, name: str) -> str:
@@ -55,6 +61,8 @@ class ModelExpressGeneratorConfig:
     lease_ttl_seconds: int | None = None
     # Maximum source-discovery and transfer attempts for one staged update.
     max_transfer_attempts: int = 3
+    # Maximum number of payload revisions applied by one target replay.
+    max_replay_chain_length: int = 64
     # Deadline applied independently to each control-plane or manifest RPC.
     rpc_timeout_seconds: float = 30.0
     # Canonical object-storage checkpoint settings.
@@ -74,6 +82,9 @@ class ModelExpressGeneratorConfig:
             rl_envs.require_positive_int(self.lease_ttl_seconds, "lease_ttl_seconds")
         rl_envs.require_positive_int(
             self.max_transfer_attempts, "max_transfer_attempts"
+        )
+        rl_envs.require_positive_int(
+            self.max_replay_chain_length, "max_replay_chain_length"
         )
         rl_envs.require_positive_float(self.rpc_timeout_seconds, "rpc_timeout_seconds")
         if self.source_order is not None:
@@ -116,11 +127,12 @@ class StagedWeightHandle:
         *,
         client: ModelExpressGeneratorClient,
         version_id: str,
-        update: SessionUpdate,
+        update: SessionUpdate | None,
     ) -> None:
         self._client = client
         self.version_id = version_id
         self._update = update
+        self._no_op_released = False
 
     def release(self) -> None:
         """Release local staging buffers; repeated calls are idempotent."""
@@ -129,11 +141,15 @@ class StagedWeightHandle:
     @property
     def metrics(self) -> dict[str, float]:
         """Return preparation metrics exposed by the selected adapter."""
+        if self._update is None:
+            return {}
         return self._update.prepared.metrics
 
     @property
     def applied(self) -> bool:
         """Return whether engine installation completed."""
+        if self._update is None:
+            return True
         return self._update.applied
 
 
@@ -179,6 +195,7 @@ class ModelExpressGeneratorClient:
         self._operation_lock = threading.RLock()
         self._active_handle: StagedWeightHandle | None = None
         self._serving_version_id: str | None = None
+        self._engine_state = _EngineState.READY
         self._runtime: GeneratorRuntime | None = None
         self._closed = False
 
@@ -219,6 +236,7 @@ class ModelExpressGeneratorClient:
         client._registration_ttl_seconds = registration_ttl_seconds
         client._lease_ttl_seconds = lease_ttl_seconds
         client._rpc_timeout_seconds = config.rpc_timeout_seconds
+        client._max_replay_chain_length = config.max_replay_chain_length
         try:
             runtime = GeneratorRuntime.initialize(
                 engine_context=config.engine_context,
@@ -260,9 +278,32 @@ class ModelExpressGeneratorClient:
                 if self._active_handle.version_id == version.version_id:
                     return self._active_handle
                 raise RuntimeError("another generator update is still active")
-            ready = self._get_ready_version(version.version_id)
             assert self._runtime is not None
-            update = self._runtime.session.stage(ready)
+            if (
+                self._runtime.initial_version_id is not None
+                and version.version_id == self._serving_version_id
+                and self._engine_state is _EngineState.READY
+            ):
+                self._fetch_ready_version(
+                    version.version_id,
+                    target_version_id=version.version_id,
+                )
+                self._active_handle = StagedWeightHandle(
+                    client=self,
+                    version_id=version.version_id,
+                    update=None,
+                )
+                return self._active_handle
+            if self._runtime.initial_version_id is not None:
+                chain = self._resolve_replay_chain(version.version_id)
+                update = (
+                    self._runtime.session.stage(chain[0])
+                    if len(chain) == 1
+                    else self._runtime.session.stage_chain(chain)
+                )
+            else:
+                ready = self._get_ready_version(version.version_id)
+                update = self._runtime.session.stage(ready)
             self._active_handle = StagedWeightHandle(
                 client=self,
                 version_id=version.version_id,
@@ -275,11 +316,21 @@ class ModelExpressGeneratorClient:
         if not isinstance(staged, StagedWeightHandle) or staged._client is not self:
             raise ValueError("staged handle does not belong to this client")
         with self._operation_lock:
+            if staged._update is None:
+                if staged._no_op_released:
+                    raise RuntimeError("staged weight has already been released")
+                return None
             if staged._update.released:
                 raise RuntimeError("staged weight has already been released")
             assert self._runtime is not None
-            result = self._runtime.session.apply(staged._update)
+            try:
+                result = self._runtime.session.apply(staged._update)
+            except BaseException:
+                if staged._update.installation_started and not staged._update.applied:
+                    self._engine_state = _EngineState.UNCERTAIN
+                raise
             self._serving_version_id = staged.version_id
+            self._engine_state = _EngineState.READY
             return result
 
     def close(self) -> None:
@@ -342,42 +393,132 @@ class ModelExpressGeneratorClient:
                 continue
 
     def _get_ready_version(self, version_id: str) -> WeightVersion:
-        response = self._service.GetWeightVersion(
-            refit_pb2.GetWeightVersionRequest(uid=version_id),
-            timeout=self._rpc_timeout_seconds,
+        version = self._fetch_ready_version(
+            version_id,
+            target_version_id=version_id,
         )
-        if not response.HasField("version"):
-            raise RuntimeError("MX GetWeightVersion response is missing version")
-        version = _weight_version(response.version)
-        if version.state is not WeightVersionState.READY:
-            raise RuntimeError(f"weight version {version_id!r} is not READY")
-        if version.model_name != self.model_name:
-            raise RuntimeError("weight version model_name does not match the generator")
         assert self._runtime is not None
-        if self._runtime.initial_version_id is not None:
-            if version.payload_format is WeightPayloadFormat.XOR_DELTA:
-                if version.base_version_id is None:
-                    raise RuntimeError("XOR_DELTA version is missing base_version_id")
-                if (
-                    version.version_id != self._serving_version_id
-                    and version.base_version_id != self._serving_version_id
-                ):
-                    raise RuntimeError(
-                        f"weight version base {version.base_version_id!r} does not "
-                        f"match serving version {self._serving_version_id!r}"
-                    )
-            elif version.payload_format is WeightPayloadFormat.FULL_HF_CHECKPOINT:
-                if version.base_version_id is not None:
-                    raise RuntimeError(
-                        "FULL_HF_CHECKPOINT version must not have base_version_id"
-                    )
-            else:
-                raise RuntimeError(
-                    "object-storage generator requires XOR_DELTA or "
-                    "FULL_HF_CHECKPOINT weight versions"
-                )
         self._runtime.session.validate(version)
         return version
+
+    def _fetch_ready_version(
+        self,
+        version_id: str,
+        *,
+        target_version_id: str,
+    ) -> WeightVersion:
+        try:
+            response = self._service.GetWeightVersion(
+                refit_pb2.GetWeightVersionRequest(uid=version_id),
+                timeout=self._rpc_timeout_seconds,
+            )
+        except grpc.RpcError as error:
+            raise RuntimeError(
+                f"target {target_version_id!r}: failed to resolve revision "
+                f"{version_id!r}: {error.details()}"
+            ) from error
+        if not response.HasField("version"):
+            raise RuntimeError(
+                f"target {target_version_id!r}: MX GetWeightVersion response is "
+                f"missing revision {version_id!r}"
+            )
+        version = _weight_version(response.version)
+        if version.version_id != version_id:
+            raise RuntimeError(
+                f"target {target_version_id!r}: requested revision {version_id!r} "
+                f"but MX returned {version.version_id!r}"
+            )
+        if version.state is not WeightVersionState.READY:
+            raise RuntimeError(
+                f"target {target_version_id!r}: revision {version_id!r} is not READY"
+            )
+        if version.model_name != self.model_name:
+            raise RuntimeError(
+                f"target {target_version_id!r}: revision {version_id!r} model_name "
+                "does not match the generator"
+            )
+        return version
+
+    def _resolve_replay_chain(
+        self,
+        target_version_id: str,
+    ) -> tuple[WeightVersion, ...]:
+        """Resolve a canonical chain completely before payload preparation."""
+        serving_version_id = self._serving_version_id
+        if serving_version_id is None:
+            raise RuntimeError("canonical replay requires a known serving version")
+
+        reverse_chain: list[WeightVersion] = []
+        seen: set[str] = set()
+        revision_id = target_version_id
+        layout_signature: str | None = None
+        while True:
+            if reverse_chain and revision_id == serving_version_id:
+                break
+            if revision_id in seen:
+                raise RuntimeError(
+                    f"target {target_version_id!r}: cycle detected at revision "
+                    f"{revision_id!r}"
+                )
+            if len(reverse_chain) >= self._max_replay_chain_length:
+                raise RuntimeError(
+                    f"target {target_version_id!r}: replay exceeds maximum chain "
+                    f"length {self._max_replay_chain_length} before revision "
+                    f"{revision_id!r}"
+                )
+            seen.add(revision_id)
+            try:
+                version = self._fetch_ready_version(
+                    revision_id,
+                    target_version_id=target_version_id,
+                )
+            except RuntimeError as error:
+                if revision_id != target_version_id:
+                    raise RuntimeError(
+                        f"target {target_version_id!r}: chain does not match serving "
+                        f"version {serving_version_id!r}; {error}"
+                    ) from error
+                raise
+            if version.layout_signature:
+                if layout_signature is None:
+                    layout_signature = version.layout_signature
+                elif version.layout_signature != layout_signature:
+                    raise RuntimeError(
+                        f"target {target_version_id!r}: layout format mismatch at "
+                        f"revision {revision_id!r}"
+                    )
+            if version.object_storage is None:
+                raise RuntimeError(
+                    f"target {target_version_id!r}: no legal source for revision "
+                    f"{revision_id!r}; object-storage source is missing"
+                )
+            reverse_chain.append(version)
+            if version.version_id == serving_version_id:
+                break
+            if version.payload_format is WeightPayloadFormat.FULL_HF_CHECKPOINT:
+                if version.base_version_id is not None:
+                    raise RuntimeError(
+                        f"target {target_version_id!r}: FULL_HF_CHECKPOINT revision "
+                        f"{revision_id!r} must not have base_version_id"
+                    )
+                break
+            if version.payload_format is not WeightPayloadFormat.XOR_DELTA:
+                raise RuntimeError(
+                    f"target {target_version_id!r}: revision {revision_id!r} has "
+                    f"unsupported replay format {version.payload_format.value}"
+                )
+            if version.base_version_id is None:
+                raise RuntimeError(
+                    f"target {target_version_id!r}: XOR_DELTA revision "
+                    f"{revision_id!r} is missing base_version_id"
+                )
+            revision_id = version.base_version_id
+
+        chain = tuple(reversed(reverse_chain))
+        assert self._runtime is not None
+        for version in chain:
+            self._runtime.session.validate(version)
+        return chain
 
     def _validate_initial_base(self, version_id: str) -> None:
         response = self._service.GetWeightVersion(
@@ -461,6 +602,13 @@ class ModelExpressGeneratorClient:
         if staged._client is not self:
             raise ValueError("staged handle does not belong to this client")
         with self._operation_lock:
+            if staged._update is None:
+                if staged._no_op_released:
+                    return
+                staged._no_op_released = True
+                if self._active_handle is staged:
+                    self._active_handle = None
+                return
             if staged._update.released:
                 return
             assert self._runtime is not None

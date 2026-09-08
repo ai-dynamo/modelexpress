@@ -82,6 +82,12 @@ def publish_metadata_and_ready(
 
     tensor_protos = build_tensor_protos(tensors, device_id, worker_rank)
 
+    # This node's RDMA-fabric location, published once so the topology_aware
+    # selector can rank sources by locality. Empty when unconfigured.
+    from ..topology import local_topology
+
+    node_topology = local_topology()
+
     if _is_p2p_metadata_enabled(mx_client):
         from .worker_server import WorkerGrpcServer
 
@@ -114,6 +120,7 @@ def publish_metadata_and_ready(
             agent_name=nixl_manager.agent_name,
             worker_grpc_endpoint=f"{host}:{actual_port}",
             accelerator=accelerator,
+            topology=node_topology,
         )
 
         def publish_fn() -> str:
@@ -147,6 +154,7 @@ def publish_metadata_and_ready(
             tensors=tensor_protos,
             tensor_source=tensor_source_metadata(tensor_protos),
             accelerator=accelerator,
+            topology=node_topology,
         )
 
         def publish_fn() -> str:
@@ -165,6 +173,10 @@ def publish_metadata_and_ready(
 
         cleanup_fn = None
 
+    # Refresh this source's load on each heartbeat so the server advertises
+    # live load for the load_aware selector.
+    from ..nic_metrics import make_source_load_provider
+
     publisher = PublisherThread(
         mx_client=mx_client,
         worker_id=worker_id,
@@ -173,6 +185,7 @@ def publish_metadata_and_ready(
         publish_fn=publish_fn,
         ready_fn=ready_fn,
         cleanup_fn=cleanup_fn,
+        source_load_provider=make_source_load_provider(device_id),
     )
     publisher.start()
     _heartbeat_threads[worker_rank] = publisher

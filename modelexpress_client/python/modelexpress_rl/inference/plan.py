@@ -175,6 +175,21 @@ class UpdateMethod(ABC):
         del prepared
         return nullcontext()
 
+    def prepare_chain(
+        self,
+        chain: tuple[tuple[WeightVersion, ResolvedSource], ...],
+    ) -> PreparedArtifact:
+        """Prepare an ordered version chain as one installable artifact."""
+        if len(chain) != 1:
+            raise RuntimeError(
+                f"{type(self).__name__} does not support version-chain replay"
+            )
+        version, source = chain[0]
+        return self.prepare(version=version, source=source)
+
+    def installation_failed(self, prepared: PreparedArtifact) -> None:
+        """Fence method-owned state after an engine installation failure."""
+
     def publish_applied(self, *, version_id: str, prepared: PreparedArtifact) -> None:
         """Optionally advertise an installed update as a generator source."""
 
@@ -298,9 +313,9 @@ __all__ = [
     "ResolvedSource",
     "StagedEngineTensors",
     "TrainerUpdateSource",
+    "UpdateMethod",
     "WeightSource",
     "SourceResolver",
-    "UpdateMethod",
     "WeightUpdatePlan",
     "WeightUpdatePlanner",
 ]

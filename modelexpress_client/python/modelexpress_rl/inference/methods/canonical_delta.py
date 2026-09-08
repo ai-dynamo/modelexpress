@@ -71,8 +71,24 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
         version: WeightVersion,
         source: ResolvedSource,
     ) -> PreparedArtifact:
+        return self.prepare_chain(((version, source),))
+
+    def prepare_chain(
+        self,
+        chain: tuple[tuple[WeightVersion, ResolvedSource], ...],
+    ) -> PreparedArtifact:
         if self._active is not None:
             raise RuntimeError("release staged weight before staging another version")
+        versions = [self._version(version, source) for version, source in chain]
+        try:
+            checkpoint = self._checkpoint.prepare_chain(tuple(versions))
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
+        self._active = PreparedCheckpointArtifact(checkpoint=checkpoint)
+        return self._active
+
+    @staticmethod
+    def _version(version: WeightVersion, source: ResolvedSource) -> _S3Version:
         if not isinstance(source, ObjectStorageUpdateSource):
             raise TypeError("canonical checkpoint requires an object-storage source")
         storage = source.storage
@@ -86,19 +102,12 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
                 raise ValueError("FULL_HF_CHECKPOINT must not have base_version_id")
         else:
             raise ValueError("unsupported canonical S3 payload format")
-        try:
-            checkpoint = self._checkpoint.prepare(
-                _S3Version(
-                    version_id=version.version_id,
-                    base_version_id=version.base_version_id,
-                    payload_format=version.payload_format,
-                    uri=storage.uri,
-                )
-            )
-        except ValueError as error:
-            raise RuntimeError(str(error)) from error
-        self._active = PreparedCheckpointArtifact(checkpoint=checkpoint)
-        return self._active
+        return _S3Version(
+            version_id=version.version_id,
+            base_version_id=version.base_version_id,
+            payload_format=version.payload_format,
+            uri=storage.uri,
+        )
 
     def installation_context(self, prepared: PreparedArtifact):
         if prepared is not self._active:

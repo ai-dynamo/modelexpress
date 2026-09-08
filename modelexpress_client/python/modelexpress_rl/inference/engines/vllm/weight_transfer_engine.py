@@ -50,6 +50,7 @@ class ModelExpressWeightTransferInitInfo(WeightTransferInitInfo):
     registration_ttl_seconds: int | None = None
     lease_ttl_seconds: int | None = None
     max_transfer_attempts: int = 3
+    max_replay_chain_length: int = 64
     rpc_timeout_seconds: float = 30.0
 
 
@@ -161,6 +162,7 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
                 registration_ttl_seconds=init_info.registration_ttl_seconds,
                 lease_ttl_seconds=init_info.lease_ttl_seconds,
                 max_transfer_attempts=init_info.max_transfer_attempts,
+                max_replay_chain_length=init_info.max_replay_chain_length,
                 rpc_timeout_seconds=init_info.rpc_timeout_seconds,
                 object_storage=object_storage,
             )

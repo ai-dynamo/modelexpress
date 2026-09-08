@@ -259,6 +259,8 @@ impl P2pService for P2pServiceImpl {
                 updated_at: info.updated_at,
                 training_step: info.training_step,
                 layout_signature: info.layout_signature,
+                source_load: info.source_load,
+                topology: info.topology,
             })
             .collect();
 
@@ -394,9 +396,24 @@ impl P2pService for P2pServiceImpl {
             }
         };
 
+        // Publisher-asserted and public. A non-finite value would serialize as
+        // JSON null in the status summary and make the rank unreadable, so it is
+        // treated as "no reading" rather than rejected: rejecting the heartbeat
+        // would trip the client's re-registration path over a telemetry glitch.
+        let source_load = req
+            .source_load
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 1.0));
+
         match self
             .state
-            .update_worker_status(&req.mx_source_id, &req.worker_id, req.worker_rank, status)
+            .update_worker_status(
+                &req.mx_source_id,
+                &req.worker_id,
+                req.worker_rank,
+                status,
+                source_load,
+            )
             .await
         {
             Ok(()) => tagged(
@@ -435,6 +452,7 @@ mod tests {
     use modelexpress_common::grpc::p2p::{
         ArtifactSourceMetadata, MxSourceType, SourceIdentity, SourceStatus, TensorSourceMetadata,
     };
+    use std::collections::HashMap;
 
     fn make_service(mock: MockMetadataBackend) -> P2pServiceImpl {
         P2pServiceImpl::new(Arc::new(P2pStateManager::with_backend(Arc::new(mock))))
@@ -635,6 +653,8 @@ mod tests {
                         agent_name: String::new(),
                         worker_grpc_endpoint: String::new(),
                         accelerator: String::new(),
+                        source_load: None,
+                        topology: Default::default(),
                         artifact_source: None,
                     }],
                     published_at: 1234567890,
@@ -692,6 +712,7 @@ mod tests {
                 worker_id: "worker-uuid-1".to_string(),
                 worker_rank: 0,
                 status: 99,
+                source_load: None,
             }))
             .await
             .expect("rpc")
@@ -709,6 +730,7 @@ mod tests {
                 worker_id: "worker-uuid-1".to_string(),
                 worker_rank: 0,
                 status: SourceStatus::Ready as i32,
+                source_load: None,
             }))
             .await
             .expect("rpc")
@@ -725,6 +747,7 @@ mod tests {
                 worker_id: String::new(),
                 worker_rank: 0,
                 status: SourceStatus::Ready as i32,
+                source_load: None,
             }))
             .await
             .expect("rpc")
@@ -736,8 +759,12 @@ mod tests {
     async fn test_update_status_success() {
         let mut mock = MockMetadataBackend::new();
         mock.expect_update_status()
+            // Assert the request's source_load reaches the backend unchanged.
+            .withf(|_, _, _, _, _, source_load| {
+                source_load.is_some_and(|v| (v - 0.42).abs() < f32::EPSILON)
+            })
             .once()
-            .returning(|_, _, _, _, _| Ok(()));
+            .returning(|_, _, _, _, _, _| Ok(()));
 
         let svc = make_service(mock);
         let resp = svc
@@ -746,6 +773,7 @@ mod tests {
                 worker_id: "worker-uuid-1".to_string(),
                 worker_rank: 3,
                 status: SourceStatus::Ready as i32,
+                source_load: Some(0.42),
             }))
             .await
             .expect("rpc")
@@ -809,6 +837,8 @@ mod tests {
                         status: SourceStatus::Ready as i32,
                         updated_at: now,
                         accelerator: "cuda".to_string(),
+                        source_load: Some(0.25),
+                        topology: HashMap::from([("rack".to_string(), "r3".to_string())]),
                         training_step: Some(42),
                         layout_signature: Some("layout-a".to_string()),
                     },
@@ -820,6 +850,8 @@ mod tests {
                         status: SourceStatus::Ready as i32,
                         updated_at: now,
                         accelerator: "cuda".to_string(),
+                        source_load: Some(0.75),
+                        topology: Default::default(),
                         training_step: Some(42),
                         layout_signature: Some("layout-a".to_string()),
                     },
@@ -843,6 +875,12 @@ mod tests {
         assert_eq!(resp.instances.len(), 2);
         assert_eq!(resp.instances[0].worker_id, "w1");
         assert_eq!(resp.instances[0].worker_rank, 0);
+        assert_eq!(resp.instances[0].source_load, Some(0.25));
+        assert_eq!(
+            resp.instances[0].topology.get("rack").map(String::as_str),
+            Some("r3"),
+            "topology surfaces onto the SourceInstanceRef"
+        );
         assert_eq!(resp.instances[0].accelerator, "cuda");
         assert_eq!(resp.instances[0].updated_at, now);
         assert_eq!(resp.instances[0].training_step, Some(42));
@@ -852,6 +890,7 @@ mod tests {
         );
         assert_eq!(resp.instances[1].worker_id, "w2");
         assert_eq!(resp.instances[1].worker_rank, 1);
+        assert_eq!(resp.instances[1].source_load, Some(0.75));
     }
 
     #[tokio::test]
@@ -875,6 +914,8 @@ mod tests {
                     status: SourceStatus::Ready as i32,
                     updated_at: now,
                     accelerator: "cuda".to_string(),
+                    source_load: None,
+                    topology: Default::default(),
                     training_step: None,
                     layout_signature: None,
                 }])
@@ -914,6 +955,8 @@ mod tests {
                         status: SourceStatus::Ready as i32,
                         updated_at: now,
                         accelerator: "cuda".to_string(),
+                        source_load: None,
+                        topology: Default::default(),
                         training_step: None,
                         layout_signature: None,
                     },
@@ -925,6 +968,8 @@ mod tests {
                         status: SourceStatus::Ready as i32,
                         updated_at: expired_updated_at,
                         accelerator: "cuda".to_string(),
+                        source_load: None,
+                        topology: Default::default(),
                         training_step: None,
                         layout_signature: None,
                     },
@@ -966,6 +1011,8 @@ mod tests {
                         agent_name: "artifact-agent".to_string(),
                         worker_grpc_endpoint: "10.0.0.1:6555".to_string(),
                         accelerator: "cuda".to_string(),
+                        source_load: None,
+                        topology: Default::default(),
                         artifact_source: Some(
                             ArtifactSourceMetadata {
                                 artifact_id: "sha256:artifact".to_string(),
@@ -1155,7 +1202,7 @@ mod tests {
         let mut mock = MockMetadataBackend::new();
         mock.expect_update_status()
             .once()
-            .returning(|_, _, _, _, _| Err("write failed".into()));
+            .returning(|_, _, _, _, _, _| Err("write failed".into()));
 
         let svc = make_service(mock);
         let resp = svc
@@ -1164,6 +1211,7 @@ mod tests {
                 worker_id: "worker-uuid-1".to_string(),
                 worker_rank: 0,
                 status: SourceStatus::Ready as i32,
+                source_load: None,
             }))
             .await
             .expect("rpc")

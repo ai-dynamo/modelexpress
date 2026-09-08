@@ -32,7 +32,6 @@
 .env.local
 *.local.toml
 .cargo/
-.claude/skills/
 
 # Backup files
 *~
