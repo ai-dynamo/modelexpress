@@ -22,12 +22,12 @@ from modelexpress_rl.version import WeightVersionRef
 from .. import refit_pb2, refit_pb2_grpc
 from ..control import WeightVersion, WeightVersionState, _weight_version
 from ..object_storage import ObjectStorageType
-from ..train import WeightPayloadFormat
 from .adapter import GeneratorEngineContext
 from .plan import WeightSource
 from .receiver import ObjectStorageGeneratorConfig
 from .runtime import GeneratorRuntime
 from .session import SessionUpdate
+from .version_chain import resolve_replay_chain
 
 logger = logging.getLogger("modelexpress_rl.inference.client")
 
@@ -447,74 +447,15 @@ class ModelExpressGeneratorClient:
         serving_version_id = self._serving_version_id
         if serving_version_id is None:
             raise RuntimeError("canonical replay requires a known serving version")
-
-        reverse_chain: list[WeightVersion] = []
-        seen: set[str] = set()
-        revision_id = target_version_id
-        layout_signature: str | None = None
-        while True:
-            if reverse_chain and revision_id == serving_version_id:
-                break
-            if revision_id in seen:
-                raise RuntimeError(
-                    f"target {target_version_id!r}: cycle detected at revision "
-                    f"{revision_id!r}"
-                )
-            if len(reverse_chain) >= self._max_replay_chain_length:
-                raise RuntimeError(
-                    f"target {target_version_id!r}: replay exceeds maximum chain "
-                    f"length {self._max_replay_chain_length} before revision "
-                    f"{revision_id!r}"
-                )
-            seen.add(revision_id)
-            try:
-                version = self._fetch_ready_version(
-                    revision_id,
-                    target_version_id=target_version_id,
-                )
-            except RuntimeError as error:
-                if revision_id != target_version_id:
-                    raise RuntimeError(
-                        f"target {target_version_id!r}: chain does not match serving "
-                        f"version {serving_version_id!r}; {error}"
-                    ) from error
-                raise
-            if version.layout_signature:
-                if layout_signature is None:
-                    layout_signature = version.layout_signature
-                elif version.layout_signature != layout_signature:
-                    raise RuntimeError(
-                        f"target {target_version_id!r}: layout format mismatch at "
-                        f"revision {revision_id!r}"
-                    )
-            if version.object_storage is None:
-                raise RuntimeError(
-                    f"target {target_version_id!r}: no legal source for revision "
-                    f"{revision_id!r}; object-storage source is missing"
-                )
-            reverse_chain.append(version)
-            if version.version_id == serving_version_id:
-                break
-            if version.payload_format is WeightPayloadFormat.FULL_HF_CHECKPOINT:
-                if version.base_version_id is not None:
-                    raise RuntimeError(
-                        f"target {target_version_id!r}: FULL_HF_CHECKPOINT revision "
-                        f"{revision_id!r} must not have base_version_id"
-                    )
-                break
-            if version.payload_format is not WeightPayloadFormat.XOR_DELTA:
-                raise RuntimeError(
-                    f"target {target_version_id!r}: revision {revision_id!r} has "
-                    f"unsupported replay format {version.payload_format.value}"
-                )
-            if version.base_version_id is None:
-                raise RuntimeError(
-                    f"target {target_version_id!r}: XOR_DELTA revision "
-                    f"{revision_id!r} is missing base_version_id"
-                )
-            revision_id = version.base_version_id
-
-        chain = tuple(reversed(reverse_chain))
+        chain = resolve_replay_chain(
+            target_version_id=target_version_id,
+            fetch_ready_version=lambda version_id: self._fetch_ready_version(
+                version_id,
+                target_version_id=target_version_id,
+            ),
+            max_chain_length=self._max_replay_chain_length,
+            stop_before_version_id=serving_version_id,
+        )
         assert self._runtime is not None
         for version in chain:
             self._runtime.session.validate(version)

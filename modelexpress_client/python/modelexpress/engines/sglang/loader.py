@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 
 from ... import envs, p2p_pb2
-from ...load_strategy import LoadContext, LoadStrategyChain
+from ...load_strategy import LoadContext, run_load_strategy_chain
 from ...load_strategy.base import clear_exception_tracebacks
 from ...load_strategy.context import LoadResult
 from ...metadata.publisher import PublisherThread
@@ -129,7 +129,7 @@ class MxModelLoader:
         with selection_metrics.time_load_phase(
             "sglang", ctx.identity.model_name, "chain"
         ):
-            model = LoadStrategyChain.run(model, ctx)
+            model = run_load_strategy_chain(model, ctx)
 
         _tensor_registry[ctx.device_id] = ctx.tensors
         if ctx.nixl_manager is not None:
