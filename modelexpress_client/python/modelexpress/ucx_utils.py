@@ -167,9 +167,8 @@ def _pci_path_components(bdf: str) -> list[str]:
     The returned list keeps the root-complex component (``pci0000:00``)
     followed by the BDF-shaped components, in order from closest-to-root
     to leaf. Common-prefix length between two such lists encodes PCIe
-    affinity (longer prefix = same root complex / switch / bridge), which
-    is exactly the metric nvidia-smi topo -m uses to label PIX / PXB / PHB
-    / NODE / SYS connections.
+    affinity, which is exactly the metric nvidia-smi topo -m uses to label
+    PIX / PXB / PHB / NODE / SYS connections.
 
     Returns [] on any read failure.
     """
