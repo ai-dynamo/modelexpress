@@ -43,6 +43,12 @@ ENV_SELECTOR = "MX_P2P_SOURCE_SELECTOR"
 DEFAULT_SELECTOR = "random"
 
 
+def configured_topology_filter_level() -> str | None:
+    """Return the normalized hard topology-filter level, if enabled."""
+    level = (envs.MX_P2P_TOPOLOGY_FILTER_LEVEL or "").strip()
+    return level or None
+
+
 def filter_candidates_by_topology(
     candidates: list[p2p_pb2.SourceInstanceRef],
     ctx: LoadContext,
@@ -56,7 +62,7 @@ def filter_candidates_by_topology(
     rejected in this mode so an unreachable peer cannot trigger a mutated-model
     retry; the strategy then falls through to local loading.
     """
-    level = (envs.MX_P2P_TOPOLOGY_FILTER_LEVEL or "").strip()
+    level = configured_topology_filter_level()
     if not level:
         return candidates
 

@@ -305,6 +305,7 @@ def test_no_peers_published_records_a_zero_funnel(monkeypatch):
     m = MagicMock()
     monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
     monkeypatch.delenv(ENV_SELECTOR, raising=False)
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_FILTER_LEVEL", "   ")
 
     ctx = _rdma_ctx([])
     assert RdmaStrategy()._find_source_instances(ctx) == []
@@ -336,11 +337,14 @@ def test_successful_listing_records_an_ok_outcome(monkeypatch):
     m = MagicMock()
     monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
     monkeypatch.setenv(ENV_SELECTOR, "rendezvous_hash")
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_FILTER_LEVEL", "   ")
 
     ctx = _rdma_ctx([_ref("s0aaaaaaaaaaaaaa", "w0", worker_rank=0)])
     RdmaStrategy()._find_source_instances(ctx)
 
     m.record_list_sources.assert_called_once_with("rendezvous_hash", "ok")
+    stages = {call.args[1] for call in m.observe_candidates.call_args_list}
+    assert "topology_matched" not in stages
 
 
 def test_find_source_instances_filters_incompatible_accelerator():

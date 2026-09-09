@@ -14,9 +14,10 @@ from typing import TYPE_CHECKING, ClassVar
 import torch.nn as nn
 
 from .. import envs
+from ..adapter import StrategyRecoveryError
+from ..metadata.publish import publish_metadata_and_ready
 from ..nixl_transfer import is_nixl_available
 from ..tensor_utils import log_tensor_summary
-from ..metadata.publish import publish_metadata_and_ready
 from .context import LoadContext, LoadResult
 
 if TYPE_CHECKING:
@@ -26,6 +27,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger("modelexpress.load_strategy")
 
 
+class IteratorCleanupError(StrategyRecoveryError):
+    """Raised when abandoned weight-iterator resources cannot be released."""
+
+
 def close_weight_iterator(weights_iter, *, worker_rank: int) -> None:
     """Release loader-owned buffers when a weight iterator is abandoned.
 
@@ -33,20 +38,18 @@ def close_weight_iterator(weights_iter, *, worker_rank: int) -> None:
     staging tensors, file descriptors, or a native streamer handle.  Python's
     generator finalization is not prompt while an exception traceback is still
     being unwound, so close an abandoned iterator explicitly before retry
-    reinitializes the model.  Cleanup is best effort and never masks the load
-    failure that triggered it.
+    reinitializes the model. Cleanup failures are recovery failures because
+    retrying with live staging resources can trigger a second-model OOM.
     """
     close = getattr(weights_iter, "close", None)
     if not callable(close):
         return
     try:
         close()
-    except Exception as exc:  # noqa: BLE001 - cleanup must not mask load errors
-        logger.warning(
-            "[Worker %s] Failed to close abandoned weight iterator: %s",
-            worker_rank,
-            exc,
-        )
+    except Exception as exc:
+        raise IteratorCleanupError(
+            f"[Worker {worker_rank}] Failed to close abandoned weight iterator: {exc}"
+        ) from exc
 
 
 def clear_exception_tracebacks(exc: BaseException) -> None:

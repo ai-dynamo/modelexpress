@@ -21,6 +21,7 @@ from ..metrics import metrics as selection_metrics
 from ..nixl_transfer import is_nixl_available
 from ..source_selection import (
     configured_policy_label,
+    configured_topology_filter_level,
     filter_candidates_by_topology,
     get_configured_selector,
 )
@@ -300,7 +301,7 @@ class RdmaStrategy(LoadStrategy):
                 # identical on a dashboard.
                 selection_metrics.record_list_sources(policy, "empty")
                 empty_stages = ("listed", "rank_matched", "accelerator_matched")
-                if envs.MX_P2P_TOPOLOGY_FILTER_LEVEL:
+                if configured_topology_filter_level():
                     empty_stages += ("topology_matched",)
                 for stage in empty_stages:
                     selection_metrics.observe_candidates(policy, stage, 0)
@@ -346,7 +347,7 @@ class RdmaStrategy(LoadStrategy):
             selection_metrics.observe_candidates(
                 selector.name, "accelerator_matched", len(accelerator_matched)
             )
-            if envs.MX_P2P_TOPOLOGY_FILTER_LEVEL:
+            if configured_topology_filter_level():
                 selection_metrics.observe_candidates(
                     selector.name, "topology_matched", len(candidates)
                 )

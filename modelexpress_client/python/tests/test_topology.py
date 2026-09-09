@@ -214,6 +214,13 @@ def test_hard_filter_is_disabled_by_default(monkeypatch):
     assert filter_candidates_by_topology(candidates, _ctx()) == candidates
 
 
+def test_hard_filter_whitespace_only_is_disabled(monkeypatch):
+    from modelexpress.source_selection import configured_topology_filter_level
+
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_FILTER_LEVEL", "   ")
+    assert configured_topology_filter_level() is None
+
+
 def test_within_tier_spreads_deterministically(monkeypatch):
     # Sources all in the same rack (equidistant): topology gives no signal, so
     # the jitter tiebreak decides -- deterministic and identical to rendezvous.
