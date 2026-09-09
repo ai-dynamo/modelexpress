@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-
 from modelexpress import envs, p2p_pb2
 from modelexpress.client import MxClientBase
 from modelexpress.load_strategy.base import unpublish_metadata_for_worker
@@ -129,11 +128,12 @@ def _source_structure(source) -> tuple:
     return (
         source.dtype,
         tuple(source.global_shape),
+        source.elsize,
         tuple(
             (
-                shard.agent_name,
-                shard.device_id,
+                shard.session,
                 shard.addr,
+                shard.elsize,
                 tuple(shard.shard_offset),
                 tuple(shard.shape),
             )
