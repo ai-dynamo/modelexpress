@@ -14,7 +14,9 @@ s3_endpoint_url=http://vime-delta-refit-minio:9000
 s3_region=us-east-1
 generation_url=http://vime-delta-refit-generation:8000
 discovery_url=http://vime-delta-refit-frontend-admin:8001
-num_rollout=100
+# CI overrides these while the standalone example keeps its original behavior.
+num_rollout=${NUM_ROLLOUT:-100}
+full_hf_checkpoint_interval=${FULL_HF_CHECKPOINT_INTERVAL:-None}
 scratch=/mxdelta/$run_id
 vime_root=/root/vime
 
@@ -76,6 +78,7 @@ print(json.dumps({
     "preparation_cache_dir": "$scratch/mx-prepare",
     "rpc_timeout_seconds": 30.0,
     "max_transfer_attempts": 3,
+    "full_hf_checkpoint_interval": $full_hf_checkpoint_interval,
 }))
 PY
 )

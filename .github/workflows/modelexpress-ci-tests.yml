@@ -68,7 +68,7 @@
 #                         entry. Relies on the cluster-wide Dynamo operator
 #                         installed in dynamo-system by setup-mx-vcluster.
 #
-#   test-vime-delta-refit — conditionally runs a two-step Vime TP2 + Dynamo
+#   test-vime-delta-refit — conditionally runs a ten-step Vime TP2 + Dynamo
 #                           vLLM TP1 smoke through ModelExpress and MinIO.
 #
 #   test-stale-metadata — Reaper-correctness check. mx-server runs with the
@@ -1016,7 +1016,7 @@ jobs:
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
 
-  # Two-step TP2 trainer + TP1 rollout smoke using MinIO for delta objects.
+  # Ten-step TP2 trainer + TP1 rollout smoke using MinIO for delta objects.
   test-vime-delta-refit:
     name: Vime delta-refit smoke
     if: vars.MX_VIME_DELTA_REFIT_CI_ENABLED == 'true'
@@ -1069,7 +1069,7 @@ jobs:
             --from-literal=MINIO_ROOT_PASSWORD=delta-refit-smoke
           kubectl -n "${NAMESPACE}" create secret generic hf-token-secret \
             --from-literal=HF_TOKEN="${HF_TOKEN}"
-          sed "s|WORKER_IMAGE|${WORKER_IMAGE}|g" ci/rl/model-cache.yaml \
+          sed "s|WORKER_IMAGE|${WORKER_IMAGE}|g" ci/rl/model-download.yaml \
             | kubectl -n "${NAMESPACE}" create -f -
           kubectl -n "${NAMESPACE}" wait --for=jsonpath='{.status.phase}'=Bound \
             persistentvolumeclaim/shared-model-cache --timeout=5m

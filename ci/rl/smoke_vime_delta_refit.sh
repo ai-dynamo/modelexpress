@@ -30,11 +30,11 @@ sed -e "s|WORKER_IMAGE|$worker_image|g" -e "s|MODEL_SUBPATH|$model_subpath|g" \
 "${k[@]}" rollout status deployment/vime-delta-refit-mx --timeout=5m
 "${k[@]}" wait --for=condition=Ready dynamographdeployment/vime-delta-refit --timeout=15m
 
-# Start the example trainer with its 100 steps reduced to two for CI.
+# Run ten CI steps with a full Hugging Face checkpoint at versions 5 and 10.
 sed -e "s|TRAINER_IMAGE|$trainer_image|g" -e "s|MODEL_SUBPATH|$model_subpath|g" \
   "$example/trainer.yaml" \
   | kubectl patch --local --type=strategic -f - \
-      -p '{"spec":{"activeDeadlineSeconds":1800,"nodeSelector":{"agentpool":"a100b"},"tolerations":[{"key":"nvidia.com/gpu","operator":"Exists","effect":"NoSchedule"},{"key":"no-datadog","operator":"Exists","effect":"NoExecute"}],"containers":[{"name":"trainer","command":["/bin/bash","-lc"],"args":["sed s/num_rollout=100/num_rollout=2/ /opt/delta-refit/trainer.sh >/tmp/trainer.sh && grep -qx num_rollout=2 /tmp/trainer.sh && exec bash /tmp/trainer.sh"]}]}}' \
+      -p '{"spec":{"activeDeadlineSeconds":1800,"nodeSelector":{"agentpool":"a100b"},"tolerations":[{"key":"nvidia.com/gpu","operator":"Exists","effect":"NoSchedule"},{"key":"no-datadog","operator":"Exists","effect":"NoExecute"}],"containers":[{"name":"trainer","env":[{"name":"NUM_ROLLOUT","value":"10"},{"name":"FULL_HF_CHECKPOINT_INTERVAL","value":"5"}]}]}}' \
       -o yaml \
   | "${k[@]}" create -f -
 
@@ -43,12 +43,19 @@ sed -e "s|TRAINER_IMAGE|$trainer_image|g" -e "s|MODEL_SUBPATH|$model_subpath|g" 
 "${k[@]}" logs --follow pod/vime-delta-refit-trainer | tee "$logs/trainer.log"
 "${k[@]}" wait --for=jsonpath='{.status.phase}'=Succeeded pod/vime-delta-refit-trainer --timeout=1m
 
-# Verify that training finished and vLLM installed both delta versions.
+# Verify training, the final install, and the periodic full-checkpoint cadence.
 worker=$("${k[@]}" get pod \
   -l nvidia.com/dynamo-graph-deployment-name=vime-delta-refit,nvidia.com/dynamo-component=VLLMWorker \
   -o jsonpath='{.items[0].metadata.name}')
 "${k[@]}" logs "$worker" -c vllm-engine | tee "$logs/vllm.log"
 grep -qx 'TRAINING COMPLETE' "$logs/trainer.log"
-grep -Fq 'ModelExpress weight update finished version=vime-delta-refit-v1' "$logs/vllm.log"
-grep -Fq 'ModelExpress weight update finished version=vime-delta-refit-v2' "$logs/vllm.log"
+grep -Fq 'ModelExpress weight update finished version=vime-delta-refit-v10' "$logs/vllm.log"
+"${k[@]}" exec deployment/vime-delta-refit-mx -c modelexpress -- python3 -c '
+from modelexpress_rl import ModelExpressControlClient, WeightPayloadFormat
+with ModelExpressControlClient.connect(server_url="127.0.0.1:8101") as control:
+    actual = [control.get_weight_version(f"vime-delta-refit-v{version}").payload_format for version in range(1, 11)]
+expected = [WeightPayloadFormat.XOR_DELTA] * 4 + [WeightPayloadFormat.FULL_HF_CHECKPOINT]
+expected += [WeightPayloadFormat.XOR_DELTA] * 4 + [WeightPayloadFormat.FULL_HF_CHECKPOINT]
+assert actual == expected, actual
+'
 echo "SMOKE PASS"

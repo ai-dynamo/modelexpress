@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# Inference CI downloads per Pod; RL needs one local seed visible to both the
+# trainer and rollout worker, so this creates per-run RWX staging.
+
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
