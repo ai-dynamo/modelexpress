@@ -8,10 +8,13 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import time
 from typing import Any
 
 import torch.distributed as dist
 
+from modelexpress import envs as mx_envs
+from modelexpress_rl import timing
 from modelexpress_rl.train.adapter import (
     CompletionFence,
     NixlMetadataProvider,
@@ -41,6 +44,7 @@ class MegatronTrainerAdapter(TrainerEngineAdapter):
         self._nixl_metadata_endpoint = nixl_metadata_endpoint
         self._source_slot_id: str | None = None
         self._registered_addrs: dict[str, int] | None = None
+        self._manifest: WeightVersionShardManifest | None = None
 
     @property
     def source_slot_id(self) -> str:
@@ -73,7 +77,9 @@ class MegatronTrainerAdapter(TrainerEngineAdapter):
         ).hexdigest()
         source_slot_id = f"megatron:partition:{digest}"
         if self._source_slot_id is not None and self._source_slot_id != source_slot_id:
-            raise RuntimeError("Megatron logical tensor partition changed after binding")
+            raise RuntimeError(
+                "Megatron logical tensor partition changed after binding"
+            )
         self._source_slot_id = source_slot_id
         return source_slot_id
 
@@ -110,35 +116,62 @@ class MegatronTrainerAdapter(TrainerEngineAdapter):
             raise ValueError("Megatron tensor names must be unique within this rank")
         addresses = {name: tensor.data_ptr() for name, tensor in sources.items()}
         if self._registered_addrs is None:
+            started = time.perf_counter()
             self._manager.register_tensors(sources)
+            duration = time.perf_counter() - started
+            timing.record_measured(
+                "setup_registration",
+                duration,
+                metadata={"trainer_registration_s": duration},
+            )
             self._registered_addrs = addresses
         elif addresses != self._registered_addrs:
             raise RuntimeError(
                 "Megatron source storage changed after NIXL registration; "
                 "IN_PLACE requires stable tensor addresses"
             )
-        published = build_hf_aliases(
-            tensors,
-            agent_name=str(self._manager.agent_name),
-        )
-        manifest = build_megatron_reshard_manifest(
-            manager=self._manager,
-            published=published,
-            metadata_endpoint=self._nixl_metadata_endpoint,
-        )
-        total_bytes = sum(
-            math.prod(shard.shape) * tensor.elsize
-            for tensor in manifest.tensors
-            for shard in tensor.shards
-        )
-
-        return StagedWeightVersionShardData(
-            manifest=WeightVersionShardManifest(
+        cache_hit = self._manifest is not None and not mx_envs.MX_RESHARD_PUBLISH_DIGEST
+        if not cache_hit:
+            started = time.perf_counter()
+            published = build_hf_aliases(
+                tensors,
+                agent_name=str(self._manager.agent_name),
+            )
+            manifest = build_megatron_reshard_manifest(
+                manager=self._manager,
+                published=published,
+                metadata_endpoint=self._nixl_metadata_endpoint,
+            )
+            duration = time.perf_counter() - started
+            total_bytes = sum(
+                math.prod(shard.shape) * tensor.elsize
+                for tensor in manifest.tensors
+                for shard in tensor.shards
+            )
+            self._manifest = WeightVersionShardManifest(
                 data=manifest.blob,
                 tensor_count=len(manifest.tensors),
                 total_bytes=total_bytes,
                 transport="NIXL",
-            ),
+            )
+            timing.record_measured(
+                "source_preparation",
+                duration,
+                metadata={"manifest_generation_s": duration},
+            )
+        assert self._manifest is not None
+        timing.record_measured(
+            "source_preparation",
+            0.0,
+            metadata={
+                "manifest_bytes": len(self._manifest.data),
+                "manifest_cache_hit": cache_hit,
+                "manifest_tensor_count": self._manifest.tensor_count,
+            },
+        )
+
+        return StagedWeightVersionShardData(
+            manifest=self._manifest,
             # IN_PLACE performs no asynchronous copy, so the shard is ready to
             # publish as soon as its manifest has been built.
             publish_ready=CompletionFence(lambda: None),

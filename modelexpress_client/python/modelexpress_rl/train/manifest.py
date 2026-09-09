@@ -51,6 +51,11 @@ class WeightVersionShardManifestService(refit_pb2_grpc.RefitWorkerServiceService
             self._manifests[key] = manifest
         return self.endpoint
 
+    def release_manifest(self, *, version_id: str, source_slot_id: str) -> None:
+        key = (version_id, source_slot_id)
+        with self._lock:
+            self._manifests.pop(key, None)
+
     def GetWeightVersionShardManifest(self, request, context):
         key = (request.version_id, request.source_slot_id)
         with self._lock:

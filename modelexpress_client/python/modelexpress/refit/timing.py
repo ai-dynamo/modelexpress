@@ -17,9 +17,9 @@ import logging
 import os
 import sys
 import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterator
-
+from typing import Any
 
 MX_REFIT_TIMING_PREFIX = "MX_REFIT_TIMING"
 REFIT_TIMING_STAGES = (
@@ -35,7 +35,7 @@ REFIT_TIMING_STAGES = (
     "rollout_readiness",
 )
 _STAGE_SET = frozenset(REFIT_TIMING_STAGES)
-_current_recorder: contextvars.ContextVar["RefitTimingRecorder | None"] = (
+_current_recorder: contextvars.ContextVar[RefitTimingRecorder | None] = (
     contextvars.ContextVar("mx_refit_timing_recorder", default=None)
 )
 
@@ -115,6 +115,7 @@ class RefitTimingRecorder:
         *,
         status: str = "ok",
         metadata: dict[str, Any] | None = None,
+        accumulate_metadata: bool = False,
     ) -> None:
         """Add an externally measured duration to a normalized stage."""
         self._validate_stage(stage)
@@ -126,7 +127,15 @@ class RefitTimingRecorder:
         if status not in item.statuses:
             item.statuses.append(status)
         if metadata:
-            item.metadata.update(metadata)
+            for name, value in metadata.items():
+                if (
+                    accumulate_metadata
+                    and isinstance(value, (int, float))
+                    and isinstance(item.metadata.get(name, 0), (int, float))
+                ):
+                    item.metadata[name] = item.metadata.get(name, 0) + value
+                else:
+                    item.metadata[name] = value
 
     def mark_not_applicable(
         self,
@@ -220,15 +229,13 @@ class RefitTimingRecorder:
             return self._emitted_payload
         self.finish()
         payload = self.as_dict()
-        line = "%s %s" % (
-            MX_REFIT_TIMING_PREFIX,
-            json.dumps(
-                payload,
-                separators=(",", ":"),
-                sort_keys=False,
-                default=str,
-            ),
+        encoded = json.dumps(
+            payload,
+            separators=(",", ":"),
+            sort_keys=False,
+            default=str,
         )
+        line = f"{MX_REFIT_TIMING_PREFIX} {encoded}"
         logger.info("%s", line)
         if os.environ.get("MX_REFIT_TIMING_STDOUT", "0") != "0":
             print(line, flush=True, file=sys.stdout)

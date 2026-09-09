@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 
 from modelexpress import p2p_pb2
@@ -19,14 +20,14 @@ from ..nixl_staged_transfer import (
     _StagedNixlWeights,
 )
 from ..plan import (
-    MethodCapabilities,
     GeneratorPeerUpdateSource,
+    MethodCapabilities,
     PreparedArtifact,
     PreparedEngineTensors,
     ResolvedSource,
     TrainerUpdateSource,
-    WeightSource,
     UpdateMethod,
+    WeightSource,
 )
 
 
@@ -79,6 +80,7 @@ class FullTensorNixlUpdateMethod(UpdateMethod):
         self._enable_peer_publication = enable_peer_publication
         self._active_plan: _PreparedNixlTransfer | None = None
         self._active_fingerprint: tuple | None = None
+        self._active_manifest_digests: tuple[str, ...] = ()
         self._active_staged: _StagedNixlWeights | None = None
 
     @property
@@ -106,6 +108,7 @@ class FullTensorNixlUpdateMethod(UpdateMethod):
             )
             self._active_plan = None
             self._active_fingerprint = None
+            self._active_manifest_digests = ()
         elif isinstance(source, TrainerUpdateSource):
             inputs = source.inputs
             if any(
@@ -113,18 +116,53 @@ class FullTensorNixlUpdateMethod(UpdateMethod):
                 for item in inputs.sources
             ):
                 raise ValueError("full-tensor method requires NIXL sources")
+            fingerprint_started = time.perf_counter()
             reusable = (
                 self._active_plan is not None
                 and self._active_fingerprint == inputs.physical_fingerprint
             )
+            fingerprint_s = time.perf_counter() - fingerprint_started
+            timing.record_measured(
+                "source_preparation",
+                fingerprint_s,
+                metadata={"fingerprint_compare_s": fingerprint_s},
+                accumulate_metadata=True,
+            )
             timing.record_cold(not reusable)
+            manifests = [item.transport.manifest for item in inputs.sources]
+            manifest_digests = tuple(item.manifest_digest for item in inputs.sources)
             if not reusable:
-                with timing.refit_span("transfer_planning"):
-                    self._active_plan = self._transfer.prepare(
-                        manifests=[item.transport.manifest for item in inputs.sources],
-                        capture_layout=self._capture_layout,
-                    )
+                started = time.perf_counter()
+                self._active_plan = self._transfer.prepare(
+                    manifests=manifests,
+                    capture_layout=self._capture_layout,
+                )
+                duration = time.perf_counter() - started
+                timing.record_measured(
+                    "transfer_planning",
+                    duration,
+                    metadata={"plan_cache_hits": 0, "plan_cache_misses": 1},
+                    accumulate_metadata=True,
+                )
                 self._active_fingerprint = inputs.physical_fingerprint
+            else:
+                timing.record_measured(
+                    "transfer_planning",
+                    0.0,
+                    metadata={"plan_cache_hits": 1, "plan_cache_misses": 0},
+                    accumulate_metadata=True,
+                )
+                if manifest_digests != self._active_manifest_digests:
+                    assert self._active_plan is not None
+                    started = time.perf_counter()
+                    self._transfer.refresh_sources(self._active_plan, manifests)
+                    duration = time.perf_counter() - started
+                    timing.record_measured(
+                        "source_preparation",
+                        duration,
+                        metadata={"manifest_refresh_s": duration},
+                    )
+            self._active_manifest_digests = manifest_digests
             staged = self._transfer.stage(self._active_plan)
         else:
             raise TypeError("full-tensor method received an unsupported source")
@@ -159,6 +197,7 @@ class FullTensorNixlUpdateMethod(UpdateMethod):
         self._active_staged = None
         self._active_plan = None
         self._active_fingerprint = None
+        self._active_manifest_digests = ()
         self._transfer.close()
 
 

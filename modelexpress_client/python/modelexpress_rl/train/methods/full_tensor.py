@@ -5,10 +5,11 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from typing import Any
 
-from ... import refit_pb2, refit_pb2_grpc
+from ... import refit_pb2, refit_pb2_grpc, timing
 from ...version import WeightVersionRef
 from ..adapter import (
     StagedWeightVersionShardData,
@@ -80,15 +81,37 @@ class FullTensorNixlPublicationMethod:
     ) -> None:
         if not isinstance(staged, StagedWeightVersionShardData):
             raise TypeError("full-tensor publication received an invalid shard")
+        started = time.perf_counter()
         staged.publish_ready.wait()
+        duration = time.perf_counter() - started
+        timing.record_measured(
+            "source_preparation",
+            duration,
+            metadata={"staging_sync_s": duration},
+        )
         if staged.manifest.transport.upper() != "NIXL":
             raise ValueError(
                 f"unsupported shard transport {staged.manifest.transport!r}"
             )
+        started = time.perf_counter()
+        manifest_digest = staged.manifest.digest
+        duration = time.perf_counter() - started
+        timing.record_measured(
+            "source_preparation",
+            duration,
+            metadata={"manifest_digest_s": duration},
+        )
+        started = time.perf_counter()
         endpoint = self._manifest_publisher.publish_manifest(
             version_id=version.version_id,
             source_slot_id=self.source_slot_id,
             manifest=staged.manifest,
+        )
+        duration = time.perf_counter() - started
+        timing.record_measured(
+            "setup_registration",
+            duration,
+            metadata={"manifest_publish_s": duration},
         )
         if not endpoint.strip():
             raise ValueError("manifest_endpoint is required")
@@ -98,12 +121,19 @@ class FullTensorNixlPublicationMethod:
             worker_id=self._worker_id,
             tensor_count=staged.manifest.tensor_count,
             total_bytes=staged.manifest.total_bytes,
-            manifest_digest=staged.manifest.digest,
+            manifest_digest=manifest_digest,
             manifest_endpoint=endpoint,
         )
+        started = time.perf_counter()
         self._service().CreateWeightVersionShard(
             refit_pb2.CreateWeightVersionShardRequest(shard=shard),
             timeout=self._rpc_timeout_seconds,
+        )
+        duration = time.perf_counter() - started
+        timing.record_measured(
+            "setup_registration",
+            duration,
+            metadata={"publication_rpc_s": duration},
         )
         self.published.setdefault(version.version_id, []).append(staged)
 
@@ -117,6 +147,10 @@ class FullTensorNixlPublicationMethod:
                 worker_id=self._worker_id,
             ),
             timeout=self._rpc_timeout_seconds,
+        )
+        self._manifest_publisher.release_manifest(
+            version_id=version.version_id,
+            source_slot_id=self.source_slot_id,
         )
         del self.published[version.version_id]
 

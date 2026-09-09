@@ -10,6 +10,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
+from functools import cached_property
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
@@ -94,7 +95,7 @@ class WeightVersionShardManifest:
         if not self.transport:
             raise ValueError("transport must not be empty")
 
-    @property
+    @cached_property
     def digest(self) -> str:
         """Return the SHA-256 digest advertised through RefitService."""
         return hashlib.sha256(self.data).hexdigest()
@@ -158,6 +159,9 @@ class WeightVersionShardManifestPublisher(Protocol):
         manifest: WeightVersionShardManifest,
     ) -> str:
         """Publish ``manifest`` and return its ready, worker-local endpoint."""
+
+    def release_manifest(self, *, version_id: str, source_slot_id: str) -> None:
+        """Stop serving a released version's manifest."""
 
 
 __all__ = [

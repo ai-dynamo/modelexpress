@@ -22,6 +22,7 @@ class NixlGeneratorSource:
 
     manifest_endpoint: str
     manifest: bytes
+    structural_digest: str = ""
 
 
 @dataclass(frozen=True)
@@ -39,7 +40,7 @@ class GeneratorSource:
         return (
             "NIXL",
             self.transport.manifest_endpoint,
-            self.manifest_digest,
+            self.transport.structural_digest or self.manifest_digest,
         )
 
 

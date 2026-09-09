@@ -125,6 +125,23 @@ def _required_agent_metadata(
     }
 
 
+def _source_structure(source) -> tuple:
+    return (
+        source.dtype,
+        tuple(source.global_shape),
+        tuple(
+            (
+                shard.agent_name,
+                shard.device_id,
+                shard.addr,
+                tuple(shard.shard_offset),
+                tuple(shard.shape),
+            )
+            for shard in source.shards
+        ),
+    )
+
+
 def _load_agent_metadata(
     manager: NixlTransferManager, metadata_by_agent: dict[str, bytes]
 ) -> None:
@@ -324,9 +341,7 @@ class _NixlStagedTransfer:
             if self._loaded_agent_metadata.get(agent) != metadata
         }
         conflicting = sorted(
-            agent
-            for agent in changed
-            if agent in self._loaded_agent_metadata
+            agent for agent in changed if agent in self._loaded_agent_metadata
         )
         if conflicting:
             raise RuntimeError(
@@ -357,6 +372,28 @@ class _NixlStagedTransfer:
         )
         self._active = prepared
         return prepared
+
+    def refresh_sources(
+        self, prepared: _PreparedNixlTransfer, manifests: list[bytes]
+    ) -> None:
+        """Refresh version-specific source digests without rebuilding the plan."""
+        if prepared is not self._active:
+            raise RuntimeError("NIXL transfer plan is no longer active")
+        resolved = _resolve_sources(manifests)
+        used_sources = {
+            copy.src_name: resolved.sources[copy.src_name]
+            for copy in prepared.capture.copies
+            if copy.src_name in resolved.sources
+        }
+        if set(used_sources) != set(prepared.sources):
+            raise RuntimeError("source tensor set changed while reusing transfer plan")
+        if any(
+            _source_structure(source) != _source_structure(prepared.sources[name])
+            for name, source in used_sources.items()
+        ):
+            raise RuntimeError("source geometry changed while reusing transfer plan")
+        prepared.sources.clear()
+        prepared.sources.update(used_sources)
 
     @staticmethod
     def _validate_complete(
@@ -431,10 +468,7 @@ class _NixlStagedTransfer:
         )
 
         recv_params = set(recv_expected)
-        if (
-            self._registered_recv_params
-            and self._registered_recv_params != recv_params
-        ):
+        if self._registered_recv_params and self._registered_recv_params != recv_params:
             raise RuntimeError(
                 "receive parameter set changed; restart the generator engine"
             )
@@ -615,9 +649,7 @@ class _NixlStagedTransfer:
                     timeout_seconds=self._timeout,
                 )
             else:
-                remote_agent_name = self._manager.add_remote_agent(
-                    source.nixl_metadata
-                )
+                remote_agent_name = self._manager.add_remote_agent(source.nixl_metadata)
             bytes_received, tensor_count, wire_seconds = (
                 self._manager.receive_from_source(
                     source_metadata=b"",

@@ -13,6 +13,7 @@ from modelexpress.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
     _mx_version,
+    structural_manifest_digest,
     wrap_rendezvous_blob,
 )
 
@@ -36,6 +37,52 @@ def _one_tensor(agent_name="trainer-agent"):
             ],
         )
     ]
+
+
+def test_structural_digest_ignores_version_and_content_digest():
+    first = _one_tensor()
+    first[0].shards[0].digest = "version-a"
+    second = _one_tensor()
+    second[0].shards[0].digest = "version-b"
+
+    first_blob = wrap_rendezvous_blob(
+        b"nixl",
+        "trainer-agent",
+        "trainer:1234",
+        first,
+        publisher_step=1,
+    )
+    second_blob = wrap_rendezvous_blob(
+        b"nixl",
+        "trainer-agent",
+        "trainer:1234",
+        second,
+        publisher_step=2,
+    )
+
+    assert structural_manifest_digest(first_blob) == structural_manifest_digest(
+        second_blob
+    )
+    moved = _one_tensor()
+    moved[0].shards[0].addr = 8192
+    moved_blob = wrap_rendezvous_blob(
+        b"nixl",
+        "trainer-agent",
+        "trainer:1234",
+        moved,
+    )
+    restarted_blob = wrap_rendezvous_blob(
+        b"new-registration",
+        "trainer-agent",
+        "trainer:1234",
+        second,
+    )
+    assert structural_manifest_digest(first_blob) != structural_manifest_digest(
+        moved_blob
+    )
+    assert structural_manifest_digest(first_blob) != structural_manifest_digest(
+        restarted_blob
+    )
 
 
 def test_mx_version_falls_back_only_when_package_is_missing(monkeypatch):
@@ -145,8 +192,9 @@ def test_published_rendezvous_stays_ready_and_closes_stale(monkeypatch):
     last = client.status_updates[-1]
     # Compare the identity/status fields under test; the heartbeat also carries
     # advisory telemetry (source_load) that is not what this test asserts.
-    assert {k: last.get(k) for k in
-            ("mx_source_id", "worker_id", "worker_rank", "status")} == {
+    assert {
+        k: last.get(k) for k in ("mx_source_id", "worker_id", "worker_rank", "status")
+    } == {
         "mx_source_id": "source-id",
         "worker_id": "trainer-2",
         "worker_rank": 2,

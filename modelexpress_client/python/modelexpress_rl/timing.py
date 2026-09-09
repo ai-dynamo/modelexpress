@@ -29,7 +29,8 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
 
 from modelexpress.refit.timing import (
     RefitTimingRecorder,
@@ -48,6 +49,7 @@ def start_cycle(
     *,
     version_id: str,
     rank: int | None = None,
+    backend: str = BACKEND,
 ) -> RefitTimingRecorder | None:
     """Open a recorder for one generator refit, or ``None`` when disabled.
 
@@ -62,7 +64,7 @@ def start_cycle(
         # A caller driving its own cycle wins. Nesting a second recorder would
         # split one refit across two records and leave both looking incomplete.
         return None
-    return RefitTimingRecorder(backend=BACKEND, version=version_id, rank=rank)
+    return RefitTimingRecorder(backend=backend, version=version_id, rank=rank)
 
 
 @contextlib.contextmanager
@@ -75,7 +77,9 @@ def active(recorder: RefitTimingRecorder | None) -> Iterator[None]:
         yield
 
 
-def emit(recorder: RefitTimingRecorder | None, logger: logging.Logger) -> None:
+def emit(
+    recorder: RefitTimingRecorder | None, logger: logging.Logger
+) -> dict[str, Any] | None:
     """Emit the cycle's record, once, if there is one.
 
     Idempotent in the recorder, which is what lets the client call this from
@@ -84,7 +88,8 @@ def emit(recorder: RefitTimingRecorder | None, logger: logging.Logger) -> None:
     vanishing.
     """
     if recorder is not None:
-        recorder.emit(logger)
+        return recorder.emit(logger)
+    return None
 
 
 def record_measured(
@@ -92,6 +97,7 @@ def record_measured(
     seconds: float,
     *,
     metadata: dict[str, Any] | None = None,
+    accumulate_metadata: bool = False,
 ) -> None:
     """Attribute an already-measured duration to a normalized stage.
 
@@ -102,7 +108,12 @@ def record_measured(
     """
     recorder = current_refit_timing()
     if recorder is not None:
-        recorder.add_duration(stage, max(0.0, float(seconds)), metadata=metadata)
+        recorder.add_duration(
+            stage,
+            max(0.0, float(seconds)),
+            metadata=metadata,
+            accumulate_metadata=accumulate_metadata,
+        )
 
 
 def record_bytes(count: int) -> None:

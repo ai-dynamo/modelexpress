@@ -8,6 +8,7 @@ from contextlib import contextmanager
 
 import grpc
 import pytest
+
 from modelexpress import p2p_pb2, p2p_pb2_grpc
 from modelexpress.client import MxClient
 from modelexpress.types import ManifestMismatchError
@@ -139,8 +140,10 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
 class _WorkerService(refit_pb2_grpc.RefitWorkerServiceServicer):
     def __init__(self, manifest=b"manifest"):
         self.manifest = manifest
+        self.requests = []
 
-    def GetWeightVersionShardManifest(self, _request, _context):
+    def GetWeightVersionShardManifest(self, request, _context):
+        self.requests.append(request)
         return refit_pb2.GetWeightVersionShardManifestResponse(
             manifest=self.manifest,
             manifest_digest=hashlib.sha256(self.manifest).hexdigest(),
@@ -329,9 +332,7 @@ class _TestInstaller(EngineInstaller):
 
     @property
     def capabilities(self):
-        return EngineCapabilities(
-            artifact_types=frozenset({PreparedEngineTensors})
-        )
+        return EngineCapabilities(artifact_types=frozenset({PreparedEngineTensors}))
 
     def install(self, prepared):
         return self._adapter.apply_weight(prepared.staged)
@@ -419,9 +420,8 @@ def _start_server(*, state=None, manifest=b"manifest", manifest_digest=None):
         manifest_digest=manifest_digest or hashlib.sha256(manifest).hexdigest(),
     )
     refit_pb2_grpc.add_RefitServiceServicer_to_server(service, server)
-    refit_pb2_grpc.add_RefitWorkerServiceServicer_to_server(
-        _WorkerService(manifest), server
-    )
+    service.worker = _WorkerService(manifest)
+    refit_pb2_grpc.add_RefitWorkerServiceServicer_to_server(service.worker, server)
     p2p_service = _P2pService()
     p2p_pb2_grpc.add_P2pServiceServicer_to_server(p2p_service, server)
     service.p2p = p2p_service
@@ -582,9 +582,7 @@ def test_generator_rejects_unsupported_object_storage_before_adapter_creation(
     monkeypatch.setattr(
         GeneratorRuntime,
         "initialize",
-        classmethod(
-            lambda _cls, **_kwargs: pytest.fail("runtime must not be created")
-        ),
+        classmethod(lambda _cls, **_kwargs: pytest.fail("runtime must not be created")),
     )
 
     with pytest.raises(ValueError, match="only S3 object storage"):
@@ -687,13 +685,12 @@ def test_generator_stages_applies_releases_and_reuses_valid_plan(monkeypatch):
     assert len(adapter.publish_calls) == 1
     assert len(adapter.release_calls) == 3
     assert adapter.close_calls == 1
+    assert len(service.worker.requests) == 3
     assert [source.source_slot_id for source in adapter.create_calls[0].sources] == [
         "rank:0",
         "rank:1",
     ]
-    assert (
-        adapter.create_calls[0].payload_format is WeightPayloadFormat.FULL_TENSOR
-    )
+    assert adapter.create_calls[0].payload_format is WeightPayloadFormat.FULL_TENSOR
 
 
 def test_generator_logs_weight_update_lifecycle(monkeypatch, caplog):
@@ -792,9 +789,11 @@ def test_generator_reports_missing_trainer_manifest_digest(monkeypatch, caplog):
     generator = _initialize(monkeypatch, endpoint, adapter)
 
     try:
-        with caplog.at_level(logging.WARNING):
-            with pytest.raises(RuntimeError, match=r"no usable refit source"):
-                generator.stage_weight(version=WeightVersionRef("version-a"))
+        with (
+            caplog.at_level(logging.WARNING),
+            pytest.raises(RuntimeError, match=r"no usable refit source"),
+        ):
+            generator.stage_weight(version=WeightVersionRef("version-a"))
     finally:
         generator.close()
         server.stop(grace=None).wait()
@@ -1258,6 +1257,24 @@ def test_generator_retries_with_redundant_worker_for_same_slot(monkeypatch):
     ]
 
 
+def test_generator_fetches_fallback_manifest_only_after_primary_failure(monkeypatch):
+    server, endpoint, service = _start_server()
+    replica = refit_pb2.WeightVersionShard()
+    replica.CopyFrom(service.shards[0])
+    replica.worker_id = "trainer-replica"
+    service.shards.append(replica)
+    generator = _initialize(monkeypatch, endpoint, _Adapter(service))
+
+    try:
+        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+        staged.release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert len(service.worker.requests) == 2
+
+
 def test_generator_preserves_transfer_error_when_lease_cleanup_also_fails(
     monkeypatch,
 ):
@@ -1320,9 +1337,7 @@ def test_generator_recovers_uncertain_engine_with_active_or_new_version(
             uri="s3://weights/base-a/model.safetensors.index.json",
         )
     )
-    service.additional_versions["version-b"] = _canonical_version(
-        "version-b", "base-a"
-    )
+    service.additional_versions["version-b"] = _canonical_version("version-b", "base-a")
     adapter = _Adapter(service)
     adapter.apply_failure = True
     generator = _initialize(monkeypatch, endpoint, adapter, object_storage=True)
@@ -1438,19 +1453,17 @@ def test_generator_discovers_rank_matched_p2p_peer(monkeypatch):
             ),
         ]
     )
-    service.p2p.metadata[("peer-source", "generator-peer")] = (
-        p2p_pb2.WorkerMetadata(
-            worker_rank=0,
-            tensors=[
-                p2p_pb2.TensorDescriptor(
-                    name="weight",
-                    addr=1234,
-                    size=16,
-                    device_id=0,
-                    dtype="torch.float32",
-                )
-            ],
-        )
+    service.p2p.metadata[("peer-source", "generator-peer")] = p2p_pb2.WorkerMetadata(
+        worker_rank=0,
+        tensors=[
+            p2p_pb2.TensorDescriptor(
+                name="weight",
+                addr=1234,
+                size=16,
+                device_id=0,
+                dtype="torch.float32",
+            )
+        ],
     )
     adapter = _Adapter(service)
     generator = _initialize(monkeypatch, endpoint, adapter)
@@ -1596,19 +1609,17 @@ def test_object_storage_generator_skips_full_peer_for_delta_version(monkeypatch)
             worker_rank=0,
         )
     )
-    service.p2p.metadata[("peer-source", "generator-peer")] = (
-        p2p_pb2.WorkerMetadata(
-            worker_rank=0,
-            tensors=[
-                p2p_pb2.TensorDescriptor(
-                    name="weight",
-                    addr=1234,
-                    size=16,
-                    device_id=0,
-                    dtype="torch.float32",
-                )
-            ],
-        )
+    service.p2p.metadata[("peer-source", "generator-peer")] = p2p_pb2.WorkerMetadata(
+        worker_rank=0,
+        tensors=[
+            p2p_pb2.TensorDescriptor(
+                name="weight",
+                addr=1234,
+                size=16,
+                device_id=0,
+                dtype="torch.float32",
+            )
+        ],
     )
     adapter = _Adapter(service)
     generator = _initialize(monkeypatch, endpoint, adapter, object_storage=True)

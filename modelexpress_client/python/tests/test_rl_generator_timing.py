@@ -12,10 +12,25 @@ processing and the copy into kernel storage all charged as one span.
 """
 
 import logging
+from types import SimpleNamespace
 
-from modelexpress.refit import RefitTimingRecorder, current_refit_timing, use_refit_timing
+from modelexpress.refit import (
+    RefitTimingRecorder,
+    current_refit_timing,
+    use_refit_timing,
+)
 from modelexpress_rl import timing
-from modelexpress_rl.inference.methods.full_tensor import _attribute_transfer
+from modelexpress_rl.inference.adapter import (
+    GeneratorSource,
+    GeneratorTransferInputs,
+    NixlGeneratorSource,
+)
+from modelexpress_rl.inference.methods.full_tensor import (
+    FullTensorNixlUpdateMethod,
+    _attribute_transfer,
+)
+from modelexpress_rl.inference.plan import TrainerUpdateSource
+from modelexpress_rl.train import WeightPayloadFormat
 
 STAGED_METRICS = {
     "bytes_received": 4_000_000_000,
@@ -104,6 +119,68 @@ def test_reusing_a_transfer_plan_is_marked_warm(monkeypatch):
         timing.record_cold(False)
 
     assert recorder.as_dict()["cold_warm"] == "warm"
+
+
+def test_version_digest_refreshes_verification_without_replanning():
+    class Transfer:
+        def __init__(self):
+            self.prepare_calls = 0
+            self.refresh_calls = 0
+
+        def unpublish_peer(self):
+            pass
+
+        def prepare(self, **_kwargs):
+            self.prepare_calls += 1
+            return object()
+
+        def refresh_sources(self, _prepared, _manifests):
+            self.refresh_calls += 1
+
+        def stage(self, _prepared):
+            return SimpleNamespace(metrics={"bytes_received": 0})
+
+    transfer = Transfer()
+    method = FullTensorNixlUpdateMethod(
+        transfer=transfer,
+        capture_layout=lambda _manifest: None,
+        parameter_layout=dict,
+        build_identity=lambda _version: None,
+        worker_rank=0,
+        worker_id="worker",
+        accelerator="cuda",
+        p2p_client=object(),
+    )
+
+    def source(version, digest):
+        return TrainerUpdateSource(
+            inputs=GeneratorTransferInputs(
+                version_id=version,
+                base_version_id=None,
+                layout_signature="layout",
+                payload_format=WeightPayloadFormat.FULL_TENSOR,
+                sources=(
+                    GeneratorSource(
+                        source_slot_id="rank:0",
+                        worker_id="trainer-0",
+                        manifest_digest=digest,
+                        transport=NixlGeneratorSource(
+                            manifest_endpoint="trainer:9000",
+                            manifest=version.encode(),
+                            structural_digest="stable-structure",
+                        ),
+                    ),
+                ),
+            )
+        )
+
+    first = method.prepare(version=None, source=source("v1", "digest-1"))
+    method.release(first)
+    second = method.prepare(version=None, source=source("v2", "digest-2"))
+    method.release(second)
+
+    assert transfer.prepare_calls == 1
+    assert transfer.refresh_calls == 1
 
 
 def test_the_record_is_emitted_once(monkeypatch, caplog):
