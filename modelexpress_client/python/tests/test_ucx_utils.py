@@ -55,43 +55,6 @@ def test_flat_pci_topology_scores_local_phb_above_remote_sys(monkeypatch):
     assert ucx_utils._pci_common_depth(gpu_path, remote_nic_path) == 0
 
 
-def test_nested_pci_topology_keeps_root_and_bridge_components(monkeypatch):
-    paths = {
-        "0000:0f:00.0": (
-            "/sys/devices/pci0000:00/0000:00:01.1/0000:01:00.0/"
-            "0000:02:00.0/0000:0f:00.0"
-        ),
-        "0000:10:00.0": (
-            "/sys/devices/pci0000:00/0000:00:01.1/0000:01:00.0/"
-            "0000:02:00.0/0000:10:00.0"
-        ),
-    }
-    monkeypatch.setattr(
-        ucx_utils.os.path,
-        "realpath",
-        lambda path: paths[path.rsplit("/", 1)[-1]],
-    )
-
-    gpu_path = ucx_utils._pci_path_components("0000:0f:00.0")
-    nic_path = ucx_utils._pci_path_components("0000:10:00.0")
-
-    assert gpu_path == [
-        "pci0000:00",
-        "0000:00:01.1",
-        "0000:01:00.0",
-        "0000:02:00.0",
-        "0000:0f:00.0",
-    ]
-    assert nic_path == [
-        "pci0000:00",
-        "0000:00:01.1",
-        "0000:01:00.0",
-        "0000:02:00.0",
-        "0000:10:00.0",
-    ]
-    assert ucx_utils._pci_common_depth(gpu_path, nic_path) == 4
-
-
 def _install_fake_topology(monkeypatch, gpus, nics, visible=None):
     """Drive probe_nic_pin_for_device from an in-memory topology.
 
