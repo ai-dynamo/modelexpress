@@ -43,7 +43,7 @@ inputs:
     default: 'v1.34.10'
   dynamo_ref:
     description: |
-      Git ref of the ai-dynamo/dynamo repo to clone for the helm chart.
+      Branch, tag, or commit of ai-dynamo/dynamo to use for the helm chart.
       Pinned to the `v1.0.2` release tag so the chart matches the operator
       image tag below. Previously `main`, but that drifted: a re-bootstrap
       pulled a `main` chart against the `1.0.2` image and the operator's
@@ -203,11 +203,12 @@ runs:
         echo "::group::Clone ai-dynamo/dynamo @ ${DYNAMO_REF} (shallow, sparse)"
         DYNAMO_DIR="${RUNNER_TEMP}/dynamo"
         rm -rf "${DYNAMO_DIR}"
-        git clone --depth 1 --filter=blob:none --sparse \
-          --branch "${DYNAMO_REF}" \
-          https://github.com/ai-dynamo/dynamo.git "${DYNAMO_DIR}"
-        cd "${DYNAMO_DIR}"
-        git sparse-checkout set deploy/helm
+        git init "${DYNAMO_DIR}"
+        git -C "${DYNAMO_DIR}" remote add origin https://github.com/ai-dynamo/dynamo.git
+        git -C "${DYNAMO_DIR}" sparse-checkout init --cone
+        git -C "${DYNAMO_DIR}" sparse-checkout set deploy/helm
+        git -C "${DYNAMO_DIR}" fetch --depth 1 --filter=blob:none origin "${DYNAMO_REF}"
+        git -C "${DYNAMO_DIR}" checkout --detach FETCH_HEAD
         echo "DYNAMO_DIR=${DYNAMO_DIR}" >> "$GITHUB_ENV"
         echo "::endgroup::"
 
