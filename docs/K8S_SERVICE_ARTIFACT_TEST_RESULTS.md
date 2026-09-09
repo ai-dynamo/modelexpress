@@ -37,6 +37,7 @@ Source and target were placed on different nodes for TP1, TP2, TP4, and TP8.
 | TP8 cross-node | Qwen3-0.6B | 8 source + 8 target | PASS | Triton 4.95 MiB in 0.240 s; FlashInfer 0.02 MiB in 0.235 s; source marker matched | Eight rank-local transfers of 0.16 GB, 68.7-109.1 Gbps | PASS |
 | Mixed Service | 1 compatible + 7 incompatible sources, 2 concurrent targets | 10 GPUs total | PASS with explicit high retry limit | Both targets rejected incompatible endpoints, resolved the compatible Pod IP, transferred the compatible marker, and installed Triton and FlashInfer | Both targets loaded 1.20 GB; 275.7 and 302.8 Gbps | PASS on both targets |
 | True multi-node TP2 | Qwen3-0.6B, SGLang 0.5.17 | source: 2 nodes x 1 GPU; target: 2 different nodes x 1 GPU | PASS | node 0 fetched only source-node-0; node 1 fetched only source-node-1; Triton, TVM-FFI, and FlashInfer transferred | Rank 0: 0.62 GB in 0.017 s; rank 1: 0.62 GB in 0.016 s | Exact token-ID match with source |
+| True multi-node PP2 | Qwen3-0.6B, vLLM 0.26.0 | source: 2 nodes x 1 GPU; target: 2 different nodes x 1 GPU | PASS | node 0 fetched only source-node-0; node 1 fetched only source-node-1; Triton and FlashInfer transferred | Rank 0: 170 tensors/0.76 GB in 0.023 s; rank 1: 171 tensors/0.76 GB in 0.023 s | Source and target text matched |
 
 No case was skipped for insufficient capacity. These throughput numbers use a
 small model and include no controlled benchmark warmup, so they are evidence of
@@ -134,9 +135,33 @@ matched the branch working tree.
 
 A preliminary vLLM 0.17.1 attempt reached a true two-node process topology but
 failed inside vLLM before ModelExpress loading with
-`AssertionError: inner dp world group is not initialized`. The successful
-SGLang run demonstrates the ModelExpress weights and artifact paths; it does
-not claim that this vLLM launcher configuration works.
+`AssertionError: inner dp world group is not initialized`.
+
+The same strict topology subsequently passed with vLLM 0.26.0. This used
+pipeline parallel size 2, tensor parallel size 1, `--nnodes 2`, and one GPU per
+Pod. The source and target each spanned two nodes, and anti-affinity placed all
+four Pods on distinct H200 nodes:
+
+- source rank 0 at `10.53.12.217`, source rank 1 at `10.53.67.70`;
+- target rank 0 at `10.48.48.250`, target rank 1 at `10.53.65.207`;
+- both model groups logged `world_size=2`, `local_world_size=1`, and NCCL ranks
+  0/1, without the vLLM 0.17.1 assertion.
+
+Each target rank queried only its rank/node-specific Service. Rank 0 resolved
+`mx-mn-source-node-0:6555` to source rank 0, installed its
+`true-multinode-source-node-0` marker, and received 170 tensors (0.76 GB) by
+RDMA in 0.023 seconds. Rank 1 resolved `mx-mn-source-node-1:6555` to source
+rank 1, installed `true-multinode-source-node-1`, and received 171 tensors
+(0.76 GB) in 0.023 seconds. Both ranks transferred their node-local Triton and
+FlashInfer artifacts; absent optional cache types returned `NOT_FOUND` and did
+not trigger a weight disk fallback.
+
+The source and target OpenAI endpoints returned identical text for the fixed
+prompt and decoding parameters: ` Paris. The capital of France is also`.
+The test image was
+`nvcr.io/nvidian/dynamo-dev/zhongdongmin:mx-k8s-artifact-vllm026-20260908`
+(`sha256:a52e795de6e0ac4fcfc4d4b7e5bfb6fbb2892ddd2ded6232d92a8cf4419cc4f5`),
+with vLLM 0.26.0 and NIXL 1.3.2.
 
 ## Local regression coverage
 
@@ -152,7 +177,7 @@ local environment not having the optional `transformers` package; the same
 
 ## Cleanup
 
-The TP4, TP8, mixed-Service, and true multi-node namespaces were deleted after
-evidence was collected. TP1 and TP2 namespaces had already been deleted after
-their runs.
+The TP4, TP8, mixed-Service, SGLang true multi-node, and vLLM 0.26 true
+multi-node namespaces were deleted after evidence was collected. TP1 and TP2
+namespaces had already been deleted after their runs.
 No test Service, Deployment, Pod, Secret, or PVC was left running.
