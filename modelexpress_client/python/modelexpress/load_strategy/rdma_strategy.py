@@ -343,6 +343,11 @@ class RdmaStrategy(LoadStrategy):
             )
             selection_metrics.observe_selection_seconds(selector.name, select_seconds)
 
+            # Surface the source-published load the client saw, so a dashboard can
+            # compare how load_aware steers vs random/rendezvous. The collector
+            # decides what one series means when the per-peer label is off.
+            selection_metrics.observe_candidate_loads(ordered)
+
             logger.info(
                 f"[Worker {ctx.global_rank}] Source selection: "
                 f"source_selector={selector.name} "

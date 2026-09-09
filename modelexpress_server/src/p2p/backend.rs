@@ -65,6 +65,12 @@ pub struct SourceInstanceInfo {
     /// Runtime accelerator family for compatibility filtering (e.g. "cuda").
     /// Empty when unknown (records that predate the field).
     pub accelerator: String,
+    /// Source-published busyness in [0, 1] (default provider: RDMA NIC
+    /// utilization), refreshed via UpdateStatus heartbeats. `None` when the
+    /// source has not reported one (older client, or a provider with no
+    /// signal); `Some(0.0)` is a measured idle. Consumed by the client
+    /// `load_aware` selector, which ranks `None` as a neutral prior.
+    pub source_load: Option<f32>,
     /// Datacenter topology domain values keyed by level. Empty when unknown.
     pub topology: HashMap<String, String>,
     /// Training step/version from SourceIdentity.extra_parameters, when present.
@@ -159,6 +165,9 @@ pub struct WorkerRecord {
     pub worker_grpc_endpoint: String,
     /// Runtime accelerator family for compatibility filtering.
     pub accelerator: String,
+    /// Source-published busyness in [0, 1]. Not carried on WorkerMetadata;
+    /// set by UpdateStatus heartbeats (see `update_status`).
+    pub source_load: Option<f32>,
     /// Datacenter topology domain values keyed by level. Static per node.
     pub topology: HashMap<String, String>,
     /// Small discovery summary for file-backed artifact sources.
@@ -216,6 +225,8 @@ impl From<WorkerMetadata> for WorkerRecord {
             agent_name: meta.agent_name,
             worker_grpc_endpoint: meta.worker_grpc_endpoint,
             accelerator: meta.accelerator,
+            // Not on WorkerMetadata; refreshed via UpdateStatus heartbeats.
+            source_load: None,
             topology: meta.topology,
             artifact_source,
         }
@@ -403,6 +414,7 @@ pub trait MetadataBackend: Send + Sync {
         worker_rank: u32,
         status: SourceStatus,
         updated_at: i64,
+        source_load: Option<f32>,
     ) -> MetadataResult<()>;
 }
 

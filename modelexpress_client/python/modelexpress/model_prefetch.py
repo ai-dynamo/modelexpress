@@ -38,7 +38,7 @@ _REPO_DIR_PREFIX = "models--"
 # helpers that take it again.
 _lock = threading.RLock()
 _snapshot_to_repo_id: dict[str, str] = {}
-_revision_snapshots: dict[tuple[str, str | None], str] = {}
+_revision_snapshots: dict[tuple[str, str | None, str], str] = {}
 
 
 def is_enabled() -> bool:
@@ -63,12 +63,22 @@ def is_repo_id(model: str) -> bool:
     return not Path(model).exists()
 
 
-def ensure_metadata(repo_id: str, revision: str | None = None) -> Path | None:
+def ensure_metadata(
+    repo_id: str,
+    revision: str | None = None,
+    *,
+    cache_directory: str | os.PathLike[str] | None = None,
+) -> Path | None:
     """Install the model's non-weight files locally, once per process.
 
     Returns the snapshot directory, or None when the prefetch does not apply.
     Errors from the server propagate; callers on the engine's critical path
     decide whether to fail or fall through.
+
+    ``cache_directory`` names the root to install under. Leave it unset for the
+    client's own resolution order; pass it when the caller knows which root the
+    engine will read from, which is not always this worker's default -- a
+    snapshot path resolved on the frontend node carries a root of its own.
 
     The install runs under the lock so that a caller arriving mid-install waits
     for that result instead of walking away with None -- the engine resolves
@@ -79,25 +89,37 @@ def ensure_metadata(repo_id: str, revision: str | None = None) -> Path | None:
         return None
 
     from .model_client import ModelCacheClient
+    from .model_snapshot import resolve_cache_root
 
     requested = revision or None
+    # Resolved rather than taken as given: two callers naming the same root
+    # relatively and absolutely are one install, and an unset root has to key
+    # on whatever the client would have picked anyway.
+    root = resolve_cache_root(cache_directory).resolve()
     with _lock:
-        # Keyed by revision as well as repo id: two revisions of one model are
-        # two different installs, and returning the first one for the second
-        # request would hand the engine a revision it did not ask for.
-        installed = _known_snapshot(repo_id, requested)
+        # Keyed by revision and root as well as repo id: two revisions of one
+        # model are two different installs, and returning the first one for the
+        # second request would hand the engine a revision it did not ask for.
+        # The root is part of the key because the same revision installed under
+        # two roots is two snapshots, and only one of them is the one this
+        # caller will read from.
+        installed = _known_snapshot(repo_id, requested, root)
         if installed is not None:
             # Later calls in the same process (tokenizer, processor) resolve
             # from the snapshot the first call installed.
             return installed
 
-        with ModelCacheClient(chunk_size=configured_chunk_size()) as client:
+        with ModelCacheClient(
+            cache_directory=cache_directory, chunk_size=configured_chunk_size()
+        ) as client:
             snapshot_path = client.install_metadata_snapshot(
                 repo_id, requested_revision=requested
             )
 
         _snapshot_to_repo_id[_normalize(snapshot_path)] = repo_id
-        _revision_snapshots[(repo_id, requested)] = _normalize(snapshot_path)
+        _revision_snapshots[(repo_id, requested, _normalize(root))] = _normalize(
+            snapshot_path
+        )
         return snapshot_path
 
 
@@ -147,9 +169,9 @@ def reset() -> None:
         _revision_snapshots.clear()
 
 
-def _known_snapshot(repo_id: str, revision: str | None) -> Path | None:
+def _known_snapshot(repo_id: str, revision: str | None, root: Path) -> Path | None:
     with _lock:
-        recorded = _revision_snapshots.get((repo_id, revision))
+        recorded = _revision_snapshots.get((repo_id, revision, _normalize(root)))
     return Path(recorded) if recorded is not None else None
 
 

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import tempfile
 import uuid
@@ -57,6 +58,13 @@ WEIGHT_FILE_SUFFIXES = (
 )
 
 MAIN_REF = "main"
+
+_SNAPSHOTS_DIR = "snapshots"
+
+# huggingface_hub resolves a revision straight to snapshots/<sha> only when it
+# matches REGEX_COMMIT_HASH, which is lowercase-only. Directory names therefore
+# carry the lowercase form even though a request may be written in either case.
+_COMMIT_DIR_PATTERN = re.compile(r"[0-9a-f]{40}")
 
 _LOCK_FILE = ".modelexpress.lock"
 _STAGING_PREFIX = ".modelexpress-staging-"
@@ -124,6 +132,38 @@ def repo_dir_name(model_name: str) -> str:
     if any(part in ("", ".", "..") for part in parts):
         raise ValueError(f"Invalid Hugging Face model name: {model_name!r}")
     return f"models--{'--'.join(parts)}"
+
+
+def is_snapshot_commit_directory(name: str) -> bool:
+    """Return whether a ``snapshots/`` entry names an immutable commit."""
+    return _COMMIT_DIR_PATTERN.fullmatch(name) is not None
+
+
+def snapshot_location(
+    model_name: str, path: str | os.PathLike[str]
+) -> tuple[Path, str] | None:
+    """Split a standard snapshot path into its cache root and commit.
+
+    Matches ``<root>/models--<org>--<name>/snapshots/<commit>`` structurally,
+    without touching the filesystem, and returns None for anything else. The
+    root is what a worker needs when the engine resolved the path on another
+    node: the snapshot has to be installed under the root the engine will read
+    from, not under whichever root this worker happens to default to.
+    """
+    candidate = Path(str(path))
+    if not is_snapshot_commit_directory(candidate.name):
+        return None
+    snapshots_dir = candidate.parent
+    if snapshots_dir.name != _SNAPSHOTS_DIR:
+        return None
+    repo_root = snapshots_dir.parent
+    try:
+        expected = repo_dir_name(model_name)
+    except ValueError:
+        return None
+    if repo_root.name != expected:
+        return None
+    return repo_root.parent, candidate.name
 
 
 def resolve_cache_root(explicit: str | os.PathLike[str] | None = None) -> Path:

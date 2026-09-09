@@ -223,6 +223,96 @@ class TestLoad:
         assert FakeClient.instances == []
 
 
+class TestCacheRoot:
+    """Weights have to land in the snapshot root the engine will read from.
+
+    The engine loads from the path in ``ModelConfig``, which the frontend node
+    resolved against its own cache. A worker that installs under its own
+    default root instead produces a complete snapshot the engine never opens.
+    """
+
+    def _run(self, ctx):
+        with patch("modelexpress.load_strategy.server_cache_strategy.register_tensors"):
+            ServerCacheStrategy().load(LoadResult(value=MagicMock()), ctx)
+
+    def test_existing_snapshot_pins_the_client_to_its_own_root(
+        self, enabled, snapshot, fake_client, monkeypatch
+    ):
+        monkeypatch.setenv("MODEL_EXPRESS_CACHE_DIRECTORY", "/somewhere/else")
+        ctx = _make_context(REPO, model_path=str(snapshot))
+
+        self._run(ctx)
+
+        client = FakeClient.instances[0]
+        assert client.kwargs["cache_directory"] == snapshot.parent.parent.parent
+        assert client.calls == [(REPO, snapshot)]
+
+    def test_missing_snapshot_installs_under_the_paths_root(
+        self, enabled, tmp_path, fake_client, monkeypatch
+    ):
+        """The multi-node case: EngineCore gets a path this node has nothing at."""
+        monkeypatch.setenv("MODEL_EXPRESS_CACHE_DIRECTORY", str(tmp_path / "cache-a"))
+        other_root = tmp_path / "cache-b"
+        engine_path = other_root / "models--org--model" / "snapshots" / COMMIT
+        ctx = _make_context(REPO, model_path=str(engine_path), revision=None)
+
+        def install(repo_id, revision=None, *, cache_directory=None):
+            assert cache_directory == other_root
+            # The commit comes from the directory name, not from ModelConfig:
+            # a local path leaves revision unresolved, and the server's default
+            # would be a different snapshot than the one the engine reads.
+            assert revision == COMMIT
+            engine_path.mkdir(parents=True)
+            return engine_path
+
+        with patch.object(model_prefetch, "ensure_metadata", side_effect=install):
+            self._run(ctx)
+
+        client = FakeClient.instances[0]
+        assert client.kwargs["cache_directory"] == other_root
+        assert client.calls == [(REPO, engine_path)]
+
+    def test_metadata_failure_on_a_missing_snapshot_is_a_clean_miss(
+        self, enabled, tmp_path, fake_client
+    ):
+        """An old server that will not confirm the commit must not install its own."""
+        engine_path = tmp_path / "models--org--model" / "snapshots" / COMMIT
+        ctx = _make_context(REPO, model_path=str(engine_path))
+
+        with patch.object(model_prefetch, "ensure_metadata", return_value=None):
+            with pytest.raises(StrategyFailed) as excinfo:
+                self._run(ctx)
+
+        assert excinfo.value.mutated is False
+        assert FakeClient.instances == []
+
+    def test_a_path_outside_the_cache_layout_keeps_the_old_behaviour(
+        self, enabled, tmp_path, fake_client
+    ):
+        plain = tmp_path / "checkpoints" / "model"
+        plain.mkdir(parents=True)
+        model_prefetch._snapshot_to_repo_id[str(plain)] = REPO
+        ctx = _make_context(str(plain), model_path=str(plain))
+
+        self._run(ctx)
+
+        client = FakeClient.instances[0]
+        assert client.kwargs["cache_directory"] is None
+        assert client.calls == [(REPO, plain)]
+
+    def test_a_repo_id_keeps_the_old_behaviour(self, enabled, snapshot, fake_client):
+        ctx = _make_context(REPO, model_path=None, revision="main")
+
+        with patch.object(
+            model_prefetch, "ensure_metadata", return_value=snapshot
+        ) as ensure:
+            self._run(ctx)
+
+        assert ensure.call_args.kwargs["cache_directory"] is None
+        assert ensure.call_args.args[1] == "main"
+        assert FakeClient.instances[0].kwargs["cache_directory"] is None
+
+
 class TestChainOrder:
     def test_sits_between_rdma_and_local_strategies(self):
         import inspect

@@ -128,17 +128,19 @@ impl MetadataBackend for InMemoryMetadataBackend {
                     .ranks
                     .get(&entry.index_rank)
                     .or_else(|| entry.ranks.values().next());
-                let (status, updated_at, accelerator, topology) = reported.map_or_else(
-                    || (0, 0, String::new(), HashMap::new()),
-                    |r| {
-                        (
-                            r.status,
-                            r.updated_at,
-                            r.accelerator.clone(),
-                            r.topology.clone(),
-                        )
-                    },
-                );
+                let (status, updated_at, accelerator, source_load, topology) = reported
+                    .map_or_else(
+                        || (0, 0, String::new(), None, HashMap::new()),
+                        |r| {
+                            (
+                                r.status,
+                                r.updated_at,
+                                r.accelerator.clone(),
+                                r.source_load,
+                                r.topology.clone(),
+                            )
+                        },
+                    );
                 result.push(SourceInstanceInfo {
                     source_id: sid.clone(),
                     worker_id: worker_id.clone(),
@@ -147,6 +149,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
                     status,
                     updated_at,
                     accelerator,
+                    source_load,
                     topology,
                     training_step: super::parse_training_step(&source.extra_parameters),
                     layout_signature: super::parse_layout_signature(&source.extra_parameters),
@@ -188,6 +191,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
         worker_rank: u32,
         status: SourceStatus,
         updated_at: i64,
+        source_load: Option<f32>,
     ) -> MetadataResult<()> {
         let mut sources = self.lock();
         let record = sources
@@ -198,6 +202,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
             Some(record) => {
                 record.status = status as i32;
                 record.updated_at = updated_at;
+                record.source_load = source_load;
                 Ok(())
             }
             None => Err(format!(
@@ -386,7 +391,7 @@ mod tests {
             .await
             .expect("publish");
         backend
-            .update_status(&source_id, "w1", 0, SourceStatus::Ready, 123)
+            .update_status(&source_id, "w1", 0, SourceStatus::Ready, 123, Some(0.0))
             .await
             .expect("patch existing rank");
 
@@ -400,14 +405,14 @@ mod tests {
 
         assert!(
             backend
-                .update_status(&source_id, "w1", 99, SourceStatus::Ready, 1)
+                .update_status(&source_id, "w1", 99, SourceStatus::Ready, 1, Some(0.0))
                 .await
                 .is_err(),
             "unknown rank errors"
         );
         assert!(
             backend
-                .update_status(&source_id, "ghost", 0, SourceStatus::Ready, 1)
+                .update_status(&source_id, "ghost", 0, SourceStatus::Ready, 1, Some(0.0))
                 .await
                 .is_err(),
             "unknown worker errors"
@@ -455,5 +460,37 @@ mod tests {
             backend.list_sources().await.expect("list").is_empty(),
             "source dropped with its last worker"
         );
+    }
+
+    // source_load is Option: a worker that has never heartbeated lists as None
+    // (no reading), and a heartbeat's Some(x) is what list_workers surfaces.
+    // None and 0.0 are different answers on the wire and must stay so here.
+    #[tokio::test]
+    async fn source_load_round_trips_as_option() {
+        let backend = InMemoryMetadataBackend::new();
+        let id = identity("m");
+        let source_id = compute_mx_source_id(&id);
+        backend
+            .publish_metadata(&id, "w1", worker(0, SourceStatus::Ready), "", "", "")
+            .await
+            .expect("publish");
+
+        let before = backend
+            .list_workers(Some(source_id.clone()), None)
+            .await
+            .expect("list");
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].source_load, None);
+
+        backend
+            .update_status(&source_id, "w1", 0, SourceStatus::Ready, 7, Some(0.42))
+            .await
+            .expect("update_status");
+        let after = backend
+            .list_workers(Some(source_id), None)
+            .await
+            .expect("list");
+        assert_eq!(after[0].source_load, Some(0.42));
+        assert_eq!(after[0].updated_at, 7);
     }
 }

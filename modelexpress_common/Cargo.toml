@@ -29,6 +29,7 @@ tls-rustls = [
     "dep:object-store-reqwest",
     "rustls/ring",
     "rustls/std",
+    "object_store/ring",
     "reqwest/rustls-tls",
     "object-store-reqwest/rustls-no-provider",
 ]

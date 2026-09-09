@@ -1240,3 +1240,64 @@ def test_load_buckets_match_the_rust_xslow_band():
     assert rust_buckets == tuple(float(b) for b in _XSLOW_BUCKETS), (
         f"Rust XSLOW {rust_buckets} != Python _XSLOW_BUCKETS {_XSLOW_BUCKETS}"
     )
+
+
+class TestObserveCandidateLoads:
+    """With the per-peer label off there is ONE series: it must hold the chosen
+    candidate's load, not whichever candidate the loop happened to write last
+    (under load_aware, the busiest)."""
+
+    @staticmethod
+    def _refs(loads):
+        from modelexpress import p2p_pb2
+        out = []
+        for i, load in enumerate(loads):
+            r = p2p_pb2.SourceInstanceRef(mx_source_id="deadbeefdeadbeef", worker_id=f"w{i}", worker_rank=0)
+            if load is not None:
+                r.source_load = load
+            out.append(r)
+        return out
+
+    @staticmethod
+    def _collector(monkeypatch, label_on):
+        from prometheus_client import CollectorRegistry
+        from modelexpress import metrics as M
+        monkeypatch.setattr(M.envs, "MX_METRICS_ENABLED", True, raising=False)
+        monkeypatch.setattr(M.envs, "MX_METRICS_SOURCE_ID_LABEL", label_on, raising=False)
+        monkeypatch.setattr(M.envs, "PROMETHEUS_MULTIPROC_DIR", None, raising=False)
+        reg = CollectorRegistry()
+        c = M.MetricsCollector(registry=reg)
+        assert c._ensure()
+        return c, reg
+
+    @staticmethod
+    def _series(reg):
+        from prometheus_client import generate_latest
+        return [l for l in generate_latest(reg).decode().splitlines() if l.startswith("mx_p2p_source_load{")]
+
+    def test_label_off_records_the_chosen_source_not_the_busiest(self, monkeypatch):
+        c, reg = self._collector(monkeypatch, label_on=False)
+        c.observe_candidate_loads(self._refs([0.0, 0.3, 0.9]))  # best-first
+        lines = self._series(reg)
+        assert len(lines) == 1, lines
+        assert lines[0].endswith(" 0.0"), lines
+
+    def test_label_on_records_every_candidate(self, monkeypatch):
+        c, reg = self._collector(monkeypatch, label_on=True)
+        c.observe_candidate_loads(self._refs([0.0, 0.3, 0.9]))
+        lines = self._series(reg)
+        assert len(lines) == 3, lines
+        # The wire field is a proto float32, so compare the parsed value, not text.
+        by_worker = {l.split('source_worker_id="')[1].split('"')[0]: float(l.rsplit(" ", 1)[1]) for l in lines}
+        assert by_worker["w2"] == pytest.approx(0.9, abs=1e-6), lines
+        assert by_worker["w0"] == pytest.approx(0.0, abs=1e-6), lines
+
+    def test_unknown_load_is_skipped_not_recorded_as_zero(self, monkeypatch):
+        c, reg = self._collector(monkeypatch, label_on=False)
+        c.observe_candidate_loads(self._refs([None, 0.4]))  # chosen has no reading
+        assert self._series(reg) == []
+
+    def test_empty_ordered_is_a_noop(self, monkeypatch):
+        c, reg = self._collector(monkeypatch, label_on=False)
+        c.observe_candidate_loads([])
+        assert self._series(reg) == []
