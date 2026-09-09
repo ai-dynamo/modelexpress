@@ -15,15 +15,15 @@
 #                         self-hosted builder runner. All build jobs run in
 #                         parallel.
 #
-#   build-vime-delta-refit — conditionally builds the Vime trainer and the
-#                            combined Dynamo/vLLM/ModelExpress worker.
+#   build-vime-delta-refit — builds the Vime trainer and the combined
+#                            Dynamo/vLLM/ModelExpress worker.
 #
 #   ensure-vcluster     — bootstraps the persistent mx-ci-cluster vCluster on
 #                         first run (no-ops on re-runs). Runs in parallel with
 #                         the build jobs.
 #
-#   ensure-vime-vcluster — conditionally bootstraps an isolated vCluster with
-#                          the newer Dynamo operator required by RL refit.
+#   ensure-vime-vcluster — bootstraps an isolated vCluster with the newer
+#                          Dynamo operator required by RL refit.
 #
 #   test-p2p            — matrix over frameworks; needs build-client,
 #                         build-server, and ensure-vcluster. Each matrix entry
@@ -68,8 +68,8 @@
 #                         entry. Relies on the cluster-wide Dynamo operator
 #                         installed in dynamo-system by setup-mx-vcluster.
 #
-#   test-vime-delta-refit — conditionally runs a ten-step Vime TP2 + Dynamo
-#                           vLLM TP1 smoke through ModelExpress and MinIO.
+#   test-vime-delta-refit — runs a ten-step Vime TP2 + Dynamo vLLM TP1 smoke
+#                           through ModelExpress and MinIO.
 #
 #   test-stale-metadata — Reaper-correctness check. mx-server runs with the
 #                         Redis backend (sidecar) and compressed reaper knobs
@@ -116,11 +116,6 @@
 #   AZURE_AKS_CI_KUBECONFIG_B64   — base64-encoded kubeconfig for the AKS host cluster
 #   NGC_API_KEY                   — push/pull registry images
 #   HF_TOKEN                      — HuggingFace token (required; used to create hf-token-secret in the test namespace)
-#
-# Optional repository variable:
-#   MX_VIME_DELTA_REFIT_CI_ENABLED — set to "true" to build and run the
-#                                    three-GPU Vime delta-refit smoke
-
 name: ModelExpress CI Tests
 
 on:
@@ -267,7 +262,6 @@ jobs:
   # Build the two images used only by the Vime delta-refit smoke.
   build-vime-delta-refit:
     name: Build Vime delta-refit images
-    if: vars.MX_VIME_DELTA_REFIT_CI_ENABLED == 'true'
     runs-on: prod-modelexpress-builder-amd-v1
     permissions:
       contents: read
@@ -419,11 +413,7 @@ jobs:
   # v1alpha1 operator while reusing the same AKS host and vCluster actions.
   ensure-vime-vcluster:
     name: Ensure Vime RL vCluster
-    if: vars.MX_VIME_DELTA_REFIT_CI_ENABLED == 'true'
     runs-on: prod-modelexpress-builder-amd-v1
-    concurrency:
-      group: mx-vime-ci-cluster-setup
-      cancel-in-progress: false
     permissions:
       contents: read
 
@@ -1019,7 +1009,6 @@ jobs:
   # Ten-step TP2 trainer + TP1 rollout smoke using MinIO for delta objects.
   test-vime-delta-refit:
     name: Vime delta-refit smoke
-    if: vars.MX_VIME_DELTA_REFIT_CI_ENABLED == 'true'
     runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 120
     needs:
@@ -1370,9 +1359,8 @@ jobs:
   # job runs and the bash check below decides pass/fail based on each
   # dependency's `.result`.
   #
-  # `success` and `skipped` are both accepted as "passing":
-  #   - `success` is the happy path
-  #   - `skipped` accommodates the repository-variable-gated Vime jobs
+  # Every dependency is unconditional and must succeed. Treat a skipped job
+  # as a failure so an accidentally disabled test cannot pass branch protection.
   # ---------------------------------------------------------------------------
   ci-status-check:
     name: CI status check
@@ -1395,7 +1383,7 @@ jobs:
       - model-streamer
     if: always()
     steps:
-      - name: All dependent jobs succeeded (or skipped)
+      - name: All dependent jobs succeeded
         run: |
           echo '${{ toJson(needs) }}' \
-            | jq -e 'to_entries | map(.value.result) | all(. as $r | ["success", "skipped"] | any($r == .))'
+            | jq -e 'to_entries | map(.value.result) | all(. == "success")'
