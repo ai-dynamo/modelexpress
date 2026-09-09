@@ -1,0 +1,225 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vime-delta-refit-minio
+  labels: {app: vime-delta-refit-minio}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: vime-delta-refit-minio}
+  template:
+    metadata:
+      labels: {app: vime-delta-refit-minio}
+    spec:
+      containers:
+      - name: minio
+        image: quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+        args: [server, /data, --console-address, ":9001"]
+        env:
+        - name: MINIO_ROOT_USER
+          valueFrom:
+            secretKeyRef: {name: mx-minio-creds, key: MINIO_ROOT_USER}
+        - name: MINIO_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef: {name: mx-minio-creds, key: MINIO_ROOT_PASSWORD}
+        ports:
+        - {name: s3, containerPort: 9000}
+        readinessProbe:
+          httpGet: {path: /minio/health/ready, port: s3}
+          periodSeconds: 2
+        resources:
+          requests: {cpu: 250m, memory: 256Mi}
+          limits: {cpu: "1", memory: 1Gi}
+        volumeMounts:
+        - {name: data, mountPath: /data}
+      volumes:
+      - name: data
+        emptyDir: {sizeLimit: 64Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vime-delta-refit-minio
+spec:
+  selector: {app: vime-delta-refit-minio}
+  ports:
+  - {name: s3, port: 9000, targetPort: s3}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vime-delta-refit-mx
+  labels: {app: vime-delta-refit-mx}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: vime-delta-refit-mx}
+  template:
+    metadata:
+      labels: {app: vime-delta-refit-mx}
+    spec:
+      imagePullSecrets:
+      - {name: nvcr-imagepullsecret}
+      initContainers:
+      - name: redis
+        image: redis:7.2-alpine
+        args: [redis-server, --save, "", --appendonly, "no"]
+        restartPolicy: Always
+        startupProbe:
+          tcpSocket: {port: 6379}
+          periodSeconds: 1
+          failureThreshold: 30
+        resources:
+          requests: {cpu: 100m, memory: 64Mi}
+          limits: {cpu: 500m, memory: 256Mi}
+      containers:
+      - name: modelexpress
+        image: WORKER_IMAGE
+        imagePullPolicy: Always
+        command: [/usr/local/bin/modelexpress-server]
+        args: [--host, 0.0.0.0, --port, "8101"]
+        env:
+        - {name: MX_METADATA_BACKEND, value: redis}
+        - {name: REDIS_URL, value: "redis://localhost:6379"}
+        ports:
+        - {name: grpc, containerPort: 8101}
+        readinessProbe:
+          tcpSocket: {port: grpc}
+          periodSeconds: 2
+        resources:
+          requests: {cpu: 250m, memory: 256Mi}
+          limits: {cpu: "1", memory: 1Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vime-delta-refit-mx
+spec:
+  selector: {app: vime-delta-refit-mx}
+  ports:
+  - {name: grpc, port: 8101, targetPort: grpc}
+---
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeployment
+metadata:
+  name: vime-delta-refit
+spec:
+  components:
+  - name: Frontend
+    type: frontend
+    replicas: 1
+    podTemplate:
+      metadata:
+        labels: {app: vime-delta-refit}
+      spec:
+        imagePullSecrets:
+        - {name: nvcr-imagepullsecret}
+        containers:
+        - name: main
+          image: nvcr.io/nvidia/ai-dynamo/dynamo-frontend:1.4.1
+          env:
+          - {name: DYN_ENABLE_RL, value: "true"}
+          ports:
+          - {name: http, containerPort: 8000}
+          - {name: rl-discovery, containerPort: 8001}
+  - name: VLLMWorker
+    type: worker
+    replicas: 1
+    runtimeVersionOverride: "1.5.0"
+    podTemplate:
+      metadata:
+        labels: {app: vime-delta-refit}
+      spec:
+        imagePullSecrets:
+        - {name: nvcr-imagepullsecret}
+        tolerations:
+        - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+        volumes:
+        - name: dshm
+          emptyDir: {medium: Memory, sizeLimit: 16Gi}
+        - name: model
+          persistentVolumeClaim: {claimName: shared-model-cache}
+        - name: mxdelta
+          emptyDir: {sizeLimit: 64Gi}
+        initContainers:
+        - name: vllm-engine
+          image: WORKER_IMAGE
+          imagePullPolicy: Always
+          restartPolicy: Always
+          command: [/bin/sh, -c]
+          args:
+          - >-
+            exec "$(python3 -c 'import os,vllm; print(os.path.join(os.path.dirname(vllm.__file__), "vllm-rs"))')"
+            serve /models --host 0.0.0.0 --port 8000 --grpc-port 50051
+            --tensor-parallel-size 1 --enable-sleep-mode
+            --weight-transfer-config '{"backend":"modelexpress"}'
+            --gpu-memory-utilization 0.5 --max-model-len 512 --max-num-seqs 8
+          env:
+          - {name: MX_SERVER_ADDRESS, value: "vime-delta-refit-mx:8101"}
+          - {name: VLLM_PLUGINS, value: modelexpress}
+          - {name: AWS_ENDPOINT_URL, value: "http://vime-delta-refit-minio:9000"}
+          - {name: AWS_DEFAULT_REGION, value: us-east-1}
+          - {name: AWS_EC2_METADATA_DISABLED, value: "true"}
+          - name: AWS_ACCESS_KEY_ID
+            valueFrom:
+              secretKeyRef: {name: mx-minio-creds, key: MINIO_ROOT_USER}
+          - name: AWS_SECRET_ACCESS_KEY
+            valueFrom:
+              secretKeyRef: {name: mx-minio-creds, key: MINIO_ROOT_PASSWORD}
+          ports:
+          - {name: engine-http, containerPort: 8000}
+          - {name: engine-grpc, containerPort: 50051}
+          startupProbe:
+            exec:
+              command: [python3, -c, "import socket; socket.create_connection(('127.0.0.1', 50051), 2).close()"]
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 120
+          resources:
+            requests: {cpu: "4", memory: 16Gi, nvidia.com/gpu: "1"}
+            limits: {nvidia.com/gpu: "1"}
+          volumeMounts:
+          - {name: dshm, mountPath: /dev/shm}
+          - {name: model, mountPath: /models, subPath: MODEL_SUBPATH, readOnly: true}
+          - {name: mxdelta, mountPath: /mxdelta}
+        containers:
+        - name: main
+          image: WORKER_IMAGE
+          imagePullPolicy: Always
+          command: [/usr/local/bin/dynamo-vllm-sidecar]
+          args: [--grpc-endpoint, "127.0.0.1:50051", --enable-rl]
+          env:
+          - {name: DYN_SYSTEM_PORT, value: "8081"}
+          ports:
+          - {name: system, containerPort: 8081}
+          resources:
+            requests: {cpu: 500m, memory: 512Mi}
+            limits: {cpu: "2", memory: 2Gi}
+          volumeMounts:
+          - {name: model, mountPath: /models, subPath: MODEL_SUBPATH, readOnly: true}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vime-delta-refit-frontend-admin
+spec:
+  selector:
+    nvidia.com/dynamo-graph-deployment-name: vime-delta-refit
+    nvidia.com/dynamo-component: Frontend
+  ports:
+  - {name: http, port: 8000, targetPort: 8000}
+  - {name: rl-discovery, port: 8001, targetPort: 8001}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vime-delta-refit-generation
+spec:
+  selector:
+    nvidia.com/dynamo-graph-deployment-name: vime-delta-refit
+    nvidia.com/dynamo-component: VLLMWorker
+  ports:
+  - {name: http, port: 8000, targetPort: 8000}

@@ -82,6 +82,5 @@ A successful run ends with `E2E PASS` and includes the installed WeightVersion
 UID, worker count, and post-refit generation. Keep worker, server, and coordinator
 logs as separate evidence; the pass line does not by itself qualify throughput
 or delta/S3 behavior. This first slice is the full-weight NIXL lifecycle needed
-by the existing `modelexpress_rl` protocol. XOR/ADD artifact-backed S3 deltas
-require the planned protocol extension for an artifact URI and are not claimed
-by this example.
+by the existing `modelexpress_rl` protocol. For XOR artifact-backed S3 deltas,
+see [`vime_dynamo_delta_refit`](../vime_dynamo_delta_refit/README.md).
