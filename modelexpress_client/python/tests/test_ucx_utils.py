@@ -32,6 +32,66 @@ def test_nic_access_rejects_host_only_uverbs_device(monkeypatch):
     assert not ucx_utils._nic_has_accessible_verbs_device("mlx5_0")
 
 
+def test_flat_pci_topology_scores_local_phb_above_remote_sys(monkeypatch):
+    paths = {
+        "0002:00:01.0": "/sys/devices/pci0002:00/0002:00:01.0",
+        "0002:00:09.0": "/sys/devices/pci0002:00/0002:00:09.0",
+        "0003:00:09.0": "/sys/devices/pci0003:00/0003:00:09.0",
+    }
+    monkeypatch.setattr(
+        ucx_utils.os.path,
+        "realpath",
+        lambda path: paths[path.rsplit("/", 1)[-1]],
+    )
+
+    gpu_path = ucx_utils._pci_path_components("0002:00:01.0")
+    local_nic_path = ucx_utils._pci_path_components("0002:00:09.0")
+    remote_nic_path = ucx_utils._pci_path_components("0003:00:09.0")
+
+    assert gpu_path == ["pci0002:00", "0002:00:01.0"]
+    assert local_nic_path == ["pci0002:00", "0002:00:09.0"]
+    assert remote_nic_path == ["pci0003:00", "0003:00:09.0"]
+    assert ucx_utils._pci_common_depth(gpu_path, local_nic_path) == 1
+    assert ucx_utils._pci_common_depth(gpu_path, remote_nic_path) == 0
+
+
+def test_nested_pci_topology_keeps_root_and_bridge_components(monkeypatch):
+    paths = {
+        "0000:0f:00.0": (
+            "/sys/devices/pci0000:00/0000:00:01.1/0000:01:00.0/"
+            "0000:02:00.0/0000:0f:00.0"
+        ),
+        "0000:10:00.0": (
+            "/sys/devices/pci0000:00/0000:00:01.1/0000:01:00.0/"
+            "0000:02:00.0/0000:10:00.0"
+        ),
+    }
+    monkeypatch.setattr(
+        ucx_utils.os.path,
+        "realpath",
+        lambda path: paths[path.rsplit("/", 1)[-1]],
+    )
+
+    gpu_path = ucx_utils._pci_path_components("0000:0f:00.0")
+    nic_path = ucx_utils._pci_path_components("0000:10:00.0")
+
+    assert gpu_path == [
+        "pci0000:00",
+        "0000:00:01.1",
+        "0000:01:00.0",
+        "0000:02:00.0",
+        "0000:0f:00.0",
+    ]
+    assert nic_path == [
+        "pci0000:00",
+        "0000:00:01.1",
+        "0000:01:00.0",
+        "0000:02:00.0",
+        "0000:10:00.0",
+    ]
+    assert ucx_utils._pci_common_depth(gpu_path, nic_path) == 4
+
+
 def _install_fake_topology(monkeypatch, gpus, nics, visible=None):
     """Drive probe_nic_pin_for_device from an in-memory topology.
 
@@ -76,15 +136,54 @@ def _install_fake_topology(monkeypatch, gpus, nics, visible=None):
     )
 
 
+def test_flat_topology_selection_keeps_gpus_on_local_nics(monkeypatch):
+    gpus = {
+        gpu: (
+            f"000{2 + gpu // 4}:00:{1 + gpu % 4:02x}.0",
+            gpu // 4,
+            [
+                f"pci000{2 + gpu // 4}:00",
+                f"000{2 + gpu // 4}:00:{1 + gpu % 4:02x}.0",
+            ],
+        )
+        for gpu in range(8)
+    }
+    nics = [
+        (
+            f"mlx5_{5 + nic}",
+            nic // 4,
+            400.0,
+            [
+                f"pci000{2 + nic // 4}:00",
+                f"000{2 + nic // 4}:00:{9 + nic % 4:02x}.0",
+            ],
+        )
+        for nic in range(8)
+    ]
+    _install_fake_topology(monkeypatch, gpus, nics)
+
+    chosen = {gpu: ucx_utils.probe_nic_pin_for_device(gpu) for gpu in gpus}
+
+    assert chosen == {
+        0: "mlx5_5:1",
+        1: "mlx5_6:1",
+        2: "mlx5_7:1",
+        3: "mlx5_8:1",
+        4: "mlx5_10:1",
+        5: "mlx5_11:1",
+        6: "mlx5_12:1",
+        7: "mlx5_9:1",
+    }
+
+
 # Measured on cluster node hx78c: 4 GPUs all on NUMA 1, but the RDMA device
 # plugin handed the pod three rails rooted on NUMA 0 and one on NUMA 1.
 #
 # The paths matter as much as the NUMA numbers, and are the real measured ones.
 # Only GPU3 shares a component with mlx5_11; GPU0/1/2 share nothing with any
-# rail and so score 0 against all four, including the same-socket one. That is
-# not a simplification of the fixture - it is what the metric does on this
-# hardware, because _pci_common_depth drops the root complex. The tests below
-# depend on it, so test_the_fixture_reproduces_the_depth_collapse asserts it.
+# rail and so score 0 against all four, including the same-socket one. The
+# omitted root-complex components are distinct for those pairs, so retaining
+# them in production does not change these nested-topology common depths.
 _MISAFFINE_GPUS = {
     0: ("0000:9a:00.0", 1, ["0000:97:01.0", "0000:98:00.0", "0000:9a:00.0"]),
     1: ("0000:aa:00.0", 1, ["0000:a7:01.0", "0000:a8:00.0", "0000:aa:00.0"]),
