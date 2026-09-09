@@ -16,6 +16,7 @@ def test_defaults_when_unset(monkeypatch):
         "MX_POOL_REG",
         "MX_VMM_ARENA",
         "MX_MS_DISTRIBUTED",
+        "MX_LOAD_STRATEGY_CHAIN",
         "MX_INSTANT_TENSOR",
         "VLLM_ATTENTION_BACKEND",
         "SGLANG_CACHE_DIR",
@@ -39,6 +40,7 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_POOL_REG is False
     assert envs.MX_VMM_ARENA is False
     assert envs.MX_MS_DISTRIBUTED is True
+    assert envs.MX_LOAD_STRATEGY_CHAIN == "INFERENCE"
     assert envs.MX_INSTANT_TENSOR is True
     assert envs.VLLM_ATTENTION_BACKEND == "auto"
     assert envs.SGLANG_CACHE_DIR is None
@@ -112,6 +114,11 @@ def test_bool_parsing(monkeypatch, caplog):
     monkeypatch.setenv("MX_RESHARD_FUSED_WIRE", "maybe")
     assert envs.MX_RESHARD_FUSED_WIRE is True
     assert "Invalid MX_RESHARD_FUSED_WIRE='maybe'; using default True" in caplog.text
+
+
+def test_load_strategy_chain_is_normalized(monkeypatch):
+    monkeypatch.setenv("MX_LOAD_STRATEGY_CHAIN", " rl ")
+    assert envs.MX_LOAD_STRATEGY_CHAIN == "RL"
 
 
 def test_normalization(monkeypatch):
