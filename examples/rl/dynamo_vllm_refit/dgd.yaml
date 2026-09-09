@@ -37,6 +37,7 @@ spec:
             containerPort: 8001
   - name: VLLMWorker
     type: worker
+    runtimeVersionOverride: 1.4.1
     replicas: 1
     podTemplate:
       spec:
@@ -107,8 +108,10 @@ spec:
             exec:
               command:
               - python3
-              - -c
-              - import socket; socket.create_connection(('127.0.0.1', 50051), 2).close()
+              - -m
+              - modelexpress_rl.inference.engines.vllm.startup_probe
+              - --address
+              - 127.0.0.1:50051
             periodSeconds: 5
             timeoutSeconds: 5
             failureThreshold: 120

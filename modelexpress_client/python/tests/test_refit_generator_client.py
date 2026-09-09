@@ -433,7 +433,9 @@ def _initialize(
     max_transfer_attempts=3,
     max_replay_chain_length=64,
     source_order=None,
+    initial_serving_version_id=None,
 ):
+    """Initialize a generator client backed by the test runtime."""
     monkeypatch.setattr(
         GeneratorRuntime,
         "initialize",
@@ -463,6 +465,7 @@ def _initialize(
             max_transfer_attempts=max_transfer_attempts,
             max_replay_chain_length=max_replay_chain_length,
             source_order=source_order,
+            initial_serving_version_id=initial_serving_version_id,
         )
     )
 
@@ -829,6 +832,31 @@ def test_generator_treats_installed_initial_base_as_successful_no_op(monkeypatch
     assert adapter.apply_calls == []
 
 
+def test_generator_uses_engine_observed_serving_version_after_cold_start(
+    monkeypatch,
+):
+    """Use the engine-observed version as the initial serving version."""
+    server, endpoint, service = _start_server()
+    service.version.uid = "version-a"
+    adapter = _Adapter(service)
+    generator = _initialize(
+        monkeypatch,
+        endpoint,
+        adapter,
+        initial_serving_version_id="version-a",
+    )
+
+    try:
+        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+        assert staged.applied is True
+        staged.release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert adapter.stage_calls == []
+
+
 def _canonical_version(uid, base_version_id):
     return refit_pb2.WeightVersion(
         uid=uid,
@@ -1076,12 +1104,13 @@ def test_generator_rejects_wrong_delta_base_before_lease(monkeypatch):
 
 
 def test_generator_validates_the_initial_s3_base_before_registration(monkeypatch):
+    """Validate an initial S3 base before registering the generator."""
     server, endpoint, service = _start_server()
     service.base.state = refit_pb2.WEIGHT_VERSION_STATE_STAGING
     adapter = _Adapter(service)
 
     try:
-        with pytest.raises(RuntimeError, match="initial base.*not READY"):
+        with pytest.raises(RuntimeError, match=r"initial serving version.*not READY"):
             _initialize(
                 monkeypatch,
                 endpoint,

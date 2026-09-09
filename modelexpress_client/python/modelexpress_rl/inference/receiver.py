@@ -1117,38 +1117,59 @@ class _LocalCheckpoint:
                 mapped.close()
                 file_handle.close()
 
+    def _validate_prepared(
+        self,
+        prepared: PreparedCheckpoint,
+        *,
+        message: str,
+    ) -> None:
+        """Ensure the prepared checkpoint still matches durable store state."""
+        state = self.store.state()
+        if (
+            state is None
+            or state.status is not CheckpointState.READY
+            or state.version != prepared.target_version
+            or state.files != checkpoint_files_state(self.checkpoint_paths)
+        ):
+            raise ReceiverInstallError(message)
+
+    def activate(self, prepared: PreparedCheckpoint) -> None:
+        """Commit a prepared checkpoint after every local installer succeeds."""
+        with self.store.installation_locked(), self.store.locked():
+            self._validate_prepared(
+                prepared,
+                message="prepared checkpoint changed before activation",
+            )
+            self.store.activate(prepared.target_version)
+            self.store.enforce_capacity(
+                protected_versions={prepared.target_version},
+            )
+
     @contextmanager
-    def installation_context(self, prepared: PreparedCheckpoint):
+    def installation_context(
+        self,
+        prepared: PreparedCheckpoint,
+        *,
+        activate: bool = True,
+    ):
+        """Hold installation locks and optionally activate on successful exit."""
         with self.store.installation_locked(shared=True):
             with self.store.locked(shared=True):
-                state = self.store.state()
-                if (
-                    state is None
-                    or state.status is not CheckpointState.READY
-                    or state.version != prepared.target_version
-                    or state.files
-                    != checkpoint_files_state(self.checkpoint_paths)
-                ):
-                    raise ReceiverInstallError(
-                        "prepared checkpoint changed before installation"
-                    )
-                yield
-            with self.store.locked():
-                state = self.store.state()
-                if (
-                    state is None
-                    or state.status is not CheckpointState.READY
-                    or state.version != prepared.target_version
-                    or state.files
-                    != checkpoint_files_state(self.checkpoint_paths)
-                ):
-                    raise ReceiverInstallError(
-                        "prepared checkpoint changed during installation"
-                    )
-                self.store.activate(prepared.target_version)
-                self.store.enforce_capacity(
-                    protected_versions={prepared.target_version},
+                self._validate_prepared(
+                    prepared,
+                    message="prepared checkpoint changed before installation",
                 )
+                yield
+            if activate:
+                with self.store.locked():
+                    self._validate_prepared(
+                        prepared,
+                        message="prepared checkpoint changed during installation",
+                    )
+                    self.store.activate(prepared.target_version)
+                    self.store.enforce_capacity(
+                        protected_versions={prepared.target_version},
+                    )
 
 
 __all__ = [

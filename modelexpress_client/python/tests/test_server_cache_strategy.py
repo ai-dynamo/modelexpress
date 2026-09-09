@@ -99,6 +99,7 @@ def fake_client(monkeypatch):
 
 
 def _make_context(model_name, *, adapter=None, model_path=None, revision=None):
+    """Build a load context for server-cache strategy tests."""
     from modelexpress.load_strategy import LoadContext
 
     return LoadContext(
@@ -107,6 +108,7 @@ def _make_context(model_name, *, adapter=None, model_path=None, revision=None):
         target_device=torch.device("cpu"),
         global_rank=0,
         worker_rank=0,
+        local_rank=0,
         device_id=0,
         identity=p2p_pb2.SourceIdentity(model_name=model_name, tensor_parallel_size=1),
         mx_client=MagicMock(),

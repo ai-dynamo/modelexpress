@@ -1331,6 +1331,27 @@ def test_canonical_s3_failed_install_keeps_previous_active_version(
     adapter.close()
 
 
+def test_canonical_s3_can_defer_activation_until_distributed_load_completes(
+    monkeypatch, tmp_path
+):
+    """Defer checkpoint activation until distributed loading completes."""
+    objects = _full_artifact(torch.tensor([7.0, 8.0]))
+    adapter, _storage = _build(monkeypatch, tmp_path, objects)
+    prepared = adapter.stage_weight(_full_inputs())
+
+    with adapter._method.installation_context(
+        adapter._active,
+        activate=False,
+    ):
+        pass
+
+    assert adapter._checkpoint.store.active_version() == "base-a"
+    adapter._method.activate(adapter._active)
+    assert adapter._checkpoint.store.active_version() == "full-a"
+    adapter.release_staged_weight(prepared)
+    adapter.close()
+
+
 def test_canonical_s3_applies_one_delta_to_the_active_checkpoint(
     monkeypatch, tmp_path
 ):

@@ -592,10 +592,25 @@ activation.
 
 RL cold-start bootstrap populates only the immutable full-checkpoint cache; it
 does not rewrite preparation or activation state. Generator ranks sharing that
-cache serialize reconstruction through the same store locks, so the first rank
-prepares the desired target and later ranks attach to the verified `READY`
-checkpoint. Node-local caches elect one preparer per node, while a shared volume
-elects one preparer for the volume.
+cache use local rank 0 as the preparer. Global rank 0 first broadcasts one
+immutable desired UID, and every rank verifies its local configuration against
+that pinned value before agreeing on the replay chain. Node-local followers attach to the
+verified `READY` checkpoint. A CPU-process-group barrier keeps every rank out of
+the engine's distributed checkpoint loader until all nodes are prepared. The
+cache activation commit runs only after every engine rank reports a successful
+load; configuration drift, phase disagreement, or a partial load fails the
+cold start without advancing `active.json`.
+
+The engine's serving version remains separate from checkpoint-cache state.
+vLLM constructs its Control server only after EngineCore and its workers finish
+loading. Because an explicit desired UID makes the MX loader fail closed, the
+Control endpoint is reachable only after every rank loads that UID. The MX
+startup probe then calls vLLM's native `UpdateWeightVersion`, reads it back with
+`GetWeightVersion`, and succeeds only on an exact match. Dynamo's main sidecar
+therefore cannot start or admit the worker before vLLM reports the loaded UID.
+When the weight-transfer backend is initialized later, the controller passes
+that observed UID as `initial_serving_version_id`; the canonical
+`initial_base_version_id` continues to describe only replay lineage.
 
 `WeightVersion.uid` is MX's opaque version identity. A create request may supply
 the UID; MX generates one when it is omitted. Creating another version with an
@@ -910,6 +925,8 @@ RL framework integrations live in the separate `modelexpress_rl` package:
 | `train/engines/fsdp/adapter.py` | FSDP/DTensor source capture with in-place or device-copy staging |
 | `inference/client.py` | Rank-local generator lifecycle, leases, exact-version source discovery, staging, and apply |
 | `inference/runtime.py` | Generator source policy, method/resource composition, and update-session ownership |
+| `inference/engines/vllm/control.py` | Direct vLLM Control gRPC client |
+| `inference/engines/vllm/startup_probe.py` | Serving-version reconciliation and startup gate |
 | `inference/source/` | Independent generator-peer, trainer-memory, and object-storage discovery |
 | `inference/methods/` | Independent full-tensor NIXL and canonical-checkpoint preparation |
 | `inference/checkpoint_store.py` | Host-local immutable lineage, locking, temporary-directory promotion, atomic JSON persistence, artifact fingerprints, and activation state |
