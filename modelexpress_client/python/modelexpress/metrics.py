@@ -105,6 +105,34 @@ LOAD_PHASES = ("artifact_install", "model_init", "chain", "publish")
 #: Terminal outcomes of a load. A load either returns a model or raises.
 LOAD_OUTCOMES = ("success", "error")
 
+#: Compile-cache artifacts the install path knows how to unpack: the ``name`` of
+#: each factory in ``metadata.artifact_transfer``. Closed with an ``other``
+#: fallback so an out-of-tree transfer cannot open the label domain.
+ARTIFACT_KINDS = (
+    "torch_compile_cache",
+    "triton_cache",
+    "tvm_ffi_cache",
+    "deep_gemm_cache",
+    "tilelang_cache",
+    "cute_dsl_cache",
+    "flashinfer_cache",
+    "other",
+)
+
+#: The two on-target steps of installing one archive, in the order they run.
+#: Neither is a load phase. Both happen inside ``artifact_install``, which also
+#: covers source discovery and the RDMA copy, so the two sum to *less* than that
+#: phase -- the remainder is the network.
+#:
+#:   validate  a Python pass over every tar member, rejecting unsafe paths
+#:   extract   ``tar -xf`` into the engine's cache directory
+ARTIFACT_INSTALL_STEPS = ("validate", "extract")
+
+#: Sub-second floor, minutes ceiling. A compile cache is tens of MiB to a few
+#: GiB of small files, so a healthy extract is well under a second and a
+#: pathological one (slow overlay filesystem, tar in D state) is minutes.
+_ARTIFACT_STEP_BUCKETS = (0.1, 0.25, 0.5, 1, 2.5, 5, 15, 30, 60, 120, 300)
+
 #: Longest model id kept in the ``model`` label; longer ones are truncated.
 #:
 #: This is the one label on the load families whose domain is NOT a closed enum,
@@ -409,6 +437,31 @@ class MetricsCollector:
             "their sum is bounded by mx_load_seconds.",
             ["engine", "model", "phase", "scheme"],
             buckets=_XSLOW_BUCKETS,
+            registry=registry,
+        )
+        # Inside artifact_install, not beside it. The phase says how long the
+        # whole artifact step took; this says how much of that was the target
+        # unpacking the archive rather than waiting on the network. Recorded per
+        # archive from install(), which is the only place the two steps run.
+        # ``archive`` is the cache-root name the engine adapter declared in
+        # code ("primary" plus any additional roots), so its domain is fixed by
+        # the adapter rather than by the deployment.
+        self.artifact_install_step_seconds = Histogram(
+            "mx_artifact_install_step_seconds",
+            "On-target time for one step of an artifact install, per archive: "
+            "validate (walk the tar members) or extract (tar -xf). Both run "
+            "inside the artifact_install load phase, which also covers "
+            "discovery and the RDMA copy, so they sum to less than it.",
+            ["artifact", "archive", "step", "scheme"],
+            buckets=_ARTIFACT_STEP_BUCKETS,
+            registry=registry,
+        )
+        self.artifact_install_bytes = Counter(
+            "mx_artifact_install_bytes_total",
+            "Archive bytes extracted on the target, per artifact and archive. "
+            "Divided by the extract step's _sum this is extraction throughput, "
+            "which is what separates a slow disk from a large cache.",
+            ["artifact", "archive", "scheme"],
             registry=registry,
         )
 
@@ -732,6 +785,56 @@ class MetricsCollector:
                 ).observe(seconds)
             except Exception:
                 pass
+
+    def observe_artifact_install_step_seconds(
+        self, artifact: str, archive: str, step: str, seconds: float
+    ) -> None:
+        """Record one on-target step of installing one archive.
+
+        An unknown step is dropped, for the same reason an unknown phase is: the
+        two steps are meant to be read against each other and against the
+        phase, and a stray name folded into one of them would inflate it while
+        looking sound. An unknown artifact clamps to ``other``.
+        """
+        if self._ensure():
+            try:
+                if step not in ARTIFACT_INSTALL_STEPS:
+                    return
+                if artifact not in ARTIFACT_KINDS:
+                    artifact = "other"
+                self.artifact_install_step_seconds.labels(
+                    artifact, archive, step, self.scheme
+                ).observe(seconds)
+            except Exception:
+                pass
+
+    def record_artifact_install_bytes(self, artifact: str, archive: str, nbytes: int) -> None:
+        """Count the bytes of one archive extracted on the target."""
+        if self._ensure():
+            try:
+                if artifact not in ARTIFACT_KINDS:
+                    artifact = "other"
+                self.artifact_install_bytes.labels(artifact, archive, self.scheme).inc(
+                    nbytes
+                )
+            except Exception:
+                pass
+
+    @contextlib.contextmanager
+    def time_artifact_install_step(self, artifact: str, archive: str, step: str):
+        """Time one install step of one archive.
+
+        Recorded on the way out of both paths. A ``tar -xf`` that fails after
+        thirty seconds on a full disk is the observation an operator is looking
+        for; dropping it would leave only the healthy installs.
+        """
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.observe_artifact_install_step_seconds(
+                artifact, archive, step, time.perf_counter() - start
+            )
 
     @contextlib.contextmanager
     def time_load(self, engine: str, model: object, model_role: str):

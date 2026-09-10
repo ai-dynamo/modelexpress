@@ -421,6 +421,8 @@ touched.
 | `mx_nixl_receive_total` | Counter | `scheme`, `result` |
 | `mx_load_seconds` | Histogram | `engine`, `model`, `model_role`, `scheme`, `outcome` |
 | `mx_load_phase_seconds` | Histogram | `engine`, `model`, `phase`, `scheme` |
+| `mx_artifact_install_step_seconds` | Histogram | `artifact`, `archive`, `step`, `scheme` |
+| `mx_artifact_install_bytes_total` | Counter | `artifact`, `archive`, `scheme` |
 
 ### Load timing, and what it does not measure
 
@@ -534,6 +536,62 @@ rather than an edge.
 Quantiles still need observations to mean anything. A single load gives a p95
 that is bucket interpolation whatever the boundaries are; these are fleet
 statistics, and on one pod the mean per phase is the honest panel to read.
+
+### Inside `artifact_install`: validate and extract
+
+`artifact_install` is one interval, and it is a wide one: it covers finding a
+source, fetching the manifest header, the RDMA copy of the archive, a validation
+pass over the tar, and `tar -xf` into the engine's cache directory. A slow
+install is ambiguous until the last two are visible on their own, because they
+are the only part the target does by itself. That is what
+`mx_artifact_install_step_seconds` is for.
+
+| Step | What runs | Scales with |
+| --- | --- | --- |
+| `validate` | A Python walk over every tar member, rejecting unsafe paths | file count |
+| `extract` | `tar -xf` into `target_root` | bytes, and the target filesystem |
+
+One observation per step per archive, recorded from `install()` and nowhere
+else. The steps are **not** load phases and must not be added to
+`LOAD_PHASES`: they sit inside `artifact_install` rather than beside it, so
+they sum to *less* than the phase, and the remainder is the network. Read the
+three together:
+
+```promql
+# Of the artifact_install phase, how much was the target unpacking the archive?
+sum(mx_artifact_install_step_seconds_sum) / sum(mx_load_phase_seconds_sum{phase="artifact_install"})
+
+# Extraction throughput. Separates a slow disk from a large cache: a ten-second
+# extract is fine for 4 GiB on a healthy volume and alarming for 200 MiB on an
+# overlay filesystem, and only the ratio tells them apart.
+sum by (artifact, archive) (mx_artifact_install_bytes_total)
+  / sum by (artifact, archive) (mx_artifact_install_step_seconds_sum{step="extract"})
+```
+
+`artifact` is the factory name (`torch_compile_cache`, `flashinfer_cache`, ...),
+a closed enum with an `other` fallback; a test asserts the enum matches the
+factories in `artifact_transfer.py`. `archive` is the cache-root name the engine
+adapter declared in code -- `primary` for every artifact, plus any additional
+roots such as FlashInfer's -- so its domain is fixed by the adapter rather than
+by the deployment. `step` is closed; an unknown step is dropped for the same
+reason an unknown phase is.
+
+A step that raises is still recorded. A `tar -xf` that dies after thirty
+seconds on a full disk is precisely the reading someone goes looking for.
+
+Throughput is only meaningful for archives of at least a few MiB. Measured on
+nscale, a 42 MiB torch compile cache extracted at 1.26 GB/s while 10-40 KiB
+Triton and FlashInfer archives all took about 2 ms regardless of size -- the cost
+of spawning `tar` -- so their bytes-over-seconds says nothing about the disk.
+
+The same two numbers are also on the `[TIMING] Artifact archive extracted` and
+`[TIMING] Artifact install complete` log lines, per archive and in total, so a
+log-only benchmark run gets them without a scrape endpoint.
+
+The buckets run from 0.1 s to 300 s rather than the hour-scale load band. A
+healthy extract of a compile cache is sub-second and a pathological one is
+minutes, and a band whose first boundary is 0.5 s would put every healthy
+reading in one bucket.
 
 ### The `model` label is bounded by convention, not by code
 
@@ -726,17 +784,19 @@ ConfigMap for the Grafana sidecar to discover. Adjust `metrics.dashboard.label`
 if your sidecar watches something other than `grafana_dashboard`.
 
 It covers the server end to end -- gRPC, storage backend, download lifecycle,
-capacity -- and the client down to total transfer time. It does **not** yet plot
-the load tiers: `mx_load_seconds` and `mx_load_phase_seconds` exist as of this
-change but have no panel, so a load's phase split is queryable and not yet
-visible. Below the phase level there is still nothing — the transfer panel can
-say a transfer took 90 seconds but not where inside it the 90 seconds went.
+capacity -- and the client from the load tiers down to total transfer time. The
+**Model load** row plots `mx_load_seconds`, the phase split of
+`mx_load_phase_seconds`, and the validate/extract steps inside
+`artifact_install`. Below that there is still nothing for the weight transfer
+itself — the transfer panel can say a transfer took 90 seconds but not where
+inside it the 90 seconds went.
 
 Read **Overview** first; the rows below it answer *why* once a tile is not green.
 
 | Row | Answers | Panels |
 | --- | --- | --- |
 | **Overview** | Is anything wrong right now? | 8 stat tiles |
+| **Model load** | How long did a load take, and which part? | 5 |
 | **Downloads** | Is the primary job working, and how fast? | 6 |
 | **Server internals** | gRPC and storage backend: rate, errors, p99, in flight | 8 + 1 note |
 | **P2P clients** | Selection funnel, transfer time, NIXL health | 8 + 1 note |
