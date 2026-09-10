@@ -167,11 +167,12 @@ class RdmaStrategy(LoadStrategy):
             )
 
             try:
-                source_worker = self._fetch_worker_metadata(
-                    ctx,
-                    mx_source_id,
-                    worker_id,
-                )
+                with selection_metrics.time_source_attempt_phase(policy, "metadata"):
+                    source_worker = self._fetch_worker_metadata(
+                        ctx,
+                        mx_source_id,
+                        worker_id,
+                    )
             except Exception as e:
                 logger.warning(
                     f"[Worker {ctx.global_rank}] Failed to fetch metadata for worker {worker_id}: {e}. "
@@ -480,11 +481,14 @@ class RdmaStrategy(LoadStrategy):
         source_worker_id: str,
     ) -> LoadResult:
         """Receive fully-processed weights via RDMA from an existing source."""
+        policy = configured_policy_label()
         try:
-            result = ctx.adapter.prepare_rdma_target(result)
-            result = ctx.adapter.before_rdma_receive(result)
+            with selection_metrics.time_source_attempt_phase(policy, "prepare"):
+                result = ctx.adapter.prepare_rdma_target(result)
+                result = ctx.adapter.before_rdma_receive(result)
             self._receive_from_peer(result, ctx, source_worker, mx_source_id)
-            return ctx.adapter.after_rdma_receive(result)
+            with selection_metrics.time_source_attempt_phase(policy, "finalize"):
+                return ctx.adapter.after_rdma_receive(result)
         except StrategyFailed:
             raise
         except Exception as e:
@@ -499,7 +503,9 @@ class RdmaStrategy(LoadStrategy):
     ) -> None:
         """Receive fully-processed tensors via RDMA from the detected source."""
         receive_start = time.perf_counter()
-        register_tensors(result, ctx)
+        policy = configured_policy_label()
+        with selection_metrics.time_source_attempt_phase(policy, "register"):
+            register_tensors(result, ctx)
 
         is_p2p = bool(source_worker.worker_grpc_endpoint)
         remote_agent_name = None
@@ -525,11 +531,12 @@ class RdmaStrategy(LoadStrategy):
                 # Claimed before the dial so a fetch that fails part-way, leaving
                 # metadata that lands later, is still released.
                 remote_agent_name = source_worker.agent_name
-                ctx.nixl_manager.fetch_remote_and_wait(
-                    remote_agent_name=source_worker.agent_name,
-                    ip=host,
-                    port=int(port_str),
-                )
+                with selection_metrics.time_source_attempt_phase(policy, "handshake"):
+                    ctx.nixl_manager.fetch_remote_and_wait(
+                        remote_agent_name=source_worker.agent_name,
+                        ip=host,
+                        port=int(port_str),
+                    )
                 nixl_fetch_time = time.perf_counter() - nixl_fetch_start
                 logger.info(
                     f"[Worker {ctx.global_rank}] [TIMING] P2P NIXL metadata fetch: "
@@ -549,9 +556,10 @@ class RdmaStrategy(LoadStrategy):
                 # Loaded here rather than inside receive_from_source so this method
                 # holds the name it is responsible for releasing.
                 add_start = time.perf_counter()
-                remote_agent_name = ctx.nixl_manager.add_remote_agent(
-                    source_worker.nixl_metadata
-                )
+                with selection_metrics.time_source_attempt_phase(policy, "handshake"):
+                    remote_agent_name = ctx.nixl_manager.add_remote_agent(
+                        source_worker.nixl_metadata
+                    )
                 logger.info(
                     f"[Worker {ctx.global_rank}] [TIMING] add_remote_agent: "
                     f"{time.perf_counter() - add_start:.3f}s (agent={remote_agent_name})"
@@ -576,17 +584,18 @@ class RdmaStrategy(LoadStrategy):
 
             transfer_start = time.perf_counter()
             try:
-                (
-                    bytes_transferred,
-                    tensor_count,
-                    _,
-                ) = ctx.nixl_manager.receive_from_source(
-                    source_metadata=source_worker.nixl_metadata,
-                    source_tensors=source_tensors,
-                    timeout_seconds=_transfer_timeout_seconds(),
-                    remote_agent_name=remote_agent_name,
-                    require_exact_match=require_exact_match,
-                )
+                with selection_metrics.time_source_attempt_phase(policy, "receive"):
+                    (
+                        bytes_transferred,
+                        tensor_count,
+                        _,
+                    ) = ctx.nixl_manager.receive_from_source(
+                        source_metadata=source_worker.nixl_metadata,
+                        source_tensors=source_tensors,
+                        timeout_seconds=_transfer_timeout_seconds(),
+                        remote_agent_name=remote_agent_name,
+                        require_exact_match=require_exact_match,
+                    )
             except Exception as e:
                 raise SourceTransferError(f"RDMA receive failed: {e}") from e
             transfer_time = time.perf_counter() - transfer_start
@@ -609,7 +618,8 @@ class RdmaStrategy(LoadStrategy):
             # hooks, and in P2P only the reader holds a record of the peer to
             # invalidate. None means acquisition failed with nothing to release.
             if remote_agent_name is not None:
-                ctx.nixl_manager.remove_remote_agent(remote_agent_name)
+                with selection_metrics.time_source_attempt_phase(policy, "release"):
+                    ctx.nixl_manager.remove_remote_agent(remote_agent_name)
 
         total_time = time.perf_counter() - receive_start
         logger.info(

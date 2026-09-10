@@ -63,6 +63,7 @@ _RECORDERS = [
     ("observe_candidates", ("random", "listed", 2)),
     ("observe_selection_seconds", ("random", 0.001)),
     ("observe_transfer_seconds", ("random", "success", 1.0)),
+    ("observe_source_attempt_phase_seconds", ("random", "receive", "ok", 1.0)),
     ("record_nixl_error", ("timeout",)),
     ("record_nixl_receive", ("complete",)),
     ("observe_load_seconds", ("vllm", "Qwen/Qwen2.5-0.5B-Instruct", "main", "success", 12.0)),
@@ -157,6 +158,7 @@ def test_recorders_never_raise_into_load_path(monkeypatch):
     m.candidates = boom
     m.selection_seconds = boom
     m.transfer_seconds = boom
+    m.source_attempt_phase_seconds = boom
     m.nixl_errors = boom
     m.nixl_receives = boom
     # None of these may propagate the RuntimeError.
@@ -1355,9 +1357,14 @@ class TestObserveCandidateLoads:
     def _collector(monkeypatch, label_on):
         from prometheus_client import CollectorRegistry
         from modelexpress import metrics as M
-        monkeypatch.setattr(M.envs, "MX_METRICS_ENABLED", True, raising=False)
-        monkeypatch.setattr(M.envs, "MX_METRICS_SOURCE_ID_LABEL", label_on, raising=False)
-        monkeypatch.setattr(M.envs, "PROMETHEUS_MULTIPROC_DIR", None, raising=False)
+        # Through the environment, never setattr on the envs module: envs resolves
+        # names dynamically, so getattr succeeds when monkeypatch records the old
+        # value and the teardown pins a real attribute that shadows the lookup
+        # for the rest of the process -- every later test that relies on
+        # MX_METRICS_ENABLED then records nothing.
+        monkeypatch.setenv("MX_METRICS_ENABLED", "1")
+        monkeypatch.setenv("MX_METRICS_SOURCE_ID_LABEL", "1" if label_on else "0")
+        monkeypatch.delenv("PROMETHEUS_MULTIPROC_DIR", raising=False)
         reg = CollectorRegistry()
         c = M.MetricsCollector(registry=reg)
         assert c._ensure()
