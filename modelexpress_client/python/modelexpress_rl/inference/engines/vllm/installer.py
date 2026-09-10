@@ -20,13 +20,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
-
 from modelexpress.refit.reshard.geometry import (
     capture_weights,
     convert_source_weights,
 )
 from modelexpress.refit.reshard.types import IncompleteRefit
 from modelexpress.refit.timing import refit_span
+
 from modelexpress_rl.inference.plan import (
     EngineCapabilities,
     EngineInstaller,
@@ -37,10 +37,9 @@ from modelexpress_rl.inference.plan import (
 from modelexpress_rl.inference.receiver import PreparedCheckpoint
 
 if TYPE_CHECKING:
+    from modelexpress.refit.reshard.types import CaptureResult
     from torch.nn import Module
     from vllm.config import ModelConfig, VllmConfig
-
-    from modelexpress.refit.reshard.types import CaptureResult
 
 logger = logging.getLogger("modelexpress_rl.inference.engines.vllm.installer")
 

@@ -8,7 +8,6 @@ from contextlib import contextmanager
 
 import grpc
 import pytest
-
 from modelexpress import p2p_pb2, p2p_pb2_grpc
 from modelexpress.client import MxClient
 from modelexpress.types import ManifestMismatchError
@@ -1314,7 +1313,11 @@ def test_generator_preserves_transfer_error_when_lease_cleanup_also_fails(
         server.stop(grace=None).wait()
 
 
-def test_generator_reports_lease_cleanup_failure_after_success(monkeypatch):
+def test_generator_reports_lease_cleanup_failure_after_success(
+    monkeypatch,
+    caplog,
+):
+    monkeypatch.delenv("MX_REFIT_TIMING", raising=False)
     server, endpoint, service = _start_server()
     service.fail_lease_deletion = True
     adapter = _Adapter(service)
@@ -1322,8 +1325,12 @@ def test_generator_reports_lease_cleanup_failure_after_success(monkeypatch):
 
     try:
         staged = generator.stage_weight(version=WeightVersionRef("version-a"))
-        with pytest.raises(grpc.RpcError, match="lease backend unavailable"):
+        with (
+            caplog.at_level(logging.INFO),
+            pytest.raises(grpc.RpcError, match="lease backend unavailable"),
+        ):
             staged.release()
+        assert "MX_REFIT_TIMING" in caplog.text
     finally:
         generator.close()
         server.stop(grace=None).wait()
