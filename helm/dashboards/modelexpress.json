@@ -1651,20 +1651,20 @@
       "id": 116,
       "type": "table",
       "title": "Where a source attempt's time went",
-      "description": "Mean duration of each phase of a P2P source attempt, by outcome. This is the breakdown of the two transfer panels above: they say a transfer took ninety seconds, these rows say whether that was the registration, the handshake with the peer, or the RDMA read itself.\n\nAll phases but `metadata` fall inside mx_p2p_transfer_seconds, so they sum to less than it -- the remainder is descriptor bookkeeping and logging. `metadata` is the GetMetadata and manifest fetch that runs before the transfer span opens; it belongs to the attempt but not to the transfer.\n\nOutcome is on the table because a receive that hit the transfer deadline and one that finished are not the same duration, and a mean across the two describes neither.",
+      "description": "Mean duration of each phase of a P2P source attempt, by outcome. This is the breakdown of the two transfer panels above: they say a transfer took ninety seconds, these rows say whether that was the registration, the handshake with the peer, or the RDMA read itself.\n\nAll phases but `metadata` fall inside mx_p2p_transfer_seconds, so they sum to less than it -- the remainder is descriptor bookkeeping and logging. `metadata` is the GetMetadata and manifest fetch that runs before the transfer span opens; it belongs to the attempt but not to the transfer.\n\nOutcome is on the table because a receive that hit the transfer deadline and one that finished are not the same duration, and a mean across the two describes neither.\n\nReads the last sample inside the dashboard range rather than the instant value. A load happens once in a process's life and the pod is often gone before anyone looks; an instant query goes empty five minutes after the last scrape, which would show this table as 0 for exactly the attempt someone came to read about.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
       "gridPos": {
-        "h": 8,
+        "h": 10,
         "w": 14,
         "x": 0,
         "y": 86
       },
       "targets": [
         {
-          "expr": "sum by (phase, outcome) (mx_p2p_source_attempt_phase_seconds_sum) / sum by (phase, outcome) (mx_p2p_source_attempt_phase_seconds_count)",
+          "expr": "sum by (phase, outcome) (last_over_time(mx_p2p_source_attempt_phase_seconds_sum[$__range])) / sum by (phase, outcome) (last_over_time(mx_p2p_source_attempt_phase_seconds_count[$__range]))",
           "format": "table",
           "instant": true,
           "refId": "A",
@@ -1758,7 +1758,7 @@
         "uid": "${datasource}"
       },
       "gridPos": {
-        "h": 8,
+        "h": 10,
         "w": 10,
         "x": 14,
         "y": 86
@@ -1805,7 +1805,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 94
+        "y": 96
       },
       "targets": [
         {
@@ -1844,7 +1844,7 @@
         "h": 6,
         "w": 18,
         "x": 6,
-        "y": 94
+        "y": 96
       },
       "options": {
         "mode": "markdown",
@@ -1860,7 +1860,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 100
+        "y": 102
       },
       "panels": []
     },
@@ -1876,7 +1876,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 101
+        "y": 103
       },
       "targets": [
         {
@@ -1908,7 +1908,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 101
+        "y": 103
       },
       "targets": [
         {
@@ -1941,7 +1941,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 101
+        "y": 103
       },
       "targets": [
         {
