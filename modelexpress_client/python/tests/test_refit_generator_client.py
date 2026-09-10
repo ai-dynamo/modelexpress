@@ -1278,6 +1278,48 @@ def test_generator_retries_with_redundant_worker_for_same_slot(monkeypatch):
     ]
 
 
+def test_generator_assembles_healthy_replicas_from_different_offsets(monkeypatch):
+    """Health is per slot, so the healthy replicas need not line up across slots.
+
+    Pairing them by a shared offset yields nothing here: the aligned pairs are
+    (trainer-0, trainer-1) and (trainer-a1, trainer-b1), and each contains one
+    unusable source, though the complete healthy set (trainer-0, trainer-b1)
+    exists the whole time.
+    """
+    server, endpoint, service = _start_server()
+    unusable = "0" * 64
+    # rank:0 keeps its first replica and gains a broken second one.
+    broken_first_slot = refit_pb2.WeightVersionShard()
+    broken_first_slot.CopyFrom(service.shards[0])
+    broken_first_slot.worker_id = "trainer-a1"
+    broken_first_slot.manifest_digest = unusable
+    # rank:1 is the mirror image: its first replica is the broken one.
+    healthy_second_slot = refit_pb2.WeightVersionShard()
+    healthy_second_slot.CopyFrom(service.shards[1])
+    healthy_second_slot.worker_id = "trainer-b1"
+    service.shards[1].manifest_digest = unusable
+    service.shards.extend([broken_first_slot, healthy_second_slot])
+    adapter = _Adapter(service)
+    generator = _initialize(
+        monkeypatch,
+        endpoint,
+        adapter,
+        source_order=(WeightSource.TRAINER,),
+    )
+
+    try:
+        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+        staged.release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert [source.worker_id for source in adapter.stage_calls[0].sources] == [
+        "trainer-0",
+        "trainer-b1",
+    ]
+
+
 def test_generator_fetches_fallback_manifest_only_after_primary_failure(monkeypatch):
     server, endpoint, service = _start_server()
     replica = refit_pb2.WeightVersionShard()

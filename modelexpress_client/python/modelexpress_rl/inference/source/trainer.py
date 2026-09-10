@@ -23,6 +23,59 @@ logger = logging.getLogger("modelexpress_rl.inference.source.trainer")
 _MAX_MANIFEST_MESSAGE_SIZE_BYTES = 100 * 1024 * 1024
 
 
+class _SlotReplicas:
+    """Replicas published for one source slot, resolved as far as asked.
+
+    Health is decided per slot and independently of every other slot. Pairing
+    replicas by a shared offset instead means a fleet whose healthy replicas
+    sit at different offsets in different slots yields no candidate at all,
+    even though a complete healthy set exists: with only ``a0`` up in one slot
+    and only ``b1`` in the next, the aligned pairs ``(a0, b0)`` and
+    ``(a1, b1)`` both contain a dead source and ``(a0, b1)`` is never tried.
+
+    Resolution stays lazy because it is charged per manifest fetched, and the
+    first replica of each slot is all a healthy fleet ever needs.
+    """
+
+    def __init__(
+        self,
+        slot_id: str,
+        shards: list[refit_pb2.WeightVersionShard],
+        resolve: Callable[[refit_pb2.WeightVersionShard], GeneratorSource],
+    ) -> None:
+        self.slot_id = slot_id
+        self._pending = list(shards)
+        self._resolve = resolve
+        self._usable: list[GeneratorSource] = []
+
+    def usable(self, index: int) -> GeneratorSource | None:
+        """Return the index-th usable replica, resolving no further than needed."""
+        while len(self._usable) <= index and self._pending:
+            shard = self._pending.pop(0)
+            try:
+                self._usable.append(self._resolve(shard))
+            except (grpc.RpcError, RuntimeError) as error:
+                logger.warning(
+                    "trainer source %s failed for slot %s: %s",
+                    shard.worker_id,
+                    self.slot_id,
+                    error,
+                )
+        if index < len(self._usable):
+            return self._usable[index]
+        return None
+
+    @property
+    def exhausted(self) -> bool:
+        """Whether every published replica has been tried."""
+        return not self._pending
+
+    @property
+    def usable_count(self) -> int:
+        """How many replicas resolved so far; final once exhausted."""
+        return len(self._usable)
+
+
 class TrainerSourceResolver(SourceResolver):
     """Resolve trainer shard manifests without compiling a transfer plan."""
 
@@ -72,52 +125,59 @@ class TrainerSourceResolver(SourceResolver):
         for shard in response.shards:
             published[shard.source_slot_id].append(shard)
 
-        ordered_slots = []
+        slots = []
         for source_slot_id in version.expected_source_slots:
-            ordered = sorted(published[source_slot_id], key=lambda item: item.worker_id)
+            ordered = sorted(
+                published[source_slot_id], key=lambda item: item.worker_id
+            )
             if not ordered:
                 logger.warning(
                     "no trainer source published for required slot %s",
                     source_slot_id,
                 )
                 return
-            ordered_slots.append(ordered)
+            slots.append(_SlotReplicas(source_slot_id, ordered, self._resolve_source))
 
-        seen = set()
-        candidate_count = max((len(slot) for slot in ordered_slots), default=1)
-        for offset in range(candidate_count):
-            selected_shards = tuple(slot[offset % len(slot)] for slot in ordered_slots)
+        seen: set[tuple[tuple[str, str], ...]] = set()
+        offset = 0
+        while True:
+            selected = []
+            for slot in slots:
+                source = slot.usable(offset)
+                if source is None:
+                    if not slot.usable_count:
+                        logger.warning(
+                            "no usable trainer source for required slot %s",
+                            slot.slot_id,
+                        )
+                        return
+                    # Exhausted and shorter than the candidate index, so cycle
+                    # its healthy replicas rather than give up on a slot that
+                    # simply has fewer of them.
+                    source = slot.usable(offset % slot.usable_count)
+                selected.append(source)
             selection = tuple(
-                (shard.source_slot_id, shard.worker_id) for shard in selected_shards
+                (source.source_slot_id, source.worker_id) for source in selected
             )
-            if selection in seen:
-                continue
-            seen.add(selection)
-            resolved = []
-            for shard in selected_shards:
-                try:
-                    resolved.append(self._resolve_source(shard))
-                except (grpc.RpcError, RuntimeError) as error:
-                    logger.warning(
-                        "trainer source %s failed for slot %s: %s",
-                        shard.worker_id,
-                        shard.source_slot_id,
-                        error,
+            if selection not in seen:
+                seen.add(selection)
+                yield TrainerUpdateSource(
+                    inputs=GeneratorTransferInputs(
+                        version_id=version.version_id,
+                        base_version_id=version.base_version_id,
+                        layout_signature=version.layout_signature,
+                        payload_format=version.payload_format,
+                        sources=tuple(selected),
                     )
-                    break
-            if len(resolved) != len(ordered_slots):
-                continue
-            yield TrainerUpdateSource(
-                inputs=GeneratorTransferInputs(
-                    version_id=version.version_id,
-                    base_version_id=version.base_version_id,
-                    layout_signature=version.layout_signature,
-                    payload_format=version.payload_format,
-                    sources=tuple(resolved),
                 )
-            )
+            deepest = max((slot.usable_count for slot in slots), default=1)
+            if all(slot.exhausted for slot in slots) and offset + 1 >= deepest:
+                return
+            offset += 1
 
-    def _resolve_source(self, shard: refit_pb2.WeightVersionShard) -> GeneratorSource:
+    def _resolve_source(
+        self, shard: refit_pb2.WeightVersionShard
+    ) -> GeneratorSource:
         if not shard.manifest_endpoint:
             raise RuntimeError("NIXL source is missing its manifest endpoint")
         if not shard.manifest_digest:
@@ -166,7 +226,9 @@ class TrainerSourceResolver(SourceResolver):
             ),
         )
 
-    def _fetch_manifest(self, shard: refit_pb2.WeightVersionShard) -> tuple[bytes, str]:
+    def _fetch_manifest(
+        self, shard: refit_pb2.WeightVersionShard
+    ) -> tuple[bytes, str]:
         """Fetch, verify and fingerprint one worker's manifest.
 
         Three spans on one stage rather than one, because the stage total
@@ -174,22 +236,19 @@ class TrainerSourceResolver(SourceResolver):
         CPU, and with digests published these manifests are refetched by
         construction on every version.
         """
-        with (
-            refit_span(
-                "source_preparation",
-                accumulate_metadata=True,
-                duration_key="manifest_fetch_s",
-            ),
-            grpc.insecure_channel(
-                shard.manifest_endpoint,
-                options=[
-                    (
-                        "grpc.max_receive_message_length",
-                        _MAX_MANIFEST_MESSAGE_SIZE_BYTES,
-                    )
-                ],
-            ) as channel,
-        ):
+        with refit_span(
+            "source_preparation",
+            accumulate_metadata=True,
+            duration_key="manifest_fetch_s",
+        ), grpc.insecure_channel(
+            shard.manifest_endpoint,
+            options=[
+                (
+                    "grpc.max_receive_message_length",
+                    _MAX_MANIFEST_MESSAGE_SIZE_BYTES,
+                )
+            ],
+        ) as channel:
             response = refit_pb2_grpc.RefitWorkerServiceStub(
                 channel
             ).GetWeightVersionShardManifest(
