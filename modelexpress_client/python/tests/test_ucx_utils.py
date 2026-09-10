@@ -144,21 +144,36 @@ def test_flat_topology_selection_keeps_gpus_on_local_nics(monkeypatch):
 # plugin handed the pod three rails rooted on NUMA 0 and one on NUMA 1.
 #
 # The paths matter as much as the NUMA numbers, and are the real measured ones.
-# Only GPU3 shares a component with mlx5_11; GPU0/1/2 share nothing with any
-# rail and so score 0 against all four, including the same-socket one. The
-# omitted root-complex components are distinct for those pairs, so retaining
-# them in production does not change these nested-topology common depths.
+# Only GPU3 shares a root complex and bridge with mlx5_11; GPU0/1/2 share
+# nothing with any rail and so score 0 against all four, including the
+# same-socket one.
 _MISAFFINE_GPUS = {
-    0: ("0000:9a:00.0", 1, ["0000:97:01.0", "0000:98:00.0", "0000:9a:00.0"]),
-    1: ("0000:aa:00.0", 1, ["0000:a7:01.0", "0000:a8:00.0", "0000:aa:00.0"]),
-    2: ("0000:ba:00.0", 1, ["0000:b7:01.0", "0000:b8:00.0", "0000:ba:00.0"]),
-    3: ("0000:ca:00.0", 1, ["0000:c7:01.0", "0000:c8:00.0", "0000:ca:00.0"]),
+    0: (
+        "0000:9a:00.0",
+        1,
+        ["pci0000:97", "0000:97:01.0", "0000:98:00.0", "0000:9a:00.0"],
+    ),
+    1: (
+        "0000:aa:00.0",
+        1,
+        ["pci0000:a7", "0000:a7:01.0", "0000:a8:00.0", "0000:aa:00.0"],
+    ),
+    2: (
+        "0000:ba:00.0",
+        1,
+        ["pci0000:b7", "0000:b7:01.0", "0000:b8:00.0", "0000:ba:00.0"],
+    ),
+    3: (
+        "0000:ca:00.0",
+        1,
+        ["pci0000:c7", "0000:c7:01.0", "0000:c8:00.0", "0000:ca:00.0"],
+    ),
 }
 _MISAFFINE_NICS = [
-    ("mlx5_0", 0, 400.0, ["0000:15:01.0", "0000:19:00.0"]),
-    ("mlx5_1", 0, 400.0, ["0000:26:01.0", "0000:2a:00.0"]),
-    ("mlx5_11", 1, 400.0, ["0000:c7:01.0", "0000:cb:00.0"]),
-    ("mlx5_2", 0, 400.0, ["0000:37:01.0", "0000:3b:00.0"]),
+    ("mlx5_0", 0, 400.0, ["pci0000:15", "0000:15:01.0", "0000:19:00.0"]),
+    ("mlx5_1", 0, 400.0, ["pci0000:26", "0000:26:01.0", "0000:2a:00.0"]),
+    ("mlx5_11", 1, 400.0, ["pci0000:c7", "0000:c7:01.0", "0000:cb:00.0"]),
+    ("mlx5_2", 0, 400.0, ["pci0000:37", "0000:37:01.0", "0000:3b:00.0"]),
 ]
 
 
