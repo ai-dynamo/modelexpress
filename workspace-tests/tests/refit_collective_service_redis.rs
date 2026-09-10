@@ -116,7 +116,6 @@ async fn register(
                 worker_id: worker_id.to_string(),
                 role: role.into(),
                 model_name: model_name.to_string(),
-                endpoint: format!("{worker_id}:9000"),
                 expires_at_unix_ms: 0,
             }),
             ttl_seconds,

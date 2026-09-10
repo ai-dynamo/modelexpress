@@ -577,7 +577,9 @@ impl CollectiveBackend for RedisCollectiveBackend {
             }
             "INVALID_PLAN_SOURCE" => {
                 return Err(CollectiveBackendError::InvalidArgument(
-                    "plan_source must be the registered trainer coordinator endpoint".to_string(),
+                    "only a live trainer at index 0 may advertise a plan source, and only \
+                     under its own worker_id"
+                        .to_string(),
                 ));
             }
             "CONFLICTING_ASSIGNMENT" => {

@@ -150,7 +150,6 @@ class TestJoin:
         assert stub.events[:2] == ["register", "join"]
         registered = stub.registered[0]
         assert registered.worker.role == rz.refit_pb2.WORKER_ROLE_TRAINER
-        assert registered.worker.endpoint == "collective://w0"
         assert registered.ttl_seconds == 90
         sent = stub.joined[0]
         assert sent.source_partition == 0
@@ -207,7 +206,10 @@ class TestJoin:
         # Generators verify the fetched plan against the digest MX advertises,
         # so the two must not be allowed to drift apart at the source.
         assert source.digest == "abc"
-        assert stub.registered[0].worker.endpoint == "host:1234"
+        # Advertising a plan endpoint does not put one on the worker
+        # registration: registration carries identity and liveness only, and
+        # the wire has no field to put an endpoint in.
+        assert "endpoint" not in rz.refit_pb2.WorkerRegistration.DESCRIPTOR.fields_by_name
 
     def test_a_server_rank_disagreement_is_rejected_before_communicator_init(self):
         stub = FakeStub(
@@ -251,7 +253,7 @@ class TestJoin:
         assert stub.joined == []
         assert stub.registered == []
 
-    def test_an_explicit_registration_endpoint_is_immutable_across_joins(self):
+    def test_one_rendezvous_cannot_register_two_worker_identities(self):
         stub = FakeStub(
             membership=membership(
                 assignments=[
@@ -268,20 +270,16 @@ class TestJoin:
             source_partition_count=1,
             slot_id="g0",
             worker_id="w1",
-            worker_endpoint="actor://generator-0",
             role=Role.GENERATOR,
             index_in_role=0,
             plan_digest="d",
         )
         client.join(**kwargs)
         client.join(**kwargs)
-        assert [r.worker.endpoint for r in stub.registered] == [
-            "actor://generator-0",
-            "actor://generator-0",
-        ]
+        assert [r.worker.worker_id for r in stub.registered] == ["w1", "w1"]
 
         with pytest.raises(RendezvousError, match="more than one worker identity"):
-            client.join(**{**kwargs, "worker_endpoint": "actor://other"})
+            client.join(**{**kwargs, "worker_id": "w2"})
         assert len(stub.joined) == 2
 
     def test_close_stops_the_registration_renewal_thread(self, monkeypatch):

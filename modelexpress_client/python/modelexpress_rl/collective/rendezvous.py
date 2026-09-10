@@ -125,7 +125,6 @@ class _WorkerRegistrationSpec:
     worker_id: str
     role: Role
     model_name: str
-    endpoint: str
 
 
 def _lane_kind(value: int) -> str:
@@ -306,7 +305,6 @@ class CollectiveRendezvous:
                     worker_id=registration.worker_id,
                     role=_ROLE_TO_WORKER_PROTO[registration.role],
                     model_name=registration.model_name,
-                    endpoint=registration.endpoint,
                 ),
                 ttl_seconds=self._registration_ttl_s,
             ),
@@ -383,7 +381,6 @@ class CollectiveRendezvous:
         source_partition_count: int,
         slot_id: str,
         worker_id: str,
-        worker_endpoint: str | None = None,
         role: Role,
         index_in_role: int,
         plan_digest: str,
@@ -397,10 +394,10 @@ class CollectiveRendezvous:
         a worker that declares a different set resolves a *different* group and
         waits there alone rather than corrupting the real one.
 
-        ``worker_endpoint`` is registration metadata, not a collective data
-        path. Workers without a peer service use the stable opaque
-        ``collective://<worker_id>`` marker; a plan-serving trainer advertises
-        its reachable address separately through ``plan_endpoint``.
+        A plan-serving trainer advertises its reachable address through
+        ``plan_endpoint``. Worker registration carries no endpoint of its own,
+        so only trainer index 0 may advertise a plan source and only under its
+        own ``worker_id``.
         """
         if not isinstance(role, Role):
             raise ValueError(f"unsupported collective role {role!r}")
@@ -423,7 +420,6 @@ class CollectiveRendezvous:
         )
         if plan_endpoint is not None and not (role is Role.TRAINER and index_in_role == 0):
             raise ValueError("only trainer index 0 may advertise the reshard plan endpoint")
-        registration_endpoint = worker_endpoint or plan_endpoint or f"collective://{worker_id}"
 
         spec = pb.CollectiveGroupSpec(
             model_name=model_name,
@@ -455,7 +451,6 @@ class CollectiveRendezvous:
                 worker_id=worker_id,
                 role=role,
                 model_name=model_name,
-                endpoint=registration_endpoint,
             )
         )
         response = self._stub.JoinCollectiveGroup(request, timeout=self._rpc_timeout_s)

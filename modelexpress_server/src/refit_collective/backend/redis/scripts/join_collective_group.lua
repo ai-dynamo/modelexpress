@@ -65,8 +65,7 @@ if not registration_matches(ARGV[6], ARGV[7], ARGV[2]) then
 end
 
 if ARGV[11] ~= '' then
-  if ARGV[7] ~= 'TRAINER' or ARGV[8] ~= '0' or ARGV[11] ~= ARGV[6]
-      or redis.call('HGET', KEYS[4], 'endpoint') ~= ARGV[12] then
+  if ARGV[7] ~= 'TRAINER' or ARGV[8] ~= '0' or ARGV[11] ~= ARGV[6] then
     return 'INVALID_PLAN_SOURCE'
   end
 end
