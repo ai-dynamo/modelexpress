@@ -73,9 +73,9 @@ fn validate_spec(spec: Option<&CollectiveGroupSpec>) -> Result<&CollectiveGroupS
             "spec.expected_generator_slots must not be empty",
         ));
     }
-    if spec.source_partition_count == 0 {
+    if spec.lanes.is_empty() {
         return Err(Status::invalid_argument(
-            "spec.source_partition_count must be greater than zero",
+            "spec.lanes must declare at least one lane",
         ));
     }
     // Duplicate slots would make the expected count disagree with the number
@@ -293,13 +293,19 @@ impl RefitCollectiveService for RefitCollectiveServiceImpl {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use modelexpress_common::grpc::refit_collective::{LaneKind, LaneSpec};
 
     fn spec() -> CollectiveGroupSpec {
         CollectiveGroupSpec {
             model_name: "m".to_string(),
             expected_trainer_slots: vec!["t0".to_string(), "t1".to_string()],
             expected_generator_slots: vec!["g0".to_string()],
-            source_partition_count: 1,
+            lanes: vec![LaneSpec {
+                lane_id: 0,
+                kind: LaneKind::Broadcast.into(),
+                trainer_slots: vec!["t0".to_string(), "t1".to_string()],
+                generator_slots: vec!["g0".to_string()],
+            }],
         }
     }
 
@@ -327,7 +333,7 @@ mod tests {
         assert!(validate_spec(Some(&s)).is_err());
 
         let mut s = spec();
-        s.source_partition_count = 0;
+        s.lanes.clear();
         assert!(validate_spec(Some(&s)).is_err());
 
         let mut s = spec();

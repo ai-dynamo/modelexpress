@@ -2,26 +2,25 @@
 -- the group on first contact, and re-evaluate readiness.
 --
 -- KEYS[1]: group hash
--- KEYS[2]: participants hash (slot_id -> worker_id|role|index|partition|joined_epoch)
+-- KEYS[2]: participants hash (slot_id -> worker_id|role|index|joined_epoch)
 -- KEYS[3]: reported plan digests hash (slot_id -> digest)
 -- KEYS[4]: the incoming worker's TTL-bound Refit registration
--- KEYS[5..4+lane_count]: one lane hash per lane, reshard lanes then broadcast
+-- KEYS[5..4+lane_count]: one lane hash per declared lane, in declared order
 -- ARGV[1]:  group_id
 -- ARGV[2]:  model_name
--- ARGV[3]:  source_partition_count
+-- ARGV[3]:  declared lane set, one line per lane
 -- ARGV[4]:  expected participant total
 -- ARGV[5]:  slot_id
 -- ARGV[6]:  worker_id
 -- ARGV[7]:  role (TRAINER or GENERATOR)
 -- ARGV[8]:  index_in_role
--- ARGV[9]:  source_partition ('' for generators)
--- ARGV[10]: plan_digest
--- ARGV[11]: plan_source_worker_id ('' when this worker does not serve it)
--- ARGV[12]: plan_source_endpoint
--- ARGV[13]: plan_source_digest
--- ARGV[14]: expected_trainer_slots, newline separated
--- ARGV[15]: expected_generator_slots, newline separated
--- ARGV[16]: created_at_unix_ms
+-- ARGV[9]:  plan_digest
+-- ARGV[9]: plan_source_worker_id ('' when this worker does not serve it)
+-- ARGV[10]: plan_source_endpoint
+-- ARGV[11]: plan_source_digest
+-- ARGV[12]: expected_trainer_slots, newline separated
+-- ARGV[13]: expected_generator_slots, newline separated
+-- ARGV[14]: created_at_unix_ms
 
 local function contains_slot(list, target)
   for slot in string.gmatch(list .. '\n', '([^\n]*)\n') do
@@ -36,7 +35,7 @@ local function parse_participant(record)
   if not record then
     return nil
   end
-  return string.match(record, '^([^|]*)|([^|]*)|([^|]*)|([^|]*)|([^|]*)$')
+  return string.match(record, '^([^|]*)|([^|]*)|([^|]*)|([^|]*)$')
 end
 
 local function registration_key(worker_id)
@@ -55,7 +54,7 @@ local function registration_matches(worker_id, role, model_name)
 end
 
 local lane_count = #KEYS - 4
-local expected_slots = ARGV[7] == 'TRAINER' and ARGV[14] or ARGV[15]
+local expected_slots = ARGV[7] == 'TRAINER' and ARGV[13] or ARGV[14]
 if not contains_slot(expected_slots, ARGV[5]) then
   return 'UNEXPECTED_SLOT'
 end
@@ -64,8 +63,8 @@ if not registration_matches(ARGV[6], ARGV[7], ARGV[2]) then
   return 'UNREGISTERED'
 end
 
-if ARGV[11] ~= '' then
-  if ARGV[7] ~= 'TRAINER' or ARGV[8] ~= '0' or ARGV[11] ~= ARGV[6] then
+if ARGV[10] ~= '' then
+  if ARGV[7] ~= 'TRAINER' or ARGV[8] ~= '0' or ARGV[10] ~= ARGV[6] then
     return 'INVALID_PLAN_SOURCE'
   end
 end
@@ -87,17 +86,17 @@ if not epoch then
   redis.call('HSET', KEYS[1],
     'group_id', ARGV[1],
     'model_name', ARGV[2],
-    'source_partition_count', ARGV[3],
+    'lanes', ARGV[3],
     'expected_total', ARGV[4],
-    'expected_trainer_slots', ARGV[14],
-    'expected_generator_slots', ARGV[15],
-    'plan_digest', ARGV[10],
+    'expected_trainer_slots', ARGV[13],
+    'expected_generator_slots', ARGV[14],
+    'plan_digest', ARGV[9],
     'epoch', epoch,
     'state', 'FORMING',
     'plan_source_worker_id', '',
     'plan_source_endpoint', '',
     'plan_source_digest', '',
-    'created_at_unix_ms', ARGV[16])
+    'created_at_unix_ms', ARGV[15])
 else
   -- The first membership change from READY invalidates the old communicator
   -- and opens a clean FORMING epoch. Further replacements in that same clean
@@ -132,14 +131,14 @@ else
 
   local existing = redis.call('HGET', KEYS[2], ARGV[5])
   if existing then
-    local worker_id, role, index, partition = parse_participant(existing)
+    local worker_id, role, index = parse_participant(existing)
     if not worker_id then
       return 'CORRUPT_PARTICIPANT'
     end
     -- A stable slot has one immutable rank assignment. Only its process
-    -- generation may change; changing role/ordinal/partition under the same
-    -- group identity would put peers in different lanes.
-    if role ~= ARGV[7] or index ~= ARGV[8] or partition ~= ARGV[9] then
+    -- generation may change; changing role or ordinal under the same group
+    -- identity would put peers in different lanes.
+    if role ~= ARGV[7] or index ~= ARGV[8] then
       return 'CONFLICTING_ASSIGNMENT'
     end
     if worker_id ~= ARGV[6] then
@@ -172,7 +171,7 @@ else
     end
   end
 
-  if redis.call('HGET', KEYS[1], 'plan_digest') ~= ARGV[10] then
+  if redis.call('HGET', KEYS[1], 'plan_digest') ~= ARGV[9] then
     changed = true
   end
 end
@@ -181,7 +180,7 @@ if changed then
   epoch = epoch + 1
   redis.call('HSET', KEYS[1],
     'epoch', epoch,
-    'plan_digest', ARGV[10],
+    'plan_digest', ARGV[9],
     'state', 'FORMING',
     'plan_source_worker_id', '',
     'plan_source_endpoint', '',
@@ -192,14 +191,14 @@ if changed then
 end
 
 redis.call('HSET', KEYS[2], ARGV[5],
-  ARGV[6] .. '|' .. ARGV[7] .. '|' .. ARGV[8] .. '|' .. ARGV[9] .. '|' .. epoch)
-redis.call('HSET', KEYS[3], ARGV[5], ARGV[10])
+  ARGV[6] .. '|' .. ARGV[7] .. '|' .. ARGV[8] .. '|' .. epoch)
+redis.call('HSET', KEYS[3], ARGV[5], ARGV[9])
 
-if ARGV[11] ~= '' then
+if ARGV[10] ~= '' then
   redis.call('HSET', KEYS[1],
-    'plan_source_worker_id', ARGV[11],
-    'plan_source_endpoint', ARGV[12],
-    'plan_source_digest', ARGV[13])
+    'plan_source_worker_id', ARGV[10],
+    'plan_source_endpoint', ARGV[11],
+    'plan_source_digest', ARGV[12])
 end
 
 -- READY means every exact slot/rank is live and has acknowledged this epoch,
@@ -210,7 +209,7 @@ local ready = admitted == tonumber(ARGV[4])
 if ready then
   local records = redis.call('HVALS', KEYS[2])
   for i = 1, #records do
-    local worker_id, role, index, partition, joined_epoch = parse_participant(records[i])
+    local worker_id, role, index, joined_epoch = parse_participant(records[i])
     if not worker_id or tonumber(joined_epoch) ~= epoch
         or not registration_matches(worker_id, role, ARGV[2]) then
       ready = false

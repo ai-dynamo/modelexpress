@@ -44,7 +44,8 @@ impl Lane {
         self.trainer_slots.iter().chain(self.generator_slots.iter())
     }
 
-    fn world_size(&self) -> u32 {
+    #[must_use]
+    pub fn world_size(&self) -> u32 {
         let total = self.trainer_slots.len().saturating_add(self.generator_slots.len());
         u32::try_from(total).unwrap_or(u32::MAX)
     }

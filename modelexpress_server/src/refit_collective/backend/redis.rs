@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{CollectiveBackend, CollectiveBackendError, CollectiveResult};
-use crate::refit_collective::lanes::LaneLayout;
+use crate::refit_collective::lanes::{Lane, LaneLayout};
 
 const JOIN_GROUP_LUA: &str = include_str!("redis/scripts/join_collective_group.lua");
 const PUBLISH_BOOTSTRAP_LUA: &str = include_str!("redis/scripts/publish_group_bootstrap.lua");
@@ -87,7 +87,15 @@ fn group_id_for(spec: &CollectiveGroupSpec) -> String {
     let mut hasher = Sha256::new();
     hasher.update(spec.model_name.as_bytes());
     hasher.update([0]);
-    hasher.update(spec.source_partition_count.to_le_bytes());
+    for lane in &spec.lanes {
+        hasher.update(lane.lane_id.to_le_bytes());
+        hasher.update(lane.kind.to_le_bytes());
+        for slot in lane.trainer_slots.iter().chain(lane.generator_slots.iter()) {
+            hasher.update(slot.as_bytes());
+            hasher.update([0]);
+        }
+        hasher.update([2]);
+    }
     hasher.update([0]);
     for slot in &trainers {
         hasher.update(slot.as_bytes());
@@ -197,6 +205,82 @@ fn transfer_state_from_str(text: &str) -> CollectiveTransferState {
     }
 }
 
+/// The declared lane set, flattened for the group hash: one line per lane,
+/// `lane_id|kind|trainer_slots|generator_slots`, slot lists comma separated.
+/// Slot ids in this path are role-ordinal strings, so none of the three
+/// separators can occur inside one.
+fn encode_lanes(lanes: &[Lane]) -> String {
+    lanes
+        .iter()
+        .map(|lane| {
+            format!(
+                "{}|{}|{}|{}",
+                lane.lane_id,
+                i32::from(lane.kind),
+                lane.trainer_slots.join(","),
+                lane.generator_slots.join(",")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn decode_lanes(text: &str) -> CollectiveResult<Vec<Lane>> {
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    text.split('\n')
+        .map(|line| {
+            let mut parts = line.split('|');
+            let lane_id: u32 = parts
+                .next()
+                .unwrap_or_default()
+                .parse()
+                .map_err(|error| {
+                    CollectiveBackendError::Internal(format!("invalid stored lane_id: {error}"))
+                })?;
+            let kind_code: i32 = parts.next().unwrap_or_default().parse().map_err(|error| {
+                CollectiveBackendError::Internal(format!("invalid stored lane kind: {error}"))
+            })?;
+            let kind = LaneKind::try_from(kind_code).map_err(|_| {
+                CollectiveBackendError::Internal(format!("unknown stored lane kind {kind_code}"))
+            })?;
+            let trainer_slots = split_csv(parts.next().unwrap_or_default());
+            let generator_slots = split_csv(parts.next().unwrap_or_default());
+            if parts.next().is_some() {
+                return Err(CollectiveBackendError::Internal(
+                    "stored lane record has extra fields".to_string(),
+                ));
+            }
+            Ok(Lane {
+                lane_id,
+                kind,
+                trainer_slots,
+                generator_slots,
+            })
+        })
+        .collect()
+}
+
+fn lanes_from_spec(spec: &CollectiveGroupSpec) -> Vec<Lane> {
+    spec.lanes
+        .iter()
+        .map(|lane| Lane {
+            lane_id: lane.lane_id,
+            kind: LaneKind::try_from(lane.kind).unwrap_or(LaneKind::Unspecified),
+            trainer_slots: lane.trainer_slots.clone(),
+            generator_slots: lane.generator_slots.clone(),
+        })
+        .collect()
+}
+
+fn split_csv(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    text.split(',').map(str::to_string).collect()
+}
+
 fn split_slots(text: &str) -> Vec<String> {
     if text.is_empty() {
         return Vec::new();
@@ -204,11 +288,11 @@ fn split_slots(text: &str) -> Vec<String> {
     text.split('\n').map(str::to_string).collect()
 }
 
-/// Parse one `worker_id|role|index_in_role|source_partition|joined_epoch` record.
+/// Parse one `worker_id|role|index_in_role|joined_epoch` record.
 fn participant_from_record(
     slot_id: &str,
     record: &str,
-) -> CollectiveResult<(CollectiveParticipant, Option<u32>)> {
+) -> CollectiveResult<CollectiveParticipant> {
     let mut parts = record.split('|');
     let worker_id = parts.next().unwrap_or_default().to_string();
     let role = match parts.next().unwrap_or_default() {
@@ -223,12 +307,6 @@ fn participant_from_record(
     let index_in_role: u32 = parts.next().unwrap_or_default().parse().map_err(|error| {
         CollectiveBackendError::Internal(format!("invalid participant index: {error}"))
     })?;
-    let partition = match parts.next().unwrap_or_default() {
-        "" => None,
-        value => Some(value.parse::<u32>().map_err(|error| {
-            CollectiveBackendError::Internal(format!("invalid participant partition: {error}"))
-        })?),
-    };
     let _: u64 = parts.next().unwrap_or_default().parse().map_err(|error| {
         CollectiveBackendError::Internal(format!("invalid participant epoch: {error}"))
     })?;
@@ -238,16 +316,13 @@ fn participant_from_record(
         ));
     }
 
-    Ok((
-        CollectiveParticipant {
-            slot_id: slot_id.to_string(),
-            worker_id,
-            role: role.into(),
-            index_in_role,
-            rank_in_lane: 0,
-        },
-        partition,
-    ))
+    Ok(CollectiveParticipant {
+        slot_id: slot_id.to_string(),
+        worker_id,
+        role: role.into(),
+        index_in_role,
+        rank_in_lane: 0,
+    })
 }
 
 pub struct RedisCollectiveBackend {
@@ -262,14 +337,12 @@ impl RedisCollectiveBackend {
     }
 
     fn layout_for(spec: &CollectiveGroupSpec) -> CollectiveResult<LaneLayout> {
-        let trainers = u32::try_from(spec.expected_trainer_slots.len()).map_err(|_| {
-            CollectiveBackendError::InvalidArgument("too many trainer slots".to_string())
-        })?;
-        let generators = u32::try_from(spec.expected_generator_slots.len()).map_err(|_| {
-            CollectiveBackendError::InvalidArgument("too many generator slots".to_string())
-        })?;
-        LaneLayout::new(spec.source_partition_count, trainers, generators)
-            .map_err(|error| CollectiveBackendError::InvalidArgument(error.to_string()))
+        LaneLayout::new(
+            lanes_from_spec(spec),
+            &spec.expected_trainer_slots,
+            &spec.expected_generator_slots,
+        )
+        .map_err(|error| CollectiveBackendError::InvalidArgument(error.to_string()))
     }
 
     async fn read_group_once(&self, group_id: &str) -> CollectiveResult<CollectiveGroup> {
@@ -285,13 +358,12 @@ impl RedisCollectiveBackend {
         }
 
         let epoch: u64 = parse_field(&fields, "epoch")?;
-        let partitions: u32 = parse_field(&fields, "source_partition_count")?;
         let trainer_slots = split_slots(field(&fields, "expected_trainer_slots")?);
         let generator_slots = split_slots(field(&fields, "expected_generator_slots")?);
         let layout = LaneLayout::new(
-            partitions,
-            u32::try_from(trainer_slots.len()).unwrap_or(0),
-            u32::try_from(generator_slots.len()).unwrap_or(0),
+            decode_lanes(field(&fields, "lanes")?)?,
+            &trainer_slots,
+            &generator_slots,
         )
         .map_err(|error| CollectiveBackendError::Internal(error.to_string()))?;
 
@@ -303,57 +375,47 @@ impl RedisCollectiveBackend {
         // Place every participant in one pass. Rebuilding the assignment per
         // lane instead would parse and re-assign the whole membership
         // `lane_count` times, and `publish_bootstrap` reads a group twice.
-        let mut lane_participants: Vec<Vec<CollectiveParticipant>> =
-            vec![Vec::new(); layout.lane_count() as usize];
+        let mut lane_participants: HashMap<u32, Vec<CollectiveParticipant>> = layout
+            .lanes()
+            .iter()
+            .map(|lane| (lane.lane_id, Vec::new()))
+            .collect();
         for (slot_id, record) in &records {
-            let (participant, partition) = participant_from_record(slot_id, record)?;
-            let role =
-                CollectiveRole::try_from(participant.role).unwrap_or(CollectiveRole::Unspecified);
-            let assignments = layout
-                .assign(role, participant.index_in_role, partition)
-                .map_err(|error| {
-                    CollectiveBackendError::Internal(format!(
-                        "stored participant {slot_id} has an invalid lane assignment: {error}"
-                    ))
-                })?;
+            let participant = participant_from_record(slot_id, record)?;
+            let assignments = layout.assign(slot_id).map_err(|error| {
+                CollectiveBackendError::Internal(format!(
+                    "stored participant {slot_id} has an invalid lane assignment: {error}"
+                ))
+            })?;
             for assignment in assignments {
-                if let Some(lane) = lane_participants.get_mut(assignment.lane_id as usize) {
+                if let Some(lane) = lane_participants.get_mut(&assignment.lane_id) {
                     let mut placed = participant.clone();
                     placed.rank_in_lane = assignment.rank_in_lane;
                     lane.push(placed);
                 }
             }
         }
-        for participants in &mut lane_participants {
+        for participants in lane_participants.values_mut() {
             participants.sort_by_key(|p| p.rank_in_lane);
         }
 
         let mut lane_pipe = redis::pipe();
-        for lane_id in 0..layout.lane_count() {
-            lane_pipe.hgetall(lane_key(group_id, lane_id));
+        for lane in layout.lanes() {
+            lane_pipe.hgetall(lane_key(group_id, lane.lane_id));
         }
         let lane_hashes: Vec<HashMap<String, String>> = lane_pipe
             .query_async(&mut connection)
             .await
             .map_err(redis_error)?;
 
-        let mut lanes: Vec<CollectiveLane> = Vec::with_capacity(layout.lane_count() as usize);
-        for (lane_id, participants) in lane_participants.into_iter().enumerate() {
-            let lane_id = u32::try_from(lane_id).map_err(|_| {
-                CollectiveBackendError::Internal("collective lane count overflowed".to_string())
-            })?;
-            let kind = if lane_id == layout.broadcast_lane_id() {
-                LaneKind::Broadcast
-            } else {
-                LaneKind::Reshard
-            };
-            let world_size = if kind == LaneKind::Broadcast {
-                layout.broadcast_world_size()
-            } else {
-                layout.reshard_world_size()
-            };
+        let mut lanes: Vec<CollectiveLane> = Vec::with_capacity(layout.lanes().len());
+        for (position, declared) in layout.lanes().iter().enumerate() {
+            let lane_id = declared.lane_id;
+            let kind = declared.kind;
+            let world_size = declared.world_size();
+            let participants = lane_participants.remove(&lane_id).unwrap_or_default();
             let empty = HashMap::new();
-            let lane_fields = lane_hashes.get(lane_id as usize).unwrap_or(&empty);
+            let lane_fields = lane_hashes.get(position).unwrap_or(&empty);
             let nccl_unique_id = match lane_fields.get("nccl_unique_id") {
                 Some(text) => hex_decode(text)?,
                 None => Vec::new(),
@@ -400,26 +462,24 @@ impl RedisCollectiveBackend {
 
     async fn refresh_group_state(&self, group_id: &str) -> CollectiveResult<()> {
         let mut connection = self.connection.clone();
-        let partitions: Option<u32> = connection
-            .hget(group_key(group_id), "source_partition_count")
+        let stored: Option<String> = connection
+            .hget(group_key(group_id), "lanes")
             .await
             .map_err(redis_error)?;
-        let Some(partitions) = partitions else {
+        let Some(stored) = stored else {
             return Err(CollectiveBackendError::NotFound(format!(
                 "collective group {group_id} was not found"
             )));
         };
-        let lane_count = partitions.checked_add(1).ok_or_else(|| {
-            CollectiveBackendError::Internal("collective lane count overflowed".to_string())
-        })?;
+        let lanes = decode_lanes(&stored)?;
 
         let refresh_script = Script::new(REFRESH_GROUP_LUA);
         let mut script = refresh_script.prepare_invoke();
         script.key(group_key(group_id));
         script.key(participants_key(group_id));
         script.key(digests_key(group_id));
-        for lane_id in 0..lane_count {
-            script.key(lane_key(group_id, lane_id));
+        for lane in &lanes {
+            script.key(lane_key(group_id, lane.lane_id));
         }
         let outcome: String = script
             .invoke_async(&mut connection)
@@ -505,7 +565,7 @@ impl CollectiveBackend for RedisCollectiveBackend {
         let layout = Self::layout_for(spec)?;
         let role = CollectiveRole::try_from(request.role).unwrap_or(CollectiveRole::Unspecified);
         let assignments = layout
-            .assign(role, request.index_in_role, request.source_partition)
+            .assign(&request.slot_id)
             .map_err(|error| CollectiveBackendError::InvalidArgument(error.to_string()))?;
 
         let group_id = group_id_for(spec);
@@ -515,8 +575,8 @@ impl CollectiveBackend for RedisCollectiveBackend {
             digests_key(&group_id),
             worker_key(&request.worker_id),
         ];
-        for lane_id in 0..layout.lane_count() {
-            keys.push(lane_key(&group_id, lane_id));
+        for lane in layout.lanes() {
+            keys.push(lane_key(&group_id, lane.lane_id));
         }
 
         let role_text = match role {
@@ -539,18 +599,12 @@ impl CollectiveBackend for RedisCollectiveBackend {
         let outcome: String = script
             .arg(&group_id)
             .arg(&spec.model_name)
-            .arg(spec.source_partition_count)
+            .arg(encode_lanes(layout.lanes()))
             .arg(expected_total)
             .arg(&request.slot_id)
             .arg(&request.worker_id)
             .arg(role_text)
             .arg(request.index_in_role)
-            .arg(
-                request
-                    .source_partition
-                    .map(|p| p.to_string())
-                    .unwrap_or_default(),
-            )
             .arg(&request.plan_digest)
             .arg(&plan_source.worker_id)
             .arg(&plan_source.endpoint)
@@ -635,7 +689,7 @@ impl CollectiveBackend for RedisCollectiveBackend {
                 })
                 .collect(),
             state: state.into(),
-            is_bootstrap_leader: layout.is_bootstrap_leader(role, request.index_in_role),
+            is_bootstrap_leader: layout.is_bootstrap_leader(&request.slot_id),
         })
     }
 
@@ -906,28 +960,75 @@ impl CollectiveBackend for RedisCollectiveBackend {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use modelexpress_common::grpc::refit_collective::LaneSpec;
 
+    /// One reshard lane per `lane_count`, splitting the trainers evenly across
+    /// them, plus a broadcast lane spanning everyone. The split is the TEST's
+    /// choice: nothing in MX computes it.
     fn spec(
         model: &str,
         trainers: &[&str],
         generators: &[&str],
-        partitions: u32,
+        lane_count: u32,
     ) -> CollectiveGroupSpec {
+        let trainer_slots: Vec<String> = trainers.iter().map(|s| (*s).to_string()).collect();
+        let generator_slots: Vec<String> = generators.iter().map(|s| (*s).to_string()).collect();
+        let per_lane = trainer_slots.len().div_ceil(lane_count.max(1) as usize);
+        let mut lanes: Vec<LaneSpec> = trainer_slots
+            .chunks(per_lane.max(1))
+            .enumerate()
+            .map(|(index, chunk)| LaneSpec {
+                lane_id: u32::try_from(index).unwrap_or(0),
+                kind: LaneKind::Reshard.into(),
+                trainer_slots: chunk.to_vec(),
+                generator_slots: generator_slots.clone(),
+            })
+            .collect();
+        lanes.push(LaneSpec {
+            lane_id: u32::try_from(lanes.len()).unwrap_or(0),
+            kind: LaneKind::Broadcast.into(),
+            trainer_slots: trainer_slots.clone(),
+            generator_slots: generator_slots.clone(),
+        });
         CollectiveGroupSpec {
             model_name: model.to_string(),
-            expected_trainer_slots: trainers.iter().map(|s| (*s).to_string()).collect(),
-            expected_generator_slots: generators.iter().map(|s| (*s).to_string()).collect(),
-            source_partition_count: partitions,
+            expected_trainer_slots: trainer_slots,
+            expected_generator_slots: generator_slots,
+            lanes,
         }
     }
 
     #[test]
-    fn group_id_is_stable_under_slot_ordering() {
+    fn group_id_is_stable_under_membership_ordering() {
         // Workers enumerate their peers in whatever order the framework hands
-        // them over; declaring the same set must still land on one group.
-        let a = spec("m", &["t0", "t1"], &["g0", "g1"], 1);
-        let b = spec("m", &["t1", "t0"], &["g1", "g0"], 1);
+        // them over; declaring the same MEMBERSHIP must still land on one
+        // group, so the expected-slot lists are order insensitive.
+        let mut a = spec("m", &["t0", "t1"], &["g0", "g1"], 1);
+        let mut b = spec("m", &["t0", "t1"], &["g0", "g1"], 1);
+        a.expected_trainer_slots.reverse();
+        b.expected_generator_slots.reverse();
         assert_eq!(group_id_for(&a), group_id_for(&b));
+    }
+
+    #[test]
+    fn group_id_separates_lanes_that_order_their_ranks_differently() {
+        // Lane order is NOT membership: it is the rank assignment. Two callers
+        // that put different slots at rank 0 need different communicators, so
+        // they must not resolve to the same group and silently disagree.
+        let a = spec("m", &["t0", "t1"], &["g0"], 1);
+        let mut b = spec("m", &["t0", "t1"], &["g0"], 1);
+        for lane in &mut b.lanes {
+            lane.trainer_slots.reverse();
+        }
+        assert_ne!(group_id_for(&a), group_id_for(&b));
+    }
+
+    #[test]
+    fn group_id_separates_different_lane_counts() {
+        assert_ne!(
+            group_id_for(&spec("m", &["t0", "t1"], &["g0"], 1)),
+            group_id_for(&spec("m", &["t0", "t1"], &["g0"], 2))
+        );
     }
 
     #[test]
@@ -972,18 +1073,39 @@ mod tests {
 
     #[test]
     fn participant_records_round_trip() {
-        let (trainer, partition) =
-            participant_from_record("t0", "w1|TRAINER|3|1|7").expect("trainer record");
+        let trainer = participant_from_record("t0", "w1|TRAINER|3|7").expect("trainer record");
         assert_eq!(trainer.worker_id, "w1");
         assert_eq!(trainer.index_in_role, 3);
-        assert_eq!(partition, Some(1));
 
-        let (generator, partition) =
-            participant_from_record("g0", "w2|GENERATOR|0||7").expect("generator record");
+        let generator = participant_from_record("g0", "w2|GENERATOR|0|7").expect("generator");
         assert_eq!(generator.worker_id, "w2");
-        assert_eq!(partition, None);
 
-        assert!(participant_from_record("x", "w|BOGUS|0||7").is_err());
-        assert!(participant_from_record("x", "w|TRAINER|0|0").is_err());
+        assert!(participant_from_record("x", "w|BOGUS|0|7").is_err());
+        // A record carrying the retired partition component has one field too
+        // many and must be refused rather than silently re-parsed.
+        assert!(participant_from_record("x", "w|TRAINER|3|1|7").is_err());
+    }
+
+    #[test]
+    fn the_declared_lane_set_round_trips_through_the_group_hash() {
+        let lanes = vec![
+            Lane {
+                lane_id: 0,
+                kind: LaneKind::Reshard,
+                trainer_slots: vec!["t0".to_string(), "t1".to_string()],
+                generator_slots: vec!["g0".to_string()],
+            },
+            Lane {
+                lane_id: 9,
+                kind: LaneKind::Broadcast,
+                trainer_slots: vec!["t0".to_string(), "t1".to_string()],
+                generator_slots: vec!["g0".to_string()],
+            },
+        ];
+        let decoded = decode_lanes(&encode_lanes(&lanes)).expect("round trip");
+        assert_eq!(decoded, lanes);
+        assert_eq!(decode_lanes("").expect("empty"), Vec::new());
+        assert!(decode_lanes("0|1|t0|g0|extra").is_err());
+        assert!(decode_lanes("notanumber|1|t0|g0").is_err());
     }
 }
