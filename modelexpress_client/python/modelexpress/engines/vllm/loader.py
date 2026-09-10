@@ -36,6 +36,7 @@ from ... import configure_vllm_logging, envs, model_prefetch
 from ...load_strategy import (
     LoadContext,
     publish_metadata,
+    register_tensors,
     run_load_strategy_chain,
     unpublish_metadata,
 )
@@ -89,6 +90,9 @@ class MxModelLoader(BaseModelLoader):
         # you most need to diagnose. No-op unless enabled; never raises.
         enable_metrics()
         self._ctx: LoadContext | None = None
+        # Set by on_sleep(), consulted by on_wake_up(): wake_up(tags) doesn't
+        # carry the preceding sleep's level, so this loader remembers it.
+        self._last_sleep_level: int | None = None
 
     def load_model(
         self,
@@ -213,6 +217,53 @@ class MxModelLoader(BaseModelLoader):
         except AttributeError:
             object.__setattr__(disk_config, "load_format", "auto")
         DefaultModelLoader(disk_config).load_weights(model, model_config)
+
+    def on_sleep(self, level: int) -> None:
+        """Stop P2P source-serving before vLLM's sleep() invalidates the GPU
+        memory this loader registered with NIXL.
+        """
+        self._last_sleep_level = level
+        if self._ctx is None:
+            return
+
+        if level != 1:
+            logger.warning(
+                f"MxModelLoader only supports vLLM sleep level 1, got level "
+                f"{level}; P2P source-serving will not resume on wake_up()"
+            )
+            return
+
+        unpublish_metadata(self._ctx)
+        if self._ctx.nixl_manager is not None:
+            self._ctx.nixl_manager.shutdown()
+            self._ctx.nixl_manager = None
+
+    def on_wake_up(self, tags: list[str] | None) -> None:
+        """Resume P2P source-serving once vLLM's wake_up() has restored
+        valid GPU memory.
+
+        Only for level 1: wake_up() restores offloaded weights to GPU.
+        wake_up() doesn't carry the sleep level itself, so this reads it
+        back from what on_sleep() recorded.
+        """
+        if self._ctx is None:
+            return
+
+        if self._last_sleep_level != 1:
+            logger.warning(
+                "MxModelLoader.on_wake_up() called after a non-level-1 "
+                f"sleep ({self._last_sleep_level}); skipping since weight "
+                "content is not guaranteed to be valid"
+            )
+            return
+
+        wake_weights = tags is None or "weights" in tags
+        if not wake_weights:
+            return
+
+        if self._ctx.nixl_manager is None:
+            register_tensors(None, self._ctx, reuse_discovered=True)
+        publish_metadata(self._ctx)
 
     @property
     def nixl_manager(self) -> NixlTransferManager | None:

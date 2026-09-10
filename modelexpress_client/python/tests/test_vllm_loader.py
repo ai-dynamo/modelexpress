@@ -551,6 +551,123 @@ class TestAbstractMethodCompleteness:
         assert registered["mx"] is MxModelLoader
 
 
+class TestSleepWakeReloadHooks:
+    """Verify MxModelLoader.on_sleep/on_wake_up.
+
+    These back vLLM's optional BaseModelLoader hooks, called from
+    Worker.sleep/wake_up so a sleeping replica stops advertising itself as
+    a P2P source before its GPU memory becomes invalid, and resumes once
+    it's valid again.
+    """
+
+    def test_on_sleep_unpublishes_for_level_1(self):
+        loader = _make_loader()
+        loader._ctx = _make_load_context()
+        with patch("modelexpress.engines.vllm.loader.unpublish_metadata") as mock_unpub:
+            loader.on_sleep(1)
+        mock_unpub.assert_called_once_with(loader._ctx)
+
+    def test_on_sleep_skips_unpublish_for_non_level_1(self):
+        """Level 2 support is deferred; source-serving stays up."""
+        loader = _make_loader()
+        loader._ctx = _make_load_context()
+        with patch("modelexpress.engines.vllm.loader.unpublish_metadata") as mock_unpub:
+            loader.on_sleep(2)
+        mock_unpub.assert_not_called()
+
+    def test_on_sleep_shuts_down_nixl_manager_when_present(self):
+        """unpublish_metadata alone only stops new discovery -- it does
+        nothing for a peer that already has a connection/manifest.
+        nixl_manager.shutdown() additionally stops accepting new
+        connections from such a peer."""
+        loader = _make_loader()
+        mock_manager = MagicMock()
+        loader._ctx = _make_load_context(nixl_manager=mock_manager)
+        with patch("modelexpress.engines.vllm.loader.unpublish_metadata"):
+            loader.on_sleep(1)
+        mock_manager.shutdown.assert_called_once()
+        assert loader._ctx.nixl_manager is None
+
+    def test_on_sleep_records_level_for_on_wake_up(self):
+        """wake_up(tags) doesn't carry the sleep level itself, so on_sleep
+        must remember it for on_wake_up to read back later."""
+        loader = _make_loader()
+        loader._ctx = _make_load_context()
+        with patch("modelexpress.engines.vllm.loader.unpublish_metadata"):
+            loader.on_sleep(2)
+        assert loader._last_sleep_level == 2
+
+    def test_on_sleep_noop_without_ctx(self):
+        loader = _make_loader()
+        assert loader._ctx is None
+        with patch("modelexpress.engines.vllm.loader.unpublish_metadata") as mock_unpub:
+            loader.on_sleep(1)
+        mock_unpub.assert_not_called()
+
+    @pytest.mark.parametrize("tags", [None, ["weights"]])
+    def test_on_wake_up_publishes_for_level_1_when_weights_woken(self, tags):
+        """tags=None means every pool (including weights) was restored."""
+        loader = _make_loader()
+        loader._ctx = _make_load_context()
+        loader._last_sleep_level = 1
+        with patch("modelexpress.engines.vllm.loader.publish_metadata") as mock_pub, \
+             patch("modelexpress.engines.vllm.loader.register_tensors") as mock_reg:
+            loader.on_wake_up(tags)
+        mock_pub.assert_called_once_with(loader._ctx)
+        mock_reg.assert_called_once()
+
+    def test_on_wake_up_recreates_nixl_manager_when_torn_down(self):
+        """on_sleep() tears the agent down, so nixl_manager is None here --
+        must be recreated before republishing."""
+        loader = _make_loader()
+        loader._ctx = _make_load_context()
+        loader._last_sleep_level = 1
+        assert loader._ctx.nixl_manager is None
+        with patch("modelexpress.engines.vllm.loader.publish_metadata"), \
+             patch("modelexpress.engines.vllm.loader.register_tensors") as mock_reg:
+            loader.on_wake_up(None)
+        mock_reg.assert_called_once_with(None, loader._ctx, reuse_discovered=True)
+
+    def test_on_wake_up_skips_recreation_when_nixl_manager_present(self):
+        loader = _make_loader()
+        loader._ctx = _make_load_context(nixl_manager=MagicMock())
+        loader._last_sleep_level = 1
+        with patch("modelexpress.engines.vllm.loader.publish_metadata"), \
+             patch("modelexpress.engines.vllm.loader.register_tensors") as mock_reg:
+            loader.on_wake_up(None)
+        mock_reg.assert_not_called()
+
+    def test_on_wake_up_skips_when_weights_not_in_tags(self):
+        loader = _make_loader()
+        loader._ctx = _make_load_context()
+        loader._last_sleep_level = 1
+        with patch("modelexpress.engines.vllm.loader.publish_metadata") as mock_pub, \
+             patch("modelexpress.engines.vllm.loader.register_tensors") as mock_reg:
+            loader.on_wake_up(["kv_cache"])
+        mock_pub.assert_not_called()
+        mock_reg.assert_not_called()
+
+    @pytest.mark.parametrize("last_sleep_level", [None, 2])
+    def test_on_wake_up_skips_for_non_level_1_sleep(self, last_sleep_level):
+        """Level 2 discards weights with no CPU backup, so content isn't
+        valid when wake_up() returns. None covers wake_up() called with no
+        prior on_sleep() at all."""
+        loader = _make_loader()
+        loader._ctx = _make_load_context()
+        loader._last_sleep_level = last_sleep_level
+        with patch("modelexpress.engines.vllm.loader.publish_metadata") as mock_pub, \
+             patch("modelexpress.engines.vllm.loader.register_tensors") as mock_reg:
+            loader.on_wake_up(None)
+        mock_pub.assert_not_called()
+        mock_reg.assert_not_called()
+
+    def test_on_wake_up_noop_without_ctx(self):
+        loader = _make_loader()
+        with patch("modelexpress.engines.vllm.loader.publish_metadata") as mock_pub:
+            loader.on_wake_up(None)
+        mock_pub.assert_not_called()
+
+
 class TestMtpDrafterSecondLoad:
     """vLLM loads MTP in two passes on one worker: the target, then the drafter
     via a second load_model whose draft ModelConfig has runner_type="draft" and
