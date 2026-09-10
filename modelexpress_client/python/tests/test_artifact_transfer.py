@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 import tarfile
 from concurrent import futures
 from pathlib import Path
@@ -677,6 +678,81 @@ def test_tarred_p2p_artifact_transfer_keeps_empty_directories(tmp_path):
     assert (target / "cached_ops" / "kernel.so").read_bytes() == b"compiled"
 
 
+def test_install_records_validate_and_extract_per_archive(tmp_path, monkeypatch):
+    """Each archive of a multi-root artifact gets both steps and its byte count.
+
+    Asserted against the collector calls rather than a registry because the
+    property under test is the call site: install() is the one place the two
+    steps run, and a second site would double-count the way a second phase
+    site would.
+    """
+    recorder = MagicMock()
+    recorder.time_artifact_install_step.return_value.__enter__ = MagicMock()
+    recorder.time_artifact_install_step.return_value.__exit__ = MagicMock(return_value=False)
+    monkeypatch.setattr(artifact_transfer_module, "install_metrics", recorder)
+
+    source = tmp_path / "source"
+    (source / "cubin").mkdir(parents=True)
+    (source / "kernel.so").write_bytes(b"k" * 100)
+    (source / "cubin" / "a.cubin").write_bytes(b"c" * 50)
+    extra = ArtifactCacheRoot(
+        name="cubin",
+        source_root=source / "cubin",
+        target_root=tmp_path / "extract-cubin",
+    )
+    transfer = flashinfer_cache_artifact_transfer(
+        source,
+        tmp_path / "extract",
+        tmp_path / "bundle",
+        additional_roots=(extra,),
+    )
+    bundle = transfer.prepare_source()
+    transfer.install(
+        p2p_pb2.GetArtifactManifestHeaderResponse(files=bundle.manifest.files)
+    )
+
+    steps = [call.args for call in recorder.time_artifact_install_step.call_args_list]
+    assert steps == [
+        ("flashinfer_cache", "primary", "validate"),
+        ("flashinfer_cache", "primary", "extract"),
+        ("flashinfer_cache", "cubin", "validate"),
+        ("flashinfer_cache", "cubin", "extract"),
+    ]
+    sizes = {Path(file.path).name: file.size for file in bundle.manifest.files}
+    assert [call.args for call in recorder.record_artifact_install_bytes.call_args_list] == [
+        ("flashinfer_cache", "primary", sizes["artifact.tar"]),
+        ("flashinfer_cache", "cubin", sizes["cubin.tar"]),
+    ]
+
+
+def test_install_stops_at_validate_for_an_unsafe_archive(tmp_path, monkeypatch):
+    """A rejected archive records its validate step and never reaches extract."""
+    recorder = MagicMock()
+    recorder.time_artifact_install_step.return_value.__enter__ = MagicMock()
+    recorder.time_artifact_install_step.return_value.__exit__ = MagicMock(return_value=False)
+    monkeypatch.setattr(artifact_transfer_module, "install_metrics", recorder)
+
+    tar_path = tmp_path / "artifact.tar"
+    info = tarfile.TarInfo("../escape.txt")
+    info.size = 6
+    with tarfile.open(tar_path, "w") as archive:
+        archive.addfile(info, io.BytesIO(b"escape"))
+    transfer = torch_compile_cache_artifact_transfer(
+        tmp_path, tmp_path / "extract", tmp_path / "bundle"
+    )
+    header = p2p_pb2.GetArtifactManifestHeaderResponse(
+        files=[p2p_pb2.ArtifactManifestFile(path=tar_path.as_posix())]
+    )
+
+    with pytest.raises(ValueError, match="unsafe tar member"):
+        transfer.install(header)
+
+    assert [call.args for call in recorder.time_artifact_install_step.call_args_list] == [
+        ("torch_compile_cache", "primary", "validate"),
+    ]
+    recorder.record_artifact_install_bytes.assert_not_called()
+
+
 def test_extract_tarred_artifact_rejects_unsafe_member(tmp_path):
     tar_path = tmp_path / "artifact.tar"
     data = b"escape"
@@ -798,6 +874,15 @@ def test_tarred_p2p_artifact_transfer_splits_transfer_and_install(tmp_path, capl
         chunk.chunk_index for chunk in bundle.manifest.chunks
     ]
     assert "[TIMING] Artifact prepare complete: name=torch_compile_cache" in caplog.text
+    assert (
+        "[TIMING] Artifact archive extracted: name=torch_compile_cache archive=primary"
+        in caplog.text
+    )
+    assert re.search(
+        r"\[TIMING\] Artifact install complete: .*validate=\d+\.\d{3}s extract=\d+\.\d{3}s "
+        r"elapsed=\d+\.\d{3}s",
+        caplog.text,
+    ), caplog.text
     assert "[TIMING] Artifact transfer complete" in caplog.text
     assert "[TIMING] Artifact install complete" in caplog.text
 

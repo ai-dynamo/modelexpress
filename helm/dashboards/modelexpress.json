@@ -686,6 +686,133 @@
       }
     },
     {
+      "id": 114,
+      "type": "table",
+      "title": "Artifact install: validate and extract per archive",
+      "description": "Mean on-target time for each step of installing one compile-cache archive, per artifact and archive: validate walks the tar's member list in Python and scales with file count; extract is tar -xf and scales with bytes and with the target filesystem.\n\nThis is the breakdown inside the artifact_install phase in the table above. That phase also covers source discovery and the RDMA copy, so these two steps sum to less than it, and the remainder is the network. A phase that is slow with small steps here is a transfer problem; a phase that is slow because extract is slow is the target's disk.\n\nSeries: mx_artifact_install_step_seconds.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 14,
+        "x": 0,
+        "y": 20
+      },
+      "targets": [
+        {
+          "expr": "sum by (artifact, archive, step) (mx_artifact_install_step_seconds_sum) / sum by (artifact, archive, step) (mx_artifact_install_step_seconds_count)",
+          "format": "table",
+          "instant": true,
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": ""
+        }
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "indexByName": {
+              "artifact": 0,
+              "archive": 1,
+              "step": 2,
+              "Value": 3
+            },
+            "renameByName": {
+              "Value": "mean"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "artifact",
+                "desc": false
+              },
+              {
+                "field": "archive",
+                "desc": false
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": 115,
+      "type": "bargauge",
+      "title": "Artifact extraction throughput",
+      "description": "Archive bytes extracted divided by time spent in tar -xf, per artifact and archive: mx_artifact_install_bytes_total over the extract step of mx_artifact_install_step_seconds_sum.\n\nSeparates a slow disk from a large cache. Two installs can both show a ten-second extract; one is 4 GiB on a healthy volume and the other is 200 MiB on an overlay filesystem, and only the throughput tells them apart. Both are process-local counters, so this is the mean over the pods currently scraped.\n\nRead only the bars for archives of at least a few MiB. An archive under a megabyte extracts in about 2 ms regardless of size, which is the cost of spawning tar, so its throughput reflects process startup rather than disk I/O.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 10,
+        "x": 14,
+        "y": 20
+      },
+      "targets": [
+        {
+          "expr": "sum by (artifact, archive) (mx_artifact_install_bytes_total) / sum by (artifact, archive) (mx_artifact_install_step_seconds_sum{step=\"extract\"})",
+          "legendFormat": "{{artifact}}  {{archive}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "noValue": "0",
+          "min": 0
+        }
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true
+      }
+    },
+    {
       "id": 6,
       "type": "row",
       "title": "Downloads",
@@ -694,7 +821,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 20
+        "y": 30
       },
       "panels": []
     },
@@ -710,7 +837,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 21
+        "y": 31
       },
       "targets": [
         {
@@ -760,7 +887,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 21
+        "y": 31
       },
       "targets": [
         {
@@ -792,7 +919,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 21
+        "y": 31
       },
       "targets": [
         {
@@ -824,7 +951,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 21
+        "y": 31
       },
       "targets": [
         {
@@ -856,7 +983,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 29
+        "y": 39
       },
       "targets": [
         {
@@ -888,7 +1015,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 29
+        "y": 39
       },
       "targets": [
         {
@@ -917,7 +1044,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 37
+        "y": 47
       },
       "panels": []
     },
@@ -933,7 +1060,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 38
+        "y": 48
       },
       "targets": [
         {
@@ -965,7 +1092,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 38
+        "y": 48
       },
       "targets": [
         {
@@ -998,7 +1125,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 38
+        "y": 48
       },
       "targets": [
         {
@@ -1030,7 +1157,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 38
+        "y": 48
       },
       "targets": [
         {
@@ -1058,7 +1185,7 @@
         "h": 5,
         "w": 24,
         "x": 0,
-        "y": 46
+        "y": 56
       },
       "options": {
         "mode": "markdown",
@@ -1077,7 +1204,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 51
+        "y": 61
       },
       "targets": [
         {
@@ -1109,7 +1236,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 51
+        "y": 61
       },
       "targets": [
         {
@@ -1151,7 +1278,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 51
+        "y": 61
       },
       "targets": [
         {
@@ -1183,7 +1310,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 51
+        "y": 61
       },
       "targets": [
         {
@@ -1212,7 +1339,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 59
+        "y": 69
       },
       "panels": []
     },
@@ -1228,7 +1355,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 60
+        "y": 70
       },
       "targets": [
         {
@@ -1260,7 +1387,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 60
+        "y": 70
       },
       "targets": [
         {
@@ -1322,7 +1449,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 60
+        "y": 70
       },
       "targets": [
         {
@@ -1354,7 +1481,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 60
+        "y": 70
       },
       "targets": [
         {
@@ -1386,7 +1513,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 68
+        "y": 78
       },
       "targets": [
         {
@@ -1436,7 +1563,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 68
+        "y": 78
       },
       "targets": [
         {
@@ -1468,7 +1595,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 68
+        "y": 78
       },
       "targets": [
         {
@@ -1500,7 +1627,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 68
+        "y": 78
       },
       "targets": [
         {
@@ -1532,7 +1659,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 76
+        "y": 86
       },
       "targets": [
         {
@@ -1571,7 +1698,7 @@
         "h": 6,
         "w": 18,
         "x": 6,
-        "y": 76
+        "y": 86
       },
       "options": {
         "mode": "markdown",
@@ -1587,7 +1714,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 82
+        "y": 92
       },
       "panels": []
     },
@@ -1603,7 +1730,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 83
+        "y": 93
       },
       "targets": [
         {
@@ -1635,7 +1762,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 83
+        "y": 93
       },
       "targets": [
         {
@@ -1668,7 +1795,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 83
+        "y": 93
       },
       "targets": [
         {
