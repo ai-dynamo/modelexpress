@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -23,9 +24,11 @@ from .. import refit_pb2, refit_pb2_grpc
 from ..control import WeightVersion, WeightVersionState, _weight_version
 from ..object_storage import ObjectStorageType
 from .adapter import GeneratorEngineContext
-from .plan import WeightSource
+from .methods import CanonicalDeltaUpdateMethod
+from .plan import ObjectStorageUpdateSource, WeightSource
 from .receiver import ObjectStorageGeneratorConfig
-from .runtime import GeneratorRuntime
+from .refit_strategy import RefitStageChain
+from .runtime import GeneratorRuntime, initialize_generator_runtime
 from .session import SessionUpdate
 from .version_chain import resolve_replay_chain
 
@@ -82,9 +85,8 @@ class ModelExpressGeneratorConfig:
     object_storage: ObjectStorageGeneratorConfig | None = None
     # Version read from the engine's serving-version API after cold start.
     initial_serving_version_id: str | None = None
-    # Ordered fallback for full-tensor sources. Canonical object storage is
-    # currently isolated because peer installation does not advance its local
-    # checkpoint base.
+    # Ordered source fallback. Canonical object storage may be used alone or
+    # combined with generator P2P in either order.
     source_order: tuple[WeightSource, ...] | None = None
 
     def __post_init__(self) -> None:
@@ -137,17 +139,26 @@ class ModelExpressGeneratorConfig:
                 raise ValueError(
                     "object_storage settings require OBJECT_STORAGE in source_order"
                 )
-            if self.object_storage is not None and self.source_order != (
-                WeightSource.OBJECT_STORAGE,
-            ):
+            if self.object_storage is not None and frozenset(self.source_order) not in {
+                frozenset({WeightSource.OBJECT_STORAGE}),
+                frozenset(
+                    {WeightSource.GENERATOR, WeightSource.OBJECT_STORAGE}
+                ),
+            }:
                 raise ValueError(
-                    "object_storage currently requires source_order="
-                    "(WeightSource.OBJECT_STORAGE,)"
+                    "object_storage source_order may contain only "
+                    "WeightSource.GENERATOR and WeightSource.OBJECT_STORAGE"
                 )
 
 
 class StagedWeightHandle:
-    """Local verified staging buffers for one exact WeightVersion."""
+    """An exact version prepared for, but not yet installed into, the engine.
+
+    Preparation may transfer P2P tensors or reconstruct an S3 checkpoint. The
+    live engine remains unchanged until ``apply_weight`` runs at its safe point.
+    The handle keeps session internals private and binds idempotent release to
+    the client that owns the staged resources.
+    """
 
     def __init__(
         self,
@@ -159,7 +170,6 @@ class StagedWeightHandle:
         self._client = client
         self.version_id = version_id
         self._update = update
-        self._no_op_released = False
 
     def release(self) -> None:
         """Release local staging buffers; repeated calls are idempotent."""
@@ -226,6 +236,11 @@ class ModelExpressGeneratorClient:
         self._has_initial_serving_version = False
         self._engine_state = _EngineState.READY
         self._runtime: GeneratorRuntime | None = None
+        self._refit_stage_chain: RefitStageChain | None = None
+        self._cache_rebuild_method: CanonicalDeltaUpdateMethod | None = None
+        self._cache_rebuild_executor: ThreadPoolExecutor | None = None
+        self._pending_cache_rebuild_version_id: str | None = None
+        self._cache_rebuild_worker_running = False
         self._closed = False
 
     @classmethod
@@ -267,7 +282,7 @@ class ModelExpressGeneratorClient:
         client._rpc_timeout_seconds = config.rpc_timeout_seconds
         client._max_replay_chain_length = config.max_replay_chain_length
         try:
-            runtime = GeneratorRuntime.initialize(
+            runtime = initialize_generator_runtime(
                 engine_context=config.engine_context,
                 worker_id=worker_id,
                 server_url=server_url,
@@ -277,8 +292,38 @@ class ModelExpressGeneratorClient:
                 rpc_timeout_seconds=config.rpc_timeout_seconds,
                 service=lambda: client._service,
                 start_lease=client._start_version_lease,
+                resolve_replay_chain=lambda version, from_full_root: (
+                    client._resolve_replay_chain(
+                        version.version_id,
+                        from_full_root=from_full_root,
+                    )
+                ),
             )
             client._runtime = runtime
+            source_order = runtime.source_order
+            rebuild_from_full_root = {
+                WeightSource.GENERATOR,
+                WeightSource.OBJECT_STORAGE,
+            }.issubset(source_order)
+            client._refit_stage_chain = RefitStageChain(
+                source_order=source_order,
+                session=runtime.session,
+            )
+            full_tensor = runtime.engine.full_tensor
+            if (
+                rebuild_from_full_root
+                and config.object_storage is not None
+                and full_tensor is not None
+                and full_tensor.local_rank == 0
+            ):
+                client._cache_rebuild_method = CanonicalDeltaUpdateMethod(
+                    model_name=runtime.engine.model_name,
+                    config=config.object_storage,
+                )
+                client._cache_rebuild_executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix=f"modelexpress-cache-rebuild-{worker_id}",
+                )
             client._has_initial_serving_version = (
                 config.initial_serving_version_id is not None
             )
@@ -331,16 +376,9 @@ class ModelExpressGeneratorClient:
                     update=None,
                 )
                 return self._active_handle
-            if self._runtime.initial_version_id is not None:
-                chain = self._resolve_replay_chain(version.version_id)
-                update = (
-                    self._runtime.session.stage(chain[0])
-                    if len(chain) == 1
-                    else self._runtime.session.stage_chain(chain)
-                )
-            else:
-                ready = self._get_ready_version(version.version_id)
-                update = self._runtime.session.stage(ready)
+            ready = self._get_ready_version(version.version_id)
+            assert self._refit_stage_chain is not None
+            update = self._refit_stage_chain.stage(ready)
             self._active_handle = StagedWeightHandle(
                 client=self,
                 version_id=version.version_id,
@@ -353,13 +391,14 @@ class ModelExpressGeneratorClient:
         if not isinstance(staged, StagedWeightHandle) or staged._client is not self:
             raise ValueError("staged handle does not belong to this client")
         with self._operation_lock:
+            if self._active_handle is not staged:
+                raise RuntimeError("staged weight has already been released")
             if staged._update is None:
-                if staged._no_op_released:
-                    raise RuntimeError("staged weight has already been released")
                 return None
             if staged._update.released:
                 raise RuntimeError("staged weight has already been released")
             assert self._runtime is not None
+            was_applied = staged._update.applied
             try:
                 result = self._runtime.session.apply(staged._update)
             except BaseException:
@@ -368,6 +407,8 @@ class ModelExpressGeneratorClient:
                 raise
             self._serving_version_id = staged.version_id
             self._engine_state = _EngineState.READY
+            if not was_applied:
+                self._schedule_cache_rebuild(staged)
             return result
 
     def close(self) -> None:
@@ -377,6 +418,15 @@ class ModelExpressGeneratorClient:
         with self._operation_lock:
             if self._active_handle is not None:
                 self._release_staged(self._active_handle)
+        if self._cache_rebuild_executor is not None:
+            self._cache_rebuild_executor.shutdown(wait=True)
+            self._cache_rebuild_executor = None
+        if self._cache_rebuild_method is not None:
+            try:
+                self._cache_rebuild_method.close()
+            except Exception:
+                logger.warning("failed to close cache rebuild method", exc_info=True)
+            self._cache_rebuild_method = None
         if self._registration_thread is not None:
             self._registration_stop.set()
             self._registration_thread.join()
@@ -430,13 +480,10 @@ class ModelExpressGeneratorClient:
                 continue
 
     def _get_ready_version(self, version_id: str) -> WeightVersion:
-        version = self._fetch_ready_version(
+        return self._fetch_ready_version(
             version_id,
             target_version_id=version_id,
         )
-        assert self._runtime is not None
-        self._runtime.session.validate(version)
-        return version
 
     def _fetch_ready_version(
         self,
@@ -479,10 +526,12 @@ class ModelExpressGeneratorClient:
     def _resolve_replay_chain(
         self,
         target_version_id: str,
+        *,
+        from_full_root: bool = False,
     ) -> tuple[WeightVersion, ...]:
         """Resolve a canonical chain completely before payload preparation."""
-        serving_version_id = self._serving_version_id
-        if serving_version_id is None:
+        serving_version_id = None if from_full_root else self._serving_version_id
+        if not from_full_root and serving_version_id is None:
             raise RuntimeError("canonical replay requires a known serving version")
         chain = resolve_replay_chain(
             target_version_id=target_version_id,
@@ -493,10 +542,117 @@ class ModelExpressGeneratorClient:
             max_chain_length=self._max_replay_chain_length,
             stop_before_version_id=serving_version_id,
         )
-        assert self._runtime is not None
-        for version in chain:
-            self._runtime.session.validate(version)
         return chain
+
+    def _schedule_cache_rebuild(self, staged: StagedWeightHandle) -> None:
+        if staged._update is None:
+            return
+        if staged._update.plan.source.kind is not WeightSource.GENERATOR:
+            return
+        executor = self._cache_rebuild_executor
+        if executor is None:
+            return
+        self._pending_cache_rebuild_version_id = staged.version_id
+        if self._cache_rebuild_worker_running:
+            return
+        self._cache_rebuild_worker_running = True
+        try:
+            executor.submit(self._run_cache_rebuilds)
+        except RuntimeError:
+            self._cache_rebuild_worker_running = False
+            self._pending_cache_rebuild_version_id = None
+            logger.exception(
+                "failed to schedule canonical cache rebuild for version %s",
+                staged.version_id,
+            )
+
+    def _run_cache_rebuilds(self) -> None:
+        while True:
+            with self._operation_lock:
+                target_version_id = self._pending_cache_rebuild_version_id
+                self._pending_cache_rebuild_version_id = None
+                if target_version_id is None:
+                    self._cache_rebuild_worker_running = False
+                    return
+            self._rebuild_cached_checkpoint(target_version_id)
+
+    def _rebuild_cached_checkpoint(self, target_version_id: str) -> None:
+        runtime = self._runtime
+        method = self._cache_rebuild_method
+        if runtime is None or method is None:
+            return
+        with self._operation_lock:
+            if (
+                self._runtime is not runtime
+                or self._serving_version_id != target_version_id
+                or self._engine_state is not _EngineState.READY
+            ):
+                logger.info(
+                    "skipping cache rebuild for superseded version %s",
+                    target_version_id,
+                )
+                return
+        prepared = None
+        leases = []
+        try:
+            chain = self._resolve_replay_chain(
+                target_version_id,
+                from_full_root=True,
+            )
+            for version in chain:
+                leases.append(self._start_version_lease(version.version_id))
+            rebuild_chain = []
+            for version in chain:
+                storage = version.object_storage
+                if storage is None:
+                    raise RuntimeError(
+                        f"canonical cache rebuild for {target_version_id!r} "
+                        f"is missing object storage for {version.version_id!r}"
+                    )
+                rebuild_chain.append(
+                    (
+                        version,
+                        ObjectStorageUpdateSource(
+                            storage=storage,
+                            payload_format=version.payload_format,
+                        ),
+                    )
+                )
+            prepared = method.prepare_chain(tuple(rebuild_chain))
+            with self._operation_lock:
+                if (
+                    self._runtime is runtime
+                    and self._serving_version_id == target_version_id
+                    and self._engine_state is _EngineState.READY
+                ):
+                    method.activate(prepared)
+                else:
+                    logger.info(
+                        "skipping cache activation for superseded version %s",
+                        target_version_id,
+                    )
+        except Exception:
+            logger.exception(
+                "canonical cache rebuild failed for version %s",
+                target_version_id,
+            )
+        finally:
+            if prepared is not None:
+                try:
+                    method.release(prepared)
+                except Exception:
+                    logger.exception(
+                        "failed to release cache rebuild for version %s",
+                        target_version_id,
+                    )
+            for lease in reversed(leases):
+                try:
+                    lease.close()
+                except Exception:
+                    logger.exception(
+                        "failed to release cache rebuild lease for version %s",
+                        target_version_id,
+                    )
 
     def _validate_initial_serving_version(self, version_id: str) -> None:
         """Verify that the engine-observed initial version is ready and compatible."""
@@ -585,19 +741,15 @@ class ModelExpressGeneratorClient:
         if staged._client is not self:
             raise ValueError("staged handle does not belong to this client")
         with self._operation_lock:
-            if staged._update is None:
-                if staged._no_op_released:
-                    return
-                staged._no_op_released = True
+            if self._active_handle is not staged:
+                return
+            try:
+                if staged._update is not None and not staged._update.released:
+                    assert self._runtime is not None
+                    self._runtime.session.release(staged._update)
+            finally:
                 if self._active_handle is staged:
                     self._active_handle = None
-                return
-            if staged._update.released:
-                return
-            assert self._runtime is not None
-            self._runtime.session.release(staged._update)
-            if self._active_handle is staged:
-                self._active_handle = None
 
 
 __all__ = [

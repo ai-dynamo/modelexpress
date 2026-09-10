@@ -187,6 +187,9 @@ class UpdateMethod(ABC):
         version, source = chain[0]
         return self.prepare(version=version, source=source)
 
+    def preparation_failed(self) -> None:
+        """Restore method-owned state after preparation fails."""
+
     def installation_failed(self, prepared: PreparedArtifact) -> None:
         """Fence method-owned state after an engine installation failure."""
 
@@ -236,8 +239,15 @@ class WeightUpdatePlanner:
         self._installer = installer
         self._max_transfer_attempts = max_transfer_attempts
 
-    def plans(self, version: WeightVersion):
+    def plans(
+        self,
+        version: WeightVersion,
+        *,
+        source_kind: WeightSource | None = None,
+    ):
         for resolver in self._resolvers:
+            if source_kind is not None and resolver.kind is not source_kind:
+                continue
             if not resolver.supports(version):
                 continue
             resolved_plans = []
@@ -274,10 +284,17 @@ class WeightUpdatePlanner:
                 for _ in range(1, self._max_transfer_attempts):
                     yield resolved_plans[0]
 
-    def validate(self, version: WeightVersion) -> None:
+    def validate(
+        self,
+        version: WeightVersion,
+        *,
+        source_kind: WeightSource | None = None,
+    ) -> None:
         """Reject unsupported static combinations before source I/O or leases."""
         candidates = []
         for resolver in self._resolvers:
+            if source_kind is not None and resolver.kind is not source_kind:
+                continue
             if not resolver.supports(version):
                 continue
             candidates.append((resolver.kind, resolver.payload_format(version)))

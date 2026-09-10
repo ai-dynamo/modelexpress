@@ -11,10 +11,17 @@ from dataclasses import dataclass
 from typing import Any
 
 import grpc
+from modelexpress.adapter import StrategyRecoveryError
 from modelexpress.types import ManifestMismatchError
 
 from ..control import WeightVersion
-from .plan import PreparedArtifact, WeightUpdatePlan, WeightUpdatePlanner
+from .plan import (
+    PreparedArtifact,
+    UpdateMethod,
+    WeightSource,
+    WeightUpdatePlan,
+    WeightUpdatePlanner,
+)
 
 logger = logging.getLogger("modelexpress_rl.inference.session")
 
@@ -53,13 +60,14 @@ class _LeaseGroup:
 class WeightUpdateSession:
     """Coordinate one rank-local generator update across composed modules.
 
-    The session owns the version lease and update lifecycle, but no payload or
-    engine-specific behavior. During ``stage`` it asks the planner for ordered
-    source/method/installer plans and returns the first successfully prepared
-    artifact. During ``apply`` it installs that artifact at the caller's safe
-    point and lets the selected method advertise the applied version when that
-    method supports peer publication. ``release`` always returns method-owned
-    staging and the version lease.
+    The session owns the version lease and update lifecycle, but no engine-
+    specific behavior. ``stage`` prepares one target from a selected source.
+    Object storage targets are first expanded into an ordered replay chain;
+    other sources retain the planner's candidate retry and fallback behavior.
+    During ``apply`` the session installs the prepared artifact at the caller's
+    safe point and lets the selected method advertise the applied version when
+    that method supports peer publication. ``release`` always returns method-
+    owned staging and the version lease.
 
     For canonical object storage, the selected plan is an
     ``ObjectStorageSourceResolver`` feeding ``CanonicalDeltaUpdateMethod``,
@@ -73,20 +81,53 @@ class WeightUpdateSession:
         *,
         planner: WeightUpdatePlanner,
         start_lease: Callable[[str], Any],
+        resolve_replay_chain: Callable[
+            [WeightVersion], tuple[WeightVersion, ...]
+        ]
+        | None = None,
     ) -> None:
         self._planner = planner
         self._start_lease = start_lease
+        self._resolve_replay_chain = resolve_replay_chain
 
-    def validate(self, version: WeightVersion) -> None:
-        self._planner.validate(version)
+    def stage(
+        self,
+        version: WeightVersion,
+        *,
+        source_kind: WeightSource | None = None,
+    ) -> SessionUpdate:
+        """Prepare one target version from the selected source."""
+        if source_kind is not WeightSource.OBJECT_STORAGE:
+            self._planner.validate(version, source_kind=source_kind)
+            return self._stage_one(version, source_kind=source_kind)
+        if self._resolve_replay_chain is None:
+            raise RuntimeError("object-storage replay-chain resolver is unavailable")
+        versions = self._resolve_replay_chain(version)
+        for replay_version in versions:
+            self._planner.validate(
+                replay_version,
+                source_kind=source_kind,
+            )
+        return self._stage_replay_chain(
+            versions,
+            source_kind=source_kind,
+        )
 
-    def stage(self, version: WeightVersion) -> SessionUpdate:
+    def _stage_one(
+        self,
+        version: WeightVersion,
+        *,
+        source_kind: WeightSource | None = None,
+    ) -> SessionUpdate:
         lease = self._start_lease(version.version_id)
         try:
             last_error: BaseException | None = None
             found_plan = False
             try:
-                for plan in self._planner.plans(version):
+                for plan in self._planner.plans(
+                    version,
+                    source_kind=source_kind,
+                ):
                     found_plan = True
                     source = plan.source.kind.value
                     method = type(plan.method).__name__
@@ -104,11 +145,14 @@ class WeightUpdateSession:
                             version=version,
                             source=plan.source,
                         )
+                    except StrategyRecoveryError:
+                        raise
                     except (
                         grpc.RpcError,
                         RuntimeError,
                         ManifestMismatchError,
                     ) as error:
+                        self._recover_preparation(plan.method, error)
                         last_error = error
                         logger.warning(
                             "ModelExpress weight update version=%s preparation "
@@ -143,10 +187,20 @@ class WeightUpdateSession:
             self._close_lease(lease, version.version_id, primary_error)
             raise
 
-    def stage_chain(self, versions: tuple[WeightVersion, ...]) -> SessionUpdate:
+    def _stage_replay_chain(
+        self,
+        versions: tuple[WeightVersion, ...],
+        *,
+        source_kind: WeightSource | None = None,
+    ) -> SessionUpdate:
         """Prepare an already-resolved base-to-target chain atomically."""
         if not versions:
             raise ValueError("version chain is empty")
+        if len(versions) == 1:
+            return self._stage_one(
+                versions[0],
+                source_kind=source_kind,
+            )
         leases = []
         try:
             for version in versions:
@@ -161,7 +215,12 @@ class WeightUpdateSession:
             plans = []
             for version in versions:
                 try:
-                    plan = next(self._planner.plans(version))
+                    plan = next(
+                        self._planner.plans(
+                            version,
+                            source_kind=source_kind,
+                        )
+                    )
                 except StopIteration as error:
                     raise RuntimeError(
                         f"no usable refit source for replay revision "
@@ -175,9 +234,13 @@ class WeightUpdateSession:
                 for plan in plans
             ):
                 raise RuntimeError("version replay chain requires one update method")
-            prepared = target_plan.method.prepare_chain(
-                tuple((plan.version, plan.source) for plan in plans)
-            )
+            try:
+                prepared = target_plan.method.prepare_chain(
+                    tuple((plan.version, plan.source) for plan in plans)
+                )
+            except BaseException as error:
+                self._recover_preparation(target_plan.method, error)
+                raise
             return SessionUpdate(
                 plan=target_plan,
                 prepared=prepared,
@@ -186,6 +249,19 @@ class WeightUpdateSession:
         except BaseException as primary_error:
             self._close_lease(lease_group, versions[-1].version_id, primary_error)
             raise
+
+    @staticmethod
+    def _recover_preparation(
+        method: UpdateMethod,
+        primary_error: BaseException,
+    ) -> None:
+        try:
+            method.preparation_failed()
+        except Exception as recovery_error:
+            raise StrategyRecoveryError(
+                f"{type(method).__name__} could not recover after preparation "
+                f"failed: {primary_error}"
+            ) from recovery_error
 
     def apply(self, update: SessionUpdate) -> Any:
         if update.released:

@@ -566,10 +566,26 @@ staging buffers—not engine-specific packed kernel tensors—under that identit
 An identical-rank peer pulls those buffers directly with NIXL, then uses the
 same graph-safe engine installer as a trainer update.
 
-An object-storage generator defaults to a same-rank generator peer first and the
-version-level object-storage source second. A memory-backed generator defaults
-to a peer first and trainer manifests second. `source_order` can select or
-reorder supported sources without changing an engine integration.
+An object-storage generator with full-tensor engine support defaults to a
+same-rank generator peer first and the version-level object-storage source
+second. Engines without that support use object storage directly. An explicit
+`source_order` may select object storage only or combine `GENERATOR` and
+`OBJECT_STORAGE` in either order. A memory-backed generator defaults to a peer
+first and trainer manifests second. If the rank-local NIXL transport cannot be
+initialized, an object-storage generator drops the peer attempt and remains
+available with object storage as its only source.
+
+For an active refit, the peer lookup is for the exact target UID. If no peer can
+prepare that version, the generator resolves the full canonical lineage from
+its `FULL_HF_CHECKPOINT` root through the target deltas, then synchronously
+reconstructs and installs the target. If peer installation succeeds, serving
+advances immediately and a serialized background task on local rank 0
+reconstructs the same full lineage into the host-local cache. Background
+reconstruction holds version leases but never mutates the live engine. It
+advances `active.json` only if the engine still serves that target; a failure or
+a superseding refit leaves the previous cache activation intact and does not
+roll back serving. Pending rebuilds are coalesced to the newest serving version;
+an already-running superseded rebuild may finish but cannot activate its target.
 
 The canonical receiver retains each full checkpoint and delta payload under its
 version, then writes a resolved chain manifest. A full target is directly
@@ -578,8 +594,9 @@ checkpoint into a version-scoped derived checkpoint. Later sequential deltas
 rename the active materialization and apply only the incoming XOR delta in
 place, avoiding another full-model copy. Canonical artifacts are never modified
 during reconstruction, and derived checkpoints can be rebuilt from the lineage.
-If an in-place delta fails, the cache remains `UPDATING` until initialization
-rebuilds it; the running engine retains its previously installed weights.
+If an in-place delta fails, the cache remains `UPDATING` until the active refit
+session or the next initialization restores the immutable full root. The running
+engine retains its previously installed weights.
 
 Under the local checkpoint lock, preparation state advances from `READY` to
 `UPDATING` before artifact construction and back to `READY(target)` only after
@@ -925,6 +942,7 @@ RL framework integrations live in the separate `modelexpress_rl` package:
 | `train/engines/fsdp/adapter.py` | FSDP/DTensor source capture with in-place or device-copy staging |
 | `inference/client.py` | Rank-local generator lifecycle, leases, exact-version source discovery, staging, and apply |
 | `inference/runtime.py` | Generator source policy, method/resource composition, and update-session ownership |
+| `inference/refit_strategy.py` | Ordered active-refit source fallback and source-specific staging |
 | `inference/engines/vllm/control.py` | Direct vLLM Control gRPC client |
 | `inference/engines/vllm/startup_probe.py` | Serving-version reconciliation and startup gate |
 | `inference/source/` | Independent generator-peer, trainer-memory, and object-storage discovery |

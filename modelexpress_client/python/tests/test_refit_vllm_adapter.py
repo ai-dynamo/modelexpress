@@ -26,6 +26,9 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
     config_module.ModelConfig = ModelConfig
     config_module.VllmConfig = VllmConfig
     monkeypatch.setitem(sys.modules, "vllm.config", config_module)
+    distributed_module = ModuleType("vllm.distributed")
+    distributed_module.get_world_group = lambda: SimpleNamespace(local_rank=1)
+    monkeypatch.setitem(sys.modules, "vllm.distributed", distributed_module)
 
     class Engine:
         accelerator_backend = SimpleNamespace(name="cuda")
@@ -92,6 +95,7 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
     }
     assert runtime.full_tensor is not None
     assert runtime.full_tensor.device_id == 2
+    assert runtime.full_tensor.local_rank == 1
     assert runtime.full_tensor.worker_rank == 3
     assert runtime.full_tensor.accelerator == "cuda"
     assert runtime.full_tensor.capture_layout(["manifest"]) == ["manifest"]
