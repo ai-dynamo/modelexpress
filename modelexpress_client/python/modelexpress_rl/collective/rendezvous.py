@@ -20,6 +20,7 @@ from __future__ import annotations
 import math
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import grpc
@@ -127,6 +128,30 @@ class _WorkerRegistrationSpec:
     model_name: str
 
 
+_KIND_TO_PROTO = {
+    "RESHARD": pb.LANE_KIND_RESHARD,
+    "BROADCAST": pb.LANE_KIND_BROADCAST,
+}
+
+
+@dataclass(frozen=True)
+class LaneDeclaration:
+    """One communicator the caller wants, and who is on it in rank order.
+
+    MX brokers a bootstrap for it and hands each slot the rank its position
+    here gives it. What the lane MEANS -- a pipeline stage, a replica group,
+    anything else -- is the caller's business and is never sent.
+    """
+
+    lane_id: int
+    kind: str
+    trainer_slots: tuple[str, ...]
+    generator_slots: tuple[str, ...]
+
+    def slots_in_rank_order(self) -> tuple[str, ...]:
+        return tuple(self.trainer_slots) + tuple(self.generator_slots)
+
+
 def _lane_kind(value: int) -> str:
     if value == pb.LANE_KIND_RESHARD:
         return "RESHARD"
@@ -147,87 +172,44 @@ def _positive_finite(value: float, name: str) -> float:
 
 def _expected_assignments(
     *,
-    trainer_count: int,
-    generator_count: int,
-    source_partition_count: int,
-    role: Role,
-    index_in_role: int,
-    source_partition: int | None,
+    lanes: Sequence[LaneDeclaration],
+    slot_id: str,
 ) -> tuple[tuple[LaneMembership, ...], bool]:
-    """Mirror the server's lane arithmetic and fail before communicator init."""
-    if source_partition_count <= 0:
-        raise ValueError("source_partition_count must be positive")
-    if trainer_count <= 0 or generator_count <= 0:
-        raise ValueError("trainer_slots and generator_slots must not be empty")
-    if trainer_count % source_partition_count != 0:
-        raise ValueError(
-            f"trainer count {trainer_count} is not divisible by "
-            f"source_partition_count {source_partition_count}"
-        )
+    """Mirror the server's placement and fail before communicator init.
 
-    trainers_per_partition = trainer_count // source_partition_count
-    reshard_world_size = trainers_per_partition + generator_count
-    broadcast_world_size = trainer_count + generator_count
-    broadcast_lane_id = source_partition_count
-
-    if role is Role.TRAINER:
-        if not 0 <= index_in_role < trainer_count:
-            raise ValueError(f"trainer index_in_role {index_in_role} is out of range")
-        if source_partition is None:
-            raise ValueError("a trainer must declare its source_partition")
-        implied_partition = index_in_role // trainers_per_partition
-        if source_partition != implied_partition:
-            raise ValueError(
-                f"trainer index_in_role {index_in_role} implies source partition "
-                f"{implied_partition}, not {source_partition}"
+    The server does the same walk over the same declaration, so a disagreement
+    here means the two sides would have entered different communicators.
+    """
+    if not lanes:
+        raise ValueError("at least one lane must be declared")
+    seen_ids: set[int] = set()
+    broadcast = 0
+    memberships: list[LaneMembership] = []
+    for lane in lanes:
+        if lane.lane_id in seen_ids:
+            raise ValueError(f"lane_id {lane.lane_id} is declared more than once")
+        seen_ids.add(lane.lane_id)
+        if lane.kind not in _KIND_TO_PROTO:
+            raise ValueError(f"unsupported lane kind {lane.kind!r}")
+        if lane.kind == "BROADCAST":
+            broadcast += 1
+        slots = lane.slots_in_rank_order()
+        if len(set(slots)) != len(slots):
+            raise ValueError(f"lane {lane.lane_id} declares a slot more than once")
+        if slot_id in slots:
+            memberships.append(
+                LaneMembership(
+                    lane.lane_id,
+                    lane.kind,
+                    slots.index(slot_id),
+                    len(slots),
+                )
             )
-        reshard_rank = index_in_role % trainers_per_partition
-        return (
-            (
-                LaneMembership(
-                    source_partition,
-                    "RESHARD",
-                    reshard_rank,
-                    reshard_world_size,
-                ),
-                LaneMembership(
-                    broadcast_lane_id,
-                    "BROADCAST",
-                    index_in_role,
-                    broadcast_world_size,
-                ),
-            ),
-            reshard_rank == 0,
-        )
-
-    if role is Role.GENERATOR:
-        if not 0 <= index_in_role < generator_count:
-            raise ValueError(f"generator index_in_role {index_in_role} is out of range")
-        if source_partition is not None:
-            raise ValueError("a generator must not declare a source_partition")
-        lanes = tuple(
-            LaneMembership(
-                lane_id,
-                "RESHARD",
-                trainers_per_partition + index_in_role,
-                reshard_world_size,
-            )
-            for lane_id in range(source_partition_count)
-        )
-        return (
-            lanes
-            + (
-                LaneMembership(
-                    broadcast_lane_id,
-                    "BROADCAST",
-                    trainer_count + index_in_role,
-                    broadcast_world_size,
-                ),
-            ),
-            False,
-        )
-
-    raise ValueError(f"unsupported collective role {role!r}")
+    if broadcast > 1:
+        raise ValueError("at most one broadcast lane may be declared")
+    if not memberships:
+        raise ValueError(f"slot {slot_id!r} is on none of the declared lanes")
+    return tuple(memberships), any(m.rank_in_lane == 0 for m in memberships)
 
 
 def _validate_assignments(
@@ -378,13 +360,12 @@ class CollectiveRendezvous:
         model_name: str,
         trainer_slots: list[str],
         generator_slots: list[str],
-        source_partition_count: int,
+        lanes: Sequence[LaneDeclaration],
         slot_id: str,
         worker_id: str,
         role: Role,
         index_in_role: int,
         plan_digest: str,
-        source_partition: int | None = None,
         plan_endpoint: str | None = None,
     ) -> Membership:
         """Ask MX to admit this worker, and take the rank it assigns.
@@ -411,12 +392,8 @@ class CollectiveRendezvous:
         if slot_id not in role_slots:
             raise ValueError(f"slot_id {slot_id!r} is not declared for role {role.value}")
         expected_assignments, expected_leader = _expected_assignments(
-            trainer_count=len(trainer_slots),
-            generator_count=len(generator_slots),
-            source_partition_count=source_partition_count,
-            role=role,
-            index_in_role=index_in_role,
-            source_partition=source_partition,
+            lanes=lanes,
+            slot_id=slot_id,
         )
         if plan_endpoint is not None and not (role is Role.TRAINER and index_in_role == 0):
             raise ValueError("only trainer index 0 may advertise the reshard plan endpoint")
@@ -425,7 +402,15 @@ class CollectiveRendezvous:
             model_name=model_name,
             expected_trainer_slots=trainer_slots,
             expected_generator_slots=generator_slots,
-            source_partition_count=source_partition_count,
+            lanes=[
+                pb.LaneSpec(
+                    lane_id=lane.lane_id,
+                    kind=_KIND_TO_PROTO[lane.kind],
+                    trainer_slots=list(lane.trainer_slots),
+                    generator_slots=list(lane.generator_slots),
+                )
+                for lane in lanes
+            ],
         )
         request = pb.JoinCollectiveGroupRequest(
             spec=spec,
@@ -435,8 +420,6 @@ class CollectiveRendezvous:
             index_in_role=index_in_role,
             plan_digest=plan_digest,
         )
-        if source_partition is not None:
-            request.source_partition = source_partition
         if plan_endpoint is not None:
             request.plan_source.CopyFrom(
                 pb.PlanSource(
@@ -621,11 +604,13 @@ def _missing_slots(group: pb.CollectiveGroup) -> list[str]:
     Read off the broadcast lane, which is the only one every participant joins,
     so it is the single place the full admitted set is visible.
     """
+    # The broadcast lane is the one place the full admitted set is visible in
+    # a single read, but a caller need not declare one, so fall back to the
+    # union across every lane rather than reporting everyone as missing.
     admitted: set[tuple[int, str]] = set()
-    for lane in group.lanes:
-        if lane.kind == pb.LANE_KIND_BROADCAST:
-            admitted = {(p.role, p.slot_id) for p in lane.participants}
-            break
+    broadcast = [lane for lane in group.lanes if lane.kind == pb.LANE_KIND_BROADCAST]
+    for lane in broadcast or group.lanes:
+        admitted |= {(p.role, p.slot_id) for p in lane.participants}
 
     expected = [
         (pb.COLLECTIVE_ROLE_TRAINER, slot, f"trainer slot {slot}")

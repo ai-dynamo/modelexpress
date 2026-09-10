@@ -21,7 +21,8 @@ use modelexpress_common::grpc::refit::{
 use modelexpress_common::grpc::refit_collective::{
     CollectiveGroup, CollectiveGroupSpec, CollectiveGroupState, CollectiveRole, CollectiveTransfer,
     CollectiveTransferState, CreateCollectiveTransferRequest, DeleteCollectiveTransferRequest,
-    GetCollectiveGroupRequest, JoinCollectiveGroupRequest, PublishGroupBootstrapRequest,
+    GetCollectiveGroupRequest, JoinCollectiveGroupRequest, LaneKind, LaneSpec,
+    PublishGroupBootstrapRequest,
     ReportCollectiveTransferRequest, refit_collective_service_client::RefitCollectiveServiceClient,
 };
 use modelexpress_server::backend_config::BackendConfig;
@@ -95,11 +96,28 @@ async fn stop(tx: oneshot::Sender<()>, handle: JoinHandle<ServerResult>) {
 }
 
 fn spec(model_name: &str, trainers: &[&str], generators: &[&str]) -> CollectiveGroupSpec {
+    let trainer_slots: Vec<String> = trainers.iter().map(|slot| (*slot).to_string()).collect();
+    let generator_slots: Vec<String> = generators.iter().map(|slot| (*slot).to_string()).collect();
     CollectiveGroupSpec {
         model_name: model_name.to_string(),
-        expected_trainer_slots: trainers.iter().map(|slot| (*slot).to_string()).collect(),
-        expected_generator_slots: generators.iter().map(|slot| (*slot).to_string()).collect(),
-        source_partition_count: 1,
+        expected_trainer_slots: trainer_slots.clone(),
+        expected_generator_slots: generator_slots.clone(),
+        // One reshard lane over every trainer plus a broadcast lane. The split
+        // is the caller's choice; the server is told the result, not the rule.
+        lanes: vec![
+            LaneSpec {
+                lane_id: 0,
+                kind: LaneKind::Reshard.into(),
+                trainer_slots: trainer_slots.clone(),
+                generator_slots: generator_slots.clone(),
+            },
+            LaneSpec {
+                lane_id: 1,
+                kind: LaneKind::Broadcast.into(),
+                trainer_slots,
+                generator_slots,
+            },
+        ],
     }
 }
 
@@ -137,7 +155,6 @@ fn join_request(
         worker_id: worker_id.to_string(),
         role: role.into(),
         index_in_role,
-        source_partition: (role == CollectiveRole::Trainer).then_some(0),
         plan_digest: "plan-digest".to_string(),
         plan_source: None,
     }

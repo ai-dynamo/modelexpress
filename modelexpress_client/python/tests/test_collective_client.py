@@ -119,8 +119,17 @@ class FakeRendezvous:
 class FakeRendezvousPP2(FakeRendezvous):
     def join(self, **kwargs):
         self.joins += 1
-        source_partition = kwargs["source_partition"]
-        assert source_partition == 1
+        # Four trainers over two reshard lanes, so the client must declare
+        # lanes 0 and 1 plus a broadcast lane, and t2 leads lane 1.
+        lanes = kwargs["lanes"]
+        assert [(lane.lane_id, lane.kind) for lane in lanes] == [
+            (0, "RESHARD"),
+            (1, "RESHARD"),
+            (2, "BROADCAST"),
+        ]
+        assert lanes[0].trainer_slots == ("t0", "t1")
+        assert lanes[1].trainer_slots == ("t2", "t3")
+        assert lanes[2].trainer_slots == ("t0", "t1", "t2", "t3")
         return Membership(
             group_id="g",
             epoch=1,

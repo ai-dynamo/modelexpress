@@ -123,8 +123,9 @@ class RefitCollectiveServiceServicer(object):
 
     def JoinCollectiveGroup(self, request, context):
         """Worker-client-facing. Workers join a group; they never create or delete
-        one. Groups are reclaimed automatically once every participant's
-        `WorkerRegistration` has lapsed and no transfer still references them.
+        one. A worker must first create and continuously renew its TTL-bound
+        `WorkerRegistration`; expiry fences that generation and advances the group
+        epoch. Automatic reclamation of empty group metadata is a later slice.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')

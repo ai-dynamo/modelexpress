@@ -31,7 +31,7 @@ from .backend import (
 )
 from .comm import CommunicatorCache, LaneCommunicator, LaneKey, new_unique_id
 from .plan import plan_digest, validate_coverage
-from .rendezvous import CollectiveRendezvous, Membership
+from .rendezvous import CollectiveRendezvous, LaneDeclaration, Membership
 from .spi import Loader, Publisher, resolve_specs
 from .types import ReshardPlan, Role
 
@@ -164,6 +164,32 @@ class _RefitClientBase:
         """
         return self._streams[lane_id % len(self._streams)]
 
+    def _declared_lanes(self) -> list[LaneDeclaration]:
+        """The communicators this client wants, from ITS OWN partitioning.
+
+        The split lives here and is never sent as a partition count: MX is
+        handed the resulting membership and nothing about what produced it.
+        """
+        per_lane = len(self._trainer_slots) // self._source_partition_count
+        lanes = [
+            LaneDeclaration(
+                partition,
+                "RESHARD",
+                tuple(self._trainer_slots[partition * per_lane : (partition + 1) * per_lane]),
+                tuple(self._generator_slots),
+            )
+            for partition in range(self._source_partition_count)
+        ]
+        lanes.append(
+            LaneDeclaration(
+                self._source_partition_count,
+                "BROADCAST",
+                tuple(self._trainer_slots),
+                tuple(self._generator_slots),
+            )
+        )
+        return lanes
+
     def _join_and_bootstrap(
         self, role: Role, source_partition: int | None
     ) -> Membership:
@@ -171,33 +197,38 @@ class _RefitClientBase:
             raise RuntimeError("initialize must run before compute_plan")
         require_nccl_m2n()
 
+        declared = self._declared_lanes()
         membership = self._rendezvous.join(
             model_name=self._model_name,
             trainer_slots=self._trainer_slots,
             generator_slots=self._generator_slots,
-            source_partition_count=self._source_partition_count,
+            lanes=declared,
             slot_id=self._slot_id,
             worker_id=self._worker_id,
             role=role,
             index_in_role=self._index_in_role,
             plan_digest=self._digest,
-            source_partition=source_partition,
         )
-        expected_reshard = (
-            {source_partition}
-            if role is Role.TRAINER and source_partition is not None
-            else set(range(self._source_partition_count))
-        )
+        # Which reshard lanes this worker belongs on is a fact about what it
+        # just declared, not a re-derivation of a rule the server also applies.
+        expected_reshard = {
+            lane.lane_id
+            for lane in declared
+            if lane.kind == "RESHARD" and self._slot_id in lane.slots_in_rank_order()
+        }
         actual_reshard = {lane.lane_id for lane in membership.reshard_lanes}
         if actual_reshard != expected_reshard:
             raise RuntimeError(
                 "MX returned unexpected reshard-lane membership: "
                 f"expected {sorted(expected_reshard)}, got {sorted(actual_reshard)}"
             )
-        if membership.broadcast_lane.lane_id != self._source_partition_count:
+        declared_broadcast = next(
+            lane.lane_id for lane in declared if lane.kind == "BROADCAST"
+        )
+        if membership.broadcast_lane.lane_id != declared_broadcast:
             raise RuntimeError(
                 "MX returned an unexpected broadcast lane id: "
-                f"expected {self._source_partition_count}, got "
+                f"expected {declared_broadcast}, got "
                 f"{membership.broadcast_lane.lane_id}"
             )
 
@@ -237,9 +268,8 @@ class _RefitClientBase:
         )
 
         by_lane_id = {lane.lane_id: lane for lane in group.lanes}
-        all_lane_ids = set(range(self._source_partition_count)) | {
-            membership.broadcast_lane.lane_id
-        }
+        declared = self._declared_lanes()
+        all_lane_ids = {lane.lane_id for lane in declared}
         missing = sorted(all_lane_ids - set(by_lane_id))
         if missing:
             raise RuntimeError(
@@ -250,9 +280,11 @@ class _RefitClientBase:
         # full-group barrier after every reshard-lane init. Without those
         # barriers, a PP-stage trainer can enter lane N+1 while generators are
         # still initializing lane N; overlapping communicator creation can hang.
-        lane_order = [membership.broadcast_lane.lane_id] + list(
-            range(self._source_partition_count)
-        )
+        # Every rank walks the FULL declared lane set, including lanes it is
+        # not on, so the barriers line up; membership.lane raises for those.
+        lane_order = [membership.broadcast_lane.lane_id] + [
+            lane.lane_id for lane in declared if lane.kind == "RESHARD"
+        ]
         try:
             for lane_id in lane_order:
                 lane_record = by_lane_id[lane_id]

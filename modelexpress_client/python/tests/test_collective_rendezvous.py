@@ -66,6 +66,30 @@ class FakeStub:
         return pb.CollectiveTransfer(operation_id=request.operation_id)
 
 
+def lanes_for(trainer_slots, generator_slots, *, lane_count=1):
+    """Declare `lane_count` reshard lanes over the trainers, plus a broadcast.
+
+    How the trainers are split is the TEST's choice, exactly as it is the
+    caller's in production. MX is never told what the split means.
+    """
+    per_lane = max(-(-len(trainer_slots) // max(lane_count, 1)), 1)
+    lanes = [
+        rz.LaneDeclaration(
+            index,
+            "RESHARD",
+            tuple(trainer_slots[index * per_lane : (index + 1) * per_lane]),
+            tuple(generator_slots),
+        )
+        for index in range(lane_count)
+    ]
+    lanes.append(
+        rz.LaneDeclaration(
+            lane_count, "BROADCAST", tuple(trainer_slots), tuple(generator_slots)
+        )
+    )
+    return lanes
+
+
 def make_rendezvous(stub, *, start_thread=False):
     client = CollectiveRendezvous.__new__(CollectiveRendezvous)
     client._stub = stub
@@ -132,13 +156,12 @@ class TestJoin:
             model_name="m",
             trainer_slots=["t0", "t1"],
             generator_slots=["g0"],
-            source_partition_count=1,
+            lanes=lanes_for(["t0", "t1"], ["g0"]),
             slot_id="t0",
             worker_id="w0",
             role=Role.TRAINER,
             index_in_role=0,
             plan_digest="d",
-            source_partition=0,
         )
 
         assert isinstance(result, Membership)
@@ -152,7 +175,7 @@ class TestJoin:
         assert registered.worker.role == rz.refit_pb2.WORKER_ROLE_TRAINER
         assert registered.ttl_seconds == 90
         sent = stub.joined[0]
-        assert sent.source_partition == 0
+        assert [lane.lane_id for lane in sent.spec.lanes] == [0, 1]
         assert sent.role == pb.COLLECTIVE_ROLE_TRAINER
 
     def test_a_generator_sends_no_partition(self):
@@ -168,14 +191,18 @@ class TestJoin:
             model_name="m",
             trainer_slots=["t0"],
             generator_slots=["g0"],
-            source_partition_count=1,
+            lanes=lanes_for(["t0"], ["g0"]),
             slot_id="g0",
             worker_id="w1",
             role=Role.GENERATOR,
             index_in_role=0,
             plan_digest="d",
         )
-        assert not stub.joined[0].HasField("source_partition")
+        # A generator is placed by the lanes that declared its slot, so the
+        # request has nowhere to carry a partition and no need of one.
+        assert "source_partition" not in (
+            pb.JoinCollectiveGroupRequest.DESCRIPTOR.fields_by_name
+        )
         assert stub.registered[0].worker.role == rz.refit_pb2.WORKER_ROLE_GENERATOR
 
     def test_a_plan_endpoint_is_advertised_with_the_matching_digest(self):
@@ -192,13 +219,12 @@ class TestJoin:
             model_name="m",
             trainer_slots=["t0"],
             generator_slots=["g0"],
-            source_partition_count=1,
+            lanes=lanes_for(["t0"], ["g0"]),
             slot_id="t0",
             worker_id="w0",
             role=Role.TRAINER,
             index_in_role=0,
             plan_digest="abc",
-            source_partition=0,
             plan_endpoint="host:1234",
         )
         source = stub.joined[0].plan_source
@@ -226,7 +252,7 @@ class TestJoin:
                 model_name="m",
                 trainer_slots=["t0"],
                 generator_slots=["g0"],
-                source_partition_count=1,
+                lanes=lanes_for(["t0"], ["g0"]),
                 slot_id="g0",
                 worker_id="w1",
                 role=Role.GENERATOR,
@@ -241,13 +267,12 @@ class TestJoin:
                 model_name="m",
                 trainer_slots=["t0", "t1"],
                 generator_slots=["g0"],
-                source_partition_count=1,
+                lanes=lanes_for(["t0", "t1"], ["g0"]),
                 slot_id="t1",
                 worker_id="w1",
                 role=Role.TRAINER,
                 index_in_role=1,
                 plan_digest="d",
-                source_partition=0,
                 plan_endpoint="host:1234",
             )
         assert stub.joined == []
@@ -267,7 +292,7 @@ class TestJoin:
             model_name="m",
             trainer_slots=["t0"],
             generator_slots=["g0"],
-            source_partition_count=1,
+            lanes=lanes_for(["t0"], ["g0"]),
             slot_id="g0",
             worker_id="w1",
             role=Role.GENERATOR,
@@ -314,7 +339,7 @@ class TestJoin:
             model_name="m",
             trainer_slots=["t0"],
             generator_slots=["g0"],
-            source_partition_count=1,
+            lanes=lanes_for(["t0"], ["g0"]),
             slot_id="g0",
             worker_id="w1",
             role=Role.GENERATOR,
