@@ -127,6 +127,7 @@ def test_flat_topology_selection_keeps_gpus_on_local_nics(monkeypatch):
 
     chosen = {gpu: ucx_utils.probe_nic_pin_for_device(gpu) for gpu in gpus}
 
+    # NIC names are the final tiebreak, so mlx5_10 sorts before mlx5_9.
     assert chosen == {
         0: "mlx5_5:1",
         1: "mlx5_6:1",
