@@ -109,7 +109,9 @@ pub const DEFAULT_NGC_AUTHN_BASE: &str = "https://authn.nvidia.com";
 // ── Redis / metadata backend (server) ───────────────────────────────────────
 /// Selects the metadata backend implementation (`redis`, `kubernetes`, `memory`).
 pub const MX_METADATA_BACKEND: &str = "MX_METADATA_BACKEND";
-/// Full Redis connection URL for the redis metadata backend.
+/// Full Redis connection URL (preferred) for the redis metadata backend.
+pub const MX_REDIS_URL: &str = "MX_REDIS_URL";
+/// Full Redis connection URL alias for charts predating the `MX_` prefix.
 pub const REDIS_URL: &str = "REDIS_URL";
 /// Redis host (preferred) when building the URL from host + port.
 pub const MX_REDIS_HOST: &str = "MX_REDIS_HOST";
@@ -259,9 +261,9 @@ pub fn metadata_backend() -> String {
     env::var(MX_METADATA_BACKEND).unwrap_or_default()
 }
 
-/// Full Redis URL from [`REDIS_URL`].
+/// Full Redis URL from [`MX_REDIS_URL`], then [`REDIS_URL`].
 pub fn redis_url() -> Option<String> {
-    env::var(REDIS_URL).ok()
+    env::var(MX_REDIS_URL).or_else(|_| env::var(REDIS_URL)).ok()
 }
 
 /// Redis host from [`MX_REDIS_HOST`], then [`REDIS_HOST`].
@@ -374,6 +376,7 @@ mod tests {
         assert_eq!(NGC_CLI_API_KEY, "NGC_CLI_API_KEY");
         assert_eq!(NGC_CLI_HOME, "NGC_CLI_HOME");
         assert_eq!(MX_METADATA_BACKEND, "MX_METADATA_BACKEND");
+        assert_eq!(MX_REDIS_URL, "MX_REDIS_URL");
         assert_eq!(REDIS_URL, "REDIS_URL");
         assert_eq!(MX_REDIS_HOST, "MX_REDIS_HOST");
         assert_eq!(REDIS_HOST, "REDIS_HOST");
@@ -459,6 +462,16 @@ mod tests {
         assert_eq!(redis_host().as_deref(), Some("legacy-host"));
         let _h1 = EnvVarGuard::set(&lock, MX_REDIS_HOST, "mx-host");
         assert_eq!(redis_host().as_deref(), Some("mx-host"));
+
+        let _u1 = EnvVarGuard::remove(&lock, MX_REDIS_URL);
+        let _u2 = EnvVarGuard::set(&lock, REDIS_URL, "redis://legacy:6379/0");
+        assert_eq!(redis_url().as_deref(), Some("redis://legacy:6379/0"));
+        let _u1 = EnvVarGuard::set(&lock, MX_REDIS_URL, "redis://mx:6379/0");
+        assert_eq!(redis_url().as_deref(), Some("redis://mx:6379/0"));
+        let _u2 = EnvVarGuard::remove(&lock, REDIS_URL);
+        assert_eq!(redis_url().as_deref(), Some("redis://mx:6379/0"));
+        let _u1 = EnvVarGuard::remove(&lock, MX_REDIS_URL);
+        assert_eq!(redis_url(), None);
 
         let _n1 = EnvVarGuard::remove(&lock, MX_METADATA_NAMESPACE);
         let _n2 = EnvVarGuard::set(&lock, POD_NAMESPACE, "pod-ns");
