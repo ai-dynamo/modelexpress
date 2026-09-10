@@ -1,23 +1,26 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Lane layout and rank assignment for the NCCL M2N collective path.
+//! Lane membership and rank assignment for the NCCL M2N collective path.
 //!
-//! This is the whole of what MX knows about the transfer's shape. It derives a
-//! lane set and a rank per participant from three inputs -- role, ordinal
-//! within the role, and source partition -- and nothing else. Tensor, expert,
-//! data and pipeline parallelism stay entirely client-side; a change to any of
-//! them reaches this module only as a different partition count or a different
-//! participant count.
+//! This is the whole of what MX knows about the transfer's shape, and it is
+//! only what the caller declared: a set of lanes, each an ordered list of
+//! slots. MX brokers one bootstrap per lane, assigns each slot the rank its
+//! position gives it, and gates readiness on every lane. It does not derive the
+//! lane set, does not infer which lanes a slot belongs to, and has no notion of
+//! a source partition.
 //!
-//! Keeping it that way is deliberate. The moment the server has to interpret a
+//! Keeping it that way is the point. Tensor, expert, data and pipeline
+//! parallelism are the caller's; the moment the server has to interpret a
 //! parallelism layout to place a rank, every trainer framework needs server
 //! support before it can use this path.
 
-use modelexpress_common::grpc::refit_collective::{CollectiveRole, LaneKind};
+use std::collections::{HashMap, HashSet};
+
+use modelexpress_common::grpc::refit_collective::LaneKind;
 
 /// A participant's placement in one lane.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Assignment {
     pub lane_id: u32,
     pub kind: LaneKind,
@@ -25,234 +28,209 @@ pub struct Assignment {
     pub world_size: u32,
 }
 
-/// The lane set implied by a group's declared membership.
+/// One communicator, exactly as the caller declared it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lane {
+    pub lane_id: u32,
+    pub kind: LaneKind,
+    /// Slots in rank order. Trainers take the low ranks, generators follow, so
+    /// a lane's source ranks are always `[0, trainer_slots.len())`.
+    pub trainer_slots: Vec<String>,
+    pub generator_slots: Vec<String>,
+}
+
+impl Lane {
+    fn slots_in_rank_order(&self) -> impl Iterator<Item = &String> {
+        self.trainer_slots.iter().chain(self.generator_slots.iter())
+    }
+
+    fn world_size(&self) -> u32 {
+        let total = self.trainer_slots.len().saturating_add(self.generator_slots.len());
+        u32::try_from(total).unwrap_or(u32::MAX)
+    }
+}
+
+/// The declared lanes of one operation, indexed for lookup.
+#[derive(Debug, Clone)]
 pub struct LaneLayout {
-    pub source_partition_count: u32,
+    lanes: Vec<Lane>,
+    /// slot_id -> the assignments that slot holds, in declared lane order.
+    by_slot: HashMap<String, Vec<Assignment>>,
     pub trainer_count: u32,
     pub generator_count: u32,
 }
 
-/// Lane id of the single broadcast lane. Reshard lanes take `0..partitions`,
-/// so the broadcast lane sits immediately after them.
-#[must_use]
-pub fn broadcast_lane_id(source_partition_count: u32) -> u32 {
-    source_partition_count
-}
-
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum LaneError {
-    #[error("source_partition_count must be greater than zero")]
-    NoPartitions,
+    #[error("a collective group must declare at least one lane")]
+    NoLanes,
     #[error("expected_trainer_slots must not be empty")]
     NoTrainers,
     #[error("expected_generator_slots must not be empty")]
     NoGenerators,
-    #[error(
-        "trainer count {trainers} is not divisible by source_partition_count {partitions}; \
-         every partition must hold the same number of trainer ranks"
-    )]
-    UnevenPartitions { trainers: u32, partitions: u32 },
-    #[error("index_in_role {index} is out of range for {count} {role} slots")]
-    IndexOutOfRange {
-        index: u32,
-        count: u32,
+    #[error("lane_id {lane_id} is declared more than once")]
+    DuplicateLaneId { lane_id: u32 },
+    #[error("lane {lane_id} declares kind LANE_KIND_UNSPECIFIED")]
+    UnspecifiedLaneKind { lane_id: u32 },
+    #[error("lane {lane_id} declares slot {slot_id}, which is not an expected {role} slot")]
+    UnknownSlot {
+        lane_id: u32,
+        slot_id: String,
         role: &'static str,
     },
-    #[error("a trainer must declare its source_partition")]
-    MissingPartition,
-    #[error("source_partition {partition} is out of range for {count} partitions")]
-    PartitionOutOfRange { partition: u32, count: u32 },
-    #[error(
-        "trainer index_in_role {index} implies source partition {implied}, not the declared {declared}"
-    )]
-    PartitionMismatch {
-        index: u32,
-        implied: u32,
-        declared: u32,
-    },
-    #[error("a generator must not declare a source_partition; it joins every reshard lane")]
-    UnexpectedPartition,
-    #[error("role must be specified")]
-    UnspecifiedRole,
+    #[error("lane {lane_id} declares slot {slot_id} more than once")]
+    DuplicateSlotInLane { lane_id: u32, slot_id: String },
+    #[error("slot {slot_id} is expected but is on no declared lane")]
+    UnassignedSlot { slot_id: String },
+    #[error("at most one broadcast lane may be declared; found {found}")]
+    MultipleBroadcastLanes { found: usize },
+    #[error("slot {slot_id} is not a member of this group")]
+    UnknownParticipant { slot_id: String },
 }
 
 impl LaneLayout {
-    /// Validate the declared membership and derive the lane geometry.
+    /// Validate a declared lane set against the group's expected slots.
+    ///
+    /// Every check here is structural: unique lane ids, slots that exist, no
+    /// slot declared twice on one lane, no expected slot left off every lane.
+    /// None of them is a claim about what the lanes mean.
     pub fn new(
-        source_partition_count: u32,
-        trainer_count: u32,
-        generator_count: u32,
+        lanes: Vec<Lane>,
+        expected_trainer_slots: &[String],
+        expected_generator_slots: &[String],
     ) -> Result<Self, LaneError> {
-        if source_partition_count == 0 {
-            return Err(LaneError::NoPartitions);
-        }
-        if trainer_count == 0 {
+        if expected_trainer_slots.is_empty() {
             return Err(LaneError::NoTrainers);
         }
-        if generator_count == 0 {
+        if expected_generator_slots.is_empty() {
             return Err(LaneError::NoGenerators);
         }
-        if !trainer_count.is_multiple_of(source_partition_count) {
-            return Err(LaneError::UnevenPartitions {
-                trainers: trainer_count,
-                partitions: source_partition_count,
-            });
+        if lanes.is_empty() {
+            return Err(LaneError::NoLanes);
         }
+
+        let trainers: HashSet<&String> = expected_trainer_slots.iter().collect();
+        let generators: HashSet<&String> = expected_generator_slots.iter().collect();
+
+        let broadcast = lanes
+            .iter()
+            .filter(|lane| lane.kind == LaneKind::Broadcast)
+            .count();
+        if broadcast > 1 {
+            return Err(LaneError::MultipleBroadcastLanes { found: broadcast });
+        }
+
+        let mut seen_lane_ids: HashSet<u32> = HashSet::new();
+        let mut by_slot: HashMap<String, Vec<Assignment>> = HashMap::new();
+
+        for lane in &lanes {
+            if !seen_lane_ids.insert(lane.lane_id) {
+                return Err(LaneError::DuplicateLaneId {
+                    lane_id: lane.lane_id,
+                });
+            }
+            if lane.kind == LaneKind::Unspecified {
+                return Err(LaneError::UnspecifiedLaneKind {
+                    lane_id: lane.lane_id,
+                });
+            }
+            for (slot_id, known, role) in lane
+                .trainer_slots
+                .iter()
+                .map(|s| (s, &trainers, "trainer"))
+                .chain(
+                    lane.generator_slots
+                        .iter()
+                        .map(|s| (s, &generators, "generator")),
+                )
+            {
+                if !known.contains(slot_id) {
+                    return Err(LaneError::UnknownSlot {
+                        lane_id: lane.lane_id,
+                        slot_id: slot_id.clone(),
+                        role,
+                    });
+                }
+            }
+
+            let world_size = lane.world_size();
+            let mut seen_in_lane: HashSet<&String> = HashSet::new();
+            for (rank, slot_id) in lane.slots_in_rank_order().enumerate() {
+                if !seen_in_lane.insert(slot_id) {
+                    return Err(LaneError::DuplicateSlotInLane {
+                        lane_id: lane.lane_id,
+                        slot_id: slot_id.clone(),
+                    });
+                }
+                by_slot.entry(slot_id.clone()).or_default().push(Assignment {
+                    lane_id: lane.lane_id,
+                    kind: lane.kind,
+                    rank_in_lane: u32::try_from(rank).unwrap_or(u32::MAX),
+                    world_size,
+                });
+            }
+        }
+
+        // A slot on no lane would be admitted, counted toward readiness, and
+        // then wait on a communicator it was never placed in.
+        for slot_id in expected_trainer_slots.iter().chain(expected_generator_slots) {
+            if !by_slot.contains_key(slot_id) {
+                return Err(LaneError::UnassignedSlot {
+                    slot_id: slot_id.clone(),
+                });
+            }
+        }
+
         Ok(Self {
-            source_partition_count,
-            trainer_count,
-            generator_count,
+            lanes,
+            by_slot,
+            trainer_count: u32::try_from(expected_trainer_slots.len()).unwrap_or(u32::MAX),
+            generator_count: u32::try_from(expected_generator_slots.len()).unwrap_or(u32::MAX),
         })
     }
 
-    /// Trainer ranks per source partition.
     #[must_use]
-    pub fn trainers_per_partition(&self) -> u32 {
-        // Non-zero by construction; `new` rejects a zero partition count.
-        self.trainer_count
-            .checked_div(self.source_partition_count)
-            .unwrap_or(0)
+    pub fn lanes(&self) -> &[Lane] {
+        &self.lanes
     }
 
-    /// World size of one reshard lane: its partition's trainers, plus every
-    /// admitted generator. Generators join every reshard lane because a
-    /// generator holds all layers and so needs bytes from every partition.
-    #[must_use]
-    pub fn reshard_world_size(&self) -> u32 {
-        self.trainers_per_partition()
-            .saturating_add(self.generator_count)
-    }
-
-    /// World size of the broadcast lane: every admitted rank on both sides.
-    #[must_use]
-    pub fn broadcast_world_size(&self) -> u32 {
-        self.trainer_count.saturating_add(self.generator_count)
-    }
-
-    #[must_use]
-    pub fn broadcast_lane_id(&self) -> u32 {
-        broadcast_lane_id(self.source_partition_count)
-    }
-
-    /// Total lanes: one per source partition, plus the broadcast lane.
     #[must_use]
     pub fn lane_count(&self) -> u32 {
-        self.source_partition_count.saturating_add(1)
+        u32::try_from(self.lanes.len()).unwrap_or(u32::MAX)
     }
 
-    /// Every lane this participant belongs to, with its rank in each.
-    ///
-    /// Trainers occupy the low ranks of a lane and generators follow, so each
-    /// lane is a self-contained world whose source ranks are `[0, trainers)`.
-    /// The client-side mesh arithmetic depends on exactly that, which is why
-    /// the rule lives here rather than being negotiated per deployment.
-    pub fn assign(
-        &self,
-        role: CollectiveRole,
-        index_in_role: u32,
-        source_partition: Option<u32>,
-    ) -> Result<Vec<Assignment>, LaneError> {
-        match role {
-            CollectiveRole::Trainer => self.assign_trainer(index_in_role, source_partition),
-            CollectiveRole::Generator => self.assign_generator(index_in_role, source_partition),
-            CollectiveRole::Unspecified => Err(LaneError::UnspecifiedRole),
-        }
-    }
-
-    fn assign_trainer(
-        &self,
-        index_in_role: u32,
-        source_partition: Option<u32>,
-    ) -> Result<Vec<Assignment>, LaneError> {
-        if index_in_role >= self.trainer_count {
-            return Err(LaneError::IndexOutOfRange {
-                index: index_in_role,
-                count: self.trainer_count,
-                role: "trainer",
-            });
-        }
-        let declared = source_partition.ok_or(LaneError::MissingPartition)?;
-        if declared >= self.source_partition_count {
-            return Err(LaneError::PartitionOutOfRange {
-                partition: declared,
-                count: self.source_partition_count,
-            });
-        }
-        // Trainer ordinals are contiguous per partition, so the partition is
-        // recoverable from the ordinal. Cross-checking the two catches a
-        // client that numbers its ranks one way and its partitions another --
-        // which would otherwise place a rank in the wrong lane and hang it.
-        let implied = index_in_role
-            .checked_div(self.trainers_per_partition())
-            .unwrap_or(0);
-        if implied != declared {
-            return Err(LaneError::PartitionMismatch {
-                index: index_in_role,
-                implied,
-                declared,
-            });
-        }
-
-        Ok(vec![
-            Assignment {
-                lane_id: declared,
-                kind: LaneKind::Reshard,
-                rank_in_lane: index_in_role
-                    .checked_rem(self.trainers_per_partition())
-                    .unwrap_or(0),
-                world_size: self.reshard_world_size(),
-            },
-            Assignment {
-                lane_id: self.broadcast_lane_id(),
-                kind: LaneKind::Broadcast,
-                rank_in_lane: index_in_role,
-                world_size: self.broadcast_world_size(),
-            },
-        ])
-    }
-
-    fn assign_generator(
-        &self,
-        index_in_role: u32,
-        source_partition: Option<u32>,
-    ) -> Result<Vec<Assignment>, LaneError> {
-        if source_partition.is_some() {
-            return Err(LaneError::UnexpectedPartition);
-        }
-        if index_in_role >= self.generator_count {
-            return Err(LaneError::IndexOutOfRange {
-                index: index_in_role,
-                count: self.generator_count,
-                role: "generator",
-            });
-        }
-        let trainers = self.trainers_per_partition();
-        let mut assignments: Vec<Assignment> = (0..self.source_partition_count)
-            .map(|lane_id| Assignment {
-                lane_id,
-                kind: LaneKind::Reshard,
-                rank_in_lane: trainers.saturating_add(index_in_role),
-                world_size: self.reshard_world_size(),
-            })
-            .collect();
-        assignments.push(Assignment {
-            lane_id: self.broadcast_lane_id(),
-            kind: LaneKind::Broadcast,
-            rank_in_lane: self.trainer_count.saturating_add(index_in_role),
-            world_size: self.broadcast_world_size(),
-        });
-        Ok(assignments)
-    }
-
-    /// Whether this participant owes a lane its `ncclUniqueId`. Rank 0 of every
-    /// reshard lane is a trainer by construction, so only trainers ever do.
     #[must_use]
-    pub fn is_bootstrap_leader(&self, role: CollectiveRole, index_in_role: u32) -> bool {
-        role == CollectiveRole::Trainer
-            && index_in_role
-                .checked_rem(self.trainers_per_partition())
-                .is_some_and(|remainder| remainder == 0)
+    pub fn lane(&self, lane_id: u32) -> Option<&Lane> {
+        self.lanes.iter().find(|lane| lane.lane_id == lane_id)
+    }
+
+    /// The lane the caller declared as spanning every participant, if any. MX
+    /// reads it only to report which slots have not been admitted yet.
+    #[must_use]
+    pub fn broadcast_lane_id(&self) -> Option<u32> {
+        self.lanes
+            .iter()
+            .find(|lane| lane.kind == LaneKind::Broadcast)
+            .map(|lane| lane.lane_id)
+    }
+
+    /// Where this slot sits in every lane that declared it.
+    pub fn assign(&self, slot_id: &str) -> Result<Vec<Assignment>, LaneError> {
+        self.by_slot
+            .get(slot_id)
+            .cloned()
+            .ok_or_else(|| LaneError::UnknownParticipant {
+                slot_id: slot_id.to_string(),
+            })
+    }
+
+    /// Whether this slot owes any lane its `ncclUniqueId`. Rank 0 of a lane is
+    /// a trainer by construction, since trainers take the low ranks.
+    #[must_use]
+    pub fn is_bootstrap_leader(&self, slot_id: &str) -> bool {
+        self.by_slot
+            .get(slot_id)
+            .is_some_and(|assignments| assignments.iter().any(|a| a.rank_in_lane == 0))
     }
 }
 
@@ -261,183 +239,234 @@ impl LaneLayout {
 mod tests {
     use super::*;
 
-    fn layout(partitions: u32, trainers: u32, generators: u32) -> LaneLayout {
-        LaneLayout::new(partitions, trainers, generators).expect("valid layout")
+    fn s(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| (*v).to_string()).collect()
+    }
+
+    /// Two reshard lanes plus a broadcast lane, declared the way a caller with
+    /// two pipeline stages would declare them. Nothing here tells MX that.
+    fn layout() -> LaneLayout {
+        LaneLayout::new(
+            vec![
+                Lane {
+                    lane_id: 0,
+                    kind: LaneKind::Reshard,
+                    trainer_slots: s(&["t0", "t1"]),
+                    generator_slots: s(&["g0", "g1"]),
+                },
+                Lane {
+                    lane_id: 1,
+                    kind: LaneKind::Reshard,
+                    trainer_slots: s(&["t2", "t3"]),
+                    generator_slots: s(&["g0", "g1"]),
+                },
+                Lane {
+                    lane_id: 2,
+                    kind: LaneKind::Broadcast,
+                    trainer_slots: s(&["t0", "t1", "t2", "t3"]),
+                    generator_slots: s(&["g0", "g1"]),
+                },
+            ],
+            &s(&["t0", "t1", "t2", "t3"]),
+            &s(&["g0", "g1"]),
+        )
+        .expect("layout")
     }
 
     #[test]
-    fn single_partition_puts_trainers_first_and_generators_after() {
-        let l = layout(1, 2, 4);
-        assert_eq!(l.reshard_world_size(), 6);
-        assert_eq!(l.broadcast_world_size(), 6);
-
-        let t0 = l.assign(CollectiveRole::Trainer, 0, Some(0)).expect("t0");
-        assert_eq!(t0[0].rank_in_lane, 0);
-        let t1 = l.assign(CollectiveRole::Trainer, 1, Some(0)).expect("t1");
-        assert_eq!(t1[0].rank_in_lane, 1);
-        let g0 = l.assign(CollectiveRole::Generator, 0, None).expect("g0");
-        assert_eq!(g0[0].rank_in_lane, 2);
-        let g3 = l.assign(CollectiveRole::Generator, 3, None).expect("g3");
-        assert_eq!(g3[0].rank_in_lane, 5);
+    fn a_rank_is_the_slots_position_in_the_lane_it_was_declared_on() {
+        let layout = layout();
+        assert_eq!(
+            layout.assign("t2").expect("t2"),
+            vec![
+                Assignment {
+                    lane_id: 1,
+                    kind: LaneKind::Reshard,
+                    rank_in_lane: 0,
+                    world_size: 4
+                },
+                Assignment {
+                    lane_id: 2,
+                    kind: LaneKind::Broadcast,
+                    rank_in_lane: 2,
+                    world_size: 6
+                },
+            ]
+        );
     }
 
     #[test]
-    fn each_reshard_lane_is_a_self_contained_world() {
-        // 2 partitions x 2 trainers, 4 generators: each lane is 2 + 4 = 6.
-        let l = layout(2, 4, 4);
-        assert_eq!(l.trainers_per_partition(), 2);
-        assert_eq!(l.reshard_world_size(), 6);
-        assert_eq!(l.broadcast_world_size(), 8);
-
-        // Trainer 2 is the first rank of partition 1, so it is rank 0 there.
-        let t2 = l.assign(CollectiveRole::Trainer, 2, Some(1)).expect("t2");
-        assert_eq!(t2[0].lane_id, 1);
-        assert_eq!(t2[0].rank_in_lane, 0);
-        // ... but keeps its global ordinal on the broadcast lane.
-        assert_eq!(t2[1].kind, LaneKind::Broadcast);
-        assert_eq!(t2[1].rank_in_lane, 2);
+    fn a_generator_takes_the_ranks_after_the_trainers_on_every_lane_it_is_on() {
+        let layout = layout();
+        let g1 = layout.assign("g1").expect("g1");
+        assert_eq!(g1.len(), 3);
+        assert_eq!(g1[0].rank_in_lane, 3);
+        assert_eq!(g1[1].rank_in_lane, 3);
+        assert_eq!(g1[2].rank_in_lane, 5);
     }
 
     #[test]
-    fn generators_join_every_reshard_lane_at_the_same_rank() {
-        let l = layout(3, 6, 2);
-        let g1 = l.assign(CollectiveRole::Generator, 1, None).expect("g1");
-        let reshard: Vec<_> = g1.iter().filter(|a| a.kind == LaneKind::Reshard).collect();
-        assert_eq!(reshard.len(), 3);
-        for (expected_lane, a) in reshard.iter().enumerate() {
-            assert_eq!(a.lane_id, u32::try_from(expected_lane).expect("small"));
-            // trainers_per_partition (2) + index_in_role (1)
-            assert_eq!(a.rank_in_lane, 3);
-        }
+    fn only_a_lanes_rank_zero_owes_it_a_bootstrap() {
+        let layout = layout();
+        assert!(layout.is_bootstrap_leader("t0"));
+        assert!(layout.is_bootstrap_leader("t2"));
+        assert!(!layout.is_bootstrap_leader("t1"));
+        assert!(!layout.is_bootstrap_leader("g0"));
     }
 
     #[test]
-    fn every_lane_rank_is_assigned_exactly_once() {
-        let l = layout(2, 4, 4);
-        for lane in 0..l.lane_count() {
-            let mut seen: Vec<u32> = Vec::new();
-            for i in 0..l.trainer_count {
-                for a in l
-                    .assign(
-                        CollectiveRole::Trainer,
-                        i,
-                        i.checked_div(l.trainers_per_partition()),
-                    )
-                    .expect("trainer")
-                {
-                    if a.lane_id == lane {
-                        seen.push(a.rank_in_lane);
-                    }
-                }
+    fn the_broadcast_lane_is_whichever_one_the_caller_labelled() {
+        assert_eq!(layout().broadcast_lane_id(), Some(2));
+    }
+
+    #[test]
+    fn a_layout_with_no_broadcast_lane_is_valid() {
+        let layout = LaneLayout::new(
+            vec![Lane {
+                lane_id: 7,
+                kind: LaneKind::Reshard,
+                trainer_slots: s(&["t0"]),
+                generator_slots: s(&["g0"]),
+            }],
+            &s(&["t0"]),
+            &s(&["g0"]),
+        )
+        .expect("layout");
+        assert_eq!(layout.broadcast_lane_id(), None);
+        assert_eq!(layout.lane_count(), 1);
+    }
+
+    #[test]
+    fn a_slot_left_off_every_lane_is_rejected_rather_than_admitted_and_hung() {
+        let error = LaneLayout::new(
+            vec![Lane {
+                lane_id: 0,
+                kind: LaneKind::Reshard,
+                trainer_slots: s(&["t0"]),
+                generator_slots: s(&["g0"]),
+            }],
+            &s(&["t0", "t1"]),
+            &s(&["g0"]),
+        )
+        .expect_err("t1 is on no lane");
+        assert_eq!(
+            error,
+            LaneError::UnassignedSlot {
+                slot_id: "t1".to_string()
             }
-            for i in 0..l.generator_count {
-                for a in l.assign(CollectiveRole::Generator, i, None).expect("gen") {
-                    if a.lane_id == lane {
-                        seen.push(a.rank_in_lane);
-                    }
-                }
-            }
-            seen.sort_unstable();
-            let world = if lane == l.broadcast_lane_id() {
-                l.broadcast_world_size()
-            } else {
-                l.reshard_world_size()
-            };
-            let expected: Vec<u32> = (0..world).collect();
-            assert_eq!(seen, expected, "lane {lane} must be covered exactly once");
-        }
-    }
-
-    #[test]
-    fn rank_zero_of_every_reshard_lane_is_a_trainer() {
-        let l = layout(4, 8, 3);
-        for partition in 0_u32..4 {
-            let first = partition.saturating_mul(l.trainers_per_partition());
-            let a = l
-                .assign(CollectiveRole::Trainer, first, Some(partition))
-                .expect("trainer");
-            assert_eq!(a[0].rank_in_lane, 0);
-            assert!(l.is_bootstrap_leader(CollectiveRole::Trainer, first));
-        }
-        assert!(!l.is_bootstrap_leader(CollectiveRole::Generator, 0));
-        assert!(!l.is_bootstrap_leader(CollectiveRole::Trainer, 1));
-    }
-
-    #[test]
-    fn uneven_partitions_are_rejected() {
-        assert_eq!(
-            LaneLayout::new(3, 8, 2),
-            Err(LaneError::UnevenPartitions {
-                trainers: 8,
-                partitions: 3
-            })
         );
     }
 
     #[test]
-    fn empty_membership_is_rejected() {
-        assert_eq!(LaneLayout::new(0, 4, 2), Err(LaneError::NoPartitions));
-        assert_eq!(LaneLayout::new(1, 0, 2), Err(LaneError::NoTrainers));
-        assert_eq!(LaneLayout::new(1, 4, 0), Err(LaneError::NoGenerators));
+    fn a_lane_declaring_a_slot_the_group_does_not_have_is_rejected() {
+        let error = LaneLayout::new(
+            vec![Lane {
+                lane_id: 0,
+                kind: LaneKind::Reshard,
+                trainer_slots: s(&["t0", "ghost"]),
+                generator_slots: s(&["g0"]),
+            }],
+            &s(&["t0"]),
+            &s(&["g0"]),
+        )
+        .expect_err("ghost is not a trainer slot");
+        assert!(matches!(error, LaneError::UnknownSlot { .. }));
     }
 
     #[test]
-    fn a_trainer_numbering_its_partitions_inconsistently_is_rejected() {
-        let l = layout(2, 4, 2);
-        // Trainer 0 belongs to partition 0; claiming partition 1 would place it
-        // in the wrong lane and hang that lane instead of failing.
-        assert_eq!(
-            l.assign(CollectiveRole::Trainer, 0, Some(1)),
-            Err(LaneError::PartitionMismatch {
-                index: 0,
-                implied: 0,
-                declared: 1
-            })
-        );
+    fn a_repeated_lane_id_is_rejected() {
+        let error = LaneLayout::new(
+            vec![
+                Lane {
+                    lane_id: 0,
+                    kind: LaneKind::Reshard,
+                    trainer_slots: s(&["t0"]),
+                    generator_slots: s(&["g0"]),
+                },
+                Lane {
+                    lane_id: 0,
+                    kind: LaneKind::Broadcast,
+                    trainer_slots: s(&["t0"]),
+                    generator_slots: s(&["g0"]),
+                },
+            ],
+            &s(&["t0"]),
+            &s(&["g0"]),
+        )
+        .expect_err("lane 0 twice");
+        assert_eq!(error, LaneError::DuplicateLaneId { lane_id: 0 });
     }
 
     #[test]
-    fn role_shaped_misuse_is_rejected() {
-        let l = layout(2, 4, 2);
-        assert_eq!(
-            l.assign(CollectiveRole::Trainer, 0, None),
-            Err(LaneError::MissingPartition)
-        );
-        assert_eq!(
-            l.assign(CollectiveRole::Generator, 0, Some(0)),
-            Err(LaneError::UnexpectedPartition)
-        );
-        assert_eq!(
-            l.assign(CollectiveRole::Unspecified, 0, None),
-            Err(LaneError::UnspecifiedRole)
-        );
+    fn a_slot_declared_twice_on_one_lane_is_rejected() {
+        let error = LaneLayout::new(
+            vec![Lane {
+                lane_id: 0,
+                kind: LaneKind::Reshard,
+                trainer_slots: s(&["t0", "t0"]),
+                generator_slots: s(&["g0"]),
+            }],
+            &s(&["t0"]),
+            &s(&["g0"]),
+        )
+        .expect_err("t0 twice on lane 0");
+        assert!(matches!(error, LaneError::DuplicateSlotInLane { .. }));
     }
 
     #[test]
-    fn out_of_range_ordinals_are_rejected() {
-        let l = layout(2, 4, 2);
-        assert_eq!(
-            l.assign(CollectiveRole::Trainer, 4, Some(1)),
-            Err(LaneError::IndexOutOfRange {
-                index: 4,
-                count: 4,
-                role: "trainer"
-            })
-        );
-        assert_eq!(
-            l.assign(CollectiveRole::Generator, 2, None),
-            Err(LaneError::IndexOutOfRange {
-                index: 2,
-                count: 2,
-                role: "generator"
-            })
-        );
-        assert_eq!(
-            l.assign(CollectiveRole::Trainer, 0, Some(9)),
-            Err(LaneError::PartitionOutOfRange {
-                partition: 9,
-                count: 2
-            })
-        );
+    fn two_broadcast_lanes_are_rejected() {
+        let error = LaneLayout::new(
+            vec![
+                Lane {
+                    lane_id: 0,
+                    kind: LaneKind::Broadcast,
+                    trainer_slots: s(&["t0"]),
+                    generator_slots: s(&["g0"]),
+                },
+                Lane {
+                    lane_id: 1,
+                    kind: LaneKind::Broadcast,
+                    trainer_slots: s(&["t0"]),
+                    generator_slots: s(&["g0"]),
+                },
+            ],
+            &s(&["t0"]),
+            &s(&["g0"]),
+        )
+        .expect_err("two broadcast lanes");
+        assert_eq!(error, LaneError::MultipleBroadcastLanes { found: 2 });
+    }
+
+    #[test]
+    fn a_slot_that_is_not_a_member_cannot_be_assigned() {
+        let error = layout().assign("nobody").expect_err("not a member");
+        assert!(matches!(error, LaneError::UnknownParticipant { .. }));
+    }
+
+    /// An uneven split is the case the derived layout used to refuse outright.
+    /// Nothing about it is MX's business once the caller declares the lanes.
+    #[test]
+    fn an_uneven_split_is_just_another_declaration() {
+        let layout = LaneLayout::new(
+            vec![
+                Lane {
+                    lane_id: 0,
+                    kind: LaneKind::Reshard,
+                    trainer_slots: s(&["t0"]),
+                    generator_slots: s(&["g0"]),
+                },
+                Lane {
+                    lane_id: 1,
+                    kind: LaneKind::Reshard,
+                    trainer_slots: s(&["t1", "t2"]),
+                    generator_slots: s(&["g0"]),
+                },
+            ],
+            &s(&["t0", "t1", "t2"]),
+            &s(&["g0"]),
+        )
+        .expect("uneven is fine");
+        assert_eq!(layout.assign("t2").expect("t2")[0].rank_in_lane, 1);
+        assert_eq!(layout.lane_count(), 2);
     }
 }

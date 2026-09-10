@@ -49,11 +49,12 @@ enum CollectiveRole {
 
 enum LaneKind {
   LANE_KIND_UNSPECIFIED = 0;
-  // One per disjoint source partition, spanning that partition's trainer ranks
-  // plus every admitted generator rank. Carries `nccl.m2n.reshard`.
+  // Carries `nccl.m2n.reshard`. What its membership means is the caller's
+  // business; MX only brokers the bootstrap and tracks readiness.
   LANE_KIND_RESHARD = 1;
-  // Exactly one, spanning every admitted trainer and generator rank. Carries
-  // the packed broadcast for parameters the reshard does not move.
+  // Carries the packed broadcast for parameters the reshard does not move.
+  // MX reads this lane's membership when reporting which slots are missing,
+  // so a caller that declares one should give it every participating slot.
   LANE_KIND_BROADCAST = 2;
 }
 
@@ -150,13 +151,25 @@ message LaneAssignment {
 // an identical declaration; MX hashes it into the group_id, so a disagreement
 // surfaces as two groups that never reach READY rather than as one group with
 // inconsistent geometry.
+// One communicator the caller needs, declared by the caller. MX brokers a
+// bootstrap for it and assigns ranks from the declared order. MX does not know
+// what a lane means to the caller and never derives the lane set: the caller
+// owns its own parallelism, and this message is the whole of what MX is told.
+message LaneSpec {
+  uint32 lane_id = 1;
+  LaneKind kind = 2;
+  // Slots on this lane, in rank order. Trainers take the low ranks and
+  // generators follow, so a lane's source ranks are always [0, trainer_slots).
+  repeated string trainer_slots = 3;
+  repeated string generator_slots = 4;
+}
+
 message CollectiveGroupSpec {
   string model_name = 1;
   repeated string expected_trainer_slots = 2;
   repeated string expected_generator_slots = 3;
-  // Number of disjoint source partitions. One reshard lane is created per
-  // partition, plus one broadcast lane.
-  uint32 source_partition_count = 4;
+  // The communicators this operation needs. Declared, never inferred.
+  repeated LaneSpec lanes = 4;
 }
 
 message JoinCollectiveGroupRequest {
@@ -165,9 +178,6 @@ message JoinCollectiveGroupRequest {
   string worker_id = 3;
   CollectiveRole role = 4;
   uint32 index_in_role = 5;
-  // Which source partition this worker's parameters belong to. Trainers only;
-  // generators join every reshard lane and must leave this unset.
-  optional uint32 source_partition = 6;
   // The digest this worker computed for the reshard plan. Readiness requires
   // every participant to report the same one.
   string plan_digest = 7;
