@@ -346,6 +346,21 @@ seed checkpoint, write the cache, or validate the base version.
 
 ## Weight Update
 
+With full-tensor engine support, active refit uses this order:
+
+1. load the exact requested version from a same-rank generator peer;
+2. if no peer can prepare it, reconstruct the complete S3 lineage from its full
+   checkpoint root through the target deltas and install that checkpoint.
+
+A successful peer install is not delayed by checkpoint reconstruction. The
+engine starts serving the new version, while local rank 0 on each node rebuilds
+the same canonical S3 lineage in the host-local cache. The background worker
+advances `active.json` only while that version is still serving. A rebuild
+failure is logged and leaves both the serving engine and the prior cache
+activation unchanged. Pending work is coalesced to the latest serving version,
+so an obsolete queued version is not reconstructed. Shutdown waits for an
+in-progress rebuild before closing its S3 and control-plane resources.
+
 ### Generator-side S3 artifact contract
 
 The weight version's `object_storage.uri` points to a global JSON index. Shard

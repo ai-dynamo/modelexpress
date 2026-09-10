@@ -527,6 +527,19 @@ class _LocalCheckpoint:
             checkpoint_paths=self.checkpoint_paths,
         )
 
+    def recover_incomplete_preparation(self) -> None:
+        """Restore a usable cache head after an in-process replay failure."""
+        with self.store.installation_locked(), self.store.locked():
+            state = self.store.state()
+            if state is None or state.status is CheckpointState.READY:
+                return
+            self.local_checkpoint = self.store.full_path(self.initial_version)
+            self._restore_cached_initial_checkpoint()
+            self.store.activate(self.initial_version)
+            self.store.enforce_capacity(
+                protected_versions={self.initial_version},
+            )
+
     def _set_local_checkpoint(self, path: Path) -> None:
         self.local_checkpoint = path
         (

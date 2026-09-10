@@ -18,6 +18,7 @@ def _create_vllm_engine_runtime(
 
     from torch.nn import Module
     from vllm.config import ModelConfig, VllmConfig
+    from vllm.distributed import get_world_group
 
     from modelexpress.engines.vllm.adapter import VllmAdapter
 
@@ -52,6 +53,7 @@ def _create_vllm_engine_runtime(
         full_tensor=FullTensorEngineCapability(
             device_id=engine.get_device_id(),
             device=engine.get_target_device(),
+            local_rank=int(get_world_group().local_rank),
             worker_rank=engine.get_worker_rank(),
             accelerator=engine.accelerator_backend.name,
             capture_layout=installer.capture,

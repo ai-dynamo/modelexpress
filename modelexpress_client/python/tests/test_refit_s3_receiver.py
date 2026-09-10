@@ -1482,6 +1482,13 @@ def test_canonical_s3_in_place_delta_failure_requires_recovery(
         adapter._checkpoint.store.state().status
         is checkpoint_store_module.CheckpointState.UPDATING
     )
+
+    adapter._method.preparation_failed()
+
+    state = adapter._checkpoint.store.state()
+    assert state.status is checkpoint_store_module.CheckpointState.READY
+    assert state.version == "base-a"
+    assert adapter._checkpoint.store.active_version() == "base-a"
     adapter.close()
 
 
