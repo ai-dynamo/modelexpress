@@ -52,6 +52,9 @@
 #
 # Triggers:
 #   - schedule: daily 09:00 UTC (01:00 PST) — release mode forced on
+#   - push to pull-request/<N> (copy-pr-bot mirrors): build-validation only —
+#     no tests (they run via their own PR triggers on the same commit), no
+#     wheels (same reason), no staging, no Slack paging
 #   - workflow_dispatch: release defaults OFF (build+test only); enabling it
 #     requires approval via the `manual-release-approval` environment.
 #     Dispatch is also the branch-testing path: velonix job-admission rules
@@ -73,6 +76,18 @@ name: ModelExpress Nightly CI
 on:
   schedule:
     - cron: '0 9 * * *'   # 09:00 UTC = 01:00 PST daily
+  # PR validation for the nightly-specific build lanes. copy-pr-bot pushes to
+  # pull-request/<N> are admitted by the velonix runner rules (dev/feature
+  # branches are not). These runs are build-only: preflight forces
+  # release=false and run_tests=false, because staging from PR content is
+  # forbidden and the test suites already run on this same commit via their
+  # own PR triggers (ci.yml, modelexpress-ci-tests.yml, build-wheels.yml).
+  # What a PR run adds is exactly what no other PR workflow covers: the
+  # production server image on both arches, the multi-arch manifest, crate
+  # packaging, and the stamped helm chart with its image-coherence check.
+  push:
+    branches:
+      - "pull-request/[0-9]+"
   workflow_dispatch:
     inputs:
       release:
@@ -96,14 +111,21 @@ on:
 permissions:
   contents: read
 
-# No workflow-level concurrency group: a dispatch parked on the
-# manual-release-approval environment would hold it for days and starve the
-# scheduled nightlies. Job-level groups are avoided too — a group keeps only
-# ONE pending slot and CANCELS the previous occupant, so a third overlapping
-# run would kill a human-approved release rather than queue it. Shared state
-# is made safe by construction instead: every tag/path/name this workflow
-# writes is either immutable per commit or run-unique, and floating-tag moves
-# are last-writer-wins by design.
+# Concurrency: PR-mirror pushes group per PR branch with cancel-in-progress,
+# so consecutive pushes to one PR replace the previous validation run (the
+# same policy the e2e workflow uses). Scheduled and dispatched runs get a
+# run-unique group — deliberately NOT shared: a shared group keeps only ONE
+# pending slot and CANCELS the previous occupant, so it could kill a
+# human-approved release, and a dispatch parked on the approval environment
+# must never starve the cron. Shared state is safe by construction instead:
+# every tag/path/name this workflow writes is either immutable per commit or
+# run-unique, and floating-tag moves are last-writer-wins by design.
+concurrency:
+  group: >-
+    ${{ github.event_name == 'push'
+        && format('nightly-ci-{0}', github.ref_name)
+        || format('nightly-ci-{0}-{1}', github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 env:
   MX_IMAGE_REPO: nvcr.io/0980761089281446
@@ -193,6 +215,14 @@ jobs:
             schedule)
               # The cron is the real nightly: always stage, always test.
               RELEASE=true
+              ;;
+            push)
+              # PR-mirror push: validate the nightly-only build lanes.
+              # Tests and wheels already run on this exact commit through
+              # their own PR triggers; running them again here would double
+              # the GPU matrix and the builder load for zero new signal.
+              RELEASE=false
+              RUN_TESTS=false
               ;;
             workflow_dispatch)
               RELEASE="${DISPATCH_RELEASE}"
@@ -483,8 +513,12 @@ jobs:
     # runs immediately; on a release=true dispatch it waits for the reviewer,
     # and a rejection skips it — no wheels reach Artifactory unapproved.
     needs: [preflight, manual-release-approval]
+    # Skipped on PR-mirror pushes: build-wheels.yml already runs directly on
+    # the same push event (its own trigger) and uploads the PR wheels — a
+    # second dev-versioned build here would double both arch builders' load.
     if: >-
       ${{ !cancelled() &&
+          github.event_name != 'push' &&
           needs.preflight.result == 'success' &&
           (needs.manual-release-approval.result == 'success' || needs.manual-release-approval.result == 'skipped') }}
     uses: ./.github/workflows/build-wheels.yml
@@ -1124,8 +1158,11 @@ jobs:
     # conclusion is visible to the jobs API query, and (b) its verdict — which
     # catches red states the API cannot see, like a release-mandatory job that
     # was skipped — can force the alert.
+    # Not on PR-mirror pushes: a failing PR validation shows up on the PR
+    # itself; paging the nightly channel for every red PR push is noise that
+    # trains people to ignore the real 09:00 alert.
     needs: [nightly-status]
-    if: always()
+    if: ${{ always() && github.event_name != 'push' }}
     uses: ./.github/workflows/notify-slack.yml
     permissions:
       contents: read
