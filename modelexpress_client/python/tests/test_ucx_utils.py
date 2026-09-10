@@ -99,29 +99,41 @@ def _install_fake_topology(monkeypatch, gpus, nics, visible=None):
     )
 
 
-def test_flat_topology_selection_keeps_gpus_on_local_nics(monkeypatch):
+def test_flat_topology_selection_uses_root_complex_when_numa_unknown(monkeypatch):
+    gpu_bdfs = [
+        "0002:00:01.0",
+        "0002:00:02.0",
+        "0002:00:03.0",
+        "0002:00:04.0",
+        "0003:00:01.0",
+        "0003:00:02.0",
+        "0003:00:03.0",
+        "0003:00:04.0",
+    ]
+    nic_bdfs = [
+        ("mlx5_5", "0002:00:09.0"),
+        ("mlx5_6", "0002:00:0a.0"),
+        ("mlx5_7", "0002:00:0b.0"),
+        ("mlx5_8", "0002:00:0c.0"),
+        ("mlx5_9", "0003:00:09.0"),
+        ("mlx5_10", "0003:00:0a.0"),
+        ("mlx5_11", "0003:00:0b.0"),
+        ("mlx5_12", "0003:00:0c.0"),
+    ]
+
+    def _flat_realpath(path):
+        bdf = os.path.basename(path)
+        domain = bdf.split(":", 1)[0]
+        return f"/sys/devices/pci{domain}:00/{bdf}"
+
+    monkeypatch.setattr(ucx_utils.os.path, "realpath", _flat_realpath)
     gpus = {
-        gpu: (
-            f"000{2 + gpu // 4}:00:{1 + gpu % 4:02x}.0",
-            gpu // 4,
-            [
-                f"pci000{2 + gpu // 4}:00",
-                f"000{2 + gpu // 4}:00:{1 + gpu % 4:02x}.0",
-            ],
-        )
-        for gpu in range(8)
+        gpu: (bdf, -1, ucx_utils._pci_path_components(bdf))
+        for gpu, bdf in enumerate(gpu_bdfs)
     }
     nics = [
-        (
-            f"mlx5_{5 + nic}",
-            nic // 4,
-            400.0,
-            [
-                f"pci000{2 + nic // 4}:00",
-                f"000{2 + nic // 4}:00:{9 + nic % 4:02x}.0",
-            ],
-        )
-        for nic in range(8)
+        (name, -1, 400.0, ucx_utils._pci_path_components(bdf))
+        for name, bdf in nic_bdfs
     ]
     _install_fake_topology(monkeypatch, gpus, nics)
 
