@@ -28,7 +28,8 @@ logger = logging.getLogger("modelexpress.sglang.refit")
 
 class SglangLiveRefit:
     def __init__(self, runner, *, model_name, timeout=600.0):
-        self._rank = getattr(runner, "tp_rank", 0)
+        parallel_state = getattr(runner, "ps", runner)
+        self._rank = getattr(parallel_state, "tp_rank", 0)
         self._client = ModelExpressGeneratorClient.initialize(
             ModelExpressGeneratorConfig(
                 engine_context=SglangGeneratorContext(runner, enable_full_tensor=True),

@@ -297,3 +297,23 @@ def test_worker_allows_retry_after_nonmutating_stage_failure(monkeypatch):
     assert binding.update(version_id="v1", training_step=1)["success"]
     assert not binding.update(version_id="other", training_step=1)["success"]
     assert client.stage_weight.call_count == 2
+
+
+@pytest.mark.parametrize("modern", [True, False])
+def test_worker_timing_uses_runner_parallel_state_rank(monkeypatch, modern):
+    from modelexpress_rl.inference.engines.sglang import worker
+
+    runner = _live_runner()
+    if modern:
+        runner.ps = SimpleNamespace(tp_rank=1)
+    else:
+        runner.tp_rank = 1
+    client = Mock()
+    client.stage_weight.return_value = Mock(metrics={})
+    client.apply_weight.return_value = {}
+    monkeypatch.setattr(worker.ModelExpressGeneratorClient, "initialize", lambda config: client)
+    result = worker.SglangLiveRefit(runner, model_name="qwen").update(
+        version_id="v1", training_step=1
+    )
+    assert result["success"]
+    assert result["timing"]["rank"] == 1
