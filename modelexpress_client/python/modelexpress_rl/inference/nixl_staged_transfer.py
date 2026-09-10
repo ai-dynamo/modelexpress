@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+
 from modelexpress import envs, p2p_pb2
 from modelexpress.client import MxClientBase
 from modelexpress.load_strategy.base import unpublish_metadata_for_worker
@@ -125,6 +126,12 @@ def _required_agent_metadata(
 
 
 def _source_structure(source) -> tuple:
+    """Reduce a source to the fields a reused transfer plan has baked in.
+
+    Deliberately excludes the per-shard content digests, which are exactly what
+    a refresh replaces, and includes the addresses, which a plan holds and must
+    never be allowed to drift underneath.
+    """
     return (
         source.dtype,
         tuple(source.global_shape),
@@ -341,7 +348,9 @@ class _NixlStagedTransfer:
             if self._loaded_agent_metadata.get(agent) != metadata
         }
         conflicting = sorted(
-            agent for agent in changed if agent in self._loaded_agent_metadata
+            agent
+            for agent in changed
+            if agent in self._loaded_agent_metadata
         )
         if conflicting:
             raise RuntimeError(
@@ -468,7 +477,10 @@ class _NixlStagedTransfer:
         )
 
         recv_params = set(recv_expected)
-        if self._registered_recv_params and self._registered_recv_params != recv_params:
+        if (
+            self._registered_recv_params
+            and self._registered_recv_params != recv_params
+        ):
             raise RuntimeError(
                 "receive parameter set changed; restart the generator engine"
             )
@@ -649,7 +661,9 @@ class _NixlStagedTransfer:
                     timeout_seconds=self._timeout,
                 )
             else:
-                remote_agent_name = self._manager.add_remote_agent(source.nixl_metadata)
+                remote_agent_name = self._manager.add_remote_agent(
+                    source.nixl_metadata
+                )
             bytes_received, tensor_count, wire_seconds = (
                 self._manager.receive_from_source(
                     source_metadata=b"",

@@ -52,6 +52,11 @@ class WeightVersionShardManifestService(refit_pb2_grpc.RefitWorkerServiceService
         return self.endpoint
 
     def release_manifest(self, *, version_id: str, source_slot_id: str) -> None:
+        """Drop a served manifest once its version is released.
+
+        Without this the worker holds every manifest it ever published for the
+        life of the process, which on a large MoE is megabytes per step.
+        """
         key = (version_id, source_slot_id)
         with self._lock:
             self._manifests.pop(key, None)

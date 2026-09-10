@@ -12,8 +12,8 @@ import time
 from typing import Any
 
 import torch.distributed as dist
-
 from modelexpress import envs as mx_envs
+
 from modelexpress_rl import timing
 from modelexpress_rl.train.adapter import (
     CompletionFence,

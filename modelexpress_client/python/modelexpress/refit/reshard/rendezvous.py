@@ -117,6 +117,12 @@ def _encode_shard(shard) -> dict:
 
 
 def _encode_tensor_entries(tensors: list) -> list[dict]:
+    """Encode published tensors, shared by the shard table and the blob wrapper.
+
+    The wrapper used to build the shard table and immediately parse it back to
+    reach these entries, paying a serialize and a parse of the whole table to
+    get at a value it could construct directly.
+    """
     return [
         {
             "name": tensor.name,
@@ -313,10 +319,29 @@ def wrap_rendezvous_blob(
 
 
 def structural_manifest_digest(blob: bytes) -> str:
-    """Hash transfer structure while excluding version-specific content digests."""
+    """Hash transfer structure while excluding version-specific content digests.
+
+    Falls back to hashing the raw bytes for anything this cannot read as a
+    rendezvous payload, and says so, because the fallback is not equivalent: a
+    raw-byte digest moves with the per-shard content digests, so every version
+    looks structurally different and plan reuse turns itself off. That is a
+    safe direction to fail in -- a replan is correct, just slower -- but it is
+    not one to fail in quietly, since the symptom is a warm refit that stays as
+    expensive as a cold one for no visible reason.
+    """
     try:
         payload = json.loads(blob.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
+        logger.warning(
+            "rendezvous manifest is not a decodable JSON blob; falling back to a "
+            "content-sensitive digest, which disables transfer-plan reuse"
+        )
+        return hashlib.sha256(blob).hexdigest()
+    if not isinstance(payload, dict):
+        logger.warning(
+            "rendezvous manifest did not decode to an object; falling back to a "
+            "content-sensitive digest, which disables transfer-plan reuse"
+        )
         return hashlib.sha256(blob).hexdigest()
     payload.pop("publisher_step", None)
     for tensor in payload.get("tensors", ()):

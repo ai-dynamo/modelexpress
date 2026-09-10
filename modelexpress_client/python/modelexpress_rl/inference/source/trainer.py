@@ -10,7 +10,6 @@ from collections import defaultdict
 from collections.abc import Callable, Iterator
 
 import grpc
-
 from modelexpress.refit.reshard.rendezvous import structural_manifest_digest
 
 from ... import refit_pb2, refit_pb2_grpc, timing

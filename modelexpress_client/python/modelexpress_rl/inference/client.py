@@ -17,7 +17,8 @@ from modelexpress import auth, envs
 from modelexpress.client import _get_server_url
 from modelexpress.refit.timing import RefitTimingRecorder
 
-from modelexpress_rl import envs as rl_envs, timing
+from modelexpress_rl import envs as rl_envs
+from modelexpress_rl import timing
 from modelexpress_rl.version import WeightVersionRef
 
 from .. import refit_pb2, refit_pb2_grpc
@@ -340,19 +341,27 @@ class ModelExpressGeneratorClient:
                 version_id=version.version_id,
                 rank=rl_envs.LOCAL_RANK,
             )
-            with timing.active(recorder):
-                if self._runtime.initial_version_id is not None:
-                    with timing.refit_span("control_discovery"):
-                        chain = self._resolve_replay_chain(version.version_id)
-                    update = (
-                        self._runtime.session.stage(chain[0])
-                        if len(chain) == 1
-                        else self._runtime.session.stage_chain(chain)
-                    )
-                else:
-                    with timing.refit_span("control_discovery"):
-                        ready = self._get_ready_version(version.version_id)
-                    update = self._runtime.session.stage(ready)
+            try:
+                with timing.active(recorder):
+                    if self._runtime.initial_version_id is not None:
+                        with timing.refit_span("control_discovery"):
+                            chain = self._resolve_replay_chain(version.version_id)
+                        update = (
+                            self._runtime.session.stage(chain[0])
+                            if len(chain) == 1
+                            else self._runtime.session.stage_chain(chain)
+                        )
+                    else:
+                        with timing.refit_span("control_discovery"):
+                            ready = self._get_ready_version(version.version_id)
+                        update = self._runtime.session.stage(ready)
+            except BaseException:
+                # Nothing else will report this cycle: the recorder is handed on
+                # through the staged handle, and staging failed before there was
+                # one. A refit that died on the wire is exactly the case the
+                # stage split exists to explain.
+                timing.emit(recorder, logger)
+                raise
             self._active_handle = StagedWeightHandle(
                 client=self,
                 version_id=version.version_id,
@@ -615,11 +624,14 @@ class ModelExpressGeneratorClient:
             if staged._update.released:
                 return
             assert self._runtime is not None
-            self._runtime.session.release(staged._update)
-            # Covers a version that was staged and dropped without ever being
-            # installed, which the apply path never sees. A no-op once the apply
-            # has already reported the cycle.
-            timing.emit(staged._timing, logger)
+            try:
+                self._runtime.session.release(staged._update)
+            finally:
+                # Covers a version that was staged and dropped without ever
+                # being installed, which the apply path never sees, and a
+                # release that itself raised. A no-op once the apply has
+                # already reported the cycle.
+                timing.emit(staged._timing, logger)
             if self._active_handle is staged:
                 self._active_handle = None
 

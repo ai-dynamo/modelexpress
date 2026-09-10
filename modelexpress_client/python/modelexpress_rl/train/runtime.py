@@ -44,6 +44,12 @@ logger = logging.getLogger("modelexpress_rl.train.runtime")
 
 
 def _flatten_timing(payload: dict[str, Any]) -> dict[str, int | float]:
+    """Flatten one refit record into scalar metrics a framework can chart.
+
+    Stages with no measurements are dropped rather than reported as zero, since
+    a stage that did not run and a stage that took no time are different facts
+    and only one of them is worth a point on a graph.
+    """
     metrics: dict[str, int | float] = {
         "trainer_refit_e2e_s": float(payload["e2e_ms"]) / 1000.0,
     }

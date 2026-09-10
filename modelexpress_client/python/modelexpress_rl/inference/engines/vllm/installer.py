@@ -244,8 +244,11 @@ class _VllmInstaller(EngineInstaller):
         loader = DefaultModelLoader(load_config)
 
         self._reload(lambda: loader.load_weights(self._model, model_config))
-        _update_mla_absorbed_weights(self._model, quantized=self._is_quantized)
-        torch.cuda.synchronize(self._device)
+        # Same fixups and synchronize as install_tensors, so a checkpoint refit
+        # reports the stage too rather than charging it to the caller's total.
+        with refit_span("post_install"):
+            _update_mla_absorbed_weights(self._model, quantized=self._is_quantized)
+            torch.cuda.synchronize(self._device)
 
     @torch.no_grad()
     def _process_and_commit(self, tensors: dict[str, torch.Tensor]) -> None:

@@ -782,6 +782,28 @@ def test_generator_fetches_trainer_manifest_larger_than_grpc_default(monkeypatch
     )
 
 
+def test_generator_reports_timing_for_a_refit_that_never_staged(monkeypatch, caplog):
+    """A staging failure is the case the stage split most needs to explain, and
+    it is the one path where nothing downstream can report it: the recorder is
+    handed on through the staged handle, and there is no handle yet."""
+    monkeypatch.delenv("MX_REFIT_TIMING", raising=False)
+    server, endpoint, service = _start_server(manifest_digest="bad-digest")
+    adapter = _Adapter(service)
+    generator = _initialize(monkeypatch, endpoint, adapter)
+
+    try:
+        with (
+            caplog.at_level(logging.INFO),
+            pytest.raises(RuntimeError, match=r"no usable refit source"),
+        ):
+            generator.stage_weight(version=WeightVersionRef("version-a"))
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert "MX_REFIT_TIMING" in caplog.text
+
+
 def test_generator_reports_missing_trainer_manifest_digest(monkeypatch, caplog):
     server, endpoint, service = _start_server()
     service.shards[0].manifest_digest = ""

@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
+import logging
 from importlib import metadata
 from threading import Event
 from types import SimpleNamespace
@@ -82,6 +84,21 @@ def test_structural_digest_ignores_version_and_content_digest():
     )
     assert structural_manifest_digest(first_blob) != structural_manifest_digest(
         restarted_blob
+    )
+
+
+@pytest.mark.parametrize(
+    "blob", [b"\xff\xfe not json", b"{ definitely not json", b'["a", "list"]']
+)
+def test_an_unreadable_manifest_says_it_disabled_plan_reuse(caplog, blob):
+    """The raw-byte fallback moves with the per-shard content digests, so every
+    version looks structurally different and plan reuse stops. Correct, but the
+    symptom is a warm refit priced like a cold one, which needs a reason."""
+    with caplog.at_level(logging.WARNING):
+        assert structural_manifest_digest(blob) == hashlib.sha256(blob).hexdigest()
+
+    assert [m for m in caplog.messages if "disables transfer-plan reuse" in m], (
+        f"an unreadable manifest must say so, got {caplog.messages}"
     )
 
 

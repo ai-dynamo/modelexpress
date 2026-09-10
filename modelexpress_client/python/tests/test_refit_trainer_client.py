@@ -6,10 +6,9 @@ from concurrent import futures
 from unittest.mock import MagicMock
 
 import grpc
-import pytest
-
 import modelexpress_rl.train.client as client_module
 import modelexpress_rl.train.runtime as runtime_module
+import pytest
 from modelexpress_rl import (
     FSDPTrainerContext,
     ModelExpressTrainerClient,

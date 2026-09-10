@@ -116,17 +116,9 @@ class FullTensorNixlUpdateMethod(UpdateMethod):
                 for item in inputs.sources
             ):
                 raise ValueError("full-tensor method requires NIXL sources")
-            fingerprint_started = time.perf_counter()
             reusable = (
                 self._active_plan is not None
                 and self._active_fingerprint == inputs.physical_fingerprint
-            )
-            fingerprint_s = time.perf_counter() - fingerprint_started
-            timing.record_measured(
-                "source_preparation",
-                fingerprint_s,
-                metadata={"fingerprint_compare_s": fingerprint_s},
-                accumulate_metadata=True,
             )
             timing.record_cold(not reusable)
             manifests = [item.transport.manifest for item in inputs.sources]
