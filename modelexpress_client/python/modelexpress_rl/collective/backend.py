@@ -36,8 +36,10 @@ def require_nccl_m2n() -> None:
         from nccl.m2n import reshard as _  # noqa: F401
     except (ImportError, OSError) as error:  # pragma: no cover - environment dependent
         raise NcclUnavailableError(
-            "the collective refit data plane requires the nccl.m2n extension "
-            "in addition to nccl4py"
+            "the collective refit data plane needs nccl.m2n, which ships as "
+            "the nccl-extensions distribution rather than as part of nccl4py; "
+            "install nccl-extensions[cu12] or nccl-extensions[cu13] to match "
+            "the host CUDA toolkit"
         ) from error
 
 

@@ -48,7 +48,9 @@ def _nccl() -> Any:
     except (ImportError, OSError) as error:  # pragma: no cover - environment dependent
         raise NcclUnavailableError(
             "the NCCL M2N refit path needs a compatible nccl4py installation "
-            "and the nccl.m2n extension"
+            "and nccl.m2n, which ships as the nccl-extensions distribution; "
+            "install nccl-extensions[cu12] or nccl-extensions[cu13] to match "
+            "the host CUDA toolkit"
         ) from error
     return communicator, utils, bindings
 
