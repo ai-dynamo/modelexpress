@@ -262,7 +262,7 @@ def _list_compute_ib_nics(
     Returns a list of (nic_name, numa_node, rate_gbps, pci_path)
     sorted alphabetically by NIC name. The PCIe path is the BDF chain
     from /sys realpath; pair-wise common-prefix depth between a GPU's
-    path and a NIC's path encodes affinity (PIX > PXB > NODE > SYS)
+    path and a NIC's path encodes affinity (PIX > PXB > PHB > NODE > SYS)
     and is the actual selection signal in probe_nic_pin_for_device().
     NIC name ordering only affects the final lex tiebreak.
 
@@ -323,7 +323,7 @@ def probe_nic_pin_for_device(
     Selection signal is PCIe sysfs path distance: each device's
     /sys/bus/pci/devices/<bdf> realpath exposes the full bus tree, and
     the longest common PCIe component prefix between a GPU's path and a NIC's
-    path encodes affinity (PIX > PXB > NODE > SYS, the same metric
+    path encodes affinity (PIX > PXB > PHB > NODE > SYS, the same metric
     nvidia-smi topo -m reports). NIC names and GPU indices stop
     mattering for correctness; they only affect the final lex tiebreak.
 
