@@ -109,10 +109,25 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
             uri=storage.uri,
         )
 
-    def installation_context(self, prepared: PreparedArtifact):
+    def installation_context(
+        self,
+        prepared: PreparedArtifact,
+        *,
+        activate: bool = True,
+    ):
+        """Install a prepared checkpoint and optionally activate it afterward."""
         if prepared is not self._active:
             raise RuntimeError("canonical checkpoint is no longer active")
-        return self._checkpoint.installation_context(prepared.checkpoint)
+        return self._checkpoint.installation_context(
+            prepared.checkpoint,
+            activate=activate,
+        )
+
+    def activate(self, prepared: PreparedArtifact) -> None:
+        """Activate the prepared checkpoint after distributed loading succeeds."""
+        if prepared is not self._active:
+            raise RuntimeError("canonical checkpoint is no longer active")
+        self._checkpoint.activate(prepared.checkpoint)
 
     def release(self, prepared: PreparedArtifact) -> None:
         if prepared is not self._active:

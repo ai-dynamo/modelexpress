@@ -67,6 +67,8 @@ class ModelExpressGeneratorConfig:
     rpc_timeout_seconds: float = 30.0
     # Canonical object-storage checkpoint settings.
     object_storage: ObjectStorageGeneratorConfig | None = None
+    # Version read from the engine's serving-version API after cold start.
+    initial_serving_version_id: str | None = None
     # Ordered fallback for full-tensor sources. Canonical object storage is
     # currently isolated because peer installation does not advance its local
     # checkpoint base.
@@ -74,6 +76,11 @@ class ModelExpressGeneratorConfig:
 
     def __post_init__(self) -> None:
         """Validate explicit settings before client initialization."""
+        if (
+            self.initial_serving_version_id is not None
+            and not self.initial_serving_version_id.strip()
+        ):
+            raise ValueError("initial_serving_version_id must not be empty")
         if self.registration_ttl_seconds is not None:
             rl_envs.require_positive_int(
                 self.registration_ttl_seconds, "registration_ttl_seconds"
@@ -188,6 +195,7 @@ class ModelExpressGeneratorClient:
     """Synchronous rank-local generator client for exact-version refit."""
 
     def __init__(self) -> None:
+        """Create an uninitialized rank-local generator client."""
         self._channel: grpc.Channel | None = None
         self._stub: refit_pb2_grpc.RefitServiceStub | None = None
         self._registration_stop = threading.Event()
@@ -195,6 +203,7 @@ class ModelExpressGeneratorClient:
         self._operation_lock = threading.RLock()
         self._active_handle: StagedWeightHandle | None = None
         self._serving_version_id: str | None = None
+        self._has_initial_serving_version = False
         self._engine_state = _EngineState.READY
         self._runtime: GeneratorRuntime | None = None
         self._closed = False
@@ -250,9 +259,14 @@ class ModelExpressGeneratorClient:
                 start_lease=client._start_version_lease,
             )
             client._runtime = runtime
-            client._serving_version_id = runtime.initial_version_id
+            client._has_initial_serving_version = (
+                config.initial_serving_version_id is not None
+            )
+            client._serving_version_id = (
+                config.initial_serving_version_id or runtime.initial_version_id
+            )
             if client._serving_version_id is not None:
-                client._validate_initial_base(client._serving_version_id)
+                client._validate_initial_serving_version(client._serving_version_id)
             client._register_worker()
             client._registration_thread = threading.Thread(
                 target=client._renew_worker_registration,
@@ -280,7 +294,10 @@ class ModelExpressGeneratorClient:
                 raise RuntimeError("another generator update is still active")
             assert self._runtime is not None
             if (
-                self._runtime.initial_version_id is not None
+                (
+                    self._runtime.initial_version_id is not None
+                    or self._has_initial_serving_version
+                )
                 and version.version_id == self._serving_version_id
                 and self._engine_state is _EngineState.READY
             ):
@@ -461,7 +478,8 @@ class ModelExpressGeneratorClient:
             self._runtime.session.validate(version)
         return chain
 
-    def _validate_initial_base(self, version_id: str) -> None:
+    def _validate_initial_serving_version(self, version_id: str) -> None:
+        """Verify that the engine-observed initial version is ready and compatible."""
         response = self._service.GetWeightVersion(
             refit_pb2.GetWeightVersionRequest(uid=version_id),
             timeout=self._rpc_timeout_seconds,
@@ -470,9 +488,13 @@ class ModelExpressGeneratorClient:
             raise RuntimeError("MX GetWeightVersion response is missing version")
         version = _weight_version(response.version)
         if version.state is not WeightVersionState.READY:
-            raise RuntimeError(f"initial base {version_id!r} is not READY")
+            raise RuntimeError(
+                f"initial serving version {version_id!r} is not READY"
+            )
         if version.model_name != self.model_name:
-            raise RuntimeError("initial base model_name does not match the generator")
+            raise RuntimeError(
+                "initial serving version model_name does not match the generator"
+            )
 
     def _register_lease(self, version_id: str):
         response = self._service.RegisterVersionLease(

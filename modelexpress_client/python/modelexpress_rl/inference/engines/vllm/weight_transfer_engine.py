@@ -39,6 +39,7 @@ class ModelExpressWeightTransferInitInfo(WeightTransferInitInfo):
     """Optional ModelExpress connection and object-storage settings."""
 
     model_name: str | None = None
+    initial_serving_version_id: str | None = None
     initial_base_version_id: str | None = None
     seed_checkpoint_path: str | None = None
     refit_checkpoint_dir: str | None = None
@@ -165,6 +166,7 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
                 max_replay_chain_length=init_info.max_replay_chain_length,
                 rpc_timeout_seconds=init_info.rpc_timeout_seconds,
                 object_storage=object_storage,
+                initial_serving_version_id=init_info.initial_serving_version_id,
             )
         )
         logger.info("ModelExpress weight transfer initialized model=%s", model_name)

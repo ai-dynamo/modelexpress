@@ -288,6 +288,7 @@ class TestAcceleratorCapabilityGates:
         self,
         mock_accelerator_backend_cls,
     ):
+        """GDS is unavailable when the selected backend lacks GDS support."""
         from modelexpress.load_strategy.context import LoadContext
         from modelexpress.load_strategy.gds_strategy import GdsStrategy
 
@@ -301,6 +302,7 @@ class TestAcceleratorCapabilityGates:
             target_device=torch.device("cpu"),
             global_rank=0,
             worker_rank=0,
+            local_rank=0,
             device_id=0,
             identity=MagicMock(),
             mx_client=MagicMock(),

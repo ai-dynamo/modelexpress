@@ -64,6 +64,7 @@ def test_weight_transfer_engine_initializes_client_in_init_hook(monkeypatch):
 
 
 def test_weight_transfer_engine_parses_vime_object_storage_init_info(monkeypatch):
+    """Parse VIME object-storage metadata into generator initialization."""
     client = MagicMock()
     initialize = MagicMock(return_value=client)
     monkeypatch.setattr(
@@ -82,6 +83,7 @@ def test_weight_transfer_engine_parses_vime_object_storage_init_info(monkeypatch
 
     init_info = {
         "model_name": "policy",
+        "initial_serving_version_id": "version-c",
         "initial_base_version_id": "base-a",
         "seed_checkpoint_path": "/models/launch",
         "refit_checkpoint_dir": "/cache/modelexpress",
@@ -99,6 +101,7 @@ def test_weight_transfer_engine_parses_vime_object_storage_init_info(monkeypatch
 
     config = initialize.call_args.args[0]
     assert config.model_name == "policy"
+    assert config.initial_serving_version_id == "version-c"
     assert config.engine_context.model is model
     assert config.server_url == "mx:8001"
     assert config.registration_ttl_seconds == 90

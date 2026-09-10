@@ -113,6 +113,42 @@ def test_vllm_is_cuda_alike_uses_current_platform(
     assert adapter.is_cuda_alike() is True
 
 
+def test_vllm_all_gathers_state_on_cpu_group(monkeypatch):
+    """Use vLLM's CPU group for state collectives."""
+    cpu_group = object()
+    broadcasts = []
+
+    def broadcast(state, *, src):
+        """Record a broadcast and return the simulated rank-zero value."""
+        broadcasts.append((state, src))
+        return "rank-zero"
+
+    world_group = SimpleNamespace(
+        world_size=2,
+        cpu_group=cpu_group,
+        local_rank=0,
+        broadcast_object=broadcast,
+    )
+    distributed = ModuleType("vllm.distributed")
+    distributed.get_world_group = lambda: world_group
+    monkeypatch.setitem(sys.modules, "vllm.distributed", distributed)
+
+    def all_gather(states, state, *, group):
+        """Populate the gather destination with local and peer state."""
+        assert group is cpu_group
+        states[:] = [state, ("peer",)]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather)
+    adapter = object.__new__(VllmAdapter)
+
+    assert adapter.all_gather_state(("local",)) == (
+        ("local",),
+        ("peer",),
+    )
+    assert adapter.broadcast_state("local") == "rank-zero"
+    assert broadcasts == [("local", 0)]
+
+
 def test_vllm_adapter_discovery_uses_backend_predicate(
     monkeypatch,
     mock_accelerator_backend_cls,
@@ -132,8 +168,10 @@ def test_vllm_adapter_discovery_uses_backend_predicate(
 
 
 def test_build_vllm_load_context_uses_current_platform_for_bare_cuda(monkeypatch):
+    """Resolve a bare CUDA device through vLLM's current platform."""
     _stub_vllm_current_device(monkeypatch, current_device=2)
     _stub_metadata_client(monkeypatch)
+    sys.modules["vllm.distributed"].get_world_group.return_value.local_rank = 2
     vllm_config = _context_config(load_device=None)
 
     ctx = build_vllm_load_context(vllm_config, _model_config())
@@ -141,11 +179,14 @@ def test_build_vllm_load_context_uses_current_platform_for_bare_cuda(monkeypatch
     assert ctx.target_device == torch.device("cuda")
     assert ctx.target_device.index is None
     assert ctx.device_id == 2
+    assert ctx.local_rank == 2
 
 
 def test_build_vllm_load_context_keeps_explicit_cuda_index(monkeypatch):
+    """Preserve an explicitly configured CUDA device index."""
     _stub_vllm_current_device(monkeypatch, current_device=2)
     _stub_metadata_client(monkeypatch)
+    sys.modules["vllm.distributed"].get_world_group.return_value.local_rank = 3
     vllm_config = _context_config(load_device="cuda:3")
 
     ctx = build_vllm_load_context(vllm_config, _model_config())
@@ -153,10 +194,13 @@ def test_build_vllm_load_context_keeps_explicit_cuda_index(monkeypatch):
     assert ctx.target_device == torch.device("cuda:3")
     assert ctx.target_device.index == 3
     assert ctx.device_id == ctx.target_device.index
+    assert ctx.local_rank == 3
 
 
 def test_build_vllm_load_context_uses_node_rank_as_node_rank(monkeypatch):
+    """Populate node rank from vLLM's parallel configuration."""
     _stub_metadata_client(monkeypatch)
+    sys.modules["vllm.distributed"].get_world_group.return_value.local_rank = 0
     vllm_config = _context_config(load_device="cuda:0")
     vllm_config.parallel_config.node_rank = 1
 

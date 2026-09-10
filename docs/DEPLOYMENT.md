@@ -543,6 +543,13 @@ kubectl apply -f examples/dynamo_model_cache_k8s/agg.yaml
 
 See [`../examples/dynamo_model_cache_k8s/README.md`](../examples/dynamo_model_cache_k8s/README.md) for the full guide.
 
+For RL cold start and active weight refit, see
+[`../examples/rl/dynamo_vllm_refit/README.md`](../examples/rl/dynamo_vllm_refit/README.md).
+Its vLLM startup probe directly reconciles the desired MX UID through vLLM's
+native Control gRPC service. Keep that probe on the restartable vLLM init
+container: Kubernetes does not start the Dynamo sidecar until vLLM reports the
+desired UID, so a failed or mismatched reconciliation cannot admit the worker.
+
 ## P2P GPU Weight Transfers
 
 ModelExpress supports GPU-to-GPU model weight transfers between supported inference instances using NVIDIA NIXL over RDMA. vLLM 0.23.0 and newer recognize `--load-format modelexpress` natively, which runs the fixed priority chain P2P RDMA -> server cache -> InstantTensor -> ModelStreamer -> GDS -> native loader; the ModelExpress Python package must still be installed, and `mx` remains a backward-compatible alias. SGLang uses `remote_instance` with the `modelexpress` backend; see [SGLang Clients](#sglang-clients).

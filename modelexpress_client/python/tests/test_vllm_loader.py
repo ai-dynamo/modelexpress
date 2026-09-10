@@ -127,6 +127,7 @@ def _make_load_context(**overrides):
         target_device=torch.device("cpu"),
         global_rank=0,
         worker_rank=0,
+        local_rank=0,
         device_id=0,
         identity=_make_identity(),
         mx_client=MagicMock(),
