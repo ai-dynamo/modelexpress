@@ -159,16 +159,16 @@ def _gpu_numa_node(device_id: int) -> int | None:
 
 
 def _pci_path_components(bdf: str) -> list[str]:
-    """Resolve a PCI BDF to its sysfs realpath and return the BDF chain.
+    """Resolve a PCI BDF to its sysfs realpath and return the PCIe chain.
 
     For a device at 0000:0f:00.0, the realpath of
     /sys/bus/pci/devices/0000:0f:00.0 typically looks like:
         /sys/devices/pci0000:00/0000:00:01.1/0000:01:00.0/0000:02:00.0/0000:0f:00.0
-    The returned list keeps only the BDF-shaped components, in order
-    from closest-to-root to leaf. Common-prefix length between two such
-    lists encodes PCIe affinity (longer prefix = same switch / bridge),
-    which is exactly the metric nvidia-smi topo -m uses to label PIX /
-    PXB / NODE / SYS connections.
+    The returned list keeps the root-complex component (``pci0000:00``)
+    followed by the BDF-shaped components, in order from closest-to-root
+    to leaf. Common-prefix length between two such lists encodes PCIe
+    affinity, which is exactly the metric nvidia-smi topo -m uses to label
+    PIX / PXB / PHB / NODE / SYS connections.
 
     Returns [] on any read failure.
     """
@@ -176,27 +176,24 @@ def _pci_path_components(bdf: str) -> list[str]:
         rp = os.path.realpath(f"/sys/bus/pci/devices/{bdf}")
     except OSError:
         return []
-    bdf_re = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$")
-    return [p for p in rp.split("/") if bdf_re.match(p)]
+    pci_component_re = re.compile(
+        r"^(?:pci[0-9a-f]{4}:[0-9a-f]{2}|"
+        r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f])$"
+    )
+    return [p for p in rp.split("/") if pci_component_re.match(p)]
 
 
 def _pci_common_depth(a: list[str], b: list[str]) -> int:
     """Length of the longest shared prefix between two PCIe path component lists.
 
     Higher values mean closer in the PCIe tree:
-      - 4+ shared = PIX (single PCIe bridge), best
-      - 2-3 shared = PXB / PHB (multiple bridges, same root port)
-      - 1 shared = same root port
-      - 0 shared = NODE or SYS, indistinguishable here
+      - 2+ shared = same downstream bridge ancestry, with larger values closer
+      - 1 shared = same root complex, including flat-tree PHB connections
+      - 0 shared = different root complexes
 
-    That last line is the one to remember. ``_pci_path_components`` keeps
-    only BDF-shaped components, and the root complex appears in the
-    realpath as ``pci0000:97``, which is not BDF-shaped and so is dropped.
-    Two devices under the same root complex but different root ports
-    therefore share no retained component and score 0, exactly like two
-    devices on opposite sockets. Anything needing to tell NODE from SYS
-    must read numa_node instead; this metric cannot, and the caller's
-    cross-socket term exists for that reason.
+    A score of 0 does not by itself distinguish NODE from SYS: distinct root
+    complexes can still belong to the same NUMA node. The caller therefore
+    uses ``numa_node`` as a cross-socket tiebreak after PCIe depth.
     """
     n = min(len(a), len(b))
     for i in range(n):
@@ -265,7 +262,7 @@ def _list_compute_ib_nics(
     Returns a list of (nic_name, numa_node, rate_gbps, pci_path)
     sorted alphabetically by NIC name. The PCIe path is the BDF chain
     from /sys realpath; pair-wise common-prefix depth between a GPU's
-    path and a NIC's path encodes affinity (PIX > PXB > NODE > SYS)
+    path and a NIC's path encodes affinity (PIX > PXB > PHB > NODE > SYS)
     and is the actual selection signal in probe_nic_pin_for_device().
     NIC name ordering only affects the final lex tiebreak.
 
@@ -325,8 +322,8 @@ def probe_nic_pin_for_device(
 
     Selection signal is PCIe sysfs path distance: each device's
     /sys/bus/pci/devices/<bdf> realpath exposes the full bus tree, and
-    the longest common BDF prefix between a GPU's path and a NIC's
-    path encodes affinity (PIX > PXB > NODE > SYS, the same metric
+    the longest common PCIe component prefix between a GPU's path and a NIC's
+    path encodes affinity (PIX > PXB > PHB > NODE > SYS, the same metric
     nvidia-smi topo -m reports). NIC names and GPU indices stop
     mattering for correctness; they only affect the final lex tiebreak.
 
@@ -486,11 +483,11 @@ def probe_nic_pin_for_device(
         for nic_name, nic_numa, _nic_rate, nic_path in nics:
             score = _pci_common_depth(gpu_path, nic_path)
             # NUMA locality ranks BELOW load balancing. PCIe common depth
-            # separates PIX from everything else but cannot separate NODE from
-            # SYS - see _pci_common_depth, the root complex is filtered out of
-            # the path - so without this term a same-socket rail ties with a
-            # cross-socket one at depth 0 and the tiebreak falls through to name
-            # order, leaving the local rail unused. It stays for that reason.
+            # distinguishes shared root-complex and bridge ancestry but cannot
+            # separate same-NUMA from cross-socket devices under different root
+            # complexes. Without this term those devices tie at depth 0 and the
+            # tiebreak falls through to name order, possibly leaving the local
+            # rail unused. It stays for that reason.
             # What it must not do is outrank distinctness: measured, sharing a
             # rail costs 4.45x and crossing a socket costs ~0, and ranking it
             # higher forces every GPU onto a lone same-socket rail in turn. An
