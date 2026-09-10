@@ -50,6 +50,7 @@ from modelexpress.refit.reshard.types import (
 )
 from modelexpress.refit.reshard.verify import shard_region, tensor_digest
 from modelexpress.types import TensorDescriptor
+from modelexpress.refit.timing import refit_span, add_refit_bytes
 
 # Named under modelexpress.* (not modelexpress_rl) so the per-update summary surfaces
 # in the vLLM engine process, which only configures the modelexpress logger.
@@ -309,40 +310,41 @@ class _NixlStagedTransfer:
         """Compile one exact source version into a physical NIXL plan."""
         if self._closed:
             raise RuntimeError("NIXL staged transfer is closed")
-        resolved = _resolve_sources(manifests)
-        manifest = [
-            (name, source.dtype, tuple(source.global_shape))
-            for name, source in resolved.sources.items()
-        ]
-        capture, parameter_layout = capture_layout(manifest)
-        plan = _plan_staged_transfer(capture, resolved.sources)
-        self._validate_complete(capture, parameter_layout, plan)
-        required_metadata = _required_agent_metadata(plan, resolved)
-        changed = {
-            agent: metadata
-            for agent, metadata in required_metadata.items()
-            if self._loaded_agent_metadata.get(agent) != metadata
-        }
-        conflicting = sorted(
-            agent
-            for agent in changed
-            if agent in self._loaded_agent_metadata
-        )
-        if conflicting:
-            raise RuntimeError(
-                "NIXL metadata changed for an already connected source agent: "
-                f"{conflicting[:10]}"
+        with refit_span("source_preparation"):
+            resolved = _resolve_sources(manifests)
+            manifest = [
+                (name, source.dtype, tuple(source.global_shape))
+                for name, source in resolved.sources.items()
+            ]
+            capture, parameter_layout = capture_layout(manifest)
+        with refit_span("transfer_planning"):
+            plan = _plan_staged_transfer(capture, resolved.sources)
+            self._validate_complete(capture, parameter_layout, plan)
+        with refit_span("setup_registration"):
+            required_metadata = _required_agent_metadata(plan, resolved)
+            changed = {
+                agent: metadata
+                for agent, metadata in required_metadata.items()
+                if self._loaded_agent_metadata.get(agent) != metadata
+            }
+            conflicting = sorted(
+                agent for agent in changed if agent in self._loaded_agent_metadata
             )
-        _load_agent_metadata(self._manager, changed)
-        self._loaded_agent_metadata.update(changed)
-        transport = NixlReshardTransport(
-            self._manager,
-            resolved.session_to_agent,
-            resolved.session_to_device,
-            timeout_seconds=self._timeout,
-        )
-        self._ensure_workspace(plan, parameter_layout)
-        descriptors = tuple(self._descriptors(plan))
+            if conflicting:
+                raise RuntimeError(
+                    "NIXL metadata changed for an already connected source agent: "
+                    f"{conflicting[:10]}"
+                )
+            _load_agent_metadata(self._manager, changed)
+            self._loaded_agent_metadata.update(changed)
+            transport = NixlReshardTransport(
+                self._manager,
+                resolved.session_to_agent,
+                resolved.session_to_device,
+                timeout_seconds=self._timeout,
+            )
+            self._ensure_workspace(plan, parameter_layout)
+            descriptors = tuple(self._descriptors(plan))
         used_sources = {
             copy.src_name: resolved.sources[copy.src_name]
             for copy in capture.copies
@@ -431,10 +433,7 @@ class _NixlStagedTransfer:
         )
 
         recv_params = set(recv_expected)
-        if (
-            self._registered_recv_params
-            and self._registered_recv_params != recv_params
-        ):
+        if self._registered_recv_params and self._registered_recv_params != recv_params:
             raise RuntimeError(
                 "receive parameter set changed; restart the generator engine"
             )
@@ -494,31 +493,38 @@ class _NixlStagedTransfer:
         if prepared is not self._active:
             raise RuntimeError("NIXL transfer plan is no longer active")
         started = time.perf_counter()
-        prepared.transport.read(list(prepared.descriptors))
+        with refit_span("wire_transfer"):
+            prepared.transport.read(list(prepared.descriptors))
         wire_seconds = time.perf_counter() - started
 
         reconstruct_started = time.perf_counter()
-        for full in prepared.plan.full_pulls:
-            source = self._full_buffers[full.src_name]
-            for copy in full.copies:
-                destination = self._recv_buffers[copy.param_name].as_strided(
-                    copy.dest_shape,
-                    copy.dest_stride,
-                    self._recv_buffers[copy.param_name].storage_offset()
-                    + copy.dest_offset,
+        with refit_span("transformation"):
+            for full in prepared.plan.full_pulls:
+                source = self._full_buffers[full.src_name]
+                for copy in full.copies:
+                    destination = self._recv_buffers[copy.param_name].as_strided(
+                        copy.dest_shape,
+                        copy.dest_stride,
+                        self._recv_buffers[copy.param_name].storage_offset()
+                        + copy.dest_offset,
+                    )
+                    destination.copy_(_replay_ops(source, copy.op_chain))
+            for convert in prepared.plan.converts:
+                self._recv_buffers[convert.param_name].copy_(
+                    self._convert_buffers[convert.param_name]
                 )
-                destination.copy_(_replay_ops(source, copy.op_chain))
-        for convert in prepared.plan.converts:
-            self._recv_buffers[convert.param_name].copy_(
-                self._convert_buffers[convert.param_name]
-            )
-        torch.cuda.synchronize(self._device)
+        with refit_span("receive_sync"):
+            torch.cuda.synchronize(self._device)
         reconstruct_seconds = time.perf_counter() - reconstruct_started
         # Only digest mode has complete tensors and stamped digests to check.
         if envs.MX_RESHARD_PUBLISH_DIGEST:
-            self._verify(prepared)
+            with refit_span(
+                "source_preparation", metadata={"operation": "verification"}
+            ):
+                self._verify(prepared)
 
         bytes_received = sum(d.nbytes for d in prepared.descriptors)
+        add_refit_bytes(bytes_received)
         # This is the path the FSDP trainer refits over, and the path the 20x
         # collapse was measured on, so it is the one the floor most needs to cover.
         throughput.warn_if_below_floor(
@@ -615,9 +621,7 @@ class _NixlStagedTransfer:
                     timeout_seconds=self._timeout,
                 )
             else:
-                remote_agent_name = self._manager.add_remote_agent(
-                    source.nixl_metadata
-                )
+                remote_agent_name = self._manager.add_remote_agent(source.nixl_metadata)
             bytes_received, tensor_count, wire_seconds = (
                 self._manager.receive_from_source(
                     source_metadata=b"",

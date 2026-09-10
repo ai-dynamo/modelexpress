@@ -1579,3 +1579,29 @@ def test_generator_closes_adapter_when_registration_fails(monkeypatch):
         )
 
     assert adapter.close_calls == 1
+
+
+def test_trainer_resolver_receives_manifest_larger_than_grpc_default():
+    manifest = b"x" * (5 * 1024 * 1024)
+    digest = hashlib.sha256(manifest).hexdigest()
+
+    class LargeManifestService(refit_pb2_grpc.RefitWorkerServiceServicer):
+        def GetWeightVersionShardManifest(self, request, context):
+            return refit_pb2.GetWeightVersionShardManifestResponse(
+                manifest=manifest, manifest_digest=digest
+            )
+
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
+    refit_pb2_grpc.add_RefitWorkerServiceServicer_to_server(LargeManifestService(), server)
+    port = server.add_insecure_port("127.0.0.1:0")
+    server.start()
+    try:
+        resolver = TrainerSourceResolver(service=lambda: None, rpc_timeout_seconds=5)
+        source = resolver._resolve_source(refit_pb2.WeightVersionShard(
+            version_id="large-version", source_slot_id="rank:0", worker_id="worker",
+            manifest_endpoint=f"127.0.0.1:{port}", manifest_digest=digest,
+        ))
+        assert source.transport.manifest == manifest
+        assert source.manifest_digest == digest
+    finally:
+        server.stop(grace=None).wait()

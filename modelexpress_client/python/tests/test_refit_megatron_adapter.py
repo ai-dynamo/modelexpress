@@ -136,7 +136,7 @@ def test_megatron_source_slot_groups_replicas_by_logical_partition(monkeypatch):
 
 def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
     monkeypatch.setattr(
-        "modelexpress_rl.train.engines.megatron.aliases.tensor_digest",
+        "modelexpress_rl.train.engines.megatron.aliases.published_digest",
         lambda _tensor: "tensor-digest",
     )
     monkeypatch.setattr(

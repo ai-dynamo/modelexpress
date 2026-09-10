@@ -1364,3 +1364,33 @@ Optimization opportunities: contiguous regions (blocked), warm source pool, Deep
 ## Deployment and Configuration
 
 See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the full deployment guide covering server/client configuration, Docker, Kubernetes, Helm, P2P transfer setup, and debugging commands.
+
+
+### Miles and SGLang full-tensor RL refit
+
+`modelexpress_rl.integrations.miles.create_miles_publisher` translates Miles'
+explicit Megatron geometry into `MegatronTensorSpec` and uses the shared trainer
+client. Registration remains live across versions and rollout cohort changes;
+changed trainer storage requires a new trainer process. No Ray code lives in MX.
+
+SGLang's `SglangGeneratorContext(enable_full_tensor=True)` opts into Qwen3 dense
+and MoE BF16 capture and in-place installation. The existing prepared-checkpoint
+path remains available without opting in. Full-tensor capture dry-runs the real
+loader with recording tensors, validates complete destination coverage, and
+stages through the shared NIXL update method. Installation validates every shape,
+dtype and device before copying into existing parameter storage. Quantization,
+LoRA, speculative models, aliased/non-contiguous parameter storage, hidden tensor
+attributes and changed live addresses are rejected. An installation or device
+synchronization failure poisons the installer until the worker is replaced.
+
+`modelexpress_rl.inference.engines.sglang.worker.SglangLiveRefit` binds exact MX
+version IDs to a runner and supplies idempotent step acknowledgements. It must be
+called at an engine safe point. SGLang owns scheduler/TP aggregation, native
+begin/end hooks and cache handling; Miles owns the selected fleet, pause/resume
+and the all-worker completion gate. An MX READY version describes available
+sources, not a fleet serving commit. Miles retires the version and releases
+trainer shards after receiver completion, including failed rounds; lease-protected
+release failures keep trainer storage fenced. A failed fleet round is terminal
+for this integration and requires worker replacement, rather than an implicit
+rollback or resume. This path requires the matching Miles and SGLang endpoint
+bindings; installing the MX package alone does not add an upstream HTTP endpoint.

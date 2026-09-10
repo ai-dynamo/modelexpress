@@ -182,3 +182,29 @@ def test_generator_runtime_closes_resources_when_resolver_creation_fails(
 
     assert full_tensor.closed
     assert p2p.closed
+
+
+@pytest.mark.parametrize("publish_peers", [False, True])
+def test_full_tensor_publication_respects_explicit_source_policy(publish_peers):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from modelexpress_rl.inference.methods.full_tensor import FullTensorNixlUpdateMethod
+    from modelexpress_rl.inference.plan import PreparedEngineTensors
+
+    transfer = Mock()
+    method = FullTensorNixlUpdateMethod(
+        transfer=transfer,
+        capture_layout=lambda manifest: manifest,
+        parameter_layout=lambda: {},
+        build_identity=lambda version: p2p_pb2.SourceIdentity(revision=version),
+        worker_rank=0,
+        worker_id="generator",
+        accelerator="cuda",
+        p2p_client=Mock(),
+        publish_peers=publish_peers,
+    )
+    staged = SimpleNamespace(tensors={}, metrics={})
+    method._active_staged = staged
+    method.publish_applied(version_id="v1", prepared=PreparedEngineTensors(staged))
+    assert transfer.publish_peer.call_count == int(publish_peers)

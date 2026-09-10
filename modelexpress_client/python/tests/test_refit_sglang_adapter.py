@@ -145,3 +145,155 @@ def test_sglang_install_wraps_errors(
 
     with pytest.raises(ReceiverInstallError, match=message):
         installer.install(_prepared(tmp_path))
+
+
+class _LoadableModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.first = torch.nn.Parameter(torch.zeros(2, 3, dtype=torch.bfloat16))
+        self.second = torch.nn.Parameter(torch.zeros(3, dtype=torch.bfloat16))
+
+    def load_weights(self, weights):
+        params = dict(self.named_parameters())
+        for name, value in weights:
+            params[name].weight_loader(params[name], value)
+
+
+def _live_runner():
+    return SimpleNamespace(
+        model=_LoadableModel(),
+        device="cpu",
+        model_config=SimpleNamespace(
+            model_path="Qwen/Qwen3-0.6B",
+            dtype=torch.bfloat16,
+            quantization=None,
+            architectures=["Qwen3ForCausalLM"],
+        ),
+        server_args=SimpleNamespace(),
+    )
+
+
+def test_full_tensor_capture_does_not_change_live_weights(monkeypatch):
+    from modelexpress_rl.inference.engines.sglang.layout import SglangFullTensorLayout
+
+    runner = _live_runner()
+    layout = SglangFullTensorLayout(runner)
+    monkeypatch.setattr(
+        "modelexpress_rl.inference.engines.sglang.layout._sglang_default_weight_loader",
+        lambda: lambda param, value: param.copy_(value),
+    )
+    capture, params = layout.capture(
+        [("first", torch.bfloat16, (2, 3)), ("second", torch.bfloat16, (3,))]
+    )
+    assert set(params) == {copy.param_name for copy in capture.copies}
+    assert all(torch.count_nonzero(value) == 0 for value in runner.model.parameters())
+    with pytest.raises(Exception, match="exact destination"):
+        layout.capture([("first", torch.bfloat16, (2, 3))])
+
+
+def test_full_tensor_install_validates_all_inputs_before_writing():
+    from modelexpress_rl.inference.engines.sglang.layout import SglangFullTensorLayout
+    from modelexpress_rl.inference.plan import PreparedEngineTensors
+
+    runner = _live_runner()
+    installer = _SglangInstaller(runner, layout=SglangFullTensorLayout(runner))
+    pointers = [param.data_ptr() for param in runner.model.parameters()]
+    tensors = {
+        name: torch.ones_like(param) for name, param in runner.model.named_parameters()
+    }
+    tensors["second"] = torch.ones(4, dtype=torch.bfloat16)
+    artifact = PreparedEngineTensors(SimpleNamespace(tensors=tensors))
+    with pytest.raises(ReceiverInstallError, match="layout mismatch"):
+        installer.install(artifact)
+    assert torch.count_nonzero(runner.model.first) == 0
+    tensors["second"] = torch.ones_like(runner.model.second)
+    installer.install(artifact)
+    assert all(torch.all(param == 1) for param in runner.model.parameters())
+    assert pointers == [param.data_ptr() for param in runner.model.parameters()]
+
+
+def test_partial_install_failure_permanently_fences_installer(monkeypatch):
+    from modelexpress_rl.inference.engines.sglang.layout import SglangFullTensorLayout
+    from modelexpress_rl.inference.plan import PreparedEngineTensors
+
+    runner = _live_runner()
+    installer = _SglangInstaller(runner, layout=SglangFullTensorLayout(runner))
+    tensors = {
+        name: torch.ones_like(param) for name, param in runner.model.named_parameters()
+    }
+    artifact = PreparedEngineTensors(SimpleNamespace(tensors=tensors))
+    original = torch.Tensor.copy_
+
+    def copy(destination, source, *args, **kwargs):
+        if destination is runner.model.second:
+            raise RuntimeError("injected second copy failure")
+        return original(destination, source, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "copy_", copy)
+    with pytest.raises(RuntimeError, match="second copy failure"):
+        installer.install(artifact)
+    assert torch.all(runner.model.first == 1)
+    assert torch.all(runner.model.second == 0)
+    monkeypatch.setattr(torch.Tensor, "copy_", original)
+    with pytest.raises(ReceiverInstallError, match="poisoned"):
+        installer.install(artifact)
+
+
+@pytest.mark.parametrize("case", ["quantized", "lora", "hidden", "alias", "storage"])
+def test_full_tensor_rejects_unsupported_storage(case):
+    from modelexpress_rl.inference.engines.sglang.layout import SglangFullTensorLayout
+
+    runner = _live_runner()
+    if case == "quantized":
+        runner.model_config.quantization = "fp8"
+    elif case == "lora":
+        runner.server_args.enable_lora = True
+    elif case == "hidden":
+        runner.model.hidden = torch.zeros(1)
+    elif case == "alias":
+        runner.model.alias = runner.model.first
+    if case == "storage":
+        layout = SglangFullTensorLayout(runner)
+        runner.model.first.data = torch.ones_like(runner.model.first)
+        with pytest.raises(Exception, match="storage changed"):
+            layout.validate_storage()
+    else:
+        with pytest.raises(Exception):
+            SglangFullTensorLayout(runner)
+
+
+def test_worker_fences_apply_failure_and_releases_handle(monkeypatch):
+    from modelexpress_rl.inference.engines.sglang import worker
+
+    handle = Mock(metrics={})
+    client = Mock()
+    client.stage_weight.return_value = handle
+    client.apply_weight.side_effect = RuntimeError("partial install")
+    monkeypatch.setattr(
+        worker.ModelExpressGeneratorClient, "initialize", lambda config: client
+    )
+    binding = worker.SglangLiveRefit(_live_runner(), model_name="qwen")
+    failed = binding.update(version_id="v1", training_step=1)
+    assert not failed["success"] and failed["receiver_poisoned"]
+    handle.release.assert_called_once()
+    again = binding.update(version_id="v2", training_step=2)
+    assert not again["success"] and again["receiver_poisoned"]
+    client.stage_weight.assert_called_once()
+
+
+def test_worker_allows_retry_after_nonmutating_stage_failure(monkeypatch):
+    from modelexpress_rl.inference.engines.sglang import worker
+
+    handle = Mock(metrics={})
+    client = Mock()
+    client.stage_weight.side_effect = [RuntimeError("transfer failed"), handle]
+    client.apply_weight.return_value = {}
+    monkeypatch.setattr(
+        worker.ModelExpressGeneratorClient, "initialize", lambda config: client
+    )
+    binding = worker.SglangLiveRefit(_live_runner(), model_name="qwen")
+    assert not binding.update(version_id="v1", training_step=1)["receiver_poisoned"]
+    assert binding.update(version_id="v1", training_step=1)["success"]
+    assert binding.update(version_id="v1", training_step=1)["success"]
+    assert not binding.update(version_id="other", training_step=1)["success"]
+    assert client.stage_weight.call_count == 2

@@ -9,6 +9,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterator
 
 import grpc
+from modelexpress.refit.timing import refit_span
 
 from ... import refit_pb2, refit_pb2_grpc
 from ...control import WeightVersion
@@ -43,12 +44,13 @@ class TrainerSourceResolver(SourceResolver):
 
     def candidates(self, version: WeightVersion) -> Iterator[ResolvedSource]:
         try:
-            response = self._service().ListWeightVersionShards(
-                refit_pb2.ListWeightVersionShardsRequest(
-                    version_id=version.version_id
-                ),
-                timeout=self._rpc_timeout_seconds,
-            )
+            with refit_span("control_discovery"):
+                response = self._service().ListWeightVersionShards(
+                    refit_pb2.ListWeightVersionShardsRequest(
+                        version_id=version.version_id
+                    ),
+                    timeout=self._rpc_timeout_seconds,
+                )
         except grpc.RpcError as error:
             logger.warning(
                 "trainer source discovery failed for version %s: %s",
@@ -68,7 +70,8 @@ class TrainerSourceResolver(SourceResolver):
             resolved = []
             for shard in ordered:
                 try:
-                    source = self._resolve_source(shard)
+                    with refit_span("control_discovery"):
+                        source = self._resolve_source(shard)
                 except (grpc.RpcError, RuntimeError) as error:
                     logger.warning(
                         "trainer source %s failed for slot %s: %s",
@@ -109,7 +112,12 @@ class TrainerSourceResolver(SourceResolver):
     def _resolve_source(self, shard: refit_pb2.WeightVersionShard) -> GeneratorSource:
         if not shard.manifest_endpoint:
             raise RuntimeError("NIXL source is missing its manifest endpoint")
-        with grpc.insecure_channel(shard.manifest_endpoint) as channel:
+        # MoE manifests can exceed gRPC's 4 MiB default. Match MxClient's
+        # bounded 100 MiB receive budget; tensor payloads still travel via NIXL.
+        with grpc.insecure_channel(
+            shard.manifest_endpoint,
+            options=(("grpc.max_receive_message_length", 100 * 1024 * 1024),),
+        ) as channel:
             response = refit_pb2_grpc.RefitWorkerServiceStub(
                 channel
             ).GetWeightVersionShardManifest(

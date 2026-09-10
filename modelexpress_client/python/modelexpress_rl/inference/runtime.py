@@ -161,6 +161,7 @@ class GeneratorRuntime:
                         worker_id=worker_id,
                         accelerator=full_tensor.accelerator,
                         p2p_client=p2p_client,
+                        publish_peers=WeightSource.GENERATOR in source_order,
                     )
                 )
 

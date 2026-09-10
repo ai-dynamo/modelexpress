@@ -13,9 +13,10 @@ from ...adapter import GeneratorEngineContext
 
 @dataclass(frozen=True)
 class SglangGeneratorContext(GeneratorEngineContext):
-    """Live SGLang model runner used to install prepared checkpoints."""
+    """Live SGLang runner; full-tensor refit is opt-in for validated BF16 models."""
 
     model_runner: Any
+    enable_full_tensor: bool = False
 
 
 __all__ = ["SglangGeneratorContext"]
