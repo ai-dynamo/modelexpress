@@ -10,7 +10,7 @@ local function parse_participant(record)
   if not record then
     return nil
   end
-  return string.match(record, '^([^|]*)|([^|]*)|([^|]*)|([^|]*)|([^|]*)$')
+  return string.match(record, '^([^|]*)|([^|]*)|([^|]*)|([^|]*)$')
 end
 
 local function registration_matches(worker_id, role, model_name)
@@ -62,7 +62,7 @@ local ready = expected ~= nil and admitted == expected
 if ready then
   local participants = redis.call('HVALS', KEYS[2])
   for i = 1, #participants do
-    local worker_id, role, index, partition, joined_epoch = parse_participant(participants[i])
+    local worker_id, role, index, joined_epoch = parse_participant(participants[i])
     if not worker_id or tonumber(joined_epoch) ~= epoch
         or not registration_matches(worker_id, role, model_name) then
       ready = false

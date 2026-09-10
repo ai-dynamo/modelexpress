@@ -95,6 +95,11 @@ async fn stop(tx: oneshot::Sender<()>, handle: JoinHandle<ServerResult>) {
         .expect("server failed");
 }
 
+/// Lane ids are the caller's to choose. These are deliberately not 0 and 1
+/// so that anything still indexing lanes by position fails loudly.
+const RESHARD_LANE: u32 = 3;
+const BROADCAST_LANE: u32 = 7;
+
 fn spec(model_name: &str, trainers: &[&str], generators: &[&str]) -> CollectiveGroupSpec {
     let trainer_slots: Vec<String> = trainers.iter().map(|slot| (*slot).to_string()).collect();
     let generator_slots: Vec<String> = generators.iter().map(|slot| (*slot).to_string()).collect();
@@ -105,14 +110,16 @@ fn spec(model_name: &str, trainers: &[&str], generators: &[&str]) -> CollectiveG
         // One reshard lane over every trainer plus a broadcast lane. The split
         // is the caller's choice; the server is told the result, not the rule.
         lanes: vec![
+            // Deliberately not 0 and 1: lane ids are the caller's to choose,
+            // and dense ids would hide any place that still indexes by them.
             LaneSpec {
-                lane_id: 0,
+                lane_id: RESHARD_LANE,
                 kind: LaneKind::Reshard.into(),
                 trainer_slots: trainer_slots.clone(),
                 generator_slots: generator_slots.clone(),
             },
             LaneSpec {
-                lane_id: 1,
+                lane_id: BROADCAST_LANE,
                 kind: LaneKind::Broadcast.into(),
                 trainer_slots,
                 generator_slots,
@@ -318,7 +325,7 @@ async fn admission_bootstrap_epoch_and_transfer_fences_hold() {
         .publish_group_bootstrap(PublishGroupBootstrapRequest {
             group_id: t0.group_id.clone(),
             epoch: 1,
-            lane_id: 0,
+            lane_id: RESHARD_LANE,
             worker_id: worker_g0.clone(),
             nccl_unique_id: vec![1; 128],
         })
@@ -326,16 +333,16 @@ async fn admission_bootstrap_epoch_and_transfer_fences_hold() {
         .expect_err("only rank zero may publish a lane bootstrap");
     assert_eq!(non_leader.code(), tonic::Code::FailedPrecondition);
 
-    publish(&mut collective, &t0.group_id, 1, 0, &worker_t0, 1).await;
-    let ready = publish(&mut collective, &t0.group_id, 1, 1, &worker_t0, 2).await;
+    publish(&mut collective, &t0.group_id, 1, RESHARD_LANE, &worker_t0, 1).await;
+    let ready = publish(&mut collective, &t0.group_id, 1, BROADCAST_LANE, &worker_t0, 2).await;
     assert_eq!(ready.state, i32::from(CollectiveGroupState::Ready));
 
-    publish(&mut collective, &t0.group_id, 1, 0, &worker_t0, 1).await;
+    publish(&mut collective, &t0.group_id, 1, RESHARD_LANE, &worker_t0, 1).await;
     let conflicting_bootstrap = collective
         .publish_group_bootstrap(PublishGroupBootstrapRequest {
             group_id: t0.group_id.clone(),
             epoch: 1,
-            lane_id: 0,
+            lane_id: RESHARD_LANE,
             worker_id: worker_t0.clone(),
             nccl_unique_id: vec![9; 128],
         })
@@ -365,7 +372,7 @@ async fn admission_bootstrap_epoch_and_transfer_fences_hold() {
         .publish_group_bootstrap(PublishGroupBootstrapRequest {
             group_id: t0.group_id.clone(),
             epoch: 2,
-            lane_id: 0,
+            lane_id: RESHARD_LANE,
             worker_id: worker_t0.clone(),
             nccl_unique_id: vec![3; 128],
         })
@@ -382,8 +389,8 @@ async fn admission_bootstrap_epoch_and_transfer_fences_hold() {
         join_request(&group_spec, "g0", &worker_g0, CollectiveRole::Generator, 0),
     )
     .await;
-    publish(&mut collective, &t0.group_id, 2, 0, &worker_t0, 3).await;
-    publish(&mut collective, &t0.group_id, 2, 1, &worker_t0, 4).await;
+    publish(&mut collective, &t0.group_id, 2, RESHARD_LANE, &worker_t0, 3).await;
+    publish(&mut collective, &t0.group_id, 2, BROADCAST_LANE, &worker_t0, 4).await;
     let epoch_two = collective
         .get_collective_group(GetCollectiveGroupRequest {
             group_id: t0.group_id.clone(),
@@ -541,8 +548,8 @@ async fn full_cohort_replacement_converges_on_one_new_epoch() {
         join_request(&group_spec, "g0", &old_g0, CollectiveRole::Generator, 0),
     )
     .await;
-    publish(&mut collective, &initial.group_id, 1, 0, &old_t0, 10).await;
-    let initial_ready = publish(&mut collective, &initial.group_id, 1, 1, &old_t0, 11).await;
+    publish(&mut collective, &initial.group_id, 1, RESHARD_LANE, &old_t0, 10).await;
+    let initial_ready = publish(&mut collective, &initial.group_id, 1, BROADCAST_LANE, &old_t0, 11).await;
     assert_eq!(initial_ready.state, i32::from(CollectiveGroupState::Ready));
 
     let new_t0 = unique_id("new-t0");
@@ -571,8 +578,8 @@ async fn full_cohort_replacement_converges_on_one_new_epoch() {
     assert_eq!(replacement_t1.epoch, 2);
     assert_eq!(replacement_g0.epoch, 2);
 
-    publish(&mut collective, &initial.group_id, 2, 0, &new_t0, 12).await;
-    let replacement_ready = publish(&mut collective, &initial.group_id, 2, 1, &new_t0, 13).await;
+    publish(&mut collective, &initial.group_id, 2, RESHARD_LANE, &new_t0, 12).await;
+    let replacement_ready = publish(&mut collective, &initial.group_id, 2, BROADCAST_LANE, &new_t0, 13).await;
     assert_eq!(replacement_ready.epoch, 2);
     assert_eq!(
         replacement_ready.state,
@@ -602,7 +609,7 @@ async fn full_cohort_replacement_converges_on_one_new_epoch() {
     )
     .await;
     assert_eq!(third_epoch.epoch, 3);
-    publish(&mut collective, &initial.group_id, 3, 0, &newer_t0, 14).await;
+    publish(&mut collective, &initial.group_id, 3, RESHARD_LANE, &newer_t0, 14).await;
     let fourth_epoch = join(
         &mut collective,
         join_request(&group_spec, "t1", &newer_t1, CollectiveRole::Trainer, 1),
@@ -652,8 +659,8 @@ async fn expired_registration_revokes_ready_membership() {
         join_request(&group_spec, "g0", &generator, CollectiveRole::Generator, 0),
     )
     .await;
-    publish(&mut collective, &membership.group_id, 1, 0, &trainer, 5).await;
-    let ready = publish(&mut collective, &membership.group_id, 1, 1, &trainer, 6).await;
+    publish(&mut collective, &membership.group_id, 1, RESHARD_LANE, &trainer, 5).await;
+    let ready = publish(&mut collective, &membership.group_id, 1, BROADCAST_LANE, &trainer, 6).await;
     assert_eq!(ready.state, i32::from(CollectiveGroupState::Ready));
 
     tokio::time::sleep(Duration::from_millis(1_200)).await;

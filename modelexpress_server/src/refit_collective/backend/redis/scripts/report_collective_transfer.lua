@@ -11,7 +11,7 @@ local function parse_participant(record)
   if not record then
     return nil
   end
-  return string.match(record, '^([^|]*)|([^|]*)|([^|]*)|([^|]*)|([^|]*)$')
+  return string.match(record, '^([^|]*)|([^|]*)|([^|]*)|([^|]*)$')
 end
 
 local state = redis.call('HGET', KEYS[1], 'state')
@@ -45,7 +45,7 @@ end
 local admitted = false
 local participants = redis.call('HVALS', KEYS[4])
 for i = 1, #participants do
-  local worker_id, role, index, partition, joined_epoch = parse_participant(participants[i])
+  local worker_id, role, index, joined_epoch = parse_participant(participants[i])
   if not worker_id or tonumber(joined_epoch) ~= tonumber(ARGV[3])
       or redis.call('EXISTS', 'mx:refit:worker:' .. worker_id) ~= 1 then
     return 'NOTREADY'

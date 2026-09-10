@@ -719,10 +719,11 @@ impl CollectiveBackend for RedisCollectiveBackend {
         request: &PublishGroupBootstrapRequest,
     ) -> CollectiveResult<CollectiveGroup> {
         let group = self.read_group(&request.group_id).await?;
-        let lane_count = u32::try_from(group.lanes.len()).unwrap_or(0);
-        if request.lane_id >= lane_count {
+        // Lane ids are whatever the caller declared, so membership is the
+        // test, not a range check against the count.
+        if !group.lanes.iter().any(|lane| lane.lane_id == request.lane_id) {
             return Err(CollectiveBackendError::InvalidArgument(format!(
-                "lane {} is out of range for {lane_count} lanes",
+                "lane {} is not declared by this group",
                 request.lane_id
             )));
         }
@@ -754,8 +755,8 @@ impl CollectiveBackend for RedisCollectiveBackend {
         script.key(participants_key(&request.group_id));
         script.key(digests_key(&request.group_id));
         script.key(lane_key(&request.group_id, request.lane_id));
-        for lane_id in 0..lane_count {
-            script.key(lane_key(&request.group_id, lane_id));
+        for lane in &group.lanes {
+            script.key(lane_key(&request.group_id, lane.lane_id));
         }
 
         let outcome: String = script
