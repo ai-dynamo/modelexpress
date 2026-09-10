@@ -435,6 +435,22 @@ impl RedisCollectiveBackend {
             });
         }
 
+        // The digests hash already holds every slot's reported digest; the
+        // group only ever stored the latest. Surfacing the disagreement is the
+        // difference between a diagnosable cohort split and an unexplained
+        // FORMING that never resolves.
+        let group_digest = field(&fields, "plan_digest")?.to_string();
+        let reported: HashMap<String, String> = connection
+            .hgetall(digests_key(group_id))
+            .await
+            .map_err(redis_error)?;
+        let mut disagreeing_slots: Vec<String> = reported
+            .into_iter()
+            .filter(|(_, digest)| *digest != group_digest)
+            .map(|(slot_id, _)| slot_id)
+            .collect();
+        disagreeing_slots.sort();
+
         let plan_source_worker = field(&fields, "plan_source_worker_id")?.to_string();
         let plan_source = if plan_source_worker.is_empty() {
             None
@@ -453,10 +469,11 @@ impl RedisCollectiveBackend {
             state: group_state_from_str(field(&fields, "state")?).into(),
             lanes,
             plan_source,
-            plan_digest: field(&fields, "plan_digest")?.to_string(),
+            plan_digest: group_digest,
             expected_trainer_slots: trainer_slots,
             expected_generator_slots: generator_slots,
             created_at_unix_ms: parse_field(&fields, "created_at_unix_ms")?,
+            disagreeing_slots,
         })
     }
 

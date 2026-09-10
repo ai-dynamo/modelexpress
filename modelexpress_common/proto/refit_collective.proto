@@ -126,6 +126,11 @@ message CollectiveGroup {
   repeated string expected_trainer_slots = 8;
   repeated string expected_generator_slots = 9;
   uint64 created_at_unix_ms = 10;
+  // Slots whose reported plan digest differs from the group's. Readiness
+  // already requires every digest to agree, so a group can never become READY
+  // with this non-empty; it exists so that a cohort which disagrees is
+  // diagnosable instead of merely stuck in FORMING with no field to read.
+  repeated string disagreeing_slots = 11;
 }
 
 // What a joining worker needs in order to build its communicators.

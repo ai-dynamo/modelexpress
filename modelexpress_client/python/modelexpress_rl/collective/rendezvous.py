@@ -604,6 +604,14 @@ def _missing_slots(group: pb.CollectiveGroup) -> list[str]:
     Read off the broadcast lane, which is the only one every participant joins,
     so it is the single place the full admitted set is visible.
     """
+    # A digest disagreement is the CAUSE, not a symptom: every lane bootstrap
+    # will also look stale, so reporting the lanes would point at the wrong
+    # subsystem. Say what actually happened.
+    if group.disagreeing_slots:
+        return [
+            f"plan digest disagreement on slot {slot}" for slot in group.disagreeing_slots
+        ]
+
     # The broadcast lane is the one place the full admitted set is visible in
     # a single read, but a caller need not declare one, so fall back to the
     # union across every lane rather than reporting everyone as missing.
