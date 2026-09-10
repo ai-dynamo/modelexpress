@@ -67,6 +67,16 @@ class PublisherThread:
             ``MX_HEARTBEAT_INTERVAL_SECS``.
         heartbeat_after_publish: If False, the thread exits after publish_fn
             succeeds instead of sending READY heartbeats.
+        retry_publish_forever: If True, a source that has not published within
+            ``publish_timeout_secs`` keeps retrying every tick instead of
+            giving up and stopping. Long-lived weight sources want this: the
+            weights stay resident and (on the P2P path) the worker manifest
+            gRPC server stays up, so the only thing missing is the publication
+            itself, which succeeds as soon as the metadata server returns.
+            Tearing the source down after a fixed window turns a transient
+            server outage into a permanent loss of the source. One-shot
+            publishes (artifacts, reshard rendezvous) keep the bounded
+            give-up.
     """
 
     def __init__(
@@ -83,6 +93,7 @@ class PublisherThread:
         interval_secs: int | None = None,
         heartbeat_after_publish: bool = True,
         source_load_provider: Callable[[], float | None] | None = None,
+        retry_publish_forever: bool = False,
     ):
         if mx_source_id is None and publish_fn is None:
             raise ValueError("PublisherThread requires mx_source_id or publish_fn")
@@ -107,6 +118,11 @@ class PublisherThread:
         )
         self._publish_started_at: float | None = None
         self._publish_given_up = False
+        # True once we logged that a retry_publish_forever source has been
+        # unpublishable for longer than its timeout, so the notice appears
+        # once instead of on every tick.
+        self._publish_overdue_logged = False
+        self._retry_publish_forever = retry_publish_forever
         self._cleaned_up = False
         # True once we have demoted this worker for an unhealthy data plane, so the
         # demotion and its log line happen once rather than every interval.
@@ -284,6 +300,7 @@ class PublisherThread:
         self._mx_source_id = None
         self._publish_started_at = None
         self._publish_given_up = False
+        self._publish_overdue_logged = False
 
     def _cleanup(self) -> None:
         if self._cleanup_fn is None or self._cleaned_up:
@@ -304,6 +321,21 @@ class PublisherThread:
 
     def _publish_timed_out(self, elapsed: float) -> bool:
         if elapsed <= self._publish_timeout:
+            return False
+        if self._retry_publish_forever:
+            # The source data is resident and the worker manifest server (on
+            # the P2P path) is still serving; only the publication is
+            # missing. Tearing down would turn a metadata-server outage into
+            # a permanent loss of an otherwise-healthy source, so keep
+            # retrying every tick instead.
+            if not self._publish_overdue_logged:
+                self._publish_overdue_logged = True
+                logger.warning(
+                    f"[Worker {self._worker_rank}] Source still unpublished "
+                    f"after {elapsed:.0f}s (timeout={self._publish_timeout}s). "
+                    f"The metadata server has not accepted the publication; "
+                    f"retrying indefinitely."
+                )
             return False
         if not self._publish_given_up:
             logger.warning(

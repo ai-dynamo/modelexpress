@@ -515,6 +515,10 @@ class MxModelLoader:
                     if envs.MX_ARTIFACT_READY_URL.strip()
                     else None
                 ),
+                # The weights stay resident; keep retrying publication through
+                # a metadata-server outage instead of giving up after
+                # MX_PUBLISH_TIMEOUT_SECS.
+                retry_publish_forever=True,
             )
             heartbeat.start()
             _heartbeat_threads[ctx.worker_rank] = heartbeat
