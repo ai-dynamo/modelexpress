@@ -53,8 +53,9 @@ grep -Fq 'ModelExpress weight update finished version=vime-delta-refit-v10' "$lo
 "${k[@]}" exec deployment/vime-delta-refit-mx -c modelexpress -- python3 -c '
 from modelexpress_rl import ModelExpressControlClient, WeightPayloadFormat
 with ModelExpressControlClient.connect(server_url="127.0.0.1:8101") as control:
-    actual = [control.get_weight_version(f"vime-delta-refit-v{version}").payload_format for version in range(1, 11)]
-expected = [WeightPayloadFormat.XOR_DELTA] * 4 + [WeightPayloadFormat.FULL_HF_CHECKPOINT]
+    actual = [control.get_weight_version(f"vime-delta-refit-v{version}").payload_format for version in range(11)]
+expected = [WeightPayloadFormat.FULL_TENSOR]
+expected += [WeightPayloadFormat.XOR_DELTA] * 4 + [WeightPayloadFormat.FULL_HF_CHECKPOINT]
 expected += [WeightPayloadFormat.XOR_DELTA] * 4 + [WeightPayloadFormat.FULL_HF_CHECKPOINT]
 assert actual == expected, actual
 '

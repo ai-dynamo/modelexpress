@@ -10,6 +10,7 @@ model_path=/models
 mx_server_url=vime-delta-refit-mx:8101
 s3_bucket=delta-weights
 s3_uri_prefix=s3://$s3_bucket/$run_id
+# This throwaway MinIO has no external endpoint.
 s3_endpoint_url=http://vime-delta-refit-minio:9000
 s3_region=us-east-1
 generation_url=http://vime-delta-refit-generation:8000
@@ -28,7 +29,7 @@ mkdir -p "$scratch/mx-prepare"
 test -f "$model_path/config.json"
 test -f "$model_path/model.safetensors"
 
-# Create the MinIO bucket and register the initial ModelExpress base version.
+# Create the bucket and register the local model seed as catalog-only v0.
 python3 - <<PY
 import boto3
 from botocore.config import Config

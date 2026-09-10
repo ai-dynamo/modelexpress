@@ -141,6 +141,8 @@ env:
   VCLUSTER_NAMESPACE: mx-ci
   VIME_VCLUSTER_NAME: mx-vime-ci-cluster
   VIME_VCLUSTER_NAMESPACE: mx-vime-ci
+  VIME_DYNAMO_REF: c3e05f0244ae6264d7953f68e2499c6dc2f54723
+  VIME_DYNAMO_NIGHTLY_TAG: 20260909-c3e05f0
   MX_CI_S3_BUCKET: ai-dynamo-modelexpress-ci
   MX_CI_S3_REGION: us-west-2
   MX_IMAGE_REPO: nvcr.io/0980761089281446
@@ -272,10 +274,15 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Checkout latest Dynamo main
+      - name: Checkout pinned Dynamo nightly
         run: |
-          git clone --depth 1 --branch main \
-            https://github.com/ai-dynamo/dynamo.git "${RUNNER_TEMP}/dynamo"
+          rm -rf "${RUNNER_TEMP}/dynamo"
+          git init --quiet "${RUNNER_TEMP}/dynamo"
+          git -C "${RUNNER_TEMP}/dynamo" remote add origin \
+            https://github.com/ai-dynamo/dynamo.git
+          git -C "${RUNNER_TEMP}/dynamo" fetch --depth 1 --filter=blob:none \
+            origin "${VIME_DYNAMO_REF}"
+          git -C "${RUNNER_TEMP}/dynamo" checkout --detach FETCH_HEAD
           git -C "${RUNNER_TEMP}/dynamo" rev-parse HEAD
 
       - name: Log in to image registry
@@ -438,8 +445,9 @@ jobs:
           kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
           vcluster_name: ${{ env.VIME_VCLUSTER_NAME }}
           vcluster_namespace: ${{ env.VIME_VCLUSTER_NAMESPACE }}
-          dynamo_ref: 8538060266749c3b28b0a8645af95d33c3777678
-          dynamo_operator_tag: 1.5.0
+          dynamo_ref: ${{ env.VIME_DYNAMO_REF }}
+          dynamo_operator_image: nvcr.io/nvidia/ai-dynamo/kubernetes-operator-nightly
+          dynamo_operator_tag: ${{ env.VIME_DYNAMO_NIGHTLY_TAG }}
 
       - name: Connect to Vime RL vCluster
         if: steps.vcluster-check.outputs.exists == 'true'
@@ -455,14 +463,47 @@ jobs:
             get storageclass azurefile-csi
           echo "KUBECONFIG=${GITHUB_WORKSPACE}/.kubeconfig-vcluster" >> "$GITHUB_ENV"
 
-      - name: Check Dynamo 1.5 operator
+      - name: Check expected Dynamo operator
+        id: operator-check
+        continue-on-error: true
+        run: |
+          kubectl -n dynamo-system get deployment \
+            dynamo-platform-dynamo-operator-controller-manager \
+            -o jsonpath='{.spec.template.spec.containers[?(@.name=="manager")].image}' \
+            | grep -qx "nvcr.io/nvidia/ai-dynamo/kubernetes-operator-nightly:${VIME_DYNAMO_NIGHTLY_TAG}"
+          kubectl get crd dynamographdeployments.nvidia.com \
+            -o jsonpath='{.spec.versions[?(@.name=="v1beta1")].served}' | grep -qx true
+
+      - name: Reap stale vCluster port-forward
+        if: steps.operator-check.outcome == 'failure'
+        run: |
+          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
+            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
+          fi
+
+      - name: Rebuild stale Vime RL vCluster
+        if: steps.operator-check.outcome == 'failure'
+        uses: ./.github/actions/setup-mx-vcluster
+        with:
+          kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
+          vcluster_name: ${{ env.VIME_VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.VIME_VCLUSTER_NAMESPACE }}
+          dynamo_ref: ${{ env.VIME_DYNAMO_REF }}
+          dynamo_operator_image: nvcr.io/nvidia/ai-dynamo/kubernetes-operator-nightly
+          dynamo_operator_tag: ${{ env.VIME_DYNAMO_NIGHTLY_TAG }}
+
+      - name: Select rebuilt Vime RL vCluster
+        if: steps.operator-check.outcome == 'failure'
+        run: echo "KUBECONFIG=${GITHUB_WORKSPACE}/.kubeconfig-vcluster" >> "$GITHUB_ENV"
+
+      - name: Verify Dynamo 1.5 operator
         run: |
           kubectl -n dynamo-system rollout status \
             deployment/dynamo-platform-dynamo-operator-controller-manager --timeout=2m
           kubectl -n dynamo-system get deployment \
             dynamo-platform-dynamo-operator-controller-manager \
             -o jsonpath='{.spec.template.spec.containers[?(@.name=="manager")].image}' \
-            | grep -qx 'nvcr.io/nvidia/ai-dynamo/kubernetes-operator:1.5.0'
+            | grep -qx "nvcr.io/nvidia/ai-dynamo/kubernetes-operator-nightly:${VIME_DYNAMO_NIGHTLY_TAG}"
           kubectl get crd dynamographdeployments.nvidia.com \
             -o jsonpath='{.spec.versions[?(@.name=="v1beta1")].served}' | grep -qx true
 

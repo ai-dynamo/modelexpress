@@ -1,12 +1,13 @@
 # Vime + Dynamo S3 delta refit
 
-This example runs 100 Vime training steps, publishes an XOR delta after each step
-to MinIO through ModelExpress, and installs them in one live Dynamo vLLM worker.
+This example uses the mounted Hugging Face model as its local v0 seed, runs 100
+Vime training steps, publishes an XOR delta after each step to MinIO through
+ModelExpress, and installs them in one live Dynamo vLLM worker.
 
 ```mermaid
 flowchart LR
     V[Vime trainer<br/>Megatron TP2 / 2 GPUs<br/>vLLM library only]
-    V -->|XOR delta| S[MinIO]
+    V -->|XOR deltas| S[MinIO]
     V -->|version lifecycle| M[ModelExpress + Redis]
     V -->|discover and control| D[Dynamo]
     D --> L[vLLM rollout<br/>TP1 / 1 GPU]
@@ -22,13 +23,22 @@ flowchart LR
 - A `shared-model-cache` PVC containing `Qwen/Qwen3-0.6B`.
 - An `nvcr-imagepullsecret` image-pull Secret and an `mx-minio-creds` Secret
   containing `MINIO_ROOT_USER` and `MINIO_ROOT_PASSWORD`.
-- A sibling `dynamo` worktree checked out at the latest `origin/main`. The
-  trainer uses the pinned Vime revision declared in the Dockerfile. Its base
-  already contains Megatron-LM and Megatron Bridge; the recipe does not install
-  another copy.
+- A sibling `dynamo` worktree checked out at commit
+  `c3e05f0244ae6264d7953f68e2499c6dc2f54723`, matching the pinned Dynamo
+  nightly frontend. The trainer uses the Vime revision declared in the
+  Dockerfile. Its base already contains Megatron-LM and Megatron Bridge; the
+  recipe does not install another copy.
 - `docker buildx` and `kubectl` on the client machine.
 
 If your PVC or Secret names differ, edit the YAML directly.
+
+MinIO intentionally uses HTTP because it is a disposable, ClusterIP-only fixture
+containing public-model test data. Use HTTPS for external or persistent object
+storage.
+
+The v0 ModelExpress record is catalog-only: trainer and rollout workers seed it
+from the mounted model, so no v0 object is uploaded to MinIO. Periodic full
+checkpoints, when enabled, are real S3 artifacts.
 
 ## Run
 
