@@ -5,11 +5,12 @@
 
 from __future__ import annotations
 
-import time
 from collections.abc import Callable
 from typing import Any
 
-from ... import refit_pb2, refit_pb2_grpc, timing
+from modelexpress.refit.timing import refit_span
+
+from ... import refit_pb2, refit_pb2_grpc
 from ...version import WeightVersionRef
 from ..adapter import (
     StagedWeightVersionShardData,
@@ -81,38 +82,37 @@ class FullTensorNixlPublicationMethod:
     ) -> None:
         if not isinstance(staged, StagedWeightVersionShardData):
             raise TypeError("full-tensor publication received an invalid shard")
-        started = time.perf_counter()
-        staged.publish_ready.wait()
-        duration = time.perf_counter() - started
-        timing.record_measured(
+        with refit_span(
             "source_preparation",
-            duration,
-            metadata={"staging_sync_s": duration},
-        )
+            metadata={"staging_syncs": 1},
+            accumulate_metadata=True,
+            duration_key="staging_sync_s",
+        ):
+            staged.publish_ready.wait()
         if staged.manifest.transport.upper() != "NIXL":
             raise ValueError(
                 f"unsupported shard transport {staged.manifest.transport!r}"
             )
-        started = time.perf_counter()
-        manifest_digest = staged.manifest.digest
-        duration = time.perf_counter() - started
-        timing.record_measured(
+        # A cached property that hashes the whole manifest, so the first read is
+        # the digest being computed and every later one is free.
+        with refit_span(
             "source_preparation",
-            duration,
-            metadata={"manifest_digest_s": duration},
-        )
-        started = time.perf_counter()
-        endpoint = self._manifest_publisher.publish_manifest(
-            version_id=version.version_id,
-            source_slot_id=self.source_slot_id,
-            manifest=staged.manifest,
-        )
-        duration = time.perf_counter() - started
-        timing.record_measured(
+            metadata={"manifest_digests": 1},
+            accumulate_metadata=True,
+            duration_key="manifest_digest_s",
+        ):
+            manifest_digest = staged.manifest.digest
+        with refit_span(
             "setup_registration",
-            duration,
-            metadata={"manifest_publish_s": duration},
-        )
+            metadata={"manifest_publications": 1},
+            accumulate_metadata=True,
+            duration_key="manifest_publish_s",
+        ):
+            endpoint = self._manifest_publisher.publish_manifest(
+                version_id=version.version_id,
+                source_slot_id=self.source_slot_id,
+                manifest=staged.manifest,
+            )
         if not endpoint.strip():
             raise ValueError("manifest_endpoint is required")
         shard = refit_pb2.WeightVersionShard(
@@ -124,17 +124,16 @@ class FullTensorNixlPublicationMethod:
             manifest_digest=manifest_digest,
             manifest_endpoint=endpoint,
         )
-        started = time.perf_counter()
-        self._service().CreateWeightVersionShard(
-            refit_pb2.CreateWeightVersionShardRequest(shard=shard),
-            timeout=self._rpc_timeout_seconds,
-        )
-        duration = time.perf_counter() - started
-        timing.record_measured(
+        with refit_span(
             "setup_registration",
-            duration,
-            metadata={"publication_rpc_s": duration},
-        )
+            metadata={"publication_rpcs": 1},
+            accumulate_metadata=True,
+            duration_key="publication_rpc_s",
+        ):
+            self._service().CreateWeightVersionShard(
+                refit_pb2.CreateWeightVersionShardRequest(shard=shard),
+                timeout=self._rpc_timeout_seconds,
+            )
         self.published.setdefault(version.version_id, []).append(staged)
 
     def release(self, *, version: WeightVersionRef) -> None:

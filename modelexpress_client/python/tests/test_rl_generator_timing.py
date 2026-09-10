@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from modelexpress.refit import (
     RefitTimingRecorder,
     current_refit_timing,
+    set_refit_cold,
     use_refit_timing,
 )
 from modelexpress_rl import timing
@@ -116,7 +117,7 @@ def test_reusing_a_transfer_plan_is_marked_warm(monkeypatch):
     recorder = timing.start_cycle(version_id="run.a1:7", rank=0)
 
     with timing.active(recorder):
-        timing.record_cold(False)
+        set_refit_cold(False)
 
     assert recorder.as_dict()["cold_warm"] == "warm"
 
@@ -148,6 +149,7 @@ def test_version_digest_refreshes_verification_without_replanning():
         build_identity=lambda _version: None,
         worker_rank=0,
         worker_id="worker",
+        enable_peer_publication=False,
         accelerator="cuda",
         p2p_client=object(),
     )
@@ -206,6 +208,6 @@ def test_nothing_is_emitted_when_there_is_no_cycle():
     timing.emit(None, logger)
     with timing.active(None):
         _attribute_transfer(STAGED_METRICS)
-        timing.record_cold(True)
+        set_refit_cold(True)
 
     assert current_refit_timing() is None

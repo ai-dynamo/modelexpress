@@ -86,27 +86,45 @@ class RefitTimingRecorder:
         *,
         status: str = "ok",
         metadata: dict[str, Any] | None = None,
-    ) -> Iterator[None]:
-        """Measure a stage; failed spans are retained and re-raised."""
+        accumulate_metadata: bool = False,
+        duration_key: str | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Measure a stage; failed spans are retained and re-raised.
+
+        Yields a dict for counters only knowable once the work has run -- a
+        shard count, a cache outcome, a byte total. Without it a caller with
+        something to report on exit has to time the region by hand instead,
+        which is how a span turns into a pair of clock reads.
+
+        ``duration_key`` also files the measured duration under that metadata
+        name. Several spans usually share one normalized stage, and the stage
+        total cannot say which of them was expensive; naming them is what
+        separates a slow fetch from a slow hash inside the same stage.
+        """
         self._validate_stage(stage)
+        discovered: dict[str, Any] = {}
         started = self._clock()
-        try:
-            yield
-        except BaseException:
+
+        def record(final_status: str) -> None:
+            elapsed = self._clock() - started
+            extra = {**(metadata or {}), **discovered}
+            if duration_key is not None:
+                extra[duration_key] = elapsed
             self.add_duration(
                 stage,
-                self._clock() - started,
-                status="error",
-                metadata=metadata,
+                elapsed,
+                status=final_status,
+                metadata=extra,
+                accumulate_metadata=accumulate_metadata,
             )
+
+        try:
+            yield discovered
+        except BaseException:
+            record("error")
             raise
         else:
-            self.add_duration(
-                stage,
-                self._clock() - started,
-                status=status,
-                metadata=metadata,
-            )
+            record(status)
 
     def add_duration(
         self,
@@ -136,6 +154,32 @@ class RefitTimingRecorder:
                     item.metadata[name] = item.metadata.get(name, 0) + value
                 else:
                     item.metadata[name] = value
+
+    def add_metadata(
+        self,
+        stage: str,
+        metadata: dict[str, Any],
+        *,
+        accumulate: bool = False,
+    ) -> None:
+        """Attach facts to a stage without claiming to have measured anything.
+
+        For sizes, counts and cache outcomes that describe a stage but have no
+        duration of their own. Passing them through :meth:`add_duration` with a
+        zero would work and would also add a span, leaving the stage looking
+        like it ran more times than it did.
+        """
+        self._validate_stage(stage)
+        item = self._stages[stage]
+        for name, value in metadata.items():
+            if (
+                accumulate
+                and isinstance(value, (int, float))
+                and isinstance(item.metadata.get(name, 0), (int, float))
+            ):
+                item.metadata[name] = item.metadata.get(name, 0) + value
+            else:
+                item.metadata[name] = value
 
     def mark_not_applicable(
         self,
@@ -272,14 +316,69 @@ def refit_span(
     *,
     status: str = "ok",
     metadata: dict[str, Any] | None = None,
-) -> Iterator[None]:
-    """Record a span when a cycle is active; otherwise act as a no-op."""
+    accumulate_metadata: bool = False,
+    duration_key: str | None = None,
+) -> Iterator[dict[str, Any]]:
+    """Record a span when a cycle is active; otherwise act as a no-op.
+
+    The first choice for work the calling function owns and performs itself.
+    Reach for :func:`add_refit_duration` only when the duration was produced
+    somewhere else.
+    """
     recorder = current_refit_timing()
     if recorder is None:
-        yield
+        yield {}
         return
-    with recorder.span(stage, status=status, metadata=metadata):
-        yield
+    with recorder.span(
+        stage,
+        status=status,
+        metadata=metadata,
+        accumulate_metadata=accumulate_metadata,
+        duration_key=duration_key,
+    ) as discovered:
+        yield discovered
+
+
+def add_refit_duration(
+    stage: str,
+    seconds: float,
+    *,
+    status: str = "ok",
+    metadata: dict[str, Any] | None = None,
+    accumulate_metadata: bool = False,
+) -> None:
+    """Attribute an already-measured duration to a normalized stage.
+
+    For durations another layer produced, where the work cannot be wrapped in
+    a span from here: a transport that times its own wire read and hands the
+    number back, or a figure a legacy metric already reports. Work the calling
+    function performs itself belongs in :func:`refit_span`, which cannot
+    disagree with the clock about what it covered.
+
+    Negative values are clamped rather than rejected, since these arrive from
+    a clock this function did not read.
+    """
+    recorder = current_refit_timing()
+    if recorder is not None:
+        recorder.add_duration(
+            stage,
+            max(0.0, float(seconds)),
+            status=status,
+            metadata=metadata,
+            accumulate_metadata=accumulate_metadata,
+        )
+
+
+def add_refit_metadata(
+    stage: str,
+    metadata: dict[str, Any],
+    *,
+    accumulate: bool = False,
+) -> None:
+    """Attach facts to a stage without claiming to have measured anything."""
+    recorder = current_refit_timing()
+    if recorder is not None:
+        recorder.add_metadata(stage, metadata, accumulate=accumulate)
 
 
 def add_refit_bytes(count: int) -> None:
@@ -288,12 +387,26 @@ def add_refit_bytes(count: int) -> None:
         recorder.add_bytes(count)
 
 
+def set_refit_cold(cold: bool) -> None:
+    """Mark whether this cycle built its transfer plan or reused one.
+
+    The distinction dominates ``transfer_planning``: a reused plan makes it
+    almost free, so a mean over both is a number that describes neither.
+    """
+    recorder = current_refit_timing()
+    if recorder is not None:
+        recorder.set_cold(cold)
+
+
 __all__ = [
     "MX_REFIT_TIMING_PREFIX",
     "REFIT_TIMING_STAGES",
     "RefitTimingRecorder",
     "add_refit_bytes",
+    "add_refit_duration",
+    "add_refit_metadata",
     "current_refit_timing",
     "refit_span",
+    "set_refit_cold",
     "use_refit_timing",
 ]

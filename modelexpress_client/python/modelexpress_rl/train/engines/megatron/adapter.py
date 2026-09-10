@@ -8,13 +8,12 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import time
 from typing import Any
 
 import torch.distributed as dist
 from modelexpress import envs as mx_envs
+from modelexpress.refit.timing import add_refit_metadata, refit_span
 
-from modelexpress_rl import timing
 from modelexpress_rl.train.adapter import (
     CompletionFence,
     NixlMetadataProvider,
@@ -116,14 +115,13 @@ class MegatronTrainerAdapter(TrainerEngineAdapter):
             raise ValueError("Megatron tensor names must be unique within this rank")
         addresses = {name: tensor.data_ptr() for name, tensor in sources.items()}
         if self._registered_addrs is None:
-            started = time.perf_counter()
-            self._manager.register_tensors(sources)
-            duration = time.perf_counter() - started
-            timing.record_measured(
+            with refit_span(
                 "setup_registration",
-                duration,
-                metadata={"trainer_registration_s": duration},
-            )
+                metadata={"trainer_registrations": 1},
+                accumulate_metadata=True,
+                duration_key="trainer_registration_s",
+            ):
+                self._manager.register_tensors(sources)
             self._registered_addrs = addresses
         elif addresses != self._registered_addrs:
             raise RuntimeError(
@@ -132,17 +130,21 @@ class MegatronTrainerAdapter(TrainerEngineAdapter):
             )
         cache_hit = self._manifest is not None and not mx_envs.MX_RESHARD_PUBLISH_DIGEST
         if not cache_hit:
-            started = time.perf_counter()
-            published = build_hf_aliases(
-                tensors,
-                agent_name=str(self._manager.agent_name),
-            )
-            manifest = build_megatron_reshard_manifest(
-                manager=self._manager,
-                published=published,
-                metadata_endpoint=self._nixl_metadata_endpoint,
-            )
-            duration = time.perf_counter() - started
+            with refit_span(
+                "source_preparation",
+                metadata={"manifest_generations": 1},
+                accumulate_metadata=True,
+                duration_key="manifest_generation_s",
+            ):
+                published = build_hf_aliases(
+                    tensors,
+                    agent_name=str(self._manager.agent_name),
+                )
+                manifest = build_megatron_reshard_manifest(
+                    manager=self._manager,
+                    published=published,
+                    metadata_endpoint=self._nixl_metadata_endpoint,
+                )
             total_bytes = sum(
                 math.prod(shard.shape) * tensor.elsize
                 for tensor in manifest.tensors
@@ -154,16 +156,10 @@ class MegatronTrainerAdapter(TrainerEngineAdapter):
                 total_bytes=total_bytes,
                 transport="NIXL",
             )
-            timing.record_measured(
-                "source_preparation",
-                duration,
-                metadata={"manifest_generation_s": duration},
-            )
         assert self._manifest is not None
-        timing.record_measured(
+        add_refit_metadata(
             "source_preparation",
-            0.0,
-            metadata={
+            {
                 "manifest_bytes": len(self._manifest.data),
                 "manifest_cache_hit": cache_hit,
                 "manifest_tensor_count": self._manifest.tensor_count,

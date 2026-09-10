@@ -15,7 +15,7 @@ from typing import Any
 import grpc
 from modelexpress import auth, envs
 from modelexpress.client import _get_server_url
-from modelexpress.refit.timing import RefitTimingRecorder
+from modelexpress.refit.timing import RefitTimingRecorder, refit_span
 
 from modelexpress_rl import envs as rl_envs
 from modelexpress_rl import timing
@@ -344,7 +344,7 @@ class ModelExpressGeneratorClient:
             try:
                 with timing.active(recorder):
                     if self._runtime.initial_version_id is not None:
-                        with timing.refit_span("control_discovery"):
+                        with refit_span("control_discovery"):
                             chain = self._resolve_replay_chain(version.version_id)
                         update = (
                             self._runtime.session.stage(chain[0])
@@ -352,7 +352,7 @@ class ModelExpressGeneratorClient:
                             else self._runtime.session.stage_chain(chain)
                         )
                     else:
-                        with timing.refit_span("control_discovery"):
+                        with refit_span("control_discovery"):
                             ready = self._get_ready_version(version.version_id)
                         update = self._runtime.session.stage(ready)
             except BaseException:

@@ -5,14 +5,14 @@
 
 import hashlib
 import logging
-import time
 from collections import defaultdict
 from collections.abc import Callable, Iterator
 
 import grpc
 from modelexpress.refit.reshard.rendezvous import structural_manifest_digest
+from modelexpress.refit.timing import refit_span
 
-from ... import refit_pb2, refit_pb2_grpc, timing
+from ... import refit_pb2, refit_pb2_grpc
 from ...control import WeightVersion
 from ...train import WeightPayloadFormat
 from ..adapter import GeneratorSource, GeneratorTransferInputs, NixlGeneratorSource
@@ -47,12 +47,20 @@ class TrainerSourceResolver(SourceResolver):
         return version.payload_format
 
     def candidates(self, version: WeightVersion) -> Iterator[ResolvedSource]:
-        list_started = time.perf_counter()
         try:
-            response = self._service().ListWeightVersionShards(
-                refit_pb2.ListWeightVersionShardsRequest(version_id=version.version_id),
-                timeout=self._rpc_timeout_seconds,
-            )
+            with refit_span(
+                "source_preparation",
+                metadata={"manifest_list_count": 1},
+                accumulate_metadata=True,
+                duration_key="manifest_list_s",
+            ) as counters:
+                response = self._service().ListWeightVersionShards(
+                    refit_pb2.ListWeightVersionShardsRequest(
+                        version_id=version.version_id
+                    ),
+                    timeout=self._rpc_timeout_seconds,
+                )
+                counters["published_shard_count"] = len(response.shards)
         except grpc.RpcError as error:
             logger.warning(
                 "trainer source discovery failed for version %s: %s",
@@ -60,26 +68,13 @@ class TrainerSourceResolver(SourceResolver):
                 error,
             )
             return
-        list_s = time.perf_counter() - list_started
-        timing.record_measured(
-            "source_preparation",
-            list_s,
-            metadata={
-                "manifest_list_s": list_s,
-                "manifest_list_count": 1,
-                "published_shard_count": len(response.shards),
-            },
-            accumulate_metadata=True,
-        )
-        candidates = defaultdict(list)
+        published = defaultdict(list)
         for shard in response.shards:
-            candidates[shard.source_slot_id].append(shard)
+            published[shard.source_slot_id].append(shard)
 
         ordered_slots = []
         for source_slot_id in version.expected_source_slots:
-            ordered = sorted(
-                candidates[source_slot_id], key=lambda item: item.worker_id
-            )
+            ordered = sorted(published[source_slot_id], key=lambda item: item.worker_id)
             if not ordered:
                 logger.warning(
                     "no trainer source published for required slot %s",
@@ -99,19 +94,9 @@ class TrainerSourceResolver(SourceResolver):
                 continue
             seen.add(selection)
             resolved = []
-            stats: dict[str, int | float] = {
-                "manifest_fetch_s": 0.0,
-                "manifest_hash_s": 0.0,
-                "manifest_fingerprint_s": 0.0,
-                "manifest_bytes": 0,
-                "manifest_fetch_bytes": 0,
-                "manifest_cache_hits": 0,
-                "manifest_cache_misses": 0,
-                "manifest_fetch_count": 0,
-            }
             for shard in selected_shards:
                 try:
-                    source, source_stats = self._resolve_source(shard)
+                    resolved.append(self._resolve_source(shard))
                 except (grpc.RpcError, RuntimeError) as error:
                     logger.warning(
                         "trainer source %s failed for slot %s: %s",
@@ -120,20 +105,6 @@ class TrainerSourceResolver(SourceResolver):
                         error,
                     )
                     break
-                resolved.append(source)
-                for name, value in source_stats.items():
-                    stats[name] += value
-            source_preparation_s = (
-                float(stats["manifest_fetch_s"])
-                + float(stats["manifest_hash_s"])
-                + float(stats["manifest_fingerprint_s"])
-            )
-            timing.record_measured(
-                "source_preparation",
-                source_preparation_s,
-                metadata=stats,
-                accumulate_metadata=True,
-            )
             if len(resolved) != len(ordered_slots):
                 continue
             yield TrainerUpdateSource(
@@ -146,74 +117,45 @@ class TrainerSourceResolver(SourceResolver):
                 )
             )
 
-    def _resolve_source(
-        self, shard: refit_pb2.WeightVersionShard
-    ) -> tuple[GeneratorSource, dict[str, int | float]]:
+    def _resolve_source(self, shard: refit_pb2.WeightVersionShard) -> GeneratorSource:
         if not shard.manifest_endpoint:
             raise RuntimeError("NIXL source is missing its manifest endpoint")
         if not shard.manifest_digest:
             raise RuntimeError("source is missing its manifest digest")
         key = (shard.source_slot_id, shard.worker_id)
         cached = self._manifest_cache.get(key)
-        cache_hit = (
+        reusable = (
             cached is not None
             and cached[0] == shard.manifest_endpoint
             and cached[1] == shard.manifest_digest
         )
-        fetch_s = 0.0
-        hash_s = 0.0
-        fingerprint_s = 0.0
-        if cache_hit:
-            assert cached is not None
-            manifest = cached[2]
-            structure_digest = cached[3]
-        else:
-            fetch_started = time.perf_counter()
-            with grpc.insecure_channel(
-                shard.manifest_endpoint,
-                options=[
-                    (
-                        "grpc.max_receive_message_length",
-                        _MAX_MANIFEST_MESSAGE_SIZE_BYTES,
-                    )
-                ],
-            ) as channel:
-                response = refit_pb2_grpc.RefitWorkerServiceStub(
-                    channel
-                ).GetWeightVersionShardManifest(
-                    refit_pb2.GetWeightVersionShardManifestRequest(
-                        version_id=shard.version_id,
-                        source_slot_id=shard.source_slot_id,
-                    ),
-                    timeout=self._rpc_timeout_seconds,
+        with refit_span(
+            "source_preparation",
+            metadata={
+                "manifest_cache_hits": int(reusable),
+                "manifest_cache_misses": int(not reusable),
+            },
+            accumulate_metadata=True,
+        ) as counters:
+            if reusable:
+                # These bytes hashed to this digest when they were stored, so
+                # verifying them again would be checking them against
+                # themselves.
+                assert cached is not None
+                manifest = cached[2]
+                structure_digest = cached[3]
+            else:
+                manifest, structure_digest = self._fetch_manifest(shard)
+                self._manifest_cache[key] = (
+                    shard.manifest_endpoint,
+                    shard.manifest_digest,
+                    manifest,
+                    structure_digest,
                 )
-            fetch_s = time.perf_counter() - fetch_started
-            hash_started = time.perf_counter()
-            digest = hashlib.sha256(response.manifest).hexdigest()
-            hash_s = time.perf_counter() - hash_started
-            if (
-                response.manifest_digest != shard.manifest_digest
-                or digest != shard.manifest_digest
-            ):
-                raise RuntimeError(
-                    f"manifest digest mismatch for source slot {shard.source_slot_id!r}"
-                )
-            fingerprint_started = time.perf_counter()
-            try:
-                structure_digest = structural_manifest_digest(response.manifest)
-            except (AttributeError, KeyError, TypeError, ValueError) as error:
-                raise RuntimeError(
-                    f"invalid manifest for source slot {shard.source_slot_id!r}"
-                ) from error
-            fingerprint_s = time.perf_counter() - fingerprint_started
-            manifest = response.manifest
-            self._manifest_cache[key] = (
-                shard.manifest_endpoint,
-                shard.manifest_digest,
-                manifest,
-                structure_digest,
-            )
-        source = GeneratorSource(
+                counters["manifest_fetch_bytes"] = len(manifest)
+                counters["manifest_fetch_count"] = 1
+            counters["manifest_bytes"] = len(manifest)
+        return GeneratorSource(
             source_slot_id=shard.source_slot_id,
             worker_id=shard.worker_id,
             manifest_digest=shard.manifest_digest,
@@ -223,16 +165,65 @@ class TrainerSourceResolver(SourceResolver):
                 structural_digest=structure_digest,
             ),
         )
-        return source, {
-            "manifest_fetch_s": fetch_s,
-            "manifest_hash_s": hash_s,
-            "manifest_fingerprint_s": fingerprint_s,
-            "manifest_bytes": len(manifest),
-            "manifest_fetch_bytes": len(manifest) * int(not cache_hit),
-            "manifest_cache_hits": int(cache_hit),
-            "manifest_cache_misses": int(not cache_hit),
-            "manifest_fetch_count": int(not cache_hit),
-        }
+
+    def _fetch_manifest(self, shard: refit_pb2.WeightVersionShard) -> tuple[bytes, str]:
+        """Fetch, verify and fingerprint one worker's manifest.
+
+        Three spans on one stage rather than one, because the stage total
+        cannot say whether a slow warm refit is waiting on the wire or on the
+        CPU, and with digests published these manifests are refetched by
+        construction on every version.
+        """
+        with (
+            refit_span(
+                "source_preparation",
+                accumulate_metadata=True,
+                duration_key="manifest_fetch_s",
+            ),
+            grpc.insecure_channel(
+                shard.manifest_endpoint,
+                options=[
+                    (
+                        "grpc.max_receive_message_length",
+                        _MAX_MANIFEST_MESSAGE_SIZE_BYTES,
+                    )
+                ],
+            ) as channel,
+        ):
+            response = refit_pb2_grpc.RefitWorkerServiceStub(
+                channel
+            ).GetWeightVersionShardManifest(
+                refit_pb2.GetWeightVersionShardManifestRequest(
+                    version_id=shard.version_id,
+                    source_slot_id=shard.source_slot_id,
+                ),
+                timeout=self._rpc_timeout_seconds,
+            )
+        with refit_span(
+            "source_preparation",
+            accumulate_metadata=True,
+            duration_key="manifest_hash_s",
+        ):
+            digest = hashlib.sha256(response.manifest).hexdigest()
+        if (
+            response.manifest_digest != shard.manifest_digest
+            or digest != shard.manifest_digest
+        ):
+            raise RuntimeError(
+                f"manifest digest mismatch for source slot {shard.source_slot_id!r}"
+            )
+        try:
+            with refit_span(
+                "source_preparation",
+                accumulate_metadata=True,
+                duration_key="manifest_fingerprint_s",
+            ):
+                structure_digest = structural_manifest_digest(response.manifest)
+        except (AttributeError, KeyError, TypeError, ValueError) as error:
+            raise RuntimeError(
+                f"invalid manifest for source slot {shard.source_slot_id!r}"
+            ) from error
+        return response.manifest, structure_digest
 
 
 __all__ = ["TrainerSourceResolver"]
