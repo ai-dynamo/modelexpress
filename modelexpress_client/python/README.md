@@ -36,6 +36,12 @@ resolves and then fails to import, because `cuda-bindings` only arrives
 through one of those two extras. Nothing else in the client imports it, so
 an installation that never uses collective refit does not need it.
 
+Reshard needs NCCL 2.30.7 or newer, and an image that ships its own older
+libnccl will win the load over the one pip installed. That failure surfaces
+inside the reshard call rather than at import, so check which library the
+process resolves rather than which one is on disk. The NGC PyTorch 26.06
+image ships 2.30.5 and needs the newer library preloaded.
+
 ### Requirements
 
 - Python >= 3.10
