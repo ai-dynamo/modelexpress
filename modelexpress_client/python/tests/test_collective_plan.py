@@ -433,3 +433,29 @@ class TestEnvironment:
         monkeypatch.delenv("MX_NCCL_REFIT_REGISTRATION_TTL_S", raising=False)
         monkeypatch.setenv("MX_HEARTBEAT_INTERVAL_SECS", "7")
         assert envs.MX_NCCL_REFIT_REGISTRATION_TTL_S == 21
+
+
+class TestAgreementMembers:
+    """The digest is what readiness compares, so a mismatch on either of these
+    must stop the group forming rather than surface inside a collective."""
+
+    def _plan(self):
+        return ReshardPlan(bulk=[], misc=[MiscParam("m", (4,), "bfloat16")])
+
+    def test_a_differing_receiver_protocol_changes_the_digest(self):
+        plan = self._plan()
+        assert plan_digest(plan, receiver_protocol="a") != plan_digest(
+            plan, receiver_protocol="b"
+        )
+
+    def test_a_differing_m2n_abi_version_changes_the_digest(self):
+        plan = self._plan()
+        assert plan_digest(plan, m2n_abi_version="1.0") != plan_digest(
+            plan, m2n_abi_version="1.1"
+        )
+
+    def test_the_same_inputs_still_agree(self):
+        plan = self._plan()
+        assert plan_digest(plan, receiver_protocol="a", m2n_abi_version="1") == (
+            plan_digest(plan, receiver_protocol="a", m2n_abi_version="1")
+        )

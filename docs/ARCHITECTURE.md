@@ -113,7 +113,7 @@ ModelExpress/
 │       │       └── instrumented.rs      # Metrics decorator over RefitBackend
 │       ├── refit_collective.rs          # Collective refit module exports
 │       ├── refit_collective/
-│       │   ├── lanes.rs                 # Lane layout and rank assignment
+│       │   ├── lanes.rs                 # Declared lane membership and rank lookup
 │       │   ├── service.rs               # Backend-neutral collective gRPC service
 │       │   ├── backend.rs               # CollectiveBackend contract and factory
 │       │   └── backend/
@@ -448,7 +448,12 @@ rendezvous are testable without a GPU. Two guarantees there are gates rather
 than conventions, because both failures are silent at refit time: `plan.py`
 proves that the bulk and misc lists together name every parameter exactly once,
 and folds that result into a plan digest every participant must agree on before
-the group becomes READY.
+the group becomes READY. The digest also covers the receiver protocol and the
+M2N ABI version, so peers that could not speak to each other fail to form a
+group rather than discovering it inside a collective. When digests do disagree,
+`GetCollectiveGroup` reports which slots differ; without that the group simply
+sits in `FORMING` and every lane bootstrap looks stale, which points at the
+wrong subsystem.
 
 Before `JoinCollectiveGroup`, each worker must call `RefitService.RegisterWorker`
 with the same `worker_id`, model, and role, then renew that immutable registration
@@ -458,10 +463,20 @@ bootstrap transitions validate the registration atomically. `GetCollectiveGroup`
 also removes expired generations, advances the epoch, and clears lane bootstrap
 identifiers before returning state, so `READY` cannot survive a dead rank.
 
-Lanes are one per disjoint source partition plus one broadcast lane. MX derives
-them and assigns ranks from role, ordinal within role, and partition alone; it
-never interprets tensor, expert, data or pipeline parallelism, which stay
-client-side. `refit_collective/lanes.rs` is the whole of that logic.
+Lanes are declared by the caller, not derived. `CollectiveGroupSpec` carries one
+`LaneSpec` per communicator the operation needs, each an ordered list of slots,
+and MX brokers one bootstrap per lane, gives each slot the rank its position
+gives it, and gates readiness on all of them. It does not know what a lane means:
+tensor, expert, data and pipeline parallelism stay client-side, and a caller that
+splits its trainers unevenly is simply declaring different lanes. What
+`refit_collective/lanes.rs` still checks is structural - unique lane ids, slots
+that exist, no slot twice on one lane, no expected slot left off every lane, at
+most one broadcast lane - and none of those is a claim about topology.
+
+Lane order is part of the group's identity. The declared membership is hashed
+into the group id along with the expected slot lists, so two callers that put
+different slots at rank 0 resolve different groups instead of meeting in one and
+disagreeing about who is who.
 
 The data plane lives in `collective/{backend,client,comm,spi}.py`. `nccl4py` is
 imported lazily, so the plan contract and the rendezvous stay usable and

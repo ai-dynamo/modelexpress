@@ -93,12 +93,25 @@ def validate_coverage(plan: ReshardPlan, expected: list[str]) -> None:
         )
 
 
-def plan_digest(plan: ReshardPlan) -> str:
+DEFAULT_RECEIVER_PROTOCOL = "mx-nccl-m2n-bootstrap-v1"
+
+
+def plan_digest(
+    plan: ReshardPlan,
+    *,
+    receiver_protocol: str = DEFAULT_RECEIVER_PROTOCOL,
+    m2n_abi_version: str = "",
+) -> str:
     """A canonical digest over the whole plan.
 
     Every participant computes this independently and reports it when it joins.
     MX admits the group only when they all agree, and a change bumps the group
     epoch, which drops the cached plan and the cached communicator together.
+
+    ``receiver_protocol`` names the bootstrap encoding both sides must share
+    and ``m2n_abi_version`` the M2N build they must be compatible on. Peers
+    that disagree on either produce different digests, so the group never
+    reaches READY instead of meeting inside a collective and finding out.
 
     Both lists are hashed in order. The backend walks bulk entries as collective
     operations and misc entries as broadcast payloads, so either ordering is
@@ -109,6 +122,13 @@ def plan_digest(plan: ReshardPlan) -> str:
     plan.validate()
     hasher = hashlib.sha256()
     hasher.update(b"mx-nccl-m2n-plan-v2\0")
+    # The digest is what readiness compares, so anything two peers must agree
+    # on before they meet inside a collective belongs in it. The plan says what
+    # moves; these say whether both sides can speak about it at all. They are
+    # supplied by the caller rather than probed here, because this module is
+    # deliberately importable without nccl4py present.
+    hasher.update(f"{receiver_protocol}\0".encode())
+    hasher.update(f"{m2n_abi_version}\0".encode())
     hasher.update(f"{plan.source_partition_count}\0".encode())
 
     hasher.update(b"bulk\0")

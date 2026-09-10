@@ -30,7 +30,7 @@ from .backend import (
     require_nccl_m2n,
 )
 from .comm import CommunicatorCache, LaneCommunicator, LaneKey, new_unique_id
-from .plan import plan_digest, validate_coverage
+from .plan import DEFAULT_RECEIVER_PROTOCOL, plan_digest, validate_coverage
 from .rendezvous import CollectiveRendezvous, LaneDeclaration, Membership
 from .spi import Loader, Publisher, resolve_specs
 from .types import ReshardPlan, Role
@@ -72,6 +72,8 @@ class _RefitClientBase:
         slot_id: str,
         worker_id: str,
         index_in_role: int,
+        receiver_protocol: str = DEFAULT_RECEIVER_PROTOCOL,
+        m2n_abi_version: str = "",
         device: Any = None,
         streams: list[Any] | None = None,
     ) -> None:
@@ -83,6 +85,8 @@ class _RefitClientBase:
         self._slot_id = slot_id
         self._worker_id = worker_id
         self._index_in_role = index_in_role
+        self._receiver_protocol = receiver_protocol
+        self._m2n_abi_version = m2n_abi_version
         self._device = device
         self._streams = list(streams) if streams else [None]
 
@@ -147,7 +151,11 @@ class _RefitClientBase:
             expected = list(parameter_names())
         validate_coverage(plan, list(expected))
         self._plan = plan
-        self._digest = plan_digest(plan)
+        self._digest = plan_digest(
+            plan,
+            receiver_protocol=self._receiver_protocol,
+            m2n_abi_version=self._m2n_abi_version,
+        )
 
     def setup_layer_groups(self, groupings: list[list[str]] | None) -> None:
         """Optional. Without it every bulk parameter is in layer group 0."""
