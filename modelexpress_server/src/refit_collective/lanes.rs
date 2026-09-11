@@ -46,7 +46,10 @@ impl Lane {
 
     #[must_use]
     pub fn world_size(&self) -> u32 {
-        let total = self.trainer_slots.len().saturating_add(self.generator_slots.len());
+        let total = self
+            .trainer_slots
+            .len()
+            .saturating_add(self.generator_slots.len());
         u32::try_from(total).unwrap_or(u32::MAX)
     }
 }
@@ -163,18 +166,24 @@ impl LaneLayout {
                         slot_id: slot_id.clone(),
                     });
                 }
-                by_slot.entry(slot_id.clone()).or_default().push(Assignment {
-                    lane_id: lane.lane_id,
-                    kind: lane.kind,
-                    rank_in_lane: u32::try_from(rank).unwrap_or(u32::MAX),
-                    world_size,
-                });
+                by_slot
+                    .entry(slot_id.clone())
+                    .or_default()
+                    .push(Assignment {
+                        lane_id: lane.lane_id,
+                        kind: lane.kind,
+                        rank_in_lane: u32::try_from(rank).unwrap_or(u32::MAX),
+                        world_size,
+                    });
             }
         }
 
         // A slot on no lane would be admitted, counted toward readiness, and
         // then wait on a communicator it was never placed in.
-        for slot_id in expected_trainer_slots.iter().chain(expected_generator_slots) {
+        for slot_id in expected_trainer_slots
+            .iter()
+            .chain(expected_generator_slots)
+        {
             if !by_slot.contains_key(slot_id) {
                 return Err(LaneError::UnassignedSlot {
                     slot_id: slot_id.clone(),

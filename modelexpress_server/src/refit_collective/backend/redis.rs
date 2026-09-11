@@ -232,13 +232,9 @@ fn decode_lanes(text: &str) -> CollectiveResult<Vec<Lane>> {
     text.split('\n')
         .map(|line| {
             let mut parts = line.split('|');
-            let lane_id: u32 = parts
-                .next()
-                .unwrap_or_default()
-                .parse()
-                .map_err(|error| {
-                    CollectiveBackendError::Internal(format!("invalid stored lane_id: {error}"))
-                })?;
+            let lane_id: u32 = parts.next().unwrap_or_default().parse().map_err(|error| {
+                CollectiveBackendError::Internal(format!("invalid stored lane_id: {error}"))
+            })?;
             let kind_code: i32 = parts.next().unwrap_or_default().parse().map_err(|error| {
                 CollectiveBackendError::Internal(format!("invalid stored lane kind: {error}"))
             })?;
@@ -289,10 +285,7 @@ fn split_slots(text: &str) -> Vec<String> {
 }
 
 /// Parse one `worker_id|role|index_in_role|joined_epoch` record.
-fn participant_from_record(
-    slot_id: &str,
-    record: &str,
-) -> CollectiveResult<CollectiveParticipant> {
+fn participant_from_record(slot_id: &str, record: &str) -> CollectiveResult<CollectiveParticipant> {
     let mut parts = record.split('|');
     let worker_id = parts.next().unwrap_or_default().to_string();
     let role = match parts.next().unwrap_or_default() {
@@ -721,7 +714,11 @@ impl CollectiveBackend for RedisCollectiveBackend {
         let group = self.read_group(&request.group_id).await?;
         // Lane ids are whatever the caller declared, so membership is the
         // test, not a range check against the count.
-        if !group.lanes.iter().any(|lane| lane.lane_id == request.lane_id) {
+        if !group
+            .lanes
+            .iter()
+            .any(|lane| lane.lane_id == request.lane_id)
+        {
             return Err(CollectiveBackendError::InvalidArgument(format!(
                 "lane {} is not declared by this group",
                 request.lane_id
