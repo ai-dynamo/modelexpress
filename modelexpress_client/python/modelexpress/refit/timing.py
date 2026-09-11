@@ -15,6 +15,7 @@ import contextvars
 import json
 import logging
 import os
+import socket
 import sys
 import time
 from dataclasses import dataclass, field
@@ -56,6 +57,7 @@ class RefitTimingRecorder:
         *,
         backend: str,
         version: int | str,
+        version_id: str | None = None,
         rank: int | None = None,
         tp_rank: int | None = None,
         tp_size: int | None = None,
@@ -66,6 +68,7 @@ class RefitTimingRecorder:
     ) -> None:
         self.backend = backend
         self.version = version
+        self.version_id = version_id
         self.rank = rank
         self.tp_rank = tp_rank
         self.tp_size = tp_size
@@ -75,6 +78,8 @@ class RefitTimingRecorder:
         self.bytes = 0
         self._clock = clock
         self._started_at = clock()
+        self._wall_started_ns = time.time_ns()
+        self._intervals: list[dict[str, Any]] = []
         self._finished_at: float | None = None
         self._stages = {name: _Stage() for name in REFIT_TIMING_STAGES}
         self._emitted_payload: dict[str, Any] | None = None
@@ -90,22 +95,25 @@ class RefitTimingRecorder:
         """Measure a stage; failed spans are retained and re-raised."""
         self._validate_stage(stage)
         started = self._clock()
+        outcome = status
         try:
             yield
         except BaseException:
-            self.add_duration(
-                stage,
-                self._clock() - started,
-                status="error",
-                metadata=metadata,
-            )
+            outcome = "error"
             raise
-        else:
+        finally:
+            ended = self._clock()
             self.add_duration(
-                stage,
-                self._clock() - started,
-                status=status,
-                metadata=metadata,
+                stage, ended - started, status=outcome, metadata=metadata
+            )
+            self._intervals.append(
+                {
+                    "stage": stage,
+                    "start_ms": (started - self._started_at) * 1000.0,
+                    "end_ms": (ended - self._started_at) * 1000.0,
+                    "status": outcome,
+                    "metadata": dict(metadata or {}),
+                }
             )
 
     def add_duration(
@@ -190,7 +198,22 @@ class RefitTimingRecorder:
             if item.metadata:
                 value["metadata"] = dict(item.metadata)
             stages[name] = value
+        intervals = sorted(
+            (max(0.0, item["start_ms"]), min(e2e_s * 1000.0, item["end_ms"]))
+            for item in self._intervals
+        )
+        union_ms, previous_end = 0.0, 0.0
+        for start_ms, end_ms in intervals:
+            union_ms += max(0.0, end_ms - max(start_ms, previous_end))
+            previous_end = max(previous_end, end_ms)
         return {
+            "schema": "mx-refit-timing-v2",
+            "version_id": self.version_id,
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            "wall_start_ns": self._wall_started_ns,
+            "intervals": list(self._intervals),
+            "interval_unattributed_ms": round(max(0.0, e2e_s * 1000.0 - union_ms), 3),
             "backend": self.backend,
             "version": self.version,
             "rank": self.rank,

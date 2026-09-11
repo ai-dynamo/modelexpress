@@ -115,3 +115,28 @@ def test_unknown_stage_and_negative_bytes_rejected():
         timing.add_duration("download", 1.0)
     with pytest.raises(ValueError, match="non-negative"):
         timing.add_bytes(-1)
+
+
+def test_interval_union_does_not_double_count_nested_spans():
+    clock = _Clock()
+    timing = RefitTimingRecorder(backend="test", version=1, version_id="exact", clock=clock)
+    with timing.span("source_preparation"):
+        clock.advance(1)
+        with timing.span("transfer_planning"):
+            clock.advance(2)
+        clock.advance(1)
+    clock.advance(3)
+    payload = timing.as_dict()
+    assert payload["version_id"] == "exact"
+    assert payload["interval_unattributed_ms"] == 3000
+    assert len(payload["intervals"]) == 2
+    assert payload["intervals"][0]["start_ms"] == 1000
+    assert payload["intervals"][0]["end_ms"] == 3000
+
+
+def test_external_duration_is_not_claimed_as_located_interval():
+    clock = _Clock()
+    timing = RefitTimingRecorder(backend="test", version=1, clock=clock)
+    clock.advance(2)
+    timing.add_duration("installation", 1.5)
+    assert timing.as_dict()["interval_unattributed_ms"] == 2000

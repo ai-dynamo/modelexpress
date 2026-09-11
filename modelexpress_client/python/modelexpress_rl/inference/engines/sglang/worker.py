@@ -63,6 +63,7 @@ class SglangLiveRefit:
             recorder = RefitTimingRecorder(
                 backend="sglang-rl-nixl",
                 version=training_step,
+                version_id=version_id,
                 rank=self._rank,
                 cold=cold,
             )

@@ -1394,3 +1394,13 @@ release failures keep trainer storage fenced. A failed fleet round is terminal
 for this integration and requires worker replacement, rather than an implicit
 rollback or resume. This path requires the matching Miles and SGLang endpoint
 bindings; installing the MX package alone does not add an upstream HTTP endpoint.
+
+### Refit timing interval records
+
+The shared recorder retains per-span relative start/end times in addition to
+legacy accumulated stage durations. Its interval_unattributed_ms uses the union
+of located intervals, so nested spans do not double-count attributed time.
+Externally added durations remain unlocated and are not claimed in that union.
+SGLang records the opaque version ID alongside its training-step counter.
+Wall-clock anchors are diagnostic; cross-host unions require independent clock
+alignment/uncertainty evidence.
