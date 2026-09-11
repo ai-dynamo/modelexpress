@@ -133,6 +133,46 @@ ARTIFACT_INSTALL_STEPS = ("validate", "extract")
 #: pathological one (slow overlay filesystem, tar in D state) is minutes.
 _ARTIFACT_STEP_BUCKETS = (0.1, 0.25, 0.5, 1, 2.5, 5, 15, 30, 60, 120, 300)
 
+#: The phases of one P2P source attempt, in the order they run. A source attempt
+#: is one candidate in ``RdmaStrategy.load`` -- the unit ``mx_p2p_source_attempts_total``
+#: already counts -- and these partition it: every one is a disjoint interval
+#: the strategy itself brackets, so their sum is bounded by the attempt.
+#:
+#:   metadata   GetMetadata, plus the tensor-manifest fetch when the response
+#:              did not carry one. Before the transfer span opens.
+#:   prepare    the adapter readies the target model to receive
+#:   register   NIXL memory registration and the agent metadata blob
+#:   handshake  loading the peer's NIXL metadata (fetched P2P, or added from
+#:              the central record)
+#:   receive    name matching, descriptor prep, the RDMA READ, and the sync
+#:   finalize   the adapter's post-receive processing
+#:   release    dropping the remote agent
+#:
+#: ``mx_p2p_transfer_seconds`` covers everything after ``metadata``, so
+#: ``sum(phase != "metadata") <= transfer`` and ``sum(all) <= the rdma attempt``.
+#: The ``receive`` phase is the wire plus the descriptor work around it; splitting
+#: those apart would mean timing inside the NIXL manager rather than around it.
+SOURCE_ATTEMPT_PHASES = (
+    "metadata",
+    "prepare",
+    "register",
+    "handshake",
+    "receive",
+    "finalize",
+    "release",
+)
+
+#: Whether the phase returned or raised. A receive that times out at the
+#: transfer deadline and one that finishes are not the same duration, and a
+#: mean across them describes neither.
+SOURCE_ATTEMPT_PHASE_OUTCOMES = ("ok", "error")
+
+#: Ten milliseconds to ten minutes. A handshake or a metadata fetch is
+#: milliseconds, a registration is tens of milliseconds to seconds, and a receive
+#: runs from under a second on a small model to the transfer timeout on a wedged
+#: one. No existing band covers both ends.
+_ATTEMPT_PHASE_BUCKETS = (0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600)
+
 #: Longest model id kept in the ``model`` label; longer ones are truncated.
 #:
 #: This is the one label on the load families whose domain is NOT a closed enum,
@@ -218,6 +258,19 @@ def reset_multiproc_dir(path: str | None = None) -> None:
         logger.info("Reset metrics directory %s (%d stale file(s))", directory, removed)
     except OSError as e:
         logger.warning("Failed to reset metrics directory %s: %s", directory, e)
+
+
+class _PhaseSpan:
+    """Duration holder for :meth:`MetricsCollector.time_source_attempt_phase`.
+
+    Set on exit, so a caller that logs the same span reads it from here instead
+    of keeping a second clock for the same interval.
+    """
+
+    __slots__ = ("seconds",)
+
+    def __init__(self) -> None:
+        self.seconds = 0.0
 
 
 class MetricsCollector:
@@ -411,6 +464,20 @@ class MetricsCollector:
             "End-to-end transfer time in seconds.",
             ["policy", "scheme", "outcome"],  # success|retry|fallback
             buckets=(0.5, 1, 2, 5, 10, 30, 60, 120, 300),
+            registry=registry,
+        )
+        # Below the transfer: the phases of one source attempt, recorded from
+        # the strategy that brackets each of them. The transfer span above is
+        # left exactly as it was -- this is a sibling, not new labels on it, so
+        # its two panels and its place in the family list do not move.
+        self.source_attempt_phase_seconds = Histogram(
+            "mx_p2p_source_attempt_phase_seconds",
+            "Duration of one phase of a P2P source attempt: metadata, prepare, "
+            "register, handshake, receive, finalize or release. The phases "
+            "partition the attempt; all but metadata fall inside "
+            "mx_p2p_transfer_seconds.",
+            ["policy", "phase", "outcome", "scheme"],
+            buckets=_ATTEMPT_PHASE_BUCKETS,
             registry=registry,
         )
         # L0. The window the caller actually waited on: one observation per
@@ -739,6 +806,52 @@ class MetricsCollector:
                 self.transfer_seconds.labels(policy, self.scheme, outcome).observe(seconds)
             except Exception:
                 pass
+
+    def observe_source_attempt_phase_seconds(
+        self, policy: str, phase: str, outcome: str, seconds: float
+    ) -> None:
+        """Record one phase of a P2P source attempt.
+
+        An unknown phase is dropped rather than clamped: these partition the
+        attempt, and folding a stray name into a real phase would inflate it
+        while the sum still looked sound. An unknown outcome clamps to ``error``.
+        """
+        if self._ensure():
+            try:
+                if phase not in SOURCE_ATTEMPT_PHASES:
+                    return
+                if outcome not in SOURCE_ATTEMPT_PHASE_OUTCOMES:
+                    outcome = "error"
+                self.source_attempt_phase_seconds.labels(
+                    policy, phase, outcome, self.scheme
+                ).observe(seconds)
+            except Exception:
+                pass
+
+    @contextlib.contextmanager
+    def time_source_attempt_phase(self, policy: str, phase: str):
+        """Time one phase of a source attempt, recording how it ended.
+
+        Unlike a strategy attempt, a phase has two outcomes and the exception
+        path is the whole distinction, so the context manager classifies it
+        alone. A phase that raises is still recorded, as ``error``: that is what
+        lets the dashboard say which phase a failed attempt died in, and it keeps
+        a receive that ran to the transfer deadline out of the ``ok`` mean.
+
+        The yielded handle carries the measured duration after exit, for the
+        caller's own log line -- one clock per span.
+        """
+        span = _PhaseSpan()
+        start = time.perf_counter()
+        outcome = "ok"
+        try:
+            yield span
+        except BaseException:
+            outcome = "error"
+            raise
+        finally:
+            span.seconds = time.perf_counter() - start
+            self.observe_source_attempt_phase_seconds(policy, phase, outcome, span.seconds)
 
     def observe_load_seconds(
         self, engine: str, model: object, model_role: str, outcome: str, seconds: float

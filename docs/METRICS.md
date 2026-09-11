@@ -15,10 +15,11 @@ and storage-backend coverage on the server, the download lifecycle, NIXL client
 health, the Kubernetes scrape, alerting and dashboard surface, and the first two
 load-timing tiers — the `load_model()` window and the phases that partition it.
 
-The tiers below those do not exist yet. Nothing here attributes time to an
-individual strategy attempt or splits a transfer into registration, handshake
-and wire, so the dashboard can say a load spent ninety seconds in `chain` but
-not which strategy spent it or where inside the transfer it went.
+The per-strategy tier between those and the transfer is a separate change.
+Below it, a P2P source attempt is split into its phases — `metadata`,
+`prepare`, `register`, `handshake`, `receive`, `finalize`, `release` — so the
+dashboard can say not just that a transfer took ninety seconds but which of
+those it spent them in.
 
 ---
 
@@ -417,6 +418,7 @@ touched.
 | `mx_p2p_candidates` | Histogram | `policy`, `scheme`, `stage` |
 | `mx_p2p_source_selection_seconds` | Histogram | `policy`, `scheme` |
 | `mx_p2p_transfer_seconds` | Histogram | `policy`, `scheme`, `outcome` |
+| `mx_p2p_source_attempt_phase_seconds` | Histogram | `policy`, `phase`, `outcome`, `scheme` |
 | `mx_nixl_data_plane_errors_total` | Counter | `scheme`, `kind` |
 | `mx_nixl_receive_total` | Counter | `scheme`, `result` |
 | `mx_load_seconds` | Histogram | `engine`, `model`, `model_role`, `scheme`, `outcome` |
@@ -616,6 +618,59 @@ says more than no model at all, and 96 characters clears every id in the wild by
 a wide margin. An absent or blank id records as `unknown` rather than as an
 empty string, which would render as `model=""` and read as an exporter bug.
 
+### Inside a source attempt: where the transfer time went
+
+`mx_p2p_transfer_seconds` is one interval per source attempt, from the moment
+the strategy commits to a candidate until the adapter hands the weights back.
+Ninety seconds there is ambiguous: the RDMA read, or a registration that
+crawled, or a peer that took a minute to answer the handshake all look the
+same. `mx_p2p_source_attempt_phase_seconds` splits it.
+
+| Phase | What runs | Inside the transfer span |
+| --- | --- | --- |
+| `metadata` | `GetMetadata`, plus the tensor-manifest fetch when the response did not carry one | no — it runs before the span opens |
+| `prepare` | the adapter readies the target model to receive | yes |
+| `register` | NIXL memory registration and the agent metadata blob | yes |
+| `handshake` | loading the peer's NIXL metadata: fetched over P2P, or added from the central record | yes |
+| `receive` | name matching, descriptor prep, the RDMA READ, and the device sync | yes |
+| `finalize` | the adapter's post-receive processing | yes |
+| `release` | dropping the remote agent, from the `finally` | yes |
+
+One observation per phase per attempt, recorded from `RdmaStrategy` — the code
+that already brackets each of these calls — and nowhere else. Nothing inside the
+NIXL manager was touched to get them, which is why `receive` is one phase rather
+than three: separating the descriptor work from the wire would mean timing
+inside the manager instead of around it.
+
+Two invariants, both by construction:
+
+```promql
+# Phases inside the span sum to less than the transfer. The remainder is
+# descriptor bookkeeping and logging that no phase owns.
+sum(mx_p2p_source_attempt_phase_seconds_sum{phase!="metadata"})
+  <= sum(mx_p2p_transfer_seconds_sum)
+
+# Where did a failed attempt die? Every phase before it is ok, the one it died
+# in is error, and the ones after it never ran -- except release, which runs
+# from the finally.
+sum by (phase, outcome) (mx_p2p_source_attempt_phase_seconds_count)
+```
+
+`metadata` is the phase that belongs to the attempt but not to the transfer.
+It was log-timed and nothing else until now, and it is where a slow or
+unreachable metadata backend shows up — a candidate that fails there records
+`metadata` with `error` and no other phase at all, because the transfer span
+never opened.
+
+`outcome` is on the family because a receive that hit the transfer deadline and
+one that finished are not the same duration. A phase that raises is still
+recorded; it is the reading someone comes looking for.
+
+The band runs from 10 ms to 10 minutes. A handshake is milliseconds, a
+registration tens of milliseconds to seconds, a receive anything from under a
+second to the transfer timeout — no existing band covers both ends, and a
+sub-second floor would put every handshake in one bucket.
+
 ### NIXL data-plane health
 
 `mx_nixl_data_plane_errors_total{kind}` counts the failures that demote an agent
@@ -787,9 +842,9 @@ It covers the server end to end -- gRPC, storage backend, download lifecycle,
 capacity -- and the client from the load tiers down to total transfer time. The
 **Model load** row plots `mx_load_seconds`, the phase split of
 `mx_load_phase_seconds`, and the validate/extract steps inside
-`artifact_install`. Below that there is still nothing for the weight transfer
-itself — the transfer panel can say a transfer took 90 seconds but not where
-inside it the 90 seconds went.
+`artifact_install`. The **P2P clients** row now carries the transfer's own
+breakdown: a table of mean phase durations under the two transfer panels, and
+a count per phase that shows where a failed attempt died.
 
 Read **Overview** first; the rows below it answer *why* once a tile is not green.
 
@@ -799,7 +854,7 @@ Read **Overview** first; the rows below it answer *why* once a tile is not green
 | **Model load** | How long did a load take, and which part? | 5 |
 | **Downloads** | Is the primary job working, and how fast? | 6 |
 | **Server internals** | gRPC and storage backend: rate, errors, p99, in flight | 8 + 1 note |
-| **P2P clients** | Selection funnel, transfer time, NIXL health | 8 + 1 note |
+| **P2P clients** | Selection funnel, transfer time and its phases, NIXL health | 11 + 1 note |
 | **Capacity** | Map growth, evictions, version skew | 3 |
 
 Six of the eight Overview tiles are coloured by the same condition an alert fires

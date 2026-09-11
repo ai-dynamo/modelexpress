@@ -51,6 +51,8 @@ const CLIENT_FAMILIES: &[&str] = &[
     "mx_p2p_candidates_count",
     "mx_p2p_candidates_sum",
     "mx_p2p_list_sources_total",
+    "mx_p2p_source_attempt_phase_seconds_count",
+    "mx_p2p_source_attempt_phase_seconds_sum",
     "mx_p2p_source_attempts_total",
     "mx_p2p_source_selections_total",
     "mx_p2p_transfer_seconds_bucket",

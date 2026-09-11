@@ -1648,6 +1648,152 @@
       "description": "NIXL failures by classified kind. A non-zero count is what demotes an agent from READY."
     },
     {
+      "id": 116,
+      "type": "table",
+      "title": "Where a source attempt's time went",
+      "description": "Mean duration of each phase of a P2P source attempt, by outcome. This is the breakdown of the two transfer panels above: they say a transfer took ninety seconds, these rows say whether that was the registration, the handshake with the peer, or the RDMA read itself.\n\nAll phases but `metadata` fall inside mx_p2p_transfer_seconds, so they sum to less than it -- the remainder is descriptor bookkeeping and logging. `metadata` is the GetMetadata and manifest fetch that runs before the transfer span opens; it belongs to the attempt but not to the transfer.\n\nOutcome is on the table because a receive that hit the transfer deadline and one that finished are not the same duration, and a mean across the two describes neither.\n\nReads the last sample inside the dashboard range rather than the instant value. A load happens once in a process's life and the pod is often gone before anyone looks; an instant query goes empty five minutes after the last scrape, which would show this table as 0 for exactly the attempt someone came to read about.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 14,
+        "x": 0,
+        "y": 86
+      },
+      "targets": [
+        {
+          "expr": "sum by (phase, outcome) (last_over_time(mx_p2p_source_attempt_phase_seconds_sum[$__range])) / sum by (phase, outcome) (last_over_time(mx_p2p_source_attempt_phase_seconds_count[$__range]))",
+          "format": "table",
+          "instant": true,
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "0"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "phase"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 140
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "outcome"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 110
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "fields": ""
+        }
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "indexByName": {
+              "phase": 0,
+              "outcome": 1,
+              "Value": 2
+            },
+            "renameByName": {
+              "Value": "mean"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "phase",
+                "desc": false
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": 117,
+      "type": "bargauge",
+      "title": "Attempt phases recorded",
+      "description": "How many times each phase ran, by outcome. Every phase of a completed attempt records once, so on a healthy fleet these are equal and all `ok`; a phase that is short by one against its neighbours is an attempt that died before reaching it, and an `error` bar names the phase it died in.\n\nA cumulative count rather than a rate: a load happens a handful of times in a process's life, so rate() over a scrape window reads zero on a fleet that is working.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 10,
+        "x": 14,
+        "y": 86
+      },
+      "targets": [
+        {
+          "expr": "sum by (phase, outcome) (mx_p2p_source_attempt_phase_seconds_count)",
+          "legendFormat": "{{phase}}  {{outcome}}",
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0"
+        }
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true
+      }
+    },
+    {
       "id": 38,
       "type": "stat",
       "title": "Client pods exporting",
@@ -1659,7 +1805,7 @@
         "h": 6,
         "w": 6,
         "x": 0,
-        "y": 86
+        "y": 96
       },
       "targets": [
         {
@@ -1698,7 +1844,7 @@
         "h": 6,
         "w": 18,
         "x": 6,
-        "y": 86
+        "y": 96
       },
       "options": {
         "mode": "markdown",
@@ -1714,7 +1860,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 92
+        "y": 102
       },
       "panels": []
     },
@@ -1730,7 +1876,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 93
+        "y": 103
       },
       "targets": [
         {
@@ -1762,7 +1908,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 93
+        "y": 103
       },
       "targets": [
         {
@@ -1795,7 +1941,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 93
+        "y": 103
       },
       "targets": [
         {
