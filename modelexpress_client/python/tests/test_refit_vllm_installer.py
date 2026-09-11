@@ -7,14 +7,14 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
-from torch import nn
-
 from modelexpress.refit.reshard.types import IncompleteRefit
-from modelexpress_rl.inference.plan import PreparedStreamingTensors
+from modelexpress.refit.timing import RefitTimingRecorder, use_refit_timing
 from modelexpress_rl.inference.engines.vllm.installer import (
     _update_mla_absorbed_weights,
     _VllmInstaller,
 )
+from modelexpress_rl.inference.plan import PreparedStreamingTensors
+from torch import nn
 
 
 def _install_fake_vllm(monkeypatch, initialize):
@@ -196,8 +196,10 @@ def test_installer_loads_prepared_checkpoint_inside_vllm_config(monkeypatch, tmp
         device=torch.device("cpu"),
     )
     prepared = tmp_path / "prepared"
+    recorder = RefitTimingRecorder(backend="test", version="version-a")
 
-    installer.install_checkpoint(prepared)
+    with use_refit_timing(recorder):
+        installer.install_checkpoint(prepared)
 
     assert events == [
         ("loader", "safetensors"),
@@ -210,6 +212,7 @@ def test_installer_loads_prepared_checkpoint_inside_vllm_config(monkeypatch, tmp
     assert model_config.revision == "main"
     assert vllm_config.load_config.load_format == "modelexpress"
     assert synchronized == [torch.device("cpu")]
+    assert recorder.as_dict()["stages"]["post_install"]["count"] == 1
 
 
 def test_installer_caches_parameter_layout():

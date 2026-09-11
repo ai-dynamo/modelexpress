@@ -9,6 +9,12 @@ from collections.abc import Callable
 
 from modelexpress import p2p_pb2
 from modelexpress.client import MxClientBase
+from modelexpress.refit.timing import (
+    add_refit_bytes,
+    add_refit_duration,
+    refit_span,
+    set_refit_cold,
+)
 
 from ...train import WeightPayloadFormat
 from ..adapter import NixlGeneratorSource
@@ -18,16 +24,38 @@ from ..nixl_staged_transfer import (
     _StagedNixlWeights,
 )
 from ..plan import (
-    MethodCapabilities,
     GeneratorPeerUpdateSource,
+    MethodCapabilities,
     PreparedArtifact,
     PreparedEngineTensors,
     PreparedStreamingTensors,
     ResolvedSource,
     TrainerUpdateSource,
-    WeightSource,
     UpdateMethod,
+    WeightSource,
 )
+
+
+def _attribute_transfer(metrics: dict[str, float]) -> None:
+    """Hand the staging path's own measurements to the active refit cycle.
+
+    Timed inside ``_NixlStagedTransfer`` rather than here, because the wire read
+    and the reconstruction are consecutive statements in one method and cannot be
+    separated from outside it. Both numbers were already on the staged handle;
+    without this they stayed there, and the cycle charged the whole staging call
+    as a single opaque span.
+
+    ``reconstruct_s`` covers replaying the copy chain, the dtype conversions and
+    the device synchronize that makes them observable, which is receive-side
+    work on data already pulled -- so it lands in ``receive_sync`` and not in
+    ``wire_transfer``. Keeping them apart is what distinguishes a slow fabric
+    from an expensive layout.
+    """
+    add_refit_bytes(metrics.get("bytes_received", 0))
+    if "wire_s" in metrics:
+        add_refit_duration("wire_transfer", metrics["wire_s"])
+    if "reconstruct_s" in metrics:
+        add_refit_duration("receive_sync", metrics["reconstruct_s"])
 
 
 class FullTensorNixlUpdateMethod(UpdateMethod):
@@ -57,6 +85,7 @@ class FullTensorNixlUpdateMethod(UpdateMethod):
         self._enable_peer_publication = enable_peer_publication
         self._active_plan: _PreparedNixlTransfer | None = None
         self._active_fingerprint: tuple | None = None
+        self._active_manifest_digests: tuple[str, ...] = ()
         self._active_staged: _StagedNixlWeights | None = None
         self._active_streamed: PreparedStreamingTensors | None = None
 
@@ -125,6 +154,7 @@ class FullTensorNixlUpdateMethod(UpdateMethod):
             )
             self._active_plan = None
             self._active_fingerprint = None
+            self._active_manifest_digests = ()
         elif isinstance(source, TrainerUpdateSource):
             inputs = source.inputs
             if any(
@@ -136,15 +166,40 @@ class FullTensorNixlUpdateMethod(UpdateMethod):
                 self._active_plan is not None
                 and self._active_fingerprint == inputs.physical_fingerprint
             )
-            if not reusable:
-                self._active_plan = self._transfer.prepare(
-                    manifests=[item.transport.manifest for item in inputs.sources],
-                    capture_layout=self._capture_layout,
-                )
-                self._active_fingerprint = inputs.physical_fingerprint
+            set_refit_cold(not reusable)
+            manifests = [item.transport.manifest for item in inputs.sources]
+            manifest_digests = tuple(item.manifest_digest for item in inputs.sources)
+            # One span either way: planning on a cold cycle, and on a warm one
+            # the near-zero it actually costs. Two stages would make the mean
+            # over a run describe neither.
+            with refit_span(
+                "transfer_planning",
+                metadata={
+                    "plan_cache_hits": int(reusable),
+                    "plan_cache_misses": int(not reusable),
+                },
+                accumulate_metadata=True,
+            ):
+                if not reusable:
+                    self._active_plan = self._transfer.prepare(
+                        manifests=manifests,
+                        capture_layout=self._capture_layout,
+                    )
+                    self._active_fingerprint = inputs.physical_fingerprint
+            if reusable and manifest_digests != self._active_manifest_digests:
+                assert self._active_plan is not None
+                with refit_span(
+                    "source_preparation",
+                    metadata={"manifest_refreshes": 1},
+                    accumulate_metadata=True,
+                    duration_key="manifest_refresh_s",
+                ):
+                    self._transfer.refresh_sources(self._active_plan, manifests)
+            self._active_manifest_digests = manifest_digests
             staged = self._transfer.stage(self._active_plan)
         else:
             raise TypeError("full-tensor method received an unsupported source")
+        _attribute_transfer(staged.metrics)
         self._active_staged = staged
         return PreparedEngineTensors(staged=staged)
 
@@ -183,6 +238,7 @@ class FullTensorNixlUpdateMethod(UpdateMethod):
         self._active_staged = None
         self._active_plan = None
         self._active_fingerprint = None
+        self._active_manifest_digests = ()
         self._transfer.close()
 
 

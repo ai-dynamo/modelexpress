@@ -142,8 +142,10 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
 class _WorkerService(refit_pb2_grpc.RefitWorkerServiceServicer):
     def __init__(self, manifest=b"manifest"):
         self.manifest = manifest
+        self.requests = []
 
-    def GetWeightVersionShardManifest(self, _request, _context):
+    def GetWeightVersionShardManifest(self, request, _context):
+        self.requests.append(request)
         return refit_pb2.GetWeightVersionShardManifestResponse(
             manifest=self.manifest,
             manifest_digest=hashlib.sha256(self.manifest).hexdigest(),
@@ -420,9 +422,8 @@ def _start_server(*, state=None, manifest=b"manifest", manifest_digest=None):
         manifest_digest=manifest_digest or hashlib.sha256(manifest).hexdigest(),
     )
     refit_pb2_grpc.add_RefitServiceServicer_to_server(service, server)
-    refit_pb2_grpc.add_RefitWorkerServiceServicer_to_server(
-        _WorkerService(manifest), server
-    )
+    service.worker = _WorkerService(manifest)
+    refit_pb2_grpc.add_RefitWorkerServiceServicer_to_server(service.worker, server)
     p2p_service = _P2pService()
     p2p_pb2_grpc.add_P2pServiceServicer_to_server(p2p_service, server)
     service.p2p = p2p_service
@@ -686,6 +687,7 @@ def test_generator_stages_applies_releases_and_reuses_valid_plan(monkeypatch):
     assert len(adapter.publish_calls) == 1
     assert len(adapter.release_calls) == 3
     assert adapter.close_calls == 1
+    assert len(service.worker.requests) == 3
     assert [source.source_slot_id for source in adapter.create_calls[0].sources] == [
         "rank:0",
         "rank:1",
@@ -782,6 +784,28 @@ def test_generator_fetches_trainer_manifest_larger_than_grpc_default(monkeypatch
     )
 
 
+def test_generator_reports_timing_for_a_refit_that_never_staged(monkeypatch, caplog):
+    """A staging failure is the case the stage split most needs to explain, and
+    it is the one path where nothing downstream can report it: the recorder is
+    handed on through the staged handle, and there is no handle yet."""
+    monkeypatch.delenv("MX_REFIT_TIMING", raising=False)
+    server, endpoint, service = _start_server(manifest_digest="bad-digest")
+    adapter = _Adapter(service)
+    generator = _initialize(monkeypatch, endpoint, adapter)
+
+    try:
+        with (
+            caplog.at_level(logging.INFO),
+            pytest.raises(RuntimeError, match=r"no usable refit source"),
+        ):
+            generator.stage_weight(version=WeightVersionRef("version-a"))
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert "MX_REFIT_TIMING" in caplog.text
+
+
 def test_generator_reports_missing_trainer_manifest_digest(monkeypatch, caplog):
     server, endpoint, service = _start_server()
     service.shards[0].manifest_digest = ""
@@ -789,9 +813,11 @@ def test_generator_reports_missing_trainer_manifest_digest(monkeypatch, caplog):
     generator = _initialize(monkeypatch, endpoint, adapter)
 
     try:
-        with caplog.at_level(logging.WARNING):
-            with pytest.raises(RuntimeError, match=r"no usable refit source"):
-                generator.stage_weight(version=WeightVersionRef("version-a"))
+        with (
+            caplog.at_level(logging.WARNING),
+            pytest.raises(RuntimeError, match=r"no usable refit source"),
+        ):
+            generator.stage_weight(version=WeightVersionRef("version-a"))
     finally:
         generator.close()
         server.stop(grace=None).wait()
@@ -1255,6 +1281,66 @@ def test_generator_retries_with_redundant_worker_for_same_slot(monkeypatch):
     ]
 
 
+def test_generator_assembles_healthy_replicas_from_different_offsets(monkeypatch):
+    """Health is per slot, so the healthy replicas need not line up across slots.
+
+    Pairing them by a shared offset yields nothing here: the aligned pairs are
+    (trainer-0, trainer-1) and (trainer-a1, trainer-b1), and each contains one
+    unusable source, though the complete healthy set (trainer-0, trainer-b1)
+    exists the whole time.
+    """
+    server, endpoint, service = _start_server()
+    unusable = "0" * 64
+    # rank:0 keeps its first replica and gains a broken second one.
+    broken_first_slot = refit_pb2.WeightVersionShard()
+    broken_first_slot.CopyFrom(service.shards[0])
+    broken_first_slot.worker_id = "trainer-a1"
+    broken_first_slot.manifest_digest = unusable
+    # rank:1 is the mirror image: its first replica is the broken one.
+    healthy_second_slot = refit_pb2.WeightVersionShard()
+    healthy_second_slot.CopyFrom(service.shards[1])
+    healthy_second_slot.worker_id = "trainer-b1"
+    service.shards[1].manifest_digest = unusable
+    service.shards.extend([broken_first_slot, healthy_second_slot])
+    adapter = _Adapter(service)
+    generator = _initialize(
+        monkeypatch,
+        endpoint,
+        adapter,
+        source_order=(WeightSource.TRAINER,),
+    )
+
+    try:
+        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+        staged.release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert [source.worker_id for source in adapter.stage_calls[0].sources] == [
+        "trainer-0",
+        "trainer-b1",
+    ]
+
+
+def test_generator_fetches_fallback_manifest_only_after_primary_failure(monkeypatch):
+    server, endpoint, service = _start_server()
+    replica = refit_pb2.WeightVersionShard()
+    replica.CopyFrom(service.shards[0])
+    replica.worker_id = "trainer-replica"
+    service.shards.append(replica)
+    generator = _initialize(monkeypatch, endpoint, _Adapter(service))
+
+    try:
+        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+        staged.release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert len(service.worker.requests) == 2
+
+
 def test_generator_preserves_transfer_error_when_lease_cleanup_also_fails(
     monkeypatch,
 ):
@@ -1272,7 +1358,11 @@ def test_generator_preserves_transfer_error_when_lease_cleanup_also_fails(
         server.stop(grace=None).wait()
 
 
-def test_generator_reports_lease_cleanup_failure_after_success(monkeypatch):
+def test_generator_reports_lease_cleanup_failure_after_success(
+    monkeypatch,
+    caplog,
+):
+    monkeypatch.delenv("MX_REFIT_TIMING", raising=False)
     server, endpoint, service = _start_server()
     service.fail_lease_deletion = True
     adapter = _Adapter(service)
@@ -1280,10 +1370,14 @@ def test_generator_reports_lease_cleanup_failure_after_success(monkeypatch):
 
     try:
         staged = generator.stage_weight(version=WeightVersionRef("version-a"))
-        with pytest.raises(grpc.RpcError, match="lease backend unavailable"):
+        with (
+            caplog.at_level(logging.INFO),
+            pytest.raises(grpc.RpcError, match="lease backend unavailable"),
+        ):
             staged.release()
         assert staged._update.released
         assert generator._active_handle is None
+        assert "MX_REFIT_TIMING" in caplog.text
         staged.release()
         service.fail_lease_deletion = False
         service.version.uid = "version-b"

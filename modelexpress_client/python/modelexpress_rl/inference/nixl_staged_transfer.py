@@ -186,6 +186,30 @@ def _required_agent_metadata(
     }
 
 
+def _source_structure(source) -> tuple:
+    """Reduce a source to the fields a reused transfer plan has baked in.
+
+    Deliberately excludes the per-shard content digests, which are exactly what
+    a refresh replaces, and includes the addresses, which a plan holds and must
+    never be allowed to drift underneath.
+    """
+    return (
+        source.dtype,
+        tuple(source.global_shape),
+        source.elsize,
+        tuple(
+            (
+                shard.session,
+                shard.addr,
+                shard.elsize,
+                tuple(shard.shard_offset),
+                tuple(shard.shape),
+            )
+            for shard in source.shards
+        ),
+    )
+
+
 def _load_agent_metadata(
     manager: NixlTransferManager, metadata_by_agent: dict[str, bytes]
 ) -> None:
@@ -534,6 +558,28 @@ class _NixlStagedTransfer:
                 torch.cuda.synchronize(self._device)
         finally:
             self._active = prepared
+
+    def refresh_sources(
+        self, prepared: _PreparedNixlTransfer, manifests: list[bytes]
+    ) -> None:
+        """Refresh version-specific source digests without rebuilding the plan."""
+        if prepared is not self._active:
+            raise RuntimeError("NIXL transfer plan is no longer active")
+        resolved = _resolve_sources(manifests)
+        used_sources = {
+            copy.src_name: resolved.sources[copy.src_name]
+            for copy in prepared.capture.copies
+            if copy.src_name in resolved.sources
+        }
+        if set(used_sources) != set(prepared.sources):
+            raise RuntimeError("source tensor set changed while reusing transfer plan")
+        if any(
+            _source_structure(source) != _source_structure(prepared.sources[name])
+            for name, source in used_sources.items()
+        ):
+            raise RuntimeError("source geometry changed while reusing transfer plan")
+        prepared.sources.clear()
+        prepared.sources.update(used_sources)
 
     @staticmethod
     def _validate_complete(

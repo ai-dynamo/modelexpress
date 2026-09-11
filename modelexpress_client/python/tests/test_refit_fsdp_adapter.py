@@ -59,9 +59,7 @@ def test_source_slot_id_is_rank_stamped(dist_ready):
 def test_bind_tensors_validates_state_dict_and_returns_rank_slot(dist_ready):
     adapter = _adapter()
 
-    assert adapter.bind_tensors({"w": torch.ones(2, 4)}) == (
-        "publisher:global-rank:0"
-    )
+    assert adapter.bind_tensors({"w": torch.ones(2, 4)}) == ("publisher:global-rank:0")
     with pytest.raises(TypeError, match="state_dict"):
         adapter.bind_tensors([torch.ones(2, 4)])
 
@@ -81,6 +79,30 @@ def test_in_place_stage_registers_once(dist_ready):
     # Re-staging the same weights must not re-register (setup is one-time).
     _stage(adapter, state_dict)
     assert len(manager.registered) == 1
+
+
+def test_warm_stage_reuses_structural_manifest(dist_ready, monkeypatch):
+    monkeypatch.delenv("MX_RESHARD_PUBLISH_DIGEST", raising=False)
+    adapter = _adapter()
+    state_dict = {"w": torch.ones(2, 4, dtype=torch.bfloat16)}
+
+    first = _stage(adapter, state_dict)
+    state_dict["w"].fill_(2)
+    second = _stage(adapter, state_dict)
+
+    assert second.manifest is first.manifest
+
+
+def test_digest_mode_rebuilds_version_manifest(dist_ready, monkeypatch):
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
+    adapter = _adapter()
+    state_dict = {"w": torch.ones(2, 4, dtype=torch.bfloat16)}
+
+    first = _stage(adapter, state_dict)
+    state_dict["w"].fill_(2)
+    second = _stage(adapter, state_dict)
+
+    assert second.manifest.data != first.manifest.data
 
 
 def test_in_place_rejects_a_moved_source(dist_ready):

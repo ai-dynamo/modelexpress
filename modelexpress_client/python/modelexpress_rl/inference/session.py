@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import grpc
+from modelexpress.refit.timing import refit_span
 from modelexpress.types import ManifestMismatchError
 
 from ..control import WeightVersion
@@ -81,7 +82,8 @@ class WeightUpdateSession:
         self._planner.validate(version)
 
     def stage(self, version: WeightVersion) -> SessionUpdate:
-        lease = self._start_lease(version.version_id)
+        with refit_span("setup_registration"):
+            lease = self._start_lease(version.version_id)
         try:
             last_error: BaseException | None = None
             found_plan = False
@@ -149,8 +151,9 @@ class WeightUpdateSession:
             raise ValueError("version chain is empty")
         leases = []
         try:
-            for version in versions:
-                leases.append(self._start_lease(version.version_id))
+            with refit_span("setup_registration"):
+                for version in versions:
+                    leases.append(self._start_lease(version.version_id))
         except BaseException as primary_error:
             self._close_lease(
                 _LeaseGroup(leases), versions[-1].version_id, primary_error

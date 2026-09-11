@@ -8,6 +8,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from modelexpress.refit.timing import refit_span
+
 from ... import refit_pb2, refit_pb2_grpc
 from ...version import WeightVersionRef
 from ..adapter import (
@@ -80,16 +82,37 @@ class FullTensorNixlPublicationMethod:
     ) -> None:
         if not isinstance(staged, StagedWeightVersionShardData):
             raise TypeError("full-tensor publication received an invalid shard")
-        staged.publish_ready.wait()
+        with refit_span(
+            "source_preparation",
+            metadata={"staging_syncs": 1},
+            accumulate_metadata=True,
+            duration_key="staging_sync_s",
+        ):
+            staged.publish_ready.wait()
         if staged.manifest.transport.upper() != "NIXL":
             raise ValueError(
                 f"unsupported shard transport {staged.manifest.transport!r}"
             )
-        endpoint = self._manifest_publisher.publish_manifest(
-            version_id=version.version_id,
-            source_slot_id=self.source_slot_id,
-            manifest=staged.manifest,
-        )
+        # A cached property that hashes the whole manifest, so the first read is
+        # the digest being computed and every later one is free.
+        with refit_span(
+            "source_preparation",
+            metadata={"manifest_digests": 1},
+            accumulate_metadata=True,
+            duration_key="manifest_digest_s",
+        ):
+            manifest_digest = staged.manifest.digest
+        with refit_span(
+            "setup_registration",
+            metadata={"manifest_publications": 1},
+            accumulate_metadata=True,
+            duration_key="manifest_publish_s",
+        ):
+            endpoint = self._manifest_publisher.publish_manifest(
+                version_id=version.version_id,
+                source_slot_id=self.source_slot_id,
+                manifest=staged.manifest,
+            )
         if not endpoint.strip():
             raise ValueError("manifest_endpoint is required")
         shard = refit_pb2.WeightVersionShard(
@@ -98,13 +121,19 @@ class FullTensorNixlPublicationMethod:
             worker_id=self._worker_id,
             tensor_count=staged.manifest.tensor_count,
             total_bytes=staged.manifest.total_bytes,
-            manifest_digest=staged.manifest.digest,
+            manifest_digest=manifest_digest,
             manifest_endpoint=endpoint,
         )
-        self._service().CreateWeightVersionShard(
-            refit_pb2.CreateWeightVersionShardRequest(shard=shard),
-            timeout=self._rpc_timeout_seconds,
-        )
+        with refit_span(
+            "setup_registration",
+            metadata={"publication_rpcs": 1},
+            accumulate_metadata=True,
+            duration_key="publication_rpc_s",
+        ):
+            self._service().CreateWeightVersionShard(
+                refit_pb2.CreateWeightVersionShardRequest(shard=shard),
+                timeout=self._rpc_timeout_seconds,
+            )
         self.published.setdefault(version.version_id, []).append(staged)
 
     def release(self, *, version: WeightVersionRef) -> None:
@@ -117,6 +146,10 @@ class FullTensorNixlPublicationMethod:
                 worker_id=self._worker_id,
             ),
             timeout=self._rpc_timeout_seconds,
+        )
+        self._manifest_publisher.release_manifest(
+            version_id=version.version_id,
+            source_slot_id=self.source_slot_id,
         )
         del self.published[version.version_id]
 
