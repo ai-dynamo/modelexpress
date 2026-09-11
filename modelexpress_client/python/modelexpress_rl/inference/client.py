@@ -25,7 +25,7 @@ from .. import refit_pb2, refit_pb2_grpc
 from ..control import WeightVersion, WeightVersionState, _weight_version
 from ..object_storage import ObjectStorageType
 from .adapter import GeneratorEngineContext
-from .plan import WeightSource
+from .plan import WeightSource, parse_weight_source_order
 from .receiver import ObjectStorageGeneratorConfig
 from .runtime import GeneratorRuntime, initialize_generator_runtime
 from .session import SessionUpdate
@@ -43,19 +43,6 @@ def _required(value: str, name: str) -> str:
     if not value.strip():
         raise ValueError(f"{name} is required")
     return value
-
-
-def _source_order_from_env(value: str) -> tuple[WeightSource, ...]:
-    names = tuple(item.strip().upper() for item in value.split(","))
-    if not names or any(not name for name in names):
-        raise ValueError("MX_GENERATOR_SOURCE_ORDER must be a comma-separated list")
-    try:
-        return tuple(WeightSource(name) for name in names)
-    except ValueError as exc:
-        choices = ", ".join(source.value for source in WeightSource)
-        raise ValueError(
-            f"MX_GENERATOR_SOURCE_ORDER entries must be one of: {choices}"
-        ) from exc
 
 
 @dataclass(frozen=True)
@@ -100,7 +87,7 @@ class ModelExpressGeneratorConfig:
             object.__setattr__(
                 self,
                 "source_order",
-                _source_order_from_env(source_order_env),
+                parse_weight_source_order(source_order_env),
             )
         if self.registration_ttl_seconds is not None:
             rl_envs.require_positive_int(

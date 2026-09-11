@@ -607,7 +607,7 @@ def test_generator_config_explicit_source_order_overrides_env(monkeypatch):
     assert config.source_order == (WeightSource.TRAINER,)
 
 
-@pytest.mark.parametrize("value", ["", "TRAINER,", "unknown"])
+@pytest.mark.parametrize("value", ["", "TRAINER,", "unknown", "TRAINER,TRAINER"])
 def test_generator_config_rejects_invalid_source_order_env(monkeypatch, value):
     monkeypatch.setenv("MX_GENERATOR_SOURCE_ORDER", value)
 

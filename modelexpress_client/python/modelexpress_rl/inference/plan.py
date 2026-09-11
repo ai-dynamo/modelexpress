@@ -31,6 +31,23 @@ class WeightSource(str, Enum):
     OBJECT_STORAGE = "OBJECT_STORAGE"
 
 
+def parse_weight_source_order(value: str) -> tuple[WeightSource, ...]:
+    """Parse a comma-separated weight-source fallback order."""
+    names = tuple(item.strip().upper() for item in value.split(","))
+    if not names or any(not name for name in names):
+        raise ValueError("MX_GENERATOR_SOURCE_ORDER must be a comma-separated list")
+    try:
+        sources = tuple(WeightSource(name) for name in names)
+    except ValueError as exc:
+        choices = ", ".join(source.value for source in WeightSource)
+        raise ValueError(
+            f"MX_GENERATOR_SOURCE_ORDER entries must be one of: {choices}"
+        ) from exc
+    if len(set(sources)) != len(sources):
+        raise ValueError("MX_GENERATOR_SOURCE_ORDER must not contain duplicates")
+    return sources
+
+
 @dataclass(frozen=True)
 class MethodCapabilities:
     """Combinations accepted and produced by an update method."""
