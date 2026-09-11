@@ -20,10 +20,7 @@ from typing import Any
 import torch
 
 from modelexpress import envs, p2p_pb2
-from modelexpress.client import MxClientBase
-from modelexpress.load_strategy.base import unpublish_metadata_for_worker
 from modelexpress.metadata.payload import worker_tensor_descriptors
-from modelexpress.metadata.publish import publish_metadata_and_ready
 from modelexpress.nixl_transfer import NixlTransferManager
 from modelexpress.refit.reshard import throughput
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
@@ -282,7 +279,7 @@ class _NixlStagedTransfer:
         agent_name: str,
         device_id: int,
         device: torch.device,
-        listen_port: int,
+        listen_port: int | None,
         timeout_seconds: float = 1200.0,
     ) -> None:
         self._device_id = device_id
@@ -315,7 +312,6 @@ class _NixlStagedTransfer:
         self._full_registered = False
         self._active: _PreparedNixlTransfer | None = None
         self._loaded_agent_metadata: dict[str, bytes] = {}
-        self._published_peer_rank: int | None = None
         self._closed = False
 
     def prepare(
@@ -604,10 +600,9 @@ class _NixlStagedTransfer:
         source: p2p_pb2.WorkerMetadata,
         parameter_layout: dict[str, tuple[tuple[int, ...], torch.dtype]],
     ) -> _StagedNixlWeights:
-        """Pull an identical-rank peer's canonical staging buffers."""
+        """Pull an identical-rank peer's complete runtime tensor set."""
         if self._closed:
             raise RuntimeError("NIXL staged transfer is closed")
-        self.unpublish_peer()
         self._ensure_buffers(
             self._recv_buffers,
             parameter_layout,
@@ -698,48 +693,6 @@ class _NixlStagedTransfer:
             },
         )
 
-    def publish_peer(
-        self,
-        *,
-        staged: _StagedNixlWeights,
-        identity: p2p_pb2.SourceIdentity,
-        p2p_client: MxClientBase,
-        worker_rank: int,
-        worker_id: str,
-        accelerator: str,
-    ) -> None:
-        """Advertise verified canonical buffers for the applied version."""
-        previous_rank = self._published_peer_rank
-        self.unpublish_peer()
-        # Supersede any boot-time source owned by this rank before binding the
-        # shared publication slot to the exact WeightVersion identity.
-        if previous_rank != worker_rank:
-            unpublish_metadata_for_worker(
-                worker_rank=worker_rank,
-                device_id=self._device_id,
-            )
-        publish_metadata_and_ready(
-            p2p_client,
-            self._manager,
-            staged.tensors,
-            worker_rank,
-            self._device_id,
-            identity,
-            worker_id,
-            accelerator=accelerator,
-        )
-        self._published_peer_rank = worker_rank
-
-    def unpublish_peer(self) -> None:
-        """Stop advertising buffers before they are reused by another stage."""
-        if self._published_peer_rank is None:
-            return
-        unpublish_metadata_for_worker(
-            worker_rank=self._published_peer_rank,
-            device_id=self._device_id,
-        )
-        self._published_peer_rank = None
-
     def _verification_tensor(self, prepared: _PreparedNixlTransfer, name: str):
         source = prepared.sources[name]
         if name in self._full_buffers:
@@ -790,7 +743,6 @@ class _NixlStagedTransfer:
     def close(self) -> None:
         if self._closed:
             return
-        self.unpublish_peer()
         self._closed = True
         self._manager.shutdown()
 

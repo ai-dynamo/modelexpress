@@ -109,6 +109,17 @@ class PreparedEngineTensors(PreparedArtifact):
 
 
 @dataclass(frozen=True)
+class PreparedRuntimeTensors(PreparedArtifact):
+    """Post-load engine tensors ready for an in-place runtime copy."""
+
+    staged: StagedEngineTensors
+
+    @property
+    def metrics(self) -> dict[str, float]:
+        return dict(getattr(self.staged, "metrics", {}))
+
+
+@dataclass(frozen=True)
 class PreparedCheckpointArtifact(PreparedArtifact):
     checkpoint: PreparedCheckpoint
 
@@ -193,9 +204,6 @@ class UpdateMethod(ABC):
     def installation_failed(self, prepared: PreparedArtifact) -> None:
         """Fence method-owned state after an engine installation failure."""
 
-    def publish_applied(self, *, version_id: str, prepared: PreparedArtifact) -> None:
-        """Optionally advertise an installed update as a generator source."""
-
     def close(self) -> None:
         """Release method-owned process resources."""
 
@@ -238,6 +246,11 @@ class WeightUpdatePlanner:
         self._methods = methods
         self._installer = installer
         self._max_transfer_attempts = max_transfer_attempts
+
+    @property
+    def source_order(self) -> tuple[WeightSource, ...]:
+        """Return source kinds in the order configured for fallback."""
+        return tuple(resolver.kind for resolver in self._resolvers)
 
     def plans(
         self,
@@ -327,6 +340,7 @@ __all__ = [
     "PreparedArtifact",
     "PreparedCheckpointArtifact",
     "PreparedEngineTensors",
+    "PreparedRuntimeTensors",
     "ResolvedSource",
     "StagedEngineTensors",
     "TrainerUpdateSource",

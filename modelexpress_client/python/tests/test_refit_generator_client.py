@@ -191,16 +191,10 @@ class _Adapter:
         self.apply_failure = False
         self.installation_context_failure = False
         self.installation_failure_calls = []
-        self.cache_prepare_calls = []
-        self.cache_activate_calls = []
-        self.cache_release_calls = []
-        self.cache_prepare_started = threading.Event()
-        self.cache_prepare_continue = threading.Event()
-        self.cache_prepare_continue.set()
-        self.cache_prepare_failure = False
         self.preparation_failure_calls = 0
         self.preparation_recovery_failure = False
-        self.local_rank = 0
+        self.unpublish_runtime_tensors = lambda: None
+        self.publish_runtime_tensors = self._publish_runtime_tensors
 
     @property
     def worker_rank(self):
@@ -220,12 +214,14 @@ class _Adapter:
         return {"peer": source}
 
     def publish_weight_version(self, **kwargs):
-        assert self.service.active_leases
         self.publish_attempts += 1
         if self.publish_failures:
             self.publish_failures -= 1
             raise RuntimeError("publication failed")
         self.publish_calls.append(kwargs)
+
+    def _publish_runtime_tensors(self, version_id):
+        self.publish_weight_version(version_id=version_id)
 
     def create_transfer_plan(self, inputs):
         self.create_calls.append(inputs)
@@ -258,12 +254,10 @@ class _Adapter:
 
 
 class _TestMethod(UpdateMethod):
-    def __init__(self, adapter, *, publish_peer):
+    def __init__(self, adapter):
         self._adapter = adapter
-        self._publish_peer = publish_peer
         self._cached_plan = None
         self._cached_fingerprint = None
-        self._active_source = None
 
     @property
     def capabilities(self):
@@ -280,7 +274,6 @@ class _TestMethod(UpdateMethod):
         )
 
     def prepare(self, *, version, source: ResolvedSource):
-        self._active_source = source.kind
         if isinstance(source, GeneratorPeerUpdateSource):
             staged = self._adapter.stage_peer_weight(source.worker)
         else:
@@ -333,16 +326,6 @@ class _TestMethod(UpdateMethod):
         if self._adapter.preparation_recovery_failure:
             raise RuntimeError("preparation recovery failed")
 
-    def publish_applied(self, *, version_id, prepared):
-        if not self._publish_peer or self._active_source is WeightSource.OBJECT_STORAGE:
-            return
-        self._adapter.publish_weight_version(
-            version_id=version_id,
-            staged=prepared.staged,
-            p2p_client=None,
-            worker_id="generator-0",
-        )
-
     def close(self):
         self._adapter.close()
 
@@ -357,28 +340,6 @@ class _TestInstaller(EngineInstaller):
 
     def install(self, prepared):
         return self._adapter.apply_weight(prepared.staged)
-
-
-class _CacheRebuildMethod:
-    def __init__(self, adapter):
-        self._adapter = adapter
-
-    def prepare_chain(self, chain):
-        self._adapter.cache_prepare_calls.append(chain)
-        self._adapter.cache_prepare_started.set()
-        self._adapter.cache_prepare_continue.wait()
-        if self._adapter.cache_prepare_failure:
-            raise RuntimeError("cache rebuild failed")
-        return tuple(version.version_id for version, _source in chain)
-
-    def activate(self, prepared):
-        self._adapter.cache_activate_calls.append(prepared)
-
-    def release(self, prepared):
-        self._adapter.cache_release_calls.append(prepared)
-
-    def close(self):
-        pass
 
 
 def _runtime(
@@ -428,10 +389,7 @@ def _runtime(
             )
         else:
             resolvers.append(ObjectStorageSourceResolver())
-    method = _TestMethod(
-        adapter,
-        publish_peer=WeightSource.GENERATOR in source_order,
-    )
+    method = _TestMethod(adapter)
     installer = _TestInstaller(adapter)
     runtime = GeneratorRuntime(
         engine=EngineRuntime(
@@ -441,11 +399,12 @@ def _runtime(
                 FullTensorEngineCapability(
                     device_id=0,
                     device="cuda:0",
-                    local_rank=adapter.local_rank,
                     worker_rank=adapter.worker_rank,
-                    accelerator="cuda",
                     capture_layout=lambda manifest: manifest,
-                    parameter_layout=lambda: {},
+                    runtime_tensors={"weight": object()},
+                    source_worker_id=worker_id,
+                    unpublish_runtime_tensors=adapter.unpublish_runtime_tensors,
+                    publish_runtime_tensors=adapter.publish_runtime_tensors,
                     build_identity=adapter.build_p2p_identity,
                 )
                 if WeightSource.GENERATOR in source_order
@@ -462,7 +421,7 @@ def _runtime(
             ),
             start_lease=start_lease,
             resolve_replay_chain=lambda version: resolve_replay_chain(
-                version,
+                version.version_id,
                 {
                     WeightSource.GENERATOR,
                     WeightSource.OBJECT_STORAGE,
@@ -470,7 +429,6 @@ def _runtime(
             ),
         ),
         p2p_client=p2p_client,
-        source_order=source_order,
         initial_version_id=(
             object_storage.initial_base_version_id
             if object_storage is not None
@@ -515,11 +473,6 @@ def _initialize(
         client_module,
         "initialize_generator_runtime",
         lambda **kwargs: _runtime(adapter, **kwargs),
-    )
-    monkeypatch.setattr(
-        client_module,
-        "CanonicalDeltaUpdateMethod",
-        lambda **_kwargs: _CacheRebuildMethod(adapter),
     )
     return ModelExpressGeneratorClient.initialize(
         ModelExpressGeneratorConfig(
@@ -778,6 +731,35 @@ def test_generator_stages_applies_releases_and_reuses_valid_plan(monkeypatch):
         "rank:1",
     ]
     assert adapter.create_calls[0].payload_format is WeightPayloadFormat.FULL_TENSOR
+
+
+def test_generator_republishes_runtime_tensors_around_first_install(monkeypatch):
+    server, endpoint, service = _start_server()
+    adapter = _Adapter(service)
+    events = []
+    adapter.unpublish_runtime_tensors = lambda: events.append("unpublish")
+    adapter.publish_runtime_tensors = (
+        lambda version_id: events.append(f"publish:{version_id}")
+    )
+    generator = _initialize(monkeypatch, endpoint, adapter)
+
+    original_apply = adapter.apply_weight
+
+    def apply(prepared):
+        events.append("install")
+        return original_apply(prepared)
+
+    adapter.apply_weight = apply
+    try:
+        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+        assert generator.apply_weight(staged) == "installed"
+        assert generator.apply_weight(staged) == "installed"
+        staged.release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert events == ["unpublish", "install", "publish:version-a"]
 
 
 def test_generator_logs_weight_update_lifecycle(monkeypatch, caplog):
@@ -1792,13 +1774,12 @@ def test_generator_randomizes_and_limits_peers_before_trainer_fallback(monkeypat
     assert len(adapter.create_calls) == 1
 
 
-def test_object_storage_generator_uses_peer_then_rebuilds_cache(monkeypatch):
+def test_object_storage_generator_uses_peer_without_fetching_s3(monkeypatch):
     server, endpoint, service = _start_server()
     service.version.CopyFrom(_canonical_version("version-a", "base-a"))
     service.base.CopyFrom(_full_checkpoint_version("base-a"))
     _add_generator_peer(service)
     adapter = _Adapter(service)
-    adapter.cache_prepare_continue.clear()
     generator = _initialize(
         monkeypatch,
         endpoint,
@@ -1813,48 +1794,10 @@ def test_object_storage_generator_uses_peer_then_rebuilds_cache(monkeypatch):
         assert adapter.stage_calls == []
         assert generator.apply_weight(staged) == "installed"
         assert generator.apply_weight(staged) == "installed"
-        assert adapter.cache_prepare_started.wait(timeout=1)
-        assert adapter.cache_activate_calls == []
-        staged.release()
-        adapter.cache_prepare_continue.set()
-    finally:
-        adapter.cache_prepare_continue.set()
-        generator.close()
-        server.stop(grace=None).wait()
-
-    assert len(adapter.cache_prepare_calls) == 1
-    assert [
-        version.version_id
-        for version, _source in adapter.cache_prepare_calls[0]
-    ] == ["base-a", "version-a"]
-    assert len(adapter.cache_activate_calls) == 1
-    assert len(adapter.cache_release_calls) == 1
-
-
-def test_nonlocal_leader_does_not_rebuild_shared_cache(monkeypatch):
-    server, endpoint, service = _start_server()
-    service.version.CopyFrom(_canonical_version("version-a", "base-a"))
-    service.base.CopyFrom(_full_checkpoint_version("base-a"))
-    _add_generator_peer(service)
-    adapter = _Adapter(service)
-    adapter.local_rank = 1
-    generator = _initialize(
-        monkeypatch,
-        endpoint,
-        adapter,
-        object_storage=True,
-        source_order=(WeightSource.GENERATOR, WeightSource.OBJECT_STORAGE),
-    )
-
-    try:
-        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
-        assert generator.apply_weight(staged) == "installed"
         staged.release()
     finally:
         generator.close()
         server.stop(grace=None).wait()
-
-    assert adapter.cache_prepare_calls == []
 
 
 def test_object_storage_generator_falls_back_from_peer_to_full_s3_chain(monkeypatch):
@@ -1890,9 +1833,6 @@ def test_object_storage_generator_falls_back_from_peer_to_full_s3_chain(monkeypa
         generator.close()
         server.stop(grace=None).wait()
 
-    assert adapter.cache_prepare_calls == []
-
-
 def test_object_storage_generator_honors_storage_before_peer(monkeypatch):
     server, endpoint, service = _start_server()
     service.version.CopyFrom(_canonical_version("version-a", "base-a"))
@@ -1926,7 +1866,7 @@ def test_object_storage_generator_falls_back_from_storage_to_peer(monkeypatch):
     service.base.CopyFrom(_full_checkpoint_version("base-a"))
     _add_generator_peer(service)
     adapter = _Adapter(service)
-    adapter.stage_failures = 3
+    adapter.stage_failures = 1
     generator = _initialize(
         monkeypatch,
         endpoint,
@@ -1972,84 +1912,6 @@ def test_object_storage_generator_stops_when_storage_recovery_fails(monkeypatch)
     assert adapter.preparation_failure_calls == 1
     assert adapter.peer_stage_calls == []
     assert not service.active_leases
-
-
-def test_p2p_cache_rebuild_failure_does_not_roll_back_serving_version(monkeypatch):
-    server, endpoint, service = _start_server()
-    service.version.CopyFrom(_canonical_version("version-a", "base-a"))
-    service.base.CopyFrom(_full_checkpoint_version("base-a"))
-    _add_generator_peer(service)
-    adapter = _Adapter(service)
-    adapter.cache_prepare_failure = True
-    generator = _initialize(
-        monkeypatch,
-        endpoint,
-        adapter,
-        object_storage=True,
-        source_order=(WeightSource.GENERATOR, WeightSource.OBJECT_STORAGE),
-    )
-
-    try:
-        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
-        assert generator.apply_weight(staged) == "installed"
-        staged.release()
-    finally:
-        generator.close()
-        server.stop(grace=None).wait()
-
-    assert generator._serving_version_id == "version-a"
-    assert adapter.cache_activate_calls == []
-
-
-def test_superseded_p2p_cache_rebuild_coalesces_pending_versions(monkeypatch):
-    server, endpoint, service = _start_server()
-    service.version.CopyFrom(_canonical_version("version-a", "base-a"))
-    service.base.CopyFrom(_full_checkpoint_version("base-a"))
-    _add_generator_peer(service)
-    adapter = _Adapter(service)
-    adapter.cache_prepare_continue.clear()
-    generator = _initialize(
-        monkeypatch,
-        endpoint,
-        adapter,
-        object_storage=True,
-        source_order=(WeightSource.GENERATOR, WeightSource.OBJECT_STORAGE),
-    )
-
-    try:
-        first = generator.stage_weight(version=WeightVersionRef("version-a"))
-        assert generator.apply_weight(first) == "installed"
-        first.release()
-        assert adapter.cache_prepare_started.wait(timeout=1)
-
-        service.additional_versions["version-a"] = _canonical_version(
-            "version-a",
-            "base-a",
-        )
-        service.version.CopyFrom(_canonical_version("version-b", "version-a"))
-        second = generator.stage_weight(version=WeightVersionRef("version-b"))
-        assert generator.apply_weight(second) == "installed"
-        second.release()
-
-        service.additional_versions["version-b"] = _canonical_version(
-            "version-b",
-            "version-a",
-        )
-        service.version.CopyFrom(_canonical_version("version-c", "version-b"))
-        third = generator.stage_weight(version=WeightVersionRef("version-c"))
-        assert generator.apply_weight(third) == "installed"
-        third.release()
-
-        adapter.cache_prepare_continue.set()
-    finally:
-        adapter.cache_prepare_continue.set()
-        generator.close()
-        server.stop(grace=None).wait()
-
-    assert len(adapter.cache_prepare_calls) == 2
-    assert adapter.cache_activate_calls == [
-        ("base-a", "version-a", "version-b", "version-c"),
-    ]
 
 
 def test_generator_closes_adapter_when_registration_fails(monkeypatch):

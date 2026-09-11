@@ -71,6 +71,7 @@ def build_source_identity(
         expert_parallel_size=ep_size,
         dtype=dtype,
         quantization=quantization,
+        extra_parameters={"weight_layout": "runtime"},
         revision=_resolve_model_revision(model_config),
     )
 

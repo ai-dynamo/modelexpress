@@ -158,7 +158,6 @@ def _peer_stage(monkeypatch, *, nbytes: int, wire_s: float):
     transfer._manager = _Manager()
     transfer._recv_buffers = {}
     transfer._registered_recv_params = set()
-    transfer._published_peer_rank = None
     transfer._active = None
     source = p2p_pb2.WorkerMetadata(
         nixl_metadata=b"peer-metadata",

@@ -66,9 +66,9 @@ class WeightUpdateSession:
     Object storage targets are first expanded into an ordered replay chain;
     other sources retain the planner's candidate retry and fallback behavior.
     During ``apply`` the session installs the prepared artifact at the caller's
-    safe point and lets the selected method advertise the applied version when
-    that method supports peer publication. ``release`` always returns method-
-    owned staging and the version lease.
+    safe point. ``release`` always returns method-owned staging and the version
+    lease. Publication of installed runtime tensors is owned by the generator
+    runtime, independently of the source method selected for the update.
 
     For canonical object storage, the selected plan is an
     ``ObjectStorageSourceResolver`` feeding ``CanonicalDeltaUpdateMethod``,
@@ -94,10 +94,42 @@ class WeightUpdateSession:
     def stage(
         self,
         version: WeightVersion,
-        *,
-        source_kind: WeightSource | None = None,
     ) -> SessionUpdate:
-        """Prepare one target version from the selected source."""
+        """Prepare one target version using the configured source order."""
+        source_order = self._planner.source_order
+        if not source_order:
+            raise RuntimeError("no refit source is configured")
+        if WeightSource.OBJECT_STORAGE not in source_order:
+            return self._stage_one(version)
+        for source_kind in source_order[:-1]:
+            try:
+                return self._stage_source(version, source_kind=source_kind)
+            except StrategyRecoveryError:
+                raise
+            except (
+                grpc.RpcError,
+                RuntimeError,
+                ManifestMismatchError,
+            ) as error:
+                logger.info(
+                    "ModelExpress active refit version=%s source=%s unavailable: %s",
+                    version.version_id,
+                    source_kind.value,
+                    error,
+                )
+        return self._stage_source(version, source_kind=source_order[-1])
+
+    def _stage_source(
+        self,
+        version: WeightVersion,
+        *,
+        source_kind: WeightSource,
+    ) -> SessionUpdate:
+        logger.info(
+            "ModelExpress active refit version=%s trying source=%s",
+            version.version_id,
+            source_kind.value,
+        )
         if source_kind is not WeightSource.OBJECT_STORAGE:
             self._planner.validate(version, source_kind=source_kind)
             return self._stage_one(version, source_kind=source_kind)
@@ -111,7 +143,6 @@ class WeightUpdateSession:
             )
         return self._stage_replay_chain(
             versions,
-            source_kind=source_kind,
         )
 
     def _stage_one(
@@ -183,7 +214,10 @@ class WeightUpdateSession:
                 last_error = RuntimeError(
                     f"no usable refit source for weight version {version.version_id!r}"
                 )
-            assert last_error is not None
+            if last_error is None:
+                raise RuntimeError(
+                    f"no usable refit source for weight version {version.version_id!r}"
+                )
             raise last_error
         except BaseException as primary_error:
             self._close_lease(lease, version.version_id, primary_error)
@@ -192,8 +226,6 @@ class WeightUpdateSession:
     def _stage_replay_chain(
         self,
         versions: tuple[WeightVersion, ...],
-        *,
-        source_kind: WeightSource | None = None,
     ) -> SessionUpdate:
         """Prepare an already-resolved base-to-target chain atomically."""
         if not versions:
@@ -201,7 +233,7 @@ class WeightUpdateSession:
         if len(versions) == 1:
             return self._stage_one(
                 versions[0],
-                source_kind=source_kind,
+                source_kind=WeightSource.OBJECT_STORAGE,
             )
         leases = []
         try:
@@ -221,7 +253,7 @@ class WeightUpdateSession:
                     plan = next(
                         self._planner.plans(
                             version,
-                            source_kind=source_kind,
+                            source_kind=WeightSource.OBJECT_STORAGE,
                         )
                     )
                 except StopIteration as error:
@@ -285,16 +317,6 @@ class WeightUpdateSession:
                 update.installation_started = True
                 update.apply_result = update.plan.installer.install(update.prepared)
             update.applied = True
-            try:
-                update.plan.method.publish_applied(
-                    version_id=update.plan.version.version_id,
-                    prepared=update.prepared,
-                )
-            except Exception:
-                logger.exception(
-                    "failed to publish applied version %s as a P2P source",
-                    update.plan.version.version_id,
-                )
             logger.info(
                 "ModelExpress weight update version=%s installed "
                 "source=%s method=%s installer=%s",

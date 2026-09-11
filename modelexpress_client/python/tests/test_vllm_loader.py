@@ -36,6 +36,24 @@ def _make_loader():
     return loader
 
 
+def test_get_load_context_returns_completed_inference_context():
+    from modelexpress.engines.vllm import loader as loader_mod
+
+    ctx = _make_load_context(device_id=3)
+    loader_mod._load_context_registry[3] = ctx
+    try:
+        assert loader_mod.get_load_context(3) is ctx
+    finally:
+        loader_mod._load_context_registry.pop(3, None)
+
+
+def test_get_load_context_returns_none_for_unknown_device():
+    from modelexpress.engines.vllm import loader as loader_mod
+
+    loader_mod._load_context_registry.pop(99, None)
+    assert loader_mod.get_load_context(99) is None
+
+
 def _make_identity(model_name="test-model"):
     # Realistic identity: unquantized weights with dtype set, matching every
     # production vLLM/SGLang/TRT-LLM publish path. The accelerator gate treats
@@ -359,6 +377,7 @@ class TestAbstractMethodCompleteness:
         finally:
             loader_mod._nixl_managers.pop(3, None)
             loader_mod._tensor_registry.pop(3, None)
+            loader_mod._load_context_registry.pop(3, None)
 
     @pytest.mark.parametrize(
         ("ready_url", "health_gated"),
@@ -552,6 +571,7 @@ class TestMtpDrafterSecondLoad:
         finally:
             loader_mod._tensor_registry.pop(0, None)
             loader_mod._nixl_managers.pop(0, None)
+            loader_mod._load_context_registry.pop(0, None)
 
     def test_rl_drafter_is_rejected_before_initialization(self):
         """RL has no version contract for speculative draft weights."""

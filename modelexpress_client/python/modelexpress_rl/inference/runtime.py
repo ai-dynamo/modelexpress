@@ -13,11 +13,14 @@ from typing import Any
 from modelexpress import p2p_pb2
 from modelexpress.client import MxClient
 
-from .. import envs as rl_envs
 from ..control import WeightVersion
 
 from .adapter import GeneratorEngineContext
-from .methods import CanonicalDeltaUpdateMethod, FullTensorNixlUpdateMethod
+from .methods import (
+    CanonicalDeltaUpdateMethod,
+    LoadTimeTensorNixlUpdateMethod,
+    RuntimeTensorNixlUpdateMethod,
+)
 from .nixl_staged_transfer import _NixlStagedTransfer
 from .plan import (
     EngineInstaller,
@@ -39,18 +42,18 @@ logger = logging.getLogger("modelexpress_rl.inference.runtime")
 
 @dataclass(frozen=True)
 class FullTensorEngineCapability:
-    """Engine facts required by the generic full-tensor NIXL method."""
+    """Engine facts required by load-time and runtime NIXL methods."""
 
-    # Accelerator ordinal used for device access and the NIXL listen port.
+    # Accelerator ordinal used for device access by NIXL.
     device_id: int
     device: Any
-    # Process rank within one node; local rank 0 owns the shared cache rebuild.
-    local_rank: int
     # Rank in the engine's weight-transfer group; peer selection matches it.
     worker_rank: int
-    accelerator: str
     capture_layout: Callable
-    parameter_layout: Callable
+    runtime_tensors: dict[str, Any] | None
+    source_worker_id: str | None
+    unpublish_runtime_tensors: Callable[[], None]
+    publish_runtime_tensors: Callable[[str], None]
     build_identity: Callable[[str], p2p_pb2.SourceIdentity]
 
 
@@ -73,16 +76,24 @@ class GeneratorRuntime:
         methods: tuple[UpdateMethod, ...],
         session: WeightUpdateSession,
         p2p_client: MxClient | None,
-        source_order: tuple[WeightSource, ...],
         initial_version_id: str | None,
     ) -> None:
         self.engine = engine
         self.methods = methods
         self.session = session
         self.p2p_client = p2p_client
-        self.source_order = source_order
         self.initial_version_id = initial_version_id
         self._closed = False
+
+    def unpublish_runtime_tensors(self) -> None:
+        capability = self.engine.full_tensor
+        if capability is not None and capability.runtime_tensors is not None:
+            capability.unpublish_runtime_tensors()
+
+    def publish_runtime_tensors(self, version_id: str) -> None:
+        capability = self.engine.full_tensor
+        if capability is not None and capability.runtime_tensors is not None:
+            capability.publish_runtime_tensors(version_id)
 
     def close(self) -> None:
         if self._closed:
@@ -106,14 +117,29 @@ def _resolve_source_order(
     object_storage: ObjectStorageGeneratorConfig | None,
     source_order: tuple[WeightSource, ...] | None,
 ) -> tuple[WeightSource, ...]:
+    has_runtime_tensors = (
+        engine.full_tensor is not None
+        and bool(engine.full_tensor.runtime_tensors)
+    )
     if source_order is not None:
+        if (
+            WeightSource.GENERATOR in source_order
+            and not has_runtime_tensors
+            and WeightSource.OBJECT_STORAGE in source_order
+        ):
+            logger.warning(
+                "inference runtime tensors are unavailable; using object storage only"
+            )
+            return tuple(
+                source for source in source_order if source is not WeightSource.GENERATOR
+            )
         return source_order
     if object_storage is not None:
-        if engine.full_tensor is not None:
+        if has_runtime_tensors:
             return (WeightSource.GENERATOR, WeightSource.OBJECT_STORAGE)
         return (WeightSource.OBJECT_STORAGE,)
     defaults = []
-    if engine.full_tensor is not None:
+    if has_runtime_tensors:
         defaults.append(WeightSource.GENERATOR)
     defaults.append(WeightSource.TRAINER)
     return tuple(defaults)
@@ -130,7 +156,9 @@ def _validate_source_order(
     if object_storage is not None:
         supported_sources.add(WeightSource.OBJECT_STORAGE)
     if engine.full_tensor is not None:
-        supported_sources.update({WeightSource.GENERATOR, WeightSource.TRAINER})
+        supported_sources.add(WeightSource.TRAINER)
+        if engine.full_tensor.runtime_tensors:
+            supported_sources.add(WeightSource.GENERATOR)
     for source in source_order:
         if source not in supported_sources:
             raise ValueError(
@@ -139,51 +167,41 @@ def _validate_source_order(
             )
 
 
-def _needs_full_tensor(source_order: tuple[WeightSource, ...]) -> bool:
-    return any(
-        source in {WeightSource.GENERATOR, WeightSource.TRAINER}
-        for source in source_order
-    )
-
-
-def _create_full_tensor_method(
+def _create_load_time_tensor_method(
     *,
     capability: FullTensorEngineCapability,
     worker_id: str,
-    p2p_client: MxClient,
-    enable_peer_publication: bool,
-) -> FullTensorNixlUpdateMethod:
+) -> LoadTimeTensorNixlUpdateMethod:
     transfer = _NixlStagedTransfer(
-        agent_name=f"mx-refit-{worker_id}",
+        agent_name=f"mx-refit-load-time-{worker_id}",
         device_id=capability.device_id,
         device=capability.device,
-        listen_port=(
-            rl_envs.MX_REFIT_METADATA_PORT + capability.device_id
-            if enable_peer_publication
-            else None
-        ),
+        listen_port=None,
     )
-    try:
-        return FullTensorNixlUpdateMethod(
-            transfer=transfer,
-            capture_layout=capability.capture_layout,
-            parameter_layout=capability.parameter_layout,
-            build_identity=capability.build_identity,
-            worker_rank=capability.worker_rank,
-            worker_id=worker_id,
-            accelerator=capability.accelerator,
-            p2p_client=p2p_client,
-            enable_peer_publication=enable_peer_publication,
-        )
-    except BaseException:
-        try:
-            transfer.close()
-        except Exception:
-            logger.warning(
-                "failed to close NIXL transfer after initialization error",
-                exc_info=True,
-            )
-        raise
+    return LoadTimeTensorNixlUpdateMethod(
+        transfer=transfer,
+        capture_layout=capability.capture_layout,
+    )
+
+
+def _create_runtime_tensor_method(
+    *,
+    capability: FullTensorEngineCapability,
+    worker_id: str,
+) -> RuntimeTensorNixlUpdateMethod:
+    runtime_tensors = capability.runtime_tensors
+    if runtime_tensors is None:
+        raise ValueError("generator P2P requires inference runtime tensors")
+    transfer = _NixlStagedTransfer(
+        agent_name=f"mx-refit-runtime-target-{worker_id}",
+        device_id=capability.device_id,
+        device=capability.device,
+        listen_port=None,
+    )
+    return RuntimeTensorNixlUpdateMethod(
+        transfer=transfer,
+        runtime_tensors=runtime_tensors,
+    )
 
 
 def _create_resolvers(
@@ -191,21 +209,25 @@ def _create_resolvers(
     engine: EngineRuntime,
     source_order: tuple[WeightSource, ...],
     p2p_client: MxClient | None,
-    worker_id: str,
     rpc_timeout_seconds: float,
     service: Callable,
 ) -> tuple[SourceResolver, ...]:
     resolvers = []
     for source in source_order:
         if source is WeightSource.GENERATOR:
-            assert engine.full_tensor is not None
-            assert p2p_client is not None
+            capability = engine.full_tensor
+            if (
+                capability is None
+                or capability.source_worker_id is None
+                or p2p_client is None
+            ):
+                raise ValueError("generator P2P source is not initialized")
             resolvers.append(
                 GeneratorSourceResolver(
                     p2p_client=p2p_client,
-                    worker_id=worker_id,
-                    worker_rank=engine.full_tensor.worker_rank,
-                    build_identity=engine.full_tensor.build_identity,
+                    worker_id=capability.source_worker_id,
+                    worker_rank=capability.worker_rank,
+                    build_identity=capability.build_identity,
                     rpc_timeout_seconds=rpc_timeout_seconds,
                 )
             )
@@ -255,7 +277,7 @@ def initialize_generator_runtime(
     service: Callable,
     start_lease: Callable[[str], Any],
     resolve_replay_chain: Callable[
-        [WeightVersion, bool], tuple[WeightVersion, ...]
+        [str, bool], tuple[WeightVersion, ...]
     ]
     | None = None,
 ) -> GeneratorRuntime:
@@ -278,27 +300,37 @@ def initialize_generator_runtime(
     p2p_client = None
     try:
         if WeightSource.OBJECT_STORAGE in resolved_source_order:
-            assert object_storage is not None
+            if object_storage is None:
+                raise ValueError("object storage source requires configuration")
             methods.append(
                 CanonicalDeltaUpdateMethod(
                     model_name=engine.model_name,
                     config=object_storage,
                 )
             )
-        if _needs_full_tensor(resolved_source_order):
-            assert engine.full_tensor is not None
+        if any(
+            source in {WeightSource.GENERATOR, WeightSource.TRAINER}
+            for source in resolved_source_order
+        ):
+            if engine.full_tensor is None:
+                raise ValueError("full-tensor source requires engine support")
+            p2p_method_start = len(methods)
             try:
-                p2p_client = MxClient(server_url=server_url)
-                methods.append(
-                    _create_full_tensor_method(
-                        capability=engine.full_tensor,
-                        worker_id=worker_id,
-                        p2p_client=p2p_client,
-                        enable_peer_publication=(
-                            WeightSource.GENERATOR in resolved_source_order
-                        ),
+                if WeightSource.TRAINER in resolved_source_order:
+                    methods.append(
+                        _create_load_time_tensor_method(
+                            capability=engine.full_tensor,
+                            worker_id=worker_id,
+                        )
                     )
-                )
+                if WeightSource.GENERATOR in resolved_source_order:
+                    p2p_client = MxClient(server_url=server_url)
+                    methods.append(
+                        _create_runtime_tensor_method(
+                            capability=engine.full_tensor,
+                            worker_id=worker_id,
+                        )
+                    )
             except Exception as error:
                 if WeightSource.OBJECT_STORAGE not in resolved_source_order:
                     raise
@@ -306,6 +338,15 @@ def initialize_generator_runtime(
                     "P2P initialization failed; using object storage only: %s",
                     error,
                 )
+                for method in methods[p2p_method_start:]:
+                    try:
+                        method.close()
+                    except Exception:
+                        logger.warning(
+                            "failed to close unavailable P2P method",
+                            exc_info=True,
+                        )
+                del methods[p2p_method_start:]
                 if p2p_client is not None:
                     try:
                         p2p_client.close()
@@ -330,7 +371,6 @@ def initialize_generator_runtime(
                         engine=engine,
                         source_order=resolved_source_order,
                         p2p_client=p2p_client,
-                        worker_id=worker_id,
                         rpc_timeout_seconds=rpc_timeout_seconds,
                         service=service,
                     ),
@@ -343,13 +383,12 @@ def initialize_generator_runtime(
                     None
                     if resolve_replay_chain is None
                     else lambda version: resolve_replay_chain(
-                        version,
+                        version.version_id,
                         replay_from_full_root,
                     )
                 ),
             ),
             p2p_client=p2p_client,
-            source_order=resolved_source_order,
             initial_version_id=(
                 object_storage.initial_base_version_id
                 if WeightSource.OBJECT_STORAGE in resolved_source_order

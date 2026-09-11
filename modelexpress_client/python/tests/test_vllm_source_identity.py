@@ -151,6 +151,7 @@ def test_build_source_identity_carries_the_remaining_vllm_fields():
     assert identity.dtype == "bfloat16"
     assert identity.quantization == "fp8"
     assert identity.revision == "abc123"
+    assert identity.extra_parameters["weight_layout"] == "runtime"
 
 
 def test_expert_parallel_config_never_reads_a_nonexistent_attribute():

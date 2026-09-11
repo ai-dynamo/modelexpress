@@ -57,6 +57,12 @@ logger = logging.getLogger(__name__)
 # Global storage for tensor metadata, keyed by device_id (local CUDA ordinal).
 _tensor_registry: dict[int, dict[str, torch.Tensor]] = {}
 _nixl_managers: dict[int, NixlTransferManager] = {}
+_load_context_registry: dict[int, LoadContext] = {}
+
+
+def get_load_context(device_id: int) -> LoadContext | None:
+    """Return the completed inference load context for one local device."""
+    return _load_context_registry.get(device_id)
 
 
 class MxModelLoader(BaseModelLoader):
@@ -140,6 +146,7 @@ class MxModelLoader(BaseModelLoader):
                         model = run_load_strategy_chain(model, ctx)
 
                     if ctx.p2p_enabled:
+                        _load_context_registry[ctx.device_id] = ctx
                         _tensor_registry[ctx.device_id] = ctx.tensors
                         if ctx.nixl_manager is not None:
                             _nixl_managers[ctx.device_id] = ctx.nixl_manager

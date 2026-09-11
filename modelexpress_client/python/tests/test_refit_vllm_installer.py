@@ -13,6 +13,7 @@ from modelexpress_rl.inference.engines.vllm.installer import (
     _update_mla_absorbed_weights,
     _VllmInstaller,
 )
+from modelexpress_rl.inference.plan import PreparedRuntimeTensors
 from torch import nn
 
 
@@ -176,28 +177,73 @@ def test_installer_loads_prepared_checkpoint_inside_vllm_config(monkeypatch, tmp
     assert recorder.as_dict()["stages"]["post_install"]["count"] == 1
 
 
-def test_installer_caches_parameter_layout():
-    twin = nn.Module()
-    twin.register_parameter(
-        "weight",
-        nn.Parameter(torch.empty((2, 3), dtype=torch.float16)),
+def test_installer_copies_runtime_tensors_in_place(monkeypatch):
+    live = {
+        "weight": torch.tensor([1.0, 2.0]),
+        "runtime_buffer": torch.tensor([3.0]),
+    }
+    original_pointers = {name: tensor.data_ptr() for name, tensor in live.items()}
+    refreshed = []
+    synchronized = []
+    monkeypatch.setattr(torch.cuda, "synchronize", synchronized.append)
+    installer = _VllmInstaller(
+        model=nn.Module(),
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
+        runtime_tensors=live,
+        refresh_runtime_state=lambda: refreshed.append(True),
     )
-    calls = []
-    installer = object.__new__(_VllmInstaller)
-    installer._parameter_layout = None
+    staged = type(
+        "Staged",
+        (),
+        {
+            "tensors": {
+                "weight": torch.tensor([7.0, 8.0]),
+                "runtime_buffer": torch.tensor([9.0]),
+            },
+            "metrics": {},
+        },
+    )()
 
-    def build_meta_twin():
-        calls.append("build")
-        return twin
+    installer.install(PreparedRuntimeTensors(staged=staged))
 
-    installer._build_meta_twin = build_meta_twin
+    assert torch.equal(live["weight"], torch.tensor([7.0, 8.0]))
+    assert torch.equal(live["runtime_buffer"], torch.tensor([9.0]))
+    assert {name: tensor.data_ptr() for name, tensor in live.items()} == original_pointers
+    assert refreshed == [True]
+    assert synchronized == [torch.device("cpu")]
 
-    first = installer.parameter_layout()
-    second = installer.parameter_layout()
 
-    assert first == {"weight": ((2, 3), torch.float16)}
-    assert second is first
-    assert calls == ["build"]
+def test_installer_validates_all_runtime_tensors_before_copying():
+    live = {
+        "a": torch.tensor([1.0]),
+        "b": torch.tensor([2.0]),
+    }
+    installer = _VllmInstaller(
+        model=nn.Module(),
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
+        runtime_tensors=live,
+        refresh_runtime_state=lambda: None,
+    )
+    staged = type(
+        "Staged",
+        (),
+        {
+            "tensors": {
+                "a": torch.tensor([7.0]),
+                "b": torch.tensor([8.0, 9.0]),
+            },
+            "metrics": {},
+        },
+    )()
+
+    with pytest.raises(IncompleteRefit, match="metadata differs"):
+        installer.install(PreparedRuntimeTensors(staged=staged))
+
+    assert torch.equal(live["a"], torch.tensor([1.0]))
 
 
 def test_installer_rejects_quantized_mla_derived_weight_refresh():
