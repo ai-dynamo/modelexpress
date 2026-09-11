@@ -3,8 +3,8 @@
 
 """Unit tests for Mooncake and etcd environment promotion.
 
-``modelexpress.mooncake_env`` is a leaf module that only uses the standard
-library, so the promotion logic itself has no torch/mooncake dependency.
+``modelexpress.metadata.mooncake_env`` is a leaf module that only uses the
+standard library, so the promotion logic itself has no torch/mooncake dependency.
 Importing the module still executes ``modelexpress/__init__.py``, so running
 these tests requires the client dependencies (torch, grpc) to be installed.
 """
@@ -15,7 +15,7 @@ import os
 
 import pytest
 
-from modelexpress.mooncake_env import mx_mc_env_override
+from modelexpress.metadata.mooncake_env import mx_mc_env_override
 
 _MOONCAKE_ENV_PREFIXES = ("MX_MC_", "MC_", "MX_ETCD_", "ETCD_")
 

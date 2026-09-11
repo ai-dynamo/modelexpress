@@ -30,7 +30,7 @@ from uuid import uuid4
 import torch
 
 from .. import envs, p2p_pb2
-from ..mooncake_env import mx_mc_env_override
+from .mooncake_env import mx_mc_env_override
 from .artifact_manifest import (
     DEFAULT_ARTIFACT_TRANSFER_CHUNK_SIZE,
     _crc32c_hex,

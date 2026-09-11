@@ -24,7 +24,7 @@ import os
 from contextlib import contextmanager
 from typing import Iterator
 
-logger = logging.getLogger("modelexpress.mooncake_env")
+logger = logging.getLogger("modelexpress.metadata.mooncake_env")
 
 # Mooncake uses ``MC_*`` while its etcd client reads ``ETCD_*``.
 _PROMOTION_PREFIXES = (
