@@ -533,6 +533,45 @@ deploy, and need `metrics.clientPodMonitor` with a selector you supply.
 See [METRICS.md](METRICS.md) for the discovery models, the alert runbook and the
 dashboard.
 
+### FSDP refit tensor precision
+
+The FSDP publisher transfers floating tensors in BF16 by default. Frameworks
+whose models require higher precision for selected tensors can provide exact
+state-dict names through the trainer context:
+
+```python
+import torch
+from modelexpress_rl import FSDPTrainerContext, ModelExpressTrainerConfig
+
+config = ModelExpressTrainerConfig(
+    engine_context=FSDPTrainerContext(
+        wire_dtype_overrides={"model.layers.0.mlp.router.selection_bias": torch.float32},
+    ),
+    model_name="my-model",
+    device_id=0,
+    server_url="localhost:8001",
+)
+```
+
+Model-specific name selection belongs to the framework. Overrides accept
+`torch.float16`, `torch.bfloat16`, and `torch.float32`; these are unquantized
+tensor dtypes, not packed FP8/FP4 format support. Other tensors retain the BF16
+default. An unknown name or non-floating tensor is rejected rather than silently
+ignoring a precision exception. Names must match the state dict supplied by that
+trainer, including any wrapper prefixes.
+
+`COPY_TO_DEVICE` registers persistent buffers in each selected dtype and copies
+subsequent versions into those buffers. `IN_PLACE` requires the source dtype to
+match the selected dtype. The adapter copies the override mapping at creation;
+changing the caller's mapping does not change an active adapter. A source dtype
+change after initialization is rejected before writing a new version. Recreate
+the adapter and rebind when the model's precision policy changes.
+
+Manifests describe each served tensor's dtype and element size, and byte totals
+sum their actual sizes. Existing receiver dtype conversion remains available,
+but casting a rounded BF16 value back to FP32 cannot recover source precision.
+Verify installed parameters and generation separately from transfer completion.
+
 ### Dynamo Model Cache Deployment
 
 For deploying ModelExpress alongside Dynamo with a vLLM worker:
