@@ -1301,6 +1301,18 @@ Metrics include `staging_peak_bytes`, `batches`, `bytes_received`, `wire_s`, and
 `reconstruct_s`; wire time excludes installation. GPU validation is required
 for each target model and topology before performance qualification.
 
+Streaming reports independent `streaming_total_s`, `streaming_prepare_s`,
+`streaming_apply_s`, and `streaming_release_s` intervals. Preparation contains
+`source_metadata_s`, `layout_capture_s`, `transfer_planning_s`, and
+`connection_registration_s`; the remaining preparation time includes version
+discovery and lease/control operations. Application contains NIXL `wire_s`,
+`reconstruct_s`, `install_commit_s` (including CUDA completion), `reload_s`, and
+`derived_refresh_s`. The ordinary `perf/mx_receive_install_time` is not emitted
+for streaming because its application interval includes network reads.
+Do not sum nested parent and child intervals or maxima from different ranks.
+Preserve raw samples and expose residual/unattributed time against the independent
+total rather than describing the entire streaming operation as wire or install.
+
 | Model | Total Data | Transfer Time | Per-Worker Speed |
 |-------|-----------|---------------|------------------|
 | DeepSeek-V3 (671B, FP8) | 681 GB (8 GPUs) | ~15 seconds | ~45 Gbps |

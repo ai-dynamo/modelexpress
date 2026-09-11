@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import threading
 import uuid
 from dataclasses import dataclass
@@ -367,10 +368,12 @@ class ModelExpressGeneratorClient:
             if self._active_handle is not None:
                 raise RuntimeError("another generator update is still active")
             assert self._runtime is not None
+            started = time.perf_counter()
             update = self._runtime.session.prepare_streaming(
                 self._get_ready_version(version.version_id),
                 max_staging_bytes=max_staging_bytes,
             )
+            prepare_s = time.perf_counter() - started
             staged = StagedWeightHandle(
                 client=self, version_id=version.version_id, update=update
             )
@@ -387,7 +390,11 @@ class ModelExpressGeneratorClient:
                     )
                 raise
             else:
+                release_started = time.perf_counter()
                 self._release_staged(staged)
+                metrics["streaming_prepare_s"] = prepare_s
+                metrics["streaming_release_s"] = time.perf_counter() - release_started
+                metrics["streaming_total_s"] = time.perf_counter() - started
                 return metrics
 
     def apply_weight(self, staged: StagedWeightHandle) -> Any:

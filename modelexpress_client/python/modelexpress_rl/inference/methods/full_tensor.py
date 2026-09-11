@@ -77,7 +77,7 @@ class FullTensorNixlUpdateMethod(UpdateMethod):
             capture_layout=self._capture_layout,
             max_staging_bytes=max_staging_bytes,
         )
-        metrics = {}
+        metrics = dict(prepared.metrics)
         self._active_streamed = PreparedStreamingTensors(
             batches=lambda: self._transfer.iter_bounded(prepared, metrics),
             parameter_names=frozenset(

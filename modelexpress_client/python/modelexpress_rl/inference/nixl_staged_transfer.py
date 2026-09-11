@@ -15,7 +15,7 @@ import logging
 import math
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -97,6 +97,7 @@ class _PreparedBoundedTransfer:
     batches: tuple[_BoundedBatch, ...]
     sources: dict
     transport: NixlReshardTransport
+    metrics: dict[str, float] = field(default_factory=dict)
 
 
 def _bounded_batches(capture, parameter_layout, sources, max_staging_bytes):
@@ -373,12 +374,17 @@ class _NixlStagedTransfer:
             raise RuntimeError("NIXL staged transfer is closed")
         if max_staging_bytes is not None and self._device.type != "cuda":
             raise ValueError("bounded NIXL staging requires a CUDA device")
+        phase_started = time.perf_counter()
         resolved = _resolve_sources(manifests)
         manifest = [
             (name, source.dtype, tuple(source.global_shape))
             for name, source in resolved.sources.items()
         ]
+        metrics = {"source_metadata_s": time.perf_counter() - phase_started}
+        phase_started = time.perf_counter()
         capture, parameter_layout = capture_layout(manifest)
+        metrics["layout_capture_s"] = time.perf_counter() - phase_started
+        phase_started = time.perf_counter()
         plan = _plan_staged_transfer(capture, resolved.sources)
         self._validate_complete(capture, parameter_layout, plan)
         batches = None
@@ -390,6 +396,8 @@ class _NixlStagedTransfer:
             raise RuntimeError(
                 "cannot mix full-copy and bounded staging in one transfer"
             )
+        metrics["transfer_planning_s"] = time.perf_counter() - phase_started
+        phase_started = time.perf_counter()
         required_metadata = _required_agent_metadata(plan, resolved)
         if batches is not None:
             for batch in batches:
@@ -436,7 +444,10 @@ class _NixlStagedTransfer:
                 )
             if self._bounded_arena.numel() > max_staging_bytes:
                 raise RuntimeError("existing bounded arena exceeds the requested limit")
-            prepared = _PreparedBoundedTransfer(batches, resolved.sources, transport)
+            metrics["connection_registration_s"] = time.perf_counter() - phase_started
+            prepared = _PreparedBoundedTransfer(
+                batches, resolved.sources, transport, metrics
+            )
             self._active = prepared
             return prepared
         self._ensure_workspace(plan, parameter_layout)
@@ -684,8 +695,8 @@ class _NixlStagedTransfer:
             metrics={
                 "bytes_received": bytes_received,
                 "segments": len(prepared.descriptors),
-                "wire_s": round(wire_seconds, 6),
-                "reconstruct_s": round(reconstruct_seconds, 6),
+                "wire_s": wire_seconds,
+                "reconstruct_s": reconstruct_seconds,
                 "full_pull_sources": len(prepared.plan.full_pulls),
                 "converts": len(prepared.plan.converts),
             },

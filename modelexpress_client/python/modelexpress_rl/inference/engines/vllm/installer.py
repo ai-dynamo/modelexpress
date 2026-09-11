@@ -84,6 +84,7 @@ class _VllmInstaller(EngineInstaller):
             self.install_tensors(prepared.staged.tensors)
         elif isinstance(prepared, PreparedStreamingTensors):
             self.install_streaming(prepared)
+            return {"streaming_apply_s": time.perf_counter() - started}
         elif isinstance(prepared, PreparedCheckpointArtifact):
             checkpoint = prepared.checkpoint
             if not isinstance(checkpoint, PreparedCheckpoint):
@@ -226,7 +227,13 @@ class _VllmInstaller(EngineInstaller):
                 "bounded streaming currently requires an unquantized engine"
             )
 
+        metrics = prepared.transfer_metrics
+        load_s = 0.0
+        commit_s = 0.0
+
         def load():
+            nonlocal load_s, commit_s
+            load_started = time.perf_counter()
             expected = set(dict(self._model.named_parameters()))
             if expected != prepared.parameter_names:
                 raise IncompleteRefit(
@@ -250,6 +257,7 @@ class _VllmInstaller(EngineInstaller):
                             raise IncompleteRefit(
                                 "streaming batch splits an owning module"
                             )
+                    commit_started = time.perf_counter()
                     self._process_and_commit(tensors, reload=False)
                     arena_storage = {
                         tensor.untyped_storage().data_ptr()
@@ -274,16 +282,24 @@ class _VllmInstaller(EngineInstaller):
                                 "engine retained bounded staging storage; restart required"
                             )
                     installed.update(names)
+                    torch.cuda.synchronize(self._device)
+                    commit_s += time.perf_counter() - commit_started
             finally:
                 batches.close()
             if installed != expected:
                 raise IncompleteRefit(
                     "streaming transfer ended before every parameter was installed"
                 )
+            load_s = time.perf_counter() - load_started
 
+        reload_started = time.perf_counter()
         self._reload(load)
+        metrics["reload_s"] = time.perf_counter() - reload_started - load_s
+        metrics["install_commit_s"] = commit_s
+        derived_started = time.perf_counter()
         _update_mla_absorbed_weights(self._model, quantized=False)
         torch.cuda.synchronize(self._device)
+        metrics["derived_refresh_s"] = time.perf_counter() - derived_started
 
     def install_checkpoint(self, path: str | Path) -> None:
         """Reload a prepared safetensors checkpoint into the live model."""

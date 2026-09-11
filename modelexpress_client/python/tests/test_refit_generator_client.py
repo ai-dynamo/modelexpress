@@ -1376,6 +1376,7 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
             assert kwargs["max_staging_bytes"] == 512
             assert service.active_leases
             return SimpleNamespace(
+                metrics={},
                 batches=[
                     SimpleNamespace(layouts=({"a.weight": None, "b.weight": None},))
                 ]
