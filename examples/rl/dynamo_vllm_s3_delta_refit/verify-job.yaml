@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mx-s3-refit-restart-verify
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      serviceAccountName: mx-s3-refit-orchestrator
+      restartPolicy: Never
+      imagePullSecrets:
+      - {name: nvcr-imagepullsecret}
+      volumes:
+      - name: scripts
+        configMap: {name: mx-s3-refit-scripts}
+      containers:
+      - name: verify
+        image: ${WORKER_IMAGE}
+        command: [python3, /opt/e2e/orchestrate.py]
+        envFrom:
+        - secretRef: {name: hf-token-secret}
+        env:
+        - {name: MODEL_NAME, value: "${MODEL_NAME}"}
+        - {name: RUN_ID, value: "${RUN_ID}"}
+        - {name: EXPECTED_WORKERS, value: "2"}
+        - {name: TEST_MODE, value: verify}
+        - {name: MX_SERVER_ADDRESS, value: "mx-s3-refit-server:8000"}
+        - {name: AWS_ENDPOINT_URL, value: "http://mx-s3-refit-minio:9000"}
+        - {name: AWS_DEFAULT_REGION, value: us-east-1}
+        resources:
+          requests: {cpu: "1", memory: 1Gi}
+          limits: {memory: 2Gi}
+        volumeMounts:
+        - {name: scripts, mountPath: /opt/e2e}

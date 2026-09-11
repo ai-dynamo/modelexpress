@@ -570,15 +570,39 @@ creating a second Refit peer registry. A generator serving an exact version
 publishes its normal `SourceIdentity` with `revision=WeightVersion.uid`; another
 generator queries `P2pService.ListSources` with the same engine-compatible
 identity and selects a READY source for its worker rank before falling back to
-trainer shard publications. Applied generators publish their verified canonical
-staging buffers—not engine-specific packed kernel tensors—under that identity.
-An identical-rank peer pulls those buffers directly with NIXL, then uses the
-same graph-safe engine installer as a trainer update.
+trainer shard publications. Applied generators publish their complete post-load
+runtime tensors, including registered runtime buffers. An identical-rank peer
+pulls that exact runtime representation into private staging buffers, then
+copies it into the existing live tensor storage at the engine safe point.
+Trainer NIXL inputs remain a separate load-time representation that runs through
+vLLM's normal post-weight-load processing.
 
-An object-storage generator defaults to a same-rank generator peer first and the
-version-level object-storage source second. A memory-backed generator defaults
-to a peer first and trainer manifests second. `source_order` can select or
-reorder supported sources without changing an engine integration.
+The vLLM inference loader discovers this post-load tensor set once and retains
+the device-local mapping. The RL runtime reuses that mapping for peer layout
+validation, publication, and in-place installation instead of walking the model
+again after warmup or compilation. It also borrows the loader-owned NIXL agent:
+live tensors and private receive buffers are separate registrations on one
+rank-local transport, and the loader retains responsibility for shutting it
+down. This warm-copy path is currently unavailable for quantized models and FP8
+KV caches because their derived host state cannot be safely refreshed in place.
+Those workers skip generator P2P and use the canonical S3 path before any
+live-engine mutation.
+
+An object-storage generator with full-tensor engine support defaults to a
+same-rank generator peer first and the version-level object-storage source
+second. Engines without that support use object storage directly. An explicit
+`source_order` may select object storage only or combine `GENERATOR` and
+`OBJECT_STORAGE` in either order. A memory-backed generator defaults to a peer
+first and trainer manifests second. If the rank-local NIXL transport cannot be
+initialized, an object-storage generator drops the peer attempt and remains
+available with object storage as its only source.
+
+For an active refit, the peer lookup is for the exact target UID. If no peer can
+prepare that version, the generator resolves the full canonical lineage from
+its `FULL_HF_CHECKPOINT` root through the target deltas, then synchronously
+reconstructs and installs the target. A successful peer refit does not rebuild
+the canonical checkpoint in the background; object storage is consulted only
+when a later refit cannot use P2P.
 
 The canonical receiver retains each full checkpoint and delta payload under its
 version, then writes a resolved chain manifest. A full target is directly
@@ -587,8 +611,9 @@ checkpoint into a version-scoped derived checkpoint. Later sequential deltas
 rename the active materialization and apply only the incoming XOR delta in
 place, avoiding another full-model copy. Canonical artifacts are never modified
 during reconstruction, and derived checkpoints can be rebuilt from the lineage.
-If an in-place delta fails, the cache remains `UPDATING` until initialization
-rebuilds it; the running engine retains its previously installed weights.
+If an in-place delta fails, the cache remains `UPDATING` until the active refit
+session or the next initialization restores the immutable full root. The running
+engine retains its previously installed weights.
 
 Under the local checkpoint lock, preparation state advances from `READY` to
 `UPDATING` before artifact construction and back to `READY(target)` only after
@@ -937,12 +962,12 @@ RL framework integrations live in the separate `modelexpress_rl` package:
 | `inference/engines/vllm/control.py` | Direct vLLM Control gRPC client |
 | `inference/engines/vllm/startup_probe.py` | Serving-version reconciliation and startup gate |
 | `inference/source/` | Independent generator-peer, trainer-memory, and object-storage discovery |
-| `inference/methods/` | Independent full-tensor NIXL and canonical-checkpoint preparation |
+| `inference/methods/` | Trainer load-time tensor, generator runtime tensor, and canonical-checkpoint preparation |
 | `inference/checkpoint_store.py` | Host-local immutable lineage, locking, temporary-directory promotion, atomic JSON persistence, artifact fingerprints, and activation state |
 | `inference/receiver.py` | Canonical S3 index/shard decoding, full-checkpoint validation, and XOR reconstruction into derived checkpoints |
 | `inference/load_strategy.py` | RL cold-start policy: exact desired-version P2P, canonical S3 replay, and version-agnostic fallback when no desired version is configured |
 | `inference/version_chain.py` | Shared validation and resolution of immutable full-checkpoint and delta lineage |
-| `inference/nixl_staged_transfer.py` | Private engine-neutral exact-manifest NIXL planning, transfer, reusable buffers, and verification |
+| `inference/nixl_staged_transfer.py` | Private engine-neutral exact-manifest NIXL planning, transfer, reusable destination buffers, and verification |
 | `inference/engines/sglang/` | SGLang context and native checkpoint installer |
 | `inference/engines/vllm/context.py` | Public typed vLLM objects passed to `ModelExpressGeneratorClient.initialize()` |
 | `inference/engines/vllm/installer.py` | Private vLLM load-layout capture plus graph-safe tensor or prepared-checkpoint installation |
@@ -985,13 +1010,13 @@ Thin orchestration layer that delegates to `LoadStrategyChain.run()`. Builds a `
 
 ### vLLM Refit Installation
 
-The vLLM integration exposes engine installation and full-tensor target geometry
-to `GeneratorRuntime`; it does not select a transport or source. Runtime
-composition adds the NIXL full-tensor method when generator or trainer memory is
-requested and adds the canonical-checkpoint method when object storage is
+The vLLM integration exposes engine installation and tensor geometry to
+`GeneratorRuntime`; it does not select a transport or source. Runtime composition
+uses separate NIXL methods for trainer load-time tensors and generator runtime
+tensors, and adds the canonical-checkpoint method when object storage is
 configured. XOR deltas mutate an exact base; full HF checkpoints stream tensors
 into the existing mmap-backed checkpoint and become the base for later deltas.
-Both methods feed the shared private installer, which commits staged tensors or
+All methods feed the shared private installer, which commits staged tensors or
 reloads a prepared checkpoint through vLLM's graph-safe layerwise reload path.
 
 The ModelExpress vLLM plugin registers one `modelexpress` native weight-transfer
@@ -1060,11 +1085,12 @@ work.
 
 `modelexpress_rl/inference/nixl_staged_transfer.py` owns exact-manifest planning,
 registered staging buffers, transfer, and verification. The vLLM-specific
-`installer.py` captures geometry on an unquantized meta twin and installs verified
-tensors through vLLM's layerwise reload and `process_weights_after_loading` path.
-The adapter composes those modules and rebuilds the plan when validated source
-manifests change; an incompatible destination staging layout requires an engine
-restart.
+`installer.py` captures trainer load-time geometry through layerwise reload and
+installs it through `process_weights_after_loading`. Generator peers instead
+transfer the complete post-load runtime tensor set and copy it into existing
+live storage without re-running PWAL. The adapter rebuilds a trainer plan when
+validated source manifests change; an incompatible destination staging layout
+requires an engine restart.
 
 See the [RL weight refit overview](../modelexpress_client/python/modelexpress/refit/README.md)
 for the end-to-end design, integration contract, implementation status, and

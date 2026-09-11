@@ -25,9 +25,9 @@ from .. import refit_pb2, refit_pb2_grpc
 from ..control import WeightVersion, WeightVersionState, _weight_version
 from ..object_storage import ObjectStorageType
 from .adapter import GeneratorEngineContext
-from .plan import WeightSource
+from .plan import WeightSource, parse_weight_source_order
 from .receiver import ObjectStorageGeneratorConfig
-from .runtime import GeneratorRuntime
+from .runtime import GeneratorRuntime, initialize_generator_runtime
 from .session import SessionUpdate
 from .version_chain import resolve_replay_chain
 
@@ -43,19 +43,6 @@ def _required(value: str, name: str) -> str:
     if not value.strip():
         raise ValueError(f"{name} is required")
     return value
-
-
-def _source_order_from_env(value: str) -> tuple[WeightSource, ...]:
-    names = tuple(item.strip().upper() for item in value.split(","))
-    if not names or any(not name for name in names):
-        raise ValueError("MX_GENERATOR_SOURCE_ORDER must be a comma-separated list")
-    try:
-        return tuple(WeightSource(name) for name in names)
-    except ValueError as exc:
-        choices = ", ".join(source.value for source in WeightSource)
-        raise ValueError(
-            f"MX_GENERATOR_SOURCE_ORDER entries must be one of: {choices}"
-        ) from exc
 
 
 @dataclass(frozen=True)
@@ -84,9 +71,8 @@ class ModelExpressGeneratorConfig:
     object_storage: ObjectStorageGeneratorConfig | None = None
     # Version read from the engine's serving-version API after cold start.
     initial_serving_version_id: str | None = None
-    # Ordered fallback for full-tensor sources. Canonical object storage is
-    # currently isolated because peer installation does not advance its local
-    # checkpoint base.
+    # Ordered source fallback. Canonical object storage may be used alone or
+    # combined with generator P2P in either order.
     source_order: tuple[WeightSource, ...] | None = None
 
     def __post_init__(self) -> None:
@@ -101,7 +87,7 @@ class ModelExpressGeneratorConfig:
             object.__setattr__(
                 self,
                 "source_order",
-                _source_order_from_env(source_order_env),
+                parse_weight_source_order(source_order_env),
             )
         if self.registration_ttl_seconds is not None:
             rl_envs.require_positive_int(
@@ -139,17 +125,24 @@ class ModelExpressGeneratorConfig:
                 raise ValueError(
                     "object_storage settings require OBJECT_STORAGE in source_order"
                 )
-            if self.object_storage is not None and self.source_order != (
+            if self.object_storage is not None and set(self.source_order) - {
+                WeightSource.GENERATOR,
                 WeightSource.OBJECT_STORAGE,
-            ):
+            }:
                 raise ValueError(
-                    "object_storage currently requires source_order="
-                    "(WeightSource.OBJECT_STORAGE,)"
+                    "object_storage source_order may contain only "
+                    "WeightSource.GENERATOR and WeightSource.OBJECT_STORAGE"
                 )
 
 
 class StagedWeightHandle:
-    """Local verified staging buffers for one exact WeightVersion."""
+    """An exact version prepared for, but not yet installed into, the engine.
+
+    Preparation may transfer P2P tensors or reconstruct an S3 checkpoint. The
+    live engine remains unchanged until ``apply_weight`` runs at its safe point.
+    The handle keeps session internals private and binds idempotent release to
+    the client that owns the staged resources.
+    """
 
     def __init__(
         self,
@@ -273,7 +266,7 @@ class ModelExpressGeneratorClient:
         client._rpc_timeout_seconds = config.rpc_timeout_seconds
         client._max_replay_chain_length = config.max_replay_chain_length
         try:
-            runtime = GeneratorRuntime.initialize(
+            runtime = initialize_generator_runtime(
                 engine_context=config.engine_context,
                 worker_id=worker_id,
                 server_url=server_url,
@@ -283,6 +276,7 @@ class ModelExpressGeneratorClient:
                 rpc_timeout_seconds=config.rpc_timeout_seconds,
                 service=lambda: client._service,
                 start_lease=client._start_version_lease,
+                resolve_replay_chain=client._resolve_replay_chain,
             )
             client._runtime = runtime
             client._has_initial_serving_version = (
@@ -318,10 +312,10 @@ class ModelExpressGeneratorClient:
                 if self._active_handle.version_id == version.version_id:
                     return self._active_handle
                 raise RuntimeError("another generator update is still active")
-            assert self._runtime is not None
+            runtime = self._require_runtime()
             if (
                 (
-                    self._runtime.initial_version_id is not None
+                    runtime.initial_version_id is not None
                     or self._has_initial_serving_version
                 )
                 and version.version_id == self._serving_version_id
@@ -343,18 +337,9 @@ class ModelExpressGeneratorClient:
             )
             try:
                 with timing.active(recorder):
-                    if self._runtime.initial_version_id is not None:
-                        with refit_span("control_discovery"):
-                            chain = self._resolve_replay_chain(version.version_id)
-                        update = (
-                            self._runtime.session.stage(chain[0])
-                            if len(chain) == 1
-                            else self._runtime.session.stage_chain(chain)
-                        )
-                    else:
-                        with refit_span("control_discovery"):
-                            ready = self._get_ready_version(version.version_id)
-                        update = self._runtime.session.stage(ready)
+                    with refit_span("control_discovery"):
+                        ready = self._get_ready_version(version.version_id)
+                    update = runtime.session.stage(ready)
             except BaseException:
                 # Nothing else will report this cycle: the recorder is handed on
                 # through the staged handle, and staging failed before there was
@@ -375,16 +360,19 @@ class ModelExpressGeneratorClient:
         if not isinstance(staged, StagedWeightHandle) or staged._client is not self:
             raise ValueError("staged handle does not belong to this client")
         with self._operation_lock:
+            if self._active_handle is not staged:
+                raise RuntimeError("staged weight has already been released")
             if staged._update is None:
-                if staged._no_op_released:
-                    raise RuntimeError("staged weight has already been released")
                 return None
             if staged._update.released:
                 raise RuntimeError("staged weight has already been released")
-            assert self._runtime is not None
+            runtime = self._require_runtime()
+            was_applied = staged._update.applied
+            if not was_applied:
+                runtime.unpublish_runtime_tensors()
             try:
                 with timing.active(staged._timing):
-                    result = self._runtime.session.apply(staged._update)
+                    result = runtime.session.apply(staged._update)
             except BaseException:
                 if staged._update.installation_started and not staged._update.applied:
                     self._engine_state = _EngineState.UNCERTAIN
@@ -397,6 +385,14 @@ class ModelExpressGeneratorClient:
                 timing.emit(staged._timing, logger)
             self._serving_version_id = staged.version_id
             self._engine_state = _EngineState.READY
+            if not was_applied:
+                try:
+                    runtime.publish_runtime_tensors(staged.version_id)
+                except Exception:
+                    logger.exception(
+                        "failed to publish installed runtime tensors for %s",
+                        staged.version_id,
+                    )
             return result
 
     def close(self) -> None:
@@ -430,8 +426,14 @@ class ModelExpressGeneratorClient:
         if self._channel is None:
             self._channel = auth.with_auth(grpc.insecure_channel(self.server_url))
             self._stub = refit_pb2_grpc.RefitServiceStub(self._channel)
-        assert self._stub is not None
+        if self._stub is None:
+            raise RuntimeError("generator refit service is not initialized")
         return self._stub
+
+    def _require_runtime(self) -> GeneratorRuntime:
+        if self._runtime is None:
+            raise RuntimeError("generator client is not initialized")
+        return self._runtime
 
     def _register_worker(self) -> None:
         self._service.RegisterWorker(
@@ -459,13 +461,10 @@ class ModelExpressGeneratorClient:
                 continue
 
     def _get_ready_version(self, version_id: str) -> WeightVersion:
-        version = self._fetch_ready_version(
+        return self._fetch_ready_version(
             version_id,
             target_version_id=version_id,
         )
-        assert self._runtime is not None
-        self._runtime.session.validate(version)
-        return version
 
     def _fetch_ready_version(
         self,
@@ -508,10 +507,11 @@ class ModelExpressGeneratorClient:
     def _resolve_replay_chain(
         self,
         target_version_id: str,
+        from_full_root: bool = False,
     ) -> tuple[WeightVersion, ...]:
         """Resolve a canonical chain completely before payload preparation."""
-        serving_version_id = self._serving_version_id
-        if serving_version_id is None:
+        serving_version_id = None if from_full_root else self._serving_version_id
+        if not from_full_root and serving_version_id is None:
             raise RuntimeError("canonical replay requires a known serving version")
         chain = resolve_replay_chain(
             target_version_id=target_version_id,
@@ -522,9 +522,6 @@ class ModelExpressGeneratorClient:
             max_chain_length=self._max_replay_chain_length,
             stop_before_version_id=serving_version_id,
         )
-        assert self._runtime is not None
-        for version in chain:
-            self._runtime.session.validate(version)
         return chain
 
     def _validate_initial_serving_version(self, version_id: str) -> None:
@@ -614,26 +611,19 @@ class ModelExpressGeneratorClient:
         if staged._client is not self:
             raise ValueError("staged handle does not belong to this client")
         with self._operation_lock:
-            if staged._update is None:
-                if staged._no_op_released:
-                    return
-                staged._no_op_released = True
+            if self._active_handle is not staged:
+                return
+            try:
+                if staged._update is not None and not staged._update.released:
+                    try:
+                        self._require_runtime().session.release(staged._update)
+                    finally:
+                        timing.emit(staged._timing, logger)
+                elif staged._update is None:
+                    staged._no_op_released = True
+            finally:
                 if self._active_handle is staged:
                     self._active_handle = None
-                return
-            if staged._update.released:
-                return
-            assert self._runtime is not None
-            try:
-                self._runtime.session.release(staged._update)
-            finally:
-                # Covers a version that was staged and dropped without ever
-                # being installed, which the apply path never sees, and a
-                # release that itself raised. A no-op once the apply has
-                # already reported the cycle.
-                timing.emit(staged._timing, logger)
-            if self._active_handle is staged:
-                self._active_handle = None
 
 
 __all__ = [

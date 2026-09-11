@@ -27,8 +27,6 @@ from modelexpress_rl.inference.load_strategy import (
     RLLoadStrategyChain,
     _resolve_s3_replay_chain,
 )
-
-
 def _context():
     """Build a default load context for cold-start strategy tests."""
     ctx = MagicMock()
@@ -109,6 +107,66 @@ def test_desired_version_does_not_use_version_agnostic_fallbacks(monkeypatch):
         RLLoadStrategyChain.run(model, ctx)
 
     fallback.load.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        (None, [DesiredVersionP2PStrategy, DesiredVersionS3Strategy]),
+        ("OBJECT_STORAGE", [DesiredVersionS3Strategy]),
+        (
+            "OBJECT_STORAGE,GENERATOR",
+            [DesiredVersionS3Strategy, DesiredVersionP2PStrategy],
+        ),
+        ("GENERATOR", [DesiredVersionP2PStrategy]),
+    ],
+)
+def test_desired_version_uses_configured_source_order(
+    monkeypatch,
+    configured,
+    expected,
+):
+    monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "version-7")
+    if configured is None:
+        monkeypatch.delenv("MX_GENERATOR_SOURCE_ORDER", raising=False)
+    else:
+        monkeypatch.setenv("MX_GENERATOR_SOURCE_ORDER", configured)
+    model = nn.Linear(1, 1)
+
+    with patch(
+        "modelexpress_rl.inference.load_strategy.execute_load_strategies",
+        return_value=model,
+    ) as execute:
+        assert RLLoadStrategyChain.run(model, _context()) is model
+
+    strategies = execute.call_args.args[2]
+    assert [type(strategy) for strategy in strategies] == expected
+
+
+def test_desired_version_rejects_trainer_source(monkeypatch):
+    monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "version-7")
+    monkeypatch.setenv("MX_GENERATOR_SOURCE_ORDER", "TRAINER,GENERATOR")
+
+    with pytest.raises(ValueError, match="cannot include TRAINER"):
+        RLLoadStrategyChain.run(nn.Linear(1, 1), _context())
+
+
+def test_distributed_cold_start_rejects_source_order_disagreement(monkeypatch):
+    monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "version-7")
+    monkeypatch.setenv("MX_GENERATOR_SOURCE_ORDER", "GENERATOR,OBJECT_STORAGE")
+
+    def gather(state):
+        phase, desired, configured, result = state
+        peer_result = ("OBJECT_STORAGE",) if phase == "source_order" else result
+        return state, (phase, desired, configured, peer_result)
+
+    ctx = _context()
+    ctx.adapter = _DistributedAdapter(gather)
+    with pytest.raises(
+        StrategyRecoveryError,
+        match="result disagreement during cold-start source order",
+    ):
+        RLLoadStrategyChain.run(nn.Linear(1, 1), ctx)
 
 
 def test_distributed_cold_start_rejects_desired_version_disagreement(monkeypatch):
@@ -309,6 +367,7 @@ def test_missing_optional_sources_reaches_engine_default(monkeypatch, caplog):
     monkeypatch.delenv("MX_REFIT_DESIRED_VERSION_UID", raising=False)
     monkeypatch.delenv("MX_REFIT_CHECKPOINT_DIR", raising=False)
     monkeypatch.delenv("MX_MODEL_URI", raising=False)
+    monkeypatch.setenv("MX_GENERATOR_SOURCE_ORDER", "invalid")
     model = nn.Linear(1, 1)
     ctx = _context()
     unavailable = MagicMock()
