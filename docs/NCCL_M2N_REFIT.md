@@ -425,6 +425,9 @@ is exactly what the fused-parameter path already does.
 | `MX_NCCL_REFIT_GROUP_TIMEOUT_S` | `600` | Deadline for `FORMING -> READY` |
 | `MX_NCCL_REFIT_POLL_INTERVAL_S` | `0.25` | `GetCollectiveGroup` poll backoff floor |
 | `MX_NCCL_REFIT_MISC_CHUNK_BYTES` | `268435456` | Packed misc-broadcast chunk size |
+| `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S` | `300` | Deadline for one lane's non-blocking `Communicator.init` |
+| `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600` | Deadline for the transfer, i.e. `RUNNING -> ABORTED` above |
+| `MX_NCCL_REFIT_REGISTRATION_TTL_S` | `3 x MX_HEARTBEAT_INTERVAL_SECS` | Participant registration lifetime without a heartbeat |
 
 Timing is reported through the existing `RefitTimingRecorder` stage vocabulary so
 NIXL-pull and NCCL-push refits are directly comparable. For this path, *setup and
