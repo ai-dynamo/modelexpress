@@ -398,6 +398,31 @@ def test_repair_loser_does_not_modify_objects_or_remove_owner_lock(
     assert memory_store.values[mc._repair_key(cache_key)] == other_lock
 
 
+def test_explicit_object_already_exists_is_repair_lock_contention(memory_store):
+    repair_key = "artifact/repair"
+    other_lock = mc._encode_repair_lock("other-owner")
+    memory_store.values[repair_key] = other_lock
+    original_put_bytes = memory_store.put_bytes
+
+    def put_bytes(key, data, *, soft_pin=True):
+        if key == repair_key and key in memory_store.values:
+            return -705
+        return original_put_bytes(key, data, soft_pin=soft_pin)
+
+    memory_store.put_bytes = put_bytes
+    token = "competing-owner"
+
+    assert not mc._acquire_repair_lock(
+        memory_store,
+        repair_key,
+        mc._encode_repair_lock(token),
+        token=token,
+        transfer_name="triton_cache",
+        cache_key="artifact",
+    )
+    assert memory_store.values[repair_key] == other_lock
+
+
 def test_repair_does_not_reclaim_live_marker(tmp_path, memory_store, monkeypatch):
     transfer = _transfer(tmp_path)
     identity = _identity()

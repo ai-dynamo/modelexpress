@@ -35,14 +35,17 @@ if os.getenv("MX_RUN_MOONCAKE_INTEGRATION") != "1":
 def test_real_mooncake_store_put_get_and_missing_key():
     prefix = f"modelexpress-test/{uuid4().hex}"
     payload = b"modelexpress-mooncake-smoke"
+    key = f"{prefix}/present"
     with mc._store_session() as store:
-        assert store.put_bytes(f"{prefix}/present", payload) == 0
-        assert (
-            store.get_bytes(f"{prefix}/present", expected_size=len(payload))
-            == payload
-        )
-        assert store.get_bytes(f"{prefix}/missing", expected_size=len(payload)) is None
-        mc._remove_object_with_retry(store, f"{prefix}/present")
+        try:
+            assert store.put_bytes(key, payload) == 0
+            assert store.get_bytes(key, expected_size=len(payload)) == payload
+            assert (
+                store.get_bytes(f"{prefix}/missing", expected_size=len(payload))
+                is None
+            )
+        finally:
+            mc._remove_object_with_retry(store, key)
 
 
 @pytest.mark.slow

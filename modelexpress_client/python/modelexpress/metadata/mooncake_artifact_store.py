@@ -1120,7 +1120,10 @@ def _put_repair_lock(
     # still allowed, and stale-owner recovery below takes over after ten
     # minutes, so soft pinning does not turn the marker into a permanent lock.
     rc = store.put_bytes(repair_key, lock_data, soft_pin=True)
-    if rc != 0:
+    # OBJECT_ALREADY_EXISTS (-705) means the repair key already exists.
+    # Acquisition is decided by reading the marker and comparing its token
+    # in _acquire_repair_lock().
+    if rc not in (0, -705):
         raise MooncakeArtifactCacheUnavailable(
             "Mooncake put repair marker failed: "
             f"name={transfer_name} key={repair_key!r} "
@@ -1194,6 +1197,7 @@ def _close_store(store) -> None:
 def _result_debug(result: int | None) -> str:
     names = {
         -704: "OBJECT_NOT_FOUND",
+        -705: "OBJECT_ALREADY_EXISTS",
         -706: "OBJECT_HAS_LEASE",
     }
     if result is None:
