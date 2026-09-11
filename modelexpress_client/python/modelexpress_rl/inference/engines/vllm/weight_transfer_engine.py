@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterator
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from time import perf_counter
 from typing import Any
 
@@ -86,13 +86,11 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
 
     def __init__(self, config, vllm_config, device, model) -> None:
         super().__init__(config, vllm_config, device, model)
-        self._generator_config = ModelExpressGeneratorConfig(
-            engine_context=VllmGeneratorContext(
-                model=model,
-                vllm_config=vllm_config,
-            ),
-            model_name=getattr(vllm_config.model_config, "model", None),
+        self._engine_context = VllmGeneratorContext(
+            model=model,
+            vllm_config=vllm_config,
         )
+        self._model_name = getattr(vllm_config.model_config, "model", None)
         self._client: ModelExpressGeneratorClient | None = None
         self._update_active = False
         self._active_version_id: str | None = None
@@ -153,11 +151,11 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
         model_name = (
             init_info.model_name
             if init_info.model_name is not None
-            else self._generator_config.model_name
+            else self._model_name
         )
         self._client = ModelExpressGeneratorClient.initialize(
-            replace(
-                self._generator_config,
+            ModelExpressGeneratorConfig(
+                engine_context=self._engine_context,
                 model_name=model_name,
                 server_url=init_info.server_url,
                 registration_ttl_seconds=init_info.registration_ttl_seconds,

@@ -406,6 +406,7 @@ def _runtime(
                     unpublish_runtime_tensors=adapter.unpublish_runtime_tensors,
                     publish_runtime_tensors=adapter.publish_runtime_tensors,
                     build_identity=adapter.build_p2p_identity,
+                    nixl_manager=object(),
                 )
                 if WeightSource.GENERATOR in source_order
                 else None

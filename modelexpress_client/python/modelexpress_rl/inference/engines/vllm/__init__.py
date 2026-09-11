@@ -52,6 +52,7 @@ def _create_vllm_engine_runtime(
         loader.tensors
         if loader is not None
         and loader.tensors
+        and loader.nixl_manager is not None
         and _supports_runtime_tensor_p2p(vllm_config)
         else None
     )
@@ -93,6 +94,7 @@ def _create_vllm_engine_runtime(
             unpublish_runtime_tensors=unpublish_runtime_tensors,
             publish_runtime_tensors=publish_runtime_tensors,
             build_identity=build_identity,
+            nixl_manager=loader.nixl_manager if loader is not None else None,
         ),
     )
 

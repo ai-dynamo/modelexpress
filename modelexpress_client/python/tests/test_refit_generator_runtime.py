@@ -70,11 +70,18 @@ class _P2P:
 
 
 _DEFAULT_RUNTIME_TENSORS = object()
+_DEFAULT_NIXL_MANAGER = object()
 
 
-def _full_tensor_engine(*, runtime_tensors=_DEFAULT_RUNTIME_TENSORS):
+def _full_tensor_engine(
+    *,
+    runtime_tensors=_DEFAULT_RUNTIME_TENSORS,
+    nixl_manager=_DEFAULT_NIXL_MANAGER,
+):
     if runtime_tensors is _DEFAULT_RUNTIME_TENSORS:
         runtime_tensors = {"weight": torch.ones(1)}
+    if nixl_manager is _DEFAULT_NIXL_MANAGER:
+        nixl_manager = object()
     return EngineRuntime(
         model_name="test/model",
         installer=_Installer(),
@@ -93,6 +100,7 @@ def _full_tensor_engine(*, runtime_tensors=_DEFAULT_RUNTIME_TENSORS):
                 model_name="test/model",
                 revision=version_id,
             ),
+            nixl_manager=nixl_manager,
         ),
     )
 
@@ -182,16 +190,28 @@ def test_object_storage_runtime_preserves_source_order(
     "source_order",
     [None, (WeightSource.GENERATOR, WeightSource.OBJECT_STORAGE)],
 )
+@pytest.mark.parametrize(
+    ("runtime_tensors", "nixl_manager"),
+    [
+        (None, object()),
+        ({"weight": torch.ones(1)}, None),
+    ],
+)
 def test_missing_inference_context_uses_object_storage_without_p2p(
     monkeypatch,
     tmp_path,
     source_order,
+    runtime_tensors,
+    nixl_manager,
 ):
     context = GeneratorEngineContext()
     monkeypatch.setattr(
         engines_module,
         "_create_engine_runtime",
-        lambda received: _full_tensor_engine(runtime_tensors=None),
+        lambda received: _full_tensor_engine(
+            runtime_tensors=runtime_tensors,
+            nixl_manager=nixl_manager,
+        ),
     )
     monkeypatch.setattr(
         runtime_module,

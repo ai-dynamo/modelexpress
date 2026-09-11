@@ -55,6 +55,7 @@ class FullTensorEngineCapability:
     unpublish_runtime_tensors: Callable[[], None]
     publish_runtime_tensors: Callable[[str], None]
     build_identity: Callable[[str], p2p_pb2.SourceIdentity]
+    nixl_manager: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -117,29 +118,30 @@ def _resolve_source_order(
     object_storage: ObjectStorageGeneratorConfig | None,
     source_order: tuple[WeightSource, ...] | None,
 ) -> tuple[WeightSource, ...]:
-    has_runtime_tensors = (
+    has_generator_p2p = (
         engine.full_tensor is not None
         and bool(engine.full_tensor.runtime_tensors)
+        and engine.full_tensor.nixl_manager is not None
     )
     if source_order is not None:
         if (
             WeightSource.GENERATOR in source_order
-            and not has_runtime_tensors
+            and not has_generator_p2p
             and WeightSource.OBJECT_STORAGE in source_order
         ):
             logger.warning(
-                "inference runtime tensors are unavailable; using object storage only"
+                "inference P2P state is unavailable; using object storage only"
             )
             return tuple(
                 source for source in source_order if source is not WeightSource.GENERATOR
             )
         return source_order
     if object_storage is not None:
-        if has_runtime_tensors:
+        if has_generator_p2p:
             return (WeightSource.GENERATOR, WeightSource.OBJECT_STORAGE)
         return (WeightSource.OBJECT_STORAGE,)
     defaults = []
-    if has_runtime_tensors:
+    if has_generator_p2p:
         defaults.append(WeightSource.GENERATOR)
     defaults.append(WeightSource.TRAINER)
     return tuple(defaults)
@@ -157,7 +159,10 @@ def _validate_source_order(
         supported_sources.add(WeightSource.OBJECT_STORAGE)
     if engine.full_tensor is not None:
         supported_sources.add(WeightSource.TRAINER)
-        if engine.full_tensor.runtime_tensors:
+        if (
+            engine.full_tensor.runtime_tensors
+            and engine.full_tensor.nixl_manager is not None
+        ):
             supported_sources.add(WeightSource.GENERATOR)
     for source in source_order:
         if source not in supported_sources:
@@ -187,16 +192,16 @@ def _create_load_time_tensor_method(
 def _create_runtime_tensor_method(
     *,
     capability: FullTensorEngineCapability,
-    worker_id: str,
 ) -> RuntimeTensorNixlUpdateMethod:
     runtime_tensors = capability.runtime_tensors
     if runtime_tensors is None:
         raise ValueError("generator P2P requires inference runtime tensors")
+    if capability.nixl_manager is None:
+        raise ValueError("generator P2P requires the inference NIXL manager")
     transfer = _NixlStagedTransfer(
-        agent_name=f"mx-refit-runtime-target-{worker_id}",
         device_id=capability.device_id,
         device=capability.device,
-        listen_port=None,
+        manager=capability.nixl_manager,
     )
     return RuntimeTensorNixlUpdateMethod(
         transfer=transfer,
@@ -328,7 +333,6 @@ def initialize_generator_runtime(
                     methods.append(
                         _create_runtime_tensor_method(
                             capability=engine.full_tensor,
-                            worker_id=worker_id,
                         )
                     )
             except Exception as error:

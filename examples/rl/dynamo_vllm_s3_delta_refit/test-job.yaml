@@ -1,0 +1,88 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mx-s3-refit-orchestrator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mx-s3-refit-orchestrator
+rules:
+- apiGroups: [""]
+  resources: [configmaps]
+  resourceNames: [mx-s3-refit-desired-version]
+  verbs: [get, patch, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mx-s3-refit-orchestrator
+subjects:
+- kind: ServiceAccount
+  name: mx-s3-refit-orchestrator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: mx-s3-refit-orchestrator
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mx-s3-refit-active
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      serviceAccountName: mx-s3-refit-orchestrator
+      restartPolicy: Never
+      imagePullSecrets:
+      - {name: nvcr-imagepullsecret}
+      volumes:
+      - name: scripts
+        configMap: {name: mx-s3-refit-scripts}
+      - name: model
+        persistentVolumeClaim: {claimName: shared-model-cache}
+      initContainers:
+      - name: publish-versions
+        image: ${WORKER_IMAGE}
+        command: [python3, /opt/e2e/publish_versions.py]
+        envFrom:
+        - secretRef: {name: hf-token-secret}
+        env: &test-env
+        - {name: MODEL_NAME, value: "${MODEL_NAME}"}
+        - {name: MODEL_PATH, value: /models}
+        - {name: RUN_ID, value: "${RUN_ID}"}
+        - {name: EXPECTED_WORKERS, value: "2"}
+        - {name: MX_SERVER_ADDRESS, value: "mx-s3-refit-server:8000"}
+        - {name: AWS_ENDPOINT_URL, value: "http://mx-s3-refit-minio:9000"}
+        - {name: AWS_DEFAULT_REGION, value: us-east-1}
+        - {name: AWS_EC2_METADATA_DISABLED, value: "true"}
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef: {name: mx-minio-creds, key: MINIO_ROOT_USER}
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef: {name: mx-minio-creds, key: MINIO_ROOT_PASSWORD}
+        resources:
+          requests: {cpu: "4", memory: 8Gi}
+          limits: {memory: 16Gi}
+        volumeMounts:
+        - {name: scripts, mountPath: /opt/e2e}
+        - {name: model, mountPath: /models, subPath: "${MODEL_SUBPATH}"}
+      containers:
+      - name: orchestrate
+        image: ${WORKER_IMAGE}
+        command: [python3, /opt/e2e/orchestrate.py]
+        envFrom:
+        - secretRef: {name: hf-token-secret}
+        env: *test-env
+        resources:
+          requests: {cpu: "1", memory: 1Gi}
+          limits: {memory: 2Gi}
+        volumeMounts:
+        - {name: scripts, mountPath: /opt/e2e}
+        - {name: model, mountPath: /models, subPath: "${MODEL_SUBPATH}"}

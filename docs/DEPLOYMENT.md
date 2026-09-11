@@ -544,7 +544,7 @@ kubectl apply -f examples/dynamo_model_cache_k8s/agg.yaml
 See [`../examples/dynamo_model_cache_k8s/README.md`](../examples/dynamo_model_cache_k8s/README.md) for the full guide.
 
 For RL cold start and active weight refit, see
-[`../examples/rl/dynamo_vllm_refit/README.md`](../examples/rl/dynamo_vllm_refit/README.md).
+[`../examples/rl/dynamo_vllm_reshard_refit/README.md`](../examples/rl/dynamo_vllm_reshard_refit/README.md).
 Its vLLM startup probe directly reconciles the desired MX UID through vLLM's
 native Control gRPC service. Keep that probe on the restartable vLLM init
 container: Kubernetes does not start the Dynamo sidecar until vLLM reports the

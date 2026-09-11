@@ -276,25 +276,32 @@ class _NixlStagedTransfer:
     def __init__(
         self,
         *,
-        agent_name: str,
         device_id: int,
         device: torch.device,
-        listen_port: int | None,
+        agent_name: str | None = None,
+        listen_port: int | None = None,
         timeout_seconds: float = 1200.0,
+        manager: NixlTransferManager | None = None,
     ) -> None:
         self._device_id = device_id
         self._device = device
         self._timeout = timeout_seconds
-        self._manager = NixlTransferManager(
-            agent_name=agent_name,
-            device_id=device_id,
-            listen_port=listen_port,
-        )
-        try:
-            self._manager.initialize()
-        except Exception:
-            self._manager.shutdown()
-            raise
+        self._owns_manager = manager is None
+        if manager is None:
+            if agent_name is None:
+                raise ValueError("an owned NIXL manager requires an agent name")
+            manager = NixlTransferManager(
+                agent_name=agent_name,
+                device_id=device_id,
+                listen_port=listen_port,
+            )
+        self._manager = manager
+        if self._owns_manager:
+            try:
+                self._manager.initialize()
+            except Exception:
+                self._manager.shutdown()
+                raise
         # Canonical engine-layout staging buffers. Exact slices land directly
         # here; reconstructed or converted values are copied here before these
         # buffers are verified, installed, and advertised to peer generators.
@@ -744,7 +751,8 @@ class _NixlStagedTransfer:
         if self._closed:
             return
         self._closed = True
-        self._manager.shutdown()
+        if self._owns_manager:
+            self._manager.shutdown()
 
 
 __all__: list[str] = []

@@ -15,17 +15,24 @@ from modelexpress_rl.inference.engines.vllm import (
 
 
 @pytest.mark.parametrize(
-    ("quant_config", "cache_dtype", "runtime_p2p_available"),
+    (
+        "quant_config",
+        "cache_dtype",
+        "has_nixl_manager",
+        "runtime_p2p_available",
+    ),
     [
-        (None, "auto", True),
-        (object(), "auto", False),
-        (None, "fp8_e4m3", False),
+        (None, "auto", True, True),
+        (None, "auto", False, False),
+        (object(), "auto", True, False),
+        (None, "fp8_e4m3", True, False),
     ],
 )
 def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
     monkeypatch,
     quant_config,
     cache_dtype,
+    has_nixl_manager,
     runtime_p2p_available,
 ):
     class ModelConfig:
@@ -87,6 +94,7 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
             publication_events.append(("publish", self, version_id))
 
     loader = Loader()
+    loader.nixl_manager = object() if has_nixl_manager else None
     loader_module = ModuleType("modelexpress.engines.vllm.loader")
     loader_module.get_model_loader = lambda device_id: loader
     monkeypatch.setitem(
@@ -139,6 +147,7 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
     assert runtime.full_tensor.source_worker_id == (
         "inference-worker-3" if runtime_p2p_available else None
     )
+    assert runtime.full_tensor.nixl_manager is loader.nixl_manager
     if runtime_p2p_available:
         runtime.full_tensor.unpublish_runtime_tensors()
         runtime.full_tensor.publish_runtime_tensors("version-a")

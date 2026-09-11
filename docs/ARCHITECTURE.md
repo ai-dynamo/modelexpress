@@ -580,10 +580,13 @@ vLLM's normal post-weight-load processing.
 The vLLM inference loader discovers this post-load tensor set once and retains
 the device-local mapping. The RL runtime reuses that mapping for peer layout
 validation, publication, and in-place installation instead of walking the model
-again after warmup or compilation. This warm-copy path is currently unavailable
-for quantized models and FP8 KV caches because their derived host state cannot be
-safely refreshed in place. Those workers skip generator P2P and use the canonical
-S3 path before any live-engine mutation.
+again after warmup or compilation. It also borrows the loader-owned NIXL agent:
+live tensors and private receive buffers are separate registrations on one
+rank-local transport, and the loader retains responsibility for shutting it
+down. This warm-copy path is currently unavailable for quantized models and FP8
+KV caches because their derived host state cannot be safely refreshed in place.
+Those workers skip generator P2P and use the canonical S3 path before any
+live-engine mutation.
 
 An object-storage generator with full-tensor engine support defaults to a
 same-rank generator peer first and the version-level object-storage source

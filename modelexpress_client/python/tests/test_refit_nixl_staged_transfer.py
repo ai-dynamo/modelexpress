@@ -293,10 +293,27 @@ def test_transfer_manager_is_closed_after_failed_init_and_only_once(monkeypatch)
 
     transfer = object.__new__(_NixlStagedTransfer)
     transfer._manager = _Manager()
+    transfer._owns_manager = True
     transfer._closed = False
     transfer.close()
     transfer.close()
     assert calls == ["initialize", "shutdown", "shutdown"]
+
+
+def test_borrowed_manager_is_not_initialized_or_closed():
+    class _Manager:
+        def initialize(self):
+            raise AssertionError("borrowed manager must already be initialized")
+
+        def shutdown(self):
+            raise AssertionError("borrowed manager is owned by the loader")
+
+    transfer = _NixlStagedTransfer(
+        device_id=0,
+        device=torch.device("cpu"),
+        manager=_Manager(),
+    )
+    transfer.close()
 
 
 def test_peer_stage_uses_exact_canonical_tensor_catalog(monkeypatch):
