@@ -3,10 +3,9 @@
 
 from contextlib import nullcontext
 
+import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 import pytest
 import torch
-
-import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 from modelexpress import p2p_pb2
 from modelexpress.refit.reshard.rendezvous import (
     PublishedShard,
@@ -29,6 +28,7 @@ from modelexpress_rl.inference.nixl_staged_transfer import (
     _required_agent_metadata,
     _resolve_sources,
     _ResolvedSources,
+    _source_structure,
 )
 
 
@@ -55,6 +55,29 @@ def _manifest(*, agent_name: str, endpoint: str, offset: int, address: int) -> b
             )
         ],
     )
+
+
+def test_source_structure_uses_planner_shard_fields_and_ignores_digest():
+    source = SourceInfo(
+        global_shape=(4,),
+        dtype=torch.float32,
+        elsize=4,
+        shards=[
+            Shard(
+                shard_offset=(0,),
+                shape=(4,),
+                session="trainer-0",
+                addr=100,
+                elsize=4,
+                digest="version-a",
+            )
+        ],
+    )
+
+    expected = _source_structure(source)
+    source.shards[0].digest = "version-b"
+
+    assert _source_structure(source) == expected
 
 
 def test_exact_manifests_resolve_without_legacy_source_discovery():

@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import hashlib
+import logging
 from importlib import metadata
 from threading import Event
 from types import SimpleNamespace
@@ -13,6 +15,7 @@ from modelexpress.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
     _mx_version,
+    structural_manifest_digest,
     wrap_rendezvous_blob,
 )
 
@@ -36,6 +39,67 @@ def _one_tensor(agent_name="trainer-agent"):
             ],
         )
     ]
+
+
+def test_structural_digest_ignores_version_and_content_digest():
+    first = _one_tensor()
+    first[0].shards[0].digest = "version-a"
+    second = _one_tensor()
+    second[0].shards[0].digest = "version-b"
+
+    first_blob = wrap_rendezvous_blob(
+        b"nixl",
+        "trainer-agent",
+        "trainer:1234",
+        first,
+        publisher_step=1,
+    )
+    second_blob = wrap_rendezvous_blob(
+        b"nixl",
+        "trainer-agent",
+        "trainer:1234",
+        second,
+        publisher_step=2,
+    )
+
+    assert structural_manifest_digest(first_blob) == structural_manifest_digest(
+        second_blob
+    )
+    moved = _one_tensor()
+    moved[0].shards[0].addr = 8192
+    moved_blob = wrap_rendezvous_blob(
+        b"nixl",
+        "trainer-agent",
+        "trainer:1234",
+        moved,
+    )
+    restarted_blob = wrap_rendezvous_blob(
+        b"new-registration",
+        "trainer-agent",
+        "trainer:1234",
+        second,
+    )
+    assert structural_manifest_digest(first_blob) != structural_manifest_digest(
+        moved_blob
+    )
+    assert structural_manifest_digest(first_blob) != structural_manifest_digest(
+        restarted_blob
+    )
+
+
+@pytest.mark.parametrize(
+    "blob", [b"\xff\xfe not json", b"{ definitely not json", b'["a", "list"]']
+)
+def test_an_unreadable_manifest_says_it_disabled_plan_reuse(caplog, blob):
+    """The raw-byte fallback moves with the per-shard content digests, so every
+    version looks structurally different and plan reuse stops. Correct, but the
+    symptom is a warm refit priced like a cold one, which needs a reason."""
+    with caplog.at_level(logging.WARNING):
+        assert structural_manifest_digest(blob) == hashlib.sha256(blob).hexdigest()
+
+    assert [m for m in caplog.messages if "disables transfer-plan reuse" in m], (
+        f"an unreadable manifest must say so, got {caplog.messages}"
+    )
 
 
 def test_mx_version_falls_back_only_when_package_is_missing(monkeypatch):
@@ -145,8 +209,9 @@ def test_published_rendezvous_stays_ready_and_closes_stale(monkeypatch):
     last = client.status_updates[-1]
     # Compare the identity/status fields under test; the heartbeat also carries
     # advisory telemetry (source_load) that is not what this test asserts.
-    assert {k: last.get(k) for k in
-            ("mx_source_id", "worker_id", "worker_rank", "status")} == {
+    assert {
+        k: last.get(k) for k in ("mx_source_id", "worker_id", "worker_rank", "status")
+    } == {
         "mx_source_id": "source-id",
         "worker_id": "trainer-2",
         "worker_rank": 2,

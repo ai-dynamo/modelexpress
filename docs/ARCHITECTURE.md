@@ -492,6 +492,15 @@ and leases, but it does not discover engine tensor layouts or transfer weights.
 For NIXL, `RefitWorkerService` is the trainer-local manifest endpoint.
 The manifest is an opaque description of the exact published source buffers;
 the generator uses it to compile and validate its receiver-local transfer plan.
+Full-tensor trainers reuse manifest bytes while registrations, addresses, and
+tensor geometry remain stable and content digests are disabled. Generators
+cache each selected worker manifest by endpoint and digest. A changed endpoint,
+registration metadata,
+address, dtype, shape, or sharding changes the structural fingerprint and
+rebuilds the transfer plan. Content-only digest changes refresh verification
+metadata without rebuilding that plan. Releasing a trainer shard evicts its
+worker-local version entry only after the central service accepts the deletion;
+the service rejects deletion while a version lease is active.
 For S3, `WeightVersion.object_storage` identifies the storage type and global
 `model.safetensors.index.json` URI directly; the server validates only this
 typed location and does not contact S3.
