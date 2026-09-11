@@ -71,12 +71,9 @@
 #                         (vllm / sglang). No target pod — the assertion runs
 #                         against mx-server directly via gRPC.
 #
-#   h100-smoke          — non-gating canary that validates the dedicated
-#                         ModelExpress runner starts with exactly two H100 GPUs.
-#
-#   h100-cluster-smoke  — non-gating canary that validates a zero-GPU deploy
-#                         runner can schedule a 2+1 H100 workload and mount
-#                         shared RWX storage in the dedicated H100 vCluster.
+#   h100-smoke          — non-gating same-node NIXL canary. Runs one isolated
+#                         TP=1 rank on each H100 and validates an exact GPU-to-GPU
+#                         tensor transfer through ModelExpress.
 #
 #   model-streamer       — matrix over frameworks; single worker pod, no
 #                          vCluster, no P2P. Streams weights directly from S3
@@ -1084,21 +1081,32 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
-  # Dedicated H100 runner availability and device-allocation canary.
-  # The ARC container hook injects two GPUs; the runner requires a job container.
+  # Dedicated H100 runner and same-node NIXL canary. The ARC container hook
+  # injects two GPUs; each spawned TP=1 rank is masked to exactly one of them.
   # ---------------------------------------------------------------------------
   h100-smoke:
-    name: H100 runner smoke test
+    name: H100 NIXL TP1-to-TP1 smoke test
     runs-on: prod-modelexpress-tester-amd-h100-v1
-    timeout-minutes: 15
-    permissions: {}
+    needs: [build-client]
+    timeout-minutes: 30
+    permissions:
+      contents: read
     container:
-      image: nvcr.io/nvidia/cuda:13.0.0-base-ubuntu24.04
+      # `env` is unavailable while GitHub evaluates the job container image.
+      image: nvcr.io/0980761089281446/mx-worker-vllm:${{ github.sha }}
       credentials:
         username: "$oauthtoken"
         password: ${{ secrets.NGC_API_KEY }}
+      env:
+        MODEL_EXPRESS_LOG_LEVEL: INFO
+        MX_NIXL_BACKEND: UCX
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
       - name: Verify H100 allocation
         shell: bash
         run: |
@@ -1106,6 +1114,9 @@ jobs:
 
           mapfile -t gpu_names < <(
             nvidia-smi --query-gpu=name --format=csv,noheader
+          )
+          mapfile -t gpu_uuids < <(
+            nvidia-smi --query-gpu=uuid --format=csv,noheader
           )
           printf 'Detected GPU: %s\n' "${gpu_names[@]}"
 
@@ -1119,71 +1130,11 @@ jobs:
             exit 1
           fi
 
-  # ---------------------------------------------------------------------------
-  # Dedicated H100 vCluster access, single-node scheduling, and RWX canary.
-  # This remains non-gating until the deploy runner and vCluster are proven.
-  # Velonix must provision both before this job can be scheduled successfully.
-  # ---------------------------------------------------------------------------
-  h100-cluster-smoke:
-    name: H100 cluster infrastructure smoke test
-    runs-on: prod-modelexpress-deploy-tester-v1
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    concurrency:
-      group: modelexpress-h100-cluster-smoke
-      cancel-in-progress: false
-    env:
-      H100_KUBE_CONTEXT: ${{ vars.MX_H100_KUBE_CONTEXT || 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02' }}
-      H100_VCLUSTER_NAME: ${{ vars.MX_H100_VCLUSTER_NAME || 'mx-vime-h100-ci' }}
-      H100_VCLUSTER_NAMESPACE: ${{ vars.MX_H100_VCLUSTER_NAMESPACE || 'mx-vime-h100-ci' }}
-      H100_STORAGE_CLASS: ${{ vars.MX_H100_STORAGE_CLASS || 'dgxc-enterprise-file' }}
+          echo "MX_H100_SOURCE_GPU=${gpu_uuids[0]}" >> "$GITHUB_ENV"
+          echo "MX_H100_TARGET_GPU=${gpu_uuids[1]}" >> "$GITHUB_ENV"
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Select Teleport H100 context
-        id: host-kubeconfig
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ ! -f /teleport/kubeconfig.yaml ]; then
-            echo "Expected a tbot kubeconfig at /teleport/kubeconfig.yaml" >&2
-            exit 1
-          fi
-
-          host_kubeconfig="${RUNNER_TEMP}/mx-h100-host.yaml"
-          install -m 600 /teleport/kubeconfig.yaml "$host_kubeconfig"
-          kubectl --kubeconfig="$host_kubeconfig" config use-context \
-            "$H100_KUBE_CONTEXT"
-          encoded=$(base64 -w 0 < "$host_kubeconfig")
-          echo "::add-mask::$encoded"
-          echo "kubeconfig_base64=$encoded" >> "$GITHUB_OUTPUT"
-
-      - name: Connect to dedicated H100 vCluster
-        id: connect-vcluster
-        uses: ./.github/actions/connect-vcluster
-        with:
-          host_kubeconfig_base64: ${{ steps.host-kubeconfig.outputs.kubeconfig_base64 }}
-          vcluster_name: ${{ env.H100_VCLUSTER_NAME }}
-          vcluster_namespace: ${{ env.H100_VCLUSTER_NAMESPACE }}
-
-      - name: Validate single-node H100 scheduling and shared RWX
-        env:
-          KUBECONFIG: ${{ github.workspace }}/.kubeconfig-vcluster
-        run: ci/k8s/run-h100-infra-smoke.sh
-
-      - name: Reap H100 vCluster port-forward
-        if: always()
-        shell: bash
-        run: |
-          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
-            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
-          fi
+      - name: Transfer TP1 source tensor to TP1 target
+        run: python3 ci/h100_tp1_smoke.py
 
   # ---------------------------------------------------------------------------
   # Model Streamer S3 tests — single worker pod, no vCluster, no P2P.
