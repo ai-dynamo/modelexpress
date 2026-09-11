@@ -3,7 +3,14 @@
 
 """Explicit trainer-engine selection for full-tensor publication."""
 
-from dataclasses import dataclass
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
 
 
 class TrainerEngineContext:
@@ -13,6 +20,9 @@ class TrainerEngineContext:
 @dataclass(frozen=True)
 class FSDPTrainerContext(TrainerEngineContext):
     """Select FSDP/DTensor tensor capture and geometry."""
+
+    wire_dtype_overrides: Mapping[str, torch.dtype] = field(default_factory=dict)
+    """Exact state-dict names to transfer as FP16, BF16 or FP32; other tensors use BF16."""
 
 
 @dataclass(frozen=True)
