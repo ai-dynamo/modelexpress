@@ -63,6 +63,7 @@ class _ResolvedSources:
     session_to_agent: dict
     session_to_device: dict
     agent_metadata: dict[str, bytes]
+    tables: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -91,7 +92,8 @@ def _resolve_sources(manifests: list[bytes]) -> _ResolvedSources:
     agents = [payload.agent_name for payload in payloads]
     if len(set(agents)) != len(agents):
         raise ValueError("source manifests contain duplicate NIXL agents")
-    merged = merge_shard_tables([payload.tensors for payload in payloads])
+    tables = tuple(payload.tensors for payload in payloads)
+    merged = merge_shard_tables(tables)
     sources, session_to_agent, session_to_device = build_sources(merged)
     return _ResolvedSources(
         sources=sources,
@@ -100,7 +102,25 @@ def _resolve_sources(manifests: list[bytes]) -> _ResolvedSources:
         agent_metadata={
             payload.agent_name: payload.agent_metadata for payload in payloads
         },
+        tables=tables,
     )
+
+
+
+def _prefer_plan_sources(plan: TransferPlan, resolved: _ResolvedSources) -> _ResolvedSources:
+    """Route replicas through the publishers already supplying most wire bytes."""
+    if not resolved.tables:
+        return resolved
+    volumes = plan.bytes_by_session()
+    preference = tuple(
+        resolved.session_to_agent[session]
+        for session in sorted(volumes, key=volumes.__getitem__, reverse=True)
+    )
+    merged = merge_shard_tables(resolved.tables, preferred_agents=preference)
+    sources, agents, devices = build_sources(merged)
+    if sources == resolved.sources:
+        return resolved
+    return _ResolvedSources(sources, agents, devices, resolved.agent_metadata, resolved.tables)
 
 
 def _required_agent_metadata(
@@ -319,6 +339,10 @@ class _NixlStagedTransfer:
             capture, parameter_layout = capture_layout(manifest)
         with refit_span("transfer_planning"):
             plan = _plan_staged_transfer(capture, resolved.sources)
+            preferred = _prefer_plan_sources(plan, resolved)
+            if preferred is not resolved:
+                resolved = preferred
+                plan = _plan_staged_transfer(capture, resolved.sources)
             self._validate_complete(capture, parameter_layout, plan)
         with refit_span("setup_registration"):
             required_metadata = _required_agent_metadata(plan, resolved)

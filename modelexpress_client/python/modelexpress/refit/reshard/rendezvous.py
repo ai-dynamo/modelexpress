@@ -217,7 +217,7 @@ def build_sources(tensors: list) -> tuple:
     return sources, session_to_agent, session_to_device
 
 
-def merge_shard_tables(tables: list) -> list:
+def merge_shard_tables(tables: list, *, preferred_agents: tuple[str, ...] = ()) -> list:
     """Merge per-rank ``list[PublishedTensor]`` into one, concatenating shards
     for the same source across ranks (reshard fans in cross-rank). full_shape /
     dtype / elsize must agree across ranks for a given tensor name.
@@ -237,9 +237,13 @@ def merge_shard_tables(tables: list) -> list:
     collide under one name, and then retaining the first installs bytes that
     belong to the other. Publishers must therefore use globally unique names for
     parallelism-local tensors.
+
+    ``preferred_agents`` ranks equivalent replicas only; all distinct geometric
+    shards are retained. With no preference, the first offer remains selected.
     """
+    priority = {agent: index for index, agent in enumerate(preferred_agents)}
     merged: dict = {}
-    # name -> geometry -> first shard, insertion-ordered so the retained geometry
+    # name -> geometry -> chosen shard, insertion-ordered so the retained geometry
     # sequence is deterministic.
     candidates: dict = {}
     for table in tables:
@@ -258,7 +262,11 @@ def merge_shard_tables(tables: list) -> list:
             per_geometry = candidates[t.name]
             for shard in t.shards:
                 geometry = (tuple(shard.shard_offset), tuple(shard.shape))
-                per_geometry.setdefault(geometry, shard)
+                previous = per_geometry.get(geometry)
+                if previous is None or priority.get(shard.agent_name, len(priority)) < priority.get(
+                    previous.agent_name, len(priority)
+                ):
+                    per_geometry[geometry] = shard
 
     for name, tensor in merged.items():
         tensor.shards.extend(candidates[name].values())

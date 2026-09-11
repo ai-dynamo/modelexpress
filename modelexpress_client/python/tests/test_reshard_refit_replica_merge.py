@@ -215,3 +215,14 @@ def test_distinct_tensor_names_are_independent():
 
     assert sorted(t.name for t in merged) == ["a", "b"]
     assert all(len(t.shards) == 1 for t in merged)
+
+
+def test_preference_selects_one_replica_and_preserves_geometries():
+    tables = _dp_replica_tables(replicas=4)
+    selected = merge_shard_tables(tables, preferred_agents=("missing", "dp2", "dp1"))
+    assert [s.agent_name for s in selected[0].shards] == ["dp2", "dp2"]
+    assert [s.shard_offset for s in selected[0].shards] == [(0, 0), (4, 0)]
+    unchanged = merge_shard_tables(tables, preferred_agents=("missing",))
+    assert [s.agent_name for s in unchanged[0].shards] == ["dp0", "dp0"]
+    distinct = merge_shard_tables(_fan_in_tables(), preferred_agents=("r2",))
+    assert {s.agent_name for s in distinct[0].shards} == {"r0", "r1", "r2", "r3"}

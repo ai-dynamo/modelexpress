@@ -110,6 +110,12 @@ class TransferPlan:
     def bytes_planned(self) -> int:
         return sum(segment.nbytes for segment in self._all_segments())
 
+    def bytes_by_session(self) -> dict:
+        totals = {}
+        for segment in self._all_segments():
+            totals[segment.session] = totals.get(segment.session, 0) + segment.nbytes
+        return totals
+
     def descriptor_count(self) -> int:
         return sum(1 for _ in self._all_segments())
 

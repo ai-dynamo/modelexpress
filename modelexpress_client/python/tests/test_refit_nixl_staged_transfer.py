@@ -456,3 +456,42 @@ def test_registered_workspace_is_reused_only_for_the_same_layout(monkeypatch):
             {"weight": ((8,), torch.float32)},
             label="receive-buffer",
         )
+
+
+def test_replica_routing_prefers_expert_owner_without_extra_bytes():
+    from modelexpress.refit.reshard.transfer_plan import execute_transfer
+    from modelexpress.refit.reshard.transport.base import InMemoryReferenceTransport
+    from modelexpress_rl.inference.nixl_staged_transfer import _prefer_plan_sources
+
+    shared = [torch.arange(4, dtype=torch.float32) for _ in range(2)]
+    experts = [torch.arange(16, dtype=torch.float32).reshape(4, 4) + rank * 100 for rank in range(2)]
+    manifests = []
+    for rank in range(2):
+        agent = f"trainer-{rank}"
+        tables = [
+            PublishedTensor("shared", "torch.float32", 4, (4,), [
+                PublishedShard(agent, rank, shared[rank].data_ptr(), (0,), (4,))
+            ]),
+            PublishedTensor("experts", "torch.float32", 4, (8, 4), [
+                PublishedShard(agent, rank, experts[rank].data_ptr(), (rank * 4, 0), (4, 4))
+            ]),
+        ]
+        manifests.append(wrap_rendezvous_blob(b"metadata", agent, f"host:{rank}", tables))
+    resolved = _resolve_sources(manifests)
+    capture = CaptureResult(copies=[
+        RecordedCopy(src_name="shared", op_chain=(), param_name="shared", dest_offset=0,
+                     dest_shape=(4,), dest_stride=(1,), dest_dtype=torch.float32),
+        RecordedCopy(src_name="experts", op_chain=(("narrow", (0, 4, 4), ()),), param_name="expert",
+                     dest_offset=0, dest_shape=(4, 4), dest_stride=(4, 1), dest_dtype=torch.float32),
+    ])
+    initial = _plan_staged_transfer(capture, resolved.sources)
+    assert initial.bytes_by_session() == {"trainer-0": 16, "trainer-1": 64}
+    selected = _prefer_plan_sources(initial, resolved)
+    optimized = _plan_staged_transfer(capture, selected.sources)
+    assert optimized.bytes_by_session() == {"trainer-1": 80}
+    assert optimized.bytes_planned() == initial.bytes_planned()
+    assert len(selected.sources["experts"].shards) == 2
+    destinations = {"shared": torch.empty_like(shared[0]), "expert": torch.empty_like(experts[1])}
+    execute_transfer(optimized, lambda name: destinations[name].data_ptr(), InMemoryReferenceTransport())
+    assert torch.equal(destinations["shared"], shared[0])
+    assert torch.equal(destinations["expert"], experts[1])

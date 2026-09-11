@@ -1404,3 +1404,26 @@ Externally added durations remain unlocated and are not claimed in that union.
 SGLang records the opaque version ID alongside its training-step counter.
 Wall-clock anchors are diagnostic; cross-host unions require independent clock
 alignment/uncertainty evidence.
+
+### NIXL read timing
+
+An active refit timing recorder enables `MX_NIXL_READ_TIMING` records for batched
+reads. Each record identifies the refit version and receiver rank, reports
+per-peer bytes and descriptor counts, and separates descriptor preparation,
+submission, observed completion, handle release, and final device synchronization.
+Completion timestamps are observations made while polling; they are not hardware
+packet timestamps. The canonical `wire_transfer` stage retains its existing
+end-to-end read boundary, including device synchronization, so detailed intervals
+must not be added to that parent stage a second time.
+
+### Replicated weights in expert-parallel refits
+
+Miles advertises the shared tensors already resident on each EP trainer, alongside
+its globally named expert shards. The staged receiver first plans its required
+reads, then prefers equivalent replicas from publishers contributing the most
+bytes to that plan. It replans only when the selected replica addresses change.
+Selection applies only to equal tensor names and exact shard geometry; each
+region is read once and distinct shards remain intact. This removes forced
+fan-out from EP rank zero without assuming matching GPU ordinals imply network
+locality. The heuristic reduces unnecessary peer paths; it does not replace
+measured fabric topology or independently verify replica contents.

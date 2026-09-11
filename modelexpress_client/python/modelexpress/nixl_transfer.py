@@ -15,6 +15,7 @@ also uses the same agent for host DRAM chunk staging.
 from __future__ import annotations
 
 import atexit
+import json
 import logging
 import os
 import time
@@ -32,6 +33,7 @@ from .accelerators import (
     CudaAcceleratorBackend,
 )
 from .types import ManifestMismatchError, TensorDescriptor
+from .refit.timing import current_refit_timing
 
 if TYPE_CHECKING:
     from .vmm.arena import VmmArena
@@ -105,6 +107,9 @@ class PostedRead:
     total_bytes: int
     num_ranges: int
     posted_at: float = field(default_factory=time.perf_counter)
+    prepared_at: float | None = None
+    submitted_at: float | None = None
+    remote_device_ids: tuple[int, ...] = ()
 
 
 class NixlTransferManager:
@@ -622,6 +627,8 @@ class NixlTransferManager:
         handles: list,
         timeout_seconds: float | None,
         label: str,
+        *,
+        completion_times: dict[int, float] | None = None,
     ) -> None:
         """Poll several NIXL handles until all complete or one fails.
 
@@ -656,6 +663,8 @@ class NixlTransferManager:
             for handle in pending:
                 status = self._agent.check_xfer_state(handle)
                 if status in ("DONE", "SUCCESS"):
+                    if completion_times is not None:
+                        completion_times[id(handle)] = time.perf_counter()
                     continue
                 if status in ("ERR", "ERROR", "FAIL"):
                     self._data_plane_error = f"{label} failed with status {status}"
@@ -1109,7 +1118,9 @@ class NixlTransferManager:
                 remote_indices=indices,
                 backends=self._backends,
             )
+            prepared_at = time.perf_counter()
             self._agent.transfer(handle)
+            submitted_at = time.perf_counter()
         except Exception:
             # Nothing is in flight for this batch, so drop its handle here rather
             # than handing a dead batch to await_read_batches.
@@ -1123,6 +1134,9 @@ class NixlTransferManager:
             total_bytes=sum(nbytes for (_r, _l, nbytes, _d) in ranges),
             num_ranges=len(ranges),
             posted_at=posted_at,
+            prepared_at=prepared_at,
+            submitted_at=submitted_at,
+            remote_device_ids=tuple(sorted({r[3] for r in ranges})),
         )
 
     def _release_xfer_handle(self, handle: Any) -> None:
@@ -1156,17 +1170,51 @@ class NixlTransferManager:
         if not batches:
             return 0, 0, 0.0
 
+        recorder = current_refit_timing()
+        completions: dict[int, float] | None = {} if recorder is not None else None
+        wait_started = time.perf_counter()
         try:
+            kwargs = {"completion_times": completions} if completions is not None else {}
             self._wait_for_xfers(
                 [p.handle for p in batches],
                 timeout_seconds,
                 "NIXL reshard READ batch",
+                **kwargs,
             )
         finally:
+            release_started = time.perf_counter()
             for batch in batches:
                 self._release_xfer_handle(batch.handle)
 
+        sync_started = time.perf_counter()
         self._accelerator_backend.synchronize(self._device_id)
+        finished = time.perf_counter()
+        if recorder is not None:
+            origin = min(p.posted_at for p in batches)
+            payload = {
+                "schema": "mx-nixl-read-timing-v1",
+                "version_id": recorder.version_id,
+                "rank": recorder.rank,
+                "device_id": self._device_id,
+                "wait_ms": (release_started - wait_started) * 1000,
+                "release_ms": (sync_started - release_started) * 1000,
+                "device_sync_ms": (finished - sync_started) * 1000,
+                "total_ms": (finished - origin) * 1000,
+                "batches": [
+                    {
+                        "peer": p.remote_agent_name,
+                        "remote_devices": p.remote_device_ids,
+                        "bytes": p.total_bytes,
+                        "ranges": p.num_ranges,
+                        "prepare_ms": None if p.prepared_at is None else (p.prepared_at - p.posted_at) * 1000,
+                        "submit_ms": None if p.submitted_at is None or p.prepared_at is None else (p.submitted_at - p.prepared_at) * 1000,
+                        "submitted_offset_ms": None if p.submitted_at is None else (p.submitted_at - origin) * 1000,
+                        "completion_offset_ms": None if completions is None or id(p.handle) not in completions else (completions[id(p.handle)] - origin) * 1000,
+                    }
+                    for p in batches
+                ],
+            }
+            logger.info("MX_NIXL_READ_TIMING %s", json.dumps(payload, separators=(",", ":")))
         return (
             sum(p.total_bytes for p in batches),
             sum(p.num_ranges for p in batches),
