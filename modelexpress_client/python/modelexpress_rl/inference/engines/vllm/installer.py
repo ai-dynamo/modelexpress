@@ -57,7 +57,6 @@ class _VllmInstaller(EngineInstaller):
         device: torch.device,
         convert_native_to_hf: Callable[[dict], dict] | None = None,
         runtime_tensors: dict[str, torch.Tensor] | None = None,
-        refresh_runtime_state: Callable[[], None] | None = None,
     ) -> None:
         self._model = model
         self._vllm_config = vllm_config
@@ -65,7 +64,6 @@ class _VllmInstaller(EngineInstaller):
         self._device = device
         self._convert_native_to_hf = convert_native_to_hf
         self._runtime_tensors = runtime_tensors
-        self._refresh_runtime_state = refresh_runtime_state
 
     @property
     def capabilities(self) -> EngineCapabilities:
@@ -177,7 +175,7 @@ class _VllmInstaller(EngineInstaller):
     @torch.no_grad()
     def install_runtime_tensors(self, tensors: dict[str, torch.Tensor]) -> None:
         """Copy a peer's processed tensors into existing graph-bound storage."""
-        if self._runtime_tensors is None or self._refresh_runtime_state is None:
+        if self._runtime_tensors is None:
             raise RuntimeError("vLLM runtime tensor installation is unavailable")
         destinations = self._runtime_tensors
         local_only = sorted(set(destinations) - set(tensors))
@@ -199,7 +197,6 @@ class _VllmInstaller(EngineInstaller):
         for name, source in tensors.items():
             destination = destinations[name]
             destination.copy_(source)
-        self._refresh_runtime_state()
         torch.cuda.synchronize(self._device)
 
     def install_checkpoint(self, path: str | Path) -> None:

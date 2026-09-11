@@ -183,7 +183,6 @@ def test_installer_copies_runtime_tensors_in_place(monkeypatch):
         "runtime_buffer": torch.tensor([3.0]),
     }
     original_pointers = {name: tensor.data_ptr() for name, tensor in live.items()}
-    refreshed = []
     synchronized = []
     monkeypatch.setattr(torch.cuda, "synchronize", synchronized.append)
     installer = _VllmInstaller(
@@ -192,7 +191,6 @@ def test_installer_copies_runtime_tensors_in_place(monkeypatch):
         model_config=object(),
         device=torch.device("cpu"),
         runtime_tensors=live,
-        refresh_runtime_state=lambda: refreshed.append(True),
     )
     staged = type(
         "Staged",
@@ -211,7 +209,6 @@ def test_installer_copies_runtime_tensors_in_place(monkeypatch):
     assert torch.equal(live["weight"], torch.tensor([7.0, 8.0]))
     assert torch.equal(live["runtime_buffer"], torch.tensor([9.0]))
     assert {name: tensor.data_ptr() for name, tensor in live.items()} == original_pointers
-    assert refreshed == [True]
     assert synchronized == [torch.device("cpu")]
 
 
@@ -226,7 +223,6 @@ def test_installer_validates_all_runtime_tensors_before_copying():
         model_config=object(),
         device=torch.device("cpu"),
         runtime_tensors=live,
-        refresh_runtime_state=lambda: None,
     )
     staged = type(
         "Staged",

@@ -33,7 +33,12 @@ import torch
 import torch.nn as nn
 
 from ... import configure_vllm_logging, envs, model_prefetch
-from ...load_strategy import LoadContext, run_load_strategy_chain
+from ...load_strategy import (
+    LoadContext,
+    publish_metadata,
+    run_load_strategy_chain,
+    unpublish_metadata,
+)
 from ...metrics import enable_metrics, metrics
 from ...nixl_transfer import NixlTransferManager
 from ...vmm.runtime import log_arena_post_load, maybe_enter_vmm_arena
@@ -57,12 +62,12 @@ logger = logging.getLogger(__name__)
 # Global storage for tensor metadata, keyed by device_id (local CUDA ordinal).
 _tensor_registry: dict[int, dict[str, torch.Tensor]] = {}
 _nixl_managers: dict[int, NixlTransferManager] = {}
-_load_context_registry: dict[int, LoadContext] = {}
+_loader_registry: dict[int, MxModelLoader] = {}
 
 
-def get_load_context(device_id: int) -> LoadContext | None:
-    """Return the completed inference load context for one local device."""
-    return _load_context_registry.get(device_id)
+def get_model_loader(device_id: int) -> MxModelLoader | None:
+    """Return the ModelExpress loader that completed this device's main load."""
+    return _loader_registry.get(device_id)
 
 
 class MxModelLoader(BaseModelLoader):
@@ -109,7 +114,8 @@ class MxModelLoader(BaseModelLoader):
         ctx.p2p_enabled = not is_speculative_draft
         if envs.MX_ARTIFACT_READY_URL.strip():
             ctx.source_ready_fn = lambda: _vllm_health_ready(ctx)
-        self._ctx = ctx
+        if ctx.p2p_enabled:
+            self._ctx = ctx
 
         logger.info(
             f"[Worker {ctx.global_rank}] MxModelLoader starting "
@@ -146,7 +152,7 @@ class MxModelLoader(BaseModelLoader):
                         model = run_load_strategy_chain(model, ctx)
 
                     if ctx.p2p_enabled:
-                        _load_context_registry[ctx.device_id] = ctx
+                        _loader_registry[ctx.device_id] = self
                         _tensor_registry[ctx.device_id] = ctx.tensors
                         if ctx.nixl_manager is not None:
                             _nixl_managers[ctx.device_id] = ctx.nixl_manager
@@ -221,3 +227,21 @@ class MxModelLoader(BaseModelLoader):
         if self._ctx is not None:
             return self._ctx.tensors
         return {}
+
+    @property
+    def worker_id(self) -> str | None:
+        """Return the inference P2P worker ID after a completed main load."""
+        if self._ctx is not None:
+            return self._ctx.worker_id
+        return None
+
+    def unpublish_runtime_tensors(self) -> None:
+        """Withdraw this loader's runtime tensors before an active refit."""
+        if self._ctx is not None:
+            unpublish_metadata(self._ctx)
+
+    def publish_runtime_tensors(self, version_id: str) -> None:
+        """Publish this loader's installed runtime tensors at an exact version."""
+        if self._ctx is not None:
+            self._ctx.identity.revision = version_id
+            publish_metadata(self._ctx)

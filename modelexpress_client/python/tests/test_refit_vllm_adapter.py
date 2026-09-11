@@ -4,9 +4,9 @@
 import sys
 from types import ModuleType, SimpleNamespace
 
+import pytest
 import torch
 
-import modelexpress.load_strategy as load_strategy_module
 from modelexpress import p2p_pb2
 from modelexpress_rl.inference.engines.vllm import (
     VllmGeneratorContext,
@@ -14,14 +14,29 @@ from modelexpress_rl.inference.engines.vllm import (
 )
 
 
+@pytest.mark.parametrize(
+    ("quant_config", "cache_dtype", "runtime_p2p_available"),
+    [
+        (None, "auto", True),
+        (object(), "auto", False),
+        (None, "fp8_e4m3", False),
+    ],
+)
 def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
     monkeypatch,
+    quant_config,
+    cache_dtype,
+    runtime_p2p_available,
 ):
     class ModelConfig:
         model = "test/model"
 
     class VllmConfig:
         model_config = ModelConfig()
+
+        def __init__(self):
+            self.quant_config = quant_config
+            self.cache_config = SimpleNamespace(cache_dtype=cache_dtype)
 
     config_module = ModuleType("vllm.config")
     config_module.ModelConfig = ModelConfig
@@ -47,9 +62,6 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
         def build_identity(self):
             return p2p_pb2.SourceIdentity(model_name="test/model")
 
-        def after_runtime_tensor_receive(self, result):
-            assert result.model is model
-
     class Installer:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
@@ -63,27 +75,24 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
         sys.modules, "modelexpress.engines.vllm.adapter", adapter_module
     )
     model = torch.nn.Linear(4, 4)
-    load_context = SimpleNamespace(
-        tensors={"weight": model.weight},
-        worker_id="inference-worker-3",
-        identity=p2p_pb2.SourceIdentity(model_name="test/model", revision="base"),
-    )
+
+    class Loader:
+        tensors = {"weight": model.weight}
+        worker_id = "inference-worker-3"
+
+        def unpublish_runtime_tensors(self):
+            publication_events.append(("unpublish", self))
+
+        def publish_runtime_tensors(self, version_id):
+            publication_events.append(("publish", self, version_id))
+
+    loader = Loader()
     loader_module = ModuleType("modelexpress.engines.vllm.loader")
-    loader_module.get_load_context = lambda device_id: load_context
+    loader_module.get_model_loader = lambda device_id: loader
     monkeypatch.setitem(
         sys.modules, "modelexpress.engines.vllm.loader", loader_module
     )
     publication_events = []
-    monkeypatch.setattr(
-        load_strategy_module,
-        "unpublish_metadata",
-        lambda ctx: publication_events.append(("unpublish", ctx)),
-    )
-    monkeypatch.setattr(
-        load_strategy_module,
-        "publish_metadata",
-        lambda ctx: publication_events.append(("publish", ctx)),
-    )
     installer_module = ModuleType(
         "modelexpress_rl.inference.engines.vllm.installer"
     )
@@ -108,7 +117,7 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
     assert {
         key: value
         for key, value in runtime.installer.kwargs.items()
-        if key not in {"runtime_tensors", "refresh_runtime_state"}
+        if key != "runtime_tensors"
     } == {
         "model": model,
         "vllm_config": config,
@@ -116,21 +125,27 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
         "device": torch.device("cuda:2"),
         "convert_native_to_hf": convert_native_to_hf,
     }
-    assert runtime.installer.kwargs["runtime_tensors"] == {"weight": model.weight}
-    runtime.installer.kwargs["refresh_runtime_state"]()
+    expected_runtime_tensors = (
+        {"weight": model.weight} if runtime_p2p_available else None
+    )
+    assert runtime.installer.kwargs["runtime_tensors"] == expected_runtime_tensors
     assert runtime.full_tensor is not None
     assert runtime.full_tensor.device_id == 2
     assert runtime.full_tensor.worker_rank == 3
     assert runtime.full_tensor.capture_layout(["manifest"]) == ["manifest"]
-    assert runtime.full_tensor.runtime_tensors is load_context.tensors
-    assert runtime.full_tensor.source_worker_id == "inference-worker-3"
-    runtime.full_tensor.unpublish_runtime_tensors()
-    runtime.full_tensor.publish_runtime_tensors("version-a")
-    assert publication_events == [
-        ("unpublish", load_context),
-        ("publish", load_context),
-    ]
-    assert load_context.identity.revision == "version-a"
+    assert (runtime.full_tensor.runtime_tensors is loader.tensors) is (
+        runtime_p2p_available
+    )
+    assert runtime.full_tensor.source_worker_id == (
+        "inference-worker-3" if runtime_p2p_available else None
+    )
+    if runtime_p2p_available:
+        runtime.full_tensor.unpublish_runtime_tensors()
+        runtime.full_tensor.publish_runtime_tensors("version-a")
+        assert publication_events == [
+            ("unpublish", loader),
+            ("publish", loader, "version-a"),
+        ]
     identity = runtime.full_tensor.build_identity("version-a")
     assert identity.model_name == "test/model"
     assert identity.revision == "version-a"

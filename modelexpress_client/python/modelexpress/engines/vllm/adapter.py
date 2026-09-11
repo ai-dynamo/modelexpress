@@ -267,10 +267,6 @@ class VllmAdapter(EngineAdapter):
         )
         return self._refresh_host_quantization_state(result)
 
-    def after_runtime_tensor_receive(self, result: LoadResult) -> LoadResult:
-        """Refresh non-transferable host mirrors after runtime tensor copy."""
-        return self._refresh_host_quantization_state(result)
-
     def apply_weight_iter(
         self,
         result: LoadResult,

@@ -571,17 +571,19 @@ publishes its normal `SourceIdentity` with `revision=WeightVersion.uid`; another
 generator queries `P2pService.ListSources` with the same engine-compatible
 identity and selects a READY source for its worker rank before falling back to
 trainer shard publications. Applied generators publish their complete post-load
-runtime tensors, including registered runtime buffers, under an
-identity tagged with `weight_layout=runtime`. An identical-rank peer pulls that
-exact runtime representation into private staging buffers, then copies it into
-the existing live tensor storage at the engine safe point. Trainer NIXL inputs
-remain a separate load-time representation that runs through vLLM's normal
-post-weight-load processing.
+runtime tensors, including registered runtime buffers. An identical-rank peer
+pulls that exact runtime representation into private staging buffers, then
+copies it into the existing live tensor storage at the engine safe point.
+Trainer NIXL inputs remain a separate load-time representation that runs through
+vLLM's normal post-weight-load processing.
 
 The vLLM inference loader discovers this post-load tensor set once and retains
 the device-local mapping. The RL runtime reuses that mapping for peer layout
 validation, publication, and in-place installation instead of walking the model
-again after warmup or compilation.
+again after warmup or compilation. This warm-copy path is currently unavailable
+for quantized models and FP8 KV caches because their derived host state cannot be
+safely refreshed in place. Those workers skip generator P2P and use the canonical
+S3 path before any live-engine mutation.
 
 An object-storage generator with full-tensor engine support defaults to a
 same-rank generator peer first and the version-level object-storage source

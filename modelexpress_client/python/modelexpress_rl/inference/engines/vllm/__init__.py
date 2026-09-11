@@ -10,6 +10,19 @@ from ...runtime import EngineRuntime, FullTensorEngineCapability
 from .context import VllmGeneratorContext
 
 
+def _supports_runtime_tensor_p2p(vllm_config: object) -> bool:
+    """Return whether a warm copy needs no derived quantized-state refresh."""
+    # Model quantization may keep host-side scale mirrors or kernel state that
+    # is not part of the registered runtime tensor set.
+    if getattr(vllm_config, "quant_config", None) is not None:
+        return False
+    # FP8 is the quantized KV-cache format supported by vLLM. Its KV scales are
+    # likewise derived state; non-FP8 cache dtypes do not need that refresh.
+    cache_config = getattr(vllm_config, "cache_config", None)
+    cache_dtype = getattr(cache_config, "cache_dtype", None)
+    return not (isinstance(cache_dtype, str) and cache_dtype.startswith("fp8"))
+
+
 def _create_vllm_engine_runtime(
     engine_context: GeneratorEngineContext,
 ) -> EngineRuntime:
@@ -20,9 +33,7 @@ def _create_vllm_engine_runtime(
     from vllm.config import ModelConfig, VllmConfig
 
     from modelexpress.engines.vllm.adapter import VllmAdapter
-    from modelexpress.engines.vllm.loader import get_load_context
-    from modelexpress.load_strategy import publish_metadata, unpublish_metadata
-    from modelexpress.load_strategy.context import LoadResult
+    from modelexpress.engines.vllm.loader import get_model_loader
 
     from .installer import _VllmInstaller
 
@@ -36,16 +47,14 @@ def _create_vllm_engine_runtime(
     if not isinstance(model_config, ModelConfig):
         raise TypeError("vLLM engine context model_config must be a ModelConfig")
     engine = VllmAdapter(vllm_config, model_config)
-    load_context = get_load_context(engine.get_device_id())
+    loader = get_model_loader(engine.get_device_id())
     runtime_tensors = (
-        load_context.tensors
-        if load_context is not None and load_context.tensors
+        loader.tensors
+        if loader is not None
+        and loader.tensors
+        and _supports_runtime_tensor_p2p(vllm_config)
         else None
     )
-
-    def refresh_runtime_state() -> None:
-        result = LoadResult(value=model, model=model)
-        engine.after_runtime_tensor_receive(result)
 
     installer = _VllmInstaller(
         model=model,
@@ -54,7 +63,6 @@ def _create_vllm_engine_runtime(
         device=engine.get_target_device(),
         convert_native_to_hf=engine_context.convert_native_to_hf,
         runtime_tensors=runtime_tensors,
-        refresh_runtime_state=refresh_runtime_state,
     )
 
     def build_identity(version_id: str):
@@ -63,13 +71,12 @@ def _create_vllm_engine_runtime(
         return identity
 
     def unpublish_runtime_tensors() -> None:
-        if load_context is not None:
-            unpublish_metadata(load_context)
+        if loader is not None:
+            loader.unpublish_runtime_tensors()
 
     def publish_runtime_tensors(version_id: str) -> None:
-        if load_context is not None:
-            load_context.identity.revision = version_id
-            publish_metadata(load_context)
+        if loader is not None:
+            loader.publish_runtime_tensors(version_id)
 
     return EngineRuntime(
         model_name=vllm_config.model_config.model,
@@ -81,7 +88,7 @@ def _create_vllm_engine_runtime(
             capture_layout=installer.capture,
             runtime_tensors=runtime_tensors,
             source_worker_id=(
-                load_context.worker_id if runtime_tensors is not None else None
+                loader.worker_id if runtime_tensors is not None else None
             ),
             unpublish_runtime_tensors=unpublish_runtime_tensors,
             publish_runtime_tensors=publish_runtime_tensors,
