@@ -132,6 +132,52 @@ ARTIFACT_INSTALL_STEPS = ("validate", "extract")
 #: GiB of small files, so a healthy extract is well under a second and a
 #: pathological one (slow overlay filesystem, tar in D state) is minutes.
 _ARTIFACT_STEP_BUCKETS = (0.1, 0.25, 0.5, 1, 2.5, 5, 15, 30, 60, 120, 300)
+#: The six strategies the chain builds, in the order it tries them, plus the one
+#: load path that is a chain by hand. L2 lives one level below the ``chain``
+#: phase of L1: ``chain`` says the strategy chain spent four seconds, L2 says
+#: which strategy spent them.
+#:
+#: Closed by construction rather than by clamping. ``LoadStrategyChain.run``
+#: rebuilds the first six on every call -- there is no registry, no plugin hook,
+#: no out-of-tree extension point -- so a name that is not here means this tuple
+#: and that list have drifted, not that a deployment invented a strategy.
+#:
+#: ``transfer_engine`` is SGLang's transport that never enters the chain. It
+#: tries the transfer and, on failure, re-initializes and falls through to
+#: ``default`` exactly as the chain would, so it records the same attempt spans
+#: from the same call sites -- it is simply not one of the six objects.
+#:
+#: ``server-cache`` keeps its hyphen. It is already the value the tracer sets as
+#: ``weight_loading_strategy`` on the load span, and normalizing it here would
+#: desynchronize the metric from the trace for nothing.
+LOAD_STRATEGIES = (
+    "rdma",
+    "server-cache",
+    "instant_tensor",
+    "model_streamer",
+    "gds",
+    "default",
+    "transfer_engine",
+)
+
+#: How one strategy attempt ended. Not a restatement of ``LOAD_OUTCOMES``: a
+#: single load runs up to six attempts, of which at most one is a ``success``.
+#:
+#:   success         returned weights; the chain stops here
+#:   fallback        clean miss, model untouched, chain tries the next strategy
+#:   fallback_dirty  miss after mutating the model, forcing a re-init first
+#:   recovery_error  the re-init itself failed; the whole chain fails closed
+#:   error           an unexpected exception, which the chain treats as a miss
+#:
+#: ``fallback`` and ``fallback_dirty`` stay separate because only the dirty one
+#: pays for ``_reinit_for_retry``, and that is the expensive case worth seeing.
+LOAD_STRATEGY_OUTCOMES = (
+    "success",
+    "fallback",
+    "fallback_dirty",
+    "recovery_error",
+    "error",
+)
 
 #: The phases of one P2P source attempt, in the order they run. A source attempt
 #: is one candidate in ``RdmaStrategy.load`` -- the unit ``mx_p2p_source_attempts_total``
@@ -273,6 +319,15 @@ class _PhaseSpan:
         self.seconds = 0.0
 
 
+class _StrategyAttempt:
+    """Mutable outcome holder for :meth:`MetricsCollector.time_load_strategy`."""
+
+    __slots__ = ("outcome",)
+
+    def __init__(self) -> None:
+        self.outcome = "error"
+
+
 class MetricsCollector:
     """Lazy holder for prometheus_client collectors.
 
@@ -403,7 +458,7 @@ class MetricsCollector:
         self.attempts = Counter(
             "mx_p2p_source_attempts_total",
             "Source attempts by result.",
-            # success|metadata_miss|transfer_retry|transfer_fallback
+            # success|metadata_miss|accelerator_reject|transfer_retry|transfer_fallback
             ["policy", "scheme", "result"],
             registry=registry,
         )
@@ -529,6 +584,44 @@ class MetricsCollector:
             "Divided by the extract step's _sum this is extraction throughput, "
             "which is what separates a slow disk from a large cache.",
             ["artifact", "archive", "scheme"],
+            registry=registry,
+        )
+
+        # L2. One observation per strategy the chain actually tried, so these
+        # are disjoint sub-intervals of the `chain` phase. Their sum is strictly
+        # LESS than that phase and always will be: `chain` also covers the
+        # eligibility filter, the span setup and the loop bookkeeping. Reading a
+        # residual here as lost time is a misreading -- see docs/METRICS.md.
+        #
+        # Reusing _XSLOW_BUCKETS, whose floor is 0.5 s, is a deliberate trade.
+        # The point of L2 is to be read against the `chain` phase on the same
+        # dashboard, and quantiles from differently-bucketed histograms are not
+        # comparable -- the reason that band is duplicated value-for-value in
+        # Rust in the first place. The cost is that a clean miss, which takes
+        # milliseconds, lands in the bottom bucket: for fast misses the count is
+        # the signal and the quantile is not.
+        self.load_strategy_seconds = Histogram(
+            "mx_load_strategy_seconds",
+            "Duration of one strategy attempt inside the chain phase of a load. "
+            "Disjoint sub-intervals of that phase, so their sum is bounded by "
+            "it. An rdma attempt is an envelope, not a transfer: it may contain "
+            "several source candidates, which mx_p2p_transfer_seconds splits.",
+            ["engine", "model", "strategy", "outcome", "scheme"],
+            buckets=_XSLOW_BUCKETS,
+            registry=registry,
+        )
+        # The companion to the histogram above, and what keeps it honest. Without
+        # it a strategy filtered out before the loop is indistinguishable from
+        # one that was eligible and never reached, and "rdma recorded nothing"
+        # has two opposite explanations.
+        self.strategy_skips = Counter(
+            "mx_load_strategy_skipped_total",
+            "Strategies the eligibility filter dropped before the chain could "
+            "run them. Does not count a strategy that was eligible but never "
+            "reached because an earlier one succeeded -- that distinction is "
+            "the whole point, and without it an empty row has two opposite "
+            "readings.",
+            ["engine", "strategy", "scheme"],
             registry=registry,
         )
 
@@ -921,6 +1014,32 @@ class MetricsCollector:
             except Exception:
                 pass
 
+    def observe_load_strategy_seconds(
+        self, engine: str, model: object, strategy: str, outcome: str, seconds: float
+    ) -> None:
+        """Record one strategy attempt inside the chain phase (L2).
+
+        An unknown strategy is dropped, for the same reason an unknown phase is:
+        these intervals are supposed to partition the chain phase, and folding a
+        stray name into an existing strategy would inflate that strategy while
+        the sum still looked sound. An unknown outcome is clamped instead --
+        outcomes partition nothing, so a catch-all loses a distinction rather
+        than corrupting a total.
+        """
+        if self._ensure():
+            try:
+                if strategy not in LOAD_STRATEGIES:
+                    return
+                if engine not in LOAD_ENGINES:
+                    engine = "other"
+                if outcome not in LOAD_STRATEGY_OUTCOMES:
+                    outcome = "error"
+                self.load_strategy_seconds.labels(
+                    engine, _model_label(model), strategy, outcome, self.scheme
+                ).observe(seconds)
+            except Exception:
+                pass
+
     def record_artifact_install_bytes(self, artifact: str, archive: str, nbytes: int) -> None:
         """Count the bytes of one archive extracted on the target."""
         if self._ensure():
@@ -930,6 +1049,32 @@ class MetricsCollector:
                 self.artifact_install_bytes.labels(artifact, archive, self.scheme).inc(
                     nbytes
                 )
+            except Exception:
+                pass
+
+    def record_chain_skips(self, engine: str, skipped: object) -> None:
+        """Record the strategies the eligibility filter dropped (L2).
+
+        Takes the whole set so the chain spends one call on this rather than a
+        loop: the caller owns the eligibility decision, this module owns what is
+        done with it.
+
+        An unrecognized name clamps to ``other`` rather than being dropped. This
+        counter partitions nothing, so there is no sum a catch-all can corrupt,
+        whereas dropping would lose the event outright -- the opposite trade
+        from the histogram above, and deliberate.
+
+        No ``model`` label. Eligibility is a property of the environment -- a
+        driver, a package, an env var -- not of the model being loaded.
+        """
+        if self._ensure():
+            try:
+                if engine not in LOAD_ENGINES:
+                    engine = "other"
+                for name in skipped:
+                    if name not in LOAD_STRATEGIES:
+                        name = "other"
+                    self.strategy_skips.labels(engine, name, self.scheme).inc()
             except Exception:
                 pass
 
@@ -947,6 +1092,25 @@ class MetricsCollector:
         finally:
             self.observe_artifact_install_step_seconds(
                 artifact, archive, step, time.perf_counter() - start
+            )
+
+    @contextlib.contextmanager
+    def time_load_strategy(self, engine: str, model: object, strategy: str):
+        """Time one strategy attempt and record it however it ends (L2).
+
+        Yields a handle whose ``outcome`` the caller sets on each terminal
+        branch. It starts at ``error`` so that an exception no handler catches --
+        KeyboardInterrupt, SystemExit, CancelledError -- is still recorded
+        rather than dropped, which is the property a ``finally`` has and an
+        ``except`` clause does not.
+        """
+        attempt = _StrategyAttempt()
+        start = time.perf_counter()
+        try:
+            yield attempt
+        finally:
+            self.observe_load_strategy_seconds(
+                engine, model, strategy, attempt.outcome, time.perf_counter() - start
             )
 
     @contextlib.contextmanager
