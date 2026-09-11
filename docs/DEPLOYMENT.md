@@ -677,6 +677,25 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 
 Each GPU worker publishes independently using its global rank (`torch.distributed.get_rank()`). No inter-worker coordination or barriers required.
 
+### Collective Refit (NCCL M2N) Environment Variables
+
+Client-side policy for the NCCL M2N collective refit path
+(`modelexpress_rl.collective`), which is a sibling of the NIXL pull path
+rather than a mode of it. Every value is validated when it is read: a
+non-numeric, zero or negative setting raises rather than falling back to the
+default, so a typo fails loudly at startup instead of silently restoring
+stock behavior. Design: [NCCL_M2N_REFIT.md](NCCL_M2N_REFIT.md).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MX_NCCL_REFIT_GROUP_TIMEOUT_S` | `600.0` | Deadline for group formation, from join until the group reports `READY` with every participant admitted. |
+| `MX_NCCL_REFIT_POLL_INTERVAL_S` | `0.25` | Backoff floor for `GetCollectiveGroup` polling while waiting for formation and for lane bootstrap ids to be published. |
+| `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S` | `300.0` | Deadline for bringing up one lane's NCCL communicator once its bootstrap id is published. Communicators are created non-blocking, and this bounds the poll to `ncclSuccess`. Setting `NCCL_COMM_BLOCKING` to anything other than `0` is rejected at startup, because blocking initialization would defeat this deadline. |
+| `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600.0` | Deadline for the reshard itself, armed per weight version. `READY` only means the group formed, so this bounds what happens after it; on expiry the group is aborted and has to re-form at a fresh epoch, because peers that disagree about which collectives completed cannot be recovered on the same communicator. |
+| `MX_NCCL_REFIT_NUM_STREAMS` | `2` | CUDA streams used to overlap per-pipeline-stage reshard lanes. |
+| `MX_NCCL_REFIT_MISC_CHUNK_BYTES` | `268435456` (256 MiB) | Bytes per packed-broadcast chunk. |
+| `MX_NCCL_REFIT_REGISTRATION_TTL_S` | `3 x MX_HEARTBEAT_INTERVAL_SECS`, so `90` | How long a participant's registration stays alive without a heartbeat. Derived from `MX_HEARTBEAT_INTERVAL_SECS` (default `30`), so raising the heartbeat interval raises this with it. |
+
 ### NIXL Backend Selection
 
 `MX_NIXL_BACKEND` selects the NIXL plugin used for GPU-to-GPU RDMA.
