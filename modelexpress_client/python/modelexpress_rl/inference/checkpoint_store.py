@@ -429,13 +429,16 @@ class LocalCheckpointStore:
     def verify_artifact(self, artifact: Path) -> None:
         self._verified_artifact_metadata(artifact)
 
+    def artifact_source(self, artifact: Path) -> dict[str, str] | None:
+        """Return the recorded immutable source after verifying local files."""
+        return self._verified_artifact_metadata(artifact).get("source")
+
     def verify_artifact_source(
         self,
         artifact: Path,
         expected_source: dict[str, str],
     ) -> None:
-        metadata = self._verified_artifact_metadata(artifact)
-        if metadata.get("source") != expected_source:
+        if self.artifact_source(artifact) != expected_source:
             raise ValueError("prepared checkpoint has different source identity")
 
 

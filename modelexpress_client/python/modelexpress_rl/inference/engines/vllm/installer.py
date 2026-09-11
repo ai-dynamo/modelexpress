@@ -33,6 +33,7 @@ from modelexpress_rl.inference.plan import (
     PreparedArtifact,
     PreparedCheckpointArtifact,
     PreparedEngineTensors,
+    PreparedRuntimeTensors,
 )
 from modelexpress_rl.inference.receiver import PreparedCheckpoint
 
@@ -55,15 +56,14 @@ class _VllmInstaller(EngineInstaller):
         model_config: ModelConfig,
         device: torch.device,
         convert_native_to_hf: Callable[[dict], dict] | None = None,
+        runtime_tensors: dict[str, torch.Tensor] | None = None,
     ) -> None:
         self._model = model
         self._vllm_config = vllm_config
         self._model_config = model_config
         self._device = device
         self._convert_native_to_hf = convert_native_to_hf
-        self._parameter_layout: dict[
-            str, tuple[tuple[int, ...], torch.dtype]
-        ] | None = None
+        self._runtime_tensors = runtime_tensors
 
     @property
     def capabilities(self) -> EngineCapabilities:
@@ -71,6 +71,7 @@ class _VllmInstaller(EngineInstaller):
             artifact_types=frozenset(
                 {
                     PreparedEngineTensors,
+                    PreparedRuntimeTensors,
                     PreparedCheckpointArtifact,
                 }
             )
@@ -80,6 +81,8 @@ class _VllmInstaller(EngineInstaller):
         started = time.perf_counter()
         if isinstance(prepared, PreparedEngineTensors):
             self.install_tensors(prepared.staged.tensors)
+        elif isinstance(prepared, PreparedRuntimeTensors):
+            self.install_runtime_tensors(prepared.staged.tensors)
         elif isinstance(prepared, PreparedCheckpointArtifact):
             checkpoint = prepared.checkpoint
             if not isinstance(checkpoint, PreparedCheckpoint):
@@ -95,51 +98,6 @@ class _VllmInstaller(EngineInstaller):
     def _is_quantized(self) -> bool:
         """Whether the live model uses a post-load quantized kernel layout."""
         return getattr(self._vllm_config, "quant_config", None) is not None
-
-    def _build_meta_twin(self) -> Module:
-        """Build an unquantized, storage-free copy of the load-time model.
-
-        Quantized live parameters are already packed for their kernels, so they
-        cannot describe where bf16 trainer weights land during normal loading.
-        The unquantized meta twin has the same structural fusion and load-time
-        parameter layout without allocating tensor storage.
-        """
-        try:
-            from vllm.model_executor.model_loader.utils import initialize_model
-            from vllm.utils.torch_utils import set_default_torch_dtype
-        except (ImportError, AttributeError) as error:
-            raise RuntimeError(
-                "ModelExpress refit requires vLLM's layerwise reload APIs"
-            ) from error
-
-        # Strip quantization so capture observes pre-PWAL load-time parameters,
-        # not fp8/Marlin kernel storage.
-        twin_config = copy.copy(self._vllm_config)
-        twin_model_config = copy.copy(self._vllm_config.model_config)
-        twin_model_config.quantization = None
-        twin_config.model_config = twin_model_config
-        twin_config.quant_config = None
-        # The live model already populated static_forward_context. The twin needs
-        # a separate empty registry or Attention initialization rejects duplicate
-        # layer prefixes.
-        twin_compilation_config = copy.copy(self._vllm_config.compilation_config)
-        twin_compilation_config.static_forward_context = {}
-        twin_config.compilation_config = twin_compilation_config
-
-        # Match vLLM's normal loader initialization; otherwise torch's fp32
-        # default would produce the wrong destination dtype during capture.
-        with set_default_torch_dtype(self._model_config.dtype), torch.device("meta"):
-            return initialize_model(twin_config)
-
-    @staticmethod
-    def _layout_of(
-        model: Module,
-    ) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
-        """Describe one model's named parameter shapes and dtypes."""
-        return {
-            name: (tuple(parameter.shape), parameter.dtype)
-            for name, parameter in model.named_parameters()
-        }
 
     def capture(
         self, manifest: list[tuple[str, torch.dtype, tuple[int, ...]]]
@@ -201,14 +159,7 @@ class _VllmInstaller(EngineInstaller):
             len(capture.unsupported),
             self._is_quantized,
         )
-        self._parameter_layout = param_layout
         return capture, param_layout
-
-    def parameter_layout(self) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
-        """Return the canonical load-time layout used by peer staging buffers."""
-        if self._parameter_layout is None:
-            self._parameter_layout = self._layout_of(self._build_meta_twin())
-        return self._parameter_layout
 
     def install_tensors(self, tensors: dict[str, torch.Tensor]) -> None:
         """Install verified load-layout tensors without changing graph addresses."""
@@ -220,6 +171,33 @@ class _VllmInstaller(EngineInstaller):
         with refit_span("post_install"):
             _update_mla_absorbed_weights(self._model, quantized=self._is_quantized)
             torch.cuda.synchronize(self._device)
+
+    @torch.no_grad()
+    def install_runtime_tensors(self, tensors: dict[str, torch.Tensor]) -> None:
+        """Copy a peer's processed tensors into existing graph-bound storage."""
+        if self._runtime_tensors is None:
+            raise RuntimeError("vLLM runtime tensor installation is unavailable")
+        destinations = self._runtime_tensors
+        local_only = sorted(set(destinations) - set(tensors))
+        source_only = sorted(set(tensors) - set(destinations))
+        if local_only or source_only:
+            raise IncompleteRefit(
+                "vLLM runtime tensor set differs from the staged peer: "
+                f"{len(local_only)} local-only, {len(source_only)} source-only"
+            )
+        for name, source in tensors.items():
+            destination = destinations[name]
+            if (
+                destination.shape != source.shape
+                or destination.dtype != source.dtype
+            ):
+                raise IncompleteRefit(
+                    f"vLLM runtime tensor metadata differs for {name!r}"
+                )
+        for name, source in tensors.items():
+            destination = destinations[name]
+            destination.copy_(source)
+        torch.cuda.synchronize(self._device)
 
     def install_checkpoint(self, path: str | Path) -> None:
         """Reload a prepared safetensors checkpoint into the live model."""

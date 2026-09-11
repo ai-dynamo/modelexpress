@@ -26,8 +26,8 @@ from modelexpress_rl.inference.adapter import (
     GeneratorTransferInputs,
     NixlGeneratorSource,
 )
-from modelexpress_rl.inference.methods.full_tensor import (
-    FullTensorNixlUpdateMethod,
+from modelexpress_rl.inference.methods.load_time_tensor import (
+    LoadTimeTensorNixlUpdateMethod,
     _attribute_transfer,
 )
 from modelexpress_rl.inference.plan import TrainerUpdateSource
@@ -142,16 +142,9 @@ def test_version_digest_refreshes_verification_without_replanning():
             return SimpleNamespace(metrics={"bytes_received": 0})
 
     transfer = Transfer()
-    method = FullTensorNixlUpdateMethod(
+    method = LoadTimeTensorNixlUpdateMethod(
         transfer=transfer,
         capture_layout=lambda _manifest: None,
-        parameter_layout=dict,
-        build_identity=lambda _version: None,
-        worker_rank=0,
-        worker_id="worker",
-        enable_peer_publication=False,
-        accelerator="cuda",
-        p2p_client=object(),
     )
 
     def source(version, digest):

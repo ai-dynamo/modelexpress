@@ -346,6 +346,20 @@ seed checkpoint, write the cache, or validate the base version.
 
 ## Weight Update
 
+With full-tensor engine support, active refit uses this order:
+
+1. load the exact requested version from a same-rank generator peer;
+2. if no peer can prepare it, reconstruct the complete S3 lineage from its full
+   checkpoint root through the target deltas and install that checkpoint.
+
+Post-load generator P2P is currently unavailable for quantized models and FP8
+KV caches. These configurations select the S3 path before staging or mutating
+the live engine.
+
+A successful peer install does not trigger checkpoint reconstruction. If a
+later active refit cannot use a same-rank generator peer, that foreground refit
+resolves the immutable full root and delta lineage from S3 before installation.
+
 ### Generator-side S3 artifact contract
 
 The weight version's `object_storage.uri` points to a global JSON index. Shard

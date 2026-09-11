@@ -31,6 +31,23 @@ class WeightSource(str, Enum):
     OBJECT_STORAGE = "OBJECT_STORAGE"
 
 
+def parse_weight_source_order(value: str) -> tuple[WeightSource, ...]:
+    """Parse a comma-separated weight-source fallback order."""
+    names = tuple(item.strip().upper() for item in value.split(","))
+    if not names or any(not name for name in names):
+        raise ValueError("MX_GENERATOR_SOURCE_ORDER must be a comma-separated list")
+    try:
+        sources = tuple(WeightSource(name) for name in names)
+    except ValueError as exc:
+        choices = ", ".join(source.value for source in WeightSource)
+        raise ValueError(
+            f"MX_GENERATOR_SOURCE_ORDER entries must be one of: {choices}"
+        ) from exc
+    if len(set(sources)) != len(sources):
+        raise ValueError("MX_GENERATOR_SOURCE_ORDER must not contain duplicates")
+    return sources
+
+
 @dataclass(frozen=True)
 class MethodCapabilities:
     """Combinations accepted and produced by an update method."""
@@ -101,6 +118,17 @@ class PreparedArtifact(ABC):
 
 @dataclass(frozen=True)
 class PreparedEngineTensors(PreparedArtifact):
+    staged: StagedEngineTensors
+
+    @property
+    def metrics(self) -> dict[str, float]:
+        return dict(getattr(self.staged, "metrics", {}))
+
+
+@dataclass(frozen=True)
+class PreparedRuntimeTensors(PreparedArtifact):
+    """Post-load engine tensors ready for an in-place runtime copy."""
+
     staged: StagedEngineTensors
 
     @property
@@ -187,11 +215,11 @@ class UpdateMethod(ABC):
         version, source = chain[0]
         return self.prepare(version=version, source=source)
 
+    def preparation_failed(self) -> None:
+        """Restore method-owned state after preparation fails."""
+
     def installation_failed(self, prepared: PreparedArtifact) -> None:
         """Fence method-owned state after an engine installation failure."""
-
-    def publish_applied(self, *, version_id: str, prepared: PreparedArtifact) -> None:
-        """Optionally advertise an installed update as a generator source."""
 
     def close(self) -> None:
         """Release method-owned process resources."""
@@ -236,8 +264,20 @@ class WeightUpdatePlanner:
         self._installer = installer
         self._max_transfer_attempts = max_transfer_attempts
 
-    def plans(self, version: WeightVersion):
+    @property
+    def source_order(self) -> tuple[WeightSource, ...]:
+        """Return source kinds in the order configured for fallback."""
+        return tuple(resolver.kind for resolver in self._resolvers)
+
+    def plans(
+        self,
+        version: WeightVersion,
+        *,
+        source_kind: WeightSource | None = None,
+    ):
         for resolver in self._resolvers:
+            if source_kind is not None and resolver.kind is not source_kind:
+                continue
             if not resolver.supports(version):
                 continue
             resolved_plans = []
@@ -274,10 +314,17 @@ class WeightUpdatePlanner:
                 for _ in range(1, self._max_transfer_attempts):
                     yield resolved_plans[0]
 
-    def validate(self, version: WeightVersion) -> None:
+    def validate(
+        self,
+        version: WeightVersion,
+        *,
+        source_kind: WeightSource | None = None,
+    ) -> None:
         """Reject unsupported static combinations before source I/O or leases."""
         candidates = []
         for resolver in self._resolvers:
+            if source_kind is not None and resolver.kind is not source_kind:
+                continue
             if not resolver.supports(version):
                 continue
             candidates.append((resolver.kind, resolver.payload_format(version)))
@@ -310,6 +357,7 @@ __all__ = [
     "PreparedArtifact",
     "PreparedCheckpointArtifact",
     "PreparedEngineTensors",
+    "PreparedRuntimeTensors",
     "ResolvedSource",
     "StagedEngineTensors",
     "TrainerUpdateSource",
