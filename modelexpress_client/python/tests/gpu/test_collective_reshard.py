@@ -185,3 +185,78 @@ def test_a_cohort_that_never_reshards_does_not_match() -> None:
 def test_a_wrong_expectation_does_not_match() -> None:
     """Control: the comparison discriminates values, not merely shapes."""
     assert _run_cohort("perturb-expectation") == {rank: False for rank in DST_RANKS}
+
+def _two_lane_main(rank: int, uids: tuple[bytes, bytes], results) -> None:
+    """Create one lane, use it, create a second, then use the first again."""
+    from modelexpress_rl.collective.comm import CommunicatorCache, LaneKey
+
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+    stream = torch.cuda.Stream(device=device)
+    cache = CommunicatorCache()
+
+    def barrier(lane) -> None:
+        buf = torch.zeros(1, dtype=torch.uint8, device=device)
+        with torch.cuda.device(device):
+            lane.handle.broadcast(
+                sendbuf=buf, recvbuf=buf, root=0,
+                stream=int(lane.stream.cuda_stream),
+            )
+        lane.synchronize()
+
+    try:
+        first = cache.create(
+            LaneKey(group_id="two-lane", epoch=1, lane_id=0),
+            rank=rank, world_size=RANKS, unique_id=uids[0],
+            device=device, stream=stream, timeout_s=120.0,
+        )
+        barrier(first)
+        cache.create(
+            LaneKey(group_id="two-lane", epoch=1, lane_id=1),
+            rank=rank, world_size=RANKS, unique_id=uids[1],
+            device=device, stream=stream, timeout_s=120.0,
+        )
+        barrier(first)
+        results.put((rank, True))
+    except Exception as error:  # noqa: BLE001 - the failure is the result
+        results.put((rank, f"{type(error).__name__}: {error}"))
+
+
+@pytest.mark.skipif(_requirements() is not None, reason=_requirements() or "")
+def test_a_lane_stays_usable_after_another_lane_is_created() -> None:
+    """Bringing up a second communicator must not strand the first.
+
+    The lanes of a group are created one at a time with a full-group barrier
+    between them, and a new init puts every other non-blocking communicator
+    back into ncclInProgress. Without settling them, that second barrier fails
+    with ncclInvalidArgument on every rank, which takes the whole collective
+    path down before any weight moves.
+    """
+    from nccl.core import utils
+
+    def mint() -> bytes:
+        value = utils.get_unique_id()
+        raw = getattr(value, "as_bytes", None)
+        return bytes(raw() if callable(raw) else raw)
+
+    uids = (mint(), mint())
+    context = mp.get_context("spawn")
+    results = context.Queue()
+    workers = [
+        context.Process(target=_two_lane_main, args=(rank, uids, results))
+        for rank in range(RANKS)
+    ]
+    for worker in workers:
+        worker.start()
+    collected: dict[int, object] = {}
+    try:
+        for _ in range(RANKS):
+            rank, outcome = results.get(timeout=300)
+            collected[rank] = outcome
+    finally:
+        for worker in workers:
+            worker.join(timeout=60)
+            if worker.is_alive():
+                worker.terminate()
+    failures = {rank: out for rank, out in collected.items() if out is not True}
+    assert not failures, f"lane unusable after a second init: {failures}"

@@ -310,7 +310,28 @@ class CommunicatorCache:
             unique_id=bytes(unique_id),
         )
         self._lanes[key] = lane
+        # Bringing a new communicator up puts every other live one back into
+        # ncclInProgress, and a non-blocking communicator refuses collectives
+        # until it has been polled to ncclSuccess again. The lanes of a group
+        # are created one at a time with a full-group barrier between them, so
+        # without this the barrier after the second lane fails with
+        # ncclInvalidArgument on every rank. Poll here rather than on every
+        # handle access: creation is rare and is what causes the transition.
+        self._settle_others(key, bindings, timeout_s)
         return lane
+
+    def _settle_others(self, created: LaneKey, bindings: Any, timeout_s: float) -> None:
+        """Return every other live lane to ncclSuccess after a new init."""
+        for key, lane in list(self._lanes.items()):
+            if key == created or lane.aborted:
+                continue
+            try:
+                _wait_until_initialized(lane.handle, bindings, timeout_s)
+            except Exception as error:
+                raise RuntimeError(
+                    f"lane {key.lane_id} of group {key.group_id} did not return to a "
+                    f"usable state after lane {created.lane_id} was initialized: {error!r}"
+                ) from error
 
     def invalidate_epoch(self, group_id: str, epoch: int) -> int:
         """Drop every lane not at ``epoch``. Returns how many were dropped."""
