@@ -13,6 +13,7 @@ from modelexpress_rl.inference.engines.vllm.installer import (
     _update_mla_absorbed_weights,
     _VllmInstaller,
 )
+from modelexpress_rl.inference.plan import PreparedStreamingTensors
 from torch import nn
 
 
@@ -80,6 +81,44 @@ def test_installer_resolves_load_time_parameters_after_layerwise_reload(monkeypa
     installer._process_and_commit({"weight": torch.tensor([7.0])})
 
     assert model.weight.item() == 7.0
+
+
+@pytest.mark.parametrize("fail_second", [False, True])
+def test_streaming_preserves_storage_and_propagates_partial_failure(
+    monkeypatch, fail_second
+):
+    _install_fake_vllm(monkeypatch, lambda model: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    model = nn.Sequential(nn.Linear(2, 2, bias=False), nn.Linear(2, 2, bias=False))
+    addresses = {n: p.data_ptr() for n, p in model.named_parameters()}
+    before_second = model[1].weight.detach().clone()
+    arena = torch.ones(2, 2)
+
+    def batches():
+        yield {"0.weight": arena}
+        arena.fill_(2)
+        assert torch.equal(model[0].weight, torch.ones(2, 2))
+        if fail_second:
+            raise RuntimeError("injected transport failure")
+        yield {"1.weight": arena}
+        arena.fill_(3)
+
+    prepared = PreparedStreamingTensors(batches, frozenset(addresses), {})
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
+    )
+    if fail_second:
+        with pytest.raises(RuntimeError, match="injected transport failure"):
+            installer.install_streaming(prepared)
+        assert torch.equal(model[1].weight, before_second)
+    else:
+        installer.install_streaming(prepared)
+        assert torch.equal(model[1].weight, torch.full((2, 2), 2.0))
+    assert torch.equal(model[0].weight, torch.ones(2, 2))
+    assert {n: p.data_ptr() for n, p in model.named_parameters()} == addresses
 
 
 def test_installer_rejects_parameters_left_on_meta(monkeypatch):
@@ -198,6 +237,87 @@ def test_installer_caches_parameter_layout():
     assert first == {"weight": ((2, 3), torch.float16)}
     assert second is first
     assert calls == ["build"]
+
+
+def test_layerwise_capture_and_streaming_preserve_tied_parameters(monkeypatch):
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedding = nn.Linear(2, 2, bias=False)
+            self.lm_head = nn.Linear(2, 2, bias=False)
+            self.lm_head.weight = self.embedding.weight
+
+        def load_weights(self, weights):
+            for name, weight in weights:
+                if name == "embedding.weight":
+                    self.embedding.weight.weight_loader(self.embedding.weight, weight)
+
+    class Info:
+        def __init__(self, parameter):
+            self.kernel_tensors = ({"weight": parameter}, {})
+
+        def reset(self):
+            self.kernel_tensors = None
+
+    def initialize(model):
+        for layer in (model.embedding, model.lm_head):
+            layerwise.LAYERWISE_INFO[layer] = Info(layer.weight)
+            layer.weight = nn.Parameter(torch.empty_like(layer.weight, device="meta"))
+
+    _install_fake_vllm(monkeypatch, initialize)
+    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
+
+    def place(layer, info):
+        layer.weight = info.kernel_tensors[0]["weight"]
+
+    def commit(layer, info):
+        info.kernel_tensors[0]["weight"].data.copy_(layer.weight)
+        place(layer, info)
+
+    def finalize(model, config):
+        for layer in (model.embedding, model.lm_head):
+            info = layerwise.LAYERWISE_INFO[layer]
+            if info.kernel_tensors is not None:
+                place(layer, info)
+                info.reset()
+
+    layerwise._get_original_loader = lambda parameter: None
+    layerwise._place_kernel_tensors = place
+    layerwise._copy_and_restore_kernel_tensors = commit
+    layerwise.finalize_layerwise_reload = finalize
+    weight_utils = ModuleType("vllm.model_executor.model_loader.weight_utils")
+    weight_utils.default_weight_loader = lambda parameter, weight: parameter.data.copy_(
+        weight
+    )
+    monkeypatch.setitem(sys.modules, weight_utils.__name__, weight_utils)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    model = Model()
+    original = model.embedding.weight.detach().clone()
+    address = model.embedding.weight.data_ptr()
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
+    )
+    capture, layout = installer.capture([("embedding.weight", torch.float32, (2, 2))])
+    assert (
+        set(layout)
+        == {copy.param_name for copy in capture.copies}
+        == {"embedding.weight"}
+    )
+    assert model.embedding.weight is model.lm_head.weight
+    assert torch.equal(model.embedding.weight, original)
+
+    def batches():
+        yield {"embedding.weight": torch.full((2, 2), 7.0)}
+
+    installer.install_streaming(
+        PreparedStreamingTensors(batches, frozenset(layout), {})
+    )
+    assert model.embedding.weight is model.lm_head.weight
+    assert model.embedding.weight.data_ptr() == address
+    assert torch.equal(model.lm_head.weight, torch.full((2, 2), 7.0))
 
 
 def test_installer_rejects_quantized_mla_derived_weight_refresh():

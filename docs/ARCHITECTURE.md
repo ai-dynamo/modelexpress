@@ -540,6 +540,35 @@ in the planner/session rather than in engine integrations.
   through SGLang's native safetensors loader.
 
 The corresponding trainer composition is owned by `TrainerRuntime`. Public
+The explicit `apply_weight_streaming(version=..., max_staging_bytes=...)`
+generator API holds a version lease across metadata preparation and incremental
+installation. The NIXL receiver plans complete owning-module batches and uses a
+single registered CUDA byte arena. Receive tensors, wire-dtype conversion
+buffers, full-source reconstruction buffers, and alignment all count toward the
+limit. The vLLM installer commits each batch into existing kernel storage and
+rejects retained references to the reusable arena. Ordinary `stage_weight()`
+continues to transfer a full independent copy before any installation.
+
+Before vLLM rebuilds per-module load-time parameter skeletons, the adapter records
+shared parameter objects and reconnects those aliases afterward. Capture then
+counts tied weights once, and installation preserves their shared kernel storage.
+Alias groups with inconsistent load-time shapes or dtypes are rejected.
+
+Released full-copy and bounded updates may alternate on one client. The transfer
+owner tears down its agent before clearing the mode-specific buffers and reloads
+source metadata into the new registrations. The update method invalidates cached
+full-copy descriptors before entering bounded preparation. Preparation retries
+retain one version lease and discard failed setup state; installation failures
+still fence the engine rather than retrying a partially committed update.
+
+Streaming is opt-in, trainer-only, and currently limited to unquantized vLLM
+models. It does not publish generator peers or roll back partially installed
+versions. An installation failure marks the client engine state uncertain and
+blocks further streaming updates. The hosting framework must keep all replicas
+paused and restart them after any failed update. Only completion of all replicas
+permits resuming generation. The staging limit excludes live model weights,
+engine-owned post-load workspace, CUDA allocator overhead, and transport metadata.
+
 `FSDPTrainerContext` and `MegatronTrainerContext` select only engine capture;
 full-tensor NIXL and canonical-checkpoint object-storage publication remain separate
 method implementations. This keeps transport, payload preparation, engine

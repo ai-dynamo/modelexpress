@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import threading
 import uuid
 from dataclasses import dataclass
@@ -370,6 +371,54 @@ class ModelExpressGeneratorClient:
             )
             return self._active_handle
 
+    def apply_weight_streaming(
+        self, *, version: WeightVersionRef, max_staging_bytes: int
+    ) -> Any:
+        """Transfer and install bounded GPU batches while inference is paused.
+
+        This operation mutates weights incrementally. On any failure the caller
+        must keep inference paused and restart the engine; there is no rollback.
+        ``stage_weight`` retains its full-copy, non-mutating staging contract.
+        """
+        if not isinstance(version, WeightVersionRef):
+            raise TypeError("version must be a WeightVersionRef")
+        with self._operation_lock:
+            if self._engine_state is _EngineState.UNCERTAIN:
+                raise RuntimeError(
+                    "engine weights are uncertain; restart before streaming refit"
+                )
+            if self._active_handle is not None:
+                raise RuntimeError("another generator update is still active")
+            assert self._runtime is not None
+            started = time.perf_counter()
+            update = self._runtime.session.prepare_streaming(
+                self._get_ready_version(version.version_id),
+                max_staging_bytes=max_staging_bytes,
+            )
+            prepare_s = time.perf_counter() - started
+            staged = StagedWeightHandle(
+                client=self, version_id=version.version_id, update=update
+            )
+            self._active_handle = staged
+            try:
+                result = self.apply_weight(staged)
+                metrics = {**(result or {}), **staged.metrics}
+            except BaseException:
+                try:
+                    self._release_staged(staged)
+                except Exception:
+                    logger.exception(
+                        "failed to release streaming update after installation error"
+                    )
+                raise
+            else:
+                release_started = time.perf_counter()
+                self._release_staged(staged)
+                metrics["streaming_prepare_s"] = prepare_s
+                metrics["streaming_release_s"] = time.perf_counter() - release_started
+                metrics["streaming_total_s"] = time.perf_counter() - started
+                return metrics
+
     def apply_weight(self, staged: StagedWeightHandle) -> Any:
         """Install a verified local staged version at the caller's safe point."""
         if not isinstance(staged, StagedWeightHandle) or staged._client is not self:
@@ -537,9 +586,7 @@ class ModelExpressGeneratorClient:
             raise RuntimeError("MX GetWeightVersion response is missing version")
         version = _weight_version(response.version)
         if version.state is not WeightVersionState.READY:
-            raise RuntimeError(
-                f"initial serving version {version_id!r} is not READY"
-            )
+            raise RuntimeError(f"initial serving version {version_id!r} is not READY")
         if version.model_name != self.model_name:
             raise RuntimeError(
                 "initial serving version model_name does not match the generator"
@@ -611,6 +658,7 @@ class ModelExpressGeneratorClient:
         )
 
     def _release_staged(self, staged: StagedWeightHandle) -> None:
+        """Free the active slot once locally released, including cleanup errors."""
         if staged._client is not self:
             raise ValueError("staged handle does not belong to this client")
         with self._operation_lock:
@@ -621,19 +669,14 @@ class ModelExpressGeneratorClient:
                 if self._active_handle is staged:
                     self._active_handle = None
                 return
-            if staged._update.released:
-                return
-            assert self._runtime is not None
             try:
-                self._runtime.session.release(staged._update)
+                if not staged._update.released:
+                    assert self._runtime is not None
+                    self._runtime.session.release(staged._update)
             finally:
-                # Covers a version that was staged and dropped without ever
-                # being installed, which the apply path never sees, and a
-                # release that itself raised. A no-op once the apply has
-                # already reported the cycle.
+                if staged._update.released and self._active_handle is staged:
+                    self._active_handle = None
                 timing.emit(staged._timing, logger)
-            if self._active_handle is staged:
-                self._active_handle = None
 
 
 __all__ = [
