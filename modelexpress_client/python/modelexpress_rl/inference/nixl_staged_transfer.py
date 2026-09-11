@@ -526,7 +526,7 @@ class _NixlStagedTransfer:
                 "full-tensor refit must cover every engine parameter; "
                 f"missing={len(missing)}, unsupported={len(unsupported)}, "
                 f"unattributed={capture.unattributed}, fallback={len(plan.fallback)}, "
-                f"causes={causes}"
+                f"causes={causes}, missing_names={missing[:10]}"
             )
 
     @staticmethod

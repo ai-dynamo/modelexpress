@@ -144,6 +144,30 @@ class _VllmInstaller(EngineInstaller):
             for name, parameter in model.named_parameters()
         }
 
+    @staticmethod
+    def _parameter_aliases(model: Module) -> list[list[tuple[Module, str]]]:
+        groups: dict[int, list[tuple[Module, str]]] = {}
+        for module in model.modules():
+            for name, parameter in module._parameters.items():
+                if parameter is not None:
+                    groups.setdefault(id(parameter), []).append((module, name))
+        return [group for group in groups.values() if len(group) > 1]
+
+    @staticmethod
+    def _restore_parameter_aliases(aliases: list[list[tuple[Module, str]]]) -> None:
+        # vLLM restores metadata separately for each module. Reconnect shared
+        # parameters so a tied loader still covers one canonical destination.
+        for group in aliases:
+            first_module, first_name = group[0]
+            parameter = getattr(first_module, first_name)
+            for module, name in group[1:]:
+                other = getattr(module, name)
+                if other.shape != parameter.shape or other.dtype != parameter.dtype:
+                    raise IncompleteRefit(
+                        "tied parameters have incompatible load-time layouts"
+                    )
+                setattr(module, name, parameter)
+
     def capture(
         self, manifest: list[tuple[str, torch.dtype, tuple[int, ...]]]
     ) -> tuple[
@@ -174,9 +198,11 @@ class _VllmInstaller(EngineInstaller):
             ) from error
 
         model = self._model
+        aliases = self._parameter_aliases(model)
         with torch.device(self._device), set_current_vllm_config(self._vllm_config):
             initialize_layerwise_reload(model)
             try:
+                self._restore_parameter_aliases(aliases)
                 # Trace the ORIGINAL loaders, not the reload shims they were wrapped in.
                 for _, param in model.named_parameters():
                     param.weight_loader = _get_original_loader(param)
@@ -437,9 +463,11 @@ class _VllmInstaller(EngineInstaller):
         bare_tensors = {
             module: values for module, values in bare_tensors.items() if values
         }
+        aliases = self._parameter_aliases(self._model)
 
         with torch.device(self._device), set_current_vllm_config(self._vllm_config):
             initialize_layerwise_reload(self._model)
+            self._restore_parameter_aliases(aliases)
             load()
             finalize_layerwise_reload(self._model, self._model_config)
 

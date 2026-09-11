@@ -540,6 +540,11 @@ limit. The vLLM installer commits each batch into existing kernel storage and
 rejects retained references to the reusable arena. Ordinary `stage_weight()`
 continues to transfer a full independent copy before any installation.
 
+Before vLLM rebuilds per-module load-time parameter skeletons, the adapter records
+shared parameter objects and reconnects those aliases afterward. Capture then
+counts tied weights once, and installation preserves their shared kernel storage.
+Alias groups with inconsistent load-time shapes or dtypes are rejected.
+
 Streaming is opt-in, trainer-only, and currently limited to unquantized vLLM
 models. It does not publish generator peers or roll back partially installed
 versions. An installation failure marks the client engine state uncertain and
