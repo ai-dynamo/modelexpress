@@ -5,7 +5,6 @@
 
 import multiprocessing
 import time
-from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -124,31 +123,24 @@ def test_successful_publish_retains_lease(monkeypatch, tmp_path):
     assert al.mark_publish_scheduled(ctx, _transfer(tmp_path), _identity()) is None
 
 
-def test_marker_key_uses_deterministic_identity_serializer(monkeypatch, tmp_path):
+def test_marker_key_uses_canonical_compatibility_identity(tmp_path):
     transfer = _transfer(tmp_path)
-    identity = _identity()
-    sentinel = b"deterministic-identity"
-    monkeypatch.setattr(al, "_identity_bytes", lambda value: sentinel)
-
-    expected = sha256()
-    expected.update(sentinel)
-    for root in transfer.roots:
-        expected.update(str(root.target_root.resolve()).encode())
-    expected.update(transfer.name.encode())
-
-    assert al.artifact_marker_key(transfer, identity, "install") == (
-        expected.hexdigest()[:16]
+    upper = p2p_pb2.SourceIdentity(
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
+        model_name="ORG/Test-Model",
+        revision="MAIN",
+        extra_parameters={"Z": "VALUE", "A": "OTHER"},
+    )
+    lower = p2p_pb2.SourceIdentity(
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
+        model_name="org/test-model",
+        revision="main",
+        extra_parameters={"a": "other", "z": "value"},
     )
 
-
-def test_identity_serializer_falls_back_for_legacy_protobuf_bindings():
-    class LegacyIdentity:
-        def SerializeToString(self, **kwargs):
-            if kwargs:
-                raise TypeError("deterministic is unsupported")
-            return b"legacy-identity"
-
-    assert al._identity_bytes(LegacyIdentity()) == b"legacy-identity"
+    assert al.artifact_marker_key(transfer, upper, "install") == (
+        al.artifact_marker_key(transfer, lower, "install")
+    )
 
 
 def test_scheduled_publisher_lease_reclaimed_after_owner_terminates(

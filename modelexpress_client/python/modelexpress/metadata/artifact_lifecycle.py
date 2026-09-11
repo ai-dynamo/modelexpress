@@ -279,16 +279,14 @@ def install_artifact_once(
     engine_label: str,
     on_install_completed: InstallCompleted | None = None,
 ) -> p2p_pb2.GetArtifactManifestHeaderResponse | None:
-    """Install one artifact at most once per artifact marker.
+    """Serialize installation attempts for one artifact identity.
 
-    The marker is written before the transport attempt, matching the original
-    P2P behavior.  A failed attempt therefore suppresses later attempts until
-    the marker is removed by an external cleanup or a new cache identity is
-    used.
+    The marker records that an attempt started. Direct-transfer callers skip
+    duplicate attempts while it exists; registered transports interpret marker
+    states through their lifecycle policy.
     """
-    # Keep private callers and older tests that still provide the pre-transport
-    # transfer object working. The production lifecycle uses the transport
-    # path below, and this branch follows the same marker/lock semantics.
+    # Transfer implementations that expose discovery directly use the same
+    # marker and lock coordination as registered transports.
     legacy_fetch = getattr(transfer, "discover_and_transfer", None)
     if legacy_fetch is not None:
         marker_path = artifact_marker_path(transfer, identity, "install-attempted")
@@ -391,13 +389,6 @@ def publish_artifact(
         elapsed,
     )
     return published
-
-
-def _identity_bytes(identity: p2p_pb2.SourceIdentity) -> bytes:
-    try:
-        return identity.SerializeToString(deterministic=True)
-    except TypeError:
-        return identity.SerializeToString()
 
 
 def artifact_ready_fn(
@@ -673,7 +664,7 @@ def artifact_marker_key(
     action: str,
 ) -> str:
     digest = sha256()
-    digest.update(_identity_bytes(identity))
+    digest.update(compute_mx_source_id(identity).encode())
     for root in transfer.roots:
         path = root.source_root if action == "publish-scheduled" else root.target_root
         digest.update(str(path.resolve()).encode())

@@ -57,12 +57,12 @@ class P2PArtifactTransport(ArtifactTransport):
     # P2P always exposes the local artifact after startup, independently of
     # whether this worker fetched a remote copy or rebuilt it locally.
     publish_requires_install_state = False
-    # Preserve the original PublisherThread behavior for transient P2P
-    # registration or source-publication failures.
+    # Retry transient registration and source-publication failures while the
+    # serving worker remains available.
     retry_publish_on_failure = True
 
     def state_after_cache_miss(self) -> ArtifactInstallState:
-        """Preserve the original P2P attempted-marker semantics."""
+        """Suppress duplicate remote discovery after a P2P cache miss."""
         return ArtifactInstallState(ArtifactInstallStatus.ATTEMPTED)
 
     def resolve_install_state(

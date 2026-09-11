@@ -72,7 +72,7 @@ def _publish_sglang_cache_artifact(
     transfer: ArtifactTransfer,
     identity: p2p_pb2.SourceIdentity,
 ) -> PublicationHandle:
-    """Compatibility wrapper for the shared source publication operation."""
+    """Publish one SGLang cache artifact through the selected transport."""
     return _common_artifacts.publish_artifact(
         ctx,
         transfer,

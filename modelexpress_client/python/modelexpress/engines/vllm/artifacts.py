@@ -253,7 +253,7 @@ def _install_vllm_cache_artifact_once(
     transfer: ArtifactTransfer,
     identity: p2p_pb2.SourceIdentity,
 ):
-    """Compatibility wrapper for the shared install-once operation."""
+    """Install one vLLM cache artifact through the shared lifecycle."""
     return _artifact_lifecycle.install_artifact_once(
         ctx,
         transfer,
@@ -267,7 +267,7 @@ def _publish_vllm_cache_artifact(
     transfer: ArtifactTransfer,
     identity: p2p_pb2.SourceIdentity,
 ) -> PublicationHandle:
-    """Compatibility wrapper for the shared source publication operation."""
+    """Publish one vLLM cache artifact through the selected transport."""
     if transfer.mx_source_type == p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE:
         # Runs on the publisher thread, which is gated on engine readiness, so
         # compilation has finished and vLLM's cache_dir is populated. Never let
