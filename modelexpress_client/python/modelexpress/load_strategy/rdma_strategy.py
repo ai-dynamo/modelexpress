@@ -481,6 +481,9 @@ class RdmaStrategy(LoadStrategy):
         source_worker_id: str,
     ) -> LoadResult:
         """Receive fully-processed weights via RDMA from an existing source."""
+        # The source-selection policy (random, rendezvous_hash, load_aware, ...)
+        # that chose this candidate. Every P2P client family carries it, so a
+        # phase duration can be read against the policy that picked the peer.
         policy = configured_policy_label()
         try:
             with selection_metrics.time_source_attempt_phase(policy, "prepare"):
@@ -525,22 +528,26 @@ class RdmaStrategy(LoadStrategy):
                     )
                     for t in tensor_protos
                 ]
-                nixl_fetch_start = time.perf_counter()
                 ep = source_worker.metadata_endpoint
                 host, port_str = ep.rsplit(":", 1)
                 # Claimed before the dial so a fetch that fails part-way, leaving
                 # metadata that lands later, is still released.
                 remote_agent_name = source_worker.agent_name
-                with selection_metrics.time_source_attempt_phase(policy, "handshake"):
+                # One handshake phase, two transports: here the peer's NIXL
+                # metadata is fetched from the peer itself; the centralized
+                # branch below loads the copy the MX server holds. Exactly one
+                # of the two runs per attempt.
+                with selection_metrics.time_source_attempt_phase(
+                    policy, "handshake"
+                ) as handshake:
                     ctx.nixl_manager.fetch_remote_and_wait(
                         remote_agent_name=source_worker.agent_name,
                         ip=host,
                         port=int(port_str),
                     )
-                nixl_fetch_time = time.perf_counter() - nixl_fetch_start
                 logger.info(
                     f"[Worker {ctx.global_rank}] [TIMING] P2P NIXL metadata fetch: "
-                    f"{nixl_fetch_time:.3f}s"
+                    f"{handshake.seconds:.3f}s"
                 )
             else:
                 source_tensors = [
@@ -555,14 +562,15 @@ class RdmaStrategy(LoadStrategy):
                 ]
                 # Loaded here rather than inside receive_from_source so this method
                 # holds the name it is responsible for releasing.
-                add_start = time.perf_counter()
-                with selection_metrics.time_source_attempt_phase(policy, "handshake"):
+                with selection_metrics.time_source_attempt_phase(
+                    policy, "handshake"
+                ) as handshake:
                     remote_agent_name = ctx.nixl_manager.add_remote_agent(
                         source_worker.nixl_metadata
                     )
                 logger.info(
                     f"[Worker {ctx.global_rank}] [TIMING] add_remote_agent: "
-                    f"{time.perf_counter() - add_start:.3f}s (agent={remote_agent_name})"
+                    f"{handshake.seconds:.3f}s (agent={remote_agent_name})"
                 )
 
             logger.info(
@@ -582,9 +590,10 @@ class RdmaStrategy(LoadStrategy):
                 and target_accelerator != source_accelerator
             )
 
-            transfer_start = time.perf_counter()
             try:
-                with selection_metrics.time_source_attempt_phase(policy, "receive"):
+                with selection_metrics.time_source_attempt_phase(
+                    policy, "receive"
+                ) as received:
                     (
                         bytes_transferred,
                         tensor_count,
@@ -598,7 +607,7 @@ class RdmaStrategy(LoadStrategy):
                     )
             except Exception as e:
                 raise SourceTransferError(f"RDMA receive failed: {e}") from e
-            transfer_time = time.perf_counter() - transfer_start
+            transfer_time = received.seconds
 
             bandwidth_gbps = (
                 (bytes_transferred * 8) / (transfer_time * 1e9)

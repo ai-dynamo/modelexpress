@@ -260,6 +260,19 @@ def reset_multiproc_dir(path: str | None = None) -> None:
         logger.warning("Failed to reset metrics directory %s: %s", directory, e)
 
 
+class _PhaseSpan:
+    """Duration holder for :meth:`MetricsCollector.time_source_attempt_phase`.
+
+    Set on exit, so a caller that logs the same span reads it from here instead
+    of keeping a second clock for the same interval.
+    """
+
+    __slots__ = ("seconds",)
+
+    def __init__(self) -> None:
+        self.seconds = 0.0
+
+
 class MetricsCollector:
     """Lazy holder for prometheus_client collectors.
 
@@ -819,23 +832,26 @@ class MetricsCollector:
     def time_source_attempt_phase(self, policy: str, phase: str):
         """Time one phase of a source attempt, recording how it ended.
 
-        No handle to set: unlike a strategy attempt, a phase has two outcomes
-        and the exception path is the whole distinction, so the context manager
-        can classify it alone. A phase that raises is still recorded -- a
-        receive that hits the transfer deadline is the reading someone comes
-        looking for.
+        Unlike a strategy attempt, a phase has two outcomes and the exception
+        path is the whole distinction, so the context manager classifies it
+        alone. A phase that raises is still recorded, as ``error``: that is what
+        lets the dashboard say which phase a failed attempt died in, and it keeps
+        a receive that ran to the transfer deadline out of the ``ok`` mean.
+
+        The yielded handle carries the measured duration after exit, for the
+        caller's own log line -- one clock per span.
         """
+        span = _PhaseSpan()
         start = time.perf_counter()
         outcome = "ok"
         try:
-            yield
+            yield span
         except BaseException:
             outcome = "error"
             raise
         finally:
-            self.observe_source_attempt_phase_seconds(
-                policy, phase, outcome, time.perf_counter() - start
-            )
+            span.seconds = time.perf_counter() - start
+            self.observe_source_attempt_phase_seconds(policy, phase, outcome, span.seconds)
 
     def observe_load_seconds(
         self, engine: str, model: object, model_role: str, outcome: str, seconds: float

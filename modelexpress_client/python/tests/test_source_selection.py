@@ -1309,6 +1309,18 @@ def test_a_metadata_miss_records_only_the_metadata_phase(monkeypatch):
     assert transfer == 0.0
 
 
+def test_the_phase_span_hands_its_duration_back_for_the_log_line(monkeypatch):
+    """One clock per span: the strategy logs what the metric measured."""
+    import time
+
+    collector = _real_metrics(monkeypatch)
+    with collector.time_source_attempt_phase("random", "receive") as span:
+        time.sleep(0.005)
+    assert span.seconds >= 0.005
+    phases, _ = _phase_series(collector)
+    assert phases[("receive", "ok")][1] == pytest.approx(span.seconds)
+
+
 def test_an_unknown_phase_is_dropped_and_an_unknown_outcome_clamps(monkeypatch):
     collector = _real_metrics(monkeypatch)
     collector.observe_source_attempt_phase_seconds("random", "not_a_phase", "ok", 1.0)
