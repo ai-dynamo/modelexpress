@@ -102,19 +102,17 @@ trainer_node=$(kubectl -n "$namespace" get pod/trainer \
   -o jsonpath='{.spec.nodeName}')
 rollout_node=$(kubectl -n "$namespace" get pod/rollout \
   -o jsonpath='{.spec.nodeName}')
-if [[ -z "$trainer_node" || -z "$rollout_node" || "$trainer_node" == "$rollout_node" ]]; then
-  echo "Expected trainer and rollout on distinct H100 nodes" >&2
+if [[ -z "$trainer_node" || -z "$rollout_node" || "$trainer_node" != "$rollout_node" ]]; then
+  echo "Expected trainer and rollout on the same H100 node" >&2
   exit 1
 fi
 
-for node in "$trainer_node" "$rollout_node"; do
-  pool=$(kubectl get node "$node" \
-    -o jsonpath='{.metadata.labels.ai-dynamo\.github\.com/ci-pool}')
-  if [[ "$pool" != h100 ]]; then
-    echo "Node '$node' is not in the H100 CI pool" >&2
-    exit 1
-  fi
-done
+pool=$(kubectl get node "$trainer_node" \
+  -o jsonpath='{.metadata.labels.ai-dynamo\.github\.com/ci-pool}')
+if [[ "$pool" != h100 ]]; then
+  echo "Node '$trainer_node' is not in the H100 CI pool" >&2
+  exit 1
+fi
 
 trainer_log=$(kubectl -n "$namespace" logs pod/trainer)
 rollout_log=$(kubectl -n "$namespace" logs pod/rollout)
@@ -135,4 +133,4 @@ if [[ "$unique_gpu_count" -ne 3 ]]; then
   exit 1
 fi
 
-echo "H100_INFRA_SMOKE_OK trainer_node=$trainer_node rollout_node=$rollout_node"
+echo "H100_INFRA_SMOKE_OK node=$trainer_node"

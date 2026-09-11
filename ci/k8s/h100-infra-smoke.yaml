@@ -38,13 +38,6 @@ spec:
   nodeSelector:
     ai-dynamo.github.com/ci-pool: h100
     kubernetes.io/arch: amd64
-  affinity:
-    podAntiAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        - topologyKey: kubernetes.io/hostname
-          labelSelector:
-            matchLabels:
-              app.kubernetes.io/name: mx-h100-infra-smoke
   containers:
     - name: trainer
       image: nvcr.io/nvidia/cuda:13.0.0-base-ubuntu24.04
@@ -125,12 +118,12 @@ spec:
     ai-dynamo.github.com/ci-pool: h100
     kubernetes.io/arch: amd64
   affinity:
-    podAntiAffinity:
+    podAffinity:
       requiredDuringSchedulingIgnoredDuringExecution:
         - topologyKey: kubernetes.io/hostname
           labelSelector:
             matchLabels:
-              app.kubernetes.io/name: mx-h100-infra-smoke
+              ci.modelexpress.nvidia.com/role: trainer
   containers:
     - name: rollout
       image: nvcr.io/nvidia/cuda:13.0.0-base-ubuntu24.04

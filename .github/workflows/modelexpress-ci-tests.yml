@@ -76,7 +76,7 @@
 #
 #   h100-cluster-smoke  — non-gating canary that validates a zero-GPU deploy
 #                         runner can schedule a 2+1 H100 workload and mount
-#                         cross-node RWX storage in the dedicated H100 vCluster.
+#                         shared RWX storage in the dedicated H100 vCluster.
 #
 #   model-streamer       — matrix over frameworks; single worker pod, no
 #                          vCluster, no P2P. Streams weights directly from S3
@@ -1120,7 +1120,7 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
-  # Dedicated H100 vCluster access, scheduling, and RWX storage canary.
+  # Dedicated H100 vCluster access, single-node scheduling, and RWX canary.
   # This remains non-gating until the deploy runner and vCluster are proven.
   # Velonix must provision both before this job can be scheduled successfully.
   # ---------------------------------------------------------------------------
@@ -1172,7 +1172,7 @@ jobs:
           vcluster_name: ${{ env.H100_VCLUSTER_NAME }}
           vcluster_namespace: ${{ env.H100_VCLUSTER_NAMESPACE }}
 
-      - name: Validate H100 scheduling and cross-node RWX
+      - name: Validate single-node H100 scheduling and shared RWX
         env:
           KUBECONFIG: ${{ github.workspace }}/.kubeconfig-vcluster
         run: ci/k8s/run-h100-infra-smoke.sh
