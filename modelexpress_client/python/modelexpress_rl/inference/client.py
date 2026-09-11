@@ -629,6 +629,7 @@ class ModelExpressGeneratorClient:
         )
 
     def _release_staged(self, staged: StagedWeightHandle) -> None:
+        """Free the active slot once locally released, including cleanup errors."""
         if staged._client is not self:
             raise ValueError("staged handle does not belong to this client")
         with self._operation_lock:
@@ -639,12 +640,13 @@ class ModelExpressGeneratorClient:
                 if self._active_handle is staged:
                     self._active_handle = None
                 return
-            if staged._update.released:
-                return
-            assert self._runtime is not None
-            self._runtime.session.release(staged._update)
-            if self._active_handle is staged:
-                self._active_handle = None
+            try:
+                if not staged._update.released:
+                    assert self._runtime is not None
+                    self._runtime.session.release(staged._update)
+            finally:
+                if staged._update.released and self._active_handle is staged:
+                    self._active_handle = None
 
 
 __all__ = [

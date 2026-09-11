@@ -151,6 +151,7 @@ def _peer_stage(monkeypatch, *, nbytes: int, wire_s: float):
 
     monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
     transfer = object.__new__(_NixlStagedTransfer)
+    transfer._workspace_mode = "full"
     transfer._closed = False
     transfer._device = torch.device("cpu")
     transfer._device_id = DEVICE_ID

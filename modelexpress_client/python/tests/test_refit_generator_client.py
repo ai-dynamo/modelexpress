@@ -1282,6 +1282,16 @@ def test_generator_reports_lease_cleanup_failure_after_success(monkeypatch):
         staged = generator.stage_weight(version=WeightVersionRef("version-a"))
         with pytest.raises(grpc.RpcError, match="lease backend unavailable"):
             staged.release()
+        assert staged._update.released
+        assert generator._active_handle is None
+        staged.release()
+        service.fail_lease_deletion = False
+        service.version.uid = "version-b"
+        for shard in service.shards:
+            shard.version_id = "version-b"
+        next_staged = generator.stage_weight(version=WeightVersionRef("version-b"))
+        assert next_staged.version_id == "version-b"
+        next_staged.release()
     finally:
         generator.close()
         server.stop(grace=None).wait()
@@ -1361,8 +1371,19 @@ def test_generator_does_not_fence_when_installation_context_entry_fails(monkeypa
 
 
 @pytest.mark.parametrize("fail_second", [False, True])
+@pytest.mark.parametrize(
+    "prepare_failures,prepare_error,reset_failure",
+    [
+        (0, RuntimeError, False),
+        (1, RuntimeError, False),
+        (1, grpc.RpcError, False),
+        (1, ManifestMismatchError, False),
+        (3, RuntimeError, False),
+        (1, RuntimeError, True),
+    ],
+)
 def test_streaming_client_holds_lease_and_fences_partial_install(
-    monkeypatch, fail_second
+    monkeypatch, fail_second, prepare_failures, prepare_error, reset_failure
 ):
     server, endpoint, service = _start_server()
     adapter = _Adapter(service)
@@ -1370,16 +1391,25 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
         monkeypatch, endpoint, adapter, source_order=(WeightSource.TRAINER,)
     )
     installed = []
+    prepare_calls = []
 
     class Transfer:
+        def reset_workspace(self):
+            assert service.active_leases
+            if reset_failure:
+                raise RuntimeError("cleanup failure")
+
         def prepare(self, **kwargs):
             assert kwargs["max_staging_bytes"] == 512
             assert service.active_leases
+            prepare_calls.append(kwargs)
+            if len(prepare_calls) <= prepare_failures:
+                raise prepare_error("preparation failure")
             return SimpleNamespace(
                 metrics={},
                 batches=[
                     SimpleNamespace(layouts=({"a.weight": None, "b.weight": None},))
-                ]
+                ],
             )
 
         def iter_bounded(self, prepared, metrics):
@@ -1421,7 +1451,19 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
     planner._methods = (method,)
     planner._installer = Installer()
     try:
-        if fail_second:
+        if reset_failure:
+            with pytest.raises(ValueError, match="restart the generator engine"):
+                generator.apply_weight_streaming(
+                    version=WeightVersionRef("version-a"), max_staging_bytes=512
+                )
+            assert installed == []
+        elif prepare_failures == 3:
+            with pytest.raises(prepare_error, match="preparation failure"):
+                generator.apply_weight_streaming(
+                    version=WeightVersionRef("version-a"), max_staging_bytes=512
+                )
+            assert installed == []
+        elif fail_second:
             with pytest.raises(RuntimeError, match="partial streaming failure"):
                 generator.apply_weight_streaming(
                     version=WeightVersionRef("version-a"), max_staging_bytes=512
@@ -1441,6 +1483,10 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
         assert not service.active_leases
         assert generator._active_handle is None
         assert method._active_streamed is None
+        assert len(prepare_calls) == (
+            1 if reset_failure else min(prepare_failures + 1, 3)
+        )
+        assert service.lease_registrations == 1
     finally:
         generator.close()
         server.stop(grace=None).wait()

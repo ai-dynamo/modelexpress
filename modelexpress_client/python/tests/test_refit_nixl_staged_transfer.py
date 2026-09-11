@@ -22,6 +22,14 @@ from modelexpress.refit.reshard.types import (
     RecordedCopy,
 )
 from modelexpress.refit.reshard.verify import tensor_digest
+from modelexpress_rl import WeightPayloadFormat
+from modelexpress_rl.inference.adapter import (
+    GeneratorSource,
+    GeneratorTransferInputs,
+    NixlGeneratorSource,
+)
+from modelexpress_rl.inference.methods import FullTensorNixlUpdateMethod
+from modelexpress_rl.inference.plan import TrainerUpdateSource
 from modelexpress_rl.inference.nixl_staged_transfer import (
     _bounded_batches,
     _load_agent_metadata,
@@ -150,6 +158,196 @@ def _manifest(*, agent_name: str, endpoint: str, offset: int, address: int) -> b
             )
         ],
     )
+
+
+@pytest.mark.parametrize("switch_failure", [None, "initialize", "register"])
+def test_released_updates_switch_workspaces_without_reusing_stale_plans(
+    monkeypatch, switch_failure
+):
+    """Switch modes with real plans and byte copies, mocking only CUDA/NIXL."""
+    events = []
+    source_tensor = torch.arange(4, dtype=torch.float32)
+    real_empty = torch.empty
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
+    monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: events.append("sync"))
+
+    def empty(shape, **kwargs):
+        if torch.device(kwargs.get("device", "cpu")).type == "cuda":
+            kwargs["device"] = "cpu"
+        return real_empty(shape, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", empty)
+
+    class Manager:
+        def __init__(self, **kwargs):
+            self.ready = False
+            self.registered = {}
+            self.fail_initialize = 0
+            self.fail_register = 0
+
+        def initialize(self):
+            if self.ready:
+                return
+            events.append("initialize")
+            if self.fail_initialize:
+                self.fail_initialize -= 1
+                raise RuntimeError("initialization failed")
+            self.ready = True
+
+        def shutdown(self):
+            if self.registered:
+                assert transfer._recv_buffers or transfer._bounded_arena is not None
+            events.append("shutdown")
+            self.registered.clear()
+            self.ready = False
+
+        def register_tensors(self, tensors):
+            assert self.ready
+            events.append("register")
+            self.registered.update(tensors)
+            if self.fail_register:
+                self.fail_register -= 1
+                raise RuntimeError("registration failed")
+
+        def add_remote_agent(self, metadata):
+            assert self.ready
+            events.append("metadata")
+            return metadata.decode()
+
+    class Transport:
+        def __init__(self, manager, *args, **kwargs):
+            self.manager = manager
+
+        def read(self, descriptors):
+            assert self.manager.ready
+            for d in descriptors:
+                assert any(
+                    t.data_ptr() <= d.dst_addr
+                    and d.dst_addr + d.nbytes
+                    <= t.data_ptr() + t.numel() * t.element_size()
+                    for t in self.manager.registered.values()
+                )
+                ctypes.memmove(d.dst_addr, d.src_addr, d.nbytes)
+
+    monkeypatch.setattr(transfer_module, "NixlTransferManager", Manager)
+    monkeypatch.setattr(transfer_module, "NixlReshardTransport", Transport)
+    manifest = wrap_rendezvous_blob(
+        b"source",
+        "source",
+        "source:19000",
+        [
+            PublishedTensor(
+                name="weight",
+                dtype="torch.float32",
+                elsize=4,
+                full_shape=(4,),
+                shards=[
+                    PublishedShard(
+                        agent_name="source",
+                        device_id=0,
+                        addr=source_tensor.data_ptr(),
+                        shard_offset=(0,),
+                        shape=(4,),
+                    )
+                ],
+            ),
+        ],
+    )
+    source = TrainerUpdateSource(
+        GeneratorTransferInputs(
+            version_id="v",
+            base_version_id=None,
+            layout_signature="layout",
+            payload_format=WeightPayloadFormat.FULL_TENSOR,
+            sources=(
+                GeneratorSource(
+                    "rank:0",
+                    "trainer",
+                    "unchanged",
+                    NixlGeneratorSource("source:19000", manifest),
+                ),
+            ),
+        )
+    )
+    capture = CaptureResult(
+        copies=[
+            RecordedCopy(
+                src_name="weight",
+                op_chain=(),
+                param_name="layer.weight",
+                dest_offset=0,
+                dest_shape=(4,),
+                dest_stride=(1,),
+                dest_dtype=torch.float32,
+            )
+        ]
+    )
+    transfer = _NixlStagedTransfer(
+        agent_name="receiver",
+        device_id=0,
+        device=torch.device("cuda:0"),
+        listen_port=None,
+    )
+    method = FullTensorNixlUpdateMethod(
+        transfer=transfer,
+        capture_layout=lambda manifest: (
+            capture,
+            {"layer.weight": ((4,), torch.float32)},
+        ),
+        parameter_layout=None,
+        build_identity=None,
+        worker_rank=0,
+        worker_id="receiver",
+        accelerator="cuda",
+        p2p_client=None,
+        enable_peer_publication=False,
+    )
+    first_plan = None
+    try:
+        for index, bounded in enumerate((False, True, False, True)):
+            source_tensor.add_(1)
+            if bounded:
+                if index == 1 and switch_failure is not None:
+                    setattr(transfer._manager, f"fail_{switch_failure}", 1)
+                    with pytest.raises(RuntimeError, match="failed"):
+                        method.prepare_streaming(
+                            version=None, source=source, max_staging_bytes=256
+                        )
+                    assert method._active_plan is None
+                    assert not transfer._manager.registered
+                prepared = method.prepare_streaming(
+                    version=None, source=source, max_staging_bytes=256
+                )
+                with pytest.raises(RuntimeError, match="release"):
+                    method.prepare(version=None, source=source)
+                for tensors in prepared.batches():
+                    assert torch.equal(tensors["layer.weight"], source_tensor)
+                with pytest.raises(RuntimeError, match="no longer active"):
+                    transfer.stage(first_plan)
+            else:
+                prepared = method.prepare(version=None, source=source)
+                assert torch.equal(
+                    prepared.staged.tensors["layer.weight"], source_tensor
+                )
+                with pytest.raises(RuntimeError, match="release"):
+                    method.prepare_streaming(
+                        version=None, source=source, max_staging_bytes=256
+                    )
+                if first_plan is None:
+                    first_plan = method._active_plan
+                else:
+                    assert method._active_plan is not first_plan
+            method.release(prepared)
+        # Every switch disconnects/deregisters before registering replacement storage.
+        expected_registrations = 5 if switch_failure == "register" else 4
+        assert events.count("metadata") == expected_registrations
+        assert events.count("register") == expected_registrations
+        for i, event in enumerate(events):
+            if event == "shutdown" and i and events[i - 1] == "sync":
+                assert events[i + 1] == "initialize"
+    finally:
+        method.close()
 
 
 def test_exact_manifests_resolve_without_legacy_source_discovery():
@@ -407,6 +605,7 @@ def test_peer_stage_uses_exact_canonical_tensor_catalog(monkeypatch):
     transfer._published_peer_rank = None
     transfer._active = None
     transfer._closed = False
+    transfer._workspace_mode = "full"
     source = p2p_pb2.WorkerMetadata(
         nixl_metadata=b"peer-metadata",
         tensors=[

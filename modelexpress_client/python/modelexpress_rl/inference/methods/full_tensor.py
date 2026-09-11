@@ -72,11 +72,24 @@ class FullTensorNixlUpdateMethod(UpdateMethod):
             for item in source.inputs.sources
         ):
             raise ValueError("bounded staging requires NIXL trainer sources")
-        prepared = self._transfer.prepare(
-            manifests=[item.transport.manifest for item in source.inputs.sources],
-            capture_layout=self._capture_layout,
-            max_staging_bytes=max_staging_bytes,
-        )
+        # Streaming replaces the full-copy destinations, including any cached
+        # descriptors into them. Invalidate before a possibly failing switch.
+        self._active_plan = None
+        self._active_fingerprint = None
+        try:
+            prepared = self._transfer.prepare(
+                manifests=[item.transport.manifest for item in source.inputs.sources],
+                capture_layout=self._capture_layout,
+                max_staging_bytes=max_staging_bytes,
+            )
+        except Exception:
+            try:
+                self._transfer.reset_workspace()
+            except Exception as cleanup_error:
+                raise ValueError(
+                    "failed to reset streaming preparation; restart the generator engine"
+                ) from cleanup_error
+            raise
         metrics = dict(prepared.metrics)
         self._active_streamed = PreparedStreamingTensors(
             batches=lambda: self._transfer.iter_bounded(prepared, metrics),
@@ -102,7 +115,7 @@ class FullTensorNixlUpdateMethod(UpdateMethod):
         source: ResolvedSource,
     ) -> PreparedArtifact:
         del version
-        if self._active_staged is not None:
+        if self._active_staged is not None or self._active_streamed is not None:
             raise RuntimeError("release staged weight before staging another version")
         self._transfer.unpublish_peer()
         if isinstance(source, GeneratorPeerUpdateSource):
@@ -166,6 +179,7 @@ class FullTensorNixlUpdateMethod(UpdateMethod):
         )
 
     def close(self) -> None:
+        self._active_streamed = None
         self._active_staged = None
         self._active_plan = None
         self._active_fingerprint = None

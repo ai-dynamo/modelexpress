@@ -1297,6 +1297,18 @@ Some modules may already contain the new version, so a failed operation cannot
 be treated as a usable old version. The framework owns this pause/restart policy.
 Quantized engines, generator-peer publication, and object-storage delta replay
 are not supported by this API. `stage_weight()` keeps its full-copy behavior.
+After releasing an update, callers can switch between full-copy and bounded
+staging on the same trainer-only client. A mode switch disconnects the NIXL
+agent and deregisters its workspace before freeing the old buffers, then
+reinitializes registrations and plans for the new mode. Same-mode updates retain
+their reusable workspace. Never switch while an update handle remains active.
+
+Streaming preparation retries transient RPC, runtime, and manifest-validation
+failures up to `max_transfer_attempts`, keeping the version lease across attempts.
+Failed preparation storage is reset before retrying; a reset failure requires an
+engine restart. Once installation starts, failures are not automatically retried.
+Release errors remain visible to callers, but a locally released update no longer
+holds the client's active slot even when lease deletion fails.
 Metrics include `staging_peak_bytes`, `batches`, `bytes_received`, `wire_s`, and
 `reconstruct_s`; wire time excludes installation. GPU validation is required
 for each target model and topology before performance qualification.

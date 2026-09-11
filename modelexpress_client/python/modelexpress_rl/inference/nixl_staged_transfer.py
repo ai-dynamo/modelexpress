@@ -355,6 +355,37 @@ class _NixlStagedTransfer:
         self._published_peer_rank: int | None = None
         self._closed = False
         self._bounded_arena: torch.Tensor | None = None
+        self._workspace_mode: str | None = None
+
+    def reset_workspace(self) -> None:
+        """Discard released or failed preparation after disconnecting its agent."""
+        if self._device.type == "cuda":
+            torch.cuda.synchronize(self._device)
+        self.unpublish_peer()
+        self._manager.shutdown()
+        self._active = None
+        self._recv_buffers.clear()
+        self._convert_buffers.clear()
+        self._full_buffers.clear()
+        self._bounded_arena = None
+        self._registered_recv_params.clear()
+        self._convert_registered = False
+        self._full_registered = False
+        self._loaded_agent_metadata.clear()
+        self._workspace_mode = None
+
+    def _select_workspace_mode(self, mode: str) -> None:
+        """Replace released staging storage only after tearing down its agent."""
+        if self._workspace_mode == mode:
+            return
+        if self._workspace_mode is not None:
+            self.reset_workspace()
+        try:
+            self._manager.initialize()
+        except Exception:
+            self._manager.shutdown()
+            raise
+        self._workspace_mode = mode
 
     def prepare(
         self,
@@ -392,12 +423,9 @@ class _NixlStagedTransfer:
             batches = _bounded_batches(
                 capture, parameter_layout, resolved.sources, max_staging_bytes
             )
-        elif self._bounded_arena is not None:
-            raise RuntimeError(
-                "cannot mix full-copy and bounded staging in one transfer"
-            )
         metrics["transfer_planning_s"] = time.perf_counter() - phase_started
         phase_started = time.perf_counter()
+        self._select_workspace_mode("bounded" if batches is not None else "full")
         required_metadata = _required_agent_metadata(plan, resolved)
         if batches is not None:
             for batch in batches:
@@ -425,10 +453,6 @@ class _NixlStagedTransfer:
         )
         if batches is not None:
             if self._bounded_arena is None:
-                if self._recv_buffers or self._convert_buffers or self._full_buffers:
-                    raise RuntimeError(
-                        "cannot mix full-copy and bounded staging in one transfer"
-                    )
                 with classic_cuda_alloc():
                     self._bounded_arena = torch.empty(
                         max(b.nbytes for b in batches),
@@ -712,6 +736,7 @@ class _NixlStagedTransfer:
         if self._closed:
             raise RuntimeError("NIXL staged transfer is closed")
         self.unpublish_peer()
+        self._select_workspace_mode("full")
         self._ensure_buffers(
             self._recv_buffers,
             parameter_layout,
