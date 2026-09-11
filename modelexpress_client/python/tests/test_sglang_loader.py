@@ -94,12 +94,14 @@ def test_sglang_context_uses_tp_rank_for_matching_and_url_override():
 
 
 def test_sglang_context_separates_worker_rank_from_global_rank(monkeypatch):
+    """Keep SGLang's engine worker rank separate from the distributed rank."""
     sglang_mod = ModuleType("sglang")
     srt_mod = ModuleType("sglang.srt")
     distributed_mod = ModuleType("sglang.srt.distributed")
     distributed_mod.get_tensor_model_parallel_rank = lambda: 1
     distributed_mod.get_pipeline_model_parallel_rank = lambda: 2
     distributed_mod.get_tensor_model_parallel_world_size = lambda: 4
+    distributed_mod.get_world_group = lambda: SimpleNamespace(local_rank=3)
     srt_mod.distributed = distributed_mod
 
     monkeypatch.setitem(sys.modules, "sglang", sglang_mod)
@@ -117,6 +119,7 @@ def test_sglang_context_separates_worker_rank_from_global_rank(monkeypatch):
 
     assert ctx.worker_rank == 9
     assert ctx.global_rank == 17
+    assert ctx.local_rank == 3
     assert ctx.mx_client.server_url == "mx.example:9000"
 
 
@@ -572,7 +575,7 @@ def test_mx_model_loader_nixl_path_delegates_to_shared_strategy_chain(
     loader = MxModelLoader(_load_config(modelexpress_transport="nixl"))
 
     with patch.dict(os.environ, {"MX_ARTIFACT_READY_URL": ready_url}), patch(
-        "modelexpress.engines.sglang.loader.LoadStrategyChain.run",
+        "modelexpress.engines.sglang.loader.run_load_strategy_chain",
         return_value=model,
     ) as run, patch(
         "modelexpress.engines.sglang.loader.install_sglang_cache_artifacts",

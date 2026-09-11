@@ -39,7 +39,10 @@ def test_store_owns_the_versioned_layout_and_state(tmp_path):
     assert store.checkpoint_path("base/a") == checkpoint
     state = store.state()
     assert state is not None
-    assert state["files"]["model.safetensors"][0] == len(b"weights")
+    assert state.status is CheckpointState.READY
+    assert state.version == "base/a"
+    assert state.files is not None
+    assert state.files["model.safetensors"][0] == len(b"weights")
     assert store.active_version() == "base/a"
 
 

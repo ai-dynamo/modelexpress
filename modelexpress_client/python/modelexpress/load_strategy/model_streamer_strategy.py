@@ -49,7 +49,8 @@ class ModelStreamerStrategy(LoadStrategy):
         EngineAdapter.build_model_streamer_weight_iter,
     )
 
-    def is_available(self, ctx: LoadContext) -> bool:
+    def supports_explicit_uri(self, ctx: LoadContext) -> bool:
+        """Return whether this engine can stream a caller-supplied URI."""
         if not super().is_available(ctx):
             return False
         if importlib.util.find_spec("runai_model_streamer") is None:
@@ -57,7 +58,11 @@ class ModelStreamerStrategy(LoadStrategy):
                 f"[Worker {ctx.global_rank}] runai_model_streamer not installed, skipping"
             )
             return False
+        return True
 
+    def is_available(self, ctx: LoadContext) -> bool:
+        if not self.supports_explicit_uri(ctx):
+            return False
         model_uri = envs.MX_MODEL_URI or ""
         if not model_uri:
             logger.info(
@@ -67,10 +72,19 @@ class ModelStreamerStrategy(LoadStrategy):
         return True
 
     def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
-        result = _as_load_result(result)
         model_uri = _resolve_model_uri(ctx)
         if not model_uri:
             raise StrategyFailed("ModelStreamer model URI is not configured", mutated=False)
+        return self.load_uri(result, ctx, model_uri)
+
+    def load_uri(
+        self,
+        result: LoadResult,
+        ctx: LoadContext,
+        model_uri: str,
+    ) -> LoadResult:
+        """Load from an explicit URI without consulting ``MX_MODEL_URI``."""
+        result = _as_load_result(result)
 
         logger.info(f"[Worker {ctx.global_rank}] Attempting model streamer loading from {model_uri}")
         try:

@@ -37,6 +37,9 @@ use tower::{Layer, ServiceExt};
 /// these against exact exported series names, not against the exposition as
 /// text, so `mx_p2p_transfer_seconds` would not stand in for its `_bucket`.
 const CLIENT_FAMILIES: &[&str] = &[
+    "mx_artifact_install_bytes_total",
+    "mx_artifact_install_step_seconds_count",
+    "mx_artifact_install_step_seconds_sum",
     "mx_load_phase_seconds_count",
     "mx_load_phase_seconds_sum",
     "mx_load_seconds_bucket",
@@ -48,6 +51,8 @@ const CLIENT_FAMILIES: &[&str] = &[
     "mx_p2p_candidates_count",
     "mx_p2p_candidates_sum",
     "mx_p2p_list_sources_total",
+    "mx_p2p_source_attempt_phase_seconds_count",
+    "mx_p2p_source_attempt_phase_seconds_sum",
     "mx_p2p_source_attempts_total",
     "mx_p2p_source_selections_total",
     "mx_p2p_transfer_seconds_bucket",

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import functools
 import os
-from typing import TYPE_CHECKING, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
 
 import torch
 
@@ -208,3 +208,11 @@ class EngineAdapter:
     def after_native_load(self, result: LoadResult) -> LoadResult:
         """Run engine post-processing after load_via_native() succeeds."""
         return result
+
+    def all_gather_state(self, state: Any) -> tuple[Any, ...]:
+        """All-gather one state value from every engine rank."""
+        return (state,)
+
+    def broadcast_state(self, state: Any) -> Any:
+        """Broadcast one state value from global rank zero."""
+        return state

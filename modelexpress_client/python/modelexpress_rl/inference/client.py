@@ -22,12 +22,12 @@ from modelexpress_rl.version import WeightVersionRef
 from .. import refit_pb2, refit_pb2_grpc
 from ..control import WeightVersion, WeightVersionState, _weight_version
 from ..object_storage import ObjectStorageType
-from ..train import WeightPayloadFormat
 from .adapter import GeneratorEngineContext
 from .plan import WeightSource
 from .receiver import ObjectStorageGeneratorConfig
 from .runtime import GeneratorRuntime
 from .session import SessionUpdate
+from .version_chain import resolve_replay_chain
 
 logger = logging.getLogger("modelexpress_rl.inference.client")
 
@@ -41,6 +41,19 @@ def _required(value: str, name: str) -> str:
     if not value.strip():
         raise ValueError(f"{name} is required")
     return value
+
+
+def _source_order_from_env(value: str) -> tuple[WeightSource, ...]:
+    names = tuple(item.strip().upper() for item in value.split(","))
+    if not names or any(not name for name in names):
+        raise ValueError("MX_GENERATOR_SOURCE_ORDER must be a comma-separated list")
+    try:
+        return tuple(WeightSource(name) for name in names)
+    except ValueError as exc:
+        choices = ", ".join(source.value for source in WeightSource)
+        raise ValueError(
+            f"MX_GENERATOR_SOURCE_ORDER entries must be one of: {choices}"
+        ) from exc
 
 
 @dataclass(frozen=True)
@@ -67,6 +80,8 @@ class ModelExpressGeneratorConfig:
     rpc_timeout_seconds: float = 30.0
     # Canonical object-storage checkpoint settings.
     object_storage: ObjectStorageGeneratorConfig | None = None
+    # Version read from the engine's serving-version API after cold start.
+    initial_serving_version_id: str | None = None
     # Ordered fallback for full-tensor sources. Canonical object storage is
     # currently isolated because peer installation does not advance its local
     # checkpoint base.
@@ -74,6 +89,18 @@ class ModelExpressGeneratorConfig:
 
     def __post_init__(self) -> None:
         """Validate explicit settings before client initialization."""
+        if (
+            self.initial_serving_version_id is not None
+            and not self.initial_serving_version_id.strip()
+        ):
+            raise ValueError("initial_serving_version_id must not be empty")
+        source_order_env = envs.MX_GENERATOR_SOURCE_ORDER
+        if self.source_order is None and source_order_env is not None:
+            object.__setattr__(
+                self,
+                "source_order",
+                _source_order_from_env(source_order_env),
+            )
         if self.registration_ttl_seconds is not None:
             rl_envs.require_positive_int(
                 self.registration_ttl_seconds, "registration_ttl_seconds"
@@ -188,6 +215,7 @@ class ModelExpressGeneratorClient:
     """Synchronous rank-local generator client for exact-version refit."""
 
     def __init__(self) -> None:
+        """Create an uninitialized rank-local generator client."""
         self._channel: grpc.Channel | None = None
         self._stub: refit_pb2_grpc.RefitServiceStub | None = None
         self._registration_stop = threading.Event()
@@ -195,6 +223,7 @@ class ModelExpressGeneratorClient:
         self._operation_lock = threading.RLock()
         self._active_handle: StagedWeightHandle | None = None
         self._serving_version_id: str | None = None
+        self._has_initial_serving_version = False
         self._engine_state = _EngineState.READY
         self._runtime: GeneratorRuntime | None = None
         self._closed = False
@@ -250,9 +279,14 @@ class ModelExpressGeneratorClient:
                 start_lease=client._start_version_lease,
             )
             client._runtime = runtime
-            client._serving_version_id = runtime.initial_version_id
+            client._has_initial_serving_version = (
+                config.initial_serving_version_id is not None
+            )
+            client._serving_version_id = (
+                config.initial_serving_version_id or runtime.initial_version_id
+            )
             if client._serving_version_id is not None:
-                client._validate_initial_base(client._serving_version_id)
+                client._validate_initial_serving_version(client._serving_version_id)
             client._register_worker()
             client._registration_thread = threading.Thread(
                 target=client._renew_worker_registration,
@@ -280,7 +314,10 @@ class ModelExpressGeneratorClient:
                 raise RuntimeError("another generator update is still active")
             assert self._runtime is not None
             if (
-                self._runtime.initial_version_id is not None
+                (
+                    self._runtime.initial_version_id is not None
+                    or self._has_initial_serving_version
+                )
                 and version.version_id == self._serving_version_id
                 and self._engine_state is _EngineState.READY
             ):
@@ -447,80 +484,22 @@ class ModelExpressGeneratorClient:
         serving_version_id = self._serving_version_id
         if serving_version_id is None:
             raise RuntimeError("canonical replay requires a known serving version")
-
-        reverse_chain: list[WeightVersion] = []
-        seen: set[str] = set()
-        revision_id = target_version_id
-        layout_signature: str | None = None
-        while True:
-            if reverse_chain and revision_id == serving_version_id:
-                break
-            if revision_id in seen:
-                raise RuntimeError(
-                    f"target {target_version_id!r}: cycle detected at revision "
-                    f"{revision_id!r}"
-                )
-            if len(reverse_chain) >= self._max_replay_chain_length:
-                raise RuntimeError(
-                    f"target {target_version_id!r}: replay exceeds maximum chain "
-                    f"length {self._max_replay_chain_length} before revision "
-                    f"{revision_id!r}"
-                )
-            seen.add(revision_id)
-            try:
-                version = self._fetch_ready_version(
-                    revision_id,
-                    target_version_id=target_version_id,
-                )
-            except RuntimeError as error:
-                if revision_id != target_version_id:
-                    raise RuntimeError(
-                        f"target {target_version_id!r}: chain does not match serving "
-                        f"version {serving_version_id!r}; {error}"
-                    ) from error
-                raise
-            if version.layout_signature:
-                if layout_signature is None:
-                    layout_signature = version.layout_signature
-                elif version.layout_signature != layout_signature:
-                    raise RuntimeError(
-                        f"target {target_version_id!r}: layout format mismatch at "
-                        f"revision {revision_id!r}"
-                    )
-            if version.object_storage is None:
-                raise RuntimeError(
-                    f"target {target_version_id!r}: no legal source for revision "
-                    f"{revision_id!r}; object-storage source is missing"
-                )
-            reverse_chain.append(version)
-            if version.version_id == serving_version_id:
-                break
-            if version.payload_format is WeightPayloadFormat.FULL_HF_CHECKPOINT:
-                if version.base_version_id is not None:
-                    raise RuntimeError(
-                        f"target {target_version_id!r}: FULL_HF_CHECKPOINT revision "
-                        f"{revision_id!r} must not have base_version_id"
-                    )
-                break
-            if version.payload_format is not WeightPayloadFormat.XOR_DELTA:
-                raise RuntimeError(
-                    f"target {target_version_id!r}: revision {revision_id!r} has "
-                    f"unsupported replay format {version.payload_format.value}"
-                )
-            if version.base_version_id is None:
-                raise RuntimeError(
-                    f"target {target_version_id!r}: XOR_DELTA revision "
-                    f"{revision_id!r} is missing base_version_id"
-                )
-            revision_id = version.base_version_id
-
-        chain = tuple(reversed(reverse_chain))
+        chain = resolve_replay_chain(
+            target_version_id=target_version_id,
+            fetch_ready_version=lambda version_id: self._fetch_ready_version(
+                version_id,
+                target_version_id=target_version_id,
+            ),
+            max_chain_length=self._max_replay_chain_length,
+            stop_before_version_id=serving_version_id,
+        )
         assert self._runtime is not None
         for version in chain:
             self._runtime.session.validate(version)
         return chain
 
-    def _validate_initial_base(self, version_id: str) -> None:
+    def _validate_initial_serving_version(self, version_id: str) -> None:
+        """Verify that the engine-observed initial version is ready and compatible."""
         response = self._service.GetWeightVersion(
             refit_pb2.GetWeightVersionRequest(uid=version_id),
             timeout=self._rpc_timeout_seconds,
@@ -529,9 +508,13 @@ class ModelExpressGeneratorClient:
             raise RuntimeError("MX GetWeightVersion response is missing version")
         version = _weight_version(response.version)
         if version.state is not WeightVersionState.READY:
-            raise RuntimeError(f"initial base {version_id!r} is not READY")
+            raise RuntimeError(
+                f"initial serving version {version_id!r} is not READY"
+            )
         if version.model_name != self.model_name:
-            raise RuntimeError("initial base model_name does not match the generator")
+            raise RuntimeError(
+                "initial serving version model_name does not match the generator"
+            )
 
     def _register_lease(self, version_id: str):
         response = self._service.RegisterVersionLease(

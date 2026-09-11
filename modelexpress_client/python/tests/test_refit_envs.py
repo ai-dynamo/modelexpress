@@ -18,6 +18,8 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_TRAINER_STAGING_MODE == "IN_PLACE"
     assert envs.MX_WEIGHT_PAYLOAD_FORMAT == "FULL_TENSOR"
     assert envs.MX_REFIT_CHECKSUM_FORMAT == "adler32"
+    assert envs.MX_REFIT_DESIRED_VERSION_UID is None
+    assert envs.MX_REFIT_CHECKPOINT_DIR is None
     assert envs.MX_REFIT_DELTA_BUCKET_BYTES == 512 * 1024**2
     assert envs.MX_REFIT_DELTA_WORKERS == min(32, os.cpu_count() or 8)
     assert envs.MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES == 4 * 1024**3
@@ -39,6 +41,8 @@ def test_values_are_normalized_and_read_live(monkeypatch):
     monkeypatch.setenv("MX_TRAINER_STAGING_MODE", " copy_to_device ")
     monkeypatch.setenv("MX_WEIGHT_PAYLOAD_FORMAT", " xor_delta ")
     monkeypatch.setenv("MX_REFIT_CHECKSUM_FORMAT", " ADLER32 ")
+    monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "version-7")
+    monkeypatch.setenv("MX_REFIT_CHECKPOINT_DIR", " /checkpoints ")
     monkeypatch.setenv("MX_REFIT_DELTA_BUCKET_BYTES", "1024")
     monkeypatch.setenv("MX_REFIT_DELTA_WORKERS", "3")
     monkeypatch.setenv("MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES", "8192")
@@ -58,6 +62,8 @@ def test_values_are_normalized_and_read_live(monkeypatch):
     assert envs.MX_TRAINER_STAGING_MODE == "COPY_TO_DEVICE"
     assert envs.MX_WEIGHT_PAYLOAD_FORMAT == "XOR_DELTA"
     assert envs.MX_REFIT_CHECKSUM_FORMAT == "adler32"
+    assert envs.MX_REFIT_DESIRED_VERSION_UID == "version-7"
+    assert envs.MX_REFIT_CHECKPOINT_DIR == "/checkpoints"
     assert envs.MX_REFIT_DELTA_BUCKET_BYTES == 1024
     assert envs.MX_REFIT_DELTA_WORKERS == 3
     assert envs.MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES == 8192
@@ -101,6 +107,11 @@ def test_positive_integer_settings_reject_zero(monkeypatch, name):
 def test_unknown_attribute_raises():
     with pytest.raises(AttributeError):
         _ = envs.NOT_A_REAL_ENV_VAR
+
+
+def test_blank_desired_version_is_unset(monkeypatch):
+    monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "  ")
+    assert envs.MX_REFIT_DESIRED_VERSION_UID is None
 
 
 def test_refit_metadata_port_must_be_positive(monkeypatch):

@@ -62,6 +62,17 @@ class SglangAdapter(EngineAdapter):
             return int(torch.distributed.get_rank())
         return self.get_worker_rank()
 
+    def get_local_rank(self) -> int:
+        """Return this worker's rank within its local node."""
+        if not (
+            torch.distributed.is_available() and torch.distributed.is_initialized()
+        ):
+            return 0
+
+        from sglang.srt import distributed
+
+        return int(distributed.get_world_group().local_rank)
+
     def get_device_id(self) -> int:
         gpu_id = getattr(self.device_config, "gpu_id", None)
         if gpu_id is not None:
@@ -379,6 +390,7 @@ def build_sglang_load_context(
         target_device=adapter.get_target_device(),
         global_rank=global_rank,
         worker_rank=worker_rank,
+        local_rank=adapter.get_local_rank(),
         device_id=adapter.get_device_id(),
         identity=adapter.build_identity(),
         mx_client=create_metadata_client(

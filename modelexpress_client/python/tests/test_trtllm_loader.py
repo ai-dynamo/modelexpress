@@ -38,7 +38,7 @@ def test_loader_runs_shared_strategy_chain(monkeypatch):
     )
     run = Mock(return_value=model)
     monkeypatch.setattr(
-        "modelexpress.engines.trtllm.loader.LoadStrategyChain.run",
+        "modelexpress.engines.trtllm.loader.run_load_strategy_chain",
         run,
     )
 
@@ -64,7 +64,7 @@ def test_loader_logs_same_start_and_completion_milestones(monkeypatch, caplog):
         lambda **kwargs: context,
     )
     monkeypatch.setattr(
-        "modelexpress.engines.trtllm.loader.LoadStrategyChain.run",
+        "modelexpress.engines.trtllm.loader.run_load_strategy_chain",
         Mock(return_value=model),
     )
 
@@ -136,7 +136,7 @@ def test_loader_preserves_native_engine_value(monkeypatch):
         lambda **kwargs: context,
     )
     monkeypatch.setattr(
-        "modelexpress.engines.trtllm.loader.LoadStrategyChain.run",
+        "modelexpress.engines.trtllm.loader.run_load_strategy_chain",
         Mock(return_value=native_value),
     )
     loader = MxModelLoader(**_loader_kwargs())

@@ -137,10 +137,13 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
 
 
 class _WorkerService(refit_pb2_grpc.RefitWorkerServiceServicer):
+    def __init__(self, manifest=b"manifest"):
+        self.manifest = manifest
+
     def GetWeightVersionShardManifest(self, _request, _context):
         return refit_pb2.GetWeightVersionShardManifestResponse(
-            manifest=b"manifest",
-            manifest_digest=hashlib.sha256(b"manifest").hexdigest(),
+            manifest=self.manifest,
+            manifest_digest=hashlib.sha256(self.manifest).hexdigest(),
         )
 
 
@@ -406,17 +409,19 @@ def _runtime(
     )
 
 
-def _start_server(*, state=None, manifest_digest=None):
+def _start_server(*, state=None, manifest=b"manifest", manifest_digest=None):
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
     port = server.add_insecure_port("127.0.0.1:0")
     endpoint = f"127.0.0.1:{port}"
     service = _RefitService(
         endpoint=endpoint,
         state=state,
-        manifest_digest=manifest_digest,
+        manifest_digest=manifest_digest or hashlib.sha256(manifest).hexdigest(),
     )
     refit_pb2_grpc.add_RefitServiceServicer_to_server(service, server)
-    refit_pb2_grpc.add_RefitWorkerServiceServicer_to_server(_WorkerService(), server)
+    refit_pb2_grpc.add_RefitWorkerServiceServicer_to_server(
+        _WorkerService(manifest), server
+    )
     p2p_service = _P2pService()
     p2p_pb2_grpc.add_P2pServiceServicer_to_server(p2p_service, server)
     service.p2p = p2p_service
@@ -433,7 +438,9 @@ def _initialize(
     max_transfer_attempts=3,
     max_replay_chain_length=64,
     source_order=None,
+    initial_serving_version_id=None,
 ):
+    """Initialize a generator client backed by the test runtime."""
     monkeypatch.setattr(
         GeneratorRuntime,
         "initialize",
@@ -463,6 +470,7 @@ def _initialize(
             max_transfer_attempts=max_transfer_attempts,
             max_replay_chain_length=max_replay_chain_length,
             source_order=source_order,
+            initial_serving_version_id=initial_serving_version_id,
         )
     )
 
@@ -537,6 +545,37 @@ def test_generator_config_rejects_invalid_source_order():
         )
 
 
+def test_generator_config_reads_source_order_from_env(monkeypatch):
+    monkeypatch.setenv("MX_GENERATOR_SOURCE_ORDER", "trainer")
+
+    config = ModelExpressGeneratorConfig(
+        engine_context=VllmGeneratorContext(model=object(), vllm_config=object())
+    )
+
+    assert config.source_order == (WeightSource.TRAINER,)
+
+
+def test_generator_config_explicit_source_order_overrides_env(monkeypatch):
+    monkeypatch.setenv("MX_GENERATOR_SOURCE_ORDER", "invalid")
+
+    config = ModelExpressGeneratorConfig(
+        engine_context=VllmGeneratorContext(model=object(), vllm_config=object()),
+        source_order=(WeightSource.TRAINER,),
+    )
+
+    assert config.source_order == (WeightSource.TRAINER,)
+
+
+@pytest.mark.parametrize("value", ["", "TRAINER,", "unknown"])
+def test_generator_config_rejects_invalid_source_order_env(monkeypatch, value):
+    monkeypatch.setenv("MX_GENERATOR_SOURCE_ORDER", value)
+
+    with pytest.raises(ValueError, match="MX_GENERATOR_SOURCE_ORDER"):
+        ModelExpressGeneratorConfig(
+            engine_context=VllmGeneratorContext(model=object(), vllm_config=object())
+        )
+
+
 def test_generator_rejects_unsupported_object_storage_before_adapter_creation(
     monkeypatch,
 ):
@@ -590,6 +629,19 @@ def test_generator_uses_configured_source_order(monkeypatch):
         adapter,
         source_order=(WeightSource.TRAINER,),
     )
+    try:
+        resolvers = generator._runtime.session._planner._resolvers
+        assert [resolver.kind for resolver in resolvers] == [WeightSource.TRAINER]
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+
+def test_generator_uses_source_order_from_env(monkeypatch):
+    monkeypatch.setenv("MX_GENERATOR_SOURCE_ORDER", "TRAINER")
+    server, endpoint, service = _start_server()
+    adapter = _Adapter(service)
+    generator = _initialize(monkeypatch, endpoint, adapter)
     try:
         resolvers = generator._runtime.session._planner._resolvers
         assert [resolver.kind for resolver in resolvers] == [WeightSource.TRAINER]
@@ -707,6 +759,30 @@ def test_generator_releases_lease_when_manifest_is_invalid(monkeypatch):
     assert service.lease_registrations == 1
     assert service.lease_deletions == 1
     assert adapter.stage_calls == []
+
+
+def test_generator_fetches_trainer_manifest_larger_than_grpc_default(monkeypatch):
+    manifest = b"x" * (4 * 1024 * 1024 + 1)
+    server, endpoint, service = _start_server(manifest=manifest)
+    adapter = _Adapter(service)
+    generator = _initialize(
+        monkeypatch,
+        endpoint,
+        adapter,
+        source_order=(WeightSource.TRAINER,),
+    )
+
+    try:
+        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+        staged.release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert all(
+        source.transport.manifest == manifest
+        for source in adapter.stage_calls[0].sources
+    )
 
 
 def test_generator_reports_missing_trainer_manifest_digest(monkeypatch, caplog):
@@ -827,6 +903,31 @@ def test_generator_treats_installed_initial_base_as_successful_no_op(monkeypatch
     assert service.lease_registrations == 0
     assert adapter.stage_calls == []
     assert adapter.apply_calls == []
+
+
+def test_generator_uses_engine_observed_serving_version_after_cold_start(
+    monkeypatch,
+):
+    """Use the engine-observed version as the initial serving version."""
+    server, endpoint, service = _start_server()
+    service.version.uid = "version-a"
+    adapter = _Adapter(service)
+    generator = _initialize(
+        monkeypatch,
+        endpoint,
+        adapter,
+        initial_serving_version_id="version-a",
+    )
+
+    try:
+        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+        assert staged.applied is True
+        staged.release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert adapter.stage_calls == []
 
 
 def _canonical_version(uid, base_version_id):
@@ -1076,12 +1177,13 @@ def test_generator_rejects_wrong_delta_base_before_lease(monkeypatch):
 
 
 def test_generator_validates_the_initial_s3_base_before_registration(monkeypatch):
+    """Validate an initial S3 base before registering the generator."""
     server, endpoint, service = _start_server()
     service.base.state = refit_pb2.WEIGHT_VERSION_STATE_STAGING
     adapter = _Adapter(service)
 
     try:
-        with pytest.raises(RuntimeError, match="initial base.*not READY"):
+        with pytest.raises(RuntimeError, match=r"initial serving version.*not READY"):
             _initialize(
                 monkeypatch,
                 endpoint,

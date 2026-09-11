@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     MX_PUBLISH_TIMEOUT_SECS: int
     MX_MODEL_REVISION: str
     MX_MODEL_URI: Optional[str]
+    MX_LOAD_STRATEGY_CHAIN: str
     MX_P2P_METADATA: str
     MX_RESHARD_FUSED_WIRE: bool
     MX_RESHARD_BATCH_INSTALL: bool
@@ -118,8 +119,14 @@ if TYPE_CHECKING:
     MX_ARTIFACT_TRANSFER_CHUNK_SIZE: Optional[str]
     # Trainer weight sync
     MX_REDIS_URL: str
+    # Generator weight sync
+    MX_GENERATOR_SOURCE_ORDER: Optional[str]
     # P2P source selection
     MX_P2P_SOURCE_SELECTOR: Optional[str]
+    # Weight of the NIC-utilization penalty in the load_aware selector.
+    MX_P2P_LOAD_WEIGHT: float
+    # Optional runtime /metrics URL (vLLM/SGLang) for the source_load signal.
+    MX_P2P_RUNTIME_METRICS_URL: Optional[str]
     # Topology-aware selection: ordered levels (broad->narrow), this node's
     # {level: value} JSON map, and the optional within-tier load-blend weight.
     MX_P2P_TOPOLOGY_LEVELS: Optional[str]
@@ -263,6 +270,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_PUBLISH_TIMEOUT_SECS": lambda: _env_int("MX_PUBLISH_TIMEOUT_SECS", 30 * 60),
     "MX_MODEL_REVISION": lambda: os.environ.get("MX_MODEL_REVISION", ""),
     "MX_MODEL_URI": lambda: os.environ.get("MX_MODEL_URI"),
+    "MX_LOAD_STRATEGY_CHAIN": lambda: (
+        os.environ.get("MX_LOAD_STRATEGY_CHAIN", "INFERENCE").strip().upper()
+    ),
     "MX_P2P_METADATA": lambda: os.environ.get("MX_P2P_METADATA", "1"),
     "MX_RESHARD_FUSED_WIRE": lambda: _env_bool("MX_RESHARD_FUSED_WIRE", True),
     # Issue the per-view re-slice copies of full-pulled sources as one batched
@@ -396,9 +406,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_ARTIFACT_TRANSFER_CHUNK_SIZE": lambda: os.environ.get("MX_ARTIFACT_TRANSFER_CHUNK_SIZE"),
     # ── Trainer pull (live weight sync from a running trainer) ─────────────
     "MX_REDIS_URL": lambda: os.environ.get("MX_REDIS_URL", "redis://localhost:6379"),
+    # ── Generator weight sync ──────────────────────────────────────────────
+    "MX_GENERATOR_SOURCE_ORDER": lambda: os.environ.get("MX_GENERATOR_SOURCE_ORDER"),
     # ── P2P source selection ───────────────────────────────────────────────
     # Raw (None when unset); source_selection applies its DEFAULT_SELECTOR fallback.
     "MX_P2P_SOURCE_SELECTOR": lambda: os.environ.get("MX_P2P_SOURCE_SELECTOR"),
+    # Clamp to >= 0: a negative weight would invert LoadAwareSelector into
+    # preferring busier sources. 0 disables the load term (== rendezvous_hash).
+    "MX_P2P_LOAD_WEIGHT": lambda: max(0.0, _env_float("MX_P2P_LOAD_WEIGHT", 1.0)),
+    "MX_P2P_RUNTIME_METRICS_URL": lambda: os.environ.get("MX_P2P_RUNTIME_METRICS_URL"),
     "MX_P2P_TOPOLOGY_LEVELS": lambda: os.environ.get("MX_P2P_TOPOLOGY_LEVELS"),
     "MX_P2P_TOPOLOGY": lambda: os.environ.get("MX_P2P_TOPOLOGY"),
     # Clamp to >= 0: a negative weight would invert the within-tier load blend

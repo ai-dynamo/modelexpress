@@ -10,6 +10,7 @@ import json
 import shutil
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from urllib.parse import quote
@@ -29,6 +30,48 @@ class CheckpointState(str, Enum):
 
     READY = "READY"
     UPDATING = "UPDATING"
+
+
+@dataclass(frozen=True)
+class CheckpointRecord:
+    """Typed representation of the preparation transaction in ``state.json``."""
+
+    status: CheckpointState
+    version: str
+    files: dict[str, list[int]] | None = None
+    source: dict[str, str] | None = None
+
+    @classmethod
+    def from_dict(cls, value: dict | None) -> CheckpointRecord | None:
+        if value is None or not isinstance(value.get("version"), str):
+            return None
+        try:
+            status = CheckpointState(value.get("status"))
+        except (TypeError, ValueError):
+            return None
+        files = value.get("files")
+        source = value.get("source")
+        if files is not None and not isinstance(files, dict):
+            return None
+        if source is not None and not isinstance(source, dict):
+            return None
+        return cls(
+            status=status,
+            version=value["version"],
+            files=files,
+            source=source,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        value: dict[str, object] = {
+            "status": self.status.value,
+            "version": self.version,
+        }
+        if self.files is not None:
+            value["files"] = self.files
+        if self.source is not None:
+            value["source"] = self.source
+        return value
 
 
 class CheckpointCacheCapacityError(RuntimeError):
@@ -311,8 +354,8 @@ class LocalCheckpointStore:
             return None
         return value if isinstance(value, dict) else None
 
-    def state(self) -> dict | None:
-        return self._read_json(self.state_path)
+    def state(self) -> CheckpointRecord | None:
+        return CheckpointRecord.from_dict(self._read_json(self.state_path))
 
     def write_state(
         self,
@@ -322,12 +365,17 @@ class LocalCheckpointStore:
         checkpoint_paths: Iterable[Path],
         source: dict[str, str] | None = None,
     ) -> None:
-        state: dict[str, object] = {"status": status, "version": version}
-        if status is CheckpointState.READY:
-            state["files"] = checkpoint_files_state(checkpoint_paths)
-        if source is not None:
-            state["source"] = source
-        self._write_json(self.state_path, state)
+        state = CheckpointRecord(
+            status=status,
+            version=version,
+            files=(
+                checkpoint_files_state(checkpoint_paths)
+                if status is CheckpointState.READY
+                else None
+            ),
+            source=source,
+        )
+        self._write_json(self.state_path, state.to_dict())
 
     def chain(self, version: str) -> dict | None:
         return self._read_json(self.chain_path(version))
@@ -393,6 +441,7 @@ class LocalCheckpointStore:
 
 __all__ = [
     "CheckpointCacheCapacityError",
+    "CheckpointRecord",
     "CheckpointState",
     "LocalCheckpointStore",
     "checkpoint_files_state",

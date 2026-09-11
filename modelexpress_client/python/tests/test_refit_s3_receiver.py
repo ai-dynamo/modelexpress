@@ -506,6 +506,165 @@ def _full_inputs(*, version="full-a", version_label=2):
     )
 
 
+def test_bootstrap_s3_checkpoint_downloads_and_reuses_full_root(tmp_path):
+    objects = _full_artifact(torch.tensor([7.0, 8.0]))
+    storage = _MemoryS3(objects)
+    version = receiver_module._S3Version(
+        version_id="full-a",
+        base_version_id=None,
+        payload_format=WeightPayloadFormat.FULL_HF_CHECKPOINT,
+        uri="s3://weights/test/v2/model.safetensors.index.json",
+    )
+
+    path = receiver_module.bootstrap_s3_checkpoint(
+        model_name="test/model",
+        version=version,
+        refit_checkpoint_dir=tmp_path / "cache",
+        s3=storage,
+    )
+
+    assert torch.equal(
+        load_file(path / "model-00001-of-00001.safetensors")["weight"],
+        torch.tensor([7.0, 8.0]),
+    )
+    first_calls = list(storage.calls)
+    assert first_calls == [
+        "s3://weights/test/v2/model.safetensors.index.json",
+        "s3://weights/test/v2/model-00001-of-00001.safetensors",
+    ]
+
+    assert receiver_module.bootstrap_s3_checkpoint(
+        model_name="test/model",
+        version=version,
+        refit_checkpoint_dir=tmp_path / "cache",
+        s3=storage,
+    ) == path
+    assert storage.calls == first_calls
+
+
+def test_cold_start_ranks_do_not_rewind_prepared_target(monkeypatch, tmp_path):
+    base = torch.tensor([1.0, 2.0])
+    target = torch.tensor([3.0, 4.0])
+    objects = _full_artifact(base, version_label=20)
+    objects.update(
+        _artifact(
+            base.view(torch.uint8).numpy(),
+            target.view(torch.uint8).numpy(),
+            version="v21",
+            version_label=21,
+            base_version="v20",
+        )
+    )
+    storage = _MemoryS3(objects)
+    monkeypatch.setattr(canonical_delta_module, "S3Client", lambda **_kwargs: storage)
+    root = receiver_module._S3Version(
+        version_id="v20",
+        base_version_id=None,
+        payload_format=WeightPayloadFormat.FULL_HF_CHECKPOINT,
+        uri="s3://weights/test/v20/model.safetensors.index.json",
+    )
+    cache = tmp_path / "cache"
+    seed = receiver_module.bootstrap_s3_checkpoint(
+        model_name="test/model",
+        version=root,
+        refit_checkpoint_dir=cache,
+        s3=storage,
+    )
+    adapter = _Adapter(
+        model_name="test/model",
+        config=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="v20",
+            seed_checkpoint_path=seed,
+            refit_checkpoint_dir=cache,
+        ),
+    )
+    staged = adapter.stage_chain(
+        (
+            _full_inputs(version="v20", version_label=20),
+            _inputs(
+                None,
+                base_version="v20",
+                version="v21",
+                version_label=21,
+            ),
+        )
+    )
+    state_before = adapter._checkpoint.store.state_path.read_bytes()
+    assert not adapter._checkpoint.store.active_path.exists()
+
+    assert receiver_module.bootstrap_s3_checkpoint(
+        model_name="test/model",
+        version=root,
+        refit_checkpoint_dir=cache,
+        s3=storage,
+    ) == seed
+    assert adapter._checkpoint.store.state_path.read_bytes() == state_before
+    assert not adapter._checkpoint.store.active_path.exists()
+
+    calls_before_follower = list(storage.calls)
+    follower = _Adapter(
+        model_name="test/model",
+        config=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="v20",
+            seed_checkpoint_path=seed,
+            refit_checkpoint_dir=cache,
+        ),
+    )
+    assert follower._checkpoint.local_checkpoint == staged.path
+    assert follower._checkpoint.store.state_path.read_bytes() == state_before
+    follower_staged = follower.stage_chain(
+        (
+            _full_inputs(version="v20", version_label=20),
+            _inputs(
+                None,
+                base_version="v20",
+                version="v21",
+                version_label=21,
+            ),
+        )
+    )
+    assert follower_staged.path == staged.path
+    assert storage.calls == calls_before_follower
+
+    follower.release_staged_weight(follower_staged)
+    follower.close()
+    adapter.release_staged_weight(staged)
+    adapter.close()
+
+    store = adapter._checkpoint.store
+    store.write_state(
+        status=checkpoint_store_module.CheckpointState.UPDATING,
+        version="v21",
+        checkpoint_paths=(),
+    )
+    recovered = _Adapter(
+        model_name="test/model",
+        config=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="v20",
+            seed_checkpoint_path=seed,
+            refit_checkpoint_dir=cache,
+        ),
+    )
+    assert recovered._checkpoint.store.state().version == "v20"
+    recovered_staged = recovered.stage_chain(
+        (
+            _full_inputs(version="v20", version_label=20),
+            _inputs(
+                None,
+                base_version="v20",
+                version="v21",
+                version_label=21,
+            ),
+        )
+    )
+    assert recovered_staged.path == staged.path
+    recovered.release_staged_weight(recovered_staged)
+    recovered.close()
+
+
 @pytest.mark.parametrize(
     "filename",
     ["/tmp/shard", "../shard", "foo/bar", "foo/bar/", ".", ".."],
@@ -654,8 +813,8 @@ def test_canonical_s3_rejects_checkpoint_that_exceeds_cache_quota(
 
     state = store.state()
     assert state is not None
-    assert state["status"] == "READY"
-    assert state["version"] == "base-a"
+    assert state.status is checkpoint_store_module.CheckpointState.READY
+    assert state.version == "base-a"
 
     store.max_size_bytes = None
     staged = adapter.stage_weight(_full_inputs())
@@ -900,7 +1059,7 @@ def test_canonical_s3_recovers_from_failed_v2_install_with_disjoint_target(
             raise RuntimeError("injected install failure")
     adapter._method.installation_failed(adapter._active)
     adapter.release_staged_weight(failed)
-    assert adapter._checkpoint.store.state()["version"] == "v2"
+    assert adapter._checkpoint.store.state().version == "v2"
     assert adapter._checkpoint.store.active_version() == "base-a"
 
     replays = {
@@ -954,7 +1113,10 @@ def test_canonical_s3_reinstalls_active_checkpoint_after_install_failure(
     assert recovery.path == adapter._checkpoint.store.full_path("full-a")
     adapter.apply_weight(recovery)
     adapter.release_staged_weight(recovery)
-    assert adapter._checkpoint.store.state()["status"] == "READY"
+    assert (
+        adapter._checkpoint.store.state().status
+        is checkpoint_store_module.CheckpointState.READY
+    )
     assert adapter._checkpoint.store.active_version() == "full-a"
     adapter.close()
 
@@ -990,8 +1152,8 @@ def test_canonical_s3_requires_delta_index_metadata_fields(
     assert storage.calls == [root_uri]
     state = adapter._checkpoint.store.state()
     assert state is not None
-    assert state["status"] == "READY"
-    assert state["version"] == "base-a"
+    assert state.status is checkpoint_store_module.CheckpointState.READY
+    assert state.version == "base-a"
     adapter.close()
 
 
@@ -1020,8 +1182,8 @@ def test_canonical_s3_rejects_mismatched_delta_formats(
     assert storage.calls == [root_uri]
     state = adapter._checkpoint.store.state()
     assert state is not None
-    assert state["status"] == "READY"
-    assert state["version"] == "base-a"
+    assert state.status is checkpoint_store_module.CheckpointState.READY
+    assert state.version == "base-a"
     adapter.close()
 
 
@@ -1169,6 +1331,27 @@ def test_canonical_s3_failed_install_keeps_previous_active_version(
     adapter.close()
 
 
+def test_canonical_s3_can_defer_activation_until_distributed_load_completes(
+    monkeypatch, tmp_path
+):
+    """Defer checkpoint activation until distributed loading completes."""
+    objects = _full_artifact(torch.tensor([7.0, 8.0]))
+    adapter, _storage = _build(monkeypatch, tmp_path, objects)
+    prepared = adapter.stage_weight(_full_inputs())
+
+    with adapter._method.installation_context(
+        adapter._active,
+        activate=False,
+    ):
+        pass
+
+    assert adapter._checkpoint.store.active_version() == "base-a"
+    adapter._method.activate(adapter._active)
+    assert adapter._checkpoint.store.active_version() == "full-a"
+    adapter.release_staged_weight(prepared)
+    adapter.close()
+
+
 def test_canonical_s3_applies_one_delta_to_the_active_checkpoint(
     monkeypatch, tmp_path
 ):
@@ -1295,7 +1478,10 @@ def test_canonical_s3_in_place_delta_failure_requires_recovery(
     assert not first_path.exists()
     assert second_path.exists()
     assert adapter._checkpoint.store.active_version() == "target-a"
-    assert adapter._checkpoint.store.state()["status"] == "UPDATING"
+    assert (
+        adapter._checkpoint.store.state().status
+        is checkpoint_store_module.CheckpointState.UPDATING
+    )
     adapter.close()
 
 
@@ -2043,8 +2229,8 @@ def test_canonical_s3_rejects_unsupported_compression(monkeypatch, tmp_path):
     assert storage.calls == [key]
     state = adapter._checkpoint.store.state()
     assert state is not None
-    assert state["status"] == "READY"
-    assert state["version"] == "base-a"
+    assert state.status is checkpoint_store_module.CheckpointState.READY
+    assert state.version == "base-a"
 
 
 def test_canonical_s3_rejects_invalid_manifest_json(monkeypatch, tmp_path):
@@ -2057,8 +2243,8 @@ def test_canonical_s3_rejects_invalid_manifest_json(monkeypatch, tmp_path):
     assert storage.calls == [key]
     state = adapter._checkpoint.store.state()
     assert state is not None
-    assert state["status"] == "READY"
-    assert state["version"] == "base-a"
+    assert state.status is checkpoint_store_module.CheckpointState.READY
+    assert state.version == "base-a"
 
 
 def test_canonical_s3_downloads_unique_shards_concurrently(monkeypatch, tmp_path):
