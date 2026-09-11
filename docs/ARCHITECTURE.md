@@ -1073,6 +1073,15 @@ shards, and compiles one-sided read descriptors without materializing a full
 trainer tensor. Geometry, slice planning, transfer planning, and the transport
 protocol are engine-agnostic.
 
+Geometry capture passes all lazy source weights through the engine loader in
+one call, amortizing model-wide parameter and expert-map construction. Each
+lazy tensor retains its original source identity, including native-to-HF view
+conversions. If an unsupported operation interrupts the bulk attempt, its new
+copy records and unattributed-write count are discarded before retrying each
+source individually for precise diagnostics. Unexpected engine errors propagate,
+and parameter loader hooks are restored on every exit. This optimizes the first
+capture without caching layouts across model or source changes.
+
 The minimal rendezvous publisher is called only after its NIXL agent and source
 buffers are registered, so `publish()` stores the worker as READY and repeated
 publication replaces that worker record. The shared `PublisherThread` sends a

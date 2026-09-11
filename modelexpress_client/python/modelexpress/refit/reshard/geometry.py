@@ -18,9 +18,9 @@ pull.
 Design notes:
   * Framework-neutral: the caller supplies the model (ideally a disposable
     ``meta`` twin) and the framework's default weight-loader; no engine import.
-  * Per-source isolation: we bake one source tensor at a time, so unsupported
-    geometry is attributed to the specific source before the receiver fails the
-    update. It never produces an incorrect partial plan.
+  * Bulk capture amortizes model-wide loader setup. If an unsupported operation
+    interrupts it, discard that attempt's records and retry per source to retain
+    precise diagnostics before the receiver fails the update.
   * Allowlist of pure view/slice ops; anything else (arithmetic, .to/.float,
     bool-mask indexing) lands in ``__torch_dispatch__`` and raises
     ``UnsupportedReshard`` for that source, not wrong bytes.
@@ -307,7 +307,7 @@ def capture_weights(
     pre-built ``weights`` against ``model`` (ideally a disposable meta twin).
 
     Args:
-        model: the engine model exposing ``load_weights([(name, tensor)])`` and
+        model: the engine model exposing ``load_weights([(name, tensor), ...])`` and
             per-param ``weight_loader`` hooks. Should be on ``meta`` so no real
             storage is touched.
         weights: ``{name: LazyWeight}`` from :func:`build_lazy_weights` (optionally
@@ -324,18 +324,23 @@ def capture_weights(
     unsupported: list[str] = []
     unsupported_reasons: dict[str, str] = {}
     try:
-        # One source at a time: a single unsupported loader is attributed only
-        # to that tensor, never the whole bake. Fused params (qkv/gate_up) still
-        # resolve - each source writes its own sub-region of the persistent (meta)
-        # dest param across separate calls. A converted lazy's ``_name`` is the
-        # original published source, so that is what an unsupported placement names.
-        for name, tensor in weights.items():
-            source = getattr(tensor, "_name", name)
-            try:
-                model.load_weights([(name, tensor)])
-            except UnsupportedReshard as exc:
-                unsupported.append(source)
-                unsupported_reasons[source] = str(exc)
+        # Large MoE loaders rebuild model-wide parameter/expert maps on entry.
+        # LazyWeights carry their own source identity across one bulk invocation.
+        copies_start, unattributed_start = len(recorder.copies), recorder.unattributed
+        try:
+            model.load_weights(list(weights.items()))
+        except UnsupportedReshard:
+            # The failed attempt may have recorded a prefix. Never count it twice
+            # when retrying the original per-source diagnostic path.
+            del recorder.copies[copies_start:]
+            recorder.unattributed = unattributed_start
+            for name, tensor in weights.items():
+                source = getattr(tensor, "_name", name)
+                try:
+                    model.load_weights([(name, tensor)])
+                except UnsupportedReshard as exc:
+                    unsupported.append(source)
+                    unsupported_reasons[source] = str(exc)
     finally:
         _restore_stamps(saved)
 

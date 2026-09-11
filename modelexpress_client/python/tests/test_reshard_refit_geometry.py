@@ -14,7 +14,6 @@ import re
 
 import pytest
 import torch
-
 from modelexpress.refit.reshard.geometry import (
     LazyWeight,
     build_lazy_weights,
@@ -149,6 +148,96 @@ def test_unsupported_source_records_the_op_that_defeated_capture():
     # The offending source and its op-chain stay in the message, which is what
     # makes a single failure actionable without a re-run.
     assert "'bad'" in reason
+
+
+def test_capture_initializes_the_model_loader_once_for_all_weights():
+    class CountingModel(ToyModel):
+        def __init__(self):
+            super().__init__()
+            self.load_calls = 0
+
+        def load_weights(self, weights):
+            self.load_calls += 1
+            return super().load_weights(weights)
+
+    with torch.device("meta"):
+        model = CountingModel()
+    originals = {name: param.weight_loader for name, param in model.named_parameters()}
+    result = capture_geometry(model, _manifest())
+
+    assert len(result.copies) == len(_manifest())
+    assert model.load_calls == 1
+    assert result.unsupported == [] and result.unattributed == 0
+    assert all(
+        param.weight_loader is originals[name]
+        for name, param in model.named_parameters()
+    )
+
+
+@pytest.mark.parametrize("failure_position", [0, 3, 6])
+def test_batch_failure_preserves_only_serial_capture_records(failure_position):
+    class PartialFailureModel(ToyModel):
+        def __init__(self):
+            super().__init__(with_bad=True)
+
+        def load_weights(self, weights):
+            for name, tensor in weights:
+                if name == "bad":
+                    # A loader may record both attributed and unattributed writes
+                    # before encountering an unsupported operation.
+                    self.norm.weight_loader(self.norm, tensor[0])
+                    self.norm.data.copy_(tensor[1])
+                super().load_weights([(name, tensor)])
+
+    with torch.device("meta"):
+        model = PartialFailureModel()
+    weights = build_lazy_weights(_manifest(with_bad=True))
+    ordered = [(name, tensor) for name, tensor in weights.items() if name != "bad"]
+    ordered.insert(failure_position, ("bad", weights["bad"]))
+    result = capture_weights(model, dict(ordered))
+
+    assert result.unsupported == ["bad"]
+    assert result.unattributed == 1
+    assert [copy.src_name for copy in result.copies].count("bad") == 1
+    assert len(result.copies) == len(_manifest()) + 1
+    assert {copy.src_name for copy in result.copies} == set(weights)
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, ValueError])
+def test_batch_capture_propagates_unexpected_errors_and_restores_loaders(failure):
+    class BrokenModel(ToyModel):
+        def load_weights(self, weights):
+            super().load_weights(weights)
+            raise failure("engine failure")
+
+    with torch.device("meta"):
+        model = BrokenModel()
+    originals = {name: param.weight_loader for name, param in model.named_parameters()}
+    with pytest.raises(failure, match="engine failure"):
+        capture_geometry(model, _manifest())
+    assert all(
+        param.weight_loader is originals[name]
+        for name, param in model.named_parameters()
+    )
+
+
+def test_batch_unsupported_operation_keeps_original_converted_source_name():
+    with torch.device("meta"):
+        model = ToyModel(with_bad=True)
+    lazy = build_lazy_weights([("native.experts", torch.float32, (2, 4, 4))])
+    result = capture_weights(
+        model,
+        {
+            "bad": lazy["native.experts"].select(0, 0),
+            "q": lazy["native.experts"].select(0, 1),
+        },
+    )
+    assert result.unsupported == ["native.experts"]
+    assert set(result.unsupported_reasons) == {"native.experts"}
+    assert len(result.copies) == 1
+    assert result.copies[0].src_name == "native.experts"
+    assert result.copies[0].param_name == "qkv"
+    assert result.copies[0].op_chain == (("select", (0, 1), ()),)
 
 
 def test_summarize_unsupported_groups_one_cause_across_many_sources():
