@@ -74,6 +74,10 @@
 #   h100-smoke          — non-gating canary that validates the dedicated
 #                         ModelExpress runner starts with exactly two H100 GPUs.
 #
+#   h100-cluster-smoke  — non-gating canary that validates a zero-GPU deploy
+#                         runner can schedule a 2+1 H100 workload and mount
+#                         cross-node RWX storage in the dedicated H100 vCluster.
+#
 #   model-streamer       — matrix over frameworks; single worker pod, no
 #                          vCluster, no P2P. Streams weights directly from S3
 #                          via runai-model-streamer + IRSA. Validates the
@@ -1113,6 +1117,72 @@ jobs:
           if printf '%s\n' "${gpu_names[@]}" | grep -qv '^NVIDIA H100'; then
             echo "Expected every GPU to be an NVIDIA H100" >&2
             exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Dedicated H100 vCluster access, scheduling, and RWX storage canary.
+  # This remains non-gating until the deploy runner and vCluster are proven.
+  # Velonix must provision both before this job can be scheduled successfully.
+  # ---------------------------------------------------------------------------
+  h100-cluster-smoke:
+    name: H100 cluster infrastructure smoke test
+    runs-on: prod-modelexpress-deploy-tester-v1
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    concurrency:
+      group: modelexpress-h100-cluster-smoke
+      cancel-in-progress: false
+    env:
+      H100_KUBE_CONTEXT: ${{ vars.MX_H100_KUBE_CONTEXT || 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02' }}
+      H100_VCLUSTER_NAME: ${{ vars.MX_H100_VCLUSTER_NAME || 'mx-vime-h100-ci' }}
+      H100_VCLUSTER_NAMESPACE: ${{ vars.MX_H100_VCLUSTER_NAMESPACE || 'mx-vime-h100-ci' }}
+      H100_STORAGE_CLASS: ${{ vars.MX_H100_STORAGE_CLASS || 'dgxc-enterprise-file' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Select Teleport H100 context
+        id: host-kubeconfig
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f /teleport/kubeconfig.yaml ]; then
+            echo "Expected a tbot kubeconfig at /teleport/kubeconfig.yaml" >&2
+            exit 1
+          fi
+
+          host_kubeconfig="${RUNNER_TEMP}/mx-h100-host.yaml"
+          install -m 600 /teleport/kubeconfig.yaml "$host_kubeconfig"
+          kubectl --kubeconfig="$host_kubeconfig" config use-context \
+            "$H100_KUBE_CONTEXT"
+          encoded=$(base64 -w 0 < "$host_kubeconfig")
+          echo "::add-mask::$encoded"
+          echo "kubeconfig_base64=$encoded" >> "$GITHUB_OUTPUT"
+
+      - name: Connect to dedicated H100 vCluster
+        id: connect-vcluster
+        uses: ./.github/actions/connect-vcluster
+        with:
+          host_kubeconfig_base64: ${{ steps.host-kubeconfig.outputs.kubeconfig_base64 }}
+          vcluster_name: ${{ env.H100_VCLUSTER_NAME }}
+          vcluster_namespace: ${{ env.H100_VCLUSTER_NAMESPACE }}
+
+      - name: Validate H100 scheduling and cross-node RWX
+        env:
+          KUBECONFIG: ${{ github.workspace }}/.kubeconfig-vcluster
+        run: ci/k8s/run-h100-infra-smoke.sh
+
+      - name: Reap H100 vCluster port-forward
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
+            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
 
   # ---------------------------------------------------------------------------
