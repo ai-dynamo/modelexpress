@@ -159,13 +159,13 @@ The header currently returns the full file table sorted by manifest path, while 
 
 ### Tarred Cache Artifact Helpers
 
-The Python `P2PArtifactTransfer` interface is the shared lifecycle for cache artifact transfer helpers:
+The Python `ArtifactTransfer` interface defines backend-independent cache artifact packaging and installation:
 
-1. Source worker creates a transfer helper, calls `prepare_source()`, and publishes the returned bundle with `publish_artifact_source()`.
-2. Target worker creates the same helper type with its own `target_root` and `bundle_root`, calls `discover_and_transfer()` or `transfer_from_worker()`, and receives a target-local staged artifact.
-3. Target worker calls `install()` to unpack the staged artifact into the runtime cache directory before the framework starts using that cache.
+1. A source calls `prepare_source()` to seal a publishable bundle.
+2. The selected `ArtifactTransport` publishes or fetches that bundle through P2P or Mooncake.
+3. A target calls `install()` to unpack the staged artifact before using the cache.
 
-The current implementation, `TarredP2PArtifactTransfer`, packages the source cache directory into one uncompressed tar file before building the artifact manifest. The source manifest records the publisher's tar path and therefore contributes that path to `artifact_id`. During transfer, the target rewrites the received file table to its own `bundle_root / artifact.tar`, then extracts that tar into `target_root`. This keeps the published manifest sealed while avoiding any requirement that source and target share the same absolute staging path.
+`TarredArtifactTransfer` packages each configured cache root as an uncompressed tar file and builds the shared manifest used by both transports.
 
 Factory helpers provide the cache source types currently expected by loaders:
 

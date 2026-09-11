@@ -46,8 +46,10 @@ def _clear_publish_leases():
 def _schedule_publish(tmp_dir, rank, results):
     al.tempfile.gettempdir = lambda: tmp_dir
     al._artifact_transfer_enabled = lambda: True
+    al._artifact_backend = lambda: "p2p"
     al._p2p_metadata_enabled_for_artifacts = lambda ctx, engine, log: True
     al._metadata_publication_configured = lambda ctx: True
+    al.is_nixl_available = lambda: True
     scheduled_publishers = {}
     al.schedule_artifact_publish(
         SimpleNamespace(
@@ -62,7 +64,7 @@ def _schedule_publish(tmp_dir, rank, results):
         engine_label="test",
         ready_fn_factory=lambda roots: lambda: True,
         artifact_publish_fn=lambda transfer, identity: SimpleNamespace(
-            endpoint=SimpleNamespace(mx_source_id=f"source-{rank}")
+            identifier=f"source-{rank}"
         ),
         scheduled_publishers=scheduled_publishers,
     )
@@ -119,6 +121,26 @@ def test_successful_publish_retains_lease(monkeypatch, tmp_path):
     al.clear_publish_scheduled(SimpleNamespace(mx_source_id="source-id"), lease_path)
 
     assert al.mark_publish_scheduled(ctx, _transfer(tmp_path), _identity()) is None
+
+
+def test_marker_key_uses_canonical_compatibility_identity(tmp_path):
+    transfer = _transfer(tmp_path)
+    upper = p2p_pb2.SourceIdentity(
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
+        model_name="ORG/Test-Model",
+        revision="MAIN",
+        extra_parameters={"Z": "VALUE", "A": "OTHER"},
+    )
+    lower = p2p_pb2.SourceIdentity(
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
+        model_name="org/test-model",
+        revision="main",
+        extra_parameters={"a": "other", "z": "value"},
+    )
+
+    assert al.artifact_marker_key(transfer, upper, "install") == (
+        al.artifact_marker_key(transfer, lower, "install")
+    )
 
 
 def test_scheduled_publisher_lease_reclaimed_after_owner_terminates(
