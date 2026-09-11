@@ -67,6 +67,8 @@ class PublisherThread:
             ``MX_HEARTBEAT_INTERVAL_SECS``.
         heartbeat_after_publish: If False, the thread exits after publish_fn
             succeeds instead of sending READY heartbeats.
+        retry_publish_on_failure: If False, stop after the first publish
+            failure. The failure is logged at error level and cleanup runs.
     """
 
     def __init__(
@@ -82,6 +84,7 @@ class PublisherThread:
         publish_timeout_secs: int | None = None,
         interval_secs: int | None = None,
         heartbeat_after_publish: bool = True,
+        retry_publish_on_failure: bool = True,
     ):
         if mx_source_id is None and publish_fn is None:
             raise ValueError("PublisherThread requires mx_source_id or publish_fn")
@@ -97,6 +100,7 @@ class PublisherThread:
         self._ready_fn = ready_fn
         self._cleanup_fn = cleanup_fn
         self._heartbeat_after_publish = heartbeat_after_publish
+        self._retry_publish_on_failure = retry_publish_on_failure
 
         self._publish_timeout = (
             publish_timeout_secs
@@ -330,11 +334,19 @@ class PublisherThread:
             )
             return True
         except Exception as exc:
-            logger.warning(
-                f"[Worker {self._worker_rank}] Source publish attempt failed "
-                f"({elapsed:.0f}s elapsed, timeout={self._publish_timeout}s), "
-                f"will retry next tick: {exc}"
-            )
+            if not self._retry_publish_on_failure:
+                logger.error(
+                    f"[Worker {self._worker_rank}] Source publish failed; "
+                    f"not retrying: {exc}"
+                )
+                self._stop_event.set()
+                self._cleanup()
+            else:
+                logger.warning(
+                    f"[Worker {self._worker_rank}] Source publish attempt failed "
+                    f"({elapsed:.0f}s elapsed, timeout={self._publish_timeout}s), "
+                    f"will retry next tick: {exc}"
+                )
             return False
 
     def _tick(self) -> None:

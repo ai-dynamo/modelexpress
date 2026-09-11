@@ -151,10 +151,10 @@ cache artifacts after the SGLang `/health` endpoint is ready and the cache
 directories have stopped changing briefly. Supported cache roots are
 `TORCHINDUCTOR_CACHE_DIR` (or PyTorch Inductor's runtime `cache_dir()`),
 `TRITON_CACHE_DIR`, `TVM_FFI_CACHE_DIR`, `SGLANG_DG_CACHE_DIR`, `TILELANG_CACHE_DIR`,
-`CUTE_DSL_CACHE_DIR`, and `FLASHINFER_WORKSPACE_BASE`. This path requires
-`MX_P2P_METADATA=1` and a central-coordinator metadata backend (`redis` or
-`kubernetes`) for artifact discovery. Cache publication uses the same health
-endpoint as weight publication.
+`CUTE_DSL_CACHE_DIR`, and `FLASHINFER_WORKSPACE_BASE`. The default `p2p`
+artifact backend requires `MX_P2P_METADATA=1` and a central coordinator; the
+`mooncake` backend uses its configured store without MX metadata. Cache
+publication uses the same health endpoint as weight publication.
 
 For Mooncake TransferEngine, use the same command shape and change only the
 transport. The SGLang image must include `mooncake-transfer-engine-cuda13`.

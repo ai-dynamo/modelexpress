@@ -644,9 +644,12 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_REFIT_METADATA_PORT` | `7555` | Base NIXL listen port for an RL generator's refit client; effective port is `MX_REFIT_METADATA_PORT + device_id`, separate from a boot-time loader manager |
 | `MX_WORKER_GRPC_PORT` | `6555` | Base worker gRPC port for P2P tensor and artifact manifest serving |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
-| `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. The SGLang NIXL loader uses the same artifact path for compatible torch compile, Triton, TVM-FFI, DeepGEMM, TileLang, CuTe DSL, and FlashInfer caches. Requires the P2P metadata path; if `MX_P2P_METADATA=0`, the loader logs a warning and skips artifact transfer. |
+| `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. The SGLang NIXL loader uses the same artifact lifecycle for compatible torch compile, Triton, TVM-FFI, DeepGEMM, TileLang, CuTe DSL, and FlashInfer caches. |
+| `MX_ARTIFACT_BACKEND` | `p2p` | Select exactly one artifact backend: `p2p` or `mooncake`. There is no fallback. |
 | `MX_ARTIFACT_TRANSFER_CHUNK_SIZE` | `67108864` | Artifact transfer chunk size in bytes. Default is 64 MiB; maximum is 4 GiB. Larger values reduce manifest/RPC overhead but increase registered DRAM buffer memory, approximately `chunk_size * max_inflight_chunks` per source and target worker. |
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles. |
+| `MX_ARTIFACT_MOONCAKE_NAMESPACE` | `modelexpress/artifacts` | Key prefix used by the Mooncake artifact backend. |
+| `MX_MOONCAKE_CONFIG_PATH` | (unset) | Optional Mooncake JSON configuration file; `MOONCAKE_CONFIG_PATH` is the fallback. |
 | `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before source workers publish weight metadata or prepare and publish cache artifact bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim. See [Multi-node readiness](#multi-node-readiness). |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication before giving up. |
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Adds compile configuration as a partitioning dimension for the torch compile cache artifact source pool. Workers that share a value discover each other's caches; workers with different values do not. Unset removes **only this dimension** — the pool is still partitioned by every other `SourceIdentity` field (model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch), so workers matching on all of those share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](#pairing-workers-by-compile-configuration). |
@@ -848,11 +851,29 @@ P2P metadata exchange is enabled by default. Source workers expose their own per
 
 Set `MX_METADATA_PORT` and `MX_WORKER_GRPC_PORT` to fixed ports when running in K8s (port 0 picks an ephemeral port). Set `MX_WORKER_HOST` if the pod IP auto-detection doesn't produce a routable address.
 
-For cache artifact transfer, set `MX_ARTIFACT_TRANSFER=1` on source and target workers. The default P2P metadata path is also required; if it was disabled, set `MX_P2P_METADATA=1`. The vLLM and SGLang NIXL loaders install compatible artifacts before model initialization, then schedule publisher threads after successful load. Each publisher waits for readiness before publishing local cache directories and waits for their file count, total size, and max mtime to settle before sealing the artifact.
+### Artifact Transfer Backends
+
+Set `MX_ARTIFACT_TRANSFER=1` on source and target workers. The vLLM and SGLang
+NIXL loaders install compatible artifacts before model initialization, then
+schedule publisher threads after successful load. Each publisher waits for
+readiness and for the cache file count, total size, and max mtime to settle
+before sealing the artifact.
+
+`MX_ARTIFACT_BACKEND=p2p` is the default. It preserves the existing worker
+discovery, manifest/chunk RPC, and NIXL data path, and therefore requires
+`MX_P2P_METADATA=1` plus a central metadata backend (`redis` or `kubernetes`).
+
+`MX_ARTIFACT_BACKEND=mooncake` uses a shared Mooncake store instead. Install a
+package that exposes `mooncake.store`, configure at least
+`MX_MC_METADATA_ADDR` and `MX_MC_MASTER_SERVER` (or provide
+`MX_MOONCAKE_CONFIG_PATH`), and optionally set `MX_MC_PROTOCOL`,
+`MX_MC_DEVICE_NAME`, and `MX_ETCD_*` credentials. This backend does not contact
+the MX server and does not require `MX_P2P_METADATA`. See
+[`CONFIGURATION.md`](CONFIGURATION.md#artifact-transfer) for all settings.
 
 vLLM publishes torch compile (`VLLM_CACHE_ROOT/torch_compile_cache`), Triton (`TRITON_CACHE_DIR`, or `~/.triton/cache`), DeepGEMM (`DG_JIT_CACHE_DIR`, or `VLLM_CACHE_ROOT/deep_gemm`), TileLang (`TILELANG_CACHE_DIR`, or `~/.tilelang/cache`), CuTe DSL (`CUTE_DSL_CACHE_DIR`, or `$TMPDIR/<user>/cutlass_python_cache`), and FlashInfer (`FLASHINFER_WORKSPACE_BASE/.cache/flashinfer`, or `~/.cache/flashinfer`) caches. The FlashInfer artifact also includes vLLM's persistent autotune directory from `VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR`, or `VLLM_CACHE_ROOT/flashinfer_autotune_cache` when unset; ModelExpress does not change either path.
 
-SGLang's NIXL loader publishes torch compile (`TORCHINDUCTOR_CACHE_DIR`, or PyTorch Inductor's runtime `cache_dir()`), Triton (`TRITON_CACHE_DIR`, or `~/.triton/cache`), TVM-FFI (`TVM_FFI_CACHE_DIR`, or `~/.cache/tvm-ffi`), DeepGEMM (`SGLANG_DG_CACHE_DIR`, or `~/.cache/deep_gemm`), TileLang (`TILELANG_CACHE_DIR`, or `~/.tilelang/cache`), CuTe DSL (`CUTE_DSL_CACHE_DIR`, or `$TMPDIR/<user>/cutlass_python_cache`), and FlashInfer (`FLASHINFER_WORKSPACE_BASE/.cache/flashinfer`, or `~/.cache/flashinfer`) caches. The FlashInfer artifact also includes SGLang's persistent autotune directory from `SGLANG_CACHE_DIR/flashinfer/autotune`, or `~/.cache/sglang/flashinfer/autotune` when unset. SGLang runs that autotuner only for eligible FlashInfer MoE or FP4 backends; DeepGEMM + DeepEP does not produce an autotune cache. SGLang TransferEngine transport currently remains weight-only for ModelExpress artifact transfer because cache artifact bytes move through the NIXL artifact path.
+SGLang's NIXL loader publishes torch compile (`TORCHINDUCTOR_CACHE_DIR`, or PyTorch Inductor's runtime `cache_dir()`), Triton (`TRITON_CACHE_DIR`, or `~/.triton/cache`), TVM-FFI (`TVM_FFI_CACHE_DIR`, or `~/.cache/tvm-ffi`), DeepGEMM (`SGLANG_DG_CACHE_DIR`, or `~/.cache/deep_gemm`), TileLang (`TILELANG_CACHE_DIR`, or `~/.tilelang/cache`), CuTe DSL (`CUTE_DSL_CACHE_DIR`, or `$TMPDIR/<user>/cutlass_python_cache`), and FlashInfer (`FLASHINFER_WORKSPACE_BASE/.cache/flashinfer`, or `~/.cache/flashinfer`) caches. The FlashInfer artifact also includes SGLang's persistent autotune directory from `SGLANG_CACHE_DIR/flashinfer/autotune`, or `~/.cache/sglang/flashinfer/autotune` when unset. SGLang runs that autotuner only for eligible FlashInfer MoE or FP4 backends; DeepGEMM + DeepEP does not produce an autotune cache. SGLang's Mooncake TransferEngine selection for model weights is independent of `MX_ARTIFACT_BACKEND`; its TransferEngine model-loading mode remains weight-only, while the NIXL loader can use either artifact backend.
 
 Artifacts are sealed as tar archives holding regular files and directories
 only. Symlinks in a cache directory are left out of the archive rather than
@@ -923,7 +944,13 @@ and this worker recompiled — the signal that the pool needs partitioning. You
 can confirm independently by comparing the `Using cache directory:` hash that
 each worker logs.
 
-In multi-node deployments, artifact metadata records the framework `node_rank`, so each target node selects the corresponding source node without making the artifact worker-specific. If artifact transfer is enabled while P2P metadata is disabled, the loader logs a warning and skips artifact transfer. Artifact discovery currently requires a central-coordinator backend (`redis` or `kubernetes`), and Kubernetes deployments must use the matching `ModelMetadata` CRD containing `status.worker.artifactSource.nodeRank`.
+In multi-node deployments, the artifact key includes the framework `node_rank`,
+so each target node selects the corresponding source-node artifact without
+making it worker-specific. For P2P, that rank is carried in artifact metadata;
+artifact discovery requires a central coordinator (`redis` or `kubernetes`),
+and Kubernetes deployments must use the matching `ModelMetadata` CRD containing
+`status.worker.artifactSource.nodeRank`. Mooncake includes the same rank in its
+deterministic object key and needs no MX metadata record.
 
 #### Multi-node readiness
 
@@ -945,8 +972,8 @@ multi-node examples work unchanged with their loopback `MX_ARTIFACT_READY_URL`.
 Cache artifacts may contain executable code. Transfer checksums detect corruption
 but do not authenticate the publishing replica or attest the artifact. Enable
 artifact transfer only within a trusted deployment, and network-isolate the MX
-server and worker gRPC endpoints from untrusted clients. ModelExpress does not
-currently sign cache artifacts.
+server, worker gRPC endpoints, and Mooncake store from untrusted clients.
+ModelExpress does not currently sign cache artifacts.
 
 RL refit has the same trusted-network requirement. Its trainer-local
 `RefitWorkerService` serves exact-version manifests over plaintext gRPC; the

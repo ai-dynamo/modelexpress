@@ -10,14 +10,11 @@ import json
 import logging
 import os
 import tempfile
-import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
-from dataclasses import dataclass
-from enum import Enum
 from fcntl import LOCK_EX, LOCK_NB, LOCK_UN, flock
 from getpass import getuser
 from hashlib import sha256
@@ -34,16 +31,20 @@ from ..load_strategy.context import LoadContext
 from ..nixl_transfer import is_nixl_available
 from .artifact_transfer import (
     ArtifactCacheRoot,
-    ArtifactBundle,
-    P2PArtifactTransfer,
-    PublishedArtifactSource,
-    publish_artifact_source,
+    ArtifactTransfer,
 )
-from .mooncake_artifact_cache import (
-    MooncakeArtifactCacheMiss,
-    install_from_mooncake,
-    publish_to_mooncake,
+from .artifact_transport import (
+    ArtifactCacheMiss,
+    ArtifactCacheStale,
+    ArtifactInstallDisposition,
+    ArtifactInstallState,
+    ArtifactInstallStatus,
+    ArtifactTransport,
+    ArtifactTransportContext,
+    PublicationHandle,
 )
+from .mooncake_artifact_transport import MooncakeArtifactTransport
+from .p2p_artifact_transport import P2PArtifactTransport
 from .publisher import PublisherThread
 from .publish import _get_worker_server, _is_p2p_metadata_enabled
 from .source_id import compute_mx_source_id
@@ -53,27 +54,9 @@ logger = logging.getLogger("modelexpress.metadata.artifact_lifecycle")
 READY_POLL_SECS = 5
 CACHE_SETTLE_SECS = 5
 
-ArtifactEntry = tuple[P2PArtifactTransfer, p2p_pb2.SourceIdentity]
-InstallCompleted = Callable[[P2PArtifactTransfer, p2p_pb2.SourceIdentity], None]
+ArtifactEntry = tuple[ArtifactTransfer, p2p_pb2.SourceIdentity]
+InstallCompleted = Callable[[ArtifactTransfer, p2p_pb2.SourceIdentity], None]
 _publish_leases: dict[Path, TextIO] = {}
-_prepared_artifact_bundles: dict[tuple[int, bytes], ArtifactBundle] = {}
-_prepared_artifact_locks: dict[tuple[int, bytes], threading.Lock] = {}
-_prepared_artifact_locks_guard = threading.Lock()
-_mooncake_publish_needed: set[tuple[bytes, int, str, int, str]] = set()
-
-
-class MooncakeInstallStatus(Enum):
-    """Outcome of the per-pod Mooncake artifact installation marker."""
-
-    INSTALLED = "installed"
-    ALREADY_INSTALLED = "already_installed"
-    MISS = "miss"
-
-
-@dataclass(frozen=True)
-class MooncakeInstallResult:
-    status: MooncakeInstallStatus
-    header: p2p_pb2.GetArtifactManifestHeaderResponse | None = None
 
 
 def install_artifacts(
@@ -87,91 +70,25 @@ def install_artifacts(
     """Best-effort install of compatible artifacts before model loading."""
     if not _artifact_transfer_enabled():
         return
-    mooncake_enabled = _mooncake_artifact_enabled()
-    p2p_available = _p2p_artifact_install_available(ctx, engine_label, log)
-    if not mooncake_enabled and not p2p_available:
+    backend = _artifact_backend()
+    transport = _create_artifact_transport(ctx, backend, engine_label, log)
+    if transport is None:
         return
-
     for transfer, identity in transfers_factory():
-        if mooncake_enabled:
-            try:
-                start = time.perf_counter()
-                result = install_mooncake_artifact_once(
-                    ctx,
-                    transfer,
-                    identity,
-                    engine_label=engine_label,
-                    on_install_completed=on_install_completed,
-                )
-                elapsed = time.perf_counter() - start
-                if result.status is MooncakeInstallStatus.ALREADY_INSTALLED:
-                    log.debug(
-                        "[Worker %s] %s Mooncake artifact %s already installed "
-                        "by another worker; continuing to the next artifact",
-                        ctx.global_rank,
-                        engine_label,
-                        transfer.name,
-                    )
-                    continue
-                if result.status is MooncakeInstallStatus.MISS:
-                    _mark_mooncake_publish_needed(ctx, transfer, identity)
-                    log.info(
-                        "[Worker %s] Mooncake %s artifact cache miss: name=%s "
-                        "(cached miss; skipping repeated query)",
-                        ctx.global_rank,
-                        engine_label,
-                        transfer.name,
-                    )
-                header = result.header
-                if (
-                    result.status is MooncakeInstallStatus.INSTALLED
-                    and header is not None
-                ):
-                    log.info(
-                        "[Worker %s] [TIMING] %s Mooncake artifact install complete: "
-                        "name=%s artifact_id=%s size=%.2f MiB elapsed=%.3fs",
-                        ctx.global_rank,
-                        engine_label,
-                        transfer.name,
-                        header.artifact_id,
-                        header.total_size / (1024 * 1024),
-                        elapsed,
-                    )
-                    continue
-            except MooncakeArtifactCacheMiss:
-                _mark_mooncake_publish_needed(ctx, transfer, identity)
-                log.info(
-                    "[Worker %s] Mooncake %s artifact cache miss: name=%s",
-                    ctx.global_rank,
-                    engine_label,
-                    transfer.name,
-                )
-            except Exception as exc:
-                _mark_mooncake_publish_needed(ctx, transfer, identity)
-                log.warning(
-                    "[Worker %s] Failed to install Mooncake %s artifact: "
-                    "name=%s error=%s",
-                    ctx.global_rank,
-                    engine_label,
-                    transfer.name,
-                    exc,
-                )
-
-        if not p2p_available:
-            continue
         try:
             start = time.perf_counter()
-            header = install_artifact_once(
+            header, transport_name = _install_artifact_via_transports(
                 ctx,
                 transfer,
                 identity,
-                engine_label=engine_label,
+                transport=transport,
                 on_install_completed=on_install_completed,
             )
             elapsed = time.perf_counter() - start
             if header is None:
                 log.debug(
-                    "[Worker %s] %s artifact %s already installed in this pod",
+                    "[Worker %s] %s artifact %s already attempted in this pod; "
+                    "skipping",
                     ctx.global_rank,
                     engine_label,
                     transfer.name,
@@ -179,26 +96,42 @@ def install_artifacts(
                 continue
             log.info(
                 "[Worker %s] [TIMING] %s artifact install complete: "
-                "name=%s artifact_id=%s mx_source_id=%s size=%.2f MiB elapsed=%.3fs",
+                "name=%s transport=%s artifact_id=%s mx_source_id=%s "
+                "size=%.2f MiB elapsed=%.3fs",
                 ctx.global_rank,
                 engine_label,
                 transfer.name,
+                transport_name,
                 header.artifact_id,
                 compute_mx_source_id(identity),
                 header.total_size / (1024 * 1024),
                 elapsed,
             )
-        except LookupError:
+        except ArtifactCacheStale as exc:
+            log.warning(
+                "[Worker %s] Remote %s artifact is stale for %s "
+                "(backend=%s mx_source_id=%s compile_config_digest=%r): %s; "
+                "the engine will rebuild and republish this cache",
+                ctx.global_rank,
+                engine_label,
+                transfer.name,
+                backend,
+                compute_mx_source_id(identity),
+                identity.compile_config_digest,
+                exc,
+            )
+        except ArtifactCacheMiss:
             # Logged at INFO, not DEBUG: a miss here is the difference between a
             # warm start and a full recompile, and the mx_source_id plus digest
             # are what an operator needs to diff two pods that fail to pair.
             log.info(
-                "[Worker %s] No ready %s artifact source for %s "
-                "(mx_source_id=%s compile_config_digest=%r); "
+                "[Worker %s] No remote %s artifact available for %s "
+                "(backend=%s mx_source_id=%s compile_config_digest=%r); "
                 "the engine will rebuild this cache locally",
                 ctx.global_rank,
                 engine_label,
                 transfer.name,
+                backend,
                 compute_mx_source_id(identity),
                 identity.compile_config_digest,
             )
@@ -212,6 +145,57 @@ def install_artifacts(
             )
 
 
+def _install_artifact_via_transports(
+    ctx: LoadContext,
+    transfer: ArtifactTransfer,
+    identity: p2p_pb2.SourceIdentity,
+    *,
+    transport: ArtifactTransport,
+    on_install_completed: InstallCompleted | None,
+) -> tuple[p2p_pb2.GetArtifactManifestHeaderResponse | None, str]:
+    """Fetch and install an artifact once, independent of its transport.
+
+    The lifecycle serializes fetch and install while the selected transport
+    defines how an existing result affects later workers and publication.
+    """
+    marker_path = artifact_marker_path(transfer, identity, "install-attempted")
+    with artifact_lock(marker_path):
+        if marker_path.exists():
+            state = _read_artifact_install_state(marker_path)
+            disposition = transport.resolve_install_state(state)
+            if disposition is ArtifactInstallDisposition.SKIP:
+                return None, "marker"
+            if disposition is ArtifactInstallDisposition.CACHED_MISS:
+                raise ArtifactCacheMiss(
+                    f"cached {transport.name} miss for {transfer.name}"
+                )
+
+        _write_artifact_install_state(
+            marker_path,
+            ArtifactInstallState(ArtifactInstallStatus.ATTEMPTED),
+        )
+
+        context = _artifact_transport_context(ctx)
+        try:
+            staged = transport.fetch(transfer, identity, context)
+            transfer.install(staged.header)
+            _write_artifact_install_state(
+                marker_path,
+                ArtifactInstallState(
+                    ArtifactInstallStatus.INSTALLED,
+                    artifact_id=staged.header.artifact_id,
+                ),
+            )
+            if on_install_completed is not None:
+                on_install_completed(transfer, identity)
+            return staged.header, staged.transport
+        except ArtifactCacheMiss:
+            _write_artifact_install_state(
+                marker_path, transport.state_after_cache_miss()
+            )
+            raise
+
+
 def schedule_artifact_publish(
     ctx: LoadContext,
     transfers_factory: Callable[[], list[ArtifactEntry]],
@@ -219,8 +203,7 @@ def schedule_artifact_publish(
     engine_label: str,
     ready_fn_factory: Callable[[tuple[ArtifactCacheRoot, ...]], Callable[[], bool]],
     artifact_publish_fn: Callable[
-        [P2PArtifactTransfer, p2p_pb2.SourceIdentity],
-        PublishedArtifactSource,
+        [ArtifactTransfer, p2p_pb2.SourceIdentity], PublicationHandle
     ],
     scheduled_publishers: dict[tuple[int, int], PublisherThread],
     log: logging.Logger = logger,
@@ -228,39 +211,26 @@ def schedule_artifact_publish(
     """Schedule readiness-gated publication of local cache artifacts."""
     if not _artifact_transfer_enabled():
         return
-    mooncake_enabled = _mooncake_artifact_enabled()
-    p2p_publish_available = True
-    if mooncake_enabled:
-        if not _is_p2p_metadata_enabled(ctx.mx_client):
-            log.info(
-                "[Worker %s] MX_P2P_METADATA is disabled; skipping P2P %s "
-                "artifact publish fallback",
-                ctx.global_rank,
-                engine_label,
-            )
-            p2p_publish_available = False
-    elif not _p2p_metadata_enabled_for_artifacts(ctx, engine_label, log):
+    backend = _artifact_backend()
+    transport = _create_artifact_transport(ctx, backend, engine_label, log)
+    if transport is None:
         return
-    if not _metadata_publication_configured(ctx):
-        if not mooncake_enabled:
-            log.info(
-                "[Worker %s] No MX metadata path configured, skipping %s artifacts",
-                ctx.global_rank,
-                engine_label,
-            )
-            return
-        p2p_publish_available = False
-    if ctx.nixl_manager is None:
-        if not mooncake_enabled:
-            log.info(
-                "[Worker %s] No NIXL manager, skipping %s artifact publish",
-                ctx.global_rank,
-                engine_label,
-            )
-            return
-        p2p_publish_available = False
-
     for transfer, identity in transfers_factory():
+        if transport.publish_requires_install_state:
+            install_marker_path = artifact_marker_path(
+                transfer, identity, "install-attempted"
+            )
+            with artifact_lock(install_marker_path):
+                install_state = (
+                    _read_artifact_install_state(install_marker_path)
+                    if install_marker_path.exists()
+                    else None
+                )
+                if not transport.should_publish(install_state):
+                    continue
+        elif not transport.should_publish(None):
+            continue
+
         marker_path = mark_publish_scheduled(ctx, transfer, identity)
         if marker_path is None:
             continue
@@ -278,20 +248,13 @@ def schedule_artifact_publish(
             worker_rank=ctx.worker_rank,
             nixl_manager=ctx.nixl_manager,
             publish_fn=lambda transfer=transfer, identity=identity: (
-                _publish_mooncake_then_p2p_artifact(
-                    ctx,
-                    transfer,
-                    identity,
-                    engine_label=engine_label,
-                    p2p_publish_fn=artifact_publish_fn,
-                    p2p_publish_available=p2p_publish_available,
-                    log=log,
-                )
+                artifact_publish_fn(transfer, identity).identifier
             ),
             ready_fn=ready_fn_factory(source_roots),
             publish_timeout_secs=envs.MX_ARTIFACT_READY_TIMEOUT_SECS,
             interval_secs=READY_POLL_SECS,
             heartbeat_after_publish=False,
+            retry_publish_on_failure=transport.retry_publish_on_failure,
             cleanup_fn=lambda marker_path=marker_path, publisher_ref=publisher_ref: (
                 clear_publish_scheduled(publisher_ref[0], marker_path)
             ),
@@ -310,30 +273,30 @@ def schedule_artifact_publish(
 
 def install_artifact_once(
     ctx: LoadContext,
-    transfer: P2PArtifactTransfer,
+    transfer: ArtifactTransfer,
     identity: p2p_pb2.SourceIdentity,
     *,
     engine_label: str,
     on_install_completed: InstallCompleted | None = None,
 ) -> p2p_pb2.GetArtifactManifestHeaderResponse | None:
-    """Install one artifact at most once per pod.
+    """Install one artifact at most once per artifact marker.
 
-    The companion ``.lock`` file is the in-progress lease.  Only a completed
-    installation is persisted in ``marker_path``; an ``attempted`` marker from
-    an older implementation is treated as stale after this process acquires
-    the lease.
+    The marker is written before the transport attempt, matching the original
+    P2P behavior.  A failed attempt therefore suppresses later attempts until
+    the marker is removed by an external cleanup or a new cache identity is
+    used.
     """
-    marker_path = artifact_marker_path(transfer, identity, "install-attempted")
-    with artifact_lock(marker_path):
-        if _artifact_install_marker_is_valid(marker_path, transfer):
-            return None
-        marker_path.unlink(missing_ok=True)
-        if ctx.nixl_manager is None:
-            raise RuntimeError(
-                f"NIXL manager is required for {engine_label} artifact install"
-            )
-        try:
-            header = transfer.discover_and_transfer(
+    # Keep private callers and older tests that still provide the pre-transport
+    # transfer object working. The production lifecycle uses the transport
+    # path below, and this branch follows the same marker/lock semantics.
+    legacy_fetch = getattr(transfer, "discover_and_transfer", None)
+    if legacy_fetch is not None:
+        marker_path = artifact_marker_path(transfer, identity, "install-attempted")
+        with artifact_lock(marker_path):
+            if marker_path.exists():
+                return None
+            write_marker(marker_path, "attempted")
+            header = legacy_fetch(
                 ctx.mx_client,
                 identity,
                 ctx.nixl_manager,
@@ -342,104 +305,49 @@ def install_artifact_once(
                 accelerator=ctx.accelerator_backend.name,
             )
             transfer.install(header)
-            if on_install_completed is not None:
-                on_install_completed(transfer, identity)
             _write_artifact_install_marker(marker_path, header.artifact_id)
-            return header
-        except Exception:
-            marker_path.unlink(missing_ok=True)
-            raise
-
-
-def install_mooncake_artifact_once(
-    ctx: LoadContext,
-    transfer: P2PArtifactTransfer,
-    identity: p2p_pb2.SourceIdentity,
-    *,
-    engine_label: str,
-    on_install_completed: InstallCompleted | None = None,
-) -> MooncakeInstallResult:
-    """Install one Mooncake artifact at most once per pod.
-
-    The companion ``.lock`` file is held for the complete installation.  The
-    marker records successful installations and deterministic cache misses. A
-    miss is a pod-local negative cache, so other ranks skip the same Mooncake
-    query and proceed to the configured fallback. Unexpected failures remove
-    the marker so a later call can retry.
-    """
-    marker_path = artifact_marker_path(transfer, identity, "mooncake-install-attempted")
-    with artifact_lock(marker_path):
-        if marker_path.exists():
-            marker = _read_mooncake_install_marker(marker_path)
-            if marker["status"] == "installed":
-                required_roots = tuple(
-                    root.target_root for root in transfer.roots if not root.optional
-                )
-                if all(has_files(path) for path in required_roots):
-                    return MooncakeInstallResult(
-                        MooncakeInstallStatus.ALREADY_INSTALLED
-                    )
-                # The marker outlived the target files (for example after a
-                # container-local cache cleanup), so it must not suppress a
-                # fresh Mooncake/P2P installation.
-                marker_path.unlink(missing_ok=True)
-            elif marker["status"] == "miss":
-                owner = marker.get("owner")
-                if owner is not None and _process_owner_is_alive(*owner):
-                    return MooncakeInstallResult(MooncakeInstallStatus.MISS)
-                # A negative marker owned by a dead process is stale. Reclaim
-                # it so a new service instance can retry a cache lookup.
-                marker_path.unlink(missing_ok=True)
-            else:
-                # Legacy attempted markers and corrupt markers cannot prove
-                # that the target cache is complete. Reclaim them and install
-                # again. The lease already tells us that no installer is
-                # active when this branch is reached.
-                marker_path.unlink(missing_ok=True)
-        try:
-            header = install_from_mooncake(
-                transfer,
-                identity,
-                node_rank=ctx.node_rank,
-                accelerator=ctx.accelerator_backend.name,
-            )
-            transfer.install(header)
             if on_install_completed is not None:
                 on_install_completed(transfer, identity)
-            _write_mooncake_install_marker(marker_path, "installed")
-            return MooncakeInstallResult(
-                MooncakeInstallStatus.INSTALLED,
-                header,
-            )
-        except MooncakeArtifactCacheMiss:
-            # Keep a pod-level negative result so every rank does not create a
-            # Mooncake store and repeat the same deterministic cache lookup.
-            _write_mooncake_install_marker(marker_path, "miss")
-            raise
-        except Exception:
-            marker_path.unlink(missing_ok=True)
-            raise
+            return header
+
+    backend = _artifact_backend()
+    transport = _create_artifact_transport(ctx, backend, engine_label, logger)
+    if transport is None:
+        raise RuntimeError(f"Artifact backend {backend!r} is unavailable")
+    header, _ = _install_artifact_via_transports(
+        ctx,
+        transfer,
+        identity,
+        transport=transport,
+        on_install_completed=on_install_completed,
+    )
+    return header
 
 
 def publish_artifact(
     ctx: LoadContext,
-    transfer: P2PArtifactTransfer,
+    transfer: ArtifactTransfer,
     identity: p2p_pb2.SourceIdentity,
     *,
     engine_label: str,
     accelerator: str,
-    published_sources: dict[tuple[int, int], PublishedArtifactSource],
+    published_sources: dict[tuple[int, int], PublicationHandle],
     log: logging.Logger = logger,
-    prepared_bundle: ArtifactBundle | None = None,
-) -> PublishedArtifactSource:
-    """Prepare and publish one local artifact source."""
-    if ctx.nixl_manager is None:
-        raise RuntimeError(
-            f"NIXL manager is required for {engine_label} artifact publish"
-        )
-    worker_grpc_server = _get_worker_server(ctx.device_id)
-    if worker_grpc_server is None:
-        raise RuntimeError("P2P worker gRPC server is required for artifact publish")
+) -> PublicationHandle:
+    """Prepare and publish one artifact through the selected transport."""
+    backend = _artifact_backend()
+    worker_grpc_server = (
+        _get_worker_server(ctx.device_id) if backend == "p2p" else None
+    )
+    transport = _create_artifact_transport(
+        ctx,
+        backend,
+        engine_label,
+        log,
+        worker_grpc_server=worker_grpc_server,
+    )
+    if transport is None:
+        raise RuntimeError(f"Artifact backend {backend!r} is unavailable")
 
     required_roots = tuple(
         root.source_root for root in transfer.roots if not root.optional
@@ -452,165 +360,37 @@ def publish_artifact(
         )
 
     start = time.perf_counter()
-    bundle = (
-        prepared_bundle
-        or _prepared_artifact_bundles.pop(
-            _prepared_artifact_key(transfer, identity),
-            None,
-        )
-        or transfer.prepare_source()
-    )
+    bundle = transfer.prepare_source()
     key = (ctx.device_id, transfer.mx_source_type)
     previous = published_sources.pop(key, None)
     if previous is not None:
         previous.stop()
-    published = publish_artifact_source(
-        ctx.mx_client,
+    published = transport.publish(
         transfer,
-        bundle,
         identity,
-        ctx.nixl_manager,
-        worker_id=ctx.worker_id,
-        worker_grpc_server=worker_grpc_server,
-        worker_rank=ctx.worker_rank,
-        node_rank=ctx.node_rank,
-        accelerator=accelerator,
+        bundle,
+        ArtifactTransportContext(
+            node_rank=getattr(ctx, "node_rank", 0),
+            accelerator=accelerator,
+        ),
     )
     published_sources[key] = published
     elapsed = time.perf_counter() - start
     total_size = sum(file.size for file in bundle.manifest.files)
     log.info(
         "[Worker %s] [TIMING] %s artifact publish complete: "
-        "name=%s artifact_id=%s mx_source_id=%s size=%.2f MiB elapsed=%.3fs",
+        "name=%s transport=%s artifact_id=%s published_id=%s "
+        "size=%.2f MiB elapsed=%.3fs",
         ctx.global_rank,
         engine_label,
         transfer.name,
+        backend,
         bundle.artifact_id,
-        published.endpoint.mx_source_id,
+        published.identifier,
         total_size / (1024 * 1024),
         elapsed,
     )
     return published
-
-
-def _publish_mooncake_then_p2p_artifact(
-    ctx: LoadContext,
-    transfer: P2PArtifactTransfer,
-    identity: p2p_pb2.SourceIdentity,
-    *,
-    engine_label: str,
-    p2p_publish_fn: Callable[
-        [P2PArtifactTransfer, p2p_pb2.SourceIdentity],
-        PublishedArtifactSource,
-    ],
-    p2p_publish_available: bool,
-    log: logging.Logger,
-) -> str:
-    bundle: ArtifactBundle | None = None
-    mooncake_published = False
-    # Do not touch Mooncake-specific context fields on the default P2P path.
-    # Besides avoiding unnecessary key work, this keeps the legacy P2P
-    # publisher compatible with lightweight contexts that do not expose
-    # node_rank or accelerator_backend.
-    publish_to_mooncake_needed = False
-    mooncake_publish_key = None
-    if _mooncake_artifact_enabled():
-        mooncake_publish_key = _mooncake_publish_key(ctx, transfer, identity)
-        publish_to_mooncake_needed = (
-            mooncake_publish_key in _mooncake_publish_needed
-        )
-    if publish_to_mooncake_needed:
-        try:
-            required_roots = tuple(
-                root.source_root for root in transfer.roots if not root.optional
-            )
-            if not all(has_files(path) for path in required_roots):
-                raise LookupError(
-                    f"Required {engine_label} artifact sources {transfer.name} are empty "
-                    f"or missing: "
-                    f"{required_roots}"
-                )
-            bundle = transfer.prepare_source()
-            publish_to_mooncake(
-                transfer,
-                identity,
-                bundle,
-                node_rank=ctx.node_rank,
-                accelerator=ctx.accelerator_backend.name,
-            )
-            mooncake_published = True
-            _mooncake_publish_needed.discard(mooncake_publish_key)
-        except Exception as exc:
-            log.warning(
-                "[Worker %s] Failed to publish %s artifact %s to Mooncake; "
-                "continuing with P2P: %s",
-                ctx.global_rank,
-                engine_label,
-                transfer.name,
-                exc,
-            )
-    if not p2p_publish_available:
-        if mooncake_published or (
-            _mooncake_artifact_enabled() and not publish_to_mooncake_needed
-        ):
-            return "mooncake-artifact-cache"
-        raise RuntimeError(
-            "Mooncake artifact publish failed and P2P publish is unavailable"
-        )
-    if bundle is None:
-        return p2p_publish_fn(transfer, identity).endpoint.mx_source_id
-
-    # ``p2p_publish_fn`` synchronously calls ``publish_artifact`` in the vLLM
-    # and SGLang paths. Keep the prepared bundle available for that call without
-    # changing the callback contract. Serialize overlapping publication of the
-    # same transfer and identity so no callback can consume or remove another
-    # call's bundle.
-    prepared_key = _prepared_artifact_key(transfer, identity)
-    with _prepared_artifact_lock(prepared_key):
-        _prepared_artifact_bundles[prepared_key] = bundle
-        try:
-            return p2p_publish_fn(transfer, identity).endpoint.mx_source_id
-        finally:
-            # ``publish_artifact`` normally consumes this entry. Preserve a
-            # later publisher's entry if a future callback writes one before
-            # this call's cleanup.
-            if _prepared_artifact_bundles.get(prepared_key) is bundle:
-                _prepared_artifact_bundles.pop(prepared_key, None)
-
-
-def _mark_mooncake_publish_needed(
-    ctx: LoadContext,
-    transfer: P2PArtifactTransfer,
-    identity: p2p_pb2.SourceIdentity,
-) -> None:
-    _mooncake_publish_needed.add(_mooncake_publish_key(ctx, transfer, identity))
-
-
-def _mooncake_publish_key(
-    ctx: LoadContext,
-    transfer: P2PArtifactTransfer,
-    identity: p2p_pb2.SourceIdentity,
-) -> tuple[bytes, int, str, int, str]:
-    return (
-        _identity_bytes(identity),
-        transfer.mx_source_type,
-        transfer.name,
-        ctx.node_rank,
-        ctx.accelerator_backend.name,
-    )
-
-
-def _prepared_artifact_key(
-    transfer: P2PArtifactTransfer,
-    identity: p2p_pb2.SourceIdentity,
-) -> tuple[int, bytes]:
-    return id(transfer), _identity_bytes(identity)
-
-
-def _prepared_artifact_lock(key: tuple[int, bytes]) -> threading.Lock:
-    """Return the process-local lock for one temporary prepared bundle."""
-    with _prepared_artifact_locks_guard:
-        return _prepared_artifact_locks.setdefault(key, threading.Lock())
 
 
 def _identity_bytes(identity: p2p_pb2.SourceIdentity) -> bytes:
@@ -757,7 +537,7 @@ def cache_signature(
 
 def mark_publish_scheduled(
     ctx: LoadContext,
-    transfer: P2PArtifactTransfer,
+    transfer: ArtifactTransfer,
     identity: p2p_pb2.SourceIdentity,
 ) -> Path | None:
     """Acquire one process-owned artifact publication lease."""
@@ -778,34 +558,6 @@ def mark_publish_scheduled(
     return lease_path
 
 
-def _process_owner_is_alive(pid: int, expected_starttime: str | None) -> bool:
-    """Return whether a marker owner still denotes the same process."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # A process outside our UID may still be the active owner in a shared
-        # PID namespace. Retain the marker rather than duplicate the lookup.
-        return True
-    actual_starttime = _process_starttime(pid)
-    if expected_starttime is None or actual_starttime is None:
-        return True
-    return actual_starttime == expected_starttime
-
-
-def _process_starttime(pid: int) -> str | None:
-    """Return Linux ``/proc`` process starttime (field 22)."""
-    try:
-        # ``comm`` (field 2) is parenthesized and may contain spaces, so split
-        # only after its final closing parenthesis. The remaining fields begin
-        # at field 3; starttime is therefore index 19.
-        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
-        return fields[19]
-    except (OSError, IndexError):
-        return None
-
-
 def clear_publish_scheduled(
     publisher: PublisherThread | None,
     lease_path: Path,
@@ -818,7 +570,7 @@ def clear_publish_scheduled(
 
 
 def artifact_marker_path(
-    transfer: P2PArtifactTransfer,
+    transfer: ArtifactTransfer,
     identity: p2p_pb2.SourceIdentity,
     action: str,
 ) -> Path:
@@ -828,45 +580,72 @@ def artifact_marker_path(
     )
 
 
-def _artifact_install_marker_is_valid(
-    marker_path: Path,
-    transfer: P2PArtifactTransfer,
-) -> bool:
-    """Return whether a legacy or current P2P marker proves completion."""
+def _read_artifact_install_state(marker_path: Path) -> ArtifactInstallState:
+    raw = marker_path.read_text(encoding="utf-8").strip()
+    if raw == ArtifactInstallStatus.ATTEMPTED.value or not raw:
+        return ArtifactInstallState(ArtifactInstallStatus.ATTEMPTED)
+
     try:
-        value = marker_path.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        return False
-    except UnicodeDecodeError:
-        return False
-    if not value or value in {"attempted", "miss"}:
-        return False
-    required_roots = tuple(
-        root.target_root for root in transfer.roots if not root.optional
-    )
-    return all(has_files(path) for path in required_roots)
-
-
-def _write_artifact_install_marker(marker_path: Path, artifact_id: str) -> None:
-    """Atomically persist the successful P2P artifact installation marker."""
-    _write_marker_atomically(marker_path, artifact_id)
-
-
-def _write_mooncake_install_marker(marker_path: Path, status: str) -> None:
-    if status not in {"installed", "miss"}:
-        raise ValueError(
-            "Mooncake install markers only persist installed or miss state"
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return ArtifactInstallState(
+            ArtifactInstallStatus.INSTALLED,
+            artifact_id=raw,
         )
-    pid = os.getpid()
+
+    if isinstance(value, dict) and value.get("status") == "miss":
+        transport = value.get("transport")
+        pid = value.get("pid")
+        starttime = value.get("starttime")
+        if (
+            isinstance(transport, str)
+            and type(pid) is int
+            and pid > 0
+            and (starttime is None or isinstance(starttime, str))
+        ):
+            return ArtifactInstallState(
+                ArtifactInstallStatus.MISS,
+                transport=transport,
+                owner_pid=pid,
+                owner_starttime=starttime,
+            )
+
+    return ArtifactInstallState(ArtifactInstallStatus.ATTEMPTED)
+
+
+def _write_artifact_install_state(
+    marker_path: Path,
+    state: ArtifactInstallState,
+) -> None:
+    if state.status is ArtifactInstallStatus.ATTEMPTED:
+        write_marker(marker_path, ArtifactInstallStatus.ATTEMPTED.value)
+        return
+    if state.status is ArtifactInstallStatus.INSTALLED:
+        if not state.artifact_id:
+            raise ValueError("installed artifact state requires an artifact ID")
+        _write_artifact_install_marker(marker_path, state.artifact_id)
+        return
+    if (
+        state.status is not ArtifactInstallStatus.MISS
+        or not state.transport
+        or state.owner_pid is None
+    ):
+        raise ValueError("cache miss state requires transport and owner PID")
     value = json.dumps(
         {
-            "status": status,
-            "pid": pid,
-            "starttime": _process_starttime(pid),
+            "pid": state.owner_pid,
+            "starttime": state.owner_starttime,
+            "status": state.status.value,
+            "transport": state.transport,
         },
         sort_keys=True,
     )
     _write_marker_atomically(marker_path, value)
+
+
+def _write_artifact_install_marker(marker_path: Path, artifact_id: str) -> None:
+    """Atomically persist the successful artifact installation marker."""
+    _write_marker_atomically(marker_path, artifact_id)
 
 
 def _write_marker_atomically(marker_path: Path, value: str) -> None:
@@ -888,40 +667,8 @@ def _write_marker_atomically(marker_path: Path, value: str) -> None:
         Path(temporary_path).unlink(missing_ok=True)
 
 
-def _read_mooncake_install_marker(marker_path: Path) -> dict[str, object]:
-    """Read an install marker, returning ``invalid`` for corrupt state."""
-    raw = marker_path.read_text(encoding="utf-8").strip()
-    try:
-        marker = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        # Older in-progress markers were literal strings. Any other non-JSON
-        # value may be a torn write and must be retried rather than accepted as
-        # a completed installation.
-        if raw in {"attempted", "miss"}:
-            return {"status": raw, "owner": None}
-        return {"status": "invalid", "owner": None}
-    if not isinstance(marker, dict):
-        return {"status": "invalid", "owner": None}
-    status = marker.get("status")
-    if status not in {"installed", "miss", "attempted"}:
-        return {"status": "invalid", "owner": None}
-    pid = marker.get("pid")
-    starttime = marker.get("starttime")
-    owner = (
-        (pid, starttime)
-        if (
-            type(pid) is int
-            and pid > 0
-            and "starttime" in marker
-            and (starttime is None or isinstance(starttime, str))
-        )
-        else None
-    )
-    return {"status": status, "owner": owner}
-
-
 def artifact_marker_key(
-    transfer: P2PArtifactTransfer,
+    transfer: ArtifactTransfer,
     identity: p2p_pb2.SourceIdentity,
     action: str,
 ) -> str:
@@ -958,8 +705,54 @@ def _artifact_transfer_enabled() -> bool:
     return envs.MX_ARTIFACT_TRANSFER
 
 
-def _mooncake_artifact_enabled() -> bool:
-    return envs.MX_ARTIFACT_BACKEND in {"mooncake", "auto"}
+def _artifact_backend() -> str:
+    """Return the explicitly selected artifact transport backend."""
+    return envs.MX_ARTIFACT_BACKEND.strip().lower()
+
+
+def _artifact_transport_context(ctx: LoadContext) -> ArtifactTransportContext:
+    accelerator_backend = getattr(ctx, "accelerator_backend", None)
+    return ArtifactTransportContext(
+        node_rank=getattr(ctx, "node_rank", 0),
+        accelerator=getattr(accelerator_backend, "name", ""),
+    )
+
+
+def _create_artifact_transport(
+    ctx: LoadContext,
+    backend: str,
+    engine_label: str,
+    log: logging.Logger,
+    *,
+    worker_grpc_server=None,
+) -> ArtifactTransport | None:
+    """Select exactly one supported transport and validate its prerequisites."""
+    if backend == "mooncake":
+        if not MooncakeArtifactTransport.is_available():
+            log.warning(
+                "[Worker %s] Mooncake backend is unavailable, skipping %s artifacts",
+                ctx.global_rank,
+                engine_label,
+            )
+            return None
+        return MooncakeArtifactTransport()
+    if backend == "p2p":
+        if not _p2p_artifact_install_available(ctx, engine_label, log):
+            return None
+        return P2PArtifactTransport(
+            mx_client=ctx.mx_client,
+            nixl_manager=ctx.nixl_manager,
+            worker_id=ctx.worker_id,
+            worker_rank=ctx.worker_rank,
+            device_id=ctx.device_id,
+            worker_grpc_server=worker_grpc_server,
+        )
+    log.warning(
+        "Unsupported MX_ARTIFACT_BACKEND=%r; skipping %s artifacts",
+        backend,
+        engine_label,
+    )
+    return None
 
 
 def _p2p_artifact_install_available(

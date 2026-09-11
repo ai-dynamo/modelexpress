@@ -175,6 +175,29 @@ class TestPublisherPublishAndReady:
         ready.assert_called_once_with()
         publish.assert_called_once_with()
 
+    def test_publish_failure_can_stop_without_retrying(
+        self, mx_client, nixl_manager, caplog
+    ):
+        publish = MagicMock(side_effect=RuntimeError("put chunk failed"))
+        publisher = PublisherThread(
+            mx_client=mx_client,
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            publish_fn=publish,
+            interval_secs=1,
+            heartbeat_after_publish=False,
+            retry_publish_on_failure=False,
+        )
+
+        with caplog.at_level("ERROR", logger="modelexpress.metadata.publisher"):
+            assert publisher._tick() is None
+            publisher._tick()
+
+        publish.assert_called_once_with()
+        assert publisher._stop_event.is_set()
+        assert "Source publish failed; not retrying" in caplog.text
+
 
 class TestHeartbeatStop:
     def test_stop_marks_stale(self, heartbeat, mx_client):

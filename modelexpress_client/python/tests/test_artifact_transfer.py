@@ -23,9 +23,9 @@ from modelexpress.metadata.artifact_manifest import (
     build_artifact_manifest,
 )
 from modelexpress.metadata.artifact_transfer import (
+    ArtifactTransfer,
     ArtifactBundle,
     ArtifactCacheRoot,
-    P2PArtifactTransfer,
     cute_dsl_cache_artifact_transfer,
     deep_gemm_cache_artifact_transfer,
     discover_artifact_source,
@@ -488,11 +488,12 @@ def test_flashinfer_cache_transfer_includes_engine_autotune_files(tmp_path, capl
     server, port = _start_server(servicer)
 
     try:
-        header = target_transfer.transfer_from_worker(
+        header = transfer_artifact_from_worker(
             f"127.0.0.1:{port}",
             mx_source_id="source-123",
             artifact_id=bundle.artifact_id,
             nixl_manager=target_nixl,
+            target_file_paths=target_transfer.target_file_paths(),
             timeout=1.0,
         )
         target_transfer.install(header)
@@ -583,11 +584,12 @@ def test_tarred_p2p_artifact_transfer_rejects_target_bundle_symlink(tmp_path):
     )
 
     with pytest.raises(ValueError, match="symlink"):
-        transfer.transfer_from_worker(
+        transfer_artifact_from_worker(
             "127.0.0.1:1",
             mx_source_id="source-123",
             artifact_id="artifact",
             nixl_manager=object(),
+            target_file_paths=transfer.target_file_paths(),
         )
     assert outside.read_bytes() == b"keep-me"
 
@@ -760,11 +762,12 @@ def test_tarred_p2p_artifact_transfer_splits_transfer_and_install(tmp_path, capl
             logging.INFO,
             logger="modelexpress.metadata.artifact_transfer",
         ):
-            header = target_transfer.transfer_from_worker(
+            header = transfer_artifact_from_worker(
                 f"127.0.0.1:{port}",
                 mx_source_id="source-123",
                 artifact_id=bundle.artifact_id,
                 nixl_manager=target_nixl,
+                target_file_paths=target_transfer.target_file_paths(),
                 timeout=1.0,
             )
         assert header.files[0].path == (
@@ -858,7 +861,7 @@ def test_cache_artifact_transfers_share_p2p_interface(
         chunk_size=6,
     )
 
-    assert isinstance(transfer, P2PArtifactTransfer)
+    assert isinstance(transfer, ArtifactTransfer)
     assert transfer.name == name
     assert transfer.mx_source_type == mx_source_type
     bundle = transfer.prepare_source()
@@ -880,11 +883,12 @@ def test_cache_artifact_transfers_share_p2p_interface(
     server, port = _start_server(servicer)
 
     try:
-        header = transfer.transfer_from_worker(
+        header = transfer_artifact_from_worker(
             f"127.0.0.1:{port}",
             mx_source_id="source-123",
             artifact_id=bundle.artifact_id,
             nixl_manager=target_nixl,
+            target_file_paths=transfer.target_file_paths(),
             timeout=1.0,
         )
         assert not (transfer.roots[0].target_root / "kernel.so").exists()
@@ -1271,10 +1275,12 @@ def test_torch_compile_cache_transfer_discovers_source_through_mx_server(tmp_pat
 
     try:
         discovered = discover_artifact_source(mx_client, identity)
-        header = transfer.discover_and_transfer(
-            mx_client,
-            identity,
+        header = transfer_artifact_from_worker(
+            discovered.worker_grpc_endpoint,
+            discovered.mx_source_id,
+            discovered.artifact_id,
             target_nixl,
+            target_file_paths=transfer.target_file_paths(),
             timeout=1.0,
             max_inflight_chunks=2,
         )
