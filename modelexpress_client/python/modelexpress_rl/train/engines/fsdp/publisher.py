@@ -41,7 +41,7 @@ logger = logging.getLogger("modelexpress_rl.train.engines.fsdp.publisher")
 # The dtype weights are served on the wire as. The cast only actually happens
 # when the source dtype differs (e.g. an fp32 master): a matching source copies
 # as-is, and IN_PLACE can serve a matching source with no copy at all.
-# TODO: make this configurable at client initialization; hardcoded to bf16 for now.
+# Per-name overrides are supplied through FSDPTrainerContext.
 WIRE_DTYPE = torch.bfloat16
 
 

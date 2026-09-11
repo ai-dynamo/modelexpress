@@ -1,13 +1,135 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from contextlib import nullcontext
+
 import pytest
 import torch
-
+from modelexpress.refit.reshard.rendezvous import unwrap_rendezvous_blob
 from modelexpress_rl.train.adapter import TrainerStagingMode, WeightPayloadFormat
+from modelexpress_rl.train.context import FSDPTrainerContext
+from modelexpress_rl.train.engines import _create_trainer_adapter
 from modelexpress_rl.train.engines.fsdp.adapter import FSDPTrainerAdapter
 
 ADAPTER = "modelexpress_rl.train.engines.fsdp.adapter"
+
+
+def test_copy_preserves_per_tensor_dtype_and_warm_buffers(dist_ready, monkeypatch):
+    monkeypatch.setattr(f"{ADAPTER}.classic_cuda_alloc", nullcontext)
+    manager = _Manager()
+    overrides = {"bias": torch.float32}
+    adapter = _create_trainer_adapter(
+        FSDPTrainerContext(wire_dtype_overrides=overrides),
+        manager=manager,
+        nixl_metadata_endpoint="host:1234",
+    )
+    # Use values that BF16 cannot represent exactly; restoring FP32 must not hide rounding.
+    bias = torch.tensor([1.000123, -2.0031, 0.015540123], dtype=torch.float32)
+    weights = torch.tensor([1.000123, 2.0031], dtype=torch.float32)
+    state = {"bias": bias, "weights": weights}
+    first = _stage(adapter, state, TrainerStagingMode.COPY_TO_DEVICE)
+    first.publish_ready.wait()
+    served = {
+        key.split("__", 3)[-1]: value for key, value in manager.registered[0].items()
+    }
+    assert served["bias"].dtype == torch.float32
+    assert torch.equal(served["bias"], bias)
+    assert served["weights"].dtype == torch.bfloat16
+    assert torch.equal(served["weights"], weights.bfloat16())
+    assert first.manifest.total_bytes == bias.numel() * 4 + weights.numel() * 2
+    published = {t.name: t for t in unwrap_rendezvous_blob(first.manifest.data).tensors}
+    assert (published["bias"].dtype, published["bias"].elsize) == ("torch.float32", 4)
+    assert (published["weights"].dtype, published["weights"].elsize) == (
+        "torch.bfloat16",
+        2,
+    )
+    addresses = {name: value.data_ptr() for name, value in served.items()}
+    overrides["bias"] = torch.bfloat16  # Caller mutation cannot change a bound policy.
+    bias.add_(0.000321)
+    second = _stage(adapter, state, TrainerStagingMode.COPY_TO_DEVICE)
+    second.publish_ready.wait()
+    assert torch.equal(served["bias"], bias)
+    assert second.manifest.total_bytes == first.manifest.total_bytes
+    assert {name: value.data_ptr() for name, value in served.items()} == addresses
+    assert len(manager.registered) == 1
+
+
+def test_in_place_accepts_fp32_override(dist_ready):
+    adapter = FSDPTrainerAdapter(
+        manager=_Manager(),
+        nixl_metadata_endpoint="host:1234",
+        wire_dtype_overrides={"bias": torch.float32},
+    )
+    staged = _stage(
+        adapter,
+        {"bias": torch.tensor([1.000123]), "w": torch.ones(2, dtype=torch.bfloat16)},
+    )
+    assert staged.manifest.total_bytes == 8
+
+
+def test_multiple_dtype_overrides_include_fp16_and_scalar(dist_ready, monkeypatch):
+    monkeypatch.setattr(f"{ADAPTER}.classic_cuda_alloc", nullcontext)
+    manager = _Manager()
+    adapter = FSDPTrainerAdapter(
+        manager=manager,
+        nixl_metadata_endpoint="host:1234",
+        wire_dtype_overrides={"projection": torch.float16, "scale": torch.float32},
+    )
+    state = {
+        "projection": torch.ones(2, 3),
+        "scale": torch.tensor(1.000123),
+        "weights": torch.ones(4),
+    }
+    staged = _stage(adapter, state, TrainerStagingMode.COPY_TO_DEVICE)
+    served = {
+        key.split("__", 3)[-1]: value for key, value in manager.registered[0].items()
+    }
+    assert served["projection"].dtype == torch.float16
+    assert served["weights"].dtype == torch.bfloat16
+    assert torch.equal(served["scale"], state["scale"])
+    assert staged.manifest.total_bytes == 6 * 2 + 4 + 4 * 2
+
+
+def test_copy_rejects_source_dtype_change_before_writing(dist_ready, monkeypatch):
+    monkeypatch.setattr(f"{ADAPTER}.classic_cuda_alloc", nullcontext)
+    manager = _Manager()
+    adapter = FSDPTrainerAdapter(
+        manager=manager,
+        nixl_metadata_endpoint="host:1234",
+        wire_dtype_overrides={"bias": torch.float32},
+    )
+    _stage(
+        adapter, {"bias": torch.tensor([1.000123])}, TrainerStagingMode.COPY_TO_DEVICE
+    )
+    arena = next(iter(manager.registered[0].values()))
+    before = arena.clone()
+    with pytest.raises(ValueError, match="dtype changed"):
+        _stage(
+            adapter,
+            {"bias": torch.tensor([9.0], dtype=torch.bfloat16)},
+            TrainerStagingMode.COPY_TO_DEVICE,
+        )
+    assert torch.equal(arena, before)
+
+
+def test_rejects_unknown_override_name(dist_ready):
+    adapter = FSDPTrainerAdapter(
+        manager=_Manager(),
+        nixl_metadata_endpoint="host:1234",
+        wire_dtype_overrides={"misspelled": torch.float32},
+    )
+    with pytest.raises(ValueError, match="override.*state_dict"):
+        adapter.bind_tensors({"bias": torch.ones(2)})
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.float8_e4m3fn, "float32"])
+def test_rejects_unsupported_wire_dtype(dist_ready, dtype):
+    with pytest.raises(ValueError, match="wire dtype"):
+        FSDPTrainerAdapter(
+            manager=_Manager(),
+            nixl_metadata_endpoint="host:1234",
+            wire_dtype_overrides={"bias": dtype},
+        )
 
 
 class _Manager:
@@ -59,9 +181,7 @@ def test_source_slot_id_is_rank_stamped(dist_ready):
 def test_bind_tensors_validates_state_dict_and_returns_rank_slot(dist_ready):
     adapter = _adapter()
 
-    assert adapter.bind_tensors({"w": torch.ones(2, 4)}) == (
-        "publisher:global-rank:0"
-    )
+    assert adapter.bind_tensors({"w": torch.ones(2, 4)}) == ("publisher:global-rank:0")
     with pytest.raises(TypeError, match="state_dict"):
         adapter.bind_tensors([torch.ones(2, 4)])
 

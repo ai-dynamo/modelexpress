@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Training-engine adapters for ModelExpress RL."""
+
 """Trainer engine selection."""
 
 from ..adapter import NixlMetadataProvider, TrainerEngineAdapter
@@ -17,7 +18,11 @@ def _create_trainer_adapter(
     if isinstance(context, FSDPTrainerContext):
         from .fsdp import FSDPTrainerAdapter
 
-        adapter_type = FSDPTrainerAdapter
+        return FSDPTrainerAdapter(
+            manager=manager,
+            nixl_metadata_endpoint=nixl_metadata_endpoint,
+            wire_dtype_overrides=context.wire_dtype_overrides,
+        )
     elif isinstance(context, MegatronTrainerContext):
         from .megatron import MegatronTrainerAdapter
 

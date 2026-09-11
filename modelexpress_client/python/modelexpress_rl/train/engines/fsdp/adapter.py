@@ -22,12 +22,13 @@ the client passes each stage, so a trainer that re-materializes its state_dict
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from typing import Any
 
 import torch
 import torch.distributed as dist
-
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
+
 from modelexpress_rl.train.adapter import (
     CompletionFence,
     NixlMetadataProvider,
@@ -59,10 +60,17 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         *,
         manager: NixlMetadataProvider,
         nixl_metadata_endpoint: str,
+        wire_dtype_overrides: Mapping[str, torch.dtype] | None = None,
     ) -> None:
         if not dist.is_available() or not dist.is_initialized():
             raise RuntimeError("FSDP distributed process group is not initialized")
         self._manager = manager
+        self._wire_dtype_overrides = dict(wire_dtype_overrides or {})
+        for name, dtype in self._wire_dtype_overrides.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError("wire dtype overrides require non-empty tensor names")
+            if dtype not in (torch.float16, torch.bfloat16, torch.float32):
+                raise ValueError(f"unsupported wire dtype {dtype!r} for {name!r}")
         self._nixl_metadata_endpoint = nixl_metadata_endpoint
         self._source_slot_id = f"publisher:global-rank:{dist.get_rank()}"
         self._initialized = False
@@ -71,6 +79,7 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         self._expected_layout: dict[
             str, tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]
         ] = {}
+        self._expected_source_dtypes: dict[str, torch.dtype] = {}
         self._arenas: dict[str, torch.Tensor] = {}  # COPY: name -> registered arena
         # name -> the address we registered (the arena for COPY, the live source
         # for IN_PLACE). The served buffer must keep sitting here.
@@ -112,6 +121,7 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         self._expected_layout = {
             s.name: (s.global_shape, s.shard_offset, s.local_shape) for s in shards
         }
+        self._expected_source_dtypes = {s.name: s.source_tensor.dtype for s in shards}
 
         if staging_mode is TrainerStagingMode.COPY_TO_DEVICE:
             self._allocate_and_register_arenas(shards)
@@ -122,7 +132,7 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         self._initialized = True
 
     def _allocate_and_register_arenas(self, shards: list[LocalTensorShard]) -> None:
-        """Allocate one persistent bf16 arena per shard and register them once."""
+        """Allocate one persistent arena per shard in its selected wire dtype."""
         # TODO(staging-followups):
         # - register via a single VmmArena + register_arena (one dmabuf MR).
         # - env var to stage into CPU pinned host memory vs GPU device memory
@@ -130,7 +140,9 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         with classic_cuda_alloc():
             self._arenas = {
                 s.name: torch.empty(
-                    s.local_shape, dtype=WIRE_DTYPE, device=s.source_tensor.device
+                    s.local_shape,
+                    dtype=self._wire_dtype(s),
+                    device=s.source_tensor.device,
                 )
                 for s in shards
             }
@@ -196,7 +208,7 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
     def _snapshot_into_arenas(self, shards: list[LocalTensorShard]) -> CompletionFence:
         """Copy each rank-local source into its persistent registered arena.
 
-        ``copy_`` casts to bf16 only when the source dtype differs. The arena is
+        ``copy_`` casts to the selected wire dtype when the source dtype differs. The arena is
         the served buffer, so point each shard at it.
         """
         stream = torch.cuda.current_stream() if torch.cuda.is_available() else None
@@ -227,6 +239,16 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
     def _capture(self, tensors: Any) -> list[LocalTensorShard]:
         if not isinstance(tensors, dict):
             raise TypeError("tensors must be an FSDP state_dict (dict[str, Tensor])")
+        unknown = self._wire_dtype_overrides.keys() - tensors.keys()
+        if unknown:
+            raise ValueError(
+                f"wire dtype override names absent from state_dict: {sorted(unknown)}"
+            )
+        for name in self._wire_dtype_overrides:
+            if not tensors[name].is_floating_point():
+                raise ValueError(
+                    f"wire dtype override requires a floating state_dict tensor: {name}"
+                )
         shards = capture_local_shards(tensors)
         if not shards:
             raise ValueError("no local FSDP shards to publish")
@@ -243,6 +265,8 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
                 f"(missing={missing[:5]} extra={extra[:5]})"
             )
         for shard in shards:
+            if shard.source_tensor.dtype != self._expected_source_dtypes[shard.name]:
+                raise ValueError(f"{shard.name}: source dtype changed since initialize")
             layout = (shard.global_shape, shard.shard_offset, shard.local_shape)
             if layout != self._expected_layout[shard.name]:
                 raise ValueError(
@@ -255,12 +279,15 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
     def _register_key(index: int, name: str) -> str:
         return f"__pub__{index}__{name}"
 
-    @staticmethod
-    def _require_in_place_servable(shard: LocalTensorShard) -> None:
-        if shard.source_tensor.dtype != WIRE_DTYPE:
+    def _wire_dtype(self, shard: LocalTensorShard) -> torch.dtype:
+        return self._wire_dtype_overrides.get(shard.name, WIRE_DTYPE)
+
+    def _require_in_place_servable(self, shard: LocalTensorShard) -> None:
+        dtype = self._wire_dtype(shard)
+        if shard.source_tensor.dtype != dtype:
             raise NotImplementedError(
                 f"{shard.name}: IN_PLACE serves the source dtype but wire is "
-                f"{WIRE_DTYPE}; use COPY_TO_DEVICE to cast"
+                f"{dtype}; use COPY_TO_DEVICE to cast"
             )
         if not shard.source_tensor.is_contiguous():
             raise NotImplementedError(
@@ -276,8 +303,9 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
             shards=shards,
             metadata_endpoint=self._nixl_metadata_endpoint,
         )
-        wire_elsize = torch.empty((), dtype=WIRE_DTYPE).element_size()
-        total_bytes = sum(math.prod(s.local_shape) * wire_elsize for s in shards)
+        total_bytes = sum(
+            math.prod(s.local_shape) * s.served_tensor.element_size() for s in shards
+        )
         return StagedWeightVersionShardData(
             manifest=WeightVersionShardManifest(
                 data=blob,
