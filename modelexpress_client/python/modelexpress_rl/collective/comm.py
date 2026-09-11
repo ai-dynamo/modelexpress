@@ -139,8 +139,22 @@ class LaneCommunicator:
                 "aborting the NCCL communicator did not complete cleanly: %r", error
             )
 
-    def synchronize(self) -> None:
-        """Wait for work enqueued on this lane's stream."""
+    def synchronize(self, timeout_s: float | None = None) -> None:
+        """Wait for work enqueued on this lane's stream.
+
+        With ``timeout_s`` the wait is bounded: a CUDA event is recorded on the
+        stream and polled, so a collective that never completes raises rather
+        than blocking the process forever. A plain ``stream.synchronize()``
+        cannot be bounded from Python, which is why the deadline needs an event
+        rather than a check either side of the call. Without ``timeout_s`` the
+        wait is the blocking synchronize, unchanged.
+
+        Falls through to the blocking wait when the stream is not something a
+        CUDA event can be recorded on - a test double, or a build without
+        torch. Those cannot hang on device work, so there is nothing to bound.
+        """
+        if timeout_s is not None and self._synchronize_bounded(timeout_s):
+            return
         stream = self.stream
         if stream is not None and callable(getattr(stream, "synchronize", None)):
             stream.synchronize()
@@ -156,6 +170,61 @@ class LaneCommunicator:
                 torch.cuda.current_stream().synchronize()
             else:
                 torch.cuda.ExternalStream(int(stream)).synchronize()
+
+    def _synchronize_bounded(self, timeout_s: float) -> bool:
+        """Poll a CUDA event until this lane's work lands or the deadline passes.
+
+        Returns False when the stream cannot carry an event, so the caller can
+        fall back rather than silently reporting a bound it did not apply.
+        """
+        try:
+            import torch
+        except ImportError:
+            return False
+        if not torch.cuda.is_available():
+            return False
+
+        stream = self.stream
+        device_context = (
+            torch.cuda.device(self.device) if self.device is not None else nullcontext()
+        )
+        # Resolving and recording is attempted rather than predicted. An object
+        # merely CARRYING a cuda_stream attribute is not necessarily one torch
+        # can record against - the test doubles in this repo have exactly that
+        # shape - and a wrong guess here would raise on a GPU box while every
+        # CPU box stayed green.
+        try:
+            with device_context:
+                if stream is None:
+                    target = torch.cuda.current_stream()
+                elif isinstance(stream, torch.cuda.Stream):
+                    target = stream
+                elif isinstance(stream, int):
+                    target = torch.cuda.ExternalStream(stream)
+                elif hasattr(stream, "cuda_stream"):
+                    target = torch.cuda.ExternalStream(int(stream.cuda_stream))
+                else:
+                    return False
+                event = torch.cuda.Event()
+                event.record(target)
+        except Exception as error:  # noqa: BLE001 - any resolve failure means fall back
+            logger.debug(
+                "this lane's stream cannot carry a CUDA event, falling back to a "
+                "blocking wait: %r",
+                error,
+            )
+            return False
+
+        deadline = time.monotonic() + timeout_s
+        while not event.query():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"lane {self.rank}/{self.world_size} did not finish its enqueued "
+                    f"work within {timeout_s:.1f}s"
+                )
+            time.sleep(min(0.005, remaining))
+        return True
 
 
 def _wait_until_initialized(comm: Any, bindings: Any, timeout_s: float) -> None:

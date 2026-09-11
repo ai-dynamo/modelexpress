@@ -9,11 +9,13 @@ Every property here corresponds to a failure that would otherwise present as a
 hung communicator rather than an exception.
 """
 
+import math
 import sys
 from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from modelexpress_rl.collective import backend
 from modelexpress_rl.collective import (
     CommunicatorCache,
     LaneCommunicator,
@@ -526,3 +528,178 @@ class TestCommunicatorCache:
         entry_lane = LaneCommunicator(Stubborn(), rank=0, world_size=2, stream=None)
         entry_lane.abort()
         assert entry_lane.aborted
+
+
+class TestTransferDeadline:
+    """MX_NCCL_REFIT_TRANSFER_TIMEOUT_S bounds what happens after READY.
+
+    The deadline exists because the group forming is not the same as the
+    transfer completing: a reshard that never lands would otherwise hang the
+    process with no owner and no attributable failure.
+    """
+
+    @pytest.fixture
+    def clock(self, monkeypatch):
+        """A hand-advanced monotonic clock for backend.py."""
+
+        class Clock:
+            def __init__(self):
+                self.now = 1000.0
+
+            def advance(self, seconds):
+                self.now += seconds
+
+        c = Clock()
+        monkeypatch.setattr(backend.time, "monotonic", lambda: c.now)
+        return c
+
+    @pytest.fixture
+    def short_deadline(self, monkeypatch):
+        monkeypatch.setattr(backend, "transfer_timeout", lambda: 30.0)
+
+    def test_a_transfer_that_overruns_raises_instead_of_hanging(
+        self, recorder, clock, short_deadline
+    ):
+        plan = ReshardPlan(bulk=[entry("a")])
+        half, _ = build(recorder, plan=plan, half_cls=NcclM2nSender)
+        half.start_weight_update("v7")
+
+        clock.advance(31.0)
+
+        with pytest.raises(TimeoutError) as excinfo:
+            half.publish_weights(0)
+        message = str(excinfo.value)
+        assert "v7" in message, "the failure must name the version that overran"
+        assert "MX_NCCL_REFIT_TRANSFER_TIMEOUT_S" in message, (
+            "the failure must name the knob that produced it"
+        )
+
+    def test_overrunning_aborts_the_group_rather_than_leaving_it_usable(
+        self, recorder, clock, short_deadline
+    ):
+        plan = ReshardPlan(bulk=[entry("a")])
+        half, cache = build(recorder, plan=plan, half_cls=NcclM2nSender)
+        half.start_weight_update("v7")
+        clock.advance(31.0)
+
+        with pytest.raises(TimeoutError):
+            half.publish_weights(0)
+
+        # Peers that disagree about which collectives completed cannot be
+        # recovered on the same communicator, so every lane must be gone.
+        assert all(lane.aborted for lane in cache._lanes.values())
+
+    def test_a_transfer_inside_its_deadline_is_untouched(
+        self, recorder, clock, short_deadline
+    ):
+        """Positive control: the guard must not fire on a healthy transfer."""
+        plan = ReshardPlan(bulk=[entry("a")], misc=[MiscParam("m", (4,), "f")])
+        half, cache = build(recorder, plan=plan, half_cls=NcclM2nSender)
+        half.start_weight_update("v7")
+        clock.advance(1.0)
+        half.publish_weights(0)
+        half.finish_weight_update(1)
+
+        assert [op.comm._name for op in recorder.ops if op.kind == "reshard"] == ["lane0"]
+        assert not any(lane.aborted for lane in cache._lanes.values())
+
+    def test_the_deadline_is_rearmed_per_version_not_per_client(
+        self, recorder, clock, short_deadline
+    ):
+        """A second version gets its own budget, not the leftovers of the first."""
+        plan = ReshardPlan(bulk=[entry("a")])
+        half, _ = build(recorder, plan=plan, half_cls=NcclM2nSender)
+
+        half.start_weight_update("v1")
+        clock.advance(29.0)
+        half.publish_weights(0)
+
+        half.start_weight_update("v2")
+        clock.advance(29.0)
+        half.publish_weights(0)
+
+    def test_a_half_with_no_armed_transfer_is_not_bounded(self, recorder, clock):
+        """Nothing that never called start_weight_update inherits a deadline."""
+        plan = ReshardPlan(bulk=[entry("a")])
+        half, _ = build(recorder, plan=plan, half_cls=NcclM2nSender)
+        clock.advance(10_000.0)
+        assert half._remaining() == math.inf
+
+    def test_the_remaining_budget_reaches_the_lane_and_shrinks(
+        self, recorder, clock, short_deadline
+    ):
+        """The bound is PLUMBED, not merely checked at the boundaries.
+
+        Checking the clock either side of a blocking synchronize cannot bound
+        it, so the drain has to hand the lane what is left of the budget.
+        """
+        seen = []
+        plan = ReshardPlan(bulk=[entry("a")])
+        half, cache = build(recorder, plan=plan, half_cls=NcclM2nReceiver)
+
+        for key, live in list(cache._lanes.items()):
+            def record(timeout_s=None, _live=live):
+                seen.append(timeout_s)
+
+            live.synchronize = record
+
+        half.start_weight_update("v7")
+        clock.advance(10.0)
+        half.update_weights(0)
+
+        assert seen, "the drain never reached a lane"
+        assert all(t is not None for t in seen), (
+            "an unbounded synchronize is the hang this deadline exists to stop"
+        )
+        assert all(t == pytest.approx(20.0) for t in seen), seen
+
+    def test_a_lane_timeout_is_reported_against_the_version(
+        self, recorder, clock, short_deadline
+    ):
+        """A TimeoutError from the lane becomes an attributable refit failure."""
+        plan = ReshardPlan(bulk=[entry("a")])
+        half, cache = build(recorder, plan=plan, half_cls=NcclM2nReceiver)
+
+        for live in cache._lanes.values():
+            def boom(timeout_s=None):
+                raise TimeoutError("stream never drained")
+
+            live.synchronize = boom
+
+        half.start_weight_update("v7")
+        with pytest.raises(TimeoutError) as excinfo:
+            half.update_weights(0)
+        assert "v7" in str(excinfo.value)
+        assert all(lane.aborted for lane in cache._lanes.values())
+
+
+class TestBoundedSynchronizeFallback:
+    """The bound applies only where an event can be recorded.
+
+    This is the branch that decides whether a deadline is enforced at all, so
+    a bug here silently un-bounds every transfer while every other test stays
+    green. The polling path itself needs a device and is exercised by the GPU
+    tests, not here.
+    """
+
+    def test_a_stream_that_cannot_carry_an_event_falls_back_rather_than_lying(
+        self, recorder
+    ):
+        """Must hold with OR without a device.
+
+        FakeStream carries a ``cuda_stream`` attribute, so on a CPU box this
+        returns False at the availability gate and on a GPU box it returns
+        False because recording against a test double fails. Asserting it
+        without pinning the reason is deliberate: the earlier version of this
+        test passed only because the box had no CUDA, which is the same test
+        passing for a reason that does not generalize.
+        """
+        live = lane(recorder, "lane0")
+        assert live._synchronize_bounded(5.0) is False
+
+    def test_the_fallback_still_waits(self, recorder):
+        live = lane(recorder, "lane0")
+        live.synchronize(timeout_s=5.0)
+        assert any(op.kind == "sync" for op in recorder.ops), (
+            "falling back must still drain the stream, not skip the wait"
+        )

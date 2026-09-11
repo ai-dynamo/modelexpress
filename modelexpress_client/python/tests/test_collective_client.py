@@ -201,7 +201,7 @@ def fake_nccl(monkeypatch):
     )
     monkeypatch.setattr(
         "modelexpress_rl.collective.comm.LaneCommunicator.synchronize",
-        lambda self: None,
+        lambda self, timeout_s=None: None,
     )
     return ops
 

@@ -14,7 +14,9 @@ end of each transfer they own.
 from __future__ import annotations
 
 import logging
+import math
 import threading
+import time
 from collections import OrderedDict
 from contextlib import nullcontext
 from typing import Any
@@ -149,6 +151,9 @@ class _CollectiveHalf:
         self._pending_misc = False
         self._active_lanes: OrderedDict[int, LaneCommunicator] = OrderedDict()
         self._pending_contexts: list[RefitCtx] = []
+        self._deadline: float | None = None
+        self._timeout_s: float | None = None
+        self._version: str | None = None
 
     def setup_layer_groups(self, groupings: list[list[str]] | None) -> None:
         """Partition the bulk parameters into layer groups.
@@ -211,11 +216,50 @@ class _CollectiveHalf:
             )
         return lane
 
+    def _begin_transfer(self, version: str) -> None:
+        """Arm this version's transfer deadline.
+
+        READY only means the group formed. What follows it can block
+        indefinitely on its own, so the transfer carries its own deadline and
+        a version that overruns becomes an attributable failure rather than a
+        hang with no owner.
+        """
+        self._pending_misc = True
+        self._version = version
+        self._timeout_s = transfer_timeout()
+        self._deadline = time.monotonic() + self._timeout_s
+
+    def _remaining(self) -> float:
+        """Seconds left on this transfer, raising once it is spent."""
+        if self._deadline is None:
+            return math.inf
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            self._fail_deadline()
+        return remaining
+
+    def _fail_deadline(self) -> None:
+        """Abort the group and name what overran.
+
+        The abort is not optional. Peers that disagree about which collectives
+        completed cannot be recovered by retrying on the same communicator, so
+        the group is torn down and has to re-form at a fresh epoch.
+        """
+        timeout_s = self._timeout_s
+        version = self._version
+        self.abort()
+        raise TimeoutError(
+            f"collective refit of version {version!r} did not complete within "
+            f"MX_NCCL_REFIT_TRANSFER_TIMEOUT_S ({timeout_s:.1f}s); group "
+            f"{self._group_id} was aborted and must re-form at a new epoch"
+        )
+
     def abort(self) -> None:
         """Give up on every lane of this group at once."""
         self._cache.abort_group(self._group_id)
         self._active_lanes.clear()
         self._pending_contexts.clear()
+        self._deadline = None
 
     def _stream_context(self, lane: LaneCommunicator, spec: LocalParamSpec):
         stream = lane.stream
@@ -242,11 +286,18 @@ class _CollectiveHalf:
     def _drain_active_lanes(self) -> None:
         lanes = list(self._active_lanes.values())
         for lane in lanes:
-            lane.synchronize()
+            remaining = self._remaining()
+            try:
+                lane.synchronize(
+                    timeout_s=None if remaining == math.inf else remaining
+                )
+            except TimeoutError:
+                self._fail_deadline()
         self._active_lanes.clear()
         self._pending_contexts.clear()
 
     def _issue_reshard(self, entry: ParamPlan, *, src: Any, dst: Any) -> None:
+        self._remaining()
         lane = self._lane(entry.partition_id)
         spec = self._specs[entry.name]
         with self._stream_context(lane, spec):
@@ -267,6 +318,7 @@ class _CollectiveHalf:
         self._drain_active_lanes()
         lane = self._lane(broadcast_lane_id)
         for misc in self._plan.misc:
+            self._remaining()
             spec = self._specs[misc.name]
             with self._stream_context(lane, spec):
                 ctx = spec.enter()
@@ -287,7 +339,7 @@ class NcclM2nSender(_CollectiveHalf):
         super().__init__(active_partition=source_partition, **kwargs)
 
     def start_weight_update(self, version: str) -> None:
-        self._pending_misc = True
+        self._begin_transfer(version)
         logger.debug("collective sender starting version %s", version)
 
     def publish_weights(self, layer_group_id: int) -> None:
@@ -311,7 +363,7 @@ class NcclM2nReceiver(_CollectiveHalf):
     """Generator half: supplies each parameter's destination to the collective."""
 
     def start_weight_update(self, version: str) -> None:
-        self._pending_misc = True
+        self._begin_transfer(version)
         logger.debug("collective receiver starting version %s", version)
 
     def update_weights(self, layer_group_id: int) -> None:
@@ -348,6 +400,11 @@ def _broadcast(lane: LaneCommunicator, buf: Any, *, root: int) -> None:
 def misc_chunk_size() -> int:
     """Bytes per packed-broadcast chunk."""
     return envs.MX_NCCL_REFIT_MISC_CHUNK_BYTES
+
+
+def transfer_timeout() -> float:
+    """Deadline for one version's transfer, in seconds."""
+    return envs.MX_NCCL_REFIT_TRANSFER_TIMEOUT_S
 
 
 __all__ = [
