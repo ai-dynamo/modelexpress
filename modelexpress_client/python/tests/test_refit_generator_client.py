@@ -3,6 +3,7 @@
 
 import hashlib
 import logging
+from types import SimpleNamespace
 from concurrent import futures
 from contextlib import contextmanager
 
@@ -25,6 +26,7 @@ from modelexpress_rl import (
     refit_pb2_grpc,
 )
 from modelexpress_rl.inference.adapter import GeneratorTransferInputs
+from modelexpress_rl.inference.methods import FullTensorNixlUpdateMethod
 from modelexpress_rl.inference.plan import (
     EngineCapabilities,
     EngineInstaller,
@@ -32,6 +34,7 @@ from modelexpress_rl.inference.plan import (
     MethodCapabilities,
     ObjectStorageUpdateSource,
     PreparedEngineTensors,
+    PreparedStreamingTensors,
     ResolvedSource,
     TrainerUpdateSource,
     UpdateMethod,
@@ -329,9 +332,7 @@ class _TestInstaller(EngineInstaller):
 
     @property
     def capabilities(self):
-        return EngineCapabilities(
-            artifact_types=frozenset({PreparedEngineTensors})
-        )
+        return EngineCapabilities(artifact_types=frozenset({PreparedEngineTensors}))
 
     def install(self, prepared):
         return self._adapter.apply_weight(prepared.staged)
@@ -582,9 +583,7 @@ def test_generator_rejects_unsupported_object_storage_before_adapter_creation(
     monkeypatch.setattr(
         GeneratorRuntime,
         "initialize",
-        classmethod(
-            lambda _cls, **_kwargs: pytest.fail("runtime must not be created")
-        ),
+        classmethod(lambda _cls, **_kwargs: pytest.fail("runtime must not be created")),
     )
 
     with pytest.raises(ValueError, match="only S3 object storage"):
@@ -691,9 +690,7 @@ def test_generator_stages_applies_releases_and_reuses_valid_plan(monkeypatch):
         "rank:0",
         "rank:1",
     ]
-    assert (
-        adapter.create_calls[0].payload_format is WeightPayloadFormat.FULL_TENSOR
-    )
+    assert adapter.create_calls[0].payload_format is WeightPayloadFormat.FULL_TENSOR
 
 
 def test_generator_logs_weight_update_lifecycle(monkeypatch, caplog):
@@ -1320,9 +1317,7 @@ def test_generator_recovers_uncertain_engine_with_active_or_new_version(
             uri="s3://weights/base-a/model.safetensors.index.json",
         )
     )
-    service.additional_versions["version-b"] = _canonical_version(
-        "version-b", "base-a"
-    )
+    service.additional_versions["version-b"] = _canonical_version("version-b", "base-a")
     adapter = _Adapter(service)
     adapter.apply_failure = True
     generator = _initialize(monkeypatch, endpoint, adapter, object_storage=True)
@@ -1363,6 +1358,91 @@ def test_generator_does_not_fence_when_installation_context_entry_fails(monkeypa
 
     assert adapter.installation_failure_calls == []
     assert adapter.apply_calls == []
+
+
+@pytest.mark.parametrize("fail_second", [False, True])
+def test_streaming_client_holds_lease_and_fences_partial_install(
+    monkeypatch, fail_second
+):
+    server, endpoint, service = _start_server()
+    adapter = _Adapter(service)
+    generator = _initialize(
+        monkeypatch, endpoint, adapter, source_order=(WeightSource.TRAINER,)
+    )
+    installed = []
+
+    class Transfer:
+        def prepare(self, **kwargs):
+            assert kwargs["max_staging_bytes"] == 512
+            assert service.active_leases
+            return SimpleNamespace(
+                batches=[
+                    SimpleNamespace(layouts=({"a.weight": None, "b.weight": None},))
+                ]
+            )
+
+        def iter_bounded(self, prepared, metrics):
+            assert service.active_leases
+            yield {"a.weight": 1}
+            assert service.active_leases
+            if fail_second:
+                raise RuntimeError("partial streaming failure")
+            yield {"b.weight": 2}
+            metrics["staging_peak_bytes"] = 512
+
+        def close(self):
+            pass
+
+    class Installer(EngineInstaller):
+        @property
+        def capabilities(self):
+            return EngineCapabilities(
+                frozenset({PreparedEngineTensors, PreparedStreamingTensors})
+            )
+
+        def install(self, prepared):
+            for tensors in prepared.batches():
+                installed.extend(tensors)
+            return {"install_s": 0.1}
+
+    method = FullTensorNixlUpdateMethod(
+        transfer=Transfer(),
+        capture_layout=None,
+        parameter_layout=None,
+        build_identity=None,
+        worker_rank=0,
+        worker_id="generator-0",
+        accelerator="cuda",
+        p2p_client=None,
+        enable_peer_publication=False,
+    )
+    planner = generator._runtime.session._planner
+    planner._methods = (method,)
+    planner._installer = Installer()
+    try:
+        if fail_second:
+            with pytest.raises(RuntimeError, match="partial streaming failure"):
+                generator.apply_weight_streaming(
+                    version=WeightVersionRef("version-a"), max_staging_bytes=512
+                )
+            with pytest.raises(RuntimeError, match="uncertain"):
+                generator.apply_weight_streaming(
+                    version=WeightVersionRef("version-a"), max_staging_bytes=512
+                )
+            assert installed == ["a.weight"]
+        else:
+            metrics = generator.apply_weight_streaming(
+                version=WeightVersionRef("version-a"), max_staging_bytes=512
+            )
+            assert metrics["staging_peak_bytes"] == 512
+            assert installed == ["a.weight", "b.weight"]
+            assert generator._serving_version_id == "version-a"
+        assert not service.active_leases
+        assert generator._active_handle is None
+        assert method._active_streamed is None
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
 
 
 def test_generator_rejects_non_ready_version_before_leasing(monkeypatch):
@@ -1438,19 +1518,17 @@ def test_generator_discovers_rank_matched_p2p_peer(monkeypatch):
             ),
         ]
     )
-    service.p2p.metadata[("peer-source", "generator-peer")] = (
-        p2p_pb2.WorkerMetadata(
-            worker_rank=0,
-            tensors=[
-                p2p_pb2.TensorDescriptor(
-                    name="weight",
-                    addr=1234,
-                    size=16,
-                    device_id=0,
-                    dtype="torch.float32",
-                )
-            ],
-        )
+    service.p2p.metadata[("peer-source", "generator-peer")] = p2p_pb2.WorkerMetadata(
+        worker_rank=0,
+        tensors=[
+            p2p_pb2.TensorDescriptor(
+                name="weight",
+                addr=1234,
+                size=16,
+                device_id=0,
+                dtype="torch.float32",
+            )
+        ],
     )
     adapter = _Adapter(service)
     generator = _initialize(monkeypatch, endpoint, adapter)
@@ -1596,19 +1674,17 @@ def test_object_storage_generator_skips_full_peer_for_delta_version(monkeypatch)
             worker_rank=0,
         )
     )
-    service.p2p.metadata[("peer-source", "generator-peer")] = (
-        p2p_pb2.WorkerMetadata(
-            worker_rank=0,
-            tensors=[
-                p2p_pb2.TensorDescriptor(
-                    name="weight",
-                    addr=1234,
-                    size=16,
-                    device_id=0,
-                    dtype="torch.float32",
-                )
-            ],
-        )
+    service.p2p.metadata[("peer-source", "generator-peer")] = p2p_pb2.WorkerMetadata(
+        worker_rank=0,
+        tensors=[
+            p2p_pb2.TensorDescriptor(
+                name="weight",
+                addr=1234,
+                size=16,
+                device_id=0,
+                dtype="torch.float32",
+            )
+        ],
     )
     adapter = _Adapter(service)
     generator = _initialize(monkeypatch, endpoint, adapter, object_storage=True)

@@ -1270,6 +1270,37 @@ kubectl -n $NAMESPACE exec deploy/mx-vllm -- curl -s http://localhost:8000/v1/co
 
 ## Performance Reference
 
+### Bounded GPU refit
+
+For unquantized vLLM models whose weights leave insufficient memory for a second
+complete weight copy, initialize the generator with
+`source_order=(WeightSource.TRAINER,)` and call:
+
+```python
+# Pause generation on every replica before entering this operation.
+metrics = generator.apply_weight_streaming(
+    version=WeightVersionRef(version_uid),
+    max_staging_bytes=4 * 1024**3,
+)
+# Resume only after every replica completes successfully.
+```
+
+This API interleaves NIXL reads and per-module installation. It supports mixed
+floating-point wire/engine dtypes through the existing conversion planner and
+does not stage weight payloads on CPU. The limit covers receive, conversion,
+full-pull scratch, and alignment in one CUDA arena. A module larger than the
+limit fails during preparation. Engine post-load workspaces and live weights
+require additional headroom; the limit is not a total process-memory cap.
+
+Any failure requires keeping the deployment paused and restarting its engines.
+Some modules may already contain the new version, so a failed operation cannot
+be treated as a usable old version. The framework owns this pause/restart policy.
+Quantized engines, generator-peer publication, and object-storage delta replay
+are not supported by this API. `stage_weight()` keeps its full-copy behavior.
+Metrics include `staging_peak_bytes`, `batches`, `bytes_received`, `wire_s`, and
+`reconstruct_s`; wire time excludes installation. GPU validation is required
+for each target model and topology before performance qualification.
+
 | Model | Total Data | Transfer Time | Per-Worker Speed |
 |-------|-----------|---------------|------------------|
 | DeepSeek-V3 (671B, FP8) | 681 GB (8 GPUs) | ~15 seconds | ~45 Gbps |

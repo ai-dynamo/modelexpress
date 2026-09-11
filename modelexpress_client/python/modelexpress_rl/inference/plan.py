@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import Enum
@@ -106,6 +106,19 @@ class PreparedEngineTensors(PreparedArtifact):
     @property
     def metrics(self) -> dict[str, float]:
         return dict(getattr(self.staged, "metrics", {}))
+
+
+@dataclass(frozen=True)
+class PreparedStreamingTensors(PreparedArtifact):
+    """Deferred bounded transfer; payload is read only during installation."""
+
+    batches: Callable[[], Iterator[dict[str, Any]]]
+    parameter_names: frozenset[str]
+    transfer_metrics: dict[str, float]
+
+    @property
+    def metrics(self) -> dict[str, float]:
+        return dict(self.transfer_metrics)
 
 
 @dataclass(frozen=True)

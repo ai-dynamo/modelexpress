@@ -22,6 +22,7 @@ from ..plan import (
     GeneratorPeerUpdateSource,
     PreparedArtifact,
     PreparedEngineTensors,
+    PreparedStreamingTensors,
     ResolvedSource,
     TrainerUpdateSource,
     WeightSource,
@@ -57,6 +58,34 @@ class FullTensorNixlUpdateMethod(UpdateMethod):
         self._active_plan: _PreparedNixlTransfer | None = None
         self._active_fingerprint: tuple | None = None
         self._active_staged: _StagedNixlWeights | None = None
+        self._active_streamed: PreparedStreamingTensors | None = None
+
+    def prepare_streaming(self, *, version, source, max_staging_bytes):
+        """Prepare trainer metadata without transferring a full weight copy."""
+        del version
+        if self._enable_peer_publication:
+            raise ValueError("bounded staging requires trainer-only source policy")
+        if self._active_staged is not None or self._active_streamed is not None:
+            raise RuntimeError("release the active update before preparing another")
+        if not isinstance(source, TrainerUpdateSource) or any(
+            not isinstance(item.transport, NixlGeneratorSource)
+            for item in source.inputs.sources
+        ):
+            raise ValueError("bounded staging requires NIXL trainer sources")
+        prepared = self._transfer.prepare(
+            manifests=[item.transport.manifest for item in source.inputs.sources],
+            capture_layout=self._capture_layout,
+            max_staging_bytes=max_staging_bytes,
+        )
+        metrics = {}
+        self._active_streamed = PreparedStreamingTensors(
+            batches=lambda: self._transfer.iter_bounded(prepared, metrics),
+            parameter_names=frozenset(
+                name for batch in prepared.batches for name in batch.layouts[0]
+            ),
+            transfer_metrics=metrics,
+        )
+        return self._active_streamed
 
     @property
     def capabilities(self) -> MethodCapabilities:
@@ -107,6 +136,11 @@ class FullTensorNixlUpdateMethod(UpdateMethod):
         return PreparedEngineTensors(staged=staged)
 
     def release(self, prepared: PreparedArtifact) -> None:
+        if isinstance(prepared, PreparedStreamingTensors):
+            if prepared is not self._active_streamed:
+                raise RuntimeError("streaming update is no longer active")
+            self._active_streamed = None
+            return
         if not isinstance(prepared, PreparedEngineTensors):
             raise TypeError("full-tensor method requires staged engine tensors")
         if prepared.staged is not self._active_staged:
@@ -114,6 +148,8 @@ class FullTensorNixlUpdateMethod(UpdateMethod):
         self._active_staged = None
 
     def publish_applied(self, *, version_id: str, prepared: PreparedArtifact) -> None:
+        if isinstance(prepared, PreparedStreamingTensors):
+            return
         if not isinstance(prepared, PreparedEngineTensors):
             raise TypeError("full-tensor method requires staged engine tensors")
         if prepared.staged is not self._active_staged:

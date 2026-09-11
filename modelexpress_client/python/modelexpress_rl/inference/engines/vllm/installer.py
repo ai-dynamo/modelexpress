@@ -32,6 +32,7 @@ from modelexpress_rl.inference.plan import (
     PreparedArtifact,
     PreparedCheckpointArtifact,
     PreparedEngineTensors,
+    PreparedStreamingTensors,
 )
 from modelexpress_rl.inference.receiver import PreparedCheckpoint
 
@@ -61,9 +62,9 @@ class _VllmInstaller(EngineInstaller):
         self._model_config = model_config
         self._device = device
         self._convert_native_to_hf = convert_native_to_hf
-        self._parameter_layout: dict[
-            str, tuple[tuple[int, ...], torch.dtype]
-        ] | None = None
+        self._parameter_layout: (
+            dict[str, tuple[tuple[int, ...], torch.dtype]] | None
+        ) = None
 
     @property
     def capabilities(self) -> EngineCapabilities:
@@ -73,6 +74,7 @@ class _VllmInstaller(EngineInstaller):
                     PreparedEngineTensors,
                     PreparedCheckpointArtifact,
                 }
+                | ({PreparedStreamingTensors} if not self._is_quantized else set())
             )
         )
 
@@ -80,15 +82,15 @@ class _VllmInstaller(EngineInstaller):
         started = time.perf_counter()
         if isinstance(prepared, PreparedEngineTensors):
             self.install_tensors(prepared.staged.tensors)
+        elif isinstance(prepared, PreparedStreamingTensors):
+            self.install_streaming(prepared)
         elif isinstance(prepared, PreparedCheckpointArtifact):
             checkpoint = prepared.checkpoint
             if not isinstance(checkpoint, PreparedCheckpoint):
                 raise TypeError("checkpoint preparation has an invalid value")
             self.install_checkpoint(checkpoint.path)
         else:
-            raise TypeError(
-                f"unsupported prepared artifact {type(prepared).__name__}"
-            )
+            raise TypeError(f"unsupported prepared artifact {type(prepared).__name__}")
         return {"perf/mx_receive_install_time": time.perf_counter() - started}
 
     @property
@@ -216,6 +218,73 @@ class _VllmInstaller(EngineInstaller):
         _update_mla_absorbed_weights(self._model, quantized=self._is_quantized)
         torch.cuda.synchronize(self._device)
 
+    @torch.no_grad()
+    def install_streaming(self, prepared: PreparedStreamingTensors) -> None:
+        """Commit complete modules into existing storage before arena reuse."""
+        if self._is_quantized:
+            raise IncompleteRefit(
+                "bounded streaming currently requires an unquantized engine"
+            )
+
+        def load():
+            expected = set(dict(self._model.named_parameters()))
+            if expected != prepared.parameter_names:
+                raise IncompleteRefit(
+                    "streaming parameter coverage differs from the live load layout"
+                )
+            installed = set()
+            batches = prepared.batches()
+            try:
+                for tensors in batches:
+                    names = set(tensors)
+                    if not names or names - expected or names & installed:
+                        raise IncompleteRefit(
+                            "invalid or repeated streaming parameter batch"
+                        )
+                    for module_name, module in self._model.named_modules():
+                        owned = {
+                            f"{module_name}.{leaf}" if module_name else leaf
+                            for leaf, _ in module.named_parameters(recurse=False)
+                        }
+                        if names & owned and not owned <= names:
+                            raise IncompleteRefit(
+                                "streaming batch splits an owning module"
+                            )
+                    self._process_and_commit(tensors, reload=False)
+                    arena_storage = {
+                        tensor.untyped_storage().data_ptr()
+                        for tensor in tensors.values()
+                    }
+                    for module in self._model.modules():
+                        values = [
+                            *module.parameters(recurse=False),
+                            *module.buffers(recurse=False),
+                        ]
+                        values.extend(
+                            v
+                            for v in module.__dict__.values()
+                            if isinstance(v, torch.Tensor)
+                        )
+                        if any(
+                            v.device.type != "meta"
+                            and v.untyped_storage().data_ptr() in arena_storage
+                            for v in values
+                        ):
+                            raise IncompleteRefit(
+                                "engine retained bounded staging storage; restart required"
+                            )
+                    installed.update(names)
+            finally:
+                batches.close()
+            if installed != expected:
+                raise IncompleteRefit(
+                    "streaming transfer ended before every parameter was installed"
+                )
+
+        self._reload(load)
+        _update_mla_absorbed_weights(self._model, quantized=False)
+        torch.cuda.synchronize(self._device)
+
     def install_checkpoint(self, path: str | Path) -> None:
         """Reload a prepared safetensors checkpoint into the live model."""
         try:
@@ -242,7 +311,9 @@ class _VllmInstaller(EngineInstaller):
         torch.cuda.synchronize(self._device)
 
     @torch.no_grad()
-    def _process_and_commit(self, tensors: dict[str, torch.Tensor]) -> None:
+    def _process_and_commit(
+        self, tensors: dict[str, torch.Tensor], *, reload: bool = True
+    ) -> None:
         """Run vLLM's per-layer post-load processing into graph-bound storage.
 
         ``initialize_layerwise_reload`` restores load-time parameter skeletons
@@ -286,6 +357,20 @@ class _VllmInstaller(EngineInstaller):
 
             for layer, parameters in groups.items():
                 info = LAYERWISE_INFO.get(layer)
+                if not reload and (info is None or info.kernel_tensors is None):
+                    for full_name, leaf in parameters:
+                        target = getattr(layer, leaf)
+                        source = tensors[full_name]
+                        if (
+                            target.device.type == "meta"
+                            or target.shape != source.shape
+                            or target.dtype != source.dtype
+                        ):
+                            raise IncompleteRefit(
+                                "unmanaged streaming parameter has no compatible live storage"
+                            )
+                        target.copy_(source)
+                    continue
                 for full_name, leaf in parameters:
                     setattr(
                         layer,
@@ -302,7 +387,10 @@ class _VllmInstaller(EngineInstaller):
                 if info is not None:
                     info.reset()
 
-        self._reload(load)
+        if reload:
+            self._reload(load)
+        else:
+            load()
 
     @torch.no_grad()
     def _reload(self, load: Callable[[], None]) -> None:

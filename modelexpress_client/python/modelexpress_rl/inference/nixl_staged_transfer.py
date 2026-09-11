@@ -12,6 +12,7 @@ how an inference engine captures its load layout or installs received weights.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -81,6 +82,65 @@ class _StagedNixlWeights:
 
     tensors: dict[str, torch.Tensor]
     metrics: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _BoundedBatch:
+    capture: CaptureResult
+    plan: TransferPlan
+    layouts: tuple[dict, dict, dict]
+    nbytes: int
+
+
+@dataclass(frozen=True)
+class _PreparedBoundedTransfer:
+    batches: tuple[_BoundedBatch, ...]
+    sources: dict
+    transport: NixlReshardTransport
+
+
+def _bounded_batches(capture, parameter_layout, sources, max_staging_bytes):
+    """Validate all owning-module batches before allocating or installing."""
+    if (
+        isinstance(max_staging_bytes, bool)
+        or not isinstance(max_staging_bytes, int)
+        or max_staging_bytes <= 0
+    ):
+        raise ValueError("max_staging_bytes must be a positive integer")
+    complete = _plan_staged_transfer(capture, sources)
+    _NixlStagedTransfer._validate_complete(capture, parameter_layout, complete)
+    if {copy.param_name for copy in capture.copies} - parameter_layout.keys():
+        raise IncompleteRefit("bounded capture references unknown engine parameters")
+    groups = {}
+    for name in parameter_layout:
+        groups.setdefault(name.rpartition(".")[0], {})[name] = parameter_layout[name]
+    batches = []
+    for module, recv in groups.items():
+        subset = CaptureResult(
+            copies=[c for c in capture.copies if c.param_name in recv]
+        )
+        plan = _plan_staged_transfer(subset, sources)
+        _NixlStagedTransfer._validate_complete(subset, recv, plan)
+        convert = {
+            c.param_name: (tuple(c.dest_shape), c.src_dtype) for c in plan.converts
+        }
+        full = {f.src_name: (tuple(f.global_shape), f.dtype) for f in plan.full_pulls}
+        layouts = (recv, convert, full)
+        # Each typed view begins at a 256-byte boundary in one registered arena.
+        nbytes = sum(
+            ((math.prod(shape) * dtype.itemsize + 255) // 256) * 256
+            for layout in layouts
+            for shape, dtype in layout.values()
+        )
+        if nbytes > max_staging_bytes:
+            raise IncompleteRefit(
+                f"module {module!r} requires {nbytes} staging bytes, exceeds "
+                f"max_staging_bytes={max_staging_bytes}; no CPU fallback"
+            )
+        batches.append(_BoundedBatch(subset, plan, layouts, nbytes))
+    if not batches:
+        raise IncompleteRefit("bounded refit has no engine parameters")
+    return tuple(batches)
 
 
 def _resolve_sources(manifests: list[bytes]) -> _ResolvedSources:
@@ -289,10 +349,11 @@ class _NixlStagedTransfer:
         self._registered_recv_params: set[str] = set()
         self._convert_registered = False
         self._full_registered = False
-        self._active: _PreparedNixlTransfer | None = None
+        self._active: _PreparedNixlTransfer | _PreparedBoundedTransfer | None = None
         self._loaded_agent_metadata: dict[str, bytes] = {}
         self._published_peer_rank: int | None = None
         self._closed = False
+        self._bounded_arena: torch.Tensor | None = None
 
     def prepare(
         self,
@@ -305,10 +366,13 @@ class _NixlStagedTransfer:
                 dict[str, tuple[tuple[int, ...], torch.dtype]],
             ],
         ],
-    ) -> _PreparedNixlTransfer:
+        max_staging_bytes: int | None = None,
+    ) -> _PreparedNixlTransfer | _PreparedBoundedTransfer:
         """Compile one exact source version into a physical NIXL plan."""
         if self._closed:
             raise RuntimeError("NIXL staged transfer is closed")
+        if max_staging_bytes is not None and self._device.type != "cuda":
+            raise ValueError("bounded NIXL staging requires a CUDA device")
         resolved = _resolve_sources(manifests)
         manifest = [
             (name, source.dtype, tuple(source.global_shape))
@@ -317,16 +381,26 @@ class _NixlStagedTransfer:
         capture, parameter_layout = capture_layout(manifest)
         plan = _plan_staged_transfer(capture, resolved.sources)
         self._validate_complete(capture, parameter_layout, plan)
+        batches = None
+        if max_staging_bytes is not None:
+            batches = _bounded_batches(
+                capture, parameter_layout, resolved.sources, max_staging_bytes
+            )
+        elif self._bounded_arena is not None:
+            raise RuntimeError(
+                "cannot mix full-copy and bounded staging in one transfer"
+            )
         required_metadata = _required_agent_metadata(plan, resolved)
+        if batches is not None:
+            for batch in batches:
+                required_metadata.update(_required_agent_metadata(batch.plan, resolved))
         changed = {
             agent: metadata
             for agent, metadata in required_metadata.items()
             if self._loaded_agent_metadata.get(agent) != metadata
         }
         conflicting = sorted(
-            agent
-            for agent in changed
-            if agent in self._loaded_agent_metadata
+            agent for agent in changed if agent in self._loaded_agent_metadata
         )
         if conflicting:
             raise RuntimeError(
@@ -341,6 +415,30 @@ class _NixlStagedTransfer:
             resolved.session_to_device,
             timeout_seconds=self._timeout,
         )
+        if batches is not None:
+            if self._bounded_arena is None:
+                if self._recv_buffers or self._convert_buffers or self._full_buffers:
+                    raise RuntimeError(
+                        "cannot mix full-copy and bounded staging in one transfer"
+                    )
+                with classic_cuda_alloc():
+                    self._bounded_arena = torch.empty(
+                        max(b.nbytes for b in batches),
+                        dtype=torch.uint8,
+                        device=self._device,
+                    )
+                self._manager.register_tensors(
+                    {"__bounded_arena__": self._bounded_arena}
+                )
+            elif self._bounded_arena.numel() < max(b.nbytes for b in batches):
+                raise RuntimeError(
+                    "bounded workspace layout grew; restart the generator engine"
+                )
+            if self._bounded_arena.numel() > max_staging_bytes:
+                raise RuntimeError("existing bounded arena exceeds the requested limit")
+            prepared = _PreparedBoundedTransfer(batches, resolved.sources, transport)
+            self._active = prepared
+            return prepared
         self._ensure_workspace(plan, parameter_layout)
         descriptors = tuple(self._descriptors(plan))
         used_sources = {
@@ -357,6 +455,50 @@ class _NixlStagedTransfer:
         )
         self._active = prepared
         return prepared
+
+    def iter_bounded(self, prepared: _PreparedBoundedTransfer, metrics: dict):
+        """Yield verified GPU batches; callers must commit before advancing."""
+        if self._closed or prepared is not self._active:
+            raise RuntimeError("bounded NIXL transfer is no longer active")
+        assert self._bounded_arena is not None
+        metrics["staging_peak_bytes"] = self._bounded_arena.numel()
+        metrics["batches"] = len(prepared.batches)
+        try:
+            for batch in prepared.batches:
+                offset = 0
+                buffers = []
+                for layout in batch.layouts:
+                    tensors = {}
+                    for name, (shape, dtype) in layout.items():
+                        nbytes = math.prod(shape) * dtype.itemsize
+                        tensors[name] = (
+                            self._bounded_arena[offset : offset + nbytes]
+                            .view(dtype)
+                            .view(shape)
+                        )
+                        offset += ((nbytes + 255) // 256) * 256
+                    buffers.append(tensors)
+                self._recv_buffers, self._convert_buffers, self._full_buffers = buffers
+                sources = {
+                    c.src_name: prepared.sources[c.src_name]
+                    for c in batch.capture.copies
+                }
+                chunk = _PreparedNixlTransfer(
+                    batch.plan,
+                    batch.capture,
+                    sources,
+                    tuple(self._descriptors(batch.plan)),
+                    prepared.transport,
+                )
+                self._active = chunk
+                staged = self.stage(chunk)
+                for key, value in staged.metrics.items():
+                    metrics[key] = metrics.get(key, 0) + value
+                yield staged.tensors
+                # All installation reads must complete before arena reuse.
+                torch.cuda.synchronize(self._device)
+        finally:
+            self._active = prepared
 
     @staticmethod
     def _validate_complete(
@@ -431,10 +573,7 @@ class _NixlStagedTransfer:
         )
 
         recv_params = set(recv_expected)
-        if (
-            self._registered_recv_params
-            and self._registered_recv_params != recv_params
-        ):
+        if self._registered_recv_params and self._registered_recv_params != recv_params:
             raise RuntimeError(
                 "receive parameter set changed; restart the generator engine"
             )
@@ -615,9 +754,7 @@ class _NixlStagedTransfer:
                     timeout_seconds=self._timeout,
                 )
             else:
-                remote_agent_name = self._manager.add_remote_agent(
-                    source.nixl_metadata
-                )
+                remote_agent_name = self._manager.add_remote_agent(source.nixl_metadata)
             bytes_received, tensor_count, wire_seconds = (
                 self._manager.receive_from_source(
                     source_metadata=b"",
@@ -747,6 +884,10 @@ class _NixlStagedTransfer:
         self.unpublish_peer()
         self._closed = True
         self._manager.shutdown()
+        self._recv_buffers.clear()
+        self._convert_buffers.clear()
+        self._full_buffers.clear()
+        self._bounded_arena = None
 
 
 __all__: list[str] = []

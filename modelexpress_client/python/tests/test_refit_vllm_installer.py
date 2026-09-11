@@ -10,6 +10,7 @@ import torch
 from torch import nn
 
 from modelexpress.refit.reshard.types import IncompleteRefit
+from modelexpress_rl.inference.plan import PreparedStreamingTensors
 from modelexpress_rl.inference.engines.vllm.installer import (
     _update_mla_absorbed_weights,
     _VllmInstaller,
@@ -80,6 +81,44 @@ def test_installer_resolves_load_time_parameters_after_layerwise_reload(monkeypa
     installer._process_and_commit({"weight": torch.tensor([7.0])})
 
     assert model.weight.item() == 7.0
+
+
+@pytest.mark.parametrize("fail_second", [False, True])
+def test_streaming_preserves_storage_and_propagates_partial_failure(
+    monkeypatch, fail_second
+):
+    _install_fake_vllm(monkeypatch, lambda model: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    model = nn.Sequential(nn.Linear(2, 2, bias=False), nn.Linear(2, 2, bias=False))
+    addresses = {n: p.data_ptr() for n, p in model.named_parameters()}
+    before_second = model[1].weight.detach().clone()
+    arena = torch.ones(2, 2)
+
+    def batches():
+        yield {"0.weight": arena}
+        arena.fill_(2)
+        assert torch.equal(model[0].weight, torch.ones(2, 2))
+        if fail_second:
+            raise RuntimeError("injected transport failure")
+        yield {"1.weight": arena}
+        arena.fill_(3)
+
+    prepared = PreparedStreamingTensors(batches, frozenset(addresses), {})
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
+    )
+    if fail_second:
+        with pytest.raises(RuntimeError, match="injected transport failure"):
+            installer.install_streaming(prepared)
+        assert torch.equal(model[1].weight, before_second)
+    else:
+        installer.install_streaming(prepared)
+        assert torch.equal(model[1].weight, torch.full((2, 2), 2.0))
+    assert torch.equal(model[0].weight, torch.ones(2, 2))
+    assert {n: p.data_ptr() for n, p in model.named_parameters()} == addresses
 
 
 def test_installer_rejects_parameters_left_on_meta(monkeypatch):
