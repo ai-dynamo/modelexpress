@@ -18,7 +18,13 @@ import torch
 
 from .. import envs
 from ..adapter import EngineAdapter, StrategyFailed
-from .base import LoadContext, LoadStrategy, _as_load_result, register_tensors
+from .base import (
+    LoadContext,
+    LoadStrategy,
+    _as_load_result,
+    close_weight_iterator,
+    register_tensors,
+)
 from .context import LoadResult
 
 logger = logging.getLogger("modelexpress.strategy_model_streamer")
@@ -104,6 +110,8 @@ class ModelStreamerStrategy(LoadStrategy):
                 f"[Worker {ctx.global_rank}] Model streamer loading failed, falling through: {e}"
             )
             raise StrategyFailed(str(e), mutated=True) from e
+        finally:
+            close_weight_iterator(weights_iter, worker_rank=ctx.global_rank)
 
         register_tensors(result, ctx)
         return result

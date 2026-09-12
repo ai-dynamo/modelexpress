@@ -43,6 +43,55 @@ ENV_SELECTOR = "MX_P2P_SOURCE_SELECTOR"
 DEFAULT_SELECTOR = "random"
 
 
+def configured_topology_filter_level() -> str | None:
+    """Return the normalized hard topology-filter level, if enabled."""
+    level = (envs.MX_P2P_TOPOLOGY_FILTER_LEVEL or "").strip()
+    return level or None
+
+
+def filter_candidates_by_topology(
+    candidates: list[p2p_pb2.SourceInstanceRef],
+    ctx: LoadContext,
+) -> list[p2p_pb2.SourceInstanceRef]:
+    """Apply an explicit hard RDMA-domain boundary, when configured.
+
+    ``topology_aware`` remains a preference policy by default. A deployment
+    with separate, non-interconnected RDMA fabrics can set
+    ``MX_P2P_TOPOLOGY_FILTER_LEVEL`` (for example ``fabric`` or ``block``) to
+    require the same published value on both sides. Missing metadata is
+    rejected in this mode so an unreachable peer cannot trigger a mutated-model
+    retry; the strategy then falls through to local loading.
+    """
+    level = configured_topology_filter_level()
+    if not level:
+        return candidates
+
+    from .topology import local_topology
+
+    local_value = local_topology().get(level)
+    if not local_value:
+        logger.warning(
+            "MX_P2P_TOPOLOGY_FILTER_LEVEL=%r is set but local topology has no "
+            "value; skipping all RDMA sources for safety",
+            level,
+        )
+        return []
+
+    matched = [
+        candidate
+        for candidate in candidates
+        if dict(getattr(candidate, "topology", {}) or {}).get(level) == local_value
+    ]
+    logger.info(
+        "RDMA topology filter: level=%s local_value=%s candidates=%d matched=%d",
+        level,
+        local_value,
+        len(candidates),
+        len(matched),
+    )
+    return matched
+
+
 @runtime_checkable
 class SourceSelector(Protocol):
     """Orders compatible candidates into a per-target preference list."""

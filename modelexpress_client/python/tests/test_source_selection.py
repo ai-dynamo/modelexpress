@@ -52,6 +52,7 @@ def _ref(
     model_name="m",
     accelerator="",
     source_load=0.0,
+    topology=None,
 ):
     return p2p_pb2.SourceInstanceRef(
         mx_source_id=mx_source_id,
@@ -60,6 +61,7 @@ def _ref(
         worker_rank=worker_rank,
         accelerator=accelerator,
         source_load=source_load,
+        topology=topology or {},
     )
 
 
@@ -261,6 +263,30 @@ def test_find_source_instances_filters_by_worker_rank(monkeypatch):
     assert {c.worker_id for c in out} == {"w0", "w2"}
 
 
+def test_find_source_instances_filters_rdma_domain_before_retry_slice(monkeypatch):
+    monkeypatch.setenv("MX_P2P_TOPOLOGY", '{"fabric":"local"}')
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_FILTER_LEVEL", "fabric")
+    instances = [
+        _ref(
+            f"s{i}aaaaaaaaaaaaaa",
+            f"remote-{i}",
+            topology={"fabric": "remote"},
+        )
+        for i in range(MAX_SOURCE_RETRIES)
+    ]
+    instances.append(
+        _ref(
+            "slocalaaaaaaaaaaa",
+            "local",
+            topology={"fabric": "local"},
+        )
+    )
+
+    out = RdmaStrategy()._find_source_instances(_rdma_ctx(instances))
+
+    assert [candidate.worker_id for candidate in out] == ["local"]
+
+
 def test_find_source_instances_empty_on_list_error():
     ctx = _rdma_ctx([])
     ctx.mx_client.list_sources.side_effect = RuntimeError("grpc down")
@@ -279,6 +305,7 @@ def test_no_peers_published_records_a_zero_funnel(monkeypatch):
     m = MagicMock()
     monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
     monkeypatch.delenv(ENV_SELECTOR, raising=False)
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_FILTER_LEVEL", "   ")
 
     ctx = _rdma_ctx([])
     assert RdmaStrategy()._find_source_instances(ctx) == []
@@ -310,11 +337,14 @@ def test_successful_listing_records_an_ok_outcome(monkeypatch):
     m = MagicMock()
     monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
     monkeypatch.setenv(ENV_SELECTOR, "rendezvous_hash")
+    monkeypatch.setenv("MX_P2P_TOPOLOGY_FILTER_LEVEL", "   ")
 
     ctx = _rdma_ctx([_ref("s0aaaaaaaaaaaaaa", "w0", worker_rank=0)])
     RdmaStrategy()._find_source_instances(ctx)
 
     m.record_list_sources.assert_called_once_with("rendezvous_hash", "ok")
+    stages = {call.args[1] for call in m.observe_candidates.call_args_list}
+    assert "topology_matched" not in stages
 
 
 def test_find_source_instances_filters_incompatible_accelerator():
@@ -733,6 +763,24 @@ def test_load_clean_transfer_failure_tries_next_source_without_reinit():
     ctx.accelerator_backend.name = ""
 
     assert strat.load(MagicMock(), ctx) == "loaded"
+    ctx.adapter.reinit_for_retry.assert_not_called()
+
+
+def test_load_last_candidate_mutated_failure_propagates_without_internal_reinit():
+    """The chain, not RdmaStrategy, owns final-candidate recovery."""
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(1))
+    strat._fetch_worker_metadata = MagicMock(return_value=MagicMock())
+    failure = StrategyFailed("mutated failure", mutated=True)
+    strat._load_as_target = MagicMock(side_effect=failure)
+    ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""
+
+    with pytest.raises(StrategyFailed) as exc:
+        strat.load(MagicMock(), ctx)
+
+    assert exc.value is failure
+    assert exc.value.mutated is True
     ctx.adapter.reinit_for_retry.assert_not_called()
 
 

@@ -78,6 +78,14 @@ pub const MODEL_EXPRESS_SERVER_ENDPOINT: &str = "MODEL_EXPRESS_SERVER_ENDPOINT";
 /// something to assume has already happened.
 pub const MX_METRICS_SCHEME: &str = "MX_METRICS_SCHEME";
 
+// ── Python P2P source selection ────────────────────────────────────────────
+/// Hard topology level used to exclude cross-domain RDMA sources.
+///
+/// The Python inference integrations consume this variable. It is registered
+/// here as well so ModelExpress-owned environment variable names stay in the
+/// workspace-wide registry.
+pub const MX_P2P_TOPOLOGY_FILTER_LEVEL: &str = "MX_P2P_TOPOLOGY_FILTER_LEVEL";
+
 // ── HuggingFace ─────────────────────────────────────────────────────────────
 /// HuggingFace Hub auth token.
 pub const HF_TOKEN: &str = "HF_TOKEN";
