@@ -186,6 +186,9 @@ def publish_metadata_and_ready(
         ready_fn=ready_fn,
         cleanup_fn=cleanup_fn,
         source_load_provider=make_source_load_provider(device_id),
+        # Weight sources hold their data resident for the process lifetime;
+        # a metadata-server outage must not permanently disqualify them.
+        retry_publish_forever=True,
     )
     publisher.start()
     _heartbeat_threads[worker_rank] = publisher
