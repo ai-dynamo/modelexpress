@@ -3,7 +3,7 @@
 
 # ModelExpress K8s CI.
 #
-# Ten jobs:
+# Jobs:
 #   build-server        — builds and pushes the MX coordination server image
 #                         from ci/k8s/server/Dockerfile.server. Runs on the
 #                         self-hosted builder runner
@@ -70,6 +70,10 @@
 #                         after the heartbeat window. Matrix over framework
 #                         (vllm / sglang). No target pod — the assertion runs
 #                         against mx-server directly via gRPC.
+#
+#   h100-smoke          — non-gating same-node NIXL canary. Runs one isolated
+#                         TP=1 rank on each H100 and validates an exact GPU-to-GPU
+#                         tensor transfer through ModelExpress.
 #
 #   model-streamer       — matrix over frameworks; single worker pod, no
 #                          vCluster, no P2P. Streams weights directly from S3
@@ -1075,6 +1079,64 @@ jobs:
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
+
+  # ---------------------------------------------------------------------------
+  # Dedicated H100 runner and same-node NIXL canary. The ARC container hook
+  # injects two GPUs; each spawned TP=1 rank is masked to exactly one of them.
+  # ---------------------------------------------------------------------------
+  h100-smoke:
+    name: H100 NIXL TP1-to-TP1 smoke test
+    runs-on: prod-modelexpress-tester-amd-h100-v1
+    needs: [build-client]
+    # Must exceed the runner's four-hour pod-preparation window so the smoke
+    # can still initialize, execute, and clean up after H100 capacity arrives.
+    timeout-minutes: 300
+    permissions:
+      contents: read
+    container:
+      # `env` is unavailable while GitHub evaluates the job container image.
+      image: nvcr.io/0980761089281446/mx-worker-vllm:${{ github.sha }}
+      credentials:
+        username: "$oauthtoken"
+        password: ${{ secrets.NGC_API_KEY }}
+      env:
+        MODEL_EXPRESS_LOG_LEVEL: INFO
+        MX_NIXL_BACKEND: UCX
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Verify H100 allocation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t gpu_names < <(
+            nvidia-smi --query-gpu=name --format=csv,noheader
+          )
+          mapfile -t gpu_uuids < <(
+            nvidia-smi --query-gpu=uuid --format=csv,noheader
+          )
+          printf 'Detected GPU: %s\n' "${gpu_names[@]}"
+
+          if [ "${#gpu_names[@]}" -ne 2 ]; then
+            echo "Expected 2 GPUs, found ${#gpu_names[@]}" >&2
+            exit 1
+          fi
+
+          if printf '%s\n' "${gpu_names[@]}" | grep -qv '^NVIDIA H100'; then
+            echo "Expected every GPU to be an NVIDIA H100" >&2
+            exit 1
+          fi
+
+          echo "MX_H100_SOURCE_GPU=${gpu_uuids[0]}" >> "$GITHUB_ENV"
+          echo "MX_H100_TARGET_GPU=${gpu_uuids[1]}" >> "$GITHUB_ENV"
+
+      - name: Transfer TP1 source tensor to TP1 target
+        run: python3 ci/h100_tp1_smoke.py
 
   # ---------------------------------------------------------------------------
   # Model Streamer S3 tests — single worker pod, no vCluster, no P2P.
