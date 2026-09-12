@@ -202,7 +202,7 @@ vLLM 0.23.0 recognizes the load format natively; the ModelExpress Python package
 
 ### ModelStreamer on Kubernetes
 
-Set `MX_MODEL_URI` to an `s3://`, `gs://`, or `az://` URI or an absolute local path. For tensor-parallel deployments, participating ranks divide remote reads via `MX_MS_DISTRIBUTED` (on by default; set to `0` to disable); TP=1 ignores the setting. [ModelStreamer examples](examples/model_streamer_k8s/README.md) · [vLLM recipes](examples/model_streamer_k8s/client/vllm/README.md).
+Set `MX_MODEL_URI` to an `s3://`, `gs://`, or `az://` URI or an absolute local path. For vLLM object-storage URIs, also set `MX_INSTANT_TENSOR=0` so the earlier InstantTensor strategy does not treat ModelStreamer's partially materialized local cache as a complete checkpoint. For tensor-parallel deployments, participating ranks divide remote reads via `MX_MS_DISTRIBUTED` (on by default; set to `0` to disable); TP=1 ignores the setting. [ModelStreamer examples](examples/model_streamer_k8s/README.md) · [vLLM recipes](examples/model_streamer_k8s/client/vllm/README.md).
 
 ### Docker
 

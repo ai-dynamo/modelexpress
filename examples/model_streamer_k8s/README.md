@@ -32,6 +32,7 @@ The vLLM manifests use:
 - `--load-format modelexpress`
 - `VLLM_PLUGINS=modelexpress`
 - `MX_MODEL_URI` as the model path passed to vLLM
+- `MX_INSTANT_TENSOR=0` for object-storage URIs, preventing InstantTensor from probing ModelStreamer's partially materialized local cache
 
 Distributed streaming is on by default. To disable it for a tensor parallel
 deployment with TP > 1, set the container's `MX_MS_DISTRIBUTED` env var to `0`
