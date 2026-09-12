@@ -1088,7 +1088,9 @@ jobs:
     name: H100 NIXL TP1-to-TP1 smoke test
     runs-on: prod-modelexpress-tester-amd-h100-v1
     needs: [build-client]
-    timeout-minutes: 30
+    # Must exceed the runner's four-hour pod-preparation window so the smoke
+    # can still initialize, execute, and clean up after H100 capacity arrives.
+    timeout-minutes: 300
     permissions:
       contents: read
     container:
