@@ -64,6 +64,14 @@ otel = [
 metrics = [
     "prometheus-client>=0.20.0",
 ]
+# Version 0.1.0 does not identify a unique source revision. Failure-tolerant
+# production builds must use a revision-stamped wheel containing bounded
+# m2nWaitCommReady support (official port-m2n-async-wait-timeout revision
+# 45c3f9b, or its reviewed merged successor). abe83984 and official main at
+# review time (5fab732a) retain an unbounded native wait.
+nccl-m2n = [
+    "nccl-extensions==0.1.0",
+]
 # Required for the VmmArena allocator (CudaVmmBackend uses cuMem* APIs).
 # The pure-Python VmmArena tests don't need it; CudaVmmBackend does.
 vmm = [
