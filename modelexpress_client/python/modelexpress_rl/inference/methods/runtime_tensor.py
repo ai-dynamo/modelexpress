@@ -54,6 +54,8 @@ class RuntimeTensorNixlUpdateMethod(UpdateMethod):
         }
         self._active_staged = self._transfer.stage_peer(
             source=source.worker,
+            mx_source_id=source.mx_source_id,
+            worker_id=source.worker_id,
             parameter_layout=layout,
         )
         _attribute_transfer(self._active_staged.metrics)

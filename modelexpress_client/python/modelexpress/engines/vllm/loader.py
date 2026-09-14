@@ -35,6 +35,7 @@ import torch.nn as nn
 from ... import configure_vllm_logging, envs, model_prefetch
 from ...load_strategy import (
     LoadContext,
+    drain_tensor_readers,
     publish_metadata,
     run_load_strategy_chain,
     unpublish_metadata,
@@ -238,6 +239,10 @@ class MxModelLoader(BaseModelLoader):
     def unpublish_runtime_tensors(self) -> None:
         """Withdraw this loader's runtime tensors before an active refit."""
         if self._ctx is not None:
+            drain_tensor_readers(
+                self._ctx,
+                timeout=envs.MX_TRANSFER_TIMEOUT,
+            )
             unpublish_metadata(self._ctx)
 
     def publish_runtime_tensors(self, version_id: str) -> None:

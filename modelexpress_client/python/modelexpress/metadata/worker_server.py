@@ -6,24 +6,27 @@ Per-worker gRPC server for P2P manifest exchange.
 
 When MX_P2P_METADATA=1, each source worker starts a WorkerGrpcServer
 that serves its tensor descriptors directly to target workers via the
-GetTensorManifest RPC. Artifact sources can serve their sealed file manifest
-through GetArtifactManifestHeader/GetArtifactManifestChunks and coordinate NIXL
-file chunk transfers through PrepareArtifactChunk/ReleaseArtifactChunk.
+GetTensorManifest RPC. Tensor readers acquire a bounded lease before accessing
+published storage. Artifact sources can serve their sealed file manifest through
+GetArtifactManifestHeader/GetArtifactManifestChunks and coordinate NIXL file
+chunk transfers through PrepareArtifactChunk/ReleaseArtifactChunk.
 """
 
 from __future__ import annotations
 
 import logging
+import math
+import time
+import uuid
 from concurrent import futures
 from collections.abc import Mapping
 from dataclasses import dataclass
-from threading import Lock
+from threading import Condition, Lock
 from typing import Any
 
 import grpc
 
-from .. import p2p_pb2
-from .. import p2p_pb2_grpc
+from .. import envs, p2p_pb2, p2p_pb2_grpc
 
 logger = logging.getLogger("modelexpress.metadata.worker_server")
 
@@ -33,10 +36,88 @@ logger = logging.getLogger("modelexpress.metadata.worker_server")
 _ARTIFACT_CHUNK_METADATA_PAGE_SIZE = 1024
 
 
+def _tensor_read_lease_timeout_seconds() -> int:
+    """Cover one NIXL metadata handshake and one bounded tensor receive."""
+    return max(1, math.ceil(2 * envs.MX_TRANSFER_TIMEOUT + 30))
+
+
 @dataclass
 class _ArtifactSource:
     manifests: dict[str, p2p_pb2.ArtifactManifest]
     chunk_manager: Any
+
+
+class _TensorReadLeases:
+    """Protect published tensor storage while peers are reading it."""
+
+    def __init__(self) -> None:
+        self._condition = Condition()
+        self._accepting = True
+        self._leases: dict[str, float] = {}
+        self._legacy_lease_id = uuid.uuid4().hex
+
+    def prepare(self, timeout_seconds: int) -> str:
+        if timeout_seconds <= 0:
+            raise ValueError("tensor read lease timeout must be positive")
+        with self._condition:
+            self._drop_expired_locked()
+            if not self._accepting:
+                raise RuntimeError("tensor source is draining")
+            lease_id = uuid.uuid4().hex
+            self._leases[lease_id] = time.monotonic() + timeout_seconds
+            return lease_id
+
+    def prepare_legacy(self, timeout_seconds: int) -> None:
+        """Extend one shared lease for clients that cannot release it."""
+        with self._condition:
+            self._drop_expired_locked()
+            if not self._accepting:
+                raise RuntimeError("tensor source is draining")
+            expires_at = time.monotonic() + timeout_seconds
+            self._leases[self._legacy_lease_id] = max(
+                expires_at,
+                self._leases.get(self._legacy_lease_id, 0),
+            )
+
+    def release(self, lease_id: str) -> None:
+        with self._condition:
+            self._drop_expired_locked()
+            if self._leases.pop(lease_id, None) is None:
+                raise KeyError(lease_id)
+            self._condition.notify_all()
+
+    def drain(self, timeout: float) -> None:
+        if timeout < 0:
+            raise ValueError("tensor read drain timeout must not be negative")
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            self._accepting = False
+            while self._leases:
+                self._drop_expired_locked()
+                if not self._leases:
+                    return
+                now = time.monotonic()
+                remaining = deadline - now
+                if remaining <= 0:
+                    self._accepting = True
+                    self._condition.notify_all()
+                    raise TimeoutError(
+                        f"timed out waiting for {len(self._leases)} tensor readers"
+                    )
+                next_expiry = min(self._leases.values()) - now
+                self._condition.wait(timeout=min(remaining, max(next_expiry, 0.0)))
+
+    def _drop_expired_locked(self) -> None:
+        now = time.monotonic()
+        expired = [
+            lease_id
+            for lease_id, expires_at in self._leases.items()
+            if expires_at <= now
+        ]
+        for lease_id in expired:
+            self._leases.pop(lease_id, None)
+        if expired:
+            self._condition.notify_all()
 
 
 class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
@@ -61,6 +142,8 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         self._worker_rank = worker_rank
         self._accelerator = accelerator
         self._worker_id = worker_id
+        self._tensor_read_leases = _TensorReadLeases()
+        self._tensor_read_lease_timeout = _tensor_read_lease_timeout_seconds()
         self._artifact_sources: dict[str, _ArtifactSource] = {}
         self._artifact_lock = Lock()
         if artifact_manifests and mx_source_id:
@@ -104,6 +187,69 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
             request.worker_id if request.HasField("worker_id") else None,
             context,
         )
+        # Legacy clients cannot return a lease ID. Keep their published tensor
+        # addresses stable for one bounded transfer window after this response.
+        self._prepare_tensor_read_lease(context, legacy=True)
+        response = self._tensor_manifest_response()
+        logger.info(
+            f"GetTensorManifest served: {len(self._tensor_protos)} tensors, "
+            f"{response.ByteSize()} bytes (worker_rank={self._worker_rank})"
+        )
+        return response
+
+    def PrepareTensorRead(self, request, context):
+        self._validate_tensor_source(
+            request.mx_source_id,
+            request.worker_id if request.HasField("worker_id") else None,
+            context,
+        )
+        lease_id = self._prepare_tensor_read_lease(context)
+        response = p2p_pb2.PrepareTensorReadResponse(
+            lease_id=lease_id,
+            manifest=self._tensor_manifest_response(),
+        )
+        logger.info(
+            f"PrepareTensorRead served: {len(self._tensor_protos)} tensors, "
+            f"lease_id={lease_id} (worker_rank={self._worker_rank})"
+        )
+        return response
+
+    def ReleaseTensorRead(self, request, context):
+        self._validate_tensor_source(
+            request.mx_source_id,
+            request.worker_id if request.HasField("worker_id") else None,
+            context,
+        )
+        try:
+            self._tensor_read_leases.release(request.lease_id)
+        except KeyError:
+            context.abort(
+                grpc.StatusCode.NOT_FOUND,
+                f"tensor read lease not found or expired: {request.lease_id}",
+            )
+        logger.info(
+            f"ReleaseTensorRead served: lease_id={request.lease_id} "
+            f"(worker_rank={self._worker_rank})"
+        )
+        return p2p_pb2.ReleaseTensorReadResponse()
+
+    def drain_tensor_reads(self, timeout: float) -> None:
+        self._tensor_read_leases.drain(timeout)
+
+    def _prepare_tensor_read_lease(self, context, *, legacy: bool = False) -> str:
+        try:
+            if legacy:
+                self._tensor_read_leases.prepare_legacy(
+                    self._tensor_read_lease_timeout
+                )
+                return ""
+            return self._tensor_read_leases.prepare(
+                self._tensor_read_lease_timeout
+            )
+        except RuntimeError as error:
+            context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
+
+    def _tensor_manifest_response(self) -> p2p_pb2.GetTensorManifestResponse:
         response = p2p_pb2.GetTensorManifestResponse(
             tensors=self._tensor_protos,
             mx_source_id=self._mx_source_id or "",
@@ -114,10 +260,6 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         )
         if self._worker_id:
             response.worker_id = self._worker_id
-        logger.info(
-            f"GetTensorManifest served: {len(self._tensor_protos)} tensors, "
-            f"{response.ByteSize()} bytes (worker_rank={self._worker_rank})"
-        )
         return response
 
     def PrepareArtifactChunk(self, request, context):
@@ -329,7 +471,12 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         worker_id: str | None,
         context,
     ) -> None:
-        if mx_source_id and mx_source_id != self._mx_source_id:
+        if not mx_source_id:
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                "mx_source_id is required for tensor reads",
+            )
+        if mx_source_id != self._mx_source_id:
             context.abort(
                 grpc.StatusCode.FAILED_PRECONDITION,
                 f"mx_source_id mismatch: expected {self._mx_source_id}, "
@@ -446,6 +593,129 @@ class WorkerGrpcServer:
             self._port = None
             server.stop(grace)
             logger.info("WorkerGrpcServer stopped")
+
+    def drain_tensor_reads(self, timeout: float) -> None:
+        if self._servicer is None:
+            raise RuntimeError("Server must be started before draining tensor reads")
+        self._servicer.drain_tensor_reads(timeout)
+
+
+class TensorReadLease:
+    """A version-validated source manifest held against donor mutation."""
+
+    def __init__(
+        self,
+        *,
+        channel,
+        stub,
+        mx_source_id: str,
+        worker_id: str,
+        lease_id: str,
+        manifest: p2p_pb2.GetTensorManifestResponse,
+        timeout: float,
+    ) -> None:
+        self._channel = channel
+        self._stub = stub
+        self._mx_source_id = mx_source_id
+        self._worker_id = worker_id
+        self._lease_id = lease_id
+        self._timeout = timeout
+        self._released = False
+        self.manifest = manifest
+
+    def release(self) -> None:
+        if self._released:
+            return
+        request = p2p_pb2.ReleaseTensorReadRequest(
+            mx_source_id=self._mx_source_id,
+            lease_id=self._lease_id,
+        )
+        if self._worker_id:
+            request.worker_id = self._worker_id
+        self._stub.ReleaseTensorRead(request, timeout=self._timeout)
+        self._released = True
+
+    def close(self) -> None:
+        try:
+            self.release()
+        finally:
+            self._channel.close()
+
+    def __enter__(self) -> "TensorReadLease":
+        return self
+
+    def __exit__(self, *_args) -> None:
+        self.close()
+
+
+def prepare_tensor_read(
+    endpoint: str,
+    mx_source_id: str,
+    *,
+    worker_id: str = "",
+    timeout: float = 5.0,
+    max_retries: int = 0,
+    retry_backoff_seconds: float = 0.0,
+) -> tuple[TensorReadLease, int]:
+    """Prepare a source read lease and its tensor manifest on one channel."""
+    if max_retries < 0:
+        raise ValueError("tensor read max_retries must not be negative")
+    if retry_backoff_seconds < 0:
+        raise ValueError("tensor read retry backoff must not be negative")
+    request = p2p_pb2.PrepareTensorReadRequest(
+        mx_source_id=mx_source_id,
+    )
+    if worker_id:
+        request.worker_id = worker_id
+    for attempt in range(max_retries + 1):
+        channel = grpc.insecure_channel(endpoint)
+        stub = p2p_pb2_grpc.WorkerServiceStub(channel)
+        try:
+            response = stub.PrepareTensorRead(request, timeout=timeout)
+            manifest = response.manifest
+            if manifest.mx_source_id != mx_source_id:
+                raise RuntimeError(
+                    f"mx_source_id mismatch: expected {mx_source_id}, "
+                    f"got {manifest.mx_source_id}"
+                )
+            if (
+                worker_id
+                and manifest.HasField("worker_id")
+                and manifest.worker_id != worker_id
+            ):
+                raise RuntimeError(
+                    f"worker_id mismatch: expected {worker_id}, "
+                    f"got {manifest.worker_id}"
+                )
+            lease = TensorReadLease(
+                channel=channel,
+                stub=stub,
+                mx_source_id=mx_source_id,
+                worker_id=worker_id,
+                lease_id=response.lease_id,
+                manifest=manifest,
+                timeout=timeout,
+            )
+            return lease, response.ByteSize()
+        except grpc.RpcError as error:
+            channel.close()
+            if (
+                error.code() == grpc.StatusCode.FAILED_PRECONDITION
+                and attempt < max_retries
+            ):
+                time.sleep(retry_backoff_seconds)
+                continue
+            raise
+        except RuntimeError:
+            channel.close()
+            if attempt < max_retries:
+                time.sleep(retry_backoff_seconds)
+                continue
+            raise
+        except BaseException:
+            channel.close()
+            raise
+    raise RuntimeError("tensor read preparation exhausted without a result")
 
 
 def fetch_tensor_manifest(

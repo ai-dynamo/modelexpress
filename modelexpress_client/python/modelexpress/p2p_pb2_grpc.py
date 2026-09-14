@@ -268,6 +268,16 @@ class WorkerServiceStub(object):
                 request_serializer=p2p__pb2.GetTensorManifestRequest.SerializeToString,
                 response_deserializer=p2p__pb2.GetTensorManifestResponse.FromString,
                 _registered_method=True)
+        self.PrepareTensorRead = channel.unary_unary(
+                '/model_express.p2p.WorkerService/PrepareTensorRead',
+                request_serializer=p2p__pb2.PrepareTensorReadRequest.SerializeToString,
+                response_deserializer=p2p__pb2.PrepareTensorReadResponse.FromString,
+                _registered_method=True)
+        self.ReleaseTensorRead = channel.unary_unary(
+                '/model_express.p2p.WorkerService/ReleaseTensorRead',
+                request_serializer=p2p__pb2.ReleaseTensorReadRequest.SerializeToString,
+                response_deserializer=p2p__pb2.ReleaseTensorReadResponse.FromString,
+                _registered_method=True)
         self.GetArtifactManifestHeader = channel.unary_unary(
                 '/model_express.p2p.WorkerService/GetArtifactManifestHeader',
                 request_serializer=p2p__pb2.GetArtifactManifestHeaderRequest.SerializeToString,
@@ -308,6 +318,20 @@ class WorkerServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def PrepareTensorRead(self, request, context):
+        """Prepare/Release protect a mutable RL generator's live tensor storage while
+        another generator reads it during active-refit P2P transfer.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReleaseTensorRead(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def GetArtifactManifestHeader(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -339,6 +363,16 @@ def add_WorkerServiceServicer_to_server(servicer, server):
                     servicer.GetTensorManifest,
                     request_deserializer=p2p__pb2.GetTensorManifestRequest.FromString,
                     response_serializer=p2p__pb2.GetTensorManifestResponse.SerializeToString,
+            ),
+            'PrepareTensorRead': grpc.unary_unary_rpc_method_handler(
+                    servicer.PrepareTensorRead,
+                    request_deserializer=p2p__pb2.PrepareTensorReadRequest.FromString,
+                    response_serializer=p2p__pb2.PrepareTensorReadResponse.SerializeToString,
+            ),
+            'ReleaseTensorRead': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReleaseTensorRead,
+                    request_deserializer=p2p__pb2.ReleaseTensorReadRequest.FromString,
+                    response_serializer=p2p__pb2.ReleaseTensorReadResponse.SerializeToString,
             ),
             'GetArtifactManifestHeader': grpc.unary_unary_rpc_method_handler(
                     servicer.GetArtifactManifestHeader,
@@ -397,6 +431,60 @@ class WorkerService(object):
             '/model_express.p2p.WorkerService/GetTensorManifest',
             p2p__pb2.GetTensorManifestRequest.SerializeToString,
             p2p__pb2.GetTensorManifestResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PrepareTensorRead(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.p2p.WorkerService/PrepareTensorRead',
+            p2p__pb2.PrepareTensorReadRequest.SerializeToString,
+            p2p__pb2.PrepareTensorReadResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReleaseTensorRead(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/model_express.p2p.WorkerService/ReleaseTensorRead',
+            p2p__pb2.ReleaseTensorReadRequest.SerializeToString,
+            p2p__pb2.ReleaseTensorReadResponse.FromString,
             options,
             channel_credentials,
             insecure,

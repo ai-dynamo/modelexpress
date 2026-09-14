@@ -9,6 +9,8 @@ import io
 import logging
 import re
 import tarfile
+import threading
+import time
 from concurrent import futures
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -42,6 +44,7 @@ from modelexpress.metadata.source_id import compute_mx_source_id
 from modelexpress.metadata.worker_server import (
     WorkerGrpcServer,
     WorkerServiceServicer,
+    prepare_tensor_read,
     fetch_tensor_manifest,
 )
 
@@ -158,6 +161,168 @@ def test_worker_grpc_server_shares_port_for_tensor_and_artifact_sources(tmp_path
     assert [tensor.name for tensor in tensors] == ["weight"]
     assert header.mx_source_id == "artifact-source"
     assert header.artifact_id == artifact_id
+
+
+def test_tensor_read_drain_waits_for_inflight_lease_and_rejects_new_readers():
+    server = WorkerGrpcServer(
+        tensor_protos=[
+            p2p_pb2.TensorDescriptor(
+                name="weight",
+                addr=1234,
+                size=8,
+                device_id=0,
+                dtype="torch.float16",
+            )
+        ],
+        mx_source_id="source-123",
+        port=0,
+        worker_id="generation-1",
+    )
+    port = server.start()
+    endpoint = f"127.0.0.1:{port}"
+    lease, _ = prepare_tensor_read(
+        endpoint,
+        "source-123",
+        worker_id="generation-1",
+        timeout=1.0,
+    )
+    drain_finished = threading.Event()
+    drain_started = threading.Event()
+
+    def drain() -> None:
+        drain_started.set()
+        server.drain_tensor_reads(timeout=5.0)
+        drain_finished.set()
+
+    thread = threading.Thread(target=drain)
+    thread.start()
+    try:
+        assert drain_started.wait(timeout=1.0)
+        assert not drain_finished.is_set()
+        deadline = time.monotonic() + 1.0
+        while True:
+            try:
+                late_lease, _ = prepare_tensor_read(
+                    endpoint,
+                    "source-123",
+                    worker_id="generation-1",
+                    timeout=1.0,
+                )
+            except grpc.RpcError as error:
+                exc_info = error
+                break
+            late_lease.release()
+            late_lease.close()
+            if time.monotonic() >= deadline:
+                raise AssertionError("tensor source did not enter drain state")
+        assert exc_info.code() == grpc.StatusCode.UNAVAILABLE
+        with pytest.raises(grpc.RpcError) as legacy_error:
+            fetch_tensor_manifest(
+                endpoint,
+                "source-123",
+                worker_id="generation-1",
+                timeout=1.0,
+            )
+        assert legacy_error.value.code() == grpc.StatusCode.UNAVAILABLE
+
+        lease.release()
+        thread.join(timeout=2.0)
+        assert drain_finished.is_set()
+    finally:
+        lease.close()
+        server.stop(grace=None)
+
+
+def test_tensor_read_drain_timeout_restores_source_availability():
+    server = WorkerGrpcServer(
+        tensor_protos=[],
+        mx_source_id="source-123",
+        port=0,
+        worker_id="generation-1",
+    )
+    port = server.start()
+    endpoint = f"127.0.0.1:{port}"
+    lease, _ = prepare_tensor_read(
+        endpoint,
+        "source-123",
+        worker_id="generation-1",
+        timeout=1.0,
+    )
+    try:
+        with pytest.raises(TimeoutError, match="tensor readers"):
+            server.drain_tensor_reads(timeout=0.01)
+
+        next_lease, _ = prepare_tensor_read(
+            endpoint,
+            "source-123",
+            worker_id="generation-1",
+            timeout=1.0,
+        )
+        next_lease.release()
+        next_lease.close()
+    finally:
+        lease.release()
+        lease.close()
+        server.stop(grace=None)
+
+
+def test_abandoned_tensor_read_lease_expires_without_client_cleanup(monkeypatch):
+    monkeypatch.setattr(
+        "modelexpress.metadata.worker_server._tensor_read_lease_timeout_seconds",
+        lambda: 0.01,
+    )
+    servicer = WorkerServiceServicer(
+        tensor_protos=[],
+        mx_source_id="source-123",
+        worker_id="generation-1",
+    )
+    response = servicer.PrepareTensorRead(
+        p2p_pb2.PrepareTensorReadRequest(
+            mx_source_id="source-123",
+            worker_id="generation-1",
+        ),
+        MagicMock(),
+    )
+    assert response.lease_id
+
+    # Simulate a target pod disappearing without calling ReleaseTensorRead.
+    time.sleep(0.02)
+    servicer.drain_tensor_reads(timeout=0)
+
+
+def test_legacy_tensor_manifest_holds_a_bounded_read_lease():
+    servicer = WorkerServiceServicer(
+        tensor_protos=[],
+        mx_source_id="source-123",
+    )
+    servicer.GetTensorManifest(
+        p2p_pb2.GetTensorManifestRequest(mx_source_id="source-123"),
+        MagicMock(),
+    )
+    servicer.GetTensorManifest(
+        p2p_pb2.GetTensorManifestRequest(mx_source_id="source-123"),
+        MagicMock(),
+    )
+
+    with pytest.raises(TimeoutError, match="1 tensor readers"):
+        servicer.drain_tensor_reads(timeout=0)
+
+
+def test_prepare_tensor_read_requires_source_id():
+    servicer = WorkerServiceServicer(
+        tensor_protos=[],
+        mx_source_id="source-123",
+    )
+    context = MagicMock()
+    context.abort.side_effect = RuntimeError("aborted")
+
+    with pytest.raises(RuntimeError, match="aborted"):
+        servicer.PrepareTensorRead(
+            p2p_pb2.PrepareTensorReadRequest(),
+            context,
+        )
+
+    assert context.abort.call_args.args[0] == grpc.StatusCode.INVALID_ARGUMENT
 
 
 def test_fetch_tensor_manifest_rejects_stale_worker_generation():

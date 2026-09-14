@@ -233,7 +233,6 @@ def _create_resolvers(
                     worker_id=capability.source_worker_id,
                     worker_rank=capability.worker_rank,
                     build_identity=capability.build_identity,
-                    rpc_timeout_seconds=rpc_timeout_seconds,
                 )
             )
         elif source is WeightSource.TRAINER:

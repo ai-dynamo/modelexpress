@@ -143,6 +143,9 @@ def _peer_stage(monkeypatch, *, nbytes: int, wire_s: float):
         def add_remote_agent(self, metadata) -> str:
             return "peer-agent"
 
+        def fetch_remote_and_wait(self, **kwargs) -> None:
+            pass
+
         def receive_from_source(self, **kwargs):
             return nbytes, 1, wire_s
 
@@ -150,17 +153,11 @@ def _peer_stage(monkeypatch, *, nbytes: int, wire_s: float):
             pass
 
     monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
-    transfer = object.__new__(_NixlStagedTransfer)
-    transfer._closed = False
-    transfer._device = torch.device("cpu")
-    transfer._device_id = DEVICE_ID
-    transfer._timeout = 30.0
-    transfer._manager = _Manager()
-    transfer._recv_buffers = {}
-    transfer._registered_recv_params = set()
-    transfer._active = None
-    source = p2p_pb2.WorkerMetadata(
-        nixl_metadata=b"peer-metadata",
+    manifest = p2p_pb2.GetTensorManifestResponse(
+        mx_source_id="source-1",
+        worker_id="worker-1",
+        metadata_endpoint="127.0.0.1:17000",
+        agent_name="peer-agent",
         tensors=[
             p2p_pb2.TensorDescriptor(
                 name="weight",
@@ -171,8 +168,38 @@ def _peer_stage(monkeypatch, *, nbytes: int, wire_s: float):
             )
         ],
     )
+
+    class _Lease:
+        def __init__(self):
+            self.manifest = manifest
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(
+        transfer_module,
+        "prepare_tensor_read",
+        lambda *_args, **_kwargs: (_Lease(), 0),
+    )
+    transfer = object.__new__(_NixlStagedTransfer)
+    transfer._closed = False
+    transfer._device = torch.device("cpu")
+    transfer._device_id = DEVICE_ID
+    transfer._timeout = 30.0
+    transfer._manager = _Manager()
+    transfer._recv_buffers = {}
+    transfer._registered_recv_params = set()
+    transfer._active = None
+    source = p2p_pb2.WorkerMetadata(
+        worker_grpc_endpoint="127.0.0.1:18000",
+    )
     return transfer.stage_peer(
         source=source,
+        mx_source_id="source-1",
+        worker_id="worker-1",
         parameter_layout={"weight": ((4,), torch.float32)},
     )
 
