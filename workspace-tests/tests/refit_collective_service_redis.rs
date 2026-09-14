@@ -21,7 +21,7 @@ use modelexpress_common::grpc::refit::{
 use modelexpress_common::grpc::refit_collective::{
     CollectiveGroup, CollectiveGroupSpec, CollectiveGroupState, CollectiveRole, CollectiveTransfer,
     CollectiveTransferState, CreateCollectiveTransferRequest, DeleteCollectiveTransferRequest,
-    GetCollectiveGroupRequest, JoinCollectiveGroupRequest, LaneKind, LaneSpec,
+    GetCollectiveGroupRequest, JoinCollectiveGroupRequest, LaneKind, LaneSpec, PlanSource,
     PublishGroupBootstrapRequest, ReportCollectiveTransferRequest,
     refit_collective_service_client::RefitCollectiveServiceClient,
 };
@@ -98,6 +98,7 @@ async fn stop(tx: oneshot::Sender<()>, handle: JoinHandle<ServerResult>) {
 /// Lane ids are the caller's to choose. These are deliberately not 0 and 1
 /// so that anything still indexing lanes by position fails loudly.
 const RESHARD_LANE: u32 = 3;
+const DEAD_PLAN_ENDPOINT: &str = "http://plan-source.invalid:9999";
 const BROADCAST_LANE: u32 = 7;
 
 fn spec(model_name: &str, trainers: &[&str], generators: &[&str]) -> CollectiveGroupSpec {
@@ -708,6 +709,103 @@ async fn full_cohort_replacement_converges_on_one_new_epoch() {
             .lanes
             .iter()
             .all(|lane| lane.nccl_unique_id.is_empty())
+    );
+
+    stop(stop_server, server).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis at REDIS_URL"]
+async fn an_expired_plan_source_owner_does_not_leave_its_endpoint_behind() {
+    // The join path's expiry sweep removes the participant record before the
+    // replacement branch runs, so a plan source owned by the expiring worker
+    // would survive it. A replacement may omit the optional plan_source, and
+    // the group can then reach READY advertising an endpoint nobody serves.
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let port = free_port();
+    let (stop_server, server) = start_server(port, &redis_url);
+    let (mut refit, mut collective) = connect(port).await;
+
+    let model = unique_id("plan-source-expiry");
+    let group_spec = spec(&model, &["t0", "t1"], &["g0"]);
+    let dead_leader = unique_id("expiring-plan-source");
+    let other_trainer = unique_id("live-trainer");
+    let generator = unique_id("live-generator");
+    register(&mut refit, &model, &dead_leader, WorkerRole::Trainer, 1).await;
+    register(&mut refit, &model, &other_trainer, WorkerRole::Trainer, 60).await;
+    register(&mut refit, &model, &generator, WorkerRole::Generator, 60).await;
+
+    let mut leader_join = join_request(&group_spec, "t0", &dead_leader, CollectiveRole::Trainer, 0);
+    leader_join.plan_source = Some(PlanSource {
+        worker_id: dead_leader.clone(),
+        endpoint: DEAD_PLAN_ENDPOINT.to_string(),
+        digest: "plan-digest".to_string(),
+    });
+    let membership = join(&mut collective, leader_join).await;
+    join(
+        &mut collective,
+        join_request(
+            &group_spec,
+            "t1",
+            &other_trainer,
+            CollectiveRole::Trainer,
+            1,
+        ),
+    )
+    .await;
+    join(
+        &mut collective,
+        join_request(&group_spec, "g0", &generator, CollectiveRole::Generator, 0),
+    )
+    .await;
+
+    let before = collective
+        .get_collective_group(GetCollectiveGroupRequest {
+            group_id: membership.group_id.clone(),
+        })
+        .await
+        .expect("read group while the plan source is live")
+        .into_inner();
+    assert_eq!(
+        before
+            .plan_source
+            .as_ref()
+            .map(|source| source.endpoint.as_str()),
+        Some(DEAD_PLAN_ENDPOINT),
+        "the plan source must be set before this test can mean anything"
+    );
+
+    // Let the leader's registration lapse, then bring a replacement in for its
+    // slot WITHOUT a plan source. Nothing reads the group in between, so the
+    // join script's sweep is what evicts the dead worker.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    let replacement = unique_id("replacement-trainer");
+    register(&mut refit, &model, &replacement, WorkerRole::Trainer, 60).await;
+    join(
+        &mut collective,
+        join_request(&group_spec, "t0", &replacement, CollectiveRole::Trainer, 0),
+    )
+    .await;
+
+    let after = collective
+        .get_collective_group(GetCollectiveGroupRequest {
+            group_id: membership.group_id,
+        })
+        .await
+        .expect("read group after the plan source owner expired")
+        .into_inner();
+    let stale = after
+        .plan_source
+        .as_ref()
+        .map(|source| (source.worker_id.as_str(), source.endpoint.as_str()));
+    assert!(
+        !matches!(stale, Some((_, DEAD_PLAN_ENDPOINT))),
+        "the group still advertises the expired worker's plan source: {stale:?}"
+    );
+    assert!(
+        !matches!(stale, Some((worker, _)) if worker == dead_leader),
+        "the group still names the expired worker as plan source: {stale:?}"
     );
 
     stop(stop_server, server).await;

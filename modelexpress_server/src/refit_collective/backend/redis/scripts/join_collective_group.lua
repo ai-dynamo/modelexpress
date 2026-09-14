@@ -15,12 +15,12 @@
 -- ARGV[7]:  role (TRAINER or GENERATOR)
 -- ARGV[8]:  index_in_role
 -- ARGV[9]:  plan_digest
--- ARGV[9]: plan_source_worker_id ('' when this worker does not serve it)
--- ARGV[10]: plan_source_endpoint
--- ARGV[11]: plan_source_digest
--- ARGV[12]: expected_trainer_slots, newline separated
--- ARGV[13]: expected_generator_slots, newline separated
--- ARGV[14]: created_at_unix_ms
+-- ARGV[10]: plan_source_worker_id ('' when this worker does not serve it)
+-- ARGV[11]: plan_source_endpoint
+-- ARGV[12]: plan_source_digest
+-- ARGV[13]: expected_trainer_slots, newline separated
+-- ARGV[14]: expected_generator_slots, newline separated
+-- ARGV[15]: created_at_unix_ms
 
 local function contains_slot(list, target)
   for slot in string.gmatch(list .. '\n', '([^\n]*)\n') do
@@ -123,6 +123,17 @@ else
     if not worker_id or not registration_matches(worker_id, role, ARGV[2]) then
       redis.call('HDEL', KEYS[2], slot_id)
       redis.call('HDEL', KEYS[3], slot_id)
+      -- Same clearing the replacement path below does. Without it an expired
+      -- plan-source owner leaves its endpoint and digest on the group, and a
+      -- replacement that omits the optional plan_source lets the group reach
+      -- READY advertising a dead one.
+      if worker_id
+          and redis.call('HGET', KEYS[1], 'plan_source_worker_id') == worker_id then
+        redis.call('HSET', KEYS[1],
+          'plan_source_worker_id', '',
+          'plan_source_endpoint', '',
+          'plan_source_digest', '')
+      end
       if membership_change_requires_bump then
         changed = true
       end

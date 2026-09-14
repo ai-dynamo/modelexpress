@@ -52,8 +52,10 @@ fn lane_key(group_id: &str, lane_id: u32) -> String {
     format!("mx:refitc:group:{group_id}:lane:{lane_id}")
 }
 
+const OPERATION_KEY_PREFIX: &str = "mx:refitc:op:";
+
 fn operation_key(operation_id: &str) -> String {
-    format!("mx:refitc:op:{operation_id}")
+    format!("{OPERATION_KEY_PREFIX}{operation_id}")
 }
 
 fn reported_key(operation_id: &str) -> String {
@@ -84,10 +86,17 @@ fn group_id_for(spec: &CollectiveGroupSpec) -> String {
     trainers.sort();
     generators.sort();
 
+    // Lane order is normalized for the same reason the slot lists are: two
+    // participants declaring the same membership in a different vector order
+    // would otherwise resolve two groups, each stuck below its expected count.
+    // Slot order WITHIN a lane stays significant - it is the rank assignment.
+    let mut lanes: Vec<&_> = spec.lanes.iter().collect();
+    lanes.sort_by_key(|lane| (lane.lane_id, lane.kind));
+
     let mut hasher = Sha256::new();
     hasher.update(spec.model_name.as_bytes());
     hasher.update([0]);
-    for lane in &spec.lanes {
+    for lane in lanes {
         hasher.update(lane.lane_id.to_le_bytes());
         hasher.update(lane.kind.to_le_bytes());
         for slot in lane.trainer_slots.iter().chain(lane.generator_slots.iter()) {
@@ -828,6 +837,7 @@ impl CollectiveBackend for RedisCollectiveBackend {
             .arg(&request.idempotency_key)
             .arg("PENDING")
             .arg(now_unix_ms()?)
+            .arg(OPERATION_KEY_PREFIX)
             .invoke_async(&mut self.connection.clone())
             .await
             .map_err(redis_error)?;
@@ -1036,6 +1046,18 @@ mod tests {
             lane.trainer_slots.reverse();
         }
         assert_ne!(group_id_for(&a), group_id_for(&b));
+    }
+
+    #[test]
+    fn group_id_is_stable_under_lane_declaration_order() {
+        // The lane VECTOR's order is not membership either. Two participants
+        // that list the same lanes in a different order must resolve one
+        // group; resolving two would leave each below its expected count and
+        // report that as a missing-slot timeout.
+        let a = spec("m", &["t0", "t1"], &["g0"], 2);
+        let mut b = spec("m", &["t0", "t1"], &["g0"], 2);
+        b.lanes.reverse();
+        assert_eq!(group_id_for(&a), group_id_for(&b));
     }
 
     #[test]

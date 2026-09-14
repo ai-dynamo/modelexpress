@@ -4,7 +4,7 @@
 -- KEYS[2]: create-request idempotency key
 -- KEYS[3]: group hash
 -- ARGV: operation_id, group_id, version_id, model_name, idempotency_key,
---       state, created_at_unix_ms
+--       state, created_at_unix_ms, operation_key_prefix
 --
 -- Returns:
 --   CREATED
@@ -18,7 +18,7 @@
 
 local existing = redis.call('GET', KEYS[2])
 if existing then
-  if redis.call('EXISTS', 'mx:refitc:op:' .. existing) == 1 then
+  if redis.call('EXISTS', ARGV[8] .. existing) == 1 then
     return 'EXISTING:' .. existing
   end
   -- Recover an orphaned reservation left by partial/manual metadata cleanup.
