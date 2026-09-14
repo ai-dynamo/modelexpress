@@ -397,11 +397,6 @@ def _broadcast(lane: LaneCommunicator, buf: Any, *, root: int) -> None:
         )
 
 
-def misc_chunk_size() -> int:
-    """Bytes per packed-broadcast chunk."""
-    return envs.MX_NCCL_REFIT_MISC_CHUNK_BYTES
-
-
 def transfer_timeout() -> float:
     """Deadline for one version's transfer, in seconds."""
     return envs.MX_NCCL_REFIT_TRANSFER_TIMEOUT_S
@@ -412,5 +407,4 @@ __all__ = [
     "NcclM2nReceiver",
     "NcclM2nSender",
     "RefitCtx",
-    "misc_chunk_size",
 ]

@@ -23,7 +23,6 @@ if TYPE_CHECKING:
     MX_NCCL_REFIT_POLL_INTERVAL_S: float
     MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S: float
     MX_NCCL_REFIT_TRANSFER_TIMEOUT_S: float
-    MX_NCCL_REFIT_MISC_CHUNK_BYTES: int
     MX_NCCL_REFIT_REGISTRATION_TTL_S: int
 
 
@@ -56,9 +55,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "MX_NCCL_REFIT_TRANSFER_TIMEOUT_S": lambda: _float(
         "MX_NCCL_REFIT_TRANSFER_TIMEOUT_S", 600.0
-    ),
-    "MX_NCCL_REFIT_MISC_CHUNK_BYTES": lambda: _int(
-        "MX_NCCL_REFIT_MISC_CHUNK_BYTES", 268435456
     ),
     "MX_NCCL_REFIT_REGISTRATION_TTL_S": lambda: _int(
         "MX_NCCL_REFIT_REGISTRATION_TTL_S",

@@ -190,8 +190,15 @@ two different spans:
 
 | Lane kind | Count | Span | Carries |
 |---|---|---|---|
-| `LANE_KIND_RESHARD` | `trainer_pp_size` | PP stage `s`'s trainer ranks + all admitted generator ranks | `nccl.m2n.reshard` bulk params |
-| `LANE_KIND_BROADCAST` | 1 | All admitted trainer + generator ranks | Packed misc-param broadcast |
+| `LANE_KIND_RESHARD` | caller's choice, typically one per PP stage | the trainer slots that stage declares + all admitted generator ranks | `nccl.m2n.reshard` bulk params |
+| `LANE_KIND_BROADCAST` | at most 1 | All admitted trainer + generator ranks | Packed misc-param broadcast |
+
+The lane set is **declared by the caller**, not derived by MX. The client sends
+each lane's membership in rank order and MX validates it structurally - unique
+lane ids, slots that exist, no slot twice on one lane, no expected slot left off
+every lane, at most one broadcast lane, and a trainer slot in every lane. It
+does not compute a lane count from `trainer_pp_size` and has no knowledge of
+the parallelism that produced the split.
 
 This is NeMo RL's `pp_comm_group` / `model_update_group` split, promoted from two
 ad-hoc `StatelessProcessGroup`s into one MX-brokered resource. Keeping the bulk
@@ -201,25 +208,24 @@ overlapping communicators can deadlock.
 
 ### 5.3 Rank assignment
 
-MX assigns `rank_in_lane`. The rule reproduces NeMo RL's convention exactly, so
-the mesh arithmetic in §6 is unchanged:
+`rank_in_lane` is the slot's **position in the lane the caller declared**:
+trainer slots in the order given, then generator slots in the order given.
 
 ```text
-reshard lane s     world_size = trainer_ranks_per_stage + admitted_generator_count
-  trainer  index_in_role r  ->  rank_in_lane = r % trainer_ranks_per_stage
-  generator index_in_role g ->  rank_in_lane = trainer_ranks_per_stage + g
-
-broadcast lane     world_size = trainer_world_size + admitted_generator_count
-  trainer  index_in_role r  ->  rank_in_lane = r
-  generator index_in_role g ->  rank_in_lane = trainer_world_size + g
+lane     world_size = len(trainer_slots) + len(generator_slots)
+  trainer  at declared position i   ->  rank_in_lane = i
+  generator at declared position g  ->  rank_in_lane = len(trainer_slots) + g
 ```
 
-MX needs no knowledge of TP/EP/DP to do this — only the role, the lane, and the
-index within the role. All parallelism semantics stay client-side (§6). That is
-the whole point of keeping MX a rendezvous rather than a planner on this path.
+So the caller reproduces whatever convention it wants - for NeMo RL, one
+reshard lane per PP stage carrying that stage's trainer ranks - by choosing the
+order it declares. MX needs no knowledge of TP/EP/DP to assign a rank, and all
+parallelism semantics stay client-side (§6). That is the whole point of keeping
+MX a rendezvous rather than a planner on this path.
 
-`rank_in_lane == 0` of each lane is always a trainer, and that participant
-generates and posts the lane's `ncclUniqueId`.
+`rank_in_lane == 0` of each lane is always a trainer, because MX rejects a lane
+that declares no trainer slot. That participant generates and posts the lane's
+`ncclUniqueId`.
 
 ### 5.4 States
 
@@ -424,7 +430,6 @@ is exactly what the fused-parameter path already does.
 | `MX_NCCL_REFIT_NUM_STREAMS` | `2` | CUDA streams for overlapping per-PP-stage reshard lanes |
 | `MX_NCCL_REFIT_GROUP_TIMEOUT_S` | `600` | Deadline for `FORMING -> READY` |
 | `MX_NCCL_REFIT_POLL_INTERVAL_S` | `0.25` | `GetCollectiveGroup` poll backoff floor |
-| `MX_NCCL_REFIT_MISC_CHUNK_BYTES` | `268435456` | Packed misc-broadcast chunk size |
 | `MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S` | `300` | Deadline for one lane's non-blocking `Communicator.init` |
 | `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` | `600` | Deadline for the transfer, i.e. `RUNNING -> ABORTED` above |
 | `MX_NCCL_REFIT_REGISTRATION_TTL_S` | `3 x MX_HEARTBEAT_INTERVAL_SECS` | Participant registration lifetime without a heartbeat |
@@ -445,7 +450,10 @@ from nccl.core.communicator import Communicator       # Communicator.init(nranks
 from nccl.m2n import reshard                          # the M-to-N collective
 ```
 
-It is an **optional extra** (`modelexpress[nccl-m2n]`). Importing
+`nccl.m2n` ships as the separate `nccl-extensions` distribution rather than as
+part of `nccl4py`, under the same `nccl` namespace: install
+`nccl-extensions[cu12]` or `nccl-extensions[cu13]` to match the host CUDA
+toolkit. Reshard needs NCCL 2.30.7 or newer. Importing
 `modelexpress_rl.collective` without it raises at `initialize()` with an
 actionable message; the torch-free plan and rendezvous modules import and test
 cleanly without NCCL, CUDA, or torch.
