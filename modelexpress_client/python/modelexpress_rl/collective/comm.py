@@ -169,7 +169,8 @@ class LaneCommunicator:
             if stream is None:
                 torch.cuda.current_stream().synchronize()
             else:
-                torch.cuda.ExternalStream(int(stream)).synchronize()
+                handle = getattr(stream, "cuda_stream", stream)
+                torch.cuda.ExternalStream(int(handle)).synchronize()
 
     def _synchronize_bounded(self, timeout_s: float) -> bool:
         """Poll a CUDA event until this lane's work lands or the deadline passes.

@@ -65,10 +65,7 @@ class Placement:
         torch is imported here rather than at module scope so the plan
         contract stays importable, and testable, without it.
         """
-        from torch.distributed.tensor.placement_types import (  # noqa: PLC0415
-            Replicate,
-            Shard,
-        )
+        from torch.distributed.tensor import Replicate, Shard  # noqa: PLC0415
 
         return Replicate() if self.kind is PlacementKind.REPLICATE else Shard(self.dim)
 

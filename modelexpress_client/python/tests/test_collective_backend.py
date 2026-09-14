@@ -697,6 +697,38 @@ class TestBoundedSynchronizeFallback:
         live = lane(recorder, "lane0")
         assert live._synchronize_bounded(5.0) is False
 
+    def test_the_fallback_accepts_a_stream_that_only_carries_a_raw_handle(
+        self, recorder, monkeypatch
+    ):
+        """The unbounded path must take the same shapes the bounded one does.
+
+        _synchronize_bounded and backend._stream_handle both read
+        ``cuda_stream`` off the object. int() on the object itself raises
+        TypeError, and this path is reachable whenever timeout_s is None.
+        """
+        import torch
+
+        synced = []
+
+        class FakeExternalStream:
+            def __init__(self, handle):
+                self.handle = handle
+
+            def synchronize(self):
+                synced.append(self.handle)
+
+        monkeypatch.setattr(torch.cuda, "ExternalStream", FakeExternalStream)
+
+        class HandleOnlyStream:
+            """A raw-handle carrier with no synchronize of its own."""
+
+            cuda_stream = 4242
+
+        live = lane(recorder, "lane0", stream=HandleOnlyStream())
+        live.synchronize()
+
+        assert synced == [4242]
+
     def test_the_fallback_still_waits(self, recorder):
         live = lane(recorder, "lane0")
         live.synchronize(timeout_s=5.0)
