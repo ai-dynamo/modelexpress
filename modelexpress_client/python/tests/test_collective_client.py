@@ -413,6 +413,104 @@ class TestCommunicatorBootstrap:
             )
 
 
+class TestBootstrapBarrier:
+    """The barrier between lane initializations runs after READY.
+
+    Everything past READY carries a deadline. This one is the odd case: it is
+    not inside Communicator.init, so COMM_INIT_TIMEOUT does not reach it on
+    its own, and the transfer deadline does not arm until bootstrap is done.
+    """
+
+    def _lane(self, waits):
+        class FakeHandle:
+            def broadcast(self, **kwargs):
+                pass
+
+        return SimpleNamespace(
+            handle=FakeHandle(),
+            stream=None,
+            synchronize=lambda timeout_s=None: waits.append(timeout_s),
+        )
+
+    def test_the_barrier_wait_is_bounded(self, monkeypatch):
+        waits = []
+        torch = ModuleType("torch")
+        torch.uint8 = "uint8"
+        torch.zeros = lambda *a, **kw: object()
+        torch.cuda = SimpleNamespace(device=lambda d: nullcontext())
+        monkeypatch.setitem(sys.modules, "torch", torch)
+
+        collective_client._bootstrap_barrier(self._lane(waits), None)
+
+        assert waits and waits[0] is not None, (
+            "an unbounded barrier blocks forever if a peer dies after READY"
+        )
+        assert waits[0] > 0
+
+    def test_an_explicit_deadline_wins(self, monkeypatch):
+        waits = []
+        torch = ModuleType("torch")
+        torch.uint8 = "uint8"
+        torch.zeros = lambda *a, **kw: object()
+        torch.cuda = SimpleNamespace(device=lambda d: nullcontext())
+        monkeypatch.setitem(sys.modules, "torch", torch)
+
+        collective_client._bootstrap_barrier(self._lane(waits), None, timeout_s=1.5)
+
+        assert waits == [1.5]
+
+
+class TestLaneDeclaration:
+    def test_a_trainer_count_the_partition_count_does_not_divide_is_refused(self):
+        # Floor division would silently leave the last trainers off every
+        # reshard lane. Their parameters never move and the peers expecting
+        # their ranks block, which is the failure mode with no error in it.
+        client = RefitClientTrainer(
+            rendezvous=FakeRendezvous(),
+            model_name="m",
+            trainer_slots=["t0", "t1", "t2", "t3", "t4"],
+            generator_slots=["g0"],
+            source_partition_count=2,
+            slot_id="t0",
+            worker_id="w0",
+            index_in_role=0,
+        )
+        with pytest.raises(ValueError, match="must divide the trainer slot count"):
+            client._declared_lanes()
+
+    def test_more_partitions_than_trainers_is_refused(self):
+        client = RefitClientTrainer(
+            rendezvous=FakeRendezvous(),
+            model_name="m",
+            trainer_slots=["t0", "t1"],
+            generator_slots=["g0"],
+            source_partition_count=4,
+            slot_id="t0",
+            worker_id="w0",
+            index_in_role=0,
+        )
+        with pytest.raises(ValueError, match="must divide the trainer slot count"):
+            client._declared_lanes()
+
+    def test_a_split_that_divides_is_unchanged(self):
+        client = RefitClientTrainer(
+            rendezvous=FakeRendezvous(),
+            model_name="m",
+            trainer_slots=["t0", "t1", "t2", "t3"],
+            generator_slots=["g0"],
+            source_partition_count=2,
+            slot_id="t0",
+            worker_id="w0",
+            index_in_role=0,
+        )
+        lanes = client._declared_lanes()
+        assert [lane.trainer_slots for lane in lanes] == [
+            ("t0", "t1"),
+            ("t2", "t3"),
+            ("t0", "t1", "t2", "t3"),
+        ]
+
+
 class TestEpochInvalidation:
     def test_a_second_compute_plan_at_a_new_epoch_rebuilds_the_lanes(self, fake_nccl):
         rz = FakeRendezvous(epochs=(1, 2))

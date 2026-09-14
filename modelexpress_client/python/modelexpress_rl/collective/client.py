@@ -38,8 +38,18 @@ from .types import ReshardPlan, Role
 logger = logging.getLogger("modelexpress_rl.collective.client")
 
 
-def _bootstrap_barrier(lane: LaneCommunicator, device: Any) -> None:
-    """Full-group barrier used between overlapping communicator initializations."""
+def _bootstrap_barrier(
+    lane: LaneCommunicator, device: Any, *, timeout_s: float | None = None
+) -> None:
+    """Full-group barrier used between overlapping communicator initializations.
+
+    Bounded like every other wait past READY. This barrier runs after each
+    lane comes up, so a peer that dies between READY and here would otherwise
+    block this rank forever: ``MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S`` bounds
+    ``Communicator.init`` only, and the transfer deadline does not arm until
+    bootstrap is done. The caller's ``except BaseException`` aborts the group,
+    so a timeout raised here tears it down and forces a fresh epoch.
+    """
     import torch
 
     device_context = torch.cuda.device(device) if device is not None else nullcontext()
@@ -57,7 +67,11 @@ def _bootstrap_barrier(lane: LaneCommunicator, device: Any) -> None:
             root=0,
             stream=stream_arg,
         )
-        lane.synchronize()
+        lane.synchronize(
+            timeout_s=envs.MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S
+            if timeout_s is None
+            else timeout_s
+        )
 
 
 class _RefitClientBase:
@@ -178,6 +192,12 @@ class _RefitClientBase:
         The split lives here and is never sent as a partition count: MX is
         handed the resulting membership and nothing about what produced it.
         """
+        if len(self._trainer_slots) % self._source_partition_count:
+            raise ValueError(
+                "source_partition_count must divide the trainer slot count: "
+                f"{len(self._trainer_slots)} trainer slots, "
+                f"{self._source_partition_count} source partitions"
+            )
         per_lane = len(self._trainer_slots) // self._source_partition_count
         lanes = [
             LaneDeclaration(
