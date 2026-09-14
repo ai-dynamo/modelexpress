@@ -278,6 +278,41 @@ class TestJoin:
         assert stub.joined == []
         assert stub.registered == []
 
+    def test_an_ordinal_that_contradicts_the_declared_slot_order_is_rejected(self):
+        # index_in_role IS the slot's position in its role list - the server
+        # rejects two slots claiming one ordinal, but a single slot sending
+        # the wrong one is admitted, and the plan-source guard below trusts
+        # it. Catch it where the caller can still see which value was wrong.
+        stub = FakeStub(membership=membership())
+        with pytest.raises(ValueError, match="does not match the declared position"):
+            make_rendezvous(stub).join(
+                model_name="m",
+                trainer_slots=["t0", "t1"],
+                generator_slots=["g0"],
+                lanes=lanes_for(["t0", "t1"], ["g0"]),
+                slot_id="t1",
+                worker_id="w1",
+                role=Role.TRAINER,
+                index_in_role=0,
+                plan_digest="d",
+            )
+        assert stub.events == [], "nothing may reach the server on a bad ordinal"
+
+    def test_a_generator_ordinal_is_checked_against_its_own_role_list(self):
+        stub = FakeStub(membership=membership())
+        with pytest.raises(ValueError, match="does not match the declared position"):
+            make_rendezvous(stub).join(
+                model_name="m",
+                trainer_slots=["t0"],
+                generator_slots=["g0", "g1"],
+                lanes=lanes_for(["t0"], ["g0", "g1"]),
+                slot_id="g0",
+                worker_id="w0",
+                role=Role.GENERATOR,
+                index_in_role=1,
+                plan_digest="d",
+            )
+
     def test_one_rendezvous_cannot_register_two_worker_identities(self):
         stub = FakeStub(
             membership=membership(
@@ -446,6 +481,105 @@ class TestAwaitReady:
         participant.slot_id = "rank0"
         participant.role = pb.COLLECTIVE_ROLE_TRAINER
         assert rz._missing_slots(g) == ["generator slot rank0"]
+
+
+class _FlakyStub(FakeStub):
+    """Fails the first `failures` polls with `error`, then behaves."""
+
+    def __init__(self, *, error, failures, groups):
+        super().__init__(groups=groups)
+        self._error = error
+        self._failures = failures
+
+    def GetCollectiveGroup(self, request, timeout=None):  # noqa: N802
+        self.get_calls += 1
+        self.get_timeouts.append(timeout)
+        if self.get_calls <= self._failures:
+            raise self._error
+        return self._groups[min(self.get_calls - 1, len(self._groups) - 1)]
+
+
+def _rpc_error(status):
+    class _Error(grpc.RpcError):
+        def code(self):
+            return status
+
+    return _Error()
+
+
+class TestAwaitReadyRetries:
+    """A poll failure is not a verdict on whether the group will form.
+
+    Each poll is bounded by rpc_timeout_s, which is much shorter than the
+    group timeout, so failing the whole rendezvous on one slow or restarted
+    control-plane call throws away most of the deadline the caller asked for.
+    """
+
+    def test_a_slow_poll_does_not_end_a_wait_that_has_time_left(self):
+        stub = _FlakyStub(
+            error=_rpc_error(grpc.StatusCode.DEADLINE_EXCEEDED),
+            failures=2,
+            groups=[group(state=pb.COLLECTIVE_GROUP_STATE_READY)],
+        )
+        result = make_rendezvous(stub).await_ready(
+            group_id="g1", epoch=1, timeout_s=5, poll_interval_s=0.001
+        )
+        assert result.state == pb.COLLECTIVE_GROUP_STATE_READY
+        assert stub.get_calls == 3
+
+    def test_a_control_plane_restart_does_not_end_it_either(self):
+        stub = _FlakyStub(
+            error=_rpc_error(grpc.StatusCode.UNAVAILABLE),
+            failures=1,
+            groups=[group(state=pb.COLLECTIVE_GROUP_STATE_READY)],
+        )
+        result = make_rendezvous(stub).await_ready(
+            group_id="g1", epoch=1, timeout_s=5, poll_interval_s=0.001
+        )
+        assert result.state == pb.COLLECTIVE_GROUP_STATE_READY
+
+    def test_a_non_retryable_code_still_fails_at_once(self):
+        # The retry must not swallow a real refusal and sit there until the
+        # group deadline reporting missing slots instead of the cause.
+        stub = FakeStub(get_error=_rpc_error(grpc.StatusCode.PERMISSION_DENIED))
+        with pytest.raises(grpc.RpcError):
+            make_rendezvous(stub).await_ready(
+                group_id="g1", epoch=1, timeout_s=5, poll_interval_s=0.001
+            )
+        assert stub.get_calls == 1
+
+    def test_a_retryable_code_past_the_deadline_names_the_missing_slots(self):
+        stub = FakeStub(get_error=_rpc_error(grpc.StatusCode.UNAVAILABLE))
+        with pytest.raises(GroupNotReadyError):
+            make_rendezvous(stub).await_ready(
+                group_id="g1", epoch=1, timeout_s=0.05, poll_interval_s=0.001
+            )
+
+
+class TestRegistrationRenewal:
+    def test_the_loop_outlives_a_failure_that_is_not_an_rpc_error(self):
+        # grpcio raises ValueError on a closed channel in several versions.
+        # Letting that escape ends the thread while _registration_thread stays
+        # set, so nothing restarts it and the lease expires with no error
+        # naming the cause.
+        client = make_rendezvous(FakeStub())
+        client._registration = object()
+        client._registration_ttl_s = 0.003
+        attempts = []
+
+        def register(_registration):
+            attempts.append(len(attempts))
+            if len(attempts) == 1:
+                raise ValueError("channel closed")
+            if len(attempts) >= 3:
+                client._registration_stop.set()
+
+        client._register_worker = register
+        client._renew_worker_registration()
+
+        assert len(attempts) >= 3, (
+            "the renewal loop stopped at the first non-RpcError failure"
+        )
 
 
 class _RejectingPublishStub(FakeStub):

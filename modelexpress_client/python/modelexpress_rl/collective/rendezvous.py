@@ -17,6 +17,7 @@ only the backend that owns the communicator interprets it.
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 import time
@@ -30,6 +31,17 @@ from .. import refit_collective_pb2_grpc as pb_grpc
 from .. import refit_pb2, refit_pb2_grpc
 from . import envs
 from .types import Role
+
+logger = logging.getLogger("modelexpress_rl.collective.rendezvous")
+
+#: Poll failures that say nothing about whether the group will become READY,
+#: so they are retried until the group deadline rather than failing the wait.
+_RETRYABLE_POLL_CODES = frozenset(
+    {
+        grpc.StatusCode.DEADLINE_EXCEEDED,
+        grpc.StatusCode.UNAVAILABLE,
+    }
+)
 
 _ROLE_TO_PROTO = {
     Role.TRAINER: pb.COLLECTIVE_ROLE_TRAINER,
@@ -329,10 +341,19 @@ class CollectiveRendezvous:
                 continue
             try:
                 self._register_worker(registration)
-            except grpc.RpcError:
+            except Exception:  # noqa: BLE001 - the renewal loop must outlive any one failure
                 # A later renewal retries after a transient control-plane error.
                 # If failures persist, the server lets the lease expire and
                 # moves the collective out of READY.
+                #
+                # Not narrowed to grpc.RpcError: anything else escaping here
+                # ends the thread while _registration_thread stays set, so no
+                # replacement ever starts and the lease expires with nothing
+                # naming the cause. An RPC on a closed channel raises
+                # ValueError on several grpcio versions.
+                logger.warning(
+                    "collective worker registration renewal failed", exc_info=True
+                )
                 continue
 
     def close(self) -> None:
@@ -391,6 +412,11 @@ class CollectiveRendezvous:
         role_slots = trainer_slots if role is Role.TRAINER else generator_slots
         if slot_id not in role_slots:
             raise ValueError(f"slot_id {slot_id!r} is not declared for role {role.value}")
+        if index_in_role != role_slots.index(slot_id):
+            raise ValueError(
+                f"index_in_role {index_in_role} does not match the declared position "
+                f"of slot {slot_id!r} in role {role.value}"
+            )
         expected_assignments, expected_leader = _expected_assignments(
             lanes=lanes,
             slot_id=slot_id,
@@ -549,16 +575,23 @@ class CollectiveRendezvous:
                     timeout=min(self._rpc_timeout_s, remaining),
                 )
             except grpc.RpcError as error:
-                if (
-                    error.code() is grpc.StatusCode.DEADLINE_EXCEEDED
-                    and time.monotonic() >= deadline
-                ):
+                # The per-RPC timeout is much shorter than the group timeout,
+                # so one slow GetCollectiveGroup - or a control-plane restart
+                # answering UNAVAILABLE - must not fail a rendezvous that has
+                # most of its deadline left. Same posture as the registration
+                # renewal above.
+                if error.code() not in _RETRYABLE_POLL_CODES:
+                    raise
+                if time.monotonic() >= deadline:
                     raise GroupNotReadyError(
                         group_id,
                         _missing_slots(group) if group is not None else [],
                         timeout_s,
                     ) from error
-                raise
+                time.sleep(
+                    max(0.0, min(poll_interval_s, deadline - time.monotonic()))
+                )
+                continue
             if group.epoch != epoch:
                 raise EpochChangedError(group_id, epoch, group.epoch)
             if group.state == pb.COLLECTIVE_GROUP_STATE_READY:
