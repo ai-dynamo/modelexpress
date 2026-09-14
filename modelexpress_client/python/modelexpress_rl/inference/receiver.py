@@ -527,6 +527,21 @@ class _LocalCheckpoint:
             checkpoint_paths=self.checkpoint_paths,
         )
 
+    def recover_incomplete_preparation(self) -> None:
+        """Restore a usable cache head after an in-process replay failure."""
+        with self.store.installation_locked(), self.store.locked():
+            state = self.store.state()
+            if state is None or state.status is CheckpointState.READY:
+                return
+            self.local_checkpoint = self.store.full_path(self.initial_version)
+            self._restore_cached_initial_checkpoint()
+            self.store.enforce_capacity(
+                protected_versions=_protected_versions(
+                    self.store,
+                    self.initial_version,
+                ),
+            )
+
     def _set_local_checkpoint(self, path: Path) -> None:
         self.local_checkpoint = path
         (
@@ -814,26 +829,28 @@ class _LocalCheckpoint:
     ) -> tuple[float, float]:
         target = self.store.full_path(version.version_id)
         if target.exists():
-            self.store.enforce_capacity(
-                protected_versions=_protected_versions(
-                    self.store,
+            source = self.store.artifact_source(target)
+            if source is not None:
+                self.store.enforce_capacity(
+                    protected_versions=_protected_versions(
+                        self.store,
+                        version.version_id,
+                    ),
+                )
+                self.store.verify_artifact_source(
+                    target,
+                    _source_identity(version),
+                )
+                self._set_local_checkpoint(target)
+                self.store.write_chain(
                     version.version_id,
-                ),
-            )
-            self.store.verify_artifact_source(
-                target,
-                _source_identity(version),
-            )
-            self._set_local_checkpoint(target)
-            self.store.write_chain(
-                version.version_id,
-                {
-                    "version": version.version_id,
-                    "full_version": version.version_id,
-                    "deltas": [],
-                },
-            )
-            return 0.0, 0.0
+                    {
+                        "version": version.version_id,
+                        "full_version": version.version_id,
+                        "deltas": [],
+                    },
+                )
+                return 0.0, 0.0
 
         protected_versions = _protected_versions(self.store, version.version_id)
         self.store.ensure_capacity(

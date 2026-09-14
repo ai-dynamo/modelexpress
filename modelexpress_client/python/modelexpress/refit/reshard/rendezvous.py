@@ -34,6 +34,7 @@ copy is byte-for-byte, so source and dest dtypes must agree).
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import time
@@ -115,21 +116,28 @@ def _encode_shard(shard) -> dict:
     return encoded
 
 
+def _encode_tensor_entries(tensors: list) -> list[dict]:
+    """Encode published tensors, shared by the shard table and the blob wrapper.
+
+    The wrapper used to build the shard table and immediately parse it back to
+    reach these entries, paying a serialize and a parse of the whole table to
+    get at a value it could construct directly.
+    """
+    return [
+        {
+            "name": tensor.name,
+            "dtype": tensor.dtype,
+            "elsize": tensor.elsize,
+            "full_shape": list(tensor.full_shape),
+            "shards": [_encode_shard(shard) for shard in tensor.shards],
+        }
+        for tensor in tensors
+    ]
+
+
 def encode_shard_table(tensors: list) -> bytes:
     """Serialize published tensors + shards to a JSON blob."""
-    payload = {
-        "schema": _SCHEMA,
-        "tensors": [
-            {
-                "name": t.name,
-                "dtype": t.dtype,
-                "elsize": t.elsize,
-                "full_shape": list(t.full_shape),
-                "shards": [_encode_shard(s) for s in t.shards],
-            }
-            for t in tensors
-        ],
-    }
+    payload = {"schema": _SCHEMA, "tensors": _encode_tensor_entries(tensors)}
     return json.dumps(payload).encode("utf-8")
 
 
@@ -303,11 +311,44 @@ def wrap_rendezvous_blob(
         "agent_name": agent_name,
         "metadata_endpoint": metadata_endpoint,
         "agent_meta_b64": base64.b64encode(agent_metadata).decode("ascii"),
-        "tensors": json.loads(encode_shard_table(tensors).decode("utf-8"))["tensors"],
+        "tensors": _encode_tensor_entries(tensors),
     }
     if publisher_step is not None:
         payload["publisher_step"] = int(publisher_step)
     return json.dumps(payload).encode("utf-8")
+
+
+def structural_manifest_digest(blob: bytes) -> str:
+    """Hash transfer structure while excluding version-specific content digests.
+
+    Falls back to hashing the raw bytes for anything this cannot read as a
+    rendezvous payload, and says so, because the fallback is not equivalent: a
+    raw-byte digest moves with the per-shard content digests, so every version
+    looks structurally different and plan reuse turns itself off. That is a
+    safe direction to fail in -- a replan is correct, just slower -- but it is
+    not one to fail in quietly, since the symptom is a warm refit that stays as
+    expensive as a cold one for no visible reason.
+    """
+    try:
+        payload = json.loads(blob.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        logger.warning(
+            "rendezvous manifest is not a decodable JSON blob; falling back to a "
+            "content-sensitive digest, which disables transfer-plan reuse"
+        )
+        return hashlib.sha256(blob).hexdigest()
+    if not isinstance(payload, dict):
+        logger.warning(
+            "rendezvous manifest did not decode to an object; falling back to a "
+            "content-sensitive digest, which disables transfer-plan reuse"
+        )
+        return hashlib.sha256(blob).hexdigest()
+    payload.pop("publisher_step", None)
+    for tensor in payload.get("tensors", ()):
+        for shard in tensor.get("shards", ()):
+            shard.pop("digest", None)
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class RendezvousPayload(NamedTuple):

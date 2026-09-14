@@ -20,10 +20,7 @@ from typing import Any
 import torch
 
 from modelexpress import envs, p2p_pb2
-from modelexpress.client import MxClientBase
-from modelexpress.load_strategy.base import unpublish_metadata_for_worker
 from modelexpress.metadata.payload import worker_tensor_descriptors
-from modelexpress.metadata.publish import publish_metadata_and_ready
 from modelexpress.nixl_transfer import NixlTransferManager
 from modelexpress.refit.reshard import throughput
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
@@ -123,6 +120,30 @@ def _required_agent_metadata(
         for agent, metadata in resolved.agent_metadata.items()
         if agent in needed
     }
+
+
+def _source_structure(source) -> tuple:
+    """Reduce a source to the fields a reused transfer plan has baked in.
+
+    Deliberately excludes the per-shard content digests, which are exactly what
+    a refresh replaces, and includes the addresses, which a plan holds and must
+    never be allowed to drift underneath.
+    """
+    return (
+        source.dtype,
+        tuple(source.global_shape),
+        source.elsize,
+        tuple(
+            (
+                shard.session,
+                shard.addr,
+                shard.elsize,
+                tuple(shard.shard_offset),
+                tuple(shard.shape),
+            )
+            for shard in source.shards
+        ),
+    )
 
 
 def _load_agent_metadata(
@@ -255,25 +276,32 @@ class _NixlStagedTransfer:
     def __init__(
         self,
         *,
-        agent_name: str,
         device_id: int,
         device: torch.device,
-        listen_port: int,
+        agent_name: str | None = None,
+        listen_port: int | None = None,
         timeout_seconds: float = 1200.0,
+        manager: NixlTransferManager | None = None,
     ) -> None:
         self._device_id = device_id
         self._device = device
         self._timeout = timeout_seconds
-        self._manager = NixlTransferManager(
-            agent_name=agent_name,
-            device_id=device_id,
-            listen_port=listen_port,
-        )
-        try:
-            self._manager.initialize()
-        except Exception:
-            self._manager.shutdown()
-            raise
+        self._owns_manager = manager is None
+        if manager is None:
+            if agent_name is None:
+                raise ValueError("an owned NIXL manager requires an agent name")
+            manager = NixlTransferManager(
+                agent_name=agent_name,
+                device_id=device_id,
+                listen_port=listen_port,
+            )
+        self._manager = manager
+        if self._owns_manager:
+            try:
+                self._manager.initialize()
+            except Exception:
+                self._manager.shutdown()
+                raise
         # Canonical engine-layout staging buffers. Exact slices land directly
         # here; reconstructed or converted values are copied here before these
         # buffers are verified, installed, and advertised to peer generators.
@@ -291,7 +319,6 @@ class _NixlStagedTransfer:
         self._full_registered = False
         self._active: _PreparedNixlTransfer | None = None
         self._loaded_agent_metadata: dict[str, bytes] = {}
-        self._published_peer_rank: int | None = None
         self._closed = False
 
     def prepare(
@@ -357,6 +384,28 @@ class _NixlStagedTransfer:
         )
         self._active = prepared
         return prepared
+
+    def refresh_sources(
+        self, prepared: _PreparedNixlTransfer, manifests: list[bytes]
+    ) -> None:
+        """Refresh version-specific source digests without rebuilding the plan."""
+        if prepared is not self._active:
+            raise RuntimeError("NIXL transfer plan is no longer active")
+        resolved = _resolve_sources(manifests)
+        used_sources = {
+            copy.src_name: resolved.sources[copy.src_name]
+            for copy in prepared.capture.copies
+            if copy.src_name in resolved.sources
+        }
+        if set(used_sources) != set(prepared.sources):
+            raise RuntimeError("source tensor set changed while reusing transfer plan")
+        if any(
+            _source_structure(source) != _source_structure(prepared.sources[name])
+            for name, source in used_sources.items()
+        ):
+            raise RuntimeError("source geometry changed while reusing transfer plan")
+        prepared.sources.clear()
+        prepared.sources.update(used_sources)
 
     @staticmethod
     def _validate_complete(
@@ -558,10 +607,9 @@ class _NixlStagedTransfer:
         source: p2p_pb2.WorkerMetadata,
         parameter_layout: dict[str, tuple[tuple[int, ...], torch.dtype]],
     ) -> _StagedNixlWeights:
-        """Pull an identical-rank peer's canonical staging buffers."""
+        """Pull an identical-rank peer's complete runtime tensor set."""
         if self._closed:
             raise RuntimeError("NIXL staged transfer is closed")
-        self.unpublish_peer()
         self._ensure_buffers(
             self._recv_buffers,
             parameter_layout,
@@ -652,48 +700,6 @@ class _NixlStagedTransfer:
             },
         )
 
-    def publish_peer(
-        self,
-        *,
-        staged: _StagedNixlWeights,
-        identity: p2p_pb2.SourceIdentity,
-        p2p_client: MxClientBase,
-        worker_rank: int,
-        worker_id: str,
-        accelerator: str,
-    ) -> None:
-        """Advertise verified canonical buffers for the applied version."""
-        previous_rank = self._published_peer_rank
-        self.unpublish_peer()
-        # Supersede any boot-time source owned by this rank before binding the
-        # shared publication slot to the exact WeightVersion identity.
-        if previous_rank != worker_rank:
-            unpublish_metadata_for_worker(
-                worker_rank=worker_rank,
-                device_id=self._device_id,
-            )
-        publish_metadata_and_ready(
-            p2p_client,
-            self._manager,
-            staged.tensors,
-            worker_rank,
-            self._device_id,
-            identity,
-            worker_id,
-            accelerator=accelerator,
-        )
-        self._published_peer_rank = worker_rank
-
-    def unpublish_peer(self) -> None:
-        """Stop advertising buffers before they are reused by another stage."""
-        if self._published_peer_rank is None:
-            return
-        unpublish_metadata_for_worker(
-            worker_rank=self._published_peer_rank,
-            device_id=self._device_id,
-        )
-        self._published_peer_rank = None
-
     def _verification_tensor(self, prepared: _PreparedNixlTransfer, name: str):
         source = prepared.sources[name]
         if name in self._full_buffers:
@@ -744,9 +750,9 @@ class _NixlStagedTransfer:
     def close(self) -> None:
         if self._closed:
             return
-        self.unpublish_peer()
         self._closed = True
-        self._manager.shutdown()
+        if self._owns_manager:
+            self._manager.shutdown()
 
 
 __all__: list[str] = []
