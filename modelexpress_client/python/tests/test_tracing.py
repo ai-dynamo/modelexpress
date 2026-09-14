@@ -25,12 +25,14 @@ def tracer_and_exporter():
 
 
 def _ctx():
+    """Build a load context for tracing tests."""
     return LoadContext(
         model_config=MagicMock(),
         load_config=MagicMock(),
         target_device=torch.device("cpu"),
         global_rank=3,
         worker_rank=3,
+        local_rank=0,
         device_id=0,
         identity=p2p_pb2.SourceIdentity(model_name="test/model"),
         mx_client=MagicMock(),

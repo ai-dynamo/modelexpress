@@ -205,6 +205,25 @@ class VllmAdapter(EngineAdapter):
 
         return bool(current_platform.is_cuda_alike())
 
+    def all_gather_state(self, state) -> tuple[object, ...]:
+        """Gather rank-local state through vLLM's CPU process group."""
+        from vllm.distributed import get_world_group
+
+        group = get_world_group()
+        states = [None] * group.world_size
+        torch.distributed.all_gather_object(
+            states,
+            state,
+            group=group.cpu_group,
+        )
+        return tuple(states)
+
+    def broadcast_state(self, state):
+        """Broadcast rank-zero state through vLLM's world group."""
+        from vllm.distributed import get_world_group
+
+        return get_world_group().broadcast_object(state, src=0)
+
     def discover_tensors(self, result: LoadResult) -> dict[str, torch.Tensor]:
         if result.model is None:
             raise RuntimeError("vLLM tensor discovery requires result.model")
@@ -723,6 +742,8 @@ def _get_vllm_device_id(target_device: torch.device) -> int:
 def build_vllm_load_context(vllm_config, model_config) -> LoadContext:
     """Build a LoadContext from vLLM config objects."""
 
+    from vllm.distributed import get_world_group
+
     adapter = VllmAdapter(vllm_config, model_config)
     global_rank = adapter.get_global_rank()
     worker_rank = adapter.get_worker_rank()
@@ -732,6 +753,7 @@ def build_vllm_load_context(vllm_config, model_config) -> LoadContext:
         target_device=adapter.get_target_device(),
         global_rank=global_rank,
         worker_rank=worker_rank,
+        local_rank=int(get_world_group().local_rank),
         device_id=adapter.get_device_id(),
         identity=adapter.build_identity(),
         mx_client=create_metadata_client(worker_rank=worker_rank),

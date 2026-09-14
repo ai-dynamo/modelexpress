@@ -101,6 +101,7 @@ def _route(worker: dict[str, Any], group: str, name: str) -> str:
 
 
 def main() -> None:
+    """Run the end-to-end Dynamo and vLLM refit example."""
     dist.init_process_group(
         "nccl",
         init_method="tcp://127.0.0.1:29500",
@@ -147,9 +148,23 @@ def main() -> None:
                 )
                 paused.append(worker)
             for worker in workers:
+                installed = _post(
+                    _route(worker, "control", "get_weight_version"), {}
+                )
+                observed = installed.get("version", installed.get("weight_version"))
+                if not isinstance(observed, str) or not observed:
+                    raise RuntimeError(
+                        f"worker returned invalid serving version: {installed}"
+                    )
                 _post(
                     _route(worker, "update", "init_weight_transfer_engine"),
-                    {"init_info": {}},
+                    {
+                        "init_info": (
+                            {"initial_serving_version_id": observed}
+                            if observed != "default"
+                            else {}
+                        )
+                    },
                 )
                 _post(_route(worker, "update", "start_weight_update"), {})
                 _post(
