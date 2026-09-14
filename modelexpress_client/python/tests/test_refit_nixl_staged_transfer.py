@@ -80,6 +80,18 @@ def test_source_structure_uses_planner_shard_fields_and_ignores_digest():
     assert _source_structure(source) == expected
 
 
+def test_default_transfer_timeout_matches_the_lease_budget(monkeypatch):
+    monkeypatch.setenv("MX_TRANSFER_TIMEOUT", "17")
+
+    transfer = _NixlStagedTransfer(
+        device_id=0,
+        device=torch.device("cpu"),
+        manager=object(),
+    )
+
+    assert transfer._timeout == 17.0
+
+
 def test_exact_manifests_resolve_without_legacy_source_discovery():
     resolved = _resolve_sources(
         [

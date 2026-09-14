@@ -38,7 +38,8 @@ _ARTIFACT_CHUNK_METADATA_PAGE_SIZE = 1024
 
 def _tensor_read_lease_timeout_seconds() -> int:
     """Cover one NIXL metadata handshake and one bounded tensor receive."""
-    return max(1, math.ceil(2 * envs.MX_TRANSFER_TIMEOUT + 30))
+    transfer_timeout = max(1, envs.MX_TRANSFER_TIMEOUT)
+    return math.ceil(2 * max(120, transfer_timeout) + 30)
 
 
 @dataclass
@@ -54,7 +55,6 @@ class _TensorReadLeases:
         self._condition = Condition()
         self._accepting = True
         self._leases: dict[str, float] = {}
-        self._legacy_lease_id = uuid.uuid4().hex
 
     def prepare(self, timeout_seconds: int) -> str:
         if timeout_seconds <= 0:
@@ -67,17 +67,10 @@ class _TensorReadLeases:
             self._leases[lease_id] = time.monotonic() + timeout_seconds
             return lease_id
 
-    def prepare_legacy(self, timeout_seconds: int) -> None:
-        """Extend one shared lease for clients that cannot release it."""
+    def ensure_accepting(self) -> None:
         with self._condition:
-            self._drop_expired_locked()
             if not self._accepting:
                 raise RuntimeError("tensor source is draining")
-            expires_at = time.monotonic() + timeout_seconds
-            self._leases[self._legacy_lease_id] = max(
-                expires_at,
-                self._leases.get(self._legacy_lease_id, 0),
-            )
 
     def release(self, lease_id: str) -> None:
         with self._condition:
@@ -187,9 +180,10 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
             request.worker_id if request.HasField("worker_id") else None,
             context,
         )
-        # Legacy clients cannot return a lease ID. Keep their published tensor
-        # addresses stable for one bounded transfer window after this response.
-        self._prepare_tensor_read_lease(context, legacy=True)
+        try:
+            self._tensor_read_leases.ensure_accepting()
+        except RuntimeError as error:
+            context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
         response = self._tensor_manifest_response()
         logger.info(
             f"GetTensorManifest served: {len(self._tensor_protos)} tensors, "
@@ -236,13 +230,8 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
     def drain_tensor_reads(self, timeout: float) -> None:
         self._tensor_read_leases.drain(timeout)
 
-    def _prepare_tensor_read_lease(self, context, *, legacy: bool = False) -> str:
+    def _prepare_tensor_read_lease(self, context) -> str:
         try:
-            if legacy:
-                self._tensor_read_leases.prepare_legacy(
-                    self._tensor_read_lease_timeout
-                )
-                return ""
             return self._tensor_read_leases.prepare(
                 self._tensor_read_lease_timeout
             )
@@ -670,6 +659,7 @@ def prepare_tensor_read(
     for attempt in range(max_retries + 1):
         channel = grpc.insecure_channel(endpoint)
         stub = p2p_pb2_grpc.WorkerServiceStub(channel)
+        response = None
         try:
             response = stub.PrepareTensorRead(request, timeout=timeout)
             manifest = response.manifest
@@ -707,6 +697,22 @@ def prepare_tensor_read(
                 continue
             raise
         except RuntimeError:
+            if response is not None and response.lease_id:
+                manifest = response.manifest
+                release_request = p2p_pb2.ReleaseTensorReadRequest(
+                    mx_source_id=manifest.mx_source_id,
+                    lease_id=response.lease_id,
+                )
+                if manifest.HasField("worker_id"):
+                    release_request.worker_id = manifest.worker_id
+                try:
+                    stub.ReleaseTensorRead(release_request, timeout=timeout)
+                except grpc.RpcError as error:
+                    logger.warning(
+                        "Failed to release rejected tensor read lease %s: %s",
+                        response.lease_id,
+                        error,
+                    )
             channel.close()
             if attempt < max_retries:
                 time.sleep(retry_backoff_seconds)

@@ -20,6 +20,7 @@ import pytest
 import torch
 
 import modelexpress.metadata.artifact_transfer as artifact_transfer_module
+import modelexpress.metadata.worker_server as worker_server_module
 from modelexpress import p2p_pb2, p2p_pb2_grpc
 from modelexpress.metadata.artifact_manifest import (
     artifact_manifest_id,
@@ -216,14 +217,14 @@ def test_tensor_read_drain_waits_for_inflight_lease_and_rejects_new_readers():
             if time.monotonic() >= deadline:
                 raise AssertionError("tensor source did not enter drain state")
         assert exc_info.code() == grpc.StatusCode.UNAVAILABLE
-        with pytest.raises(grpc.RpcError) as legacy_error:
+        with pytest.raises(grpc.RpcError) as manifest_error:
             fetch_tensor_manifest(
                 endpoint,
                 "source-123",
                 worker_id="generation-1",
                 timeout=1.0,
             )
-        assert legacy_error.value.code() == grpc.StatusCode.UNAVAILABLE
+        assert manifest_error.value.code() == grpc.StatusCode.UNAVAILABLE
 
         lease.release()
         thread.join(timeout=2.0)
@@ -290,7 +291,13 @@ def test_abandoned_tensor_read_lease_expires_without_client_cleanup(monkeypatch)
     servicer.drain_tensor_reads(timeout=0)
 
 
-def test_legacy_tensor_manifest_holds_a_bounded_read_lease():
+def test_tensor_read_lease_covers_handshake_and_transfer_timeouts(monkeypatch):
+    monkeypatch.setenv("MX_TRANSFER_TIMEOUT", "10")
+
+    assert worker_server_module._tensor_read_lease_timeout_seconds() == 270
+
+
+def test_tensor_manifest_does_not_prepare_an_rl_read_lease():
     servicer = WorkerServiceServicer(
         tensor_protos=[],
         mx_source_id="source-123",
@@ -304,8 +311,7 @@ def test_legacy_tensor_manifest_holds_a_bounded_read_lease():
         MagicMock(),
     )
 
-    with pytest.raises(TimeoutError, match="1 tensor readers"):
-        servicer.drain_tensor_reads(timeout=0)
+    servicer.drain_tensor_reads(timeout=0)
 
 
 def test_prepare_tensor_read_requires_source_id():
@@ -378,6 +384,62 @@ def test_fetch_tensor_manifest_closes_channel_on_rpc_error(monkeypatch):
 
     with pytest.raises(grpc.RpcError, match="manifest failed"):
         fetch_tensor_manifest("source:6555", "source-123")
+
+    channel.close.assert_called_once()
+
+
+def test_prepare_tensor_read_releases_a_rejected_response(monkeypatch):
+    channel = MagicMock()
+    stub = MagicMock()
+    stub.PrepareTensorRead.return_value = p2p_pb2.PrepareTensorReadResponse(
+        lease_id="lease-1",
+        manifest=p2p_pb2.GetTensorManifestResponse(
+            mx_source_id="unexpected-source",
+            worker_id="unexpected-worker",
+        ),
+    )
+    monkeypatch.setattr(grpc, "insecure_channel", MagicMock(return_value=channel))
+    monkeypatch.setattr(
+        p2p_pb2_grpc,
+        "WorkerServiceStub",
+        MagicMock(return_value=stub),
+    )
+
+    with pytest.raises(RuntimeError, match="mx_source_id mismatch"):
+        prepare_tensor_read(
+            "source:6555",
+            "expected-source",
+            worker_id="expected-worker",
+        )
+
+    release_request = stub.ReleaseTensorRead.call_args.args[0]
+    assert release_request.mx_source_id == "unexpected-source"
+    assert release_request.worker_id == "unexpected-worker"
+    assert release_request.lease_id == "lease-1"
+    channel.close.assert_called_once()
+
+
+def test_rejected_response_preserves_validation_error_when_release_fails(
+    monkeypatch,
+):
+    channel = MagicMock()
+    stub = MagicMock()
+    stub.PrepareTensorRead.return_value = p2p_pb2.PrepareTensorReadResponse(
+        lease_id="lease-1",
+        manifest=p2p_pb2.GetTensorManifestResponse(
+            mx_source_id="unexpected-source",
+        ),
+    )
+    stub.ReleaseTensorRead.side_effect = grpc.RpcError("release failed")
+    monkeypatch.setattr(grpc, "insecure_channel", MagicMock(return_value=channel))
+    monkeypatch.setattr(
+        p2p_pb2_grpc,
+        "WorkerServiceStub",
+        MagicMock(return_value=stub),
+    )
+
+    with pytest.raises(RuntimeError, match="mx_source_id mismatch"):
+        prepare_tensor_read("source:6555", "expected-source")
 
     channel.close.assert_called_once()
 

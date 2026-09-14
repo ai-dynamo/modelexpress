@@ -72,8 +72,9 @@ def _source_worker(p2p: bool):
     )
 
 
-def _receive(manager, p2p=True, ctx=None):
+def _receive(manager, p2p=True, ctx=None, leased=True):
     strategy = RdmaStrategy()
+    strategy.requires_tensor_read_lease = leased
 
     class _Lease:
         manifest = SimpleNamespace(
@@ -116,6 +117,14 @@ def _receive(manager, p2p=True, ctx=None):
 
 
 class TestReleaseOnTheLoadPath:
+    def test_standard_p2p_does_not_prepare_a_tensor_read_lease(self):
+        mgr = _manager()
+
+        assert RdmaStrategy.requires_tensor_read_lease is False
+        prepare_read = _receive(mgr, p2p=True, leased=False)
+
+        prepare_read.assert_not_called()
+
     def test_p2p_uses_metadata_backend_retry_policy(self):
         mgr = _manager()
         ctx = _ctx(mgr)

@@ -96,6 +96,7 @@ class RdmaStrategy(LoadStrategy):
 
     name = "rdma"
     requires = (EngineAdapter.discover_tensors,)
+    requires_tensor_read_lease = False
 
     def rollback(self, ctx: LoadContext) -> None:
         """Clean up NIXL state from a failed RDMA target attempt."""
@@ -453,16 +454,14 @@ class RdmaStrategy(LoadStrategy):
         worker_id: str,
     ) -> None:
         """Fetch once before target preparation and retain it for the transfer."""
-        from ..metadata.worker_server import prepare_tensor_read
+        from ..metadata.worker_server import fetch_tensor_manifest
 
         manifest_start = time.perf_counter()
-        lease, manifest_bytes = prepare_tensor_read(
+        tensor_protos, manifest_bytes = fetch_tensor_manifest(
             endpoint=source_worker.worker_grpc_endpoint,
             mx_source_id=mx_source_id,
             worker_id=worker_id,
         )
-        with lease:
-            tensor_protos = list(lease.manifest.tensors)
         # Store the validated descriptors on the metadata object so the
         # transfer can reuse them without a second manifest RPC.
         source_worker.tensor_source.ClearField("tensors")
@@ -472,6 +471,41 @@ class RdmaStrategy(LoadStrategy):
             f"[Worker {ctx.global_rank}] [TIMING] P2P tensor manifest: "
             f"{manifest_time:.3f}s ({len(tensor_protos)} tensors, "
             f"{manifest_bytes} bytes)"
+        )
+
+    @staticmethod
+    def _use_prefetched_manifest(source_worker):
+        return (
+            None,
+            worker_tensor_descriptors(source_worker),
+            source_worker.metadata_endpoint,
+            source_worker.agent_name,
+        )
+
+    def _prepare_leased_manifest(
+        self,
+        ctx: LoadContext,
+        source_worker,
+        mx_source_id: str,
+        source_worker_id: str,
+    ):
+        from ..metadata.worker_server import prepare_tensor_read
+
+        max_retries, retry_backoff = ctx.mx_client.worker_rpc_retry_policy()
+        tensor_read, _ = prepare_tensor_read(
+            source_worker.worker_grpc_endpoint,
+            mx_source_id,
+            worker_id=source_worker_id,
+            timeout=_transfer_timeout_seconds(),
+            max_retries=max_retries,
+            retry_backoff_seconds=retry_backoff,
+        )
+        manifest = tensor_read.manifest
+        return (
+            tensor_read,
+            manifest.tensors,
+            manifest.metadata_endpoint,
+            manifest.agent_name,
         )
 
     def _load_as_target(
@@ -525,22 +559,19 @@ class RdmaStrategy(LoadStrategy):
         tensor_read = None
         try:
             if is_p2p:
-                from ..metadata.worker_server import (
-                    prepare_tensor_read,
-                )
-
-                transfer_timeout = _transfer_timeout_seconds()
-                max_retries, retry_backoff = ctx.mx_client.worker_rpc_retry_policy()
-                tensor_read, _ = prepare_tensor_read(
-                    source_worker.worker_grpc_endpoint,
-                    mx_source_id,
-                    worker_id=source_worker_id,
-                    timeout=transfer_timeout,
-                    max_retries=max_retries,
-                    retry_backoff_seconds=retry_backoff,
-                )
-                manifest = tensor_read.manifest
-                tensor_protos = manifest.tensors
+                if self.requires_tensor_read_lease:
+                    tensor_read, tensor_protos, ep, agent_name = (
+                        self._prepare_leased_manifest(
+                            ctx,
+                            source_worker,
+                            mx_source_id,
+                            source_worker_id,
+                        )
+                    )
+                else:
+                    tensor_read, tensor_protos, ep, agent_name = (
+                        self._use_prefetched_manifest(source_worker)
+                    )
                 source_tensors = [
                     TensorDescriptor(
                         name=t.name,
@@ -551,11 +582,10 @@ class RdmaStrategy(LoadStrategy):
                     )
                     for t in tensor_protos
                 ]
-                ep = manifest.metadata_endpoint
                 host, port_str = ep.rsplit(":", 1)
                 # Claimed before the dial so a fetch that fails part-way, leaving
                 # metadata that lands later, is still released.
-                remote_agent_name = manifest.agent_name
+                remote_agent_name = agent_name
                 # One handshake phase, two transports: here the peer's NIXL
                 # metadata is fetched from the peer itself; the centralized
                 # branch below loads the copy the MX server holds. Exactly one
@@ -565,7 +595,7 @@ class RdmaStrategy(LoadStrategy):
                         policy, "handshake"
                     ) as handshake:
                         ctx.nixl_manager.fetch_remote_and_wait(
-                            remote_agent_name=manifest.agent_name,
+                            remote_agent_name=agent_name,
                             ip=host,
                             port=int(port_str),
                         )

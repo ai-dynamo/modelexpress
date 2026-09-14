@@ -7,7 +7,7 @@ K8s-Service-routed metadata client.
 Duck-typed replacement for :class:`MxClient` that skips the central
 coordinator entirely. Each source pool sits behind a Kubernetes Service;
 peers open a gRPC channel directly to the Service DNS name and call
-``PrepareTensorRead``. Kube-proxy load-balances across the ready
+``GetTensorManifest``. Kube-proxy load-balances across the ready
 backends.
 
 The ``MX_K8S_SERVICE_PATTERN`` pattern decides how rank is encoded:
@@ -28,7 +28,7 @@ Rank-matching is enforced two ways regardless of shape:
 1. Shape 1: the Service selector scopes the backend pool to pods with
    the right ``mx.rank`` label. Shape 2: the port differentiation
    naturally picks the right rank-R WorkerGrpcServer inside the pod.
-2. ``PrepareTensorRead`` validates ``mx_source_id`` server-side and the
+2. ``GetTensorManifest`` validates ``mx_source_id`` server-side and the
    client validates the response's ``mx_source_id`` and ``worker_rank``
    before accepting. Mismatches return ``FAILED_PRECONDITION`` (or
    raise on the client side), and the client retries on a fresh
@@ -46,11 +46,10 @@ import time
 import grpc
 
 from .. import envs
-from .. import p2p_pb2
+from .. import p2p_pb2, p2p_pb2_grpc
 from .payload import tensor_source_metadata
 from ..client import MxClientBase
 from .source_id import compute_mx_source_id
-from .worker_server import prepare_tensor_read
 
 logger = logging.getLogger("modelexpress.metadata.k8s_service_client")
 
@@ -174,7 +173,7 @@ class MxK8sServiceClient(MxClientBase):
         mx_source_id: str,
         worker_id: str,
     ) -> "p2p_pb2.GetMetadataResponse":
-        """Prepare and release a tensor read against the Service.
+        """Call GetTensorManifest against the Service, retrying on mismatch.
 
         Each retry opens a fresh gRPC channel so kube-proxy re-picks a
         backend (a live channel is sticky to one backend, so reusing it
@@ -190,14 +189,11 @@ class MxK8sServiceClient(MxClientBase):
         last_error: Exception | None = None
 
         for attempt in range(1, self._max_retries + 2):
+            channel = grpc.insecure_channel(endpoint)
             try:
-                lease, _ = prepare_tensor_read(
-                    endpoint,
-                    mx_source_id,
-                    timeout=30,
-                )
-                resp = lease.manifest
-                lease.close()
+                stub = p2p_pb2_grpc.WorkerServiceStub(channel)
+                req = p2p_pb2.GetTensorManifestRequest(mx_source_id=mx_source_id)
+                resp = stub.GetTensorManifest(req, timeout=30)
 
                 # Defense-in-depth: validate the response matches what
                 # was asked for. The server-side handshake in
@@ -281,20 +277,8 @@ class MxK8sServiceClient(MxClientBase):
                     time.sleep(self._backoff_seconds)
                     continue
                 raise
-            except RuntimeError as exc:
-                last_error = exc
-                if attempt <= self._max_retries:
-                    logger.warning(
-                        "MxK8sServiceClient.get_metadata: %s on attempt %d/%d; "
-                        "retrying on fresh channel after %.2fs backoff",
-                        exc,
-                        attempt,
-                        self._max_retries + 1,
-                        self._backoff_seconds,
-                    )
-                    time.sleep(self._backoff_seconds)
-                    continue
-                raise
+            finally:
+                channel.close()
         message = (
             f"MxK8sServiceClient.get_metadata: exhausted "
             f"{self._max_retries + 1} attempts against {endpoint}"

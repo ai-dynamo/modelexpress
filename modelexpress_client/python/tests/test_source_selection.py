@@ -67,17 +67,6 @@ def _sources(n, worker_rank=0):
     return [_ref(f"src{i:04x}aaaaaaaaaa", f"w{i}", worker_rank) for i in range(n)]
 
 
-class _PreparedTensorRead:
-    def __init__(self, tensors=()):
-        self.manifest = p2p_pb2.GetTensorManifestResponse(tensors=tensors)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_args):
-        return None
-
-
 def test_clear_exception_tracebacks_releases_transfer_frame_locals():
     class Allocation:
         pass
@@ -585,15 +574,15 @@ def test_load_generation_mismatch_tries_next_candidate(monkeypatch):
     ]
     strat._load_as_target = MagicMock(return_value="loaded")
     manifest = [p2p_pb2.TensorDescriptor(name="weight")]
-    prepare_read = MagicMock(
+    fetch_manifest = MagicMock(
         side_effect=[
             RuntimeError("worker_id mismatch"),
-            (_PreparedTensorRead(manifest), 10),
+            (manifest, 10),
         ],
     )
     monkeypatch.setattr(
-        "modelexpress.metadata.worker_server.prepare_tensor_read",
-        prepare_read,
+        "modelexpress.metadata.worker_server.fetch_tensor_manifest",
+        fetch_manifest,
     )
     monkeypatch.setattr(
         "modelexpress.load_strategy.rdma_strategy.worker_tensor_count",
@@ -609,12 +598,12 @@ def test_load_generation_mismatch_tries_next_candidate(monkeypatch):
     result = strat.load(MagicMock(), ctx)
 
     assert result == "loaded"
-    assert prepare_read.call_args_list[0].kwargs == {
+    assert fetch_manifest.call_args_list[0].kwargs == {
         "endpoint": "source:6555",
         "mx_source_id": cands[0].mx_source_id,
         "worker_id": cands[0].worker_id,
     }
-    assert prepare_read.call_args_list[1].kwargs == {
+    assert fetch_manifest.call_args_list[1].kwargs == {
         "endpoint": "source:6556",
         "mx_source_id": cands[1].mx_source_id,
         "worker_id": cands[1].worker_id,
@@ -627,7 +616,7 @@ def test_load_generation_mismatch_tries_next_candidate(monkeypatch):
     ]
 
 
-def test_fetch_worker_metadata_prepares_missing_manifest(monkeypatch):
+def test_fetch_worker_metadata_fetches_missing_manifest(monkeypatch):
     strat = RdmaStrategy()
     worker = p2p_pb2.WorkerMetadata(worker_grpc_endpoint="source:6555")
     ctx = MagicMock(global_rank=0)
@@ -635,16 +624,16 @@ def test_fetch_worker_metadata_prepares_missing_manifest(monkeypatch):
         found=True,
         worker=worker,
     )
-    prepare_read = MagicMock(return_value=(_PreparedTensorRead(), 0))
+    fetch_manifest = MagicMock(return_value=([], 0))
     monkeypatch.setattr(
-        "modelexpress.metadata.worker_server.prepare_tensor_read",
-        prepare_read,
+        "modelexpress.metadata.worker_server.fetch_tensor_manifest",
+        fetch_manifest,
     )
 
     result = strat._fetch_worker_metadata(ctx, "source-123", "")
 
     assert result is not None
-    prepare_read.assert_called_once_with(
+    fetch_manifest.assert_called_once_with(
         endpoint="source:6555",
         mx_source_id="source-123",
         worker_id="",

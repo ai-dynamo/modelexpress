@@ -283,12 +283,16 @@ class _NixlStagedTransfer:
         device: torch.device,
         agent_name: str | None = None,
         listen_port: int | None = None,
-        timeout_seconds: float = 1200.0,
+        timeout_seconds: float | None = None,
         manager: NixlTransferManager | None = None,
     ) -> None:
         self._device_id = device_id
         self._device = device
-        self._timeout = timeout_seconds
+        self._timeout = float(
+            envs.MX_TRANSFER_TIMEOUT
+            if timeout_seconds is None
+            else timeout_seconds
+        )
         self._owns_manager = manager is None
         if manager is None:
             if agent_name is None:
