@@ -230,6 +230,26 @@ class VllmAdapter(EngineAdapter):
         adopt_hidden_tensors(result.model, self.accelerator_backend)
         return collect_module_tensors(result.model, self.accelerator_backend)
 
+    def begin_streaming_reload(self, result: LoadResult) -> None:
+        if result.model is None:
+            raise RuntimeError("vLLM streaming reload requires result.model")
+
+        from vllm.model_executor.model_loader.reload import (
+            initialize_layerwise_reload,
+        )
+
+        initialize_layerwise_reload(result.model)
+
+    def end_streaming_reload(self, result: LoadResult) -> None:
+        if result.model is None:
+            return
+
+        from vllm.model_executor.model_loader.reload import (
+            finalize_layerwise_reload,
+        )
+
+        finalize_layerwise_reload(result.model, self.model_config)
+
     def prepare_rdma_target(self, result: LoadResult) -> LoadResult:
         if result.model is None:
             raise RuntimeError("vLLM RDMA target preparation requires result.model")

@@ -1011,6 +1011,7 @@ Thin orchestration layer that delegates to `LoadStrategyChain.run()`. Builds a `
 **Sleep/wake lifecycle hooks.** `MxModelLoader` implements vLLM's optional `BaseModelLoader.on_sleep(level)` / `on_wake_up(tags)` hooks so a sleeping replica stops advertising itself as a P2P source before `sleep()` unmaps its GPU memory.
 - `on_sleep` calls `unpublish_metadata` (gates discovery) and `nixl_manager.shutdown()` (stops receiving new requests from peers).
 - `on_wake_up` recreates the NIXL agent and calls `publish_metadata` to mark the replica ready for new incoming P2P connections. It does so only after a level-1 sleep: level 2 discards the weights, so this has to happen on `reload_weights()` instead.
+- After a level-2 sleep, `reload_weights()` refreshes weight content in place through `reload_model()` (see below), whose strategy chain registers the tensors and republishes the replica, as on any successful load.
 
 ### vLLM Refit Installation
 

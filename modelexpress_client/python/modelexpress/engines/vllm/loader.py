@@ -106,6 +106,40 @@ class MxModelLoader(BaseModelLoader):
         a model subtree. ModelExpress does not interpret it; it is passed through
         to vLLM's initialize_model().
         """
+        return self._load_or_reload_model(vllm_config, model_config, prefix)
+
+    def reload_model(
+        self,
+        vllm_config: VllmConfig,
+        model_config: ModelConfig,
+        model: nn.Module,
+        prefix: str = "",
+    ) -> nn.Module:
+        """Reload weights into an already-initialized model.
+
+        Unlike `load_model`, `model` is required: the strategy chain runs
+        against this existing instance instead of building a fresh one via
+        `initialize_model()`. Each strategy decides what a reload changes for
+        it: those that stream weights through vLLM's load_weights() run inside
+        `initialize_layerwise_reload`/`finalize_layerwise_reload` to avoid
+        transient double-materialization, while RDMA writes into the existing
+        buffers and must not have them deferred to meta.
+        """
+        return self._load_or_reload_model(vllm_config, model_config, prefix, model)
+
+    def _load_or_reload_model(
+        self,
+        vllm_config: VllmConfig,
+        model_config: ModelConfig,
+        prefix: str = "",
+        model: nn.Module | None = None,
+    ) -> nn.Module:
+        """Load model, auto-detecting the best loading strategy.
+
+        `prefix` is vLLM's BaseModelLoader.load_model argument for initializing
+        a model subtree. ModelExpress does not interpret it; it is passed through
+        to vLLM's initialize_model().
+        """
         load_start = time.perf_counter()
 
         is_speculative_draft = _is_speculative_draft(vllm_config, model_config)
@@ -116,6 +150,7 @@ class MxModelLoader(BaseModelLoader):
 
         ctx = build_vllm_load_context(vllm_config, model_config)
         ctx.p2p_enabled = not is_speculative_draft
+        ctx.is_reload = model is not None
         if envs.MX_ARTIFACT_READY_URL.strip():
             ctx.source_ready_fn = lambda: _vllm_health_ready(ctx)
         if ctx.p2p_enabled:
@@ -145,12 +180,13 @@ class MxModelLoader(BaseModelLoader):
                         install_vllm_cache_artifacts(ctx)
                 with set_default_torch_dtype(model_config.dtype):
                     with ctx.target_device:
-                        with metrics.time_load_phase("vllm", model_id, "model_init"):
-                            model = initialize_model(
-                                vllm_config=vllm_config,
-                                model_config=model_config,
-                                prefix=prefix,
-                            )
+                        if model is None:
+                            with metrics.time_load_phase("vllm", model_id, "model_init"):
+                                model = initialize_model(
+                                    vllm_config=vllm_config,
+                                    model_config=model_config,
+                                    prefix=prefix,
+                                )
 
                     with metrics.time_load_phase("vllm", model_id, "chain"):
                         model = run_load_strategy_chain(model, ctx)
@@ -221,16 +257,14 @@ class MxModelLoader(BaseModelLoader):
     def on_sleep(self, level: int) -> None:
         """Stop P2P source-serving before vLLM's sleep() invalidates the GPU
         memory this loader registered with NIXL.
+
+        Applies regardless of level: both level 1 (offload) and level 2
+        (discard) unmap the physical GPU pages backing the registered
+        virtual addresses, so a peer's RDMA read against either would hit
+        invalid memory.
         """
         self._last_sleep_level = level
         if self._ctx is None:
-            return
-
-        if level != 1:
-            logger.warning(
-                f"MxModelLoader only supports vLLM sleep level 1, got level "
-                f"{level}; P2P source-serving will not resume on wake_up()"
-            )
             return
 
         unpublish_metadata(self._ctx)
@@ -242,24 +276,18 @@ class MxModelLoader(BaseModelLoader):
         """Resume P2P source-serving once vLLM's wake_up() has restored
         valid GPU memory.
 
-        Only for level 1: wake_up() restores offloaded weights to GPU. A
-        level-2 sleep discards the weights, so after one this has to happen
-        on reload_weights() instead. wake_up() doesn't carry the sleep level
-        itself, so this reads it back from what on_sleep() recorded.
+        Only for level 1: wake_up() restores offloaded weights to GPU. For
+        level 2, weights are discarded with no backup -- content is only
+        valid again once reload_weights() actually repopulates them, and
+        reload_model() registers and republishes the replica itself.
+        wake_up() doesn't carry the sleep level itself, so this reads it back
+        from what on_sleep() recorded.
         """
         if self._ctx is None:
             return
 
-        if self._last_sleep_level != 1:
-            logger.warning(
-                "MxModelLoader.on_wake_up() called after a non-level-1 "
-                f"sleep ({self._last_sleep_level}); skipping since weight "
-                "content is not guaranteed to be valid"
-            )
-            return
-
         wake_weights = tags is None or "weights" in tags
-        if not wake_weights:
+        if self._last_sleep_level != 1 or not wake_weights:
             return
 
         if self._ctx.nixl_manager is None:

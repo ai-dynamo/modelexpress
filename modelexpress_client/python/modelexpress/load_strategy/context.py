@@ -92,3 +92,7 @@ class LoadContext:
     # cuMemGetHandleForAddressRange + ibv_reg_dmabuf_mr, collapsing
     # O(plugin_calls) MRs to 1.
     vmm_arena: VmmArena | None = None
+    # Whether this run refreshes weights in an already-initialized model
+    # rather than loading into a freshly built one. Each strategy's prepare(),
+    # finalize() and abort() decide what that changes for it.
+    is_reload: bool = False

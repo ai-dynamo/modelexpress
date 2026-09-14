@@ -143,6 +143,7 @@ def _maybe_mock_vllm():
         "vllm.model_executor.model_loader.base_loader": MagicMock(),
         "vllm.model_executor.model_loader.default_loader": MagicMock(),
         "vllm.model_executor.model_loader.dummy_loader": MagicMock(),
+        "vllm.model_executor.model_loader.reload": MagicMock(),
         "vllm.model_executor.model_loader.utils": MagicMock(),
         "vllm.utils": MagicMock(),
         "vllm.utils.torch_utils": MagicMock(),

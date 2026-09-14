@@ -7,18 +7,17 @@ from __future__ import annotations
 
 import logging
 
-from ..adapter import EngineAdapter, StrategyFailed
-from .base import LoadContext, LoadStrategy, _as_load_result, register_tensors
+from ..adapter import StrategyFailed
+from .base import LoadContext, WeightsIteratorLoadStrategy, _as_load_result
 from .context import LoadResult
 
 logger = logging.getLogger("modelexpress.strategy_gds")
 
 
-class GdsStrategy(LoadStrategy):
+class GdsStrategy(WeightsIteratorLoadStrategy):
     """Load weights via GPUDirect Storage (direct file-to-GPU)."""
 
     name = "gds"
-    requires = (EngineAdapter.apply_weight_iter,)
 
     def is_available(self, ctx: LoadContext) -> bool:
         if not super().is_available(ctx):
@@ -59,7 +58,6 @@ class GdsStrategy(LoadStrategy):
             try:
                 result = ctx.adapter.apply_weight_iter(result, weights_iter)
                 logger.info(f"[Worker {ctx.global_rank}] GDS weight loading complete")
-                result = ctx.adapter.after_weight_iter_load(result)
             except Exception as e:
                 logger.warning(
                     f"[Worker {ctx.global_rank}] GDS loading failed, falling through: {e}"
@@ -68,7 +66,6 @@ class GdsStrategy(LoadStrategy):
         finally:
             gds_loader.shutdown()
 
-        register_tensors(result, ctx)
         return result
 
 

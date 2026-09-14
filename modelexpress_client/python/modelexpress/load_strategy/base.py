@@ -9,11 +9,13 @@ import logging
 import traceback
 import uuid
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, ClassVar
 
 import torch.nn as nn
 
 from .. import envs
+from ..adapter import EngineAdapter, StrategyFailed
 from ..nixl_transfer import is_nixl_available
 from ..tensor_utils import log_tensor_summary
 from ..metadata.publish import publish_metadata_and_ready
@@ -59,6 +61,22 @@ class SourceTransferError(Exception):
     """
 
 
+@contextmanager
+def mutates_model():
+    """Report a failure inside a phase as a mutated StrategyFailed.
+
+    prepare(), finalize() and abort() all write into the model, so a strategy
+    that falls through after one of them failed leaves the next needing a
+    reinitialized model.
+    """
+    try:
+        yield
+    except StrategyFailed:
+        raise
+    except Exception as e:
+        raise StrategyFailed(str(e), mutated=True) from e
+
+
 class LoadStrategy(ABC):
     """Base class for weight-loading strategies.
 
@@ -74,6 +92,65 @@ class LoadStrategy(ABC):
 
     name: str
     requires: ClassVar[tuple] = ()
+
+    def prepare(self, result: LoadResult, ctx: LoadContext) -> None:
+        """Bring the model to the state this strategy needs before loading.
+
+        The default suits strategies that hand weights to the engine through
+        its own load_weights() callbacks. A cold load needs nothing here. A
+        reload enters the engine's layerwise reload, which puts parameters
+        back on the meta device and materializes each layer as its weights
+        arrive, so a reload never transiently holds two copies of the model.
+
+        Works on ``result`` in place: it is the stable envelope the chain
+        holds for the whole attempt.
+        """
+        if ctx.is_reload:
+            with mutates_model():
+                ctx.adapter.begin_streaming_reload(result)
+
+    def finalize(self, result: LoadResult, ctx: LoadContext) -> None:
+        """Bring the loaded weights to their final runtime layout.
+
+        Runs only after `load` succeeded. On a cold load that is
+        :meth:`post_process`. On a reload, leaving the layerwise reload
+        entered by :meth:`prepare` already processed each layer as it
+        materialized, so post-processing must not run again.
+
+        Then registers the model's tensors with NIXL. Tensor discovery has to
+        see the model in its final layout, which is only true from here on.
+        An override that does not call this registers on its own terms, as
+        RDMA does mid-transfer. Registration is best-effort and never writes
+        into the model, so it sits outside :func:`mutates_model`.
+
+        Works on ``result`` in place, like :meth:`prepare`.
+        """
+        with mutates_model():
+            if ctx.is_reload:
+                ctx.adapter.end_streaming_reload(result)
+            else:
+                self.post_process(result, ctx)
+        if result.model_for_publish is not None:
+            register_tensors(result, ctx)
+
+    def abort(self, result: LoadResult, ctx: LoadContext) -> None:
+        """Undo whatever :meth:`prepare` started, after `load` failed.
+
+        Runs instead of :meth:`finalize`. A reload has to leave the layerwise
+        reload here too, so a fallback never starts against a model still
+        deferred to meta.
+        """
+        if ctx.is_reload:
+            with mutates_model():
+                ctx.adapter.end_streaming_reload(result)
+
+    def post_process(self, result: LoadResult, ctx: LoadContext) -> None:
+        """Convert the raw weights a cold load delivered into their runtime layout.
+
+        Which adapter hook does that follows from how ``load`` handed the
+        weights to the engine; see :class:`WeightsIteratorLoadStrategy` and
+        :class:`NativeLoadStrategy`.
+        """
 
     def is_available(self, ctx: LoadContext) -> bool:
         """Check environment: is this strategy usable right now?"""
@@ -99,6 +176,24 @@ class LoadStrategy(ABC):
         that through StrategyFailed(mutated=True).
         """
         return None
+
+
+class WeightsIteratorLoadStrategy(LoadStrategy):
+    """A strategy whose load() streams weights through adapter.apply_weight_iter()."""
+
+    requires: ClassVar[tuple] = (EngineAdapter.apply_weight_iter,)
+
+    def post_process(self, result: LoadResult, ctx: LoadContext) -> None:
+        ctx.adapter.after_weight_iter_load(result)
+
+
+class NativeLoadStrategy(LoadStrategy):
+    """A strategy whose load() hands weights to adapter.load_via_native()."""
+
+    requires: ClassVar[tuple] = (EngineAdapter.load_via_native,)
+
+    def post_process(self, result: LoadResult, ctx: LoadContext) -> None:
+        ctx.adapter.after_native_load(result)
 
 
 # ---------------------------------------------------------------------------

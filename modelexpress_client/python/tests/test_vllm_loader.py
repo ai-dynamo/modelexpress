@@ -15,6 +15,7 @@ import torch.nn as nn
 
 from modelexpress import p2p_pb2
 from modelexpress.adapter import EngineAdapter, StrategyFailed, StrategyRecoveryError
+from modelexpress.load_strategy import _strategy_phases
 from modelexpress.load_strategy.context import LoadResult
 from modelexpress.nixl_transfer import NixlTransferManager
 
@@ -555,25 +556,19 @@ class TestSleepWakeReloadHooks:
     """Verify MxModelLoader.on_sleep/on_wake_up.
 
     These back vLLM's optional BaseModelLoader hooks, called from
-    Worker.sleep/wake_up so a sleeping replica stops advertising itself as
-    a P2P source before its GPU memory becomes invalid, and resumes once
-    it's valid again.
+    Worker.sleep/wake_up/reload_weights so a sleeping replica stops
+    advertising itself as a P2P source before its GPU memory becomes
+    invalid, and resumes once it's valid again.
     """
 
-    def test_on_sleep_unpublishes_for_level_1(self):
+    def test_on_sleep_unpublishes_regardless_of_level(self):
         loader = _make_loader()
         loader._ctx = _make_load_context()
         with patch("modelexpress.engines.vllm.loader.unpublish_metadata") as mock_unpub:
             loader.on_sleep(1)
-        mock_unpub.assert_called_once_with(loader._ctx)
-
-    def test_on_sleep_skips_unpublish_for_non_level_1(self):
-        """Level 2 support is deferred; source-serving stays up."""
-        loader = _make_loader()
-        loader._ctx = _make_load_context()
-        with patch("modelexpress.engines.vllm.loader.unpublish_metadata") as mock_unpub:
             loader.on_sleep(2)
-        mock_unpub.assert_not_called()
+        assert mock_unpub.call_count == 2
+        mock_unpub.assert_called_with(loader._ctx)
 
     def test_on_sleep_shuts_down_nixl_manager_when_present(self):
         """unpublish_metadata alone only stops new discovery -- it does
@@ -1308,18 +1303,20 @@ class TestLoadStrategyChainRunErrorHandling:
 
 
 class TestDefaultStrategy:
-    @patch("modelexpress.load_strategy.default_strategy.register_tensors")
-    def test_after_native_load_failure_is_mutated(self, mock_register):
+    def test_after_native_load_failure_is_mutated(self):
         from modelexpress.load_strategy.default_strategy import DefaultStrategy
 
         ctx = _make_load_context()
         ctx.adapter.after_native_load = MagicMock(side_effect=RuntimeError("post load"))
 
+        model = MagicMock()
+        strategy = DefaultStrategy()
+        result = LoadResult(value=model, model=model)
         with pytest.raises(StrategyFailed, match="post load") as exc:
-            DefaultStrategy().load(MagicMock(), ctx)
+            with _strategy_phases(strategy, result, ctx):
+                strategy.load(result, ctx)
 
         assert exc.value.mutated is True
-        mock_register.assert_not_called()
 
 
 class TestRdmaStrategyAvailability:
@@ -1624,13 +1621,16 @@ class TestRdmaStrategyLoad:
         assert isinstance(result, LoadResult)
         assert attempts == ["w-1"]
 
-    def test_load_as_target_marks_post_prepare_failure_as_mutated(self):
+    def test_prepare_phase_failure_is_mutated(self):
+        """Preparing the target dummy-allocates and reshapes, so a failure
+        leaves a dirty model -- and nothing is received into it."""
         from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
 
         ctx = _make_load_context()
+        ctx.is_reload = False
         result = LoadResult(value=MagicMock(), model=MagicMock())
         strategy = RdmaStrategy()
-        source_worker = _make_worker()
+        strategy._receive_from_peer = MagicMock()
 
         ctx.adapter.prepare_rdma_target = MagicMock(side_effect=lambda result: result)
         ctx.adapter.before_rdma_receive = MagicMock(
@@ -1638,9 +1638,71 @@ class TestRdmaStrategyLoad:
         )
 
         with pytest.raises(StrategyFailed, match="post-prepare failure") as exc:
-            strategy._load_as_target(result, ctx, source_worker, "src", "worker")
+            strategy._load_as_target(result, ctx, MagicMock(), "mx-source", "w-1")
 
         assert exc.value.mutated is True
+        strategy._receive_from_peer.assert_not_called()
+
+    def test_no_source_leaves_the_model_untouched(self):
+        """Without a source, the next strategy must get the model as it was.
+
+        Preparing the target rewrites it into the source's processed layout,
+        which a strategy streaming raw checkpoint weights cannot load into --
+        and a miss reports itself as not mutated, so nothing would rebuild it.
+        """
+        from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
+
+        ctx = _make_load_context()
+        ctx.is_reload = False
+        result = LoadResult(value=MagicMock(), model=MagicMock())
+        strategy = RdmaStrategy()
+        strategy._find_source_instances = MagicMock(return_value=[])
+        ctx.adapter.prepare_rdma_target = MagicMock()
+        ctx.adapter.before_rdma_receive = MagicMock()
+
+        with pytest.raises(StrategyFailed, match="No RDMA source") as exc:
+            with _strategy_phases(strategy, result, ctx):
+                strategy.load(result, ctx)
+
+        assert exc.value.mutated is False
+        ctx.adapter.prepare_rdma_target.assert_not_called()
+        ctx.adapter.before_rdma_receive.assert_not_called()
+
+    def test_each_candidate_prepares_the_target_it_receives_into(self):
+        """A failed candidate leaves a reinitialized model, so the next one
+        has to prepare it again."""
+        from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
+
+        ctx = _make_load_context()
+        ctx.is_reload = False
+        strategy = RdmaStrategy()
+        strategy._find_source_instances = MagicMock(
+            return_value=[
+                _make_instance_ref(worker_id="w-1"),
+                _make_instance_ref(worker_id="w-2"),
+            ]
+        )
+        strategy._fetch_worker_metadata = MagicMock(return_value=MagicMock())
+        strategy._accelerator_compatible = MagicMock(return_value=True)
+        strategy._receive_from_peer = MagicMock(
+            side_effect=[RuntimeError("READ timed out"), None]
+        )
+        ctx.adapter.prepare_rdma_target = MagicMock(side_effect=lambda r: r)
+        ctx.adapter.before_rdma_receive = MagicMock(side_effect=lambda r: r)
+        model = MagicMock()
+        ctx.adapter.reinit_for_retry = MagicMock(
+            return_value=LoadResult(value=model, model=model)
+        )
+
+        with patch(
+            "modelexpress.load_strategy.rdma_strategy.get_configured_selector",
+            return_value=_IdentitySelector(),
+        ):
+            strategy.load(LoadResult(value=MagicMock(), model=MagicMock()), ctx)
+
+        assert ctx.adapter.prepare_rdma_target.call_count == 2
+        assert ctx.adapter.before_rdma_receive.call_count == 2
+        ctx.adapter.reinit_for_retry.assert_called_once()
 
     def test_rollback_shuts_down_nixl_manager(self):
         from modelexpress.load_strategy.rdma_strategy import RdmaStrategy

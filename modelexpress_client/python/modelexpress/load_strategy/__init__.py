@@ -11,6 +11,7 @@ MxModelLoader iterates the chain until one succeeds.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 
 import torch.nn as nn
 
@@ -101,6 +102,33 @@ class LoadStrategyChain:
             ) from exc
 
 
+@contextmanager
+def _strategy_phases(
+    strategy: LoadStrategy,
+    result: LoadResult,
+    ctx: LoadContext,
+):
+    """Wrap one attempt in the strategy's prepare() and finalize().
+
+    The chain only sequences the phases. What each one does, including how it
+    differs on a reload, is the strategy's own decision. finalize() sits after
+    the yield rather than in a finally, because a failed attempt has nothing
+    to bring to a final layout; abort() runs instead, to undo whatever
+    prepare() started.
+
+    The phases work on ``result`` in place: LoadResult is the stable envelope
+    the chain holds for the whole attempt, which is why reinit_for_retry
+    copies a replacement's state back into it rather than handing one out.
+    """
+    strategy.prepare(result, ctx)
+    try:
+        yield
+    except BaseException:
+        strategy.abort(result, ctx)
+        raise
+    strategy.finalize(result, ctx)
+
+
 def execute_load_strategies(
     model: nn.Module,
     ctx: LoadContext,
@@ -119,7 +147,8 @@ def execute_load_strategies(
         for strategy in eligible:
             logger.info(f"[Worker {ctx.global_rank}] Trying strategy: {strategy.name}")
             try:
-                result = strategy.load(result, ctx)
+                with _strategy_phases(strategy, result, ctx):
+                    result = strategy.load(result, ctx)
                 publish_source_if_supported(result, ctx)
                 span.set_attribute("weight_loading_strategy", strategy.name)
                 return result.value

@@ -12,6 +12,7 @@ import torch
 
 from modelexpress import p2p_pb2
 from modelexpress.adapter import EngineAdapter, StrategyFailed
+from modelexpress.load_strategy import _strategy_phases
 from modelexpress.load_strategy.context import LoadResult
 
 
@@ -154,8 +155,7 @@ class TestInstantTensorIsAvailable:
 
 
 class TestInstantTensorLoad:
-    @patch("modelexpress.load_strategy.instant_tensor_strategy.register_tensors")
-    def test_success_path(self, mock_register):
+    def test_success_path(self):
         model = MagicMock()
         adapter = _FakeAdapter()
         adapter.build_instanttensor_weight_iter = MagicMock(
@@ -173,10 +173,8 @@ class TestInstantTensorLoad:
         assert result.model is model
         adapter.build_instanttensor_weight_iter.assert_called_once_with(model=model)
         model.load_weights.assert_called_once()
-        mock_register.assert_called_once_with(result, ctx)
 
-    @patch("modelexpress.load_strategy.instant_tensor_strategy.register_tensors")
-    def test_iterator_setup_failure_is_not_mutated(self, mock_register):
+    def test_iterator_setup_failure_is_not_mutated(self):
         model = MagicMock()
         adapter = _FakeAdapter()
         adapter.build_instanttensor_weight_iter = MagicMock(
@@ -189,10 +187,8 @@ class TestInstantTensorLoad:
             strategy.load(model, ctx)
 
         assert exc.value.mutated is False
-        mock_register.assert_not_called()
 
-    @patch("modelexpress.load_strategy.instant_tensor_strategy.register_tensors")
-    def test_apply_weight_iter_failure_is_mutated(self, mock_register):
+    def test_apply_weight_iter_failure_is_mutated(self):
         model = MagicMock()
         adapter = _FakeAdapter()
         adapter.build_instanttensor_weight_iter = MagicMock(
@@ -206,10 +202,8 @@ class TestInstantTensorLoad:
             strategy.load(model, ctx)
 
         assert exc.value.mutated is True
-        mock_register.assert_not_called()
 
-    @patch("modelexpress.load_strategy.instant_tensor_strategy.register_tensors")
-    def test_after_weight_iter_failure_is_mutated(self, mock_register):
+    def test_after_weight_iter_failure_is_mutated(self):
         model = MagicMock()
         adapter = _FakeAdapter()
         adapter.build_instanttensor_weight_iter = MagicMock(
@@ -219,11 +213,14 @@ class TestInstantTensorLoad:
         ctx = _make_load_context(adapter=adapter)
         strategy = _make_strategy()
 
+        # Post-processing is a chain-run phase now, so the conversion of its
+        # failure into a mutated StrategyFailed belongs to the phase runner.
+        result = LoadResult(value=model, model=model)
         with pytest.raises(StrategyFailed, match="post load") as exc:
-            strategy.load(model, ctx)
+            with _strategy_phases(strategy, result, ctx):
+                strategy.load(result, ctx)
 
         assert exc.value.mutated is True
-        mock_register.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
