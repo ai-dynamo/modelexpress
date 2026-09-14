@@ -443,6 +443,17 @@ jobs:
             worker_port: "8002"
             expected_artifact_sources: "1"
             expected_artifact_source_types: "torch_compile_cache"
+          - framework: vllm
+            label: vllm MTP
+            namespace: mx-ci-vllm-mtp-${{ github.run_id }}
+            manifest: ci/k8s/client/vllm/manifest-azure-mtp.yaml
+            test_script: ci/k8s/client/test_p2p_k8s.py
+            pytest_args: "--expect-mtp"
+            model: Qwen/Qwen3.5-0.8B
+            source_extra_env: "JOB_NAME=mx-source"
+            extra_env: "JOB_NAME=mx-target"
+            source_port: "8031"
+            worker_port: "8032"
           - framework: sglang
             namespace: mx-ci-sglang-${{ github.run_id }}
             manifest: ci/k8s/client/sgl/manifest-azure.yaml
@@ -556,7 +567,7 @@ jobs:
           worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
           worker_registry: nvcr.io
           ngc_api_key: ${{ secrets.NGC_API_KEY }}
-          model: ${{ env.MX_CI_MODEL }}
+          model: ${{ matrix.model || env.MX_CI_MODEL }}
           hf_token: ${{ secrets.HF_TOKEN }}
           server_manifest: ${{ matrix.server_manifest || 'ci/k8s/server/mx-server.yaml' }}
           mx_p2p_metadata: ${{ matrix.mx_p2p_metadata || '1' }}

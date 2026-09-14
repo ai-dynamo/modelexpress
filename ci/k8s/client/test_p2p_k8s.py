@@ -14,6 +14,8 @@ have reached Running state.  Asserts:
      are loaded and the model is serving correctly on each.
   4. When enabled by the workflow, target peak and final VRAM do not materially
      exceed source VRAM.
+  5. When --expect-mtp is set, the target transfers the main model through P2P
+     before loading the MTP draft model locally.
 
 Invoked by the workflow as:
   pytest ci/k8s/client/test_p2p_k8s.py -v \
@@ -23,7 +25,8 @@ Invoked by the workflow as:
       --worker-port $WORKER_PORT \
       --tp-size $TP_SIZE \
       [--dp-size $DP_SIZE] \
-      [--p2p-marker "framework-specific transfer complete string"]
+      [--p2p-marker "framework-specific transfer complete string"] \
+      [--expect-mtp]
 
 --p2p-marker defaults:
   vLLM: "RDMA transfer complete" (emitted by vLLM's RdmaStrategy)
@@ -204,6 +207,36 @@ def test_rdma_transfer_logged(namespace: str, p2p_marker: str) -> None:
     assert p2p_marker in logs, (
         f"P2P marker {p2p_marker!r} not found in target logs.\n"
         f"Last 50 log lines:\n" + "\n".join(logs.splitlines()[-50:])
+    )
+
+
+def test_mtp_load_phases(namespace: str, expect_mtp: bool) -> None:
+    """MTP must use P2P only for the main model, never for its draft head."""
+    if not expect_mtp:
+        pytest.skip("MTP phase assertion not enabled")
+
+    logs = _all_pod_logs(namespace, "mx-target", "mx-target")
+    main_marker = "p2p_enabled=True"
+    transfer_marker = "RDMA transfer complete"
+    draft_marker = "p2p_enabled=False"
+    main_index = logs.find(main_marker)
+    transfer_index = logs.find(transfer_marker, main_index + 1)
+    draft_index = logs.find(draft_marker, transfer_index + 1)
+    phase_lines = [
+        line
+        for line in logs.splitlines()
+        if any(marker in line for marker in (main_marker, transfer_marker, draft_marker))
+    ]
+    print("[mx-target] MTP load phases:\n" + "\n".join(phase_lines))
+    assert main_index >= 0, "Target did not start a P2P-enabled main-model load"
+    assert transfer_index > main_index, (
+        "Target did not complete RDMA transfer after starting the main-model load"
+    )
+    assert draft_index > transfer_index, (
+        "Target did not load the MTP draft locally after the main-model transfer"
+    )
+    assert logs.find(transfer_marker, draft_index + 1) < 0, (
+        "Target performed another RDMA transfer while loading the MTP draft"
     )
 
 
