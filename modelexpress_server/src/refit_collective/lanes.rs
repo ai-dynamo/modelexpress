@@ -90,6 +90,8 @@ pub enum LaneError {
     MultipleBroadcastLanes { found: usize },
     #[error("slot {slot_id} is not a member of this group")]
     UnknownParticipant { slot_id: String },
+    #[error("lane {lane_id} declares no trainer slot; rank 0 of a lane must be a trainer")]
+    NoTrainerSlotInLane { lane_id: u32 },
 }
 
 impl LaneLayout {
@@ -135,6 +137,17 @@ impl LaneLayout {
             }
             if lane.kind == LaneKind::Unspecified {
                 return Err(LaneError::UnspecifiedLaneKind {
+                    lane_id: lane.lane_id,
+                });
+            }
+            // Rank 0 of every lane is a trainer by construction, and
+            // publish_bootstrap requires an admitted rank-0 participant. A
+            // lane declaring no trainer would put a generator at rank 0, or -
+            // with both lists empty - give a lane world_size 0 that can never
+            // bootstrap, so the group would sit FORMING until the client
+            // deadline instead of failing here with a reason.
+            if lane.trainer_slots.is_empty() {
+                return Err(LaneError::NoTrainerSlotInLane {
                     lane_id: lane.lane_id,
                 });
             }
@@ -365,6 +378,59 @@ mod tests {
                 slot_id: "t1".to_string()
             }
         );
+    }
+
+    #[test]
+    fn a_lane_with_no_trainer_slot_is_rejected_rather_than_bootstrapped() {
+        // Rank 0 would be a generator, which every rank-0-is-a-trainer caller
+        // and publish_bootstrap both assume away.
+        let error = LaneLayout::new(
+            vec![
+                Lane {
+                    lane_id: 0,
+                    kind: LaneKind::Reshard,
+                    trainer_slots: s(&[]),
+                    generator_slots: s(&["g0"]),
+                },
+                Lane {
+                    lane_id: 1,
+                    kind: LaneKind::Broadcast,
+                    trainer_slots: s(&["t0"]),
+                    generator_slots: s(&["g0"]),
+                },
+            ],
+            &s(&["t0"]),
+            &s(&["g0"]),
+        )
+        .expect_err("lane 0 has no trainer to lead it");
+        assert_eq!(error, LaneError::NoTrainerSlotInLane { lane_id: 0 });
+    }
+
+    #[test]
+    fn an_empty_lane_is_rejected_rather_than_left_to_time_out() {
+        // world_size 0 has no rank 0 to admit, so publish_bootstrap fails this
+        // lane on every attempt and the group sits FORMING until the client
+        // deadline. The same check catches it, with a reason.
+        let error = LaneLayout::new(
+            vec![
+                Lane {
+                    lane_id: 4,
+                    kind: LaneKind::Reshard,
+                    trainer_slots: s(&[]),
+                    generator_slots: s(&[]),
+                },
+                Lane {
+                    lane_id: 5,
+                    kind: LaneKind::Broadcast,
+                    trainer_slots: s(&["t0"]),
+                    generator_slots: s(&["g0"]),
+                },
+            ],
+            &s(&["t0"]),
+            &s(&["g0"]),
+        )
+        .expect_err("lane 4 has no participants at all");
+        assert_eq!(error, LaneError::NoTrainerSlotInLane { lane_id: 4 });
     }
 
     #[test]
