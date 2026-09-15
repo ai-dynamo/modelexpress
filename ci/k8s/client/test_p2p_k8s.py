@@ -15,7 +15,8 @@ have reached Running state.  Asserts:
   4. When enabled by the workflow, target peak and final VRAM do not materially
      exceed source VRAM.
   5. When --expect-mtp is set, the target transfers the main model through P2P
-     before loading the MTP draft model locally.
+     before loading the MTP draft model locally, and source/target greedy
+     completions for a small prompt match exactly.
 
 Invoked by the workflow as:
   pytest ci/k8s/client/test_p2p_k8s.py -v \
@@ -155,7 +156,15 @@ def _ready_artifact_source_types(namespace: str) -> set[str]:
     return source_types
 
 
-def _assert_inference(namespace: str, job_name: str, model: str, remote_port: int, local_port: int) -> None:
+def _assert_inference(
+    namespace: str,
+    job_name: str,
+    model: str,
+    remote_port: int,
+    local_port: int,
+    *,
+    deterministic: bool = False,
+) -> str:
     # Pin to pod-0 explicitly. For multi-node StatefulSets, only the head
     # pod (apps.kubernetes.io/pod-index=0) runs the vLLM HTTP API server;
     # the worker pod has no HTTP listener. For single-pod Jobs, _pod_name
@@ -165,11 +174,14 @@ def _assert_inference(namespace: str, job_name: str, model: str, remote_port: in
     print(f"\n[{job_name}] pod={pod} remote_port={remote_port} local_port={local_port}")
     # TODO: replace with a more complex prompt that exercises multi-token reasoning
     # to better validate model correctness beyond a single-word completion.
-    payload = json.dumps({
+    request_payload = {
         "model": model,
         "prompt": "The capital of France is",
         "max_tokens": 8,
-    }).encode()
+    }
+    if deterministic:
+        request_payload.update({"temperature": 0, "seed": 0})
+    payload = json.dumps(request_payload).encode()
     with port_forward(namespace, pod, local_port=local_port, remote_port=remote_port) as port:
         req = urllib.request.Request(
             f"http://localhost:{port}/v1/completions",
@@ -189,6 +201,7 @@ def _assert_inference(namespace: str, job_name: str, model: str, remote_port: in
     text = choices[0].get("text", "")
     print(f"[{job_name}] completion text: {text!r}")
     assert text, f"Empty completion text from {job_name}: {body}"
+    return text
 
 
 def test_rdma_transfer_logged(namespace: str, p2p_marker: str) -> None:
@@ -454,6 +467,39 @@ def test_source_inference_produces_output(namespace: str, model: str, source_por
 def test_target_inference_produces_output(namespace: str, model: str, worker_port: int) -> None:
     """Target server must return a valid completion response after P2P transfer."""
     _assert_inference(namespace, "mx-target", model, remote_port=worker_port, local_port=18000)
+
+
+def test_mtp_source_target_outputs_match(
+    namespace: str,
+    model: str,
+    source_port: int,
+    worker_port: int,
+    expect_mtp: bool,
+) -> None:
+    """Disk-loaded source and P2P-loaded target must produce identical output."""
+    if not expect_mtp:
+        pytest.skip("MTP output consistency assertion not enabled")
+
+    source_text = _assert_inference(
+        namespace,
+        "mx-source",
+        model,
+        remote_port=source_port,
+        local_port=18003,
+        deterministic=True,
+    )
+    target_text = _assert_inference(
+        namespace,
+        "mx-target",
+        model,
+        remote_port=worker_port,
+        local_port=18004,
+        deterministic=True,
+    )
+    assert target_text == source_text, (
+        "MTP source/target completions differ for the deterministic prompt: "
+        f"source={source_text!r}, target={target_text!r}"
+    )
 
 
 def _assert_target_vram_matches_source(
