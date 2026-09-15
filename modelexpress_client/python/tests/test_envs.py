@@ -32,6 +32,7 @@ def test_defaults_when_unset(monkeypatch):
         "MX_RESHARD_FUSED_WIRE",
         "MX_RESHARD_BATCH_INSTALL",
         "MX_RESHARD_CACHE_DESCRIPTORS",
+        "MX_P2P_TOPOLOGY_FILTER_LEVEL",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -57,6 +58,7 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_RESHARD_FUSED_WIRE is True
     assert envs.MX_RESHARD_BATCH_INSTALL is True
     assert envs.MX_RESHARD_CACHE_DESCRIPTORS is True
+    assert envs.MX_P2P_TOPOLOGY_FILTER_LEVEL is None
 
 
 def test_int_and_float_parsing(monkeypatch):

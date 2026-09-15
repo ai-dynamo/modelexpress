@@ -23,9 +23,9 @@ from .base import (
     LoadStrategy,
     SourceTransferError,
     clear_exception_tracebacks,
+    publish_metadata,
     publish_source_if_supported,
     register_tensors,
-    publish_metadata,
     unpublish_metadata,
 )
 
@@ -37,8 +37,8 @@ __all__ = [
     "execute_load_strategies",
     "run_load_strategy_chain",
     "SourceTransferError",
-    "register_tensors",
     "publish_metadata",
+    "register_tensors",
     "unpublish_metadata",
 ]
 

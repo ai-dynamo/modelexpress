@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+import gc
 import json
 import logging
 import os
@@ -178,9 +179,10 @@ def _select_draft_weight_files(
 class VllmAdapter(EngineAdapter):
     """Adapter that maps strategy hooks onto vLLM's native loader APIs."""
 
-    def __init__(self, vllm_config, model_config):
+    def __init__(self, vllm_config, model_config, prefix: str = ""):
         self.vllm_config = vllm_config
         self.model_config = model_config
+        self.prefix = prefix
         self.load_config = vllm_config.load_config
         self.target_device = self._resolve_target_device()
         self.accelerator_backend = accelerator_backend_for(self.target_device)
@@ -386,24 +388,59 @@ class VllmAdapter(EngineAdapter):
 
         stale_value = result.value
         stale_model = result.model
+        if stale_model is None:
+            raise RuntimeError("vLLM retry reinitialization requires result.model")
+        if stale_value is not stale_model:
+            raise RuntimeError(
+                "vLLM retry reinitialization requires result.value and "
+                "result.model to reference the same model root"
+            )
+        publishable = result.publishable
+        metadata = result.metadata
         result.value = None
         result.model = None
         # Unregister before dropping the model: its registrations identify it,
         # and clearing them frees its parameters before the rebuild allocates.
         self._unregister_model_layers(stale_model)
+        # The vLLM loader retains the model root in its caller while this hook
+        # runs. Synchronize outstanding copies, then empty the root shell so a
+        # fresh initialization cannot coexist with the old parameter graph.
+        self.accelerator_backend.synchronize()
+        stale_model.__dict__.clear()
         del stale_value
-        del stale_model
+        gc.collect()
         self.accelerator_backend.empty_cache()
         logger.info(
             "[Worker %s] Re-initializing vLLM model after failed strategy",
             self.get_global_rank(),
         )
-        with self.target_device:
-            model = initialize_model(
-                vllm_config=self.vllm_config,
-                model_config=self.model_config,
-            )
-        return LoadResult(value=model, model=model, publishable=result.publishable)
+        try:
+            with self.target_device:
+                fresh_model = initialize_model(
+                    vllm_config=self.vllm_config,
+                    model_config=self.model_config,
+                    prefix=self.prefix,
+                )
+            if type(fresh_model) is not type(stale_model):
+                raise RuntimeError(
+                    "vLLM retry initialization returned a different model type: "
+                    f"expected {type(stale_model).__qualname__}, "
+                    f"got {type(fresh_model).__qualname__}"
+                )
+        except BaseException:
+            result.value = stale_model
+            result.model = stale_model
+            result.publishable = publishable
+            result.metadata = metadata
+            raise
+
+        stale_model.__dict__.update(fresh_model.__dict__)
+        del fresh_model
+        result.value = stale_model
+        result.model = stale_model
+        result.publishable = publishable
+        result.metadata = metadata
+        return result
 
     def _process_weights_after_loading(
         self,
@@ -739,12 +776,16 @@ def _get_vllm_device_id(target_device: torch.device) -> int:
     return device_id
 
 
-def build_vllm_load_context(vllm_config, model_config) -> LoadContext:
+def build_vllm_load_context(
+    vllm_config,
+    model_config,
+    prefix: str = "",
+) -> LoadContext:
     """Build a LoadContext from vLLM config objects."""
 
     from vllm.distributed import get_world_group
 
-    adapter = VllmAdapter(vllm_config, model_config)
+    adapter = VllmAdapter(vllm_config, model_config, prefix=prefix)
     global_rank = adapter.get_global_rank()
     worker_rank = adapter.get_worker_rank()
     return LoadContext(

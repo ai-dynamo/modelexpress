@@ -8,7 +8,13 @@ from __future__ import annotations
 import logging
 
 from ..adapter import EngineAdapter, StrategyFailed
-from .base import LoadContext, LoadStrategy, _as_load_result, register_tensors
+from .base import (
+    LoadContext,
+    LoadStrategy,
+    _as_load_result,
+    close_weight_iterator,
+    register_tensors,
+)
 from .context import LoadResult
 
 logger = logging.getLogger("modelexpress.strategy_gds")
@@ -65,6 +71,8 @@ class GdsStrategy(LoadStrategy):
                     f"[Worker {ctx.global_rank}] GDS loading failed, falling through: {e}"
                 )
                 raise StrategyFailed(str(e), mutated=True) from e
+            finally:
+                close_weight_iterator(weights_iter, worker_rank=ctx.global_rank)
         finally:
             gds_loader.shutdown()
 
