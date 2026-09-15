@@ -31,7 +31,10 @@ echo "run=$RUN model=$MODEL trainer=$TRAINER trainers=$T generators=$G rounds=$R
 
 sleep 5
 for rank in $(seq 0 $((T-1))); do
+  # LOCAL_RANK and WORLD_SIZE are DeepSpeed's; each process pins one visible
+  # device, so its local rank is always zero.
   ( CUDA_VISIBLE_DEVICES=$((G+rank)) LOCAL_DEVICE=0 RANK=$rank \
+    LOCAL_RANK=0 WORLD_SIZE=$T \
     MASTER_ADDR=127.0.0.1 MASTER_PORT=${MASTER_PORT:-29555} \
     python3 -m mx_m2n_e2e.trainer --model-dir "$MODEL" --endpoint "$MX_ENDPOINT" \
       --model-name "$RUN" --run-id "$RUN" --trainers "$T" --generators "$G" \

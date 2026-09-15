@@ -169,17 +169,27 @@ def build_fsdp2(model_dir, mesh, device, trainers):
 
 
 def build_deepspeed(model_dir, device, trainers):
+    """A ZeRO-3 engine holding the checkpoint, partitioned as DeepSpeed does it.
+
+    ``HfDeepSpeedConfig`` has to exist, and stay alive, before ``from_pretrained``
+    runs: it is what puts transformers into ZeRO-3 loading. Entering
+    ``deepspeed.zero.Init`` by hand instead partitions the parameters underneath a
+    loader that then compares the partitioned extents against the checkpoint's and
+    refuses them as mismatched shapes.
+    """
     import deepspeed
     from transformers import AutoModelForCausalLM
+    from transformers.integrations import HfDeepSpeedConfig
 
     config = {
         "train_micro_batch_size_per_gpu": 1,
         "bf16": {"enabled": True},
         "zero_optimization": {"stage": 3, "stage3_param_persistence_threshold": 0},
     }
-    with deepspeed.zero.Init(config_dict_or_path=config, dtype=torch.bfloat16):
-        model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.bfloat16)
+    holder = HfDeepSpeedConfig(config)  # noqa: F841 - must outlive from_pretrained
+    model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.bfloat16)
     engine, *_ = deepspeed.initialize(model=model, config=config)
+    engine._mx_hf_ds_config = holder
     return engine
 
 
