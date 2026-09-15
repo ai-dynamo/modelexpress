@@ -197,7 +197,9 @@ def fake_nccl(monkeypatch):
     ]:
         monkeypatch.setitem(sys.modules, name, mod)
     monkeypatch.setattr(
-        collective_client, "_bootstrap_barrier", lambda lane, device: None
+        collective_client,
+        "_bootstrap_barrier",
+        lambda lane, device, **kwargs: None,
     )
     monkeypatch.setattr(
         "modelexpress_rl.collective.comm.LaneCommunicator.synchronize",
@@ -304,7 +306,7 @@ class TestBootstrap:
         monkeypatch.setattr(
             collective_client,
             "_bootstrap_barrier",
-            lambda lane, device: events.append(("barrier", lane.rank)),
+            lambda lane, device, **kwargs: events.append(("barrier", lane.rank)),
         )
 
         client.compute_plan()
