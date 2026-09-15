@@ -181,6 +181,9 @@ class _Array:
         self.sharding = _Sharding(devices)
         self.shape = shape
         self.dtype = dtype
+        self.size = 1
+        for extent in shape:
+            self.size *= extent
         self._ptr = ptr
 
     def unsafe_buffer_pointer(self):
@@ -277,3 +280,26 @@ class TestLocalShardPlanChecks:
         """The plain lookup must stay usable where there is no plan to check."""
         array = self._array(7, (slice(None), slice(0, 4)))
         assert jax_interop.local_shard(array).shape == (7, 8)
+
+
+class TestBarrierByteView:
+    """The barrier hands nccl4py an array interface and no ``__dlpack__``."""
+
+    def test_it_exposes_a_one_byte_interface_at_the_buffer_address(self):
+        view = jax_interop._ByteView(_Array(shards=["x"], ptr=0xBEEF000))
+        cai = view.__cuda_array_interface__
+        assert cai["data"] == (0xBEEF000, False)
+        assert cai["typestr"] == "|u1"
+        assert cai["strides"] is None
+        assert cai["version"] == 3
+
+    def test_it_offers_no_dlpack(self):
+        """cuda.core prefers DLPack when both are present, and JAX's rejects
+        the -1 stream sentinel nccl4py passes, which killed the barrier."""
+        view = jax_interop._ByteView(_Array(shards=["x"]))
+        assert not hasattr(view, "__dlpack__")
+
+    def test_it_holds_the_array(self):
+        array = _Array(shards=["x"])
+        view = jax_interop._ByteView(array)
+        assert view._array is array
