@@ -95,3 +95,6 @@ UID, worker count, and post-refit generation. Keep worker, server, and coordinat
 logs as separate evidence; the pass line does not by itself qualify throughput
 or delta/S3 behavior. The checked-in coordinator exercises the full-weight NIXL
 active-refit lifecycle; it does not qualify canonical S3 delta cold start.
+
+For XOR artifact-backed S3 deltas with a Vime trainer,
+see [`vime_dynamo_delta_refit`](../vime_dynamo_delta_refit/README.md).
