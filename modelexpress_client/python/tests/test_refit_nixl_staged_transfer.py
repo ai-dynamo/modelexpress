@@ -1138,7 +1138,12 @@ def test_prepare_stages_in_pinned_host_memory_and_splits_the_budget(
     try:
         # 16 bytes of payload rounds to one 256-byte residency per arena; the
         # budget is split per buffer, so 256 * buffers admits it and less does not.
-        with pytest.raises(IncompleteRefit, match="per-buffer staging budget"):
+        expected = (
+            "split across staging_buffers=2 gives 255 bytes per arena"
+            if staging_buffers == 2
+            else "exceeds max_staging_bytes=255; raise max_staging_bytes"
+        )
+        with pytest.raises(IncompleteRefit, match=expected):
             transfer.prepare(
                 manifests=[manifest],
                 capture_layout=lambda m: (capture, layout),

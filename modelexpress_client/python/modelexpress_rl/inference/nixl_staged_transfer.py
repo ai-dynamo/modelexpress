@@ -100,7 +100,20 @@ class _PreparedBoundedTransfer:
     metrics: dict[str, float] = field(default_factory=dict)
 
 
-def _bounded_batches(capture, parameter_layout, sources, max_staging_bytes):
+def _bounded_batches(
+    capture,
+    parameter_layout,
+    sources,
+    max_staging_bytes,
+    *,
+    total_staging_bytes=None,
+    staging_buffers=1,
+):
+    """Plan one batch per owning module within ``max_staging_bytes`` per arena.
+
+    ``total_staging_bytes`` and ``staging_buffers`` only shape the error when a
+    module does not fit, so the caller sees the split that produced the share.
+    """
     """Validate all owning-module batches before allocating or installing."""
     if (
         isinstance(max_staging_bytes, bool)
@@ -134,10 +147,19 @@ def _bounded_batches(capture, parameter_layout, sources, max_staging_bytes):
             for shape, dtype in layout.values()
         )
         if nbytes > max_staging_bytes:
+            if total_staging_bytes is not None and staging_buffers > 1:
+                budget = (
+                    f"max_staging_bytes={total_staging_bytes} split across "
+                    f"staging_buffers={staging_buffers} gives {max_staging_bytes} "
+                    "bytes per arena"
+                )
+                remedy = "lower staging_buffers or raise max_staging_bytes"
+            else:
+                budget = f"max_staging_bytes={max_staging_bytes}"
+                remedy = "raise max_staging_bytes"
             raise IncompleteRefit(
                 f"module {module!r} requires {nbytes} staging bytes, exceeds "
-                f"the per-buffer staging budget of {max_staging_bytes} bytes "
-                "(max_staging_bytes divided by staging_buffers)"
+                f"{budget}; {remedy} (there is no CPU fallback)"
             )
         batches.append(_BoundedBatch(subset, plan, layouts, nbytes))
     if not batches:
@@ -581,7 +603,12 @@ class _NixlStagedTransfer:
                     "max_staging_bytes must cover at least one byte per staging buffer"
                 )
             batches = _bounded_batches(
-                capture, parameter_layout, resolved.sources, buffer_budget
+                capture,
+                parameter_layout,
+                resolved.sources,
+                buffer_budget,
+                total_staging_bytes=max_staging_bytes,
+                staging_buffers=staging_buffers,
             )
             if envs.MX_REFIT_PACK_MODULES:
                 batches = _pack_bounded_batches(batches, buffer_budget)
