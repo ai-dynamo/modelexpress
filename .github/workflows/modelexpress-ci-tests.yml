@@ -71,9 +71,9 @@
 #                         (vllm / sglang). No target pod — the assertion runs
 #                         against mx-server directly via gRPC.
 #
-#   h100-smoke          — non-gating same-node NIXL canary. Runs one isolated
-#                         TP=1 rank on each H100 and validates an exact GPU-to-GPU
-#                         tensor transfer through ModelExpress.
+#   h100-smoke          — non-gating same-node NIXL canary. A CPU deploy runner
+#                         creates separate TP=1 source and target Jobs on H100s
+#                         and validates an exact GPU-to-GPU tensor transfer.
 #
 #   model-streamer       — matrix over frameworks; single worker pod, no
 #                          vCluster, no P2P. Streams weights directly from S3
@@ -1081,27 +1081,20 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
-  # Dedicated H100 runner and same-node NIXL canary. The ARC container hook
-  # injects two GPUs; each spawned TP=1 rank is masked to exactly one of them.
+  # A CPU deploy runner creates separate one-H100 source and target Jobs on the
+  # aws-dev-02 cluster. Required pod affinity keeps the transport same-node.
   # ---------------------------------------------------------------------------
   h100-smoke:
     name: H100 NIXL TP1-to-TP1 smoke test
-    runs-on: prod-modelexpress-tester-amd-h100-v1
+    runs-on: prod-deploy-tester-v1
     needs: [build-client]
-    # Must exceed the runner's four-hour pod-preparation window so the smoke
-    # can still initialize, execute, and clean up after H100 capacity arrives.
-    timeout-minutes: 300
+    timeout-minutes: 60
     permissions:
       contents: read
-    container:
-      # `env` is unavailable while GitHub evaluates the job container image.
-      image: nvcr.io/0980761089281446/mx-worker-vllm:${{ github.sha }}
-      credentials:
-        username: "$oauthtoken"
-        password: ${{ secrets.NGC_API_KEY }}
-      env:
-        MODEL_EXPRESS_LOG_LEVEL: INFO
-        MX_NIXL_BACKEND: UCX
+    env:
+      KUBE_CONTEXT: nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02
+      NAMESPACE: mx-ci-h100-${{ github.run_id }}-${{ github.run_attempt }}
+      WORKER_IMAGE: nvcr.io/0980761089281446/mx-worker-vllm:${{ github.sha }}
 
     steps:
       - name: Checkout
@@ -1109,34 +1102,131 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Verify H100 allocation
-        shell: bash
+      - name: Prepare direct H100 workload
+        env:
+          NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
         run: |
           set -euo pipefail
+          kc=(kubectl --kubeconfig=/teleport/kubeconfig.yaml --context="$KUBE_CONTEXT")
+          k=("${kc[@]}" --namespace="$NAMESPACE")
+          "${kc[@]}" config get-contexts "$KUBE_CONTEXT" -o name | grep -qx "$KUBE_CONTEXT"
+          "${kc[@]}" create namespace "$NAMESPACE" --dry-run=client -o yaml \
+            | "${kc[@]}" label --local -f - \
+                ci.modelexpress.nvidia.com/run-id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+                -o yaml \
+            | "${kc[@]}" create -f -
+          "${k[@]}" create quota h100-tp1-smoke \
+            --hard=requests.nvidia.com/gpu=2,limits.nvidia.com/gpu=2
+          "${k[@]}" create secret docker-registry nvcr-imagepullsecret \
+            --docker-server=nvcr.io \
+            --docker-username='$oauthtoken' \
+            --docker-password="$NGC_API_KEY"
+          "${k[@]}" create configmap h100-tp1-script \
+            --from-file=h100_tp1_smoke.py=ci/h100_tp1_smoke.py
+          sed "s|WORKER_IMAGE|$WORKER_IMAGE|g" ci/h100_tp1_source.yaml \
+            | "${k[@]}" create -f -
 
-          mapfile -t gpu_names < <(
-            nvidia-smi --query-gpu=name --format=csv,noheader
-          )
-          mapfile -t gpu_uuids < <(
-            nvidia-smi --query-gpu=uuid --format=csv,noheader
-          )
-          printf 'Detected GPU: %s\n' "${gpu_names[@]}"
+      - name: Wait for TP1-to-TP1 transfer
+        run: |
+          set -euo pipefail
+          k=(kubectl --kubeconfig=/teleport/kubeconfig.yaml \
+            --context="$KUBE_CONTEXT" --namespace="$NAMESPACE")
+          "${k[@]}" wait --for=create pod -l job-name=h100-tp1-source --timeout=2m
+          "${k[@]}" wait --for=condition=Ready pod \
+            -l job-name=h100-tp1-source --timeout=20m
+          sed "s|WORKER_IMAGE|$WORKER_IMAGE|g" ci/h100_tp1_target.yaml \
+            | "${k[@]}" create -f -
 
-          if [ "${#gpu_names[@]}" -ne 2 ]; then
-            echo "Expected 2 GPUs, found ${#gpu_names[@]}" >&2
-            exit 1
+          wait_for_job() {
+            local job=$1
+            local deadline=$((SECONDS + $2))
+            while (( SECONDS < deadline )); do
+              local conditions
+              conditions=$("${k[@]}" get job "$job" \
+                -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}')
+              if grep -qx 'Complete=True' <<< "$conditions"; then
+                return 0
+              fi
+              if grep -qx 'Failed=True' <<< "$conditions"; then
+                echo "$job failed" >&2
+                return 1
+              fi
+              sleep 5
+            done
+            echo "$job did not complete before timeout" >&2
+            return 1
+          }
+          wait_for_job h100-tp1-target 1200
+          wait_for_job h100-tp1-source 120
+
+          "${k[@]}" logs job/h100-tp1-source | tee source.log
+          "${k[@]}" logs job/h100-tp1-target | tee target.log
+          grep -qx 'H100_TP1_SOURCE_READY' source.log
+          grep -qx 'H100_TP1_SOURCE_OK' source.log
+          grep -q '^H100_GPU_OK role=source name=NVIDIA H100' source.log
+          grep -q '^H100_GPU_OK role=target name=NVIDIA H100' target.log
+          grep -q '^H100_TP1_TO_TP1_OK bytes=33554432 tensors=1 ' target.log
+
+          source_uuid=$(sed -n 's/^H100_GPU_OK role=source .* uuid=//p' source.log)
+          target_uuid=$(sed -n 's/^H100_GPU_OK role=target .* uuid=//p' target.log)
+          test -n "$source_uuid"
+          test -n "$target_uuid"
+          test "$source_uuid" != "$target_uuid"
+
+          source_node=$("${k[@]}" get pod -l job-name=h100-tp1-source \
+            -o jsonpath='{.items[0].spec.nodeName}')
+          target_node=$("${k[@]}" get pod -l job-name=h100-tp1-target \
+            -o jsonpath='{.items[0].spec.nodeName}')
+          test -n "$source_node"
+          test "$source_node" = "$target_node"
+          echo "H100_TWO_POD_SMOKE_OK node=$source_node"
+
+      - name: Dump direct H100 diagnostics
+        if: failure()
+        run: |
+          k=(kubectl --kubeconfig=/teleport/kubeconfig.yaml \
+            --context="$KUBE_CONTEXT" --namespace="$NAMESPACE")
+          "${k[@]}" get pods,jobs,services -o wide || true
+          "${k[@]}" get events --sort-by='.lastTimestamp' || true
+          "${k[@]}" logs job/h100-tp1-source --tail=200 || true
+          "${k[@]}" logs job/h100-tp1-target --tail=200 || true
+
+      - name: Reap direct H100 workload
+        if: always()
+        run: |
+          kc=(kubectl --kubeconfig=/teleport/kubeconfig.yaml --context="$KUBE_CONTEXT")
+          owner=$("${kc[@]}" get namespace "$NAMESPACE" --ignore-not-found \
+            -o go-template='{{ index .metadata.labels "ci.modelexpress.nvidia.com/run-id" }}')
+          if [ "$owner" = "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" ]; then
+            "${kc[@]}" delete namespace "$NAMESPACE" --wait=false
           fi
 
-          if printf '%s\n' "${gpu_names[@]}" | grep -qv '^NVIDIA H100'; then
-            echo "Expected every GPU to be an NVIDIA H100" >&2
+  h100-smoke-cleanup:
+    name: H100 NIXL smoke cleanup
+    runs-on: prod-deploy-tester-v1
+    needs: [h100-smoke]
+    if: always()
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      KUBE_CONTEXT: nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02
+      NAMESPACE: mx-ci-h100-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Delete direct H100 workload namespace
+        run: |
+          set -euo pipefail
+          kc=(kubectl --kubeconfig=/teleport/kubeconfig.yaml --context="$KUBE_CONTEXT")
+          owner=$("${kc[@]}" get namespace "$NAMESPACE" --ignore-not-found \
+            -o go-template='{{ index .metadata.labels "ci.modelexpress.nvidia.com/run-id" }}')
+          if [ -z "$owner" ]; then
+            exit 0
+          fi
+          if [ "$owner" != "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" ]; then
+            echo "Refusing to delete $NAMESPACE owned by $owner" >&2
             exit 1
           fi
-
-          echo "MX_H100_SOURCE_GPU=${gpu_uuids[0]}" >> "$GITHUB_ENV"
-          echo "MX_H100_TARGET_GPU=${gpu_uuids[1]}" >> "$GITHUB_ENV"
-
-      - name: Transfer TP1 source tensor to TP1 target
-        run: python3 ci/h100_tp1_smoke.py
+          "${kc[@]}" delete namespace "$NAMESPACE" --wait=false
 
   # ---------------------------------------------------------------------------
   # Model Streamer S3 tests — single worker pod, no vCluster, no P2P.

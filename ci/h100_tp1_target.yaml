@@ -1,0 +1,71 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: h100-tp1-target
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: h100-tp1-target
+      annotations:
+        ecr-cache.dynamoci.io/skip-rewrite: "true"
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      priorityClassName: ci-nightly-high-priority
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile: {type: RuntimeDefault}
+      imagePullSecrets:
+      - {name: nvcr-imagepullsecret}
+      nodeSelector:
+        kubernetes.io/arch: amd64
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: h100-tp1-source
+      containers:
+      - name: target
+        image: WORKER_IMAGE
+        imagePullPolicy: Always
+        command:
+        - python3
+        - /opt/h100-smoke/h100_tp1_smoke.py
+        - target
+        - --source-url
+        - http://h100-tp1-source:8080
+        env:
+        - {name: HOME, value: /tmp}
+        - {name: MX_NIXL_BACKEND, value: UCX}
+        - {name: NIXL_UCX_TLS, value: "tcp,cuda_copy"}
+        - {name: PYTHONUNBUFFERED, value: "1"}
+        resources:
+          requests: {cpu: "1", memory: 4Gi, nvidia.com/gpu: "1"}
+          limits: {cpu: "2", memory: 16Gi, nvidia.com/gpu: "1"}
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+            add: [IPC_LOCK]
+        volumeMounts:
+        - {name: script, mountPath: /opt/h100-smoke, readOnly: true}
+        - {name: dshm, mountPath: /dev/shm}
+      volumes:
+      - name: script
+        configMap: {name: h100-tp1-script}
+      - name: dshm
+        emptyDir: {medium: Memory, sizeLimit: 2Gi}
