@@ -212,16 +212,49 @@ class _VllmInstaller(EngineInstaller):
         metrics = prepared.transfer_metrics
         load_s = 0.0
         commit_s = 0.0
+        scan_s = 0.0
+
+        def retains_arena(module: Module, arena_storage: set[int]) -> bool:
+            values = [
+                *module.parameters(recurse=False),
+                *module.buffers(recurse=False),
+            ]
+            values.extend(
+                v for v in module.__dict__.values() if isinstance(v, torch.Tensor)
+            )
+            return any(
+                v.device.type != "meta"
+                and v.untyped_storage().data_ptr() in arena_storage
+                for v in values
+            )
 
         def load():
-            nonlocal load_s, commit_s
+            nonlocal load_s, commit_s, scan_s
             load_started = time.perf_counter()
             expected = set(dict(self._model.named_parameters()))
             if expected != prepared.parameter_names:
                 raise IncompleteRefit(
                     "streaming parameter coverage differs from the live load layout"
                 )
+            # One walk of the module tree serves every batch. Per-batch work is
+            # then proportional to the batch, not to the model, so a smaller
+            # arena (more batches) does not multiply installation time.
+            owner_of: dict[str, str] = {}
+            owned_by: dict[str, set[str]] = {}
+            module_by_name: dict[str, Module] = {}
+            resolved: dict[str, tuple[Module, str]] = {}
+            for module_name, module in self._model.named_modules():
+                owned = set()
+                for leaf, _ in module.named_parameters(recurse=False):
+                    full_name = f"{module_name}.{leaf}" if module_name else leaf
+                    owned.add(full_name)
+                    resolved[full_name] = (module, leaf)
+                module_by_name[module_name] = module
+                owned_by[module_name] = owned
+                for name in owned:
+                    owner_of[name] = module_name
             installed = set()
+            arena_storages: set[int] = set()
             batches = prepared.batches()
             try:
                 for tensors in batches:
@@ -230,39 +263,30 @@ class _VllmInstaller(EngineInstaller):
                         raise IncompleteRefit(
                             "invalid or repeated streaming parameter batch"
                         )
-                    for module_name, module in self._model.named_modules():
-                        owned = {
-                            f"{module_name}.{leaf}" if module_name else leaf
-                            for leaf, _ in module.named_parameters(recurse=False)
-                        }
-                        if names & owned and not owned <= names:
+                    touched = {owner_of[name] for name in names}
+                    for module_name in touched:
+                        if not owned_by[module_name] <= names:
                             raise IncompleteRefit(
                                 "streaming batch splits an owning module"
                             )
                     commit_started = time.perf_counter()
-                    self._process_and_commit(tensors, reload=False)
+                    self._process_and_commit(tensors, reload=False, resolved=resolved)
                     arena_storage = {
                         tensor.untyped_storage().data_ptr()
                         for tensor in tensors.values()
                     }
-                    for module in self._model.modules():
-                        values = [
-                            *module.parameters(recurse=False),
-                            *module.buffers(recurse=False),
-                        ]
-                        values.extend(
-                            v
-                            for v in module.__dict__.values()
-                            if isinstance(v, torch.Tensor)
-                        )
-                        if any(
-                            v.device.type != "meta"
-                            and v.untyped_storage().data_ptr() in arena_storage
-                            for v in values
-                        ):
+                    arena_storages |= arena_storage
+                    # The modules this batch loaded are the ones whose loaders
+                    # saw arena views, so they are checked before the arena can
+                    # be refilled. Anything stashed elsewhere is caught by the
+                    # whole-model sweep after the last batch.
+                    scan_started = time.perf_counter()
+                    for module_name in touched:
+                        if retains_arena(module_by_name[module_name], arena_storage):
                             raise IncompleteRefit(
                                 "engine retained bounded staging storage; restart required"
                             )
+                    scan_s += time.perf_counter() - scan_started
                     installed.update(names)
                     torch.cuda.synchronize(self._device)
                     commit_s += time.perf_counter() - commit_started
@@ -272,12 +296,20 @@ class _VllmInstaller(EngineInstaller):
                 raise IncompleteRefit(
                     "streaming transfer ended before every parameter was installed"
                 )
+            scan_started = time.perf_counter()
+            for module in module_by_name.values():
+                if retains_arena(module, arena_storages):
+                    raise IncompleteRefit(
+                        "engine retained bounded staging storage; restart required"
+                    )
+            scan_s += time.perf_counter() - scan_started
             load_s = time.perf_counter() - load_started
 
         reload_started = time.perf_counter()
         self._reload(load)
         metrics["reload_s"] = time.perf_counter() - reload_started - load_s
         metrics["install_commit_s"] = commit_s
+        metrics["retention_scan_s"] = scan_s
         derived_started = time.perf_counter()
         _update_mla_absorbed_weights(self._model, quantized=False)
         torch.cuda.synchronize(self._device)
@@ -338,7 +370,11 @@ class _VllmInstaller(EngineInstaller):
 
     @torch.no_grad()
     def _process_and_commit(
-        self, tensors: dict[str, torch.Tensor], *, reload: bool = True
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        reload: bool = True,
+        resolved: dict[str, tuple[Module, str]] | None = None,
     ) -> None:
         """Run vLLM's per-layer post-load processing into graph-bound storage.
 
@@ -366,14 +402,26 @@ class _VllmInstaller(EngineInstaller):
             # Quantized models expose kernel-packed parameters before layerwise
             # reload and load-time parameters after it. Resolve the captured
             # names only after vLLM has restored that load-time hierarchy.
+            # A caller already inside that window may pass the resolution in
+            # (streaming does, once per install) to avoid walking the model
+            # for every batch.
             groups: dict[Module, list[tuple[str, str]]] = {}
             matched: set[str] = set()
-            for module_name, module in self._model.named_modules():
-                for leaf, _parameter in module.named_parameters(recurse=False):
-                    full_name = f"{module_name}.{leaf}" if module_name else leaf
-                    if full_name in tensors:
-                        groups.setdefault(module, []).append((full_name, leaf))
-                        matched.add(full_name)
+            if resolved is not None:
+                for full_name in tensors:
+                    entry = resolved.get(full_name)
+                    if entry is None:
+                        continue
+                    module, leaf = entry
+                    groups.setdefault(module, []).append((full_name, leaf))
+                    matched.add(full_name)
+            else:
+                for module_name, module in self._model.named_modules():
+                    for leaf, _parameter in module.named_parameters(recurse=False):
+                        full_name = f"{module_name}.{leaf}" if module_name else leaf
+                        if full_name in tensors:
+                            groups.setdefault(module, []).append((full_name, leaf))
+                            matched.add(full_name)
             unmatched = sorted(set(tensors) - matched)
             if unmatched:
                 raise IncompleteRefit(

@@ -371,3 +371,78 @@ def test_installer_rejects_quantized_mla_derived_weight_refresh():
 
     with pytest.raises(IncompleteRefit, match="quantized kv_b_proj"):
         _update_mla_absorbed_weights(model, quantized=True)
+
+
+@pytest.mark.parametrize("when", ["touched", "elsewhere"])
+def test_streaming_detects_retained_arena_storage_in_batch_or_at_the_end(
+    monkeypatch, when
+):
+    """A loaded module retaining an arena view fails before the arena is
+    refilled; a module outside the batch retaining one fails in the final sweep."""
+    _install_fake_vllm(monkeypatch, lambda model: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    model = nn.Sequential(nn.Linear(2, 2, bias=False), nn.Linear(2, 2, bias=False))
+    names = frozenset(dict(model.named_parameters()))
+    arena = torch.ones(2, 2)
+    yielded = []
+
+    def batches():
+        if when == "touched":
+            model[0].stash = arena.view(-1)
+        yielded.append("0.weight")
+        yield {"0.weight": arena}
+        if when == "elsewhere":
+            # Module 0 is not part of the second batch, so only the sweep
+            # after the last batch can see this.
+            model[0].stash = arena.view(-1)
+        yielded.append("1.weight")
+        yield {"1.weight": arena}
+
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
+    )
+    with pytest.raises(IncompleteRefit, match="retained bounded staging storage"):
+        installer.install_streaming(PreparedStreamingTensors(batches, names, {}))
+    assert yielded == (["0.weight"] if when == "touched" else ["0.weight", "1.weight"])
+
+
+def test_streaming_module_walks_do_not_scale_with_batch_count(monkeypatch):
+    """Per-batch work is proportional to the batch, not the model."""
+    _install_fake_vllm(monkeypatch, lambda model: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+
+    def walks_for(batch_size):
+        model = nn.Sequential(*[nn.Linear(2, 2, bias=False) for _ in range(6)])
+        names = frozenset(dict(model.named_parameters()))
+        walks = []
+        real_named_modules = model.named_modules
+
+        def counted(*args, **kwargs):
+            walks.append(1)
+            return real_named_modules(*args, **kwargs)
+
+        monkeypatch.setattr(model, "named_modules", counted)
+        arena = torch.ones(2, 2)
+
+        def batches():
+            for start in range(0, 6, batch_size):
+                yield {f"{i}.weight": arena for i in range(start, start + batch_size)}
+
+        installer = _VllmInstaller(
+            model=model,
+            vllm_config=object(),
+            model_config=object(),
+            device=torch.device("cpu"),
+        )
+        metrics = {}
+        installer.install_streaming(PreparedStreamingTensors(batches, names, metrics))
+        assert "retention_scan_s" in metrics
+        assert all(torch.equal(p, torch.ones(2, 2)) for p in model.parameters())
+        return len(walks)
+
+    # Reload setup and derived-weight refresh walk the model a fixed number of
+    # times per install; the batch loop must not add to that.
+    assert walks_for(6) == walks_for(1)
