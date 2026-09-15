@@ -66,6 +66,12 @@ def test_factory_unknown_backend_raises(monkeypatch):
         create_metadata_client()
 
 
+def test_k8s_worker_rpc_retry_policy_uses_configured_values():
+    client = MxK8sServiceClient(max_retries=3, backoff_seconds=0.25)
+
+    assert client.worker_rpc_retry_policy() == (3, 0.25)
+
+
 # ---------------------------------------------------------------------------
 # publish_metadata / list_sources / update_status behavior
 # ---------------------------------------------------------------------------
@@ -273,7 +279,9 @@ class _FakeWorkerServicer(p2p_pb2_grpc.WorkerServiceServicer):
             )
         return p2p_pb2.GetTensorManifestResponse(
             mx_source_id=self._mx_source_id,
-            tensors=[p2p_pb2.TensorDescriptor(name="t0", size=16, device_id=0)],
+            tensors=[
+                p2p_pb2.TensorDescriptor(name="t0", size=16, device_id=0)
+            ],
             metadata_endpoint="10.0.0.1:5555",
             agent_name="fake-agent",
             worker_rank=self._worker_rank,

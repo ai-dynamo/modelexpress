@@ -96,6 +96,7 @@ class RdmaStrategy(LoadStrategy):
 
     name = "rdma"
     requires = (EngineAdapter.discover_tensors,)
+    requires_tensor_read_lease = False
 
     def rollback(self, ctx: LoadContext) -> None:
         """Clean up NIXL state from a failed RDMA target attempt."""
@@ -472,6 +473,41 @@ class RdmaStrategy(LoadStrategy):
             f"{manifest_bytes} bytes)"
         )
 
+    @staticmethod
+    def _use_prefetched_manifest(source_worker):
+        return (
+            None,
+            worker_tensor_descriptors(source_worker),
+            source_worker.metadata_endpoint,
+            source_worker.agent_name,
+        )
+
+    def _prepare_leased_manifest(
+        self,
+        ctx: LoadContext,
+        source_worker,
+        mx_source_id: str,
+        source_worker_id: str,
+    ):
+        from ..metadata.worker_server import prepare_tensor_read
+
+        max_retries, retry_backoff = ctx.mx_client.worker_rpc_retry_policy()
+        tensor_read, _ = prepare_tensor_read(
+            source_worker.worker_grpc_endpoint,
+            mx_source_id,
+            worker_id=source_worker_id,
+            timeout=_transfer_timeout_seconds(),
+            max_retries=max_retries,
+            retry_backoff_seconds=retry_backoff,
+        )
+        manifest = tensor_read.manifest
+        return (
+            tensor_read,
+            manifest.tensors,
+            manifest.metadata_endpoint,
+            manifest.agent_name,
+        )
+
     def _load_as_target(
         self,
         result: LoadResult,
@@ -489,7 +525,13 @@ class RdmaStrategy(LoadStrategy):
             with selection_metrics.time_source_attempt_phase(policy, "prepare"):
                 result = ctx.adapter.prepare_rdma_target(result)
                 result = ctx.adapter.before_rdma_receive(result)
-            self._receive_from_peer(result, ctx, source_worker, mx_source_id)
+            self._receive_from_peer(
+                result,
+                ctx,
+                source_worker,
+                mx_source_id,
+                source_worker_id,
+            )
             with selection_metrics.time_source_attempt_phase(policy, "finalize"):
                 return ctx.adapter.after_rdma_receive(result)
         except StrategyFailed:
@@ -503,6 +545,7 @@ class RdmaStrategy(LoadStrategy):
         ctx: LoadContext,
         source_worker,
         mx_source_id: str,
+        source_worker_id: str,
     ) -> None:
         """Receive fully-processed tensors via RDMA from the detected source."""
         receive_start = time.perf_counter()
@@ -513,11 +556,22 @@ class RdmaStrategy(LoadStrategy):
         is_p2p = bool(source_worker.worker_grpc_endpoint)
         remote_agent_name = None
 
+        tensor_read = None
         try:
             if is_p2p:
-                # _fetch_worker_metadata() prefetched and generation-validated
-                # this manifest before _load_as_target() prepared target tensors.
-                tensor_protos = worker_tensor_descriptors(source_worker)
+                if self.requires_tensor_read_lease:
+                    tensor_read, tensor_protos, ep, agent_name = (
+                        self._prepare_leased_manifest(
+                            ctx,
+                            source_worker,
+                            mx_source_id,
+                            source_worker_id,
+                        )
+                    )
+                else:
+                    tensor_read, tensor_protos, ep, agent_name = (
+                        self._use_prefetched_manifest(source_worker)
+                    )
                 source_tensors = [
                     TensorDescriptor(
                         name=t.name,
@@ -528,23 +582,27 @@ class RdmaStrategy(LoadStrategy):
                     )
                     for t in tensor_protos
                 ]
-                ep = source_worker.metadata_endpoint
                 host, port_str = ep.rsplit(":", 1)
                 # Claimed before the dial so a fetch that fails part-way, leaving
                 # metadata that lands later, is still released.
-                remote_agent_name = source_worker.agent_name
+                remote_agent_name = agent_name
                 # One handshake phase, two transports: here the peer's NIXL
                 # metadata is fetched from the peer itself; the centralized
                 # branch below loads the copy the MX server holds. Exactly one
                 # of the two runs per attempt.
-                with selection_metrics.time_source_attempt_phase(
-                    policy, "handshake"
-                ) as handshake:
-                    ctx.nixl_manager.fetch_remote_and_wait(
-                        remote_agent_name=source_worker.agent_name,
-                        ip=host,
-                        port=int(port_str),
-                    )
+                try:
+                    with selection_metrics.time_source_attempt_phase(
+                        policy, "handshake"
+                    ) as handshake:
+                        ctx.nixl_manager.fetch_remote_and_wait(
+                            remote_agent_name=agent_name,
+                            ip=host,
+                            port=int(port_str),
+                        )
+                except BaseException:
+                    ctx.nixl_manager.remove_remote_agent(remote_agent_name)
+                    remote_agent_name = None
+                    raise
                 logger.info(
                     f"[Worker {ctx.global_rank}] [TIMING] P2P NIXL metadata fetch: "
                     f"{handshake.seconds:.3f}s"
@@ -573,62 +631,72 @@ class RdmaStrategy(LoadStrategy):
                     f"{handshake.seconds:.3f}s (agent={remote_agent_name})"
                 )
 
-            logger.info(
-                f"[Worker {ctx.global_rank}] Receiving {len(source_tensors)} tensors from source"
-                f"{' (P2P)' if is_p2p else ''}"
-            )
-
-            # Cross-family (heterogeneous) transfers must name the exact same tensor
-            # set on both sides: a name diff can mean vendor-specific hidden/derived
-            # tensors, which would leave part of the target at dummy values while
-            # RDMA reports success. Same-family transfers tolerate subset transfers.
-            target_accelerator = ctx.accelerator_backend.name
-            source_accelerator = source_worker.accelerator
-            require_exact_match = ctx.adapter.requires_exact_tensor_catalog() or bool(
-                target_accelerator
-                and source_accelerator
-                and target_accelerator != source_accelerator
-            )
-
             try:
-                with selection_metrics.time_source_attempt_phase(
-                    policy, "receive"
-                ) as received:
-                    (
-                        bytes_transferred,
-                        tensor_count,
-                        _,
-                    ) = ctx.nixl_manager.receive_from_source(
-                        source_metadata=source_worker.nixl_metadata,
-                        source_tensors=source_tensors,
-                        timeout_seconds=_transfer_timeout_seconds(),
-                        remote_agent_name=remote_agent_name,
-                        require_exact_match=require_exact_match,
+                logger.info(
+                    f"[Worker {ctx.global_rank}] Receiving "
+                    f"{len(source_tensors)} tensors from source"
+                    f"{' (P2P)' if is_p2p else ''}"
+                )
+
+                # Cross-family (heterogeneous) transfers must name the exact same tensor
+                # set on both sides: a name diff can mean vendor-specific hidden/derived
+                # tensors, which would leave part of the target at dummy values while
+                # RDMA reports success. Same-family transfers tolerate subset transfers.
+                target_accelerator = ctx.accelerator_backend.name
+                source_accelerator = source_worker.accelerator
+                require_exact_match = (
+                    ctx.adapter.requires_exact_tensor_catalog()
+                    or bool(
+                        target_accelerator
+                        and source_accelerator
+                        and target_accelerator != source_accelerator
                     )
-            except Exception as e:
-                raise SourceTransferError(f"RDMA receive failed: {e}") from e
-            transfer_time = received.seconds
+                )
 
-            bandwidth_gbps = (
-                (bytes_transferred * 8) / (transfer_time * 1e9)
-                if transfer_time > 0
-                else 0
-            )
-            logger.info(
-                f"[Worker {ctx.global_rank}] [TIMING] RDMA transfer complete: "
-                f"{tensor_count} tensors, {bytes_transferred / 1e9:.2f} GB, "
-                f"{transfer_time:.3f}s, {bandwidth_gbps:.1f} Gbps"
-            )
+                try:
+                    with selection_metrics.time_source_attempt_phase(
+                        policy, "receive"
+                    ) as received:
+                        (
+                            bytes_transferred,
+                            tensor_count,
+                            _,
+                        ) = ctx.nixl_manager.receive_from_source(
+                            source_metadata=source_worker.nixl_metadata,
+                            source_tensors=source_tensors,
+                            timeout_seconds=_transfer_timeout_seconds(),
+                            remote_agent_name=remote_agent_name,
+                            require_exact_match=require_exact_match,
+                        )
+                except Exception as e:
+                    raise SourceTransferError(f"RDMA receive failed: {e}") from e
+                transfer_time = received.seconds
 
-            ctx.accelerator_backend.synchronize()
+                bandwidth_gbps = (
+                    (bytes_transferred * 8) / (transfer_time * 1e9)
+                    if transfer_time > 0
+                    else 0
+                )
+                logger.info(
+                    f"[Worker {ctx.global_rank}] [TIMING] RDMA transfer complete: "
+                    f"{tensor_count} tensors, {bytes_transferred / 1e9:.2f} GB, "
+                    f"{transfer_time:.3f}s, {bandwidth_gbps:.1f} Gbps"
+                )
+
+                ctx.accelerator_backend.synchronize()
+            finally:
+                # A weight load is one-shot, so release the source here instead of at
+                # process exit: the engine process is torn down without running atexit
+                # hooks, and in P2P only the reader holds a record of the peer to
+                # invalidate. None means acquisition failed with nothing to release.
+                if remote_agent_name is not None:
+                    with selection_metrics.time_source_attempt_phase(
+                        policy, "release"
+                    ):
+                        ctx.nixl_manager.remove_remote_agent(remote_agent_name)
         finally:
-            # A weight load is one-shot, so release the source here instead of at
-            # process exit: the engine process is torn down without running atexit
-            # hooks, and in P2P only the reader holds a record of the peer to
-            # invalidate. None means acquisition failed with nothing to release.
-            if remote_agent_name is not None:
-                with selection_metrics.time_source_attempt_phase(policy, "release"):
-                    ctx.nixl_manager.remove_remote_agent(remote_agent_name)
+            if tensor_read is not None:
+                tensor_read.close()
 
         total_time = time.perf_counter() - receive_start
         logger.info(

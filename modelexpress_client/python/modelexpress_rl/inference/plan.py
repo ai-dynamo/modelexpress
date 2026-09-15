@@ -70,6 +70,8 @@ class GeneratorPeerUpdateSource:
     """A generator peer that already serves the requested version."""
 
     worker: p2p_pb2.WorkerMetadata
+    mx_source_id: str
+    worker_id: str
     kind = WeightSource.GENERATOR
     payload_format = WeightPayloadFormat.FULL_TENSOR
 

@@ -20,7 +20,9 @@ class _Transfer:
         self.peer_layout = None
         self.closed = False
 
-    def stage_peer(self, *, source, parameter_layout):
+    def stage_peer(self, *, source, mx_source_id, worker_id, parameter_layout):
+        self.mx_source_id = mx_source_id
+        self.worker_id = worker_id
         self.peer_layout = parameter_layout
         return type("Staged", (), {"tensors": {}, "metrics": {}})()
 
@@ -51,7 +53,11 @@ def test_runtime_method_stages_the_complete_post_pwal_layout():
         transfer=transfer,
         runtime_tensors=runtime_tensors,
     )
-    source = GeneratorPeerUpdateSource(worker=p2p_pb2.WorkerMetadata())
+    source = GeneratorPeerUpdateSource(
+        worker=p2p_pb2.WorkerMetadata(),
+        mx_source_id="source-1",
+        worker_id="worker-1",
+    )
 
     prepared = method.prepare(version=object(), source=source)
 
@@ -60,6 +66,8 @@ def test_runtime_method_stages_the_complete_post_pwal_layout():
         "model.weight": ((2, 3), torch.bfloat16),
         "model._mx_runtime_buffer": ((4,), torch.float32),
     }
+    assert transfer.mx_source_id == "source-1"
+    assert transfer.worker_id == "worker-1"
     assert method.capabilities.payload_formats == frozenset(
         {WeightPayloadFormat.FULL_TENSOR}
     )

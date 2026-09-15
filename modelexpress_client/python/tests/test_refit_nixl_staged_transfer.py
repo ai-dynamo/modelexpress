@@ -80,6 +80,18 @@ def test_source_structure_uses_planner_shard_fields_and_ignores_digest():
     assert _source_structure(source) == expected
 
 
+def test_default_transfer_timeout_matches_the_lease_budget(monkeypatch):
+    monkeypatch.setenv("MX_TRANSFER_TIMEOUT", "17")
+
+    transfer = _NixlStagedTransfer(
+        device_id=0,
+        device=torch.device("cpu"),
+        manager=object(),
+    )
+
+    assert transfer._timeout == 17.0
+
+
 def test_exact_manifests_resolve_without_legacy_source_discovery():
     resolved = _resolve_sources(
         [
@@ -320,6 +332,39 @@ def test_peer_stage_uses_exact_canonical_tensor_catalog(monkeypatch):
     monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
     calls = []
 
+    class _Lease:
+        def __init__(self, manifest):
+            self.manifest = manifest
+
+        def __enter__(self):
+            calls.append(("lease_enter", None))
+            return self
+
+        def __exit__(self, *_args):
+            calls.append(("lease_release", None))
+
+    manifest = p2p_pb2.GetTensorManifestResponse(
+        mx_source_id="source-1",
+        worker_id="worker-1",
+        metadata_endpoint="127.0.0.1:17000",
+        agent_name="live-peer-agent",
+        tensors=[
+            p2p_pb2.TensorDescriptor(
+                name="weight",
+                addr=1234,
+                size=16,
+                device_id=0,
+                dtype="torch.float32",
+            )
+        ],
+    )
+
+    def prepare(*args, **kwargs):
+        calls.append(("prepare", (args, kwargs)))
+        return _Lease(manifest), manifest.ByteSize()
+
+    monkeypatch.setattr(transfer_module, "prepare_tensor_read", prepare)
+
     class _Manager:
         def register_tensors(self, tensors):
             calls.append(("register", tuple(tensors)))
@@ -348,38 +393,22 @@ def test_peer_stage_uses_exact_canonical_tensor_catalog(monkeypatch):
     transfer._active = None
     transfer._closed = False
     source = p2p_pb2.WorkerMetadata(
-        nixl_metadata=b"peer-metadata",
-        tensors=[
-            p2p_pb2.TensorDescriptor(
-                name="weight",
-                addr=1234,
-                size=16,
-                device_id=0,
-                dtype="torch.float32",
-            )
-        ],
+        worker_grpc_endpoint="127.0.0.1:18000",
     )
 
     staged = transfer.stage_peer(
         source=source,
+        mx_source_id="source-1",
+        worker_id="worker-1",
         parameter_layout={"weight": ((4,), torch.float32)},
     )
 
     assert staged.metrics["bytes_received"] == 16
     receive = next(value for name, value in calls if name == "receive")
-    assert receive["remote_agent_name"] == "peer-agent"
+    assert receive["remote_agent_name"] == "live-peer-agent"
     assert receive["require_exact_match"] is True
     assert set(receive["destination_tensors"]) == {"weight"}
-    assert calls[-1] == ("remove", "peer-agent")
-
-    calls.clear()
-    source.worker_grpc_endpoint = "127.0.0.1:18000"
-    source.metadata_endpoint = "127.0.0.1:17000"
-    source.agent_name = "live-peer-agent"
-    transfer.stage_peer(
-        source=source,
-        parameter_layout={"weight": ((4,), torch.float32)},
-    )
+    assert calls[-1] == ("lease_release", None)
     fetch = next(value for name, value in calls if name == "fetch")
     assert fetch == {
         "remote_agent_name": "live-peer-agent",
@@ -388,10 +417,12 @@ def test_peer_stage_uses_exact_canonical_tensor_catalog(monkeypatch):
         "timeout_seconds": 30.0,
     }
 
-    source.metadata_endpoint = ""
+    manifest.metadata_endpoint = ""
     with pytest.raises(RuntimeError, match="unusable metadata endpoint"):
         transfer.stage_peer(
             source=source,
+            mx_source_id="source-1",
+            worker_id="worker-1",
             parameter_layout={"weight": ((4,), torch.float32)},
         )
 
