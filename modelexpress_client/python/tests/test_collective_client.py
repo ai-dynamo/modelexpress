@@ -206,6 +206,13 @@ def fake_nccl(monkeypatch):
     return ops
 
 
+def _raises(error):
+    def boom(*args, **kwargs):
+        raise error
+
+    return boom
+
+
 def trainer(rz, engine, **kw):
     client = RefitClientTrainer(
         rendezvous=rz,
@@ -643,6 +650,70 @@ class TestReporting:
         client.start_weight_update("v1")
         client.finish_weight_update("v1")
         assert rz.reports == []
+
+    def test_a_trainer_aborts_even_when_reporting_the_failure_fails(
+        self, fake_nccl, monkeypatch
+    ):
+        """Reporting is a network call and the abort is not.
+
+        Ordering them report-then-abort means one unreachable control plane
+        leaves every peer parked in NCCL waiting for a rank that has already
+        given up. The abort has to happen first and unconditionally, and the
+        caller has to keep seeing the failure that actually happened rather
+        than the RPC that failed while describing it.
+        """
+        rz = FakeRendezvous()
+        monkeypatch.setattr(
+            rz, "report", _raises(RuntimeError("control plane unreachable"))
+        )
+        client = trainer(rz, FakeEngine())
+        client.compute_plan()
+        client.start_weight_update("v1")
+        assert len(client._cache) > 0, (
+            "control: the cache must be populated, or the post-abort "
+            "assertion below passes without anything having been aborted"
+        )
+
+        monkeypatch.setattr(
+            client._half, "finish_weight_update", _raises(RuntimeError("nccl timeout"))
+        )
+        with pytest.raises(RuntimeError, match="nccl timeout"):
+            client.finish_weight_update("v1", operation_id="op1")
+
+        assert len(client._cache) == 0
+
+    def test_a_generator_aborts_even_when_reporting_the_failure_fails(
+        self, fake_nccl, monkeypatch
+    ):
+        rz = FakeRendezvous()
+        monkeypatch.setattr(
+            rz, "report", _raises(RuntimeError("control plane unreachable"))
+        )
+        client = RefitClientGenerator(
+            rendezvous=rz,
+            model_name="m",
+            trainer_slots=["t0", "t1"],
+            generator_slots=["g0", "g1"],
+            source_partition_count=1,
+            slot_id="g0",
+            worker_id="w9",
+            index_in_role=0,
+        )
+        client.initialize(FakeEngine())
+        client.compute_plan()
+        client.start_weight_update("v1")
+        assert len(client._cache) > 0, (
+            "control: the cache must be populated, or the post-abort "
+            "assertion below passes without anything having been aborted"
+        )
+
+        monkeypatch.setattr(
+            client._half, "finish_weight_update", _raises(RuntimeError("nccl timeout"))
+        )
+        with pytest.raises(RuntimeError, match="nccl timeout"):
+            client.finish_weight_update("v1", operation_id="op1")
+
+        assert len(client._cache) == 0
 
 
 class TestStreams:

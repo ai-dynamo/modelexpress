@@ -439,8 +439,16 @@ class RefitClientTrainer(_RefitClientBase):
         try:
             half.finish_weight_update(self.membership.broadcast_lane.lane_id)
         except Exception as error:
-            self._report(operation_id, succeeded=False, message=repr(error))
             half.abort()
+            try:
+                self._report(operation_id, succeeded=False, message=repr(error))
+            except Exception:
+                logger.warning(
+                    "reporting the failed round to the control plane raised; "
+                    "the local half is already aborted so peers are released, "
+                    "and the original failure is re-raised below",
+                    exc_info=True,
+                )
             raise
         finally:
             self._round_started = False
@@ -535,8 +543,16 @@ class RefitClientGenerator(_RefitClientBase):
             half.finish_weight_update(self.membership.broadcast_lane.lane_id)
             self._loader.finish()
         except Exception as error:
-            self._report(operation_id, succeeded=False, message=repr(error))
             half.abort()
+            try:
+                self._report(operation_id, succeeded=False, message=repr(error))
+            except Exception:
+                logger.warning(
+                    "reporting the failed round to the control plane raised; "
+                    "the local half is already aborted so peers are released, "
+                    "and the original failure is re-raised below",
+                    exc_info=True,
+                )
             raise
         finally:
             self._round_started = False
