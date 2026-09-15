@@ -23,6 +23,50 @@ that the answers changed, refits, and requires the answers back token for token.
                   refitted  ->  " Paris."
 ```
 
+## Two trainer backends
+
+The Publisher is where a framework's storage layout is encoded, so one backend
+cannot show the boundary is general. `TRAINER=fsdp2` (default) shards the
+checkpoint with `torch.distributed.fsdp.fully_shard` and hands the wire op its
+local shard directly. `TRAINER=deepspeed` runs ZeRO-3, which partitions each
+parameter's *flattened* storage instead; that is not a dim-0 shard and cannot be
+declared as one, so that Publisher stages, gathering one parameter at a time in
+`start_new_round`. ZeRO-3 additionally reads `LOCAL_RANK` and `WORLD_SIZE` from
+the environment, which the launcher sets.
+
+## Two destination layouts
+
+`DST=replicate` (default) hands every generator rank the whole tensor and lets
+the engine's own loader split it. Correct for any architecture, and it puts the
+engine's world size in wire bytes because each rank discards most of what it
+receives.
+
+`DST=sharded` declares each parameter with the placement the engine already
+holds it in, so a rank receives exactly the slice it keeps and the Loader hands
+the wire op a view into the live fused parameter. It carries the bytes once. The
+arithmetic refuses rather than guesses: a fused parameter whose declared
+constituents do not account for its local extent falls back to the replicated
+path. Note that it writes into live weights, so a failed refit leaves the model
+inconsistent, where the replicated path is atomic per layer group.
+
+## Verification
+
+`DIFF=1` adds `--diff-checkpoint`, which compares every live parameter against
+what the engine's own loader produces from the checkpoint. **Use it.** It is
+exact, it names the parameter when something is wrong, and when it runs it
+becomes the acceptance gate.
+
+Without it the only test is the token comparison, and that is not a sound
+equality test on a larger model: greedy decoding is not bitwise reproducible
+across cache states, so a near-tied logit diverges with every weight byte
+correct and the run reports `E2E FAIL`. With `DIFF=1` that case is reported as
+what it is.
+
+The diff carries its own positive control and the run fails if the control does
+not fire: it runs first against the deliberately corrupted model, where every
+parameter must disagree. A diff that silently matched nothing would otherwise
+report zero differences after the refit and read as the strongest possible pass.
+
 ## Where each framework fact lives
 
 The plan is derived from the checkpoint's own safetensors header, which is the only
@@ -59,7 +103,9 @@ export MX_ENDPOINT=modelexpress-server.<namespace>.svc.cluster.local:8001
 ./run_e2e.sh
 ```
 
-`T` and `G` set the trainer and generator counts, `ROUNDS` the number of refits.
+`T` and `G` set the trainer and generator counts, `ROUNDS` the number of refits,
+`TRAINER` the trainer backend (`fsdp2` or `deepspeed`), `DST` the destination
+layout (`replicate` or `sharded`), and `DIFF=1` the exact verification above.
 Every parameter's first dimension must divide `T`: the plan rejects a shard that
 does not divide evenly, and an FSDP pad would otherwise land wrong bytes with every
 rank issuing its agreed op and nothing erroring.
