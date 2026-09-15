@@ -141,6 +141,64 @@ def _bounded_batches(capture, parameter_layout, sources, max_staging_bytes):
     return tuple(batches)
 
 
+def _pack_bounded_batches(batches, max_staging_bytes):
+    """Pack consecutive complete modules without changing the READ descriptors.
+
+    Owning-module batches are the unit of correctness; this only coalesces
+    neighbours that fit the same arena together, so each packed batch still
+    installs whole modules and reads exactly the bytes the unpacked plan read.
+    """
+    if (
+        isinstance(max_staging_bytes, bool)
+        or not isinstance(max_staging_bytes, int)
+        or max_staging_bytes <= 0
+    ):
+        raise ValueError("max_staging_bytes must be a positive integer")
+
+    def merge(group):
+        capture = CaptureResult(
+            copies=[copy for batch in group for copy in batch.capture.copies]
+        )
+        plan = TransferPlan()
+        layouts = ({}, {}, {})
+        for batch in group:
+            _merge_plan(plan, batch.plan)
+            for layout, incoming in zip(layouts, batch.layouts, strict=True):
+                if layout.keys() & incoming.keys():
+                    raise IncompleteRefit(
+                        "packed batches contain overlapping staging keys"
+                    )
+                layout.update(incoming)
+        return _BoundedBatch(
+            capture, plan, layouts, sum(batch.nbytes for batch in group)
+        )
+
+    packed = []
+    current = []
+    current_bytes = 0
+    full_sources = set()
+    for batch in batches:
+        if batch.nbytes > max_staging_bytes:
+            raise IncompleteRefit("owning module exceeds the packed staging budget")
+        incoming_full = set(batch.layouts[2])
+        # Two modules pulling the same complete source would need one staging
+        # slot for two distinct writes, so they must stay in separate batches.
+        if current and (
+            current_bytes + batch.nbytes > max_staging_bytes
+            or full_sources & incoming_full
+        ):
+            packed.append(merge(current))
+            current = []
+            current_bytes = 0
+            full_sources = set()
+        current.append(batch)
+        current_bytes += batch.nbytes
+        full_sources.update(incoming_full)
+    if current:
+        packed.append(merge(current))
+    return tuple(packed)
+
+
 def _resolve_sources(manifests: list[bytes]) -> _ResolvedSources:
     if not manifests:
         raise ValueError("at least one source manifest is required")
@@ -414,12 +472,16 @@ class _NixlStagedTransfer:
             return
         if self._workspace_mode is not None:
             self.reset_workspace()
-        try:
-            self._manager.initialize()
-        except Exception:
-            if self._owns_manager:
+        if self._owns_manager:
+            # The constructor initialized an owned agent and reset_workspace()
+            # shuts it down, so a mode change has to bring it back. A borrowed
+            # agent is initialized and torn down by its owner, and
+            # reset_workspace() refuses to cycle one, so it needs neither.
+            try:
+                self._manager.initialize()
+            except Exception:
                 self._manager.shutdown()
-            raise
+                raise
         self._workspace_mode = mode
 
     def prepare(
@@ -458,6 +520,8 @@ class _NixlStagedTransfer:
             batches = _bounded_batches(
                 capture, parameter_layout, resolved.sources, max_staging_bytes
             )
+            if envs.MX_REFIT_PACK_MODULES:
+                batches = _pack_bounded_batches(batches, max_staging_bytes)
         metrics["transfer_planning_s"] = time.perf_counter() - phase_started
         phase_started = time.perf_counter()
         self._select_workspace_mode("bounded" if batches is not None else "full")

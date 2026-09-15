@@ -3,6 +3,7 @@
 
 from contextlib import nullcontext
 import ctypes
+from dataclasses import replace
 
 import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 import pytest
@@ -34,6 +35,7 @@ from modelexpress_rl.inference.nixl_staged_transfer import (
     _bounded_batches,
     _load_agent_metadata,
     _NixlStagedTransfer,
+    _pack_bounded_batches,
     _plan_staged_transfer,
     _PreparedNixlTransfer,
     _required_agent_metadata,
@@ -82,7 +84,69 @@ def test_bounded_batches_preserve_module_groups_and_count_dtype_scratch(monkeypa
             _bounded_batches(CaptureResult(copies=copies), layout, sources, invalid)
 
 
-def test_bounded_transfer_reuses_arena_and_preserves_fp32(monkeypatch):
+def test_packing_coalesces_modules_without_changing_planned_reads(monkeypatch):
+    """Packing may only change how many arena residencies a refit needs. The
+    copies, planned bytes, and descriptor count must match the unpacked plan."""
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
+    sources = _resolve_sources(
+        [
+            _manifest(agent_name="a", endpoint="a:19000", offset=0, address=100),
+            _manifest(agent_name="b", endpoint="b:19000", offset=2, address=200),
+        ]
+    ).sources
+    copies = [
+        RecordedCopy(
+            src_name="weight",
+            op_chain=(),
+            param_name=name,
+            dest_offset=0,
+            dest_shape=(4,),
+            dest_stride=(1,),
+            dest_dtype=dtype,
+        )
+        for name, dtype in [
+            ("layer0.weight", torch.float32),
+            ("layer1.weight", torch.bfloat16),
+        ]
+    ]
+    layout = {c.param_name: (c.dest_shape, c.dest_dtype) for c in copies}
+    batches = _bounded_batches(CaptureResult(copies=copies), layout, sources, 512)
+    assert [b.nbytes for b in batches] == [256, 512]
+
+    packed = _pack_bounded_batches(batches, 768)
+    assert len(packed) == 1 and packed[0].nbytes == 768
+    assert list(packed[0].layouts[0]) == ["layer0.weight", "layer1.weight"]
+    assert packed[0].capture.copies == copies
+    assert packed[0].plan.bytes_planned() == sum(
+        b.plan.bytes_planned() for b in batches
+    )
+    assert packed[0].plan.descriptor_count() == sum(
+        b.plan.descriptor_count() for b in batches
+    )
+
+    # A budget that only fits one module leaves the owning-module batching intact.
+    assert len(_pack_bounded_batches(batches, 512)) == 2
+
+    # Two modules pulling the same complete source cannot share one staging slot.
+    conflicting = [
+        replace(
+            batch,
+            layouts=(*batch.layouts[:2], {"shared": ((4,), torch.float32)}),
+            nbytes=batch.nbytes + 256,
+        )
+        for batch in batches
+    ]
+    assert len(_pack_bounded_batches(conflicting, 2048)) == 2
+
+    with pytest.raises(IncompleteRefit, match="exceeds the packed staging budget"):
+        _pack_bounded_batches(batches, 256)
+    for invalid in (0, -1, True, 1.5):
+        with pytest.raises(ValueError, match="positive integer"):
+            _pack_bounded_batches(batches, invalid)
+
+
+@pytest.mark.parametrize("pack", [False, True])
+def test_bounded_transfer_reuses_arena_and_preserves_fp32(monkeypatch, pack):
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
     source_tensor = torch.tensor([1.001, 2.002, 3.003, 4.004])
@@ -105,7 +169,14 @@ def test_bounded_transfer_reuses_arena_and_preserves_fp32(monkeypatch):
         for name, dtype in [("a.weight", torch.float32), ("b.weight", torch.bfloat16)]
     ]
     layout = {c.param_name: (c.dest_shape, c.dest_dtype) for c in copies}
-    batches = _bounded_batches(CaptureResult(copies=copies), layout, {"w": source}, 512)
+    # Packing trades one larger residency for fewer of them; the 512-byte budget
+    # admits only the bigger of the two modules, so 768 is what packs them.
+    arena_bytes = 768 if pack else 512
+    batches = _bounded_batches(
+        CaptureResult(copies=copies), layout, {"w": source}, arena_bytes
+    )
+    if pack:
+        batches = _pack_bounded_batches(batches, arena_bytes)
 
     class Transport:
         def read(self, descriptors):
@@ -120,20 +191,19 @@ def test_bounded_transfer_reuses_arena_and_preserves_fp32(monkeypatch):
     transfer._active = prepared
     transfer._device = torch.device("cpu")
     transfer._device_id = 0
-    transfer._bounded_arena = torch.empty(512, dtype=torch.uint8)
+    transfer._bounded_arena = torch.empty(arena_bytes, dtype=torch.uint8)
     metrics = {}
-    results = []
+    installed = {}
     addresses = []
     for tensors in transfer.iter_bounded(prepared, metrics):
-        value = next(iter(tensors.values()))
-        addresses.append(value.data_ptr())
-        results.append(value.clone())
-    assert addresses[0] == addresses[1] == transfer._bounded_arena.data_ptr()
-    assert torch.equal(results[0], source_tensor)
-    assert torch.equal(results[1], source_tensor.to(torch.bfloat16))
-    assert metrics["staging_peak_bytes"] == 512
+        addresses.append(next(iter(tensors.values())).data_ptr())
+        installed.update({name: value.clone() for name, value in tensors.items()})
+    assert set(addresses) == {transfer._bounded_arena.data_ptr()}
+    assert torch.equal(installed["a.weight"], source_tensor)
+    assert torch.equal(installed["b.weight"], source_tensor.to(torch.bfloat16))
+    assert metrics["staging_peak_bytes"] == arena_bytes
     assert metrics["bytes_received"] == 32
-    assert metrics["batches"] == 2
+    assert metrics["batches"] == (1 if pack else 2)
 
 
 def _manifest(*, agent_name: str, endpoint: str, offset: int, address: int) -> bytes:
@@ -606,6 +676,58 @@ def test_borrowed_manager_is_not_initialized_or_closed():
         manager=_Manager(),
     )
     transfer.close()
+
+
+def test_borrowed_manager_survives_peer_staging_and_refuses_a_reset(monkeypatch):
+    """The peer path selects a workspace mode on a manager it does not own, so
+    mode selection must not initialize or cycle the loader's agent."""
+    monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
+
+    class _Manager:
+        def initialize(self):
+            raise AssertionError("borrowed manager must already be initialized")
+
+        def shutdown(self):
+            raise AssertionError("borrowed manager is owned by the loader")
+
+        def register_tensors(self, tensors):
+            pass
+
+        def add_remote_agent(self, metadata):
+            return "peer-agent"
+
+        def receive_from_source(self, **kwargs):
+            return 16, 1, 0.25
+
+        def remove_remote_agent(self, agent_name):
+            pass
+
+    transfer = _NixlStagedTransfer(
+        device_id=0,
+        device=torch.device("cpu"),
+        manager=_Manager(),
+    )
+    assert transfer._workspace_mode is None
+
+    source = p2p_pb2.WorkerMetadata(
+        nixl_metadata=b"peer-metadata",
+        tensors=[
+            p2p_pb2.TensorDescriptor(
+                name="weight", addr=1234, size=16, device_id=0, dtype="torch.float32"
+            )
+        ],
+    )
+    layout = {"weight": ((4,), torch.float32)}
+    for _ in range(2):
+        staged = transfer.stage_peer(source=source, parameter_layout=layout)
+        assert staged.metrics["bytes_received"] == 16
+    assert transfer._workspace_mode == "full"
+
+    with pytest.raises(RuntimeError, match="transfer-owned NIXL agent"):
+        transfer.reset_workspace()
+    transfer.close()
+    # Closing a borrowed transfer must leave its registered buffers referenced.
+    assert set(transfer._recv_buffers) == {"weight"}
 
 
 def test_peer_stage_uses_exact_canonical_tensor_catalog(monkeypatch):

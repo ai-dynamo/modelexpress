@@ -549,6 +549,13 @@ limit. The vLLM installer commits each batch into existing kernel storage and
 rejects retained references to the reusable arena. Ordinary `stage_weight()`
 continues to transfer a full independent copy before any installation.
 
+`MX_REFIT_PACK_MODULES` coalesces consecutive owning-module batches up to the
+same staging limit, trading a larger arena residency for fewer of them. It never
+changes which bytes are read: the packed batch carries the same copies, planned
+bytes, and READ descriptors as the modules it replaces, and modules that pull the
+same complete source stay in separate batches. It is off by default because one
+module per batch is the smallest arena a model can refit through.
+
 Before vLLM rebuilds per-module load-time parameter skeletons, the adapter records
 shared parameter objects and reconnects those aliases afterward. Capture then
 counts tied weights once, and installation preserves their shared kernel storage.
