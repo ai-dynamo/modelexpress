@@ -21,10 +21,7 @@ from typing import Any
 import torch
 
 from modelexpress import envs, p2p_pb2
-from modelexpress.client import MxClientBase
-from modelexpress.load_strategy.base import unpublish_metadata_for_worker
 from modelexpress.metadata.payload import worker_tensor_descriptors
-from modelexpress.metadata.publish import publish_metadata_and_ready
 from modelexpress.nixl_transfer import NixlTransferManager
 from modelexpress.refit.reshard import throughput
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
@@ -340,25 +337,32 @@ class _NixlStagedTransfer:
     def __init__(
         self,
         *,
-        agent_name: str,
         device_id: int,
         device: torch.device,
-        listen_port: int,
+        agent_name: str | None = None,
+        listen_port: int | None = None,
         timeout_seconds: float = 1200.0,
+        manager: NixlTransferManager | None = None,
     ) -> None:
         self._device_id = device_id
         self._device = device
         self._timeout = timeout_seconds
-        self._manager = NixlTransferManager(
-            agent_name=agent_name,
-            device_id=device_id,
-            listen_port=listen_port,
-        )
-        try:
-            self._manager.initialize()
-        except Exception:
-            self._manager.shutdown()
-            raise
+        self._owns_manager = manager is None
+        if manager is None:
+            if agent_name is None:
+                raise ValueError("an owned NIXL manager requires an agent name")
+            manager = NixlTransferManager(
+                agent_name=agent_name,
+                device_id=device_id,
+                listen_port=listen_port,
+            )
+        self._manager = manager
+        if self._owns_manager:
+            try:
+                self._manager.initialize()
+            except Exception:
+                self._manager.shutdown()
+                raise
         # Canonical engine-layout staging buffers. Exact slices land directly
         # here; reconstructed or converted values are copied here before these
         # buffers are verified, installed, and advertised to peer generators.
@@ -376,16 +380,22 @@ class _NixlStagedTransfer:
         self._full_registered = False
         self._active: _PreparedNixlTransfer | _PreparedBoundedTransfer | None = None
         self._loaded_agent_metadata: dict[str, bytes] = {}
-        self._published_peer_rank: int | None = None
         self._closed = False
         self._bounded_arena: torch.Tensor | None = None
         self._workspace_mode: str | None = None
 
     def reset_workspace(self) -> None:
         """Discard released or failed preparation after disconnecting its agent."""
+        if not self._owns_manager:
+            # A shared agent still serves its owner; tearing it down here would
+            # deregister memory we do not own. Only a transfer-owned agent can
+            # be cycled to release staging storage safely.
+            raise RuntimeError(
+                "resetting staging storage requires a transfer-owned NIXL agent; "
+                "restart the generator engine"
+            )
         if self._device.type == "cuda":
             torch.cuda.synchronize(self._device)
-        self.unpublish_peer()
         self._manager.shutdown()
         self._active = None
         self._recv_buffers.clear()
@@ -407,7 +417,8 @@ class _NixlStagedTransfer:
         try:
             self._manager.initialize()
         except Exception:
-            self._manager.shutdown()
+            if self._owns_manager:
+                self._manager.shutdown()
             raise
         self._workspace_mode = mode
 
@@ -778,10 +789,9 @@ class _NixlStagedTransfer:
         source: p2p_pb2.WorkerMetadata,
         parameter_layout: dict[str, tuple[tuple[int, ...], torch.dtype]],
     ) -> _StagedNixlWeights:
-        """Pull an identical-rank peer's canonical staging buffers."""
+        """Pull an identical-rank peer's complete runtime tensor set."""
         if self._closed:
             raise RuntimeError("NIXL staged transfer is closed")
-        self.unpublish_peer()
         self._select_workspace_mode("full")
         self._ensure_buffers(
             self._recv_buffers,
@@ -871,48 +881,6 @@ class _NixlStagedTransfer:
             },
         )
 
-    def publish_peer(
-        self,
-        *,
-        staged: _StagedNixlWeights,
-        identity: p2p_pb2.SourceIdentity,
-        p2p_client: MxClientBase,
-        worker_rank: int,
-        worker_id: str,
-        accelerator: str,
-    ) -> None:
-        """Advertise verified canonical buffers for the applied version."""
-        previous_rank = self._published_peer_rank
-        self.unpublish_peer()
-        # Supersede any boot-time source owned by this rank before binding the
-        # shared publication slot to the exact WeightVersion identity.
-        if previous_rank != worker_rank:
-            unpublish_metadata_for_worker(
-                worker_rank=worker_rank,
-                device_id=self._device_id,
-            )
-        publish_metadata_and_ready(
-            p2p_client,
-            self._manager,
-            staged.tensors,
-            worker_rank,
-            self._device_id,
-            identity,
-            worker_id,
-            accelerator=accelerator,
-        )
-        self._published_peer_rank = worker_rank
-
-    def unpublish_peer(self) -> None:
-        """Stop advertising buffers before they are reused by another stage."""
-        if self._published_peer_rank is None:
-            return
-        unpublish_metadata_for_worker(
-            worker_rank=self._published_peer_rank,
-            device_id=self._device_id,
-        )
-        self._published_peer_rank = None
-
     def _verification_tensor(self, prepared: _PreparedNixlTransfer, name: str):
         source = prepared.sources[name]
         if name in self._full_buffers:
@@ -963,13 +931,16 @@ class _NixlStagedTransfer:
     def close(self) -> None:
         if self._closed:
             return
-        self.unpublish_peer()
         self._closed = True
-        self._manager.shutdown()
-        self._recv_buffers.clear()
-        self._convert_buffers.clear()
-        self._full_buffers.clear()
-        self._bounded_arena = None
+        if self._owns_manager:
+            self._manager.shutdown()
+            # The agent's registrations are gone, so staging storage can be
+            # freed eagerly. A shared agent may still hold these buffers
+            # registered; keep them referenced until its owner shuts down.
+            self._recv_buffers.clear()
+            self._convert_buffers.clear()
+            self._full_buffers.clear()
+            self._bounded_arena = None
 
 
 __all__: list[str] = []

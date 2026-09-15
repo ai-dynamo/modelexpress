@@ -36,6 +36,51 @@ def _make_loader():
     return loader
 
 
+def test_get_model_loader_returns_completed_inference_loader():
+    from modelexpress.engines.vllm import loader as loader_mod
+
+    loader = _make_loader()
+    ctx = _make_load_context(device_id=3)
+    loader._ctx = ctx
+    loader_mod._loader_registry[3] = loader
+    try:
+        assert loader_mod.get_model_loader(3) is loader
+    finally:
+        loader_mod._loader_registry.pop(3, None)
+
+
+def test_get_model_loader_returns_none_for_unknown_device():
+    from modelexpress.engines.vllm import loader as loader_mod
+
+    loader_mod._loader_registry.pop(99, None)
+    assert loader_mod.get_model_loader(99) is None
+
+
+def test_model_loader_owns_runtime_tensor_publication(monkeypatch):
+    from modelexpress.engines.vllm import loader as loader_mod
+
+    loader = _make_loader()
+    ctx = _make_load_context(device_id=3)
+    loader._ctx = ctx
+    events = []
+    monkeypatch.setattr(
+        loader_mod,
+        "unpublish_metadata",
+        lambda received: events.append(("unpublish", received)),
+    )
+    monkeypatch.setattr(
+        loader_mod,
+        "publish_metadata",
+        lambda received: events.append(("publish", received)),
+    )
+
+    loader.unpublish_runtime_tensors()
+    loader.publish_runtime_tensors("version-a")
+
+    assert events == [("unpublish", ctx), ("publish", ctx)]
+    assert ctx.identity.revision == "version-a"
+
+
 def _make_identity(model_name="test-model"):
     # Realistic identity: unquantized weights with dtype set, matching every
     # production vLLM/SGLang/TRT-LLM publish path. The accelerator gate treats
@@ -354,11 +399,13 @@ class TestAbstractMethodCompleteness:
                 loaded = loader.load_model(MagicMock(), MagicMock(dtype=torch.float32))
 
             assert loaded is model.eval.return_value
+            assert loader_mod._loader_registry[3] is loader
             assert loader_mod._tensor_registry[3] == ctx.tensors
             assert 3 not in loader_mod._nixl_managers
         finally:
             loader_mod._nixl_managers.pop(3, None)
             loader_mod._tensor_registry.pop(3, None)
+            loader_mod._loader_registry.pop(3, None)
 
     @pytest.mark.parametrize(
         ("ready_url", "health_gated"),
@@ -546,12 +593,15 @@ class TestMtpDrafterSecondLoad:
         draft_ctx.nixl_manager = MagicMock()
         try:
             schedule = self._load(loader, draft_vllm_config, draft_config, draft_ctx)
+            assert loader_mod._loader_registry[0] is loader
+            assert loader.tensors is target_ctx.tensors
             assert loader_mod._tensor_registry[0] is target_ctx.tensors
             assert loader_mod._nixl_managers[0] is target_ctx.nixl_manager
             schedule.assert_not_called()
         finally:
             loader_mod._tensor_registry.pop(0, None)
             loader_mod._nixl_managers.pop(0, None)
+            loader_mod._loader_registry.pop(0, None)
 
     def test_rl_drafter_is_rejected_before_initialization(self):
         """RL has no version contract for speculative draft weights."""

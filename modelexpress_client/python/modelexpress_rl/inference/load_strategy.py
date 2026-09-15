@@ -9,6 +9,7 @@ import logging
 
 import torch.nn as nn
 
+from modelexpress import envs as mx_envs
 from modelexpress.adapter import StrategyFailed, StrategyRecoveryError
 from modelexpress.load_strategy import execute_load_strategies
 from modelexpress.load_strategy.context import LoadContext, LoadResult
@@ -21,7 +22,7 @@ from ..control import ModelExpressControlClient, WeightVersion, WeightVersionSta
 from ..object_storage import ObjectStorageType
 from ..s3 import S3Client
 from .methods import CanonicalDeltaUpdateMethod
-from .plan import ObjectStorageUpdateSource
+from .plan import ObjectStorageUpdateSource, WeightSource, parse_weight_source_order
 from .receiver import (
     ObjectStorageGeneratorConfig,
     _S3Version,
@@ -91,6 +92,32 @@ def _agree_desired_version(ctx: LoadContext) -> str | None:
         result=None,
     )
     return desired_version_uid
+
+
+def _validate_cold_start_source_order(
+    ctx: LoadContext,
+    desired_version_uid: str,
+) -> tuple[WeightSource, ...]:
+    """Ensure all ranks of one distributed engine select the same source order."""
+    configured = mx_envs.MX_GENERATOR_SOURCE_ORDER
+    source_order = (
+        parse_weight_source_order(configured)
+        if configured is not None
+        else (WeightSource.GENERATOR, WeightSource.OBJECT_STORAGE)
+    )
+    if WeightSource.TRAINER in source_order:
+        raise ValueError(
+            "MX_GENERATOR_SOURCE_ORDER cannot include TRAINER during "
+            "desired-version cold start"
+        )
+    results = _gather_phase(
+        ctx,
+        phase="source_order",
+        desired_version_uid=desired_version_uid,
+        result=tuple(source.value for source in source_order),
+    )
+    agreed = _require_uniform_result(results, phase="cold-start source order")
+    return tuple(WeightSource(source) for source in agreed)
 
 
 def _require_uniform_result(
@@ -463,9 +490,17 @@ class RLLoadStrategyChain:
         # A desired UID is a correctness constraint: version-agnostic fallbacks
         # could load different weights and let the worker serve the wrong version.
         if ctx.desired_version_uid is not None:
+            source_order = _validate_cold_start_source_order(
+                ctx,
+                ctx.desired_version_uid,
+            )
             strategies = [
-                DesiredVersionP2PStrategy(),
-                DesiredVersionS3Strategy(),
+                (
+                    DesiredVersionP2PStrategy()
+                    if source is WeightSource.GENERATOR
+                    else DesiredVersionS3Strategy()
+                )
+                for source in source_order
             ]
         else:
             logger.warning(
