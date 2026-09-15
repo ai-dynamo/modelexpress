@@ -372,6 +372,7 @@ def test_peer_receive_writes_directly_into_live_tensor_catalog(monkeypatch):
 
         def receive_from_source(self, **kwargs):
             calls.append(("receive", kwargs))
+            kwargs["on_transfer_start"]()
             return 16, 1, 0.25
 
         def remove_remote_agent(self, agent_name):
@@ -406,7 +407,8 @@ def test_peer_receive_writes_directly_into_live_tensor_catalog(monkeypatch):
     assert receive["remote_agent_name"] == "live-peer-agent"
     assert receive["require_exact_match"] is True
     assert receive["destination_tensors"] is live
-    assert ("transfer_start", None) in calls
+    assert callable(receive["on_transfer_start"])
+    assert calls.count(("transfer_start", None)) == 1
     assert lease.closed is False
     fetch = next(value for name, value in calls if name == "fetch")
     assert fetch == {

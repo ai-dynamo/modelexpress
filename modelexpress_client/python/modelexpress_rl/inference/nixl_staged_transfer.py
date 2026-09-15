@@ -719,7 +719,6 @@ class _NixlStagedTransfer:
                 port=port,
                 timeout_seconds=self._timeout,
             )
-            on_transfer_start()
             bytes_received, tensor_count, wire_seconds = (
                 self._manager.receive_from_source(
                     source_metadata=b"",
@@ -728,6 +727,7 @@ class _NixlStagedTransfer:
                     remote_agent_name=remote_agent_name,
                     require_exact_match=True,
                     destination_tensors=destination_tensors,
+                    on_transfer_start=on_transfer_start,
                 )
             )
         finally:

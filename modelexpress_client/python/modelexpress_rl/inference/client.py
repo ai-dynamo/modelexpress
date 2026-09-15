@@ -369,6 +369,7 @@ class ModelExpressGeneratorClient:
                 raise RuntimeError("staged weight has already been released")
             runtime = self._require_runtime()
             was_applied = staged._update.applied
+            serving_version_id = self._serving_version_id
             if not was_applied:
                 runtime.unpublish_runtime_tensors()
             try:
@@ -377,6 +378,14 @@ class ModelExpressGeneratorClient:
             except BaseException:
                 if staged._update.installation_started and not staged._update.applied:
                     self._engine_state = _EngineState.UNCERTAIN
+                elif not was_applied and serving_version_id is not None:
+                    try:
+                        runtime.publish_runtime_tensors(serving_version_id)
+                    except Exception:
+                        logger.exception(
+                            "failed to republish unchanged runtime tensors for %s",
+                            serving_version_id,
+                        )
                 raise
             finally:
                 # Reported even when the install raised: a refit that failed
