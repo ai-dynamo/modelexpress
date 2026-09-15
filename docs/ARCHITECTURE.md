@@ -1076,11 +1076,14 @@ protocol are engine-agnostic.
 Geometry capture passes all lazy source weights through the engine loader in
 one call, amortizing model-wide parameter and expert-map construction. Each
 lazy tensor retains its original source identity, including native-to-HF view
-conversions. If an unsupported operation interrupts the bulk attempt, its new
-copy records and unattributed-write count are discarded before retrying each
-source individually for precise diagnostics. Unexpected engine errors propagate,
-and parameter loader hooks are restored on every exit. This optimizes the first
-capture without caching layouts across model or source changes.
+conversions. If an unsupported operation interrupts the bulk attempt, the
+recorder rolls every accumulator it advanced back to the attempt's starting
+state before retrying each source individually for precise diagnostics, so bulk
+capture still never produces an incorrect partial plan. The bulk cause is logged
+even when the per-source retry then succeeds for every source, because bulk order
+can trip a loader that per-source order does not. Unexpected engine errors
+propagate, and parameter loader hooks are restored on every exit. This optimizes
+the first capture without caching layouts across model or source changes.
 
 The minimal rendezvous publisher is called only after its NIXL agent and source
 buffers are registered, so `publish()` stores the worker as READY and repeated

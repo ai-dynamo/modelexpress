@@ -18,9 +18,12 @@ pull.
 Design notes:
   * Framework-neutral: the caller supplies the model (ideally a disposable
     ``meta`` twin) and the framework's default weight-loader; no engine import.
-  * Bulk capture amortizes model-wide loader setup. If an unsupported operation
-    interrupts it, discard that attempt's records and retry per source to retain
-    precise diagnostics before the receiver fails the update.
+  * Bulk capture amortizes model-wide loader setup, then retries one source at a
+    time when an unsupported operation interrupts it, so unsupported geometry is
+    still attributed to the specific source before the receiver fails the update.
+    It never produces an incorrect partial plan: the interrupted attempt rolls
+    back every recorder accumulator (``_BakeRecorder.attempt``), so the retry
+    starts from exactly the state the bulk attempt began with.
   * Allowlist of pure view/slice ops; anything else (arithmetic, .to/.float,
     bool-mask indexing) lands in ``__torch_dispatch__`` and raises
     ``UnsupportedReshard`` for that source, not wrong bytes.
@@ -30,7 +33,8 @@ from __future__ import annotations
 
 import functools
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -102,6 +106,24 @@ class _BakeRecorder:
     # Set by the loader stamp to the destination param's full name so copy_ can
     # attribute the write.
     current: Any = None
+
+    @contextmanager
+    def attempt(self) -> Iterator[None]:
+        """Run a capture attempt whose records are discarded unless it completes.
+
+        Every mutable accumulator on this recorder must be restored here. A field
+        added to this class without being restored would let an abandoned attempt
+        contribute to the next one.
+        """
+        copies = len(self.copies)
+        unattributed, current = self.unattributed, self.current
+        try:
+            yield
+        except BaseException:
+            del self.copies[copies:]
+            self.unattributed = unattributed
+            self.current = current
+            raise
 
 
 class LazyWeight(torch.Tensor):
@@ -326,14 +348,18 @@ def capture_weights(
     try:
         # Large MoE loaders rebuild model-wide parameter/expert maps on entry.
         # LazyWeights carry their own source identity across one bulk invocation.
-        copies_start, unattributed_start = len(recorder.copies), recorder.unattributed
         try:
-            model.load_weights(list(weights.items()))
-        except UnsupportedReshard:
-            # The failed attempt may have recorded a prefix. Never count it twice
-            # when retrying the original per-source diagnostic path.
-            del recorder.copies[copies_start:]
-            recorder.unattributed = unattributed_start
+            with recorder.attempt():
+                model.load_weights(list(weights.items()))
+        except UnsupportedReshard as bulk_error:
+            # The per-source retry can succeed for every source even when bulk
+            # order trips a loader, which would otherwise leave `unsupported`
+            # empty and hide a bulk-only incompatibility entirely.
+            logger.warning(
+                "reshard capture: bulk load_weights raised, retrying per source; "
+                "bulk cause: %s",
+                bulk_error,
+            )
             for name, tensor in weights.items():
                 source = getattr(tensor, "_name", name)
                 try:

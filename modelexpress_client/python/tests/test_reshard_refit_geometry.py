@@ -10,6 +10,7 @@ unsupported op is identified without producing an incorrect copy). Runs in any
 torch env: pytest tests/test_reshard_refit_geometry.py
 """
 
+import logging
 import re
 
 import pytest
@@ -215,6 +216,34 @@ def test_batch_capture_propagates_unexpected_errors_and_restores_loaders(failure
     originals = {name: param.weight_loader for name, param in model.named_parameters()}
     with pytest.raises(failure, match="engine failure"):
         capture_geometry(model, _manifest())
+    assert all(
+        param.weight_loader is originals[name]
+        for name, param in model.named_parameters()
+    )
+
+
+def test_bulk_only_failure_is_reported_even_when_every_source_retries_clean(caplog):
+    """An incompatibility that appears only in bulk order leaves `unsupported`
+    empty once the per-source retry passes, so the cause has to be logged."""
+
+    class BulkOnlyFailureModel(ToyModel):
+        def load_weights(self, weights):
+            weights = list(weights)
+            if len(weights) > 1:
+                raise UnsupportedReshard("fused expert map rejects bulk order")
+            return super().load_weights(weights)
+
+    with torch.device("meta"):
+        model = BulkOnlyFailureModel()
+    originals = {name: param.weight_loader for name, param in model.named_parameters()}
+    with caplog.at_level(logging.WARNING, logger="modelexpress.refit.reshard.geometry"):
+        result = capture_geometry(model, _manifest())
+
+    assert result.unsupported == [] and result.unattributed == 0
+    assert len(result.copies) == len(_manifest())
+    assert {copy.src_name for copy in result.copies} == {n for n, _, _ in _manifest()}
+    assert "rejects bulk order" in caplog.text
+    # The retry must run against pristine stamps, and every stamp is removed on exit.
     assert all(
         param.weight_loader is originals[name]
         for name, param in model.named_parameters()
