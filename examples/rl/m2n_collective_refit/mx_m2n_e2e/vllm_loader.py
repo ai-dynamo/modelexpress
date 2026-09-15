@@ -31,7 +31,7 @@ from modelexpress_rl.collective import (
 )
 from modelexpress_rl.collective.rendezvous import CollectiveRendezvous
 
-from .plan_from_hf import build_plan
+from .plan_from_hf import build_plan, engine_placement
 
 
 class VllmLoader:
@@ -43,28 +43,109 @@ class VllmLoader:
     buffers every round would measure the allocator, not the refit.
     """
 
-    def __init__(self, model: Any, plan, groupings: list[list[str]], device: torch.device) -> None:
+    def __init__(
+        self,
+        model: Any,
+        plan,
+        groupings: list[list[str]],
+        device: torch.device,
+        *,
+        tp_size: int = 1,
+        dst_layout: str = "replicate",
+    ) -> None:
         self._model = model
         self._plan = plan
         self._groupings = groupings
         self._device = device
         self._specs: dict[str, LocalParamSpec] = {}
-        self._by_group: dict[int, list[str]] = {}
+        self._staged: dict[int, list[str]] = {}
         self.installed_rounds = 0
         self.install_calls = 0
+        self.direct = 0
+        self.staged = 0
 
         dtypes = {
             "bfloat16": torch.bfloat16,
             "float16": torch.float16,
             "float32": torch.float32,
         }
+        shapes = {entry.name: entry.global_shape for entry in plan.bulk}
+        named = dict(model.named_parameters())
+        group_of = {
+            name: gid for gid, names in enumerate(groupings) for name in names
+        }
+
         for entry in plan.bulk:
-            buffer = torch.empty(
-                entry.global_shape, dtype=dtypes[entry.dtype], device=device
+            target = None
+            if dst_layout == "sharded" and engine_placement(
+                entry.name, entry.global_shape, tp_size
+            ) is not None:
+                target = self._engine_view(named, shapes, entry.name, tp_size)
+            if target is not None:
+                # The wire op writes into the engine's live storage. No scratch,
+                # no copy, and install() has nothing left to do for this one.
+                self._specs[entry.name] = LocalParamSpec(base=target)
+                self.direct += 1
+                continue
+            self._specs[entry.name] = LocalParamSpec(
+                base=torch.empty(
+                    entry.global_shape, dtype=dtypes[entry.dtype], device=device
+                )
             )
-            self._specs[entry.name] = LocalParamSpec(base=buffer)
-        for group_id, names in enumerate(groupings):
-            self._by_group[group_id] = list(names)
+            self._staged.setdefault(group_of[entry.name], []).append(entry.name)
+            self.staged += 1
+
+    @staticmethod
+    def _engine_view(named: dict, shapes: dict, name: str, tp_size: int):
+        """This rank's slice of ``name`` inside the engine's fused storage.
+
+        Returns None when the slice cannot be established, which is the answer
+        whenever the arithmetic is not provably right: a fused parameter whose
+        constituents do not account for its local extent means the engine split
+        it some other way -- replicated key/value heads, a padded vocabulary --
+        and guessing would land wrong bytes with nothing erroring.
+        """
+        fused = {
+            "q_proj.weight": ("qkv_proj.weight", ("q_proj.weight", "k_proj.weight", "v_proj.weight")),
+            "k_proj.weight": ("qkv_proj.weight", ("q_proj.weight", "k_proj.weight", "v_proj.weight")),
+            "v_proj.weight": ("qkv_proj.weight", ("q_proj.weight", "k_proj.weight", "v_proj.weight")),
+            "gate_proj.weight": ("gate_up_proj.weight", ("gate_proj.weight", "up_proj.weight")),
+            "up_proj.weight": ("gate_up_proj.weight", ("gate_proj.weight", "up_proj.weight")),
+        }
+        for suffix, (fused_suffix, members) in fused.items():
+            if not name.endswith(suffix):
+                continue
+            prefix = name[: -len(suffix)]
+            param = named.get(prefix + fused_suffix)
+            if param is None:
+                return None
+            rows = []
+            for member in members:
+                global_shape = shapes.get(prefix + member)
+                if global_shape is None or global_shape[0] % tp_size:
+                    return None
+                rows.append(global_shape[0] // tp_size)
+            if sum(rows) != param.shape[0]:
+                return None
+            offset = sum(rows[: members.index(suffix)])
+            extent = rows[members.index(suffix)]
+            return param.data[offset : offset + extent]
+
+        param = named.get(name)
+        if param is None:
+            return None
+        expected = shapes[name]
+        # An unfused parameter is delivered whole only if the engine's local
+        # extents are exactly the declared split; a padded vocabulary is the
+        # common way this fails.
+        if len(param.shape) != len(expected):
+            return None
+        for axis, (local, declared) in enumerate(zip(param.shape, expected)):
+            if local == declared:
+                continue
+            if local * tp_size != declared:
+                return None
+        return param.data
 
     # --- Loader protocol -------------------------------------------------
 
@@ -82,7 +163,7 @@ class VllmLoader:
 
     def install(self, layer_group_id: int) -> None:
         """Hand one layer group's received tensors to vLLM's own loader."""
-        names = self._by_group.get(layer_group_id, [])
+        names = self._staged.get(layer_group_id, [])
         if not names:
             return
         loaded = self._model.load_weights(
@@ -159,6 +240,7 @@ class MxRefitWorker:
         generators: int,
         model_name: str,
         run_id: str,
+        dst_layout: str = "replicate",
     ) -> dict[str, Any]:
         """Build the plan, construct the client, and join the refit group."""
         import grpc
@@ -168,9 +250,19 @@ class MxRefitWorker:
         torch.cuda.set_device(device)
 
         plan, groupings = build_plan(
-            model_dir, trainers=trainers, generators=generators
+            model_dir,
+            trainers=trainers,
+            generators=generators,
+            dst_layout=dst_layout,
         )
-        loader = VllmLoader(self.model_runner.model, plan, groupings, device)
+        loader = VllmLoader(
+            self.model_runner.model,
+            plan,
+            groupings,
+            device,
+            tp_size=generators,
+            dst_layout=dst_layout,
+        )
 
         channel = grpc.insecure_channel(endpoint)
         grpc.channel_ready_future(channel).result(timeout=120)
@@ -205,6 +297,8 @@ class MxRefitWorker:
             "bootstrap_s": elapsed,
             "bulk_params": len(plan.bulk),
             "layer_groups": len(groupings),
+            "direct": loader.direct,
+            "staged": loader.staged,
         }
 
     def mx_refit(self, version: str) -> dict[str, Any]:

@@ -16,17 +16,18 @@ ROUNDS=${ROUNDS:-5}
 RUN=${RUN:-e2e-$(date +%s)}
 OUT=${OUT:-/work/out/$RUN}
 TRAINER=${TRAINER:-fsdp2}
+DST=${DST:-replicate}
 
 export PYTHONPATH=${PYTHONPATH:-$(cd "$(dirname "$0")" && pwd)}
 export VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL:-WARNING}
 export MX_NCCL_REFIT_GROUP_TIMEOUT_S=${MX_NCCL_REFIT_GROUP_TIMEOUT_S:-900}
 mkdir -p "$OUT"
-echo "run=$RUN model=$MODEL trainer=$TRAINER trainers=$T generators=$G rounds=$ROUNDS out=$OUT"
+echo "run=$RUN model=$MODEL trainer=$TRAINER dst=$DST trainers=$T generators=$G rounds=$ROUNDS out=$OUT"
 
 ( CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((G-1))) \
   python3 -m mx_m2n_e2e.generator --model-dir "$MODEL" --endpoint "$MX_ENDPOINT" \
     --model-name "$RUN" --run-id "$RUN" --trainers "$T" --generators "$G" \
-    --rounds "$ROUNDS" --out "$OUT" > "$OUT/generator.log" 2>&1
+    --rounds "$ROUNDS" --dst-layout "$DST" --out "$OUT" > "$OUT/generator.log" 2>&1
   echo $? > "$OUT/generator.rc" ) &
 
 sleep 5
@@ -38,7 +39,8 @@ for rank in $(seq 0 $((T-1))); do
     MASTER_ADDR=127.0.0.1 MASTER_PORT=${MASTER_PORT:-29555} \
     python3 -m mx_m2n_e2e.trainer --model-dir "$MODEL" --endpoint "$MX_ENDPOINT" \
       --model-name "$RUN" --run-id "$RUN" --trainers "$T" --generators "$G" \
-      --rounds "$ROUNDS" --backend "$TRAINER" --out "$OUT" > "$OUT/trainer$rank.log" 2>&1
+      --rounds "$ROUNDS" --backend "$TRAINER" --dst-layout "$DST" \
+      --out "$OUT" > "$OUT/trainer$rank.log" 2>&1
     echo $? > "$OUT/trainer$rank.rc" ) &
 done
 wait

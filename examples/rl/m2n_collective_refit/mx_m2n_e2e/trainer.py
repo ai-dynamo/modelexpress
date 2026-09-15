@@ -203,6 +203,9 @@ def main() -> int:
     parser.add_argument("--generators", type=int, required=True)
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--backend", default="fsdp2", choices=["fsdp2", "deepspeed"])
+    parser.add_argument(
+        "--dst-layout", default="replicate", choices=["replicate", "sharded"]
+    )
     parser.add_argument("--out", default="/work/out")
     args = parser.parse_args()
 
@@ -222,7 +225,10 @@ def main() -> int:
     load_s = time.perf_counter() - load_start
 
     plan, groupings = build_plan(
-        args.model_dir, trainers=args.trainers, generators=args.generators
+        args.model_dir,
+        trainers=args.trainers,
+        generators=args.generators,
+        dst_layout=args.dst_layout,
     )
     if args.backend == "fsdp2":
         publisher = FsdpPublisher(model, plan, groupings, args.trainers)
@@ -295,6 +301,7 @@ def main() -> int:
                 "rank": rank,
                 "role": "trainer",
                 "backend": args.backend,
+                "dst_layout": args.dst_layout,
                 "model_dir": args.model_dir,
                 "model_load_s": load_s,
                 "bootstrap_s": bootstrap_s,

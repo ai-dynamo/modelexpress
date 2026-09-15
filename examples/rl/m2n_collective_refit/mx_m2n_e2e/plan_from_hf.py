@@ -86,18 +86,59 @@ def layer_index(name: str) -> int | None:
     return None
 
 
+#: How a tensor-parallel inference engine splits each parameter. The suffix rule
+#: is a fact about this model family's architecture, and it lives HERE, in the
+#: example's plan builder, rather than in the shared core -- the core never
+#: infers geometry from a parameter name, which is what keeps it portable.
+_COLUMN_PARALLEL = (
+    "q_proj.weight",
+    "k_proj.weight",
+    "v_proj.weight",
+    "gate_proj.weight",
+    "up_proj.weight",
+    "embed_tokens.weight",
+    "lm_head.weight",
+)
+_ROW_PARALLEL = ("o_proj.weight", "down_proj.weight")
+
+
+def engine_placement(name: str, shape: tuple[int, ...], generators: int):
+    """Where one canonical parameter lands in a tensor-parallel engine.
+
+    Returns None when it cannot be delivered pre-split -- a dimension that does
+    not divide the engine's world, or a parameter this rule does not classify.
+    The caller falls back to replicating those, which is always correct and
+    costs bandwidth rather than correctness.
+    """
+    if name.endswith(_COLUMN_PARALLEL):
+        return Placement.shard(0) if shape[0] % generators == 0 else None
+    if name.endswith(_ROW_PARALLEL):
+        if len(shape) < 2 or shape[1] % generators != 0:
+            return None
+        return Placement.shard(1)
+    if len(shape) == 1:
+        return Placement.replicate()
+    return None
+
+
 def build_plan(
     model_dir: str,
     *,
     trainers: int,
     generators: int,
+    dst_layout: str = "replicate",
 ) -> tuple[ReshardPlan, list[list[str]]]:
     """Build the plan and its layer groups for one trainer/generator geometry.
 
     The trainer holds each parameter sharded on dim 0, which is what a
-    dim-0-sharding data-parallel framework produces. The generator receives it
-    replicated, because the inference engine's own loader owns the split into
-    its fused, tensor-parallel storage and needs the whole tensor to do it.
+    dim-0-sharding data-parallel framework produces.
+
+    ``dst_layout`` decides what the generator receives. ``replicate`` hands each
+    rank the whole tensor and lets the engine's own loader split it, which is
+    correct for any architecture and costs the engine's world size in wire
+    bytes. ``sharded`` delivers each rank exactly the slice it will keep, which
+    carries the bytes once but needs the receiver to know its engine's fused
+    layout, so the Loader stages through ``pre``/``post`` hooks.
 
     Layer groups follow the transformer's own layers, so a receiver installs
     one layer at a time instead of holding the whole model in scratch.
@@ -122,6 +163,9 @@ def build_plan(
             # silently. Name it instead.
             undivided.append(name)
             continue
+        dst = Placement.replicate()
+        if dst_layout == "sharded":
+            dst = engine_placement(name, shape, generators) or Placement.replicate()
         bulk.append(
             ParamPlan(
                 name=name,
@@ -131,7 +175,7 @@ def build_plan(
                 src_mesh=src_mesh,
                 src_placements=(Placement.shard(0),),
                 dst_mesh=dst_mesh,
-                dst_placements=(Placement.replicate(),),
+                dst_placements=(dst,),
             )
         )
     if undivided:

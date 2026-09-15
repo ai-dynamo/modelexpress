@@ -36,6 +36,9 @@ def main() -> int:
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--gpu-fraction", type=float, default=0.4)
+    parser.add_argument(
+        "--dst-layout", default="replicate", choices=["replicate", "sharded"]
+    )
     parser.add_argument("--out", default="/work/out")
     args = parser.parse_args()
 
@@ -87,6 +90,7 @@ def main() -> int:
             "generators": args.generators,
             "model_name": args.model_name,
             "run_id": args.run_id,
+            "dst_layout": args.dst_layout,
         },
     )
     print(f"[gen] joined: {joined}", flush=True)
@@ -108,6 +112,7 @@ def main() -> int:
         "run_id": args.run_id,
         "model_dir": args.model_dir,
         "role": "generator",
+        "dst_layout": args.dst_layout,
         "engine_start_s": engine_s,
         "tensor_parallel_size": args.generators,
         "trainers": args.trainers,
