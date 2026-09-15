@@ -17,12 +17,13 @@ value, and both must report a mismatch for the passing case to mean anything.
 
 from __future__ import annotations
 
-import ctypes
 import multiprocessing as mp
 import os
 
 import pytest
 import torch
+
+from modelexpress_rl.collective.backend import MIN_NCCL, loaded_nccl_version
 
 pytestmark = pytest.mark.gpu
 
@@ -31,32 +32,6 @@ SRC_RANKS = (0, 1)
 DST_RANKS = (2, 3)
 GLOBAL_SHAPE = (8, 16)
 
-#: The reshard entry points were added in this NCCL release. An older library
-#: fails inside the native call rather than at import, so the floor is checked
-#: against the library actually mapped into the process.
-MIN_NCCL = (2, 30, 7)
-
-
-def _loaded_nccl_version() -> tuple[int, int, int] | None:
-    """Version of the libnccl this process actually resolves, or None.
-
-    nccl4py's own ``get_version()`` reports the library it would load by path,
-    which is not necessarily the one that wins: a CUDA image ships its own
-    libnccl, and whichever is mapped first is the one the reshard runs
-    against. Asking the loaded library directly is the only reading that
-    tracks the failure.
-    """
-    try:
-        lib = ctypes.CDLL("libnccl.so.2")
-        raw = ctypes.c_int()
-        if lib.ncclGetVersion(ctypes.byref(raw)) != 0:
-            return None
-    except OSError:
-        return None
-    value = raw.value
-    return (value // 10000, (value // 100) % 100, value % 100)
-
-
 def _requirements() -> str | None:
     if torch.cuda.device_count() < RANKS:
         return f"needs {RANKS} CUDA devices"
@@ -64,7 +39,7 @@ def _requirements() -> str | None:
         import nccl.m2n  # noqa: F401
     except Exception as error:  # noqa: BLE001 - any import failure is a skip
         return f"nccl.m2n unavailable ({error})"
-    found = _loaded_nccl_version()
+    found = loaded_nccl_version()
     if found is None:
         return "libnccl.so.2 did not resolve"
     if found < MIN_NCCL:

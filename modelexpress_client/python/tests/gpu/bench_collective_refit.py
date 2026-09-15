@@ -33,7 +33,6 @@ One process per rank, ``RANK`` in the environment, results as JSON per rank.
 
 from __future__ import annotations
 
-import ctypes
 import json
 import os
 import sys
@@ -54,6 +53,7 @@ from modelexpress_rl.collective import (
     ReshardPlan,
 )
 from modelexpress_rl.collective import client as client_module
+from modelexpress_rl.collective.backend import loaded_nccl_version
 from modelexpress_rl.collective.rendezvous import CollectiveRendezvous
 
 MIN_NCCL = (2, 30, 7)
@@ -99,23 +99,6 @@ MODULUS = 251
 
 def log(*args: Any) -> None:
     print(f"[rank {RANK}]", *args, flush=True)
-
-
-def loaded_nccl_version() -> tuple[int, int, int] | None:
-    """Version of the libnccl actually mapped into this process.
-
-    nccl4py's ``get_version()`` inspects the file it would load by path, which
-    is not necessarily the one that wins when a CUDA image ships its own.
-    """
-    try:
-        lib = ctypes.CDLL("libnccl.so.2")
-        raw = ctypes.c_int()
-        if lib.ncclGetVersion(ctypes.byref(raw)) != 0:
-            return None
-    except OSError:
-        return None
-    value = raw.value
-    return (value // 10000, (value // 100) % 100, value % 100)
 
 
 def param_name(index: int) -> str:

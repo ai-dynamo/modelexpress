@@ -13,6 +13,8 @@ end of each transfer they own.
 
 from __future__ import annotations
 
+import ctypes
+import functools
 import logging
 import math
 import threading
@@ -31,9 +33,46 @@ logger = logging.getLogger("modelexpress_rl.collective.backend")
 DEFAULT_LAYER_GROUP = 0
 _M2N_CALL_LOCK = threading.Lock()
 
+#: The reshard entry points were added in this NCCL release. An older library
+#: fails inside the native call rather than at import, so importability alone
+#: does not establish the runtime is usable.
+MIN_NCCL = (2, 30, 7)
+
+
+@functools.lru_cache(maxsize=1)
+def loaded_nccl_version() -> tuple[int, int, int] | None:
+    """Version of the libnccl this process actually resolves, or None.
+
+    nccl4py's own ``get_version()`` reports the library it would load by path,
+    which is not necessarily the one that wins: a CUDA image ships its own
+    libnccl, and whichever is mapped first is the one the reshard runs
+    against. Asking the loaded library directly is the only reading that
+    tracks the failure.
+
+    None means the handle did not resolve, which is a fact about this probe
+    rather than about the library. It is deliberately distinct from a version
+    below the floor: the probe failing is not evidence of an old runtime.
+    """
+    try:
+        lib = ctypes.CDLL("libnccl.so.2")
+        raw = ctypes.c_int()
+        if lib.ncclGetVersion(ctypes.byref(raw)) != 0:
+            return None
+    except OSError:
+        return None
+    value = raw.value
+    return (value // 10000, (value // 100) % 100, value % 100)
+
 
 def require_nccl_m2n() -> None:
-    """Fail before rendezvous when the optional M2N runtime is unavailable."""
+    """Fail before rendezvous when the optional M2N runtime is unavailable.
+
+    Importability is necessary and not sufficient. The reshard entry points
+    are resolved inside the native call, so a process that imports ``nccl.m2n``
+    against an older libnccl fails mid-collective with peers already waiting.
+    Checking the mapped library here turns that into a refusal before anyone
+    joins a group.
+    """
     try:
         from nccl.m2n import reshard as _  # noqa: F401
     except (ImportError, OSError) as error:  # pragma: no cover - environment dependent
@@ -43,6 +82,21 @@ def require_nccl_m2n() -> None:
             "install nccl-extensions[cu12] or nccl-extensions[cu13] to match "
             "the host CUDA toolkit"
         ) from error
+    found = loaded_nccl_version()
+    if found is None:
+        logger.debug(
+            "libnccl.so.2 did not resolve through ctypes, so the %s floor is "
+            "unchecked; nccl.m2n imported, so this is a limit of the probe",
+            ".".join(str(part) for part in MIN_NCCL),
+        )
+        return
+    if found < MIN_NCCL:
+        raise NcclUnavailableError(
+            f"the libnccl this process loads is "
+            f"{'.'.join(str(part) for part in found)}, and reshard needs "
+            f"{'.'.join(str(part) for part in MIN_NCCL)}; preload the one "
+            "nccl-extensions installed if the image ships an older library"
+        )
 
 
 def _reshard(

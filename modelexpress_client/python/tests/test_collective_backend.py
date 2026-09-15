@@ -735,3 +735,58 @@ class TestBoundedSynchronizeFallback:
         assert any(op.kind == "sync" for op in recorder.ops), (
             "falling back must still drain the stream, not skip the wait"
         )
+
+
+class TestNcclVersionFloor:
+    """``require_nccl_m2n`` has to check the library, not just the import.
+
+    The reshard entry points resolve inside the native call, so a process that
+    imports ``nccl.m2n`` against an older libnccl gets through every guard and
+    then fails mid-collective with its peers already waiting on it.
+    """
+
+    @staticmethod
+    def _importable(monkeypatch):
+        module = ModuleType("nccl.m2n")
+        module.reshard = lambda *args, **kwargs: None
+        monkeypatch.setitem(sys.modules, "nccl", ModuleType("nccl"))
+        monkeypatch.setitem(sys.modules, "nccl.m2n", module)
+
+    def test_a_library_below_the_floor_is_refused(self, monkeypatch):
+        self._importable(monkeypatch)
+        monkeypatch.setattr(backend, "loaded_nccl_version", lambda: (2, 27, 5))
+        with pytest.raises(backend.NcclUnavailableError) as caught:
+            backend.require_nccl_m2n()
+        assert "2.27.5" in str(caught.value)
+
+    def test_the_floor_itself_passes(self, monkeypatch):
+        self._importable(monkeypatch)
+        monkeypatch.setattr(backend, "loaded_nccl_version", lambda: backend.MIN_NCCL)
+        backend.require_nccl_m2n()
+
+    def test_an_unreadable_probe_is_not_an_old_library(self, monkeypatch):
+        """None and below-the-floor are different answers.
+
+        None says the ctypes handle did not resolve, which is a fact about the
+        probe. Collapsing it into a refusal would ground the data plane on
+        every host whose loader layout this check cannot see through, and the
+        import already succeeded there.
+        """
+        self._importable(monkeypatch)
+        monkeypatch.setattr(backend, "loaded_nccl_version", lambda: None)
+        backend.require_nccl_m2n()
+
+    def test_the_version_probe_reads_the_packed_integer(self, monkeypatch):
+        """22807 is 2.28.7, not 2.2.807 - the packing is easy to get wrong."""
+        backend.loaded_nccl_version.cache_clear()
+
+        class FakeLib:
+            def ncclGetVersion(self, ref):
+                ref._obj.value = 23007
+                return 0
+
+        monkeypatch.setattr(backend.ctypes, "CDLL", lambda name: FakeLib())
+        try:
+            assert backend.loaded_nccl_version() == (2, 30, 7)
+        finally:
+            backend.loaded_nccl_version.cache_clear()
