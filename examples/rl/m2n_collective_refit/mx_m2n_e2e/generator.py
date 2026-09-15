@@ -39,6 +39,7 @@ def main() -> int:
     parser.add_argument(
         "--dst-layout", default="replicate", choices=["replicate", "sharded"]
     )
+    parser.add_argument("--diff-checkpoint", action="store_true")
     parser.add_argument("--out", default="/work/out")
     args = parser.parse_args()
 
@@ -73,6 +74,31 @@ def main() -> int:
     llm.collective_rpc("mx_corrupt", kwargs={"seed": 1234})
     corrupted = token_ids(llm.generate(prompts, sampling))
     print(f"[gen] corrupted tokens: {corrupted[0][:12]}", flush=True)
+    if args.diff_checkpoint:
+        # Positive control for the diff instrument itself. Run on the corrupted
+        # model, where every parameter is known to disagree: a diff that reports
+        # zero HERE is measuring nothing, and its zero after the refit would be
+        # the same nothing wearing a pass.
+        control = llm.collective_rpc(
+            "mx_diff_against_checkpoint", kwargs={"path": args.model_dir}
+        )
+        for entry in control:
+            print(
+                f"[gen] CONTROL rank {entry['rank']}: {entry['differing']}/"
+                f"{entry['params']} parameters disagree while corrupted",
+                flush=True,
+            )
+        if any(entry["differing"] == 0 for entry in control):
+            print(
+                "[gen] FAILED: the checkpoint diff cannot see a fully corrupted "
+                "model, so it cannot certify anything",
+                flush=True,
+            )
+            return 1
+        # The control reloaded the checkpoint, so corrupt again for the refit.
+        llm.collective_rpc("mx_corrupt", kwargs={"seed": 1234})
+        corrupted = token_ids(llm.generate(prompts, sampling))
+
     if corrupted == reference:
         print(
             "[gen] FAILED: corruption did not change generation, so a later match "
@@ -107,7 +133,40 @@ def main() -> int:
             restored = token_ids(llm.generate(prompts, sampling))
             print(f"[gen] restored tokens: {restored[0][:12]}", flush=True)
 
-    ok = restored == reference
+    exact: bool | None = None
+    if args.diff_checkpoint:
+        report = llm.collective_rpc(
+            "mx_diff_against_checkpoint", kwargs={"path": args.model_dir}
+        )
+        for entry in report:
+            print(
+                f"[gen] rank {entry['rank']}: {entry['differing']}/{entry['params']} "
+                f"parameters disagree with the checkpoint",
+                flush=True,
+            )
+            for name, shape, delta in entry["worst"]:
+                print(f"[gen]    {name} {shape} max|d|={delta}", flush=True)
+        exact = all(entry["differing"] == 0 for entry in report)
+
+    tokens_match = restored == reference
+    if exact is None:
+        # Nothing stronger was measured, so the tokens are the whole test.
+        ok = tokens_match
+    else:
+        # Weight equality is the stronger claim and it is exact. Greedy decoding
+        # is not bitwise reproducible across cache states, so a larger model can
+        # flip a near-tied logit and diverge with every weight byte correct; that
+        # is a fact about the decoder, not about the refit, and it is only safe
+        # to say so BECAUSE the parameter comparison is exact and its control
+        # fired on the corrupted model.
+        ok = exact
+        if not tokens_match:
+            print(
+                "[gen] NOTE: generation diverged while every parameter matches "
+                "the checkpoint exactly - greedy decoding is not bitwise "
+                "reproducible across cache states",
+                flush=True,
+            )
     result = {
         "run_id": args.run_id,
         "model_dir": args.model_dir,
@@ -123,7 +182,8 @@ def main() -> int:
             "reference": reference,
             "corrupted": corrupted,
             "restored": restored,
-            "match": ok,
+            "match": tokens_match,
+            "parameters_exact": exact,
         },
     }
     os.makedirs(args.out, exist_ok=True)

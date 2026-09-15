@@ -331,3 +331,40 @@ class MxRefitWorker:
             client.cleanup()
             self._mx_client = None
         return True
+
+
+def _mx_diff_against_checkpoint(self, path: str, top: int = 12) -> dict[str, Any]:
+    """Which live parameters disagree with the checkpoint, and by how much.
+
+    Generation is the right acceptance test but a poor diagnostic: greedy
+    decoding diverges from a difference too small to see in the first tokens,
+    so a FAIL localizes nothing. This compares every live parameter against
+    what the engine's own loader produces from the checkpoint, which names the
+    parameter instead.
+    """
+    import glob
+
+    from safetensors.torch import load_file
+
+    model = self.model_runner.model
+    before = {name: param.detach().clone() for name, param in model.named_parameters()}
+    device = next(model.parameters()).device
+    for shard in sorted(glob.glob(path + "/*.safetensors")):
+        state = load_file(shard)
+        model.load_weights((name, tensor.to(device)) for name, tensor in state.items())
+
+    diffs = []
+    for name, param in model.named_parameters():
+        delta = (param.detach().float() - before[name].float()).abs().max().item()
+        if delta > 0:
+            diffs.append((delta, name, tuple(param.shape)))
+    diffs.sort(reverse=True)
+    return {
+        "rank": self._mx_rank(),
+        "params": len(before),
+        "differing": len(diffs),
+        "worst": [(n, s, round(d, 6)) for d, n, s in diffs[:top]],
+    }
+
+
+MxRefitWorker.mx_diff_against_checkpoint = _mx_diff_against_checkpoint

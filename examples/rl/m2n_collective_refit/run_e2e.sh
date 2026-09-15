@@ -27,7 +27,7 @@ echo "run=$RUN model=$MODEL trainer=$TRAINER dst=$DST trainers=$T generators=$G 
 ( CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((G-1))) \
   python3 -m mx_m2n_e2e.generator --model-dir "$MODEL" --endpoint "$MX_ENDPOINT" \
     --model-name "$RUN" --run-id "$RUN" --trainers "$T" --generators "$G" \
-    --rounds "$ROUNDS" --dst-layout "$DST" --out "$OUT" > "$OUT/generator.log" 2>&1
+    --rounds "$ROUNDS" --dst-layout "$DST" ${DIFF:+--diff-checkpoint} --out "$OUT" > "$OUT/generator.log" 2>&1
   echo $? > "$OUT/generator.rc" ) &
 
 sleep 5
