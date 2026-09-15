@@ -1,0 +1,236 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-s3-refit-minio
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: mx-s3-refit-minio}
+  template:
+    metadata:
+      labels: {app: mx-s3-refit-minio}
+    spec:
+      containers:
+      - name: minio
+        image: quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+        args: [server, /data]
+        env:
+        - name: MINIO_ROOT_USER
+          valueFrom:
+            secretKeyRef: {name: mx-minio-creds, key: MINIO_ROOT_USER}
+        - name: MINIO_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef: {name: mx-minio-creds, key: MINIO_ROOT_PASSWORD}
+        ports:
+        - {name: s3, containerPort: 9000}
+        readinessProbe:
+          httpGet: {path: /minio/health/ready, port: s3}
+          periodSeconds: 2
+        resources:
+          requests: {cpu: 250m, memory: 256Mi}
+          limits: {cpu: "1", memory: 1Gi}
+        volumeMounts:
+        - {name: data, mountPath: /data}
+      volumes:
+      - name: data
+        emptyDir: {sizeLimit: 16Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-s3-refit-minio
+spec:
+  selector: {app: mx-s3-refit-minio}
+  ports:
+  - {name: s3, port: 9000, targetPort: s3}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-s3-refit-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: mx-s3-refit-server}
+  template:
+    metadata:
+      labels: {app: mx-s3-refit-server}
+    spec:
+      imagePullSecrets:
+      - {name: nvcr-imagepullsecret}
+      initContainers:
+      - name: redis
+        image: redis:7.2-alpine
+        args: [redis-server, --save, "", --appendonly, "no"]
+        restartPolicy: Always
+        startupProbe:
+          tcpSocket: {port: 6379}
+          periodSeconds: 1
+          failureThreshold: 30
+      containers:
+      - name: modelexpress
+        image: ${WORKER_IMAGE}
+        imagePullPolicy: Always
+        command: [/usr/local/bin/modelexpress-server]
+        args: [--host, 0.0.0.0, --port, "8000"]
+        env:
+        - {name: MX_METADATA_BACKEND, value: redis}
+        - {name: REDIS_URL, value: "redis://localhost:6379"}
+        ports:
+        - {name: grpc, containerPort: 8000}
+        readinessProbe:
+          tcpSocket: {port: 8000}
+          periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-s3-refit-server
+spec:
+  selector: {app: mx-s3-refit-server}
+  ports:
+  - {name: grpc, port: 8000, targetPort: grpc}
+---
+# This DGD-scoped value is the orchestrator's durable intent for replacement
+# and scale-up workers. It advances only after every current worker reports the
+# newly installed version.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mx-s3-refit-desired-version
+data:
+  desired_version_uid: ""
+---
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeployment
+metadata:
+  name: mx-s3-refit
+spec:
+  components:
+  - name: Frontend
+    type: frontend
+    replicas: 1
+    runtimeVersionOverride: "1.5.0"
+    podTemplate:
+      spec:
+        imagePullSecrets:
+        - {name: nvcr-imagepullsecret}
+        containers:
+        - name: main
+          image: ${DYNAMO_FRONTEND_IMAGE}
+          env:
+          - {name: DYN_ENABLE_RL, value: "true"}
+          - {name: DYN_RL_PORT, value: "8001"}
+          ports:
+          - {name: http, containerPort: 8000}
+          - {name: rl-discovery, containerPort: 8001}
+  - name: VLLMWorker
+    type: worker
+    replicas: 2
+    runtimeVersionOverride: "1.5.0"
+    podTemplate:
+      spec:
+        imagePullSecrets:
+        - {name: nvcr-imagepullsecret}
+        tolerations:
+        - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+        volumes:
+        - name: dshm
+          emptyDir: {medium: Memory, sizeLimit: 16Gi}
+        - name: model
+          persistentVolumeClaim: {claimName: shared-model-cache}
+        - name: refit-checkpoints
+          emptyDir: {sizeLimit: 16Gi}
+        initContainers:
+        - name: vllm-engine
+          image: ${WORKER_IMAGE}
+          imagePullPolicy: Always
+          restartPolicy: Always
+          envFrom:
+          - secretRef: {name: hf-token-secret}
+          command: [/bin/sh, -c]
+          args:
+          - >-
+            exec "$(python3 -c 'import os,vllm; print(os.path.join(os.path.dirname(vllm.__file__), "vllm-rs"))')"
+            serve ${MODEL_NAME} --host 0.0.0.0 --port 8000 --grpc-port 50051
+            --tensor-parallel-size 1 --enable-sleep-mode
+            --load-format modelexpress
+            --weight-transfer-config '{"backend":"modelexpress"}'
+            --gpu-memory-utilization 0.5 --max-model-len 512 --max-num-seqs 8
+          env:
+          - {name: MODEL_NAME, value: "${MODEL_NAME}"}
+          - {name: MX_MODEL_URI, value: /models}
+          - {name: MX_SERVER_ADDRESS, value: "mx-s3-refit-server:8000"}
+          - {name: MX_LOAD_STRATEGY_CHAIN, value: RL}
+          - {name: MX_GENERATOR_SOURCE_ORDER, value: "GENERATOR,OBJECT_STORAGE"}
+          - name: MX_REFIT_DESIRED_VERSION_UID
+            valueFrom:
+              configMapKeyRef:
+                name: mx-s3-refit-desired-version
+                key: desired_version_uid
+          - {name: MX_REFIT_CHECKPOINT_DIR, value: /var/cache/modelexpress/refit}
+          - {name: VLLM_PLUGINS, value: modelexpress}
+          - {name: AWS_ENDPOINT_URL, value: "http://mx-s3-refit-minio:9000"}
+          - {name: AWS_DEFAULT_REGION, value: us-east-1}
+          - {name: AWS_EC2_METADATA_DISABLED, value: "true"}
+          - name: AWS_ACCESS_KEY_ID
+            valueFrom:
+              secretKeyRef: {name: mx-minio-creds, key: MINIO_ROOT_USER}
+          - name: AWS_SECRET_ACCESS_KEY
+            valueFrom:
+              secretKeyRef: {name: mx-minio-creds, key: MINIO_ROOT_PASSWORD}
+          - {name: MX_RDMA_NIC_PIN, value: auto}
+          - {name: UCX_RNDV_SCHEME, value: get_zcopy}
+          - {name: UCX_RNDV_THRESH, value: "0"}
+          ports:
+          - {name: engine-http, containerPort: 8000}
+          - {name: engine-grpc, containerPort: 50051}
+          startupProbe:
+            exec:
+              command:
+              - python3
+              - -m
+              - modelexpress_rl.inference.engines.vllm.startup_probe
+              - --address
+              - 127.0.0.1:50051
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 120
+          resources:
+            requests:
+              cpu: "4"
+              memory: 16Gi
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+            limits:
+              nvidia.com/gpu: "1"
+              rdma/ib: "1"
+          volumeMounts:
+          - {name: dshm, mountPath: /dev/shm}
+          - {name: model, mountPath: /models, subPath: "${MODEL_SUBPATH}", readOnly: true}
+          - {name: refit-checkpoints, mountPath: /var/cache/modelexpress/refit}
+        containers:
+        - name: main
+          image: ${WORKER_IMAGE}
+          command: [/usr/local/bin/dynamo-vllm-sidecar]
+          args: [--grpc-endpoint, "127.0.0.1:50051", --enable-rl]
+          env:
+          - {name: DYN_SYSTEM_PORT, value: "8081"}
+          - {name: DYN_ENABLE_RL, value: "true"}
+          ports:
+          - {name: system, containerPort: 8081}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-s3-refit-frontend-admin
+spec:
+  selector:
+    nvidia.com/dynamo-graph-deployment-name: mx-s3-refit
+    nvidia.com/dynamo-component: Frontend
+  ports:
+  - {name: http, port: 8000, targetPort: 8000}
+  - {name: rl-discovery, port: 8001, targetPort: 8001}

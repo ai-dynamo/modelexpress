@@ -123,6 +123,9 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
             activate=activate,
         )
 
+    def preparation_failed(self) -> None:
+        self._checkpoint.recover_incomplete_preparation()
+
     def activate(self, prepared: PreparedArtifact) -> None:
         """Activate the prepared checkpoint after distributed loading succeeds."""
         if prepared is not self._active:

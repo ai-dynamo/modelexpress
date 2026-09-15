@@ -4,6 +4,7 @@
 import sys
 from types import ModuleType, SimpleNamespace
 
+import pytest
 import torch
 
 from modelexpress import p2p_pb2
@@ -13,14 +14,36 @@ from modelexpress_rl.inference.engines.vllm import (
 )
 
 
+@pytest.mark.parametrize(
+    (
+        "quant_config",
+        "cache_dtype",
+        "has_nixl_manager",
+        "runtime_p2p_available",
+    ),
+    [
+        (None, "auto", True, True),
+        (None, "auto", False, False),
+        (object(), "auto", True, False),
+        (None, "fp8_e4m3", True, False),
+    ],
+)
 def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
     monkeypatch,
+    quant_config,
+    cache_dtype,
+    has_nixl_manager,
+    runtime_p2p_available,
 ):
     class ModelConfig:
         model = "test/model"
 
     class VllmConfig:
         model_config = ModelConfig()
+
+        def __init__(self):
+            self.quant_config = quant_config
+            self.cache_config = SimpleNamespace(cache_dtype=cache_dtype)
 
     config_module = ModuleType("vllm.config")
     config_module.ModelConfig = ModelConfig
@@ -53,14 +76,31 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
         def capture(self, manifest):
             return manifest
 
-        def parameter_layout(self):
-            return {"weight": ((4,), torch.float32)}
-
     adapter_module = ModuleType("modelexpress.engines.vllm.adapter")
     adapter_module.VllmAdapter = Engine
     monkeypatch.setitem(
         sys.modules, "modelexpress.engines.vllm.adapter", adapter_module
     )
+    model = torch.nn.Linear(4, 4)
+
+    class Loader:
+        tensors = {"weight": model.weight}
+        worker_id = "inference-worker-3"
+
+        def unpublish_runtime_tensors(self):
+            publication_events.append(("unpublish", self))
+
+        def publish_runtime_tensors(self, version_id):
+            publication_events.append(("publish", self, version_id))
+
+    loader = Loader()
+    loader.nixl_manager = object() if has_nixl_manager else None
+    loader_module = ModuleType("modelexpress.engines.vllm.loader")
+    loader_module.get_model_loader = lambda device_id: loader
+    monkeypatch.setitem(
+        sys.modules, "modelexpress.engines.vllm.loader", loader_module
+    )
+    publication_events = []
     installer_module = ModuleType(
         "modelexpress_rl.inference.engines.vllm.installer"
     )
@@ -71,7 +111,6 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
         installer_module,
     )
 
-    model = torch.nn.Linear(4, 4)
     config = VllmConfig()
     convert_native_to_hf = lambda weights: weights
     runtime = _create_vllm_engine_runtime(
@@ -83,21 +122,39 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
     )
 
     assert runtime.model_name == "test/model"
-    assert runtime.installer.kwargs == {
+    assert {
+        key: value
+        for key, value in runtime.installer.kwargs.items()
+        if key != "runtime_tensors"
+    } == {
         "model": model,
         "vllm_config": config,
         "model_config": config.model_config,
         "device": torch.device("cuda:2"),
         "convert_native_to_hf": convert_native_to_hf,
     }
+    expected_runtime_tensors = (
+        {"weight": model.weight} if runtime_p2p_available else None
+    )
+    assert runtime.installer.kwargs["runtime_tensors"] == expected_runtime_tensors
     assert runtime.full_tensor is not None
     assert runtime.full_tensor.device_id == 2
     assert runtime.full_tensor.worker_rank == 3
-    assert runtime.full_tensor.accelerator == "cuda"
     assert runtime.full_tensor.capture_layout(["manifest"]) == ["manifest"]
-    assert runtime.full_tensor.parameter_layout() == {
-        "weight": ((4,), torch.float32)
-    }
+    assert (runtime.full_tensor.runtime_tensors is loader.tensors) is (
+        runtime_p2p_available
+    )
+    assert runtime.full_tensor.source_worker_id == (
+        "inference-worker-3" if runtime_p2p_available else None
+    )
+    assert runtime.full_tensor.nixl_manager is loader.nixl_manager
+    if runtime_p2p_available:
+        runtime.full_tensor.unpublish_runtime_tensors()
+        runtime.full_tensor.publish_runtime_tensors("version-a")
+        assert publication_events == [
+            ("unpublish", loader),
+            ("publish", loader, "version-a"),
+        ]
     identity = runtime.full_tensor.build_identity("version-a")
     assert identity.model_name == "test/model"
     assert identity.revision == "version-a"

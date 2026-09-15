@@ -22,6 +22,7 @@ Extraction rules (per state_dict tensor, floating point only):
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 
 import torch
@@ -66,7 +67,11 @@ class LocalTensorShard:
     @property
     def served_tensor(self) -> torch.Tensor:
         """The tensor NIXL actually registers/serves (staging if copied, else source)."""
-        return self.staging_tensor if self.staging_tensor is not None else self.source_tensor
+        return (
+            self.staging_tensor
+            if self.staging_tensor is not None
+            else self.source_tensor
+        )
 
 
 def capture_local_shards(
@@ -153,6 +158,7 @@ def build_fsdp_reshard_manifest(
     manager: NixlMetadataProvider,
     shards: list[LocalTensorShard],
     metadata_endpoint: str,
+    metrics: dict[str, int | float] | None = None,
 ) -> bytes:
     """Describe already-registered FSDP source shards as an MX manifest blob.
 
@@ -167,6 +173,7 @@ def build_fsdp_reshard_manifest(
     if not shards:
         raise ValueError("no local shards to publish")
 
+    generation_started = time.perf_counter()
     by_name: dict[str, PublishedTensor] = {}
     for shard in shards:
         served = shard.served_tensor
@@ -196,12 +203,30 @@ def build_fsdp_reshard_manifest(
             tensor.shards.append(published_shard)
 
     published = list(by_name.values())
-    return wrap_rendezvous_blob(
+    generation_s = time.perf_counter() - generation_started
+    serialization_started = time.perf_counter()
+    blob = wrap_rendezvous_blob(
         manager.nixl_metadata,
         agent_name,
         metadata_endpoint,
         published,
     )
+    serialization_s = time.perf_counter() - serialization_started
+    if metrics is not None:
+        metrics.update(
+            {
+                "manifest_generation_s": generation_s,
+                "manifest_serialization_s": serialization_s,
+                "manifest_bytes": len(blob),
+                "manifest_tensor_count": len(published),
+            }
+        )
+    return blob
 
 
-__all__ = ["WIRE_DTYPE", "LocalTensorShard", "capture_local_shards", "build_fsdp_reshard_manifest"]
+__all__ = [
+    "WIRE_DTYPE",
+    "LocalTensorShard",
+    "build_fsdp_reshard_manifest",
+    "capture_local_shards",
+]

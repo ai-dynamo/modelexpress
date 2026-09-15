@@ -21,13 +21,20 @@ the client passes each stage, so a trainer that re-materializes its state_dict
 
 from __future__ import annotations
 
+import contextlib
 import math
 from typing import Any
 
 import torch
 import torch.distributed as dist
 
+from modelexpress import envs as mx_envs
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
+from modelexpress.refit.timing import (
+    add_refit_duration,
+    add_refit_metadata,
+    refit_span,
+)
 from modelexpress_rl.train.adapter import (
     CompletionFence,
     NixlMetadataProvider,
@@ -75,6 +82,7 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         # name -> the address we registered (the arena for COPY, the live source
         # for IN_PLACE). The served buffer must keep sitting here.
         self._registered_addrs: dict[str, int] = {}
+        self._manifest: WeightVersionShardManifest | None = None
 
     @property
     def source_slot_id(self) -> str:
@@ -176,17 +184,49 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         # Re-read the rank-local views from THIS step's state_dict so a
         # re-materialized source still publishes the latest weights; these same
         # shards seed the one-time setup on the first stage (single capture).
-        shards = self._capture(tensors)
-        self.initialize(shards=shards, staging_mode=staging_mode)
+        with refit_span(
+            "source_preparation",
+            metadata={"shard_captures": 1},
+            accumulate_metadata=True,
+            duration_key="shard_capture_s",
+        ):
+            shards = self._capture(tensors)
+        # Charged only on the first stage. Later calls are a no-op, and a stage
+        # reporting near-zero registration would read as though registering
+        # were free rather than already done.
+        registration = (
+            contextlib.nullcontext()
+            if self._initialized
+            else refit_span(
+                "setup_registration",
+                metadata={"trainer_registrations": 1},
+                accumulate_metadata=True,
+                duration_key="trainer_registration_s",
+            )
+        )
+        with registration:
+            self.initialize(shards=shards, staging_mode=staging_mode)
         if staging_mode is not self._staging_mode:
             raise ValueError(
                 f"FSDPTrainerAdapter initialized for {self._staging_mode.value} "
                 f"staging; cannot stage {staging_mode.value}"
             )
-        self._require_same_layout(shards)
+        with refit_span(
+            "source_preparation",
+            metadata={"layout_validations": 1},
+            accumulate_metadata=True,
+            duration_key="layout_validation_s",
+        ):
+            self._require_same_layout(shards)
 
         if staging_mode is TrainerStagingMode.COPY_TO_DEVICE:
-            publish_ready = self._snapshot_into_arenas(shards)
+            with refit_span(
+                "source_preparation",
+                metadata={"staging_copy_enqueues": 1},
+                accumulate_metadata=True,
+                duration_key="staging_copy_enqueue_s",
+            ):
+                publish_ready = self._snapshot_into_arenas(shards)
         else:  # IN_PLACE serves live storage; nothing to copy.
             self._require_sources_pinned(shards)
             publish_ready = CompletionFence(lambda: None)
@@ -271,20 +311,44 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
     def _staged(
         self, shards: list[LocalTensorShard], publish_ready: CompletionFence
     ) -> StagedWeightVersionShardData:
-        blob = build_fsdp_reshard_manifest(
-            manager=self._manager,
-            shards=shards,
-            metadata_endpoint=self._nixl_metadata_endpoint,
-        )
-        wire_elsize = torch.empty((), dtype=WIRE_DTYPE).element_size()
-        total_bytes = sum(math.prod(s.local_shape) * wire_elsize for s in shards)
-        return StagedWeightVersionShardData(
-            manifest=WeightVersionShardManifest(
+        cache_hit = self._manifest is not None and not mx_envs.MX_RESHARD_PUBLISH_DIGEST
+        if not cache_hit:
+            manifest_metrics: dict[str, int | float] = {}
+            blob = build_fsdp_reshard_manifest(
+                manager=self._manager,
+                shards=shards,
+                metadata_endpoint=self._nixl_metadata_endpoint,
+                metrics=manifest_metrics,
+            )
+            wire_elsize = torch.empty((), dtype=WIRE_DTYPE).element_size()
+            total_bytes = sum(
+                math.prod(shard.local_shape) * wire_elsize for shard in shards
+            )
+            self._manifest = WeightVersionShardManifest(
                 data=blob,
-                tensor_count=len({s.name for s in shards}),
+                tensor_count=len({shard.name for shard in shards}),
                 total_bytes=total_bytes,
                 transport="NIXL",
-            ),
+            )
+            # Measured by the publisher while it built the blob, which is the
+            # only place the generation and serialization halves are separable.
+            for name in ("manifest_generation_s", "manifest_serialization_s"):
+                add_refit_duration(
+                    "source_preparation",
+                    float(manifest_metrics[name]),
+                    metadata={name: float(manifest_metrics[name])},
+                )
+        assert self._manifest is not None
+        add_refit_metadata(
+            "source_preparation",
+            {
+                "manifest_bytes": len(self._manifest.data),
+                "manifest_cache_hit": cache_hit,
+                "manifest_tensor_count": self._manifest.tensor_count,
+            },
+        )
+        return StagedWeightVersionShardData(
+            manifest=self._manifest,
             publish_ready=publish_ready,
             # Keep the served buffers alive while the version can be selected.
             buffer_owner=tuple(s.served_tensor for s in shards),
