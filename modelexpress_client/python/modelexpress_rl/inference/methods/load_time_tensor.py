@@ -111,6 +111,8 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
         version,
         source: ResolvedSource,
         max_staging_bytes: int,
+        staging_device: str = "cuda",
+        staging_buffers: int = 1,
     ) -> PreparedStreamingTensors:
         """Prepare trainer metadata without transferring a full weight copy."""
         del version
@@ -131,6 +133,8 @@ class LoadTimeTensorNixlUpdateMethod(UpdateMethod):
                 manifests=[item.transport.manifest for item in source.inputs.sources],
                 capture_layout=self._capture_layout,
                 max_staging_bytes=max_staging_bytes,
+                staging_device=staging_device,
+                staging_buffers=staging_buffers,
             )
         except Exception:
             try:

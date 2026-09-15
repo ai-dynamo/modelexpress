@@ -357,9 +357,22 @@ class ModelExpressGeneratorClient:
             return self._active_handle
 
     def apply_weight_streaming(
-        self, *, version: WeightVersionRef, max_staging_bytes: int
+        self,
+        *,
+        version: WeightVersionRef,
+        max_staging_bytes: int,
+        staging_device: str = "cuda",
+        staging_buffers: int = 1,
     ) -> Any:
-        """Transfer and install bounded GPU batches while inference is paused.
+        """Transfer and install bounded batches while inference is paused.
+
+        ``max_staging_bytes`` caps the staging arenas in total. ``staging_device``
+        selects where they live: ``"cuda"`` keeps RDMA landing in VRAM with a
+        device-to-device commit; ``"cpu"`` uses pinned host memory and commits
+        with a host-to-device copy, saving the arena's worth of VRAM.
+        ``staging_buffers=2`` splits the cap across two arenas so the next
+        batch's transfer overlaps the current commit, which hides the host copy
+        almost entirely and also speeds up the CUDA path.
 
         This operation mutates weights incrementally. On any failure the caller
         must keep inference paused and restart the engine; there is no rollback.
@@ -367,6 +380,14 @@ class ModelExpressGeneratorClient:
         """
         if not isinstance(version, WeightVersionRef):
             raise TypeError("version must be a WeightVersionRef")
+        if staging_device not in ("cuda", "cpu"):
+            raise ValueError("staging_device must be 'cuda' or 'cpu'")
+        if (
+            isinstance(staging_buffers, bool)
+            or not isinstance(staging_buffers, int)
+            or staging_buffers < 1
+        ):
+            raise ValueError("staging_buffers must be a positive integer")
         with self._operation_lock:
             if self._engine_state is _EngineState.UNCERTAIN:
                 raise RuntimeError(
@@ -379,6 +400,8 @@ class ModelExpressGeneratorClient:
             update = self._runtime.session.prepare_streaming(
                 self._get_ready_version(version.version_id),
                 max_staging_bytes=max_staging_bytes,
+                staging_device=staging_device,
+                staging_buffers=staging_buffers,
             )
             prepare_s = time.perf_counter() - started
             staged = StagedWeightHandle(

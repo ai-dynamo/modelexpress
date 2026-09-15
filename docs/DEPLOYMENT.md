@@ -1282,16 +1282,32 @@ complete weight copy, initialize the generator with
 metrics = generator.apply_weight_streaming(
     version=WeightVersionRef(version_uid),
     max_staging_bytes=4 * 1024**3,
+    staging_device="cuda",  # or "cpu" for pinned host staging
+    staging_buffers=1,      # 2 overlaps the next transfer with the current commit
 )
 # Resume only after every replica completes successfully.
 ```
 
 This API interleaves NIXL reads and per-module installation. It supports mixed
-floating-point wire/engine dtypes through the existing conversion planner and
-does not stage weight payloads on CPU. The limit covers receive, conversion,
-full-pull scratch, and alignment in one CUDA arena. A module larger than the
-limit fails during preparation. Engine post-load workspaces and live weights
-require additional headroom; the limit is not a total process-memory cap.
+floating-point wire/engine dtypes through the existing conversion planner. The
+limit covers receive, conversion, full-pull scratch, and alignment across all
+staging arenas together; with `staging_buffers=2` each arena receives half of
+it. A module larger than one arena's share fails during preparation. Engine
+post-load workspaces and live weights require additional headroom; the limit is
+not a total process-memory cap.
+
+`staging_device` selects where the arenas live. `"cuda"` (default) lands RDMA
+in VRAM and commits with a device copy. `"cpu"` allocates pinned host memory,
+registers it as NIXL DRAM, and commits with a host-to-device copy, so the arena
+costs no VRAM. The NIC writes into host memory as fast as into VRAM; the cost is
+the host-to-device copy afterward, roughly 55 GB/s on PCIe Gen5, which adds 35
+to 50 percent to an update when serialized. `staging_buffers=2` posts the next
+batch's READ into the other arena before the current batch is committed, which
+hides that copy almost entirely and also brings the CUDA path to full-copy
+speed. Pair `"cpu"` with two buffers. A host arena caps throughput at PCIe
+bandwidth, so it is an opt-in for VRAM-constrained deployments rather than the
+default. Changing either option between updates is a workspace switch (see
+below).
 
 Any failure requires keeping the deployment paused and restarting its engines.
 Some modules may already contain the new version, so a failed operation cannot

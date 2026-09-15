@@ -64,6 +64,13 @@ class _Transport:
     def read(self, descriptors) -> None:
         self.reads.append(descriptors)
 
+    def post_reads(self, descriptors) -> list:
+        self.read(descriptors)
+        return []
+
+    def await_reads(self, posted) -> None:
+        assert posted == []
+
 
 class _Descriptor:
     def __init__(self, nbytes: int) -> None:
@@ -116,7 +123,8 @@ def _stage(monkeypatch, *, nbytes: int, wire_s: float):
     monkeypatch.setattr(
         transfer_module,
         "time",
-        _Clock(0.0, wire_s, wire_s, wire_s),
+        # started, wait_started, wait end, wire end, reconstruct start, reconstruct end
+        _Clock(0.0, 0.0, wire_s, wire_s, wire_s, wire_s),
     )
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
     tensor = torch.arange(64, dtype=torch.int32)

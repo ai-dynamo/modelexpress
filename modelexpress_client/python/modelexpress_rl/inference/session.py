@@ -286,7 +286,12 @@ class WeightUpdateSession:
             raise
 
     def prepare_streaming(
-        self, version: WeightVersion, *, max_staging_bytes: int
+        self,
+        version: WeightVersion,
+        *,
+        max_staging_bytes: int,
+        staging_device: str = "cuda",
+        staging_buffers: int = 1,
     ) -> SessionUpdate:
         """Hold the version lease across deferred transfer and installation."""
         from .methods import LoadTimeTensorNixlUpdateMethod
@@ -312,6 +317,8 @@ class WeightUpdateSession:
                         version=version,
                         source=plan.source,
                         max_staging_bytes=max_staging_bytes,
+                        staging_device=staging_device,
+                        staging_buffers=staging_buffers,
                     )
                 except (grpc.RpcError, RuntimeError, ManifestMismatchError) as error:
                     last_error = error
