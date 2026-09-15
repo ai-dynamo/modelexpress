@@ -1003,6 +1003,8 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 | `receive_from_source(source_metadata, source_tensors, ..., remote_agent_name)` | Execute RDMA read transfer; `remote_agent_name` skips `add_remote_agent` (P2P) |
 | `shutdown()` | Clean up NIXL agent and resources |
 
+**Empty tensors.** Zero-byte tensors, such as optional quantization indices, remain in tensor manifests and follow the existing name, size, and dtype validation rules. They count toward matched tensors but are excluded from memory registration and NIXL transfer descriptors. A matched manifest containing only zero-byte tensors completes without a NIXL transfer; strict matching still rejects name differences and zero-match manifests.
+
 **Optional NIC pinning.** `MX_RDMA_NIC_PIN=auto` probes PCIe topology at agent init and pins `UCX_NET_DEVICES` to a NUMA-local IB NIC per worker. Workaround for [openucx/ucx#11259](https://github.com/openucx/ucx/issues/11259); see [`docs/DEPLOYMENT.md`](DEPLOYMENT.md) for details.
 
 ### vLLM Loader

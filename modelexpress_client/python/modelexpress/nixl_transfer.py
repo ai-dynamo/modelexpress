@@ -828,7 +828,8 @@ class NixlTransferManager:
         RDMA READs. Both sides may have registered either pools (MX_POOL_REG=1)
         or individual tensors; the addresses inside source_tensors and the
         local tensor data_ptrs are what NIXL prep_xfer_dlist resolves against
-        the registered memory metadata.
+        the registered memory metadata. Zero-byte tensors participate in
+        manifest validation and tensor counts but do not issue RDMA reads.
 
         Args:
             source_metadata: NIXL metadata from the source agent (unused if
@@ -883,6 +884,7 @@ class NixlTransferManager:
         remote_descs: list[tuple[int, int, int]] = []
         local_descs: list[tuple[int, int, int]] = []
         total_bytes = 0
+        matched_tensors = 0
 
         for src_tensor in source_tensors:
             local_tensor = local_tensors.get(src_tensor.name)
@@ -902,6 +904,13 @@ class NixlTransferManager:
                     f"Tensor '{src_tensor.name}' dtype mismatch: "
                     f"source={src_tensor.dtype!r}, local={local_dtype!r}"
                 )
+
+            # Count empty tensors after validation, but skip their NIXL descriptors:
+            # zero-byte tensors have no registered memory to transfer.
+            matched_tensors += 1
+            if local_size == 0:
+                continue
+
             remote_descs.append(
                 (src_tensor.addr, src_tensor.size, src_tensor.device_id)
             )
@@ -914,7 +923,6 @@ class NixlTransferManager:
             )
             total_bytes += src_tensor.size
 
-        matched_tensors = len(remote_descs)
         match_time = time.perf_counter() - match_start
 
         # Downgraded to `partial` by the name-diff check below, which does not
@@ -953,7 +961,7 @@ class NixlTransferManager:
                 len(source_only),
             )
 
-        if not remote_descs:
+        if not matched_tensors:
             if require_exact_match:
                 transfer_metrics.record_nixl_receive("rejected")
                 raise ManifestMismatchError(
@@ -967,6 +975,10 @@ class NixlTransferManager:
             f"[TIMING] match_tensors: {match_time:.3f}s "
             f"({matched_tensors} tensors, {total_bytes / 1e9:.2f} GB)"
         )
+
+        if not remote_descs:
+            transfer_metrics.record_nixl_receive(receive_result)
+            return 0, matched_tensors, 0.0
 
         # Prepare transfer descriptors on both sides.
         prep_start = time.perf_counter()

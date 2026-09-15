@@ -274,7 +274,11 @@ class TestRawDescriptorMemType:
         assert args[0][0] is tensor
         assert kwargs == {"backends": ["UCX"]}
 
-    def test_receive_transfer_descriptors_use_vram_segment(self, monkeypatch):
+    @pytest.mark.parametrize("require_exact_match", [False, True])
+    @pytest.mark.parametrize("include_empty", [False, True])
+    def test_receive_transfer_descriptors_use_vram_segment(
+        self, monkeypatch, require_exact_match, include_empty
+    ):
         monkeypatch.setattr(torch.cuda, "set_device", lambda *args, **kwargs: None)
         monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
 
@@ -285,22 +289,31 @@ class TestRawDescriptorMemType:
         mgr._agent.make_prepped_xfer.return_value = "handle"
         mgr._agent.check_xfer_state.return_value = "DONE"
 
+        source_tensors = [
+            TensorDescriptor(
+                name="w",
+                addr=0x1000,
+                size=local.numel() * local.element_size(),
+                device_id=0,
+                dtype=str(local.dtype),
+            )
+        ]
+        if include_empty:
+            for name in ("g_idx", "sort_indices"):
+                mgr._tensors[name] = torch.empty(0, dtype=torch.int32)
+                source_tensors.append(
+                    TensorDescriptor(name, 0, 0, 0, "torch.int32")
+                )
+
         result = mgr.receive_from_source(
             source_metadata=b"",
-            source_tensors=[
-                TensorDescriptor(
-                    name="w",
-                    addr=0x1000,
-                    size=local.numel() * local.element_size(),
-                    device_id=0,
-                    dtype=str(local.dtype),
-                )
-            ],
+            source_tensors=source_tensors,
             remote_agent_name="source",
+            require_exact_match=require_exact_match,
         )
 
         assert result[0] == local.numel() * local.element_size()
-        assert result[1] == 1
+        assert result[1] == (3 if include_empty else 1)
         assert mgr._agent.prep_xfer_dlist.call_args_list == [
             call(
                 agent_name="source",
@@ -317,6 +330,8 @@ class TestRawDescriptorMemType:
                 backends=["UCX"],
             ),
         ]
+        transfer_args = mgr._agent.make_prepped_xfer.call_args.kwargs
+        assert transfer_args["local_indices"] == transfer_args["remote_indices"] == [0]
 
 
 class TestReceiveFromSourceManifestValidation:
@@ -333,14 +348,18 @@ class TestReceiveFromSourceManifestValidation:
         mgr._tensors = local_tensors
         return mgr
 
-    def test_size_mismatch_raises_manifest_mismatch(self, monkeypatch):
-        # Local tensor: 40 bytes (10 float32). Source claims 80 bytes.
-        local = torch.zeros(10, dtype=torch.float32)
+    @pytest.mark.parametrize(
+        ("local_elements", "source_size"), [(10, 80), (0, 4), (1, 0)]
+    )
+    def test_size_mismatch_raises_manifest_mismatch(
+        self, monkeypatch, local_elements, source_size
+    ):
+        local = torch.zeros(local_elements, dtype=torch.float32)
         mgr = self._make_manager(monkeypatch, {"w": local})
         bogus = TensorDescriptor(
             name="w",
             addr=0x1000,
-            size=80,
+            size=source_size,
             device_id=0,
             dtype=str(local.dtype),
         )
@@ -351,14 +370,14 @@ class TestReceiveFromSourceManifestValidation:
                 remote_agent_name="dummy",
             )
 
-    def test_dtype_mismatch_raises_manifest_mismatch(self, monkeypatch):
-        # Local tensor float32 (40 bytes). Source size matches but dtype lies.
-        local = torch.zeros(10, dtype=torch.float32)
+    @pytest.mark.parametrize("local_elements", [10, 0])
+    def test_dtype_mismatch_raises_manifest_mismatch(self, monkeypatch, local_elements):
+        local = torch.zeros(local_elements, dtype=torch.float32)
         mgr = self._make_manager(monkeypatch, {"w": local})
         bogus = TensorDescriptor(
             name="w",
             addr=0x1000,
-            size=40,
+            size=local.numel() * local.element_size(),
             device_id=0,
             dtype="torch.bfloat16",
         )
@@ -431,19 +450,20 @@ class TestReceiveFromSourceManifestValidation:
             "1 local-only, 1 source-only" in rec.getMessage() for rec in caplog.records
         )
 
-    def test_hetero_name_mismatch_raises(self, monkeypatch):
+    @pytest.mark.parametrize("numel", [1, 0])
+    def test_hetero_name_mismatch_raises(self, monkeypatch, numel):
         # Cross-family transfer: local has a tensor the source manifest omits
         # (e.g. a vendor-specific derived tensor). require_exact_match must fail
         # closed rather than transfer a subset and leave "x" at dummy values.
         mgr = self._make_manager(
             monkeypatch,
             {
-                "w": torch.zeros(1, dtype=torch.float32),
-                "x": torch.zeros(1, dtype=torch.float32),
+                "w": torch.zeros(numel, dtype=torch.float32),
+                "x": torch.zeros(numel, dtype=torch.float32),
             },
         )
         src = TensorDescriptor(
-            name="w", addr=0x1000, size=4, device_id=0, dtype="torch.float32",
+            name="w", addr=0x1000, size=4 * numel, device_id=0, dtype="torch.float32",
         )
         with pytest.raises(ManifestMismatchError, match="heterogeneous transfer"):
             mgr.receive_from_source(
@@ -453,17 +473,18 @@ class TestReceiveFromSourceManifestValidation:
                 require_exact_match=True,
             )
 
-    def test_hetero_source_only_name_mismatch_raises(self, monkeypatch):
+    @pytest.mark.parametrize("numel", [1, 0])
+    def test_hetero_source_only_name_mismatch_raises(self, monkeypatch, numel):
         # Source names a tensor the target never registered.
         mgr = self._make_manager(
-            monkeypatch, {"w": torch.zeros(1, dtype=torch.float32)}
+            monkeypatch, {"w": torch.zeros(numel, dtype=torch.float32)}
         )
         src = [
             TensorDescriptor(
-                name="w", addr=0x1000, size=4, device_id=0, dtype="torch.float32",
+                name="w", addr=0x1000, size=4 * numel, device_id=0, dtype="torch.float32",
             ),
             TensorDescriptor(
-                name="extra", addr=0x2000, size=4, device_id=0, dtype="torch.float32",
+                name="extra", addr=0x2000, size=4 * numel, device_id=0, dtype="torch.float32",
             ),
         ]
         with pytest.raises(ManifestMismatchError, match="heterogeneous transfer"):
@@ -773,6 +794,37 @@ class TestReceiveOutcomeLabelsAtTheCallSite:
         ) == (0, 0, 0.0)
 
         assert spy.receives == ["empty"]
+        assert spy.errors == []
+
+    @pytest.mark.parametrize(
+        ("require_exact_match", "local_only", "expected_result"),
+        [(False, False, "complete"), (True, False, "complete"), (False, True, "partial")],
+    )
+    def test_zero_byte_matches_complete_without_nixl_transfer(
+        self, monkeypatch, require_exact_match, local_only, expected_result
+    ):
+        tensors = {
+            name: torch.empty(0, dtype=torch.int32)
+            for name in ("g_idx", "sort_indices")
+        }
+        source = [TensorDescriptor(name, 0, 0, 0, "torch.int32") for name in tensors]
+        if local_only:
+            tensors["unmatched"] = torch.ones(1)
+        spy = self._spy(monkeypatch)
+        mgr = self._manager(monkeypatch, tensors)
+        self._arm(mgr, "DONE")
+
+        assert mgr.receive_from_source(
+            source_metadata=b"",
+            source_tensors=source,
+            remote_agent_name="source",
+            require_exact_match=require_exact_match,
+        ) == (0, 2, 0.0)
+
+        mgr._agent.prep_xfer_dlist.assert_not_called()
+        mgr._agent.make_prepped_xfer.assert_not_called()
+        mgr._agent.transfer.assert_not_called()
+        assert spy.receives == [expected_result]
         assert spy.errors == []
 
     def test_every_refusal_counts_one_rejected(self, monkeypatch):
