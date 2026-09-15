@@ -61,6 +61,7 @@ spec:
     metadata:
       labels: {app: vime-delta-refit-mx}
     spec:
+      nodeSelector: {kubernetes.io/arch: amd64}
       imagePullSecrets:
       - {name: nvcr-imagepullsecret}
       initContainers:
@@ -116,6 +117,7 @@ spec:
       metadata:
         labels: {app: vime-delta-refit}
       spec:
+        nodeSelector: {kubernetes.io/arch: amd64}
         imagePullSecrets:
         - {name: nvcr-imagepullsecret}
         containers:

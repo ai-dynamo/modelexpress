@@ -15,15 +15,12 @@
 #                         self-hosted builder runner. All build jobs run in
 #                         parallel.
 #
-#   build-vime-delta-refit — builds the Vime trainer and the combined
-#                            Dynamo/vLLM/ModelExpress worker.
+#   build-vime-delta-refit — builds the Vime trainer and
+#                            Dynamo/vLLM/ModelExpress worker images.
 #
 #   ensure-vcluster     — bootstraps the persistent mx-ci-cluster vCluster on
 #                         first run (no-ops on re-runs). Runs in parallel with
 #                         the build jobs.
-#
-#   ensure-vime-vcluster — bootstraps an isolated vCluster with the newer
-#                          Dynamo operator required by RL refit.
 #
 #   test-p2p            — matrix over frameworks; needs build-client,
 #                         build-server, and ensure-vcluster. Each matrix entry
@@ -68,8 +65,8 @@
 #                         entry. Relies on the cluster-wide Dynamo operator
 #                         installed in dynamo-system by setup-mx-vcluster.
 #
-#   test-vime-delta-refit — runs a ten-step Vime TP2 + Dynamo vLLM TP1 smoke
-#                           through ModelExpress and MinIO.
+#   test-vime-delta-refit — uses a CPU deploy runner to create TP2 trainer and
+#                           TP1 rollout pods directly on the H100 cluster.
 #
 #   test-stale-metadata — Reaper-correctness check. mx-server runs with the
 #                         Redis backend (sidecar) and compressed reaper knobs
@@ -115,7 +112,7 @@
 # Required secrets:
 #   AZURE_AKS_CI_KUBECONFIG_B64   — base64-encoded kubeconfig for the AKS host cluster
 #   NGC_API_KEY                   — push/pull registry images
-#   HF_TOKEN                      — HuggingFace token (required; used to create hf-token-secret in the test namespace)
+#   HF_TOKEN                      — Hugging Face token for the model-cache Job
 name: ModelExpress CI Tests
 
 on:
@@ -139,10 +136,7 @@ env:
   MX_CI_MODEL: Qwen/Qwen2.5-0.5B
   VCLUSTER_NAME: mx-ci-cluster
   VCLUSTER_NAMESPACE: mx-ci
-  VIME_VCLUSTER_NAME: mx-vime-ci-cluster
-  VIME_VCLUSTER_NAMESPACE: mx-vime-ci
   VIME_DYNAMO_REF: c3e05f0244ae6264d7953f68e2499c6dc2f54723
-  VIME_DYNAMO_NIGHTLY_TAG: 20260909-c3e05f0
   MX_CI_S3_BUCKET: ai-dynamo-modelexpress-ci
   MX_CI_S3_REGION: us-west-2
   MX_IMAGE_REPO: nvcr.io/0980761089281446
@@ -261,7 +255,7 @@ jobs:
         run: |
           docker image rm -f "${WORKER_IMAGE}" 2>/dev/null || true
 
-  # Build the two images used only by the Vime delta-refit smoke.
+  # Build the trainer and rollout images used by the Vime delta-refit smoke.
   build-vime-delta-refit:
     name: Build Vime delta-refit images
     runs-on: prod-modelexpress-builder-amd-v1
@@ -293,7 +287,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
-      - name: Build and push trainer and worker
+      - name: Build and push trainer and rollout
         run: |
           docker buildx build --platform linux/amd64 \
             -f examples/rl/vime_dynamo_delta_refit/Dockerfile \
@@ -410,111 +404,6 @@ jobs:
         # connect-vcluster backgrounds a `kubectl port-forward` and exports
         # VCLUSTER_PF_PID via $GITHUB_ENV. Kill it before the job ends so
         # the next job on this self-hosted runner doesn't inherit an orphan.
-        if: always()
-        run: |
-          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
-            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
-          fi
-
-  # Keep the newer v1beta1 Dynamo operator isolated from inference CI's
-  # v1alpha1 operator while reusing the same AKS host and vCluster actions.
-  ensure-vime-vcluster:
-    name: Ensure Vime RL vCluster
-    runs-on: prod-modelexpress-builder-amd-v1
-    permissions:
-      contents: read
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Check if Vime RL vCluster exists
-        id: vcluster-check
-        uses: ./.github/actions/check-vcluster-exists
-        with:
-          kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
-          vcluster_name: ${{ env.VIME_VCLUSTER_NAME }}
-          vcluster_namespace: ${{ env.VIME_VCLUSTER_NAMESPACE }}
-
-      - name: Bootstrap Vime RL vCluster
-        if: steps.vcluster-check.outputs.exists != 'true'
-        uses: ./.github/actions/setup-mx-vcluster
-        with:
-          kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
-          vcluster_name: ${{ env.VIME_VCLUSTER_NAME }}
-          vcluster_namespace: ${{ env.VIME_VCLUSTER_NAMESPACE }}
-          dynamo_ref: ${{ env.VIME_DYNAMO_REF }}
-          dynamo_operator_image: nvcr.io/nvidia/ai-dynamo/kubernetes-operator-nightly
-          dynamo_operator_tag: ${{ env.VIME_DYNAMO_NIGHTLY_TAG }}
-
-      - name: Connect to Vime RL vCluster
-        if: steps.vcluster-check.outputs.exists == 'true'
-        uses: ./.github/actions/connect-vcluster
-        with:
-          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
-          vcluster_name: ${{ env.VIME_VCLUSTER_NAME }}
-          vcluster_namespace: ${{ env.VIME_VCLUSTER_NAMESPACE }}
-
-      - name: Select Vime RL vCluster
-        run: |
-          kubectl --kubeconfig="${GITHUB_WORKSPACE}/.kubeconfig-host" \
-            get storageclass azurefile-csi
-          echo "KUBECONFIG=${GITHUB_WORKSPACE}/.kubeconfig-vcluster" >> "$GITHUB_ENV"
-
-      - name: Check expected Dynamo operator
-        id: operator-check
-        continue-on-error: true
-        run: |
-          kubectl -n dynamo-system get deployment \
-            dynamo-platform-dynamo-operator-controller-manager \
-            -o jsonpath='{.spec.template.spec.containers[?(@.name=="manager")].image}' \
-            | grep -qx "nvcr.io/nvidia/ai-dynamo/kubernetes-operator-nightly:${VIME_DYNAMO_NIGHTLY_TAG}"
-          kubectl get crd dynamographdeployments.nvidia.com \
-            -o jsonpath='{.spec.versions[?(@.name=="v1beta1")].served}' | grep -qx true
-
-      - name: Reap stale vCluster port-forward
-        if: steps.operator-check.outcome == 'failure'
-        run: |
-          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
-            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
-          fi
-
-      - name: Rebuild stale Vime RL vCluster
-        if: steps.operator-check.outcome == 'failure'
-        uses: ./.github/actions/setup-mx-vcluster
-        with:
-          kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
-          vcluster_name: ${{ env.VIME_VCLUSTER_NAME }}
-          vcluster_namespace: ${{ env.VIME_VCLUSTER_NAMESPACE }}
-          dynamo_ref: ${{ env.VIME_DYNAMO_REF }}
-          dynamo_operator_image: nvcr.io/nvidia/ai-dynamo/kubernetes-operator-nightly
-          dynamo_operator_tag: ${{ env.VIME_DYNAMO_NIGHTLY_TAG }}
-
-      - name: Select rebuilt Vime RL vCluster
-        if: steps.operator-check.outcome == 'failure'
-        run: echo "KUBECONFIG=${GITHUB_WORKSPACE}/.kubeconfig-vcluster" >> "$GITHUB_ENV"
-
-      - name: Verify Dynamo 1.5 operator
-        run: |
-          kubectl -n dynamo-system rollout status \
-            deployment/dynamo-platform-dynamo-operator-controller-manager --timeout=2m
-          kubectl -n dynamo-system get deployment \
-            dynamo-platform-dynamo-operator-controller-manager \
-            -o jsonpath='{.spec.template.spec.containers[?(@.name=="manager")].image}' \
-            | grep -qx "nvcr.io/nvidia/ai-dynamo/kubernetes-operator-nightly:${VIME_DYNAMO_NIGHTLY_TAG}"
-          kubectl get crd dynamographdeployments.nvidia.com \
-            -o jsonpath='{.spec.versions[?(@.name=="v1beta1")].served}' | grep -qx true
-
-      - name: Dump Vime RL vCluster diagnostics on failure
-        if: failure()
-        uses: ./.github/actions/dump-vcluster-diagnostics
-        with:
-          vcluster_name: ${{ env.VIME_VCLUSTER_NAME }}
-          vcluster_namespace: ${{ env.VIME_VCLUSTER_NAMESPACE }}
-
-      - name: Reap vCluster port-forward
         if: always()
         run: |
           if [ -n "${VCLUSTER_PF_PID:-}" ]; then
@@ -1047,20 +936,19 @@ jobs:
             kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
           fi
 
-  # Ten-step TP2 trainer + TP1 rollout smoke using MinIO for delta objects.
+  # Ten-step TP2 trainer + TP1 Dynamo rollout smoke on three H100s.
   test-vime-delta-refit:
     name: Vime delta-refit smoke
-    runs-on: prod-modelexpress-builder-amd-v1
+    runs-on: prod-deploy-tester-v1
     timeout-minutes: 120
-    needs:
-      - build-vime-delta-refit
-      - ensure-vime-vcluster
-      - test-p2p-mla-model
-      - test-parallel
+    needs: [build-vime-delta-refit]
     permissions:
       contents: read
     env:
-      NAMESPACE: mx-ci-vime-delta-${{ github.run_id }}-${{ github.run_attempt }}
+      KUBE_CONTEXT: nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02
+      NAMESPACE: mx-ci-h100-vime-${{ github.run_id }}-${{ github.run_attempt }}
+      WORKER_IMAGE: nvcr.io/0980761089281446/vime-dynamo-mx-worker:${{ github.sha }}
+      TRAINER_IMAGE: nvcr.io/0980761089281446/vime-dynamo-mx-trainer:${{ github.sha }}
       MODEL_SUBPATH: Qwen/Qwen3-0.6B
 
     steps:
@@ -1069,77 +957,91 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Connect to Vime RL vCluster
-        uses: ./.github/actions/connect-vcluster
-        with:
-          host_kubeconfig_base64: ${{ secrets.AZURE_AKS_CI_KUBECONFIG_B64 }}
-          vcluster_name: ${{ env.VIME_VCLUSTER_NAME }}
-          vcluster_namespace: ${{ env.VIME_VCLUSTER_NAMESPACE }}
-
-      - name: Configure smoke environment
-        run: |
-          {
-            echo "KUBECONFIG=${GITHUB_WORKSPACE}/.kubeconfig-vcluster"
-            echo "WORKER_IMAGE=${MX_IMAGE_REPO}/vime-dynamo-mx-worker:${GITHUB_SHA}"
-            echo "TRAINER_IMAGE=${MX_IMAGE_REPO}/vime-dynamo-mx-trainer:${GITHUB_SHA}"
-          } >> "$GITHUB_ENV"
-
-      - name: Prepare namespace and model
+      - name: Prepare direct H100 workload
         env:
           NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          kubectl create namespace "${NAMESPACE}"
-          kubectl -n "${NAMESPACE}" create secret docker-registry nvcr-imagepullsecret \
+          set -euo pipefail
+          kc=(kubectl --kubeconfig=/teleport/kubeconfig.yaml --context="$KUBE_CONTEXT")
+          k=("${kc[@]}" --namespace="$NAMESPACE")
+          "${kc[@]}" config get-contexts "$KUBE_CONTEXT" -o name | grep -qx "$KUBE_CONTEXT"
+          "${kc[@]}" create namespace "$NAMESPACE" --dry-run=client -o yaml \
+            | "${kc[@]}" label --local -f - \
+                ci.modelexpress.nvidia.com/run-id="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+                -o yaml \
+            | "${kc[@]}" create -f -
+          "${k[@]}" create quota vime-delta-refit-gpu-budget \
+            --hard=requests.nvidia.com/gpu=3,limits.nvidia.com/gpu=3
+          "${k[@]}" create secret docker-registry nvcr-imagepullsecret \
             --docker-server=nvcr.io \
             --docker-username="\$oauthtoken" \
-            --docker-password="${NGC_API_KEY}"
-          kubectl -n "${NAMESPACE}" create secret generic mx-minio-creds \
+            --docker-password="$NGC_API_KEY"
+          "${k[@]}" create secret generic mx-minio-creds \
             --from-literal=MINIO_ROOT_USER=minio \
             --from-literal=MINIO_ROOT_PASSWORD=delta-refit-smoke
-          kubectl -n "${NAMESPACE}" create secret generic hf-token-secret \
-            --from-literal=HF_TOKEN="${HF_TOKEN}"
-          sed "s|WORKER_IMAGE|${WORKER_IMAGE}|g" ci/rl/model-download.yaml \
-            | kubectl -n "${NAMESPACE}" create -f -
-          kubectl -n "${NAMESPACE}" wait --for=jsonpath='{.status.phase}'=Bound \
+          "${k[@]}" create secret generic hf-token-secret \
+            --from-literal=HF_TOKEN="$HF_TOKEN"
+          "${k[@]}" wait --for=create persistentvolumeclaim/shared-model-cache --timeout=2m
+          "${k[@]}" wait --for=jsonpath='{.status.phase}'=Bound \
             persistentvolumeclaim/shared-model-cache --timeout=5m
-          kubectl -n "${NAMESPACE}" wait --for=condition=complete \
+          sed "s|WORKER_IMAGE|$WORKER_IMAGE|g" ci/rl/model-download.yaml \
+            | "${k[@]}" create -f -
+          "${k[@]}" wait --for=condition=complete \
             job/vime-delta-refit-model-download --timeout=20m
 
-      - name: Run Vime delta-refit smoke
+      - name: Run Kubernetes Vime delta-refit smoke
         run: ci/rl/smoke_vime_delta_refit.sh
 
-      - name: Dump workload state on failure
+      - name: Dump direct H100 diagnostics
         if: failure()
         run: |
-          kubectl -n "${NAMESPACE}" get pods,deployments,dynamographdeployments -o wide || true
-          kubectl -n "${NAMESPACE}" get events --sort-by='.lastTimestamp' || true
-          kubectl -n "${NAMESPACE}" logs job/vime-delta-refit-model-download || true
-          for pod in $(kubectl -n "${NAMESPACE}" get pods -o name 2>/dev/null); do
-            kubectl -n "${NAMESPACE}" describe "$pod" | tail -60 || true
-            kubectl -n "${NAMESPACE}" logs "$pod" --all-containers --tail=200 || true
+          k=(kubectl --kubeconfig=/teleport/kubeconfig.yaml \
+            --context="$KUBE_CONTEXT" --namespace="$NAMESPACE")
+          "${k[@]}" get pods,jobs,deployments,services,dynamographdeployments -o wide || true
+          "${k[@]}" describe dynamographdeployment/vime-delta-refit || true
+          "${k[@]}" get events --sort-by='.lastTimestamp' || true
+          for pod in $("${k[@]}" get pods -o name 2>/dev/null); do
+            "${k[@]}" describe "$pod" | tail -60 || true
+            "${k[@]}" logs "$pod" --all-containers --tail=200 || true
           done
 
-      - name: Dump vCluster diagnostics on failure
-        if: failure()
-        uses: ./.github/actions/dump-vcluster-diagnostics
-        with:
-          vcluster_name: ${{ env.VIME_VCLUSTER_NAME }}
-          vcluster_namespace: ${{ env.VIME_VCLUSTER_NAMESPACE }}
-
-      - name: Delete test namespace
+      - name: Reap direct H100 workload
         if: always()
         run: |
-          kubectl -n "${NAMESPACE}" delete dynamographdeployment/vime-delta-refit \
-            --ignore-not-found --timeout=2m || true
-          kubectl delete namespace "${NAMESPACE}" --ignore-not-found --timeout=5m
-
-      - name: Reap vCluster port-forward
-        if: always()
-        run: |
-          if [ -n "${VCLUSTER_PF_PID:-}" ]; then
-            kill "${VCLUSTER_PF_PID}" 2>/dev/null || true
+          kc=(kubectl --kubeconfig=/teleport/kubeconfig.yaml --context="$KUBE_CONTEXT")
+          owner=$("${kc[@]}" get namespace "$NAMESPACE" --ignore-not-found \
+            -o go-template='{{ index .metadata.labels "ci.modelexpress.nvidia.com/run-id" }}')
+          if [ "$owner" = "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" ]; then
+            "${kc[@]}" delete namespace "$NAMESPACE" --wait=false
           fi
+
+  test-vime-delta-refit-cleanup:
+    name: Vime delta-refit cleanup
+    runs-on: prod-deploy-tester-v1
+    needs: [test-vime-delta-refit]
+    if: always()
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      KUBE_CONTEXT: nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02
+      NAMESPACE: mx-ci-h100-vime-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Delete direct H100 workload namespace
+        run: |
+          set -euo pipefail
+          kc=(kubectl --kubeconfig=/teleport/kubeconfig.yaml --context="$KUBE_CONTEXT")
+          owner=$("${kc[@]}" get namespace "$NAMESPACE" --ignore-not-found \
+            -o go-template='{{ index .metadata.labels "ci.modelexpress.nvidia.com/run-id" }}')
+          if [ -z "$owner" ]; then
+            exit 0
+          fi
+          if [ "$owner" != "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" ]; then
+            echo "Refusing to delete $NAMESPACE owned by $owner" >&2
+            exit 1
+          fi
+          "${kc[@]}" delete namespace "$NAMESPACE" --wait=false
 
   # ---------------------------------------------------------------------------
   # Fleet scale test (row 20) — ~15 workers, CRD backend, NIXL-over-TCP.
@@ -1411,13 +1313,13 @@ jobs:
       - build-client
       - build-vime-delta-refit
       - ensure-vcluster
-      - ensure-vime-vcluster
       - test-p2p
       - test-p2p-mla-model
       - test-tp
       - test-parallel
       - test-with-dynamo
       - test-vime-delta-refit
+      - test-vime-delta-refit-cleanup
       - test-fleet-scale
       - test-rolling-update
       - test-stale-metadata

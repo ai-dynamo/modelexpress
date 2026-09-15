@@ -23,15 +23,15 @@ COPY --from=rust-builder /src/modelexpress/target/release/modelexpress-server /u
 RUN python3 -B -c \
     "import boto3, modelexpress_rl, vllm, zstandard; from modelexpress import register_modelexpress; register_modelexpress()"
 
-FROM vllm/vime@sha256:267dab8accfcdbbb31aa09ce8b74a31e13a9aaec3d7968164b3dad7ae865dd2c AS trainer
+FROM vllm/vime@sha256:5b48444d8e9962b5525ec11aaa012a75c5170544f4500d28451bc0b46a2f7728 AS trainer
 RUN rm -rf /root/vime
-ADD https://github.com/nv-hwoo/vime.git#e5c82fde22e7bebf6ed0c98d5b38ab6e5e7cf280 /root/vime
+ADD https://github.com/nv-hwoo/vime.git#c1f8530dfc64223972a479335f5ad646a6e3f3cf /root/vime
 ENV PYTHONPATH=/root/vime:/root/Megatron-LM
 RUN --mount=type=bind,source=modelexpress_client/python,target=/opt/modelexpress,rw \
     MX_SKIP_EXT=1 python3 -m pip install --no-cache-dir --no-compile --no-deps \
       --no-build-isolation /opt/modelexpress
 RUN python3 -B -c \
-    "import modelexpress_rl, torch, vime, vllm; from megatron.bridge import AutoBridge; from megatron.training.arguments import parse_args; from vllm.entrypoints.openai.cli_args import FrontendArgs; from vime.backends.megatron_utils.update_weight.update_weight_from_modelexpress import UpdateWeightFromModelExpress; from vime.backends.vllm_utils.external import discover_dynamo_engine; assert torch.__version__.startswith('2.11.') and vllm.__version__ == '0.25.1'"
+    "import modelexpress_rl, torch, vime, vllm; from megatron.training.arguments import parse_args; from vllm.entrypoints.launchers.cli_args import FrontendArgs; from vime.backends.megatron_utils.update_weight.update_weight_from_modelexpress import UpdateWeightFromModelExpress; from vime.backends.vllm_utils.external import discover_dynamo_engine"
 COPY --chmod=0755 examples/rl/vime_dynamo_delta_refit/trainer.sh /opt/delta-refit/trainer.sh
 COPY examples/rl/vime_dynamo_delta_refit/prompts.jsonl /opt/delta-refit/prompts.jsonl
 CMD ["/opt/delta-refit/trainer.sh"]
