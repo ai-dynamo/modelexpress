@@ -122,6 +122,34 @@ def as_reshard_buffer(array: Any) -> JaxDeviceBuffer:
     return JaxDeviceBuffer(local_shard(array))
 
 
+class _ByteView:
+    """A one-byte CUDA Array Interface view over a JAX buffer.
+
+    Handing the ``jax.Array`` itself to nccl4py does not work: ``cuda.core``
+    prefers DLPack when an object offers both, and calls ``__dlpack__`` with
+    the ``-1`` stream sentinel nccl4py uses to mean "do not synchronize". That
+    value is legal in the DLPack protocol for ROCm and not for CUDA, so JAX
+    passes it to the driver and the barrier dies with
+    ``CUDA_ERROR_INVALID_HANDLE``. Exposing only the array interface takes the
+    other branch, which carries no stream handshake at all.
+
+    ``uint8`` has an array-interface typestr, so nothing here runs into the
+    bfloat16 restriction that shapes the rest of this module.
+    """
+
+    __slots__ = ("_array", "__cuda_array_interface__")
+
+    def __init__(self, array: Any) -> None:
+        self._array = array
+        self.__cuda_array_interface__ = {
+            "data": (int(array.unsafe_buffer_pointer()), False),
+            "shape": (int(array.size),),
+            "typestr": "|u1",
+            "version": 3,
+            "strides": None,
+        }
+
+
 def barrier_buffer(device: Any) -> Any:
     """One device byte for the bootstrap barrier, allocated through JAX.
 
@@ -136,8 +164,12 @@ def barrier_buffer(device: Any) -> Any:
 
     zero = jnp.zeros(1, dtype=jnp.uint8)
     if device is not None:
-        zero = jax.device_put(zero, device)
-    return jax.block_until_ready(zero)
+        # The client carries whatever the communicator wants, and nccl4py wants
+        # an ordinal. ``device_put`` refuses an int, so the ordinal is resolved
+        # against this process's own devices rather than passed through.
+        target = jax.local_devices()[device] if isinstance(device, int) else device
+        zero = jax.device_put(zero, target)
+    return _ByteView(jax.block_until_ready(zero))
 
 
 def ready(*arrays: Any) -> None:
