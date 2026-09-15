@@ -22,7 +22,19 @@ class _Transfer:
     def __init__(self):
         self.prepared_tensors = None
         self.receive_tensors = None
+        self.prepare_calls = 0
+        self.received_leases = []
         self.fail_before_start = False
+        self.lease = None
+        self.closed = False
+
+    def prepare_peer_read(
+        self, *, source, mx_source_id, worker_id, destination_tensors
+    ):
+        self.prepare_calls += 1
+        self.mx_source_id = mx_source_id
+        self.worker_id = worker_id
+        self.prepared_tensors = destination_tensors
         self.lease = type(
             "Lease",
             (),
@@ -31,20 +43,13 @@ class _Transfer:
                 "close": lambda lease: setattr(lease, "closed", True),
             },
         )()
-        self.closed = False
-
-    def prepare_peer_read(
-        self, *, source, mx_source_id, worker_id, destination_tensors
-    ):
-        self.mx_source_id = mx_source_id
-        self.worker_id = worker_id
-        self.prepared_tensors = destination_tensors
         return self.lease
 
     def receive_peer(
         self, *, tensor_read, destination_tensors, on_transfer_start
     ):
         assert tensor_read is self.lease
+        self.received_leases.append(tensor_read)
         self.receive_tensors = destination_tensors
         if self.fail_before_start:
             raise RuntimeError("peer disappeared before transfer")
@@ -127,6 +132,62 @@ def test_runtime_method_keeps_pretransfer_failure_recoverable():
 
     assert method.mutated_during_installation_context(prepared) is False
     assert transfer.lease.closed is True
+
+
+def test_runtime_method_reacquires_lease_before_pretransfer_retry():
+    transfer = _Transfer()
+    transfer.fail_before_start = True
+    method = RuntimeTensorNixlUpdateMethod(
+        transfer=transfer,
+        runtime_tensors={"model.weight": torch.empty(1)},
+    )
+    prepared = method.prepare(
+        version=object(),
+        source=GeneratorPeerUpdateSource(
+            worker=p2p_pb2.WorkerMetadata(worker_grpc_endpoint="donor:9000"),
+            mx_source_id="source-1",
+            worker_id="worker-1",
+        ),
+    )
+    first_lease = transfer.lease
+
+    with pytest.raises(RuntimeError, match="before transfer"):
+        with method.installation_context(prepared):
+            pass
+
+    transfer.fail_before_start = False
+    with method.installation_context(prepared):
+        pass
+
+    assert transfer.prepare_calls == 2
+    assert transfer.received_leases[0] is first_lease
+    assert transfer.received_leases[1] is not first_lease
+
+
+def test_runtime_method_rejects_retry_after_transfer_started():
+    transfer = _Transfer()
+    method = RuntimeTensorNixlUpdateMethod(
+        transfer=transfer,
+        runtime_tensors={"model.weight": torch.empty(1)},
+    )
+    prepared = method.prepare(
+        version=object(),
+        source=GeneratorPeerUpdateSource(
+            worker=p2p_pb2.WorkerMetadata(worker_grpc_endpoint="donor:9000"),
+            mx_source_id="source-1",
+            worker_id="worker-1",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="install failed"):
+        with method.installation_context(prepared):
+            raise RuntimeError("install failed")
+
+    with pytest.raises(RuntimeError, match="cannot be retried"):
+        with method.installation_context(prepared):
+            pass
+
+    assert transfer.prepare_calls == 1
 
 
 def test_runtime_method_releases_reserved_peer_without_apply():

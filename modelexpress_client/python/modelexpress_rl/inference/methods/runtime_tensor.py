@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+from modelexpress import p2p_pb2
 from modelexpress.metadata.worker_server import TensorReadLease
 from modelexpress.refit.timing import add_refit_bytes, add_refit_duration
 
@@ -30,7 +31,10 @@ from ..plan import (
 class _PreparedRuntimeTensorRead:
     """Peer selection retained until the caller reaches its safe point."""
 
-    tensor_read: TensorReadLease
+    source: p2p_pb2.WorkerMetadata
+    mx_source_id: str
+    worker_id: str
+    tensor_read: TensorReadLease | None
     tensors: dict[str, torch.Tensor]
     metrics: dict[str, Any] = field(default_factory=dict)
     transfer_started: bool = False
@@ -74,6 +78,9 @@ class RuntimeTensorNixlUpdateMethod(UpdateMethod):
             destination_tensors=self._runtime_tensors,
         )
         self._active_read = _PreparedRuntimeTensorRead(
+            source=source.worker,
+            mx_source_id=source.mx_source_id,
+            worker_id=source.worker_id,
             tensor_read=tensor_read,
             tensors=self._runtime_tensors,
         )
@@ -86,16 +93,30 @@ class RuntimeTensorNixlUpdateMethod(UpdateMethod):
         read = prepared.staged
         if read is not self._active_read:
             raise RuntimeError("runtime tensor read is no longer active")
+        tensor_read = read.tensor_read
+        if tensor_read is None:
+            if read.transfer_started:
+                raise RuntimeError("runtime tensor transfer cannot be retried")
+            tensor_read = self._transfer.prepare_peer_read(
+                source=read.source,
+                mx_source_id=read.mx_source_id,
+                worker_id=read.worker_id,
+                destination_tensors=read.tensors,
+            )
+            read.tensor_read = tensor_read
         try:
             read.metrics.update(
                 self._transfer.receive_peer(
-                    tensor_read=read.tensor_read,
+                    tensor_read=tensor_read,
                     destination_tensors=read.tensors,
                     on_transfer_start=read.mark_transfer_started,
                 )
             )
         finally:
-            read.tensor_read.close()
+            try:
+                tensor_read.close()
+            finally:
+                read.tensor_read = None
         _attribute_transfer(read.metrics)
         yield
 
@@ -114,13 +135,17 @@ class RuntimeTensorNixlUpdateMethod(UpdateMethod):
         if prepared.staged is not self._active_read:
             raise RuntimeError("runtime tensor read is no longer active")
         try:
-            self._active_read.tensor_read.close()
+            if self._active_read.tensor_read is not None:
+                self._active_read.tensor_read.close()
         finally:
             self._active_read = None
 
     def close(self) -> None:
         try:
-            if self._active_read is not None:
+            if (
+                self._active_read is not None
+                and self._active_read.tensor_read is not None
+            ):
                 self._active_read.tensor_read.close()
         finally:
             self._active_read = None
