@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -21,7 +22,9 @@ class TrainerEngineContext:
 class FSDPTrainerContext(TrainerEngineContext):
     """Select FSDP/DTensor tensor capture and geometry."""
 
-    wire_dtype_overrides: Mapping[str, torch.dtype] = field(default_factory=dict)
+    wire_dtype_overrides: Mapping[str, torch.dtype] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
     """Exact state-dict names to transfer as FP16, BF16 or FP32; other tensors use BF16."""
 
 
