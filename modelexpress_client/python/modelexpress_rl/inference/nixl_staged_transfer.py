@@ -22,6 +22,9 @@ import torch
 
 from modelexpress import envs, p2p_pb2
 from modelexpress.metadata.payload import worker_tensor_descriptors
+from modelexpress.metadata.worker_server import (
+    prepare_tensor_read,
+)
 from modelexpress.nixl_transfer import NIXL_DRAM_MEM_TYPE, NixlTransferManager
 from modelexpress.refit.reshard import throughput
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
@@ -400,12 +403,16 @@ class _NixlStagedTransfer:
         device: torch.device,
         agent_name: str | None = None,
         listen_port: int | None = None,
-        timeout_seconds: float = 1200.0,
+        timeout_seconds: float | None = None,
         manager: NixlTransferManager | None = None,
     ) -> None:
         self._device_id = device_id
         self._device = device
-        self._timeout = timeout_seconds
+        self._timeout = float(
+            envs.MX_TRANSFER_TIMEOUT
+            if timeout_seconds is None
+            else timeout_seconds
+        )
         self._owns_manager = manager is None
         if manager is None:
             if agent_name is None:
@@ -976,6 +983,8 @@ class _NixlStagedTransfer:
         self,
         *,
         source: p2p_pb2.WorkerMetadata,
+        mx_source_id: str,
+        worker_id: str,
         parameter_layout: dict[str, tuple[tuple[int, ...], torch.dtype]],
     ) -> _StagedNixlWeights:
         """Pull an identical-rank peer's complete runtime tensor set."""
@@ -996,59 +1005,65 @@ class _NixlStagedTransfer:
             self._manager.register_tensors(self._recv_buffers)
             self._registered_recv_params = recv_params
 
-        source_tensors = [
-            TensorDescriptor(
-                name=tensor.name,
-                addr=tensor.addr,
-                size=tensor.size,
-                device_id=tensor.device_id,
-                dtype=tensor.dtype,
-            )
-            for tensor in worker_tensor_descriptors(source)
-        ]
-        if not source_tensors:
-            raise RuntimeError("P2P source has no tensor descriptors")
-
         remote_agent_name: str | None = None
         started = time.perf_counter()
-        try:
-            if source.worker_grpc_endpoint:
-                endpoint = source.metadata_endpoint
-                try:
-                    host, port_text = endpoint.rsplit(":", 1)
-                    port = int(port_text)
-                except ValueError as error:
-                    raise RuntimeError(
-                        f"P2P source published an unusable metadata endpoint: "
-                        f"{endpoint!r}"
-                    ) from error
-                if not host or not 1 <= port <= 65535:
-                    raise RuntimeError(
-                        f"P2P source published an unusable metadata endpoint: "
-                        f"{endpoint!r}"
-                    )
-                remote_agent_name = source.agent_name
+        if not source.worker_grpc_endpoint:
+            raise RuntimeError("generator P2P source has no tensor lease endpoint")
+        lease, _ = prepare_tensor_read(
+            source.worker_grpc_endpoint,
+            mx_source_id,
+            worker_id=worker_id,
+            timeout=self._timeout,
+        )
+        with lease:
+            manifest = lease.manifest
+            source_tensors = [
+                TensorDescriptor(
+                    name=tensor.name,
+                    addr=tensor.addr,
+                    size=tensor.size,
+                    device_id=tensor.device_id,
+                    dtype=tensor.dtype,
+                )
+                for tensor in manifest.tensors
+            ]
+            if not source_tensors:
+                raise RuntimeError("P2P source has no tensor descriptors")
+            endpoint = manifest.metadata_endpoint
+            try:
+                host, port_text = endpoint.rsplit(":", 1)
+                port = int(port_text)
+            except ValueError as error:
+                raise RuntimeError(
+                    f"P2P source published an unusable metadata endpoint: "
+                    f"{endpoint!r}"
+                ) from error
+            if not host or not 1 <= port <= 65535:
+                raise RuntimeError(
+                    f"P2P source published an unusable metadata endpoint: "
+                    f"{endpoint!r}"
+                )
+            remote_agent_name = manifest.agent_name
+            try:
                 self._manager.fetch_remote_and_wait(
                     remote_agent_name=remote_agent_name,
                     ip=host,
                     port=port,
                     timeout_seconds=self._timeout,
                 )
-            else:
-                remote_agent_name = self._manager.add_remote_agent(source.nixl_metadata)
-            bytes_received, tensor_count, wire_seconds = (
-                self._manager.receive_from_source(
-                    source_metadata=b"",
-                    source_tensors=source_tensors,
-                    timeout_seconds=self._timeout,
-                    remote_agent_name=remote_agent_name,
-                    require_exact_match=True,
-                    destination_tensors=self._recv_buffers,
+                bytes_received, tensor_count, wire_seconds = (
+                    self._manager.receive_from_source(
+                        source_metadata=b"",
+                        source_tensors=source_tensors,
+                        timeout_seconds=self._timeout,
+                        remote_agent_name=remote_agent_name,
+                        require_exact_match=True,
+                        destination_tensors=self._recv_buffers,
+                    )
                 )
-            )
-        finally:
-            if remote_agent_name is not None:
-                self._manager.remove_remote_agent(remote_agent_name)
+            finally:
+                if remote_agent_name is not None:
+                    self._manager.remove_remote_agent(remote_agent_name)
 
         self._active = None
         # Peer pulls move the same bytes over the same rails, so a rail that

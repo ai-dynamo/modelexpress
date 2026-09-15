@@ -453,6 +453,18 @@ def test_source_structure_uses_planner_shard_fields_and_ignores_digest():
     assert _source_structure(source) == expected
 
 
+def test_default_transfer_timeout_matches_the_lease_budget(monkeypatch):
+    monkeypatch.setenv("MX_TRANSFER_TIMEOUT", "17")
+
+    transfer = _NixlStagedTransfer(
+        device_id=0,
+        device=torch.device("cpu"),
+        manager=object(),
+    )
+
+    assert transfer._timeout == 17.0
+
+
 def test_exact_manifests_resolve_without_legacy_source_discovery():
     resolved = _resolve_sources(
         [
@@ -709,8 +721,8 @@ def test_borrowed_manager_survives_peer_staging_and_refuses_a_reset(monkeypatch)
         def register_tensors(self, tensors):
             pass
 
-        def add_remote_agent(self, metadata):
-            return "peer-agent"
+        def fetch_remote_and_wait(self, **kwargs):
+            pass
 
         def receive_from_source(self, **kwargs):
             return 16, 1, 0.25
@@ -718,6 +730,31 @@ def test_borrowed_manager_survives_peer_staging_and_refuses_a_reset(monkeypatch)
         def remove_remote_agent(self, agent_name):
             pass
 
+    manifest = p2p_pb2.GetTensorManifestResponse(
+        mx_source_id="source-1",
+        worker_id="worker-1",
+        metadata_endpoint="127.0.0.1:17000",
+        agent_name="peer-agent",
+        tensors=[
+            p2p_pb2.TensorDescriptor(
+                name="weight", addr=1234, size=16, device_id=0, dtype="torch.float32"
+            )
+        ],
+    )
+
+    class _Lease:
+        def __init__(self):
+            self.manifest = manifest
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(
+        transfer_module, "prepare_tensor_read", lambda *a, **k: (_Lease(), 0)
+    )
     transfer = _NixlStagedTransfer(
         device_id=0,
         device=torch.device("cpu"),
@@ -725,17 +762,15 @@ def test_borrowed_manager_survives_peer_staging_and_refuses_a_reset(monkeypatch)
     )
     assert transfer._workspace_mode is None
 
-    source = p2p_pb2.WorkerMetadata(
-        nixl_metadata=b"peer-metadata",
-        tensors=[
-            p2p_pb2.TensorDescriptor(
-                name="weight", addr=1234, size=16, device_id=0, dtype="torch.float32"
-            )
-        ],
-    )
+    source = p2p_pb2.WorkerMetadata(worker_grpc_endpoint="127.0.0.1:18000")
     layout = {"weight": ((4,), torch.float32)}
     for _ in range(2):
-        staged = transfer.stage_peer(source=source, parameter_layout=layout)
+        staged = transfer.stage_peer(
+            source=source,
+            mx_source_id="source-1",
+            worker_id="worker-1",
+            parameter_layout=layout,
+        )
         assert staged.metrics["bytes_received"] == 16
     assert transfer._workspace_mode == "full"
 
@@ -749,6 +784,39 @@ def test_borrowed_manager_survives_peer_staging_and_refuses_a_reset(monkeypatch)
 def test_peer_stage_uses_exact_canonical_tensor_catalog(monkeypatch):
     monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
     calls = []
+
+    class _Lease:
+        def __init__(self, manifest):
+            self.manifest = manifest
+
+        def __enter__(self):
+            calls.append(("lease_enter", None))
+            return self
+
+        def __exit__(self, *_args):
+            calls.append(("lease_release", None))
+
+    manifest = p2p_pb2.GetTensorManifestResponse(
+        mx_source_id="source-1",
+        worker_id="worker-1",
+        metadata_endpoint="127.0.0.1:17000",
+        agent_name="live-peer-agent",
+        tensors=[
+            p2p_pb2.TensorDescriptor(
+                name="weight",
+                addr=1234,
+                size=16,
+                device_id=0,
+                dtype="torch.float32",
+            )
+        ],
+    )
+
+    def prepare(*args, **kwargs):
+        calls.append(("prepare", (args, kwargs)))
+        return _Lease(manifest), manifest.ByteSize()
+
+    monkeypatch.setattr(transfer_module, "prepare_tensor_read", prepare)
 
     class _Manager:
         def register_tensors(self, tensors):
@@ -779,38 +847,22 @@ def test_peer_stage_uses_exact_canonical_tensor_catalog(monkeypatch):
     transfer._closed = False
     transfer._workspace_mode = "full"
     source = p2p_pb2.WorkerMetadata(
-        nixl_metadata=b"peer-metadata",
-        tensors=[
-            p2p_pb2.TensorDescriptor(
-                name="weight",
-                addr=1234,
-                size=16,
-                device_id=0,
-                dtype="torch.float32",
-            )
-        ],
+        worker_grpc_endpoint="127.0.0.1:18000",
     )
 
     staged = transfer.stage_peer(
         source=source,
+        mx_source_id="source-1",
+        worker_id="worker-1",
         parameter_layout={"weight": ((4,), torch.float32)},
     )
 
     assert staged.metrics["bytes_received"] == 16
     receive = next(value for name, value in calls if name == "receive")
-    assert receive["remote_agent_name"] == "peer-agent"
+    assert receive["remote_agent_name"] == "live-peer-agent"
     assert receive["require_exact_match"] is True
     assert set(receive["destination_tensors"]) == {"weight"}
-    assert calls[-1] == ("remove", "peer-agent")
-
-    calls.clear()
-    source.worker_grpc_endpoint = "127.0.0.1:18000"
-    source.metadata_endpoint = "127.0.0.1:17000"
-    source.agent_name = "live-peer-agent"
-    transfer.stage_peer(
-        source=source,
-        parameter_layout={"weight": ((4,), torch.float32)},
-    )
+    assert calls[-1] == ("lease_release", None)
     fetch = next(value for name, value in calls if name == "fetch")
     assert fetch == {
         "remote_agent_name": "live-peer-agent",
@@ -819,10 +871,12 @@ def test_peer_stage_uses_exact_canonical_tensor_catalog(monkeypatch):
         "timeout_seconds": 30.0,
     }
 
-    source.metadata_endpoint = ""
+    manifest.metadata_endpoint = ""
     with pytest.raises(RuntimeError, match="unusable metadata endpoint"):
         transfer.stage_peer(
             source=source,
+            mx_source_id="source-1",
+            worker_id="worker-1",
             parameter_layout={"weight": ((4,), torch.float32)},
         )
 

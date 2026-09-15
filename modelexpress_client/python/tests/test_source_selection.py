@@ -575,7 +575,10 @@ def test_load_generation_mismatch_tries_next_candidate(monkeypatch):
     strat._load_as_target = MagicMock(return_value="loaded")
     manifest = [p2p_pb2.TensorDescriptor(name="weight")]
     fetch_manifest = MagicMock(
-        side_effect=[RuntimeError("worker_id mismatch"), (manifest, 10)],
+        side_effect=[
+            RuntimeError("worker_id mismatch"),
+            (manifest, 10),
+        ],
     )
     monkeypatch.setattr(
         "modelexpress.metadata.worker_server.fetch_tensor_manifest",
@@ -613,7 +616,7 @@ def test_load_generation_mismatch_tries_next_candidate(monkeypatch):
     ]
 
 
-def test_fetch_worker_metadata_prefetches_legacy_endpoint(monkeypatch):
+def test_fetch_worker_metadata_fetches_missing_manifest(monkeypatch):
     strat = RdmaStrategy()
     worker = p2p_pb2.WorkerMetadata(worker_grpc_endpoint="source:6555")
     ctx = MagicMock(global_rank=0)
