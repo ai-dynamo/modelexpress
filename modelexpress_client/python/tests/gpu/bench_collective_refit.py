@@ -1,12 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Time the NCCL M2N collective refit path end to end, through the real control plane.
+"""Time the NCCL M2N collective TRANSPORT, through the real control plane.
+
+Not an end-to-end refit, and the distinction is the whole point of this line:
+the engine boundary here is ``BenchEngine``, a stub over pre-allocated tensors
+whose shapes this file chooses. The MX control plane and ``nccl.m2n.reshard``
+are real; no model, no framework and no checkpoint is involved, so nothing here
+measures what refitting a model costs. ``examples/rl/m2n_collective_refit``
+does that, against a live vLLM engine and an FSDP2-sharded checkpoint.
 
 Deliberately not a pytest test, and the filename says so: it needs a live
 ModelExpress server, one process per rank and several GPUs, and its output is
 numbers rather than a pass. ``test_collective_reshard.py`` covers correctness
-on four devices; this measures what a refit costs.
+on four devices; this measures what the transport costs.
 
 The split it exists to report is bootstrap versus transfer. Bootstrap is what
 MX adds over a bare TCPStore -- registration, admission, the brokered unique
