@@ -138,8 +138,9 @@ class ModelExpressGeneratorConfig:
 class StagedWeightHandle:
     """An exact version prepared for, but not yet installed into, the engine.
 
-    Preparation may transfer P2P tensors or reconstruct an S3 checkpoint. The
-    live engine remains unchanged until ``apply_weight`` runs at its safe point.
+    Preparation may validate and reserve a P2P peer or reconstruct an S3
+    checkpoint. The live engine remains unchanged until ``apply_weight`` runs at
+    its safe point.
     The handle keeps session internals private and binds idempotent release to
     the client that owns the staged resources.
     """

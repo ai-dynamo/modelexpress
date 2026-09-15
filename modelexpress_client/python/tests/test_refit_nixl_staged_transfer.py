@@ -328,19 +328,16 @@ def test_borrowed_manager_is_not_initialized_or_closed():
     transfer.close()
 
 
-def test_peer_stage_uses_exact_canonical_tensor_catalog(monkeypatch):
-    monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
+def test_peer_receive_writes_directly_into_live_tensor_catalog(monkeypatch):
     calls = []
 
     class _Lease:
         def __init__(self, manifest):
             self.manifest = manifest
+            self.closed = False
 
-        def __enter__(self):
-            calls.append(("lease_enter", None))
-            return self
-
-        def __exit__(self, *_args):
+        def close(self):
+            self.closed = True
             calls.append(("lease_release", None))
 
     manifest = p2p_pb2.GetTensorManifestResponse(
@@ -366,9 +363,6 @@ def test_peer_stage_uses_exact_canonical_tensor_catalog(monkeypatch):
     monkeypatch.setattr(transfer_module, "prepare_tensor_read", prepare)
 
     class _Manager:
-        def register_tensors(self, tensors):
-            calls.append(("register", tuple(tensors)))
-
         def add_remote_agent(self, metadata):
             calls.append(("add", metadata))
             return "peer-agent"
@@ -388,27 +382,32 @@ def test_peer_stage_uses_exact_canonical_tensor_catalog(monkeypatch):
     transfer._device_id = 0
     transfer._timeout = 30.0
     transfer._manager = _Manager()
-    transfer._recv_buffers = {}
-    transfer._registered_recv_params = set()
-    transfer._active = None
     transfer._closed = False
     source = p2p_pb2.WorkerMetadata(
         worker_grpc_endpoint="127.0.0.1:18000",
     )
 
-    staged = transfer.stage_peer(
+    live = {"weight": torch.empty(4, dtype=torch.float32)}
+    lease = transfer.prepare_peer_read(
         source=source,
         mx_source_id="source-1",
         worker_id="worker-1",
-        parameter_layout={"weight": ((4,), torch.float32)},
+        destination_tensors=live,
+    )
+    assert lease.closed is False
+    metrics = transfer.receive_peer(
+        tensor_read=lease,
+        destination_tensors=live,
+        on_transfer_start=lambda: calls.append(("transfer_start", None)),
     )
 
-    assert staged.metrics["bytes_received"] == 16
+    assert metrics["bytes_received"] == 16
     receive = next(value for name, value in calls if name == "receive")
     assert receive["remote_agent_name"] == "live-peer-agent"
     assert receive["require_exact_match"] is True
-    assert set(receive["destination_tensors"]) == {"weight"}
-    assert calls[-1] == ("lease_release", None)
+    assert receive["destination_tensors"] is live
+    assert ("transfer_start", None) in calls
+    assert lease.closed is False
     fetch = next(value for name, value in calls if name == "fetch")
     assert fetch == {
         "remote_agent_name": "live-peer-agent",
@@ -419,11 +418,10 @@ def test_peer_stage_uses_exact_canonical_tensor_catalog(monkeypatch):
 
     manifest.metadata_endpoint = ""
     with pytest.raises(RuntimeError, match="unusable metadata endpoint"):
-        transfer.stage_peer(
-            source=source,
-            mx_source_id="source-1",
-            worker_id="worker-1",
-            parameter_layout={"weight": ((4,), torch.float32)},
+        transfer.receive_peer(
+            tensor_read=lease,
+            destination_tensors=live,
+            on_transfer_start=lambda: None,
         )
 
 
