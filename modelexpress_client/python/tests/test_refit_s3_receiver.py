@@ -6,6 +6,8 @@ import threading
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import safetensors.numpy
@@ -15,22 +17,39 @@ import torch
 import zstandard
 from safetensors.torch import load_file, save_file
 
+from modelexpress import p2p_pb2
 from modelexpress_rl import (
+    ModelExpressGeneratorClient,
     ObjectStorageGeneratorConfig,
     ObjectStorageSource,
     ObjectStorageType,
     WeightPayloadFormat,
+    WeightSource,
     WeightVersion,
+    WeightVersionRef,
     WeightVersionState,
 )
 from modelexpress_rl.inference.adapter import GeneratorTransferInputs
 from modelexpress_rl.inference import checkpoint_store as checkpoint_store_module
 from modelexpress_rl.inference import receiver as receiver_module
-from modelexpress_rl.inference.methods import CanonicalDeltaUpdateMethod
+from modelexpress_rl.inference.methods import (
+    CanonicalDeltaUpdateMethod,
+    RuntimeTensorNixlUpdateMethod,
+)
 import modelexpress_rl.inference.methods.canonical_delta as canonical_delta_module
 from modelexpress_rl.inference.plan import (
+    EngineCapabilities,
+    EngineInstaller,
+    GeneratorPeerUpdateSource,
     ObjectStorageUpdateSource,
+    PreparedCheckpointArtifact,
+    PreparedRuntimeTensors,
+    SourceResolver,
+    WeightUpdatePlanner,
 )
+from modelexpress_rl.inference.runtime import EngineRuntime, GeneratorRuntime
+from modelexpress_rl.inference.session import WeightUpdateSession
+from modelexpress_rl.inference.source import ObjectStorageSourceResolver
 from modelexpress_rl.s3 import ImmutableS3Conflict, S3Client
 from modelexpress_rl.utils import checksum_factory, compress_delta, compute_delta
 
@@ -1477,6 +1496,240 @@ def test_canonical_s3_applies_one_delta_to_the_active_checkpoint(
     assert not first_materialized.exists()
     assert second.path.exists()
     adapter.release_staged_weight(second)
+    adapter.close()
+
+
+@pytest.mark.parametrize(
+    ("cached_delta_count", "checkpoint_installed"),
+    [(-1, False), (0, True), (1, True), (2, True), (2, False)],
+)
+def test_full_lineage_replay_resumes_from_verified_local_checkpoint(
+    monkeypatch, tmp_path, cached_delta_count, checkpoint_installed
+):
+    tensors = [torch.tensor([float(i), float(i + 1)]) for i in (1, 3, 5, 7)]
+    objects = _full_artifact(tensors[0], version_label=0)
+    lineage = [_full_inputs(version="full-a", version_label=0)]
+    for index in range(1, len(tensors)):
+        base_version = lineage[-1].version_id
+        version = f"delta-{index}"
+        objects.update(
+            _artifact(
+                tensors[index - 1].view(torch.uint8).numpy(),
+                tensors[index].view(torch.uint8).numpy(),
+                version=version,
+                version_label=index,
+                base_version=base_version,
+            )
+        )
+        lineage.append(
+            _inputs(
+                None,
+                version=version,
+                version_label=index,
+                base_version=base_version,
+            )
+        )
+    adapter, storage = _build(monkeypatch, tmp_path, objects)
+    if cached_delta_count >= 0:
+        previous = adapter.stage_chain(lineage[: cached_delta_count + 1])
+        if checkpoint_installed:
+            adapter.apply_weight(previous)
+        adapter.release_staged_weight(previous)
+    storage.calls.clear()
+
+    with (
+        patch.object(
+            adapter._checkpoint,
+            "_apply_shards",
+            wraps=adapter._checkpoint._apply_shards,
+        ) as apply_shards,
+        patch.object(
+            adapter._checkpoint.store,
+            "replace_directory",
+            wraps=adapter._checkpoint.store.replace_directory,
+        ) as replace_directory,
+    ):
+        staged = adapter.stage_chain(lineage)
+
+    assert torch.equal(
+        load_file(staged.path / "model-00001-of-00001.safetensors")["weight"],
+        tensors[-1],
+    )
+    assert [uri for uri in storage.calls if uri.endswith(".index.json")] == [
+        version.object_storage.uri for version in lineage[cached_delta_count + 1 :]
+    ]
+    assert apply_shards.call_count == 3 - max(cached_delta_count, 0)
+    assert sum(
+        call.kwargs.get("copy_from") is not None
+        for call in replace_directory.call_args_list
+    ) == (1 if cached_delta_count <= 0 else 0)
+    adapter.apply_weight(staged)
+    adapter.release_staged_weight(staged)
+    adapter.close()
+
+
+@pytest.mark.parametrize("use_peer_for_second_delta", [False, True])
+def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
+    monkeypatch, tmp_path, use_peer_for_second_delta
+):
+    tensors = [torch.tensor([float(i), float(i + 1)]) for i in (1, 3, 5, 7)]
+    objects = _full_artifact(tensors[0], version_label=0)
+    inputs = [_full_inputs(version="base-a", version_label=0)]
+    for index in range(1, len(tensors)):
+        base_version = inputs[-1].version_id
+        version = f"delta-{index}"
+        objects.update(
+            _artifact(
+                tensors[index - 1].view(torch.uint8).numpy(),
+                tensors[index].view(torch.uint8).numpy(),
+                version=version,
+                version_label=index,
+                base_version=base_version,
+            )
+        )
+        inputs.append(
+            _inputs(
+                None,
+                version=version,
+                version_label=index,
+                base_version=base_version,
+            )
+        )
+    versions = {
+        item.version_id: WeightVersion(
+            version_id=item.version_id,
+            model_name="test/model",
+            payload_format=item.payload_format,
+            base_version_id=item.base_version_id,
+            object_storage=item.object_storage,
+            expected_source_slots=(),
+            layout_signature="",
+            state=WeightVersionState.READY,
+            created_at_unix_ms=0,
+        )
+        for item in inputs
+    }
+    adapter, storage = _build(monkeypatch, tmp_path, objects)
+    generator = ModelExpressGeneratorClient()
+    generator._serving_version_id = "base-a"
+    generator._max_replay_chain_length = 64
+    monkeypatch.setattr(
+        generator,
+        "_fetch_ready_version",
+        lambda version_id, **_kwargs: versions[version_id],
+    )
+    peer = GeneratorPeerUpdateSource(
+        worker=p2p_pb2.WorkerMetadata(), mx_source_id="peer", worker_id="peer"
+    )
+    resolver = Mock(spec=SourceResolver, kind=WeightSource.GENERATOR)
+    resolver.supports.return_value = True
+    resolver.payload_format.return_value = WeightPayloadFormat.FULL_TENSOR
+    resolver.candidates.side_effect = lambda version: (
+        (peer,) if use_peer_for_second_delta and version.version_id == "delta-2" else ()
+    )
+    transfer = Mock()
+    transfer.stage_peer.return_value = SimpleNamespace(
+        tensors={"weight": tensors[2]}, metrics={}
+    )
+    peer_method = RuntimeTensorNixlUpdateMethod(
+        transfer=transfer, runtime_tensors={"weight": tensors[0]}
+    )
+    installer = Mock(spec=EngineInstaller)
+    installer.capabilities = EngineCapabilities(
+        artifact_types=frozenset({PreparedCheckpointArtifact, PreparedRuntimeTensors})
+    )
+    methods = (adapter._method, peer_method)
+    generator._runtime = GeneratorRuntime(
+        engine=EngineRuntime(model_name="test/model", installer=installer),
+        methods=methods,
+        session=WeightUpdateSession(
+            planner=WeightUpdatePlanner(
+                resolvers=(resolver, ObjectStorageSourceResolver()),
+                methods=methods,
+                installer=installer,
+                max_transfer_attempts=1,
+            ),
+            start_lease=lambda _version_id: Mock(),
+            resolve_replay_chain=lambda version: generator._resolve_replay_chain(
+                version.version_id, from_full_root=True
+            ),
+        ),
+        p2p_client=None,
+        initial_version_id="base-a",
+    )
+
+    try:
+        for version_id in ("delta-1", "delta-2"):
+            staged = generator.stage_weight(version=WeightVersionRef(version_id))
+            generator.apply_weight(staged)
+            staged.release()
+
+        assert generator._serving_version_id == "delta-2"
+        assert adapter._checkpoint.store.state().version == (
+            "delta-1" if use_peer_for_second_delta else "delta-2"
+        )
+        assert transfer.stage_peer.call_count == int(use_peer_for_second_delta)
+        storage.calls.clear()
+
+        staged = generator.stage_weight(version=WeightVersionRef("delta-3"))
+        generator.apply_weight(staged)
+        staged.release()
+
+        missing = inputs[2:] if use_peer_for_second_delta else inputs[3:]
+        assert [uri for uri in storage.calls if uri.endswith(".index.json")] == [
+            version.object_storage.uri for version in missing
+        ]
+        assert torch.equal(
+            load_file(
+                adapter._checkpoint.local_checkpoint / "model-00001-of-00001.safetensors"
+            )["weight"],
+            tensors[-1],
+        )
+        assert generator._serving_version_id == "delta-3"
+        assert adapter._checkpoint.store.active_version() == "delta-3"
+    finally:
+        generator.close()
+
+
+def test_replay_base_requires_the_same_source_identity(monkeypatch, tmp_path):
+    base = torch.tensor([1.0, 2.0])
+    middle = torch.tensor([3.0, 4.0])
+    target = torch.tensor([5.0, 6.0])
+    objects = _artifact(base.view(torch.uint8).numpy(), middle.view(torch.uint8).numpy())
+    objects.update(
+        _artifact(
+            middle.view(torch.uint8).numpy(),
+            target.view(torch.uint8).numpy(),
+            version="target-b",
+            version_label=2,
+            base_version="target-a",
+        )
+    )
+    adapter, storage = _build(monkeypatch, tmp_path, objects)
+    previous = adapter.stage_weight(_inputs(None))
+    adapter.apply_weight(previous)
+    adapter.release_staged_weight(previous)
+    storage.calls.clear()
+
+    with pytest.raises(RuntimeError, match="different source identity"):
+        adapter.stage_chain(
+            (
+                _inputs(None, uri="s3://weights/changed/model.safetensors.index.json"),
+                _inputs(
+                    None,
+                    version="target-b",
+                    version_label=2,
+                    base_version="target-a",
+                ),
+            )
+        )
+
+    assert storage.calls == []
+    assert adapter._checkpoint.store.state().version == "target-a"
+    assert torch.equal(
+        load_file(adapter._checkpoint.local_checkpoint / "model.safetensors")["weight"],
+        middle,
+    )
     adapter.close()
 
 
