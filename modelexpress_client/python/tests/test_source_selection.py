@@ -1160,3 +1160,170 @@ class TestSourceLoadPresence:
         la = [c.worker_id for c in ss.LoadAwareSelector().order(cands, self._ctx())]
         rz = [c.worker_id for c in ss.RendezvousHashSelector().order(cands, self._ctx())]
         assert la == rz
+
+
+# ---------------------------------------------------------------------------
+# RdmaStrategy.load() -> source attempt phases
+# ---------------------------------------------------------------------------
+
+
+def _real_metrics(monkeypatch):
+    """A collector on a private registry, wired into the strategy module."""
+    from prometheus_client import CollectorRegistry
+
+    from modelexpress.metrics import MetricsCollector
+
+    monkeypatch.setenv("MX_METRICS_ENABLED", "1")
+    monkeypatch.delenv("PROMETHEUS_MULTIPROC_DIR", raising=False)
+    monkeypatch.delenv(ENV_SELECTOR, raising=False)
+    collector = MetricsCollector(registry=CollectorRegistry())
+    monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", collector)
+    monkeypatch.setattr(
+        "modelexpress.load_strategy.rdma_strategy.worker_tensor_count", lambda w: 1
+    )
+    monkeypatch.setattr(
+        "modelexpress.load_strategy.rdma_strategy.register_tensors", lambda result, ctx: None
+    )
+    return collector
+
+
+def _phase_series(collector):
+    """{(phase, outcome): (count, sum)} and the transfer _sum, from the exposition."""
+    import re
+
+    from prometheus_client import generate_latest
+
+    text = generate_latest(collector._exposition_registry()).decode()
+    phases = {}
+    for kind in ("count", "sum"):
+        for m in re.finditer(
+            r"mx_p2p_source_attempt_phase_seconds_" + kind
+            + r'\{[^}]*outcome="([^"]+)"[^}]*phase="([^"]+)"[^}]*\} (\S+)',
+            text,
+        ):
+            key = (m.group(2), m.group(1))
+            c, s = phases.get(key, (0.0, 0.0))
+            phases[key] = (float(m.group(3)), s) if kind == "count" else (c, float(m.group(3)))
+    transfer = sum(
+        float(m.group(1))
+        for m in re.finditer(r"mx_p2p_transfer_seconds_sum\{[^}]*\} (\S+)", text)
+    )
+    return phases, transfer
+
+
+def _receiving_ctx():
+    """A context whose adapter and NIXL manager accept everything."""
+    ctx = MagicMock(global_rank=0)
+    ctx.accelerator_backend.name = ""  # unknown target -> accelerator gate accepts
+    ctx.nixl_manager.receive_from_source.return_value = (0, 0, 0.0)
+    ctx.nixl_manager.add_remote_agent.return_value = "peer"
+    return ctx
+
+
+def _centralized_source():
+    """A source served through the central record: no gRPC endpoint, so the
+    handshake is add_remote_agent rather than a P2P metadata fetch."""
+    source = MagicMock()
+    source.worker_grpc_endpoint = ""
+    source.tensor_source.tensors = []
+    source.nixl_metadata = b"meta"
+    source.accelerator = ""
+    return source
+
+
+def test_a_successful_attempt_records_every_phase_once_and_they_nest_in_the_transfer(
+    monkeypatch,
+):
+    """The tier-C invariant on real timings: sum(phase != metadata) <= transfer.
+
+    Every phase is a with-block around a call the strategy already made, so the
+    nesting holds by construction. The test exists so that a phase recorded
+    from a second site, or one that drifts outside the transfer span, fails
+    instead of quietly inflating a phase.
+    """
+    collector = _real_metrics(monkeypatch)
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(1))
+    strat._fetch_worker_metadata = MagicMock(return_value=_centralized_source())
+    ctx = _receiving_ctx()
+
+    strat.load(MagicMock(), ctx)
+
+    phases, transfer = _phase_series(collector)
+    assert {p for p, _ in phases} == {
+        "metadata", "prepare", "register", "handshake", "receive", "finalize", "release"
+    }, phases
+    assert all(outcome == "ok" for _, outcome in phases), phases
+    assert all(count == 1.0 for count, _ in phases.values()), phases
+    inside = sum(s for (p, _), (_, s) in phases.items() if p != "metadata")
+    assert inside <= transfer, (
+        f"phases inside the transfer summed to {inside:.6f}s but the transfer took "
+        f"{transfer:.6f}s; a phase is recorded outside the span or from two sites"
+    )
+
+
+def test_a_receive_that_raises_is_recorded_as_an_error_in_that_phase(monkeypatch):
+    """The phase a failed attempt died in is the reading worth having.
+
+    The RDMA read raises, so `receive` records `error`, the phases before it
+    record `ok`, `finalize` never runs, and `release` still runs from the
+    finally -- which is the one place a partition on failed attempts can be
+    checked at all.
+    """
+    collector = _real_metrics(monkeypatch)
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(1))
+    strat._fetch_worker_metadata = MagicMock(return_value=_centralized_source())
+    ctx = _receiving_ctx()
+    ctx.nixl_manager.receive_from_source.side_effect = RuntimeError("READ timed out")
+
+    with pytest.raises(StrategyFailed):
+        strat.load(MagicMock(), ctx)
+
+    phases, _ = _phase_series(collector)
+    by_phase = {p: outcome for p, outcome in phases}
+    assert by_phase == {
+        "metadata": "ok",
+        "prepare": "ok",
+        "register": "ok",
+        "handshake": "ok",
+        "receive": "error",
+        "release": "ok",
+    }, by_phase
+
+
+def test_a_metadata_miss_records_only_the_metadata_phase(monkeypatch):
+    """A candidate that fails GetMetadata never opens the transfer span, so
+    `metadata` is the only phase it leaves -- with `error`, since the fetch
+    raised -- and the attempt is counted as metadata_miss, not as a transfer."""
+    collector = _real_metrics(monkeypatch)
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(1))
+    strat._fetch_worker_metadata = MagicMock(side_effect=RuntimeError("unreachable"))
+
+    with pytest.raises(StrategyFailed):
+        strat.load(MagicMock(), _receiving_ctx())
+
+    phases, transfer = _phase_series(collector)
+    assert set(phases) == {("metadata", "error")}, phases
+    assert transfer == 0.0
+
+
+def test_the_phase_span_hands_its_duration_back_for_the_log_line(monkeypatch):
+    """One clock per span: the strategy logs what the metric measured."""
+    import time
+
+    collector = _real_metrics(monkeypatch)
+    with collector.time_source_attempt_phase("random", "receive") as span:
+        time.sleep(0.005)
+    assert span.seconds >= 0.005
+    phases, _ = _phase_series(collector)
+    assert phases[("receive", "ok")][1] == pytest.approx(span.seconds)
+
+
+def test_an_unknown_phase_is_dropped_and_an_unknown_outcome_clamps(monkeypatch):
+    collector = _real_metrics(monkeypatch)
+    collector.observe_source_attempt_phase_seconds("random", "not_a_phase", "ok", 1.0)
+    collector.observe_source_attempt_phase_seconds("random", "receive", "not_an_outcome", 1.0)
+    phases, _ = _phase_series(collector)
+    assert set(phases) == {("receive", "error")}, phases

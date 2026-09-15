@@ -665,6 +665,51 @@ def test_cold_start_ranks_do_not_rewind_prepared_target(monkeypatch, tmp_path):
     recovered.close()
 
 
+def test_full_root_replay_replaces_unverified_launch_seed(monkeypatch, tmp_path):
+    catalog_base = torch.tensor([1.0, 2.0])
+    target = torch.tensor([3.0, 4.0])
+    objects = _full_artifact(catalog_base, version_label=0)
+    objects.update(
+        _artifact(
+            catalog_base.view(torch.uint8).numpy(),
+            target.view(torch.uint8).numpy(),
+            version="target-a",
+            version_label=1,
+            base_version="base-a",
+        )
+    )
+    adapter, _storage = _build(
+        monkeypatch,
+        tmp_path,
+        objects,
+        launch_tensors={"weight": torch.tensor([9.0, 10.0])},
+    )
+
+    staged = adapter.stage_chain(
+        (
+            _full_inputs(version="base-a", version_label=0),
+            _inputs(
+                None,
+                base_version="base-a",
+                version="target-a",
+                version_label=1,
+            ),
+        )
+    )
+
+    assert torch.equal(
+        load_file(staged.path / "model-00001-of-00001.safetensors")["weight"],
+        target,
+    )
+    root = adapter._checkpoint.store.full_path("base-a")
+    source = json.loads((root / ".source.json").read_text())["source"]
+    assert source == {
+        "uri": "s3://weights/test/v0/model.safetensors.index.json"
+    }
+    adapter.release_staged_weight(staged)
+    adapter.close()
+
+
 @pytest.mark.parametrize(
     "filename",
     ["/tmp/shard", "../shard", "foo/bar", "foo/bar/", ".", ".."],
@@ -1331,6 +1376,27 @@ def test_canonical_s3_failed_install_keeps_previous_active_version(
     adapter.close()
 
 
+def test_canonical_s3_can_defer_activation_until_distributed_load_completes(
+    monkeypatch, tmp_path
+):
+    """Defer checkpoint activation until distributed loading completes."""
+    objects = _full_artifact(torch.tensor([7.0, 8.0]))
+    adapter, _storage = _build(monkeypatch, tmp_path, objects)
+    prepared = adapter.stage_weight(_full_inputs())
+
+    with adapter._method.installation_context(
+        adapter._active,
+        activate=False,
+    ):
+        pass
+
+    assert adapter._checkpoint.store.active_version() == "base-a"
+    adapter._method.activate(adapter._active)
+    assert adapter._checkpoint.store.active_version() == "full-a"
+    adapter.release_staged_weight(prepared)
+    adapter.close()
+
+
 def test_canonical_s3_applies_one_delta_to_the_active_checkpoint(
     monkeypatch, tmp_path
 ):
@@ -1461,6 +1527,13 @@ def test_canonical_s3_in_place_delta_failure_requires_recovery(
         adapter._checkpoint.store.state().status
         is checkpoint_store_module.CheckpointState.UPDATING
     )
+
+    adapter._method.preparation_failed()
+
+    state = adapter._checkpoint.store.state()
+    assert state.status is checkpoint_store_module.CheckpointState.READY
+    assert state.version == "base-a"
+    assert adapter._checkpoint.store.active_version() == "target-a"
     adapter.close()
 
 

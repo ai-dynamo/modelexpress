@@ -8,8 +8,11 @@ from .timing import (
     REFIT_TIMING_STAGES,
     RefitTimingRecorder,
     add_refit_bytes,
+    add_refit_duration,
+    add_refit_metadata,
     current_refit_timing,
     refit_span,
+    set_refit_cold,
     use_refit_timing,
 )
 
@@ -18,7 +21,10 @@ __all__ = [
     "REFIT_TIMING_STAGES",
     "RefitTimingRecorder",
     "add_refit_bytes",
+    "add_refit_duration",
+    "add_refit_metadata",
     "current_refit_timing",
     "refit_span",
+    "set_refit_cold",
     "use_refit_timing",
 ]

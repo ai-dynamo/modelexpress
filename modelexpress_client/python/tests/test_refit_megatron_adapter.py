@@ -7,8 +7,9 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import grpc
-import modelexpress_rl.train.runtime as runtime_module
 import pytest
+
+import modelexpress_rl.train.runtime as runtime_module
 from modelexpress.refit.reshard.rendezvous import unwrap_rendezvous_blob
 from modelexpress_rl import (
     MegatronTrainerContext,
@@ -21,11 +22,11 @@ from modelexpress_rl import (
     refit_pb2_grpc,
 )
 from modelexpress_rl.train.adapter import TrainerEngineAdapter
-from modelexpress_rl.train.manifest import WeightVersionShardManifestService
 from modelexpress_rl.train.engines.megatron import (
     MegatronTensorSpec,
     MegatronTrainerAdapter,
 )
+from modelexpress_rl.train.manifest import WeightVersionShardManifestService
 
 
 class _Tensor:
@@ -129,14 +130,15 @@ def test_megatron_source_slot_groups_replicas_by_logical_partition(monkeypatch):
 
     assert first.bind_tensors(tensors) == second.bind_tensors(tensors)
     assert first.source_slot_id == second.source_slot_id
-    assert other_partition.bind_tensors(
-        [replace(tensors[0], local_shard_range=(8, 16))]
-    ) != first.source_slot_id
+    assert (
+        other_partition.bind_tensors([replace(tensors[0], local_shard_range=(8, 16))])
+        != first.source_slot_id
+    )
 
 
 def test_megatron_adapter_uses_shared_trainer_publication_flow(monkeypatch):
     monkeypatch.setattr(
-        "modelexpress_rl.train.engines.megatron.aliases.tensor_digest",
+        "modelexpress_rl.train.engines.megatron.aliases.published_digest",
         lambda _tensor: "tensor-digest",
     )
     monkeypatch.setattr(

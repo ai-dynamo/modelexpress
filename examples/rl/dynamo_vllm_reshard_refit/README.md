@@ -1,14 +1,18 @@
-# Dynamo + vLLM ModelExpress refit
+# Dynamo + vLLM reshard refit
 
 This example validates the complete inference-side lifecycle designed for
 ModelExpress `WeightVersion` updates:
 
 1. A GPU trainer job loads `Qwen/Qwen3-0.6B`, publishes one immutable full-weight
    version through `modelexpress_rl`, and waits as the NIXL source.
-2. Dynamo discovers the vLLM worker and pauses generation.
-3. vLLM invokes the `modelexpress` weight-transfer backend for initialization,
+2. On cold start, all vLLM ranks agree on the desired UID and load it through
+   desired-version P2P or canonical S3 replay. The vLLM init container's startup
+   probe then writes and verifies that UID through vLLM's native Control gRPC
+   service before Dynamo starts its sidecar.
+3. Dynamo discovers the admitted vLLM worker and pauses generation.
+4. vLLM invokes the `modelexpress` weight-transfer backend for initialization,
    `start_weight_update`, `update_weights`, and `finish_weight_update`.
-4. The RL coordinator verifies the exact UID on every worker, resumes generation,
+5. The RL coordinator verifies the exact UID on every worker, resumes generation,
    and compares deterministic inference before and after the refit.
 
 The DGD uses the current `nvidia.com/v1beta1` schema and Dynamo's native Rust
@@ -17,6 +21,13 @@ is newer than the latest v1.4.1 release. The engine image pins the current vLLM
 nightly digest built from commit `a9a17e7095a66ef6c6685a1c7ddd657781a78d3c`.
 The latest vLLM v0.27.1 release predates the merged RL Control gRPC service, so
 it cannot serve this Dynamo sidecar flow.
+
+Global rank 0 broadcasts its `MX_REFIT_DESIRED_VERSION_UID`, and every vLLM rank
+checks its local value against that pinned UID before loading. Local rank 0 on
+each node reconstructs the canonical S3 checkpoint; followers reuse the
+node-local result. A rank disagreement or partial distributed load fails
+startup, and the checkpoint activation marker is committed only after every
+rank succeeds.
 
 ## Build
 
@@ -31,7 +42,7 @@ docker build -f ci/k8s/server/Dockerfile.server \
   -t "$REGISTRY/modelexpress-server:$MX_COMMIT-dynamo-refit" .
 docker push "$REGISTRY/modelexpress-server:$MX_COMMIT-dynamo-refit"
 
-docker build -f examples/rl/dynamo_vllm_refit/Dockerfile.vllm \
+docker build -f examples/rl/dynamo_vllm_reshard_refit/Dockerfile.vllm \
   -t "$REGISTRY/modelexpress-vllm:a9a17e7-$MX_COMMIT-dynamo-refit" .
 docker push "$REGISTRY/modelexpress-vllm:a9a17e7-$MX_COMMIT-dynamo-refit"
 ```
@@ -61,17 +72,18 @@ export MX_SERVER_IMAGE="$REGISTRY/modelexpress-server:$MX_COMMIT-dynamo-refit"
 export VLLM_ENGINE_IMAGE="$REGISTRY/modelexpress-vllm:a9a17e7-$MX_COMMIT-dynamo-refit"
 export DYNAMO_SIDECAR_IMAGE="$REGISTRY/dynamo-vllm-sidecar:ff95985"
 
-envsubst < examples/rl/dynamo_vllm_refit/server.yaml |
+envsubst < examples/rl/dynamo_vllm_reshard_refit/server.yaml |
   kubectl apply -n "$NAMESPACE" -f -
-envsubst < examples/rl/dynamo_vllm_refit/dgd.yaml |
+envsubst < examples/rl/dynamo_vllm_reshard_refit/dgd.yaml |
   kubectl apply -n "$NAMESPACE" -f -
 
 kubectl wait -n "$NAMESPACE" --for=condition=Ready \
   dgd/mx-vllm-refit --timeout=15m
 
-export RL_COORDINATOR="$(sed 's/^/    /' \
-  examples/rl/dynamo_vllm_refit/rl_coordinator.py)"
-envsubst < examples/rl/dynamo_vllm_refit/rl-job.yaml |
+kubectl create configmap mx-vllm-rl-coordinator -n "$NAMESPACE" \
+  --from-file=rl_coordinator.py=examples/rl/dynamo_vllm_reshard_refit/rl_coordinator.py \
+  --dry-run=client -o yaml | kubectl apply -n "$NAMESPACE" -f -
+envsubst < examples/rl/dynamo_vllm_reshard_refit/rl-job.yaml |
   kubectl apply -n "$NAMESPACE" -f -
 kubectl wait -n "$NAMESPACE" --for=condition=complete \
   job/mx-vllm-rl-job --timeout=15m
@@ -81,6 +93,8 @@ kubectl logs -n "$NAMESPACE" job/mx-vllm-rl-job
 A successful run ends with `E2E PASS` and includes the installed WeightVersion
 UID, worker count, and post-refit generation. Keep worker, server, and coordinator
 logs as separate evidence; the pass line does not by itself qualify throughput
-or delta/S3 behavior. This first slice is the full-weight NIXL lifecycle needed
-by the existing `modelexpress_rl` protocol. For XOR artifact-backed S3 deltas,
+or delta/S3 behavior. The checked-in coordinator exercises the full-weight NIXL
+active-refit lifecycle; it does not qualify canonical S3 delta cold start.
+
+For XOR artifact-backed S3 deltas with a Vime trainer,
 see [`vime_dynamo_delta_refit`](../vime_dynamo_delta_refit/README.md).

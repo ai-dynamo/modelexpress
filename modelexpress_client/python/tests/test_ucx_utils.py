@@ -32,6 +32,29 @@ def test_nic_access_rejects_host_only_uverbs_device(monkeypatch):
     assert not ucx_utils._nic_has_accessible_verbs_device("mlx5_0")
 
 
+def test_flat_pci_topology_scores_local_phb_above_remote_sys(monkeypatch):
+    paths = {
+        "0002:00:01.0": "/sys/devices/pci0002:00/0002:00:01.0",
+        "0002:00:09.0": "/sys/devices/pci0002:00/0002:00:09.0",
+        "0003:00:09.0": "/sys/devices/pci0003:00/0003:00:09.0",
+    }
+    monkeypatch.setattr(
+        ucx_utils.os.path,
+        "realpath",
+        lambda path: paths[path.rsplit("/", 1)[-1]],
+    )
+
+    gpu_path = ucx_utils._pci_path_components("0002:00:01.0")
+    local_nic_path = ucx_utils._pci_path_components("0002:00:09.0")
+    remote_nic_path = ucx_utils._pci_path_components("0003:00:09.0")
+
+    assert gpu_path == ["pci0002:00", "0002:00:01.0"]
+    assert local_nic_path == ["pci0002:00", "0002:00:09.0"]
+    assert remote_nic_path == ["pci0003:00", "0003:00:09.0"]
+    assert ucx_utils._pci_common_depth(gpu_path, local_nic_path) == 1
+    assert ucx_utils._pci_common_depth(gpu_path, remote_nic_path) == 0
+
+
 def _install_fake_topology(monkeypatch, gpus, nics, visible=None):
     """Drive probe_nic_pin_for_device from an in-memory topology.
 
@@ -76,26 +99,93 @@ def _install_fake_topology(monkeypatch, gpus, nics, visible=None):
     )
 
 
+def test_flat_topology_selection_uses_root_complex_when_numa_unknown(monkeypatch):
+    gpu_bdfs = [
+        "0002:00:01.0",
+        "0002:00:02.0",
+        "0002:00:03.0",
+        "0002:00:04.0",
+        "0003:00:01.0",
+        "0003:00:02.0",
+        "0003:00:03.0",
+        "0003:00:04.0",
+    ]
+    nic_bdfs = [
+        ("mlx5_5", "0002:00:09.0"),
+        ("mlx5_6", "0002:00:0a.0"),
+        ("mlx5_7", "0002:00:0b.0"),
+        ("mlx5_8", "0002:00:0c.0"),
+        ("mlx5_9", "0003:00:09.0"),
+        ("mlx5_10", "0003:00:0a.0"),
+        ("mlx5_11", "0003:00:0b.0"),
+        ("mlx5_12", "0003:00:0c.0"),
+    ]
+
+    def _flat_realpath(path):
+        bdf = os.path.basename(path)
+        domain = bdf.split(":", 1)[0]
+        return f"/sys/devices/pci{domain}:00/{bdf}"
+
+    monkeypatch.setattr(ucx_utils.os.path, "realpath", _flat_realpath)
+    gpus = {
+        gpu: (bdf, -1, ucx_utils._pci_path_components(bdf))
+        for gpu, bdf in enumerate(gpu_bdfs)
+    }
+    nics = [
+        (name, -1, 400.0, ucx_utils._pci_path_components(bdf))
+        for name, bdf in nic_bdfs
+    ]
+    _install_fake_topology(monkeypatch, gpus, nics)
+
+    chosen = {gpu: ucx_utils.probe_nic_pin_for_device(gpu) for gpu in gpus}
+
+    # NIC names are the final tiebreak, so mlx5_10 sorts before mlx5_9.
+    assert chosen == {
+        0: "mlx5_5:1",
+        1: "mlx5_6:1",
+        2: "mlx5_7:1",
+        3: "mlx5_8:1",
+        4: "mlx5_10:1",
+        5: "mlx5_11:1",
+        6: "mlx5_12:1",
+        7: "mlx5_9:1",
+    }
+
+
 # Measured on cluster node hx78c: 4 GPUs all on NUMA 1, but the RDMA device
 # plugin handed the pod three rails rooted on NUMA 0 and one on NUMA 1.
 #
 # The paths matter as much as the NUMA numbers, and are the real measured ones.
-# Only GPU3 shares a component with mlx5_11; GPU0/1/2 share nothing with any
-# rail and so score 0 against all four, including the same-socket one. That is
-# not a simplification of the fixture - it is what the metric does on this
-# hardware, because _pci_common_depth drops the root complex. The tests below
-# depend on it, so test_the_fixture_reproduces_the_depth_collapse asserts it.
+# Only GPU3 shares a root complex and bridge with mlx5_11; GPU0/1/2 share
+# nothing with any rail and so score 0 against all four, including the
+# same-socket one.
 _MISAFFINE_GPUS = {
-    0: ("0000:9a:00.0", 1, ["0000:97:01.0", "0000:98:00.0", "0000:9a:00.0"]),
-    1: ("0000:aa:00.0", 1, ["0000:a7:01.0", "0000:a8:00.0", "0000:aa:00.0"]),
-    2: ("0000:ba:00.0", 1, ["0000:b7:01.0", "0000:b8:00.0", "0000:ba:00.0"]),
-    3: ("0000:ca:00.0", 1, ["0000:c7:01.0", "0000:c8:00.0", "0000:ca:00.0"]),
+    0: (
+        "0000:9a:00.0",
+        1,
+        ["pci0000:97", "0000:97:01.0", "0000:98:00.0", "0000:9a:00.0"],
+    ),
+    1: (
+        "0000:aa:00.0",
+        1,
+        ["pci0000:a7", "0000:a7:01.0", "0000:a8:00.0", "0000:aa:00.0"],
+    ),
+    2: (
+        "0000:ba:00.0",
+        1,
+        ["pci0000:b7", "0000:b7:01.0", "0000:b8:00.0", "0000:ba:00.0"],
+    ),
+    3: (
+        "0000:ca:00.0",
+        1,
+        ["pci0000:c7", "0000:c7:01.0", "0000:c8:00.0", "0000:ca:00.0"],
+    ),
 }
 _MISAFFINE_NICS = [
-    ("mlx5_0", 0, 400.0, ["0000:15:01.0", "0000:19:00.0"]),
-    ("mlx5_1", 0, 400.0, ["0000:26:01.0", "0000:2a:00.0"]),
-    ("mlx5_11", 1, 400.0, ["0000:c7:01.0", "0000:cb:00.0"]),
-    ("mlx5_2", 0, 400.0, ["0000:37:01.0", "0000:3b:00.0"]),
+    ("mlx5_0", 0, 400.0, ["pci0000:15", "0000:15:01.0", "0000:19:00.0"]),
+    ("mlx5_1", 0, 400.0, ["pci0000:26", "0000:26:01.0", "0000:2a:00.0"]),
+    ("mlx5_11", 1, 400.0, ["pci0000:c7", "0000:c7:01.0", "0000:cb:00.0"]),
+    ("mlx5_2", 0, 400.0, ["pci0000:37", "0000:37:01.0", "0000:3b:00.0"]),
 ]
 
 

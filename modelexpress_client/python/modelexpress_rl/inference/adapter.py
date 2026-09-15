@@ -22,6 +22,13 @@ class NixlGeneratorSource:
 
     manifest_endpoint: str
     manifest: bytes
+    structural_digest: str
+    """Digest of the manifest's transfer structure, excluding content digests.
+
+    Required rather than defaulted: this is what decides plan reuse, and a
+    resolver that forgot it would fall back to the per-version manifest digest
+    and quietly replan on every refit.
+    """
 
 
 @dataclass(frozen=True)
@@ -39,7 +46,7 @@ class GeneratorSource:
         return (
             "NIXL",
             self.transport.manifest_endpoint,
-            self.manifest_digest,
+            self.transport.structural_digest,
         )
 
 
