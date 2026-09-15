@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
+from collections.abc import Callable
 from contextlib import nullcontext
 from typing import Any
 
@@ -85,8 +86,31 @@ def _is_transient_rpc_error(error: BaseException) -> bool:
     return getattr(status, "name", None) in _TRANSIENT_REPORT_CODES
 
 
+def _broadcast_barrier(
+    lane: LaneCommunicator, barrier: Any, timeout_s: float | None
+) -> None:
+    """Broadcast one device byte over the lane and wait for it, bounded."""
+    stream = lane.stream
+    stream_arg = None if stream is None else stream_handle(stream)
+    lane.handle.broadcast(
+        sendbuf=barrier,
+        recvbuf=barrier,
+        root=0,
+        stream=stream_arg,
+    )
+    lane.synchronize(
+        timeout_s=envs.MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S
+        if timeout_s is None
+        else timeout_s
+    )
+
+
 def _bootstrap_barrier(
-    lane: LaneCommunicator, device: Any, *, timeout_s: float | None = None
+    lane: LaneCommunicator,
+    device: Any,
+    *,
+    timeout_s: float | None = None,
+    alloc: Callable[[Any], Any] | None = None,
 ) -> None:
     """Full-group barrier used between overlapping communicator initializations.
 
@@ -96,7 +120,17 @@ def _bootstrap_barrier(
     ``Communicator.init`` only, and the transfer deadline does not arm until
     bootstrap is done. The caller's ``except BaseException`` aborts the group,
     so a timeout raised here tears it down and forces a fresh epoch.
+
+    ``alloc`` supplies the byte for a worker whose framework is not torch. The
+    buffer is opaque to this path -- it is written and never read, so only the
+    device it sits on matters -- and nccl4py resolves a buffer through the CUDA
+    Array Interface or DLPack, which a ``jax.Array`` satisfies. Leaving it None
+    keeps the torch allocation this path has always used.
     """
+    if alloc is not None:
+        _broadcast_barrier(lane, alloc(device), timeout_s)
+        return
+
     import torch
 
     device_context = torch.cuda.device(device) if device is not None else nullcontext()
@@ -104,21 +138,7 @@ def _bootstrap_barrier(
         barrier = torch.zeros(
             1, dtype=torch.uint8, device=device if device is not None else "cuda"
         )
-        stream = lane.stream
-        stream_arg = (
-            None if stream is None else stream_handle(stream)
-        )
-        lane.handle.broadcast(
-            sendbuf=barrier,
-            recvbuf=barrier,
-            root=0,
-            stream=stream_arg,
-        )
-        lane.synchronize(
-            timeout_s=envs.MX_NCCL_REFIT_COMM_INIT_TIMEOUT_S
-            if timeout_s is None
-            else timeout_s
-        )
+        _broadcast_barrier(lane, barrier, timeout_s)
 
 
 class _RefitClientBase:
@@ -137,6 +157,7 @@ class _RefitClientBase:
         m2n_abi_version: str = "",
         device: Any = None,
         streams: list[Any] | None = None,
+        barrier_alloc: Callable[[Any], Any] | None = None,
     ) -> None:
         self._rendezvous = rendezvous
         self._model_name = model_name
@@ -152,6 +173,7 @@ class _RefitClientBase:
         self._m2n_abi_version = m2n_abi_version or installed_m2n_build()
         self._device = device
         self._streams = list(streams) if streams else [None]
+        self._barrier_alloc = barrier_alloc
 
         # Both modes change what a rank does inside native collectives, so
         # they are read once, hashed into the digest, and handed to the code
@@ -694,7 +716,9 @@ class _RefitClientBase:
                     raise RuntimeError(
                         "broadcast communicator was not initialized first"
                     )
-                _bootstrap_barrier(broadcast, self._device)
+                _bootstrap_barrier(
+                    broadcast, self._device, alloc=self._barrier_alloc
+                )
         except BaseException:
             # Fatal for this worker. Its lease would otherwise keep the group
             # READY at this epoch with the bootstrap ids just aborted, and a
