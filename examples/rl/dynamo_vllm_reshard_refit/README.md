@@ -1,4 +1,4 @@
-# Dynamo + vLLM ModelExpress refit
+# Dynamo + vLLM reshard refit
 
 This example validates the complete inference-side lifecycle designed for
 ModelExpress `WeightVersion` updates:
@@ -42,7 +42,7 @@ docker build -f ci/k8s/server/Dockerfile.server \
   -t "$REGISTRY/modelexpress-server:$MX_COMMIT-dynamo-refit" .
 docker push "$REGISTRY/modelexpress-server:$MX_COMMIT-dynamo-refit"
 
-docker build -f examples/rl/dynamo_vllm_refit/Dockerfile.vllm \
+docker build -f examples/rl/dynamo_vllm_reshard_refit/Dockerfile.vllm \
   -t "$REGISTRY/modelexpress-vllm:a9a17e7-$MX_COMMIT-dynamo-refit" .
 docker push "$REGISTRY/modelexpress-vllm:a9a17e7-$MX_COMMIT-dynamo-refit"
 ```
@@ -72,17 +72,18 @@ export MX_SERVER_IMAGE="$REGISTRY/modelexpress-server:$MX_COMMIT-dynamo-refit"
 export VLLM_ENGINE_IMAGE="$REGISTRY/modelexpress-vllm:a9a17e7-$MX_COMMIT-dynamo-refit"
 export DYNAMO_SIDECAR_IMAGE="$REGISTRY/dynamo-vllm-sidecar:ff95985"
 
-envsubst < examples/rl/dynamo_vllm_refit/server.yaml |
+envsubst < examples/rl/dynamo_vllm_reshard_refit/server.yaml |
   kubectl apply -n "$NAMESPACE" -f -
-envsubst < examples/rl/dynamo_vllm_refit/dgd.yaml |
+envsubst < examples/rl/dynamo_vllm_reshard_refit/dgd.yaml |
   kubectl apply -n "$NAMESPACE" -f -
 
 kubectl wait -n "$NAMESPACE" --for=condition=Ready \
   dgd/mx-vllm-refit --timeout=15m
 
-export RL_COORDINATOR="$(sed 's/^/    /' \
-  examples/rl/dynamo_vllm_refit/rl_coordinator.py)"
-envsubst < examples/rl/dynamo_vllm_refit/rl-job.yaml |
+kubectl create configmap mx-vllm-rl-coordinator -n "$NAMESPACE" \
+  --from-file=rl_coordinator.py=examples/rl/dynamo_vllm_reshard_refit/rl_coordinator.py \
+  --dry-run=client -o yaml | kubectl apply -n "$NAMESPACE" -f -
+envsubst < examples/rl/dynamo_vllm_reshard_refit/rl-job.yaml |
   kubectl apply -n "$NAMESPACE" -f -
 kubectl wait -n "$NAMESPACE" --for=condition=complete \
   job/mx-vllm-rl-job --timeout=15m

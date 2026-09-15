@@ -3,10 +3,9 @@
 
 from contextlib import nullcontext
 
+import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 import pytest
 import torch
-
-import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 from modelexpress import p2p_pb2
 from modelexpress.refit.reshard.rendezvous import (
     PublishedShard,
@@ -29,6 +28,7 @@ from modelexpress_rl.inference.nixl_staged_transfer import (
     _required_agent_metadata,
     _resolve_sources,
     _ResolvedSources,
+    _source_structure,
 )
 
 
@@ -55,6 +55,29 @@ def _manifest(*, agent_name: str, endpoint: str, offset: int, address: int) -> b
             )
         ],
     )
+
+
+def test_source_structure_uses_planner_shard_fields_and_ignores_digest():
+    source = SourceInfo(
+        global_shape=(4,),
+        dtype=torch.float32,
+        elsize=4,
+        shards=[
+            Shard(
+                shard_offset=(0,),
+                shape=(4,),
+                session="trainer-0",
+                addr=100,
+                elsize=4,
+                digest="version-a",
+            )
+        ],
+    )
+
+    expected = _source_structure(source)
+    source.shards[0].digest = "version-b"
+
+    assert _source_structure(source) == expected
 
 
 def test_exact_manifests_resolve_without_legacy_source_discovery():
@@ -270,11 +293,27 @@ def test_transfer_manager_is_closed_after_failed_init_and_only_once(monkeypatch)
 
     transfer = object.__new__(_NixlStagedTransfer)
     transfer._manager = _Manager()
-    transfer._published_peer_rank = None
+    transfer._owns_manager = True
     transfer._closed = False
     transfer.close()
     transfer.close()
     assert calls == ["initialize", "shutdown", "shutdown"]
+
+
+def test_borrowed_manager_is_not_initialized_or_closed():
+    class _Manager:
+        def initialize(self):
+            raise AssertionError("borrowed manager must already be initialized")
+
+        def shutdown(self):
+            raise AssertionError("borrowed manager is owned by the loader")
+
+    transfer = _NixlStagedTransfer(
+        device_id=0,
+        device=torch.device("cpu"),
+        manager=_Manager(),
+    )
+    transfer.close()
 
 
 def test_peer_stage_uses_exact_canonical_tensor_catalog(monkeypatch):
@@ -306,7 +345,6 @@ def test_peer_stage_uses_exact_canonical_tensor_catalog(monkeypatch):
     transfer._manager = _Manager()
     transfer._recv_buffers = {}
     transfer._registered_recv_params = set()
-    transfer._published_peer_rank = None
     transfer._active = None
     transfer._closed = False
     source = p2p_pb2.WorkerMetadata(
@@ -356,86 +394,6 @@ def test_peer_stage_uses_exact_canonical_tensor_catalog(monkeypatch):
             source=source,
             parameter_layout={"weight": ((4,), torch.float32)},
         )
-
-
-def test_peer_republication_unpublishes_active_same_rank_source(monkeypatch):
-    calls = []
-    monkeypatch.setattr(
-        transfer_module,
-        "unpublish_metadata_for_worker",
-        lambda **kwargs: calls.append(("unpublish", kwargs)),
-    )
-    monkeypatch.setattr(
-        transfer_module,
-        "publish_metadata_and_ready",
-        lambda *args, **kwargs: calls.append(("publish", args, kwargs)),
-    )
-    transfer = object.__new__(_NixlStagedTransfer)
-    transfer._manager = object()
-    transfer._device_id = 2
-    transfer._published_peer_rank = 7
-    staged = transfer_module._StagedNixlWeights(
-        tensors={"weight": torch.ones(1)},
-        metrics={},
-    )
-
-    transfer.publish_peer(
-        staged=staged,
-        identity=p2p_pb2.SourceIdentity(model_name="model", revision="version-a"),
-        p2p_client=object(),
-        worker_rank=7,
-        worker_id="generator-7",
-        accelerator="cuda",
-    )
-    transfer.unpublish_peer()
-
-    assert calls[0] == (
-        "unpublish",
-        {"worker_rank": 7, "device_id": 2},
-    )
-    assert calls[1][0] == "publish"
-    assert "worker_grpc_port" not in calls[1][2]
-    assert calls[2] == (
-        "unpublish",
-        {"worker_rank": 7, "device_id": 2},
-    )
-
-
-def test_first_peer_publication_supersedes_boot_time_rank_source(monkeypatch):
-    calls = []
-    monkeypatch.setattr(
-        transfer_module,
-        "unpublish_metadata_for_worker",
-        lambda **kwargs: calls.append(("unpublish", kwargs)),
-    )
-    monkeypatch.setattr(
-        transfer_module,
-        "publish_metadata_and_ready",
-        lambda *args, **kwargs: calls.append(("publish", args, kwargs)),
-    )
-    transfer = object.__new__(_NixlStagedTransfer)
-    transfer._manager = object()
-    transfer._device_id = 2
-    transfer._published_peer_rank = None
-    staged = transfer_module._StagedNixlWeights(
-        tensors={"weight": torch.ones(1)},
-        metrics={},
-    )
-
-    transfer.publish_peer(
-        staged=staged,
-        identity=p2p_pb2.SourceIdentity(model_name="model", revision="version-a"),
-        p2p_client=object(),
-        worker_rank=7,
-        worker_id="generator-7",
-        accelerator="cuda",
-    )
-
-    assert calls[0] == (
-        "unpublish",
-        {"worker_rank": 7, "device_id": 2},
-    )
-    assert calls[1][0] == "publish"
 
 
 def test_registered_workspace_is_reused_only_for_the_same_layout(monkeypatch):
