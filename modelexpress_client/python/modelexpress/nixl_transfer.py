@@ -18,6 +18,7 @@ import atexit
 import logging
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -820,6 +821,7 @@ class NixlTransferManager:
         remote_agent_name: str | None = None,
         require_exact_match: bool = False,
         destination_tensors: dict[str, torch.Tensor] | None = None,
+        on_transfer_start: Callable[[], None] | None = None,
     ) -> tuple[int, int, float]:
         """
         Receive weights from a remote source via NIXL RDMA.
@@ -848,6 +850,8 @@ class NixlTransferManager:
                 transfers leave this False and tolerate subset transfers.
             destination_tensors: Optional registered destination catalog used for
                 name matching. Defaults to the most recently registered catalog.
+            on_transfer_start: Optional callback invoked immediately before the
+                NIXL transfer is submitted.
 
         Returns:
             Tuple of (total_bytes, total_tensors, duration)
@@ -996,9 +1000,10 @@ class NixlTransferManager:
             remote_indices=indices,
             backends=self._backends,
         )
-        self._agent.transfer(handle)
-
         try:
+            if on_transfer_start is not None:
+                on_transfer_start()
+            self._agent.transfer(handle)
             self._wait_for_xfer(handle, timeout_seconds, "Transfer")
         finally:
             self._agent.release_xfer_handle(handle)
