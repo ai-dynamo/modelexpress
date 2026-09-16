@@ -45,6 +45,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger("modelexpress_rl.inference.engines.vllm.installer")
 
 
+def _reserve_runtime_buffer_slots(model: Module, layerwise_info) -> None:
+    """Keep late-created kernel buffers registered while PWAL runs again."""
+    for layer in model.modules():
+        info = layerwise_info.get(layer)
+        if info is None or info.kernel_tensors is None:
+            continue
+        _, buffers = info.kernel_tensors
+        for name, buffer in buffers.items():
+            if name in layer._buffers:
+                continue
+            if hasattr(layer, name):
+                raise IncompleteRefit(
+                    f"{type(layer).__name__}.{name} conflicts with a runtime buffer"
+                )
+            layer.register_buffer(name, buffer)
+
+
 class _VllmInstaller(EngineInstaller):
     """Capture vLLM's load layout and install verified staged tensors."""
 
@@ -297,6 +314,7 @@ class _VllmInstaller(EngineInstaller):
         try:
             from vllm.config import set_current_vllm_config
             from vllm.model_executor.model_loader.reload.layerwise import (
+                LAYERWISE_INFO,
                 finalize_layerwise_reload,
                 initialize_layerwise_reload,
             )
@@ -323,6 +341,7 @@ class _VllmInstaller(EngineInstaller):
 
         with torch.device(self._device), set_current_vllm_config(self._vllm_config):
             initialize_layerwise_reload(self._model)
+            _reserve_runtime_buffer_slots(self._model, LAYERWISE_INFO)
             load()
             finalize_layerwise_reload(self._model, self._model_config)
 

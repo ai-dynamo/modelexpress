@@ -887,6 +887,7 @@ class NixlTransferManager:
         remote_descs: list[tuple[int, int, int]] = []
         local_descs: list[tuple[int, int, int]] = []
         total_bytes = 0
+        matched_tensors = 0
 
         for src_tensor in source_tensors:
             local_tensor = local_tensors.get(src_tensor.name)
@@ -906,6 +907,9 @@ class NixlTransferManager:
                     f"Tensor '{src_tensor.name}' dtype mismatch: "
                     f"source={src_tensor.dtype!r}, local={local_dtype!r}"
                 )
+            matched_tensors += 1
+            if src_tensor.size == 0:
+                continue
             remote_descs.append(
                 (src_tensor.addr, src_tensor.size, src_tensor.device_id)
             )
@@ -918,7 +922,6 @@ class NixlTransferManager:
             )
             total_bytes += src_tensor.size
 
-        matched_tensors = len(remote_descs)
         match_time = time.perf_counter() - match_start
 
         # Downgraded to `partial` by the name-diff check below, which does not
@@ -957,7 +960,7 @@ class NixlTransferManager:
                 len(source_only),
             )
 
-        if not remote_descs:
+        if matched_tensors == 0:
             if require_exact_match:
                 transfer_metrics.record_nixl_receive("rejected")
                 raise ManifestMismatchError(
@@ -966,6 +969,11 @@ class NixlTransferManager:
             logger.warning("No matching tensors found for transfer")
             transfer_metrics.record_nixl_receive("empty")
             return 0, 0, 0.0
+
+        if not remote_descs:
+            logger.info("All %d matching tensors are empty", matched_tensors)
+            transfer_metrics.record_nixl_receive(receive_result)
+            return 0, matched_tensors, 0.0
 
         logger.info(
             f"[TIMING] match_tensors: {match_time:.3f}s "
