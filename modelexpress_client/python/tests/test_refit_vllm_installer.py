@@ -457,14 +457,17 @@ def test_streaming_detects_retained_arena_storage_in_batch_or_at_the_end(
     assert yielded == (["0.weight"] if when == "touched" else ["0.weight", "1.weight"])
 
 
-def test_streaming_hoists_layout_walks_and_keeps_one_scan_per_batch(monkeypatch):
-    """Only the retention scan may repeat per batch.
+def test_streaming_hoists_only_the_name_only_layout_walk(monkeypatch):
+    """Exactly two walks per batch: resolve against the live tree, then scan it.
 
-    Name resolution and owning-module membership are properties of the pinned
-    load layout, so they are hoisted out of the batch loop. The arena-retention
-    scan is not: it has to see the tree as it stands before each refill, so it
-    walks per batch by necessity. Extra batches must therefore add exactly one
-    walk each -- more would mean a hoistable walk crept back into the loop.
+    Owning-module membership is expressed purely in names, so the pinned load
+    layout answers it once for the whole install. The other two walks cannot be
+    hoisted, because both depend on what the tree looks like right now rather
+    than at the start: resolution must not pin a module object a hook may have
+    replaced, and the retention scan must see any view stashed before the
+    refill. Extra batches may therefore add exactly two walks each -- three
+    would mean the membership walk fell back into the loop, one would mean a
+    live check got hoisted.
     """
     _install_fake_vllm(monkeypatch, lambda model: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
@@ -498,10 +501,10 @@ def test_streaming_hoists_layout_walks_and_keeps_one_scan_per_batch(monkeypatch)
         assert all(torch.equal(p, torch.ones(2, 2)) for p in model.parameters())
         return len(walks)
 
-    # Reload setup, the hoisted layout walk and the final sweep are fixed per
-    # install. Six single-parameter batches replace one six-parameter batch, so
-    # the only admissible difference is the five extra per-batch scans.
-    assert walks_for(1) - walks_for(6) == 5
+    # Reload setup, the hoisted membership walk and the final sweep are fixed
+    # per install. Six single-parameter batches replace one six-parameter batch,
+    # so the only admissible difference is five extra resolve-and-scan pairs.
+    assert walks_for(1) - walks_for(6) == 2 * 5
 
 
 @pytest.mark.parametrize("mode", ["consume_then_remove", "new_module"])

@@ -260,20 +260,21 @@ class _VllmInstaller(EngineInstaller):
                 raise IncompleteRefit(
                     "streaming parameter coverage differs from the live load layout"
                 )
-            # Name resolution and owning-module membership are properties of the
-            # load layout, which `expected` has just pinned, so one walk serves
-            # every batch and removes two of the three the install used to make.
-            # The arena-retention scan is not such a property and still walks
-            # the live tree per batch; see the scan below.
+            # Owning-module membership is a property of the load layout that
+            # `expected` has just pinned, and it is expressed purely in names,
+            # so one walk answers it for every batch. Nothing that pins a module
+            # *object* may be hoisted alongside it: a hook can replace a
+            # submodule between batches, and a stale object would still satisfy
+            # the name check while the install wrote into a detached module.
+            # Resolution therefore stays inside _process_and_commit, where it
+            # runs against the live tree.
             owner_of: dict[str, str] = {}
             owned_by: dict[str, set[str]] = {}
-            resolved: dict[str, tuple[Module, str]] = {}
             for module_name, module in self._model.named_modules():
                 owned = set()
                 for leaf, _ in module.named_parameters(recurse=False):
                     full_name = f"{module_name}.{leaf}" if module_name else leaf
                     owned.add(full_name)
-                    resolved[full_name] = (module, leaf)
                 owned_by[module_name] = owned
                 for name in owned:
                     owner_of[name] = module_name
@@ -294,7 +295,7 @@ class _VllmInstaller(EngineInstaller):
                                 "streaming batch splits an owning module"
                             )
                     commit_started = time.perf_counter()
-                    self._process_and_commit(tensors, reload=False, resolved=resolved)
+                    self._process_and_commit(tensors, reload=False)
                     arena_storage = {
                         tensor.untyped_storage().data_ptr()
                         for tensor in tensors.values()
@@ -398,7 +399,6 @@ class _VllmInstaller(EngineInstaller):
         tensors: dict[str, torch.Tensor],
         *,
         reload: bool = True,
-        resolved: dict[str, tuple[Module, str]] | None = None,
     ) -> None:
         """Run vLLM's per-layer post-load processing into graph-bound storage.
 
@@ -425,27 +425,17 @@ class _VllmInstaller(EngineInstaller):
         def load() -> None:
             # Quantized models expose kernel-packed parameters before layerwise
             # reload and load-time parameters after it. Resolve the captured
-            # names only after vLLM has restored that load-time hierarchy.
-            # A caller already inside that window may pass the resolution in
-            # (streaming does, once per install) to avoid walking the model
-            # for every batch.
+            # names only after vLLM has restored that load-time hierarchy, and
+            # resolve them on every call: a streaming install runs this once per
+            # batch, and a hook may have replaced a module since the last one.
             groups: dict[Module, list[tuple[str, str]]] = {}
             matched: set[str] = set()
-            if resolved is not None:
-                for full_name in tensors:
-                    entry = resolved.get(full_name)
-                    if entry is None:
-                        continue
-                    module, leaf = entry
-                    groups.setdefault(module, []).append((full_name, leaf))
-                    matched.add(full_name)
-            else:
-                for module_name, module in self._model.named_modules():
-                    for leaf, _parameter in module.named_parameters(recurse=False):
-                        full_name = f"{module_name}.{leaf}" if module_name else leaf
-                        if full_name in tensors:
-                            groups.setdefault(module, []).append((full_name, leaf))
-                            matched.add(full_name)
+            for module_name, module in self._model.named_modules():
+                for leaf, _parameter in module.named_parameters(recurse=False):
+                    full_name = f"{module_name}.{leaf}" if module_name else leaf
+                    if full_name in tensors:
+                        groups.setdefault(module, []).append((full_name, leaf))
+                        matched.add(full_name)
             unmatched = sorted(set(tensors) - matched)
             if unmatched:
                 raise IncompleteRefit(
