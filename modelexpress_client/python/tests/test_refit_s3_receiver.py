@@ -1631,6 +1631,7 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
     transfer.stage_peer.return_value = SimpleNamespace(
         tensors={"weight": tensors[2]}, metrics={}
     )
+    transfer.receive_peer.return_value = {}
     peer_method = RuntimeTensorNixlUpdateMethod(
         transfer=transfer, runtime_tensors={"weight": tensors[0]}
     )
@@ -1668,7 +1669,11 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
         assert adapter._checkpoint.store.state().version == (
             "delta-1" if use_peer_for_second_delta else "delta-2"
         )
-        assert transfer.stage_peer.call_count == int(use_peer_for_second_delta)
+        assert staged._update.plan.source.kind is (
+            WeightSource.GENERATOR
+            if use_peer_for_second_delta
+            else WeightSource.OBJECT_STORAGE
+        )
         storage.calls.clear()
 
         staged = generator.stage_weight(version=WeightVersionRef("delta-3"))
