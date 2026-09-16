@@ -260,12 +260,13 @@ class _VllmInstaller(EngineInstaller):
                 raise IncompleteRefit(
                     "streaming parameter coverage differs from the live load layout"
                 )
-            # One walk of the module tree serves every batch. Per-batch work is
-            # then proportional to the batch, not to the model, so a smaller
-            # arena (more batches) does not multiply installation time.
+            # Name resolution and owning-module membership are properties of the
+            # load layout, which `expected` has just pinned, so one walk serves
+            # every batch and removes two of the three the install used to make.
+            # The arena-retention scan is not such a property and still walks
+            # the live tree per batch; see the scan below.
             owner_of: dict[str, str] = {}
             owned_by: dict[str, set[str]] = {}
-            module_by_name: dict[str, Module] = {}
             resolved: dict[str, tuple[Module, str]] = {}
             for module_name, module in self._model.named_modules():
                 owned = set()
@@ -273,7 +274,6 @@ class _VllmInstaller(EngineInstaller):
                     full_name = f"{module_name}.{leaf}" if module_name else leaf
                     owned.add(full_name)
                     resolved[full_name] = (module, leaf)
-                module_by_name[module_name] = module
                 owned_by[module_name] = owned
                 for name in owned:
                     owner_of[name] = module_name
@@ -299,14 +299,17 @@ class _VllmInstaller(EngineInstaller):
                         tensor.untyped_storage().data_ptr()
                         for tensor in tensors.values()
                     }
-                    arena_storages |= arena_storage
-                    # The modules this batch loaded are the ones whose loaders
-                    # saw arena views, so they are checked before the arena can
-                    # be refilled. Anything stashed elsewhere is caught by the
-                    # whole-model sweep after the last batch.
+                    # A loader may stash an arena view anywhere, including on a
+                    # module this batch did not touch and on one it creates, so
+                    # only a live whole-model walk can clear the arena for
+                    # refill. Deferring any part of it to a post-install sweep
+                    # is not equivalent: by then the arena has been overwritten,
+                    # a consumer may have already committed the changed value,
+                    # and a reference that was read and deleted leaves nothing
+                    # to find.
                     scan_started = time.perf_counter()
-                    for module_name in touched:
-                        if retains_arena(module_by_name[module_name], arena_storage):
+                    for module in self._model.modules():
+                        if retains_arena(module, arena_storage):
                             raise IncompleteRefit(
                                 "engine retained bounded staging storage; restart required"
                             )
@@ -320,8 +323,12 @@ class _VllmInstaller(EngineInstaller):
                 raise IncompleteRefit(
                     "streaming transfer ended before every parameter was installed"
                 )
+            # Every batch already cleared its own arena against the live tree.
+            # This repeats the check over every arena the install used, walking
+            # the tree as it now stands rather than as it was cached, so a
+            # module added during the final batch is still covered.
             scan_started = time.perf_counter()
-            for module in module_by_name.values():
+            for module in self._model.modules():
                 if retains_arena(module, arena_storages):
                     raise IncompleteRefit(
                         "engine retained bounded staging storage; restart required"

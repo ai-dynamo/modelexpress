@@ -457,8 +457,15 @@ def test_streaming_detects_retained_arena_storage_in_batch_or_at_the_end(
     assert yielded == (["0.weight"] if when == "touched" else ["0.weight", "1.weight"])
 
 
-def test_streaming_module_walks_do_not_scale_with_batch_count(monkeypatch):
-    """Per-batch work is proportional to the batch, not the model."""
+def test_streaming_hoists_layout_walks_and_keeps_one_scan_per_batch(monkeypatch):
+    """Only the retention scan may repeat per batch.
+
+    Name resolution and owning-module membership are properties of the pinned
+    load layout, so they are hoisted out of the batch loop. The arena-retention
+    scan is not: it has to see the tree as it stands before each refill, so it
+    walks per batch by necessity. Extra batches must therefore add exactly one
+    walk each -- more would mean a hoistable walk crept back into the loop.
+    """
     _install_fake_vllm(monkeypatch, lambda model: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
 
@@ -491,6 +498,87 @@ def test_streaming_module_walks_do_not_scale_with_batch_count(monkeypatch):
         assert all(torch.equal(p, torch.ones(2, 2)) for p in model.parameters())
         return len(walks)
 
-    # Reload setup and derived-weight refresh walk the model a fixed number of
-    # times per install; the batch loop must not add to that.
-    assert walks_for(6) == walks_for(1)
+    # Reload setup, the hoisted layout walk and the final sweep are fixed per
+    # install. Six single-parameter batches replace one six-parameter batch, so
+    # the only admissible difference is the five extra per-batch scans.
+    assert walks_for(1) - walks_for(6) == 5
+
+
+@pytest.mark.parametrize("mode", ["consume_then_remove", "new_module"])
+def test_streaming_rejects_cross_module_retention_before_arena_reuse(monkeypatch, mode):
+    """A stash anywhere must be caught before the arena is refilled.
+
+    Narrowing the per-batch scan to the modules a batch touched, and deferring
+    the rest to a post-install sweep, is not equivalent. `consume_then_remove`
+    stashes an arena view on an untouched module, lets the refill change it, has
+    a later hook commit the changed value and delete the stash -- the sweep then
+    finds nothing and the install silently reports success with wrong bytes.
+    `new_module` stashes on a module created during installation, which a sweep
+    over a cached module list never visits.
+    """
+    model = nn.Module()
+    model.first = nn.Linear(1, 1, bias=False)
+    model.second = nn.Linear(1, 1, bias=False)
+    model.other = nn.Module()
+    names = frozenset(dict(model.named_parameters()))
+
+    class Info:
+        def __init__(self, parameter):
+            self.kernel_tensors = ({"weight": parameter}, {})
+
+        def reset(self):
+            self.kernel_tensors = None
+
+    def initialize(target):
+        for layer in (target.first, target.second):
+            layerwise.LAYERWISE_INFO[layer] = Info(layer.weight)
+            layer.weight = nn.Parameter(torch.empty_like(layer.weight, device="meta"))
+
+    _install_fake_vllm(monkeypatch, initialize)
+    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
+    quant_base = sys.modules[
+        "vllm.model_executor.layers.quantization.base_config"
+    ].QuantizeMethodBase
+
+    def commit(layer, info):
+        original = info.kernel_tensors[0]["weight"]
+        original.data.copy_(layer.weight)
+        layer.weight = original
+
+    monkeypatch.setattr(layerwise, "_copy_and_restore_kernel_tensors", commit)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+
+    class FirstHook(quant_base):
+        def process_weights_after_loading(self, layer):
+            if mode == "new_module":
+                model.dynamic = nn.Module()
+                model.dynamic.stash = layer.weight.detach()
+            else:
+                model.other.stash = layer.weight.detach()
+
+    class SecondHook(quant_base):
+        def process_weights_after_loading(self, layer):
+            if mode == "consume_then_remove":
+                layer.weight = nn.Parameter(layer.weight + model.other.stash)
+                del model.other.stash
+
+    model.first.quant_method = FirstHook()
+    model.second.quant_method = SecondHook()
+    arena = torch.ones(1, 1)
+    refilled = []
+
+    def batches():
+        yield {"first.weight": arena}
+        refilled.append(True)
+        arena.fill_(2)
+        yield {"second.weight": arena}
+
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
+    )
+    with pytest.raises(IncompleteRefit, match="retained bounded staging storage"):
+        installer.install_streaming(PreparedStreamingTensors(batches, names, {}))
+    assert not refilled, "retention must be rejected before the arena is reused"
