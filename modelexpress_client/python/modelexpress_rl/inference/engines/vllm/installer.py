@@ -299,6 +299,7 @@ class _VllmInstaller(EngineInstaller):
                         tensor.untyped_storage().data_ptr()
                         for tensor in tensors.values()
                     }
+                    arena_storages |= arena_storage
                     # A loader may stash an arena view anywhere, including on a
                     # module this batch did not touch and on one it creates, so
                     # only a live whole-model walk can clear the arena for

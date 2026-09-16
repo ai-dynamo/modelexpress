@@ -582,3 +582,59 @@ def test_streaming_rejects_cross_module_retention_before_arena_reuse(monkeypatch
     with pytest.raises(IncompleteRefit, match="retained bounded staging storage"):
         installer.install_streaming(PreparedStreamingTensors(batches, names, {}))
     assert not refilled, "retention must be rejected before the arena is reused"
+
+
+@pytest.mark.parametrize("cleanup_point", ["generator_finally", "iterator_close"])
+def test_final_sweep_rejects_arena_exposed_by_producer_cleanup(
+    monkeypatch, cleanup_point
+):
+    """The closing sweep must cover every arena the install used.
+
+    A producer can expose an arena reference in its own cleanup -- a generator's
+    `finally`, or an iterator's `close()` -- which runs after the last per-batch
+    scan. Only the sweep can catch that, and only if it tests the union of every
+    batch's storage rather than an empty set.
+    """
+    _install_fake_vllm(monkeypatch, lambda model: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    model = nn.Sequential(nn.Linear(2, 2, bias=False))
+    names = frozenset(dict(model.named_parameters()))
+    arena = torch.ones(2, 2)
+    cleanup_calls = []
+
+    def expose_arena():
+        model[0].stash = arena.view(-1)
+        cleanup_calls.append(cleanup_point)
+
+    def generator():
+        try:
+            yield {"0.weight": arena}
+        finally:
+            expose_arena()
+
+    class CloseableIterator:
+        def __init__(self):
+            self.yielded = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.yielded:
+                raise StopIteration
+            self.yielded = True
+            return {"0.weight": arena}
+
+        def close(self):
+            expose_arena()
+
+    batches = generator if cleanup_point == "generator_finally" else CloseableIterator
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
+    )
+    with pytest.raises(IncompleteRefit, match="retained bounded staging storage"):
+        installer.install_streaming(PreparedStreamingTensors(batches, names, {}))
+    assert cleanup_calls == [cleanup_point]
