@@ -457,17 +457,14 @@ def test_streaming_detects_retained_arena_storage_in_batch_or_at_the_end(
     assert yielded == (["0.weight"] if when == "touched" else ["0.weight", "1.weight"])
 
 
-def test_streaming_hoists_only_the_name_only_layout_walk(monkeypatch):
-    """Exactly two walks per batch: resolve against the live tree, then scan it.
+def test_streaming_makes_exactly_two_live_walks_per_batch(monkeypatch):
+    """Resolve-and-check against the live tree, then scan it. Nothing cached.
 
-    Owning-module membership is expressed purely in names, so the pinned load
-    layout answers it once for the whole install. The other two walks cannot be
-    hoisted, because both depend on what the tree looks like right now rather
-    than at the start: resolution must not pin a module object a hook may have
-    replaced, and the retention scan must see any view stashed before the
-    refill. Extra batches may therefore add exactly two walks each -- three
-    would mean the membership walk fell back into the loop, one would mean a
-    live check got hoisted.
+    Neither question survives being answered early: a hook can replace a module
+    between batches, and it can add a Parameter to a module a later batch owns.
+    So resolution and the complete-owner check share one walk, the retention
+    scan takes another, and extra batches add exactly two each. Three would mean
+    the shared walk split back apart; one would mean a live check was hoisted.
     """
     _install_fake_vllm(monkeypatch, lambda model: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
@@ -501,9 +498,9 @@ def test_streaming_hoists_only_the_name_only_layout_walk(monkeypatch):
         assert all(torch.equal(p, torch.ones(2, 2)) for p in model.parameters())
         return len(walks)
 
-    # Reload setup, the hoisted membership walk and the final sweep are fixed
-    # per install. Six single-parameter batches replace one six-parameter batch,
-    # so the only admissible difference is five extra resolve-and-scan pairs.
+    # Reload setup and the final sweep are fixed per install. Six
+    # single-parameter batches replace one six-parameter batch, so the only
+    # admissible difference is five extra resolve-and-scan pairs.
     assert walks_for(1) - walks_for(6) == 2 * 5
 
 
@@ -641,3 +638,73 @@ def test_final_sweep_rejects_arena_exposed_by_producer_cleanup(
     with pytest.raises(IncompleteRefit, match="retained bounded staging storage"):
         installer.install_streaming(PreparedStreamingTensors(batches, names, {}))
     assert cleanup_calls == [cleanup_point]
+
+
+def test_added_live_parameter_invalidates_captured_owner_completeness(monkeypatch):
+    """Owner completeness is a live question, not a property of the capture.
+
+    A hook can add a Parameter to a module a later batch owns, so a batch that
+    covered its owner completely when the layout was captured no longer does by
+    the time it arrives. Resolving only the supplied names cannot see that, so
+    the check has to ask the live tree what the owner holds now -- and reject
+    before the incomplete owner's hook runs.
+    """
+    model = nn.Module()
+    model.first = nn.Linear(2, 2, bias=False)
+    model.second = nn.Linear(2, 2, bias=False)
+    names = frozenset(dict(model.named_parameters()))
+
+    class Info:
+        def __init__(self, parameter):
+            self.kernel_tensors = ({"weight": parameter}, {})
+
+        def reset(self):
+            self.kernel_tensors = None
+
+    def initialize(target):
+        for layer in (target.first, target.second):
+            layerwise.LAYERWISE_INFO[layer] = Info(layer.weight)
+            layer.weight = nn.Parameter(torch.empty_like(layer.weight, device="meta"))
+
+    _install_fake_vllm(monkeypatch, initialize)
+    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
+    quant_base = sys.modules[
+        "vllm.model_executor.layers.quantization.base_config"
+    ].QuantizeMethodBase
+
+    def commit(layer, info):
+        original = info.kernel_tensors[0]["weight"]
+        original.data.copy_(layer.weight)
+        layer.weight = original
+
+    monkeypatch.setattr(layerwise, "_copy_and_restore_kernel_tensors", commit)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    hook_calls = []
+
+    class FirstHook(quant_base):
+        def process_weights_after_loading(self, layer):
+            # Independent storage, so this is a completeness question rather
+            # than an arena-retention one.
+            model.second.bias = nn.Parameter(torch.full((2,), 7.0))
+            hook_calls.append("added_second_bias")
+
+    class SecondHook(quant_base):
+        def process_weights_after_loading(self, layer):
+            hook_calls.append("processed_incomplete_second_owner")
+
+    model.first.quant_method = FirstHook()
+    model.second.quant_method = SecondHook()
+
+    def batches():
+        yield {"first.weight": torch.ones(2, 2)}
+        yield {"second.weight": torch.full((2, 2), 2.0)}
+
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
+    )
+    with pytest.raises(IncompleteRefit, match="streaming batch splits an owning module"):
+        installer.install_streaming(PreparedStreamingTensors(batches, names, {}))
+    assert hook_calls == ["added_second_bias"]

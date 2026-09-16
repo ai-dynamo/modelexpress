@@ -236,7 +236,11 @@ class _VllmInstaller(EngineInstaller):
         metrics = prepared.transfer_metrics
         load_s = 0.0
         commit_s = 0.0
-        scan_s = 0.0
+        setup_s = 0.0
+        batch_scan_s = 0.0
+        final_scan_s = 0.0
+        batch_scans = 0
+        final_scans = 0
 
         def retains_arena(module: Module, arena_storage: set[int]) -> bool:
             values = [
@@ -253,31 +257,21 @@ class _VllmInstaller(EngineInstaller):
             )
 
         def load():
-            nonlocal load_s, commit_s, scan_s
+            nonlocal load_s, commit_s
+            nonlocal setup_s, batch_scan_s, final_scan_s, batch_scans, final_scans
             load_started = time.perf_counter()
             expected = set(dict(self._model.named_parameters()))
             if expected != prepared.parameter_names:
                 raise IncompleteRefit(
                     "streaming parameter coverage differs from the live load layout"
                 )
-            # Owning-module membership is a property of the load layout that
-            # `expected` has just pinned, and it is expressed purely in names,
-            # so one walk answers it for every batch. Nothing that pins a module
-            # *object* may be hoisted alongside it: a hook can replace a
-            # submodule between batches, and a stale object would still satisfy
-            # the name check while the install wrote into a detached module.
-            # Resolution therefore stays inside _process_and_commit, where it
-            # runs against the live tree.
-            owner_of: dict[str, str] = {}
-            owned_by: dict[str, set[str]] = {}
-            for module_name, module in self._model.named_modules():
-                owned = set()
-                for leaf, _ in module.named_parameters(recurse=False):
-                    full_name = f"{module_name}.{leaf}" if module_name else leaf
-                    owned.add(full_name)
-                owned_by[module_name] = owned
-                for name in owned:
-                    owner_of[name] = module_name
+            # Nothing about the module tree may be cached across batches. A
+            # hook can replace a module, so a pinned module object goes stale;
+            # it can also add a Parameter to a module a later batch owns, so
+            # pinned owner membership goes stale too and a batch that was
+            # complete when the layout was captured no longer is. Resolution and
+            # the complete-owner check therefore both run against the live tree
+            # inside _process_and_commit, sharing the one walk it already makes.
             installed = set()
             arena_storages: set[int] = set()
             batches = prepared.batches()
@@ -288,19 +282,15 @@ class _VllmInstaller(EngineInstaller):
                         raise IncompleteRefit(
                             "invalid or repeated streaming parameter batch"
                         )
-                    touched = {owner_of[name] for name in names}
-                    for module_name in touched:
-                        if not owned_by[module_name] <= names:
-                            raise IncompleteRefit(
-                                "streaming batch splits an owning module"
-                            )
                     commit_started = time.perf_counter()
                     self._process_and_commit(tensors, reload=False)
+                    setup_started = time.perf_counter()
                     arena_storage = {
                         tensor.untyped_storage().data_ptr()
                         for tensor in tensors.values()
                     }
                     arena_storages |= arena_storage
+                    setup_s += time.perf_counter() - setup_started
                     # A loader may stash an arena view anywhere, including on a
                     # module this batch did not touch and on one it creates, so
                     # only a live whole-model walk can clear the arena for
@@ -315,7 +305,8 @@ class _VllmInstaller(EngineInstaller):
                             raise IncompleteRefit(
                                 "engine retained bounded staging storage; restart required"
                             )
-                    scan_s += time.perf_counter() - scan_started
+                    batch_scan_s += time.perf_counter() - scan_started
+                    batch_scans += 1
                     installed.update(names)
                     torch.cuda.synchronize(self._device)
                     commit_s += time.perf_counter() - commit_started
@@ -335,14 +326,23 @@ class _VllmInstaller(EngineInstaller):
                     raise IncompleteRefit(
                         "engine retained bounded staging storage; restart required"
                     )
-            scan_s += time.perf_counter() - scan_started
+            final_scan_s += time.perf_counter() - scan_started
+            final_scans += 1
             load_s = time.perf_counter() - load_started
 
         reload_started = time.perf_counter()
         self._reload(load)
         metrics["reload_s"] = time.perf_counter() - reload_started - load_s
         metrics["install_commit_s"] = commit_s
-        metrics["retention_scan_s"] = scan_s
+        # The per-batch scans are inside install_commit_s; the final sweep is
+        # not, and is not in reload_s either, so it is reported on its own and
+        # must be added explicitly rather than read out of the residual.
+        metrics["retention_arena_setup_s"] = setup_s
+        metrics["retention_batch_scan_s"] = batch_scan_s
+        metrics["retention_final_scan_s"] = final_scan_s
+        metrics["retention_batch_scans"] = batch_scans
+        metrics["retention_final_scans"] = final_scans
+        metrics["retention_scan_s"] = batch_scan_s + final_scan_s
         derived_started = time.perf_counter()
         _update_mla_absorbed_weights(self._model, quantized=False)
         torch.cuda.synchronize(self._device)
@@ -431,11 +431,25 @@ class _VllmInstaller(EngineInstaller):
             groups: dict[Module, list[tuple[str, str]]] = {}
             matched: set[str] = set()
             for module_name, module in self._model.named_modules():
+                owned = set()
                 for leaf, _parameter in module.named_parameters(recurse=False):
                     full_name = f"{module_name}.{leaf}" if module_name else leaf
+                    owned.add(full_name)
                     if full_name in tensors:
                         groups.setdefault(module, []).append((full_name, leaf))
                         matched.add(full_name)
+                # Streaming installs an owning module at a time, so a batch
+                # covering only part of one must be rejected before any hook
+                # runs. This asks the live tree for the same reason resolution
+                # does: an earlier hook can add a Parameter to a module a later
+                # batch owns, making a batch that was complete at capture
+                # incomplete by the time it arrives.
+                if (
+                    not reload
+                    and owned & tensors.keys()
+                    and not owned <= tensors.keys()
+                ):
+                    raise IncompleteRefit("streaming batch splits an owning module")
             unmatched = sorted(set(tensors) - matched)
             if unmatched:
                 raise IncompleteRefit(
