@@ -141,13 +141,10 @@ def _stage(monkeypatch, *, nbytes: int, wire_s: float):
     return transfer.stage(prepared)
 
 
-def _peer_stage(monkeypatch, *, nbytes: int, wire_s: float):
-    """Run stage_peer() with the manager reporting a scripted transfer."""
+def _peer_receive(monkeypatch, *, nbytes: int, wire_s: float):
+    """Run receive_peer() with the manager reporting a scripted transfer."""
 
     class _Manager:
-        def register_tensors(self, tensors) -> None:
-            pass
-
         def add_remote_agent(self, metadata) -> str:
             return "peer-agent"
 
@@ -160,7 +157,6 @@ def _peer_stage(monkeypatch, *, nbytes: int, wire_s: float):
         def remove_remote_agent(self, agent_name) -> None:
             pass
 
-    monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
     manifest = p2p_pb2.GetTensorManifestResponse(
         mx_source_id="source-1",
         worker_id="worker-1",
@@ -181,11 +177,8 @@ def _peer_stage(monkeypatch, *, nbytes: int, wire_s: float):
         def __init__(self):
             self.manifest = manifest
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return None
+        def close(self):
+            pass
 
     monkeypatch.setattr(
         transfer_module,
@@ -199,17 +192,20 @@ def _peer_stage(monkeypatch, *, nbytes: int, wire_s: float):
     transfer._device_id = DEVICE_ID
     transfer._timeout = 30.0
     transfer._manager = _Manager()
-    transfer._recv_buffers = {}
-    transfer._registered_recv_params = set()
-    transfer._active = None
     source = p2p_pb2.WorkerMetadata(
         worker_grpc_endpoint="127.0.0.1:18000",
     )
-    return transfer.stage_peer(
+    live = {"weight": torch.empty(4, dtype=torch.float32)}
+    tensor_read = transfer.prepare_peer_read(
         source=source,
         mx_source_id="source-1",
         worker_id="worker-1",
-        parameter_layout={"weight": ((4,), torch.float32)},
+        destination_tensors=live,
+    )
+    return transfer.receive_peer(
+        tensor_read=tensor_read,
+        destination_tensors=live,
+        on_transfer_start=lambda: None,
     )
 
 
@@ -281,17 +277,17 @@ def test_the_peer_pull_is_covered_too(monkeypatch, caplog):
     path silent on the failure the floor is for."""
     _floor(monkeypatch, FLOOR_GBPS)
     with caplog.at_level(logging.WARNING):
-        _peer_stage(monkeypatch, nbytes=SLOW_BYTES, wire_s=SLOW_WIRE_S)
+        _peer_receive(monkeypatch, nbytes=SLOW_BYTES, wire_s=SLOW_WIRE_S)
 
     payload = _record(caplog)
-    assert payload["phase"] == "stage_peer"
+    assert payload["phase"] == "receive_peer"
     assert payload["implied_gbps"] == pytest.approx(12.4, abs=0.2)
 
 
 def test_a_healthy_peer_pull_is_silent(monkeypatch, caplog):
     _floor(monkeypatch, FLOOR_GBPS)
     with caplog.at_level(logging.WARNING):
-        _peer_stage(monkeypatch, nbytes=SLOW_BYTES, wire_s=FAST_WIRE_S)
+        _peer_receive(monkeypatch, nbytes=SLOW_BYTES, wire_s=FAST_WIRE_S)
 
     assert not _records(caplog)
 

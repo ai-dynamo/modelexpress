@@ -193,6 +193,7 @@ class _Adapter:
         self.stage_failures = 0
         self.apply_failure = False
         self.installation_context_failure = False
+        self.installation_context_mutated = False
         self.installation_failure_calls = []
         self.preparation_failure_calls = 0
         self.preparation_recovery_failure = False
@@ -323,6 +324,10 @@ class _TestMethod(UpdateMethod):
 
     def installation_failed(self, prepared):
         self._adapter.installation_failure_calls.append(prepared)
+
+    def mutated_during_installation_context(self, prepared):
+        del prepared
+        return self._adapter.installation_context_mutated
 
     def preparation_failed(self):
         self._adapter.preparation_failure_calls += 1
@@ -1714,6 +1719,54 @@ def test_streaming_client_holds_lease_and_fences_partial_install(
     finally:
         generator.close()
         server.stop(grace=None).wait()
+
+
+def test_generator_republishes_after_pretransfer_failure(monkeypatch):
+    server, endpoint, service = _start_server()
+    adapter = _Adapter(service)
+    adapter.installation_context_failure = True
+    events = []
+    adapter.unpublish_runtime_tensors = lambda: events.append("unpublish")
+    adapter.publish_runtime_tensors = (
+        lambda version_id: events.append(f"publish:{version_id}")
+    )
+    generator = _initialize(
+        monkeypatch,
+        endpoint,
+        adapter,
+        initial_serving_version_id="base-a",
+    )
+
+    try:
+        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+        with pytest.raises(RuntimeError, match="installation context failed"):
+            generator.apply_weight(staged)
+        staged.release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert events == ["unpublish", "publish:base-a"]
+
+
+def test_generator_fences_when_installation_context_mutated_before_failure(monkeypatch):
+    server, endpoint, service = _start_server()
+    adapter = _Adapter(service)
+    adapter.installation_context_failure = True
+    adapter.installation_context_mutated = True
+    generator = _initialize(monkeypatch, endpoint, adapter)
+
+    try:
+        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+        with pytest.raises(RuntimeError, match="installation context failed"):
+            generator.apply_weight(staged)
+        staged.release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert len(adapter.installation_failure_calls) == 1
+    assert adapter.apply_calls == []
 
 
 def test_generator_rejects_non_ready_version_before_leasing(monkeypatch):

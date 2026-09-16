@@ -318,6 +318,34 @@ class TestRawDescriptorMemType:
             ),
         ]
 
+    def test_transfer_start_callback_runs_after_descriptor_preparation(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(torch.cuda, "set_device", lambda *args, **kwargs: None)
+        local = torch.zeros(4, dtype=torch.float32)
+        mgr = self._make_manager()
+        mgr._tensors = {"w": local}
+        mgr._agent.prep_xfer_dlist.side_effect = RuntimeError("descriptor failure")
+        on_transfer_start = MagicMock()
+
+        with pytest.raises(RuntimeError, match="descriptor failure"):
+            mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=[
+                    TensorDescriptor(
+                        name="w",
+                        addr=0x1000,
+                        size=local.numel() * local.element_size(),
+                        device_id=0,
+                        dtype=str(local.dtype),
+                    )
+                ],
+                remote_agent_name="source",
+                on_transfer_start=on_transfer_start,
+            )
+
+        on_transfer_start.assert_not_called()
+
 
 class TestReceiveFromSourceManifestValidation:
     """receive_from_source must reject size/dtype mismatches before building

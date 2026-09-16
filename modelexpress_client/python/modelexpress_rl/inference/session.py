@@ -379,6 +379,12 @@ class WeightUpdateSession:
             return update.apply_result
         except BaseException as error:
             primary_error = error
+            if not update.installation_started:
+                update.installation_started = (
+                    update.plan.method.mutated_during_installation_context(
+                        update.prepared
+                    )
+                )
             if update.installation_started:
                 try:
                     update.plan.method.installation_failed(update.prepared)

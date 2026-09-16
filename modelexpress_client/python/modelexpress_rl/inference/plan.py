@@ -142,7 +142,7 @@ class PreparedStreamingTensors(PreparedArtifact):
 
 @dataclass(frozen=True)
 class PreparedRuntimeTensors(PreparedArtifact):
-    """Post-load engine tensors ready for an in-place runtime copy."""
+    """A peer read prepared to write directly into live runtime tensors."""
 
     staged: StagedEngineTensors
 
@@ -182,7 +182,7 @@ class SourceResolver(ABC):
 
 
 class UpdateMethod(ABC):
-    """Prepare weights from a resolved source without mutating the live engine."""
+    """Prepare an update and protect method state while the engine applies it."""
 
     @property
     @abstractmethod
@@ -207,16 +207,24 @@ class UpdateMethod(ABC):
         version: WeightVersion,
         source: ResolvedSource,
     ) -> PreparedArtifact:
-        """Transfer and verify one update without changing live weights."""
+        """Prepare and verify one update without changing live weights."""
 
     @abstractmethod
     def release(self, prepared: PreparedArtifact) -> None:
         """Release method-owned staging for one prepared update."""
 
     def installation_context(self, prepared: PreparedArtifact):
-        """Protect method-owned state while the installer reads it."""
+        """Enter the safe point; implementations may transfer into live storage."""
         del prepared
         return nullcontext()
+
+    def mutated_during_installation_context(
+        self,
+        prepared: PreparedArtifact,
+    ) -> bool:
+        """Return whether a failed context entry may have changed live storage."""
+        del prepared
+        return False
 
     def prepare_chain(
         self,

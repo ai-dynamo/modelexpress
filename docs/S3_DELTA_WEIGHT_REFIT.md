@@ -6,6 +6,9 @@ the same local checkpoint; integrations may use a framework-selected cadence of
 full HF checkpoints to reset that base. ModelExpress coordinates each version's
 lineage and readiness.
 
+For a runnable Vime TP2 trainer, Dynamo TP1 rollout worker, and MinIO setup, see
+[`examples/rl/vime_dynamo_delta_refit`](../examples/rl/vime_dynamo_delta_refit/README.md).
+
 ## Components
 
 | Component | Responsibility |

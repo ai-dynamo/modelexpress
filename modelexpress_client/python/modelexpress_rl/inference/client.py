@@ -139,8 +139,9 @@ class ModelExpressGeneratorConfig:
 class StagedWeightHandle:
     """An exact version prepared for, but not yet installed into, the engine.
 
-    Preparation may transfer P2P tensors or reconstruct an S3 checkpoint. The
-    live engine remains unchanged until ``apply_weight`` runs at its safe point.
+    Preparation may validate and reserve a P2P peer or reconstruct an S3
+    checkpoint. The live engine remains unchanged until ``apply_weight`` runs at
+    its safe point.
     The handle keeps session internals private and binds idempotent release to
     the client that owns the staged resources.
     """
@@ -440,6 +441,7 @@ class ModelExpressGeneratorClient:
                 raise RuntimeError("staged weight has already been released")
             runtime = self._require_runtime()
             was_applied = staged._update.applied
+            serving_version_id = self._serving_version_id
             if not was_applied:
                 runtime.unpublish_runtime_tensors()
             try:
@@ -448,6 +450,14 @@ class ModelExpressGeneratorClient:
             except BaseException:
                 if staged._update.installation_started and not staged._update.applied:
                     self._engine_state = _EngineState.UNCERTAIN
+                elif not was_applied and serving_version_id is not None:
+                    try:
+                        runtime.publish_runtime_tensors(serving_version_id)
+                    except Exception:
+                        logger.exception(
+                            "failed to republish unchanged runtime tensors for %s",
+                            serving_version_id,
+                        )
                 raise
             finally:
                 # Reported even when the install raised: a refit that failed

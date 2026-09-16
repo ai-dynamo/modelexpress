@@ -81,11 +81,15 @@ class _VllmInstaller(EngineInstaller):
 
     def install(self, prepared: PreparedArtifact) -> dict[str, float]:
         started = time.perf_counter()
+        metrics = prepared.metrics
         if isinstance(prepared, PreparedEngineTensors):
             self.install_tensors(prepared.staged.tensors)
         elif isinstance(prepared, PreparedStreamingTensors):
             self.install_streaming(prepared)
-            return {"streaming_apply_s": time.perf_counter() - started}
+            # install_streaming records into the artifact's own metrics dict;
+            # re-read it so those entries travel with the install timing.
+            metrics = prepared.metrics
+            metrics["streaming_apply_s"] = time.perf_counter() - started
         elif isinstance(prepared, PreparedRuntimeTensors):
             self.install_runtime_tensors(prepared.staged.tensors)
         elif isinstance(prepared, PreparedCheckpointArtifact):
@@ -94,8 +98,11 @@ class _VllmInstaller(EngineInstaller):
                 raise TypeError("checkpoint preparation has an invalid value")
             self.install_checkpoint(checkpoint.path)
         else:
-            raise TypeError(f"unsupported prepared artifact {type(prepared).__name__}")
-        return {"perf/mx_receive_install_time": time.perf_counter() - started}
+            raise TypeError(
+                f"unsupported prepared artifact {type(prepared).__name__}"
+            )
+        metrics["perf/mx_receive_install_time"] = time.perf_counter() - started
+        return metrics
 
     @property
     def _is_quantized(self) -> bool:
@@ -315,7 +322,7 @@ class _VllmInstaller(EngineInstaller):
         torch.cuda.synchronize(self._device)
         metrics["derived_refresh_s"] = time.perf_counter() - derived_started
     def install_runtime_tensors(self, tensors: dict[str, torch.Tensor]) -> None:
-        """Copy a peer's processed tensors into existing graph-bound storage."""
+        """Finish a direct peer transfer into existing graph-bound storage."""
         if self._runtime_tensors is None:
             raise RuntimeError("vLLM runtime tensor installation is unavailable")
         destinations = self._runtime_tensors
@@ -327,18 +334,10 @@ class _VllmInstaller(EngineInstaller):
                 f"{len(local_only)} local-only, {len(source_only)} source-only"
             )
         for name, source in tensors.items():
-            destination = destinations[name]
-            if (
-                destination.shape != source.shape
-                or destination.dtype != source.dtype
-            ):
+            if destinations[name] is not source:
                 raise IncompleteRefit(
-                    f"vLLM runtime tensor metadata differs for {name!r}"
+                    "vLLM runtime P2P must write directly into live storage"
                 )
-        for name, source in tensors.items():
-            destination = destinations[name]
-            destination.copy_(source)
-        torch.cuda.synchronize(self._device)
 
     def install_checkpoint(self, path: str | Path) -> None:
         """Reload a prepared safetensors checkpoint into the live model."""
