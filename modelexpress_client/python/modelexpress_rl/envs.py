@@ -17,10 +17,13 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     MX_REFIT_CHECKSUM_FORMAT: str
+    MX_REFIT_DESIRED_VERSION_UID: str | None
+    MX_REFIT_CHECKPOINT_DIR: str | None
     MX_REFIT_DELTA_BUCKET_BYTES: int
     MX_REFIT_DELTA_WORKERS: int
     MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
     MX_REFIT_METADATA_PORT: int
+    MX_REFIT_TIMING: bool
     MX_S3_DOWNLOAD_RANGE_BYTES: int
     MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES: int
     MX_S3_DOWNLOAD_IO_CHUNK_BYTES: int
@@ -54,6 +57,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "MX_REFIT_CHECKSUM_FORMAT": lambda: (
         os.environ.get("MX_REFIT_CHECKSUM_FORMAT", "adler32").strip().lower()
+    ),
+    "MX_REFIT_DESIRED_VERSION_UID": lambda: (
+        os.environ.get("MX_REFIT_DESIRED_VERSION_UID", "").strip() or None
+    ),
+    "MX_REFIT_CHECKPOINT_DIR": lambda: (
+        os.environ.get("MX_REFIT_CHECKPOINT_DIR", "").strip() or None
     ),
     # Framework integrations read this while constructing ``hf_tensor_iter``;
     # ModelExpress preserves the supplied framework bucket boundaries.
@@ -127,6 +136,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_S3_TCP_KEEPALIVE": lambda: parse_bool(
         os.environ.get("MX_S3_TCP_KEEPALIVE", "true"),
         "MX_S3_TCP_KEEPALIVE",
+    ),
+    # One normalized timing record per generator refit. On by default: the
+    # durations are already being measured on the staging path, so recording
+    # them costs a few perf_counter calls and one log line, against a refit
+    # measured in seconds. Off is for callers that drive their own recorder and
+    # do not want a second one nested inside it.
+    "MX_REFIT_TIMING": lambda: parse_bool(
+        os.environ.get("MX_REFIT_TIMING", "true"),
+        "MX_REFIT_TIMING",
     ),
     "RANK": lambda: os.environ.get("RANK"),
 }

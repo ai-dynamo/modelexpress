@@ -160,6 +160,30 @@ def test_refit_service_uses_named_response_messages():
     )
 
 
+def test_released_manifests_do_not_accumulate():
+    service = WeightVersionShardManifestService(endpoint="trainer:9000")
+    manifest = WeightVersionShardManifest(
+        data=b"manifest",
+        tensor_count=1,
+        total_bytes=2,
+        transport="NIXL",
+    )
+
+    for index in range(1000):
+        version_id = f"version-{index}"
+        service.publish_manifest(
+            version_id=version_id,
+            source_slot_id="rank:0",
+            manifest=manifest,
+        )
+        service.release_manifest(
+            version_id=version_id,
+            source_slot_id="rank:0",
+        )
+
+    assert service._manifests == {}
+
+
 def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
     service = _RefitService()
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
@@ -205,6 +229,9 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
             trainer.bind_tensors("replacement")
         assert service.shards == []
         trainer.publish_version(version=WeightVersionRef("version-a"))
+        metrics = trainer.pop_metrics()
+        assert metrics["trainer_refit_e2e_s"] >= 0
+        assert metrics["publication_rpc_s"] >= 0
 
         worker_stub = refit_pb2_grpc.RefitWorkerServiceStub(
             grpc.insecure_channel(service.shards[0].manifest_endpoint)
@@ -228,6 +255,14 @@ def test_trainer_stages_then_publishes_one_rank_local_shard(monkeypatch):
         trainer.release_version(version=WeightVersionRef("version-a"))
         trainer.release_version(version=WeightVersionRef("version-a"))
         assert "version-a" not in method.published
+        with pytest.raises(grpc.RpcError) as released:
+            worker_stub.GetWeightVersionShardManifest(
+                refit_pb2.GetWeightVersionShardManifestRequest(
+                    version_id="version-a",
+                    source_slot_id="rank:0",
+                )
+            )
+        assert released.value.code() is grpc.StatusCode.NOT_FOUND
     finally:
         if "trainer" in locals():
             trainer.close()

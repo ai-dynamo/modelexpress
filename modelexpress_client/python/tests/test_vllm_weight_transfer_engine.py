@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from modelexpress_rl import ObjectStorageType
+from modelexpress_rl.inference.plan import WeightSource
 from modelexpress_rl.inference.engines.vllm import weight_transfer_engine
 from modelexpress_rl.inference.engines.vllm.weight_transfer_engine import (
     ModelExpressWeightTransferEngine,
@@ -64,6 +65,7 @@ def test_weight_transfer_engine_initializes_client_in_init_hook(monkeypatch):
 
 
 def test_weight_transfer_engine_parses_vime_object_storage_init_info(monkeypatch):
+    """Parse VIME object-storage metadata into generator initialization."""
     client = MagicMock()
     initialize = MagicMock(return_value=client)
     monkeypatch.setattr(
@@ -82,6 +84,7 @@ def test_weight_transfer_engine_parses_vime_object_storage_init_info(monkeypatch
 
     init_info = {
         "model_name": "policy",
+        "initial_serving_version_id": "version-c",
         "initial_base_version_id": "base-a",
         "seed_checkpoint_path": "/models/launch",
         "refit_checkpoint_dir": "/cache/modelexpress",
@@ -99,6 +102,7 @@ def test_weight_transfer_engine_parses_vime_object_storage_init_info(monkeypatch
 
     config = initialize.call_args.args[0]
     assert config.model_name == "policy"
+    assert config.initial_serving_version_id == "version-c"
     assert config.engine_context.model is model
     assert config.server_url == "mx:8001"
     assert config.registration_ttl_seconds == 90
@@ -113,6 +117,41 @@ def test_weight_transfer_engine_parses_vime_object_storage_init_info(monkeypatch
     assert config.object_storage.refit_checkpoint_max_size_gb == 500
     assert config.object_storage.endpoint_url == "http://minio:9000"
     assert config.object_storage.region_name == "us-west-2"
+
+
+def test_weight_transfer_engine_defers_env_source_order_until_init(monkeypatch):
+    monkeypatch.setenv("MX_GENERATOR_SOURCE_ORDER", "GENERATOR,OBJECT_STORAGE")
+    initialize = MagicMock(return_value=MagicMock())
+    monkeypatch.setattr(
+        weight_transfer_engine.ModelExpressGeneratorClient,
+        "initialize",
+        initialize,
+    )
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(),
+        model_config=SimpleNamespace(model="test/model"),
+    )
+    engine = ModelExpressWeightTransferEngine(
+        SimpleNamespace(),
+        vllm_config,
+        torch.device("cpu"),
+        torch.nn.Linear(2, 2),
+    )
+
+    engine.init_transfer_engine(
+        engine.init_info_cls(
+            initial_base_version_id="base-a",
+            seed_checkpoint_path="/models/launch",
+            refit_checkpoint_dir="/cache/modelexpress",
+            object_storage_type="S3",
+        )
+    )
+
+    config = initialize.call_args.args[0]
+    assert config.source_order == (
+        WeightSource.GENERATOR,
+        WeightSource.OBJECT_STORAGE,
+    )
 
 
 @pytest.mark.parametrize(

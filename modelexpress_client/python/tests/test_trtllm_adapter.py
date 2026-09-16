@@ -173,6 +173,20 @@ def test_adapter_uses_global_rank_for_worker_and_local_rank_for_device():
     assert adapter.get_target_device() == torch.device("cuda", 1)
 
 
+def test_context_uses_mapping_local_rank():
+    """Populate the load context's local rank from the TRT-LLM mapping."""
+    context = build_trtllm_load_context(
+        model_config=object(),
+        load_config=object(),
+        mapping=_mapping(local_rank=3),
+        source_identity=_TrtIdentity(),
+        p2p_enabled=True,
+        **_adapter_kwargs(),
+    )
+
+    assert context.local_rank == 3
+
+
 def test_adapter_discovers_canonical_parameters_only():
     model = nn.Module()
     model.primary = nn.Linear(2, 2, bias=False)

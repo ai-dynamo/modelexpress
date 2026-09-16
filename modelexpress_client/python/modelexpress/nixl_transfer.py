@@ -18,6 +18,7 @@ import atexit
 import logging
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -371,12 +372,18 @@ class NixlTransferManager:
             raise RuntimeError("NIXL agent not initialized")
 
         tensor_descriptors = self._build_tensor_descriptors(tensors)
+        registrable_descriptors = [
+            descriptor for descriptor in tensor_descriptors if descriptor.size > 0
+        ]
+        registrable_tensors = [
+            tensor for tensor in tensors.values() if tensor.numel() > 0
+        ]
 
         # Phase 1: Discover CUDA allocation boundaries (if pool reg enabled)
         alloc_discovery_start = time.perf_counter()
         if _pool_reg_enabled() and not force_per_tensor:
             if self._accelerator_backend.supports_pool_reg():
-                allocations = self._find_cuda_allocations(tensor_descriptors)
+                allocations = self._find_cuda_allocations(registrable_descriptors)
             else:
                 allocations = None
                 logger.warning(
@@ -405,12 +412,15 @@ class NixlTransferManager:
                 )
             )
             reg_count = len(allocations)
-        else:
-            tensor_list = list(tensors.values())
+        elif registrable_tensors:
             self._registered_memory.append(
-                self._agent.register_memory(tensor_list, backends=self._backends)
+                self._agent.register_memory(
+                    registrable_tensors, backends=self._backends
+                )
             )
-            reg_count = len(tensor_list)
+            reg_count = len(registrable_tensors)
+        else:
+            reg_count = 0
         nixl_reg_time = time.perf_counter() - nixl_reg_start
 
         # Phase 3: Get agent metadata blob
@@ -811,6 +821,7 @@ class NixlTransferManager:
         remote_agent_name: str | None = None,
         require_exact_match: bool = False,
         destination_tensors: dict[str, torch.Tensor] | None = None,
+        on_transfer_start: Callable[[], None] | None = None,
     ) -> tuple[int, int, float]:
         """
         Receive weights from a remote source via NIXL RDMA.
@@ -839,6 +850,8 @@ class NixlTransferManager:
                 transfers leave this False and tolerate subset transfers.
             destination_tensors: Optional registered destination catalog used for
                 name matching. Defaults to the most recently registered catalog.
+            on_transfer_start: Optional callback invoked immediately before the
+                NIXL transfer is submitted.
 
         Returns:
             Tuple of (total_bytes, total_tensors, duration)
@@ -874,6 +887,7 @@ class NixlTransferManager:
         remote_descs: list[tuple[int, int, int]] = []
         local_descs: list[tuple[int, int, int]] = []
         total_bytes = 0
+        matched_tensors = 0
 
         for src_tensor in source_tensors:
             local_tensor = local_tensors.get(src_tensor.name)
@@ -893,6 +907,9 @@ class NixlTransferManager:
                     f"Tensor '{src_tensor.name}' dtype mismatch: "
                     f"source={src_tensor.dtype!r}, local={local_dtype!r}"
                 )
+            matched_tensors += 1
+            if src_tensor.size == 0:
+                continue
             remote_descs.append(
                 (src_tensor.addr, src_tensor.size, src_tensor.device_id)
             )
@@ -905,7 +922,6 @@ class NixlTransferManager:
             )
             total_bytes += src_tensor.size
 
-        matched_tensors = len(remote_descs)
         match_time = time.perf_counter() - match_start
 
         # Downgraded to `partial` by the name-diff check below, which does not
@@ -944,7 +960,7 @@ class NixlTransferManager:
                 len(source_only),
             )
 
-        if not remote_descs:
+        if matched_tensors == 0:
             if require_exact_match:
                 transfer_metrics.record_nixl_receive("rejected")
                 raise ManifestMismatchError(
@@ -953,6 +969,11 @@ class NixlTransferManager:
             logger.warning("No matching tensors found for transfer")
             transfer_metrics.record_nixl_receive("empty")
             return 0, 0, 0.0
+
+        if not remote_descs:
+            logger.info("All %d matching tensors are empty", matched_tensors)
+            transfer_metrics.record_nixl_receive(receive_result)
+            return 0, matched_tensors, 0.0
 
         logger.info(
             f"[TIMING] match_tensors: {match_time:.3f}s "
@@ -987,9 +1008,10 @@ class NixlTransferManager:
             remote_indices=indices,
             backends=self._backends,
         )
-        self._agent.transfer(handle)
-
         try:
+            if on_transfer_start is not None:
+                on_transfer_start()
+            self._agent.transfer(handle)
             self._wait_for_xfer(handle, timeout_seconds, "Transfer")
         finally:
             self._agent.release_xfer_handle(handle)

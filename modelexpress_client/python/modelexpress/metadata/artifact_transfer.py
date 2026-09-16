@@ -22,6 +22,7 @@ import grpc
 import torch
 
 from .. import p2p_pb2
+from ..metrics import metrics as install_metrics
 from ..nixl_transfer import NIXL_DRAM_MEM_TYPE, NixlTransferManager
 from .artifact_manifest import (
     _crc32c_hex,
@@ -333,20 +334,48 @@ class TarredP2PArtifactTransfer(P2PArtifactTransfer):
                 f"{sorted(files_by_name)} != {sorted(expected_names)}"
             )
         installed_targets = []
+        validate_total = 0.0
+        extract_total = 0.0
         for tar_name, root in root_archives:
             tar_file = Path(files_by_name[tar_name].path).resolve(strict=True)
             output_path = root.target_root.resolve()
             output_path.mkdir(parents=True, exist_ok=True)
-            _validate_tar_members(tar_file)
-            _run_tar(["-xf", str(tar_file), "-C", str(output_path)])
+            archive_bytes = tar_file.stat().st_size
+            # The two steps are timed separately because they fail differently:
+            # validate is a Python walk over the member list and scales with
+            # file count; extract is `tar -xf` and scales with bytes and with
+            # the target filesystem. One number could not say which is slow.
+            step_start = time.perf_counter()
+            with install_metrics.time_artifact_install_step(self.name, root.name, "validate"):
+                _validate_tar_members(tar_file)
+            validate_seconds = time.perf_counter() - step_start
+            step_start = time.perf_counter()
+            with install_metrics.time_artifact_install_step(self.name, root.name, "extract"):
+                _run_tar(["-xf", str(tar_file), "-C", str(output_path)])
+            extract_seconds = time.perf_counter() - step_start
+            install_metrics.record_artifact_install_bytes(self.name, root.name, archive_bytes)
+            validate_total += validate_seconds
+            extract_total += extract_seconds
+            logger.info(
+                "[TIMING] Artifact archive extracted: name=%s archive=%s target=%s "
+                "size=%.2f MiB validate=%.3fs extract=%.3fs",
+                self.name,
+                root.name,
+                output_path,
+                _mib(archive_bytes),
+                validate_seconds,
+                extract_seconds,
+            )
             installed_targets.append(str(output_path))
         elapsed = time.perf_counter() - start
         logger.info(
             "[TIMING] Artifact install complete: artifact_id=%s targets=%s "
-            "size=%.2f MiB elapsed=%.3fs",
+            "size=%.2f MiB validate=%.3fs extract=%.3fs elapsed=%.3fs",
             header.artifact_id,
             installed_targets,
             _mib(header.total_size),
+            validate_total,
+            extract_total,
             elapsed,
         )
 

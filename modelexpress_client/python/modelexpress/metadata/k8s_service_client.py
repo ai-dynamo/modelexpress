@@ -46,9 +46,8 @@ import time
 import grpc
 
 from .. import envs
-from .. import p2p_pb2
+from .. import p2p_pb2, p2p_pb2_grpc
 from .payload import tensor_source_metadata
-from .. import p2p_pb2_grpc
 from ..client import MxClientBase
 from .source_id import compute_mx_source_id
 
@@ -96,6 +95,10 @@ class MxK8sServiceClient(MxClientBase):
 
     def close(self) -> None:
         """No-op: channels are opened per-call and closed immediately."""
+
+    def worker_rpc_retry_policy(self) -> tuple[int, float]:
+        """Retry worker RPCs because each channel may select a new pod."""
+        return self._max_retries, self._backoff_seconds
 
     # -- RPC wrappers (MxClient duck-type) -----------------------------------
 
@@ -195,13 +198,9 @@ class MxK8sServiceClient(MxClientBase):
                 # Defense-in-depth: validate the response matches what
                 # was asked for. The server-side handshake in
                 # WorkerServiceServicer rejects mismatched mx_source_id
-                # with FAILED_PRECONDITION, but only when the request
-                # carries a non-empty ID AND the server's own storage
-                # is correct. A misconfigured Service selector routing
-                # the caller to a wrong-rank pool, or the client
-                # somehow passing an empty mx_source_id, would slip
-                # past that check. Validate both fields here before
-                # accepting the manifest.
+                # with FAILED_PRECONDITION. A misconfigured Service selector
+                # could still route to the wrong rank, so validate both fields
+                # here before accepting the manifest.
                 mismatch_reason: str | None = None
                 if resp.mx_source_id != mx_source_id:
                     mismatch_reason = (
@@ -280,7 +279,6 @@ class MxK8sServiceClient(MxClientBase):
                 raise
             finally:
                 channel.close()
-
         message = (
             f"MxK8sServiceClient.get_metadata: exhausted "
             f"{self._max_retries + 1} attempts against {endpoint}"

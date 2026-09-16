@@ -14,7 +14,7 @@ import torch
 from ... import configure_trtllm_logging
 from ...load_strategy import (
     LoadResult,
-    LoadStrategyChain,
+    run_load_strategy_chain,
     publish_metadata,
     register_tensors,
     unpublish_metadata,
@@ -99,7 +99,7 @@ class MxModelLoader:
             with metrics.time_load_phase(
                 "trtllm", self._ctx.identity.model_name, "chain"
             ):
-                value = LoadStrategyChain.run(model, self._ctx)
+                value = run_load_strategy_chain(model, self._ctx)
         total_time = time.perf_counter() - load_start
         logger.info(
             "[Worker %s] TRT-LLM MxModelLoader.load_model() COMPLETE in %.2fs",

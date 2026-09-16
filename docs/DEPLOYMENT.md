@@ -119,6 +119,8 @@ installation and upgrade instructions in [`helm/README.md`](../helm/README.md);
 Helm does not update an existing CRD from the chart's `crds/` directory. Then
 either enable `serviceAccount.rbac.enabled=true` on the Helm chart or apply
 `examples/p2p_transfer_k8s/server/kubernetes_backend/rbac-modelmetadata.yaml`.
+
+Both CRD manifests are generated from the Rust types: after editing `modelexpress_server/src/{p2p,registry}/k8s_types.rs`, run `cargo run -p modelexpress-server --bin crdgen > examples/crds.yaml` and copy the output to `helm/crds/modelexpress-crds.yaml`; CI fails when `examples/crds.yaml` is stale.
 The chart creates a `ClusterRole` and `ClusterRoleBinding`, allowing the server
 to run in a dedicated namespace while accessing metadata resources in another
 namespace.
@@ -541,6 +543,13 @@ kubectl apply -f examples/dynamo_model_cache_k8s/agg.yaml
 
 See [`../examples/dynamo_model_cache_k8s/README.md`](../examples/dynamo_model_cache_k8s/README.md) for the full guide.
 
+For RL cold start and active weight refit, see
+[`../examples/rl/dynamo_vllm_reshard_refit/README.md`](../examples/rl/dynamo_vllm_reshard_refit/README.md).
+Its vLLM startup probe directly reconciles the desired MX UID through vLLM's
+native Control gRPC service. Keep that probe on the restartable vLLM init
+container: Kubernetes does not start the Dynamo sidecar until vLLM reports the
+desired UID, so a failed or mismatched reconciliation cannot admit the worker.
+
 ## P2P GPU Weight Transfers
 
 ModelExpress supports GPU-to-GPU model weight transfers between supported inference instances using NVIDIA NIXL over RDMA. vLLM 0.23.0 and newer recognize `--load-format modelexpress` natively, which runs the fixed priority chain P2P RDMA -> server cache -> InstantTensor -> ModelStreamer -> GDS -> native loader; the ModelExpress Python package must still be installed, and `mx` remains a backward-compatible alias. SGLang uses `remote_instance` with the `modelexpress` backend; see [SGLang Clients](#sglang-clients).
@@ -618,6 +627,10 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_METADATA_BACKEND` | (required on server; `""` on client) | Server: `redis` or `kubernetes`. Client: `""`/`server`/`redis`/`kubernetes` (central server) or `k8s-service` (decentralized via K8s Service routing). |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Client's gRPC server address (recommended; ignored when client uses `k8s-service` backend) |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
+| `MX_LOAD_STRATEGY_CHAIN` | `INFERENCE` | Initial-load policy. `RL` uses exact desired-version P2P and canonical S3 replay when `MX_REFIT_DESIRED_VERSION_UID` is set; otherwise it tries `MX_MODEL_URI` and then the engine-native loader. vLLM speculative draft models are rejected because the desired UID identifies only the main model. |
+| `MX_REFIT_DESIRED_VERSION_UID` | (unset) | Exact immutable version required by the RL initial-load policy. When set, startup fails if neither desired-version P2P nor S3 replay succeeds; version-agnostic fallbacks are not allowed. |
+| `MX_GENERATOR_SOURCE_ORDER` | Auto-detected | Ordered RL weight sources. For desired-version cold start, the default is `GENERATOR,OBJECT_STORAGE`; supported entries are `GENERATOR` (P2P) and `OBJECT_STORAGE` (canonical S3 replay). The same order controls active refit. `OBJECT_STORAGE` disables P2P for both paths. `TRAINER` is supported by active refit only and is rejected during desired-version cold start. |
+| `MX_REFIT_CHECKPOINT_DIR` | (unset) | Local cache for RL full checkpoints, deltas, and materialized checkpoints. Required for desired-version S3 replay. Cache persistence and capacity are determined by the mounted volume. |
 | `MX_DISABLE_PATCHES` | `0` | Emergency escape hatch that skips all runtime compatibility patches. Set to `1`, `true`, `yes`, or `on` if a patch is incompatible with the installed engine. |
 | `MX_P2P_SOURCE_SELECTOR` | `random` | P2P source-ordering policy for the RDMA load path. `random` (behavior-preserving default; local-RNG shuffle), `rendezvous_hash` (stateless deterministic spreading via HRW hashing; stable across restarts and minimally disrupted by source-set changes), `load_aware` (biases `rendezvous_hash` away from sources with high `source_load`; collapses to `rendezvous_hash` when load is 0/unset), or `topology_aware` (locality-first: prefer sources in the narrowest shared RDMA domain, rendezvous jitter as tiebreak). Unknown values log a warning and fall back to `random`. Ordering only — the `MAX_SOURCE_RETRIES=3` retry budget is unchanged. On the `kubernetes` metadata backend, `load_aware` needs the `ModelMetadata` CRD shipped with this release (`status.worker.sourceLoad`): the API server prunes fields the installed schema lacks, and Helm does not update `crds/` on upgrade, so reapply the CRD as described under [Distributed backend selection](#distributed-backend-selection) or `source_load` is silently dropped and the policy degrades to `rendezvous_hash`. |
 | `MX_P2P_LOAD_WEIGHT` | `1.0` | Weight of the `source_load` penalty in the `load_aware` selector (`score = unit_hash − w · source_load`). Higher values steer more aggressively away from busy sources; `0` makes `load_aware` behave like `rendezvous_hash`. |
@@ -843,7 +856,17 @@ handles.
 
 ### P2P Metadata Exchange
 
-P2P metadata exchange is enabled by default. Source workers expose their own per-worker gRPC `WorkerService` (the `WorkerGrpcServer` on `MX_WORKER_GRPC_PORT`) and their NIXL agent metadata directly on the worker's NIXL listen thread (`MX_METADATA_PORT`). Targets fetch tensor manifests or artifact manifests directly from the source worker rather than pulling them through the central store. For file-backed cache artifacts, targets also call `PrepareArtifactChunk` and `ReleaseArtifactChunk` on this worker service while bytes move through NIXL into target-local staging, then install the staged artifact into the runtime cache directory. The division of responsibility depends on which metadata backend is in use:
+P2P metadata exchange is enabled by default. Source workers expose their own per-worker gRPC `WorkerService` (the `WorkerGrpcServer` on `MX_WORKER_GRPC_PORT`) and their NIXL agent metadata directly on the worker's NIXL listen thread (`MX_METADATA_PORT`). Targets fetch tensor manifests or artifact manifests directly from the source worker rather than pulling them through the central store. RL generator-to-generator active refit calls `PrepareTensorRead` while preparing the update, then holds the bounded lease until the staged update is released or the NIXL transfer completes. These donor-timed leases protect the donor's live tensor storage while another generator reads it; the donor drains existing readers before overwriting that storage, and if the drain times out, refit fails before mutation. Completion and ordinary failures release immediately. A pre-transfer retry obtains a fresh lease and revalidates the exact source version and worker instead of reusing the consumed manifest. If the target pod exits without cleanup because of `SIGKILL`, OOM, or node loss, the donor expires the abandoned lease after its bounded lifetime. Ordinary inference loading continues to use `GetTensorManifest` without this RL-specific mutation fence. For file-backed cache artifacts, targets call `PrepareArtifactChunk` and `ReleaseArtifactChunk` while bytes move through NIXL into target-local staging, then install the staged artifact into the runtime cache directory. The division of responsibility depends on which metadata backend is in use:
+
+Active refit of a generator that publishes runtime tensors requires this default P2P metadata path. With `MX_P2P_METADATA=0`, ModelExpress cannot account for readers of tensor addresses stored in the central coordinator, so it fails the refit before mutation instead of risking a mixed-version transfer.
+
+Generator-to-generator active refit validates the peer first, then receives
+directly into the target's registered live runtime tensors at the engine safe
+point. It does not allocate a second model-sized GPU buffer. If that direct
+transfer fails after mutation starts, ModelExpress marks the engine state
+uncertain; reset or restart the worker before serving or retrying. Quantized
+models and FP8 KV-cache configurations use canonical object-storage refit because
+their non-tensor derived state cannot currently be refreshed by a direct copy.
 
 - **Central-coordinator backends (`redis`, `kubernetes`):** the source publishes only a lightweight pointer (its `worker_grpc_endpoint` and NIXL listen address) to the central server, and targets use that pointer to connect directly to the source for the MB-scale data. Set `MX_P2P_METADATA=0` to publish full tensor metadata (NIXL blobs + tensor descriptors) to the central server instead. Targets auto-detect which mode a source is using based on whether `worker_grpc_endpoint` is populated in the server's metadata; no configuration is needed on the target side.
 - **`k8s-service` backend:** auto-enabled for tensor metadata. The backend declares itself decentralized (via a class attribute `REQUIRES_P2P_METADATA = True`), so the client forces the P2P tensor path regardless of the env var. Deployers don't need to set `MX_P2P_METADATA` themselves. If the env var is explicitly set to `0` alongside this backend, the client logs a warning that the setting is ignored but otherwise proceeds correctly. File-backed artifact transfer currently requires a central-coordinator backend (`redis` or `kubernetes`) because `k8s-service` does not yet publish `artifact_source` discovery metadata.

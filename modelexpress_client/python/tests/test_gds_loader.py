@@ -224,6 +224,7 @@ class TestGdsStrategyIntegration:
             return result
 
     def _make_context(self):
+        """Build a CPU load context for GDS strategy tests."""
         from modelexpress.load_strategy import LoadContext
         return LoadContext(
             model_config=MagicMock(),
@@ -231,6 +232,7 @@ class TestGdsStrategyIntegration:
             target_device=torch.device("cpu"),
             global_rank=0,
             worker_rank=0,
+            local_rank=0,
             device_id=0,
             identity=MagicMock(),
             mx_client=MagicMock(),
