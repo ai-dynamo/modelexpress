@@ -483,9 +483,8 @@ class TestHeartbeatReRegistration:
         assert stale_calls == []
 
 
-class TestPublishRetryForever:
-    """Weight sources keep retrying publication past the timeout instead of
-    giving up and tearing down the worker manifest server."""
+class TestPublishTimeout:
+    """Publication timeout behavior for bounded and resident sources."""
 
     def _publisher(self, mx_client, nixl_manager, publish, **overrides):
         """Build a publishing thread with a short 10s publish timeout."""
@@ -506,48 +505,32 @@ class TestPublishRetryForever:
         publisher._publish_started_at = time.monotonic() - 10_000
         return publisher
 
-    def test_overdue_forever_publisher_keeps_trying(self, mx_client, nixl_manager):
-        """Past its timeout, a forever publisher attempts the publish anyway."""
+    def test_zero_timeout_keeps_trying(self, mx_client, nixl_manager):
+        """A zero timeout retries indefinitely."""
         publish = MagicMock(side_effect=RuntimeError("server down"))
-        publisher = self._overdue(
-            self._publisher(
-                mx_client, nixl_manager, publish, retry_publish_forever=True
+        with patch.dict("os.environ", {"MX_PUBLISH_TIMEOUT_SECS": "0"}):
+            publisher = self._overdue(
+                self._publisher(
+                    mx_client, nixl_manager, publish, publish_timeout_secs=None
+                )
             )
-        )
 
         publisher._tick()
 
         assert not publisher._stop_event.is_set()
         assert publish.call_count == 1
 
-    def test_overdue_notice_logs_once(self, mx_client, nixl_manager, caplog):
-        """The overdue notice appears on the first overdue tick only."""
-        publish = MagicMock(side_effect=RuntimeError("server down"))
-        publisher = self._overdue(
-            self._publisher(
-                mx_client, nixl_manager, publish, retry_publish_forever=True
-            )
-        )
-
-        with caplog.at_level("WARNING", logger="modelexpress.metadata.publisher"):
-            for _ in range(3):
-                publisher._tick()
-
-        overdue = [
-            r for r in caplog.records if "retrying indefinitely" in r.getMessage()
-        ]
-        assert len(overdue) == 1
-
-    def test_forever_publisher_recovers_when_server_returns(
+    def test_zero_timeout_recovers_when_server_returns(
         self, mx_client, nixl_manager
     ):
-        """A forever publisher publishes and heartbeats READY once the server returns."""
+        """An unlimited publisher recovers once the server returns."""
         publish = MagicMock(side_effect=[RuntimeError("server down"), "id1"])
-        publisher = self._overdue(
-            self._publisher(
-                mx_client, nixl_manager, publish, retry_publish_forever=True
+        with patch.dict("os.environ", {"MX_PUBLISH_TIMEOUT_SECS": "0"}):
+            publisher = self._overdue(
+                self._publisher(
+                    mx_client, nixl_manager, publish, publish_timeout_secs=None
+                )
             )
-        )
 
         publisher._tick()  # overdue but keeps going
         publisher._tick()  # server back: publishes
@@ -561,8 +544,8 @@ class TestPublishRetryForever:
         ]
         assert len(ready_calls) == 1
 
-    def test_bounded_publisher_still_gives_up(self, mx_client, nixl_manager):
-        """Without the flag, the timeout still stops the thread for good."""
+    def test_positive_timeout_still_gives_up(self, mx_client, nixl_manager):
+        """A positive timeout stops the thread after its deadline."""
         publish = MagicMock(side_effect=RuntimeError("server down"))
         publisher = self._overdue(
             self._publisher(mx_client, nixl_manager, publish)
