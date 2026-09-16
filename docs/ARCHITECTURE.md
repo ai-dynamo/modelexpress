@@ -610,10 +610,15 @@ available with object storage as its only source.
 
 For an active refit, the peer lookup is for the exact target UID. If no peer can
 prepare that version, the generator resolves the full canonical lineage from
-its `FULL_HF_CHECKPOINT` root through the target deltas, then synchronously
-reconstructs and installs the target. A successful peer refit does not rebuild
-the canonical checkpoint in the background; object storage is consulted only
-when a later refit cannot use P2P.
+its `FULL_HF_CHECKPOINT` root through the target deltas. Under the local cache
+lock, the receiver reuses its verified checkpoint when that version is on the
+target lineage, downloading and applying only the missing revisions before
+installing the target. Full-root reconstruction is retained when no matching,
+source-verified local checkpoint exists, including an unverified launch seed.
+A successful peer refit does not rebuild the canonical checkpoint in the
+background, so the local checkpoint may lag the engine's serving version.
+Fallback therefore resumes from the local checkpoint version. Object storage
+is consulted only when a later refit cannot use P2P.
 
 The canonical receiver retains each full checkpoint and delta payload under its
 version, then writes a resolved chain manifest. A full target is directly

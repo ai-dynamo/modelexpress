@@ -361,7 +361,12 @@ the live engine.
 
 A successful peer install does not trigger checkpoint reconstruction. If a
 later active refit cannot use a same-rank generator peer, that foreground refit
-resolves the immutable full root and delta lineage from S3 before installation.
+resolves the immutable full root and delta lineage before installation. The
+receiver validates its local checkpoint under the cache lock and, when it is a
+source-verified ancestor of the target, downloads and applies only the missing
+revisions. The local checkpoint can lag GPU weights after P2P updates, so its
+version determines the replay suffix. When no matching, source-verified local
+checkpoint exists, the receiver reconstructs from the full root.
 
 ### Generator-side S3 artifact contract
 
