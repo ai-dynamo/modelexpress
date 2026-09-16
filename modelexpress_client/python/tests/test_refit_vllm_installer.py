@@ -246,6 +246,45 @@ def test_installer_includes_prepared_engine_tensor_metrics(monkeypatch):
     assert metrics["perf/mx_receive_install_time"] >= 0
 
 
+def test_installer_restores_runtime_buffer_created_after_reload_metadata(monkeypatch):
+    model = nn.Module()
+    original_workspace = torch.tensor([1.0])
+    model.register_buffer("workspace", original_workspace)
+    info = SimpleNamespace(
+        kernel_tensors=({}, {"workspace": original_workspace}),
+    )
+
+    def initialize(target):
+        delattr(target, "workspace")
+
+    _install_fake_vllm(monkeypatch, initialize)
+    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
+    layerwise.LAYERWISE_INFO[model] = info
+
+    def finalize(target, _config):
+        _, buffers = info.kernel_tensors
+        for name, buffer in buffers.items():
+            if name in target._buffers:
+                buffer.data.copy_(getattr(target, name))
+        for name in list(target._parameters) + list(target._buffers):
+            delattr(target, name)
+        for name, buffer in buffers.items():
+            target.register_buffer(name, buffer)
+
+    layerwise.finalize_layerwise_reload = finalize
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
+    )
+
+    installer._reload(lambda: setattr(model, "workspace", torch.tensor([7.0])))
+
+    assert model.workspace is original_workspace
+    assert model.workspace.item() == 7.0
+
+
 def test_installer_accepts_runtime_tensors_written_directly_in_place():
     live = {
         "weight": torch.tensor([7.0, 8.0]),

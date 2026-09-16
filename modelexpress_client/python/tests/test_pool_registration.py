@@ -397,6 +397,73 @@ class TestReceiveFromSourceManifestValidation:
                 remote_agent_name="dummy",
             )
 
+    def test_empty_tensor_is_validated_but_not_transferred(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
+        weight = torch.ones(4, dtype=torch.float32)
+        indices = torch.empty(0, dtype=torch.int32)
+        mgr = self._make_manager(
+            monkeypatch,
+            {"weight": weight, "indices": indices},
+        )
+        mgr._agent.prep_xfer_dlist.side_effect = ["src", "dst"]
+        mgr._agent.make_prepped_xfer.return_value = "handle"
+        mgr._agent.check_xfer_state.return_value = "DONE"
+
+        result = mgr.receive_from_source(
+            source_metadata=b"",
+            source_tensors=[
+                TensorDescriptor(
+                    "weight",
+                    0x1000,
+                    weight.numel() * weight.element_size(),
+                    0,
+                    str(weight.dtype),
+                ),
+                TensorDescriptor("indices", 0, 0, 0, str(indices.dtype)),
+            ],
+            remote_agent_name="source",
+            require_exact_match=True,
+        )
+
+        assert result[:2] == (weight.numel() * weight.element_size(), 2)
+        assert [
+            entry.kwargs["xfer_list"]
+            for entry in mgr._agent.prep_xfer_dlist.call_args_list
+        ] == [
+            [(0x1000, weight.numel() * weight.element_size(), 0)],
+            [(weight.data_ptr(), weight.numel() * weight.element_size(), 0)],
+        ]
+
+    def test_all_empty_manifest_needs_no_nixl_transfer(self, monkeypatch):
+        indices = torch.empty(0, dtype=torch.int32)
+        mgr = self._make_manager(monkeypatch, {"indices": indices})
+
+        result = mgr.receive_from_source(
+            source_metadata=b"",
+            source_tensors=[
+                TensorDescriptor("indices", 0, 0, 0, str(indices.dtype))
+            ],
+            remote_agent_name="source",
+            require_exact_match=True,
+        )
+
+        assert result == (0, 1, 0.0)
+        mgr._agent.prep_xfer_dlist.assert_not_called()
+
+    def test_empty_tensor_still_rejects_source_size_mismatch(self, monkeypatch):
+        indices = torch.empty(0, dtype=torch.int32)
+        mgr = self._make_manager(monkeypatch, {"indices": indices})
+
+        with pytest.raises(ManifestMismatchError, match="size mismatch"):
+            mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=[
+                    TensorDescriptor("indices", 0x1000, 4, 0, str(indices.dtype))
+                ],
+                remote_agent_name="source",
+                require_exact_match=True,
+            )
+
     def test_size_mismatch_raises_for_heterogeneous_source_device(self, monkeypatch):
         # Heterogeneous transfer signature: the source tensor lives on a
         # different device ordinal (e.g. source xpu:2 -> target cuda:0). The

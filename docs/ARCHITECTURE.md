@@ -1071,6 +1071,11 @@ configured. XOR deltas mutate an exact base; full HF checkpoints stream tensors
 into the existing mmap-backed checkpoint and become the base for later deltas.
 All methods feed the shared private installer, which commits staged tensors or
 reloads a prepared checkpoint through vLLM's graph-safe layerwise reload path.
+Before a reload, the installer restores registered slots for live kernel buffers
+that were created after vLLM recorded its load-time metadata. PWAL can then
+replace those buffers without turning them into conflicting plain attributes,
+and vLLM's normal finalizer copies them back into their original graph-bound
+storage.
 
 The ModelExpress vLLM plugin registers one `modelexpress` native weight-transfer
 backend for both paths. An empty initialization payload preserves the existing
@@ -1374,6 +1379,11 @@ graph TD
 6. **Target transfers**: Executes the NIXL reads using the prefetched manifest. An RL generator-to-generator active refit validates the manifest and reserves the donor while the engine is unchanged. It holds that bounded lease until staged-handle release or, at the apply safe point, writes directly into the already-registered live runtime tensors and synchronizes the target. This prevents donor mutation without allocating another model-sized GPU buffer. Preparation failures may select the next configured source. A failure after direct mutation starts fences the target as uncertain and requires engine reset or restart; a failure before the first transfer remains retryable. For cache artifacts, the target prepares one source chunk lease at a time, receives into target registered DRAM, verifies CRC32C, writes to target-local staging, releases the lease, then installs the staged tar into the runtime cache directory. Generation mismatches and transfer failures try the next candidate (max 3); a possibly mutated target is reinitialized before retry.
 7. **Target becomes source**: After receiving weights or installing a cache artifact, publishes own metadata and starts its own heartbeat
 8. **Stale detection**: Server-side reaper marks workers STALE if `updated_at` > 90s old; `ListSources(READY)` also applies this heartbeat freshness check at query time so expired READY records are not returned while waiting for the next reaper pass. GC deletes STALE workers after 1 hour
+
+Zero-byte tensors remain in manifests and participate in exact name, size, and
+dtype validation. They count as matched tensors but are omitted from NIXL
+descriptor lists because they have no registered memory range. A manifest made
+entirely of empty tensors completes as a successful no-op transfer.
 
 Tarred cache artifacts carry regular files and directories only. The source
 side enumerates members explicitly and hands tar that list, so nothing else can
