@@ -594,10 +594,10 @@ the already-registered live tensors are the peer receive destination, and the
 loader retains responsibility for shutting down the rank-local transport. A
 failure after the direct transfer starts leaves the engine state uncertain, so
 MX fences it rather than attempting in-process source fallback. This warm-copy
-path is currently unavailable for quantized models and FP8
-KV caches because their derived host state cannot be safely refreshed in place.
-Those workers skip generator P2P and use the canonical S3 path before any
-live-engine mutation.
+path requires a nonempty loader-owned runtime tensor mapping and an initialized
+NIXL manager. Model quantization and FP8 KV-cache dtypes do not gate peer refit.
+The transfer copies registered runtime tensors without rerunning post-load
+processing or refreshing state outside that tensor set.
 
 An object-storage generator with full-tensor engine support defaults to a
 same-rank generator peer first and the version-level object-storage source

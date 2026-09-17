@@ -355,9 +355,10 @@ With full-tensor engine support, active refit uses this order:
 2. if no peer can prepare it, reconstruct the complete S3 lineage from its full
    checkpoint root through the target deltas and install that checkpoint.
 
-Post-load generator P2P is currently unavailable for quantized models and FP8
-KV caches. These configurations select the S3 path before staging or mutating
-the live engine.
+Post-load generator P2P requires registered runtime tensors and an initialized
+loader-owned NIXL manager. Quantized models and FP8 KV caches can select this
+path. It copies the registered runtime representation directly, without
+rerunning post-load processing or refreshing state outside that tensor set.
 
 A successful peer install does not trigger checkpoint reconstruction. If a
 later active refit cannot use a same-rank generator peer, that foreground refit
