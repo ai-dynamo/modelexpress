@@ -25,9 +25,9 @@ from modelexpress_rl.inference.engines.vllm import (
     [
         (None, "auto", False, True, True),
         (None, "auto", False, False, False),
-        (object(), "auto", False, True, False),
-        (None, "fp8_e4m3", False, True, False),
-        (object(), "fp8_e4m3", False, True, False),
+        (object(), "auto", False, True, True),
+        (None, "fp8_e4m3", False, True, True),
+        (object(), "fp8_e4m3", False, True, True),
         (None, "auto", True, True, True),
         (object(), "auto", True, True, True),
         (object(), "auto", True, False, False),

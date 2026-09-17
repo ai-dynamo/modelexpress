@@ -595,20 +595,21 @@ loader retains responsibility for shutting down the rank-local transport. A
 failure after the direct transfer starts leaves the engine state uncertain, so
 MX fences it rather than attempting in-process source fallback. This path
 requires a nonempty loader-owned runtime tensor mapping and an initialized
-NIXL manager. With
-`model_config.enforce_eager=True`, quantized models and FP8 KV caches can use
-this warm-copy path. After validating the live destinations, the RL installer
-uses the same host-scale refresh as cold RDMA loading: q/k/v Python scalars and
-CPU mirrors are updated from the received accelerator tensors (using the maximum
-for per-head scales), with tensor storage preserved. It also invalidates the
+NIXL manager. Model quantization, FP8 KV-cache dtype, and execution mode do not
+gate peer selection. With `model_config.enforce_eager=True`, after validating
+the live destinations, the RL installer uses the same host-scale refresh as
+cold RDMA loading: q/k/v Python scalars and CPU mirrors are updated from the
+received accelerator tensors (using the maximum for per-head scales), with
+tensor storage preserved. It also invalidates the
 FlashInfer BMM and output-scale caches together so the next eager forward
 recomputes them. It does not rerun post-weight-load processing on tensors that
 are already in runtime format. Invalid scale contracts fail installation and
 leave the mutated engine fenced.
 
-Quantized models and FP8 KV caches without `enforce_eager` still skip generator
-P2P and use the canonical S3 path before any live-engine mutation: refreshing
-host mirrors cannot update scalar values already captured in CUDA graphs.
+Without `enforce_eager`, peer refits retain the existing direct-copy behavior
+and do not run this host-scale refresh. Updating host mirrors alone cannot
+update scalar values already captured in CUDA graphs; graph-scale refresh and
+recapture remain outside this eager-mode fix.
 Cold RDMA loading retains its requirement that attention caches be uninitialized.
 
 An object-storage generator with full-tensor engine support defaults to a

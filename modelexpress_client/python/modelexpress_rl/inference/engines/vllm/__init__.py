@@ -10,21 +10,6 @@ from ...runtime import EngineRuntime, FullTensorEngineCapability
 from .context import VllmGeneratorContext
 
 
-def _supports_runtime_tensor_p2p(vllm_config: object) -> bool:
-    """Allow quantized warm copies only when host scalars are not captured."""
-    model_config = getattr(vllm_config, "model_config", None)
-    if getattr(model_config, "enforce_eager", False):
-        return True
-    # Refreshing host mirrors cannot update scalar values in captured graphs.
-    if getattr(vllm_config, "quant_config", None) is not None:
-        return False
-    # FP8 is the quantized KV-cache format supported by vLLM. Its KV scales are
-    # likewise derived state; non-FP8 cache dtypes do not need that refresh.
-    cache_config = getattr(vllm_config, "cache_config", None)
-    cache_dtype = getattr(cache_config, "cache_dtype", None)
-    return not (isinstance(cache_dtype, str) and cache_dtype.startswith("fp8"))
-
-
 def _create_vllm_engine_runtime(
     engine_context: GeneratorEngineContext,
 ) -> EngineRuntime:
@@ -55,7 +40,6 @@ def _create_vllm_engine_runtime(
         if loader is not None
         and loader.tensors
         and loader.nixl_manager is not None
-        and _supports_runtime_tensor_p2p(vllm_config)
         else None
     )
 
