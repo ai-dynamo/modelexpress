@@ -65,6 +65,13 @@ def test_model_loader_owns_runtime_tensor_publication(monkeypatch):
     events = []
     monkeypatch.setattr(
         loader_mod,
+        "drain_tensor_readers",
+        lambda received, *, timeout: events.append(
+            ("drain", received, timeout)
+        ),
+    )
+    monkeypatch.setattr(
+        loader_mod,
         "unpublish_metadata",
         lambda received: events.append(("unpublish", received)),
     )
@@ -77,8 +84,33 @@ def test_model_loader_owns_runtime_tensor_publication(monkeypatch):
     loader.unpublish_runtime_tensors()
     loader.publish_runtime_tensors("version-a")
 
-    assert events == [("unpublish", ctx), ("publish", ctx)]
+    assert events == [
+        ("drain", ctx, 900),
+        ("unpublish", ctx),
+        ("publish", ctx),
+    ]
     assert ctx.identity.revision == "version-a"
+
+
+def test_model_loader_keeps_source_published_when_reader_drain_times_out(
+    monkeypatch,
+):
+    from modelexpress.engines.vllm import loader as loader_mod
+
+    loader = _make_loader()
+    loader._ctx = _make_load_context(device_id=3)
+    unpublish = MagicMock()
+    monkeypatch.setattr(loader_mod, "unpublish_metadata", unpublish)
+    monkeypatch.setattr(
+        loader_mod,
+        "drain_tensor_readers",
+        MagicMock(side_effect=TimeoutError("active readers")),
+    )
+
+    with pytest.raises(TimeoutError, match="active readers"):
+        loader.unpublish_runtime_tensors()
+
+    unpublish.assert_not_called()
 
 
 def _make_identity(model_name="test-model"):

@@ -18,6 +18,7 @@ import atexit
 import logging
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -820,6 +821,7 @@ class NixlTransferManager:
         remote_agent_name: str | None = None,
         require_exact_match: bool = False,
         destination_tensors: dict[str, torch.Tensor] | None = None,
+        on_transfer_start: Callable[[], None] | None = None,
     ) -> tuple[int, int, float]:
         """
         Receive weights from a remote source via NIXL RDMA.
@@ -848,6 +850,8 @@ class NixlTransferManager:
                 transfers leave this False and tolerate subset transfers.
             destination_tensors: Optional registered destination catalog used for
                 name matching. Defaults to the most recently registered catalog.
+            on_transfer_start: Optional callback invoked immediately before the
+                NIXL transfer is submitted.
 
         Returns:
             Tuple of (total_bytes, total_tensors, duration)
@@ -883,6 +887,7 @@ class NixlTransferManager:
         remote_descs: list[tuple[int, int, int]] = []
         local_descs: list[tuple[int, int, int]] = []
         total_bytes = 0
+        matched_tensors = 0
 
         for src_tensor in source_tensors:
             local_tensor = local_tensors.get(src_tensor.name)
@@ -902,6 +907,9 @@ class NixlTransferManager:
                     f"Tensor '{src_tensor.name}' dtype mismatch: "
                     f"source={src_tensor.dtype!r}, local={local_dtype!r}"
                 )
+            matched_tensors += 1
+            if src_tensor.size == 0:
+                continue
             remote_descs.append(
                 (src_tensor.addr, src_tensor.size, src_tensor.device_id)
             )
@@ -914,7 +922,6 @@ class NixlTransferManager:
             )
             total_bytes += src_tensor.size
 
-        matched_tensors = len(remote_descs)
         match_time = time.perf_counter() - match_start
 
         # Downgraded to `partial` by the name-diff check below, which does not
@@ -953,7 +960,7 @@ class NixlTransferManager:
                 len(source_only),
             )
 
-        if not remote_descs:
+        if matched_tensors == 0:
             if require_exact_match:
                 transfer_metrics.record_nixl_receive("rejected")
                 raise ManifestMismatchError(
@@ -962,6 +969,11 @@ class NixlTransferManager:
             logger.warning("No matching tensors found for transfer")
             transfer_metrics.record_nixl_receive("empty")
             return 0, 0, 0.0
+
+        if not remote_descs:
+            logger.info("All %d matching tensors are empty", matched_tensors)
+            transfer_metrics.record_nixl_receive(receive_result)
+            return 0, matched_tensors, 0.0
 
         logger.info(
             f"[TIMING] match_tensors: {match_time:.3f}s "
@@ -996,9 +1008,10 @@ class NixlTransferManager:
             remote_indices=indices,
             backends=self._backends,
         )
-        self._agent.transfer(handle)
-
         try:
+            if on_transfer_start is not None:
+                on_transfer_start()
+            self._agent.transfer(handle)
             self._wait_for_xfer(handle, timeout_seconds, "Transfer")
         finally:
             self._agent.release_xfer_handle(handle)

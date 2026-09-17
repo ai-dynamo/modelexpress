@@ -24,8 +24,10 @@ from modelexpress_rl.inference.engines.vllm import (
     [
         (None, "auto", True, True),
         (None, "auto", False, False),
-        (object(), "auto", True, False),
-        (None, "fp8_e4m3", True, False),
+        (object(), "auto", True, True),
+        (None, "fp8_e4m3", True, True),
+        (object(), "fp8_e4m3", True, True),
+        (object(), "auto", False, False),
     ],
 )
 def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(

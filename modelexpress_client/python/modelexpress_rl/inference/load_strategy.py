@@ -166,6 +166,7 @@ class DesiredVersionP2PStrategy(RdmaStrategy):
     """Load the desired immutable version from an existing generator."""
 
     name = "desired_version_p2p"
+    requires_tensor_read_lease = True
 
     def is_available(self, ctx: LoadContext) -> bool:
         """Report P2P availability only when every rank agrees."""

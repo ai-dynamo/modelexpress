@@ -6,6 +6,9 @@ the same local checkpoint; integrations may use a framework-selected cadence of
 full HF checkpoints to reset that base. ModelExpress coordinates each version's
 lineage and readiness.
 
+For a runnable Vime TP2 trainer, Dynamo TP1 rollout worker, and MinIO setup, see
+[`examples/rl/vime_dynamo_delta_refit`](../examples/rl/vime_dynamo_delta_refit/README.md).
+
 ## Components
 
 | Component | Responsibility |
@@ -352,13 +355,19 @@ With full-tensor engine support, active refit uses this order:
 2. if no peer can prepare it, reconstruct the complete S3 lineage from its full
    checkpoint root through the target deltas and install that checkpoint.
 
-Post-load generator P2P is currently unavailable for quantized models and FP8
-KV caches. These configurations select the S3 path before staging or mutating
-the live engine.
+Post-load generator P2P requires registered runtime tensors and an initialized
+loader-owned NIXL manager. Quantized models and FP8 KV caches can select this
+path. It copies the registered runtime representation directly, without
+rerunning post-load processing or refreshing state outside that tensor set.
 
 A successful peer install does not trigger checkpoint reconstruction. If a
 later active refit cannot use a same-rank generator peer, that foreground refit
-resolves the immutable full root and delta lineage from S3 before installation.
+resolves the immutable full root and delta lineage before installation. The
+receiver validates its local checkpoint under the cache lock and, when it is a
+source-verified ancestor of the target, downloads and applies only the missing
+revisions. The local checkpoint can lag GPU weights after P2P updates, so its
+version determines the replay suffix. When no matching, source-verified local
+checkpoint exists, the receiver reconstructs from the full root.
 
 ### Generator-side S3 artifact contract
 

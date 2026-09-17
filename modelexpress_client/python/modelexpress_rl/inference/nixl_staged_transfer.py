@@ -21,6 +21,10 @@ import torch
 
 from modelexpress import envs, p2p_pb2
 from modelexpress.metadata.payload import worker_tensor_descriptors
+from modelexpress.metadata.worker_server import (
+    TensorReadLease,
+    prepare_tensor_read,
+)
 from modelexpress.nixl_transfer import NixlTransferManager
 from modelexpress.refit.reshard import throughput
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
@@ -46,7 +50,7 @@ from modelexpress.refit.reshard.types import (
     summarize_unsupported,
 )
 from modelexpress.refit.reshard.verify import shard_region, tensor_digest
-from modelexpress.types import TensorDescriptor
+from modelexpress.types import ManifestMismatchError, TensorDescriptor
 
 # Named under modelexpress.* (not modelexpress_rl) so the per-update summary surfaces
 # in the vLLM engine process, which only configures the modelexpress logger.
@@ -280,12 +284,16 @@ class _NixlStagedTransfer:
         device: torch.device,
         agent_name: str | None = None,
         listen_port: int | None = None,
-        timeout_seconds: float = 1200.0,
+        timeout_seconds: float | None = None,
         manager: NixlTransferManager | None = None,
     ) -> None:
         self._device_id = device_id
         self._device = device
-        self._timeout = timeout_seconds
+        self._timeout = float(
+            envs.MX_TRANSFER_TIMEOUT
+            if timeout_seconds is None
+            else timeout_seconds
+        )
         self._owns_manager = manager is None
         if manager is None:
             if agent_name is None:
@@ -601,29 +609,11 @@ class _NixlStagedTransfer:
             },
         )
 
-    def stage_peer(
-        self,
-        *,
-        source: p2p_pb2.WorkerMetadata,
-        parameter_layout: dict[str, tuple[tuple[int, ...], torch.dtype]],
-    ) -> _StagedNixlWeights:
-        """Pull an identical-rank peer's complete runtime tensor set."""
-        if self._closed:
-            raise RuntimeError("NIXL staged transfer is closed")
-        self._ensure_buffers(
-            self._recv_buffers,
-            parameter_layout,
-            label="receive-buffer",
-        )
-        recv_params = set(parameter_layout)
-        if self._registered_recv_params and self._registered_recv_params != recv_params:
-            raise RuntimeError(
-                "receive parameter set changed; restart the generator engine"
-            )
-        if not self._registered_recv_params:
-            self._manager.register_tensors(self._recv_buffers)
-            self._registered_recv_params = recv_params
-
+    @staticmethod
+    def _validate_peer_manifest(
+        manifest: p2p_pb2.GetTensorManifestResponse,
+        destination_tensors: dict[str, torch.Tensor],
+    ) -> list[TensorDescriptor]:
         source_tensors = [
             TensorDescriptor(
                 name=tensor.name,
@@ -632,40 +622,103 @@ class _NixlStagedTransfer:
                 device_id=tensor.device_id,
                 dtype=tensor.dtype,
             )
-            for tensor in worker_tensor_descriptors(source)
+            for tensor in manifest.tensors
         ]
         if not source_tensors:
             raise RuntimeError("P2P source has no tensor descriptors")
 
+        source_names = {tensor.name for tensor in source_tensors}
+        local_names = set(destination_tensors)
+        if source_names != local_names:
+            local_only = sorted(local_names - source_names)
+            source_only = sorted(source_names - local_names)
+            raise ManifestMismatchError(
+                "runtime tensor name mismatch: "
+                f"{len(local_only)} local-only (first: {local_only[:5]}), "
+                f"{len(source_only)} source-only (first: {source_only[:5]})"
+            )
+        for source in source_tensors:
+            destination = destination_tensors[source.name]
+            size = destination.numel() * destination.element_size()
+            if source.size != size or source.dtype != str(destination.dtype):
+                raise ManifestMismatchError(
+                    f"runtime tensor metadata mismatch for {source.name!r}"
+                )
+        return source_tensors
+
+    @staticmethod
+    def _peer_endpoint(
+        manifest: p2p_pb2.GetTensorManifestResponse,
+    ) -> tuple[str, int, str]:
+        endpoint = manifest.metadata_endpoint
+        try:
+            host, port_text = endpoint.rsplit(":", 1)
+            port = int(port_text)
+        except ValueError as error:
+            raise RuntimeError(
+                "P2P source published an unusable metadata endpoint: "
+                f"{endpoint!r}"
+            ) from error
+        if not host or not 1 <= port <= 65535 or not manifest.agent_name:
+            raise RuntimeError(
+                "P2P source published unusable NIXL connection metadata: "
+                f"endpoint={endpoint!r}, agent_name={manifest.agent_name!r}"
+            )
+        return host, port, manifest.agent_name
+
+    def prepare_peer_read(
+        self,
+        *,
+        source: p2p_pb2.WorkerMetadata,
+        mx_source_id: str,
+        worker_id: str,
+        destination_tensors: dict[str, torch.Tensor],
+    ) -> TensorReadLease:
+        """Validate and retain a donor lease until apply or release."""
+        if self._closed:
+            raise RuntimeError("NIXL staged transfer is closed")
+        if not source.worker_grpc_endpoint:
+            raise RuntimeError("generator P2P source has no tensor lease endpoint")
+        lease, _ = prepare_tensor_read(
+            source.worker_grpc_endpoint,
+            mx_source_id,
+            worker_id=worker_id,
+            timeout=self._timeout,
+        )
+        try:
+            self._validate_peer_manifest(lease.manifest, destination_tensors)
+            self._peer_endpoint(lease.manifest)
+        except BaseException:
+            lease.close()
+            raise
+        return lease
+
+    def receive_peer(
+        self,
+        *,
+        tensor_read: TensorReadLease,
+        destination_tensors: dict[str, torch.Tensor],
+        on_transfer_start: Callable[[], None],
+    ) -> dict[str, Any]:
+        """Pull a peer's runtime tensors directly into live engine storage."""
+        if self._closed:
+            raise RuntimeError("NIXL staged transfer is closed")
+
         remote_agent_name: str | None = None
         started = time.perf_counter()
+        manifest = tensor_read.manifest
+        source_tensors = self._validate_peer_manifest(
+            manifest,
+            destination_tensors,
+        )
+        host, port, remote_agent_name = self._peer_endpoint(manifest)
         try:
-            if source.worker_grpc_endpoint:
-                endpoint = source.metadata_endpoint
-                try:
-                    host, port_text = endpoint.rsplit(":", 1)
-                    port = int(port_text)
-                except ValueError as error:
-                    raise RuntimeError(
-                        f"P2P source published an unusable metadata endpoint: "
-                        f"{endpoint!r}"
-                    ) from error
-                if not host or not 1 <= port <= 65535:
-                    raise RuntimeError(
-                        f"P2P source published an unusable metadata endpoint: "
-                        f"{endpoint!r}"
-                    )
-                remote_agent_name = source.agent_name
-                self._manager.fetch_remote_and_wait(
-                    remote_agent_name=remote_agent_name,
-                    ip=host,
-                    port=port,
-                    timeout_seconds=self._timeout,
-                )
-            else:
-                remote_agent_name = self._manager.add_remote_agent(
-                    source.nixl_metadata
-                )
+            self._manager.fetch_remote_and_wait(
+                remote_agent_name=remote_agent_name,
+                ip=host,
+                port=port,
+                timeout_seconds=self._timeout,
+            )
             bytes_received, tensor_count, wire_seconds = (
                 self._manager.receive_from_source(
                     source_metadata=b"",
@@ -673,32 +726,26 @@ class _NixlStagedTransfer:
                     timeout_seconds=self._timeout,
                     remote_agent_name=remote_agent_name,
                     require_exact_match=True,
-                    destination_tensors=self._recv_buffers,
+                    destination_tensors=destination_tensors,
+                    on_transfer_start=on_transfer_start,
                 )
             )
         finally:
             if remote_agent_name is not None:
                 self._manager.remove_remote_agent(remote_agent_name)
 
-        self._active = None
-        # Peer pulls move the same bytes over the same rails, so a rail that
-        # collapsed for stage() collapses here too. Covering only stage() would
-        # leave a generator that refits from a peer reporting nothing at all.
         throughput.warn_if_below_floor(
             wire_bytes=bytes_received,
             wire_seconds=wire_seconds,
             log=logger,
-            context={"device_id": self._device_id, "phase": "stage_peer"},
+            context={"device_id": self._device_id, "phase": "receive_peer"},
         )
-        return _StagedNixlWeights(
-            tensors=self._recv_buffers,
-            metrics={
-                "bytes_received": bytes_received,
-                "segments": tensor_count,
-                "wire_s": round(wire_seconds, 6),
-                "peer_s": round(time.perf_counter() - started, 6),
-            },
-        )
+        return {
+            "bytes_received": bytes_received,
+            "segments": tensor_count,
+            "wire_s": round(wire_seconds, 6),
+            "peer_s": round(time.perf_counter() - started, 6),
+        }
 
     def _verification_tensor(self, prepared: _PreparedNixlTransfer, name: str):
         source = prepared.sources[name]

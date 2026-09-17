@@ -37,7 +37,7 @@ Pick based on workload, not operational preference. The choice has structural co
 
 The central-coordinator backends (`redis`, `kubernetes`) have been the defaults since MX started shipping. They provide per-worker addressability and support heterogeneous and mixed-version fleets. They are also the required metadata foundation for receiver-driven live-weight workflows under development. The cost is operational: you deploy and maintain a `modelexpress-server` pod, wire up Redis or K8s CRDs, and treat it as a first-class component of your stack.
 
-A customer ask through the Slack channel (summary: "just expose a Service we can load-balance against, we don't need the rest") motivated a simpler path for the subset of deployments that don't need the rich central-coordinator semantics. The `k8s-service` backend is that path: no central store, no substrate advertisement, routing delegated entirely to kube-proxy, with `mx_source_id` validated at the GetTensorManifest handshake rather than at the metadata-store level.
+A customer ask through the Slack channel (summary: "just expose a Service we can load-balance against, we don't need the rest") motivated a simpler path for the subset of deployments that don't need the rich central-coordinator semantics. The `k8s-service` backend is that path: no central store, no substrate advertisement, routing delegated entirely to kube-proxy, with `mx_source_id` validated at the `GetTensorManifest` handshake rather than at the metadata-store level.
 
 ## Design
 
@@ -51,7 +51,7 @@ That decoupling is the whole reason the backend is robust to library-side change
 
 ### The handshake as safety net
 
-Every `GetTensorManifest` call passes an `mx_source_id`. If the client resolves its pattern, connects to a pod, and that pod's `WorkerServiceServicer` is serving a different `mx_source_id`, the server returns `FAILED_PRECONDITION`. The client retries on a fresh channel up to `MX_K8S_SOURCE_RETRIES` times so kube-proxy can route to a potentially-matching backend. The client also validates `resp.mx_source_id` and `resp.worker_rank` against the requested values before accepting the manifest, as defense-in-depth against empty-ID requests or misconfigured Service selectors that could slip past the server's check. Content mismatches fail loudly and give the caller a retry budget; wrong weights are never silently transferred.
+Every `GetTensorManifest` call passes an `mx_source_id`. If the client resolves its pattern, connects to a pod, and that pod's `WorkerServiceServicer` is serving a different `mx_source_id`, the server returns `FAILED_PRECONDITION`. The client retries on a fresh channel up to `MX_K8S_SOURCE_RETRIES` times so kube-proxy can route to a potentially-matching backend. The client also validates `resp.mx_source_id` and `resp.worker_rank` against the requested values before accepting the manifest, as defense-in-depth against misconfigured Service selectors. Content mismatches fail loudly and give the caller a retry budget; wrong weights are never silently transferred.
 
 ### Rank encoding: hostname vs port
 
