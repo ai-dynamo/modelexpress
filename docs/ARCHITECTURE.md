@@ -593,7 +593,9 @@ again after warmup or compilation. It also borrows the loader-owned NIXL agent:
 the already-registered live tensors are the peer receive destination, and the
 loader retains responsibility for shutting down the rank-local transport. A
 failure after the direct transfer starts leaves the engine state uncertain, so
-MX fences it rather than attempting in-process source fallback. With
+MX fences it rather than attempting in-process source fallback. This path
+requires a nonempty loader-owned runtime tensor mapping and an initialized
+NIXL manager. With
 `model_config.enforce_eager=True`, quantized models and FP8 KV caches can use
 this warm-copy path. After validating the live destinations, the RL installer
 uses the same host-scale refresh as cold RDMA loading: q/k/v Python scalars and
