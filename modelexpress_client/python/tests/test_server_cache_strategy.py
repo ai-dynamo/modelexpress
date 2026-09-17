@@ -6,13 +6,16 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import grpc
 import pytest
 import torch
 
-from modelexpress import model_prefetch, p2p_pb2
+from modelexpress import model_pb2, model_prefetch, p2p_pb2
 from modelexpress.adapter import EngineAdapter, StrategyFailed
 from modelexpress.load_strategy.context import LoadResult
 from modelexpress.load_strategy.server_cache_strategy import ServerCacheStrategy
+from modelexpress.model_client import ModelCacheClient, ModelCacheError
+from modelexpress.model_snapshot import ModelSnapshotCache
 
 REPO = "org/model"
 COMMIT = "a" * 40
@@ -47,25 +50,79 @@ class _NoNativeAdapter(EngineAdapter):
         return {}
 
 
-class FakeClient:
+class FakeClient(ModelCacheClient):
     instances = []
 
     def __init__(self, **kwargs):
+        super().__init__(server_url="localhost:1", **kwargs)
         self.kwargs = kwargs
         self.calls = []
         self.error = None
         FakeClient.instances.append(self)
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc_info):
-        return None
+    @property
+    def stub(self):
+        raise AssertionError("Metadata fixtures must not require an RPC")
 
     def install_weight_files(self, repo_id, snapshot_path, *args, **kwargs):
         self.calls.append((repo_id, snapshot_path))
         if self.error is not None:
             raise self.error
+
+
+class _LegacyModelService:
+    def __init__(self, *, pin_rpc_error=False, stream_commit=COMMIT):
+        self.pin_rpc_error = pin_rpc_error
+        self.stream_commit = stream_commit
+        self.download_requests = []
+        self.list_requests = []
+        self.stream_requests = []
+
+    def EnsureModelDownloaded(self, request):
+        self.download_requests.append(request)
+        if self.pin_rpc_error and request.HasField("revision"):
+            raise grpc.RpcError("Pinned revision lookup is unavailable")
+        return iter([
+            model_pb2.ModelStatusUpdate(
+                model_name=REPO, status=model_pb2.DOWNLOADED
+            )
+        ])
+
+    def ListModelFiles(self, request):
+        self.list_requests.append(request)
+        return model_pb2.ModelFileList(
+            model_name=REPO,
+            files=[model_pb2.ModelFileInfo(relative_path="model.safetensors", size=7)],
+            total_size=7,
+        )
+
+    def StreamModelFiles(self, request):
+        self.stream_requests.append(request)
+        return iter([
+            model_pb2.FileChunk(
+                relative_path="model.safetensors",
+                data=b"weights",
+                offset=0,
+                total_size=7,
+                is_last_chunk=True,
+                is_last_file=True,
+                commit_hash=self.stream_commit,
+            )
+        ])
+
+
+def _use_legacy_service(monkeypatch, *, pin_rpc_error, stream_commit=COMMIT):
+    service = _LegacyModelService(
+        pin_rpc_error=pin_rpc_error, stream_commit=stream_commit
+    )
+
+    def client_factory(**kwargs):
+        client = ModelCacheClient(server_url="localhost:1", **kwargs)
+        client._stub = service
+        return client
+
+    monkeypatch.setattr("modelexpress.model_client.ModelCacheClient", client_factory)
+    return service
 
 
 @pytest.fixture(autouse=True)
@@ -86,9 +143,20 @@ def enabled(monkeypatch):
 
 @pytest.fixture
 def snapshot(tmp_path):
-    path = tmp_path / "models--org--model" / "snapshots" / COMMIT
+    cache = ModelSnapshotCache(REPO, tmp_path)
+    with cache.lock():
+        path = cache.snapshot_path(COMMIT)
+        path.mkdir(parents=True)
+        (path / "config.json").write_text("{}")
+        cache._write_metadata_inventory(COMMIT, {"config.json": 2})
+    return path
+
+
+@pytest.fixture
+def legacy_snapshot(tmp_path):
+    path = ModelSnapshotCache(REPO, tmp_path).snapshot_path(COMMIT)
     path.mkdir(parents=True)
-    (path / "config.json").write_text("{}")
+    (path / "config.json").write_bytes(b"{}")
     return path
 
 
@@ -163,7 +231,7 @@ class TestLoad:
         ) as register:
             out = ServerCacheStrategy().load(result, ctx)
 
-        assert FakeClient.instances[0].calls == [(REPO, snapshot)]
+        assert FakeClient.instances[-1].calls == [(REPO, snapshot)]
         assert adapter.native_calls == 1
         assert adapter.post_calls == 1
         assert register.call_count == 1
@@ -177,7 +245,7 @@ class TestLoad:
         with patch("modelexpress.load_strategy.server_cache_strategy.register_tensors"):
             ServerCacheStrategy().load(LoadResult(value=MagicMock()), ctx)
 
-        assert FakeClient.instances[0].calls == [(REPO, snapshot)]
+        assert FakeClient.instances[-1].calls == [(REPO, snapshot)]
 
     def test_installs_metadata_when_no_snapshot_exists(self, enabled, snapshot, fake_client):
         ctx = _make_context(REPO, model_path=None)
@@ -187,7 +255,40 @@ class TestLoad:
                 ServerCacheStrategy().load(LoadResult(value=MagicMock()), ctx)
 
         assert ensure.call_count == 1
-        assert FakeClient.instances[0].calls == [(REPO, snapshot)]
+        assert FakeClient.instances[-1].calls == [(REPO, snapshot)]
+
+    def test_partial_snapshot_is_prepared_before_weights(
+        self, enabled, snapshot, fake_client, monkeypatch
+    ):
+        (snapshot / "config.json").unlink()
+        root = snapshot.parent.parent.parent
+        ctx = _make_context(REPO, model_path=str(snapshot), revision="moving-branch")
+        events = []
+
+        def install_metadata(repo_id, revision, cache_directory):
+            assert repo_id == REPO
+            assert revision == COMMIT
+            assert cache_directory == root
+            events.append("metadata")
+            cache = ModelSnapshotCache(repo_id, cache_directory)
+            with cache.lock():
+                (snapshot / "config.json").write_bytes(b"{}")
+                cache._write_metadata_inventory(COMMIT, {"config.json": 2})
+            return snapshot
+
+        original_weights = FakeClient.install_weight_files
+
+        def install_weights(client, repo_id, path, *args, **kwargs):
+            assert ModelSnapshotCache(repo_id, root)._ready_metadata(COMMIT) == snapshot
+            events.append("weights")
+            return original_weights(client, repo_id, path, *args, **kwargs)
+
+        monkeypatch.setattr(model_prefetch, "_ensure_metadata_snapshot", install_metadata)
+        monkeypatch.setattr(FakeClient, "install_weight_files", install_weights)
+        with patch("modelexpress.load_strategy.server_cache_strategy.register_tensors"):
+            ServerCacheStrategy().load(LoadResult(value=MagicMock()), ctx)
+
+        assert events == ["metadata", "weights"]
 
     def test_server_failure_is_a_clean_miss(self, enabled, snapshot, monkeypatch):
         def failing_factory(**kwargs):
@@ -238,16 +339,22 @@ class TestCacheRoot:
             ServerCacheStrategy().load(LoadResult(value=MagicMock()), ctx)
 
     def test_existing_snapshot_pins_the_client_to_its_own_root(
-        self, enabled, snapshot, fake_client, monkeypatch
+        self, enabled, snapshot, fake_client, monkeypatch, tmp_path
     ):
-        monkeypatch.setenv("MODEL_EXPRESS_CACHE_DIRECTORY", "/somewhere/else")
+        default_root = tmp_path / "worker-default"
+        monkeypatch.setenv("MODEL_EXPRESS_CACHE_DIRECTORY", str(default_root))
         ctx = _make_context(REPO, model_path=str(snapshot))
 
         self._run(ctx)
 
-        client = FakeClient.instances[0]
+        client = FakeClient.instances[-1]
         assert client.kwargs["cache_directory"] == snapshot.parent.parent.parent
         assert client.calls == [(REPO, snapshot)]
+        assert all(
+            client.kwargs["cache_directory"] == snapshot.parent.parent.parent
+            for client in FakeClient.instances
+        )
+        assert not default_root.exists()
 
     def test_missing_snapshot_installs_under_the_paths_root(
         self, enabled, tmp_path, fake_client, monkeypatch
@@ -258,19 +365,23 @@ class TestCacheRoot:
         engine_path = other_root / "models--org--model" / "snapshots" / COMMIT
         ctx = _make_context(REPO, model_path=str(engine_path), revision=None)
 
-        def install(repo_id, revision=None, *, cache_directory=None):
+        def install(repo_id, revision, cache_directory):
             assert cache_directory == other_root
             # The commit comes from the directory name, not from ModelConfig:
             # a local path leaves revision unresolved, and the server's default
             # would be a different snapshot than the one the engine reads.
             assert revision == COMMIT
-            engine_path.mkdir(parents=True)
+            cache = ModelSnapshotCache(repo_id, cache_directory)
+            with cache.lock():
+                engine_path.mkdir(parents=True)
+                (engine_path / "config.json").write_bytes(b"{}")
+                cache._write_metadata_inventory(COMMIT, {"config.json": 2})
             return engine_path
 
-        with patch.object(model_prefetch, "ensure_metadata", side_effect=install):
+        with patch.object(model_prefetch, "_ensure_metadata_snapshot", side_effect=install):
             self._run(ctx)
 
-        client = FakeClient.instances[0]
+        client = FakeClient.instances[-1]
         assert client.kwargs["cache_directory"] == other_root
         assert client.calls == [(REPO, engine_path)]
 
@@ -281,8 +392,26 @@ class TestCacheRoot:
         engine_path = tmp_path / "models--org--model" / "snapshots" / COMMIT
         ctx = _make_context(REPO, model_path=str(engine_path))
 
-        with patch.object(model_prefetch, "ensure_metadata", return_value=None):
+        with patch.object(
+            model_prefetch,
+            "_ensure_metadata_snapshot",
+            side_effect=ModelCacheError("Server did not confirm revision"),
+        ):
             with pytest.raises(StrategyFailed) as excinfo:
+                self._run(ctx)
+
+        assert excinfo.value.mutated is False
+        assert "did not confirm revision" in str(excinfo.value)
+        assert FakeClient.instances == []
+
+    def test_disabled_resolved_preparation_is_a_clean_miss(
+        self, enabled, tmp_path, fake_client
+    ):
+        engine_path = tmp_path / "models--org--model" / "snapshots" / COMMIT
+        ctx = _make_context(REPO, model_path=str(engine_path))
+
+        with patch.object(model_prefetch, "_ensure_resolved_metadata", return_value=None):
+            with pytest.raises(StrategyFailed, match="did not apply") as excinfo:
                 self._run(ctx)
 
         assert excinfo.value.mutated is False
@@ -296,9 +425,14 @@ class TestCacheRoot:
         model_prefetch._snapshot_to_repo_id[str(plain)] = REPO
         ctx = _make_context(str(plain), model_path=str(plain))
 
-        self._run(ctx)
+        with patch.object(
+            model_prefetch,
+            "_ensure_resolved_metadata",
+            side_effect=AssertionError("Ordinary local paths must not fetch metadata"),
+        ):
+            self._run(ctx)
 
-        client = FakeClient.instances[0]
+        client = FakeClient.instances[-1]
         assert client.kwargs["cache_directory"] is None
         assert client.calls == [(REPO, plain)]
 
@@ -313,6 +447,95 @@ class TestCacheRoot:
         assert ensure.call_args.kwargs["cache_directory"] is None
         assert ensure.call_args.args[1] == "main"
         assert FakeClient.instances[0].kwargs["cache_directory"] is None
+
+
+class TestLegacySnapshotCompatibility:
+    @pytest.mark.parametrize(
+        "pin_rpc_error", [False, True], ids=["unconfirmed-revision", "pin-rpc-error"]
+    )
+    def test_existing_snapshot_without_inventory_keeps_the_weight_path(
+        self, enabled, legacy_snapshot, monkeypatch, pin_rpc_error
+    ):
+        service = _use_legacy_service(monkeypatch, pin_rpc_error=pin_rpc_error)
+        adapter = _FakeAdapter()
+        ctx = _make_context(REPO, adapter=adapter, model_path=str(legacy_snapshot))
+
+        with patch("modelexpress.load_strategy.server_cache_strategy.register_tensors"):
+            ServerCacheStrategy().load(LoadResult(value=MagicMock()), ctx)
+
+        assert (legacy_snapshot / "model.safetensors").read_bytes() == b"weights"
+        assert (legacy_snapshot / "config.json").read_bytes() == b"{}"
+        assert adapter.native_calls == 1
+        assert adapter.post_calls == 1
+        assert len(service.download_requests) == (2 if pin_rpc_error else 1)
+        assert service.download_requests[0].revision == COMMIT
+        assert all(not request.ignore_weights for request in service.download_requests)
+        if pin_rpc_error:
+            assert not service.download_requests[1].HasField("revision")
+        assert not service.list_requests[0].HasField("revision")
+        assert len(service.stream_requests) == 1
+        assert not model_prefetch._revision_snapshots
+        cache = ModelSnapshotCache(REPO, legacy_snapshot.parent.parent.parent)
+        assert cache._ready_metadata(COMMIT) is None
+        assert not cache._metadata_inventory_path(COMMIT).exists()
+
+    @pytest.mark.parametrize("pin_rpc_error", [False, True])
+    def test_legacy_weight_fallback_still_rejects_a_different_stream_commit(
+        self, enabled, legacy_snapshot, monkeypatch, pin_rpc_error
+    ):
+        service = _use_legacy_service(
+            monkeypatch, pin_rpc_error=pin_rpc_error, stream_commit="b" * 40
+        )
+        adapter = _FakeAdapter()
+        ctx = _make_context(REPO, adapter=adapter, model_path=str(legacy_snapshot))
+
+        with pytest.raises(StrategyFailed, match="refusing to mix revisions") as excinfo:
+            ServerCacheStrategy().load(LoadResult(value=MagicMock()), ctx)
+
+        assert excinfo.value.mutated is False
+        assert adapter.native_calls == 0
+        assert not (legacy_snapshot / "model.safetensors").exists()
+        assert len(service.stream_requests) == 1
+        assert all(not request.ignore_weights for request in service.download_requests)
+
+    @pytest.mark.parametrize("pin_rpc_error", [False, True])
+    @pytest.mark.parametrize(
+        "state",
+        ["missing-directory", "corrupt-inventory", "symlink-inventory", "missing-metadata"],
+    )
+    def test_missing_or_known_invalid_snapshot_cannot_use_legacy_directory_fallback(
+        self, enabled, tmp_path, monkeypatch, pin_rpc_error, state
+    ):
+        cache = ModelSnapshotCache(REPO, tmp_path)
+        snapshot = cache.snapshot_path(COMMIT)
+        if state != "missing-directory":
+            snapshot.mkdir(parents=True)
+            (snapshot / "config.json").write_bytes(b"{}")
+            if state == "missing-metadata":
+                with cache.lock():
+                    cache._write_metadata_inventory(COMMIT, {"config.json": 2})
+                (snapshot / "config.json").unlink()
+            else:
+                inventory = cache._metadata_inventory_path(COMMIT)
+                inventory.parent.mkdir()
+                if state == "corrupt-inventory":
+                    inventory.write_text("{")
+                else:
+                    inventory.symlink_to("missing-inventory")
+        service = _use_legacy_service(monkeypatch, pin_rpc_error=pin_rpc_error)
+        adapter = _FakeAdapter()
+        ctx = _make_context(REPO, adapter=adapter, model_path=str(snapshot))
+
+        with pytest.raises(StrategyFailed) as excinfo:
+            ServerCacheStrategy().load(LoadResult(value=MagicMock()), ctx)
+
+        assert excinfo.value.mutated is False
+        assert adapter.native_calls == 0
+        assert len(service.download_requests) == 1
+        assert service.download_requests[0].ignore_weights is True
+        assert not service.list_requests
+        assert not service.stream_requests
+        assert not (snapshot / "model.safetensors").exists()
 
 
 class TestChainOrder:
