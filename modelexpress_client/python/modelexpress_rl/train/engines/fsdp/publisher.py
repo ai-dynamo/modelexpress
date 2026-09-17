@@ -16,7 +16,7 @@ Extraction rules (per state_dict tensor, floating point only):
 - sharded DTensor: this rank serves its per-dim local box (general: FSDP dim 0,
   tensor-parallel dim 1, or 2-D meshes) via compute_local_shape_and_global_offset
 - served as the wire dtype (WIRE_DTYPE), cast into the staging arena for
-  COPY_TO_DEVICE only when the source differs
+  COPY_TO_HOST or COPY_TO_DEVICE only when the source differs
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ class LocalTensorShard:
 
     ``source_tensor`` is the live (or detached) rank-local view. ``shard_offset``
     is the per-dim offset of this shard's box inside the global tensor (all-zero
-    for unsharded/replicated). ``staging_tensor`` is set only for COPY_TO_DEVICE
+    for unsharded/replicated). ``staging_tensor`` is set for either COPY mode
     and is the WIRE_DTYPE registered arena the source is copied into (copy_
     converts only if the source dtype differs).
     """
@@ -94,7 +94,7 @@ def capture_local_shards(
         zero_offset = tuple(0 for _ in full_shape)
 
         # TODO(dedup-staging): for the full-copy tensors below (unsharded +
-        # replicated), under COPY_TO_DEVICE every rank stages a redundant copy;
+        # replicated), under either COPY mode every rank stages a redundant copy;
         # consider staging + publishing from rank 0 only in that mode.
 
         # Unsharded (not a DTensor): this rank holds the full tensor; publish it.
@@ -189,6 +189,7 @@ def build_fsdp_reshard_manifest(
             shard_offset=tuple(shard.shard_offset),
             shape=tuple(shard.local_shape),
             digest=published_digest(served),
+            memory_type="DRAM" if served.device.type == "cpu" else "VRAM",
         )
         tensor = by_name.get(shard.name)
         if tensor is None:

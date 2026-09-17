@@ -6,17 +6,18 @@ Setup is one-time; the per-step source geometry is re-read from the state_dict
 the client passes each stage, so a trainer that re-materializes its state_dict
 (CPU offload, gathered state dict) still publishes the latest weights:
 
-- COPY_TO_DEVICE (default): ``initialize`` allocates one persistent wire-dtype
-  arena per shard and registers them once. Each stage snapshots the live weights
-  into those stable arenas (cast to the wire dtype only when the source differs);
-  ``publish_ready`` fences the async copy. Robust to a moving source because the
-  registered arena never moves.
-- IN_PLACE (optimization): ``initialize`` registers the DTensor local storage
+- IN_PLACE (recommended for synchronous updates): registers DTensor local storage
   directly (contiguous, so RDMA-registerable) and serves it with no copy. Its
   premise is stable storage: the registered address must not change, so each
   stage asserts the source still sits where it was registered and fails toward
-  COPY_TO_DEVICE otherwise. The source must already be the wire dtype (no
-  in-place cast).
+  COPY_TO_HOST otherwise. Sources must remain immutable until version retirement
+  and already match the wire dtype; trainer-side conversion is incompatible.
+- COPY_TO_HOST (recommended when IN_PLACE is unavailable): allocates persistent
+  pinned CPU buffers in the wire dtype and registers them once. Each stage copies
+  the current shards into those buffers; publish_ready fences CUDA copies.
+- COPY_TO_DEVICE: retains an additional wire-format copy on the source device.
+  This can reduce latency compared with host staging, but its VRAM cost makes it
+  an explicit choice for exceptional cases such as small models.
 """
 
 from __future__ import annotations
@@ -105,7 +106,11 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
     @property
     def supported_staging_modes(self) -> frozenset[TrainerStagingMode]:
         return frozenset(
-            {TrainerStagingMode.COPY_TO_DEVICE, TrainerStagingMode.IN_PLACE}
+            {
+                TrainerStagingMode.IN_PLACE,
+                TrainerStagingMode.COPY_TO_HOST,
+                TrainerStagingMode.COPY_TO_DEVICE,
+            }
         )
 
     @property
@@ -131,26 +136,26 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         }
         self._expected_source_dtypes = {s.name: s.source_tensor.dtype for s in shards}
 
-        if staging_mode is TrainerStagingMode.COPY_TO_DEVICE:
-            self._allocate_and_register_arenas(shards)
-        else:  # IN_PLACE
+        if staging_mode is TrainerStagingMode.IN_PLACE:
             self._register_sources_in_place(shards)
+        else:
+            self._allocate_and_register_arenas(shards, staging_mode)
 
         self._staging_mode = staging_mode
         self._initialized = True
 
-    def _allocate_and_register_arenas(self, shards: list[LocalTensorShard]) -> None:
+    def _allocate_and_register_arenas(
+        self, shards: list[LocalTensorShard], staging_mode: TrainerStagingMode
+    ) -> None:
         """Allocate one persistent arena per shard in its selected wire dtype."""
-        # TODO(staging-followups):
-        # - register via a single VmmArena + register_arena (one dmabuf MR).
-        # - env var to stage into CPU pinned host memory vs GPU device memory
-        #   (host staging frees device memory when the GPU is tight).
-        with classic_cuda_alloc():
+        host = staging_mode is TrainerStagingMode.COPY_TO_HOST
+        with contextlib.nullcontext() if host else classic_cuda_alloc():
             self._arenas = {
                 s.name: torch.empty(
                     s.local_shape,
                     dtype=self._wire_dtype(s),
-                    device=s.source_tensor.device,
+                    device="cpu" if host else s.source_tensor.device,
+                    pin_memory=host and torch.cuda.is_available(),
                 )
                 for s in shards
             }
@@ -231,7 +236,7 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         ):
             self._require_same_layout(shards)
 
-        if staging_mode is TrainerStagingMode.COPY_TO_DEVICE:
+        if staging_mode is not TrainerStagingMode.IN_PLACE:
             with refit_span(
                 "source_preparation",
                 metadata={"staging_copy_enqueues": 1},
@@ -243,6 +248,8 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
             self._require_sources_pinned(shards)
             publish_ready = CompletionFence(lambda: None)
 
+        if mx_envs.MX_RESHARD_PUBLISH_DIGEST:
+            publish_ready.wait()
         return self._staged(shards, publish_ready)
 
     def _snapshot_into_arenas(self, shards: list[LocalTensorShard]) -> CompletionFence:
@@ -251,29 +258,36 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         ``copy_`` casts to the selected wire dtype when the source dtype differs. The arena is
         the served buffer, so point each shard at it.
         """
-        stream = torch.cuda.current_stream() if torch.cuda.is_available() else None
+        devices = set()
         for shard in shards:
             arena = self._arenas[shard.name]
-            arena.copy_(shard.source_tensor)
+            arena.copy_(shard.source_tensor, non_blocking=True)
             shard.staging_tensor = arena
-        if stream is not None:
+            devices.update(t.device for t in (arena, shard.source_tensor) if t.is_cuda)
+        events = []
+        for device in sorted(devices, key=str):
             done = torch.cuda.Event()
-            done.record(stream)
-            return CompletionFence(done.synchronize)
-        return CompletionFence(lambda: None)
+            done.record(torch.cuda.current_stream(device))
+            events.append(done)
+
+        def wait() -> None:
+            for event in events:
+                event.synchronize()
+
+        return CompletionFence(wait)
 
     def _require_sources_pinned(self, shards: list[LocalTensorShard]) -> None:
         """Fail unless every source still sits where it was registered.
 
         IN_PLACE publishes the registered address, so a moved source would
-        advertise stale (freed or reused) memory. Fail toward COPY_TO_DEVICE.
+        advertise stale (freed or reused) memory. Recommend COPY_TO_HOST.
         """
         for shard in shards:
             self._require_in_place_servable(shard)
             if shard.source_tensor.data_ptr() != self._registered_addrs[shard.name]:
                 raise NotImplementedError(
                     f"{shard.name}: source storage moved since registration; "
-                    "IN_PLACE requires stable storage, use COPY_TO_DEVICE"
+                    "IN_PLACE requires stable storage; use COPY_TO_HOST"
                 )
 
     def _capture(self, tensors: Any) -> list[LocalTensorShard]:
@@ -327,12 +341,12 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         if shard.source_tensor.dtype != dtype:
             raise NotImplementedError(
                 f"{shard.name}: IN_PLACE serves the source dtype but wire is "
-                f"{dtype}; use COPY_TO_DEVICE to cast"
+                f"{dtype}; use COPY_TO_HOST to cast"
             )
         if not shard.source_tensor.is_contiguous():
             raise NotImplementedError(
                 f"{shard.name}: IN_PLACE requires a contiguous local shard; "
-                "use COPY_TO_DEVICE for this tensor"
+                "use COPY_TO_HOST for this tensor"
             )
 
     def _staged(

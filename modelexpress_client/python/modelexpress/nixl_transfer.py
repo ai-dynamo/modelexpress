@@ -381,7 +381,11 @@ class NixlTransferManager:
 
         # Phase 1: Discover CUDA allocation boundaries (if pool reg enabled)
         alloc_discovery_start = time.perf_counter()
-        if _pool_reg_enabled() and not force_per_tensor:
+        if (
+            _pool_reg_enabled()
+            and not force_per_tensor
+            and all(t.is_cuda for t in registrable_tensors)
+        ):
             if self._accelerator_backend.supports_pool_reg():
                 allocations = self._find_cuda_allocations(registrable_descriptors)
             else:
@@ -394,7 +398,7 @@ class NixlTransferManager:
         else:
             allocations = None
             logger.info(
-                "Pool registration disabled (MX_POOL_REG != '1'), using per-tensor registration"
+                "Using per-tensor registration (pool disabled, forced, or non-CUDA tensors)"
             )
         alloc_discovery_time = time.perf_counter() - alloc_discovery_start
 

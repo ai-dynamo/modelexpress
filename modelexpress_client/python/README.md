@@ -187,6 +187,13 @@ client before its distributed process group is ready; the explicitly selected
 `engine_context` is constructed lazily on the first tensor operation. Deployment
 environment variables do not select Python implementations.
 
+For synchronous trainers, prefer `IN_PLACE` when storage remains stable and no
+trainer-side conversion is needed. FSDP also supports `COPY_TO_HOST`, the first
+choice when in-place publication is unavailable. Reserve `COPY_TO_DEVICE` for
+cases where measured latency justifies a persistent extra copy in VRAM. See
+[staging mode selection](../../docs/DEPLOYMENT.md#choosing-trainer-staging-for-synchronous-refits)
+for conversion, lifetime, host-memory, and compatibility requirements.
+
 Initialization fixes the staging mode. NIXL also fixes its payload format;
 canonical S3 publication follows each target `WeightVersion`. On NIXL,
 `publish()` hides manifest publication and the internal

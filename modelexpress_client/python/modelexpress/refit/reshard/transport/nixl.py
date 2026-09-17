@@ -53,6 +53,8 @@ class NixlReshardTransport:
             accelerator mem type, e.g. VRAM).
         local_mem_type: memory type of the local destination buffers when it
             differs from ``mem_type`` (``"DRAM"`` for pinned host staging).
+        session_to_memory: per-source memory kinds from the manifest; host
+            sources require an explicit local memory type.
         timeout_seconds: per-batch READ timeout.
     """
 
@@ -64,12 +66,21 @@ class NixlReshardTransport:
         mem_type: str | None = None,
         timeout_seconds: float | None = None,
         local_mem_type: str | None = None,
+        session_to_memory: dict | None = None,
     ) -> None:
         self._manager = manager
         self._session_to_agent = session_to_agent
         self._session_to_device = session_to_device or {}
         self._mem_type = mem_type
         self._local_mem_type = local_mem_type
+        self._session_to_memory = dict(session_to_memory or {})
+        for kind in self._session_to_memory.values():
+            if kind not in ("VRAM", "DRAM"):
+                raise ValueError(f"unsupported source memory type {kind!r}")
+            if kind == "DRAM" and local_mem_type is None:
+                raise ValueError("host sources require an explicit local_mem_type")
+            if mem_type is not None and mem_type != kind:
+                raise ValueError("mem_type override conflicts with source manifest")
         self._timeout = timeout_seconds
         self.bytes_moved = 0
         self.reads_issued = 0
@@ -91,16 +102,20 @@ class NixlReshardTransport:
             return []
 
         batches = [
-            (self._agent_for(session), self._ranges_for(session, group))
+            (
+                self._agent_for(session),
+                self._ranges_for(session, group),
+                self._session_to_memory.get(session, self._mem_type),
+            )
             for session, group in by_session.items()
         ]
 
         if _serial_reads_enabled():
-            for agent, ranges in batches:
+            for agent, ranges, memory_type in batches:
                 total_bytes, num_reads, _duration = self._manager.execute_read_batch(
                     remote_agent_name=agent,
                     ranges=ranges,
-                    mem_type=self._mem_type,
+                    mem_type=memory_type,
                     timeout_seconds=self._timeout,
                     local_mem_type=self._local_mem_type,
                 )
@@ -110,12 +125,12 @@ class NixlReshardTransport:
 
         posted: list = []
         try:
-            for agent, ranges in batches:
+            for agent, ranges, memory_type in batches:
                 posted.append(
                     self._manager.post_read_batch(
                         remote_agent_name=agent,
                         ranges=ranges,
-                        mem_type=self._mem_type,
+                        mem_type=memory_type,
                         local_mem_type=self._local_mem_type,
                     )
                 )

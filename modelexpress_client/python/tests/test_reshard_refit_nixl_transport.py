@@ -86,6 +86,33 @@ def _two_session_descriptors():
     ]
 
 
+@pytest.mark.parametrize("serial", [False, True])
+@pytest.mark.parametrize("local_kind", ["VRAM", "DRAM"])
+def test_reads_host_and_device_sources_with_independent_destination_kind(
+    monkeypatch, serial, local_kind
+):
+    monkeypatch.setenv("MX_RESHARD_SERIAL_READS", str(int(serial)))
+    manager = _StubManager()
+    transport = NixlReshardTransport(
+        manager,
+        {"sA": "host", "sB": "gpu"},
+        {"sA": 0, "sB": 3},
+        session_to_memory={"sA": "DRAM", "sB": "VRAM"},
+        local_mem_type=local_kind,
+    )
+    transport.read(_two_session_descriptors())
+    assert [(c[0], c[2]) for c in manager.calls] == [("host", "DRAM"), ("gpu", "VRAM")]
+    assert manager.local_mem_types == [local_kind, local_kind]
+    assert transport.bytes_moved == 40
+
+
+def test_host_source_requires_explicit_destination_memory():
+    with pytest.raises(ValueError, match="explicit local_mem_type"):
+        NixlReshardTransport(
+            _StubManager(), {"sA": "host"}, {"sA": 0}, session_to_memory={"sA": "DRAM"}
+        )
+
+
 def _transport(mgr, **kwargs):
     return NixlReshardTransport(
         manager=mgr,
