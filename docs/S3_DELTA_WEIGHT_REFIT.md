@@ -357,8 +357,14 @@ With full-tensor engine support, active refit uses this order:
 
 Post-load generator P2P requires registered runtime tensors and an initialized
 loader-owned NIXL manager. Quantized models and FP8 KV caches can select this
-path. It copies the registered runtime representation directly, without
-rerunning post-load processing or refreshing state outside that tensor set.
+path in either eager or graph mode. The peer transfer copies the registered
+runtime representation without rerunning post-load processing. Eager
+installation then refreshes q/k/v host
+scale mirrors and invalidates FlashInfer launch-scale caches for recomputation
+on the next forward. Graph-mode refits retain direct-copy behavior without
+this refresh; captured scalar updates are not handled here. This does not clear
+stored KV entries; retaining quantized KV entries across a change to their
+K/V scales remains unsupported.
 
 A successful peer install does not trigger checkpoint reconstruction. If a
 later active refit cannot use a same-rank generator peer, that foreground refit

@@ -593,11 +593,24 @@ again after warmup or compilation. It also borrows the loader-owned NIXL agent:
 the already-registered live tensors are the peer receive destination, and the
 loader retains responsibility for shutting down the rank-local transport. A
 failure after the direct transfer starts leaves the engine state uncertain, so
-MX fences it rather than attempting in-process source fallback. This warm-copy
-path requires a nonempty loader-owned runtime tensor mapping and an initialized
-NIXL manager. Model quantization and FP8 KV-cache dtypes do not gate peer refit.
-The transfer copies registered runtime tensors without rerunning post-load
-processing or refreshing state outside that tensor set.
+MX fences it rather than attempting in-process source fallback. This path
+requires a nonempty loader-owned runtime tensor mapping and an initialized
+NIXL manager. Model quantization, FP8 KV-cache dtype, and execution mode do not
+gate peer selection. With `model_config.enforce_eager=True`, after validating
+the live destinations, the RL installer uses the same host-scale refresh as
+cold RDMA loading: q/k/v Python scalars and CPU mirrors are updated from the
+received accelerator tensors (using the maximum for per-head scales), with
+tensor storage preserved. It also invalidates the
+FlashInfer BMM and output-scale caches together so the next eager forward
+recomputes them. It does not rerun post-weight-load processing on tensors that
+are already in runtime format. Invalid scale contracts fail installation and
+leave the mutated engine fenced.
+
+Without `enforce_eager`, peer refits retain the existing direct-copy behavior
+and do not run this host-scale refresh. Updating host mirrors alone cannot
+update scalar values already captured in CUDA graphs; graph-scale refresh and
+recapture remain outside this eager-mode fix.
+Cold RDMA loading retains its requirement that attention caches be uninitialized.
 
 An object-storage generator with full-tensor engine support defaults to a
 same-rank generator peer first and the version-level object-storage source
