@@ -69,11 +69,15 @@ def ensure_metadata(
     *,
     cache_directory: str | os.PathLike[str] | None = None,
 ) -> Path | None:
-    """Install the model's non-weight files locally, once per process.
+    """Install non-weight files locally, revalidating cached metadata on reuse.
 
     Returns the snapshot directory, or None when the prefetch does not apply.
     Errors from the server propagate; callers on the engine's critical path
     decide whether to fail or fall through.
+
+    Reuse requires a valid inventory, not just a remembered path. Legacy
+    installs without revision confirmation, or installs whose inventory could
+    not be persisted, may therefore repeat metadata RPCs in the same process.
 
     ``cache_directory`` names the root to install under. Leave it unset for the
     client's own resolution order; pass it when the caller knows which root the
@@ -87,7 +91,14 @@ def ensure_metadata(
     """
     if not is_enabled() or not is_repo_id(repo_id):
         return None
+    return _ensure_metadata_snapshot(repo_id, revision, cache_directory)
 
+
+def _ensure_metadata_snapshot(
+    repo_id: str,
+    revision: str | None,
+    cache_directory: str | os.PathLike[str] | None,
+) -> Path:
     from .model_client import ModelCacheClient
     from .model_snapshot import resolve_cache_root
 
@@ -121,6 +132,22 @@ def ensure_metadata(
             snapshot_path
         )
         return snapshot_path
+
+
+def _ensure_resolved_metadata(
+    repo_id: str, resolved_path: str | os.PathLike[str]
+) -> tuple[Path, Path] | None:
+    """Prepare a standard snapshot at its own root and immutable commit."""
+    if not is_enabled():
+        return None
+
+    from .model_snapshot import snapshot_location
+
+    location = snapshot_location(repo_id, resolved_path)
+    if location is None:
+        return None
+    cache_root, commit = location
+    return _ensure_metadata_snapshot(repo_id, commit, cache_root), cache_root
 
 
 def repo_id_for(model: str | os.PathLike[str]) -> str | None:
@@ -170,9 +197,23 @@ def reset() -> None:
 
 
 def _known_snapshot(repo_id: str, revision: str | None, root: Path) -> Path | None:
+    from .model_snapshot import (
+        ModelSnapshotCache,
+        is_snapshot_commit_directory,
+        snapshot_location,
+    )
+
     with _lock:
         recorded = _revision_snapshots.get((repo_id, revision, _normalize(root)))
-    return Path(recorded) if recorded is not None else None
+    if recorded is None:
+        return None
+    location = snapshot_location(repo_id, recorded)
+    if location is None or location[0].resolve() != root:
+        return None
+    _, commit = location
+    if revision and is_snapshot_commit_directory(revision) and commit != revision:
+        return None
+    return ModelSnapshotCache(repo_id, root)._ready_metadata(commit)
 
 
 def _normalize(path: str | os.PathLike[str]) -> str:
