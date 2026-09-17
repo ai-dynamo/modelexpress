@@ -18,20 +18,28 @@ from modelexpress_rl.inference.engines.vllm import (
     (
         "quant_config",
         "cache_dtype",
+        "enforce_eager",
         "has_nixl_manager",
         "runtime_p2p_available",
     ),
     [
-        (None, "auto", True, True),
-        (None, "auto", False, False),
-        (object(), "auto", True, False),
-        (None, "fp8_e4m3", True, False),
+        (None, "auto", False, True, True),
+        (None, "auto", False, False, False),
+        (object(), "auto", False, True, False),
+        (None, "fp8_e4m3", False, True, False),
+        (object(), "fp8_e4m3", False, True, False),
+        (None, "auto", True, True, True),
+        (object(), "auto", True, True, True),
+        (None, "fp8_e4m3", True, True, True),
+        (object(), "fp8_e4m3", True, True, True),
+        (object(), "fp8_e4m3", True, False, False),
     ],
 )
 def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
     monkeypatch,
     quant_config,
     cache_dtype,
+    enforce_eager,
     has_nixl_manager,
     runtime_p2p_available,
 ):
@@ -112,6 +120,7 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
     )
 
     config = VllmConfig()
+    config.model_config.enforce_eager = enforce_eager
     convert_native_to_hf = lambda weights: weights
     runtime = _create_vllm_engine_runtime(
         VllmGeneratorContext(

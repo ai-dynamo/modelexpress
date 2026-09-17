@@ -11,9 +11,11 @@ from .context import VllmGeneratorContext
 
 
 def _supports_runtime_tensor_p2p(vllm_config: object) -> bool:
-    """Return whether a warm copy needs no derived quantized-state refresh."""
-    # Model quantization may keep host-side scale mirrors or kernel state that
-    # is not part of the registered runtime tensor set.
+    """Allow quantized warm copies only when host scalars are not captured."""
+    model_config = getattr(vllm_config, "model_config", None)
+    if getattr(model_config, "enforce_eager", False):
+        return True
+    # Refreshing host mirrors cannot update scalar values in captured graphs.
     if getattr(vllm_config, "quant_config", None) is not None:
         return False
     # FP8 is the quantized KV-cache format supported by vLLM. Its KV scales are
