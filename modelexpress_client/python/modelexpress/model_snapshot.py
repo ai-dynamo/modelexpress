@@ -27,6 +27,7 @@ There are two write paths because their atomicity requirements differ:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -36,6 +37,7 @@ import uuid
 from contextlib import contextmanager
 from fcntl import LOCK_EX, LOCK_UN, flock
 from pathlib import Path
+from stat import S_ISREG
 from typing import Iterator, Mapping
 
 from huggingface_hub.constants import HF_HUB_CACHE
@@ -71,6 +73,8 @@ _STAGING_PREFIX = ".modelexpress-staging-"
 _STALE_PREFIX = ".modelexpress-stale-"
 _TEMP_PREFIX = ".modelexpress-tmp-"
 _BACKUP_PREFIX = ".modelexpress-backup-"
+_METADATA_INVENTORY_DIR = ".modelexpress-metadata"
+_METADATA_INVENTORY_VERSION = 1
 
 
 class ModelSnapshotError(RuntimeError):
@@ -89,6 +93,28 @@ def split_by_weight(paths) -> tuple[list[str], list[str]]:
     for path in paths:
         (weights if is_weight_file(path) else metadata).append(path)
     return metadata, weights
+
+
+def _metadata_file_sizes(value: object) -> dict[str, int]:
+    if not isinstance(value, dict) or not value:
+        raise ModelSnapshotError(
+            "Metadata inventory must contain a nonempty file manifest"
+        )
+    files: dict[str, int] = {}
+    for relative_path, size in value.items():
+        if not isinstance(relative_path, str):
+            raise ModelSnapshotError("Metadata inventory file paths must be strings")
+        safe_relative_path(relative_path)
+        if is_weight_file(relative_path):
+            raise ModelSnapshotError(
+                f"Metadata inventory contains a weight file: {relative_path!r}"
+            )
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise ModelSnapshotError(
+                f"Invalid metadata inventory size for {relative_path!r}: {size!r}"
+            )
+        files[relative_path] = size
+    return files
 
 
 def safe_relative_path(relative_path: str) -> Path:
@@ -117,6 +143,10 @@ def safe_commit_hash(commit_hash: str) -> str:
     ):
         raise ModelSnapshotError(f"Unsafe commit hash: {commit_hash!r}")
     return commit_hash
+
+
+def _metadata_inventory_path(repo_root: Path, commit_hash: str) -> Path:
+    return repo_root / _METADATA_INVENTORY_DIR / f"{safe_commit_hash(commit_hash)}.json"
 
 
 def repo_dir_name(model_name: str) -> str:
@@ -637,6 +667,115 @@ class ModelSnapshotCache:
         except (OSError, ModelSnapshotError):
             return False
         return True
+
+    def _metadata_inventory_path(self, commit_hash: str) -> Path:
+        return _metadata_inventory_path(self.repo_root, commit_hash)
+
+    def _read_metadata_inventory(self, commit_hash: str) -> dict[str, int] | None:
+        """Read a validated inventory without taking the repository lock."""
+        inventory_path = self._metadata_inventory_path(commit_hash)
+        try:
+            if (
+                not S_ISREG(inventory_path.lstat().st_mode)
+                or self.repo_root.is_symlink()
+                or inventory_path.parent.is_symlink()
+                or not _is_contained(inventory_path, self.cache_root)
+            ):
+                raise ModelSnapshotError("Metadata inventory is not a safe regular file")
+            with inventory_path.open(encoding="utf-8") as handle:
+                record = json.load(handle)
+            if not isinstance(record, dict):
+                raise ModelSnapshotError("Metadata inventory must be an object")
+            version = record.get("version")
+            if (
+                not isinstance(version, int)
+                or isinstance(version, bool)
+                or version != _METADATA_INVENTORY_VERSION
+                or record.get("repo") != self.model_name
+                or record.get("commit") != commit_hash
+            ):
+                raise ModelSnapshotError(
+                    "Metadata inventory version, repository or commit does not match"
+                )
+            return _metadata_file_sizes(record.get("files"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, ModelSnapshotError) as exc:
+            logger.warning("Ignoring metadata inventory %s: %s", inventory_path, exc)
+            return None
+
+    def _ready_metadata(self, commit_hash: str) -> Path | None:
+        """Reuse an immutable snapshot only while its inventory still matches."""
+        if not is_snapshot_commit_directory(commit_hash):
+            return None
+        files = self._read_metadata_inventory(commit_hash)
+        if files is None:
+            return None
+        snapshot_path = self.resolve_pinned_snapshot(files, commit_hash)
+        if snapshot_path is None:
+            logger.warning(
+                "Metadata snapshot %s no longer matches its inventory",
+                self.snapshot_path(commit_hash),
+            )
+        return snapshot_path
+
+    def _write_metadata_inventory(
+        self, commit_hash: str, expected_files: Mapping[str, int]
+    ) -> None:
+        """Validate metadata, then best-effort persist its inventory under lock()."""
+        files = _metadata_file_sizes(dict(expected_files))
+        if not self.has_files(self.snapshot_path(commit_hash), files):
+            raise ModelSnapshotError(
+                f"Cannot record incomplete metadata snapshot for {self.model_name}"
+            )
+        inventory_path = self._metadata_inventory_path(commit_hash)
+        pending_path = inventory_path.parent / f"{_TEMP_PREFIX}{uuid.uuid4().hex}"
+        pending_created = False
+        try:
+            _ensure_directory(inventory_path.parent, self.cache_root)
+            try:
+                inventory_mode = inventory_path.lstat().st_mode
+            except FileNotFoundError:
+                pass
+            else:
+                if not S_ISREG(inventory_mode):
+                    raise ModelSnapshotError(
+                        f"Refusing to replace non-regular metadata inventory: {inventory_path}"
+                    )
+            with pending_path.open("x", encoding="utf-8") as handle:
+                pending_created = True
+                json.dump(
+                    {
+                        "version": _METADATA_INVENTORY_VERSION,
+                        "repo": self.model_name,
+                        "commit": commit_hash,
+                        "files": files,
+                    },
+                    handle,
+                    sort_keys=True,
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(pending_path, inventory_path)
+            pending_created = False
+            _fsync_directory(inventory_path.parent)
+        except (OSError, ModelSnapshotError) as exc:
+            logger.warning(
+                "Could not persist metadata inventory %s: %s; "
+                "the verified snapshot remains usable",
+                inventory_path,
+                exc,
+            )
+        finally:
+            if pending_created:
+                try:
+                    pending_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning(
+                        "Could not remove metadata inventory temporary file %s: %s",
+                        pending_path,
+                        exc,
+                    )
 
     def resolve_pinned_snapshot(
         self,

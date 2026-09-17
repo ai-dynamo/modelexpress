@@ -11,9 +11,24 @@ from pathlib import Path
 import pytest
 
 from modelexpress import model_prefetch
+from modelexpress.model_snapshot import ModelSnapshotCache, is_snapshot_commit_directory
 
 REPO = "org/model"
 COMMIT = "e" * 40
+
+
+def _publish_metadata(cache_directory, repo_id=REPO, commit=COMMIT):
+    cache = ModelSnapshotCache(repo_id, cache_directory)
+    with cache.lock():
+        staging = cache.staging()
+        staging.begin_file("config.json")
+        staging.write(b"{}")
+        staging.end_file()
+        snapshot = staging.publish(
+            commit, {"config.json": 2}, requested_revision=commit
+        )
+        cache._write_metadata_inventory(commit, {"config.json": 2})
+    return snapshot
 
 
 class FakeClient:
@@ -40,6 +55,11 @@ class FakeClient:
         self.revisions.append(kwargs.get("requested_revision"))
         if self.error is not None:
             raise self.error
+        revision = kwargs.get("requested_revision")
+        commit = revision if revision and is_snapshot_commit_directory(revision) else COMMIT
+        self.snapshot = _publish_metadata(
+            self.kwargs.get("cache_directory"), repo_id, commit
+        )
         return self.snapshot
 
 
@@ -47,6 +67,7 @@ class FakeClient:
 def clean_state(monkeypatch, tmp_path):
     model_prefetch.reset()
     FakeClient.instances = []
+    monkeypatch.setenv("MODEL_EXPRESS_CACHE_DIRECTORY", str(tmp_path))
     for name in (
         "MODEL_EXPRESS_NO_SHARED_STORAGE",
         "MODEL_EXPRESS_URL",
@@ -67,12 +88,9 @@ def enabled(monkeypatch):
 @pytest.fixture
 def fake_client(monkeypatch, tmp_path):
     snapshot = tmp_path / "models--org--model" / "snapshots" / COMMIT
-    snapshot.mkdir(parents=True)
 
     def factory(**kwargs):
-        client = FakeClient(**kwargs)
-        client.snapshot = snapshot
-        return client
+        return FakeClient(**kwargs)
 
     monkeypatch.setattr("modelexpress.model_client.ModelCacheClient", factory)
     return snapshot
@@ -137,6 +155,61 @@ class TestEnsureMetadata:
         assert first == second
         assert len(FakeClient.instances) == 1
 
+    def test_warm_memo_does_not_take_a_repository_lock(
+        self, enabled, fake_client, monkeypatch
+    ):
+        snapshot = model_prefetch.ensure_metadata(REPO, COMMIT)
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("A warm memo must not take a repo lock or create a client")
+
+        monkeypatch.setattr(ModelSnapshotCache, "lock", forbidden)
+        monkeypatch.setattr("modelexpress.model_client.ModelCacheClient", forbidden)
+
+        assert model_prefetch.ensure_metadata(REPO, COMMIT) == snapshot
+
+    @pytest.mark.parametrize(
+        "damage", ["missing", "size", "dangling", "missing-inventory", "corrupt-inventory"]
+    )
+    def test_memo_revalidates_metadata_before_reuse(
+        self, enabled, fake_client, tmp_path, damage
+    ):
+        snapshot = model_prefetch.ensure_metadata(REPO, COMMIT)
+        config = snapshot / "config.json"
+        inventory = ModelSnapshotCache(REPO, tmp_path)._metadata_inventory_path(COMMIT)
+        if damage == "missing":
+            config.unlink()
+        elif damage == "size":
+            config.write_bytes(b"partial")
+        elif damage == "dangling":
+            config.unlink()
+            config.symlink_to("missing-blob")
+        elif damage == "missing-inventory":
+            inventory.unlink()
+        else:
+            inventory.write_text("{")
+
+        assert model_prefetch.ensure_metadata(REPO, COMMIT) == snapshot
+        assert len(FakeClient.instances) == 2
+        assert config.read_bytes() == b"{}"
+        assert ModelSnapshotCache(REPO, tmp_path)._ready_metadata(COMMIT) == snapshot
+
+    def test_invalidated_memo_does_not_hide_recovery_failure(
+        self, enabled, fake_client, monkeypatch
+    ):
+        snapshot = model_prefetch.ensure_metadata(REPO, COMMIT)
+        (snapshot / "config.json").unlink()
+
+        def unavailable(**kwargs):
+            client = FakeClient(**kwargs)
+            client.error = RuntimeError("server down")
+            return client
+
+        monkeypatch.setattr("modelexpress.model_client.ModelCacheClient", unavailable)
+
+        with pytest.raises(RuntimeError, match="server down"):
+            model_prefetch.ensure_metadata(REPO, COMMIT)
+
     def test_failure_is_retryable(self, enabled, fake_client, monkeypatch):
         def failing_factory(**kwargs):
             client = FakeClient(**kwargs)
@@ -185,7 +258,7 @@ class TestConcurrentEnsureMetadata:
 
         class SlowClient:
             def __init__(self, **kwargs):
-                pass
+                self.cache_directory = kwargs.get("cache_directory")
 
             def __enter__(self):
                 return self
@@ -196,7 +269,7 @@ class TestConcurrentEnsureMetadata:
             def install_metadata_snapshot(self, repo_id, *args, **kwargs):
                 installs.append(repo_id)
                 time.sleep(0.3)
-                return snapshot
+                return _publish_metadata(self.cache_directory, repo_id, "a" * 40)
 
         monkeypatch.setattr("modelexpress.model_client.ModelCacheClient", SlowClient)
 
@@ -213,7 +286,8 @@ class TestConcurrentEnsureMetadata:
         for thread in threads:
             thread.start()
         for thread in threads:
-            thread.join()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
 
         assert results["first"] == snapshot
         assert results["second"] == snapshot
@@ -260,11 +334,14 @@ class TestRevisionScopedDedup:
         Keyed by repo id alone, the second request would be served the first
         revision's snapshot -- a revision the engine never asked for.
         """
-        model_prefetch.ensure_metadata(REPO, COMMIT)
-        model_prefetch.ensure_metadata(REPO, "f" * 40)
+        first = model_prefetch.ensure_metadata(REPO, COMMIT)
+        second = model_prefetch.ensure_metadata(REPO, "f" * 40)
 
         assert len(FakeClient.instances) == 2
         assert FakeClient.instances[-1].revisions == ["f" * 40]
+        assert first != second
+        assert first.name == COMMIT
+        assert second.name == "f" * 40
 
 
 class TestCacheDirectory:
@@ -292,10 +369,13 @@ class TestCacheDirectory:
     def test_the_same_revision_under_two_roots_is_two_installs(
         self, enabled, fake_client, tmp_path
     ):
-        model_prefetch.ensure_metadata(REPO, COMMIT, cache_directory=tmp_path / "a")
-        model_prefetch.ensure_metadata(REPO, COMMIT, cache_directory=tmp_path / "b")
+        first = model_prefetch.ensure_metadata(REPO, COMMIT, cache_directory=tmp_path / "a")
+        second = model_prefetch.ensure_metadata(REPO, COMMIT, cache_directory=tmp_path / "b")
 
         assert len(FakeClient.instances) == 2
+        assert first != second
+        assert ModelSnapshotCache(REPO, tmp_path / "a")._ready_metadata(COMMIT) == first
+        assert ModelSnapshotCache(REPO, tmp_path / "b")._ready_metadata(COMMIT) == second
 
     def test_the_same_root_written_two_ways_is_one_install(
         self, enabled, fake_client, tmp_path, monkeypatch
@@ -307,6 +387,49 @@ class TestCacheDirectory:
         model_prefetch.ensure_metadata(REPO, COMMIT, cache_directory=Path("root"))
 
         assert len(FakeClient.instances) == 1
+
+
+class TestEnsureResolvedMetadata:
+    def test_disabled_does_not_prepare_a_resolved_path(self, fake_client, tmp_path):
+        assert model_prefetch._ensure_resolved_metadata(REPO, fake_client) is None
+        assert FakeClient.instances == []
+        assert not fake_client.exists()
+
+    def test_ordinary_local_directory_is_not_a_metadata_request(
+        self, enabled, fake_client, tmp_path
+    ):
+        local = tmp_path / "local-model"
+        local.mkdir()
+
+        assert model_prefetch._ensure_resolved_metadata(REPO, local) is None
+        assert FakeClient.instances == []
+        assert list(local.iterdir()) == []
+
+    def test_resolved_path_uses_its_own_root_and_commit(
+        self, enabled, fake_client, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("MODEL_EXPRESS_CACHE_DIRECTORY", str(tmp_path / "default"))
+        root = tmp_path / "engine-cache"
+        commit = "a" * 40
+        path = root / "models--org--model" / "snapshots" / commit
+
+        assert model_prefetch._ensure_resolved_metadata(REPO, path) == (path, root)
+        assert FakeClient.instances[0].kwargs["cache_directory"] == root
+        assert FakeClient.instances[0].revisions == [commit]
+        assert (path / "config.json").read_bytes() == b"{}"
+        assert not (tmp_path / "default").exists()
+
+    def test_resolved_repo_identity_is_not_shadowed_by_a_local_directory(
+        self, enabled, fake_client, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        Path(REPO).mkdir(parents=True)
+        root = tmp_path / "engine-cache"
+        path = root / "models--org--model" / "snapshots" / COMMIT
+
+        assert model_prefetch.ensure_metadata(REPO, COMMIT, cache_directory=root) is None
+        assert model_prefetch._ensure_resolved_metadata(REPO, path) == (path, root)
+        assert FakeClient.instances[0].revisions == [COMMIT]
 
 
 class TestRepoIdFor:
