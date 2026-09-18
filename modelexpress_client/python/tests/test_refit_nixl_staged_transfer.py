@@ -213,7 +213,9 @@ def test_bounded_transfer_reuses_arena_and_preserves_fp32(monkeypatch, pack):
     assert metrics["batches"] == (1 if pack else 2)
 
 
-def _manifest(*, agent_name: str, endpoint: str, offset: int, address: int) -> bytes:
+def _manifest(
+    *, agent_name: str, endpoint: str, offset: int, address: int, memory_type="VRAM"
+) -> bytes:
     return wrap_rendezvous_blob(
         b"nixl-metadata",
         agent_name,
@@ -231,6 +233,7 @@ def _manifest(*, agent_name: str, endpoint: str, offset: int, address: int) -> b
                         addr=address,
                         shard_offset=(offset,),
                         shape=(2,),
+                        memory_type=memory_type,
                     )
                 ],
             )
@@ -465,7 +468,8 @@ def test_default_transfer_timeout_matches_the_lease_budget(monkeypatch):
     assert transfer._timeout == 17.0
 
 
-def test_exact_manifests_resolve_without_legacy_source_discovery():
+@pytest.mark.parametrize("memory_type", ["VRAM", "DRAM"])
+def test_exact_manifests_resolve_without_legacy_source_discovery(memory_type):
     resolved = _resolve_sources(
         [
             _manifest(
@@ -473,6 +477,7 @@ def test_exact_manifests_resolve_without_legacy_source_discovery():
                 endpoint="trainer-0:19000",
                 offset=0,
                 address=100,
+                memory_type=memory_type,
             ),
             _manifest(
                 agent_name="trainer-1",
@@ -492,6 +497,10 @@ def test_exact_manifests_resolve_without_legacy_source_discovery():
     assert resolved.agent_metadata == {
         "trainer-0": b"nixl-metadata",
         "trainer-1": b"nixl-metadata",
+    }
+    assert resolved.session_to_memory == {
+        "trainer-0": memory_type,
+        "trainer-1": "VRAM",
     }
 
 
@@ -1029,8 +1038,9 @@ def test_abandoned_double_buffered_iteration_drains_the_prefetched_read(monkeypa
 
 
 @pytest.mark.parametrize("staging_buffers", [1, 2])
+@pytest.mark.parametrize("source_memory_type", ["VRAM", "DRAM"])
 def test_prepare_stages_in_pinned_host_memory_and_splits_the_budget(
-    monkeypatch, staging_buffers
+    monkeypatch, staging_buffers, source_memory_type
 ):
     """staging_device='cpu' registers DRAM arenas and reads with a DRAM local type."""
     events = []
@@ -1076,6 +1086,7 @@ def test_prepare_stages_in_pinned_host_memory_and_splits_the_budget(
         def __init__(self, manager, *args, **kwargs):
             self.manager = manager
             self.local_mem_type = kwargs.get("local_mem_type")
+            assert kwargs["session_to_memory"] == {"source": source_memory_type}
             transports.append(self)
 
         def post_reads(self, descriptors):
@@ -1111,6 +1122,7 @@ def test_prepare_stages_in_pinned_host_memory_and_splits_the_budget(
                         addr=source_tensor.data_ptr(),
                         shard_offset=(0,),
                         shape=(4,),
+                        memory_type=source_memory_type,
                     )
                 ],
             ),

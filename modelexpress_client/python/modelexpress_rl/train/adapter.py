@@ -47,7 +47,13 @@ class NixlMetadataProvider(Protocol):
 
 
 class TrainerStagingMode(str, Enum):
-    """How a trainer adapter preserves a version's immutable source bytes."""
+    """How a trainer adapter preserves a version's immutable source bytes.
+
+    Prefer IN_PLACE for synchronous updates with stable, matching-dtype sources
+    and no trainer-side conversion. Keep source bytes immutable until retirement.
+    Prefer COPY_TO_HOST otherwise. COPY_TO_DEVICE trades substantial extra VRAM
+    for lower latency and should be an explicit, measured exception.
+    """
 
     UNSPECIFIED = "UNSPECIFIED"
     COPY_TO_DEVICE = "COPY_TO_DEVICE"

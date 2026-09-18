@@ -560,8 +560,8 @@ default. An unknown name or non-floating tensor is rejected rather than silently
 ignoring a precision exception. Names must match the state dict supplied by that
 trainer, including any wrapper prefixes.
 
-`COPY_TO_DEVICE` registers persistent buffers in each selected dtype and copies
-subsequent versions into those buffers. `IN_PLACE` requires the source dtype to
+`COPY_TO_HOST` and `COPY_TO_DEVICE` register persistent buffers in each selected
+dtype and copy subsequent versions into those buffers. `IN_PLACE` requires the source dtype to
 match the selected dtype. The adapter copies the override mapping at creation;
 changing the caller's mapping does not change an active adapter. A source dtype
 change after initialization is rejected before writing a new version. Recreate
@@ -571,6 +571,42 @@ Manifests describe each served tensor's dtype and element size, and byte totals
 sum their actual sizes. Existing receiver dtype conversion remains available,
 but casting a rounded BF16 value back to FP32 cannot recover source precision.
 Verify installed parameters and generation separately from transfer completion.
+
+### Choosing trainer staging for synchronous refits
+
+Choose an existing `TrainerStagingMode` explicitly for the integration:
+
+| Mode | Recommendation | Lifetime and memory cost |
+|---|---|---|
+| `IN_PLACE` | First choice and lowest staging latency for synchronous integrations. Trainers wait for receivers to finish and retire/delete the version before updating its source bytes. | Registers existing contiguous storage without a second weight copy. Addresses must remain stable across updates; bytes must remain immutable while the version can be read. |
+| `COPY_TO_HOST` | First choice when `IN_PLACE` is unavailable, including trainer-side dtype conversion or moving source storage. | Keeps a persistent wire-format copy in pinned host RAM on CUDA hosts. GPU-to-host staging and host-to-receiver transfer add latency, but avoid a persistent second weight copy in VRAM. |
+| `COPY_TO_DEVICE` | Explicit exception when measured latency justifies the VRAM cost, typically for small models where `IN_PLACE` is unavailable. | Keeps an additional wire-format copy on the trainer device. It is generally faster than host staging but can consume substantial VRAM; budget all rank-local shards, including replicated tensors. |
+
+`IN_PLACE` cannot perform trainer-side conversion: each source must already have
+the selected transfer dtype and representation. A conversion plugin also rules
+out this mode. CPU offload or state-dict rematerialization can invalidate its
+stable-address requirement even when the dtypes match. Do not silently fall back
+to a device copy when these checks fail.
+
+The FSDP adapter supports all three modes for full-tensor payloads. Host staging
+preserves the per-tensor dtype overrides above and registers its persistent CPU
+buffers once. CUDA copy completion is fenced before publication; the served
+snapshot and its registration remain live until version retirement. Conversion
+can still require temporary device workspace; host staging eliminates the
+persistent wire-format device copy, not every transient allocation. Support for
+arbitrary conversion plugins remains adapter-specific.
+
+The GLM PrimeRL benchmark uses FP32 trainer shards with BF16 transfer and selected
+FP32 exceptions. This prevents `IN_PLACE` with its current precision policy;
+`COPY_TO_HOST` is the recommended alternative to evaluate. Its existing
+`COPY_TO_DEVICE` benchmark configuration is an explicit performance experiment,
+not a recommended deployment default.
+
+Trainer `COPY_TO_HOST` is independent of the generator's `staging_device="cpu"`
+setting: the former changes where source snapshots live, while the latter
+changes where receivers land incoming bytes. Host-source manifests use the
+internal `mx.reshard.shard_table.v2` format, so both ends must run a host-aware
+client. Older readers reject this format. Device-only manifests retain v1.
 
 ### Dynamo Model Cache Deployment
 

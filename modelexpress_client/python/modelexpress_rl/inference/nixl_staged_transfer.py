@@ -26,7 +26,11 @@ from modelexpress.metadata.worker_server import (
     TensorReadLease,
     prepare_tensor_read,
 )
-from modelexpress.nixl_transfer import NIXL_DRAM_MEM_TYPE, NixlTransferManager
+from modelexpress.nixl_transfer import (
+    NIXL_DRAM_MEM_TYPE,
+    NIXL_VRAM_MEM_TYPE,
+    NixlTransferManager,
+)
 from modelexpress.refit.reshard import throughput
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
 from modelexpress.refit.reshard.rendezvous import (
@@ -64,6 +68,7 @@ class _ResolvedSources:
     session_to_agent: dict
     session_to_device: dict
     agent_metadata: dict[str, bytes]
+    session_to_memory: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -234,11 +239,15 @@ def _resolve_sources(manifests: list[bytes]) -> _ResolvedSources:
     if len(set(agents)) != len(agents):
         raise ValueError("source manifests contain duplicate NIXL agents")
     merged = merge_shard_tables([payload.tensors for payload in payloads])
-    sources, session_to_agent, session_to_device = build_sources(merged)
+    session_to_memory = {}
+    sources, session_to_agent, session_to_device = build_sources(
+        merged, session_to_memory=session_to_memory
+    )
     return _ResolvedSources(
         sources=sources,
         session_to_agent=session_to_agent,
         session_to_device=session_to_device,
+        session_to_memory=session_to_memory,
         agent_metadata={
             payload.agent_name: payload.agent_metadata for payload in payloads
         },
@@ -645,7 +654,8 @@ class _NixlStagedTransfer:
             resolved.session_to_agent,
             resolved.session_to_device,
             timeout_seconds=self._timeout,
-            local_mem_type=NIXL_DRAM_MEM_TYPE if host_staging else None,
+            local_mem_type=NIXL_DRAM_MEM_TYPE if host_staging else NIXL_VRAM_MEM_TYPE,
+            session_to_memory=resolved.session_to_memory,
         )
         if batches is not None:
             assert buffer_budget is not None
