@@ -29,6 +29,7 @@ import torch
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
+from modelexpress.nixl_transfer import NIXL_DRAM_MEM_TYPE, NIXL_VRAM_MEM_TYPE
 from modelexpress.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
@@ -189,7 +190,11 @@ def build_fsdp_reshard_manifest(
             shard_offset=tuple(shard.shard_offset),
             shape=tuple(shard.local_shape),
             digest=published_digest(served),
-            memory_type="DRAM" if served.device.type == "cpu" else "VRAM",
+            memory_type=(
+                NIXL_DRAM_MEM_TYPE
+                if served.device.type == "cpu"
+                else NIXL_VRAM_MEM_TYPE
+            ),
         )
         tensor = by_name.get(shard.name)
         if tensor is None:

@@ -52,6 +52,9 @@ if _nixl_api is not None:
 SUPPORTED_NIXL_BACKENDS = ("UCX", "LIBFABRIC")
 DEFAULT_NIXL_BACKEND = "UCX"
 NIXL_DRAM_MEM_TYPE = "DRAM"
+NIXL_VRAM_MEM_TYPE = "VRAM"
+#: The memory kinds a published shard may live in, as NIXL names them.
+NIXL_MEM_TYPES = (NIXL_VRAM_MEM_TYPE, NIXL_DRAM_MEM_TYPE)
 
 
 def is_nixl_available() -> bool:

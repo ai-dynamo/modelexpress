@@ -29,6 +29,8 @@ import os
 from collections import defaultdict
 from typing import Any
 
+from modelexpress.nixl_transfer import NIXL_DRAM_MEM_TYPE, NIXL_MEM_TYPES
+
 logger = logging.getLogger("modelexpress.refit.reshard.transport.nixl")
 
 
@@ -75,9 +77,9 @@ class NixlReshardTransport:
         self._local_mem_type = local_mem_type
         self._session_to_memory = dict(session_to_memory or {})
         for kind in self._session_to_memory.values():
-            if kind not in ("VRAM", "DRAM"):
+            if kind not in NIXL_MEM_TYPES:
                 raise ValueError(f"unsupported source memory type {kind!r}")
-            if kind == "DRAM" and local_mem_type is None:
+            if kind == NIXL_DRAM_MEM_TYPE and local_mem_type is None:
                 raise ValueError("host sources require an explicit local_mem_type")
             if mem_type is not None and mem_type != kind:
                 raise ValueError("mem_type override conflicts with source manifest")

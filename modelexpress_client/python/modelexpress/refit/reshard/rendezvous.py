@@ -45,6 +45,11 @@ from typing import NamedTuple
 from modelexpress import envs, p2p_pb2
 from modelexpress.client import MxClient
 from modelexpress.metadata.publisher import PublisherThread
+from modelexpress.nixl_transfer import (
+    NIXL_DRAM_MEM_TYPE,
+    NIXL_MEM_TYPES,
+    NIXL_VRAM_MEM_TYPE,
+)
 from modelexpress.refit.reshard.slice_plan import Shard
 from modelexpress.refit.reshard.transfer_plan import SourceInfo
 
@@ -84,10 +89,10 @@ class PublishedShard:
     shard_offset: tuple
     shape: tuple
     digest: str | None = None
-    memory_type: str = "VRAM"
+    memory_type: str = NIXL_VRAM_MEM_TYPE
 
     def __post_init__(self) -> None:
-        if self.memory_type not in ("VRAM", "DRAM"):
+        if self.memory_type not in NIXL_MEM_TYPES:
             raise ValueError(f"unsupported source memory type {self.memory_type!r}")
 
 
@@ -119,7 +124,7 @@ def _encode_shard(shard) -> dict:
     }
     if shard.digest is not None:
         encoded["digest"] = shard.digest
-    if shard.memory_type != "VRAM":
+    if shard.memory_type != NIXL_VRAM_MEM_TYPE:
         encoded["memory_type"] = shard.memory_type
     return encoded
 
@@ -128,7 +133,7 @@ def _schema_for(tensors: list) -> str:
     # Old readers must reject host addresses rather than issue VRAM reads.
     return (
         _HOST_SCHEMA
-        if any(s.memory_type != "VRAM" for t in tensors for s in t.shards)
+        if any(s.memory_type != NIXL_VRAM_MEM_TYPE for t in tensors for s in t.shards)
         else _SCHEMA
     )
 
@@ -191,7 +196,7 @@ def decode_shard_entries(entries: list) -> list:
                 shard_offset=tuple(s["shard_offset"]),
                 shape=tuple(s["shape"]),
                 digest=s.get("digest"),
-                memory_type=s.get("memory_type", "VRAM"),
+                memory_type=s.get("memory_type", NIXL_VRAM_MEM_TYPE),
             )
             for s in t["shards"]
         ]
@@ -231,7 +236,7 @@ def build_sources(tensors: list, *, session_to_memory: dict | None = None) -> tu
         shards = []
         for s in t.shards:
             session = s.agent_name
-            if s.memory_type == "DRAM" and session_to_memory is None:
+            if s.memory_type == NIXL_DRAM_MEM_TYPE and session_to_memory is None:
                 raise ValueError("host sources require a memory-type-aware receiver")
             if session in session_to_device and (
                 session_to_device[session] != s.device_id

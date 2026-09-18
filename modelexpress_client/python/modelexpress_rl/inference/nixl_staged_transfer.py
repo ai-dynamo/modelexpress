@@ -26,7 +26,11 @@ from modelexpress.metadata.worker_server import (
     TensorReadLease,
     prepare_tensor_read,
 )
-from modelexpress.nixl_transfer import NIXL_DRAM_MEM_TYPE, NixlTransferManager
+from modelexpress.nixl_transfer import (
+    NIXL_DRAM_MEM_TYPE,
+    NIXL_VRAM_MEM_TYPE,
+    NixlTransferManager,
+)
 from modelexpress.refit.reshard import throughput
 from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
 from modelexpress.refit.reshard.rendezvous import (
@@ -650,7 +654,7 @@ class _NixlStagedTransfer:
             resolved.session_to_agent,
             resolved.session_to_device,
             timeout_seconds=self._timeout,
-            local_mem_type=NIXL_DRAM_MEM_TYPE if host_staging else "VRAM",
+            local_mem_type=NIXL_DRAM_MEM_TYPE if host_staging else NIXL_VRAM_MEM_TYPE,
             session_to_memory=resolved.session_to_memory,
         )
         if batches is not None:
