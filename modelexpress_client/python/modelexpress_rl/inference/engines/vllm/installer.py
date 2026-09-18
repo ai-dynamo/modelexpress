@@ -20,6 +20,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
+from modelexpress.accelerators import accelerator_backend_for
+from modelexpress.engines.vllm.host_quantization import (
+    refresh_host_quantization_state,
+)
 from modelexpress.refit.reshard.geometry import (
     capture_weights,
     convert_source_weights,
@@ -43,6 +47,23 @@ if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
 
 logger = logging.getLogger("modelexpress_rl.inference.engines.vllm.installer")
+
+
+def _reserve_runtime_buffer_slots(model: Module, layerwise_info) -> None:
+    """Keep late-created kernel buffers registered while PWAL runs again."""
+    for layer in model.modules():
+        info = layerwise_info.get(layer)
+        if info is None or info.kernel_tensors is None:
+            continue
+        _, buffers = info.kernel_tensors
+        for name, buffer in buffers.items():
+            if name in layer._buffers:
+                continue
+            if hasattr(layer, name):
+                raise IncompleteRefit(
+                    f"{type(layer).__name__}.{name} conflicts with a runtime buffer"
+                )
+            layer.register_buffer(name, buffer)
 
 
 class _VllmInstaller(EngineInstaller):
@@ -79,6 +100,7 @@ class _VllmInstaller(EngineInstaller):
 
     def install(self, prepared: PreparedArtifact) -> dict[str, float]:
         started = time.perf_counter()
+        metrics = prepared.metrics
         if isinstance(prepared, PreparedEngineTensors):
             self.install_tensors(prepared.staged.tensors)
         elif isinstance(prepared, PreparedRuntimeTensors):
@@ -92,7 +114,8 @@ class _VllmInstaller(EngineInstaller):
             raise TypeError(
                 f"unsupported prepared artifact {type(prepared).__name__}"
             )
-        return {"perf/mx_receive_install_time": time.perf_counter() - started}
+        metrics["perf/mx_receive_install_time"] = time.perf_counter() - started
+        return metrics
 
     @property
     def _is_quantized(self) -> bool:
@@ -172,9 +195,8 @@ class _VllmInstaller(EngineInstaller):
             _update_mla_absorbed_weights(self._model, quantized=self._is_quantized)
             torch.cuda.synchronize(self._device)
 
-    @torch.no_grad()
     def install_runtime_tensors(self, tensors: dict[str, torch.Tensor]) -> None:
-        """Copy a peer's processed tensors into existing graph-bound storage."""
+        """Finish a direct peer transfer into existing graph-bound storage."""
         if self._runtime_tensors is None:
             raise RuntimeError("vLLM runtime tensor installation is unavailable")
         destinations = self._runtime_tensors
@@ -186,18 +208,19 @@ class _VllmInstaller(EngineInstaller):
                 f"{len(local_only)} local-only, {len(source_only)} source-only"
             )
         for name, source in tensors.items():
-            destination = destinations[name]
-            if (
-                destination.shape != source.shape
-                or destination.dtype != source.dtype
-            ):
+            if destinations[name] is not source:
                 raise IncompleteRefit(
-                    f"vLLM runtime tensor metadata differs for {name!r}"
+                    "vLLM runtime P2P must write directly into live storage"
                 )
-        for name, source in tensors.items():
-            destination = destinations[name]
-            destination.copy_(source)
-        torch.cuda.synchronize(self._device)
+
+        if getattr(self._model_config, "enforce_eager", False):
+            with refit_span("post_install"):
+                refresh_host_quantization_state(
+                    self._model,
+                    self._vllm_config,
+                    accelerator_backend_for(self._device),
+                    allow_warm=True,
+                )
 
     def install_checkpoint(self, path: str | Path) -> None:
         """Reload a prepared safetensors checkpoint into the live model."""
@@ -304,6 +327,7 @@ class _VllmInstaller(EngineInstaller):
         try:
             from vllm.config import set_current_vllm_config
             from vllm.model_executor.model_loader.reload.layerwise import (
+                LAYERWISE_INFO,
                 finalize_layerwise_reload,
                 initialize_layerwise_reload,
             )
@@ -330,6 +354,7 @@ class _VllmInstaller(EngineInstaller):
 
         with torch.device(self._device), set_current_vllm_config(self._vllm_config):
             initialize_layerwise_reload(self._model)
+            _reserve_runtime_buffer_slots(self._model, LAYERWISE_INFO)
             load()
             finalize_layerwise_reload(self._model, self._model_config)
 

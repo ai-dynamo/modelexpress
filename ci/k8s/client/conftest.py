@@ -73,6 +73,15 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         ),
     )
     parser.addoption(
+        "--expect-mtp",
+        action="store_true",
+        default=os.environ.get("EXPECT_MTP", "").lower() in {"1", "true", "yes"},
+        help=(
+            "Assert that the target transfers the main model through P2P, "
+            "then loads the MTP draft model locally."
+        ),
+    )
+    parser.addoption(
         "--require-artifact-transfer",
         action="store_true",
         default=os.environ.get("REQUIRE_ARTIFACT_TRANSFER", "").lower() in {"1", "true", "yes"},
@@ -174,6 +183,11 @@ def dp_size(request: pytest.FixtureRequest) -> int:
 @pytest.fixture(scope="session")
 def transport(request: pytest.FixtureRequest) -> str:
     return request.config.getoption("--transport")
+
+
+@pytest.fixture(scope="session")
+def expect_mtp(request: pytest.FixtureRequest) -> bool:
+    return request.config.getoption("--expect-mtp")
 
 
 @pytest.fixture(scope="session")

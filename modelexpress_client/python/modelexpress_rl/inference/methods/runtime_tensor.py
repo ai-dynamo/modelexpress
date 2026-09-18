@@ -5,11 +5,17 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import Any
+
 import torch
+from modelexpress import p2p_pb2
+from modelexpress.metadata.worker_server import TensorReadLease
 from modelexpress.refit.timing import add_refit_bytes, add_refit_duration
 
 from ...train import WeightPayloadFormat
-from ..nixl_staged_transfer import _NixlStagedTransfer, _StagedNixlWeights
+from ..nixl_staged_transfer import _NixlStagedTransfer
 from ..plan import (
     GeneratorPeerUpdateSource,
     MethodCapabilities,
@@ -21,8 +27,24 @@ from ..plan import (
 )
 
 
+@dataclass
+class _PreparedRuntimeTensorRead:
+    """Peer selection retained until the caller reaches its safe point."""
+
+    source: p2p_pb2.WorkerMetadata
+    mx_source_id: str
+    worker_id: str
+    tensor_read: TensorReadLease | None
+    tensors: dict[str, torch.Tensor]
+    metrics: dict[str, Any] = field(default_factory=dict)
+    transfer_started: bool = False
+
+    def mark_transfer_started(self) -> None:
+        self.transfer_started = True
+
+
 class RuntimeTensorNixlUpdateMethod(UpdateMethod):
-    """Stage a generator peer's processed runtime tensor representation."""
+    """Receive a generator peer directly into live post-PWAL tensors."""
 
     def __init__(
         self,
@@ -32,7 +54,7 @@ class RuntimeTensorNixlUpdateMethod(UpdateMethod):
     ) -> None:
         self._transfer = transfer
         self._runtime_tensors = runtime_tensors
-        self._active_staged: _StagedNixlWeights | None = None
+        self._active_read: _PreparedRuntimeTensorRead | None = None
 
     @property
     def capabilities(self) -> MethodCapabilities:
@@ -44,31 +66,91 @@ class RuntimeTensorNixlUpdateMethod(UpdateMethod):
 
     def prepare(self, *, version, source: ResolvedSource) -> PreparedArtifact:
         del version
-        if self._active_staged is not None:
+        if self._active_read is not None:
             raise RuntimeError("release staged weight before staging another version")
         if not isinstance(source, GeneratorPeerUpdateSource):
             raise TypeError("runtime tensor method requires a generator source")
-        layout = {
-            name: (tuple(tensor.shape), tensor.dtype)
-            for name, tensor in self._runtime_tensors.items()
-        }
-        self._active_staged = self._transfer.stage_peer(
+
+        tensor_read = self._transfer.prepare_peer_read(
             source=source.worker,
-            parameter_layout=layout,
+            mx_source_id=source.mx_source_id,
+            worker_id=source.worker_id,
+            destination_tensors=self._runtime_tensors,
         )
-        _attribute_transfer(self._active_staged.metrics)
-        return PreparedRuntimeTensors(staged=self._active_staged)
+        self._active_read = _PreparedRuntimeTensorRead(
+            source=source.worker,
+            mx_source_id=source.mx_source_id,
+            worker_id=source.worker_id,
+            tensor_read=tensor_read,
+            tensors=self._runtime_tensors,
+        )
+        return PreparedRuntimeTensors(staged=self._active_read)
+
+    @contextmanager
+    def installation_context(self, prepared: PreparedArtifact):
+        if not isinstance(prepared, PreparedRuntimeTensors):
+            raise TypeError("runtime tensor method requires a prepared peer read")
+        read = prepared.staged
+        if read is not self._active_read:
+            raise RuntimeError("runtime tensor read is no longer active")
+        tensor_read = read.tensor_read
+        if tensor_read is None:
+            if read.transfer_started:
+                raise RuntimeError("runtime tensor transfer cannot be retried")
+            tensor_read = self._transfer.prepare_peer_read(
+                source=read.source,
+                mx_source_id=read.mx_source_id,
+                worker_id=read.worker_id,
+                destination_tensors=read.tensors,
+            )
+            read.tensor_read = tensor_read
+        try:
+            read.metrics.update(
+                self._transfer.receive_peer(
+                    tensor_read=tensor_read,
+                    destination_tensors=read.tensors,
+                    on_transfer_start=read.mark_transfer_started,
+                )
+            )
+        finally:
+            try:
+                tensor_read.close()
+            finally:
+                read.tensor_read = None
+        _attribute_transfer(read.metrics)
+        yield
+
+    def mutated_during_installation_context(
+        self,
+        prepared: PreparedArtifact,
+    ) -> bool:
+        if not isinstance(prepared, PreparedRuntimeTensors):
+            return False
+        read = prepared.staged
+        return read is self._active_read and read.transfer_started
 
     def release(self, prepared: PreparedArtifact) -> None:
         if not isinstance(prepared, PreparedRuntimeTensors):
-            raise TypeError("runtime tensor method requires staged runtime tensors")
-        if prepared.staged is not self._active_staged:
-            raise RuntimeError("runtime staged weight is no longer active")
-        self._active_staged = None
+            raise TypeError("runtime tensor method requires a prepared peer read")
+        if prepared.staged is not self._active_read:
+            raise RuntimeError("runtime tensor read is no longer active")
+        try:
+            if self._active_read.tensor_read is not None:
+                self._active_read.tensor_read.close()
+        finally:
+            self._active_read = None
 
     def close(self) -> None:
-        self._active_staged = None
-        self._transfer.close()
+        try:
+            if (
+                self._active_read is not None
+                and self._active_read.tensor_read is not None
+            ):
+                self._active_read.tensor_read.close()
+        finally:
+            self._active_read = None
+            self._transfer.close()
+
 
 def _attribute_transfer(metrics: dict[str, float]) -> None:
     add_refit_bytes(metrics.get("bytes_received", 0))
