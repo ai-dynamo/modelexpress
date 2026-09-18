@@ -23,8 +23,21 @@ memory-backend = []
 # Gates the in-process integration tests, which boot a server and are slower. Enables
 # memory-backend because the test boots run_server with MX_METADATA_BACKEND=memory.
 integration-tests = ["memory-backend"]
-tls-openssl = ["modelexpress-common/tls-native", "kube/openssl-tls"]
-tls-rustls = ["modelexpress-common/tls-rustls", "kube/rustls-tls"]
+tls-openssl = [
+    "modelexpress-common/tls-native",
+    "kube/openssl-tls",
+    "dep:openssl",
+    "dep:tokio-openssl",
+]
+tls-rustls = [
+    "modelexpress-common/tls-rustls",
+    "kube/rustls-tls",
+    "dep:rustls",
+    "rustls/ring",
+    "rustls/std",
+    "rustls/tls12",
+    "dep:tokio-rustls",
+]
 
 [dependencies]
 modelexpress-common = { workspace = true, default-features = false }
@@ -41,6 +54,10 @@ serde_json = { workspace = true }
 serde_yaml = "0.9"
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+openssl = { workspace = true, optional = true }
+tokio-openssl = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -66,6 +83,7 @@ modelexpress-common = { workspace = true, default-features = false, features = [
 mockall = { workspace = true }
 tempfile = "3.20"
 modelexpress-client.workspace = true
+rcgen = { workspace = true }
 
 [[test]]
 name = "in_process_server"
