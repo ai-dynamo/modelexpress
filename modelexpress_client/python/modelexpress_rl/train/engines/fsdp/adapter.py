@@ -149,13 +149,18 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
     ) -> None:
         """Allocate one persistent arena per shard in its selected wire dtype."""
         host = staging_mode is TrainerStagingMode.COPY_TO_HOST
+        if host and not torch.cuda.is_available():
+            # Unpinned host memory would still be registered as DRAM and read
+            # over RDMA, so decline rather than silently serve pageable pages.
+            # A trainer with no CUDA has no device shards to stage from either.
+            raise RuntimeError("COPY_TO_HOST staging requires CUDA for pinned memory")
         with contextlib.nullcontext() if host else classic_cuda_alloc():
             self._arenas = {
                 s.name: torch.empty(
                     s.local_shape,
                     dtype=self._wire_dtype(s),
                     device="cpu" if host else s.source_tensor.device,
-                    pin_memory=host and torch.cuda.is_available(),
+                    pin_memory=host,
                 )
                 for s in shards
             }

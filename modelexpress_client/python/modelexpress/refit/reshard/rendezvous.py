@@ -166,7 +166,10 @@ def decode_shard_table(blob: bytes) -> list:
     payload = json.loads(blob.decode("utf-8"))
     schema = payload.get("schema")
     if schema not in (_SCHEMA, _HOST_SCHEMA):
-        raise ValueError(f"unexpected shard-table schema {schema!r} (want {_SCHEMA!r})")
+        raise ValueError(
+            f"unexpected shard-table schema {schema!r} "
+            f"(want one of {_SCHEMA!r}, {_HOST_SCHEMA!r})"
+        )
     return decode_shard_entries(payload["tensors"])
 
 
