@@ -1200,3 +1200,120 @@ def test_prepare_rejects_invalid_staging_options():
         transfer.prepare(
             manifests=[], capture_layout=None, max_staging_bytes=1, staging_buffers=0
         )
+
+
+def test_failed_prefetch_drain_is_reported_not_swallowed(monkeypatch):
+    """An undrained prefetch leaves the arena writable, so it cannot pass quietly.
+
+    With two arenas a READ for the next batch is already in flight when the
+    caller stops consuming. Until that READ is drained the arena may still
+    receive RDMA writes, so a drain failure is a hard condition rather than a
+    cleanup nuisance. Abandoning the iterator is deliberate rather than a
+    failure, so there is nothing to mask and the drain error must surface.
+    """
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    source_tensor = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    source = SourceInfo(
+        global_shape=(4,),
+        dtype=torch.float32,
+        elsize=4,
+        shards=[Shard((0,), (4,), "source", source_tensor.data_ptr(), 4)],
+    )
+    copies = [
+        RecordedCopy(
+            src_name="w",
+            op_chain=(),
+            param_name=name,
+            dest_offset=0,
+            dest_shape=(4,),
+            dest_stride=(1,),
+            dest_dtype=torch.float32,
+        )
+        for name in ("a.weight", "b.weight")
+    ]
+    layout = {c.param_name: (c.dest_shape, c.dest_dtype) for c in copies}
+    batches = _bounded_batches(CaptureResult(copies=copies), layout, {"w": source}, 512)
+    assert len(batches) == 2
+
+    class Transport:
+        def post_reads(self, descriptors):
+            return descriptors
+
+        def await_reads(self, posted):
+            if drained:
+                raise RuntimeError("injected prefetch drain failure")
+            drained.append(True)
+            for d in posted:
+                ctypes.memmove(d.dst_addr, d.src_addr, d.nbytes)
+
+    drained = []
+    prepared = transfer_module._PreparedBoundedTransfer(
+        batches, {"w": source}, Transport()
+    )
+    transfer = object.__new__(_NixlStagedTransfer)
+    transfer._closed = False
+    transfer._active = prepared
+    transfer._device = torch.device("cpu")
+    transfer._device_id = 0
+    # Two arenas, so batch 1's READ is posted before batch 0 is yielded.
+    transfer._staging_arenas = [torch.empty(512, dtype=torch.uint8) for _ in range(2)]
+
+    iterator = transfer.iter_bounded(prepared, {})
+    next(iterator)
+    with pytest.raises(RuntimeError, match="could not be drained"):
+        iterator.close()
+
+
+def test_failed_prefetch_drain_does_not_mask_a_caller_error(monkeypatch):
+    """A drain failure must not replace the error that caused the abandonment."""
+    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    source_tensor = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    source = SourceInfo(
+        global_shape=(4,),
+        dtype=torch.float32,
+        elsize=4,
+        shards=[Shard((0,), (4,), "source", source_tensor.data_ptr(), 4)],
+    )
+    copies = [
+        RecordedCopy(
+            src_name="w",
+            op_chain=(),
+            param_name=name,
+            dest_offset=0,
+            dest_shape=(4,),
+            dest_stride=(1,),
+            dest_dtype=torch.float32,
+        )
+        for name in ("a.weight", "b.weight")
+    ]
+    layout = {c.param_name: (c.dest_shape, c.dest_dtype) for c in copies}
+    batches = _bounded_batches(CaptureResult(copies=copies), layout, {"w": source}, 512)
+    drained = []
+
+    class Transport:
+        def post_reads(self, descriptors):
+            return descriptors
+
+        def await_reads(self, posted):
+            if drained:
+                raise RuntimeError("injected prefetch drain failure")
+            drained.append(True)
+            for d in posted:
+                ctypes.memmove(d.dst_addr, d.src_addr, d.nbytes)
+
+    prepared = transfer_module._PreparedBoundedTransfer(
+        batches, {"w": source}, Transport()
+    )
+    transfer = object.__new__(_NixlStagedTransfer)
+    transfer._closed = False
+    transfer._active = prepared
+    transfer._device = torch.device("cpu")
+    transfer._device_id = 0
+    transfer._staging_arenas = [torch.empty(512, dtype=torch.uint8) for _ in range(2)]
+
+    iterator = transfer.iter_bounded(prepared, {})
+    next(iterator)
+    with pytest.raises(RuntimeError, match="the install failed"):
+        iterator.throw(RuntimeError("the install failed"))

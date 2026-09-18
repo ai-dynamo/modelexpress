@@ -745,6 +745,7 @@ class _NixlStagedTransfer:
             return chunk, (recv, convert, full), posted, started
 
         pending = None
+        unwinding = False
         try:
             pending = post(0)
             for index in range(len(batches)):
@@ -764,16 +765,37 @@ class _NixlStagedTransfer:
                 torch.cuda.synchronize(self._device)
                 if len(arenas) == 1 and index + 1 < len(batches):
                     pending = post(index + 1)
+        except GeneratorExit:
+            # Deliberate abandonment, not a failure, so a drain error below has
+            # nothing to mask and must still be reported.
+            raise
+        except BaseException:
+            unwinding = True
+            raise
         finally:
             if pending is not None:
                 # A prefetched READ is in flight for a batch the caller will
                 # never consume; drain it so the handles are released.
                 try:
                     prepared.transport.await_reads(pending[2])
-                except Exception:  # noqa: BLE001 - cleanup must not mask the cause
-                    logger.warning(
-                        "draining a prefetched bounded READ batch failed", exc_info=True
+                except Exception as error:
+                    # Not merely uncleaned: until this READ is drained the arena
+                    # may still receive RDMA writes, so reusing or freeing it is
+                    # unsafe. Report it rather than returning as if the transfer
+                    # had ended, and only downgrade to a log when an earlier
+                    # failure is already propagating and must not be masked.
+                    logger.error(
+                        "draining a prefetched bounded READ batch failed; the "
+                        "staging arena may still be written by an in-flight read "
+                        "and the generator engine must be restarted",
+                        exc_info=True,
                     )
+                    if not unwinding:
+                        raise RuntimeError(
+                            "a prefetched bounded READ could not be drained, so the "
+                            "staging arena may still be written; restart the "
+                            "generator engine"
+                        ) from error
             self._active = prepared
 
     def refresh_sources(
