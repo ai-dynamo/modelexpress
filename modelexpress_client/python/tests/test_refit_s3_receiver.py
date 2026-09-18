@@ -887,6 +887,38 @@ def test_canonical_s3_rejects_checkpoint_that_exceeds_cache_quota(
     adapter.close()
 
 
+def test_canonical_s3_preserves_active_checkpoint_when_disk_is_full(
+    monkeypatch, tmp_path
+):
+    objects = _full_artifact(torch.tensor([7.0, 8.0]))
+    adapter, _storage = _build(monkeypatch, tmp_path, objects)
+    store = adapter._checkpoint.store
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            checkpoint_store_module.shutil,
+            "disk_usage",
+            lambda _path: SimpleNamespace(free=0),
+        )
+        with pytest.raises(
+            checkpoint_store_module.CheckpointCacheCapacityError,
+            match="filesystem has 0 bytes free",
+        ):
+            adapter.stage_weight(_full_inputs())
+
+    assert store.active_version() == "base-a"
+    assert store.full_path("base-a").exists()
+    assert not store.full_path("full-a").exists()
+    state = store.state()
+    assert state.status is checkpoint_store_module.CheckpointState.READY
+    assert state.version == "base-a"
+
+    staged = adapter.stage_weight(_full_inputs())
+    assert staged.path == store.full_path("full-a")
+    adapter.release_staged_weight(staged)
+    adapter.close()
+
+
 def test_canonical_s3_reseeds_a_modified_ready_checkpoint(monkeypatch, tmp_path):
     first, _storage = _build(monkeypatch, tmp_path, {})
     checkpoint_path = first._checkpoint.local_checkpoint / "model.safetensors"

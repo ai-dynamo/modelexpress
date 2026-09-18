@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -224,3 +225,90 @@ def test_store_rejects_write_larger_than_filesystem_free_space(
         CheckpointCacheCapacityError, match="filesystem has 3 bytes free"
     ):
         store.ensure_capacity(4)
+
+
+@pytest.mark.parametrize("quota_gb, expected_gb", [(500, 300), (None, 300), (150, 150)])
+def test_store_caps_quota_to_disk_space_and_logs(
+    monkeypatch, tmp_path, caplog, quota_gb, expected_gb
+):
+    gb = 1_000_000_000
+    monkeypatch.setattr(
+        "modelexpress_rl.inference.checkpoint_store.shutil.disk_usage",
+        lambda _path: SimpleNamespace(free=300 * gb),
+    )
+    store = LocalCheckpointStore(
+        root=tmp_path,
+        model_name="test/model",
+        max_size_bytes=quota_gb * gb if quota_gb is not None else None,
+    )
+
+    with caplog.at_level(logging.INFO):
+        store.initialize()
+
+    assert store.max_size_bytes == expected_gb * gb
+    if expected_gb == 300:
+        assert "capped at 300.00 GB (free=300.00 GB)" in caplog.text
+    else:
+        assert not caplog.records
+
+
+def test_store_disk_cap_accounts_for_existing_cache(monkeypatch, tmp_path):
+    store = LocalCheckpointStore(root=tmp_path, model_name="test/model")
+    store.initialize()
+    active = store.full_path("active")
+    active.mkdir()
+    (active / "weights").write_bytes(b"x" * 100)
+    monkeypatch.setattr(
+        "modelexpress_rl.inference.checkpoint_store.shutil.disk_usage",
+        lambda _path: SimpleNamespace(free=300),
+    )
+    resumed = LocalCheckpointStore(
+        root=tmp_path, model_name="test/model", max_size_bytes=500
+    )
+
+    resumed.initialize()
+    resumed.ensure_capacity(300, protected_versions={"active"})
+
+    assert resumed.max_size_bytes == 400
+    with pytest.raises(CheckpointCacheCapacityError):
+        resumed.ensure_capacity(301, protected_versions={"active"})
+    assert (active / "weights").read_bytes() == b"x" * 100
+
+
+@pytest.mark.parametrize("free_bytes", [0, 50, 100])
+def test_store_caps_quota_to_all_available_disk_space(
+    monkeypatch, tmp_path, free_bytes
+):
+    monkeypatch.setattr(
+        "modelexpress_rl.inference.checkpoint_store.shutil.disk_usage",
+        lambda _path: SimpleNamespace(total=1000, free=free_bytes),
+    )
+    store = LocalCheckpointStore(root=tmp_path, model_name="test/model")
+    store.initialize()
+
+    assert store.max_size_bytes == free_bytes
+    store.ensure_capacity(free_bytes)
+    with pytest.raises(CheckpointCacheCapacityError, match="filesystem has"):
+        store.ensure_capacity(free_bytes + 1)
+
+
+def test_store_evicts_stale_checkpoint_to_free_disk_space(monkeypatch, tmp_path):
+    store = LocalCheckpointStore(
+        root=tmp_path, model_name="test/model", max_size_bytes=500
+    )
+    store.initialize()
+    active = store.full_path("active")
+    active.mkdir()
+    (active / "weights").write_bytes(b"x" * 60)
+    stale = store.materialized_path("stale")
+    stale.mkdir()
+    (stale / "weights").write_bytes(b"x" * 40)
+    monkeypatch.setattr(
+        "modelexpress_rl.inference.checkpoint_store.shutil.disk_usage",
+        lambda _path: SimpleNamespace(free=20 if stale.exists() else 60),
+    )
+
+    store.ensure_capacity(50, protected_versions={"active"})
+
+    assert not stale.exists()
+    assert (active / "weights").read_bytes() == b"x" * 60

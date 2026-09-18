@@ -644,6 +644,11 @@ If an in-place delta fails, the cache remains `UPDATING` until the active refit
 session or the next initialization restores the immutable full root. The running
 engine retains its previously installed weights.
 
+The local checkpoint store caps its configured quota at the existing model cache
+size plus free disk space. It logs any cap applied at initialization and rechecks
+free space before known writes and copies. Capacity checks evict stale
+checkpoints or reject the update while preserving protected lineage.
+
 Under the local checkpoint lock, preparation state advances from `READY` to
 `UPDATING` before artifact construction and back to `READY(target)` only after
 verification. `active.json` is a separate commit point: it advances only after
