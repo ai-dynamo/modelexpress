@@ -23,7 +23,7 @@ from modelexpress.metadata.source_id import compute_mx_source_id
 
 def _base_identity() -> p2p_pb2.SourceIdentity:
     return p2p_pb2.SourceIdentity(
-        mx_version="0.5.1",
+        mx_version="0.7.0",
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
         model_name="deepseek-ai/DeepSeek-V3",
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
@@ -64,6 +64,12 @@ def test_factory_unknown_backend_raises(monkeypatch):
     monkeypatch.setenv("MX_METADATA_BACKEND", "bogus")
     with pytest.raises(ValueError, match="Unknown MX_METADATA_BACKEND"):
         create_metadata_client()
+
+
+def test_k8s_worker_rpc_retry_policy_uses_configured_values():
+    client = MxK8sServiceClient(max_retries=3, backoff_seconds=0.25)
+
+    assert client.worker_rpc_retry_policy() == (3, 0.25)
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +279,9 @@ class _FakeWorkerServicer(p2p_pb2_grpc.WorkerServiceServicer):
             )
         return p2p_pb2.GetTensorManifestResponse(
             mx_source_id=self._mx_source_id,
-            tensors=[p2p_pb2.TensorDescriptor(name="t0", size=16, device_id=0)],
+            tensors=[
+                p2p_pb2.TensorDescriptor(name="t0", size=16, device_id=0)
+            ],
             metadata_endpoint="10.0.0.1:5555",
             agent_name="fake-agent",
             worker_rank=self._worker_rank,

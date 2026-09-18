@@ -292,6 +292,21 @@ def unpublish_metadata(ctx: LoadContext) -> None:
     )
 
 
+def drain_tensor_readers(ctx: LoadContext, *, timeout: float) -> None:
+    """Block new tensor reads and wait for current readers before mutation."""
+    from ..metadata.publish import _heartbeat_threads, _worker_servers
+
+    worker_server = _worker_servers.get(ctx.device_id)
+    if worker_server is not None:
+        worker_server.drain_tensor_reads(timeout)
+        return
+    if _heartbeat_threads.get(ctx.worker_rank) is not None:
+        raise RuntimeError(
+            "active refit cannot safely mutate centrally published tensors; "
+            "enable MX_P2P_METADATA"
+        )
+
+
 def unpublish_metadata_for_worker(*, worker_rank: int, device_id: int) -> None:
     """Stop one worker's publication without requiring a boot-load context."""
     from ..metadata.publish import _heartbeat_threads, _worker_servers

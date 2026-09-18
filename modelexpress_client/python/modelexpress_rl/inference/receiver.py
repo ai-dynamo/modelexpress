@@ -619,10 +619,22 @@ class _LocalCheckpoint:
             )
             if prepared is not None:
                 return prepared
+            # P2P can advance the engine without advancing this disk checkpoint.
+            # Choose the replay suffix from the verified cache head under lock.
+            for position, version in enumerate(versions[:-1]):
+                if version.version_id != state.version:
+                    continue
+                source = self.store.artifact_source(self._artifact_path(version))
+                if source is None:
+                    break
+                if source != _source_identity(version):
+                    raise ValueError("prepared checkpoint has different source identity")
+                versions = versions[position + 1 :]
+                break
             manifests, index_download_time = self._download_replay_manifests(
                 versions=versions,
                 target=target,
-                active_version=active_version,
+                base_version=state.version,
             )
             return self._reconstruct_target(
                 manifests=manifests,
@@ -678,10 +690,10 @@ class _LocalCheckpoint:
         *,
         versions: tuple[_S3Version, ...],
         target: _S3Version,
-        active_version: str,
+        base_version: str,
     ) -> tuple[list[_S3Manifest], float]:
         """Validate the entire chain before mutating preparation state."""
-        expected_base = active_version
+        expected_base = base_version
         manifests = []
         index_download_time = 0.0
         for position, version in enumerate(versions):
@@ -698,7 +710,7 @@ class _LocalCheckpoint:
                 and expected_base != version.base_version_id
             ):
                 raise RuntimeError(
-                    f"active checkpoint version {expected_base!r} does not match "
+                    f"local checkpoint version {expected_base!r} does not match "
                     f"exact base {version.base_version_id!r} for revision "
                     f"{version.version_id!r}"
                 )

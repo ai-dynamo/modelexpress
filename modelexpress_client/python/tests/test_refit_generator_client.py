@@ -190,6 +190,7 @@ class _Adapter:
         self.stage_failures = 0
         self.apply_failure = False
         self.installation_context_failure = False
+        self.installation_context_mutated = False
         self.installation_failure_calls = []
         self.preparation_failure_calls = 0
         self.preparation_recovery_failure = False
@@ -321,6 +322,10 @@ class _TestMethod(UpdateMethod):
     def installation_failed(self, prepared):
         self._adapter.installation_failure_calls.append(prepared)
 
+    def mutated_during_installation_context(self, prepared):
+        del prepared
+        return self._adapter.installation_context_mutated
+
     def preparation_failed(self):
         self._adapter.preparation_failure_calls += 1
         if self._adapter.preparation_recovery_failure:
@@ -377,7 +382,6 @@ def _runtime(
                     worker_id=worker_id,
                     worker_rank=adapter.worker_rank,
                     build_identity=adapter.build_p2p_identity,
-                    rpc_timeout_seconds=rpc_timeout_seconds,
                 )
             )
         elif source is WeightSource.TRAINER:
@@ -763,6 +767,29 @@ def test_generator_republishes_runtime_tensors_around_first_install(monkeypatch)
     assert events == ["unpublish", "install", "publish:version-a"]
 
 
+def test_generator_aborts_before_install_when_runtime_tensors_cannot_drain(
+    monkeypatch,
+):
+    server, endpoint, service = _start_server()
+    adapter = _Adapter(service)
+
+    def fail_to_drain() -> None:
+        raise TimeoutError("active tensor readers")
+
+    adapter.unpublish_runtime_tensors = fail_to_drain
+    generator = _initialize(monkeypatch, endpoint, adapter)
+
+    try:
+        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+        with pytest.raises(TimeoutError, match="active tensor readers"):
+            generator.apply_weight(staged)
+        assert adapter.apply_calls == []
+        staged.release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+
 def test_generator_logs_weight_update_lifecycle(monkeypatch, caplog):
     server, endpoint, service = _start_server()
     adapter = _Adapter(service)
@@ -1064,6 +1091,7 @@ def _add_generator_peer(service):
     service.p2p.metadata[("peer-source", "generator-peer")] = (
         p2p_pb2.WorkerMetadata(
             worker_rank=0,
+            worker_grpc_endpoint="peer:50051",
             tensors=[
                 p2p_pb2.TensorDescriptor(
                     name="weight",
@@ -1563,6 +1591,54 @@ def test_generator_does_not_fence_when_installation_context_entry_fails(monkeypa
     assert adapter.apply_calls == []
 
 
+def test_generator_republishes_after_pretransfer_failure(monkeypatch):
+    server, endpoint, service = _start_server()
+    adapter = _Adapter(service)
+    adapter.installation_context_failure = True
+    events = []
+    adapter.unpublish_runtime_tensors = lambda: events.append("unpublish")
+    adapter.publish_runtime_tensors = (
+        lambda version_id: events.append(f"publish:{version_id}")
+    )
+    generator = _initialize(
+        monkeypatch,
+        endpoint,
+        adapter,
+        initial_serving_version_id="base-a",
+    )
+
+    try:
+        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+        with pytest.raises(RuntimeError, match="installation context failed"):
+            generator.apply_weight(staged)
+        staged.release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert events == ["unpublish", "publish:base-a"]
+
+
+def test_generator_fences_when_installation_context_mutated_before_failure(monkeypatch):
+    server, endpoint, service = _start_server()
+    adapter = _Adapter(service)
+    adapter.installation_context_failure = True
+    adapter.installation_context_mutated = True
+    generator = _initialize(monkeypatch, endpoint, adapter)
+
+    try:
+        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+        with pytest.raises(RuntimeError, match="installation context failed"):
+            generator.apply_weight(staged)
+        staged.release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert len(adapter.installation_failure_calls) == 1
+    assert adapter.apply_calls == []
+
+
 def test_generator_rejects_non_ready_version_before_leasing(monkeypatch):
     server, endpoint, service = _start_server(
         state=refit_pb2.WEIGHT_VERSION_STATE_STAGING
@@ -1638,6 +1714,7 @@ def test_generator_discovers_rank_matched_p2p_peer(monkeypatch):
     )
     service.p2p.metadata[("peer-source", "generator-peer")] = p2p_pb2.WorkerMetadata(
         worker_rank=0,
+        worker_grpc_endpoint="peer:50051",
         tensors=[
             p2p_pb2.TensorDescriptor(
                 name="weight",
@@ -1692,6 +1769,7 @@ def test_generator_tries_next_peer_after_manifest_mismatch(monkeypatch):
         service.p2p.metadata[(source_id, worker_id)] = p2p_pb2.WorkerMetadata(
             worker_rank=0,
             agent_name=agent_name,
+            worker_grpc_endpoint="peer:50051",
             tensors=[
                 p2p_pb2.TensorDescriptor(
                     name="weight",
@@ -1744,7 +1822,11 @@ def test_generator_randomizes_and_limits_peers_before_trainer_fallback(monkeypat
     )
     for index in range(3):
         service.p2p.metadata[(f"peer-source-{index}", f"peer-{index}")] = (
-            p2p_pb2.WorkerMetadata(worker_rank=0, agent_name=f"peer-agent-{index}")
+            p2p_pb2.WorkerMetadata(
+                worker_rank=0,
+                agent_name=f"peer-agent-{index}",
+                worker_grpc_endpoint="peer:50051",
+            )
         )
 
     adapter = _Adapter(service)

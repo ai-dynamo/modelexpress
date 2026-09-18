@@ -270,6 +270,10 @@ def test_desired_p2p_is_skipped_without_desired_version(monkeypatch):
     assert DesiredVersionP2PStrategy().is_available(_context()) is False
 
 
+def test_desired_p2p_requires_a_tensor_read_lease():
+    assert DesiredVersionP2PStrategy.requires_tensor_read_lease is True
+
+
 def test_desired_p2p_uses_exact_revision(monkeypatch):
     monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "version-7")
     ctx = _context()
