@@ -479,6 +479,37 @@ class TestLegacySnapshotCompatibility:
         assert cache._ready_metadata(COMMIT) is None
         assert not cache._metadata_inventory_path(COMMIT).exists()
 
+    def test_legacy_directory_keeps_weight_path_when_another_commit_has_inventory(
+        self, enabled, legacy_snapshot, monkeypatch
+    ):
+        # Upgrade shape: commit B was installed by an inventory-aware client,
+        # so .modelexpress-metadata/ exists, while commit A predates it.
+        other_commit = "b" * 40
+        cache = ModelSnapshotCache(REPO, legacy_snapshot.parent.parent.parent)
+        with cache.lock():
+            other = cache.snapshot_path(other_commit)
+            other.mkdir(parents=True)
+            (other / "config.json").write_bytes(b"{}")
+            cache._write_metadata_inventory(other_commit, {"config.json": 2})
+        other_inventory = cache._metadata_inventory_path(other_commit)
+        assert other_inventory.is_file()
+        assert other_inventory.parent.is_dir()
+
+        service = _use_legacy_service(monkeypatch, pin_rpc_error=False)
+        adapter = _FakeAdapter()
+        ctx = _make_context(REPO, adapter=adapter, model_path=str(legacy_snapshot))
+
+        with patch("modelexpress.load_strategy.server_cache_strategy.register_tensors"):
+            ServerCacheStrategy().load(LoadResult(value=MagicMock()), ctx)
+
+        assert (legacy_snapshot / "model.safetensors").read_bytes() == b"weights"
+        assert adapter.native_calls == 1
+        assert len(service.download_requests) == 1
+        assert service.download_requests[0].ignore_weights is False
+        assert not cache._metadata_inventory_path(COMMIT).exists()
+        assert cache._ready_metadata(other_commit) == other
+        assert not (other / "model.safetensors").exists()
+
     @pytest.mark.parametrize("pin_rpc_error", [False, True])
     def test_legacy_weight_fallback_still_rejects_a_different_stream_commit(
         self, enabled, legacy_snapshot, monkeypatch, pin_rpc_error
@@ -501,10 +532,16 @@ class TestLegacySnapshotCompatibility:
     @pytest.mark.parametrize("pin_rpc_error", [False, True])
     @pytest.mark.parametrize(
         "state",
-        ["missing-directory", "corrupt-inventory", "symlink-inventory", "missing-metadata"],
+        [
+            "missing-directory",
+            "corrupt-inventory",
+            "symlink-inventory",
+            "missing-metadata",
+            "directory-file",
+        ],
     )
     def test_missing_or_known_invalid_snapshot_cannot_use_legacy_directory_fallback(
-        self, enabled, tmp_path, monkeypatch, pin_rpc_error, state
+        self, enabled, tmp_path, monkeypatch, caplog, pin_rpc_error, state
     ):
         cache = ModelSnapshotCache(REPO, tmp_path)
         snapshot = cache.snapshot_path(COMMIT)
@@ -515,6 +552,10 @@ class TestLegacySnapshotCompatibility:
                 with cache.lock():
                     cache._write_metadata_inventory(COMMIT, {"config.json": 2})
                 (snapshot / "config.json").unlink()
+            elif state == "directory-file":
+                # A regular file squatting on the inventory directory name makes
+                # lstat() fail with ENOTDIR rather than ENOENT.
+                cache._metadata_inventory_path(COMMIT).parent.write_bytes(b"x")
             else:
                 inventory = cache._metadata_inventory_path(COMMIT)
                 inventory.parent.mkdir()
@@ -536,6 +577,9 @@ class TestLegacySnapshotCompatibility:
         assert not service.list_requests
         assert not service.stream_requests
         assert not (snapshot / "model.safetensors").exists()
+        if state == "directory-file":
+            assert "Cannot inspect metadata inventory" in caplog.text
+            assert cache._metadata_inventory_path(COMMIT).parent.read_bytes() == b"x"
 
 
 class TestChainOrder:
