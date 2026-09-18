@@ -14,9 +14,9 @@ from __future__ import annotations
 import logging
 import math
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 
@@ -85,11 +85,22 @@ class _StagedNixlWeights:
     metrics: dict[str, Any]
 
 
+_StagingLayout = dict[str, tuple[tuple[int, ...], torch.dtype]]
+
+
+class _StagingLayouts(NamedTuple):
+    """The three typed views one batch carves out of its arena, in arena order."""
+
+    recv: _StagingLayout
+    convert: _StagingLayout
+    full: _StagingLayout
+
+
 @dataclass(frozen=True)
 class _BoundedBatch:
     capture: CaptureResult
     plan: TransferPlan
-    layouts: tuple[dict, dict, dict]
+    layouts: _StagingLayouts
     nbytes: int
 
 
@@ -101,27 +112,29 @@ class _PreparedBoundedTransfer:
     metrics: dict[str, float] = field(default_factory=dict)
 
 
+def _require_positive_bytes(value: object, name: str) -> int:
+    """Return ``value`` as a byte count, rejecting bool and non-positive ints."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
 def _bounded_batches(
-    capture,
-    parameter_layout,
-    sources,
-    max_staging_bytes,
+    capture: CaptureResult,
+    parameter_layout: _StagingLayout,
+    sources: dict,
+    max_staging_bytes: int,
     *,
-    total_staging_bytes=None,
-    staging_buffers=1,
-):
+    total_staging_bytes: int | None = None,
+    staging_buffers: int = 1,
+) -> tuple[_BoundedBatch, ...]:
     """Plan one batch per owning module within ``max_staging_bytes`` per arena.
 
+    Every batch is validated before anything is allocated or installed.
     ``total_staging_bytes`` and ``staging_buffers`` only shape the error when a
     module does not fit, so the caller sees the split that produced the share.
     """
-    """Validate all owning-module batches before allocating or installing."""
-    if (
-        isinstance(max_staging_bytes, bool)
-        or not isinstance(max_staging_bytes, int)
-        or max_staging_bytes <= 0
-    ):
-        raise ValueError("max_staging_bytes must be a positive integer")
+    _require_positive_bytes(max_staging_bytes, "max_staging_bytes")
     complete = _plan_staged_transfer(capture, sources)
     _NixlStagedTransfer._validate_complete(capture, parameter_layout, complete)
     if {copy.param_name for copy in capture.copies} - parameter_layout.keys():
@@ -140,7 +153,7 @@ def _bounded_batches(
             c.param_name: (tuple(c.dest_shape), c.src_dtype) for c in plan.converts
         }
         full = {f.src_name: (tuple(f.global_shape), f.dtype) for f in plan.full_pulls}
-        layouts = (recv, convert, full)
+        layouts = _StagingLayouts(recv, convert, full)
         # Each typed view begins at a 256-byte boundary in one registered arena.
         nbytes = sum(
             ((math.prod(shape) * dtype.itemsize + 255) // 256) * 256
@@ -168,26 +181,23 @@ def _bounded_batches(
     return tuple(batches)
 
 
-def _pack_bounded_batches(batches, max_staging_bytes):
+def _pack_bounded_batches(
+    batches: tuple[_BoundedBatch, ...], max_staging_bytes: int
+) -> tuple[_BoundedBatch, ...]:
     """Pack consecutive complete modules without changing the READ descriptors.
 
     Owning-module batches are the unit of correctness; this only coalesces
     neighbours that fit the same arena together, so each packed batch still
     installs whole modules and reads exactly the bytes the unpacked plan read.
     """
-    if (
-        isinstance(max_staging_bytes, bool)
-        or not isinstance(max_staging_bytes, int)
-        or max_staging_bytes <= 0
-    ):
-        raise ValueError("max_staging_bytes must be a positive integer")
+    _require_positive_bytes(max_staging_bytes, "max_staging_bytes")
 
-    def merge(group):
+    def merge(group: list[_BoundedBatch]) -> _BoundedBatch:
         capture = CaptureResult(
             copies=[copy for batch in group for copy in batch.capture.copies]
         )
         plan = TransferPlan()
-        layouts = ({}, {}, {})
+        layouts = _StagingLayouts({}, {}, {})
         for batch in group:
             _merge_plan(plan, batch.plan)
             for layout, incoming in zip(layouts, batch.layouts, strict=True):
@@ -207,7 +217,7 @@ def _pack_bounded_batches(batches, max_staging_bytes):
     for batch in batches:
         if batch.nbytes > max_staging_bytes:
             raise IncompleteRefit("owning module exceeds the packed staging budget")
-        incoming_full = set(batch.layouts[2])
+        incoming_full = set(batch.layouts.full)
         # Two modules pulling the same complete source would need one staging
         # slot for two distinct writes, so they must stay in separate batches.
         if current and (
@@ -695,7 +705,9 @@ class _NixlStagedTransfer:
         self._active = prepared
         return prepared
 
-    def iter_bounded(self, prepared: _PreparedBoundedTransfer, metrics: dict):
+    def iter_bounded(
+        self, prepared: _PreparedBoundedTransfer, metrics: dict[str, Any]
+    ) -> Iterator[dict[str, torch.Tensor]]:
         """Yield verified staged batches; callers must commit before advancing.
 
         With one arena each batch is read, verified, yielded, and committed in
@@ -713,7 +725,9 @@ class _NixlStagedTransfer:
         metrics["batches"] = len(prepared.batches)
         batches = prepared.batches
 
-        def carve(batch: _BoundedBatch, arena: torch.Tensor) -> tuple[dict, dict, dict]:
+        def carve(
+            batch: _BoundedBatch, arena: torch.Tensor
+        ) -> tuple[dict[str, torch.Tensor], ...]:
             offset = 0
             buffers = []
             for layout in batch.layouts:
@@ -725,9 +739,9 @@ class _NixlStagedTransfer:
                     )
                     offset += ((nbytes + 255) // 256) * 256
                 buffers.append(tensors)
-            return buffers[0], buffers[1], buffers[2]
+            return tuple(buffers)
 
-        def post(index: int):
+        def post(index: int) -> tuple:
             batch = batches[index]
             recv, convert, full = carve(batch, arenas[index % len(arenas)])
             sources = {

@@ -231,7 +231,14 @@ class _VllmInstaller(EngineInstaller):
 
     @torch.no_grad()
     def install_streaming(self, prepared: PreparedStreamingTensors) -> None:
-        """Commit complete modules into existing storage before arena reuse."""
+        """Commit complete modules into existing storage before arena reuse.
+
+        Nothing about the module tree may be cached across batches. A post-load
+        hook can replace a module, so a pinned module object goes stale, and it
+        can add a Parameter to a module a later batch owns, so a batch that was
+        complete when the layout was captured no longer is. Every resolution,
+        completeness and retention check therefore walks the live tree.
+        """
         if self._is_quantized:
             raise IncompleteRefit(
                 "bounded streaming currently requires an unquantized engine"
@@ -269,13 +276,8 @@ class _VllmInstaller(EngineInstaller):
                 raise IncompleteRefit(
                     "streaming parameter coverage differs from the live load layout"
                 )
-            # Nothing about the module tree may be cached across batches. A
-            # hook can replace a module, so a pinned module object goes stale;
-            # it can also add a Parameter to a module a later batch owns, so
-            # pinned owner membership goes stale too and a batch that was
-            # complete when the layout was captured no longer is. Resolution and
-            # the complete-owner check therefore both run against the live tree
-            # inside _process_and_commit, sharing the one walk it already makes.
+            # Resolution and the complete-owner check both happen inside
+            # _process_and_commit, sharing the one live walk it already makes.
             installed = set()
             arena_storages: set[int] = set()
             batches = prepared.batches()
@@ -295,14 +297,10 @@ class _VllmInstaller(EngineInstaller):
                     }
                     arena_storages |= arena_storage
                     setup_s += time.perf_counter() - setup_started
-                    # A loader may stash an arena view anywhere, including on a
-                    # module this batch did not touch and on one it creates, so
-                    # only a live whole-model walk can clear the arena for
-                    # refill. Deferring any part of it to a post-install sweep
-                    # is not equivalent: by then the arena has been overwritten,
-                    # a consumer may have already committed the changed value,
-                    # and a reference that was read and deleted leaves nothing
-                    # to find.
+                    # A loader may stash an arena view on any module, so clear
+                    # the arena before refill. Deferring to the post-install
+                    # sweep would read an arena already overwritten, and a view
+                    # that was read and deleted leaves nothing to find.
                     scan_started = time.perf_counter()
                     for module in self._model.modules():
                         if retains_arena(module, arena_storage):
@@ -320,10 +318,8 @@ class _VllmInstaller(EngineInstaller):
                 raise IncompleteRefit(
                     "streaming transfer ended before every parameter was installed"
                 )
-            # Every batch already cleared its own arena against the live tree.
-            # This repeats the check over every arena the install used, walking
-            # the tree as it now stands rather than as it was cached, so a
-            # module added during the final batch is still covered.
+            # Repeat over every arena the install used, so a module the final
+            # batch created is still covered.
             scan_started = time.perf_counter()
             for module in self._model.modules():
                 if retains_arena(module, arena_storages):
@@ -338,9 +334,8 @@ class _VllmInstaller(EngineInstaller):
         self._reload(load)
         metrics["reload_s"] = time.perf_counter() - reload_started - load_s
         metrics["install_commit_s"] = commit_s
-        # The per-batch scans are inside install_commit_s; the final sweep is
-        # not, and is not in reload_s either, so it is reported on its own and
-        # must be added explicitly rather than read out of the residual.
+        # retention_batch_scan_s is inside install_commit_s; retention_final_scan_s
+        # is in neither it nor reload_s, so it has to be added, not inferred.
         metrics["retention_arena_setup_s"] = setup_s
         metrics["retention_batch_scan_s"] = batch_scan_s
         metrics["retention_final_scan_s"] = final_scan_s
@@ -351,6 +346,7 @@ class _VllmInstaller(EngineInstaller):
         _update_mla_absorbed_weights(self._model, quantized=False)
         torch.cuda.synchronize(self._device)
         metrics["derived_refresh_s"] = time.perf_counter() - derived_started
+
     def install_runtime_tensors(self, tensors: dict[str, torch.Tensor]) -> None:
         """Finish a direct peer transfer into existing graph-bound storage."""
         if self._runtime_tensors is None:
@@ -451,12 +447,10 @@ class _VllmInstaller(EngineInstaller):
                     if full_name in tensors:
                         groups.setdefault(module, []).append((full_name, leaf))
                         matched.add(full_name)
-                # Streaming installs an owning module at a time, so a batch
-                # covering only part of one must be rejected before any hook
-                # runs. This asks the live tree for the same reason resolution
-                # does: an earlier hook can add a Parameter to a module a later
-                # batch owns, making a batch that was complete at capture
-                # incomplete by the time it arrives.
+                # Streaming installs an owning module at a time, so reject a
+                # batch covering only part of one before any hook runs. Asked
+                # of the live tree, since an earlier hook may have added a
+                # Parameter here since the layout was captured.
                 if (
                     not reload
                     and owned & tensors.keys()

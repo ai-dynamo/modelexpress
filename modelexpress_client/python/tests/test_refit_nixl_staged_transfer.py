@@ -115,7 +115,7 @@ def test_packing_coalesces_modules_without_changing_planned_reads(monkeypatch):
 
     packed = _pack_bounded_batches(batches, 768)
     assert len(packed) == 1 and packed[0].nbytes == 768
-    assert list(packed[0].layouts[0]) == ["layer0.weight", "layer1.weight"]
+    assert list(packed[0].layouts.recv) == ["layer0.weight", "layer1.weight"]
     assert packed[0].capture.copies == copies
     assert packed[0].plan.bytes_planned() == sum(
         b.plan.bytes_planned() for b in batches
@@ -131,7 +131,7 @@ def test_packing_coalesces_modules_without_changing_planned_reads(monkeypatch):
     conflicting = [
         replace(
             batch,
-            layouts=(*batch.layouts[:2], {"shared": ((4,), torch.float32)}),
+            layouts=batch.layouts._replace(full={"shared": ((4,), torch.float32)}),
             nbytes=batch.nbytes + 256,
         )
         for batch in batches

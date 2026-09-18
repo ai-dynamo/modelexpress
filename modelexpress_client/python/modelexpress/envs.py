@@ -323,7 +323,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_REFIT_STAGE_RECORD": lambda: _env_bool("MX_REFIT_STAGE_RECORD", True),
     # Coalesce consecutive owning-module batches up to the staging budget. Off by
     # default: one module per batch is the conservative arena bound, and packing
-    # raises the per-batch residency it was measured to reduce batch count with.
+    # trades higher per-batch arena residency for fewer batches.
     "MX_REFIT_PACK_MODULES": lambda: _env_bool("MX_REFIT_PACK_MODULES", False),
     # Per-rank fabric ceiling in Gbps used to reject impossible wire rates. Zero
     # disables the check, and is the default because only the operator knows the

@@ -336,6 +336,7 @@ class WeightUpdateSession:
         except BaseException as error:
             self._close_lease(lease, version.version_id, error)
             raise
+
     @staticmethod
     def _recover_preparation(
         method: UpdateMethod,
