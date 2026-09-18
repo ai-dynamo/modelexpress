@@ -335,9 +335,8 @@ Both builds floor the minimum at TLS 1.2 and require an h2 ALPN offer, which eve
 client sends.
 
 Settings use OpenSSL spelling on both builds. rustls implements a subset of it: TLS 1.2 and
-1.3 only, the AEAD ciphers (ECDHE with AES-GCM or
-ChaCha20-Poly1305, and the three TLS 1.3 suites), and the groups `X25519`, `secp256r1` and
-`secp384r1`. Anything else in a profile, such as the CBC ciphers of the Old profile or
+1.3 only, the AEAD ciphers (ECDHE with AES-GCM or ChaCha20-Poly1305, and the three TLS 1.3
+suites), and the groups `X25519`, `secp256r1` and `secp384r1`. Anything else in a profile, such as the CBC ciphers of the Old profile or
 `X25519MLKEM768`, is dropped with a warning.
 
 A cluster TLS policy that publishes a minimum version, a cipher list and a group list maps
@@ -365,6 +364,19 @@ tls:
 
 Kubernetes gRPC probes do not speak TLS, so switch the liveness and readiness probes to
 `tcpSocket` when enabling it.
+
+### Client configuration
+
+An `https://` endpoint turns TLS on in both clients. The Rust client and CLI take the
+endpoint from `MODEL_EXPRESS_ENDPOINT` or `--endpoint`; the Python client reads
+`MX_SERVER_ADDRESS` (or the older `MODEL_EXPRESS_URL`).
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `MODEL_EXPRESS_TLS_CA_FILE` | (system roots) | PEM CA bundle that issued the server certificate. Setting it also turns TLS on for a bare `host:port` address in the Python client. |
+
+A certificate from an in-cluster signer verifies against that signer's CA bundle. Mount the
+bundle into the worker pod and point the variable at it.
 
 ## Docker
 

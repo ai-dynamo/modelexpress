@@ -42,6 +42,16 @@ security:
   allowedServiceAccounts: []
   # cacheTtlSecs: 60
 
+# TLS termination on the gRPC listener, off by default. The Secret holds
+# tls.crt and tls.key. To have an in-cluster issuer populate it, annotate the
+# Service through service.annotations rather than creating the Secret yourself.
+tls:
+  enabled: false
+  secretName: ""
+  # minVersion: TLS1.2
+  # cipherSuites: []
+  # groups: []
+
 podAnnotations: {}
 
 podLabels: {}
@@ -67,6 +77,9 @@ securityContext:
 service:
   type: ClusterIP
   port: 8001
+  # Annotations on the Service, e.g. to have an in-cluster issuer populate
+  # tls.secretName with a serving certificate.
+  annotations: {}
 
 # Prometheus metrics.
 #

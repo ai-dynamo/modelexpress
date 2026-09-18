@@ -159,6 +159,10 @@ pub const MODEL_EXPRESS_TLS_CIPHER_SUITES: &str = "MODEL_EXPRESS_TLS_CIPHER_SUIT
 /// Comma-separated key exchange groups the listener offers (`TlsArgs::groups`).
 pub const MODEL_EXPRESS_TLS_GROUPS: &str = "MODEL_EXPRESS_TLS_GROUPS";
 
+// ── TLS (client) ────────────────────────────────────────────────────────────
+/// PEM CA bundle the client trusts for an `https://` endpoint (`ClientArgs::tls_ca_file`).
+pub const MODEL_EXPRESS_TLS_CA_FILE: &str = "MODEL_EXPRESS_TLS_CA_FILE";
+
 // ── Auth (client) ───────────────────────────────────────────────────────────
 /// Path to the Kubernetes projected ServiceAccount token file.
 pub const MX_AUTH_TOKEN_PATH: &str = "MX_AUTH_TOKEN_PATH";
@@ -427,6 +431,7 @@ mod tests {
             "MODEL_EXPRESS_TLS_CIPHER_SUITES"
         );
         assert_eq!(MODEL_EXPRESS_TLS_GROUPS, "MODEL_EXPRESS_TLS_GROUPS");
+        assert_eq!(MODEL_EXPRESS_TLS_CA_FILE, "MODEL_EXPRESS_TLS_CA_FILE");
         assert_eq!(MX_AUTH_TOKEN_PATH, "MX_AUTH_TOKEN_PATH");
         assert_eq!(MX_AUTH_TOKEN_TTL_SECONDS, "MX_AUTH_TOKEN_TTL_SECONDS");
         assert_eq!(HOME, "HOME");
