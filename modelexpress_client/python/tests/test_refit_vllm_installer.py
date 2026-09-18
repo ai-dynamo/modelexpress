@@ -20,6 +20,7 @@ from modelexpress_rl.inference.plan import (
     PreparedCheckpointArtifact,
     PreparedEngineTensors,
     PreparedRuntimeTensors,
+    PreparedStreamingTensors,
 )
 from modelexpress_rl.inference.receiver import PreparedCheckpoint
 from torch import nn
@@ -89,6 +90,44 @@ def test_installer_resolves_load_time_parameters_after_layerwise_reload(monkeypa
     installer._process_and_commit({"weight": torch.tensor([7.0])})
 
     assert model.weight.item() == 7.0
+
+
+@pytest.mark.parametrize("fail_second", [False, True])
+def test_streaming_preserves_storage_and_propagates_partial_failure(
+    monkeypatch, fail_second
+):
+    _install_fake_vllm(monkeypatch, lambda model: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    model = nn.Sequential(nn.Linear(2, 2, bias=False), nn.Linear(2, 2, bias=False))
+    addresses = {n: p.data_ptr() for n, p in model.named_parameters()}
+    before_second = model[1].weight.detach().clone()
+    arena = torch.ones(2, 2)
+
+    def batches():
+        yield {"0.weight": arena}
+        arena.fill_(2)
+        assert torch.equal(model[0].weight, torch.ones(2, 2))
+        if fail_second:
+            raise RuntimeError("injected transport failure")
+        yield {"1.weight": arena}
+        arena.fill_(3)
+
+    prepared = PreparedStreamingTensors(batches, frozenset(addresses), {})
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
+    )
+    if fail_second:
+        with pytest.raises(RuntimeError, match="injected transport failure"):
+            installer.install_streaming(prepared)
+        assert torch.equal(model[1].weight, before_second)
+    else:
+        installer.install_streaming(prepared)
+        assert torch.equal(model[1].weight, torch.full((2, 2), 2.0))
+    assert torch.equal(model[0].weight, torch.ones(2, 2))
+    assert {n: p.data_ptr() for n, p in model.named_parameters()} == addresses
 
 
 def test_installer_rejects_parameters_left_on_meta(monkeypatch):
@@ -293,6 +332,87 @@ def test_installer_rejects_a_runtime_staging_copy():
         installer.install(PreparedRuntimeTensors(staged=staged))
 
 
+def test_layerwise_capture_and_streaming_preserve_tied_parameters(monkeypatch):
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedding = nn.Linear(2, 2, bias=False)
+            self.lm_head = nn.Linear(2, 2, bias=False)
+            self.lm_head.weight = self.embedding.weight
+
+        def load_weights(self, weights):
+            for name, weight in weights:
+                if name == "embedding.weight":
+                    self.embedding.weight.weight_loader(self.embedding.weight, weight)
+
+    class Info:
+        def __init__(self, parameter):
+            self.kernel_tensors = ({"weight": parameter}, {})
+
+        def reset(self):
+            self.kernel_tensors = None
+
+    def initialize(model):
+        for layer in (model.embedding, model.lm_head):
+            layerwise.LAYERWISE_INFO[layer] = Info(layer.weight)
+            layer.weight = nn.Parameter(torch.empty_like(layer.weight, device="meta"))
+
+    _install_fake_vllm(monkeypatch, initialize)
+    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
+
+    def place(layer, info):
+        layer.weight = info.kernel_tensors[0]["weight"]
+
+    def commit(layer, info):
+        info.kernel_tensors[0]["weight"].data.copy_(layer.weight)
+        place(layer, info)
+
+    def finalize(model, config):
+        for layer in (model.embedding, model.lm_head):
+            info = layerwise.LAYERWISE_INFO[layer]
+            if info.kernel_tensors is not None:
+                place(layer, info)
+                info.reset()
+
+    layerwise._get_original_loader = lambda parameter: None
+    layerwise._place_kernel_tensors = place
+    layerwise._copy_and_restore_kernel_tensors = commit
+    layerwise.finalize_layerwise_reload = finalize
+    weight_utils = ModuleType("vllm.model_executor.model_loader.weight_utils")
+    weight_utils.default_weight_loader = lambda parameter, weight: parameter.data.copy_(
+        weight
+    )
+    monkeypatch.setitem(sys.modules, weight_utils.__name__, weight_utils)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    model = Model()
+    original = model.embedding.weight.detach().clone()
+    address = model.embedding.weight.data_ptr()
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
+    )
+    capture, layout = installer.capture([("embedding.weight", torch.float32, (2, 2))])
+    assert (
+        set(layout)
+        == {copy.param_name for copy in capture.copies}
+        == {"embedding.weight"}
+    )
+    assert model.embedding.weight is model.lm_head.weight
+    assert torch.equal(model.embedding.weight, original)
+
+    def batches():
+        yield {"embedding.weight": torch.full((2, 2), 7.0)}
+
+    installer.install_streaming(
+        PreparedStreamingTensors(batches, frozenset(layout), {})
+    )
+    assert model.embedding.weight is model.lm_head.weight
+    assert model.embedding.weight.data_ptr() == address
+    assert torch.equal(model.lm_head.weight, torch.full((2, 2), 7.0))
+
+
 @pytest.fixture
 def warm_runtime_install(monkeypatch, mock_accelerator_backend_cls):
     backend = mock_accelerator_backend_cls(torch_device_type="cpu")
@@ -426,3 +546,292 @@ def test_installer_rejects_quantized_mla_derived_weight_refresh():
 
     with pytest.raises(IncompleteRefit, match="quantized kv_b_proj"):
         _update_mla_absorbed_weights(model, quantized=True)
+
+
+@pytest.mark.parametrize("when", ["touched", "elsewhere"])
+def test_streaming_detects_retained_arena_storage_in_batch_or_at_the_end(
+    monkeypatch, when
+):
+    """A loaded module retaining an arena view fails before the arena is
+    refilled; a module outside the batch retaining one fails in the final sweep."""
+    _install_fake_vllm(monkeypatch, lambda model: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    model = nn.Sequential(nn.Linear(2, 2, bias=False), nn.Linear(2, 2, bias=False))
+    names = frozenset(dict(model.named_parameters()))
+    arena = torch.ones(2, 2)
+    yielded = []
+
+    def batches():
+        if when == "touched":
+            model[0].stash = arena.view(-1)
+        yielded.append("0.weight")
+        yield {"0.weight": arena}
+        if when == "elsewhere":
+            # Module 0 is not part of the second batch, so only the sweep
+            # after the last batch can see this.
+            model[0].stash = arena.view(-1)
+        yielded.append("1.weight")
+        yield {"1.weight": arena}
+
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
+    )
+    with pytest.raises(IncompleteRefit, match="retained bounded staging storage"):
+        installer.install_streaming(PreparedStreamingTensors(batches, names, {}))
+    assert yielded == (["0.weight"] if when == "touched" else ["0.weight", "1.weight"])
+
+
+def test_streaming_makes_exactly_two_live_walks_per_batch(monkeypatch):
+    """Resolve-and-check against the live tree, then scan it. Nothing cached.
+
+    Neither question survives being answered early: a hook can replace a module
+    between batches, and it can add a Parameter to a module a later batch owns.
+    So resolution and the complete-owner check share one walk, the retention
+    scan takes another, and extra batches add exactly two each. Three would mean
+    the shared walk split back apart; one would mean a live check was hoisted.
+    """
+    _install_fake_vllm(monkeypatch, lambda model: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+
+    def walks_for(batch_size):
+        model = nn.Sequential(*[nn.Linear(2, 2, bias=False) for _ in range(6)])
+        names = frozenset(dict(model.named_parameters()))
+        walks = []
+        real_named_modules = model.named_modules
+
+        def counted(*args, **kwargs):
+            walks.append(1)
+            return real_named_modules(*args, **kwargs)
+
+        monkeypatch.setattr(model, "named_modules", counted)
+        arena = torch.ones(2, 2)
+
+        def batches():
+            for start in range(0, 6, batch_size):
+                yield {f"{i}.weight": arena for i in range(start, start + batch_size)}
+
+        installer = _VllmInstaller(
+            model=model,
+            vllm_config=object(),
+            model_config=object(),
+            device=torch.device("cpu"),
+        )
+        metrics = {}
+        installer.install_streaming(PreparedStreamingTensors(batches, names, metrics))
+        assert "retention_scan_s" in metrics
+        assert all(torch.equal(p, torch.ones(2, 2)) for p in model.parameters())
+        return len(walks)
+
+    # Reload setup and the final sweep are fixed per install. Six
+    # single-parameter batches replace one six-parameter batch, so the only
+    # admissible difference is five extra resolve-and-scan pairs.
+    assert walks_for(1) - walks_for(6) == 2 * 5
+
+
+@pytest.mark.parametrize("mode", ["consume_then_remove", "new_module"])
+def test_streaming_rejects_cross_module_retention_before_arena_reuse(monkeypatch, mode):
+    """A stash anywhere must be caught before the arena is refilled.
+
+    Narrowing the per-batch scan to the modules a batch touched, and deferring
+    the rest to a post-install sweep, is not equivalent. `consume_then_remove`
+    stashes an arena view on an untouched module, lets the refill change it, has
+    a later hook commit the changed value and delete the stash -- the sweep then
+    finds nothing and the install silently reports success with wrong bytes.
+    `new_module` stashes on a module created during installation, which a sweep
+    over a cached module list never visits.
+    """
+    model = nn.Module()
+    model.first = nn.Linear(1, 1, bias=False)
+    model.second = nn.Linear(1, 1, bias=False)
+    model.other = nn.Module()
+    names = frozenset(dict(model.named_parameters()))
+
+    class Info:
+        def __init__(self, parameter):
+            self.kernel_tensors = ({"weight": parameter}, {})
+
+        def reset(self):
+            self.kernel_tensors = None
+
+    def initialize(target):
+        for layer in (target.first, target.second):
+            layerwise.LAYERWISE_INFO[layer] = Info(layer.weight)
+            layer.weight = nn.Parameter(torch.empty_like(layer.weight, device="meta"))
+
+    _install_fake_vllm(monkeypatch, initialize)
+    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
+    quant_base = sys.modules[
+        "vllm.model_executor.layers.quantization.base_config"
+    ].QuantizeMethodBase
+
+    def commit(layer, info):
+        original = info.kernel_tensors[0]["weight"]
+        original.data.copy_(layer.weight)
+        layer.weight = original
+
+    monkeypatch.setattr(layerwise, "_copy_and_restore_kernel_tensors", commit)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+
+    class FirstHook(quant_base):
+        def process_weights_after_loading(self, layer):
+            if mode == "new_module":
+                model.dynamic = nn.Module()
+                model.dynamic.stash = layer.weight.detach()
+            else:
+                model.other.stash = layer.weight.detach()
+
+    class SecondHook(quant_base):
+        def process_weights_after_loading(self, layer):
+            if mode == "consume_then_remove":
+                layer.weight = nn.Parameter(layer.weight + model.other.stash)
+                del model.other.stash
+
+    model.first.quant_method = FirstHook()
+    model.second.quant_method = SecondHook()
+    arena = torch.ones(1, 1)
+    refilled = []
+
+    def batches():
+        yield {"first.weight": arena}
+        refilled.append(True)
+        arena.fill_(2)
+        yield {"second.weight": arena}
+
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
+    )
+    with pytest.raises(IncompleteRefit, match="retained bounded staging storage"):
+        installer.install_streaming(PreparedStreamingTensors(batches, names, {}))
+    assert not refilled, "retention must be rejected before the arena is reused"
+
+
+@pytest.mark.parametrize("cleanup_point", ["generator_finally", "iterator_close"])
+def test_final_sweep_rejects_arena_exposed_by_producer_cleanup(
+    monkeypatch, cleanup_point
+):
+    """The closing sweep must cover every arena the install used.
+
+    A producer can expose an arena reference in its own cleanup -- a generator's
+    `finally`, or an iterator's `close()` -- which runs after the last per-batch
+    scan. Only the sweep can catch that, and only if it tests the union of every
+    batch's storage rather than an empty set.
+    """
+    _install_fake_vllm(monkeypatch, lambda model: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    model = nn.Sequential(nn.Linear(2, 2, bias=False))
+    names = frozenset(dict(model.named_parameters()))
+    arena = torch.ones(2, 2)
+    cleanup_calls = []
+
+    def expose_arena():
+        model[0].stash = arena.view(-1)
+        cleanup_calls.append(cleanup_point)
+
+    def generator():
+        try:
+            yield {"0.weight": arena}
+        finally:
+            expose_arena()
+
+    class CloseableIterator:
+        def __init__(self):
+            self.yielded = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.yielded:
+                raise StopIteration
+            self.yielded = True
+            return {"0.weight": arena}
+
+        def close(self):
+            expose_arena()
+
+    batches = generator if cleanup_point == "generator_finally" else CloseableIterator
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
+    )
+    with pytest.raises(IncompleteRefit, match="retained bounded staging storage"):
+        installer.install_streaming(PreparedStreamingTensors(batches, names, {}))
+    assert cleanup_calls == [cleanup_point]
+
+
+def test_added_live_parameter_invalidates_captured_owner_completeness(monkeypatch):
+    """Owner completeness is a live question, not a property of the capture.
+
+    A hook can add a Parameter to a module a later batch owns, so a batch that
+    covered its owner completely when the layout was captured no longer does by
+    the time it arrives. Resolving only the supplied names cannot see that, so
+    the check has to ask the live tree what the owner holds now -- and reject
+    before the incomplete owner's hook runs.
+    """
+    model = nn.Module()
+    model.first = nn.Linear(2, 2, bias=False)
+    model.second = nn.Linear(2, 2, bias=False)
+    names = frozenset(dict(model.named_parameters()))
+
+    class Info:
+        def __init__(self, parameter):
+            self.kernel_tensors = ({"weight": parameter}, {})
+
+        def reset(self):
+            self.kernel_tensors = None
+
+    def initialize(target):
+        for layer in (target.first, target.second):
+            layerwise.LAYERWISE_INFO[layer] = Info(layer.weight)
+            layer.weight = nn.Parameter(torch.empty_like(layer.weight, device="meta"))
+
+    _install_fake_vllm(monkeypatch, initialize)
+    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
+    quant_base = sys.modules[
+        "vllm.model_executor.layers.quantization.base_config"
+    ].QuantizeMethodBase
+
+    def commit(layer, info):
+        original = info.kernel_tensors[0]["weight"]
+        original.data.copy_(layer.weight)
+        layer.weight = original
+
+    monkeypatch.setattr(layerwise, "_copy_and_restore_kernel_tensors", commit)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    hook_calls = []
+
+    class FirstHook(quant_base):
+        def process_weights_after_loading(self, layer):
+            # Independent storage, so this is a completeness question rather
+            # than an arena-retention one.
+            model.second.bias = nn.Parameter(torch.full((2,), 7.0))
+            hook_calls.append("added_second_bias")
+
+    class SecondHook(quant_base):
+        def process_weights_after_loading(self, layer):
+            hook_calls.append("processed_incomplete_second_owner")
+
+    model.first.quant_method = FirstHook()
+    model.second.quant_method = SecondHook()
+
+    def batches():
+        yield {"first.weight": torch.ones(2, 2)}
+        yield {"second.weight": torch.full((2, 2), 2.0)}
+
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
+    )
+    with pytest.raises(IncompleteRefit, match="streaming batch splits an owning module"):
+        installer.install_streaming(PreparedStreamingTensors(batches, names, {}))
+    assert hook_calls == ["added_second_bias"]

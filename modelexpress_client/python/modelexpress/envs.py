@@ -73,6 +73,7 @@ if TYPE_CHECKING:
     MX_RESHARD_HANDSHAKE_ATTEMPT_S: float
     MX_RESHARD_HANDSHAKE_BACKOFF_S: float
     MX_REFIT_STAGE_RECORD: bool
+    MX_REFIT_PACK_MODULES: bool
     MX_RESHARD_MAX_GBPS: float
     MX_RESHARD_MIN_GBPS: float
     MX_RESHARD_PUBLISH_DIGEST: bool
@@ -320,6 +321,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # One JSON stage record per refit. On by default: the timings are already
     # computed, and at INFO they were never captured by a benchmark run.
     "MX_REFIT_STAGE_RECORD": lambda: _env_bool("MX_REFIT_STAGE_RECORD", True),
+    # Coalesce consecutive owning-module batches up to the staging budget. Off by
+    # default: one module per batch is the conservative arena bound, and packing
+    # raises the per-batch residency it was measured to reduce batch count with.
+    "MX_REFIT_PACK_MODULES": lambda: _env_bool("MX_REFIT_PACK_MODULES", False),
     # Per-rank fabric ceiling in Gbps used to reject impossible wire rates. Zero
     # disables the check, and is the default because only the operator knows the
     # real per-rank limit for their fabric.
