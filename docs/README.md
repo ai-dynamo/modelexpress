@@ -30,4 +30,4 @@ Start with the deployment scenario that matches where your model lives and how w
 
 ## Support boundaries
 
-The `main` branch and Helm chart currently report ModelExpress `0.5.1`. Use docs from the release tag you deploy, and treat pinned runtime images in examples as qualification snapshots. The active CI workflows are the source of truth for automated coverage; hardware-dependent P2P, GDS, and runtime combinations still need validation on the target GPU, fabric, driver, and storage stack.
+The `main` branch and Helm chart currently report ModelExpress `0.7.0`. Use docs from the release tag you deploy, and treat pinned runtime images in examples as qualification snapshots. The active CI workflows are the source of truth for automated coverage; hardware-dependent P2P, GDS, and runtime combinations still need validation on the target GPU, fabric, driver, and storage stack.

@@ -7,6 +7,9 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+from modelexpress.engines.vllm.host_quantization import (
+    refresh_host_quantization_state,
+)
 from modelexpress.refit.reshard.types import IncompleteRefit
 from modelexpress.refit.timing import RefitTimingRecorder, use_refit_timing
 from modelexpress_rl.inference.engines.vllm.installer import (
@@ -408,6 +411,130 @@ def test_layerwise_capture_and_streaming_preserve_tied_parameters(monkeypatch):
     assert model.embedding.weight is model.lm_head.weight
     assert model.embedding.weight.data_ptr() == address
     assert torch.equal(model.lm_head.weight, torch.full((2, 2), 7.0))
+
+
+@pytest.fixture
+def warm_runtime_install(monkeypatch, mock_accelerator_backend_cls):
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    monkeypatch.setattr(
+        "modelexpress_rl.inference.engines.vllm.installer.accelerator_backend_for",
+        lambda _device: backend,
+    )
+    model = nn.Module()
+    attn = nn.Module()
+    model.attn = attn
+    for key, value in (("q", 0.25), ("k", 0.5), ("v", 0.75)):
+        attn.register_buffer(f"_{key}_scale", torch.tensor([value / 2, value]))
+        setattr(attn, f"_{key}_scale_float", 1.0)
+    attn._k_scale_cpu = torch.tensor(1.0)
+    attn._v_scale_cpu = torch.tensor(1.0)
+    attn.register_buffer("_prob_scale", torch.tensor(0.125))
+    attn._prob_scale_float = 1.0
+    attn._o_scale_float = 2.0
+    attn.impl = SimpleNamespace(bmm1_scale=3.0, bmm2_scale=4.0, o_sf_scale=5.0)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(enforce_eager=True),
+        quant_config=object(),
+        cache_config=SimpleNamespace(cache_dtype="fp8_e4m3"),
+    )
+    live = dict(model.named_buffers())
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=config,
+        model_config=config.model_config,
+        device=torch.device("cpu"),
+        runtime_tensors=live,
+    )
+    staged = SimpleNamespace(tensors=live, metrics={})
+    return installer, attn, PreparedRuntimeTensors(staged=staged)
+
+
+def test_runtime_refit_refreshes_host_scales_and_invalidates_warm_caches(
+    warm_runtime_install,
+):
+    installer, attn, prepared = warm_runtime_install
+    tensors = dict(attn.named_buffers()) | {
+        "_k_scale_cpu": attn._k_scale_cpu,
+        "_v_scale_cpu": attn._v_scale_cpu,
+    }
+    pointers = {name: tensor.data_ptr() for name, tensor in tensors.items()}
+    for factor in (1, 2):
+        for key, value in (("q", 0.25), ("k", 0.5), ("v", 0.75)):
+            getattr(attn, f"_{key}_scale").copy_(
+                torch.tensor([factor * value / 2, factor * value])
+            )
+        received = {
+            name: tensor.clone() for name, tensor in attn.named_buffers()
+        }
+        installer.install(prepared)
+
+        assert attn._q_scale_float == factor * 0.25
+        assert attn._k_scale_float == attn._k_scale_cpu.item() == factor * 0.5
+        assert attn._v_scale_float == attn._v_scale_cpu.item() == factor * 0.75
+        assert attn._prob_scale_float == 1.0
+        assert attn._o_scale_float is None
+        assert attn.impl.bmm1_scale is None
+        assert attn.impl.bmm2_scale is None
+        assert attn.impl.o_sf_scale is None
+        for name, tensor in attn.named_buffers():
+            assert torch.equal(tensor, received[name])
+        for name, tensor in tensors.items():
+            assert getattr(attn, name) is tensor
+            assert tensor.data_ptr() == pointers[name]
+
+        # Simulate caches repopulated by inference before the next refit.
+        attn._o_scale_float = 6.0
+        attn.impl.bmm1_scale = 7.0
+        attn.impl.bmm2_scale = 8.0
+        attn.impl.o_sf_scale = 9.0
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value", "message"),
+    [
+        ("_k_scale", torch.tensor(float("nan")), "finite, positive"),
+        ("_v_scale", torch.tensor(0.0), "finite, positive"),
+        ("_k_scale_cpu", torch.ones(2), "Invalid vLLM attention CPU scale"),
+        ("_q_scale_float", None, "Invalid vLLM attention host scalar"),
+    ],
+)
+def test_runtime_refit_rejects_invalid_scale_state(
+    warm_runtime_install, attribute, value, message,
+):
+    installer, attn, prepared = warm_runtime_install
+    if attribute in attn._buffers:
+        getattr(attn, attribute).fill_(value.item())
+    else:
+        setattr(attn, attribute, value)
+    with pytest.raises(RuntimeError, match=message):
+        installer.install(prepared)
+
+
+def test_runtime_refit_validates_destinations_before_refresh(warm_runtime_install):
+    installer, attn, prepared = warm_runtime_install
+    with pytest.raises(IncompleteRefit, match="tensor set differs"):
+        installer.install_runtime_tensors({})
+    with pytest.raises(IncompleteRefit, match="directly into live storage"):
+        installer.install_runtime_tensors(
+            {name: tensor.clone() for name, tensor in prepared.staged.tensors.items()}
+        )
+    assert attn._q_scale_float == 1.0
+    assert attn._o_scale_float == 2.0
+    assert attn.impl.bmm1_scale == 3.0
+
+
+def test_warm_host_scale_refresh_requires_eager_execution(warm_runtime_install):
+    installer, attn, _prepared = warm_runtime_install
+    installer._vllm_config.model_config.enforce_eager = False
+    with pytest.raises(RuntimeError, match="requires enforce_eager"):
+        refresh_host_quantization_state(
+            installer._model,
+            installer._vllm_config,
+            SimpleNamespace(),
+            allow_warm=True,
+        )
+    assert attn._q_scale_float == 1.0
+    assert attn._o_scale_float == 2.0
 
 
 def test_installer_rejects_quantized_mla_derived_weight_refresh():

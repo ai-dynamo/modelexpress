@@ -1105,7 +1105,7 @@ class TestSourceLoadPresence:
         from types import SimpleNamespace
         from modelexpress import p2p_pb2
         return SimpleNamespace(
-            identity=p2p_pb2.SourceIdentity(model_name="m", mx_version="0.5.1"),
+            identity=p2p_pb2.SourceIdentity(model_name="m", mx_version="0.7.0"),
             worker_id="target-0",
             worker_rank=0,
             model_name="m",

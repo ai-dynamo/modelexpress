@@ -635,11 +635,24 @@ again after warmup or compilation. It also borrows the loader-owned NIXL agent:
 the already-registered live tensors are the peer receive destination, and the
 loader retains responsibility for shutting down the rank-local transport. A
 failure after the direct transfer starts leaves the engine state uncertain, so
-MX fences it rather than attempting in-process source fallback. This warm-copy
-path is currently unavailable for quantized models and FP8
-KV caches because their derived host state cannot be safely refreshed in place.
-Those workers skip generator P2P and use the canonical S3 path before any
-live-engine mutation.
+MX fences it rather than attempting in-process source fallback. This path
+requires a nonempty loader-owned runtime tensor mapping and an initialized
+NIXL manager. Model quantization, FP8 KV-cache dtype, and execution mode do not
+gate peer selection. With `model_config.enforce_eager=True`, after validating
+the live destinations, the RL installer uses the same host-scale refresh as
+cold RDMA loading: q/k/v Python scalars and CPU mirrors are updated from the
+received accelerator tensors (using the maximum for per-head scales), with
+tensor storage preserved. It also invalidates the
+FlashInfer BMM and output-scale caches together so the next eager forward
+recomputes them. It does not rerun post-weight-load processing on tensors that
+are already in runtime format. Invalid scale contracts fail installation and
+leave the mutated engine fenced.
+
+Without `enforce_eager`, peer refits retain the existing direct-copy behavior
+and do not run this host-scale refresh. Updating host mirrors alone cannot
+update scalar values already captured in CUDA graphs; graph-scale refresh and
+recapture remain outside this eager-mode fix.
+Cold RDMA loading retains its requirement that attention caches be uninitialized.
 
 An object-storage generator with full-tensor engine support defaults to a
 same-rank generator peer first and the version-level object-storage source
@@ -652,10 +665,15 @@ available with object storage as its only source.
 
 For an active refit, the peer lookup is for the exact target UID. If no peer can
 prepare that version, the generator resolves the full canonical lineage from
-its `FULL_HF_CHECKPOINT` root through the target deltas, then synchronously
-reconstructs and installs the target. A successful peer refit does not rebuild
-the canonical checkpoint in the background; object storage is consulted only
-when a later refit cannot use P2P.
+its `FULL_HF_CHECKPOINT` root through the target deltas. Under the local cache
+lock, the receiver reuses its verified checkpoint when that version is on the
+target lineage, downloading and applying only the missing revisions before
+installing the target. Full-root reconstruction is retained when no matching,
+source-verified local checkpoint exists, including an unverified launch seed.
+A successful peer refit does not rebuild the canonical checkpoint in the
+background, so the local checkpoint may lag the engine's serving version.
+Fallback therefore resumes from the local checkpoint version. Object storage
+is consulted only when a later refit cannot use P2P.
 
 The canonical receiver retains each full checkpoint and delta payload under its
 version, then writes a resolved chain manifest. A full target is directly
@@ -1193,7 +1211,7 @@ Auto-detects the best loading strategy with a prioritized chain. Each strategy i
 |---|---|---|---|
 | p0 | `RdmaStrategy` | NIXL available | `ListSources(READY)`, filter by `worker_rank` and runtime `accelerator`, order the survivors via the configured `SourceSelector` (`MX_P2P_SOURCE_SELECTOR`: `random` default, `rendezvous_hash`, `load_aware`, or `topology_aware`), then try candidates (max 3). Filtering before the retry slice prevents incompatible sources from exhausting the retry budget; a post-`GetMetadata` accelerator check remains as defense-in-depth. Before preparing target tensors, P2P sources must serve a manifest for the selected runtime `worker_id`; generation mismatches and transfer failures retry the next candidate, reinitializing the target first when it may have been mutated. |
 | p1 | `ServerCacheStrategy` | `MODEL_EXPRESS_NO_SHARED_STORAGE` enabled + server address configured + adapter implements `load_via_native` | Stream the model's weight files from ModelExpress Server into the snapshot the engine already resolved, then hand off to the engine's native loader. The cold-miss path for workers with no route to Hugging Face: the server downloads and caches the model once, and every later worker is served from that cache. Non-weight files arrive earlier, before the engine starts — see [Server-Backed Model Cache](#server-backed-model-cache). Falls through on failure. |
-| p2 | `InstantTensorStrategy` | `MX_INSTANT_TENSOR` enabled (default) + `instanttensor` installed + CUDA device + adapter implements `build_instanttensor_weight_iter` (and `apply_weight_iter`) | Load the model's own safetensors directly onto CUDA via the `instanttensor` library (distributed loading, pipelined prefetch, direct I/O, GDS when available). Reuses vLLM's built-in `--load-format instanttensor` path, so it needs no `MX_MODEL_URI`; the engine resolves and (if needed) downloads the weight files. Falls through on failure. |
+| p2 | `InstantTensorStrategy` | `MX_INSTANT_TENSOR` enabled (default) + no object-store `MX_MODEL_URI` + `instanttensor` installed + CUDA device + adapter implements `build_instanttensor_weight_iter` (and `apply_weight_iter`) | Load the model's own safetensors directly onto CUDA via the `instanttensor` library (distributed loading, pipelined prefetch, direct I/O, GDS when available). Reuses vLLM's built-in `--load-format instanttensor` path, so the engine resolves and (if needed) downloads the weight files. An `s3://`, `gs://`, or `az://` `MX_MODEL_URI` skips this strategy and proceeds to ModelStreamer. Falls through on other failures. |
 | p3 | `ModelStreamerStrategy` | `MX_MODEL_URI` set + `runai_model_streamer` installed | Stream safetensors to GPU via CPU staging buffer. `MX_MODEL_URI` accepts remote URIs (`s3://`, `gs://`, `az://`), absolute local paths, or HF model IDs (resolved via `HF_HUB_CACHE`). All storage backends (S3, GCS, Azure) included by default. |
 | p4 | `GdsStrategy` | Active accelerator backend supports GDS and GDS hardware is available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. Reads full checkpoint tensors and slices for TP downstream — see [GDS Reads Full Checkpoint Tensors Under TP](#gds-reads-full-checkpoint-tensors-under-tp). |
 | p5 | `DefaultStrategy` | Engine native fallback loader available | Native loader fallback (for vLLM, `DefaultModelLoader`, CPU-staged, auto-downloads from HF Hub). |

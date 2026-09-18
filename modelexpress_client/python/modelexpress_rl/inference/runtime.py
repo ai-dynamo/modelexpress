@@ -361,7 +361,7 @@ def initialize_generator_runtime(
                 p2p_client = None
                 resolved_source_order = (WeightSource.OBJECT_STORAGE,)
         method_tuple = tuple(methods)
-        replay_from_full_root = {
+        resolve_from_full_root = {
             WeightSource.GENERATOR,
             WeightSource.OBJECT_STORAGE,
         }.issubset(resolved_source_order)
@@ -387,7 +387,7 @@ def initialize_generator_runtime(
                     if resolve_replay_chain is None
                     else lambda version: resolve_replay_chain(
                         version.version_id,
-                        replay_from_full_root,
+                        resolve_from_full_root,
                     )
                 ),
             ),

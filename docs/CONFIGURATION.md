@@ -116,9 +116,9 @@ An eligible strategy can still fail and allow the next strategy to run. If a str
 | MX_SERVER_ADDRESS | unset | Preferred client address; the Python client falls back to localhost:8001 when neither address is set |
 | MODEL_EXPRESS_NO_SHARED_STORAGE | false | Enables server-backed repository-file and weight fetching when an address is configured |
 | MX_P2P_METADATA | 1 | Enables on-demand P2P metadata exchange; set 0 for full metadata through a central coordinator |
-| MX_MODEL_URI | unset | Enables ModelStreamer for s3://, gs://, az://, or absolute local paths |
+| MX_MODEL_URI | unset | Enables ModelStreamer for s3://, gs://, az://, or absolute local paths; object-store URIs also make InstantTensor ineligible |
 | MX_MS_DISTRIBUTED | 1 | Distributes ModelStreamer reads across CUDA TP ranks when TP > 1 |
-| MX_INSTANT_TENSOR | 1 | Enables the InstantTensor eligibility gate |
+| MX_INSTANT_TENSOR | 1 | Enables the InstantTensor eligibility gate when `MX_MODEL_URI` is not an object-store URI |
 | MX_DISABLE_PATCHES | false | Disables ModelExpress runtime compatibility patches |
 | MODEL_EXPRESS_LOG_LEVEL | runtime-dependent | Use DEBUG to inspect Eligible loaders and Trying strategy |
 

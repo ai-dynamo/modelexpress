@@ -20,6 +20,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
+from modelexpress.accelerators import accelerator_backend_for
+from modelexpress.engines.vllm.host_quantization import (
+    refresh_host_quantization_state,
+)
 from modelexpress.refit.reshard.geometry import (
     capture_weights,
     convert_source_weights,
@@ -363,6 +367,15 @@ class _VllmInstaller(EngineInstaller):
             if destinations[name] is not source:
                 raise IncompleteRefit(
                     "vLLM runtime P2P must write directly into live storage"
+                )
+
+        if getattr(self._model_config, "enforce_eager", False):
+            with refit_span("post_install"):
+                refresh_host_quantization_state(
+                    self._model,
+                    self._vllm_config,
+                    accelerator_backend_for(self._device),
+                    allow_warm=True,
                 )
 
     def install_checkpoint(self, path: str | Path) -> None:
