@@ -30,7 +30,7 @@ import grpc
 from . import auth
 from . import model_pb2
 from . import model_pb2_grpc
-from .client import _get_server_url
+from .client import _get_server_url, _tls_requested, open_channel
 from .model_snapshot import (
     ModelSnapshotCache,
     ModelSnapshotError,
@@ -69,6 +69,7 @@ class ModelCacheClient:
         max_message_size: int = DEFAULT_MAX_MESSAGE_SIZE,
     ):
         self.server_url = _get_server_url(server_url)
+        self._tls = _tls_requested(server_url)
         self.cache_directory = cache_directory
         self.chunk_size = DEFAULT_CHUNK_SIZE if chunk_size is None else chunk_size
         if not 0 < self.chunk_size <= MAX_CHUNK_SIZE:
@@ -104,7 +105,7 @@ class ModelCacheClient:
                 ("grpc.http2.max_pings_without_data", 0),
             ]
             self._channel = auth.with_auth(
-                grpc.insecure_channel(self.server_url, options=options)
+                open_channel(self.server_url, tls=self._tls, options=options)
             )
             self._stub = model_pb2_grpc.ModelServiceStub(self._channel)
             logger.debug("ModelCacheClient connected to %s", self.server_url)

@@ -25,6 +25,7 @@ memory-backend = []
 integration-tests = ["memory-backend"]
 tls-openssl = [
     "modelexpress-common/tls-native",
+    "modelexpress-client/tls-native",
     "kube/openssl-tls",
     "dep:openssl",
     "dep:tokio-openssl",
@@ -82,7 +83,7 @@ prometheus-client = { workspace = true }
 modelexpress-common = { workspace = true, default-features = false, features = ["test-support"] }
 mockall = { workspace = true }
 tempfile = "3.20"
-modelexpress-client.workspace = true
+modelexpress-client = { workspace = true, features = ["tls-rustls"] }
 rcgen = { workspace = true }
 
 [[test]]
@@ -93,6 +94,11 @@ required-features = ["integration-tests"]
 [[test]]
 name = "auth_e2e"
 path = "tests/auth_e2e.rs"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "tls_e2e"
+path = "tests/tls_e2e.rs"
 required-features = ["integration-tests"]
 
 [lints]

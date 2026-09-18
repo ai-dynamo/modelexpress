@@ -153,9 +153,11 @@ jobs:
     - name: Build
       run: cargo build --workspace ${{ matrix.features }} --verbose
 
-    - name: TLS unit tests
+    - name: TLS unit and end-to-end tests
       run: |
         cargo test -p modelexpress-server ${{ matrix.features }},integration-tests --lib tls::
+        cargo test -p modelexpress-server ${{ matrix.features }},integration-tests --test tls_e2e
+        cargo test -p modelexpress-client ${{ matrix.features }} --lib transport::
 
   tls-no-backend-rejected:
     name: TLS No-Backend Rejected

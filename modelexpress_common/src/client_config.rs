@@ -48,6 +48,10 @@ pub struct ClientArgs {
     #[arg(short, long, env = crate::envs::MODEL_EXPRESS_TIMEOUT)]
     pub timeout: Option<u64>,
 
+    /// PEM CA bundle to trust for an https:// endpoint
+    #[arg(long, env = crate::envs::MODEL_EXPRESS_TLS_CA_FILE)]
+    pub tls_ca_file: Option<PathBuf>,
+
     /// Cache path override
     #[arg(long, env = crate::envs::MODEL_EXPRESS_CACHE_DIRECTORY)]
     pub cache_path: Option<PathBuf>,
@@ -130,6 +134,10 @@ impl ClientConfig {
 
         if let Some(timeout) = args.timeout {
             config.connection.timeout_secs = Some(timeout);
+        }
+
+        if let Some(tls_ca_file) = args.tls_ca_file {
+            config.connection.tls_ca_file = Some(tls_ca_file);
         }
 
         // Cache settings
@@ -400,6 +408,7 @@ mod tests {
             config: None,
             endpoint: Some("cli-override:7777".to_string()),
             timeout: Some(120),
+            tls_ca_file: None,
             cache_path: None,
             log_level: None,
             log_format: None,
