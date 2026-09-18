@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from contextlib import nullcontext
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -14,6 +15,21 @@ from modelexpress_rl.train.engines.fsdp.adapter import FSDPTrainerAdapter
 ADAPTER = "modelexpress_rl.train.engines.fsdp.adapter"
 
 
+def _mock_host_allocation_without_cuda(monkeypatch):
+    """Exercise snapshot logic on CPU; the CUDA test checks real pinned copies."""
+    if torch.cuda.is_available():
+        return
+    empty = torch.empty
+
+    def allocate(size, *, dtype, device, pin_memory):
+        assert device == "cpu"
+        assert pin_memory is True
+        return empty(size, dtype=dtype, device=device)
+
+    monkeypatch.setattr(f"{ADAPTER}.torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr(f"{ADAPTER}.torch.empty", allocate)
+
+
 @pytest.mark.parametrize(
     "mode", [TrainerStagingMode.COPY_TO_HOST, TrainerStagingMode.COPY_TO_DEVICE]
 )
@@ -21,6 +37,8 @@ def test_copy_preserves_per_tensor_dtype_and_warm_buffers(
     dist_ready, monkeypatch, mode
 ):
     monkeypatch.setattr(f"{ADAPTER}.classic_cuda_alloc", nullcontext)
+    if mode is TrainerStagingMode.COPY_TO_HOST:
+        _mock_host_allocation_without_cuda(monkeypatch)
     manager = _Manager()
     overrides = {"bias": torch.float32}
     adapter = _create_trainer_adapter(
@@ -311,7 +329,25 @@ def test_non_dict_tensors_is_rejected(dist_ready):
         _stage(adapter, [torch.ones(2, 4, dtype=torch.bfloat16)])
 
 
-def test_host_snapshot_survives_source_mutation_and_rematerialization(dist_ready):
+def test_host_staging_without_cuda_rejects_before_allocation(dist_ready, monkeypatch):
+    manager = _Manager()
+    adapter = _adapter(manager)
+    source = torch.ones(2, dtype=torch.float32)
+    allocate = Mock(side_effect=AssertionError("must reject before allocation"))
+    monkeypatch.setattr(f"{ADAPTER}.torch.cuda.is_available", lambda: False)
+    monkeypatch.setattr(f"{ADAPTER}.torch.empty", allocate)
+
+    with pytest.raises(RuntimeError, match="COPY_TO_HOST staging requires CUDA"):
+        _stage(adapter, {"w": source}, TrainerStagingMode.COPY_TO_HOST)
+
+    allocate.assert_not_called()
+    assert manager.registered == []
+
+
+def test_host_snapshot_survives_source_mutation_and_rematerialization(
+    dist_ready, monkeypatch
+):
+    _mock_host_allocation_without_cuda(monkeypatch)
     manager = _Manager()
     adapter = _adapter(manager)
     source = torch.arange(12, dtype=torch.float32).reshape(3, 4).t()
