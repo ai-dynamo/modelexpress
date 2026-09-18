@@ -13,25 +13,23 @@ repository.workspace = true
 keywords.workspace = true
 
 [features]
-default = ["gcs", "tls-rustls"]
+default = ["gcs", "tls-rustls", "s3"]
 openssl = ["tls-native"]
 gcs = ["dep:google-cloud-storage", "dep:rustls", "rustls/ring", "rustls/std"]
 test-support = []
+s3 = ["dep:object_store", "dep:object-store-reqwest"]
 tls-native = [
-    "dep:object_store",
-    "dep:object-store-reqwest",
+    "dep:openssl",
     "reqwest/native-tls",
-    "object-store-reqwest/native-tls",
+    "object-store-reqwest?/native-tls",
 ]
 tls-rustls = [
     "dep:rustls",
-    "dep:object_store",
-    "dep:object-store-reqwest",
     "rustls/ring",
     "rustls/std",
-    "object_store/ring",
+    "object_store?/ring",
     "reqwest/rustls-tls",
-    "object-store-reqwest/rustls-no-provider",
+    "object-store-reqwest?/rustls-no-provider",
 ]
 
 [dependencies]
@@ -55,6 +53,7 @@ jiff = { workspace = true }
 reqwest = { workspace = true }
 tempfile = { workspace = true }
 object_store = { workspace = true, optional = true }
+openssl = { workspace = true, optional = true }
 object-store-reqwest = { workspace = true, optional = true }
 google-cloud-storage = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
