@@ -29,6 +29,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 pub mod auth;
+pub mod transport;
 
 // Re-export for public use
 pub use modelexpress_common::client_config::{ClientArgs, ClientConfig};
@@ -202,10 +203,10 @@ impl Client {
             .timeout_secs
             .unwrap_or(constants::DEFAULT_TIMEOUT_SECS);
 
-        let channel = tonic::transport::Endpoint::new(endpoint.clone())
-            .map(|endpoint| endpoint.timeout(Duration::from_secs(timeout)))?
-            .connect()
-            .await?;
+        let endpoint = tonic::transport::Endpoint::new(endpoint.clone())
+            .map(|endpoint| endpoint.timeout(Duration::from_secs(timeout)))?;
+        let channel =
+            transport::connect(endpoint, config.connection.tls_ca_file.as_deref()).await?;
 
         let interceptor = AuthInterceptor::new(Arc::new(TokenProvider::from_env()));
         let health_client =
