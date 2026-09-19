@@ -30,6 +30,23 @@ fn is_offline_mode() -> bool {
     envs::hf_offline()
 }
 
+/// Hugging Face token, preferring `HF_TOKEN` and falling back to the token file that
+/// `huggingface-cli login` writes under `HF_HOME`, unless `HF_HUB_DISABLE_IMPLICIT_TOKEN`
+/// opts out of the cached one.
+///
+/// `ApiBuilder::from_env` reads that file itself, so handing it `envs::hf_token()` unchanged
+/// discards the token whenever `HF_TOKEN` is unset. Resolving it here keeps the builder and the
+/// full-body download fallback, which sets its own bearer header, on the same credential.
+fn resolve_hf_token() -> Option<String> {
+    if let Some(token) = envs::hf_token() {
+        return Some(token);
+    }
+    if envs::hf_implicit_token_disabled() {
+        return None;
+    }
+    Cache::from_env().token()
+}
+
 /// Get the cache directory for Hugging Face models
 /// Priority order:
 /// 1. Provided cache_dir parameter
@@ -400,7 +417,7 @@ impl HuggingFaceProvider {
         revision: &str,
         cache_dir: Option<&Path>,
     ) -> Result<hf_hub::api::RepoInfo> {
-        let mut builder = ApiBuilder::from_env().with_token(envs::hf_token());
+        let mut builder = ApiBuilder::from_env().with_token(resolve_hf_token());
         if let Some(cache_dir) = cache_dir {
             builder = builder.with_cache_dir(cache_dir.to_path_buf());
         }
@@ -485,7 +502,7 @@ impl HuggingFaceProvider {
             });
         }
 
-        let token = envs::hf_token();
+        let token = resolve_hf_token();
 
         info!("Using cache directory: {:?}", cache_dir);
         // High CPU download
@@ -681,7 +698,7 @@ impl ModelProviderTrait for HuggingFaceProvider {
     /// Returns Ok(()) if the model was successfully deleted or didn't exist
     async fn delete_model(&self, model_name: &str, cache_dir: PathBuf) -> Result<()> {
         info!("Deleting model from Hugging Face cache: {model_name}");
-        let token = envs::hf_token();
+        let token = resolve_hf_token();
         let api = ApiBuilder::from_env()
             .with_token(token)
             .with_cache_dir(cache_dir.clone())
@@ -855,7 +872,7 @@ impl ModelProviderTrait for HuggingFaceProvider {
         }
 
         // Check against the latest commit hash from HF
-        let token = envs::hf_token();
+        let token = resolve_hf_token();
         let api = ApiBuilder::from_env().with_token(token).build()?;
         let repo = api.model(model_name.to_string());
         let info = repo.info().await.map_err(|e| {
@@ -933,7 +950,7 @@ mod tests {
     use std::sync::MutexGuard;
     use tempfile::TempDir;
     use tokio::time::Duration;
-    use wiremock::matchers::{method, path_regex};
+    use wiremock::matchers::{header, method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// Minimal mock of the Hugging Face Hub used by tests.
@@ -1770,6 +1787,86 @@ mod tests {
                 .await
                 .is_err(),
             "An uncached revision must not resolve"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_resolve_revision_sends_the_cached_cli_token_when_hf_token_is_unset() {
+        let env_lock = acquire_env_mutex();
+        let hf_home = TempDir::new().expect("Failed to create temporary directory");
+        std::fs::write(hf_home.path().join("token"), "hf_cached_cli_token\n")
+            .expect("Failed to write token file");
+        let _hf_home_guard =
+            EnvVarGuard::set(&env_lock, "HF_HOME", &hf_home.path().display().to_string());
+        let _hf_token_guard = EnvVarGuard::remove(&env_lock, crate::envs::HF_TOKEN);
+        let _offline_guard = EnvVarGuard::remove(&env_lock, crate::envs::HF_HUB_OFFLINE);
+        let _implicit_guard =
+            EnvVarGuard::remove(&env_lock, crate::envs::HF_HUB_DISABLE_IMPLICIT_TOKEN);
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/models/test/model(?:/.*)?$"))
+            .and(header("authorization", "Bearer hf_cached_cli_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "test/model",
+                "sha": "def5678",
+                "siblings": []
+            })))
+            .mount(&server)
+            .await;
+        let _endpoint_guard = EnvVarGuard::set(&env_lock, crate::envs::HF_ENDPOINT, &server.uri());
+
+        let cache_dir = TempDir::new().expect("Failed to create temporary cache directory");
+        let resolved = HuggingFaceProvider
+            .resolve_revision("test/model", Some(cache_dir.path().to_path_buf()), None)
+            .await
+            .expect("The token written by `huggingface-cli login` should authenticate the request");
+
+        assert_eq!(resolved.as_deref(), Some("def5678"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_resolve_revision_omits_the_cached_cli_token_when_implicit_tokens_are_disabled() {
+        let env_lock = acquire_env_mutex();
+        let hf_home = TempDir::new().expect("Failed to create temporary directory");
+        std::fs::write(hf_home.path().join("token"), "hf_cached_cli_token")
+            .expect("Failed to write token file");
+        let _hf_home_guard =
+            EnvVarGuard::set(&env_lock, "HF_HOME", &hf_home.path().display().to_string());
+        let _hf_token_guard = EnvVarGuard::remove(&env_lock, crate::envs::HF_TOKEN);
+        let _offline_guard = EnvVarGuard::remove(&env_lock, crate::envs::HF_HUB_OFFLINE);
+        let _implicit_guard =
+            EnvVarGuard::set(&env_lock, crate::envs::HF_HUB_DISABLE_IMPLICIT_TOKEN, "1");
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/models/test/model(?:/.*)?$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "test/model",
+                "sha": "def5678",
+                "siblings": []
+            })))
+            .mount(&server)
+            .await;
+        let _endpoint_guard = EnvVarGuard::set(&env_lock, crate::envs::HF_ENDPOINT, &server.uri());
+
+        let cache_dir = TempDir::new().expect("Failed to create temporary cache directory");
+        HuggingFaceProvider
+            .resolve_revision("test/model", Some(cache_dir.path().to_path_buf()), None)
+            .await
+            .expect("The request should still resolve anonymously");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("Request recording is enabled");
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.headers.contains_key("authorization")),
+            "A cached token must not be sent once HF_HUB_DISABLE_IMPLICIT_TOKEN is set"
         );
     }
 }
