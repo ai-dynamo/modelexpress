@@ -103,6 +103,13 @@ class _BoundedBatch:
     layouts: _StagingLayouts
     nbytes: int
 
+    def __post_init__(self) -> None:
+        # Readers reach these views both by name and by position, and
+        # dataclasses.replace or a plain 3-tuple would satisfy only the second.
+        # Coerce so the annotation holds however the batch was built.
+        if not isinstance(self.layouts, _StagingLayouts):
+            object.__setattr__(self, "layouts", _StagingLayouts(*self.layouts))
+
 
 @dataclass(frozen=True)
 class _PreparedBoundedTransfer:

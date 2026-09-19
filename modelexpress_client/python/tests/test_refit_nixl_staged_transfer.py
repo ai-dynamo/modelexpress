@@ -1317,3 +1317,26 @@ def test_failed_prefetch_drain_does_not_mask_a_caller_error(monkeypatch):
     next(iterator)
     with pytest.raises(RuntimeError, match="the install failed"):
         iterator.throw(RuntimeError("the install failed"))
+
+
+def test_bounded_batch_layouts_are_named_however_they_are_built():
+    """Readers use both `.full` and `[0]`, so construction style must not matter.
+
+    The annotation alone does not enforce this: a plain 3-tuple or a
+    dataclasses.replace satisfies positional access and breaks attribute
+    access, which fails at only one of the two call sites.
+    """
+    recv = {"a.weight": ((4,), torch.float32)}
+    convert: dict = {}
+    full = {"w": ((4,), torch.float32)}
+
+    built = transfer_module._BoundedBatch(
+        CaptureResult(copies=[]), TransferPlan(), (recv, convert, full), 256
+    )
+    assert isinstance(built.layouts, transfer_module._StagingLayouts)
+    assert built.layouts.recv is built.layouts[0] is recv
+    assert built.layouts.full is built.layouts[2] is full
+
+    swapped = replace(built, layouts=(recv, convert, {}))
+    assert isinstance(swapped.layouts, transfer_module._StagingLayouts)
+    assert swapped.layouts.full == {}
