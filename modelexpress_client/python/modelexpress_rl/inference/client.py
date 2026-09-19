@@ -25,6 +25,7 @@ from .. import refit_pb2, refit_pb2_grpc
 from ..control import WeightVersion, WeightVersionState, _weight_version
 from ..object_storage import ObjectStorageType
 from .adapter import GeneratorEngineContext
+from .bootstrap import ModelExpressGeneratorBootstrap
 from .plan import WeightSource, parse_weight_source_order
 from .receiver import ObjectStorageGeneratorConfig
 from .runtime import GeneratorRuntime, initialize_generator_runtime
@@ -74,6 +75,8 @@ class ModelExpressGeneratorConfig:
     # Ordered source fallback. Canonical object storage may be used alone or
     # combined with generator P2P in either order.
     source_order: tuple[WeightSource, ...] | None = None
+    # Optional MX transport initialized before an embedded inference engine.
+    bootstrap: ModelExpressGeneratorBootstrap | None = None
 
     def __post_init__(self) -> None:
         """Validate explicit settings before client initialization."""
@@ -241,7 +244,14 @@ class ModelExpressGeneratorClient:
         if not isinstance(config, ModelExpressGeneratorConfig):
             raise TypeError("config must be a ModelExpressGeneratorConfig")
         model_name = _required(config.model_name or envs.MODEL_NAME or "", "model_name")
-        worker_id = _required(config.worker_id or uuid.uuid4().hex[:8], "worker_id")
+        bootstrap = config.bootstrap
+        worker_id = _required(
+            config.worker_id
+            or (bootstrap.worker_id if bootstrap is not None else uuid.uuid4().hex[:8]),
+            "worker_id",
+        )
+        if bootstrap is not None and worker_id != bootstrap.worker_id:
+            raise ValueError("worker_id must match the generator bootstrap")
         server_url = _get_server_url(config.server_url)
         registration_ttl_seconds = config.registration_ttl_seconds
         if registration_ttl_seconds is None:
@@ -278,6 +288,7 @@ class ModelExpressGeneratorClient:
                 service=lambda: client._service,
                 start_lease=client._start_version_lease,
                 resolve_replay_chain=client._resolve_replay_chain,
+                bootstrap=bootstrap,
             )
             client._runtime = runtime
             client._has_initial_serving_version = (
