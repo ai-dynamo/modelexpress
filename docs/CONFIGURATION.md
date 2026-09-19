@@ -180,14 +180,32 @@ ModelStreamer credentials are third-party settings. See [Load from object storag
 
 | Environment variable | Default | Effect |
 |---|---|---|
-| MX_ARTIFACT_TRANSFER | false | Transfer compatible file-backed JIT artifacts on the NIXL path |
+| MX_ARTIFACT_TRANSFER | false | Enable compatible file-backed JIT artifact installation and publication |
+| MX_ARTIFACT_BACKEND | p2p | Artifact transport: `p2p` or `mooncake`; exactly one is selected and there is no fallback |
 | MX_ARTIFACT_BUNDLE_ROOT | $TMPDIR/modelexpress-artifacts | Local staging root for artifact bundles |
 | MX_ARTIFACT_COMPILE_CONFIG_DIGEST | empty | Partitions torch compile artifact sources by compile configuration |
+| MX_ARTIFACT_MOONCAKE_NAMESPACE | modelexpress/artifacts | Key prefix used by the Mooncake artifact backend |
+| MX_ARTIFACT_MOONCAKE_POOL_BYTES | 536870912 bytes | Local buffer-pool size for the process-local Mooncake artifact client; a config-file `local_buffer_size` takes precedence |
+| MX_ARTIFACT_MOONCAKE_DELETE_RETRIES | 10 | Additional attempts when stale-object or repair-marker removal reports an active lease |
+| MX_ARTIFACT_MOONCAKE_DELETE_RETRY_DELAY_SECS | 0.7 | Delay in seconds between Mooncake removal attempts |
+| MX_MOONCAKE_CONFIG_PATH | unset | Optional Mooncake JSON configuration file; `MOONCAKE_CONFIG_PATH` is the fallback |
+| MX_MC_* | unset | Artifact-store Mooncake settings promoted temporarily to the corresponding native `MC_*` names |
+| MX_ETCD_* | unset | Artifact-store etcd settings promoted temporarily to the corresponding native `ETCD_*` names |
 | MX_ARTIFACT_READY_URL | framework default | Readiness endpoint checked before publication |
 | MX_ARTIFACT_READY_TIMEOUT_SECS | 1800 | Readiness/publication timeout |
 | MX_ARTIFACT_TRANSFER_CHUNK_SIZE | 67108864 bytes | Artifact transfer chunk size; maximum is 4 GiB |
 
-Artifact transfer requires MX_P2P_METADATA=1, a central coordinator, writable target cache directories, and a trusted deployment. It transfers file-backed caches; it does not replace model weights.
+The default `p2p` backend requires `MX_P2P_METADATA=1`, a central coordinator,
+and NIXL. The `mooncake` backend requires a Python package exposing
+`mooncake.store`, plus `MX_MC_METADATA_ADDR` and `MX_MC_MASTER_SERVER` (or the
+equivalent JSON/native configuration); it does not use the MX server or
+`MX_P2P_METADATA`. Prefixed settings are restored after each artifact-store
+operation, allowing a separately initialized Mooncake client such as a KV
+cache to keep its own account and configuration.
+
+Both backends require writable target cache directories and a trusted
+deployment. Artifact transfer moves file-backed caches; it does not replace
+model-weight transfer.
 
 ## Client metrics
 
