@@ -1134,6 +1134,30 @@ STALE. Long-lived framework integrations still need to call `close()` from
 their lifecycle; SIGKILL and mid-transfer failure recovery remain follow-up
 work.
 
+A publisher declares its runtime accelerator family to `MxReshardRendezvous`, and
+`publish()` puts it on `WorkerMetadata.accelerator`; `discover_trainers()` reads it
+back onto each `RendezvousPayload.accelerator`. It rides the worker record rather
+than the identity because the identity is hash material both sides must derive
+identically, and the receiver builds it to *discover* the trainer, before knowing
+anything the trainer served — a family in the identity would make a cross-family
+source undiscoverable instead of merely incompatible. The family is supplied by the
+caller, never probed here: this class owns no device, and reading process-global
+torch state would report whichever runtime is importable rather than where the
+registered memory lives. Empty means the publisher declared none and must be read
+as unknown, not as a family. The JSON shard-table format is unchanged.
+
+Nothing on this path compares the two ends yet: the reshard receiver applies no
+publisher/target compatibility policy, and no pairing is rejected on
+accelerator-family grounds. That is a known gap rather than a finding that
+cross-family refit is safe — other NIXL, fabric, or model-geometry constraints may
+still prevent a transfer. Publishing the family is what makes the comparison
+expressible, and the gate it would run through is
+`metadata/payload.py::accelerators_compatible`. Applying the gate requires passing
+the target family into `gather_sources` and retaining each source family from the
+discovered payloads, which `gather_sources` does not return today. A target-only
+check could not express the constraint, since compatibility is a property of the
+source-target pair.
+
 `modelexpress_rl/inference/nixl_staged_transfer.py` owns exact-manifest planning,
 trainer staging buffers, direct generator-peer transfer, and verification. The
 vLLM-specific

@@ -220,10 +220,17 @@ def test_published_rendezvous_stays_ready_and_closes_stale(monkeypatch):
 
 
 class _DiscoveryClient:
-    """Serves a fixed set of READY sources, each with its own shard table."""
+    """Serves a fixed set of READY sources, each with its own shard table.
 
-    def __init__(self, blobs):
+    ``accelerators`` gives each source its published family; the default of empty
+    strings matches a publisher that declared none. The real worker record is a
+    proto, so the field is always present even when unset - hence a fake that
+    always carries it rather than one that sometimes omits the attribute.
+    """
+
+    def __init__(self, blobs, accelerators=None):
         self._blobs = list(blobs)
+        self._accelerators = list(accelerators or [""] * len(self._blobs))
 
     def list_sources(self, _identity, status_filter=None):
         return SimpleNamespace(
@@ -237,7 +244,10 @@ class _DiscoveryClient:
         index = int(source_id.rsplit("-", 1)[1])
         return SimpleNamespace(
             found=True,
-            worker=SimpleNamespace(nixl_metadata=self._blobs[index]),
+            worker=SimpleNamespace(
+                nixl_metadata=self._blobs[index],
+                accelerator=self._accelerators[index],
+            ),
         )
 
 
@@ -509,3 +519,118 @@ def test_one_unreadable_rank_does_not_abort_the_sweep():
     # The readable ranks are still returned when the quorum only needs them.
     discovered = _rendezvous(client).discover_trainers(expected_trainers=2, timeout=0)
     assert [p.agent_name for p in discovered] == ["rank-0", "rank-2"]
+
+
+def test_publish_carries_the_accelerator_the_publisher_declared():
+    """The family is the publisher's to state. It serves buffers on the device its
+    engine placed them on, so probing torch here would report whichever runtime is
+    importable rather than where the registered memory lives."""
+
+    class Client:
+        def __init__(self):
+            self.worker = None
+
+        def publish_metadata(self, _identity, worker, _worker_id):
+            self.worker = worker
+            return "source-id"
+
+        def update_status(self, **_kwargs):
+            return True
+
+    client = Client()
+    rendezvous = MxReshardRendezvous(
+        client,
+        role="trainer",
+        rank=0,
+        model_name="model",
+        accelerator="xpu",
+    )
+    try:
+        rendezvous.publish(_blob("trainer-agent", _one_tensor()))
+    finally:
+        rendezvous.close()
+
+    assert client.worker.accelerator == "xpu"
+
+
+def test_publish_leaves_the_accelerator_empty_when_none_is_declared():
+    """Empty is the publisher declaring nothing, and must stay distinguishable from
+    a family. Defaulting to the local runtime would make an undeclared publisher
+    indistinguishable from one that really is CUDA."""
+
+    class Client:
+        def __init__(self):
+            self.worker = None
+
+        def publish_metadata(self, _identity, worker, _worker_id):
+            self.worker = worker
+            return "source-id"
+
+        def update_status(self, **_kwargs):
+            return True
+
+    client = Client()
+    rendezvous = MxReshardRendezvous(
+        client, role="trainer", rank=0, model_name="model"
+    )
+    try:
+        rendezvous.publish(_blob("trainer-agent", _one_tensor()))
+    finally:
+        rendezvous.close()
+
+    assert client.worker.accelerator == ""
+
+
+def test_the_accelerator_is_not_identity_material():
+    """Two publishers differing only in accelerator must still produce the same
+    ``SourceIdentity``, which is what the server hashes into an ``mx_source_id``.
+    The receiver builds this identity to DISCOVER the trainer, before it knows
+    anything the trainer served, so a family in the identity would make a
+    cross-family source undiscoverable rather than merely incompatible."""
+    cuda_side = MxReshardRendezvous(
+        None, role="trainer", rank=0, model_name="model", accelerator="cuda"
+    )
+    xpu_side = MxReshardRendezvous(
+        None, role="trainer", rank=0, model_name="model", accelerator="xpu"
+    )
+
+    assert cuda_side._identity("trainer") == xpu_side._identity("trainer")
+
+
+def test_discovery_reports_each_publisher_accelerator():
+    client = _DiscoveryClient(
+        [_blob("cuda-rank", _one_tensor()), _blob("xpu-rank", _one_tensor())],
+        accelerators=["cuda", "xpu"],
+    )
+
+    discovered = _rendezvous(client).discover_trainers(expected_trainers=2, timeout=0)
+
+    assert [(p.agent_name, p.accelerator) for p in discovered] == [
+        ("cuda-rank", "cuda"),
+        ("xpu-rank", "xpu"),
+    ]
+
+
+def test_discovery_reports_an_undeclared_accelerator_as_empty():
+    """Read as unknown by a consumer, never as a family. Nothing is filtered on it
+    here; this only guarantees the value survives discovery intact."""
+    client = _DiscoveryClient([_blob("silent-rank", _one_tensor())])
+
+    discovered = _rendezvous(client).discover_trainers(expected_trainers=1, timeout=0)
+
+    assert discovered[0].accelerator == ""
+
+
+def test_a_cross_family_source_is_still_discovered():
+    """PR scope: publish and surface the family, filter on nothing. A consumer that
+    wants to reject a pairing has to do it itself, so discovery must keep returning
+    cross-family ranks until that consumer exists."""
+    client = _DiscoveryClient(
+        [_blob("cuda-rank", _one_tensor()), _blob("xpu-rank", _one_tensor())],
+        accelerators=["cuda", "xpu"],
+    )
+
+    discovered = _rendezvous(client).discover_trainers(expected_trainers=2, timeout=0)
+
+    assert len(discovered) == 2
+    assert {p.accelerator for p in discovered} == {"cuda", "xpu"}
