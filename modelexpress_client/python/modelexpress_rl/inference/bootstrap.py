@@ -18,7 +18,7 @@ class ModelExpressGeneratorBootstrap:
     def __init__(self, *, device_id: int) -> None:
         self.worker_id = uuid.uuid4().hex[:8]
         self.device_id = device_id
-        self._transfer = _NixlStagedTransfer(
+        self._transfer: _NixlStagedTransfer | None = _NixlStagedTransfer(
             agent_name=f"mx-refit-{self.worker_id}",
             device_id=device_id,
             device=torch.device("cuda", device_id),
@@ -35,8 +35,19 @@ class ModelExpressGeneratorBootstrap:
                 "generator bootstrap device does not match the engine: "
                 f"{self.device_id} != {device_id}"
             )
+        transfer = self._transfer
+        if transfer is None:
+            raise RuntimeError("generator bootstrap was closed")
         self._claimed = True
-        return self._transfer
+        self._transfer = None
+        return transfer
+
+    def close(self) -> None:
+        """Close the transfer unless ownership has moved to a runtime."""
+        transfer = self._transfer
+        self._transfer = None
+        if transfer is not None:
+            transfer.close()
 
 
 __all__ = ["ModelExpressGeneratorBootstrap"]
