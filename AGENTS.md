@@ -99,6 +99,7 @@ When making changes, update the appropriate documentation files:
 | Coding standards, build commands, new patterns, agent rules | `AGENTS.md` (the only agent-instruction file; `CLAUDE.md` and `.github/copilot-instructions.md` are pointers) |
 | CLI arguments or commands | `docs/CLI.md` + `.agents/skills/add-cli-argument/SKILL.md` |
 | Configuration, environment variables | `docs/DEPLOYMENT.md` |
+| Prometheus metrics, Grafana dashboard, alert rules | `docs/METRICS.md` |
 | Deployment (Docker, K8s, Helm, P2P) | `docs/DEPLOYMENT.md` |
 | Known issues, FP8 handling | `docs/ARCHITECTURE.md` |
 | Dev setup, scripts, pre-commit hooks | `CONTRIBUTING.md` |

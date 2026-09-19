@@ -12,14 +12,15 @@ deployment.
 
 This documents what ships today: the exposition path, `mx_build_info`, per-RPC
 and storage-backend coverage on the server, the download lifecycle, NIXL client
-health, the Kubernetes scrape, alerting and dashboard surface, and the first two
-load-timing tiers — the `load_model()` window and the phases that partition it.
+health, the Kubernetes scrape, alerting and dashboard surface, and the first
+three load-timing tiers — the `load_model()` window, the phases that partition
+it, and the strategy attempts that run inside the `chain` phase.
 
-The per-strategy tier between those and the transfer is a separate change.
-Below it, a P2P source attempt is split into its phases — `metadata`,
+Below those, the strategy attempts that run inside the `chain` phase, and
+beneath them a P2P source attempt split into its phases — `metadata`,
 `prepare`, `register`, `handshake`, `receive`, `finalize`, `release` — so the
-dashboard can say not just that a transfer took ninety seconds but which of
-those it spent them in.
+dashboard can say which strategy spent the time and where inside the transfer
+it went.
 
 ---
 
@@ -425,6 +426,8 @@ touched.
 | `mx_load_phase_seconds` | Histogram | `engine`, `model`, `phase`, `scheme` |
 | `mx_artifact_install_step_seconds` | Histogram | `artifact`, `archive`, `step`, `scheme` |
 | `mx_artifact_install_bytes_total` | Counter | `artifact`, `archive`, `scheme` |
+| `mx_load_strategy_seconds` | Histogram | `engine`, `model`, `strategy`, `outcome`, `scheme` |
+| `mx_load_strategy_skipped_total` | Counter | `engine`, `strategy`, `scheme` |
 
 ### Load timing, and what it does not measure
 
@@ -465,18 +468,23 @@ zeros:
 | --- | --- | --- | --- |
 | vLLM | all four | | hardware |
 | SGLang | no `model_init` | SGLang builds the module and hands it to the loader | hardware |
+| SGLang, `transfer_engine` transport | `chain` and `publish` | bypasses the chain but is one by hand; installs no artifacts | unit tests only |
 | TRT-LLM | `chain` only | model arrives built; publishing happens in a separate call, outside this window | unit tests only |
 
 TRT-LLM's row has not been observed on a GPU: CI builds worker images for vLLM
 and SGLang but not for TRT-LLM, so there is no image carrying this code to run.
 Treat its phase set as the intent rather than as a measurement.
 
-SGLang's `transfer_engine` transport is a further gap in the same direction. It
-never enters the strategy chain, so it records **`mx_load_seconds` and no phases
-at all**. The partition still holds — zero is bounded by the total — but the
-share panel reads 0% there, which under the rule above means "time is going
-somewhere no phase covers". On that transport it does, and the panel is telling
-the truth about instrumentation that has not been written yet.
+SGLang's `transfer_engine` transport never enters the strategy chain, but it
+is a chain by hand — try the transfer, and on failure re-initialize and load
+natively — so it records the same two phases from the same context managers:
+`chain` around that whole decision, and `publish` around registering and
+advertising itself as a source. Below the phase it records two attempt spans,
+`transfer_engine` and, when that misses, `default`, with the same outcomes the
+chain uses: a missing source is a `fallback`, a failed receive that forced a
+re-init is `fallback_dirty`. Like TRT-LLM's row this has not run on a GPU — no
+CI image carries the mooncake transport — so treat it as intent rather than
+measurement.
 
 **Do not add a phase from a second call site.** The partition is the property
 that makes "which part was slow" answerable without the numbers contradicting
@@ -594,6 +602,68 @@ The buckets run from 0.1 s to 300 s rather than the hour-scale load band. A
 healthy extract of a compile cache is sub-second and a pathological one is
 minutes, and a band whose first boundary is 0.5 s would put every healthy
 reading in one bucket.
+### Inside the `chain` phase: which strategy spent the time
+
+`mx_load_strategy_seconds` is one observation per strategy the chain actually
+tried. The chain runs a fixed list — `rdma`, `server-cache`, `instant_tensor`,
+`model_streamer`, `gds`, `default` — in that order, stopping at the first one
+that returns weights, so the intervals are ordered and disjoint and sit wholly
+inside the `chain` phase.
+
+They do **not** sum to that phase, and never will. `chain` also covers the
+eligibility filter, the tracing span setup and the loop's own bookkeeping, none
+of which belongs to any single strategy. The residual has the same character as
+the one-to-three milliseconds already documented between the phases and the
+whole load: real work by the caller that owns the span, not time gone missing.
+`sum(strategy) <= chain <= load` is the invariant; equality is not.
+
+Two things a reading of this family should not assume:
+
+- **An `rdma` observation is an envelope, not a transfer.** That one strategy
+  retries over several source candidates, and each of those is separately timed
+  by `mx_p2p_transfer_seconds`. The nesting is strict — the transfers are inside
+  the attempt — so the two are not double counting the same seconds, but the
+  attempt is the larger number and includes the misses between.
+- **The interval charges a strategy for its own cleanup.** It opens before
+  `load()` and closes after the rollback and, where a strategy mutated the model
+  before failing, after the re-initialization its mutation forced. Read a row as
+  *what this strategy cost the chain*, not *what this strategy transferred*. The
+  alternative leaves the re-init — often the most expensive single operation in
+  the chain — attributed to nobody.
+
+`outcome` is on the family because the durations are not comparable without it.
+A `fallback` is a strategy discovering in milliseconds that it has nothing to
+offer; a `success` is a strategy moving weights for half a minute. Both are
+normal, and a mean across the two describes neither.
+
+### A strategy that recorded nothing: two opposite explanations
+
+`mx_load_strategy_skipped_total` exists because the histogram above cannot be
+read without it. A strategy can be absent from it for two reasons that look
+identical in the data and mean opposite things:
+
+- The eligibility filter dropped it before the chain ran — no NIXL, no GDS
+  driver, the package is not installed, P2P is switched off. **This** is a skip,
+  and it is what the counter records.
+- It was eligible and simply never reached, because an earlier strategy
+  succeeded and the chain returned. On a healthy load this is the common case:
+  a working `rdma` means the five strategies behind it never run.
+
+Counting the second as a skip would report `default` as permanently skipped on
+every load that worked, which is the reverse of the truth. So the counter is
+incremented once per load, only for the strategies the filter dropped, and a
+strategy that appears in neither family was eligible and not reached.
+
+It records **that** a strategy was unavailable, not **why**. Carrying the reason
+would mean asking each strategy to name its own skip, which means changing the
+eligibility contract that `LoadStrategy` has today — too much interface for a
+label. The reason is already logged at the point it is decided, by the strategy
+that decided it; the counter tells you which log line to go read.
+
+Expect a steady nonzero background on any real cluster. `gds`,
+`model_streamer` and `instant_tensor` are all normally absent from an image that
+ships none of them — a flat line, not a problem. The one worth reading is
+`rdma`, which being skipped means P2P is configured off rather than broken.
 
 ### The `model` label is bounded by convention, not by code
 
@@ -841,17 +911,18 @@ if your sidecar watches something other than `grafana_dashboard`.
 It covers the server end to end -- gRPC, storage backend, download lifecycle,
 capacity -- and the client from the load tiers down to total transfer time. The
 **Model load** row plots `mx_load_seconds`, the phase split of
-`mx_load_phase_seconds`, and the validate/extract steps inside
-`artifact_install`. The **P2P clients** row now carries the transfer's own
-breakdown: a table of mean phase durations under the two transfer panels, and
-a count per phase that shows where a failed attempt died.
+`mx_load_phase_seconds`, the validate/extract steps inside
+`artifact_install`, and the strategy attempts inside `chain`. The **P2P
+clients** row carries the transfer's own breakdown: a table of mean phase
+durations under the two transfer panels, and a count per phase that shows
+where a failed attempt died.
 
 Read **Overview** first; the rows below it answer *why* once a tile is not green.
 
 | Row | Answers | Panels |
 | --- | --- | --- |
 | **Overview** | Is anything wrong right now? | 8 stat tiles |
-| **Model load** | How long did a load take, and which part? | 5 |
+| **Model load** | How long did a load take, which part, and which strategy? | 8 |
 | **Downloads** | Is the primary job working, and how fast? | 6 |
 | **Server internals** | gRPC and storage backend: rate, errors, p99, in flight | 8 + 1 note |
 | **P2P clients** | Selection funnel, transfer time and its phases, NIXL health | 11 + 1 note |
