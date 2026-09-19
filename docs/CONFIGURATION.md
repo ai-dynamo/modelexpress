@@ -138,7 +138,7 @@ MX_P2P_METADATA=0 only changes the central-coordinator metadata representation; 
 | MX_SOURCE_QUERY_TIMEOUT | 3600 seconds | TRT-LLM source query timeout |
 | MX_TRANSFER_TIMEOUT | 900 seconds for the general client; 300 seconds for RDMA when unset | Transfer timeout used by integrations; the RDMA receive path uses its 300-second fallback until this variable is explicitly set |
 | MX_HEARTBEAT_INTERVAL_SECS | 30 | Source heartbeat interval |
-| MX_PUBLISH_TIMEOUT_SECS | 1800 | Maximum source publication wait |
+| MX_PUBLISH_TIMEOUT_SECS | 1800 | Maximum source publication wait; 0 retries indefinitely |
 | MX_K8S_SERVICE_PATTERN | mx-sources | Service DNS pattern; {rank} is replaced with the worker rank |
 | MX_K8S_SOURCE_RETRIES | 5 | Fresh-channel retries for k8s-service revision mismatches |
 | MX_K8S_SOURCE_BACKOFF_SECONDS | 0.5 | Backoff between k8s-service retries |
