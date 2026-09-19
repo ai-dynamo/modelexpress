@@ -987,7 +987,9 @@ RL framework integrations live in the separate `modelexpress_rl` package:
 | `train/engines/megatron/adapter.py` | Stable in-place Megatron tensor registration and manifest construction |
 | `train/engines/fsdp/adapter.py` | FSDP/DTensor source capture with in-place or device-copy staging |
 | `inference/client.py` | Rank-local generator lifecycle, leases, exact-version source discovery, staging, and apply |
+| `inference/bootstrap.py` | Optional trainer-only NIXL transport created before an embedded inference engine initializes |
 | `inference/runtime.py` | Generator source policy, method/resource composition, and update-session ownership |
+| `inference/engines/vllm/worker.py` | vLLM-native worker bootstrap that resolves the assigned CUDA device before engine initialization |
 | `inference/engines/vllm/control.py` | Direct vLLM Control gRPC client |
 | `inference/engines/vllm/startup_probe.py` | Serving-version reconciliation and startup gate |
 | `inference/source/` | Independent generator-peer, trainer-memory, and object-storage discovery |
@@ -1045,6 +1047,10 @@ uses separate NIXL methods for trainer load-time tensors and generator runtime
 tensors, and adds the canonical-checkpoint method when object storage is
 configured. XOR deltas mutate an exact base; full HF checkpoints stream tensors
 into the existing mmap-backed checkpoint and become the base for later deltas.
+The ModelExpress vLLM worker publishes vLLM's pre-initialization physical GPU
+assignment and resolves its visible CUDA device through the vLLM platform API
+before establishing NIXL. The trainer-only generator config claims that
+bootstrap after the live model is available.
 All methods feed the shared private installer, which commits staged tensors or
 reloads a prepared checkpoint through vLLM's graph-safe layerwise reload path.
 Before a reload, the installer restores registered slots for live kernel buffers

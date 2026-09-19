@@ -611,6 +611,24 @@ def test_generator_config_explicit_source_order_overrides_env(monkeypatch):
     assert config.source_order == (WeightSource.TRAINER,)
 
 
+def test_generator_rejects_worker_id_that_differs_from_bootstrap():
+    class _Bootstrap:
+        worker_id = "bootstrap-worker"
+
+    with pytest.raises(ValueError, match="must match the generator bootstrap"):
+        ModelExpressGeneratorClient.initialize(
+            ModelExpressGeneratorConfig(
+                engine_context=VllmGeneratorContext(
+                    model=object(),
+                    vllm_config=object(),
+                ),
+                model_name="test/model",
+                worker_id="configured-worker",
+                bootstrap=_Bootstrap(),
+            )
+        )
+
+
 @pytest.mark.parametrize("value", ["", "TRAINER,", "unknown", "TRAINER,TRAINER"])
 def test_generator_config_rejects_invalid_source_order_env(monkeypatch, value):
     monkeypatch.setenv("MX_GENERATOR_SOURCE_ORDER", value)
