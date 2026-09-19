@@ -313,6 +313,10 @@ pub struct ConnectionConfig {
 
     /// Timeout in seconds for requests
     pub timeout_secs: Option<u64>,
+
+    /// PEM CA bundle to trust for an `https://` endpoint. System roots when unset.
+    #[serde(default)]
+    pub tls_ca_file: Option<std::path::PathBuf>,
 }
 
 pub fn normalize_grpc_endpoint(endpoint: impl Into<String>) -> String {
@@ -330,6 +334,7 @@ impl Default for ConnectionConfig {
         Self {
             endpoint: format!("http://localhost:{}", crate::constants::DEFAULT_GRPC_PORT),
             timeout_secs: Some(crate::constants::DEFAULT_TIMEOUT_SECS),
+            tls_ca_file: None,
         }
     }
 }
@@ -339,6 +344,7 @@ impl ConnectionConfig {
         Self {
             endpoint: normalize_grpc_endpoint(endpoint),
             timeout_secs: Some(crate::constants::DEFAULT_TIMEOUT_SECS),
+            tls_ca_file: None,
         }
     }
 
