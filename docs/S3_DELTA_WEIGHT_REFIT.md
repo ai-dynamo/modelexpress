@@ -326,8 +326,12 @@ The corresponding generator configuration would use:
 gigabytes (`1 GB = 1,000,000,000 bytes`) for payload files under `full/`,
 `deltas/`, and `materialized/`. It defaults to 500 GB; set it to `null` to
 disable the configured quota.
-ModelExpress also checks available filesystem space before known writes and
-copies. It evicts stale derived materializations before stale canonical
+At initialization, ModelExpress caps the quota at the existing model cache size
+plus available filesystem space. A short INFO log reports the cap and free space
+when this reduces the configured quota or replaces `null` with a disk-based
+limit. This safety cap also applies when the configured quota is disabled.
+ModelExpress rechecks free space before known writes and copies as other disk
+usage changes. It evicts stale derived materializations before stale canonical
 artifacts, but never evicts the active lineage or the checkpoint being prepared
 or installed. Capacity must therefore cover the active checkpoint plus the
 rollback-safe working set for one update. A capacity rejection preserves the

@@ -223,6 +223,15 @@ GCS uses the configured/default ModelExpress cache root; `MODEL_EXPRESS_CACHE_DI
 
 See [`CLI.md`](CLI.md) for full CLI usage documentation.
 
+### Generator refit checkpoint cache
+
+`refit_checkpoint_max_size_gb` defaults to 500 GB per model. At initialization,
+the generator caps this quota at existing cache bytes plus free disk space and
+logs any reduction. Free space is checked again before known writes and copies,
+including when `null` disables the configured quota. See the
+[S3 refit cache configuration](S3_DELTA_WEIGHT_REFIT.md#refit_checkpoint_dir)
+for setup and eviction behavior.
+
 ## ServiceAccount Authentication
 
 Optional, off by default. When enabled, the server authenticates every gRPC caller
