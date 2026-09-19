@@ -28,19 +28,12 @@ Run: pytest tests/test_reshard_refit_descriptor_cache.py
 from contextlib import nullcontext
 from types import SimpleNamespace
 
-import pytest
 import torch
 
 from modelexpress.refit.reshard import receiver as receiver_mod
 from modelexpress.refit.reshard.transfer_plan import TransferPlan
 from modelexpress.refit.reshard.types import CaptureResult
 from tests.test_reshard_refit_fused_wire import _build, _RecordingTransport
-
-
-@pytest.fixture(autouse=True)
-def _cpu_only(monkeypatch):
-    """These refits run on CPU, where the stage syncs have nothing to wait on."""
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
 
 
 def _refit(harness, step):
@@ -110,7 +103,11 @@ def test_rebuilding_the_plan_drops_the_cache(monkeypatch):
     monkeypatch.setattr(
         receiver_mod, "NixlReshardTransport", lambda *_args, **_kwargs: object()
     )
-    monkeypatch.setattr(receiver_mod, "classic_cuda_alloc", nullcontext)
+    monkeypatch.setattr(
+        receiver_mod,
+        "registered_buffer_alloc_scope",
+        lambda *_args, **_kwargs: nullcontext(),
+    )
     harness._num_trainer_sources = 0
     harness._mx_client = object()
     harness._model_name = "model"
