@@ -325,3 +325,7 @@ pre-commit run --all-files
 ## License
 
 Apache 2.0. See [LICENSE](LICENSE).
+
+The `helm/LICENSE` entry is a symbolic link to that top-level file. It exists only so Helm includes
+the license when packaging the chart; Helm dereferences the link and writes a regular-file copy into
+the chart archive.
