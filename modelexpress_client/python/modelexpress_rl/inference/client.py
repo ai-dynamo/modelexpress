@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import threading
 import uuid
 from dataclasses import dataclass
@@ -356,6 +357,77 @@ class ModelExpressGeneratorClient:
             )
             return self._active_handle
 
+    def apply_weight_streaming(
+        self,
+        *,
+        version: WeightVersionRef,
+        max_staging_bytes: int,
+        staging_device: str = "cuda",
+        staging_buffers: int = 1,
+    ) -> Any:
+        """Transfer and install bounded batches while inference is paused.
+
+        ``max_staging_bytes`` caps the staging arenas in total. ``staging_device``
+        selects where they live: ``"cuda"`` keeps RDMA landing in VRAM with a
+        device-to-device commit; ``"cpu"`` uses pinned host memory and commits
+        with a host-to-device copy, saving the arena's worth of VRAM.
+        ``staging_buffers=2`` splits the cap across two arenas so the next
+        batch's transfer overlaps the current commit, which hides the host copy
+        almost entirely and also speeds up the CUDA path.
+
+        This operation mutates weights incrementally. On any failure the caller
+        must keep inference paused and restart the engine; there is no rollback.
+        ``stage_weight`` retains its full-copy, non-mutating staging contract.
+        """
+        if not isinstance(version, WeightVersionRef):
+            raise TypeError("version must be a WeightVersionRef")
+        if staging_device not in ("cuda", "cpu"):
+            raise ValueError("staging_device must be 'cuda' or 'cpu'")
+        if (
+            isinstance(staging_buffers, bool)
+            or not isinstance(staging_buffers, int)
+            or staging_buffers < 1
+        ):
+            raise ValueError("staging_buffers must be a positive integer")
+        with self._operation_lock:
+            if self._engine_state is _EngineState.UNCERTAIN:
+                raise RuntimeError(
+                    "engine weights are uncertain; restart before streaming refit"
+                )
+            if self._active_handle is not None:
+                raise RuntimeError("another generator update is still active")
+            assert self._runtime is not None
+            started = time.perf_counter()
+            update = self._runtime.session.prepare_streaming(
+                self._get_ready_version(version.version_id),
+                max_staging_bytes=max_staging_bytes,
+                staging_device=staging_device,
+                staging_buffers=staging_buffers,
+            )
+            prepare_s = time.perf_counter() - started
+            staged = StagedWeightHandle(
+                client=self, version_id=version.version_id, update=update
+            )
+            self._active_handle = staged
+            try:
+                result = self.apply_weight(staged)
+                metrics = {**(result or {}), **staged.metrics}
+            except BaseException:
+                try:
+                    self._release_staged(staged)
+                except Exception:
+                    logger.exception(
+                        "failed to release streaming update after installation error"
+                    )
+                raise
+            else:
+                release_started = time.perf_counter()
+                self._release_staged(staged)
+                metrics["streaming_prepare_s"] = prepare_s
+                metrics["streaming_release_s"] = time.perf_counter() - release_started
+                metrics["streaming_total_s"] = time.perf_counter() - started
+                return metrics
+
     def apply_weight(self, staged: StagedWeightHandle) -> Any:
         """Install a verified local staged version at the caller's safe point."""
         if not isinstance(staged, StagedWeightHandle) or staged._client is not self:
@@ -544,9 +616,7 @@ class ModelExpressGeneratorClient:
             raise RuntimeError("MX GetWeightVersion response is missing version")
         version = _weight_version(response.version)
         if version.state is not WeightVersionState.READY:
-            raise RuntimeError(
-                f"initial serving version {version_id!r} is not READY"
-            )
+            raise RuntimeError(f"initial serving version {version_id!r} is not READY")
         if version.model_name != self.model_name:
             raise RuntimeError(
                 "initial serving version model_name does not match the generator"
@@ -618,6 +688,7 @@ class ModelExpressGeneratorClient:
         )
 
     def _release_staged(self, staged: StagedWeightHandle) -> None:
+        """Free the active slot once locally released, including cleanup errors."""
         if staged._client is not self:
             raise ValueError("staged handle does not belong to this client")
         with self._operation_lock:
