@@ -18,7 +18,7 @@ import atexit
 import logging
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -26,12 +26,13 @@ import torch
 
 from . import envs
 from . import ucx_utils
-from .metrics import metrics as transfer_metrics
+from ._accelerator_buffer import describe_jax_cuda_array, is_jax_array
 from ._nixl import load_nixl_api
 from .accelerators import (
     AcceleratorBackend,
     CudaAcceleratorBackend,
 )
+from .metrics import metrics as transfer_metrics
 from .types import ManifestMismatchError, TensorDescriptor
 
 if TYPE_CHECKING:
@@ -142,6 +143,10 @@ class NixlTransferManager:
         self._metadata: bytes = b""
         self._tensor_descriptors: list[TensorDescriptor] = []
         self._tensors: dict[str, torch.Tensor] = {}
+        self._torch_tensor_registrations: list[dict[str, torch.Tensor]] = []
+        self._jax_arrays: dict[str, Any] = {}
+        self._jax_array_registrations: list[dict[str, Any]] = []
+        self._active_registration_kind: str | None = None
         # Registration descriptors must be deregistered before destroying the
         # UCX-backed NIXL agent. Dropping an agent with live GPU registrations
         # can abort inside ucp_worker_destroy during framework teardown.
@@ -422,6 +427,8 @@ class NixlTransferManager:
         else:
             reg_count = 0
         nixl_reg_time = time.perf_counter() - nixl_reg_start
+        self._torch_tensor_registrations.append(self._tensors)
+        self._active_registration_kind = "torch"
 
         # Phase 3: Get agent metadata blob
         metadata_start = time.perf_counter()
@@ -445,6 +452,65 @@ class NixlTransferManager:
             f"({reduction:.1f}% reduction), {total_bytes / 1e9:.2f} GB total"
         )
 
+        return self._metadata
+
+    def register_jax_arrays(self, arrays: Mapping[str, Any]) -> bytes:
+        """Register single-device CUDA JAX arrays as read-only NIXL sources.
+
+        JAX arrays are immutable. This method publishes their existing device
+        storage for remote reads; it does not support receiving NIXL writes into
+        a JAX array. Callers must keep every array alive, unchanged, undonated,
+        and undeleted until readers have drained and :meth:`shutdown` completes.
+        """
+        if self._agent is None:
+            raise RuntimeError("NIXL agent not initialized")
+
+        catalog = dict(arrays)
+        buffers = [
+            describe_jax_cuda_array(
+                name,
+                array,
+                device_id=self._device_id,
+            )
+            for name, array in catalog.items()
+        ]
+        descriptors = [
+            TensorDescriptor(
+                name=name,
+                addr=buffer.addr,
+                size=buffer.size,
+                device_id=buffer.device_id,
+                dtype=buffer.dtype,
+            )
+            for name, buffer in zip(catalog, buffers, strict=True)
+        ]
+        registrable = [buffer for buffer in buffers if buffer.size > 0]
+
+        registration_start = time.perf_counter()
+        if registrable:
+            registered = self._agent.register_memory(
+                [buffer.registration_tuple() for buffer in registrable],
+                mem_type=self._accelerator_backend.nixl_mem_type,
+                backends=self._backends,
+            )
+            self._registered_memory.append(registered)
+
+        self._tensors = {}
+        self._jax_arrays = catalog
+        self._jax_array_registrations.append(catalog)
+        self._active_registration_kind = "jax"
+        self._tensor_descriptors = descriptors
+        self._metadata = b""
+        self._metadata = self._agent.get_agent_metadata()
+
+        total_bytes = sum(descriptor.size for descriptor in descriptors)
+        logger.info(
+            "Registered %d JAX CUDA source arrays (%d non-empty), %.2f GB in %.3fs",
+            len(descriptors),
+            len(registrable),
+            total_bytes / 1e9,
+            time.perf_counter() - registration_start,
+        )
         return self._metadata
 
     def register_arena(
@@ -566,6 +632,8 @@ class NixlTransferManager:
             )
         )
         nixl_reg_time = time.perf_counter() - nixl_reg_start
+        self._torch_tensor_registrations.append(self._tensors)
+        self._active_registration_kind = "torch"
 
         metadata_start = time.perf_counter()
         self._metadata = self._agent.get_agent_metadata()
@@ -863,6 +931,18 @@ class NixlTransferManager:
         """
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
+        if destination_tensors is None and self._active_registration_kind == "jax":
+            raise TypeError(
+                "The active registration is a read-only JAX source; "
+                "provide a supported mutable Torch destination explicitly"
+            )
+        if destination_tensors is not None and any(
+            is_jax_array(value) for value in destination_tensors.values()
+        ):
+            raise TypeError(
+                "Direct NIXL receive into jax.Array is unsupported because "
+                "JAX arrays are immutable; use a supported mutable destination"
+            )
 
         start_time = time.perf_counter()
         self._accelerator_backend.set_device(self._device_id)
@@ -1326,6 +1406,10 @@ class NixlTransferManager:
         self._metadata = b""
         self._tensor_descriptors = []
         self._tensors = {}
+        self._torch_tensor_registrations = []
+        self._jax_arrays = {}
+        self._jax_array_registrations = []
+        self._active_registration_kind = None
         self._remote_agents = {}
         logger.info(
             "NixlTransferManager shutdown complete (%d remote agent(s) disconnected)",

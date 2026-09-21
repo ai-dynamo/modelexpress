@@ -1027,10 +1027,21 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 |--------|---------|
 | `__init__(agent_name, device_id, listen_port, accelerator_backend)` | Create NIXL agent with UCX backend; `listen_port` enables P2P listen thread; `accelerator_backend` owns torch device operations and accelerator capability gates |
 | `register_tensors(tensors)` | Register GPU tensors for RDMA, return serialized metadata. With `MX_POOL_REG=1` on a backend that supports pool registration, registers each unique cudaMalloc allocation backing the tensors instead of registering each tensor individually |
+| `register_jax_arrays(arrays)` | Register fully addressable, dense, single-device CUDA `jax.Array` objects as read-only NIXL sources through raw memory descriptors |
 | `register_arena(arena, tensors)` | Register the used VMM arena range once through dmabuf when the active accelerator backend supports the VMM arena fast path, then publish every tensor descriptor against that single MR. Falls back to per-tensor registration when a tensor lies outside the arena range, or when the arena spans several `cuMemCreate` handles (a single MR cannot be addressed by cuda_ipc then; override with `MX_ARENA_SINGLE_MR=1`) |
 | `fetch_remote_and_wait(agent_name, ip, port)` | P2P: fetch remote NIXL metadata via listen thread (polls until loaded) |
 | `receive_from_source(source_metadata, source_tensors, ..., remote_agent_name)` | Execute RDMA read transfer; `remote_agent_name` skips `add_remote_agent` (P2P) |
 | `shutdown()` | Clean up NIXL agent and resources |
+
+JAX support is intentionally a low-level source-buffer boundary, not an engine
+adapter. The manager blocks each array until ready, verifies one local NVIDIA
+CUDA shard with dense untiled row-major storage, registers its raw address, and
+retains the array until deregistration. The caller must not donate, delete, or
+otherwise change registered arrays until the source is unpublished, readers
+have drained, and shutdown completes. Pool and VMM registration remain
+Torch-specific. Direct receive into an existing `jax.Array` is rejected because
+JAX does not provide a stable mutable-array contract for external RDMA writes.
+JAX is imported lazily and remains owned by the deployment environment.
 
 **Optional NIC pinning.** `MX_RDMA_NIC_PIN=auto` probes PCIe topology at agent init and pins `UCX_NET_DEVICES` to a NUMA-local IB NIC per worker. Workaround for [openucx/ucx#11259](https://github.com/openucx/ucx/issues/11259); see [`docs/DEPLOYMENT.md`](DEPLOYMENT.md) for details.
 

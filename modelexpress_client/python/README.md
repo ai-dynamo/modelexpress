@@ -99,6 +99,38 @@ deployment.
 
 ## Programmatic Usage
 
+### JAX NIXL source registration
+
+Applications with CUDA-compatible JAX and NIXL installations can publish
+single-device `jax.Array` storage directly through the low-level NIXL manager:
+
+```python
+import jax.numpy as jnp
+
+from modelexpress.nixl_transfer import NixlTransferManager
+
+weights = {"layer.weight": jnp.asarray(...)}
+manager = NixlTransferManager(agent_name="jax-source-0", device_id=0)
+manager.initialize()
+manager.register_jax_arrays(weights)
+
+# Publish manager.nixl_metadata and manager.tensor_descriptors through the
+# application's existing metadata flow.
+```
+
+This is a read-only source contract for fully addressable, dense row-major
+arrays with exactly one local NVIDIA CUDA shard. ModelExpress registers the
+existing allocation without a Torch conversion or copy. Keep every registered
+array alive, unchanged, undonated, and undeleted until the source is
+unpublished, readers have drained, and `manager.shutdown()` has completed.
+Direct NIXL receive into an existing `jax.Array` is unsupported because JAX
+arrays are immutable.
+
+JAX and NIXL are supplied by the runtime environment; install CUDA-compatible
+versions that match the deployment instead of expecting ModelExpress to select
+them. Calling `register_jax_arrays()` without JAX installed fails with a clear
+runtime error.
+
 ### RL trainer publication
 
 An RL framework creates a weight version through the external Refit API. Each
