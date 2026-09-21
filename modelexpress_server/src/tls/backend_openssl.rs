@@ -6,7 +6,6 @@
 use std::pin::Pin;
 
 use modelexpress_common::tls::{TlsVersion, split_cipher_suites};
-use openssl::error::ErrorStack;
 use openssl::ssl::{
     AlpnError, Ssl, SslContext, SslContextBuilder, SslFiletype, SslMethod, SslVersion,
     select_next_proto,
@@ -81,18 +80,32 @@ fn min_version(configured: Option<TlsVersion>) -> TlsVersion {
     }
 }
 
-/// The subset of `groups` this OpenSSL can negotiate, in the order given.
-/// Each name is probed separately, since `set_groups_list` rejects a whole
-/// list containing one unknown name.
-fn supported_groups(groups: &[String]) -> Result<Vec<String>, ErrorStack> {
+/// The subset of `groups` this OpenSSL can negotiate, in the order given, or
+/// none when `groups` is empty, which leaves the OpenSSL defaults. Each name
+/// is probed separately, since `set_groups_list` rejects a whole list
+/// containing one unknown name. A list naming no supported group is an error:
+/// falling back to the defaults would widen the key exchange policy the list
+/// asked for.
+fn supported_groups(groups: &[String]) -> Result<Vec<String>, TlsError> {
+    let groups: Vec<&str> = groups
+        .iter()
+        .map(|g| g.trim())
+        .filter(|g| !g.is_empty())
+        .collect();
     let mut probe = SslContextBuilder::new(SslMethod::tls_server())?;
     let mut supported = Vec::with_capacity(groups.len());
-    for group in groups.iter().map(|g| g.trim()).filter(|g| !g.is_empty()) {
+    for group in groups.iter().copied() {
         if probe.set_groups_list(group).is_ok() {
             supported.push(group.to_string());
         } else {
             warn!("TLS group {group} is not supported by the linked OpenSSL; dropping it");
         }
+    }
+    if supported.is_empty() && !groups.is_empty() {
+        return Err(TlsError::Unsupported(format!(
+            "none of the groups {} are supported by the linked OpenSSL",
+            groups.join(":")
+        )));
     }
     Ok(supported)
 }
@@ -402,10 +415,21 @@ mod tests {
     }
 
     #[test]
-    fn all_unknown_groups_leave_openssl_defaults() {
+    fn all_unknown_groups_are_a_config_error() {
         let dir = TempDir::new().expect("tempdir");
         let mut config = config(&dir);
-        config.groups = vec!["NOT_A_GROUP".to_string()];
+        config.groups = vec!["NOT_A_GROUP".to_string(), "ALSO_NOT".to_string()];
+        let Err(TlsError::Unsupported(message)) = context(&config) else {
+            panic!("expected an unsupported-groups error");
+        };
+        assert!(message.contains("NOT_A_GROUP:ALSO_NOT"), "{message}");
+    }
+
+    #[test]
+    fn blank_group_names_leave_openssl_defaults() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut config = config(&dir);
+        config.groups = vec![String::new(), "  ".to_string()];
         let ctx = context(&config).expect("build").expect("enabled");
         assert!(handshake_with_groups(&ctx, SslVersion::TLS1_3, None, Some("secp384r1")).is_ok());
     }
