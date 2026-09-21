@@ -53,6 +53,21 @@ def _vllm_config(parallel):
     return SimpleNamespace(parallel_config=parallel)
 
 
+@pytest.mark.parametrize("model_name", [None, "", "mx_model_abc"])
+def test_model_name_override_preserves_vllm_model_path(monkeypatch, model_name):
+    if model_name is None:
+        monkeypatch.delenv("MODEL_NAME", raising=False)
+    else:
+        monkeypatch.setenv("MODEL_NAME", model_name)
+    model_path = "/root/.cache/vllm/assets/model_streamer/0088a9aa"
+    model_config = _model_config(model=model_path)
+
+    identity = build_source_identity(_vllm_config(_parallel_config()), model_config)
+
+    assert identity.model_name == (model_name or model_path)
+    assert model_config.model == model_path
+
+
 def test_expert_parallel_disabled_is_one_not_zero():
     assert _derive_expert_parallel_size(_parallel_config()) == 1
     assert (

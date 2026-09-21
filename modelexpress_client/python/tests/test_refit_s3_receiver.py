@@ -561,9 +561,91 @@ def test_bootstrap_s3_checkpoint_downloads_and_reuses_full_root(tmp_path):
     assert storage.calls == first_calls
 
 
+def test_implicit_cached_seed_restores_without_copying(monkeypatch, tmp_path):
+    weights = torch.tensor([1.0, 2.0])
+    storage = _MemoryS3(_full_artifact(weights, version_label=20))
+    seed = receiver_module.bootstrap_s3_checkpoint(
+        model_name="test/model",
+        version=receiver_module._S3Version(
+            version_id="seed/v0",
+            base_version_id=None,
+            payload_format=WeightPayloadFormat.FULL_HF_CHECKPOINT,
+            uri="s3://weights/test/v20/model.safetensors.index.json",
+        ),
+        refit_checkpoint_dir=tmp_path / "cache",
+        s3=storage,
+    )
+    storage.calls.clear()
+    copy_file = Mock(side_effect=AssertionError("cached seed must not be copied"))
+    copy_tree = Mock(side_effect=AssertionError("cached seed must not be copied"))
+    monkeypatch.setattr(receiver_module.shutil, "copy2", copy_file)
+    monkeypatch.setattr(receiver_module.shutil, "copytree", copy_tree)
+    checkpoint = receiver_module._LocalCheckpoint(
+        model_name="test/model",
+        config=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="seed/v0",
+            seed_checkpoint_path=None,
+            refit_checkpoint_dir=tmp_path / "cache",
+        ),
+        s3=storage,
+    )
+
+    checkpoint.initialize()
+
+    assert checkpoint.local_checkpoint == seed
+    assert checkpoint.store.state().version == "seed/v0"
+    assert torch.equal(
+        load_file(seed / "model-00001-of-00001.safetensors")["weight"], weights
+    )
+    assert storage.calls == []
+    copy_file.assert_not_called()
+    copy_tree.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "cached_root, error, message",
+    [
+        ("missing", FileNotFoundError, "cached seed checkpoint.*seed/v0.*not found"),
+        ("unrecorded", ValueError, "cached checkpoint artifact changed"),
+        ("corrupt", ValueError, "cached checkpoint artifact changed"),
+    ],
+)
+def test_implicit_cached_seed_requires_valid_root(
+    monkeypatch, tmp_path, cached_root, error, message
+):
+    storage = _MemoryS3({})
+    checkpoint = receiver_module._LocalCheckpoint(
+        model_name="test/model",
+        config=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="seed/v0",
+            seed_checkpoint_path=None,
+            refit_checkpoint_dir=tmp_path / "cache",
+        ),
+        s3=storage,
+    )
+    seed = checkpoint.local_checkpoint
+    if cached_root != "missing":
+        seed.mkdir(parents=True)
+        save_file({"weight": torch.tensor([1.0, 2.0])}, seed / "model.safetensors")
+        if cached_root == "corrupt":
+            checkpoint.store.record_artifact(seed)
+            (seed / "model.safetensors").write_bytes(b"corrupt")
+    reset = Mock(side_effect=AssertionError("cached seed must not be copied"))
+    monkeypatch.setattr(checkpoint, "reset_initial_checkpoint", reset)
+
+    with pytest.raises(error, match=message):
+        checkpoint.initialize()
+
+    assert storage.calls == []
+    reset.assert_not_called()
+
+
+@pytest.mark.parametrize("implicit_seed", [False, True])
 @pytest.mark.parametrize("aliased_manifest_ids", [False, True])
 def test_cold_start_ranks_do_not_rewind_prepared_target(
-    monkeypatch, tmp_path, aliased_manifest_ids
+    monkeypatch, tmp_path, aliased_manifest_ids, implicit_seed
 ):
     base = torch.tensor([1.0, 2.0])
     target = torch.tensor([3.0, 4.0])
@@ -597,7 +679,7 @@ def test_cold_start_ranks_do_not_rewind_prepared_target(
         config=ObjectStorageGeneratorConfig(
             storage_type=ObjectStorageType.S3,
             initial_base_version_id="v20",
-            seed_checkpoint_path=seed,
+            seed_checkpoint_path=None if implicit_seed else seed,
             refit_checkpoint_dir=cache,
         ),
     )
@@ -630,7 +712,7 @@ def test_cold_start_ranks_do_not_rewind_prepared_target(
         config=ObjectStorageGeneratorConfig(
             storage_type=ObjectStorageType.S3,
             initial_base_version_id="v20",
-            seed_checkpoint_path=seed,
+            seed_checkpoint_path=None if implicit_seed else seed,
             refit_checkpoint_dir=cache,
         ),
     )
@@ -666,7 +748,7 @@ def test_cold_start_ranks_do_not_rewind_prepared_target(
         config=ObjectStorageGeneratorConfig(
             storage_type=ObjectStorageType.S3,
             initial_base_version_id="v20",
-            seed_checkpoint_path=seed,
+            seed_checkpoint_path=None if implicit_seed else seed,
             refit_checkpoint_dir=cache,
         ),
     )

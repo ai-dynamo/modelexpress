@@ -12,6 +12,7 @@ import pytest
 import torch.nn as nn
 
 from modelexpress.adapter import EngineAdapter, StrategyFailed, StrategyRecoveryError
+from modelexpress.engines.vllm.source_identity import build_source_identity
 from modelexpress.load_strategy import LoadResult
 from modelexpress_rl import (
     ObjectStorageSource,
@@ -274,14 +275,26 @@ def test_desired_p2p_requires_a_tensor_read_lease():
     assert DesiredVersionP2PStrategy.requires_tensor_read_lease is True
 
 
-def test_desired_p2p_uses_exact_revision(monkeypatch):
+@pytest.mark.parametrize("model_name", [None, "mx_model_abc"])
+def test_desired_p2p_uses_exact_revision(monkeypatch, model_name):
     monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "version-7")
+    if model_name is None:
+        monkeypatch.delenv("MODEL_NAME", raising=False)
+    else:
+        monkeypatch.setenv("MODEL_NAME", model_name)
+    model_path = "/root/.cache/vllm/assets/model_streamer/0088a9aa"
     ctx = _context()
+    ctx.identity = build_source_identity(
+        SimpleNamespace(parallel_config=SimpleNamespace()),
+        SimpleNamespace(model=model_path, dtype="bfloat16", quantization=None),
+    )
     result = LoadResult(value=nn.Linear(1, 1))
     client = MagicMock()
     client.__enter__.return_value = client
     client.get_weight_version.return_value = _version(
-        "version-7", WeightPayloadFormat.FULL_HF_CHECKPOINT
+        "version-7",
+        WeightPayloadFormat.FULL_HF_CHECKPOINT,
+        model_name=model_name or model_path,
     )
 
     with patch(

@@ -7,13 +7,14 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
-from modelexpress import p2p_pb2
+from modelexpress.engines.vllm.source_identity import build_source_identity
 from modelexpress_rl.inference.engines.vllm import (
     VllmGeneratorContext,
     _create_vllm_engine_runtime,
 )
 
 
+@pytest.mark.parametrize("model_name", [None, "mx_model_abc"])
 @pytest.mark.parametrize(
     (
         "quant_config",
@@ -43,12 +44,22 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
     enforce_eager,
     has_nixl_manager,
     runtime_p2p_available,
+    model_name,
 ):
+    if model_name is None:
+        monkeypatch.delenv("MODEL_NAME", raising=False)
+    else:
+        monkeypatch.setenv("MODEL_NAME", model_name)
+
     class ModelConfig:
         model = "test/model"
+        dtype = torch.bfloat16
+        quantization = None
+        revision = None
 
     class VllmConfig:
         model_config = ModelConfig()
+        parallel_config = SimpleNamespace()
 
         def __init__(self):
             self.quant_config = quant_config
@@ -76,7 +87,7 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
             return 3
 
         def build_identity(self):
-            return p2p_pb2.SourceIdentity(model_name="test/model")
+            return build_source_identity(config, config.model_config)
 
     class Installer:
         def __init__(self, **kwargs):
@@ -131,7 +142,8 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
         )
     )
 
-    assert runtime.model_name == "test/model"
+    assert runtime.model_name == (model_name or "test/model")
+    assert config.model_config.model == "test/model"
     assert {
         key: value
         for key, value in runtime.installer.kwargs.items()
@@ -166,5 +178,5 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
             ("publish", loader, "version-a"),
         ]
     identity = runtime.full_tensor.build_identity("version-a")
-    assert identity.model_name == "test/model"
+    assert identity.model_name == runtime.model_name
     assert identity.revision == "version-a"

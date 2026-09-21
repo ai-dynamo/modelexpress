@@ -38,7 +38,22 @@ def _engine(monkeypatch, client=None, *, initialize=True):
     return engine, client
 
 
-def test_weight_transfer_engine_initializes_client_in_init_hook(monkeypatch):
+@pytest.mark.parametrize(
+    "model_name, init_model_name, expected_model_name",
+    [
+        (None, None, "test/model"),
+        ("", None, "test/model"),
+        ("mx_model_abc", None, "mx_model_abc"),
+        ("mx_model_abc", "explicit-model", "explicit-model"),
+    ],
+)
+def test_weight_transfer_engine_initializes_client_in_init_hook(
+    monkeypatch, model_name, init_model_name, expected_model_name
+):
+    if model_name is None:
+        monkeypatch.delenv("MODEL_NAME", raising=False)
+    else:
+        monkeypatch.setenv("MODEL_NAME", model_name)
     client = MagicMock()
     initialize = MagicMock(return_value=client)
     monkeypatch.setattr(
@@ -56,15 +71,22 @@ def test_weight_transfer_engine_initializes_client_in_init_hook(monkeypatch):
     )
 
     initialize.assert_not_called()
-    engine.init_transfer_engine(engine.init_info_cls())
+    engine.init_transfer_engine(engine.init_info_cls(model_name=init_model_name))
 
     config = initialize.call_args.args[0]
-    assert config.model_name == "test/model"
+    assert config.model_name == expected_model_name
+    assert vllm_config.model_config.model == "test/model"
     assert config.engine_context.model is model
     assert config.object_storage is None
 
 
-def test_weight_transfer_engine_parses_vime_object_storage_init_info(monkeypatch):
+@pytest.mark.parametrize(
+    "seed_info",
+    [{}, {"seed_checkpoint_path": None}, {"seed_checkpoint_path": "/models/launch"}],
+)
+def test_weight_transfer_engine_parses_vime_object_storage_init_info(
+    monkeypatch, seed_info
+):
     """Parse VIME object-storage metadata into generator initialization."""
     client = MagicMock()
     initialize = MagicMock(return_value=client)
@@ -86,7 +108,6 @@ def test_weight_transfer_engine_parses_vime_object_storage_init_info(monkeypatch
         "model_name": "policy",
         "initial_serving_version_id": "version-c",
         "initial_base_version_id": "base-a",
-        "seed_checkpoint_path": "/models/launch",
         "refit_checkpoint_dir": "/cache/modelexpress",
         "server_url": "mx:8001",
         "object_storage_type": "S3",
@@ -97,6 +118,7 @@ def test_weight_transfer_engine_parses_vime_object_storage_init_info(monkeypatch
         "max_transfer_attempts": 4,
         "max_replay_chain_length": 17,
         "rpc_timeout_seconds": 12.5,
+        **seed_info,
     }
     engine.init_transfer_engine(engine.init_info_cls(**init_info))
 
@@ -112,7 +134,9 @@ def test_weight_transfer_engine_parses_vime_object_storage_init_info(monkeypatch
     assert config.rpc_timeout_seconds == 12.5
     assert config.object_storage.storage_type is ObjectStorageType.S3
     assert config.object_storage.initial_base_version_id == "base-a"
-    assert config.object_storage.seed_checkpoint_path == "/models/launch"
+    assert config.object_storage.seed_checkpoint_path == seed_info.get(
+        "seed_checkpoint_path"
+    )
     assert config.object_storage.refit_checkpoint_dir == "/cache/modelexpress"
     assert config.object_storage.refit_checkpoint_max_size_gb == 500
     assert config.object_storage.endpoint_url == "http://minio:9000"
