@@ -6,14 +6,17 @@
 from __future__ import annotations
 
 import uuid
+from typing import ClassVar
 
 import torch
 
 from .nixl_staged_transfer import _NixlStagedTransfer
 
 
-class ModelExpressGeneratorBootstrap:
+class _ModelExpressGeneratorBootstrap:
     """Own an MX NIXL transport created before an inference engine starts."""
+
+    _default: ClassVar[_ModelExpressGeneratorBootstrap | None] = None
 
     def __init__(self, *, device_id: int) -> None:
         self.worker_id = uuid.uuid4().hex[:8]
@@ -25,6 +28,21 @@ class ModelExpressGeneratorBootstrap:
             listen_port=None,
         )
         self._claimed = False
+
+    def register_default(self) -> None:
+        """Make this bootstrap discoverable by the client in this process."""
+        if self._default is not None:
+            raise RuntimeError("a default generator bootstrap is already registered")
+        type(self)._default = self
+
+    @classmethod
+    def current_default(cls) -> _ModelExpressGeneratorBootstrap | None:
+        """Return the bootstrap created by the embedded engine worker."""
+        return cls._default
+
+    def _clear_default(self) -> None:
+        if self._default is self:
+            type(self)._default = None
 
     def claim(self, *, device_id: int) -> _NixlStagedTransfer:
         """Transfer ownership to one matching generator runtime."""
@@ -38,16 +56,15 @@ class ModelExpressGeneratorBootstrap:
         transfer = self._transfer
         if transfer is None:
             raise RuntimeError("generator bootstrap was closed")
+        self._clear_default()
         self._claimed = True
         self._transfer = None
         return transfer
 
     def close(self) -> None:
         """Close the transfer unless ownership has moved to a runtime."""
+        self._clear_default()
         transfer = self._transfer
         self._transfer = None
         if transfer is not None:
             transfer.close()
-
-
-__all__ = ["ModelExpressGeneratorBootstrap"]

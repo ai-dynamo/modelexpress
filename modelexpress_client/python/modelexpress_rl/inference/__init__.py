@@ -3,7 +3,6 @@
 
 """Inference-side ModelExpress RL integrations."""
 
-from .bootstrap import ModelExpressGeneratorBootstrap
 from .client import (
     ModelExpressGeneratorClient,
     ModelExpressGeneratorConfig,
@@ -15,7 +14,6 @@ from .engines.vllm import VllmGeneratorContext
 from .receiver import ObjectStorageGeneratorConfig
 
 __all__ = [
-    "ModelExpressGeneratorBootstrap",
     "ModelExpressGeneratorClient",
     "ModelExpressGeneratorConfig",
     "ObjectStorageGeneratorConfig",

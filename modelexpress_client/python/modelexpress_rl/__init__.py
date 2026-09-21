@@ -5,7 +5,6 @@
 
 from .control import ModelExpressControlClient, WeightVersion, WeightVersionState
 from .inference import (
-    ModelExpressGeneratorBootstrap,
     ModelExpressGeneratorClient,
     ModelExpressGeneratorConfig,
     ObjectStorageGeneratorConfig,
@@ -29,7 +28,6 @@ from .version import WeightVersionRef
 __all__ = [  # noqa: RUF022 - grouped by public API role, not alphabetically.
     # Framework-facing clients.
     "ModelExpressControlClient",
-    "ModelExpressGeneratorBootstrap",
     "ModelExpressGeneratorClient",
     "ModelExpressTrainerClient",
     # Configuration fixed when a worker client is initialized.

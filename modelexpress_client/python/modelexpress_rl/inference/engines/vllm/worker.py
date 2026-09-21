@@ -9,7 +9,7 @@ from typing import Any
 
 from vllm.v1.worker.gpu_worker import Worker as VllmWorker
 
-from ...bootstrap import ModelExpressGeneratorBootstrap
+from ...bootstrap import _ModelExpressGeneratorBootstrap
 
 
 def _get_vllm_bootstrap_device_id(vllm_config: Any, local_rank: int) -> int:
@@ -25,7 +25,7 @@ def _get_vllm_bootstrap_device_id(vllm_config: Any, local_rank: int) -> int:
     return int(current_platform.logical_device_id_to_visible_device_id(local_rank))
 
 
-class VllmGeneratorBootstrap(ModelExpressGeneratorBootstrap):
+class _VllmGeneratorBootstrap(_ModelExpressGeneratorBootstrap):
     """Resolve vLLM's pre-init device assignment and create MX transport."""
 
     def __init__(self, vllm_config: Any, local_rank: int) -> None:
@@ -44,8 +44,14 @@ class ModelExpressVllmWorker(VllmWorker):
         *args: Any,
         **kwargs: Any,
     ) -> None:
-        self._model_express_bootstrap = VllmGeneratorBootstrap(vllm_config, local_rank)
-        super().__init__(vllm_config, local_rank, *args, **kwargs)
+        bootstrap = _VllmGeneratorBootstrap(vllm_config, local_rank)
+        try:
+            bootstrap.register_default()
+            self._model_express_bootstrap = bootstrap
+            super().__init__(vllm_config, local_rank, *args, **kwargs)
+        except BaseException:
+            bootstrap.close()
+            raise
 
 
 __all__ = ["ModelExpressVllmWorker"]

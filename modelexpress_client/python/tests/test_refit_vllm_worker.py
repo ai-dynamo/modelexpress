@@ -65,20 +65,53 @@ def test_vllm_worker_bootstraps_before_base_initialization(monkeypatch):
             calls.append(("vllm", config, local_rank, args, kwargs))
 
     worker_module = _import_worker_module(monkeypatch, Worker)
-    bootstrap = object()
+
+    class Bootstrap:
+        def close(self):
+            calls.append(("close",))
+
+    bootstrap = Bootstrap()
     monkeypatch.setattr(
         worker_module,
-        "VllmGeneratorBootstrap",
+        "_VllmGeneratorBootstrap",
         lambda config, local_rank: (
             calls.append(("bootstrap", config, local_rank)) or bootstrap
         ),
     )
+    bootstrap.register_default = lambda: calls.append(("register", bootstrap))
     config = object()
 
     worker = worker_module.ModelExpressVllmWorker(config, 2, "rank", ready=True)
 
     assert calls == [
         ("bootstrap", config, 2),
+        ("register", bootstrap),
         ("vllm", config, 2, ("rank",), {"ready": True}),
     ]
     assert worker._model_express_bootstrap is bootstrap
+
+
+def test_vllm_worker_closes_bootstrap_when_base_initialization_fails(monkeypatch):
+    calls = []
+
+    class Worker:
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError("vLLM initialization failed")
+
+    class Bootstrap:
+        def close(self):
+            calls.append("close")
+
+    worker_module = _import_worker_module(monkeypatch, Worker)
+    bootstrap = Bootstrap()
+    monkeypatch.setattr(
+        worker_module,
+        "_VllmGeneratorBootstrap",
+        lambda *_args: bootstrap,
+    )
+    bootstrap.register_default = lambda: None
+
+    with pytest.raises(RuntimeError, match="vLLM initialization failed"):
+        worker_module.ModelExpressVllmWorker(object(), 0)
+
+    assert calls == ["close"]

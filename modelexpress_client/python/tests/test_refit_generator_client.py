@@ -611,9 +611,15 @@ def test_generator_config_explicit_source_order_overrides_env(monkeypatch):
     assert config.source_order == (WeightSource.TRAINER,)
 
 
-def test_generator_rejects_worker_id_that_differs_from_bootstrap():
+def test_generator_rejects_worker_id_that_differs_from_bootstrap(monkeypatch):
     class _Bootstrap:
         worker_id = "bootstrap-worker"
+
+    monkeypatch.setattr(
+        client_module._ModelExpressGeneratorBootstrap,
+        "current_default",
+        classmethod(lambda _cls: _Bootstrap()),
+    )
 
     with pytest.raises(ValueError, match="must match the generator bootstrap"):
         ModelExpressGeneratorClient.initialize(
@@ -624,9 +630,47 @@ def test_generator_rejects_worker_id_that_differs_from_bootstrap():
                 ),
                 model_name="test/model",
                 worker_id="configured-worker",
-                bootstrap=_Bootstrap(),
             )
         )
+
+
+def test_generator_uses_default_bootstrap(monkeypatch):
+    class _Bootstrap:
+        worker_id = "bootstrap-worker"
+
+    bootstrap = _Bootstrap()
+    captured = {}
+    monkeypatch.setattr(
+        client_module._ModelExpressGeneratorBootstrap,
+        "current_default",
+        classmethod(lambda _cls: bootstrap),
+    )
+
+    def initialize_runtime(**kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("stop after runtime arguments are captured")
+
+    monkeypatch.setattr(
+        client_module,
+        "initialize_generator_runtime",
+        initialize_runtime,
+    )
+
+    with pytest.raises(RuntimeError, match="runtime arguments are captured"):
+        ModelExpressGeneratorClient.initialize(
+            ModelExpressGeneratorConfig(
+                engine_context=VllmGeneratorContext(
+                    model=object(),
+                    vllm_config=object(),
+                ),
+                model_name="test/model",
+                server_url="http://localhost:8080",
+                source_order=(WeightSource.TRAINER,),
+            )
+        )
+
+    assert captured["worker_id"] == bootstrap.worker_id
+    assert captured["bootstrap"] is bootstrap
 
 
 @pytest.mark.parametrize("value", ["", "TRAINER,", "unknown", "TRAINER,TRAINER"])

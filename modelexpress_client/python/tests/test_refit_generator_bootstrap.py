@@ -4,7 +4,6 @@
 import pytest
 
 import modelexpress_rl.inference.bootstrap as bootstrap_module
-from modelexpress_rl import ModelExpressGeneratorBootstrap
 
 
 def test_generator_bootstrap_initializes_and_transfers_ownership(monkeypatch):
@@ -17,7 +16,8 @@ def test_generator_bootstrap_initializes_and_transfers_ownership(monkeypatch):
 
     monkeypatch.setattr(bootstrap_module, "_NixlStagedTransfer", create_transfer)
 
-    bootstrap = ModelExpressGeneratorBootstrap(device_id=3)
+    bootstrap = bootstrap_module._ModelExpressGeneratorBootstrap(device_id=3)
+    bootstrap.register_default()
 
     assert created[0][0] == {
         "agent_name": f"mx-refit-{bootstrap.worker_id}",
@@ -25,7 +25,9 @@ def test_generator_bootstrap_initializes_and_transfers_ownership(monkeypatch):
         "device": bootstrap_module.torch.device("cuda", 3),
         "listen_port": None,
     }
+    assert bootstrap.current_default() is bootstrap
     assert bootstrap.claim(device_id=3) is created[0][1]
+    assert bootstrap.current_default() is None
     with pytest.raises(RuntimeError, match="already claimed"):
         bootstrap.claim(device_id=3)
 
@@ -34,7 +36,7 @@ def test_generator_bootstrap_rejects_mismatched_engine_device(monkeypatch):
     monkeypatch.setattr(
         bootstrap_module, "_NixlStagedTransfer", lambda **_kwargs: object()
     )
-    bootstrap = ModelExpressGeneratorBootstrap(device_id=2)
+    bootstrap = bootstrap_module._ModelExpressGeneratorBootstrap(device_id=2)
 
     with pytest.raises(ValueError, match="does not match"):
         bootstrap.claim(device_id=1)
@@ -52,11 +54,13 @@ def test_generator_bootstrap_closes_an_unclaimed_transfer_once(monkeypatch):
     monkeypatch.setattr(
         bootstrap_module, "_NixlStagedTransfer", lambda **_kwargs: transfer
     )
-    bootstrap = ModelExpressGeneratorBootstrap(device_id=2)
+    bootstrap = bootstrap_module._ModelExpressGeneratorBootstrap(device_id=2)
+    bootstrap.register_default()
 
     bootstrap.close()
     bootstrap.close()
 
+    assert bootstrap.current_default() is None
     assert transfer.close_calls == 1
     with pytest.raises(RuntimeError, match="was closed"):
         bootstrap.claim(device_id=2)
@@ -74,7 +78,7 @@ def test_generator_bootstrap_does_not_close_a_claimed_transfer(monkeypatch):
     monkeypatch.setattr(
         bootstrap_module, "_NixlStagedTransfer", lambda **_kwargs: transfer
     )
-    bootstrap = ModelExpressGeneratorBootstrap(device_id=2)
+    bootstrap = bootstrap_module._ModelExpressGeneratorBootstrap(device_id=2)
 
     assert bootstrap.claim(device_id=2) is transfer
     bootstrap.close()

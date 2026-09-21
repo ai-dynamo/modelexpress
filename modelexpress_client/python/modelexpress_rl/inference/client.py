@@ -25,7 +25,7 @@ from .. import refit_pb2, refit_pb2_grpc
 from ..control import WeightVersion, WeightVersionState, _weight_version
 from ..object_storage import ObjectStorageType
 from .adapter import GeneratorEngineContext
-from .bootstrap import ModelExpressGeneratorBootstrap
+from .bootstrap import _ModelExpressGeneratorBootstrap
 from .plan import WeightSource, parse_weight_source_order
 from .receiver import ObjectStorageGeneratorConfig
 from .runtime import GeneratorRuntime, initialize_generator_runtime
@@ -75,9 +75,6 @@ class ModelExpressGeneratorConfig:
     # Ordered source fallback. Canonical object storage may be used alone or
     # combined with generator P2P in either order.
     source_order: tuple[WeightSource, ...] | None = None
-    # Optional MX transport initialized before an embedded inference engine.
-    bootstrap: ModelExpressGeneratorBootstrap | None = None
-
     def __post_init__(self) -> None:
         """Validate explicit settings before client initialization."""
         if (
@@ -244,7 +241,7 @@ class ModelExpressGeneratorClient:
         if not isinstance(config, ModelExpressGeneratorConfig):
             raise TypeError("config must be a ModelExpressGeneratorConfig")
         model_name = _required(config.model_name or envs.MODEL_NAME or "", "model_name")
-        bootstrap = config.bootstrap
+        bootstrap = _ModelExpressGeneratorBootstrap.current_default()
         worker_id = _required(
             config.worker_id
             or (bootstrap.worker_id if bootstrap is not None else uuid.uuid4().hex[:8]),

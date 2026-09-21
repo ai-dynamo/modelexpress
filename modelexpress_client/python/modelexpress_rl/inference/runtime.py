@@ -16,7 +16,7 @@ from modelexpress.client import MxClient
 from ..control import WeightVersion
 
 from .adapter import GeneratorEngineContext
-from .bootstrap import ModelExpressGeneratorBootstrap
+from .bootstrap import _ModelExpressGeneratorBootstrap
 from .methods import (
     CanonicalDeltaUpdateMethod,
     LoadTimeTensorNixlUpdateMethod,
@@ -177,7 +177,7 @@ def _create_load_time_tensor_method(
     *,
     capability: FullTensorEngineCapability,
     worker_id: str,
-    bootstrap: ModelExpressGeneratorBootstrap | None,
+    bootstrap: _ModelExpressGeneratorBootstrap | None,
 ) -> LoadTimeTensorNixlUpdateMethod:
     transfer = (
         bootstrap.claim(device_id=capability.device_id)
@@ -290,7 +290,7 @@ def initialize_generator_runtime(
         [str, bool], tuple[WeightVersion, ...]
     ]
     | None = None,
-    bootstrap: ModelExpressGeneratorBootstrap | None = None,
+    bootstrap: _ModelExpressGeneratorBootstrap | None = None,
 ) -> GeneratorRuntime:
     """Resolve construction policy and build one rank-local runtime."""
     from .engines import _create_engine_runtime
