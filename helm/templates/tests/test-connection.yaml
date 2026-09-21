@@ -14,5 +14,10 @@ spec:
   - name: grpc-health-probe
     image: ghcr.io/grpc-ecosystem/grpc-health-probe:v0.4.35
     command: ['/ko-app/grpc-health-probe']
-    args: ['-addr={{ include "modelexpress.fullname" . }}:{{ .Values.service.port | default 8001 }}']
+    args:
+    - '-addr={{ include "modelexpress.fullname" . }}:{{ .Values.service.port | default 8001 }}'
+    {{- if .Values.tls.enabled }}
+    - '-tls'
+    - '-tls-no-verify'
+    {{- end }}
   restartPolicy: Never

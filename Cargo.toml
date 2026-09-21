@@ -72,6 +72,7 @@ uuid = { version = "1.17", features = ["v4", "serde"] }
 thiserror = "2.0"
 tower = { version = "0.5.3", features = ["util"] }
 http = "1.4.1"
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 moka = { version = "0.12.15", features = ["future"] }
 secrecy = "0.10.3"
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
