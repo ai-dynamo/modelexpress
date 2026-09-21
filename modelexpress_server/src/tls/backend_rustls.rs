@@ -114,17 +114,20 @@ pub fn build(config: &TlsConfig) -> Result<Option<Acceptor>, TlsError> {
 }
 
 /// ring's provider narrowed to the configured ciphers and groups. The TLS 1.2
-/// and 1.3 lists are independent, as in OpenSSL.
+/// and 1.3 lists are independent, as in OpenSSL, and the TLS 1.2 list is only
+/// read when TLS 1.2 can be negotiated.
 fn provider(config: &TlsConfig) -> Result<CryptoProvider, TlsError> {
     let base = ring::default_provider();
     let (tls12, tls13) = split_cipher_suites(&config.cipher_suites);
     let mut cipher_suites = select_cipher_suites(&base, &tls13, &rustls::version::TLS13)?;
-    cipher_suites.extend(select_cipher_suites(
-        &base,
-        &tls12,
-        &rustls::version::TLS12,
-    )?);
-    let kx_groups = select_kx_groups(&base, &config.groups);
+    if config.min_version != Some(TlsVersion::Tls13) {
+        cipher_suites.extend(select_cipher_suites(
+            &base,
+            &tls12,
+            &rustls::version::TLS12,
+        )?);
+    }
+    let kx_groups = select_kx_groups(&base, &config.groups)?;
     Ok(CryptoProvider {
         cipher_suites,
         kx_groups,
@@ -170,18 +173,24 @@ fn select_cipher_suites(
     Ok(selected)
 }
 
-/// The provider's groups named in `names`, in order. Unknown names are
-/// dropped, and the provider's defaults apply when none are left.
+/// The provider's groups named in `names`, in order, or all of them when
+/// `names` is empty. Unknown names are dropped. A list naming none of them is
+/// an error, as for ciphers: falling back to the defaults would widen the key
+/// exchange policy the list asked for.
 fn select_kx_groups(
     provider: &CryptoProvider,
     names: &[String],
-) -> Vec<&'static dyn SupportedKxGroup> {
-    let mut selected: Vec<&'static dyn SupportedKxGroup> = Vec::with_capacity(names.len());
-    for name in names
+) -> Result<Vec<&'static dyn SupportedKxGroup>, TlsError> {
+    let names: Vec<&str> = names
         .iter()
         .map(|name| name.trim())
         .filter(|name| !name.is_empty())
-    {
+        .collect();
+    if names.is_empty() {
+        return Ok(provider.kx_groups.clone());
+    }
+    let mut selected: Vec<&'static dyn SupportedKxGroup> = Vec::with_capacity(names.len());
+    for name in names.iter().copied() {
         let group = GROUPS
             .iter()
             .find(|(openssl, _)| openssl.eq_ignore_ascii_case(name))
@@ -201,10 +210,12 @@ fn select_kx_groups(
         }
     }
     if selected.is_empty() {
-        provider.kx_groups.clone()
-    } else {
-        selected
+        return Err(TlsError::Unsupported(format!(
+            "none of the groups {} are supported by rustls",
+            names.join(":")
+        )));
     }
+    Ok(selected)
 }
 
 fn protocol_versions(min: Option<TlsVersion>) -> &'static [&'static SupportedProtocolVersion] {
@@ -731,6 +742,7 @@ mod tests {
     fn profile_group_list_drops_post_quantum_under_ring() {
         let names: Vec<NamedGroup> =
             select_kx_groups(&ring::default_provider(), &strings(&PROFILE_GROUPS))
+                .expect("groups")
                 .iter()
                 .map(|group| group.name())
                 .collect();
@@ -750,6 +762,7 @@ mod tests {
             &ring::default_provider(),
             &strings(&["P-256", " prime256v1 ", "x25519", "", "P-384"]),
         )
+        .expect("groups")
         .iter()
         .map(|group| group.name())
         .collect();
@@ -763,10 +776,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn all_unknown_groups_are_a_config_error() {
+        let result = select_kx_groups(
+            &ring::default_provider(),
+            &strings(&["NOT_A_GROUP", "X25519MLKEM768"]),
+        );
+        let Err(TlsError::Unsupported(message)) = result else {
+            panic!("expected an unsupported-groups error");
+        };
+        assert!(message.contains("NOT_A_GROUP:X25519MLKEM768"), "{message}");
+
+        let dir = TempDir::new().expect("tempdir");
+        let pair = chain(&dir, "server");
+        let config = TlsConfig {
+            cert_file: Some(pair.cert),
+            key_file: Some(pair.key),
+            groups: strings(&["NOT_A_GROUP"]),
+            ..TlsConfig::default()
+        };
+        assert!(matches!(build(&config), Err(TlsError::Unsupported(_))));
+    }
+
     #[tokio::test]
-    async fn all_unknown_groups_leave_provider_defaults() {
+    async fn blank_group_names_leave_provider_defaults() {
         let negotiated = handshake(
-            server(|config| config.groups = strings(&["NOT_A_GROUP", "X25519MLKEM768"])),
+            server(|config| config.groups = strings(&["", "  "])),
             Offer {
                 groups: vec![NamedGroup::secp384r1],
                 ..Offer::default()
@@ -775,6 +810,32 @@ mod tests {
         .await
         .expect("default groups");
         assert_eq!(negotiated.group, Some(NamedGroup::secp384r1));
+    }
+
+    #[tokio::test]
+    async fn tls12_ciphers_are_not_read_when_only_tls13_is_served() {
+        let tls13_only = |config: &mut TlsConfig| {
+            config.min_version = Some(TlsVersion::Tls13);
+            config.cipher_suites = strings(&["DHE-RSA-AES128-GCM-SHA256"]);
+        };
+        let negotiated = handshake(server(tls13_only), Offer::default())
+            .await
+            .expect("tls13 client");
+        assert_eq!(negotiated.version, ProtocolVersion::TLSv1_3);
+
+        let dir = TempDir::new().expect("tempdir");
+        let pair = chain(&dir, "server");
+        let tls12_served = TlsConfig {
+            cert_file: Some(pair.cert),
+            key_file: Some(pair.key),
+            min_version: Some(TlsVersion::Tls12),
+            cipher_suites: strings(&["DHE-RSA-AES128-GCM-SHA256"]),
+            ..TlsConfig::default()
+        };
+        assert!(matches!(
+            build(&tls12_served),
+            Err(TlsError::Unsupported(_))
+        ));
     }
 
     #[tokio::test]
