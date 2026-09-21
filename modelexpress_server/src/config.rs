@@ -357,21 +357,18 @@ pub struct ServerSettings {
     pub port: NonZeroU16,
     /// Prometheus `/metrics` port. `0` disables the listener.
     ///
-    /// Two properties here are load-bearing, and both exist because
-    /// `load_layered_config` swallows any deserialization error and silently
-    /// returns `T::default()` — so anything this field rejects is not "the
-    /// field is ignored" but "the entire config file is ignored", with no log
-    /// line at any level. The gRPC port, cache directory, eviction policy and
-    /// **auth settings** would all revert to defaults because of a typo here.
+    /// Two properties here are load-bearing. A value a field rejects fails the
+    /// whole file, so anything this field cannot deserialize stops the server
+    /// from starting rather than being ignored.
     ///
     /// 1. `#[serde(default)]` covers the missing-key case. `ServerSettings` has
     ///    no struct-level default, so without it every existing
     ///    `model-express.yaml` — none of which mention this field — would fail
     ///    to parse.
     /// 2. The type is `u16`, not `NonZeroU16`. `0` is the documented disable
-    ///    value, and `NonZeroU16` rejects it during deserialization, which is
-    ///    exactly the silent-total-fallback case above. Normalization to
-    ///    "disabled" happens in [`ServerConfig::metrics_socket_addr`].
+    ///    value, and `NonZeroU16` rejects it during deserialization, which
+    ///    would fail the file. Normalization to "disabled" happens in
+    ///    [`ServerConfig::metrics_socket_addr`].
     #[serde(default = "default_metrics_port")]
     pub metrics_port: u16,
 }
@@ -461,7 +458,8 @@ impl ServerConfig {
             // defaults here would drop a tls section and serve plaintext.
             modelexpress_common::config::validate_config_file(config_file)?
         } else {
-            // Env-only deployments keep the layered fallback.
+            // No explicit file: a default config file if one is found, else
+            // the defaults. A default file that does not load is fatal too.
             load_layered_config(
                 args.config.clone(),
                 modelexpress_common::envs::MODEL_EXPRESS_PREFIX,
@@ -1115,16 +1113,6 @@ mod tests {
         assert!(security.validate_resolved(AuthMode::Enforce).is_ok());
     }
 
-    /// A config file must survive both spellings of the metrics port.
-    ///
-    /// `load_layered_config` swallows every deserialization error and returns
-    /// `T::default()` with no log line, so any value this field rejects costs the
-    /// operator the gRPC port, the cache directory, the eviction policy and the
-    /// auth settings -- silently. That is why `metrics_port` is a `u16` and not a
-    /// `NonZeroU16` (`0` has to deserialize, and is normalized afterwards), and
-    /// why it carries `#[serde(default)]` (no existing model-express.yaml mentions
-    /// it). Both cases assert the *rest* of the file survived, because that is how
-    /// the failure would present.
     /// A file that does not parse must not fall back to defaults: the defaults
     /// have no certificate, so the server would come up serving plaintext.
     #[test]
@@ -1165,6 +1153,13 @@ mod tests {
         );
     }
 
+    /// A config file must survive both spellings of the metrics port.
+    ///
+    /// A value this field rejects fails the whole file. That is why
+    /// `metrics_port` is a `u16` and not a `NonZeroU16` (`0` has to deserialize,
+    /// and is normalized afterwards), and why it carries `#[serde(default)]` (no
+    /// existing model-express.yaml mentions it). Both cases assert the *rest* of
+    /// the file loaded too.
     #[test]
     #[allow(clippy::expect_used)]
     fn metrics_port_never_costs_the_rest_of_the_config_file() {

@@ -372,6 +372,27 @@ mod tests {
         assert_eq!(args.log_level, Some(LogLevel::Debug));
     }
 
+    /// A client config that does not load must not become the defaults: they
+    /// point at a plaintext localhost endpoint, whatever the file asked for.
+    #[test]
+    fn test_client_config_load_rejects_a_file_that_does_not_load() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("client.yaml");
+        std::fs::write(
+            &path,
+            "connection:\n  endpoint: \"https://mx.example:8001\"\n  timeout_secs: \"soon\"\n",
+        )
+        .expect("write config");
+        let path = path.to_str().expect("utf-8 path");
+
+        let args = ClientArgs::parse_from(["modelexpress-client", "--config", path]);
+        assert!(ClientConfig::load(args).is_err());
+
+        let missing =
+            ClientArgs::parse_from(["modelexpress-client", "--config", "/no/such/file.yaml"]);
+        assert!(ClientConfig::load(missing).is_err());
+    }
+
     #[test]
     fn test_client_config_load_applies_cli_args() {
         // Test that ClientConfig::load() properly applies CLI arguments
