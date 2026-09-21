@@ -56,7 +56,7 @@ tokio-openssl = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 rustls-native-certs = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
-hyper-util = { version = "0.1", default-features = false, features = ["tokio"], optional = true }
+hyper-util = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 
