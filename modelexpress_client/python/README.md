@@ -180,6 +180,12 @@ objects are stored beside it. A delta index records the target
 `STAGING` to `READY`. S3 versions remain READY for rollout recovery; their
 immutable objects are governed by the bucket's external lifecycle policy.
 
+Generators use registered MX IDs and base relationships to replay S3 deltas.
+The manifest's `metadata.version` and `metadata.base_version` may differ from
+those IDs or be absent, allowing existing artifacts to be registered without
+rewriting their indexes. The caller must register the correct S3 URI and base
+version; MX's exact-base checks and payload validation remain enabled.
+
 The client owns the NIXL manager and trainer-side manifest service. `server_url`
 selects the central ModelExpress control-plane service and defaults to the
 normal ModelExpress server configuration. A Megatron worker may initialize the

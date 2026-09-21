@@ -561,7 +561,10 @@ def test_bootstrap_s3_checkpoint_downloads_and_reuses_full_root(tmp_path):
     assert storage.calls == first_calls
 
 
-def test_cold_start_ranks_do_not_rewind_prepared_target(monkeypatch, tmp_path):
+@pytest.mark.parametrize("aliased_manifest_ids", [False, True])
+def test_cold_start_ranks_do_not_rewind_prepared_target(
+    monkeypatch, tmp_path, aliased_manifest_ids
+):
     base = torch.tensor([1.0, 2.0])
     target = torch.tensor([3.0, 4.0])
     objects = _full_artifact(base, version_label=20)
@@ -569,9 +572,9 @@ def test_cold_start_ranks_do_not_rewind_prepared_target(monkeypatch, tmp_path):
         _artifact(
             base.view(torch.uint8).numpy(),
             target.view(torch.uint8).numpy(),
-            version="v21",
+            version="snapshot-21" if aliased_manifest_ids else "v21",
             version_label=21,
-            base_version="v20",
+            base_version="snapshot-20" if aliased_manifest_ids else "v20",
         )
     )
     storage = _MemoryS3(objects)
@@ -1064,11 +1067,11 @@ def test_canonical_s3_validates_all_replay_manifests_before_mutation(
     )
     second_root = "s3://weights/test/v2/model.safetensors.index.json"
     manifest = json.loads(objects[second_root])
-    manifest["metadata"]["base_version"] = "wrong-base"
+    manifest["metadata"]["checksum_format"] = "crc32"
     objects[second_root] = json.dumps(manifest).encode()
     adapter, _ = _build(monkeypatch, tmp_path, objects)
 
-    with pytest.raises(RuntimeError, match=r"base_version.*target-b"):
+    with pytest.raises(RuntimeError, match=r"checksum_format.*target-b"):
         adapter.stage_chain(
             (
                 _inputs(None),
@@ -1217,11 +1220,64 @@ def test_canonical_s3_reinstalls_active_checkpoint_after_install_failure(
     adapter.close()
 
 
+@pytest.mark.parametrize("omit_version_metadata", [False, True])
+def test_canonical_s3_replays_aliased_manifest_ids_using_mx_cache_ids(
+    monkeypatch, tmp_path, omit_version_metadata
+):
+    tensors = [torch.tensor([float(i), float(i + 1)]) for i in (1, 3, 5)]
+    objects = {}
+    for index in (1, 2):
+        objects.update(
+            _artifact(
+                tensors[index - 1].view(torch.uint8).numpy(),
+                tensors[index].view(torch.uint8).numpy(),
+                version=f"snapshot-{index}",
+                base_version=f"snapshot-{index - 1}",
+                version_label=index,
+            )
+        )
+        if omit_version_metadata:
+            uri = f"s3://weights/test/v{index}/model.safetensors.index.json"
+            manifest = json.loads(objects[uri])
+            del manifest["metadata"]["version"]
+            del manifest["metadata"]["base_version"]
+            objects[uri] = json.dumps(manifest).encode()
+    adapter, storage = _build(monkeypatch, tmp_path, objects)
+    first = _inputs(None)
+    second = _inputs(
+        None, version="target-b", base_version="target-a", version_label=2
+    )
+    staged = adapter.stage_weight(first)
+    adapter.apply_weight(staged)
+    adapter.release_staged_weight(staged)
+    storage.calls.clear()
+
+    cached = adapter.stage_weight(first)
+    assert storage.calls == []
+    adapter.release_staged_weight(cached)
+    staged = adapter.stage_chain((first, second))
+
+    assert torch.equal(load_file(staged.path / "model.safetensors")["weight"], tensors[2])
+    store = adapter._checkpoint.store
+    assert store.chain("target-b") == {
+        "version": "target-b",
+        "full_version": "base-a",
+        "deltas": ["target-a", "target-b"],
+    }
+    assert store.state().version == "target-b"
+    assert store.active_version() == "target-a"
+    assert (
+        store.delta_path("target-b") / "model.safetensors.index.json"
+    ).read_bytes() == objects[second.object_storage.uri]
+    adapter.apply_weight(staged)
+    assert store.active_version() == "target-b"
+    adapter.release_staged_weight(staged)
+    adapter.close()
+
+
 @pytest.mark.parametrize(
     ("field", "message"),
     [
-        ("version", "version does not match revision"),
-        ("base_version", "base_version does not match revision"),
         ("delta_encoding", "delta_encoding does not match revision"),
         ("compression_format", "unsupported compression format"),
         ("checksum_format", "checksum_format does not match revision"),
@@ -1601,8 +1657,9 @@ def test_full_lineage_replay_resumes_from_verified_local_checkpoint(
 
 
 @pytest.mark.parametrize("use_peer_for_second_delta", [False, True])
+@pytest.mark.parametrize("aliased_manifest_ids", [False, True])
 def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
-    monkeypatch, tmp_path, use_peer_for_second_delta
+    monkeypatch, tmp_path, use_peer_for_second_delta, aliased_manifest_ids
 ):
     tensors = [torch.tensor([float(i), float(i + 1)]) for i in (1, 3, 5, 7)]
     objects = _full_artifact(tensors[0], version_label=0)
@@ -1614,9 +1671,11 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
             _artifact(
                 tensors[index - 1].view(torch.uint8).numpy(),
                 tensors[index].view(torch.uint8).numpy(),
-                version=version,
+                version=f"snapshot-{index}" if aliased_manifest_ids else version,
                 version_label=index,
-                base_version=base_version,
+                base_version=(
+                    f"snapshot-{index - 1}" if aliased_manifest_ids else base_version
+                ),
             )
         )
         inputs.append(

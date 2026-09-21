@@ -687,6 +687,11 @@ already-used caller-supplied UID returns `ALREADY_EXISTS`. For an `XOR_DELTA`,
 these UID strings as `metadata.version` and `metadata.base_version`. MX assigns
 no numeric ordering and requires no version-directory naming convention; the
 exact `object_storage.uri` identifies the version's global index.
+Generators use the registered MX IDs and base relationships for replay. A delta
+index's `metadata.version` and `metadata.base_version` are optional descriptive
+fields and may differ from the MX IDs. Cache paths and chain records use MX IDs;
+MX lineage checks and payload validation remain enabled. The registering caller
+is responsible for selecting the correct S3 artifacts and base mapping.
 `WeightVersionShard` remains the name of the per-worker manifest publication.
 Its identity is `(version_id, worker_id, source_slot_id)`: `source_slot_id`
 identifies the required, version-scoped source contribution it covers, and

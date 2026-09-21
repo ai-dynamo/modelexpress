@@ -401,10 +401,17 @@ filenames in `weight_map` are resolved relative to that index.
 }
 ```
 
-The generator requires all five metadata fields and `weight_map`. It requires
-`delta_encoding="xor"` and `checksum_format="adler32"`, and uses
-`compression_format` to select the decompressor. `version` and `base_version`
-describe the artifact.
+The generator requires `weight_map`, `delta_encoding="xor"`,
+`checksum_format="adler32"`, and a supported `compression_format` to select the
+decompressor. `metadata.version` and `metadata.base_version` are optional
+descriptive fields; the receiver does not compare them with MX IDs. This allows
+existing S3 artifacts to be registered under different IDs without rewriting
+their indexes.
+
+Reconstruction and cache bookkeeping use the registered MX IDs and base
+relationships. The caller must register the correct S3 artifact URI and exact
+base checkpoint. MX's exact-base checks, tensor validation, and checksums remain
+enabled.
 
 Each delta shard contains compressed `U8` XOR bytes. Its safetensors
 `__metadata__` must contain the Adler-32 checksum of every reconstructed full

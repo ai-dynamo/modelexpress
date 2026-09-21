@@ -153,8 +153,6 @@ def _parse_index_manifest(
     if is_delta:
         assert version is not None
         expected_metadata = {
-            "version": version.version_id,
-            "base_version": version.base_version_id,
             "delta_encoding": "xor",
             "checksum_format": "adler32",
         }
