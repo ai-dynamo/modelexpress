@@ -325,7 +325,7 @@ in the server.
 | `MODEL_EXPRESS_TLS_KEY_FILE` | `--tls-key-file` | PEM private key for the certificate. |
 | `MODEL_EXPRESS_TLS_MIN_VERSION` | `--tls-min-version` | Lowest protocol version accepted: `TLS1.2`, `TLS1.3`, or the `VersionTLS12` spelling used by cluster TLS policy APIs. `TLS1.2` when unset, and a lower value is raised to it. |
 | `MODEL_EXPRESS_TLS_CIPHER_SUITES` | `--tls-cipher-suites` | Comma-separated OpenSSL cipher names. TLS 1.2 names (`ECDHE-RSA-AES128-GCM-SHA256`) and TLS 1.3 names (`TLS_AES_128_GCM_SHA256`) can be mixed, as they are in a cluster TLS profile. OpenSSL's default when unset. |
-| `MODEL_EXPRESS_TLS_GROUPS` | `--tls-groups` | Comma-separated key exchange groups in preference order, OpenSSL names (`X25519MLKEM768`, `X25519`, `secp256r1`). Names the linked OpenSSL does not know are dropped with a warning, so a profile listing post-quantum groups still works on OpenSSL older than 3.5. OpenSSL's default when unset. |
+| `MODEL_EXPRESS_TLS_GROUPS` | `--tls-groups` | Comma-separated key exchange groups in preference order, OpenSSL names (`X25519MLKEM768`, `X25519`, `secp256r1`). Names the linked OpenSSL does not know are dropped with a warning, so a profile listing post-quantum groups still works on OpenSSL older than 3.5. A list with no supported name at all fails startup instead of falling back to the defaults. OpenSSL's default when unset. |
 
 Certificate and key must be set together. Version and cipher settings without a
 certificate fail config validation. A cipher list in which the backend knows none of the

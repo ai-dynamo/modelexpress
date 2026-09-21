@@ -174,7 +174,8 @@ pub struct TlsConfig {
     /// cluster TLS profile. OpenSSL's default when empty.
     pub cipher_suites: Vec<String>,
     /// Key exchange groups to offer, in preference order, as OpenSSL names
-    /// (`X25519MLKEM768`, `X25519`, `secp256r1`). Unknown names are dropped.
+    /// (`X25519MLKEM768`, `X25519`, `secp256r1`). Unknown names are dropped,
+    /// and a list left with none is an error. The backend's default when empty.
     pub groups: Vec<String>,
 }
 
