@@ -324,7 +324,7 @@ The corresponding generator configuration would use:
 
 `refit_checkpoint_max_size_gb` is a positive per-model quota in decimal
 gigabytes (`1 GB = 1,000,000,000 bytes`) for payload files under `full/`,
-`deltas/`, and `materialized/`. It defaults to 500 GB; set it to `null` to
+`deltas/`, and `materialized/`. It defaults to 2000 GB; set it to `null` to
 disable the configured quota.
 At initialization, ModelExpress caps the quota at the existing model cache size
 plus available filesystem space. A short INFO log reports the cap and free space
