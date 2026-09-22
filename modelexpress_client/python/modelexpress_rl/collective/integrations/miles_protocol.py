@@ -202,7 +202,6 @@ class MilesCollectiveProtocolCore:
                     canonical[name] = tensor
             if not canonical:
                 raise ValueError("MILES produced no base-model tensors")
-            generator_count = sum(self._engine_gpu_counts)
             canonical_shapes = {
                 name: tuple(int(dim) for dim in tensor.shape)
                 for name, tensor in canonical.items()
@@ -210,18 +209,12 @@ class MilesCollectiveProtocolCore:
             if self._canonical_shapes is None:
                 prepared_tensors = {}
                 for name, tensor in canonical.items():
-                    wire_shape = (
-                        generator_count * tensor.shape[0],
-                        *tensor.shape[1:],
-                    )
                     wire = torch.empty(
-                        wire_shape,
+                        tuple(tensor.shape),
                         dtype=tensor.dtype,
                         device=tensor.device,
                     )
-                    wire.view(generator_count, *tensor.shape).copy_(
-                        tensor.unsqueeze(0).expand(generator_count, *tensor.shape)
-                    )
+                    wire.copy_(tensor)
                     prepared_tensors[name] = wire
             else:
                 if canonical_shapes != self._canonical_shapes:
@@ -230,9 +223,7 @@ class MilesCollectiveProtocolCore:
                     raise RuntimeError("wire buffers are unavailable")
                 prepared_tensors = self._tensors
                 for name, tensor in canonical.items():
-                    prepared_tensors[name].view(generator_count, *tensor.shape).copy_(
-                        tensor.unsqueeze(0).expand(generator_count, *tensor.shape)
-                    )
+                    prepared_tensors[name].copy_(tensor)
         except BaseException as error:  # noqa: BLE001
             local_exception = error
             local_error = repr(error)
@@ -362,9 +353,9 @@ class MilesCollectiveProtocolCore:
                     dtype=dtype,
                     partition_id=owner,
                     src_mesh=src_mesh,
-                    src_placements=(Placement.shard(0),),
+                    src_placements=(Placement.replicate(),),
                     dst_mesh=dst_mesh,
-                    dst_placements=(Placement.shard(0),),
+                    dst_placements=(Placement.replicate(),),
                     group_key=name,
                 )
                 for name, shape, dtype, owner in ordered_manifest

@@ -20,6 +20,9 @@ readonly TEMPLATE="${SCRIPT_DIR}/k8s.yaml.template"
 : "${RUNTIME_PULL_SECRET:=nvcr-imagepullsecret}"
 : "${MX_SERVER_IMAGE:=nvcr.io/nvidian/dynamo-dev/modelexpress-server@sha256:fea73f36110fc47ab60725319c0ec1593315d90ca072368a11969c4b04c10df6}"
 : "${GPU_PRODUCT:=NVIDIA-H100-80GB-HBM3}"
+: "${MODEL_ID:=Qwen/Qwen2.5-0.5B-Instruct}"
+: "${MILES_MODEL_TYPE:=qwen2.5-0.5B}"
+: "${NCCL_DEBUG=WARN}"
 : "${MX_NCCL_REFIT_NUM_STREAMS:=2}"
 : "${MX_NCCL_REFIT_TRANSFER_TIMEOUT_S:=600}"
 : "${ACTOR_GPUS:=2}"
@@ -67,6 +70,18 @@ validate_benchmark() {
         echo "MX_MILES_VERIFY_TENSOR_EQUALITY must be 0 or 1" >&2
         exit 2
     fi
+    case "${MODEL_ID}:${MILES_MODEL_TYPE}" in
+        Qwen/Qwen2.5-0.5B-Instruct:qwen2.5-0.5B | \
+        Qwen/Qwen2.5-3B-Instruct:qwen2.5-3B) ;;
+        *)
+            echo "MODEL_ID and MILES_MODEL_TYPE must be an approved pair" >&2
+            exit 2
+            ;;
+    esac
+    if [[ "${NCCL_DEBUG}" != "WARN" && "${NCCL_DEBUG}" != "INFO" ]]; then
+        echo "NCCL_DEBUG must be WARN or INFO" >&2
+        exit 2
+    fi
     if [[ "${MILES_WEIGHT_TRANSFER_MODE}" == "external" && ! "${MX_SERVER_IMAGE}" =~ ^[A-Za-z0-9._:/-]+@sha256:[0-9a-f]{64}$ ]]; then
         echo "MX_SERVER_IMAGE must be digest-pinned with @sha256:<64 lowercase hex characters>" >&2
         exit 2
@@ -111,7 +126,8 @@ render() {
     validate_benchmark
     validate_topology
     export NAMESPACE RUN_ID JOB_NAME RUNTIME_IMAGE RUNTIME_PULL_SECRET MX_SERVER_IMAGE
-    export GPU_PRODUCT MX_NCCL_REFIT_NUM_STREAMS MX_NCCL_REFIT_TRANSFER_TIMEOUT_S
+    export GPU_PRODUCT MODEL_ID MILES_MODEL_TYPE NCCL_DEBUG
+    export MX_NCCL_REFIT_NUM_STREAMS MX_NCCL_REFIT_TRANSFER_TIMEOUT_S
     export MX_MILES_VERIFY_TENSOR_EQUALITY SGLANG_PLUGINS_VALUE
     export MX_SERVER_ADDRESS_VALUE
     export MILES_WEIGHT_TRANSFER_MODE MILES_BENCH_ROLLOUTS MILES_BENCH_RUN_LABEL

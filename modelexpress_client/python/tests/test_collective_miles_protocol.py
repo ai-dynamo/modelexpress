@@ -485,12 +485,16 @@ def test_lazy_factory_opts_out_of_megatron_forced_pp_gather(monkeypatch):
     assert protocol.required_placement.gather_pp is False
 
 
-def test_begin_sync_builds_stable_n_fold_wire_buffers(monkeypatch):
+@pytest.mark.parametrize("generator_count", [1, 6, 64])
+def test_begin_sync_storage_does_not_scale_with_generator_count(
+    monkeypatch,
+    generator_count,
+):
     protocol = MilesCollectiveProtocolCore(_args())
     protocol._verify_tensor_equality = True
     protocol.connect(
         [object()],
-        [6],
+        [generator_count],
         [0],
         _parallel_state(),
         _placement(),
@@ -512,7 +516,7 @@ def test_begin_sync_builds_stable_n_fold_wire_buffers(monkeypatch):
             return
         output[:] = [
             value,
-            [("model.other", (12, 4), "bfloat16", 1)],
+            [("model.other", (3, 4), "bfloat16", 1)],
         ]
 
     monkeypatch.setattr(
@@ -525,12 +529,18 @@ def test_begin_sync_builds_stable_n_fold_wire_buffers(monkeypatch):
     protocol.begin_sync(1, lambda *, materialize: iter([[("model.weight", source)]]))
 
     wire = protocol._tensors["model.weight"]
-    assert tuple(wire.shape) == (12, 4)
+    assert tuple(wire.shape) == tuple(source.shape)
+    assert wire.untyped_storage().nbytes() == source.untyped_storage().nbytes()
     assert protocol._plan.bulk[0].src_mesh.shape == (1,)
-    assert protocol._plan.bulk[0].src_placements == (miles_protocol.Placement.shard(0),)
-    assert protocol._plan.bulk[0].dst_mesh.shape == (6,)
-    assert protocol._plan.bulk[0].dst_placements == (miles_protocol.Placement.shard(0),)
-    assert all(torch.equal(copy, source) for copy in wire.view(6, 2, 4))
+    assert protocol._plan.bulk[0].global_shape == tuple(source.shape)
+    assert protocol._plan.bulk[0].src_placements == (
+        miles_protocol.Placement.replicate(),
+    )
+    assert protocol._plan.bulk[0].dst_mesh.shape == (generator_count,)
+    assert protocol._plan.bulk[0].dst_placements == (
+        miles_protocol.Placement.replicate(),
+    )
+    assert torch.equal(wire, source)
     assert protocol._tensor_digests == (
         ("model.other", "ab" * 32),
         ("model.weight", miles_protocol._exact_tensor_sha256(source)),
@@ -544,9 +554,10 @@ def test_begin_sync_builds_stable_n_fold_wire_buffers(monkeypatch):
     )
 
     assert protocol._tensors["model.weight"].data_ptr() == address
-    assert all(
-        torch.equal(copy, replacement)
-        for copy in protocol._tensors["model.weight"].view(6, 2, 4)
+    assert torch.equal(protocol._tensors["model.weight"], replacement)
+    assert protocol._tensor_digests == (
+        ("model.other", "ab" * 32),
+        ("model.weight", miles_protocol._exact_tensor_sha256(replacement)),
     )
 
 

@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 import subprocess
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -32,14 +33,85 @@ run_miles = _load_module("run_miles_under_test", "run_miles.py")
 parse_timings = _load_module("parse_miles_timings_under_test", "parse_miles_timings.py")
 
 
-def _timer(name: str, elapsed: float, *, rank: int = 0) -> str:
+def _timer(
+    name: str,
+    phase: str,
+    timestamp: datetime,
+    *,
+    elapsed: float | None = None,
+    rank: int = 0,
+) -> str:
     prefix = ACTOR_PREFIX.replace("actor_cell0_rank0", f"actor_cell0_rank{rank}")
-    return f"{prefix}INFO Timer {name} end (elapsed: {elapsed:.1f}s)"
+    rendered_prefix = prefix.replace(
+        "(ActorModel pid=4132, ip=10.0.0.7, actor_name=",
+        f"[{timestamp:%Y-%m-%d %H:%M:%S.%f} ",
+    ).replace(") ", "] ")
+    suffix = (
+        f" (elapsed: {elapsed:.1f}s)" if phase == "end" and elapsed is not None else ""
+    )
+    return f"{rendered_prefix}INFO Timer {name} {phase}{suffix}"
+
+
+def _update_timer_lines(
+    start: datetime,
+    *,
+    implementation_s: float,
+    finalize_s: float,
+    update_s: float,
+    rank: int = 0,
+) -> tuple[str, ...]:
+    implementation_start = start + timedelta(seconds=0.137)
+    implementation_end = implementation_start + timedelta(seconds=implementation_s)
+    finalize_start = implementation_end + timedelta(seconds=0.004)
+    finalize_end = finalize_start + timedelta(seconds=finalize_s)
+    update_end = start + timedelta(seconds=update_s)
+    return (
+        _timer("update_weights", "start", start, rank=rank),
+        _timer(
+            "update_weights_implementation",
+            "start",
+            implementation_start,
+            rank=rank,
+        ),
+        _timer(
+            "update_weights_implementation",
+            "end",
+            implementation_end,
+            elapsed=implementation_s,
+            rank=rank,
+        ),
+        _timer(
+            "finalize_and_resume_engines",
+            "start",
+            finalize_start,
+            rank=rank,
+        ),
+        _timer(
+            "finalize_and_resume_engines",
+            "end",
+            finalize_end,
+            elapsed=finalize_s,
+            rank=rank,
+        ),
+        _timer(
+            "update_weights",
+            "end",
+            update_end,
+            elapsed=update_s,
+            rank=rank,
+        ),
+    )
 
 
 def _render_manifest(mode: str, **overrides: str) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
-    environment.pop("MX_MILES_VERIFY_TENSOR_EQUALITY", None)
+    for key in (
+        "MODEL_ID",
+        "MILES_MODEL_TYPE",
+        "MX_MILES_VERIFY_TENSOR_EQUALITY",
+        "NCCL_DEBUG",
+    ):
+        environment.pop(key, None)
     environment.update(
         {
             "KUBE_CONTEXT": "test-context",
@@ -129,16 +201,23 @@ def test_broadcast_environment_excludes_model_express_and_plugin(monkeypatch):
 
 def test_parser_emits_complete_ordered_update_records(tmp_path):
     log_path = tmp_path / "actor.log"
+    start = datetime(2026, 9, 22, 12, 0, 0)
     log_path.write_text(
         "\n".join(
             (
                 "noise",
-                _timer("update_weights_implementation", 9.1),
-                _timer("finalize_and_resume_engines", 0.4),
-                _timer("update_weights", 10.2),
-                _timer("update_weights_implementation", 3.2),
-                _timer("finalize_and_resume_engines", 0.3),
-                _timer("update_weights", 3.8),
+                *_update_timer_lines(
+                    start,
+                    implementation_s=9.123,
+                    finalize_s=0.456,
+                    update_s=10.234,
+                ),
+                *_update_timer_lines(
+                    start + timedelta(seconds=20),
+                    implementation_s=3.234,
+                    finalize_s=0.345,
+                    update_s=3.876,
+                ),
             )
         )
     )
@@ -146,47 +225,75 @@ def test_parser_emits_complete_ordered_update_records(tmp_path):
     result = parse_timings.parse_log(log_path, expected_updates=2)
 
     assert result["observed_update_count"] == 2
+    assert result["schema_version"] == 2
     assert result["updates"] == [
         {
             "classification": "cold",
-            "finalize_and_resume_engines_s": 0.4,
+            "finalize_and_resume_engines_s": 0.456,
             "index": 0,
-            "update_weights_implementation_s": 9.1,
-            "update_weights_s": 10.2,
+            "timing_source": "rank_zero_log_timestamps",
+            "update_weights_implementation_s": 9.123,
+            "update_weights_s": 10.234,
         },
         {
             "classification": "steady",
-            "finalize_and_resume_engines_s": 0.3,
+            "finalize_and_resume_engines_s": 0.345,
             "index": 1,
-            "update_weights_implementation_s": 3.2,
-            "update_weights_s": 3.8,
+            "timing_source": "rank_zero_log_timestamps",
+            "update_weights_implementation_s": 3.234,
+            "update_weights_s": 3.876,
         },
     ]
 
 
 def test_parser_rejects_incomplete_triplet(tmp_path):
     log_path = tmp_path / "actor.log"
+    start = datetime(2026, 9, 22, 12, 0, 0)
     log_path.write_text(
         "\n".join(
             (
-                _timer("update_weights_implementation", 3.2),
-                _timer("update_weights", 3.8),
+                _timer("update_weights", "start", start),
+                _timer(
+                    "update_weights_implementation",
+                    "start",
+                    start + timedelta(seconds=0.1),
+                ),
+                _timer(
+                    "update_weights_implementation",
+                    "end",
+                    start + timedelta(seconds=3.3),
+                    elapsed=3.2,
+                ),
+                _timer(
+                    "update_weights",
+                    "end",
+                    start + timedelta(seconds=3.8),
+                    elapsed=3.8,
+                ),
             )
         )
     )
 
-    with pytest.raises(ValueError, match="complete timer triplet"):
+    with pytest.raises(ValueError, match="out of order"):
         parse_timings.parse_log(log_path, expected_updates=1)
 
 
 def test_parser_rejects_out_of_order_triplet(tmp_path):
     log_path = tmp_path / "actor.log"
+    start = datetime(2026, 9, 22, 12, 0, 0)
     log_path.write_text(
         "\n".join(
             (
-                _timer("finalize_and_resume_engines", 0.3),
-                _timer("update_weights_implementation", 3.2),
-                _timer("update_weights", 3.8),
+                _timer(
+                    "finalize_and_resume_engines",
+                    "start",
+                    start,
+                ),
+                _timer(
+                    "update_weights_implementation",
+                    "start",
+                    start + timedelta(seconds=0.1),
+                ),
             )
         )
     )
@@ -197,12 +304,14 @@ def test_parser_rejects_out_of_order_triplet(tmp_path):
 
 def test_parser_rejects_unexpected_update_count(tmp_path):
     log_path = tmp_path / "actor.log"
+    start = datetime(2026, 9, 22, 12, 0, 0)
     log_path.write_text(
         "\n".join(
-            (
-                _timer("update_weights_implementation", 3.2),
-                _timer("finalize_and_resume_engines", 0.3),
-                _timer("update_weights", 3.8),
+            _update_timer_lines(
+                start,
+                implementation_s=3.2,
+                finalize_s=0.3,
+                update_s=3.8,
             )
         )
     )
@@ -213,15 +322,23 @@ def test_parser_rejects_unexpected_update_count(tmp_path):
 
 def test_parser_ignores_non_rank_zero_actor_timers(tmp_path):
     log_path = tmp_path / "actor.log"
+    start = datetime(2026, 9, 22, 12, 0, 0)
     log_path.write_text(
         "\n".join(
             (
-                _timer("update_weights_implementation", 99.0, rank=1),
-                _timer("finalize_and_resume_engines", 99.0, rank=1),
-                _timer("update_weights", 99.0, rank=1),
-                _timer("update_weights_implementation", 3.2),
-                _timer("finalize_and_resume_engines", 0.3),
-                _timer("update_weights", 3.8),
+                *_update_timer_lines(
+                    start,
+                    implementation_s=99.0,
+                    finalize_s=99.0,
+                    update_s=297.0,
+                    rank=1,
+                ),
+                *_update_timer_lines(
+                    start,
+                    implementation_s=3.2,
+                    finalize_s=0.3,
+                    update_s=3.8,
+                ),
             )
         )
     )
@@ -231,13 +348,55 @@ def test_parser_ignores_non_rank_zero_actor_timers(tmp_path):
     assert result["updates"][0]["update_weights_s"] == 3.8
 
 
+def test_parser_computes_update_across_midnight(tmp_path):
+    log_path = tmp_path / "actor.log"
+    start = datetime(2026, 9, 22, 23, 59, 59, 500_000)
+    log_path.write_text(
+        "\n".join(
+            _update_timer_lines(
+                start,
+                implementation_s=0.4,
+                finalize_s=0.1,
+                update_s=1.25,
+            )
+        )
+    )
+
+    result = parse_timings.parse_log(log_path, expected_updates=1)
+
+    assert result["updates"][0]["update_weights_s"] == 1.25
+
+
+def test_parser_rejects_timer_end_before_start(tmp_path):
+    log_path = tmp_path / "actor.log"
+    start = datetime(2026, 9, 22, 12, 0, 0)
+    lines = list(
+        _update_timer_lines(
+            start,
+            implementation_s=0.4,
+            finalize_s=0.1,
+            update_s=1.25,
+        )
+    )
+    lines[2] = _timer(
+        "update_weights_implementation",
+        "end",
+        start + timedelta(seconds=0.1),
+        elapsed=0.4,
+    )
+    log_path.write_text("\n".join(lines))
+
+    with pytest.raises(ValueError, match="timer end precedes timer start"):
+        parse_timings.parse_log(log_path, expected_updates=1)
+
+
 def test_write_result_is_deterministic(tmp_path):
     output_path = tmp_path / "result.json"
     payload = {
         "updates": [],
         "observed_update_count": 0,
         "expected_update_count": 0,
-        "schema_version": 1,
+        "schema_version": 2,
     }
 
     parse_timings.write_result(output_path, payload)
@@ -282,6 +441,72 @@ def test_rendered_manifest_carries_matched_benchmark_contract(
     assert environment["SGLANG_PLUGINS"] == plugin_value
     assert environment["MX_SERVER_ADDRESS"] == server_value
     assert environment["MX_MILES_VERIFY_TENSOR_EQUALITY"] == "0"
+    assert environment["MODEL_ID"] == "Qwen/Qwen2.5-0.5B-Instruct"
+    assert environment["MILES_MODEL_TYPE"] == "qwen2.5-0.5B"
+    assert environment["NCCL_DEBUG"] == "WARN"
+
+
+def test_rendered_manifest_accepts_preregistered_3b_model():
+    result = _render_manifest(
+        "external",
+        MODEL_ID="Qwen/Qwen2.5-3B-Instruct",
+        MILES_MODEL_TYPE="qwen2.5-3B",
+        ACTOR_GPUS="4",
+        PIPELINE_PARALLEL_SIZE="4",
+        ROLLOUT_GPUS="4",
+        TOTAL_GPUS="8",
+    )
+
+    assert result.returncode == 0, result.stderr
+    job = list(yaml.safe_load_all(result.stdout))[-1]
+    environment = {
+        item["name"]: item["value"]
+        for item in job["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+    assert environment["MODEL_ID"] == "Qwen/Qwen2.5-3B-Instruct"
+    assert environment["MILES_MODEL_TYPE"] == "qwen2.5-3B"
+    assert environment["ACTOR_GPUS"] == "4"
+    assert environment["ROLLOUT_GPUS"] == "4"
+    assert environment["TOTAL_GPUS"] == "8"
+
+
+@pytest.mark.parametrize(
+    ("model_id", "model_type"),
+    (
+        ("Qwen/Qwen2.5-0.5B-Instruct", "qwen2.5-3B"),
+        ("Qwen/Qwen2.5-3B-Instruct", "qwen2.5-0.5B"),
+        ("Qwen/Qwen2.5-7B-Instruct", "qwen2.5-3B"),
+    ),
+)
+def test_rendered_manifest_rejects_unregistered_model_pair(model_id, model_type):
+    result = _render_manifest(
+        "external",
+        MODEL_ID=model_id,
+        MILES_MODEL_TYPE=model_type,
+    )
+
+    assert result.returncode == 2
+    assert "MODEL_ID and MILES_MODEL_TYPE must be an approved pair" in result.stderr
+
+
+def test_rendered_manifest_accepts_nccl_info_for_diagnostic_run():
+    result = _render_manifest("external", NCCL_DEBUG="INFO")
+
+    assert result.returncode == 0, result.stderr
+    job = list(yaml.safe_load_all(result.stdout))[-1]
+    environment = {
+        item["name"]: item["value"]
+        for item in job["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+    assert environment["NCCL_DEBUG"] == "INFO"
+
+
+@pytest.mark.parametrize("value", ["TRACE", "DEBUG", ""])
+def test_rendered_manifest_rejects_uncontrolled_nccl_debug(value):
+    result = _render_manifest("external", NCCL_DEBUG=value)
+
+    assert result.returncode == 2
+    assert "NCCL_DEBUG must be WARN or INFO" in result.stderr
 
 
 def test_qualification_must_explicitly_enable_tensor_verification():

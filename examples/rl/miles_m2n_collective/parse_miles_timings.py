@@ -8,17 +8,34 @@ from __future__ import annotations
 import argparse
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 _TIMER_PATTERN = re.compile(
-    r"Timer "
+    r"\[(?P<timestamp>\d{4}-\d{2}-\d{2} "
+    r"\d{2}:\d{2}:\d{2}\.\d+) actor_cell0_rank0\].*Timer "
     r"(?P<name>update_weights_implementation|finalize_and_resume_engines|update_weights) "
-    r"end \(elapsed: (?P<elapsed>[0-9]+(?:\.[0-9]+)?)s\)"
+    r"(?P<phase>start|end)"
 )
 _IMPLEMENTATION = "update_weights_implementation"
 _FINALIZE = "finalize_and_resume_engines"
 _UPDATE = "update_weights"
+_ORDER = (
+    (_UPDATE, "start"),
+    (_IMPLEMENTATION, "start"),
+    (_IMPLEMENTATION, "end"),
+    (_FINALIZE, "start"),
+    (_FINALIZE, "end"),
+    (_UPDATE, "end"),
+)
+
+
+def _elapsed_seconds(start: datetime, end: datetime) -> float:
+    elapsed = (end - start).total_seconds()
+    if elapsed < 0:
+        raise ValueError("timer end precedes timer start")
+    return elapsed
 
 
 def parse_log(log_path: Path, *, expected_updates: int) -> dict[str, Any]:
@@ -26,7 +43,7 @@ def parse_log(log_path: Path, *, expected_updates: int) -> dict[str, Any]:
         raise ValueError("expected_updates must be non-negative")
 
     updates: list[dict[str, Any]] = []
-    pending: dict[str, float] = {}
+    pending: dict[tuple[str, str], datetime] = {}
     for line_number, line in enumerate(
         log_path.read_text(errors="replace").splitlines(), start=1
     ):
@@ -35,52 +52,54 @@ def parse_log(log_path: Path, *, expected_updates: int) -> dict[str, Any]:
         match = _TIMER_PATTERN.search(line)
         if match is None:
             continue
-        name = match.group("name")
-        elapsed = float(match.group("elapsed"))
-        if name in pending:
+        event = (match.group("name"), match.group("phase"))
+        expected_event = _ORDER[len(pending)]
+        if event in pending:
             raise ValueError(
-                f"duplicate Timer {name} before update completion at line {line_number}"
+                f"duplicate Timer {event[0]} {event[1]} before update completion "
+                f"at line {line_number}"
             )
-        if name == _IMPLEMENTATION:
-            if pending:
-                observed = ", ".join(sorted(pending))
+        if event != expected_event:
+            raise ValueError(
+                "timer triplet is out of order at "
+                f"line {line_number}; expected Timer {expected_event[0]} "
+                f"{expected_event[1]}, observed Timer {event[0]} {event[1]}"
+            )
+        pending[event] = datetime.fromisoformat(match.group("timestamp"))
+        if event == (_UPDATE, "end"):
+            implementation_s = _elapsed_seconds(
+                pending[(_IMPLEMENTATION, "start")],
+                pending[(_IMPLEMENTATION, "end")],
+            )
+            finalize_s = _elapsed_seconds(
+                pending[(_FINALIZE, "start")],
+                pending[(_FINALIZE, "end")],
+            )
+            update_s = _elapsed_seconds(
+                pending[(_UPDATE, "start")],
+                pending[(_UPDATE, "end")],
+            )
+            ordered_timestamps = [pending[item] for item in _ORDER]
+            if ordered_timestamps != sorted(ordered_timestamps):
                 raise ValueError(
-                    "timer triplet is out of order at "
-                    f"line {line_number}; observed {observed} before {name}"
-                )
-            pending[name] = elapsed
-            continue
-        if name == _FINALIZE:
-            if set(pending) != {_IMPLEMENTATION}:
-                raise ValueError(
-                    "timer triplet is out of order at "
-                    f"line {line_number}; {_FINALIZE} must follow {_IMPLEMENTATION}"
-                )
-            pending[name] = elapsed
-            continue
-        if name == _UPDATE:
-            missing = {_IMPLEMENTATION, _FINALIZE}.difference(pending)
-            if missing:
-                missing_names = ", ".join(sorted(missing))
-                raise ValueError(
-                    "Timer update_weights ended without a complete timer triplet "
-                    f"at line {line_number}; missing {missing_names}"
+                    "timer timestamps are not monotonically nested for the "
+                    f"update ending at line {line_number}"
                 )
             index = len(updates)
             updates.append(
                 {
                     "classification": "cold" if index == 0 else "steady",
-                    "finalize_and_resume_engines_s": pending[_FINALIZE],
+                    "finalize_and_resume_engines_s": finalize_s,
                     "index": index,
-                    "update_weights_implementation_s": pending[_IMPLEMENTATION],
-                    "update_weights_s": elapsed,
+                    "timing_source": "rank_zero_log_timestamps",
+                    "update_weights_implementation_s": implementation_s,
+                    "update_weights_s": update_s,
                 }
             )
             pending.clear()
-            continue
 
     if pending:
-        names = ", ".join(sorted(pending))
+        names = ", ".join(f"{name} {phase}" for name, phase in pending)
         raise ValueError(
             f"log ended without a complete timer triplet; unmatched timers: {names}"
         )
@@ -91,7 +110,7 @@ def parse_log(log_path: Path, *, expected_updates: int) -> dict[str, Any]:
     return {
         "expected_update_count": expected_updates,
         "observed_update_count": len(updates),
-        "schema_version": 1,
+        "schema_version": 2,
         "updates": updates,
     }
 
