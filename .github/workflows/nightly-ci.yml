@@ -958,12 +958,14 @@ jobs:
     # or chart failure doesn't withhold the container/wheel scans. nightly-status
     # still flags them red.
     needs: [preflight, stage-containers-ngc, build-wheels, stage-crates, stage-helm-ngc, notify-slack-start]
+    # TEMPORARY(test): the container/wheel success gates are lifted so the
+    # pull-request/603 rehearsal exercises the handoff even while staging is
+    # incomplete. Restore both `.result == 'success'` clauses before merge —
+    # without them a failed stage still hands GitLab an artifact list to scan.
     if: >-
       ${{ !cancelled() &&
           needs.preflight.outputs.release == 'true' &&
-          inputs.skip_gitlab_pipeline != true &&
-          needs.stage-containers-ngc.result == 'success' &&
-          needs.build-wheels.result == 'success' }}
+          inputs.skip_gitlab_pipeline != true }}
     environment: automated-release
     timeout-minutes: 15
     permissions:
@@ -977,6 +979,9 @@ jobs:
           GITLAB_TRIGGER_URL: ${{ secrets.GITLAB_PIPELINE_URL }}
           GITLAB_TRIGGER_TOKEN: ${{ secrets.GITLAB_TRIGGER_TOKEN }}
           GITLAB_REF: ${{ vars.GITLAB_RELEASE_AUTOMATION_REF || 'main' }}
+          # TEMPORARY(test): rehearsal validates and scans without publishing.
+          # Set to false before merge.
+          DRY_RUN: "true"
           # Sonar files the analysis under this branch; it must track the ref
           # actually built, not a fixed name.
           SONAR_BRANCH: ${{ github.ref_name }}
@@ -1036,6 +1041,7 @@ jobs:
             --form "ref=${GITLAB_REF}" \
             --form "variables[PROJECT]=modelexpress" \
             --form "variables[PIPELINE_TYPE]=security" \
+            --form "variables[DRY_RUN]=${DRY_RUN}" \
             --form "variables[RELEASE_TYPE]=nightly" \
             --form "variables[ARTIFACTS]=${ARTIFACTS}" \
             --form "variables[SONAR_BRANCH]=${SONAR_BRANCH}" \
