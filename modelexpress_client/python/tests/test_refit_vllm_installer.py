@@ -13,7 +13,6 @@ from modelexpress.engines.vllm.host_quantization import (
 from modelexpress.refit.reshard.types import IncompleteRefit
 from modelexpress.refit.timing import RefitTimingRecorder, use_refit_timing
 from modelexpress_rl.inference.engines.vllm.installer import (
-    _update_mla_absorbed_weights,
     _VllmInstaller,
 )
 from modelexpress_rl.inference.plan import (
@@ -417,12 +416,61 @@ def test_warm_host_scale_refresh_requires_eager_execution(warm_runtime_install):
     assert attn._o_scale_float == 2.0
 
 
-def test_installer_rejects_quantized_mla_derived_weight_refresh():
+@pytest.mark.parametrize("install_path", ["tensors", "checkpoint"])
+@pytest.mark.parametrize("quantized", [False, True])
+def test_installer_preserves_vllm_mla_refresh(
+    monkeypatch, tmp_path, install_path, quantized,
+):
     model = nn.Module()
     mla = nn.Module()
     mla.kv_b_proj = nn.Linear(1, 1, bias=False)
     mla.W_UV = torch.zeros(1)
+    mla.W_UK_T = torch.zeros(1)
     model.add_module("mla", mla)
+    originals = {name: getattr(mla, name) for name in ("W_UV", "W_UK_T")}
+    pointers = {name: tensor.data_ptr() for name, tensor in originals.items()}
 
-    with pytest.raises(IncompleteRefit, match="quantized kv_b_proj"):
-        _update_mla_absorbed_weights(model, quantized=True)
+    _install_fake_vllm(monkeypatch, lambda _model: None)
+    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
+
+    def finalize(target, _config):
+        # Simulate vLLM's quantization-aware MLA post-load processing.
+        value = target.mla.kv_b_proj.weight.detach().flatten()
+        target.mla.W_UV = value + 10
+        target.mla.W_UK_T = value + 20
+
+    layerwise.finalize_layerwise_reload = finalize
+
+    class DefaultModelLoader:
+        def __init__(self, _load_config):
+            pass
+
+        def load_weights(self, target, _model_config):
+            target.mla.kv_b_proj.weight.data.fill_(7)
+
+    sys.modules[
+        "vllm.model_executor.model_loader.default_loader"
+    ].DefaultModelLoader = DefaultModelLoader
+    synchronized = []
+    monkeypatch.setattr(torch.cuda, "synchronize", synchronized.append)
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=SimpleNamespace(
+            quant_config=object() if quantized else None,
+            load_config=SimpleNamespace(load_format="modelexpress"),
+        ),
+        model_config=SimpleNamespace(model="/launch", revision="main"),
+        device=torch.device("cpu"),
+    )
+
+    if install_path == "tensors":
+        installer.install_tensors({"mla.kv_b_proj.weight": torch.tensor([[7.0]])})
+    else:
+        installer.install_checkpoint(tmp_path)
+
+    for name, expected in (("W_UV", 17), ("W_UK_T", 27)):
+        actual = getattr(mla, name)
+        assert actual is originals[name]
+        assert actual.data_ptr() == pointers[name]
+        assert actual.item() == expected
+    assert synchronized == [torch.device("cpu")]

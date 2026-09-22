@@ -187,12 +187,8 @@ class _VllmInstaller(EngineInstaller):
     def install_tensors(self, tensors: dict[str, torch.Tensor]) -> None:
         """Install verified load-layout tensors without changing graph addresses."""
         self._process_and_commit(tensors)
-        # Derived-weight fixups plus the synchronize that makes the whole
-        # install observable. Separate from the per-layer stages because it is
-        # paid once and does not scale with the number of layers, so folding it
-        # in would make those look worse than they are on small models.
+        # Synchronization is paid once per install, separately from per-layer work.
         with refit_span("post_install"):
-            _update_mla_absorbed_weights(self._model, quantized=self._is_quantized)
             torch.cuda.synchronize(self._device)
 
     def install_runtime_tensors(self, tensors: dict[str, torch.Tensor]) -> None:
@@ -244,10 +240,9 @@ class _VllmInstaller(EngineInstaller):
         loader = DefaultModelLoader(load_config)
 
         self._reload(lambda: loader.load_weights(self._model, model_config))
-        # Same fixups and synchronize as install_tensors, so a checkpoint refit
+        # Same synchronize as install_tensors, so a checkpoint refit
         # reports the stage too rather than charging it to the caller's total.
         with refit_span("post_install"):
-            _update_mla_absorbed_weights(self._model, quantized=self._is_quantized)
             torch.cuda.synchronize(self._device)
 
     @torch.no_grad()
@@ -395,43 +390,6 @@ class _VllmInstaller(EngineInstaller):
                 "vLLM refit left parameters on the meta device; "
                 f"count={len(meta_parameters)}, names={meta_parameters[:10]}"
             )
-
-
-def _update_mla_absorbed_weights(model: Module, *, quantized: bool) -> None:
-    """Refresh MLA tensors derived from ``kv_b_proj`` in graph-bound storage.
-
-    ``W_UV`` and ``W_UK_T`` are cached bare attributes rather than parameters or
-    buffers. Updating them in place preserves the addresses captured by CUDA
-    graphs.
-
-    TODO: Replace this MLA-specific recomputation with an engine-owned derived
-    tensor hook when vLLM exposes one. Address preservation is generic above;
-    recomputing the value is still model-specific here.
-    """
-    for _name, module in model.named_modules():
-        if not (hasattr(module, "W_UV") or hasattr(module, "W_UK_T")) or not hasattr(
-            module, "kv_b_proj"
-        ):
-            continue
-        if quantized:
-            raise IncompleteRefit(
-                "MLA derived-weight refresh from a quantized kv_b_proj is unsupported"
-            )
-        output_dtype = (
-            module.W_UV.dtype if hasattr(module, "W_UV") else module.W_UK_T.dtype
-        )
-        kv_b_proj_weight = module.kv_b_proj.weight.view(
-            module.num_heads,
-            module.qk_nope_head_dim + module.v_head_dim,
-            -1,
-        )
-        w_uk, w_uv = kv_b_proj_weight.split(
-            [module.qk_nope_head_dim, module.v_head_dim], dim=1
-        )
-        if hasattr(module, "W_UV"):
-            module.W_UV.copy_(w_uv.transpose(0, 1).to(output_dtype))
-        if hasattr(module, "W_UK_T"):
-            module.W_UK_T.copy_(w_uk.permute(1, 2, 0).to(output_dtype))
 
 
 __all__: list[str] = []
