@@ -285,6 +285,58 @@ class WeightUpdateSession:
             self._close_lease(lease_group, versions[-1].version_id, primary_error)
             raise
 
+    def prepare_streaming(
+        self,
+        version: WeightVersion,
+        *,
+        max_staging_bytes: int,
+        staging_device: str = "cuda",
+        staging_buffers: int = 1,
+    ) -> SessionUpdate:
+        """Hold the version lease across deferred transfer and installation."""
+        from .methods import LoadTimeTensorNixlUpdateMethod
+        from .plan import PreparedStreamingTensors, WeightSource
+
+        lease = self._start_lease(version.version_id)
+        try:
+            last_error: BaseException | None = None
+            for plan in self._planner.plans(version):
+                if plan.source.kind is not WeightSource.TRAINER:
+                    continue
+                if not isinstance(plan.method, LoadTimeTensorNixlUpdateMethod):
+                    continue
+                if (
+                    PreparedStreamingTensors
+                    not in plan.installer.capabilities.artifact_types
+                ):
+                    raise ValueError(
+                        "engine does not support bounded streaming installation"
+                    )
+                try:
+                    prepared = plan.method.prepare_streaming(
+                        version=version,
+                        source=plan.source,
+                        max_staging_bytes=max_staging_bytes,
+                        staging_device=staging_device,
+                        staging_buffers=staging_buffers,
+                    )
+                except (grpc.RpcError, RuntimeError, ManifestMismatchError) as error:
+                    last_error = error
+                    logger.warning(
+                        "Streaming preparation failed version=%s source=%s: %s",
+                        version.version_id,
+                        plan.source.kind.value,
+                        error,
+                    )
+                    continue
+                return SessionUpdate(plan=plan, prepared=prepared, lease=lease)
+            if last_error is not None:
+                raise last_error
+            raise ValueError("no NIXL trainer plan supports bounded streaming")
+        except BaseException as error:
+            self._close_lease(lease, version.version_id, error)
+            raise
+
     @staticmethod
     def _recover_preparation(
         method: UpdateMethod,

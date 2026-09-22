@@ -3,6 +3,7 @@
 
 import hashlib
 import logging
+from types import SimpleNamespace
 import threading
 from concurrent import futures
 from contextlib import contextmanager
@@ -28,6 +29,7 @@ from modelexpress_rl import (
     refit_pb2_grpc,
 )
 from modelexpress_rl.inference.adapter import GeneratorTransferInputs
+from modelexpress_rl.inference.methods import LoadTimeTensorNixlUpdateMethod
 from modelexpress_rl.inference.plan import (
     EngineCapabilities,
     EngineInstaller,
@@ -35,6 +37,7 @@ from modelexpress_rl.inference.plan import (
     MethodCapabilities,
     ObjectStorageUpdateSource,
     PreparedEngineTensors,
+    PreparedStreamingTensors,
     ResolvedSource,
     TrainerUpdateSource,
     UpdateMethod,
@@ -1512,7 +1515,17 @@ def test_generator_reports_lease_cleanup_failure_after_success(
             pytest.raises(grpc.RpcError, match="lease backend unavailable"),
         ):
             staged.release()
+        assert staged._update.released
+        assert generator._active_handle is None
         assert "MX_REFIT_TIMING" in caplog.text
+        staged.release()
+        service.fail_lease_deletion = False
+        service.version.uid = "version-b"
+        for shard in service.shards:
+            shard.version_id = "version-b"
+        next_staged = generator.stage_weight(version=WeightVersionRef("version-b"))
+        assert next_staged.version_id == "version-b"
+        next_staged.release()
     finally:
         generator.close()
         server.stop(grace=None).wait()
@@ -1589,6 +1602,123 @@ def test_generator_does_not_fence_when_installation_context_entry_fails(monkeypa
 
     assert adapter.installation_failure_calls == []
     assert adapter.apply_calls == []
+
+
+@pytest.mark.parametrize("fail_second", [False, True])
+@pytest.mark.parametrize(
+    "prepare_failures,prepare_error,reset_failure",
+    [
+        (0, RuntimeError, False),
+        (1, RuntimeError, False),
+        (1, grpc.RpcError, False),
+        (1, ManifestMismatchError, False),
+        (3, RuntimeError, False),
+        (1, RuntimeError, True),
+    ],
+)
+def test_streaming_client_holds_lease_and_fences_partial_install(
+    monkeypatch, fail_second, prepare_failures, prepare_error, reset_failure
+):
+    server, endpoint, service = _start_server()
+    adapter = _Adapter(service)
+    generator = _initialize(
+        monkeypatch, endpoint, adapter, source_order=(WeightSource.TRAINER,)
+    )
+    installed = []
+    prepare_calls = []
+
+    class Transfer:
+        def reset_workspace(self):
+            assert service.active_leases
+            if reset_failure:
+                raise RuntimeError("cleanup failure")
+
+        def prepare(self, **kwargs):
+            assert kwargs["max_staging_bytes"] == 512
+            assert kwargs["staging_device"] == "cuda"
+            assert kwargs["staging_buffers"] == 1
+            assert service.active_leases
+            prepare_calls.append(kwargs)
+            if len(prepare_calls) <= prepare_failures:
+                raise prepare_error("preparation failure")
+            return SimpleNamespace(
+                metrics={},
+                batches=[
+                    SimpleNamespace(layouts=({"a.weight": None, "b.weight": None},))
+                ],
+            )
+
+        def iter_bounded(self, prepared, metrics):
+            assert service.active_leases
+            yield {"a.weight": 1}
+            assert service.active_leases
+            if fail_second:
+                raise RuntimeError("partial streaming failure")
+            yield {"b.weight": 2}
+            metrics["staging_peak_bytes"] = 512
+
+        def close(self):
+            pass
+
+    class Installer(EngineInstaller):
+        @property
+        def capabilities(self):
+            return EngineCapabilities(
+                frozenset({PreparedEngineTensors, PreparedStreamingTensors})
+            )
+
+        def install(self, prepared):
+            for tensors in prepared.batches():
+                installed.extend(tensors)
+            return {"install_s": 0.1}
+
+    method = LoadTimeTensorNixlUpdateMethod(
+        transfer=Transfer(),
+        capture_layout=None,
+    )
+    planner = generator._runtime.session._planner
+    planner._methods = (method,)
+    planner._installer = Installer()
+    try:
+        if reset_failure:
+            with pytest.raises(ValueError, match="restart the generator engine"):
+                generator.apply_weight_streaming(
+                    version=WeightVersionRef("version-a"), max_staging_bytes=512
+                )
+            assert installed == []
+        elif prepare_failures == 3:
+            with pytest.raises(prepare_error, match="preparation failure"):
+                generator.apply_weight_streaming(
+                    version=WeightVersionRef("version-a"), max_staging_bytes=512
+                )
+            assert installed == []
+        elif fail_second:
+            with pytest.raises(RuntimeError, match="partial streaming failure"):
+                generator.apply_weight_streaming(
+                    version=WeightVersionRef("version-a"), max_staging_bytes=512
+                )
+            with pytest.raises(RuntimeError, match="uncertain"):
+                generator.apply_weight_streaming(
+                    version=WeightVersionRef("version-a"), max_staging_bytes=512
+                )
+            assert installed == ["a.weight"]
+        else:
+            metrics = generator.apply_weight_streaming(
+                version=WeightVersionRef("version-a"), max_staging_bytes=512
+            )
+            assert metrics["staging_peak_bytes"] == 512
+            assert installed == ["a.weight", "b.weight"]
+            assert generator._serving_version_id == "version-a"
+        assert not service.active_leases
+        assert generator._active_handle is None
+        assert method._active_streamed is None
+        assert len(prepare_calls) == (
+            1 if reset_failure else min(prepare_failures + 1, 3)
+        )
+        assert service.lease_registrations == 1
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
 
 
 def test_generator_republishes_after_pretransfer_failure(monkeypatch):
@@ -2025,3 +2155,81 @@ def test_generator_closes_adapter_when_registration_fails(monkeypatch):
         )
 
     assert adapter.close_calls == 1
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"staging_device": "disk"}, "staging_device"),
+        ({"staging_buffers": 0}, "staging_buffers"),
+        ({"staging_buffers": True}, "staging_buffers"),
+    ],
+)
+def test_streaming_rejects_invalid_staging_options_before_leasing(
+    monkeypatch, kwargs, match
+):
+    server, endpoint, service = _start_server()
+    adapter = _Adapter(service)
+    generator = _initialize(
+        monkeypatch, endpoint, adapter, source_order=(WeightSource.TRAINER,)
+    )
+    try:
+        with pytest.raises(ValueError, match=match):
+            generator.apply_weight_streaming(
+                version=WeightVersionRef("version-a"), max_staging_bytes=512, **kwargs
+            )
+        assert not service.active_leases
+        assert service.lease_registrations == 0
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+
+def test_streaming_forwards_staging_options_to_the_method(monkeypatch):
+    server, endpoint, service = _start_server()
+    adapter = _Adapter(service)
+    generator = _initialize(
+        monkeypatch, endpoint, adapter, source_order=(WeightSource.TRAINER,)
+    )
+    prepare_calls = []
+
+    class Transfer:
+        def prepare(self, **kwargs):
+            prepare_calls.append(kwargs)
+            return SimpleNamespace(
+                metrics={},
+                batches=[SimpleNamespace(layouts=({"a.weight": None},))],
+            )
+
+        def iter_bounded(self, prepared, metrics):
+            yield {"a.weight": 1}
+
+    class Installer:
+        @property
+        def capabilities(self):
+            return EngineCapabilities(
+                frozenset({PreparedEngineTensors, PreparedStreamingTensors})
+            )
+
+        def install(self, prepared):
+            for _tensors in prepared.batches():
+                pass
+            return {}
+
+    method = LoadTimeTensorNixlUpdateMethod(transfer=Transfer(), capture_layout=None)
+    planner = generator._runtime.session._planner
+    planner._methods = (method,)
+    planner._installer = Installer()
+    try:
+        generator.apply_weight_streaming(
+            version=WeightVersionRef("version-a"),
+            max_staging_bytes=1024,
+            staging_device="cpu",
+            staging_buffers=2,
+        )
+        assert prepare_calls[-1]["staging_device"] == "cpu"
+        assert prepare_calls[-1]["staging_buffers"] == 2
+        assert prepare_calls[-1]["max_staging_bytes"] == 1024
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()

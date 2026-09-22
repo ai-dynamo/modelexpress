@@ -37,6 +37,7 @@ from modelexpress_rl.inference.plan import (
     PreparedArtifact,
     PreparedCheckpointArtifact,
     PreparedEngineTensors,
+    PreparedStreamingTensors,
     PreparedRuntimeTensors,
 )
 from modelexpress_rl.inference.receiver import PreparedCheckpoint
@@ -95,6 +96,7 @@ class _VllmInstaller(EngineInstaller):
                     PreparedRuntimeTensors,
                     PreparedCheckpointArtifact,
                 }
+                | ({PreparedStreamingTensors} if not self._is_quantized else set())
             )
         )
 
@@ -103,6 +105,12 @@ class _VllmInstaller(EngineInstaller):
         metrics = prepared.metrics
         if isinstance(prepared, PreparedEngineTensors):
             self.install_tensors(prepared.staged.tensors)
+        elif isinstance(prepared, PreparedStreamingTensors):
+            self.install_streaming(prepared)
+            # install_streaming records into the artifact's own metrics dict;
+            # re-read it so those entries travel with the install timing.
+            metrics = prepared.metrics
+            metrics["streaming_apply_s"] = time.perf_counter() - started
         elif isinstance(prepared, PreparedRuntimeTensors):
             self.install_runtime_tensors(prepared.staged.tensors)
         elif isinstance(prepared, PreparedCheckpointArtifact):
@@ -121,6 +129,30 @@ class _VllmInstaller(EngineInstaller):
     def _is_quantized(self) -> bool:
         """Whether the live model uses a post-load quantized kernel layout."""
         return getattr(self._vllm_config, "quant_config", None) is not None
+
+    @staticmethod
+    def _parameter_aliases(model: Module) -> list[list[tuple[Module, str]]]:
+        groups: dict[int, list[tuple[Module, str]]] = {}
+        for module in model.modules():
+            for name, parameter in module._parameters.items():
+                if parameter is not None:
+                    groups.setdefault(id(parameter), []).append((module, name))
+        return [group for group in groups.values() if len(group) > 1]
+
+    @staticmethod
+    def _restore_parameter_aliases(aliases: list[list[tuple[Module, str]]]) -> None:
+        # vLLM restores metadata separately for each module. Reconnect shared
+        # parameters so a tied loader still covers one canonical destination.
+        for group in aliases:
+            first_module, first_name = group[0]
+            parameter = getattr(first_module, first_name)
+            for module, name in group[1:]:
+                other = getattr(module, name)
+                if other.shape != parameter.shape or other.dtype != parameter.dtype:
+                    raise IncompleteRefit(
+                        "tied parameters have incompatible load-time layouts"
+                    )
+                setattr(module, name, parameter)
 
     def capture(
         self, manifest: list[tuple[str, torch.dtype, tuple[int, ...]]]
@@ -152,9 +184,11 @@ class _VllmInstaller(EngineInstaller):
             ) from error
 
         model = self._model
+        aliases = self._parameter_aliases(model)
         with torch.device(self._device), set_current_vllm_config(self._vllm_config):
             initialize_layerwise_reload(model)
             try:
+                self._restore_parameter_aliases(aliases)
                 # Trace the ORIGINAL loaders, not the reload shims they were wrapped in.
                 for _, param in model.named_parameters():
                     param.weight_loader = _get_original_loader(param)
@@ -194,6 +228,124 @@ class _VllmInstaller(EngineInstaller):
         with refit_span("post_install"):
             _update_mla_absorbed_weights(self._model, quantized=self._is_quantized)
             torch.cuda.synchronize(self._device)
+
+    @torch.no_grad()
+    def install_streaming(self, prepared: PreparedStreamingTensors) -> None:
+        """Commit complete modules into existing storage before arena reuse.
+
+        Nothing about the module tree may be cached across batches. A post-load
+        hook can replace a module, so a pinned module object goes stale, and it
+        can add a Parameter to a module a later batch owns, so a batch that was
+        complete when the layout was captured no longer is. Every resolution,
+        completeness and retention check therefore walks the live tree.
+        """
+        if self._is_quantized:
+            raise IncompleteRefit(
+                "bounded streaming currently requires an unquantized engine"
+            )
+
+        metrics = prepared.transfer_metrics
+        load_s = 0.0
+        commit_s = 0.0
+        setup_s = 0.0
+        batch_scan_s = 0.0
+        final_scan_s = 0.0
+        batch_scans = 0
+        final_scans = 0
+
+        def retains_arena(module: Module, arena_storage: set[int]) -> bool:
+            values = [
+                *module.parameters(recurse=False),
+                *module.buffers(recurse=False),
+            ]
+            values.extend(
+                v for v in module.__dict__.values() if isinstance(v, torch.Tensor)
+            )
+            return any(
+                v.device.type != "meta"
+                and v.untyped_storage().data_ptr() in arena_storage
+                for v in values
+            )
+
+        def load():
+            nonlocal load_s, commit_s
+            nonlocal setup_s, batch_scan_s, final_scan_s, batch_scans, final_scans
+            load_started = time.perf_counter()
+            expected = set(dict(self._model.named_parameters()))
+            if expected != prepared.parameter_names:
+                raise IncompleteRefit(
+                    "streaming parameter coverage differs from the live load layout"
+                )
+            # Resolution and the complete-owner check both happen inside
+            # _process_and_commit, sharing the one live walk it already makes.
+            installed = set()
+            arena_storages: set[int] = set()
+            batches = prepared.batches()
+            try:
+                for tensors in batches:
+                    names = set(tensors)
+                    if not names or names - expected or names & installed:
+                        raise IncompleteRefit(
+                            "invalid or repeated streaming parameter batch"
+                        )
+                    commit_started = time.perf_counter()
+                    self._process_and_commit(tensors, reload=False)
+                    setup_started = time.perf_counter()
+                    arena_storage = {
+                        tensor.untyped_storage().data_ptr()
+                        for tensor in tensors.values()
+                    }
+                    arena_storages |= arena_storage
+                    setup_s += time.perf_counter() - setup_started
+                    # A loader may stash an arena view on any module, so clear
+                    # the arena before refill. Deferring to the post-install
+                    # sweep would read an arena already overwritten, and a view
+                    # that was read and deleted leaves nothing to find.
+                    scan_started = time.perf_counter()
+                    for module in self._model.modules():
+                        if retains_arena(module, arena_storage):
+                            raise IncompleteRefit(
+                                "engine retained bounded staging storage; restart required"
+                            )
+                    batch_scan_s += time.perf_counter() - scan_started
+                    batch_scans += 1
+                    installed.update(names)
+                    torch.cuda.synchronize(self._device)
+                    commit_s += time.perf_counter() - commit_started
+            finally:
+                batches.close()
+            if installed != expected:
+                raise IncompleteRefit(
+                    "streaming transfer ended before every parameter was installed"
+                )
+            # Repeat over every arena the install used, so a module the final
+            # batch created is still covered.
+            scan_started = time.perf_counter()
+            for module in self._model.modules():
+                if retains_arena(module, arena_storages):
+                    raise IncompleteRefit(
+                        "engine retained bounded staging storage; restart required"
+                    )
+            final_scan_s += time.perf_counter() - scan_started
+            final_scans += 1
+            load_s = time.perf_counter() - load_started
+
+        reload_started = time.perf_counter()
+        self._reload(load)
+        metrics["reload_s"] = time.perf_counter() - reload_started - load_s
+        metrics["install_commit_s"] = commit_s
+        # retention_batch_scan_s is inside install_commit_s; retention_final_scan_s
+        # is in neither it nor reload_s, so it has to be added, not inferred.
+        metrics["retention_arena_setup_s"] = setup_s
+        metrics["retention_batch_scan_s"] = batch_scan_s
+        metrics["retention_final_scan_s"] = final_scan_s
+        metrics["retention_batch_scans"] = batch_scans
+        metrics["retention_final_scans"] = final_scans
+        metrics["retention_scan_s"] = batch_scan_s + final_scan_s
+        derived_started = time.perf_counter()
+        _update_mla_absorbed_weights(self._model, quantized=False)
+        torch.cuda.synchronize(self._device)
+        metrics["derived_refresh_s"] = time.perf_counter() - derived_started
 
     def install_runtime_tensors(self, tensors: dict[str, torch.Tensor]) -> None:
         """Finish a direct peer transfer into existing graph-bound storage."""
@@ -251,7 +403,12 @@ class _VllmInstaller(EngineInstaller):
             torch.cuda.synchronize(self._device)
 
     @torch.no_grad()
-    def _process_and_commit(self, tensors: dict[str, torch.Tensor]) -> None:
+    def _process_and_commit(
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        reload: bool = True,
+    ) -> None:
         """Run vLLM's per-layer post-load processing into graph-bound storage.
 
         ``initialize_layerwise_reload`` restores load-time parameter skeletons
@@ -277,15 +434,29 @@ class _VllmInstaller(EngineInstaller):
         def load() -> None:
             # Quantized models expose kernel-packed parameters before layerwise
             # reload and load-time parameters after it. Resolve the captured
-            # names only after vLLM has restored that load-time hierarchy.
+            # names only after vLLM has restored that load-time hierarchy, and
+            # resolve them on every call: a streaming install runs this once per
+            # batch, and a hook may have replaced a module since the last one.
             groups: dict[Module, list[tuple[str, str]]] = {}
             matched: set[str] = set()
             for module_name, module in self._model.named_modules():
+                owned = set()
                 for leaf, _parameter in module.named_parameters(recurse=False):
                     full_name = f"{module_name}.{leaf}" if module_name else leaf
+                    owned.add(full_name)
                     if full_name in tensors:
                         groups.setdefault(module, []).append((full_name, leaf))
                         matched.add(full_name)
+                # Streaming installs an owning module at a time, so reject a
+                # batch covering only part of one before any hook runs. Asked
+                # of the live tree, since an earlier hook may have added a
+                # Parameter here since the layout was captured.
+                if (
+                    not reload
+                    and owned & tensors.keys()
+                    and not owned <= tensors.keys()
+                ):
+                    raise IncompleteRefit("streaming batch splits an owning module")
             unmatched = sorted(set(tensors) - matched)
             if unmatched:
                 raise IncompleteRefit(
@@ -301,6 +472,20 @@ class _VllmInstaller(EngineInstaller):
             # Charged together they cannot be acted on.
             for layer, parameters in groups.items():
                 info = LAYERWISE_INFO.get(layer)
+                if not reload and (info is None or info.kernel_tensors is None):
+                    for full_name, leaf in parameters:
+                        target = getattr(layer, leaf)
+                        source = tensors[full_name]
+                        if (
+                            target.device.type == "meta"
+                            or target.shape != source.shape
+                            or target.dtype != source.dtype
+                        ):
+                            raise IncompleteRefit(
+                                "unmanaged streaming parameter has no compatible live storage"
+                            )
+                        target.copy_(source)
+                    continue
                 for full_name, leaf in parameters:
                     setattr(
                         layer,
@@ -319,7 +504,10 @@ class _VllmInstaller(EngineInstaller):
                 if info is not None:
                     info.reset()
 
-        self._reload(load)
+        if reload:
+            self._reload(load)
+        else:
+            load()
 
     @torch.no_grad()
     def _reload(self, load: Callable[[], None]) -> None:
@@ -351,9 +539,11 @@ class _VllmInstaller(EngineInstaller):
         bare_tensors = {
             module: values for module, values in bare_tensors.items() if values
         }
+        aliases = self._parameter_aliases(self._model)
 
         with torch.device(self._device), set_current_vllm_config(self._vllm_config):
             initialize_layerwise_reload(self._model)
+            self._restore_parameter_aliases(aliases)
             _reserve_runtime_buffer_slots(self._model, LAYERWISE_INFO)
             load()
             finalize_layerwise_reload(self._model, self._model_config)
