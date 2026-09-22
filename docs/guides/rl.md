@@ -48,3 +48,7 @@ Direct pulls avoid a trainer-side full-model gather for supported shard layouts,
 The Python package exposes `ModelExpressControlClient`, `ModelExpressTrainerClient`, and `ModelExpressGeneratorClient` through `modelexpress_rl`. [Trainer publication](../../modelexpress_client/python/README.md#rl-trainer-publication) explains the adapter contract; the [S3 refit guide](../S3_DELTA_WEIGHT_REFIT.md) covers checkpoint publication and replay.
 
 Megatron and FSDP/DTensor trainer adapters are present. vLLM has the weight-transfer backend used by the examples. SGLang has a checkpoint installer; it does not currently expose the same direct tensor-refit path. These interfaces still need framework lifecycle hooks and validation for your model, dtype, and parallel layout. The [refit internals](../../modelexpress_client/python/modelexpress/refit/README.md) describe geometry capture and its limits.
+
+## In use: Prime Intellect
+
+In its [GLM-5.2 case study](https://www.primeintellect.ai/blog/nixl-modelexpress-weight-transfer), Prime Intellect reports median pause→update→resume times of **86.1 seconds** for its NCCL gather/broadcast baseline, **9.3 seconds** for ModelExpress + NIXL with its production pause cadence, and **3.9 seconds** after changing vLLM pause synchronization from every 32 waves to every wave. The measurements use 12 DGX H200 nodes and include online FP8 quantization; the post notes that the serving-throughput impact of the faster pause cadence is still being evaluated.

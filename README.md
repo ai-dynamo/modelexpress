@@ -11,6 +11,8 @@ SPDX-License-Identifier: Apache-2.0
 
 ModelExpress (MX) moves model weights between storage, training workers, and inference workers. Use it to start inference replicas from an already-loaded peer or to update rollout workers with new weights during reinforcement learning (RL). It integrates with inference engines; NVIDIA Dynamo is optional.
 
+> **Used by Prime Intellect:** GLM-5.2 RL weight updates in **3.9 seconds** using ModelExpress + NIXL with tuned vLLM pause synchronization. [Read their case study →](https://www.primeintellect.ai/blog/nixl-modelexpress-weight-transfer)
+
 [Get started](#quick-start) · [Documentation](docs/README.md) · [Compatibility](docs/COMPATIBILITY.md) · [Benchmarks](docs/BENCHMARKS.md)
 
 ## What can I do with it?
