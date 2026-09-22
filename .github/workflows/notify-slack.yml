@@ -37,6 +37,26 @@ on:
         required: false
         type: string
         default: prod-modelexpress-default-small-v1
+      always_post:
+        description: >-
+          Post a message even when every job succeeded, so the channel gets one
+          entry per run rather than only on failure.
+        required: false
+        type: boolean
+        default: false
+      mention_always:
+        description: >-
+          Slack mention text prepended to every notification. Full mention
+          syntax, e.g. "<!subteam^S123> <@U456>".
+        required: false
+        type: string
+        default: ''
+      mention_on_failure:
+        description: >-
+          Additional Slack mention text included only when the run is red.
+        required: false
+        type: string
+        default: ''
     secrets:
       SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL:
         required: true
@@ -114,7 +134,7 @@ jobs:
             echo "has_failures=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Notify Slack
+      - name: Notify Slack — failure
         if: steps.failed-jobs.outputs.has_failures == 'true'
         uses: slackapi/slack-github-action@91efab103c0de0a537f72a35f6b8cda0ee76bf0a # v2.1.1
         with:
@@ -134,3 +154,24 @@ jobs:
                 text:
                   type: mrkdwn
                   text: "${{ env.FAILED_JOBS }}"
+              - type: "section"
+                text:
+                  type: mrkdwn
+                  text: "${{ inputs.mention_always }} ${{ inputs.mention_on_failure }} please investigate and post a preliminary debug with clear next steps."
+
+      - name: Notify Slack — success
+        if: ${{ inputs.always_post && steps.failed-jobs.outputs.has_failures != 'true' }}
+        uses: slackapi/slack-github-action@91efab103c0de0a537f72a35f6b8cda0ee76bf0a # v2.1.1
+        with:
+          webhook: ${{ secrets.SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            blocks:
+              - type: "section"
+                text:
+                  type: mrkdwn
+                  text: ":white_check_mark: *ModelExpress ${{ inputs.pipeline_name }} Pipeline Succeeded*"
+              - type: "section"
+                text:
+                  type: mrkdwn
+                  text: "<https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|Workflow Summary> ${{ inputs.mention_always }}"

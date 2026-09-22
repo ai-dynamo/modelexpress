@@ -25,16 +25,16 @@
 #
 #   Stage (Dynamo release.yml pattern; unlike Dynamo, crates and helm are
 #   staged nightly too):
-#     - containers -> nvcr.io/nvstaging/ai-dynamo/
+#     - containers -> nvcr.io/<NGC_PUBLISH_ORG>/ai-dynamo/
 #         modelexpress-server-nightly:<date>-<sha7>  (immutable)
 #         modelexpress-server-nightly:latest         (floating)
 #         modelexpress-server:nightly                (floating)
 #     - wheels + sdist and crates (.crate) -> Artifactory
-#       sw-dynamo-modelexpress-cargo-local/nightly/<date>-<sha7>-<run>-<attempt>/
+#       <ARTIFACTORY_CARGO_REPO_NAME>/nightly/<date>-<sha7>-<run>-<attempt>/
 #       (attempt-unique subfolder computed once in preflight: date-only
 #       versions aren't commit-unique, so same-day runs must not overwrite;
 #       the exact path is forwarded to GitLab as ARTIFACTORY_NIGHTLY_PATH)
-#     - helm chart -> helm.ngc.nvidia.com/nvstaging/ai-dynamo (chartmuseum)
+#     - helm chart -> helm.ngc.nvidia.com/<NGC_PUBLISH_ORG>/ai-dynamo (chartmuseum)
 #     - trigger the internal GitLab release-automation pipeline
 #       (security scans / nSpect / OSRB) with the staged artifact names
 #     - Slack: thread seeded at start, staging status replied on the thread,
@@ -63,12 +63,20 @@
 #     workflow_dispatch is admitted from any branch.
 #
 # Required secrets (see workflow bodies for exact usage):
-#   repo scope:   NGC_API_KEY, HF_TOKEN, AZURE_AKS_CI_KUBECONFIG_B64,
-#                 SLACK_RELEASE_BOT_TOKEN, SLACK_RELEASE_CHANNEL_ID,
-#                 SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL
+#   repo scope:   MX_IMAGE_REPO, NGC_PUBLISH_ORG, NGC_API_KEY, HF_TOKEN,
+#                 AZURE_AKS_CI_KUBECONFIG_B64, SLACK_RELEASE_BOT_TOKEN,
+#                 SLACK_RELEASE_CHANNEL_ID, SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL
+#   MX_IMAGE_REPO and NGC_PUBLISH_ORG cannot be environment-scoped:
+#   build-server-image and package-helm-chart read them and declare no
+#   environment.
 #   automated-release environment: ARTIFACTORY_URL, ARTIFACTORY_TOKEN,
-#                 ARTIFACTORY_PYPI_REPO_NAME, NGC_PUBLISH_USERNAME,
-#                 NGC_PUBLISH_TOKEN, GITLAB_PIPELINE_URL, GITLAB_TRIGGER_TOKEN
+#                 ARTIFACTORY_PYPI_REPO_NAME, ARTIFACTORY_CARGO_REPO_NAME,
+#                 NGC_PUBLISH_USERNAME, NGC_PUBLISH_TOKEN,
+#                 GITLAB_PIPELINE_URL, GITLAB_TRIGGER_TOKEN
+# Required vars (Slack mention text, full mention syntax e.g.
+#   "<!subteam^S123>" for a user group or "<@U456>" for a user/bot):
+#   SLACK_MENTION_OPS_SUPPORT, SLACK_MENTION_DYNAMO_BOT  — on every message
+#   SLACK_MENTION_MX_DEV_TEAM                            — added when red
 # Optional vars: GITLAB_RELEASE_AUTOMATION_REF (defaults to main)
 
 name: ModelExpress Nightly CI
@@ -76,18 +84,15 @@ name: ModelExpress Nightly CI
 on:
   schedule:
     - cron: '0 9 * * *'   # 09:00 UTC = 01:00 PST daily
-  # PR validation for the nightly-specific build lanes. copy-pr-bot pushes to
-  # pull-request/<N> are admitted by the velonix runner rules (dev/feature
-  # branches are not). These runs are build-only: preflight forces
-  # release=false and run_tests=false, because staging from PR content is
-  # forbidden and the test suites already run on this same commit via their
-  # own PR triggers (ci.yml, modelexpress-ci-tests.yml, build-wheels.yml).
-  # What a PR run adds is exactly what no other PR workflow covers: the
-  # production server image on both arches, the multi-arch manifest, crate
-  # packaging, and the stamped helm chart with its image-coherence check.
+  # copy-pr-bot pushes to pull-request/<N> are the only push refs the velonix
+  # runners admit; dev and feature branches are rejected at the admission hook.
+  # TEMPORARY(test): pinned to this PR's mirror branch and running in release
+  # mode so the full staging path can be rehearsed before merge, behind the
+  # manual-release-approval gate. Before merge, restore this to
+  # "pull-request/[0-9]+" and restore the build-only forcing in preflight.
   push:
     branches:
-      - "pull-request/[0-9]+"
+      - "pull-request/603"
   workflow_dispatch:
     inputs:
       release:
@@ -120,17 +125,15 @@ permissions:
 # must never starve the cron. Shared state is safe by construction instead:
 # every tag/path/name this workflow writes is either immutable per commit or
 # run-unique, and floating-tag moves are last-writer-wins by design.
+# TEMPORARY(test): pull-request/603 now runs in release mode and can park on
+# the approval gate, so every event gets a run-unique group — the shared
+# per-branch push group would let the next push cancel a run awaiting a
+# reviewer. Restore the push branch to the shared group before merge.
 concurrency:
-  group: >-
-    ${{ github.event_name == 'push'
-        && format('nightly-ci-{0}', github.ref_name)
-        || format('nightly-ci-{0}-{1}', github.run_id, github.run_attempt) }}
-  cancel-in-progress: ${{ github.event_name == 'push' }}
+  group: nightly-ci-${{ github.run_id }}-${{ github.run_attempt }}
+  cancel-in-progress: false
 
 env:
-  MX_IMAGE_REPO: nvcr.io/0980761089281446
-  NGC_STAGING_ORG: nvstaging
-  ARTIFACTORY_NIGHTLY_REPO: sw-dynamo-modelexpress-cargo-local
   ARTIFACTORY_NIGHTLY_FOLDER: nightly
 
 jobs:
@@ -217,12 +220,12 @@ jobs:
               RELEASE=true
               ;;
             push)
-              # PR-mirror push: validate the nightly-only build lanes.
-              # Tests and wheels already run on this exact commit through
-              # their own PR triggers; running them again here would double
-              # the GPU matrix and the builder load for zero new signal.
-              RELEASE=false
-              RUN_TESTS=false
+              # TEMPORARY(test): the pinned pull-request/603 mirror rehearses
+              # the full staging path behind manual-release-approval. Restore
+              # RELEASE=false / RUN_TESTS=false before merge so PR-mirror runs
+              # are build-only again.
+              RELEASE=true
+              RUN_TESTS=true
               ;;
             workflow_dispatch)
               RELEASE="${DISPATCH_RELEASE}"
@@ -233,14 +236,14 @@ jobs:
           # Staging is only ever legitimate from main (the real nightly) or
           # from the temporary development branch. Without this, a dispatch
           # from a release/* or feature branch would silently repoint the
-          # shared floating nvstaging tags at older or unrelated code.
+          # shared floating staging-org tags at older or unrelated code.
           # The dev branch is TEMPORARY(test): it lets a workflow_dispatch
           # with release=true exercise the full staging path (behind the
           # manual-release-approval gate) before merge. Remove it from this
           # allowlist when the branch merges.
           if [ "${RELEASE}" = "true" ]; then
             case "${REF}" in
-              refs/heads/main|refs/heads/pvijayakrish/mx-nightly-ci) ;;
+              refs/heads/main|refs/heads/pvijayakrish/mx-nightly-ci|refs/heads/pull-request/603) ;;
               *)
                 echo "::error::release mode requested from ${REF}; staging is only permitted from refs/heads/main (or the temporary development branch)."
                 exit 1
@@ -254,20 +257,26 @@ jobs:
           } | tee -a "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
-  # Human gate for manual releases. Scheduled runs skip it (downstream release
-  # jobs accept the `skipped` result); a workflow_dispatch with release=true
-  # pauses here until a reviewer of the manual-release-approval environment
-  # approves.
+  # Human gate for every release run that is not an unattended scheduled first
+  # attempt. Any other trigger, and any re-run of the cron, stops here until a
+  # required reviewer of the manual-release-approval environment approves.
+  # The approved attempt number is published so downstream jobs can bind to it:
+  # "Re-run failed jobs" cannot revive a skipped approval, so the gate fails
+  # closed and a re-run needs "Re-run all jobs".
   # ---------------------------------------------------------------------------
   manual-release-approval:
     name: Manual release approval
     runs-on: prod-modelexpress-default-small-v1
     needs: [preflight]
-    if: ${{ github.event_name == 'workflow_dispatch' && needs.preflight.outputs.release == 'true' }}
+    if: >-
+      ${{ needs.preflight.outputs.release == 'true' &&
+          (github.event_name != 'schedule' || github.run_attempt != '1') }}
     environment: manual-release-approval
     timeout-minutes: 20
     permissions:
       contents: read
+    outputs:
+      approved_attempt: ${{ steps.approval.outputs.run_attempt }}
     steps:
       - name: Assert the approval environment is actually protected
         # GitHub AUTO-CREATES a referenced environment with no protection
@@ -302,7 +311,10 @@ jobs:
           fi
 
       - name: Approved
-        run: echo "Manual release approved for ${{ needs.preflight.outputs.nightly_tag }}"
+        id: approval
+        run: |
+          echo "Manual release approved for ${{ needs.preflight.outputs.nightly_tag }}"
+          echo "run_attempt=${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
   # Seed the nightly Slack thread; downstream staging jobs and the GitLab
@@ -314,7 +326,10 @@ jobs:
     runs-on: prod-modelexpress-default-small-v1
     timeout-minutes: 10
     needs: [preflight]
-    if: ${{ needs.preflight.outputs.release == 'true' }}
+    # Every run, not just release runs: this thread is the anchor that the
+    # staging reply, the GitLab handoff reply and the GitLab pipeline itself
+    # all post into, so it has to exist before any of them run.
+    if: ${{ !cancelled() && needs.preflight.result == 'success' }}
     outputs:
       thread_ts: ${{ steps.post.outputs.thread_ts }}
     steps:
@@ -327,6 +342,7 @@ jobs:
           NIGHTLY_TAG: ${{ needs.preflight.outputs.nightly_tag }}
           WHEEL_VERSION: ${{ needs.preflight.outputs.wheel_version }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MENTION: ${{ vars.SLACK_MENTION_OPS_SUPPORT }} ${{ vars.SLACK_MENTION_DYNAMO_BOT }}
         run: |
           set -euo pipefail
           PAYLOAD=$(jq -n \
@@ -334,6 +350,7 @@ jobs:
             --arg tag     "${NIGHTLY_TAG}" \
             --arg wheel   "${WHEEL_VERSION}" \
             --arg run_url "${RUN_URL}" \
+            --arg mention "${MENTION}" \
             '{
               channel: $channel,
               text: ("ModelExpress Nightly build started — " + $tag),
@@ -346,7 +363,7 @@ jobs:
                     { type: "mrkdwn", text: ("*Wheel version:*\n`" + $wheel + "`") }
                   ] },
                 { type: "context",
-                  elements: [ { type: "mrkdwn", text: ("<" + $run_url + "|GitHub Actions run>") } ] }
+                  elements: [ { type: "mrkdwn", text: ("<" + $run_url + "|GitHub Actions run> " + $mention) } ] }
               ]
             }')
           RESPONSE=$(curl -fsSL -X POST https://slack.com/api/chat.postMessage \
@@ -426,7 +443,7 @@ jobs:
         # out of the shared ~/.docker/config.json on the persistent builder.
         run: |
           echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-build-${{ matrix.arch }}" >> "$GITHUB_ENV"
-          echo "SERVER_IMAGE=${{ env.MX_IMAGE_REPO }}/modelexpress-server:${{ needs.preflight.outputs.nightly_tag }}-${{ matrix.arch }}" >> "$GITHUB_ENV"
+          echo "SERVER_IMAGE=${{ secrets.MX_IMAGE_REPO }}/modelexpress-server:${{ needs.preflight.outputs.nightly_tag }}-${{ matrix.arch }}" >> "$GITHUB_ENV"
 
       - name: Log in to image registry
         run: |
@@ -483,7 +500,7 @@ jobs:
 
       - name: Create multi-arch manifest
         env:
-          REPO: ${{ env.MX_IMAGE_REPO }}/modelexpress-server
+          REPO: ${{ secrets.MX_IMAGE_REPO }}/modelexpress-server
           TAG: ${{ needs.preflight.outputs.nightly_tag }}
         run: |
           # Immutable date-sha tag only. The floating :nightly tag is moved by
@@ -513,22 +530,25 @@ jobs:
     # runs immediately; on a release=true dispatch it waits for the reviewer,
     # and a rejection skips it — no wheels reach Artifactory unapproved.
     needs: [preflight, manual-release-approval]
-    # Skipped on PR-mirror pushes: build-wheels.yml already runs directly on
-    # the same push event (its own trigger) and uploads the PR wheels — a
-    # second dev-versioned build here would double both arch builders' load.
+    # TEMPORARY(test): the `github.event_name != 'push'` exclusion is lifted so
+    # the pinned pull-request/603 rehearsal exercises the nightly wheel lane
+    # and, through it, the GitLab handoff. Restore the exclusion before merge —
+    # build-wheels.yml already runs standalone on the same push event, so
+    # leaving this on doubles both arch builders for no PR signal.
     if: >-
       ${{ !cancelled() &&
-          github.event_name != 'push' &&
           needs.preflight.result == 'success' &&
-          (needs.manual-release-approval.result == 'success' || needs.manual-release-approval.result == 'skipped') }}
+          ((github.event_name == 'schedule' && github.run_attempt == '1') ||
+           (needs.manual-release-approval.result == 'success' &&
+            needs.manual-release-approval.outputs.approved_attempt == github.run_attempt)) }}
     uses: ./.github/workflows/build-wheels.yml
     with:
       wheel_version: ${{ needs.preflight.outputs.wheel_version }}
-      # The env context is unavailable in a reusable-call `with:`, so the repo
-      # name is a literal here (kept in sync with ARTIFACTORY_NIGHTLY_REPO).
+      # Neither env nor secrets is available in a reusable-call `with:`, so the
+      # callee resolves the repo name from its own secret.
       # The path comes from preflight so every uploader and the GitLab handoff
       # agree on one attempt-unique folder.
-      upload_repo: sw-dynamo-modelexpress-cargo-local
+      use_nightly_repo: true
       upload_prefix: ${{ needs.preflight.outputs.artifactory_path }}
       skip_upload: ${{ needs.preflight.outputs.release != 'true' }}
     secrets: inherit
@@ -549,7 +569,9 @@ jobs:
     if: >-
       ${{ !cancelled() &&
           needs.preflight.result == 'success' &&
-          (needs.manual-release-approval.result == 'success' || needs.manual-release-approval.result == 'skipped') }}
+          ((github.event_name == 'schedule' && github.run_attempt == '1') ||
+           (needs.manual-release-approval.result == 'success' &&
+            needs.manual-release-approval.outputs.approved_attempt == github.run_attempt)) }}
     # Only claim the credential-bearing environment when the run will actually
     # upload; a build-only dispatch validates packaging without holding
     # ARTIFACTORY_TOKEN.
@@ -591,14 +613,6 @@ jobs:
           echo "staged_crates=${STAGED}" >> "$GITHUB_OUTPUT"
           exit "${rc}"
 
-      - name: Upload crate artifacts
-        if: always() && steps.package.outputs.staged_crates != ''
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: modelexpress-crates-${{ needs.preflight.outputs.nightly_tag }}
-          path: crate-dist/*.crate
-          retention-days: 30
-
       # Fail-soft upload: runs even after a partial package failure so
       # staged_crates stays truthful (whatever was packaged is actually on
       # Artifactory); the job still exits red via the package step.
@@ -619,8 +633,13 @@ jobs:
               steps.package.outputs.staged_crates != '' }}
         env:
           ARTIFACTORY_PATH: ${{ needs.preflight.outputs.artifactory_path }}
+          ARTIFACTORY_NIGHTLY_REPO: ${{ secrets.ARTIFACTORY_CARGO_REPO_NAME }}
         run: |
           set -euo pipefail
+          if [ -z "${ARTIFACTORY_NIGHTLY_REPO}" ]; then
+            echo "::error::ARTIFACTORY_CARGO_REPO_NAME is not set; refusing to upload to an empty repository path"
+            exit 1
+          fi
           # Attempt-unique folder computed once in preflight, shared with the
           # wheel upload and forwarded to GitLab.
           DEST="${ARTIFACTORY_NIGHTLY_REPO}/${ARTIFACTORY_PATH}/"
@@ -628,10 +647,8 @@ jobs:
           jf rt upload --fail-no-op --flat "crate-dist/*.crate" "${DEST}"
 
   # ---------------------------------------------------------------------------
-  # Helm chart — lint + package with a semver prerelease version. Kept as a
-  # run artifact; the release-gated stage-helm-ngc job pushes it to the NGC
-  # staging org's helm registry (a deliberate deviation from Dynamo, which
-  # skips chart staging on nightly).
+  # Helm chart — lint + package with a semver prerelease version. Runs on
+  # every event and keeps nothing; stage-helm-ngc rebuilds and pushes it.
   # ---------------------------------------------------------------------------
   package-helm-chart:
     name: Package helm chart
@@ -655,70 +672,12 @@ jobs:
           install "${RUNNER_TEMP}/linux-amd64/helm" "${RUNNER_TEMP}/bin/helm"
           echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
 
-      - name: Stamp nightly image coordinates
-        # The checked-in values.yaml points at the PUBLIC GA image
-        # (nvcr.io/nvidia/ai-dynamo/modelexpress-server:<GA tag>). Packaging
-        # the chart unchanged would publish a "nightly" chart that deploys
-        # released code — the chart and the image it references must move
-        # together. Rewrite both coordinates to tonight's staged image.
-        env:
-          NIGHTLY_TAG: ${{ needs.preflight.outputs.nightly_tag }}
-        run: |
-          set -euo pipefail
-          NIGHTLY_REPO="nvcr.io/${NGC_STAGING_ORG}/ai-dynamo/modelexpress-server-nightly"
-          # Only values.yaml ships inside the packaged chart; the values-*.yaml
-          # overlays are deploy-time inputs and are intentionally untouched.
-          python3 - "$NIGHTLY_REPO" "$NIGHTLY_TAG" <<'PY'
-          import re, sys
-          repo, tag = sys.argv[1], sys.argv[2]
-          p = "helm/values.yaml"
-          s = open(p).read()
-          s, nrepo = re.subn(r'(?m)^(\s*repository:\s*).*$', lambda m: m.group(1) + repo, s, count=1)
-          s, ntag = re.subn(r'(?m)^(\s*tag:\s*).*$', lambda m: m.group(1) + '"%s"' % tag, s, count=1)
-          if nrepo != 1 or ntag != 1:
-              sys.exit("::error::failed to stamp image coordinates into helm/values.yaml "
-                       f"(repository matches={nrepo}, tag matches={ntag})")
-          open(p, "w").write(s)
-          PY
-          grep -A3 '^image:' helm/values.yaml
-
-      - name: Lint and package chart
-        env:
-          CHART_VERSION: ${{ needs.preflight.outputs.chart_version }}
-          APP_VERSION: ${{ needs.preflight.outputs.nightly_tag }}
-        run: |
-          set -euo pipefail
-          helm lint helm/
-          mkdir -p chart-dist
-          helm package helm/ \
-            --version "${CHART_VERSION}" \
-            --app-version "${APP_VERSION}" \
-            --destination chart-dist/
-          ls -la chart-dist/
-
-      - name: Verify the rendered chart references the nightly image
+      - name: Stamp, lint, package and verify the chart
         env:
           NIGHTLY_TAG: ${{ needs.preflight.outputs.nightly_tag }}
           CHART_VERSION: ${{ needs.preflight.outputs.chart_version }}
-        run: |
-          set -euo pipefail
-          EXPECTED="nvcr.io/${NGC_STAGING_ORG}/ai-dynamo/modelexpress-server-nightly:${NIGHTLY_TAG}"
-          RENDERED=$(helm template mx "chart-dist/modelexpress-${CHART_VERSION}.tgz" | grep -E '^\s+image:' | head -1)
-          echo "rendered: ${RENDERED}"
-          case "${RENDERED}" in
-            *"${EXPECTED}"*) echo "chart/image coherence OK" ;;
-            *)
-              echo "::error::packaged chart does not reference ${EXPECTED}"
-              exit 1
-              ;;
-          esac
-
-      - name: Upload chart artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: modelexpress-helm-chart-${{ needs.preflight.outputs.nightly_tag }}
-          path: chart-dist/*.tgz
-          retention-days: 30
+          NGC_STAGING_ORG: ${{ secrets.NGC_PUBLISH_ORG }}
+        run: bash .github/scripts/package_helm_chart.sh
 
   # ---------------------------------------------------------------------------
   # Push the packaged chart to the NGC staging org's helm registry (Dynamo's
@@ -730,24 +689,27 @@ jobs:
     # Also needs the image staging: the chart is stamped to reference
     # modelexpress-server-nightly:<tag>, and a chartmuseum push is immutable
     # (no --force). Publishing the chart when the image never reached
-    # nvstaging would permanently pin a chart version to a nonexistent image.
+    # the staging org would permanently pin a chart version to a missing image.
     needs: [preflight, package-helm-chart, stage-containers-ngc, manual-release-approval]
     if: >-
       ${{ !cancelled() &&
           needs.preflight.outputs.release == 'true' &&
           needs.package-helm-chart.result == 'success' &&
           needs.stage-containers-ngc.result == 'success' &&
-          (needs.manual-release-approval.result == 'success' || needs.manual-release-approval.result == 'skipped') }}
+          ((github.event_name == 'schedule' && github.run_attempt == '1') ||
+           (needs.manual-release-approval.result == 'success' &&
+            needs.manual-release-approval.outputs.approved_attempt == github.run_attempt)) }}
     environment: automated-release
     timeout-minutes: 20
     outputs:
       staged_helm: ${{ steps.push.outputs.staged_helm }}
     steps:
-      - name: Download chart artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      # The chart is rebuilt here, not downloaded: MX artifacts never pass
+      # through GitHub artifact storage.
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          name: modelexpress-helm-chart-${{ needs.preflight.outputs.nightly_tag }}
-          path: chart-dist
+          persist-credentials: false
 
       - name: Install helm
         run: |
@@ -759,6 +721,13 @@ jobs:
           curl -fsSL https://get.helm.sh/helm-v3.20.0-linux-amd64.tar.gz | tar xz -C "${RUNNER_TEMP}"
           install "${RUNNER_TEMP}/linux-amd64/helm" "${RUNNER_TEMP}/bin/helm"
           echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
+
+      - name: Stamp, lint, package and verify the chart
+        env:
+          NIGHTLY_TAG: ${{ needs.preflight.outputs.nightly_tag }}
+          CHART_VERSION: ${{ needs.preflight.outputs.chart_version }}
+          NGC_STAGING_ORG: ${{ secrets.NGC_PUBLISH_ORG }}
+        run: bash .github/scripts/package_helm_chart.sh
 
       - name: Push chart to NGC helm registry
         id: push
@@ -772,6 +741,7 @@ jobs:
           # builder, even when cm-push fails mid-script.
           HELM_CONFIG_HOME: ${{ runner.temp }}/helm-config
           HELM_PLUGINS: ${{ runner.temp }}/helm-config/plugins
+          NGC_STAGING_ORG: ${{ secrets.NGC_PUBLISH_ORG }}
         run: |
           set -euo pipefail
           REPO_ALIAS="ngc-staging-modelexpress"
@@ -812,7 +782,9 @@ jobs:
       ${{ !cancelled() &&
           needs.preflight.outputs.release == 'true' &&
           needs.assemble-server-manifest.result == 'success' &&
-          (needs.manual-release-approval.result == 'success' || needs.manual-release-approval.result == 'skipped') }}
+          ((github.event_name == 'schedule' && github.run_attempt == '1') ||
+           (needs.manual-release-approval.result == 'success' &&
+            needs.manual-release-approval.outputs.approved_attempt == github.run_attempt)) }}
     environment: automated-release
     timeout-minutes: 45
     permissions:
@@ -837,10 +809,11 @@ jobs:
       - name: Stage to NGC staging org
         id: stage
         env:
-          SRC_REPO: ${{ env.MX_IMAGE_REPO }}/modelexpress-server
+          SRC_REPO: ${{ secrets.MX_IMAGE_REPO }}/modelexpress-server
           NGC_PUBLISH_USERNAME: ${{ secrets.NGC_PUBLISH_USERNAME }}
           NGC_PUBLISH_TOKEN: ${{ secrets.NGC_PUBLISH_TOKEN }}
           NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
+          NGC_STAGING_ORG: ${{ secrets.NGC_PUBLISH_ORG }}
           TAG: ${{ needs.preflight.outputs.nightly_tag }}
         run: |
           set -euo pipefail
@@ -906,7 +879,8 @@ jobs:
       - name: Cleanup local images and credentials
         if: always()
         env:
-          SRC_REPO: ${{ env.MX_IMAGE_REPO }}/modelexpress-server
+          SRC_REPO: ${{ secrets.MX_IMAGE_REPO }}/modelexpress-server
+          NGC_STAGING_ORG: ${{ secrets.NGC_PUBLISH_ORG }}
           TAG: ${{ needs.preflight.outputs.nightly_tag }}
         run: |
           for ARCH in amd64 arm64; do
@@ -989,13 +963,19 @@ jobs:
       contents: read
     steps:
       - name: Trigger GitLab pipeline
+        id: trigger
         env:
           # Both from the automated-release environment; the URL is a secret
           # so the internal host stays masked and rotatable.
           GITLAB_TRIGGER_URL: ${{ secrets.GITLAB_PIPELINE_URL }}
           GITLAB_TRIGGER_TOKEN: ${{ secrets.GITLAB_TRIGGER_TOKEN }}
           GITLAB_REF: ${{ vars.GITLAB_RELEASE_AUTOMATION_REF || 'main' }}
+          # Sonar files the analysis under this branch; it must track the ref
+          # actually built, not a fixed name.
+          SONAR_BRANCH: ${{ github.ref_name }}
           ARTIFACTORY_PATH: ${{ needs.preflight.outputs.artifactory_path }}
+          ARTIFACTORY_NIGHTLY_REPO: ${{ secrets.ARTIFACTORY_CARGO_REPO_NAME }}
+          NGC_STAGING_ORG: ${{ secrets.NGC_PUBLISH_ORG }}
           NIGHTLY_TAG: ${{ needs.preflight.outputs.nightly_tag }}
           WHEEL_VERSION: ${{ needs.preflight.outputs.wheel_version }}
           CRATE_VERSION: ${{ needs.preflight.outputs.crate_version }}
@@ -1009,6 +989,10 @@ jobs:
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_RELEASE_CHANNEL_ID }}
         run: |
           set -euo pipefail
+          if [ -z "${ARTIFACTORY_NIGHTLY_REPO}" ]; then
+            echo "::error::ARTIFACTORY_CARGO_REPO_NAME is not set; GitLab would receive an empty artifact path"
+            exit 1
+          fi
 
           # Crates/helm are best-effort lanes: only declare what actually
           # staged, so the GitLab scan never chases phantom artifacts.
@@ -1047,6 +1031,8 @@ jobs:
             --form "variables[PIPELINE_TYPE]=security" \
             --form "variables[RELEASE_TYPE]=nightly" \
             --form "variables[ARTIFACTS]=${ARTIFACTS}" \
+            --form "variables[SONAR_BRANCH]=${SONAR_BRANCH}" \
+            --form "variables[CONTAINER_IMAGE]=nvcr.io/${NGC_STAGING_ORG}/ai-dynamo/${STAGED_CONTAINERS}" \
             --form "variables[ARTIFACTORY_NIGHTLY_REPO]=${ARTIFACTORY_NIGHTLY_REPO}" \
             --form "variables[ARTIFACTORY_NIGHTLY_PATH]=${ARTIFACTORY_PATH}" \
             --form "variables[NGC_STAGING_ORG]=${NGC_STAGING_ORG}" \
@@ -1067,6 +1053,12 @@ jobs:
           # which the secret URL exists to keep out of public logs.
           PIPELINE_ID=$(echo "${RESPONSE}" | jq -r '.id // "unknown"')
           PIPELINE_STATUS=$(echo "${RESPONSE}" | jq -r '.status // "unknown"')
+          # Must stay above the status gate below, which can exit non-zero.
+          {
+            echo "pipeline_id=${PIPELINE_ID}"
+            echo "pipeline_status=${PIPELINE_STATUS}"
+            echo "artifacts=${ARTIFACTS}"
+          } >> "$GITHUB_OUTPUT"
           echo "Triggered GitLab pipeline id: ${PIPELINE_ID} (status: ${PIPELINE_STATUS})"
           {
             echo "### GitLab release-automation"
@@ -1086,6 +1078,58 @@ jobs:
               exit 1
               ;;
           esac
+
+      - name: Post GitLab trigger reply on Slack thread
+        if: ${{ !cancelled() && needs.notify-slack-start.outputs.thread_ts != '' }}
+        continue-on-error: true
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_RELEASE_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_RELEASE_CHANNEL_ID }}
+          SLACK_THREAD_TS: ${{ needs.notify-slack-start.outputs.thread_ts }}
+          NIGHTLY_TAG: ${{ needs.preflight.outputs.nightly_tag }}
+          PIPELINE_ID: ${{ steps.trigger.outputs.pipeline_id }}
+          PIPELINE_STATUS: ${{ steps.trigger.outputs.pipeline_status }}
+          ARTIFACTS: ${{ steps.trigger.outputs.artifacts }}
+          # The step runs on the failure path too, where the outputs above are
+          # empty; the headline must follow the outcome, not assume success.
+          TRIGGER_OUTCOME: ${{ steps.trigger.outcome }}
+        run: |
+          set -euo pipefail
+          if [ "${TRIGGER_OUTCOME}" = "success" ]; then
+            HEADLINE=":rocket: *GitLab release-automation triggered*"
+          else
+            HEADLINE=":x: *GitLab release-automation handoff FAILED* — staged artifacts are not being scanned"
+          fi
+          # Report the id only; web_url embeds the internal host.
+          PAYLOAD=$(jq -n \
+            --arg channel   "${SLACK_CHANNEL_ID}" \
+            --arg thread_ts "${SLACK_THREAD_TS}" \
+            --arg headline  "${HEADLINE}" \
+            --arg pid       "${PIPELINE_ID:-none}" \
+            --arg status    "${PIPELINE_STATUS:-not created}" \
+            --arg artifacts "${ARTIFACTS:-none}" \
+            --arg tag       "${NIGHTLY_TAG}" \
+            '{
+              channel: $channel,
+              thread_ts: $thread_ts,
+              text: ($headline + " — pipeline " + $pid),
+              blocks: [
+                { type: "section",
+                  text: { type: "mrkdwn",
+                          text: ($headline + "\n pipeline `" + $pid + "` (" + $status + ")") } },
+                { type: "context",
+                  elements: [ { type: "mrkdwn",
+                                text: ("Nightly tag: `" + $tag + "` — artifacts: `" + $artifacts + "`") } ] }
+              ]
+            }')
+          RESPONSE=$(curl -fsSL -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H "Content-type: application/json; charset=utf-8" \
+            --data "${PAYLOAD}")
+          if [ "$(echo "${RESPONSE}" | jq -r '.ok')" != "true" ]; then
+            echo "::warning::Slack reply failed: $(echo "${RESPONSE}" | jq -r '.error // "unknown"')"
+            exit 1
+          fi
 
   # ---------------------------------------------------------------------------
   # Umbrella status (mirrors ci-status-check): one job to point dashboards and
@@ -1152,17 +1196,14 @@ jobs:
   # webhook. Runs every night; posts only when something actually failed.
   # ---------------------------------------------------------------------------
   notify-slack-failure:
-    name: Notify Slack — failures
+    name: Notify Slack — run status
     # Depends on the umbrella job rather than running beside it: nightly-status
     # already needs every other job, and waiting for it means (a) its own
     # conclusion is visible to the jobs API query, and (b) its verdict — which
     # catches red states the API cannot see, like a release-mandatory job that
     # was skipped — can force the alert.
-    # Not on PR-mirror pushes: a failing PR validation shows up on the PR
-    # itself; paging the nightly channel for every red PR push is noise that
-    # trains people to ignore the real 09:00 alert.
     needs: [nightly-status]
-    if: ${{ always() && github.event_name != 'push' }}
+    if: ${{ always() }}
     uses: ./.github/workflows/notify-slack.yml
     permissions:
       contents: read
@@ -1170,4 +1211,13 @@ jobs:
     with:
       pipeline_name: Nightly
       force_alert: ${{ needs.nightly-status.result != 'success' }}
+      # One channel message per run, green or red.
+      always_post: true
+      mention_always: ${{ vars.SLACK_MENTION_OPS_SUPPORT }} ${{ vars.SLACK_MENTION_DYNAMO_BOT }}
+      mention_on_failure: ${{ vars.SLACK_MENTION_MX_DEV_TEAM }}
+      # continue-on-error jobs still report conclusion "failure" to the jobs
+      # API, so every allowed-to-fail job must be listed here or it alerts.
+      ignored_jobs: |
+        Test Suite (nightly)
+        staging status
     secrets: inherit
