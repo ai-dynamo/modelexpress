@@ -84,6 +84,23 @@ examples/rl/miles_m2n_collective/microbench/run_microbench.sh gpu \
   --allow-large-profile
 ```
 
+`qwen-2.5-3b-pp4-production` is the source-derived 434-tensor,
+6,171,877,376-byte Qwen2.5-3B layout used by the PP4 production path. It assigns
+the embedding and layers 0-8 to rank 0, layers 9-17 to rank 1, layers 18-26 to
+rank 2, and layers 27-35 plus the final norm to rank 3. Bucket groups never
+cross those PP owners. The profile records that its names, shapes, order, and
+ownership are source-derived; runtime logs attest the count and model
+configuration but do not serialize the complete production plan.
+
+```bash
+M2N_MB_PARTITIONS=4 \
+M2N_MB_FANOUT=4 \
+M2N_MB_OUT=/workspace/results/m2n-pp4.json \
+examples/rl/miles_m2n_collective/microbench/run_microbench.sh gpu \
+  --profile qwen-2.5-3b-pp4-production \
+  --allow-large-profile
+```
+
 The supported source partition counts are `1`, `2`, and `4`; fanout values are
 `1`, `2`, `4`, and `8`; stream counts are `1`, `2`, and `4`. Grouping can be
 `singleton`, `layer`, or `bucket`; drains can be `per-tensor`, `per-group`, or
@@ -102,3 +119,27 @@ includes the case/manifest/plan fingerprints, imported-module provenance,
 loaded NCCL, CUDA/driver, per-rank GPU identity, topology, immutable run UUID
 and UTC start, VRAM envelope/preflight, high-resolution elapsed time, logical
 throughput, delivered effective bandwidth, and per-rank issue/drain counts.
+
+## Native broadcast transport loop
+
+`native_broadcast_microbench.py` calls the production MILES
+`update_weights_from_distributed` sender with the gathered 434-tensor Bridge
+export order and four receiver ranks. It packs indivisible Bridge source units
+into the current 512 MiB MILES buckets, verifies exact bytes on every rank, and
+requires its JSON result to use an absolute persistent path.
+
+The receiver ranks deliberately mirror the NCCL broadcast loop and use
+validating in-process metadata clients. This isolates the native sender
+transport loop; it does not include real HTTP, SGLang allocation or
+`model.load_weights`, Megatron PP export, or the MILES pause-to-resume session.
+Do not compare its timing directly with an application end-to-end update.
+
+```bash
+export NCCL_CUMEM_ENABLE=1
+
+torchrun --standalone --nproc_per_node=5 \
+  examples/rl/miles_m2n_collective/microbench/native_broadcast_microbench.py \
+  --output /workspace/results/native-broadcast.json \
+  --warmup 2 \
+  --repetitions 10
+```

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import sys
@@ -52,6 +53,137 @@ def test_qwen_3b_manifest_preserves_count_and_embedding_bytes():
     assert embedding.shape == (151_936, 2_048)
     assert embedding.bytes == 622_329_856
     assert sum(item.bytes for item in manifest) == 6_171_702_272
+
+
+def test_qwen_3b_pp4_production_manifest_matches_canonical_hf_layout():
+    manifest = microbench.manifest_for("qwen-2.5-3b-pp4-production")
+
+    expected = [("model.embed_tokens.weight", (151_936, 2_048))]
+    for layer in range(36):
+        prefix = f"model.layers.{layer}"
+        expected.extend(
+            (
+                (f"{prefix}.post_attention_layernorm.weight", (2_048,)),
+                (f"{prefix}.mlp.gate_proj.weight", (11_008, 2_048)),
+                (f"{prefix}.mlp.up_proj.weight", (11_008, 2_048)),
+                (f"{prefix}.mlp.down_proj.weight", (2_048, 11_008)),
+                (f"{prefix}.self_attn.o_proj.weight", (2_048, 2_048)),
+                (f"{prefix}.self_attn.q_proj.bias", (2_048,)),
+                (f"{prefix}.self_attn.k_proj.bias", (256,)),
+                (f"{prefix}.self_attn.v_proj.bias", (256,)),
+                (f"{prefix}.input_layernorm.weight", (2_048,)),
+                (f"{prefix}.self_attn.q_proj.weight", (2_048, 2_048)),
+                (f"{prefix}.self_attn.k_proj.weight", (256, 2_048)),
+                (f"{prefix}.self_attn.v_proj.weight", (256, 2_048)),
+            )
+        )
+    expected.append(("model.norm.weight", (2_048,)))
+
+    assert len(manifest) == 434
+    assert sum(item.bytes for item in manifest) == 6_171_877_376
+    assert [(item.name, item.shape) for item in manifest] == expected
+
+
+def test_qwen_3b_pp4_production_uses_contiguous_pipeline_ownership():
+    case = _case(
+        profile="qwen-2.5-3b-pp4-production",
+        source_partitions=4,
+    )
+    entries = microbench.build_entries(case, microbench.manifest_for(case.profile))
+
+    assert [
+        sum(entry.partition_id == partition for entry in entries)
+        for partition in range(4)
+    ] == [109, 108, 108, 109]
+    assert [
+        sum(entry.tensor.bytes for entry in entries if entry.partition_id == partition)
+        for partition in range(4)
+    ] == [2_009_715_712, 1_387_385_856, 1_387_385_856, 1_387_389_952]
+    assert (
+        next(
+            entry
+            for entry in entries
+            if entry.tensor.name == "model.embed_tokens.weight"
+        ).partition_id
+        == 0
+    )
+    assert (
+        next(
+            entry for entry in entries if entry.tensor.name == "model.norm.weight"
+        ).partition_id
+        == 3
+    )
+    for entry in entries:
+        if entry.tensor.layer is not None:
+            assert entry.partition_id == entry.tensor.layer // 9
+
+
+def test_qwen_3b_pp4_production_bucket_groups_do_not_cross_pp_owners():
+    case = _case(
+        profile="qwen-2.5-3b-pp4-production",
+        source_partitions=4,
+        schedule="synthetic",
+        grouping="bucket",
+        bucket_bytes=512 * 1024 * 1024,
+        drain="per-group",
+    )
+    entries = microbench.build_entries(case, microbench.manifest_for(case.profile))
+    group_partitions = {
+        group_id: {
+            entry.partition_id for entry in entries if entry.group_id == group_id
+        }
+        for group_id in {entry.group_id for entry in entries}
+    }
+
+    assert len(group_partitions) == 13
+    assert all(len(partitions) == 1 for partitions in group_partitions.values())
+    assert [
+        len({entry.group_id for entry in entries if entry.partition_id == partition})
+        for partition in range(4)
+    ] == [4, 3, 3, 3]
+
+
+def test_qwen_3b_pp4_production_requires_four_source_partitions():
+    with pytest.raises(ValueError, match="requires source_partitions=4"):
+        microbench.run_mock(
+            _case(
+                profile="qwen-2.5-3b-pp4-production",
+                source_partitions=2,
+            )
+        )
+
+
+def test_qwen_3b_pp4_production_report_records_source_faithful_provenance():
+    report = microbench.run_mock(
+        _case(
+            profile="qwen-2.5-3b-pp4-production",
+            source_partitions=4,
+            warmup=0,
+            repetitions=1,
+        )
+    )
+
+    assert report["manifest"]["classification"] == "source-derived-production-layout"
+    assert report["manifest"]["matches_production_plan"] is False
+    assert report["manifest"]["source"] == (
+        "MILES and Megatron Bridge Qwen2.5-3B PP4 plan construction"
+    )
+    assert report["manifest"]["provenance"] == (
+        "source-derived names, shapes, emission order, and PP ownership"
+    )
+    assert report["manifest"]["runtime_evidence"] == (
+        "runtime logs attest the 434-tensor count and model configuration, "
+        "but do not serialize the full plan"
+    )
+    assert report["manifest"]["partition_ownership"] == (
+        "rank 0: embedding and layers 0-8; rank 1: layers 9-17; "
+        "rank 2: layers 18-26; rank 3: layers 27-35 and final norm"
+    )
+    source = (HERE / "m2n_microbench.py").resolve()
+    assert report["immutable_metadata"]["benchmark_source"] == {
+        "path": str(source),
+        "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+    }
 
 
 @pytest.mark.parametrize("grouping", ("singleton", "layer", "bucket"))

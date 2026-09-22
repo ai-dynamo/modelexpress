@@ -40,6 +40,12 @@ SUPPORTED_SCHEDULES = ("miles-current", "synthetic")
 SUPPORTED_GROUPING = ("singleton", "layer", "bucket")
 SUPPORTED_DRAIN = ("per-tensor", "per-group", "end")
 SUPPORTED_GROUP_KEYS = ("unique", "shared")
+QWEN_25_3B_SYNTHETIC_PROFILE = "qwen-2.5-3b"
+QWEN_25_3B_PP4_PRODUCTION_PROFILE = "qwen-2.5-3b-pp4-production"
+LARGE_PROFILES = (
+    QWEN_25_3B_SYNTHETIC_PROFILE,
+    QWEN_25_3B_PP4_PRODUCTION_PROFILE,
+)
 
 
 @dataclass(frozen=True)
@@ -115,6 +121,14 @@ class Case:
             raise ValueError("repetitions must be positive")
         if self.timeout_s <= 0:
             raise ValueError("timeout_s must be positive")
+        if (
+            self.profile == QWEN_25_3B_PP4_PRODUCTION_PROFILE
+            and self.source_partitions != 4
+        ):
+            raise ValueError(
+                f"{QWEN_25_3B_PP4_PRODUCTION_PROFILE} requires "
+                f"source_partitions=4, got {self.source_partitions}"
+            )
 
     @property
     def world_size(self) -> int:
@@ -177,11 +191,40 @@ def _qwen_25_3b_manifest() -> tuple[TensorSpec, ...]:
     return tuple(manifest)
 
 
+def _qwen_25_3b_pp4_production_manifest() -> tuple[TensorSpec, ...]:
+    """The canonical HF tensor layout of the production Qwen2.5-3B plan."""
+    manifest = [TensorSpec("model.embed_tokens.weight", (151_936, 2_048), None)]
+    for layer in range(36):
+        prefix = f"model.layers.{layer}"
+        manifest.extend(
+            (
+                TensorSpec(
+                    f"{prefix}.post_attention_layernorm.weight", (2_048,), layer
+                ),
+                TensorSpec(f"{prefix}.mlp.gate_proj.weight", (11_008, 2_048), layer),
+                TensorSpec(f"{prefix}.mlp.up_proj.weight", (11_008, 2_048), layer),
+                TensorSpec(f"{prefix}.mlp.down_proj.weight", (2_048, 11_008), layer),
+                TensorSpec(f"{prefix}.self_attn.o_proj.weight", (2_048, 2_048), layer),
+                TensorSpec(f"{prefix}.self_attn.q_proj.bias", (2_048,), layer),
+                TensorSpec(f"{prefix}.self_attn.k_proj.bias", (256,), layer),
+                TensorSpec(f"{prefix}.self_attn.v_proj.bias", (256,), layer),
+                TensorSpec(f"{prefix}.input_layernorm.weight", (2_048,), layer),
+                TensorSpec(f"{prefix}.self_attn.q_proj.weight", (2_048, 2_048), layer),
+                TensorSpec(f"{prefix}.self_attn.k_proj.weight", (256, 2_048), layer),
+                TensorSpec(f"{prefix}.self_attn.v_proj.weight", (256, 2_048), layer),
+            )
+        )
+    manifest.append(TensorSpec("model.norm.weight", (2_048,), None))
+    return tuple(manifest)
+
+
 def manifest_for(profile: str) -> tuple[TensorSpec, ...]:
     if profile == "smoke":
         return _smoke_manifest()
-    if profile == "qwen-2.5-3b":
+    if profile == QWEN_25_3B_SYNTHETIC_PROFILE:
         return _qwen_25_3b_manifest()
+    if profile == QWEN_25_3B_PP4_PRODUCTION_PROFILE:
+        return _qwen_25_3b_pp4_production_manifest()
     raise ValueError(f"unknown profile {profile!r}")
 
 
@@ -196,6 +239,14 @@ def manifest_fingerprint(manifest: Iterable[TensorSpec]) -> str:
 def _fingerprint(value: Any) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _benchmark_source_provenance() -> dict[str, str]:
+    source = Path(__file__).resolve()
+    return {
+        "path": str(source),
+        "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+    }
 
 
 def case_id(case: Case, manifest: Iterable[TensorSpec]) -> str:
@@ -228,11 +279,21 @@ def _synthetic_group_manifest(
     groups: list[list[TensorSpec]] = []
     current: list[TensorSpec] = []
     current_bytes = 0
+    current_partition: int | None = None
     for item in manifest:
-        if current and current_bytes + item.bytes > case.bucket_bytes:
+        item_partition = (
+            _qwen_25_3b_pp4_partition(item)
+            if case.profile == QWEN_25_3B_PP4_PRODUCTION_PROFILE
+            else None
+        )
+        if current and (
+            current_bytes + item.bytes > case.bucket_bytes
+            or (item_partition is not None and item_partition != current_partition)
+        ):
             groups.append(current)
             current = []
             current_bytes = 0
+        current_partition = item_partition
         current.append(item)
         current_bytes += item.bytes
     if current:
@@ -258,15 +319,29 @@ def schedule_metadata(case: Case) -> dict[str, str]:
     }
 
 
+def _qwen_25_3b_pp4_partition(item: TensorSpec) -> int:
+    if item.name == "model.embed_tokens.weight":
+        return 0
+    if item.name == "model.norm.weight":
+        return 3
+    if item.layer is not None:
+        return item.layer // 9
+    raise ValueError(f"production profile has no PP4 owner for {item.name}")
+
+
 def build_entries(case: Case, manifest: tuple[TensorSpec, ...]) -> list[PlanEntry]:
     entries: list[PlanEntry] = []
     for group_id, group in enumerate(group_manifest(case, manifest)):
         for item in group:
             key = item.name if case.group_keys == "unique" else f"group-{group_id}"
+            if case.profile == QWEN_25_3B_PP4_PRODUCTION_PROFILE:
+                partition_id = _qwen_25_3b_pp4_partition(item)
+            else:
+                partition_id = len(entries) % case.source_partitions
             entries.append(
                 PlanEntry(
                     tensor=item,
-                    partition_id=len(entries) % case.source_partitions,
+                    partition_id=partition_id,
                     group_id=group_id,
                     group_key=key,
                 )
@@ -529,6 +604,36 @@ def _report(
     runtime: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     total_bytes = sum(item.bytes for item in manifest)
+    if case.profile == QWEN_25_3B_PP4_PRODUCTION_PROFILE:
+        manifest_metadata = {
+            "source": "MILES and Megatron Bridge Qwen2.5-3B PP4 plan construction",
+            "provenance": (
+                "source-derived names, shapes, emission order, and PP ownership"
+            ),
+            "runtime_evidence": (
+                "runtime logs attest the 434-tensor count and model configuration, "
+                "but do not serialize the full plan"
+            ),
+            "classification": "source-derived-production-layout",
+            "matches_production_plan": False,
+            "partition_ownership": (
+                "rank 0: embedding and layers 0-8; rank 1: layers 9-17; "
+                "rank 2: layers 18-26; rank 3: layers 27-35 and final norm"
+            ),
+        }
+    else:
+        manifest_metadata = {
+            "source": (
+                "synthetic representative layout"
+                if case.profile == QWEN_25_3B_SYNTHETIC_PROFILE
+                else "synthetic smoke layout"
+            ),
+            "provenance": "microbench-defined synthetic tensor manifest",
+            "runtime_evidence": "none",
+            "classification": "synthetic",
+            "matches_production_plan": False,
+            "partition_ownership": "round-robin synthetic ownership",
+        }
     return {
         "schema_version": SCHEMA_VERSION,
         "mode": mode,
@@ -536,12 +641,7 @@ def _report(
         "case": asdict(case),
         "manifest": {
             "profile": case.profile,
-            "source": (
-                "synthetic representative layout"
-                if case.profile == "qwen-2.5-3b"
-                else "synthetic smoke layout"
-            ),
-            "matches_production_plan": False,
+            **manifest_metadata,
             "fingerprint": manifest_fingerprint(manifest),
             "tensor_count": len(manifest),
             "logical_bf16_bytes": total_bytes,
@@ -576,6 +676,7 @@ def _report(
         "vram_envelope": _vram_envelope(case, entries),
         "verification": verification,
         "immutable_metadata": {
+            "benchmark_source": _benchmark_source_provenance(),
             "imports": {
                 "modelexpress_collective": _module_provenance(
                     "modelexpress_rl.collective.backend", "modelexpress"
@@ -1013,9 +1114,9 @@ def run_gpu(
     """Run one native cohort. Must be called through torchrun."""
     case.validate()
     manifest = manifest_for(case.profile)
-    if case.profile == "qwen-2.5-3b" and not allow_large_profile:
+    if case.profile in LARGE_PROFILES and not allow_large_profile:
         raise ValueError(
-            "qwen-2.5-3b allocates multi-gigabyte BF16 buffers; pass "
+            f"{case.profile} allocates multi-gigabyte BF16 buffers; pass "
             "--allow-large-profile to run it"
         )
     rank = int(os.environ.get("RANK", "0"))
@@ -1246,7 +1347,15 @@ def _matrix_cases(args: argparse.Namespace) -> Iterable[Case]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("mock", "gpu"), required=True)
-    parser.add_argument("--profile", choices=("smoke", "qwen-2.5-3b"), default="smoke")
+    parser.add_argument(
+        "--profile",
+        choices=(
+            "smoke",
+            QWEN_25_3B_SYNTHETIC_PROFILE,
+            QWEN_25_3B_PP4_PRODUCTION_PROFILE,
+        ),
+        default="smoke",
+    )
     parser.add_argument("--source-partitions", type=int, default=1)
     parser.add_argument("--destination-fanout", type=int, default=1)
     parser.add_argument("--streams", type=int, default=1)
