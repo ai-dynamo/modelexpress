@@ -952,20 +952,21 @@ jobs:
   # ---------------------------------------------------------------------------
   trigger-gitlab-release:
     name: Trigger GitLab release pipeline
-    runs-on: prod-modelexpress-builder-amd-v1
+    # The only runners with network access to the internal GitLab host; the
+    # velonix pools cannot resolve it (curl exit 6). Same group Dynamo uses.
+    runs-on:
+      group: gitlab_ci_runners
     # Crates/helm are ordering-only needs (Dynamo treats optional stages the
     # same way): their staged names are forwarded when available, but a crate
     # or chart failure doesn't withhold the container/wheel scans. nightly-status
     # still flags them red.
     needs: [preflight, stage-containers-ngc, build-wheels, stage-crates, stage-helm-ngc, notify-slack-start]
-    # TEMPORARY(test): the container/wheel success gates are lifted so the
-    # pull-request/603 rehearsal exercises the handoff even while staging is
-    # incomplete. Restore both `.result == 'success'` clauses before merge —
-    # without them a failed stage still hands GitLab an artifact list to scan.
     if: >-
       ${{ !cancelled() &&
           needs.preflight.outputs.release == 'true' &&
-          inputs.skip_gitlab_pipeline != true }}
+          inputs.skip_gitlab_pipeline != true &&
+          needs.stage-containers-ngc.result == 'success' &&
+          needs.build-wheels.result == 'success' }}
     environment: automated-release
     timeout-minutes: 15
     permissions:
