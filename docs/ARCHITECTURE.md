@@ -1144,10 +1144,7 @@ storage without re-running PWAL. The adapter rebuilds a trainer plan when
 validated source manifests change; an incompatible destination staging layout
 requires an engine restart.
 
-See the [RL weight refit overview](../modelexpress_client/python/modelexpress/refit/README.md)
-for the end-to-end design, integration contract, implementation status, and
-validation requirements, including descriptor bounding for strided slices,
-receive and staging buffer ownership, and when PWAL applies rather than MDL.
+See the [RL integration reference](RL_REFIT.md) for the end-to-end design, integration contract, implementation status, and validation requirements, including descriptor bounding for strided slices, receive and staging buffer ownership, and when PWAL applies rather than MDL.
 
 ### SGLang Loader
 

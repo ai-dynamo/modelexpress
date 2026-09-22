@@ -1,13 +1,8 @@
 # S3 Delta Weight Refit
 
-This guide shows how to publish XOR-delta weight updates to S3 and install them
-in a running vLLM model with ModelExpress. The trainer and generator start from
-the same local checkpoint; integrations may use a framework-selected cadence of
-full HF checkpoints to reset that base. ModelExpress coordinates each version's
-lineage and readiness.
+This guide shows how to publish XOR-delta weight updates to S3 and install them in a running vLLM model with ModelExpress. The trainer and generator start from the same local checkpoint; integrations may use a framework-selected cadence of full HF checkpoints to reset that base. ModelExpress coordinates each version's lineage and readiness.
 
-For a runnable Vime TP2 trainer, Dynamo TP1 rollout worker, and MinIO setup, see
-[`examples/rl/vime_dynamo_delta_refit`](../examples/rl/vime_dynamo_delta_refit/README.md).
+For a first deployment, start with the [RL guide](guides/rl.md). Framework adapter contracts are in the [RL integration reference](RL_REFIT.md). For a runnable Vime TP2 trainer, Dynamo TP1 rollout worker, and MinIO setup, see [`examples/rl/vime_dynamo_delta_refit`](../examples/rl/vime_dynamo_delta_refit/README.md).
 
 ## Components
 
@@ -21,12 +16,10 @@ For a runnable Vime TP2 trainer, Dynamo TP1 rollout worker, and MinIO setup, see
 
 - A Redis-backed ModelExpress Refit service.
 - A ModelExpress build containing the canonical S3 delta and vLLM integrations.
-- The `modelexpress` Python package installed in both the trainer environment
-  and the environment used to launch vLLM.
+- The `modelexpress` Python package installed in both the trainer environment and the environment used to launch vLLM.
 - vLLM 0.27.1.
 - Trainer ranks with S3 read/write access and vLLM hosts with read access.
-- The corresponding base checkpoint in safetensors format on every trainer and
-  vLLM host.
+- The corresponding base checkpoint in safetensors format on every trainer and vLLM host.
 
 Minimal ModelExpress server configuration:
 
@@ -49,23 +42,16 @@ Environment variables used by the clients and vLLM engine:
 | `MX_REFIT_DELTA_WORKERS` | `min(32, CPU count)` | CPU workers used to compute and apply XOR deltas. |
 | `MX_REFIT_CHECKSUM_FORMAT` | `adler32` | Checksum algorithm written by canonical S3 trainers. |
 | `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` | `4294967296` (4 GiB) | Maximum tensor bytes grouped into one full-checkpoint safetensors object. |
-| `MX_S3_UPLOAD_WORKERS` | `8` | Maximum concurrent multipart uploads per trainer rank. |
-| `MX_S3_DOWNLOAD_WORKERS` | `16` | Generator download concurrency. |
-| `MX_S3_MAX_POOL_CONNECTIONS` | `32` | Botocore HTTP connection-pool size. |
-| `MX_S3_MAX_ATTEMPTS` | `5` | Total S3 request attempts. |
 | `VLLM_SERVER_DEV_MODE` | unset | Set to `1` to enable vLLM's weight-update HTTP routes. Network-isolate these routes. |
 | `VLLM_PLUGINS` | unset | Set to `modelexpress` to load the ModelExpress vLLM plugin. |
 
-Optional S3 tuning variables and defaults are documented in
-[`modelexpress_client/python/README.md`](../modelexpress_client/python/README.md#canonical-s3-transfer-tuning).
+See [Transfer tuning](#transfer-tuning) for S3 upload, download, concurrency, and memory settings.
 
 ## Initialization
 
 ### 1. Create the base version
 
-Create a READY initial WeightVersion before initializing trainer or generator
-clients. The current API requires a syntactically valid object-storage URI, but
-this local seed-checkpoint flow does not upload or read an object at that URI.
+Create a READY initial WeightVersion before initializing trainer or generator clients. The current API requires a syntactically valid object-storage URI, but this local seed-checkpoint flow does not upload or read an object at that URI.
 
 ```python
 from modelexpress_rl import (
@@ -98,18 +84,13 @@ with ModelExpressControlClient.connect(
     )
 ```
 
-Trainer and generator initialization use `base.version_id` as their initial base
-ID. They read the real weights from `seed_checkpoint_path`; the base version URI
-is not downloaded.
+Trainer and generator initialization use `base.version_id` as their initial base ID. They read the real weights from `seed_checkpoint_path`; the base version URI is not downloaded.
 
-See [`refit.proto`](../modelexpress_common/proto/refit.proto) for the complete
-control-plane request and response schemas.
+See [`refit.proto`](../modelexpress_common/proto/refit.proto) for the complete control-plane request and response schemas.
 
 ### 2. Initialize the trainer client
 
-Initialize one trainer client on every distributed trainer rank and keep it for
-the full training run. `hf_tensor_buckets()` below represents a framework-owned
-function that returns a fresh iterable of Hugging Face tensor buckets.
+Initialize one trainer client on every distributed trainer rank and keep it for the full training run. `hf_tensor_buckets()` below represents a framework-owned function that returns a fresh iterable of Hugging Face tensor buckets.
 
 ```python
 import torch.distributed as dist
@@ -135,18 +116,17 @@ trainer = ModelExpressTrainerClient.initialize(
 trainer.prepare_delta_base(hf_tensor_iter=hf_tensor_buckets())
 ```
 
-The bucket names must match tensors in the seed checkpoint. Keep the trainer
-client alive because each successful publication advances its retained base
-from `v0` to `v1`, then `v2`, and so on.
+The bucket names must match tensors in the seed checkpoint. Keep the trainer client alive because each successful publication advances its retained base from `v0` to `v1`, then `v2`, and so on.
 
-Use a dedicated Gloo process group containing every participating trainer rank.
-ModelExpress uses it for CPU object collectives that coordinate shard and index
-publication; do not reuse the model-training NCCL group for this example.
+Use a dedicated Gloo process group containing every participating trainer rank. ModelExpress uses it for CPU object collectives that coordinate shard and index publication; do not reuse the model-training NCCL group for this example.
+
+The framework supplies Hugging Face tensor buckets using its own bucket-size setting, or `MX_REFIT_DELTA_BUCKET_BYTES` when an override is needed. ModelExpress processes each supplied bucket without splitting or merging it. `prepare_delta_base()` performs concurrent rank-local seed-checkpoint reads before training; later delta staging uses that retained snapshot. The current trainer and generator clients support only `ObjectStorageType.S3`.
+
+A `FULL_HF_CHECKPOINT` publication consumes the same bucket stream, omits `base_version_id`, and replaces the retained snapshot for the next delta. Each rank groups immutable CPU tensors into concurrently uploaded safetensors objects bounded by `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES`; an oversized tensor occupies its own object. Uploads need no trainer-side temporary checkpoint. The framework owns the optional full-checkpoint cadence, which is disabled by default.
 
 ### 3. Initialize the generator
 
-Install the `modelexpress` Python package in the same environment used to run
-`vllm serve`. The package provides the vLLM plugin entry point:
+Install the `modelexpress` Python package in the same environment used to run `vllm serve`. The package provides the vLLM plugin entry point:
 
 ```toml
 [project.entry-points."vllm.general_plugins"]
@@ -196,43 +176,20 @@ response.raise_for_status()
 
 #### `seed_checkpoint_path`
 
-This must be a complete local safetensors checkpoint for
-`initial_base_version_id`, readable by every inference engine worker. It may be
-either:
+This must be a complete local safetensors checkpoint for `initial_base_version_id`, readable by every inference engine worker. It may be either:
 
 - one unsharded `.safetensors` file containing the full model; or
-- a directory containing all `.safetensors` shards. If
-  `model.safetensors.index.json` is present, every shard referenced by its
-  `weight_map` must also be present.
+- a directory containing all `.safetensors` shards. If `model.safetensors.index.json` is present, every shard referenced by its `weight_map` must also be present.
 
-For typical sharded models such as Qwen3-30B-A3B, use the full Hugging Face
-snapshot directory.
+For typical sharded models such as Qwen3-30B-A3B, use the full Hugging Face snapshot directory.
 
 #### `refit_checkpoint_dir`
 
-This is the root of ModelExpress's host-local immutable checkpoint cache. During
-initialization, ModelExpress creates a model-specific subdirectory containing
-full checkpoints, delta payloads, resolved chains, derived materializations,
-and activation state.
+This is the root of ModelExpress's host-local immutable checkpoint cache. During initialization, ModelExpress creates a model-specific subdirectory containing full checkpoints, delta payloads, resolved chains, derived materializations, and activation state.
 
-`full/<version>/` and `deltas/<version>/` contain canonical immutable artifacts.
-`chains/<version>.json` resolves a version to one full checkpoint plus its
-ordered deltas. The first delta after a full checkpoint copies that immutable
-full checkpoint into `materialized/<version>/`. Later sequential deltas rename
-the active derived checkpoint and apply only the incoming delta in place, so
-they do not copy the full model. Current vLLM and SGLang installers consume that
-ordinary checkpoint directory. Materializations are derived and can be rebuilt
-from the canonical lineage. If an in-place delta fails, the running engine keeps
-its previous weights, the cache remains `UPDATING`, and initialization rebuilds
-the checkpoint before accepting another update.
+`full/<version>/` and `deltas/<version>/` contain canonical immutable artifacts. `chains/<version>.json` resolves a version to one full checkpoint plus its ordered deltas. The first delta after a full checkpoint copies that immutable full checkpoint into `materialized/<version>/`. Later sequential deltas rename the active derived checkpoint and apply only the incoming delta in place, so they do not copy the full model. Current vLLM and SGLang installers consume that ordinary checkpoint directory. Materializations are derived and can be rebuilt from the canonical lineage. If an in-place delta fails, the running engine keeps its previous weights, the cache remains `UPDATING`, and initialization rebuilds the checkpoint before accepting another update.
 
-`state.json` records whether preparation is `READY` or `UPDATING` and protects
-against interrupted writes. `active.json` changes only after engine installation
-succeeds, so a failed download, reconstruction, or install retains the previous
-active engine version. The cache lock coordinates artifact mutations. The
-installation lock is held shared by concurrent co-located installers and
-exclusively by preparation, preventing another preparation from entering before
-activation.
+`state.json` records whether preparation is `READY` or `UPDATING` and protects against interrupted writes. `active.json` changes only after engine installation succeeds, so a failed download, reconstruction, or install retains the previous active engine version. The cache lock coordinates artifact mutations. The installation lock is held shared by concurrent co-located installers and exclusively by preparation, preventing another preparation from entering before activation.
 
 ```text
 <refit_checkpoint_dir>/<URL-quoted-vLLM-model-path-or-ID>/
@@ -265,19 +222,9 @@ activation.
       ...
 ```
 
-The generator may request a target several revisions ahead of its active
-version. ModelExpress first resolves the complete READY chain, rejecting cycles,
-missing or incompatible revisions, and chains longer than
-`max_replay_chain_length` (64 by default). It then prepares the ordered chain as
-one immutable target checkpoint and installs only that final target. If engine
-installation starts and fails, the checkpoint remains `READY`, `active.json`
-continues to identify the last successfully installed version, and the local
-engine is marked uncertain. The next request may reinstall that active version
-or install any target reconstructed from it; either successful installation
-clears the uncertain state.
+The generator may request a target several revisions ahead of its active version. ModelExpress first resolves the complete READY chain, rejecting cycles, missing or incompatible revisions, and chains longer than `max_replay_chain_length` (64 by default). It then prepares the ordered chain as one immutable target checkpoint and installs only that final target. If engine installation starts and fails, the checkpoint remains `READY`, `active.json` continues to identify the last successfully installed version, and the local engine is marked uncertain. The next request may reinstall that active version or install any target reconstructed from it; either successful installation clears the uncertain state.
 
-All ranks sharing one host filesystem can share the same cache. Each host without
-a shared filesystem needs its own cache.
+All ranks sharing one host filesystem can share the same cache. Each host without a shared filesystem needs its own cache.
 
 A Kubernetes example:
 
@@ -322,22 +269,7 @@ The corresponding generator configuration would use:
 }
 ```
 
-`refit_checkpoint_max_size_gb` is a positive per-model quota in decimal
-gigabytes (`1 GB = 1,000,000,000 bytes`) for payload files under `full/`,
-`deltas/`, and `materialized/`. It defaults to 500 GB; set it to `null` to
-disable the configured quota.
-At initialization, ModelExpress caps the quota at the existing model cache size
-plus available filesystem space. A short INFO log reports the cap and free space
-when this reduces the configured quota or replaces `null` with a disk-based
-limit. This safety cap also applies when the configured quota is disabled.
-ModelExpress rechecks free space before known writes and copies as other disk
-usage changes. It evicts stale derived materializations before stale canonical
-artifacts, but never evicts the active lineage or the checkpoint being prepared
-or installed. Capacity must therefore cover the active checkpoint plus the
-rollback-safe working set for one update. A capacity rejection preserves the
-active checkpoint as READY so a later update can retry. On initialization, the
-configured seed is restored as the initial full artifact and becomes the active
-version.
+`refit_checkpoint_max_size_gb` is a positive per-model quota in decimal gigabytes (`1 GB = 1,000,000,000 bytes`) for payload files under `full/`, `deltas/`, and `materialized/`. It defaults to 500 GB; set it to `null` to disable the configured quota. At initialization, ModelExpress caps the quota at the existing model cache size plus available filesystem space. A short INFO log reports the cap and free space when this reduces the configured quota or replaces `null` with a disk-based limit. This safety cap also applies when the configured quota is disabled. ModelExpress rechecks free space before known writes and copies as other disk usage changes. It evicts stale derived materializations before stale canonical artifacts, but never evicts the active lineage or the checkpoint being prepared or installed. Capacity must therefore cover the active checkpoint plus the rollback-safe working set for one update. A capacity rejection preserves the active checkpoint as READY so a later update can retry. On initialization, the configured seed is restored as the initial full artifact and becomes the active version.
 
 #### Initialization behavior
 
@@ -348,41 +280,22 @@ version.
 3. verifies that the base is READY and has the configured model name; and
 4. registers itself as a ModelExpress generator worker.
 
-Initialization fails before serving updates if any worker cannot read the
-seed checkpoint, write the cache, or validate the base version.
+Initialization fails before serving updates if any worker cannot read the seed checkpoint, write the cache, or validate the base version.
 
 ## Weight Update
 
 With full-tensor engine support, active refit uses this order:
 
 1. load the exact requested version from a same-rank generator peer;
-2. if no peer can prepare it, reconstruct the complete S3 lineage from its full
-   checkpoint root through the target deltas and install that checkpoint.
+2. if no peer can prepare it, reconstruct the complete S3 lineage from its full checkpoint root through the target deltas and install that checkpoint.
 
-Post-load generator P2P requires registered runtime tensors and an initialized
-loader-owned NIXL manager. Quantized models and FP8 KV caches can select this
-path in either eager or graph mode. The peer transfer copies the registered
-runtime representation without rerunning post-load processing. Eager
-installation then refreshes q/k/v host
-scale mirrors and invalidates FlashInfer launch-scale caches for recomputation
-on the next forward. Graph-mode refits retain direct-copy behavior without
-this refresh; captured scalar updates are not handled here. This does not clear
-stored KV entries; retaining quantized KV entries across a change to their
-K/V scales remains unsupported.
+Post-load generator P2P requires registered runtime tensors and an initialized loader-owned NIXL manager. Quantized models and FP8 KV caches can select this path in either eager or graph mode. The peer transfer copies the registered runtime representation without rerunning post-load processing. Eager installation then refreshes q/k/v host scale mirrors and invalidates FlashInfer launch-scale caches for recomputation on the next forward. Graph-mode refits retain direct-copy behavior without this refresh; captured scalar updates are not handled here. This does not clear stored KV entries; retaining quantized KV entries across a change to their K/V scales remains unsupported.
 
-A successful peer install does not trigger checkpoint reconstruction. If a
-later active refit cannot use a same-rank generator peer, that foreground refit
-resolves the immutable full root and delta lineage before installation. The
-receiver validates its local checkpoint under the cache lock and, when it is a
-source-verified ancestor of the target, downloads and applies only the missing
-revisions. The local checkpoint can lag GPU weights after P2P updates, so its
-version determines the replay suffix. When no matching, source-verified local
-checkpoint exists, the receiver reconstructs from the full root.
+A successful peer install does not trigger checkpoint reconstruction. If a later active refit cannot use a same-rank generator peer, that foreground refit resolves the immutable full root and delta lineage before installation. The receiver validates its local checkpoint under the cache lock and, when it is a source-verified ancestor of the target, downloads and applies only the missing revisions. The local checkpoint can lag GPU weights after P2P updates, so its version determines the replay suffix. When no matching, source-verified local checkpoint exists, the receiver reconstructs from the full root.
 
 ### Generator-side S3 artifact contract
 
-The weight version's `object_storage.uri` points to a global JSON index. Shard
-filenames in `weight_map` are resolved relative to that index.
+The weight version's `object_storage.uri` points to a global JSON index. Shard filenames in `weight_map` are resolved relative to that index.
 
 #### `XOR_DELTA`
 
@@ -401,14 +314,9 @@ filenames in `weight_map` are resolved relative to that index.
 }
 ```
 
-The generator requires all five metadata fields and `weight_map`. It requires
-`delta_encoding="xor"` and `checksum_format="adler32"`, and uses
-`compression_format` to select the decompressor. `version` and `base_version`
-describe the artifact.
+The generator requires all five metadata fields and `weight_map`. It requires `delta_encoding="xor"` and `checksum_format="adler32"`, and uses `compression_format` to select the decompressor. `version` and `base_version` describe the artifact.
 
-Each delta shard contains compressed `U8` XOR bytes. Its safetensors
-`__metadata__` must contain the Adler-32 checksum of every reconstructed full
-tensor:
+Each delta shard contains compressed `U8` XOR bytes. Its safetensors `__metadata__` must contain the Adler-32 checksum of every reconstructed full tensor:
 
 ```json
 {
@@ -439,14 +347,9 @@ Full checkpoints use a standard Hugging Face safetensors index:
 }
 ```
 
-The generator requires a non-empty `weight_map` covering exactly the local
-checkpoint tensors. The index `metadata` field is optional. When it contains
-`checksum_format`, the only supported value is `adler32`.
+The generator requires a non-empty `weight_map` covering exactly the local checkpoint tensors. The index `metadata` field is optional. When it contains `checksum_format`, the only supported value is `adler32`.
 
-Each referenced shard contains native HF tensors. Safetensors `__metadata__`
-may contain arbitrary string-to-string entries. When the index declares
-`checksum_format="adler32"`, it must also contain a checksum keyed by tensor
-name for every referenced tensor in the shard:
+Each referenced shard contains native HF tensors. Safetensors `__metadata__` may contain arbitrary string-to-string entries. When the index declares `checksum_format="adler32"`, it must also contain a checksum keyed by tensor name for every referenced tensor in the shard:
 
 ```json
 {
@@ -462,15 +365,11 @@ name for every referenced tensor in the shard:
 }
 ```
 
-When the index omits `checksum_format`, checksum verification is skipped and
-shard metadata is not interpreted as checksums. Tensor names, dtypes, shapes,
-and byte sizes are always checked before the immutable full artifact is
-promoted.
+When the index omits `checksum_format`, checksum verification is skipped and shard metadata is not interpreted as checksums. Tensor names, dtypes, shapes, and byte sizes are always checked before the immutable full artifact is promoted.
 
 ### 1. Publish `v1`
 
-Create `v1` as STAGING, upload the delta shards and index, and then mark it
-READY. The S3 URI is the exact index URI, not a directory prefix.
+Create `v1` as STAGING, upload the delta shards and index, and then mark it READY. The S3 URI is the exact index URI, not a directory prefix.
 
 ```python
 import torch.distributed as dist
@@ -525,8 +424,7 @@ if dist.get_rank(group=refit_process_group) == 0:
 
 ### 2. Apply `v1` in vLLM
 
-Run the update while generation is paused. `mode=abort` clears active requests
-and vLLM caches before the weight update.
+Run the update while generation is paused. `mode=abort` clears active requests and vLLM caches before the weight update.
 
 ```python
 import requests
@@ -554,11 +452,24 @@ finally:
     post("resume", body={})
 ```
 
-The next delta must be `v2` with `base_version_id="v1"`. An integration may
-instead create a `FULL_HF_CHECKPOINT` version without `base_version_id`; that
-version becomes the exact base for the following delta. Full checkpoint batches
-may declare `checksum_format="adler32"` in the index and carry per-tensor
-checksums under tensor-name keys in shard metadata. They are retained as an
-immutable full artifact. XOR deltas require the complete index metadata contract
-above and are replayed in order in the canonical lineage; each preparation
-applies only the incoming delta to its exact active base.
+The next delta must be `v2` with `base_version_id="v1"`. An integration may instead create a `FULL_HF_CHECKPOINT` version without `base_version_id`; that version becomes the exact base for the following delta. Full checkpoint batches may declare `checksum_format="adler32"` in the index and carry per-tensor checksums under tensor-name keys in shard metadata. They are retained as an immutable full artifact. XOR deltas require the complete index metadata contract above and are replayed in order in the canonical lineage; each preparation applies only the incoming delta to its exact active base.
+
+Keep published S3 versions READY while generators may need them for recovery; the bucket's external lifecycle policy governs their immutable objects.
+
+## Transfer tuning
+
+Objects below the configured thresholds use one PUT or GET. Larger uploads use multipart parts, and larger downloads use ranged GETs through one persistent `s3transfer.TransferManager` per `S3Client`. The receiver's file-level pool and the manager's global request concurrency use the same worker setting, so all whole-object and ranged data GETs share one 16-request budget. HEAD requests use the manager's separate submission executor. Downloads target a seekable `BytesIO`, so the complete downloaded object remains resident; the I/O settings below bound queued chunks, not the final object size.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MX_S3_MULTIPART_THRESHOLD_BYTES` | `104857600` (100 MiB) | Minimum object size for multipart upload |
+| `MX_S3_UPLOAD_PART_BYTES` | `16777216` (16 MiB) | Multipart upload part size |
+| `MX_S3_UPLOAD_WORKERS` | `8` | Maximum concurrent multipart part uploads |
+| `MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES` | `104857600` (100 MiB) | Minimum object size for parallel ranged download |
+| `MX_S3_DOWNLOAD_RANGE_BYTES` | `8388608` (8 MiB) | Byte-range size for parallel downloads |
+| `MX_S3_DOWNLOAD_WORKERS` | `16` | Receiver file-worker limit and shared whole/ranged data GET concurrency budget |
+| `MX_S3_DOWNLOAD_IO_CHUNK_BYTES` | `1048576` (1 MiB) | TransferManager I/O queue chunk size |
+| `MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS` | `16` | Sets `max_io_queue_size` and the non-seekable-output chunk limit. For the seekable `BytesIO` target, the default bounds queued I/O to about 16 MiB but does not cap the full downloaded object |
+| `MX_S3_MAX_POOL_CONNECTIONS` | `32` | Botocore HTTP connection-pool size |
+| `MX_S3_MAX_ATTEMPTS` | `5` | Botocore total request attempts and TransferManager post-200 streaming-download attempts |
+| `MX_S3_TCP_KEEPALIVE` | `true` | Enable TCP keepalive for S3 connections |

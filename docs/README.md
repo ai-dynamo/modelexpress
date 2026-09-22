@@ -19,6 +19,7 @@ Start with the job you want ModelExpress to do:
 
 - [Compatibility](COMPATIBILITY.md): which runtime images and paths the examples and CI cover.
 - [Configuration](CONFIGURATION.md): settings, defaults, and loader selection.
+- [RL integration reference](RL_REFIT.md): framework APIs, receiver design, and limits; [S3 refit](S3_DELTA_WEIGHT_REFIT.md) covers checkpoint publication and replay.
 - [Deployment](DEPLOYMENT.md) and [Helm](../helm/README.md): server setup and operational requirements.
 - [Troubleshooting](TROUBLESHOOTING.md): diagnose the selected loader and failed dependencies.
 - [Metrics](METRICS.md): observe the server and inference workers.

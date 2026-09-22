@@ -45,9 +45,9 @@ Direct pulls avoid a trainer-side full-model gather for supported shard layouts,
 
 ## Integrate with your framework
 
-The Python package exposes `ModelExpressControlClient`, `ModelExpressTrainerClient`, and `ModelExpressGeneratorClient` through `modelexpress_rl`. [Trainer publication](../../modelexpress_client/python/README.md#rl-trainer-publication) explains the adapter contract; the [S3 refit guide](../S3_DELTA_WEIGHT_REFIT.md) covers checkpoint publication and replay.
+The Python package exposes `ModelExpressControlClient`, `ModelExpressTrainerClient`, and `ModelExpressGeneratorClient` through `modelexpress_rl`. [Trainer publication](../RL_REFIT.md#trainer-publication) explains the adapter contract; the [S3 refit guide](../S3_DELTA_WEIGHT_REFIT.md) covers checkpoint publication and replay.
 
-Megatron and FSDP/DTensor trainer adapters are present. vLLM has the weight-transfer backend used by the examples. SGLang has a checkpoint installer; it does not currently expose the same direct tensor-refit path. These interfaces still need framework lifecycle hooks and validation for your model, dtype, and parallel layout. The [refit internals](../../modelexpress_client/python/modelexpress/refit/README.md) describe geometry capture and its limits.
+Megatron and FSDP/DTensor trainer adapters are present. vLLM has the weight-transfer backend used by the examples. SGLang has a checkpoint installer; it does not currently expose the same direct tensor-refit path. These interfaces still need framework lifecycle hooks and validation for your model, dtype, and parallel layout. The [refit internals](../RL_REFIT.md#receiver-internals) describe geometry capture and its limits.
 
 ## In use: Prime Intellect
 
