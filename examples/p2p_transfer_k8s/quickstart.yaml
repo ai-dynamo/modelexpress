@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Small-model inference smoke test. Build both images from the same checkout.
 # Replace the two your-registry image references before applying.
-# Redis and model caches are ephemeral; this example is for evaluation.
+# Apply examples/crds.yaml and the Kubernetes backend RBAC first; see the vLLM guide.
+# Metadata uses Kubernetes CRDs; model caches are ephemeral. For evaluation.
 apiVersion: v1
 kind: Service
 metadata:
@@ -30,14 +31,17 @@ spec:
       labels:
         app: modelexpress-server
     spec:
+      serviceAccountName: modelexpress
       containers:
         - name: server
           image: your-registry/modelexpress-server:TAG
           env:
             - name: MX_METADATA_BACKEND
-              value: redis
-            - name: REDIS_URL
-              value: redis://localhost:6379
+              value: kubernetes
+            - name: MX_METADATA_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             - name: MODEL_EXPRESS_CACHE_DIRECTORY
               value: /app/cache
           ports:
@@ -52,18 +56,6 @@ spec:
               memory: 1Gi
             limits:
               memory: 2Gi
-        - name: redis
-          image: redis:8-alpine
-          args: ["--save", "", "--appendonly", "no"]
-          readinessProbe:
-            exec:
-              command: ["redis-cli", "ping"]
-          resources:
-            requests:
-              cpu: 100m
-              memory: 128Mi
-            limits:
-              memory: 512Mi
 ---
 apiVersion: v1
 kind: Service
@@ -131,6 +123,18 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             - name: HF_HOME
               value: /models
           ports:

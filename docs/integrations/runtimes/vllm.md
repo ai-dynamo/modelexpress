@@ -24,10 +24,17 @@ docker push registry.example.com/modelexpress-vllm:quickstart
 
 Replace `registry.example.com` with your registry. The [Dockerfile](../../../examples/p2p_transfer_k8s/client/vllm/Dockerfile) starts from `vllm/vllm-openai:v0.23.0` and installs the checked-out MX client. NIXL is supplied by the runtime image, not by the MX Python dependency list; confirm the image has a compatible NIXL/CUDA stack. vLLM 0.23.0 supports `--load-format modelexpress` natively. Older supported images use the MX plugin with `VLLM_PLUGINS=modelexpress`; `mx` remains a compatibility alias. Check [Compatibility](../../COMPATIBILITY.md) when changing runtime versions.
 
-Open [`quickstart.yaml`](../../../examples/p2p_transfer_k8s/quickstart.yaml), replace both `your-registry/...:TAG` image references, and adapt GPU/fabric resources to your cluster. It includes the MX server, Redis, and one vLLM replica. This evaluation setup uses ephemeral storage and unauthenticated APIs; use a trusted cluster network. Compilation is disabled to keep the smoke test small. Source and target use the same model revision and runtime settings; `--revision` pins the checkpoint actually loaded. `MX_MODEL_REVISION` only labels MX source identity and does not download or pin that checkpoint.
+Open [`quickstart.yaml`](../../../examples/p2p_transfer_k8s/quickstart.yaml), replace both `your-registry/...:TAG` image references, and adapt GPU/fabric resources to your cluster. It includes the MX server using Kubernetes CRDs and one vLLM replica. This evaluation setup uses ephemeral model caches and unauthenticated MX/vLLM APIs; use a trusted cluster network. Compilation is disabled to keep the smoke test small. Source and target use the same model revision and runtime settings; `--revision` pins the checkpoint actually loaded. `MX_MODEL_REVISION` only labels MX source identity and does not download or pin that checkpoint.
+
+Install the CRDs with cluster-admin permissions, then apply the namespace-scoped service account and RBAC before starting the server. Use the CRDs from the same checkout; if the cluster already has MX installed, have its administrator check schema compatibility before updating these shared definitions.
 
 ```bash
 kubectl create namespace mx-demo
+kubectl apply -f examples/crds.yaml
+kubectl wait --for=condition=Established --timeout=60s \
+  crd/modelmetadatas.modelexpress.nvidia.com \
+  crd/modelcacheentries.modelexpress.nvidia.com
+kubectl -n mx-demo apply -f examples/p2p_transfer_k8s/server/kubernetes_backend/rbac-modelmetadata.yaml
 kubectl -n mx-demo apply -f examples/p2p_transfer_k8s/quickstart.yaml
 kubectl -n mx-demo rollout status deployment/modelexpress-server --timeout=5m
 kubectl -n mx-demo rollout status deployment/mx-vllm --timeout=20m
@@ -38,11 +45,11 @@ kubectl -n mx-demo exec "$SOURCE_POD" -c vllm -- \
 kubectl -n mx-demo logs "$SOURCE_POD" -c vllm
 ```
 
-The first worker has no peer to copy, so a message such as `No RDMA source available` is expected. It loads through an eligible storage path and publishes its post-processed GPU tensors for later workers. Wait for `Source published successfully` in its logs, then keep it running. HTTP readiness can precede publication by a few seconds.
+The first worker has no peer to copy, so a message such as `No RDMA source available` is expected. It loads through an eligible storage path and publishes its post-processed GPU tensors for later workers. Wait for `[Worker 0] Status -> READY` in its logs, then keep it running. This confirms the metadata backend accepted its ready status; HTTP readiness can precede that transition by a few seconds.
 
 ## Start a target and prove P2P worked
 
-Scale only after the source is healthy and has published:
+Scale only after the source is healthy and its metadata status is READY:
 
 ```bash
 kubectl -n mx-demo scale deployment/mx-vllm --replicas=2
@@ -73,6 +80,8 @@ When finished with this example, release its GPUs and other resources:
 ```bash
 kubectl delete namespace mx-demo
 ```
+
+This removes the example's workloads, metadata, and RBAC. The cluster-wide CRD definitions remain available to other namespaces.
 
 ## Load directly from object storage
 
