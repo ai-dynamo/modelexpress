@@ -873,13 +873,21 @@ class _LocalCheckpoint:
                 )
                 return 0.0, 0.0
 
+        non_weight_source = self.seed_checkpoint_path
+        if (
+            non_weight_source.resolve()
+            == self.store.full_path(self.initial_version).resolve()
+        ):
+            # Updates carry seed metadata forward; the initial root may be evicted.
+            non_weight_source = self.local_checkpoint
         protected_versions = _protected_versions(self.store, version.version_id)
         self.store.ensure_capacity(
-            self._non_weight_files_size(self.seed_checkpoint_path) + len(index_data),
+            self._non_weight_files_size(non_weight_source) + len(index_data),
             protected_versions=protected_versions,
+            protected_paths={non_weight_source},
         )
         with self.store.replace_directory(target) as temporary:
-            self._copy_non_weight_files(self.seed_checkpoint_path, temporary)
+            self._copy_non_weight_files(non_weight_source, temporary)
             index_name = Path(version.uri).name
             (temporary / index_name).write_bytes(index_data)
             download_time, validation_time = self._download_full_checkpoint(

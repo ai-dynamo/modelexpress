@@ -1421,6 +1421,126 @@ def test_canonical_s3_rejects_mismatched_delta_formats(
     adapter.close()
 
 
+@pytest.mark.parametrize("seed_mode", ["implicit", "cached", "external"])
+@pytest.mark.parametrize("intermediate_delta", [False, True])
+def test_full_checkpoint_preserves_metadata_after_cached_seed_eviction(
+    monkeypatch, tmp_path, seed_mode, intermediate_delta
+):
+    """Full updates retain metadata when the original cached seed is evicted."""
+    weights = torch.arange(2048, dtype=torch.float32)
+    config_text = '{"model_type":"llama"}'
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    (launch / "config.json").write_text(config_text)
+    next_full = _full_artifact(weights + 3, version_label=3)
+    objects = {**_full_artifact(weights + 1, version_label=1), **next_full}
+    adapter, _storage = _build(
+        monkeypatch, tmp_path, objects, launch_tensors={"weight": weights}
+    )
+    seed = adapter._checkpoint.store.full_path("base-a")
+    adapter.close()
+    adapter = _Adapter(
+        model_name="test/model",
+        config=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="base-a",
+            seed_checkpoint_path={
+                "implicit": None,
+                "cached": seed,
+                "external": launch,
+            }[seed_mode],
+            refit_checkpoint_dir=tmp_path / "cache",
+        ),
+    )
+    store = adapter._checkpoint.store
+    first = adapter.stage_weight(_full_inputs(version="full-a", version_label=1))
+    adapter.apply_weight(first)
+    adapter.release_staged_weight(first)
+
+    if intermediate_delta:
+        delta_objects = _artifact(
+            (weights + 1).view(torch.uint8).numpy(),
+            (weights + 2).view(torch.uint8).numpy(),
+            version="delta-a",
+            version_label=2,
+            base_version="full-a",
+        )
+        objects.update(delta_objects)
+        store.max_size_bytes = (
+            2 * store.path_size_bytes(first.path)
+            + sum(len(data) for data in delta_objects.values())
+            + 512
+        )
+        delta = adapter.stage_weight(
+            _inputs(None, version="delta-a", version_label=2, base_version="full-a")
+        )
+        adapter.apply_weight(delta)
+        adapter.release_staged_weight(delta)
+        assert not seed.exists()
+
+    if seed_mode == "external":
+        config_text = '{"model_type":"llama","external_seed":true}'
+        (launch / "config.json").write_text(config_text)
+    store.max_size_bytes = (
+        store.cache_size_bytes()
+        - store._payload_size_bytes(seed)
+        + sum(len(data) for data in next_full.values())
+        + len(config_text.encode())
+    )
+    second = adapter.stage_weight(_full_inputs(version="full-b", version_label=3))
+
+    assert (second.path / "config.json").read_text() == config_text
+    assert torch.equal(
+        load_file(second.path / "model-00001-of-00001.safetensors")["weight"],
+        weights + 3,
+    )
+    assert not seed.exists()
+    adapter.apply_weight(second)
+    adapter.release_staged_weight(second)
+    adapter.close()
+
+
+def test_cached_metadata_source_is_protected_before_first_activation(tmp_path):
+    """Reject insufficient capacity before evicting an unactivated copy source."""
+    weights = torch.arange(2048, dtype=torch.float32)
+    storage = _MemoryS3(_full_artifact(weights + 1))
+    checkpoint = receiver_module._LocalCheckpoint(
+        model_name="test/model",
+        config=ObjectStorageGeneratorConfig(
+            storage_type=ObjectStorageType.S3,
+            initial_base_version_id="base-a",
+            seed_checkpoint_path=None,
+            refit_checkpoint_dir=tmp_path / "cache",
+        ),
+        s3=storage,
+    )
+    seed = checkpoint.local_checkpoint
+    seed.mkdir(parents=True)
+    (seed / "model.safetensors").write_bytes(_save_full_tensors({"weight": weights}))
+    (seed / "config.json").write_text('{"model_type":"llama"}')
+    checkpoint.store.record_artifact(seed)
+    checkpoint.initialize()
+    uri = "s3://weights/test/v2/model.safetensors.index.json"
+    checkpoint.store.max_size_bytes = (
+        checkpoint.store.cache_size_bytes() + len(storage.objects[uri])
+    )
+
+    with pytest.raises(checkpoint_store_module.CheckpointCacheCapacityError):
+        checkpoint.prepare(
+            receiver_module._S3Version(
+                version_id="full-a",
+                base_version_id=None,
+                payload_format=WeightPayloadFormat.FULL_HF_CHECKPOINT,
+                uri=uri,
+            )
+        )
+
+    assert (seed / "config.json").is_file()
+    state = checkpoint.store.state()
+    assert state.status is checkpoint_store_module.CheckpointState.READY
+    assert state.version == "base-a"
+
+
 def test_canonical_s3_full_checkpoint_resets_base_for_next_delta(monkeypatch, tmp_path):
     full_tensor = torch.tensor([7.0, 8.0])
     objects = _full_artifact(full_tensor)

@@ -235,6 +235,11 @@ Initialization fails if the required root is missing or cannot be restored.
 Passing the cached full-root path explicitly retains the same reuse behavior.
 Passing an external checkpoint path retains the existing seed-import behavior.
 
+With a cached seed, later full updates carry non-weight files forward from the
+current prepared checkpoint. Its directory is protected from eviction until the
+copy finishes, so eviction of the original seed does not drop these files.
+Explicit external seed paths remain the source of their non-weight files.
+
 #### `refit_checkpoint_dir`
 
 This is the root of ModelExpress's host-local immutable checkpoint cache. During
