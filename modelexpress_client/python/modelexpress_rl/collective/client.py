@@ -274,6 +274,20 @@ class _RefitClientBase:
             self._source_partition_count,
         )
 
+    def _declared_source_rank(self, source_partition: int) -> int:
+        lane = next(
+            lane
+            for lane in self._declared_lanes()
+            if lane.kind == "RESHARD" and lane.lane_id == source_partition
+        )
+        try:
+            return lane.slots_in_rank_order().index(self._slot_id)
+        except ValueError as error:
+            raise RuntimeError(
+                f"trainer slot {self._slot_id!r} is not in source partition "
+                f"{source_partition}"
+            ) from error
+
     def _join_and_bootstrap(
         self, role: Role, source_partition: int | None
     ) -> Membership:
@@ -331,6 +345,17 @@ class _RefitClientBase:
                     f"expected {sorted(expected_reshard)}, got "
                     f"{sorted(actual_reshard)}"
                 )
+            if role is Role.TRAINER:
+                if source_partition is None:
+                    raise AssertionError("trainer join requires a source partition")
+                actual_rank = membership.lane(source_partition).rank_in_lane
+                expected_rank = self._declared_source_rank(source_partition)
+                if actual_rank != expected_rank:
+                    raise RuntimeError(
+                        "MX returned an unexpected lane-local trainer rank: "
+                        f"expected {expected_rank}, got {actual_rank} on lane "
+                        f"{source_partition}"
+                    )
             if membership.broadcast_lane.lane_id != declared_broadcast:
                 raise RuntimeError(
                     "MX returned an unexpected broadcast lane id: "
@@ -549,16 +574,19 @@ class RefitClientTrainer(_RefitClientBase):
             raise RuntimeError("initialize must run before compute_plan")
         self._capture(self._publisher, self._expected_parameters)
         specs = self._publisher.local_params()
+        declared_source_rank = self._declared_source_rank(self._source_partition)
         required = [
             entry.name
             for entry in self.plan.bulk
             if entry.partition_id == self._source_partition
+            and declared_source_rank in entry.src_mesh.ranks()
         ] + [entry.name for entry in self.plan.misc]
         # Resolve storage before joining. READY must not include a worker that
         # will discover only afterward that it cannot issue the agreed ops.
         resolve_specs(self.plan, specs, required)
         membership = self._join_and_bootstrap(Role.TRAINER, self._source_partition)
         try:
+            source_rank_in_lane = membership.lane(self._source_partition).rank_in_lane
             self._half = NcclM2nSender(
                 plan=self.plan,
                 specs=specs,
@@ -566,6 +594,7 @@ class RefitClientTrainer(_RefitClientBase):
                 epoch=membership.epoch,
                 cache=self._cache,
                 source_partition=self._source_partition,
+                source_rank_in_lane=source_rank_in_lane,
             )
             self._half.setup_layer_groups(self._groupings)
         except BaseException:

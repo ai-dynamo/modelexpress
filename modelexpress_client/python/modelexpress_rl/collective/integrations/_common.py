@@ -126,7 +126,6 @@ class _FrozenPlan:
         trainers_per_lane = (
             len(topology.trainer_slots) // topology.source_partition_count
         )
-        expected_src_ranks = list(range(trainers_per_lane))
         expected_dst_ranks = list(
             range(
                 trainers_per_lane,
@@ -134,11 +133,21 @@ class _FrozenPlan:
             )
         )
         for entry in self._plan.bulk:
-            if entry.src_mesh.ranks() != expected_src_ranks:
+            src_ranks = entry.src_mesh.ranks()
+            contiguous = bool(src_ranks) and src_ranks == list(
+                range(src_ranks[0], src_ranks[0] + len(src_ranks))
+            )
+            if (
+                not contiguous
+                or len(src_ranks) != len(set(src_ranks))
+                or src_ranks[0] < 0
+                or src_ranks[-1] >= trainers_per_lane
+            ):
                 raise ValueError(
-                    f"{entry.name}: src_mesh ranks {entry.src_mesh.ranks()} do "
-                    "not match the trainer membership of reshard lane "
-                    f"{entry.partition_id}: {expected_src_ranks}"
+                    f"{entry.name}: src_mesh ranks {src_ranks} must be a non-empty, "
+                    "duplicate-free contiguous subset of the trainer membership "
+                    f"for reshard lane {entry.partition_id}: "
+                    f"{list(range(trainers_per_lane))}"
                 )
             if entry.dst_mesh.ranks() != expected_dst_ranks:
                 raise ValueError(

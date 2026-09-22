@@ -107,13 +107,20 @@ def lane(rec, name, *, rank=0, world=4, stream=_DEFAULT_STREAM):
     )
 
 
-def entry(name, partition=0, group_key=None):
+def entry(
+    name,
+    partition=0,
+    group_key=None,
+    *,
+    src_shape=(2,),
+    src_rank_offset=0,
+):
     return ParamPlan(
         name=name,
         global_shape=(8, 4),
         dtype="bfloat16",
         partition_id=partition,
-        src_mesh=MeshSpec(shape=(2,), rank_offset=0),
+        src_mesh=MeshSpec(shape=src_shape, rank_offset=src_rank_offset),
         src_placements=(Placement.shard(0),),
         dst_mesh=MeshSpec(shape=(2,), rank_offset=2),
         dst_placements=(Placement.shard(0),),
@@ -361,6 +368,66 @@ class TestLaneRouting:
         assert [op.comm._name for op in recorder.ops if op.kind == "reshard"] == [
             "lane1"
         ]
+
+    def test_a_nonowner_enters_the_same_reshard_with_neither_endpoint(
+        self, recorder, monkeypatch
+    ):
+        monkeypatch.setattr(backend, "require_nccl_m2n", lambda: None)
+        plan = ReshardPlan(
+            bulk=[
+                entry("owner0", src_shape=(1,), src_rank_offset=0),
+                entry("owner1", src_shape=(1,), src_rank_offset=1),
+            ]
+        )
+        cache = CommunicatorCache()
+        cache._lanes[LaneKey("g", 1, 0)] = lane(recorder, "lane0", rank=1, world=4)
+        cache._lanes[LaneKey("g", 1, 1)] = lane(recorder, "broadcast", rank=1, world=4)
+        half = NcclM2nSender(
+            plan=plan,
+            specs={"owner1": LocalParamSpec(base="buf::owner1")},
+            group_id="g",
+            epoch=1,
+            cache=cache,
+            source_partition=0,
+            source_rank_in_lane=1,
+        )
+
+        half.start_weight_update("v")
+        half.publish_weights(0)
+
+        assert [(op.src, op.dst) for op in recorder.ops] == [
+            (None, None),
+            ("buf::owner1", None),
+        ]
+
+    def test_a_source_owner_still_requires_local_storage(self, recorder):
+        plan = ReshardPlan(bulk=[entry("owner0", src_shape=(1,), src_rank_offset=0)])
+        with pytest.raises(KeyError, match="no local storage"):
+            NcclM2nSender(
+                plan=plan,
+                specs={},
+                group_id="g",
+                epoch=1,
+                cache=CommunicatorCache(),
+                source_partition=0,
+                source_rank_in_lane=0,
+            )
+
+    def test_a_nonowner_still_requires_misc_storage(self, recorder):
+        plan = ReshardPlan(
+            bulk=[entry("owner0", src_shape=(1,), src_rank_offset=0)],
+            misc=[MiscParam("m", (4,), "bfloat16")],
+        )
+        with pytest.raises(KeyError, match="m"):
+            NcclM2nSender(
+                plan=plan,
+                specs={},
+                group_id="g",
+                epoch=1,
+                cache=CommunicatorCache(),
+                source_partition=0,
+                source_rank_in_lane=1,
+            )
 
     def test_a_missing_communicator_is_a_clear_error_not_a_hang(self, recorder):
         plan = ReshardPlan(

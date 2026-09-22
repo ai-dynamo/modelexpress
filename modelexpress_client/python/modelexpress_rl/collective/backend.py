@@ -162,6 +162,7 @@ class _CollectiveHalf:
         epoch: int,
         cache: CommunicatorCache,
         active_partition: int | None = None,
+        required_bulk_names: list[str] | None = None,
     ) -> None:
         if plan.source_partition_count <= 0:
             raise ValueError("source_partition_count must be positive")
@@ -197,9 +198,12 @@ class _CollectiveHalf:
             for entry in self._all_bulk
             if active_partition is None or entry.partition_id == active_partition
         ]
-        required = [entry.name for entry in self._bulk] + [
-            entry.name for entry in plan.misc
-        ]
+        required = (
+            [entry.name for entry in self._bulk]
+            if required_bulk_names is None
+            else list(required_bulk_names)
+        )
+        required.extend(entry.name for entry in plan.misc)
         resolve_specs(plan, specs, required)
         self._groups: OrderedDict[int, list[ParamPlan]] = OrderedDict()
         self.setup_layer_groups(None)
@@ -343,18 +347,26 @@ class _CollectiveHalf:
         for lane in lanes:
             remaining = self._remaining()
             try:
-                lane.synchronize(
-                    timeout_s=None if remaining == math.inf else remaining
-                )
+                lane.synchronize(timeout_s=None if remaining == math.inf else remaining)
             except TimeoutError:
                 self._fail_deadline()
         self._active_lanes.clear()
         self._pending_contexts.clear()
 
-    def _issue_reshard(self, entry: ParamPlan, *, src: Any, dst: Any) -> None:
+    def _issue_reshard(
+        self,
+        entry: ParamPlan,
+        *,
+        spec: LocalParamSpec | None,
+        src: Any,
+        dst: Any,
+    ) -> None:
         self._remaining()
         lane = self._lane(entry.partition_id)
-        spec = self._specs[entry.name]
+        if spec is None:
+            _reshard(comm=lane, entry=entry, src=None, dst=None)
+            self._record_lane(lane)
+            return
         with self._stream_context(lane, spec):
             ctx = spec.enter()
             # Retain staging buffers and hook state until the asynchronous CUDA
@@ -390,8 +402,36 @@ class _CollectiveHalf:
 class NcclM2nSender(_CollectiveHalf):
     """Trainer half: supplies each parameter's local shard to the collective."""
 
-    def __init__(self, *, source_partition: int | None = None, **kwargs: Any) -> None:
-        super().__init__(active_partition=source_partition, **kwargs)
+    def __init__(
+        self,
+        *,
+        source_partition: int | None = None,
+        source_rank_in_lane: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        if source_rank_in_lane is not None and (
+            isinstance(source_rank_in_lane, bool)
+            or not isinstance(source_rank_in_lane, int)
+            or source_rank_in_lane < 0
+        ):
+            raise ValueError("source_rank_in_lane must be a non-negative integer")
+        plan = kwargs["plan"]
+        required_bulk_names = (
+            None
+            if source_rank_in_lane is None
+            else [
+                entry.name
+                for entry in plan.bulk
+                if (source_partition is None or entry.partition_id == source_partition)
+                and source_rank_in_lane in entry.src_mesh.ranks()
+            ]
+        )
+        super().__init__(
+            active_partition=source_partition,
+            required_bulk_names=required_bulk_names,
+            **kwargs,
+        )
+        self._source_rank_in_lane = source_rank_in_lane
 
     def start_weight_update(self, version: str) -> None:
         self._begin_transfer(version)
@@ -407,7 +447,16 @@ class NcclM2nSender(_CollectiveHalf):
         the case that deadlocks.
         """
         for entry in self.entries(layer_group_id):
-            self._issue_reshard(entry, src=lambda ctx: ctx.buf, dst=lambda ctx: None)
+            owns_source = (
+                self._source_rank_in_lane is None
+                or self._source_rank_in_lane in entry.src_mesh.ranks()
+            )
+            self._issue_reshard(
+                entry,
+                spec=self._specs[entry.name] if owns_source else None,
+                src=lambda ctx: ctx.buf,
+                dst=lambda ctx: None,
+            )
 
     def finish_weight_update(self, broadcast_lane_id: int) -> None:
         """Drain every reshard lane, then broadcast the misc parameters once."""
@@ -423,7 +472,12 @@ class NcclM2nReceiver(_CollectiveHalf):
 
     def update_weights(self, layer_group_id: int) -> None:
         for entry in self.entries(layer_group_id):
-            self._issue_reshard(entry, src=lambda ctx: None, dst=lambda ctx: ctx.buf)
+            self._issue_reshard(
+                entry,
+                spec=self._specs[entry.name],
+                src=lambda ctx: None,
+                dst=lambda ctx: ctx.buf,
+            )
         # Loader.install runs immediately after this method. It may read or
         # release receive buffers, so the group's transfers and post hooks must
         # be complete before returning.

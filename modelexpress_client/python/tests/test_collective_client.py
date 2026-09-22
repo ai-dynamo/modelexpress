@@ -31,6 +31,7 @@ from modelexpress_rl.collective import (
     build_partitioned_lanes,
 )
 from modelexpress_rl.collective.comm import new_unique_id
+from modelexpress_rl.collective.integrations._common import _FrozenPlan
 from modelexpress_rl.collective.rendezvous import (
     EpochChangedError,
     GroupNotReadyError,
@@ -100,12 +101,14 @@ class FakeRendezvous:
         epoch = self._epochs[min(self.joins, len(self._epochs) - 1)]
         self.joins += 1
         self._epoch = epoch
+        role = getattr(kwargs["role"], "value", kwargs["role"])
+        rank_in_lane = 0 if role == "TRAINER" else 2
         return Membership(
             group_id="g",
             epoch=epoch,
             lanes=(
-                LaneMembership(0, "RESHARD", 0 if self._leader else 2, 4),
-                LaneMembership(1, "BROADCAST", 0 if self._leader else 2, 4),
+                LaneMembership(0, "RESHARD", rank_in_lane, 4),
+                LaneMembership(1, "BROADCAST", rank_in_lane, 4),
             ),
             is_bootstrap_leader=self._leader,
         )
@@ -1029,6 +1032,138 @@ class TestPlanGates:
         with pytest.raises(KeyError, match="no local storage"):
             client.compute_plan()
         assert rz.joins == 0
+
+    def test_nonowner_uses_membership_lane_rank_and_still_enters_the_op(
+        self, fake_nccl, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "modelexpress_rl.collective.backend.loaded_nccl_version",
+            lambda: (2, 30, 7),
+        )
+        plan = ReshardPlan(
+            bulk=[
+                ParamPlan(
+                    name="a",
+                    global_shape=(8, 4),
+                    dtype="bfloat16",
+                    partition_id=0,
+                    src_mesh=MeshSpec(shape=(1,), rank_offset=0),
+                    src_placements=(Placement.shard(0),),
+                    dst_mesh=MeshSpec(shape=(2,), rank_offset=2),
+                    dst_placements=(Placement.shard(0),),
+                )
+            ],
+            misc=[MiscParam("m", (4,), "bfloat16")],
+        )
+
+        class NonOwnerEngine(FakeEngine):
+            def local_params(self):
+                return {"m": LocalParamSpec(base="buf::m")}
+
+        class RankOneRendezvous(FakeRendezvous):
+            def join(self, **kwargs):
+                self.joins += 1
+                return Membership(
+                    group_id="g",
+                    epoch=1,
+                    lanes=(
+                        LaneMembership(0, "RESHARD", 1, 4),
+                        LaneMembership(1, "BROADCAST", 1, 4),
+                    ),
+                    is_bootstrap_leader=False,
+                )
+
+        wire_args = []
+        sys.modules["nccl.m2n"].reshard = lambda src, dst, comm, **kwargs: (
+            wire_args.append((src, dst))
+        )
+        client = RefitClientTrainer(
+            rendezvous=RankOneRendezvous(),
+            model_name="m",
+            trainer_slots=["t0", "t1"],
+            generator_slots=["g0", "g1"],
+            source_partition_count=1,
+            slot_id="t1",
+            worker_id="w1",
+            index_in_role=99,
+        )
+        client.initialize(NonOwnerEngine(plan), source_partition=0)
+
+        client.compute_plan()
+        client.start_weight_update("v1")
+        client.publish_weights("v1")
+
+        assert wire_args == [(None, None)]
+
+    @pytest.mark.parametrize(
+        "ranks",
+        [
+            [],
+            [0, 0],
+            [0, 2],
+            [-1],
+            [4],
+        ],
+    )
+    def test_source_mesh_must_be_a_contiguous_subset_of_trainers(self, ranks):
+        class RankListMesh:
+            shape = (1,)
+            rank_offset = 0
+
+            def ranks(self):
+                return list(ranks)
+
+            def canonical(self):
+                return "test"
+
+            def nested(self):
+                return [list(ranks)]
+
+        plan = ReshardPlan(
+            bulk=[
+                ParamPlan(
+                    name="a",
+                    global_shape=(8, 4),
+                    dtype="bfloat16",
+                    partition_id=0,
+                    src_mesh=RankListMesh(),
+                    src_placements=(Placement.shard(0),),
+                    dst_mesh=MeshSpec(shape=(2,), rank_offset=4),
+                    dst_placements=(Placement.shard(0),),
+                )
+            ]
+        )
+        topology = SimpleNamespace(
+            source_partition_count=1,
+            trainer_slots=["t0", "t1", "t2", "t3"],
+            generator_slots=["g0", "g1"],
+        )
+
+        with pytest.raises(ValueError, match="contiguous subset"):
+            _FrozenPlan(plan).validate_topology(topology)
+
+    def test_source_mesh_may_be_a_proper_subset_of_trainers(self):
+        plan = ReshardPlan(
+            bulk=[
+                ParamPlan(
+                    name="a",
+                    global_shape=(8, 4),
+                    dtype="bfloat16",
+                    partition_id=0,
+                    src_mesh=MeshSpec(shape=(2,), rank_offset=1),
+                    src_placements=(Placement.shard(0),),
+                    dst_mesh=MeshSpec(shape=(2,), rank_offset=4),
+                    dst_placements=(Placement.shard(0),),
+                )
+            ]
+        )
+        topology = SimpleNamespace(
+            source_partition_count=1,
+            trainer_slots=["t0", "t1", "t2", "t3"],
+            generator_slots=["g0", "g1"],
+        )
+
+        _FrozenPlan(plan).validate_topology(topology)
 
 
 class TestRefitRound:
