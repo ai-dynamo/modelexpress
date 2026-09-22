@@ -15,6 +15,7 @@ use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use modelexpress_common::envs;
 use modelexpress_common::grpc::refit_collective::{
     CollectiveGroup, CollectiveGroupMembership, CollectiveGroupSpec, CollectiveGroupState,
     CollectiveLane, CollectiveParticipant, CollectiveRole, CollectiveTransfer,
@@ -60,6 +61,10 @@ fn participants_key(group_id: &str) -> String {
 
 fn digests_key(group_id: &str) -> String {
     format!("mx:refitc:group:{group_id}:digests")
+}
+
+fn active_ops_key(group_id: &str) -> String {
+    format!("mx:refitc:group:{group_id}:ops")
 }
 
 fn lane_key(group_id: &str, lane_id: u32) -> String {
@@ -510,10 +515,12 @@ impl RedisCollectiveBackend {
         script.key(group_key(group_id));
         script.key(participants_key(group_id));
         script.key(digests_key(group_id));
+        script.key(active_ops_key(group_id));
         for lane in &lanes {
             script.key(lane_key(group_id, lane.lane_id));
         }
         let outcome: String = script
+            .arg(OPERATION_KEY_PREFIX)
             .invoke_async(&mut connection)
             .await
             .map_err(redis_error)?;
@@ -606,6 +613,7 @@ impl CollectiveBackend for RedisCollectiveBackend {
             participants_key(&group_id),
             digests_key(&group_id),
             worker_key(&request.worker_id),
+            active_ops_key(&group_id),
         ];
         for lane in layout.lanes() {
             keys.push(lane_key(&group_id, lane.lane_id));
@@ -644,6 +652,7 @@ impl CollectiveBackend for RedisCollectiveBackend {
             .arg(spec.expected_trainer_slots.join("\n"))
             .arg(spec.expected_generator_slots.join("\n"))
             .arg(now_unix_ms()?)
+            .arg(OPERATION_KEY_PREFIX)
             .invoke_async(&mut self.connection.clone())
             .await
             .map_err(redis_error)?;
@@ -832,6 +841,7 @@ impl CollectiveBackend for RedisCollectiveBackend {
                 &request.idempotency_key,
             ))
             .key(group_key(&group_id))
+            .key(active_ops_key(&group_id))
             .arg(&operation_id)
             .arg(&group_id)
             .arg(&request.version_id)
@@ -840,6 +850,7 @@ impl CollectiveBackend for RedisCollectiveBackend {
             .arg("PENDING")
             .arg(now_unix_ms()?)
             .arg(OPERATION_KEY_PREFIX)
+            .arg(envs::nccl_refit_transfer_timeout_secs())
             .invoke_async(&mut self.connection.clone())
             .await
             .map_err(redis_error)?;
@@ -899,6 +910,7 @@ impl CollectiveBackend for RedisCollectiveBackend {
                 &transfer.model_name,
                 &transfer.idempotency_key,
             ))
+            .key(active_ops_key(&transfer.group_id))
             .arg(operation_id)
             .invoke_async(&mut self.connection.clone())
             .await
@@ -927,6 +939,7 @@ impl CollectiveBackend for RedisCollectiveBackend {
         script.key(reported_key(&request.operation_id));
         script.key(group_key(&request.group_id));
         script.key(participants_key(&request.group_id));
+        script.key(active_ops_key(&request.group_id));
         for lane in &group.lanes {
             script.key(lane_key(&request.group_id, lane.lane_id));
         }

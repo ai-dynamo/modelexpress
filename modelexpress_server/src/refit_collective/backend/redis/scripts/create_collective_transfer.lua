@@ -3,8 +3,9 @@
 -- KEYS[1]: operation hash
 -- KEYS[2]: create-request idempotency key
 -- KEYS[3]: group hash
+-- KEYS[4]: group active-operations set
 -- ARGV: operation_id, group_id, version_id, model_name, idempotency_key,
---       state, created_at_unix_ms, operation_key_prefix
+--       state, created_at_unix_ms, operation_key_prefix, idempotency_ttl_secs
 --
 -- Returns:
 --   CREATED
@@ -15,6 +16,12 @@
 -- The idempotency reservation is what makes an orchestrator retry safe: a
 -- create that timed out client-side but committed server-side returns the
 -- original operation instead of opening a second one against the same group.
+--
+-- The reservation key also carries a TTL: a worker that dies between this
+-- call and the next epoch bump would otherwise leak the key forever, since
+-- nothing but a terminal delete ever removes it. The active-operations set
+-- is the fast path that lets an epoch bump find and abort this operation
+-- before that TTL would matter.
 
 local existing = redis.call('GET', KEYS[2])
 if existing then
@@ -45,6 +52,7 @@ redis.call('HSET', KEYS[1],
   'state', ARGV[6],
   'failure_message', '',
   'created_at_unix_ms', ARGV[7])
-redis.call('SET', KEYS[2], ARGV[1])
+redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[9])
+redis.call('SADD', KEYS[4], ARGV[1])
 
 return 'CREATED'

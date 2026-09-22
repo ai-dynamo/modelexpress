@@ -4,7 +4,8 @@
 -- KEYS[2]: reported worker set
 -- KEYS[3]: group hash
 -- KEYS[4]: participants hash
--- KEYS[5..]: every lane hash, cleared if the collective fails
+-- KEYS[5]: group active-operations set
+-- KEYS[6..]: every lane hash, cleared if the collective fails
 -- ARGV: operation_id, group_id, epoch, worker_id, succeeded ('1'/'0'), message
 
 local function parse_participant(record)
@@ -62,6 +63,7 @@ redis.call('SADD', KEYS[2], ARGV[4])
 
 if ARGV[5] == '0' then
   redis.call('HSET', KEYS[1], 'state', 'FAILED', 'failure_message', ARGV[6])
+  redis.call('SREM', KEYS[5], ARGV[1])
 
   -- A failed collective has an unusable communicator. Move the group epoch in
   -- the same transaction so no later operation can reuse its bootstrap IDs.
@@ -72,7 +74,7 @@ if ARGV[5] == '0' then
     'plan_source_worker_id', '',
     'plan_source_endpoint', '',
     'plan_source_digest', '')
-  for i = 5, #KEYS do
+  for i = 6, #KEYS do
     redis.call('DEL', KEYS[i])
   end
   return 'OK:FAILED'
@@ -82,6 +84,7 @@ local reported = redis.call('SCARD', KEYS[2])
 local expected = tonumber(redis.call('HGET', KEYS[3], 'expected_total'))
 if expected and reported == expected then
   redis.call('HSET', KEYS[1], 'state', 'COMPLETE')
+  redis.call('SREM', KEYS[5], ARGV[1])
   return 'OK:COMPLETE'
 end
 

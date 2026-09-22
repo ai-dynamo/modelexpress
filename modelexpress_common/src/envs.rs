@@ -124,6 +124,15 @@ pub const MX_METADATA_NAMESPACE: &str = "MX_METADATA_NAMESPACE";
 /// Kubernetes namespace injected via the downward API for in-cluster pods.
 pub const POD_NAMESPACE: &str = "POD_NAMESPACE";
 
+// ── Refit collective (server) ───────────────────────────────────────────────
+/// Deadline (seconds) for a collective-refit weight transfer, armed per
+/// weight version once the group reports READY. Shared with the Python NCCL
+/// client, which stores it as a float; also reused server-side as the TTL on
+/// a newly created transfer op's idempotency key, so a worker that dies
+/// between create and the next group-epoch bump does not leak the key
+/// forever.
+pub const MX_NCCL_REFIT_TRANSFER_TIMEOUT_S: &str = "MX_NCCL_REFIT_TRANSFER_TIMEOUT_S";
+
 // ── Reaper (server) ─────────────────────────────────────────────────────────
 /// Interval (seconds) between reaper scans for stale/GC worker sweeps.
 pub const MX_REAPER_SCAN_INTERVAL_SECS: &str = "MX_REAPER_SCAN_INTERVAL_SECS";
@@ -167,6 +176,9 @@ const DEFAULT_REAPER_SCAN_INTERVAL_SECS: u64 = 30;
 const DEFAULT_REGISTRY_STATS_INTERVAL_SECS: u64 = 60;
 const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 90;
 const DEFAULT_GC_TIMEOUT_SECS: u64 = 3600;
+/// Default collective-refit transfer timeout, matching the Python client's
+/// `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` default of 600.0 seconds.
+const DEFAULT_NCCL_REFIT_TRANSFER_TIMEOUT_SECS: u64 = 600;
 
 // ── Getters ───────────────────────────────────────────────────────────────
 
@@ -316,11 +328,33 @@ pub fn gc_timeout_secs() -> u64 {
     env_u64(MX_GC_TIMEOUT_SECS, DEFAULT_GC_TIMEOUT_SECS)
 }
 
+/// Collective-refit transfer timeout in seconds
+/// ([`MX_NCCL_REFIT_TRANSFER_TIMEOUT_S`], default 600). Accepts either an
+/// integer or a fractional value, rounded up, since the Python client stores
+/// this as a float.
+pub fn nccl_refit_transfer_timeout_secs() -> u64 {
+    env_secs_ceil(
+        MX_NCCL_REFIT_TRANSFER_TIMEOUT_S,
+        DEFAULT_NCCL_REFIT_TRANSFER_TIMEOUT_SECS,
+    )
+}
+
 /// Read an environment variable as `u64`, falling back to `default`.
 fn env_u64(name: &str, default: u64) -> u64 {
     env::var(name)
         .ok()
         .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Read an environment variable as a number of seconds, accepting either an
+/// integer or a fractional value, rounded up to the nearest whole second.
+/// Falls back to `default` if unset or unparseable.
+fn env_secs_ceil(name: &str, default: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|v| v.max(0.0).ceil() as u64)
         .unwrap_or(default)
 }
 

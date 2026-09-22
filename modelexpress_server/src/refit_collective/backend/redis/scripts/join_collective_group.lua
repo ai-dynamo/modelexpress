@@ -5,7 +5,8 @@
 -- KEYS[2]: participants hash (slot_id -> worker_id|role|index|joined_epoch)
 -- KEYS[3]: reported plan digests hash (slot_id -> digest)
 -- KEYS[4]: the incoming worker's TTL-bound Refit registration
--- KEYS[5..4+lane_count]: one lane hash per declared lane, in declared order
+-- KEYS[5]: group active-operations set
+-- KEYS[6..5+lane_count]: one lane hash per declared lane, in declared order
 -- ARGV[1]:  group_id
 -- ARGV[2]:  model_name
 -- ARGV[3]:  declared lane set, one line per lane
@@ -21,6 +22,7 @@
 -- ARGV[13]: expected_trainer_slots, newline separated
 -- ARGV[14]: expected_generator_slots, newline separated
 -- ARGV[15]: created_at_unix_ms
+-- ARGV[16]: operation_key_prefix
 
 local function contains_slot(list, target)
   for slot in string.gmatch(list .. '\n', '([^\n]*)\n') do
@@ -53,7 +55,23 @@ local function registration_matches(worker_id, role, model_name, key)
     and redis.call('HGET', key, 'model_name') == model_name
 end
 
-local lane_count = #KEYS - 4
+-- A group churn that invalidates the current epoch's in-flight communicator
+-- also strands any transfer op still riding it. Abort every non-terminal op
+-- this group knows about before the epoch moves out from under it.
+local function abort_stale_ops(ops_set_key, op_key_prefix)
+  local op_ids = redis.call('SMEMBERS', ops_set_key)
+  for i = 1, #op_ids do
+    local op_key = op_key_prefix .. op_ids[i]
+    local op_state = redis.call('HGET', op_key, 'state')
+    if op_state == 'PENDING' or op_state == 'RUNNING' then
+      redis.call('HSET', op_key, 'state', 'ABORTED',
+        'failure_message', 'group epoch advanced before the transfer completed')
+    end
+    redis.call('SREM', ops_set_key, op_ids[i])
+  end
+end
+
+local lane_count = #KEYS - 5
 local expected_slots = ARGV[7] == 'TRAINER' and ARGV[13] or ARGV[14]
 if not contains_slot(expected_slots, ARGV[5]) then
   return 'UNEXPECTED_SLOT'
@@ -81,7 +99,7 @@ if not epoch then
   redis.call('DEL', KEYS[2])
   redis.call('DEL', KEYS[3])
   for i = 1, lane_count do
-    redis.call('DEL', KEYS[4 + i])
+    redis.call('DEL', KEYS[5 + i])
   end
   redis.call('HSET', KEYS[1],
     'group_id', ARGV[1],
@@ -106,7 +124,7 @@ else
   membership_change_requires_bump = redis.call('HGET', KEYS[1], 'state') == 'READY'
   if not membership_change_requires_bump then
     for i = 1, lane_count do
-      local bootstrap_epoch = redis.call('HGET', KEYS[4 + i], 'bootstrap_epoch')
+      local bootstrap_epoch = redis.call('HGET', KEYS[5 + i], 'bootstrap_epoch')
       if bootstrap_epoch and tonumber(bootstrap_epoch) == epoch then
         membership_change_requires_bump = true
         break
@@ -197,8 +215,9 @@ if changed then
     'plan_source_endpoint', '',
     'plan_source_digest', '')
   for i = 1, lane_count do
-    redis.call('DEL', KEYS[4 + i])
+    redis.call('DEL', KEYS[5 + i])
   end
+  abort_stale_ops(KEYS[5], ARGV[16])
 end
 
 redis.call('HSET', KEYS[2], ARGV[5],
@@ -231,7 +250,7 @@ end
 
 if ready then
   for i = 1, lane_count do
-    local stamped = redis.call('HGET', KEYS[4 + i], 'bootstrap_epoch')
+    local stamped = redis.call('HGET', KEYS[5 + i], 'bootstrap_epoch')
     if not stamped or tonumber(stamped) ~= epoch then
       ready = false
       break
