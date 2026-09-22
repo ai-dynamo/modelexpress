@@ -133,8 +133,6 @@ spec:
                   fieldPath: status.podIP
             - name: HF_HOME
               value: /models
-            - name: MX_TRANSFER_TIMEOUT
-              value: "60"
           ports:
             - name: http
               containerPort: 8000
