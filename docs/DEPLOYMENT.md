@@ -372,7 +372,7 @@ Destination layout:
 |---|---|---|
 | `push` to `pull-request/<pr_id>` (copy-pr-bot mirror) | `${ARTIFACTORY_PYPI_REPO_NAME}` | `pr/<pr_id>/<commit_sha>/<run_id>/<run_attempt>/<arch>/` |
 | `push` to `main`, `release/**` | `${ARTIFACTORY_PYPI_REPO_NAME}` | `post-merge/<commit_sha>/<run_id>/<run_attempt>/<arch>/` |
-| Nightly (`nightly-ci.yml`) | `sw-dynamo-modelexpress-cargo-local` | `nightly/<date>-<sha7>-<run_id>/<run_attempt>/` |
+| Nightly (`nightly-ci.yml`) | `${ARTIFACTORY_CARGO_REPO_NAME}` | `nightly/<date>-<sha7>-<run_id>-<run_attempt>/` |
 
 The PR and post-merge paths each contain the 6 artifacts from one arch:
 4 manylinux wheels (cp310-cp313), 1 `py3-none-any` wheel, and 1 sdist.
@@ -381,7 +381,10 @@ packaged Rust crates (`.crate`) — see
 [Nightly pipeline](#nightly-pipeline). The upload step is gated on the
 `automated-release` GitHub environment, which holds `ARTIFACTORY_URL`,
 `ARTIFACTORY_TOKEN` (JFrog identity token), and
-`ARTIFACTORY_PYPI_REPO_NAME`.
+`ARTIFACTORY_PYPI_REPO_NAME`. Registry and repository
+names are secrets so they stay out of this public repo and are masked in
+run logs: `MX_IMAGE_REPO`, `NGC_PUBLISH_ORG` (repo scope) and `ARTIFACTORY_CARGO_REPO_NAME`
+(`automated-release`).
 
 ### Nightly pipeline
 
@@ -395,21 +398,37 @@ Every job runs on the velonix self-hosted runners.
 
 | Artifact | Version | Destination |
 |---|---|---|
-| Server image (amd64 + arm64) | tag `<date>-<sha7>` | `nvcr.io/nvstaging/ai-dynamo/modelexpress-server-nightly` (+ floating `:latest`, and `modelexpress-server:nightly`) |
-| Python wheels + sdist | `<base>.dev<date>` | `sw-dynamo-modelexpress-cargo-local/nightly/<date>-<sha7>-<run_id>/<run_attempt>/` |
+| Server image (amd64 + arm64) | tag `<date>-<sha7>` | `nvcr.io/${NGC_PUBLISH_ORG}/ai-dynamo/modelexpress-server-nightly` (+ floating `:latest`, and `modelexpress-server:nightly`) |
+| Python wheels + sdist | `<base>.dev<date>` | `${ARTIFACTORY_CARGO_REPO_NAME}/nightly/<date>-<sha7>-<run_id>-<run_attempt>/` |
 | Rust crates (`.crate`) | `<base>-nightly.<date>.<run>.<attempt>.g<sha7>` | same Artifactory path |
-| Helm chart | `<base>-nightly.<date>.<run>.<attempt>.g<sha7>` | `helm.ngc.nvidia.com/nvstaging/ai-dynamo` |
+| Helm chart | `<base>-nightly.<date>.<run>.<attempt>.g<sha7>` | `helm.ngc.nvidia.com/${NGC_PUBLISH_ORG}/ai-dynamo` |
 
 The packaged nightly chart is stamped to reference the nightly server
 image, so `helm install` of a nightly chart deploys nightly code — it does
 not fall back to the released image in `helm/values.yaml`.
 
+No ModelExpress artifact is uploaded to GitHub artifact storage; the table
+above is the complete list of places a nightly artifact exists. Compliance
+scan results are the only permitted GitHub artifact. `package-helm-chart`
+and `stage-helm-ngc` each build the chart through
+`.github/scripts/package_helm_chart.sh`; keep both on that script so they
+cannot package different charts.
+
 After staging, the workflow triggers the internal GitLab
-release-automation pipeline (security scans) and reports to Slack: a
-thread is opened at start, staging results are replied on it, and any
-failed, cancelled or timed-out job raises an alert through
-`SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL`. The single job to watch is
-`nightly-status`.
+release-automation pipeline (security scans) and reports to Slack. A
+thread is opened at the start of every run, and its `thread_ts` is
+forwarded to GitLab as `SLACK_THREAD_TS`, so the GitLab pipeline
+continues posting its scan updates onto the same thread instead of
+starting a new one. Staging results and the GitLab handoff are replied on
+that thread; a channel-level message goes out through
+`SLACK_NOTIFY_NIGHTLY_WEBHOOK_URL` once per run, green or red. The single
+job to watch is `nightly-status`.
+
+Every Slack message mentions `SLACK_MENTION_OPS_SUPPORT` and
+`SLACK_MENTION_DYNAMO_BOT`; a failing run additionally mentions
+`SLACK_MENTION_MX_DEV_TEAM`. All three are repository variables holding
+full Slack mention syntax (`<!subteam^ID>` for a user group, `<@ID>` for
+a user or bot), so the IDs stay out of this public repository.
 
 Test failures do **not** block staging (matching the Dynamo nightly): a
 red test lane alerts Slack while the scan-gated staging proceeds.

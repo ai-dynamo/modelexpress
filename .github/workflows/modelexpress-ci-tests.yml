@@ -104,6 +104,7 @@
 #
 # Required secrets:
 #   AZURE_AKS_CI_KUBECONFIG_B64   — base64-encoded kubeconfig for the AKS host cluster
+#   MX_IMAGE_REPO                 — private registry the test images are built into
 #   NGC_API_KEY                   — push/pull registry images
 #   HF_TOKEN                      — HuggingFace token (required; used to create hf-token-secret in the test namespace)
 
@@ -153,7 +154,6 @@ env:
   VCLUSTER_NAMESPACE: mx-ci
   MX_CI_S3_BUCKET: ai-dynamo-modelexpress-ci
   MX_CI_S3_REGION: us-west-2
-  MX_IMAGE_REPO: nvcr.io/0980761089281446
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -178,7 +178,7 @@ jobs:
         # cleanup step reference the same value without re-templating.
         run: |
           echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-buildsrv" >> "$GITHUB_ENV"
-          echo "SERVER_IMAGE=${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}" >> "$GITHUB_ENV"
+          echo "SERVER_IMAGE=${{ secrets.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}" >> "$GITHUB_ENV"
 
       - name: Log in to image registry
         run: |
@@ -242,7 +242,7 @@ jobs:
         # cleanup step reference the same value without re-templating.
         run: |
           echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-buildcli-${{ strategy.job-index }}" >> "$GITHUB_ENV"
-          echo "WORKER_IMAGE=${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}" >> "$GITHUB_ENV"
+          echo "WORKER_IMAGE=${{ secrets.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}" >> "$GITHUB_ENV"
 
       - name: Log in to image registry
         run: |
@@ -527,10 +527,10 @@ jobs:
           namespace: ${{ matrix.namespace }}
           # Defaults to this commit's server; matrix.server_image overrides it
           # (e.g. the mixed-version embedded-metadata entry pins a released tag).
-          server_image: ${{ matrix.server_image || format('{0}/mx-server:{1}', env.MX_IMAGE_REPO, github.sha) }}
+          server_image: ${{ matrix.server_image || format('{0}/mx-server:{1}', secrets.MX_IMAGE_REPO, github.sha) }}
           manifest: ${{ matrix.manifest }}
           test_script: ${{ matrix.test_script }}
-          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
+          worker_image: ${{ secrets.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
           worker_registry: nvcr.io
           ngc_api_key: ${{ secrets.NGC_API_KEY }}
           model: ${{ env.MX_CI_MODEL }}
@@ -623,10 +623,10 @@ jobs:
         with:
           kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
           namespace: ${{ matrix.namespace }}
-          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          server_image: ${{ secrets.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
           manifest: ${{ matrix.manifest }}
           test_script: ci/k8s/client/test_p2p_k8s.py
-          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
+          worker_image: ${{ secrets.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
           worker_registry: nvcr.io
           ngc_api_key: ${{ secrets.NGC_API_KEY }}
           model: deepseek-ai/DeepSeek-V2-Lite
@@ -709,10 +709,10 @@ jobs:
         with:
           kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
           namespace: ${{ matrix.namespace }}
-          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          server_image: ${{ secrets.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
           manifest: ${{ matrix.manifest }}
           test_script: ci/k8s/client/test_p2p_k8s.py
-          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
+          worker_image: ${{ secrets.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
           worker_registry: nvcr.io
           ngc_api_key: ${{ secrets.NGC_API_KEY }}
           model: ${{ env.MX_CI_MODEL }}
@@ -813,10 +813,10 @@ jobs:
         with:
           kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
           namespace: ${{ matrix.namespace }}
-          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          server_image: ${{ secrets.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
           manifest: ${{ matrix.manifest }}
           test_script: ci/k8s/client/test_p2p_k8s.py
-          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-vllm:${{ github.sha }}
+          worker_image: ${{ secrets.MX_IMAGE_REPO }}/mx-worker-vllm:${{ github.sha }}
           worker_registry: nvcr.io
           ngc_api_key: ${{ secrets.NGC_API_KEY }}
           # DP uses the default dense CI model; EP overrides to an MoE model.
@@ -902,8 +902,8 @@ jobs:
           dgd_name: ${{ matrix.dgd_name }}
           manifest: ${{ matrix.manifest }}
           mode: ${{ matrix.mode }}
-          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
-          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-dynamo-vllm:${{ github.sha }}
+          server_image: ${{ secrets.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          worker_image: ${{ secrets.MX_IMAGE_REPO }}/mx-worker-dynamo-vllm:${{ github.sha }}
           worker_registry: nvcr.io
           ngc_api_key: ${{ secrets.NGC_API_KEY }}
           model: ${{ env.MX_CI_MODEL }}
@@ -957,8 +957,8 @@ jobs:
         with:
           kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
           namespace: mx-ci-fleet-${{ github.run_id }}
-          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
-          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-vllm:${{ github.sha }}
+          server_image: ${{ secrets.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          worker_image: ${{ secrets.MX_IMAGE_REPO }}/mx-worker-vllm:${{ github.sha }}
           worker_registry: nvcr.io
           ngc_api_key: ${{ secrets.NGC_API_KEY }}
           model: ${{ env.MX_CI_MODEL }}
@@ -1024,8 +1024,8 @@ jobs:
         with:
           kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
           namespace: ${{ matrix.namespace }}
-          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
-          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
+          server_image: ${{ secrets.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          worker_image: ${{ secrets.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
           worker_registry: nvcr.io
           ngc_api_key: ${{ secrets.NGC_API_KEY }}
           model: ${{ env.MX_CI_MODEL }}
@@ -1099,8 +1099,8 @@ jobs:
         with:
           kubeconfig_base64: ${{ steps.connect-vcluster.outputs.kubeconfig_base64 }}
           namespace: ${{ matrix.namespace }}
-          server_image: ${{ env.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
-          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
+          server_image: ${{ secrets.MX_IMAGE_REPO }}/mx-server:${{ github.sha }}
+          worker_image: ${{ secrets.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
           manifest: ${{ matrix.manifest }}
           model: ${{ env.MX_CI_MODEL }}
           hf_token: ${{ secrets.HF_TOKEN }}
@@ -1180,7 +1180,7 @@ jobs:
         uses: ./.github/actions/run-mx-streamer-test
         with:
           framework: ${{ matrix.framework }}
-          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
+          worker_image: ${{ secrets.MX_IMAGE_REPO }}/mx-worker-${{ matrix.framework }}:${{ github.sha }}
           model: ${{ env.MX_CI_MODEL }}
           s3_bucket: ${{ env.MX_CI_S3_BUCKET }}
           s3_region: ${{ env.MX_CI_S3_REGION }}

@@ -63,6 +63,8 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+      with:
+        persist-credentials: false
 
     - name: Install Rust toolchain
       run: |
@@ -130,6 +132,8 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+      with:
+        persist-credentials: false
 
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -158,6 +162,8 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+      with:
+        persist-credentials: false
 
     - name: Set up Go
       uses: actions/setup-go@v5
@@ -250,6 +256,8 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+      with:
+        persist-credentials: false
 
     - name: Install Rust toolchain
       run: |
@@ -302,6 +310,8 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+      with:
+        persist-credentials: false
 
     - name: Install Rust toolchain
       run: |
@@ -331,6 +341,8 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+      with:
+        persist-credentials: false
 
     - name: Install Rust toolchain
       run: |
@@ -370,6 +382,8 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+      with:
+        persist-credentials: false
 
     - name: Build Docker image
       run: |
@@ -406,6 +420,8 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+      with:
+        persist-credentials: false
 
     - name: Install kubectl, Helm and kind
       # Run-scoped, pinned installs. These jobs may run on a shared
@@ -449,6 +465,7 @@ jobs:
       env:
         MX_KIND_CLUSTER_NAME: mx-grpc-${{ github.run_id }}-${{ github.run_attempt }}
         KUBECONFIG: ${{ runner.temp }}/kubeconfig-grpc
+        MX_TEST_IMAGE_TAG: test-${{ github.run_id }}-${{ github.run_attempt }}
       run: |
         # kind is on $GITHUB_PATH from the install step above. Fall back to
         # deleting the node containers directly if the install step itself
@@ -459,3 +476,5 @@ jobs:
           docker rm -f $(docker ps -aq --filter "label=io.x-k8s.kind.cluster=${MX_KIND_CLUSTER_NAME}") 2>/dev/null || true
         fi
         rm -f "${KUBECONFIG}" 2>/dev/null || true
+        # Run-scoped tag, so `docker image prune` will not reclaim it.
+        docker image rm -f "modelexpress:${MX_TEST_IMAGE_TAG}" 2>/dev/null || true

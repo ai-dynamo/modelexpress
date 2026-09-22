@@ -46,13 +46,14 @@ on:
         required: false
         type: string
         default: ''
-      upload_repo:
+      use_nightly_repo:
         description: >-
-          Artifactory repository name overriding the ARTIFACTORY_PYPI_REPO_NAME
-          secret (e.g. sw-dynamo-modelexpress-cargo-local).
+          Upload to ARTIFACTORY_CARGO_REPO_NAME instead of
+          ARTIFACTORY_PYPI_REPO_NAME. Repository names are secrets, so callers
+          select one rather than passing a literal.
         required: false
-        type: string
-        default: ''
+        type: boolean
+        default: false
       skip_upload:
         description: Build the wheels but skip the Artifactory upload (dry runs).
         required: false
@@ -94,6 +95,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.11.1
@@ -175,8 +178,24 @@ jobs:
       - name: Upload to Artifactory
         if: inputs.skip_upload != true
         env:
-          UPLOAD_REPO: ${{ inputs.upload_repo || secrets.ARTIFACTORY_PYPI_REPO_NAME }}
+          # Selected in shell, not a `&&/||` expression: that expression
+          # silently falls through to DEFAULT_REPO when NIGHTLY_REPO is unset.
+          USE_NIGHTLY: ${{ inputs.use_nightly_repo }}
+          NIGHTLY_REPO: ${{ secrets.ARTIFACTORY_CARGO_REPO_NAME }}
+          DEFAULT_REPO: ${{ secrets.ARTIFACTORY_PYPI_REPO_NAME }}
         run: |
+          set -euo pipefail
+          if [ "${USE_NIGHTLY}" = "true" ]; then
+            UPLOAD_REPO="${NIGHTLY_REPO}"
+            MISSING="ARTIFACTORY_CARGO_REPO_NAME"
+          else
+            UPLOAD_REPO="${DEFAULT_REPO}"
+            MISSING="ARTIFACTORY_PYPI_REPO_NAME"
+          fi
+          if [ -z "${UPLOAD_REPO}" ]; then
+            echo "::error::${MISSING} is not set; refusing to upload to an empty repository path"
+            exit 1
+          fi
           DEST="${UPLOAD_REPO}/${{ steps.dest.outputs.subpath }}/"
           echo "Uploading to: ${DEST}"
           jf rt upload --flat "dist/*.whl" "${DEST}"
