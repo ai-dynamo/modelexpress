@@ -30,7 +30,8 @@
 #         modelexpress-server-nightly:latest         (floating)
 #         modelexpress-server:nightly                (floating)
 #     - wheels + sdist and crates (.crate) -> Artifactory
-#       <ARTIFACTORY_CARGO_REPO_NAME>/nightly/<date>-<sha7>-<run>-<attempt>/
+#       wheels -> <ARTIFACTORY_PYPI_REPO_NAME>, crates -> <ARTIFACTORY_CARGO_REPO_NAME>,
+#       both under nightly/<date>-<sha7>-<run>-<attempt>/
 #       (attempt-unique subfolder computed once in preflight: date-only
 #       versions aren't commit-unique, so same-day runs must not overwrite;
 #       the exact path is forwarded to GitLab as ARTIFACTORY_NIGHTLY_PATH)
@@ -329,7 +330,11 @@ jobs:
     # Every run, not just release runs: this thread is the anchor that the
     # staging reply, the GitLab handoff reply and the GitLab pipeline itself
     # all post into, so it has to exist before any of them run.
-    if: ${{ !cancelled() && needs.preflight.result == 'success' }}
+    # TEMPORARY(test): silence Slack for the pull-request/603 rehearsal.
+    # Drop the push exclusion when the rehearsal pins come out.
+    if: >-
+      ${{ !cancelled() && needs.preflight.result == 'success' &&
+          github.event_name != 'push' }}
     outputs:
       thread_ts: ${{ steps.post.outputs.thread_ts }}
     steps:
@@ -544,11 +549,8 @@ jobs:
     uses: ./.github/workflows/build-wheels.yml
     with:
       wheel_version: ${{ needs.preflight.outputs.wheel_version }}
-      # Neither env nor secrets is available in a reusable-call `with:`, so the
-      # callee resolves the repo name from its own secret.
-      # The path comes from preflight so every uploader and the GitLab handoff
-      # agree on one attempt-unique folder.
-      use_nightly_repo: true
+      # The path comes from preflight so the wheel upload and the GitLab
+      # handoff agree on one attempt-unique folder.
       upload_prefix: ${{ needs.preflight.outputs.artifactory_path }}
       skip_upload: ${{ needs.preflight.outputs.release != 'true' }}
     secrets: inherit
@@ -588,7 +590,9 @@ jobs:
       - name: Install build prerequisites
         run: |
           set -euo pipefail
-          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          # build-essential: the builder image ships no cc, so every Rust
+          # build script fails to link without it.
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler build-essential
           if ! command -v cargo >/dev/null; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           fi
@@ -899,9 +903,12 @@ jobs:
     runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 10
     needs: [preflight, notify-slack-start, stage-containers-ngc, build-wheels, stage-crates, stage-helm-ngc]
+    # TEMPORARY(test): silence Slack for the pull-request/603 rehearsal.
+    # Drop the push exclusion when the rehearsal pins come out.
     if: >-
       ${{ !cancelled() &&
           needs.preflight.outputs.release == 'true' &&
+          github.event_name != 'push' &&
           needs.notify-slack-start.outputs.thread_ts != '' }}
     continue-on-error: true
     steps:
@@ -974,7 +981,7 @@ jobs:
           # actually built, not a fixed name.
           SONAR_BRANCH: ${{ github.ref_name }}
           ARTIFACTORY_PATH: ${{ needs.preflight.outputs.artifactory_path }}
-          ARTIFACTORY_NIGHTLY_REPO: ${{ secrets.ARTIFACTORY_CARGO_REPO_NAME }}
+          ARTIFACTORY_WHEEL_REPO: ${{ secrets.ARTIFACTORY_PYPI_REPO_NAME }}
           NGC_STAGING_ORG: ${{ secrets.NGC_PUBLISH_ORG }}
           NIGHTLY_TAG: ${{ needs.preflight.outputs.nightly_tag }}
           WHEEL_VERSION: ${{ needs.preflight.outputs.wheel_version }}
@@ -989,8 +996,8 @@ jobs:
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_RELEASE_CHANNEL_ID }}
         run: |
           set -euo pipefail
-          if [ -z "${ARTIFACTORY_NIGHTLY_REPO}" ]; then
-            echo "::error::ARTIFACTORY_CARGO_REPO_NAME is not set; GitLab would receive an empty artifact path"
+          if [ -z "${ARTIFACTORY_WHEEL_REPO}" ]; then
+            echo "::error::ARTIFACTORY_PYPI_REPO_NAME is not set; GitLab would receive an empty artifact path"
             exit 1
           fi
 
@@ -1033,7 +1040,7 @@ jobs:
             --form "variables[ARTIFACTS]=${ARTIFACTS}" \
             --form "variables[SONAR_BRANCH]=${SONAR_BRANCH}" \
             --form "variables[CONTAINER_IMAGE]=nvcr.io/${NGC_STAGING_ORG}/ai-dynamo/${STAGED_CONTAINERS}" \
-            --form "variables[ARTIFACTORY_NIGHTLY_REPO]=${ARTIFACTORY_NIGHTLY_REPO}" \
+            --form "variables[ARTIFACTORY_NIGHTLY_REPO]=${ARTIFACTORY_WHEEL_REPO}" \
             --form "variables[ARTIFACTORY_NIGHTLY_PATH]=${ARTIFACTORY_PATH}" \
             --form "variables[NGC_STAGING_ORG]=${NGC_STAGING_ORG}" \
             --form "variables[NIGHTLY_TAG]=${NIGHTLY_TAG}" \
@@ -1203,7 +1210,9 @@ jobs:
     # catches red states the API cannot see, like a release-mandatory job that
     # was skipped — can force the alert.
     needs: [nightly-status]
-    if: ${{ always() }}
+    # TEMPORARY(test): silence Slack for the pull-request/603 rehearsal.
+    # Drop the push exclusion when the rehearsal pins come out.
+    if: ${{ always() && github.event_name != 'push' }}
     uses: ./.github/workflows/notify-slack.yml
     permissions:
       contents: read

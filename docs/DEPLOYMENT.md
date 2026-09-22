@@ -372,7 +372,8 @@ Destination layout:
 |---|---|---|
 | `push` to `pull-request/<pr_id>` (copy-pr-bot mirror) | `${ARTIFACTORY_PYPI_REPO_NAME}` | `pr/<pr_id>/<commit_sha>/<run_id>/<run_attempt>/<arch>/` |
 | `push` to `main`, `release/**` | `${ARTIFACTORY_PYPI_REPO_NAME}` | `post-merge/<commit_sha>/<run_id>/<run_attempt>/<arch>/` |
-| Nightly (`nightly-ci.yml`) | `${ARTIFACTORY_CARGO_REPO_NAME}` | `nightly/<date>-<sha7>-<run_id>-<run_attempt>/` |
+| Nightly wheels (`nightly-ci.yml`) | `${ARTIFACTORY_PYPI_REPO_NAME}` | `nightly/<date>-<sha7>-<run_id>-<run_attempt>/` |
+| Nightly crates (`nightly-ci.yml`) | `${ARTIFACTORY_CARGO_REPO_NAME}` | `nightly/<date>-<sha7>-<run_id>-<run_attempt>/` |
 
 The PR and post-merge paths each contain the 6 artifacts from one arch:
 4 manylinux wheels (cp310-cp313), 1 `py3-none-any` wheel, and 1 sdist.
@@ -399,8 +400,8 @@ Every job runs on the velonix self-hosted runners.
 | Artifact | Version | Destination |
 |---|---|---|
 | Server image (amd64 + arm64) | tag `<date>-<sha7>` | `nvcr.io/${NGC_PUBLISH_ORG}/ai-dynamo/modelexpress-server-nightly` (+ floating `:latest`, and `modelexpress-server:nightly`) |
-| Python wheels + sdist | `<base>.dev<date>` | `${ARTIFACTORY_CARGO_REPO_NAME}/nightly/<date>-<sha7>-<run_id>-<run_attempt>/` |
-| Rust crates (`.crate`) | `<base>-nightly.<date>.<run>.<attempt>.g<sha7>` | same Artifactory path |
+| Python wheels + sdist | `<base>.dev<date>` | `${ARTIFACTORY_PYPI_REPO_NAME}/nightly/<date>-<sha7>-<run_id>-<run_attempt>/` |
+| Rust crates (`.crate`) | `<base>-nightly.<date>.<run>.<attempt>.g<sha7>` | `${ARTIFACTORY_CARGO_REPO_NAME}/nightly/<date>-<sha7>-<run_id>-<run_attempt>/` |
 | Helm chart | `<base>-nightly.<date>.<run>.<attempt>.g<sha7>` | `helm.ngc.nvidia.com/${NGC_PUBLISH_ORG}/ai-dynamo` |
 
 The packaged nightly chart is stamped to reference the nightly server

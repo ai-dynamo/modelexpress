@@ -46,14 +46,6 @@ on:
         required: false
         type: string
         default: ''
-      use_nightly_repo:
-        description: >-
-          Upload to ARTIFACTORY_CARGO_REPO_NAME instead of
-          ARTIFACTORY_PYPI_REPO_NAME. Repository names are secrets, so callers
-          select one rather than passing a literal.
-        required: false
-        type: boolean
-        default: false
       skip_upload:
         description: Build the wheels but skip the Artifactory upload (dry runs).
         required: false
@@ -178,22 +170,11 @@ jobs:
       - name: Upload to Artifactory
         if: inputs.skip_upload != true
         env:
-          # Selected in shell, not a `&&/||` expression: that expression
-          # silently falls through to DEFAULT_REPO when NIGHTLY_REPO is unset.
-          USE_NIGHTLY: ${{ inputs.use_nightly_repo }}
-          NIGHTLY_REPO: ${{ secrets.ARTIFACTORY_CARGO_REPO_NAME }}
-          DEFAULT_REPO: ${{ secrets.ARTIFACTORY_PYPI_REPO_NAME }}
+          UPLOAD_REPO: ${{ secrets.ARTIFACTORY_PYPI_REPO_NAME }}
         run: |
           set -euo pipefail
-          if [ "${USE_NIGHTLY}" = "true" ]; then
-            UPLOAD_REPO="${NIGHTLY_REPO}"
-            MISSING="ARTIFACTORY_CARGO_REPO_NAME"
-          else
-            UPLOAD_REPO="${DEFAULT_REPO}"
-            MISSING="ARTIFACTORY_PYPI_REPO_NAME"
-          fi
           if [ -z "${UPLOAD_REPO}" ]; then
-            echo "::error::${MISSING} is not set; refusing to upload to an empty repository path"
+            echo "::error::ARTIFACTORY_PYPI_REPO_NAME is not set; refusing to upload to an empty repository path"
             exit 1
           fi
           DEST="${UPLOAD_REPO}/${{ steps.dest.outputs.subpath }}/"
