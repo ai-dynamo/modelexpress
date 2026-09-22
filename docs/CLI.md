@@ -22,9 +22,10 @@ Build the CLI from the ModelExpress workspace:
 
 ```bash
 cargo build --bin modelexpress-cli
+export PATH="$PWD/target/debug:$PATH"
 ```
 
-The compiled binary will be available at `target/debug/modelexpress-cli` (or `target/release/modelexpress-cli` for release builds).
+Run these commands from the repository root. The `PATH` change applies to the current shell; alternatively, invoke `./target/debug/modelexpress-cli` directly. For a release build, add `--release` and use `target/release` instead.
 
 ## Usage
 
@@ -143,10 +144,10 @@ modelexpress-cli model clear-all
 # Clear all models without confirmation
 modelexpress-cli model clear-all --yes
 
-# Validate model integrity
+# Inspect cached models
 modelexpress-cli model validate
 
-# Validate specific model
+# Check a specific model's cache path and common files
 modelexpress-cli model validate google-t5/t5-small
 
 # Show model storage statistics
@@ -175,8 +176,10 @@ For GCS downloads, configure Google Application Default Credentials on the proce
 - `status`: Show model storage status and usage
 - `clear`: Clear specific model from storage
 - `clear-all`: Clear all models from storage (use `--yes` to skip confirmation)
-- `validate`: Validate model integrity
+- `validate`: Inspect cached models or check one model's cache path and common files
 - `stats`: Show model storage statistics (use `--detailed` for more info)
+
+`model validate` is a cache-presence check, not an integrity check. For a named model, JSON reports whether its cache path exists; human output also checks for common Hugging Face files. It does not verify checksums, every shard, or whether the engine can load the checkpoint. A missing or incomplete model can still return exit code `0`. For scripts, inspect `.exists` with `jq -e`; for end-to-end validation, load the model and run an inference request.
 
 #### API Operations
 
@@ -270,10 +273,10 @@ modelexpress-cli --format json model stats --detailed
 
 ### Error Handling
 
-The CLI provides clear error messages and appropriate exit codes:
+The CLI uses these exit codes:
 
-- **Exit Code 0**: Success
-- **Exit Code 1**: General error (network, server, validation)
+- **Exit Code 0**: Command completed; `model validate` can still report a missing model
+- **Exit Code 1**: Command error (for example, network, server, or configuration failure)
 - **Exit Code 2**: Invalid command line arguments
 
 ```bash
@@ -307,11 +310,11 @@ else
     modelexpress-cli model download "$MODEL_NAME" --strategy direct
 fi
 
-# Check if model was stored successfully
-if modelexpress-cli --format json model validate "$MODEL_NAME" | jq -r '.exists' | grep -q true; then
-    echo "Model '$MODEL_NAME' is now available in storage"
+# Check cache-path presence (does not verify checkpoint completeness)
+if modelexpress-cli --format json model validate "$MODEL_NAME" | jq -e '.exists == true' >/dev/null; then
+    echo "Cache path for '$MODEL_NAME' exists"
 else
-    echo "Warning: Model may not be properly stored"
+    echo "Model cache path is missing"
 fi
 ```
 
@@ -336,10 +339,10 @@ TOTAL_MODELS=$(modelexpress-cli --format json model stats | jq -r '.total_models
 TOTAL_SIZE=$(modelexpress-cli --format json model stats | jq -r '.total_size')
 echo "Storage contains $TOTAL_MODELS models using $TOTAL_SIZE"
 
-# Check if specific model is stored
+# Check whether a specific model's cache path exists
 MODEL_EXISTS=$(modelexpress-cli --format json model validate "google-t5/t5-small" | jq -r '.exists')
 if [ "$MODEL_EXISTS" = "true" ]; then
-    echo "Model is available in storage"
+    echo "Model cache path exists; verify loading separately"
 else
     echo "Model not found in storage"
 fi
@@ -350,12 +353,22 @@ modelexpress-cli --format json model list | jq -r '.models[].name'
 
 ### CI/CD Integration
 
+This step assumes release binaries, `jq`, and a reachable Redis instance dedicated to the test. It uses a temporary cache so cleanup does not remove an existing model cache.
+
 ```yaml
 # .github/workflows/test.yml
 - name: Test ModelExpress server
+  env:
+    MX_METADATA_BACKEND: redis
+    REDIS_URL: redis://localhost:6379
   run: |
+    export MODEL_EXPRESS_CACHE_DIRECTORY="$(mktemp -d)"
+    export HF_HUB_CACHE="$MODEL_EXPRESS_CACHE_DIRECTORY"
+
     # Start server in background
     ./target/release/modelexpress-server &
+    MX_SERVER_PID=$!
+    trap 'kill "$MX_SERVER_PID"' EXIT
     sleep 5
 
     # Test health endpoint
@@ -368,8 +381,9 @@ modelexpress-cli --format json model list | jq -r '.models[].name'
     ./target/release/modelexpress-cli model download google-t5/t5-small \
       --strategy server-only
 
-    # Verify model was stored
-    ./target/release/modelexpress-cli model validate google-t5/t5-small
+    # Check cache-path presence; this is not an inference or integrity test
+    ./target/release/modelexpress-cli --format json model validate google-t5/t5-small \
+      | jq -e '.exists == true'
 
     # Test API
     ./target/release/modelexpress-cli api send ping
@@ -453,7 +467,7 @@ modelexpress-cli model status
 ### Storage Issues
 
 ```bash
-# Validate model storage integrity
+# Inspect cached models (does not verify integrity)
 modelexpress-cli model validate
 
 # Check storage statistics to find problematic models

@@ -3,32 +3,19 @@ SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES.
 SPDX-License-Identifier: Apache-2.0
 -->
 
-<h1 align="center">ModelExpress for RL Weight Refit</h1>
+# Refit internals: receiver-driven resharding
 
-<p align="center">
-  <strong>Move each trainer version into rollout-worker layouts without first assembling a full model on one rank.</strong>
-</p>
+For a first deployment, start with [Update rollout weights for RL](../../../../docs/guides/rl.md). This page explains the shared `modelexpress.refit` planning and transport code, its integration hooks, and its limits.
 
-<p align="center">
-  <a href="#overview">Overview</a> •
-  <a href="#the-design">Design</a> •
-  <a href="#implementation-status">Status</a> •
-  <a href="#integration-contract">Integration</a> •
-  <a href="#validation">Validation</a>
-</p>
-
-> [!IMPORTANT]
-> The refit package is experimental. It contains framework-neutral resharding primitives, a NIXL transport, normalized timing, and vLLM receiver/install code. It does not yet provide a turnkey integration for an RL framework, and several safety gates listed in [Implementation status](#implementation-status) remain open.
-
-## Executive summary
-
-Reinforcement Learning (RL) post-training repeatedly moves a new model version from distributed trainer ranks to rollout workers. ModelExpress (MX) extends its peer-to-peer loading model to this **refit** path: trainer ranks publish the shards they already own, and each rollout rank pulls the ranges needed for its own Tensor Parallelism (TP), Pipeline Parallelism (PP), and Expert Parallelism (EP) layout. The MX server coordinates discovery but never carries weight bytes; NVIDIA Interconnect eXchange Library (NIXL) reads move data directly between registered Graphics Processing Unit (GPU) buffers. The current code establishes this shared design and a vLLM receiver, while framework orchestration, trainer publication adapters, version-atomic discovery, and broader engine coverage remain integration work.
+Framework-facing clients live in [`modelexpress_rl`](../../modelexpress_rl/). That package provides version lifecycle APIs, Megatron and FSDP/DTensor trainer adapters, vLLM refit integration, SGLang checkpoint installation, and S3 full-checkpoint/delta replay. It uses shared primitives from this package; the two paths are not interchangeable APIs. The limits of the generic `ReshardReceiver` below should not be read as the status of every `modelexpress_rl` path.
 
 ## Overview
 
 An RL training step changes the model. Rollout workers must install that version before they generate samples against it. The time from “trainer version ready” to “required rollout workers ready” is refit latency, and it sits on the training loop's critical path.
 
-| Refit cost | Conventional path | ModelExpress design |
+Collective-based integrations coordinate participating trainer and generator ranks for broadcast or all-gather. Checkpoint-based integrations write and reload artifacts. The direct MX path instead publishes source ownership and lets each receiver plan its own reads. The tradeoff is that source buffers must remain available until readers finish.
+
+| Refit cost | Common integration approach | Direct MX path |
 |---|---|---|
 | Trainer layout | Gather or checkpoint distributed shards | Keep each rank's native shard registered |
 | Topology change | Central process reconstructs, then receivers reshard | Each receiver plans from source ownership into its own layout |
@@ -38,11 +25,7 @@ An RL training step changes the model. Rollout workers must install that version
 
 ![Conventional RL refit centralizes the model before redistribution, while ModelExpress publishes existing trainer shards and lets rollout ranks pull their needed ranges](images/rl-refit-critical-path.svg)
 
-### A plain-English model
-
-Think of the trainer as a library whose book is already split across several desks. A rollout worker does not ask one desk to photocopy and bind the whole book. It brings a page list for its local edition, looks up which desk owns each page, and reads those pages directly into the right sections.
-
-That analogy maps to four MX concepts:
+### Core concepts
 
 | Term | Meaning |
 |---|---|
@@ -106,7 +89,7 @@ Refit has two independent optimization surfaces:
 1. **Move fewer and better-shaped bytes.** The reshard planner selects source ranges and NIXL reads them into receiver buffers.
 2. **Commit those bytes with less loader overhead.** The inference adapter updates live model storage, quantization scales, fused parameters, and derived tensors.
 
-The RL path keeps transfer and engine concerns separate. [`nixl_staged_transfer.py`](../../modelexpress_rl/inference/nixl_staged_transfer.py) owns exact-manifest planning, registered staging, transfer, and verification. The private vLLM [`installer.py`](../../modelexpress_rl/inference/engines/vllm/installer.py) captures load-time geometry on an unquantized meta-model twin and uses vLLM's layerwise reload path to preserve storage referenced by compiled Compute Unified Device Architecture (CUDA) graphs.
+The RL path keeps transfer and engine concerns separate. [`nixl_staged_transfer.py`](../../modelexpress_rl/inference/nixl_staged_transfer.py) owns exact-manifest planning, registered staging, transfer, and verification. The private vLLM [`installer.py`](../../modelexpress_rl/inference/engines/vllm/installer.py) temporarily exposes the live model's load-time parameters through vLLM's layerwise reload APIs, captures their geometry, and restores the original kernel tensors. Installation also uses layerwise reload to preserve storage referenced by CUDA graphs.
 
 [`MdlLoader`](../engines/vllm/refit/installer.py) is a separate experimental vLLM installer called Mapped Direct Load (MDL). It caches direct, fused, and expert destination views so warm updates can copy into known slots instead of repeating general loader dispatch. MDL can consume partial input batches, but the reshard transport in this package does not yet expose a selector that reduces wire bytes for partial updates. The two features must not be treated as one end-to-end partial-refit path until that selector is wired and validated.
 
@@ -135,7 +118,7 @@ class RuntimeReceiver(ReshardReceiver):
 
 The framework constructs one receiver per rollout rank and calls `update_weights(step)` when its version barrier permits the update. A trainer-side adapter must build [`PublishedTensor`](reshard/rendezvous.py) records, wrap them with NIXL endpoint metadata, and publish one READY record per trainer rank.
 
-This is an adapter contract, not a complete quick start. The repository does not currently include the RL framework lifecycle hooks or a general trainer publisher that derives ownership from arbitrary training backends.
+This is the low-level shared receiver contract. Framework integrations should start with the [`modelexpress_rl` trainer client](../../README.md#rl-trainer-publication), which selects the Megatron or FSDP adapter and owns registration and publication. The framework still supplies lifecycle hooks, declares the expected source slots, pauses generation, and coordinates completion before buffers are reused. The [runnable examples](../../../../docs/guides/rl.md#start-with-a-runnable-example) show concrete integrations.
 
 ### Stable-plan assumption
 
@@ -168,23 +151,27 @@ A trainer restart, reshard, scale event, or buffer replacement requires rediscov
 | vLLM mapped direct install | Implemented as a separate opt-in installer | [`engines/vllm/refit/installer.py`](../engines/vllm/refit/installer.py) |
 | Normalized refit timing schema | Implemented | [`timing.py`](timing.py), [`test_refit_timing.py`](../../tests/test_refit_timing.py) |
 | Descriptor bound for strided slices | Implemented for gap-free dim-0 partitions | [`transfer_plan.py`](reshard/transfer_plan.py), [`test_reshard_refit_transfer.py`](../../tests/test_reshard_refit_transfer.py) |
+| Engine-parameter coverage reporting and optional floor | Implemented; opt in with `MX_RESHARD_REQUIRE_FULL_COVERAGE=1` | [`receiver.py`](reshard/receiver.py), [`test_reshard_refit_coverage.py`](../../tests/test_reshard_refit_coverage.py) |
+| Megatron and FSDP/DTensor publication | Available through `modelexpress_rl` | [`train/engines/`](../../modelexpress_rl/train/engines/) |
+| Generator sharing and S3 replay | Available through `modelexpress_rl`; separate from generic receiver rendezvous | [`inference/source/`](../../modelexpress_rl/inference/source/), [`checkpoint_store.py`](../../modelexpress_rl/inference/checkpoint_store.py) |
 
 “Implemented” means the code and focused tests are present. It does not by itself mean a framework/model/topology combination has passed distributed end-to-end validation.
 
-### Not yet provided as a general guarantee
+### Shared receiver limits
+
+This table describes `modelexpress.refit.reshard.ReshardReceiver`. The framework-facing RL clients have their own version and installation checks.
 
 | Gap | Current behavior |
 |---|---|
 | Full-pull fallback for unsupported operations | The planner identifies unsupported tensors, but `ReshardReceiver` fails closed because its full-pull/install fallback is not implemented. This is distinct from the descriptor bound above, which pulls whole source shards for *supported* but descriptor-heavy slices. |
-| Complete coverage gate | The planner does not yet prove that published overlaps cover every requested element before transfer. |
-| Version-atomic multi-rank manifest | Discovery waits for a rank count but does not commit and pin one atomic version across all trainer records. |
+| Complete element coverage | The receiver reports engine-parameter coverage and can enforce a minimum byte fraction. This is separate from proving that published overlaps cover every requested element. |
+| Version-atomic multi-rank manifest | Generic rendezvous waits for a rank count; it does not provide the `WeightVersion` lifecycle exposed by `modelexpress_rl`. |
 | Topology-change handling | The cached plan is not invalidated after trainer restart, reshard, scaling, or address change. |
 | Partial/subset wire filtering | MDL accepts subset batches, but the reshard receiver currently executes its full cached plan on each update. |
 | Expert-aware wire filtering | Expert destination mapping exists in MDL; the reshard planner has no receiver-owned expert selector. |
 | Parameter digest verification | Publishers can stamp each shard with a position-sensitive digest (`MX_RESHARD_PUBLISH_DIGEST`, see `refit/reshard/verify.py`), and it is carried through discovery into the planning inputs, but the live receiver does not yet recompute and compare. The comparison needs a fresh-discovery refresh of the expectation, or ordinary training updates between prepare and a later step read as corruption. |
-| Inference-to-inference fan-out | Rollout workers do not republish installed refit buffers through this package. |
-| General engine support | The shared core is engine-neutral, but only a vLLM receiver adapter is present. |
-| General trainer support | Framework-specific FSDP, DTensor, and Megatron publisher adapters are not present here. |
+| Engine coverage | vLLM has direct tensor installation. SGLang's `modelexpress_rl` integration installs prepared checkpoints; it does not expose the same tensor receiver. |
+| Arbitrary trainer layouts | Megatron and FSDP/DTensor adapters exist under `modelexpress_rl`; other frameworks or unsupported layouts need adapter work. |
 | Transport-neutral receiver | A transport protocol exists for planning tests, but `ReshardReceiver` setup and handshake are currently NIXL-bound. |
 
 ## Timing and configuration
@@ -209,6 +196,8 @@ The reshard planner uses this control:
 | Variable | Default | Purpose |
 |---|---|---|
 | `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Descriptor budget per captured copy. Above it, the planner pulls whole gap-free dim-0 source shards into contiguous staging instead of issuing one descriptor per strided run. |
+| `MX_RESHARD_REQUIRE_FULL_COVERAGE` | `0` | Enable the engine-parameter coverage floor for runs that require a full refit. |
+| `MX_RESHARD_COVERAGE_FLOOR` | `0.995` | Minimum fraction of engine parameter bytes installed when the coverage gate is enabled. |
 
 vLLM's separate MDL path uses these controls:
 
@@ -257,37 +246,6 @@ Performance claims must identify the exact implementation path. Reference transp
 - **Cached plan vs. elasticity:** plan reuse removes repeated setup from warm updates. It is unsafe after source membership, ownership, or addresses change unless the receiver detects and rebuilds.
 - **Generic capture vs. explicit adapters:** dry-running the real loader avoids a hand-written reshard specification for every model pair. Unsupported arithmetic, materializing reshapes, and model-specific derived state still require engine adapter work.
 - **Fail closed vs. fallback:** failing on unsupported tensors prevents silently serving mixed model versions. A production fallback must materialize and install those tensors without weakening version and coverage checks.
-
-## Open questions
-
-- **Version commit:** Which component publishes the atomic manifest that pins all trainer ranks to one version?
-- **Plan invalidation:** What stable topology and address digest should trigger rediscovery?
-- **Partial refit:** Should the selector be expressed as layers, parameter names, expert IDs, or a framework-supplied predicate?
-- **Source lifetime:** How does the orchestrator acknowledge completion before trainers release old buffers?
-- **Contention:** How should several rollout ranks distribute reads across replicated trainer sources?
-- **Installation contract:** Which inference-engine API owns derived tensors, quantization, and compiled-graph storage stability?
-
-## Roadmap
-
-### Near term
-
-- Add complete coverage and version-consistency gates.
-- Implement the full-pull fallback for unsupported loader operations; the descriptor-heavy case is already bounded.
-- Rebuild plans when source topology or registered addresses change.
-- Add a public trainer publisher contract with typed shard geometry.
-
-### Mid term
-
-- Wire partial parameter and expert selectors through planning and transport.
-- Validate the shared receiver contract with additional inference engines.
-- Add load-aware source selection and rollout-to-rollout fan-out.
-- Unify reshard transport and MDL installation under explicit, measured integration paths.
-
-### Longer term
-
-- Support planner decisions across several receivers instead of independent local plans.
-- Retain and release versions through an orchestrator-visible completion contract.
-- Feed rollout-readiness and fabric contention into topology and source selection.
 
 ## Package map
 

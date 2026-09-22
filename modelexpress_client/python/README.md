@@ -1,115 +1,76 @@
-# ModelExpress Python Client
+# ModelExpress Python client
 
-Python client for ModelExpress -- high-performance GPU-to-GPU model weight transfers using NVIDIA NIXL over RDMA/InfiniBand.
+ModelExpress helps inference workers load model weights and RL rollout workers install new trainer versions. This package supplies the runtime integrations, Python clients, and weight-transfer code; your inference or training runtime owns GPU execution.
 
-Instead of each inference engine instance loading model weights from storage,
-one instance loads the model and transfers weights directly to later instances
-via GPUDirect RDMA, bypassing the CPU entirely.
+- **Inference:** start with the [vLLM Kubernetes quickstart](../../docs/integrations/runtimes/vllm.md), then use [SGLang](../../docs/integrations/runtimes/sglang.md), [TensorRT-LLM](../../docs/integrations/runtimes/tensorrt-llm.md), or [Dynamo](../../docs/integrations/orchestrators/dynamo.md) if that is your serving stack.
+- **RL:** start with [RL weight updates](../../docs/guides/rl.md) for trainer-to-rollout refit and version handling.
+- **Direct storage loading:** use the [ModelStreamer examples](../../examples/model_streamer_k8s/README.md) to load safetensors without an MX server.
 
 ## Installation
 
-```bash
-# From PyPI (coming soon)
-pip install modelexpress
-
-# Editable install from source
-pip install -e .
-
-# With test dependencies
-pip install -e ".[dev]"
-
-# Additionally install the pinned protobuf code generator when changing protobuf APIs
-pip install -e ".[codegen]"
-```
-
-NIXL is expected to be supplied by the runtime environment (TRT-LLM,
-SGLang, Dynamo, and NemoRL runtime images all ship `nixl-cu12` or
-`nixl-cu13`). For a bare-environment install, run `pip install nixl-cu12`
-or `pip install nixl-cu13` separately, matching your host CUDA toolkit.
-
-### Requirements
-
-- Python >= 3.10
-- protobuf >= 5.27.2 and < 7
-- NVIDIA GPUs with RDMA/InfiniBand support
-- [NIXL](https://github.com/ai-dynamo/nixl) (NVIDIA Interconnect eXchange Library)
-- A running [ModelExpress server](https://github.com/ai-dynamo/modelexpress/tree/main/modelexpress_server) (Rust gRPC service backed by Redis)
-
-## Quick Start with vLLM
-
-vLLM 0.23.0 and newer recognize `--load-format modelexpress` natively. Install the ModelExpress Python package in the vLLM image; no `VLLM_PLUGINS` setting or manual loader registration is required. For older vLLM versions, set `VLLM_PLUGINS=modelexpress` or call `register_modelexpress_loaders()` manually.
+Install into your runtime environment using Python 3.10 or newer. From the ModelExpress repository root:
 
 ```bash
-export MX_SERVER_ADDRESS="modelexpress-server:8001"
+pip install ./modelexpress_client/python
 
-vllm serve deepseek-ai/DeepSeek-V4-Pro \
-    --load-format modelexpress \
-    --tensor-parallel-size 8 \
-    --trust-remote-code
+# For client development and tests
+pip install -e './modelexpress_client/python[dev]'
+
+# Only when regenerating protobuf APIs
+pip install -e './modelexpress_client/python[codegen]'
 ```
 
-Starting the vLLM engine with the `modelexpress` load format on the source worker will load the weights from disk and register/publish the NIXL and tensor metadata to the MX server. The `mx` load format is kept as a backward-compatible alias.
-On the target worker, it retrieves metadata from the MX server and streams weights over RDMA from GPU to GPU. Set `MX_ARTIFACT_TRANSFER=1` to also reuse compatible vLLM JIT caches from a ready source.
+The package does not install vLLM, SGLang, TensorRT-LLM, or NIXL. Use a [supported runtime image](../../docs/COMPATIBILITY.md) with a compatible CUDA/NIXL stack. Prefer the NIXL package supplied by that image; for a bare environment, install `nixl-cu12` or `nixl-cu13` to match the runtime's CUDA stack.
 
-## Quick Start with SGLang
+P2P requires compatible GPU workers, a working NIXL transport, and source discovery through a ModelExpress server or the `k8s-service` backend. Direct ModelStreamer storage loading does not require NIXL, RDMA, or a server. Ordinary Python control-plane API calls do not require a GPU.
 
-SGLang integrates through its `remote_instance` loader with the `modelexpress`
-backend. Use an SGLang image that includes upstream sgl-project/sglang#24723,
-such as the known-good release image `lmsysorg/sglang:v0.5.13.post1`, and
-install the ModelExpress package into that image.
+## How inference loading works
 
-```bash
-export MX_SERVER_ADDRESS="modelexpress-server:8001"
+1. A source worker loads a checkpoint through an eligible storage loader and publishes its availability.
+2. A compatible target discovers the source and copies its ready GPU tensors through NIXL. For vLLM, these are **post-processed** tensors, including the layouts produced by quantization processing; the target reconstructs the corresponding layout before receiving them.
+3. The runtime finishes startup and serves requests. Verify the target's transfer completion log and an inference response; automatic fallback can make a healthy worker look like a successful P2P run.
 
-python -m sglang.launch_server \
-    --model-path deepseek-ai/DeepSeek-V3 \
-    --tp 8 \
-    --load-format remote_instance \
-    --remote-instance-weight-loader-backend modelexpress \
-    --modelexpress-config '{"transport": "nixl"}'
-```
+The central server carries P2P discovery metadata, while weight bytes move between workers. Sources must stay available during transfer. Targets still need configuration and tokenizer files. Optional `MX_ARTIFACT_TRANSFER=1` also reuses compatible vLLM JIT caches from a healthy source. See [Choose a path](../../docs/guides/choose-a-path.md) for storage and offline deployment choices.
 
-## Quick Start with TensorRT-LLM
+## Programmatic usage
 
-TensorRT-LLM integrates through its native `checkpoint_format="MX"` interface.
-Install ModelExpress in a qualified TensorRT-LLM image, then construct the
-PyTorch backend with the ModelExpress server configuration:
+### MxClient
+
+`MxClient` is a lightweight gRPC client for communicating with the ModelExpress server. This example lists ready sources; runtime integrations perform compatibility checks and transfers:
 
 ```python
-from tensorrt_llm.llmapi import LLM
+from modelexpress import MxClient, p2p_pb2
 
-llm = LLM(
-    model="/model",
-    checkpoint_format="MX",
-    mx_config={
-        "server_url": "modelexpress-server:8001",
-    },
-    tensor_parallel_size=4,
-    backend="pytorch",
-)
+client = MxClient(server_url="modelexpress-server:8001")
+try:
+    response = client.list_sources(status_filter=p2p_pb2.SOURCE_STATUS_READY)
+    for source in response.instances:
+        print(source.model_name, source.worker_rank, source.worker_id)
+finally:
+    client.close()
 ```
 
-The first replica falls back to the Hugging Face checkpoint and publishes its
-post-transform weights; later compatible replicas receive them through
-ModelExpress. The current qualified scope is the `LlamaForCausalLM` family.
-See the
-[TensorRT-LLM P2P example](../../examples/p2p_transfer_k8s/client/trtllm/)
-for the qualified-image requirement and production-style Kubernetes
-deployment.
+### Registering Loaders Manually
 
-## Programmatic Usage
+Manual registration is only needed for integrations that construct vLLM loaders outside vLLM 0.23.0's native load-format path.
+
+```python
+from modelexpress import register_modelexpress_loaders
+
+register_modelexpress_loaders()
+# Now vLLM recognizes --load-format modelexpress and mx
+```
 
 ### RL trainer publication
 
-An RL framework creates a weight version through the external Refit API. Each
-trainer actor then invokes its rank-local client to stage and publish one shard.
-Worker registration, manifest serving, and internal shard CRUD remain hidden
-behind the client.
+For an end-to-end training and rollout workflow, start with [RL weight updates](../../docs/guides/rl.md). The trainer API below is an integration reference: the framework must create `version`, supply `megatron_tensor_specs`, coordinate all publishing ranks, and control when rollout workers resume.
 
-When creating a `WeightVersion`, the orchestrator may supply its UID or let MX
-generate one. A caller-supplied UID already assigned to another request returns
-`ALREADY_EXISTS`; an identical request retried with the same idempotency key
-returns the existing version.
+<details>
+<summary>Trainer API and lifecycle reference</summary>
+
+An RL framework creates a weight version through the external Refit API. Each trainer actor then invokes its rank-local client to stage and publish one shard. Worker registration, manifest serving, and internal shard CRUD remain hidden behind the client.
+
+When creating a `WeightVersion`, the orchestrator may supply its UID or let MX generate one. A caller-supplied UID already assigned to another request returns `ALREADY_EXISTS`; an identical request retried with the same idempotency key returns the existing version.
 
 ```python
 from modelexpress_rl import (
@@ -126,132 +87,36 @@ trainer.bind_tensors(megatron_tensor_specs)
 trainer.publish_version(version=WeightVersionRef(version.uid))
 ```
 
-The deployment supplies `MODEL_NAME`,
-`MX_TRAINER_STAGING_MODE`, `MX_WEIGHT_PAYLOAD_FORMAT`, `MX_WORKER_HOST`, and the
-normal ModelExpress server configuration. The Megatron adapter derives its
-source slot from logical tensor names and shard geometry. DP replicas of the same
-partition therefore publish redundant workers for one slot, while distinct TP
-partitions remain separate required slots. The NIXL metadata endpoint is derived
-from `MX_WORKER_HOST` and the client-owned NIXL manager's listen port. `LOCAL_RANK`
-selects the device unless `device_id` is passed to `initialize()`.
+The deployment supplies `MODEL_NAME`, `MX_TRAINER_STAGING_MODE`, `MX_WEIGHT_PAYLOAD_FORMAT`, `MX_WORKER_HOST`, and the normal ModelExpress server configuration. The Megatron adapter derives its source slot from logical tensor names and shard geometry. DP replicas of the same partition therefore publish redundant workers for one slot, while distinct TP partitions remain separate required slots. The NIXL metadata endpoint is derived from `MX_WORKER_HOST` and the client-owned NIXL manager's listen port. `LOCAL_RANK` selects the device unless `device_id` is passed to `initialize()`.
 
-Canonical S3 staging consumes Hugging Face tensor buckets produced by the
-training framework. Framework-native bucket settings remain the default.
-The public trainer API accepts
-`ModelExpressTrainerConfig(object_storage=ObjectStorageConfig(...))`; its
-`storage_type` selects the provider. Weight versions use the corresponding
-typed `ObjectStorageSource` envelope. Generator clients likewise accept
-`ModelExpressGeneratorConfig(object_storage=ObjectStorageGeneratorConfig(...))`.
-The current trainer and generator clients support only `ObjectStorageType.S3`.
-Integrations may use `MX_REFIT_DELTA_BUCKET_BYTES` as an explicit override, or
-its 512 MiB default when they have no native setting. CPU workers are configured
-by `MX_REFIT_DELTA_WORKERS` (default `min(32, CPU count)`), while
-`MX_S3_UPLOAD_WORKERS` controls concurrent full-checkpoint batch uploads.
-`MX_REFIT_CHECKSUM_FORMAT` selects the checksum algorithm and defaults to
-`adler32`.
-The framework integration reads the bucket-size setting while constructing the
-stream; ModelExpress processes each supplied bucket without splitting or merging
-it.
-Before training begins, the framework calls `prepare_delta_base()` with one
-bucket stream. ModelExpress submits each framework bucket directly for
-concurrent rank-local seed-checkpoint reads. Real delta staging therefore
-performs no seed-checkpoint reads. A `FULL_HF_CHECKPOINT` version serializes
-the current buckets as native HF safetensor shards, omits `base_version_id`, and
-replaces the retained snapshot so the next `XOR_DELTA` uses it as its exact
-base. A bounded worker pool updates the rank-local snapshot with immutable CPU
-tensors. Each publishing rank groups its snapshot into concurrently uploaded
-safetensors objects with at most `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` tensor
-bytes (4 GiB by default); an oversized tensor occupies its own object. The
-objects are sent directly to S3 without a trainer-side temporary checkpoint.
-Framework integrations own the optional full-checkpoint period; it is disabled
-by default.
-Generators use the ModelExpress S3 client to download full-checkpoint batches
-concurrently. Each worker validates one downloaded batch and copies its tensors
-into their existing local mmap destinations, without materializing a second full
-checkpoint. ModelStreamer integration remains a future optimization.
-The local checkpoint state changes from `READY` to `UPDATING` before mutation
-and returns to `READY` only after success. An interrupted update must be reseeded
-from `seed_checkpoint_path` during initialization.
-The framework supplies each version's exact `object_storage.uri` under the
-configured `uri_prefix`. That URI names the global safetensors index; its
-objects are stored beside it. A delta index records the target
-`WeightVersion.uid` and its `base_version_id` as `metadata.version` and
-`metadata.base_version`. After upload, the orchestrator changes the version from
-`STAGING` to `READY`. S3 versions remain READY for rollout recovery; their
-immutable objects are governed by the bucket's external lifecycle policy.
+Canonical S3 staging consumes Hugging Face tensor buckets produced by the training framework. Framework-native bucket settings remain the default. The public trainer API accepts `ModelExpressTrainerConfig(object_storage=ObjectStorageConfig(...))`; its `storage_type` selects the provider. Weight versions use the corresponding typed `ObjectStorageSource` envelope. Generator clients likewise accept `ModelExpressGeneratorConfig(object_storage=ObjectStorageGeneratorConfig(...))`. The current trainer and generator clients support only `ObjectStorageType.S3`. Integrations may use `MX_REFIT_DELTA_BUCKET_BYTES` as an explicit override, or its 512 MiB default when they have no native setting. CPU workers are configured by `MX_REFIT_DELTA_WORKERS` (default `min(32, CPU count)`), while `MX_S3_UPLOAD_WORKERS` controls concurrent full-checkpoint batch uploads. `MX_REFIT_CHECKSUM_FORMAT` selects the checksum algorithm and defaults to `adler32`. The framework integration reads the bucket-size setting while constructing the stream; ModelExpress processes each supplied bucket without splitting or merging it.
 
-The client owns the NIXL manager and trainer-side manifest service. `server_url`
-selects the central ModelExpress control-plane service and defaults to the
-normal ModelExpress server configuration. A Megatron worker may initialize the
-client before its distributed process group is ready; the explicitly selected
-`engine_context` is constructed lazily on the first tensor operation. Deployment
-environment variables do not select Python implementations.
+Before training begins, the framework calls `prepare_delta_base()` with one bucket stream. ModelExpress submits each framework bucket directly for concurrent rank-local seed-checkpoint reads. Real delta staging therefore performs no seed-checkpoint reads. A `FULL_HF_CHECKPOINT` version serializes the current buckets as native HF safetensor shards, omits `base_version_id`, and replaces the retained snapshot so the next `XOR_DELTA` uses it as its exact base. A bounded worker pool updates the rank-local snapshot with immutable CPU tensors. Each publishing rank groups its snapshot into concurrently uploaded safetensors objects with at most `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` tensor bytes (4 GiB by default); an oversized tensor occupies its own object. The objects are sent directly to S3 without a trainer-side temporary checkpoint. Framework integrations own the optional full-checkpoint period; it is disabled by default.
 
-Initialization fixes the staging mode. NIXL also fixes its payload format;
-canonical S3 publication follows each target `WeightVersion`. On NIXL,
-`publish()` hides manifest publication and the internal
-`CreateWeightVersionShard` RPC. The current Megatron adapter registers and
-exposes its live buffers through
-`IN_PLACE`, so callers must keep those tensors immutable while the version is
-published. The required lifecycle is synchronous: create and publish the
-version, update every generator, retire and release the version, and only then
-resume training or begin the next optimizer step.
+Generators use the ModelExpress S3 client to download full-checkpoint batches concurrently. Each worker validates one downloaded batch and copies its tensors into their existing local mmap destinations, without materializing a second full checkpoint. ModelStreamer integration remains a future optimization. The local checkpoint state changes from `READY` to `UPDATING` before mutation and returns to `READY` only after success. An interrupted update must be reseeded from `seed_checkpoint_path` during initialization.
 
-Version creation and expected-source-slot declaration remain
-framework-orchestrator responsibilities. Each trainer adapter derives its own
-source slot from the engine's native topology; the orchestrator declares the
-expected slots using the same adapter-defined convention. `initialize()`
-constructs the adapter selected by `engine_context` internally.
-Megatron and FSDP implementations are available. Megatron-specific APIs live under
-`modelexpress_rl`;
-`modelexpress.refit.reshard` remains the shared, engine-neutral transfer core.
+The framework supplies each version's exact `object_storage.uri` under the configured `uri_prefix`. That URI names the global safetensors index; its objects are stored beside it. A delta index records the target `WeightVersion.uid` and its `base_version_id` as `metadata.version` and `metadata.base_version`. After upload, the orchestrator changes the version from `STAGING` to `READY`. S3 versions remain READY for rollout recovery; their immutable objects are governed by the bucket's external lifecycle policy.
 
-### MxClient
+The client owns the NIXL manager and trainer-side manifest service. `server_url` selects the central ModelExpress control-plane service and defaults to the normal ModelExpress server configuration. A Megatron worker may initialize the client before its distributed process group is ready; the explicitly selected `engine_context` is constructed lazily on the first tensor operation. Deployment environment variables do not select Python implementations.
 
-`MxClient` is a lightweight gRPC client for communicating with the ModelExpress server:
+Initialization fixes the staging mode. NIXL also fixes its payload format; canonical S3 publication follows each target `WeightVersion`. On NIXL, `publish()` hides manifest publication and the internal `CreateWeightVersionShard` RPC. The current Megatron adapter registers and exposes its live buffers through `IN_PLACE`, so callers must keep those tensors immutable while the version is published. The required lifecycle is synchronous: create and publish the version, update every generator, retire and release the version, and only then resume training or begin the next optimizer step.
 
-```python
-from modelexpress import MxClient
+Version creation and expected-source-slot declaration remain framework-orchestrator responsibilities. Each trainer adapter derives its own source slot from the engine's native topology; the orchestrator declares the expected slots using the same adapter-defined convention. `initialize()` constructs the adapter selected by `engine_context` internally. Megatron and FSDP implementations are available. Megatron-specific APIs live under `modelexpress_rl`; `modelexpress.refit.reshard` remains the shared, engine-neutral transfer core.
 
-client = MxClient(server_url="modelexpress-server:8001")
+</details>
 
-# Query for a source model
-response = client.get_metadata("deepseek-ai/DeepSeek-V4-Pro")
-if response.found:
-    for worker in response.workers:
-        print(f"Worker rank {worker.worker_rank}: {len(worker.tensors)} tensors")
+## Environment variables
 
-# Wait for source readiness (blocks until ready or timeout)
-success, session_id, metadata_hash = client.wait_for_ready(
-    model_name="deepseek-ai/DeepSeek-V4-Pro",
-    worker_id=0,
-    timeout_seconds=7200,
-)
+For loading policy, defaults, and deployment settings, use the [configuration reference](../../docs/CONFIGURATION.md). `MX_LOAD_STRATEGY_CHAIN=INFERENCE` is the default; `RL` selects the separate RL startup policy and does not by itself perform an update on a running worker.
 
-client.close()
-```
-
-### Registering Loaders Manually
-
-Manual registration is only needed for integrations that construct vLLM loaders outside vLLM 0.23.0's native load-format path.
-
-```python
-from modelexpress import register_modelexpress_loaders
-
-register_modelexpress_loaders()
-# Now vLLM recognizes --load-format modelexpress and mx
-```
-
-## Environment Variables
+<details>
+<summary>Advanced client, refit, and transport settings</summary>
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MX_SERVER_ADDRESS` | `localhost:8001` | ModelExpress gRPC server address (recommended) |
-| `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
+| `MODEL_EXPRESS_URL` | `localhost:8001` | Legacy server address; takes precedence over `MX_SERVER_ADDRESS` when both are set. Prefer `MX_SERVER_ADDRESS`; if an older integration requires both, set them to the same endpoint. |
 | `MX_DISABLE_PATCHES` | `0` | Emergency escape hatch that skips all runtime compatibility patches. Set to `1`, `true`, `yes`, or `on` if a patch is incompatible with the installed engine. |
-| `MX_EXPECTED_WORKERS` | Auto-detected from TP size | Number of GPU workers to coordinate |
-| `MX_SYNC_PUBLISH` | `0` | Source: wait for all workers before publishing metadata |
-| `MX_SYNC_START` | `1` | Target: wait for all source workers before transferring |
 | `MX_POOL_REG` | `0` | Allocation-level NIXL registration (registers cudaMalloc blocks instead of individual tensors) |
 | `MX_P2P_METADATA` | `1` | Serve tensor and artifact manifests directly from source workers; set to `0` to route full tensor metadata through the central server |
 | `MX_LOAD_STRATEGY_CHAIN` | `INFERENCE` | Select the engine-neutral initial-load policy. With `RL`, a configured desired UID permits only desired-version P2P and S3 replay; without one, loading falls back through `MX_MODEL_URI` and then the engine default. vLLM speculative draft models are rejected in `RL` mode. |
@@ -276,19 +141,12 @@ register_modelexpress_loaders()
 | `MX_RESHARD_HANDSHAKE_BACKOFF_S` | `2` | Pause after a full pass over the pending peers makes no progress, so a transient stall is waited out rather than hammered |
 | `MX_REFIT_STAGE_RECORD` | `1` | Emit one `refit-stage-v2` JSON record per refit, giving a benchmark harness the per-stage timings without parsing logs. Set to `0` to silence it |
 | `MX_RESHARD_MAX_GBPS` | `0` | Per-rank fabric ceiling in Gbps. A measured wire rate above it means the timing is wrong rather than the transfer being fast, so the refit is rejected. `0` disables the check, since only the operator knows the real per-rank limit |
-| `MX_RESHARD_MIN_GBPS` | `0` | Per-rank floor in Gbps. Below it, the refit emits a `refit-slow-throughput-v1` JSON warning naming the rate, the bound and the shortfall. Applies to both receivers — the Megatron slice-reshard receiver and the staged receiver the FSDP trainers pull over, including its peer-to-peer pull — so one setting covers a job whichever path it refits on. Warns rather than aborting, unlike the ceiling: an impossible rate means the payload never moved, but a slow one is still correct, so enforcement belongs in a CI gate reading the record rather than in a running job. `0` disables it. Worth setting for any throughput run — a 20x collapse has been observed with byte counts exact, descriptor counts exact, coverage 100%, fallback 0 and no error anywhere, and without a lower bound there is nothing in the telemetry that dissents. When choosing a value, note that it is compared per rank against the rate one receiver sees *while its siblings are also receiving*, which is well below the rate a single receiver reaches alone; sizing it against the solo number puts the floor above the healthy concurrent rate and it will fire on good runs. Aim between the two — roughly the geometric mean of the collapsed rate and the healthy concurrent rate leaves both verdicts off a tight margin |
+| `MX_RESHARD_MIN_GBPS` | `0` | Per-rank throughput floor; emits a `refit-slow-throughput-v1` warning below the threshold. `0` disables it. Choose a floor based on concurrent multi-rank performance, not a single-rank peak; CI or benchmark tooling decides whether warnings fail a run. |
 | `MX_RESHARD_PUBLISH_DIGEST` | `0` | Have each trainer publish a position-sensitive digest of every shard it advertises, so a receiver can later confirm it installed the bytes the publisher held. Off by default: the reduction costs a pass over every published tensor, which is large next to a ~1.5 s wire, so turn it on when qualifying a build rather than when measuring throughput |
 
 ### Canonical S3 Transfer Tuning
 
-Objects below the configured thresholds use one PUT or GET. Larger uploads use
-multipart parts, and larger downloads use ranged GETs through one persistent
-`s3transfer.TransferManager` per `S3Client`. The receiver's file-level pool and
-the manager's global request concurrency use the same worker setting, so all
-whole-object and ranged data GETs share one 16-request budget. HEAD requests use
-the manager's separate submission executor. Downloads target a seekable
-`BytesIO`, so the complete downloaded object remains resident; the I/O settings
-below bound queued chunks, not the final object size.
+Objects below the configured thresholds use one PUT or GET. Larger uploads use multipart parts, and larger downloads use ranged GETs through one persistent `s3transfer.TransferManager` per `S3Client`. The receiver's file-level pool and the manager's global request concurrency use the same worker setting, so all whole-object and ranged data GETs share one 16-request budget. HEAD requests use the manager's separate submission executor. Downloads target a seekable `BytesIO`, so the complete downloaded object remains resident; the I/O settings below bound queued chunks, not the final object size.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -312,6 +170,8 @@ below bound queued chunks, not the final object size.
 | `UCX_RNDV_THRESH` | `0` | Force rendezvous for all transfers |
 | `NIXL_LOG_LEVEL` | `INFO` | NIXL logging level |
 
+</details>
+
 ## Package Structure
 
 | Module | Description |
@@ -327,15 +187,6 @@ below bound queued chunks, not the final object size.
 | `modelexpress.nixl_transfer` | `NixlTransferManager` -- NIXL agent lifecycle and RDMA transfers |
 | `modelexpress.types` | `TensorDescriptor`, `WorkerMetadata` -- core data types |
 | `modelexpress.vllm_worker` | Compatibility worker extension for older manual-registration workflows |
-
-## How It Works
-
-1. **Source** loads weights from disk, registers raw tensors with NIXL *before* FP8 processing, and publishes metadata to the ModelExpress server.
-2. **Target** creates dummy weights, waits for the source ready flag, then pulls raw tensors via RDMA read.
-3. Both source and target run `process_weights_after_loading()` independently, producing identical FP8-transformed weights.
-4. When artifact transfer is enabled, a healthy source publishes its pod-scoped JIT caches and later pods install compatible caches before model initialization.
-
-This pre-processing transfer strategy is critical for FP8 models (e.g., DeepSeek-V4-Pro) where tensors are renamed and transformed during processing.
 
 ## License
 

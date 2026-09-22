@@ -1,38 +1,27 @@
-# Dynamo + vLLM reshard refit
+# Dynamo + vLLM full-weight refit
 
-This example validates the complete inference-side lifecycle designed for
-ModelExpress `WeightVersion` updates:
+Use this example for a first trainer-to-generator weight update. It runs one GPU publisher and one vLLM inference worker with `Qwen/Qwen3-0.6B`, using NIXL for transfer and Dynamo for worker discovery and control. See the [RL guide](../../../docs/guides/rl.md) for the broader workflow.
 
-1. A GPU trainer job loads `Qwen/Qwen3-0.6B`, publishes one immutable full-weight
-   version through `modelexpress_rl`, and waits as the NIXL source.
-2. On cold start, all vLLM ranks agree on the desired UID and load it through
-   desired-version P2P or canonical S3 replay. The vLLM init container's startup
-   probe then writes and verifies that UID through vLLM's native Control gRPC
-   service before Dynamo starts its sidecar.
-3. Dynamo discovers the admitted vLLM worker and pauses generation.
-4. vLLM invokes the `modelexpress` weight-transfer backend for initialization,
-   `start_weight_update`, `update_weights`, and `finish_weight_update`.
-5. The RL coordinator verifies the exact UID on every worker, resumes generation,
-   and compares deterministic inference before and after the refit.
+1. The vLLM worker starts from the model checkpoint and serves a baseline request.
+2. The publisher loads the same checkpoint and publishes a full-weight `WeightVersion` through the FSDP adapter in `modelexpress_rl`. It keeps the GPU buffers available as the NIXL source.
+3. The coordinator pauses generation and calls vLLM's `init_weight_transfer_engine`, `start_weight_update`, `update_weights`, and `finish_weight_update` routes through Dynamo.
+4. It checks the installed version UID, resumes generation, and compares deterministic output before and after the update.
 
-The DGD uses the current `nvidia.com/v1beta1` schema and Dynamo's native Rust
-vLLM sidecar. Dynamo main is pinned because the weight-transfer route forwarding
-is newer than the latest v1.4.1 release. The engine image pins the current vLLM
-nightly digest built from commit `a9a17e7095a66ef6c6685a1c7ddd657781a78d3c`.
-The latest vLLM v0.27.1 release predates the merged RL Control gRPC service, so
-it cannot serve this Dynamo sidecar flow.
+The publisher does not run an optimizer or modify the weights. The test checks full-weight transfer and generation parity; it does not test multi-rank resharding, S3 deltas, or replacement-worker recovery.
 
-Global rank 0 broadcasts its `MX_REFIT_DESIRED_VERSION_UID`, and every vLLM rank
-checks its local value against that pinned UID before loading. Local rank 0 on
-each node reconstructs the canonical S3 checkpoint; followers reuse the
-node-local result. A rank disagreement or partial distributed load fails
-startup, and the checkpoint activation marker is committed only after every
-rank succeeds.
+The coordinator resumes workers in its cleanup block even if an update fails. Use it as a smoke test; a production integration must keep a failed worker out of service until its installed version is recovered and verified.
+
+## Requirements
+
+- A Kubernetes cluster with the `nvidia.com/v1beta1` Dynamo operator and two available GPUs, each with an `rdma/ib` resource.
+- A namespace you own and an `hf-token-secret` there; both GPU pods need access to download `Qwen/Qwen3-0.6B`.
+- `docker`, `kubectl`, `envsubst`, and a registry the cluster can pull from.
+
+Use the pinned images below together. The engine Dockerfile pins a vLLM image built from commit `a9a17e7095a66ef6c6685a1c7ddd657781a78d3c`; this sidecar flow requires its Control gRPC service. The Dynamo sidecar is built from a revision with weight-transfer route forwarding; the frontend is pinned in `dgd.yaml`.
 
 ## Build
 
-From the ModelExpress repository root, build and push the server and engine
-images. Use immutable tags in a registry visible to the cluster.
+From the ModelExpress repository root, build and push the server and engine images. Use immutable tags in a registry visible to the cluster.
 
 ```bash
 export REGISTRY=registry.example.com/your-project
@@ -47,23 +36,19 @@ docker build -f examples/rl/dynamo_vllm_reshard_refit/Dockerfile.vllm \
 docker push "$REGISTRY/modelexpress-vllm:a9a17e7-$MX_COMMIT-dynamo-refit"
 ```
 
-Build Dynamo's experimental sidecar from the pinned live-main revision:
+Build Dynamo's sidecar from the pinned revision:
 
 ```bash
-git clone https://github.com/ai-dynamo/dynamo.git
-cd dynamo
-git checkout ff959852b740ee5981e58a5fcf18d0d4ca2d5079
-docker build -f lib/sidecar/vllm/Dockerfile \
-  -t "$REGISTRY/dynamo-vllm-sidecar:ff95985" .
+git clone https://github.com/ai-dynamo/dynamo.git /tmp/mx-dynamo
+git -C /tmp/mx-dynamo checkout ff959852b740ee5981e58a5fcf18d0d4ca2d5079
+docker build -f /tmp/mx-dynamo/lib/sidecar/vllm/Dockerfile \
+  -t "$REGISTRY/dynamo-vllm-sidecar:ff95985" /tmp/mx-dynamo
 docker push "$REGISTRY/dynamo-vllm-sidecar:ff95985"
 ```
 
 ## Deploy and test
 
-Use a user-owned namespace. The commands require the Dynamo operator and an
-`hf-token-secret` in that namespace. If the images are in a private registry,
-configure image-pull credentials on the namespace's ServiceAccount or add your
-own `imagePullSecrets` entries to the pod specs.
+Run these commands from the ModelExpress repository root. If the images are in a private registry, configure image-pull credentials on the namespace's ServiceAccount or add `imagePullSecrets` entries to the pod specs.
 
 ```bash
 export NAMESPACE=your-namespace
@@ -90,11 +75,6 @@ kubectl wait -n "$NAMESPACE" --for=condition=complete \
 kubectl logs -n "$NAMESPACE" job/mx-vllm-rl-job
 ```
 
-A successful run ends with `E2E PASS` and includes the installed WeightVersion
-UID, worker count, and post-refit generation. Keep worker, server, and coordinator
-logs as separate evidence; the pass line does not by itself qualify throughput
-or delta/S3 behavior. The checked-in coordinator exercises the full-weight NIXL
-active-refit lifecycle; it does not qualify canonical S3 delta cold start.
+A successful run ends with `E2E PASS` and includes the installed version UID, worker count, and post-refit generation. Preserve the worker, server, and coordinator logs when evaluating the result. The script leaves the deployment running; remove the example resources when finished.
 
-For XOR artifact-backed S3 deltas with a Vime trainer,
-see [`vime_dynamo_delta_refit`](../vime_dynamo_delta_refit/README.md).
+For full checkpoints, deltas, and restart recovery, continue with the [S3 lifecycle example](../dynamo_vllm_s3_delta_refit/README.md). For a training loop, use [Vime + Dynamo](../vime_dynamo_delta_refit/README.md).

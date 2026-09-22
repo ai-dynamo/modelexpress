@@ -1,0 +1,174 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Small-model inference smoke test. Build both images from the same checkout.
+# Replace the two your-registry image references before applying.
+# Redis and model caches are ephemeral; this example is for evaluation.
+apiVersion: v1
+kind: Service
+metadata:
+  name: modelexpress-server
+spec:
+  selector:
+    app: modelexpress-server
+  ports:
+    - name: grpc
+      port: 8001
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: modelexpress-server
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: modelexpress-server
+  template:
+    metadata:
+      labels:
+        app: modelexpress-server
+    spec:
+      containers:
+        - name: server
+          image: your-registry/modelexpress-server:TAG
+          env:
+            - name: MX_METADATA_BACKEND
+              value: redis
+            - name: REDIS_URL
+              value: redis://localhost:6379
+            - name: MODEL_EXPRESS_CACHE_DIRECTORY
+              value: /app/cache
+          ports:
+            - name: grpc
+              containerPort: 8001
+          readinessProbe:
+            grpc:
+              port: 8001
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              memory: 2Gi
+        - name: redis
+          image: redis:8-alpine
+          args: ["--save", "", "--appendonly", "no"]
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-vllm
+spec:
+  selector:
+    app: mx-vllm
+  ports:
+    - name: http
+      port: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-vllm
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: mx-vllm
+  template:
+    metadata:
+      labels:
+        app: mx-vllm
+    spec:
+      initContainers:
+        - name: wait-for-coordinator
+          image: busybox:1.37
+          command: ["sh", "-c", "until nc -z modelexpress-server 8001; do sleep 2; done"]
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mx-vllm
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: vllm
+          image: your-registry/modelexpress-vllm:TAG
+          command: ["vllm", "serve"]
+          args:
+            - Qwen/Qwen3-0.6B
+            - --revision
+            - c1899de289a04d12100db370d81485cdf75e47ca
+            - --load-format
+            - modelexpress
+            - --tensor-parallel-size
+            - "1"
+            - --max-model-len
+            - "2048"
+            - --gpu-memory-utilization
+            - "0.5"
+            - --enforce-eager
+          env:
+            - name: MX_SERVER_ADDRESS
+              value: modelexpress-server:8001
+            - name: MX_WORKER_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: HF_HOME
+              value: /models
+            - name: MX_TRANSFER_TIMEOUT
+              value: "60"
+          ports:
+            - name: http
+              containerPort: 8000
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 120
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+          securityContext:
+            capabilities:
+              add: [IPC_LOCK]
+          resources:
+            requests:
+              cpu: "4"
+              memory: 16Gi
+            limits:
+              memory: 32Gi
+              nvidia.com/gpu: 1
+              rdma/ib: 1
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: models
+          emptyDir: {}
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi

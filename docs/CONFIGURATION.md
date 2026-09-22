@@ -16,7 +16,7 @@ For the Rust server and CLI, configuration is resolved in this order:
 3. YAML/TOML/JSON configuration file.
 4. Built-in defaults.
 
-The server still requires the metadata backend environment variables even when a config file is supplied. Use `cargo run --bin config_gen -- --output model-express.yaml` to generate a file and `cargo run --bin modelexpress-server -- --config model-express.yaml --validate-config` to validate it.
+Starting the server requires the metadata backend environment variables even when a config file is supplied. Use `cargo run --bin config_gen -- --output model-express.yaml` to generate a file and `cargo run --bin modelexpress-server -- --config model-express.yaml --validate-config` to validate it. Validation exits before backend initialization: it does not require backend variables or check Redis/Kubernetes connectivity.
 
 ## Server configuration
 
@@ -97,7 +97,7 @@ See [Deployment authentication](DEPLOYMENT.md#serviceaccount-authentication) for
 
 ## Loading strategy selection
 
-ModelExpress does not let callers define an arbitrary order. LoadStrategyChain constructs the following fixed chain:
+The default `MX_LOAD_STRATEGY_CHAIN=INFERENCE` policy tries eligible loaders in this fixed order:
 
 1. rdma: P2P from a compatible serving peer.
 2. server-cache: server-backed weight snapshot for no-shared-storage deployments.
@@ -106,12 +106,15 @@ ModelExpress does not let callers define an arbitrary order. LoadStrategyChain c
 5. gds: GPUDirect Storage when the accelerator and adapter support it.
 6. default: the engine's native loader.
 
-An eligible strategy can still fail and allow the next strategy to run. If a strategy mutates the model before failing, the adapter reinitializes the model before retrying.
+An eligible strategy can still fail and allow the next strategy to run. A recoverable failure marked as having mutated the model requires adapter reinitialization before retrying; unrecoverable recovery errors stop loading.
+
+`MX_LOAD_STRATEGY_CHAIN=RL` selects a separate cold-start policy. With `MX_REFIT_DESIRED_VERSION_UID`, it loads that exact version from a generator or canonical S3 checkpoint, following `MX_GENERATOR_SOURCE_ORDER` (default: `GENERATOR,OBJECT_STORAGE`). Without a desired version, it tries ModelStreamer and then the engine-native loader. Selecting this policy alone does not enable ongoing trainer-to-generator updates; see [RL weight updates](guides/rl.md).
 
 ### Eligibility controls
 
 | Environment variable | Default | Effect |
 |---|---|---|
+| MX_LOAD_STRATEGY_CHAIN | INFERENCE | Selects the INFERENCE or RL cold-start policy described above |
 | MODEL_EXPRESS_URL | unset | Legacy client/server address; takes precedence over MX_SERVER_ADDRESS when both are set |
 | MX_SERVER_ADDRESS | unset | Preferred client address; the Python client falls back to localhost:8001 when neither address is set |
 | MODEL_EXPRESS_NO_SHARED_STORAGE | false | Enables server-backed repository-file and weight fetching when an address is configured |
@@ -122,7 +125,7 @@ An eligible strategy can still fail and allow the next strategy to run. If a str
 | MX_DISABLE_PATCHES | false | Disables ModelExpress runtime compatibility patches |
 | MODEL_EXPRESS_LOG_LEVEL | runtime-dependent | Use DEBUG to inspect Eligible loaders and Trying strategy |
 
-MX_P2P_METADATA=0 only changes the central-coordinator metadata representation; it does not make a decentralized k8s-service backend usable because that backend requires P2P metadata.
+`MX_P2P_METADATA=0` changes how central-coordinator deployments publish tensor metadata. The `k8s-service` backend ignores this setting and always uses P2P tensor metadata.
 
 ## P2P and worker settings
 
@@ -134,7 +137,7 @@ MX_P2P_METADATA=0 only changes the central-coordinator metadata representation; 
 | MX_WORKER_HOST | auto-detect | Advertised worker host override |
 | MX_MODEL_REVISION | unset | Source-identity revision label; pin an exact revision for decentralized source pools |
 | MX_NIXL_BACKEND | UCX | NIXL backend; LIBFABRIC is used for AWS EFA |
-| MX_P2P_SOURCE_SELECTOR | random | Source ordering: random or rendezvous_hash; unknown values fall back to random |
+| MX_P2P_SOURCE_SELECTOR | random | Source ordering: random, rendezvous_hash, load_aware, or topology_aware; see [source selection settings](DEPLOYMENT.md#p2p-environment-variables) |
 | MX_SOURCE_QUERY_TIMEOUT | 3600 seconds | TRT-LLM source query timeout |
 | MX_TRANSFER_TIMEOUT | 900 seconds for the general client; 300 seconds for RDMA when unset | Transfer timeout used by integrations; the RDMA receive path uses its 300-second fallback until this variable is explicitly set |
 | MX_HEARTBEAT_INTERVAL_SECS | 30 | Source heartbeat interval |
@@ -174,7 +177,7 @@ MX_POOL_REG and MX_VMM_ARENA are alternative registration optimizations. Enable 
 | MX_GDS_TIMEOUT | 120 seconds | GDS operation timeout |
 | INSTANTTENSOR_BACKEND | runtime default | InstantTensor backend such as URING, AIO, CUFILE, or MMAP |
 
-ModelStreamer credentials are third-party settings. See [Load from object storage or a local path](guides/choose-a-path.md#load-from-object-storage-or-a-local-path).
+ModelStreamer credentials are third-party settings. See [Load from object storage or a local path](guides/choose-a-path.md#inference-read-weights-directly-from-storage).
 
 ## Artifact transfer
 

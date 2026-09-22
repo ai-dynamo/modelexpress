@@ -5,21 +5,21 @@ SPDX-License-Identifier: Apache-2.0
 
 # ModelExpress Helm Chart
 
-This Helm chart deploys ModelExpress, a model serving and management platform, to Kubernetes. For the broader deployment guide covering Docker, standalone K8s, and P2P transfers, see [`docs/DEPLOYMENT.md`](../docs/DEPLOYMENT.md).
+This chart deploys the ModelExpress server. Inference workers and Redis, when selected, are deployed separately. For the broader deployment guide covering Docker, standalone K8s, and P2P transfers, see [`docs/DEPLOYMENT.md`](../docs/DEPLOYMENT.md).
 
 ## Prerequisites
 
-- Kubernetes 1.19+
-- Helm 3.0+
+- Kubernetes with permission to create the resources for your chosen metadata backend.
+- Helm 3 and a server image built from the same revision as the chart, or a published release image used with that release's chart.
+- A default StorageClass for the default PVC, or an explicit storage override.
 
 ## Installation
 
-### 1. Add the Helm repository (if using a repository)
+### 1. Use the chart from your checkout
 
-```bash
-helm repo add modelexpress https://your-repo-url
-helm repo update
-```
+Run the commands below from the repository root. Set `MX_IMAGE_REPOSITORY` and `MX_IMAGE_TAG` to the server image you will deploy. Check the [published tags](https://catalog.ngc.nvidia.com/orgs/nvidia/ai-dynamo/containers/modelexpress-server/-/tags); the chart's `appVersion` on `main` may precede a published image. To build your own, use `docker/Dockerfile` as described in [Deployment](../docs/DEPLOYMENT.md#docker).
+
+Choose the metadata backend before installing: Kubernetes CRDs for inference source/cache metadata, or an existing Redis service. RL refit requires Redis. The defaults deliberately do not select a backend; installing without one creates a server that cannot start.
 
 ### 2. Install or update CRDs for the Kubernetes backend
 
@@ -49,20 +49,30 @@ not remove these CRDs when the application release is uninstalled.
 
 ### 3. Install the chart
 
-To view the available tags for the official ModelExpress image, see the
-[ModelExpress Server tags](https://catalog.ngc.nvidia.com/orgs/nvidia/ai-dynamo/containers/modelexpress-server/-/tags)
-in the NVIDIA NGC catalog.
+For the Kubernetes metadata backend, apply the CRDs above and enable the matching RBAC:
 
 ```bash
-# Install with default values
-helm install my-modelexpress ./helm
-
-# Install with custom values
-helm install my-modelexpress ./helm -f values.yaml
-
-# Install in a specific namespace
-helm install my-modelexpress ./helm --namespace modelexpress --create-namespace
+: "${MX_IMAGE_REPOSITORY:?Set the server image repository}"
+: "${MX_IMAGE_TAG:?Set its published or locally built tag}"
+helm install modelexpress ./helm --namespace modelexpress --create-namespace \
+  --set image.repository="$MX_IMAGE_REPOSITORY" --set-string image.tag="$MX_IMAGE_TAG" \
+  --set env.MX_METADATA_BACKEND=kubernetes \
+  --set serviceAccount.rbac.enabled=true
+kubectl -n modelexpress rollout status deployment/modelexpress --timeout=5m
 ```
+
+For Redis, supply its reachable endpoint instead of enabling Kubernetes metadata RBAC. The Redis service must already exist:
+
+```bash
+: "${MX_REDIS_URL:?Set the Redis URL reachable from the server pod}"
+helm install modelexpress ./helm --namespace modelexpress --create-namespace \
+  --set image.repository="$MX_IMAGE_REPOSITORY" --set-string image.tag="$MX_IMAGE_TAG" \
+  --set env.MX_METADATA_BACKEND=redis --set-string env.REDIS_URL="$MX_REDIS_URL"
+```
+
+These are alternative installs. For a disposable server with no PVC, add `--set persistence.enabled=false --set env.MODEL_EXPRESS_CACHE_DIRECTORY=/app/cache`; cache contents are lost with the container. For persistent use, configure the StorageClass and cache capacity for your cluster.
+
+Private or gated Hugging Face models need an `HF_TOKEN` in the server pod. Creating a Secret alone does not attach it to the chart; reference it through `extraEnv` as shown in [values.yaml](values.yaml). Public models can be downloaded without a token.
 
 ## Configuration
 
@@ -80,8 +90,9 @@ helm install my-modelexpress ./helm --namespace modelexpress --create-namespace
 ```bash
 # Copy and customize production values
 cp helm/values-production.yaml helm/my-production-values.yaml
-# Edit my-production-values.yaml with your actual values
-helm install modelexpress ./helm -f helm/my-production-values.yaml
+# Set the image, metadata backend, storage, and other values for your cluster.
+helm install modelexpress ./helm --namespace modelexpress --create-namespace \
+  -f helm/my-production-values.yaml
 ```
 
 The following table lists the configurable parameters of the ModelExpress chart and their default values.
@@ -159,11 +170,9 @@ The following table lists the configurable parameters of the ModelExpress chart 
 
 ## Examples
 
-### Basic Installation
+### Basic installation
 
-```bash
-helm install modelexpress ./helm
-```
+Use one of the [backend-specific installs](#3-install-the-chart) above. A bare install does not configure the required metadata backend.
 
 ### Custom Image Repository
 
@@ -257,13 +266,13 @@ env:
 # Helm does not upgrade existing CRDs, so update them first.
 kubectl apply -f helm/crds/modelexpress-crds.yaml
 
-helm upgrade my-modelexpress ./helm
+helm upgrade modelexpress ./helm --namespace modelexpress --reuse-values
 ```
 
 ## Uninstalling
 
 ```bash
-helm uninstall my-modelexpress
+helm uninstall modelexpress --namespace modelexpress
 ```
 
 ## Troubleshooting
@@ -271,25 +280,25 @@ helm uninstall my-modelexpress
 ### Check Pod Status
 
 ```bash
-kubectl get pods -l app.kubernetes.io/name=modelexpress
+kubectl -n modelexpress get pods -l app.kubernetes.io/name=modelexpress
 ```
 
 ### Check Logs
 
 ```bash
-kubectl logs -l app.kubernetes.io/name=modelexpress
+kubectl -n modelexpress logs -l app.kubernetes.io/name=modelexpress
 ```
 
 ### Check Service
 
 ```bash
-kubectl get svc -l app.kubernetes.io/name=modelexpress
+kubectl -n modelexpress get svc -l app.kubernetes.io/name=modelexpress
 ```
 
 ### Port Forward for Local Access
 
 ```bash
-kubectl port-forward svc/my-modelexpress 8001:8001
+kubectl -n modelexpress port-forward svc/modelexpress 8001:8001
 ```
 
 ## Contributing
