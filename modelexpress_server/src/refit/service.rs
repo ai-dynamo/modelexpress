@@ -64,6 +64,46 @@ fn validate_s3_uri(uri: &str) -> Result<(), Status> {
     Ok(())
 }
 
+fn validate_azure_uri(uri: &str) -> Result<(), Status> {
+    if uri.contains(['\r', '\n', '\t']) {
+        return Err(Status::invalid_argument(
+            "object_storage.uri must not contain CR, LF, or tab",
+        ));
+    }
+    if uri.contains('?') || uri.contains('#') {
+        return Err(Status::invalid_argument(
+            "object_storage.uri must not contain a query or fragment",
+        ));
+    }
+    let Some(scheme) = uri.get(.."az://".len()) else {
+        return Err(Status::invalid_argument(
+            "object_storage.uri must use the az:// scheme",
+        ));
+    };
+    if !scheme.eq_ignore_ascii_case("az://") {
+        return Err(Status::invalid_argument(
+            "object_storage.uri must use the az:// scheme",
+        ));
+    }
+    let location = &uri["az://".len()..];
+    let Some((container, blob)) = location.split_once('/') else {
+        return Err(Status::invalid_argument(
+            "object_storage.uri must include a container and blob",
+        ));
+    };
+    if container.trim().is_empty() || blob.is_empty() || blob.starts_with('/') {
+        return Err(Status::invalid_argument(
+            "object_storage.uri must include a container and blob",
+        ));
+    }
+    if container.contains(['@', ':']) {
+        return Err(Status::invalid_argument(
+            "object_storage.uri must not contain userinfo or a port",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_payload_format(
     request: &CreateWeightVersionRequest,
 ) -> Result<WeightPayloadFormat, Status> {
@@ -81,13 +121,14 @@ fn validate_payload_format(
         ),
         WeightPayloadFormat::FullHfCheckpoint
             if request.object_storage.as_ref().is_none_or(|source| {
-                ObjectStorageType::try_from(source.storage_type)
-                    .unwrap_or(ObjectStorageType::Unspecified)
-                    != ObjectStorageType::S3
+                !matches!(
+                    ObjectStorageType::try_from(source.storage_type),
+                    Ok(ObjectStorageType::S3 | ObjectStorageType::Azure)
+                )
             }) =>
         {
             Err(Status::invalid_argument(
-                "FULL_HF_CHECKPOINT requires S3 object_storage",
+                "FULL_HF_CHECKPOINT requires S3 or Azure object_storage",
             ))
         }
         WeightPayloadFormat::Unspecified => {
@@ -104,28 +145,34 @@ fn validate_publication(request: &CreateWeightVersionRequest) -> Result<(), Stat
     let state =
         WeightVersionState::try_from(request.state).unwrap_or(WeightVersionState::Unspecified);
     if let Some(object_storage) = request.object_storage.as_ref() {
-        if ObjectStorageType::try_from(object_storage.storage_type)
-            .unwrap_or(ObjectStorageType::Unspecified)
-            != ObjectStorageType::S3
-        {
-            return Err(Status::invalid_argument(
-                "only S3 object storage is currently supported",
-            ));
-        }
         required(&object_storage.uri, "object_storage.uri")?;
-        validate_s3_uri(&object_storage.uri)?;
+        let provider = match ObjectStorageType::try_from(object_storage.storage_type) {
+            Ok(ObjectStorageType::S3) => {
+                validate_s3_uri(&object_storage.uri)?;
+                "S3"
+            }
+            Ok(ObjectStorageType::Azure) => {
+                validate_azure_uri(&object_storage.uri)?;
+                "Azure"
+            }
+            _ => {
+                return Err(Status::invalid_argument(
+                    "only S3 and Azure object storage are currently supported",
+                ));
+            }
+        };
         if !request.expected_source_slots.is_empty() {
-            return Err(Status::invalid_argument(
-                "expected_source_slots must be empty for S3 publication",
-            ));
+            return Err(Status::invalid_argument(format!(
+                "expected_source_slots must be empty for {provider} publication"
+            )));
         }
         if !matches!(
             state,
             WeightVersionState::Staging | WeightVersionState::Ready
         ) {
-            return Err(Status::invalid_argument(
-                "S3 state must be STAGING or READY",
-            ));
+            return Err(Status::invalid_argument(format!(
+                "{provider} state must be STAGING or READY"
+            )));
         }
         return Ok(());
     }
@@ -403,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn full_hf_checkpoint_requires_s3_and_omits_base() {
+    fn full_hf_checkpoint_requires_supported_storage_and_omits_base() {
         let full_hf = CreateWeightVersionRequest {
             payload_format: WeightPayloadFormat::FullHfCheckpoint.into(),
             object_storage: Some(s3_source(
@@ -441,6 +488,174 @@ mod tests {
             error_code(validate_payload_format(&with_gcs)),
             Code::InvalidArgument
         );
+    }
+
+    fn azure_full_checkpoint(uri: &str) -> CreateWeightVersionRequest {
+        CreateWeightVersionRequest {
+            payload_format: WeightPayloadFormat::FullHfCheckpoint.into(),
+            object_storage: Some(ObjectStorageSource {
+                uri: uri.to_string(),
+                storage_type: ObjectStorageType::Azure.into(),
+            }),
+            state: WeightVersionState::Staging.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn azure_full_checkpoint_accepts_scheme_case_and_literal_blob_text() {
+        for scheme in ["az", "AZ", "Az"] {
+            for state in [WeightVersionState::Staging, WeightVersionState::Ready] {
+                let uri = format!("{scheme}://weights/Policy/V25/Model %20.index.json ");
+                let mut request = azure_full_checkpoint(&uri);
+                request.state = state.into();
+                assert!(matches!(
+                    validate_payload_format(&request),
+                    Ok(WeightPayloadFormat::FullHfCheckpoint)
+                ));
+                assert!(validate_publication(&request).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn azure_full_checkpoint_rejects_invalid_locations_without_echoing_them() {
+        for uri in [
+            "",
+            "az",
+            "az://",
+            "az://weights",
+            "az://weights/",
+            "az:///blob",
+            "az://weights//blob",
+            "s3://weights/blob",
+            "https://weights/blob",
+            "az://weights/blob?token=secret",
+            "az://weights/blob#secret",
+            "az://weights/blob?",
+            "az://weights/blob#",
+            " az://weights/blob",
+            "\0az://weights/blob",
+            "\u{001f}az://weights/blob",
+            "junkaz://weights/blob",
+            "\raz://weights/blob",
+            "az:\n//weights/blob",
+            "az://wei\tghts/blob",
+            "az://weights/bl\rob",
+            "az://weights/bl\nob",
+            "az://weights/bl\tob",
+            "az://weights/blob\n",
+            "az://user:secret@weights/blob",
+            "az://secret@weights/blob",
+            "az://weights:8080/blob",
+            "az://weights:/blob",
+            "az:// /blob",
+            "az://\u{2003}/blob",
+        ] {
+            let Err(error) = validate_publication(&azure_full_checkpoint(uri)) else {
+                panic!("publication validation unexpectedly succeeded");
+            };
+            assert_eq!(error.code(), Code::InvalidArgument, "{uri}");
+            assert!(!error.message().contains("secret"));
+        }
+    }
+
+    #[test]
+    fn azure_location_requires_azure_provider() {
+        for storage_type in [
+            ObjectStorageType::S3,
+            ObjectStorageType::Gcs,
+            ObjectStorageType::Unspecified,
+        ] {
+            let mut request = azure_full_checkpoint("az://weights/blob");
+            let Some(source) = request.object_storage.as_mut() else {
+                panic!("missing object storage");
+            };
+            source.storage_type = storage_type.into();
+            assert_eq!(
+                error_code(validate_publication(&request)),
+                Code::InvalidArgument
+            );
+        }
+    }
+
+    #[test]
+    fn azure_full_checkpoint_rejects_base_source_slots_and_invalid_state() {
+        let mut request = azure_full_checkpoint("az://weights/blob");
+        request.base_version_id = Some("previous-version".to_string());
+        assert_eq!(
+            error_code(validate_payload_format(&request)),
+            Code::InvalidArgument
+        );
+
+        request.base_version_id = None;
+        request.expected_source_slots = vec!["rank:0".to_string()];
+        assert_eq!(
+            error_code(validate_publication(&request)),
+            Code::InvalidArgument
+        );
+
+        request.expected_source_slots.clear();
+        for state in [
+            WeightVersionState::Unspecified,
+            WeightVersionState::Releasing,
+        ] {
+            request.state = state.into();
+            assert_eq!(
+                error_code(validate_publication(&request)),
+                Code::InvalidArgument
+            );
+        }
+    }
+
+    #[test]
+    fn azure_and_s3_apply_the_same_payload_and_publication_rules() {
+        for payload_format in [
+            WeightPayloadFormat::FullHfCheckpoint,
+            WeightPayloadFormat::XorDelta,
+            WeightPayloadFormat::FullTensor,
+        ] {
+            for has_base in [false, true] {
+                for state in [
+                    WeightVersionState::Staging,
+                    WeightVersionState::Ready,
+                    WeightVersionState::Releasing,
+                ] {
+                    for has_slots in [false, true] {
+                        for (provider, uri) in [
+                            (ObjectStorageType::S3, "s3://weights/blob"),
+                            (ObjectStorageType::Azure, "az://weights/blob"),
+                        ] {
+                            let request = CreateWeightVersionRequest {
+                                payload_format: payload_format.into(),
+                                base_version_id: has_base.then(|| "base".to_string()),
+                                object_storage: Some(ObjectStorageSource {
+                                    storage_type: provider.into(),
+                                    uri: uri.to_string(),
+                                }),
+                                state: state.into(),
+                                expected_source_slots: if has_slots {
+                                    vec!["rank:0".to_string()]
+                                } else {
+                                    vec![]
+                                },
+                                ..Default::default()
+                            };
+                            assert_eq!(
+                                validate_payload_format(&request).is_ok(),
+                                has_base == (payload_format == WeightPayloadFormat::XorDelta),
+                                "{provider:?} {payload_format:?} base={has_base}",
+                            );
+                            assert_eq!(
+                                validate_publication(&request).is_ok(),
+                                !has_slots && state != WeightVersionState::Releasing,
+                                "{provider:?} {payload_format:?} state={state:?} slots={has_slots}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -538,7 +753,7 @@ mod tests {
             },
             CreateWeightVersionRequest {
                 object_storage: Some(ObjectStorageSource {
-                    uri: "az://weights/root".to_string(),
+                    uri: "s3://weights/root".to_string(),
                     storage_type: ObjectStorageType::Azure.into(),
                 }),
                 state: WeightVersionState::Staging.into(),
